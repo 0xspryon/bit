@@ -1,0 +1,20 @@
+{
+  "name": "@bit/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "build": "bun build src/main.ts --target=bun --packages=external --outdir=dist",
+    "start": "bun dist/main.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@bit/contracts": "workspace:*",
+    "drizzle-orm": "0.45.4",
+    "effect": "4.0.5"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3"
+  }
+}
