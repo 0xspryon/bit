@@ -14,7 +14,9 @@ bun run dev
 ```
 
 Open http://localhost:5173. Vite proxies `/api` to the loopback-only server on
-port 3000. `GET /api/health` returns `{ "status": "ok" }`.
+port 3000. Every endpoint this application serves is under `/api/v1`, built from
+`apiPath` in `@bit/contracts` so the web app and the server cannot disagree about a
+route. `GET /api/v1/health` returns `{ "status": "ok" }`.
 
 ```sh
 bun run build

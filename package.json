@@ -15,6 +15,7 @@
     "build": "turbo run build",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
+    "test:persistence": "turbo run test:persistence",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
@@ -27,5 +28,8 @@
     "turbo": "2.11.9",
     "typescript": "6.0.3",
     "typescript-eslint": "8.71.2"
+  },
+  "overrides": {
+    "effect": "4.0.5"
   }
 }

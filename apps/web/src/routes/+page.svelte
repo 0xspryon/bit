@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { Schema } from "effect";
-  import { Health } from "@bit/contracts";
+  import { apiPath, Health } from "@bit/contracts";
 
   let status = $state("Connecting…");
   onMount(() => {
     const controller = new AbortController();
-    void fetch("/api/health", { signal: controller.signal })
+    void fetch(apiPath("health"), { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const health = Schema.decodeUnknownSync(Health)(await response.json());

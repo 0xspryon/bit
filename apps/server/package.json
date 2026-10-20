@@ -7,11 +7,14 @@
     "build": "bun build src/main.ts --target=bun --packages=external --outdir=dist",
     "start": "bun dist/main.js",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "bun test"
+    "test": "bun test",
+    "test:persistence": "bun test src/persistence src/briefing"
   },
   "dependencies": {
     "@bit/contracts": "workspace:*",
-    "drizzle-orm": "0.45.4",
+    "@effect/sql-sqlite-bun": "4.0.5",
+    "@opencode/client": "2.1.0",
+    "@opencode/schema": "2.1.0",
     "effect": "4.0.5"
   },
   "devDependencies": {
