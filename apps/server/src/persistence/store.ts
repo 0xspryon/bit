@@ -35,13 +35,24 @@
  */
 import {
   OBSERVATION_WRITE_FORMAT,
+  OUTBOX_RECOVERY_POLICIES,
   Observation,
   ObservationTestCase,
+  RecordAssetResult,
   RecordObservationResult,
   SummaryObservationConditions,
+  AddIntentResult,
+  assetIdentityOf,
+  dimensionAddress,
+  isAssetIdentityRefusal,
   parseDimensionAddress,
+  type AddIntentInput,
   type ObservationProvenance,
   type ObservationRecordFormat,
+  type OutboxEntry,
+  type OutboxRequestType,
+  type RecordAssetInput,
+  type RecordedEvent,
   type RecordObservationInput,
 } from "@bit/contracts";
 import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
@@ -110,6 +121,20 @@ export interface CallerContext {
   readonly harnessSessionId: string;
   readonly workerId: string;
   readonly attemptFence: number;
+}
+
+/**
+ * The host's own authority, for a mutation no worker makes.
+ *
+ * An intent is created by the host, not by a worker: a planner round has no execution
+ * attempt, so there is nothing for it to present and no {@link CallerContext} to build
+ * (DECISIONS.md §4's planner-authority gap, recorded in `contracts/intent.ts`). This is
+ * the smaller thing that is still true — which target, and whose receipts — and it is
+ * supplied by the process that owns the registry, never by a payload.
+ */
+export interface HostContext {
+  readonly callerScope: string;
+  readonly targetId: string;
 }
 
 export interface SeedInput {
@@ -272,7 +297,29 @@ export interface RecoveryOutcome {
   readonly detail: string;
 }
 
+/**
+ * The counter an observation's `sequence` comes from.
+ *
+ * Per target, because the counter lives in the target's own file (DECISIONS.md §8:
+ * "cursors belong to a particular target event log, not a global sequence across
+ * independent target files"). It is **not** renumbered by the two-tier split: an
+ * observation's id is `obs_<sequence>_<attemptId>` and every dimension alias a briefing
+ * has printed is built from it, so renumbering would rewrite primary keys and invalidate
+ * addresses already in circulation. Each file carries the counter it has, forward.
+ */
 const SEQUENCE_NAME = "observations";
+
+/**
+ * The event log's counter, and the outbox's.
+ *
+ * Two counters rather than one shared with each other or with observations. Sharing would
+ * mean a transaction that wrote one event and one request consumed two numbers, leaving
+ * the events table with gaps — and a gap is the one thing a consumer reading
+ * `WHERE sequence > cursor` cannot tell from a loss. Separate counters keep each sequence
+ * dense: a rollback discards its own bump along with everything else in the transaction.
+ */
+const EVENT_SEQUENCE_NAME = "events";
+const OUTBOX_SEQUENCE_NAME = "outbox";
 
 /** Stable key ordering so a retry hashes identically to the original call. */
 const canonical = (value: unknown): string => {
@@ -284,13 +331,38 @@ const canonical = (value: unknown): string => {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
 };
 
+/**
+ * The fingerprint a retry is compared against.
+ *
+ * Over the caller **and** the input, not the input alone. The receipt key already
+ * namespaces an operation id to one caller scope, so this is the finer check: the same
+ * operation id from the same scope but under a different attempt, session or worker is a
+ * different request, and answering it with the first one's result would attach provenance
+ * that nothing recorded. `canonical` sorts keys so a retry that serialises its fields in
+ * another order still hashes identically.
+ */
 const hashRequest = (
-  caller: CallerContext,
-  input: RecordObservationInput,
+  caller: CallerContext | HostContext,
+  input: unknown,
 ): string =>
   new Bun.CryptoHasher("sha256")
     .update(canonical({ caller, input }))
     .digest("hex");
+
+/** 16 random bytes as hex, for the ids nothing may derive from a position or a name. */
+const randomId = (prefix: string): string =>
+  `${prefix}_${Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("")}`;
+
+/**
+ * A dimension's id.
+ *
+ * Random, not derived from `(observation_id, position)`. An id that encoded the position
+ * would reintroduce the positional identity migration `0008` exists to remove: the alias
+ * is positional and resolved on the way in, and what it resolves *to* must not be.
+ */
+const newDimensionId = (): string => randomId("dim");
 
 /** JSON text columns, declared once so reads and writes cannot disagree. */
 const jsonList = Schema.fromJsonString(Schema.Array(Schema.String));
@@ -370,10 +442,20 @@ type StoredObservationRow = typeof StoredObservationRow.Type;
  */
 const observationColumns = Object.keys(StoredObservationRow.fields).join(", ");
 
+/**
+ * A stored command receipt, with its result left as text.
+ *
+ * It was decoded here through `RecordObservationResult` when `record_observation` was the
+ * only mutation. It cannot be now: one table holds receipts for three operations, and a
+ * schema fixed at the query would fail to decode two thirds of them. The result is
+ * therefore decoded by the operation that wrote it, through that operation's own schema
+ * (see {@link makeStore}'s `replayResult`) — which keeps the typed boundary §20 insists
+ * on. What is deliberately *not* done is `JSON.parse(text) as A`.
+ */
 const StoredReceipt = Schema.Struct({
   key: Schema.String,
   request_hash: Schema.String,
-  result: Schema.fromJsonString(RecordObservationResult),
+  result: Schema.String,
 });
 
 const SequenceRow = Schema.Struct({ value: Schema.Int });
@@ -445,26 +527,119 @@ export type AttemptRecoveryRow = typeof AttemptRecoveryRow.Type;
 const recoveryColumns = Object.keys(AttemptRecoveryRow.fields).join(", ");
 
 /**
- * One recorded "this observation took on that earlier untested dimension" link.
+ * One recorded untested dimension, as a row with its own identity (migration `0008`).
  *
- * `address` is kept verbatim as submitted so the stored link reads the way the briefing
- * printed it; `dimension_index` is the parsed position the write boundary resolved it to.
+ * `id` is opaque on purpose. It is not derived from `(observation_id, position)`,
+ * because an id that encoded the position would make position the identity again and
+ * the table would be decoration — the whole reason for it is that a dimension's identity
+ * stops depending on where it sits (DECISIONS.md §17, "dimensions become rows").
+ *
+ * The observation's `untested_dimensions` JSON column still holds the same sentences.
+ * The two cannot disagree: the rows are written from the list inside the same
+ * transaction as the observation, and nothing updates an observation afterwards. The
+ * column is that observation's own immutable record of what it declared; these rows are
+ * the addressable identities derived from it.
+ */
+const StoredDimensionRow = Schema.Struct({
+  id: Schema.String,
+  observation_id: Schema.String,
+  position: Schema.Int,
+  text: Schema.String,
+  created_at: Schema.Finite,
+});
+
+/**
+ * A dimension, with the **wire alias** a briefing prints for it.
+ *
+ * The alias is `<observationId>#u<position>` and is derived here rather than stored:
+ * storing it would be a second spelling of the same two columns. It is what a worker
+ * copies, and the write boundary resolves it back to {@link StoredDimension.dimensionId}.
+ */
+export interface StoredDimension {
+  readonly dimensionId: string;
+  readonly observationId: string;
+  readonly position: number;
+  readonly text: string;
+  readonly address: string;
+}
+
+/**
+ * One recorded "this observation took on that earlier dimension" link.
+ *
+ * The foreign key is the dimension's id now, not a parsed position. `address` is kept
+ * verbatim as submitted so the stored link reads the way the briefing printed it;
+ * which observation and position it resolved to are the dimension row's own columns,
+ * read back through a join rather than duplicated here.
  */
 const DimensionLinkRow = Schema.Struct({
   observation_id: Schema.String,
+  dimension_id: Schema.String,
   address: Schema.String,
-  source_observation_id: Schema.String,
-  dimension_index: Schema.Int,
   created_at: Schema.Finite,
+  addressing_sequence: Schema.Int,
+  addressing_outcome: Schema.Literals(["positive", "negative", "inconclusive"]),
 });
 
 export interface DimensionLink {
   /** The later observation that addressed the dimension. */
   readonly observationId: string;
+  /** The dimension row it addressed. */
+  readonly dimensionId: string;
+  /** The alias exactly as the worker submitted it. */
   readonly address: string;
-  /** The observation whose `untestedDimensions` the address points into. */
-  readonly sourceObservationId: string;
-  readonly dimensionIndex: number;
+  /**
+   * The addressing observation's own sequence and outcome, from the same join.
+   *
+   * Carried on the link rather than looked up by the reader, because since the
+   * same-intent rule relaxed (migration `0009`) the addressing observation may belong to
+   * a *sibling* intent and so may not be among the rows a briefing for this intent
+   * holds. A reader that resolved the addresser against its own list would silently drop
+   * exactly the link the relaxation exists to allow — and would report the question as
+   * untouched.
+   */
+  readonly addressingSequence: number;
+  readonly addressingOutcome: "positive" | "negative" | "inconclusive";
+}
+
+/**
+ * One intent's declaration that it addresses a dimension, with its work's state.
+ *
+ * Named `*Row` because it is a store shape, not the contract's {@link
+ * DimensionSchedule}: the briefing turns `attemptsOpen` — a count — into the boolean a
+ * reader needs, and that derivation belongs where the state is derived.
+ */
+/** One asset as stored, in the shape the table holds. */
+export interface StoredAsset {
+  readonly id: string;
+  readonly target_id: string;
+  readonly kind: string;
+  readonly identity: string;
+  readonly host: string;
+  readonly port: number;
+  readonly scheme: string | null;
+  readonly method: string | null;
+  readonly path: string | null;
+  readonly first_seen_at: number;
+}
+
+/** One recorded discovery of an asset, which a merge never overwrites. */
+export interface StoredAssetDiscovery {
+  readonly asset_id: string;
+  readonly operation_id: string;
+  readonly caller_scope: string;
+  readonly intent_id: string;
+  readonly attempt_id: string;
+  readonly discovered_as: string;
+  readonly note: string;
+  readonly discovered_at: number;
+}
+
+export interface DimensionScheduleRow {
+  readonly dimensionId: string;
+  readonly intentId: string;
+  readonly question: string;
+  readonly attemptsTotal: number;
+  readonly attemptsOpen: number;
 }
 
 /**
@@ -699,16 +874,167 @@ const makeStore = Effect.fnUntraced(function* () {
         RETURNING value`,
   });
 
-  /** The dimension list an address points into, with the row's own intent. */
-  const findDimensionSource = SqlSchema.findOneOption({
+  /**
+   * Decodes a stored receipt's result through the operation's own schema.
+   *
+   * A replay hands back a value this store already committed, so it has to come back as
+   * the type the caller was promised. Decoding rather than casting means a receipt whose
+   * stored JSON no longer matches the contract is a {@link StoredRowError} naming the
+   * receipt, not a value that type-checks and is wrong.
+   */
+  const replayResult = <A, I>(
+    key: string,
+    codec: Schema.Codec<A, I>,
+    text: string,
+  ): Effect.Effect<A, StoredRowError> =>
+    Schema.decodeUnknownEffect(Schema.fromJsonString(codec))(text).pipe(
+      Effect.mapError(
+        (issue) =>
+          new StoredRowError({
+            table: "command_receipts",
+            rowId: key,
+            detail: `the stored result no longer matches the contract: ${String(issue)}`,
+            cause: issue,
+          }),
+      ),
+    );
+
+  /**
+   * Appends one event, allocating its sequence inside the caller's transaction.
+   *
+   * Transaction-local by contract: it must be yielded from inside a
+   * `sql.withTransaction` body, so the sequence bump, the event row and the domain
+   * change it describes commit together or not at all. There is no path that writes an
+   * event on its own, which is what makes "every event has a domain change behind it"
+   * true rather than intended.
+   *
+   * The three identities are passed separately and never merged (§6). A host-originated
+   * mutation passes `null` for all of caller scope, intent and attempt, because it has
+   * no attempt — inventing one so the column could be `NOT NULL` would be the conflation
+   * the separation exists to prevent.
+   */
+  const appendEvent = Effect.fnUntraced(function* (input: {
+    readonly kind: string;
+    readonly targetId: string;
+    readonly callerScope: string | null;
+    readonly intentId: string | null;
+    readonly attemptId: string | null;
+    readonly operation: string;
+    readonly operationId: string | null;
+    readonly subjectId: string;
+    readonly payload: unknown;
+    readonly recordedAt: number;
+  }) {
+    const cursor = yield* bumpSequence(EVENT_SEQUENCE_NAME).pipe(
+      Effect.mapError(lift("sequence_cursor", EVENT_SEQUENCE_NAME)),
+    );
+    const sequence = cursor.value;
+    const eventId = `evt_${sequence.toString().padStart(6, "0")}`;
+    yield* sql`INSERT INTO events (
+        id, sequence, target_id, kind, payload, caller_scope, intent_id, attempt_id,
+        operation, operation_id, subject_id, recorded_at
+      ) VALUES (
+        ${eventId}, ${sequence}, ${input.targetId}, ${input.kind},
+        ${JSON.stringify(input.payload)}, ${input.callerScope}, ${input.intentId},
+        ${input.attemptId}, ${input.operation}, ${input.operationId},
+        ${input.subjectId}, ${input.recordedAt}
+      )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+    return { eventId, sequence };
+  });
+
+  /**
+   * Enqueues one side-effect request, in the same transaction as its event.
+   *
+   * `causedByEventId` is a real foreign key, so a request cannot exist without the event
+   * that explains it. The recovery policy is not a parameter: it is looked up from
+   * {@link OUTBOX_RECOVERY_POLICIES}, because §6 requires one policy per effect *type*
+   * and a per-call policy would let two writers disagree about whether the same remote
+   * action may be repeated.
+   *
+   * Every row is written `pending` with no lease and no attempt count. Nothing in this
+   * sprint moves it; Sprint 03 claims and dispatches.
+   */
+  const enqueueRequest = Effect.fnUntraced(function* (input: {
+    readonly requestType: OutboxRequestType;
+    readonly targetId: string;
+    readonly payload: unknown;
+    readonly causedByEventId: string;
+    readonly enqueuedAt: number;
+  }) {
+    const cursor = yield* bumpSequence(OUTBOX_SEQUENCE_NAME).pipe(
+      Effect.mapError(lift("sequence_cursor", OUTBOX_SEQUENCE_NAME)),
+    );
+    const sequence = cursor.value;
+    const outboxId = `out_${sequence.toString().padStart(6, "0")}`;
+    yield* sql`INSERT INTO outbox (
+        id, sequence, target_id, request_type, payload, recovery_policy,
+        caused_by_event_id, status, attempts, enqueued_at
+      ) VALUES (
+        ${outboxId}, ${sequence}, ${input.targetId}, ${input.requestType},
+        ${JSON.stringify(input.payload)},
+        ${OUTBOX_RECOVERY_POLICIES[input.requestType]},
+        ${input.causedByEventId}, 'pending', 0, ${input.enqueuedAt}
+      )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+    return { outboxId, sequence };
+  });
+
+  /**
+   * The dimension one alias names, with the goal and intent its observation sits under.
+   *
+   * A join rather than a parse of a JSON column: the alias is resolved to a
+   * `dimension_id`, and the scope check needs the raising observation's intent *and*
+   * that intent's goal, because the rule relaxed to "same goal, when the caller's own
+   * intent declares that dimension" (DECISIONS.md §17).
+   */
+  const findDimensionByPosition = SqlSchema.findOneOption({
+    Request: Schema.Struct({
+      observationId: Schema.String,
+      position: Schema.Int,
+    }),
+    Result: Schema.Struct({
+      dimension_id: Schema.String,
+      source_intent_id: Schema.String,
+      source_goal_id: Schema.String,
+    }),
+    execute: (request) =>
+      sql`SELECT dimensions.id AS dimension_id,
+            source.intent_id AS source_intent_id,
+            source_intent.goal_id AS source_goal_id
+          FROM observation_dimensions AS dimensions
+          INNER JOIN observations AS source
+            ON source.id = dimensions.observation_id
+          INNER JOIN intents AS source_intent
+            ON source_intent.id = source.intent_id
+          WHERE dimensions.observation_id = ${request.observationId}
+            AND dimensions.position = ${request.position}`,
+  });
+
+  /** How many dimensions one observation holds, for the out-of-range refusal only. */
+  const countDimensionsOfObservation = SqlSchema.findOne({
+    Request: Schema.String,
+    Result: CountRow,
+    execute: (observationId) =>
+      sql`SELECT COUNT(*) AS value FROM observation_dimensions
+          WHERE observation_id = ${observationId}`,
+  });
+
+  const observationExists = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({ id: Schema.String }),
+    execute: (observationId) =>
+      sql`SELECT id FROM observations WHERE id = ${observationId}`,
+  });
+
+  /** The goal an intent sits under, and the dimension it declared it addresses. */
+  const findIntentLineage = SqlSchema.findOneOption({
     Request: Schema.String,
     Result: Schema.Struct({
-      intent_id: Schema.String,
-      untested_dimensions: jsonList,
+      goal_id: Schema.String,
+      addresses_dimension: Schema.NullOr(Schema.String),
     }),
-    execute: (observationId) =>
-      sql`SELECT intent_id, untested_dimensions FROM observations
-          WHERE id = ${observationId}`,
+    execute: (intentId) =>
+      sql`SELECT goal_id, addresses_dimension FROM intents
+          WHERE id = ${intentId}`,
   });
 
   const countObservationsForAttempt = SqlSchema.findOne({
@@ -781,28 +1107,65 @@ const makeStore = Effect.fnUntraced(function* () {
         detail: `'${address}' is not an untested-dimension address; use the exact address from the briefing, e.g. obs_000003_attempt-x#u1`,
       });
     }
-    const source = yield* findDimensionSource(parsed.observationId).pipe(
-      Effect.mapError(lift("observations", parsed.observationId)),
+    const found = yield* findDimensionByPosition({
+      observationId: parsed.observationId,
+      position: parsed.index,
+    }).pipe(Effect.mapError(lift("observation_dimensions", address)));
+    if (Option.isNone(found)) {
+      // Two different mistakes, told apart so the refusal is correctable. Both cost an
+      // extra read, and only on the failing path.
+      const exists = yield* observationExists(parsed.observationId).pipe(
+        Effect.mapError(lift("observations", parsed.observationId)),
+      );
+      if (Option.isNone(exists)) {
+        return yield* new MutationError({
+          reason: "invalid",
+          detail: `no observation ${parsed.observationId} exists, so address '${address}' cannot be addressed`,
+        });
+      }
+      const held = yield* countDimensionsOfObservation(
+        parsed.observationId,
+      ).pipe(Effect.mapError(lift("observation_dimensions", address)));
+      return yield* new MutationError({
+        reason: "invalid",
+        detail: `observation ${parsed.observationId} recorded ${String(held.value)} untested dimensions, so index ${String(parsed.index)} in '${address}' does not exist`,
+      });
+    }
+    const dimension = found.value;
+    if (dimension.source_intent_id === caller.intentId) {
+      return {
+        address,
+        dimensionId: dimension.dimension_id,
+        ...parsed,
+      };
+    }
+    // The relaxation, and the whole of it: a caller may reach a dimension raised under a
+    // *different* intent of the same goal, and only when its own intent recorded that
+    // this is the dimension it addresses (migration `0009`). Authority is still checked
+    // — it is checked against recorded lineage instead of an assumption — and the
+    // caller's claim about its own intent is read from the row, never from the payload.
+    const lineage = yield* findIntentLineage(caller.intentId).pipe(
+      Effect.mapError(lift("intents", caller.intentId)),
     );
-    if (Option.isNone(source)) {
+    if (Option.isNone(lineage)) {
       return yield* new MutationError({
         reason: "invalid",
-        detail: `no observation ${parsed.observationId} exists, so address '${address}' cannot be addressed`,
+        detail: `address '${address}' belongs to intent ${dimension.source_intent_id}, not to ${caller.intentId}`,
       });
     }
-    if (source.value.intent_id !== caller.intentId) {
+    if (lineage.value.goal_id !== dimension.source_goal_id) {
       return yield* new MutationError({
         reason: "invalid",
-        detail: `address '${address}' belongs to intent ${source.value.intent_id}, not to ${caller.intentId}`,
+        detail: `address '${address}' was raised under goal ${dimension.source_goal_id} and intent ${caller.intentId} sits under goal ${lineage.value.goal_id}; an observation cannot address a dimension from another goal`,
       });
     }
-    if (parsed.index >= source.value.untested_dimensions.length) {
+    if (lineage.value.addresses_dimension !== dimension.dimension_id) {
       return yield* new MutationError({
         reason: "invalid",
-        detail: `observation ${parsed.observationId} recorded ${String(source.value.untested_dimensions.length)} untested dimensions, so index ${String(parsed.index)} in '${address}' does not exist`,
+        detail: `address '${address}' was raised by intent ${dimension.source_intent_id}, not ${caller.intentId}, and intent ${caller.intentId} does not declare that it addresses it; an intent may answer another intent's dimension of the same goal only when it was created saying so`,
       });
     }
-    return { address, ...parsed };
+    return { address, dimensionId: dimension.dimension_id, ...parsed };
   });
 
   /**
@@ -886,7 +1249,12 @@ const makeStore = Effect.fnUntraced(function* () {
                   detail: `operation ${input.operationId} was already used with different input`,
                 });
               }
-              return { ...receipt.result, replayed: true };
+              const original = yield* replayResult(
+                key,
+                RecordObservationResult,
+                receipt.result,
+              );
+              return { ...original, replayed: true };
             }
 
             yield* checkAuthority(caller);
@@ -941,15 +1309,29 @@ const makeStore = Effect.fnUntraced(function* () {
               NULL, NULL, NULL
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
 
+            // This observation's own untested dimensions, as rows with their own
+            // identities (migration `0008`). Written here, in the same transaction as
+            // the observation and from the same list, which is what makes the JSON
+            // column and these rows two views of one write rather than two records that
+            // can drift. Position is the index in the submitted list, so the wire alias
+            // the briefing prints resolves back to the row this loop created.
+            for (const [position, text] of input.untestedDimensions.entries()) {
+              yield* sql`INSERT INTO observation_dimensions (
+                id, observation_id, position, text, created_at
+              ) VALUES (
+                ${newDimensionId()}, ${observationId}, ${position}, ${text},
+                ${recordedAt}
+              )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+            }
+
             // After the observation row, because both link columns are real foreign
             // keys and SQLite checks them immediately.
             for (const link of addressed) {
               yield* sql`INSERT INTO observation_dimension_links (
-                observation_id, address, source_observation_id, dimension_index,
-                created_at
+                observation_id, dimension_id, address, created_at
               ) VALUES (
-                ${observationId}, ${link.address}, ${link.observationId},
-                ${link.index}, ${recordedAt}
+                ${observationId}, ${link.dimensionId}, ${link.address},
+                ${recordedAt}
               )`.pipe(Effect.mapError(asDatabaseError("transaction")));
             }
 
@@ -968,6 +1350,46 @@ const makeStore = Effect.fnUntraced(function* () {
               ${recordedAt}
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
 
+            // The event and the obligation it implies, in this same transaction. A
+            // refusal above rolled back before reaching here, which is why a conflicting
+            // retry writes no event and no outbox row either — not because the code
+            // checks for one, but because there is no path to this point that is not
+            // committing everything.
+            const event = yield* appendEvent({
+              kind: "observation.recorded",
+              targetId: caller.targetId,
+              callerScope: caller.callerScope,
+              intentId: caller.intentId,
+              attemptId: caller.attemptId,
+              operation: "record_observation",
+              operationId: input.operationId,
+              subjectId: observationId,
+              payload: {
+                observationId,
+                sequence,
+                outcome: input.outcome,
+                testedClaim: input.testedClaim,
+                addressedDimensionIds: addressed.map(
+                  (link) => link.dimensionId,
+                ),
+                untestedDimensionCount: input.untestedDimensions.length,
+              },
+              recordedAt,
+            });
+            yield* enqueueRequest({
+              requestType: "notification.deliver",
+              targetId: caller.targetId,
+              payload: {
+                subject: "observation.recorded",
+                observationId,
+                intentId: caller.intentId,
+                outcome: input.outcome,
+                testedClaim: input.testedClaim,
+              },
+              causedByEventId: event.eventId,
+              enqueuedAt: recordedAt,
+            });
+
             return result;
           }),
         )
@@ -980,6 +1402,454 @@ const makeStore = Effect.fnUntraced(function* () {
         );
     },
   );
+
+  const findAssetByIdentity = SqlSchema.findOneOption({
+    Request: Schema.Struct({
+      targetId: Schema.String,
+      kind: Schema.String,
+      identity: Schema.String,
+    }),
+    Result: Schema.Struct({ id: Schema.String, first_seen_at: Schema.Finite }),
+    execute: (request) =>
+      sql`SELECT id, first_seen_at FROM assets
+          WHERE target_id = ${request.targetId}
+            AND kind = ${request.kind}
+            AND identity = ${request.identity}`,
+  });
+
+  const countDiscoveries = SqlSchema.findOne({
+    Request: Schema.String,
+    Result: CountRow,
+    execute: (assetId) =>
+      sql`SELECT COUNT(*) AS value FROM asset_discoveries
+          WHERE asset_id = ${assetId}`,
+  });
+
+  /**
+   * Records one asset under the authenticated caller's identity, merging on domain
+   * identity and keeping every discovery.
+   *
+   * This is the third of §6's three identities, and the only place in this store where
+   * all three are visibly distinct in one call. **Caller authority** decides which target
+   * the asset lands in and is read from the credential, never from the payload — a worker
+   * cannot record an asset against another engagement by asking. **Operation identity**
+   * is `operationId`, namespaced to the caller's scope, and an exact retry replays with
+   * `replayed: true` having written nothing. **Domain identity** is the canonical form
+   * from `assetIdentityOf`: a second, genuinely different operation that finds the same
+   * canonical asset does *not* create a second asset and does *not* overwrite the first
+   * discovery — it adds a discovery row. One asset, two provenance records, which is
+   * exactly what §6 requires of a merge.
+   *
+   * The merge is `ON CONFLICT DO NOTHING` followed by a read, rather than a read followed
+   * by a conditional insert: inside one transaction both are correct, and letting the
+   * unique index decide means the schema is what enforces identity rather than this
+   * function's control flow.
+   *
+   * `created` and `replayed` are separate booleans because they answer different
+   * questions. `replayed` means this command had already been accepted. `created: false`
+   * with `replayed: false` means a new command found a known asset — new knowledge about
+   * where it was seen, no new asset.
+   */
+  const recordAsset = Effect.fn("ObservationStore.recordAsset")(function* (
+    caller: CallerContext,
+    input: RecordAssetInput,
+  ) {
+    const recordedAt = yield* Clock.currentTimeMillis;
+    const key = `${caller.callerScope}:record_asset:${input.operationId}`;
+    const requestHash = hashRequest(caller, input);
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const existing = yield* findReceipt(key).pipe(
+            Effect.mapError(lift("command_receipts", key)),
+          );
+          // Receipt before authority, for the reason recorded on `recordObservation`: a
+          // replay writes nothing and creates no external effect, and refusing it would
+          // make a transport retry across a settlement boundary look like lost work.
+          if (Option.isSome(existing)) {
+            const receipt = existing.value;
+            if (receipt.request_hash !== requestHash) {
+              return yield* new MutationError({
+                reason: "conflict",
+                detail: `operation ${input.operationId} was already used with different input`,
+              });
+            }
+            const original = yield* replayResult(
+              key,
+              RecordAssetResult,
+              receipt.result,
+            );
+            return { ...original, replayed: true };
+          }
+
+          yield* checkAuthority(caller);
+
+          const identity = assetIdentityOf(input);
+          if (isAssetIdentityRefusal(identity)) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: identity.detail,
+            });
+          }
+
+          yield* sql`INSERT INTO assets (
+              id, target_id, kind, identity, host, port, scheme, method, path,
+              first_seen_at
+            ) VALUES (
+              ${randomId("asset")}, ${caller.targetId}, ${identity.kind},
+              ${identity.identity}, ${identity.host}, ${identity.port},
+              ${identity.scheme}, ${identity.method}, ${identity.path},
+              ${recordedAt}
+            )
+            ON CONFLICT(target_id, kind, identity) DO NOTHING`.pipe(
+            Effect.mapError(asDatabaseError("transaction")),
+          );
+          const stored = yield* findAssetByIdentity({
+            targetId: caller.targetId,
+            kind: identity.kind,
+            identity: identity.identity,
+          }).pipe(Effect.mapError(lift("assets", identity.identity)));
+          if (Option.isNone(stored)) {
+            // Unreachable: the insert either wrote the row or found it already there,
+            // inside this transaction. Reported rather than asserted away, because an
+            // `ON CONFLICT DO NOTHING` whose row then cannot be read would mean the
+            // unique index and this query disagree about identity.
+            return yield* new DatabaseError({
+              operation: "transaction",
+              reason: `asset ${identity.identity} was neither inserted nor found`,
+              cause: identity,
+            });
+          }
+          const asset = stored.value;
+          const created = asset.first_seen_at === recordedAt;
+
+          yield* sql`INSERT INTO asset_discoveries (
+              asset_id, operation_id, caller_scope, intent_id, attempt_id,
+              discovered_as, note, discovered_at
+            ) VALUES (
+              ${asset.id}, ${input.operationId}, ${caller.callerScope},
+              ${caller.intentId}, ${caller.attemptId}, ${input.url},
+              ${input.note}, ${recordedAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          const discoveries = yield* countDiscoveries(asset.id).pipe(
+            Effect.mapError(lift("asset_discoveries", asset.id)),
+          );
+          const result: RecordAssetResult = {
+            assetId: asset.id,
+            kind: identity.kind,
+            identity: identity.identity,
+            created,
+            replayed: false,
+            discoveries: discoveries.value,
+          };
+
+          yield* sql`INSERT INTO command_receipts (
+              key, caller_scope, operation, operation_id, request_hash, result,
+              created_at
+            ) VALUES (
+              ${key}, ${caller.callerScope}, 'record_asset', ${input.operationId},
+              ${requestHash}, ${JSON.stringify(result)}, ${recordedAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          const event = yield* appendEvent({
+            kind: "asset.recorded",
+            targetId: caller.targetId,
+            callerScope: caller.callerScope,
+            intentId: caller.intentId,
+            attemptId: caller.attemptId,
+            operation: "record_asset",
+            operationId: input.operationId,
+            subjectId: asset.id,
+            payload: {
+              assetId: asset.id,
+              kind: identity.kind,
+              identity: identity.identity,
+              created,
+              discoveredAs: input.url,
+            },
+            recordedAt,
+          });
+          yield* enqueueRequest({
+            requestType: "asset.enrich",
+            targetId: caller.targetId,
+            payload: {
+              assetId: asset.id,
+              kind: identity.kind,
+              identity: identity.identity,
+              host: identity.host,
+              port: identity.port,
+            },
+            causedByEventId: event.eventId,
+            enqueuedAt: recordedAt,
+          });
+
+          return result;
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
+  const findGoal = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({ id: Schema.String, target_id: Schema.String }),
+    execute: (goalId) =>
+      sql`SELECT id, target_id FROM goals WHERE id = ${goalId}`,
+  });
+
+  /** An anchor candidate, resolved to whatever kind of node it actually is. */
+  const classifyAnchor = SqlSchema.findOne({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      as_observation_goal: Schema.NullOr(Schema.String),
+      as_intent: Schema.NullOr(Schema.String),
+      as_goal: Schema.NullOr(Schema.String),
+    }),
+    execute: (nodeId) =>
+      sql`SELECT
+            (SELECT intents.goal_id FROM observations
+               INNER JOIN intents ON intents.id = observations.intent_id
+             WHERE observations.id = ${nodeId}) AS as_observation_goal,
+            (SELECT id FROM intents WHERE id = ${nodeId}) AS as_intent,
+            (SELECT id FROM goals WHERE id = ${nodeId}) AS as_goal`,
+  });
+
+  const findIntentById = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({ id: Schema.String }),
+    execute: (intentId) => sql`SELECT id FROM intents WHERE id = ${intentId}`,
+  });
+
+  /**
+   * Creates one intent, with §4's anchoring rule enforced here rather than in a tool.
+   *
+   * §4 calls this the differentiator and says to implement it before anything else that
+   * writes to the graph: **an intent anchors only to existing recorded evidence, never to
+   * an intent, a goal or a hint, and an empty parent list means a new top-level
+   * direction.** The rejection is instructive, not a bare failure — a planner that is
+   * told "that is an intent, and an intent cannot anchor an intent; leave the list empty
+   * for a new direction" can correct itself, where one told "invalid parent" cannot.
+   *
+   * **Why it is in the store and not a planner tool.** Intents are planner-generated and
+   * a planner round has no execution attempt, so there is no `CallerContext` to
+   * authenticate: `checkAuthority` validates against a live unsettled attempt and would
+   * refuse every planner. The host creates intents, as it does today, and the
+   * planner-facing surface waits for Sprint 07 when there is a loop to authenticate. What
+   * this buys is that the rule cannot be bypassed by writing an intent some other way —
+   * there is no other way.
+   *
+   * The caller's authority is still not the payload's. `host.targetId` comes from the
+   * process that owns the registry, and the goal's own `target_id` is checked against it:
+   * a goal from another target cannot be given an intent from here.
+   *
+   * Four refusals, none of which writes anything: no such goal, a goal from another
+   * target, an anchor that is not recorded evidence (named by what it actually is), and an
+   * anchor from a different goal. A duplicate anchor in one call is refused rather than
+   * collapsed, like a duplicate dimension address, because the primary key would swallow
+   * it silently and a caller that sent one twice has made a mistake worth hearing about.
+   */
+  const addIntent = Effect.fn("ObservationStore.addIntent")(function* (
+    host: HostContext,
+    input: AddIntentInput,
+  ) {
+    const createdAt = yield* Clock.currentTimeMillis;
+    const key = `${host.callerScope}:add_intent:${input.operationId}`;
+    const requestHash = hashRequest(
+      { callerScope: host.callerScope, targetId: host.targetId },
+      input,
+    );
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const existing = yield* findReceipt(key).pipe(
+            Effect.mapError(lift("command_receipts", key)),
+          );
+          if (Option.isSome(existing)) {
+            const receipt = existing.value;
+            if (receipt.request_hash !== requestHash) {
+              return yield* new MutationError({
+                reason: "conflict",
+                detail: `operation ${input.operationId} was already used with different input`,
+              });
+            }
+            const original = yield* replayResult(
+              key,
+              AddIntentResult,
+              receipt.result,
+            );
+            return { ...original, replayed: true };
+          }
+
+          const goal = yield* findGoal(input.goalId).pipe(
+            Effect.mapError(lift("goals", input.goalId)),
+          );
+          if (Option.isNone(goal)) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `no goal ${input.goalId} exists; an intent is always a direction under a goal`,
+            });
+          }
+          if (goal.value.target_id !== host.targetId) {
+            return yield* new MutationError({
+              reason: "unauthorized",
+              detail: `goal ${input.goalId} belongs to target ${goal.value.target_id}, not ${host.targetId}`,
+            });
+          }
+          const clash = yield* findIntentById(input.intentId).pipe(
+            Effect.mapError(lift("intents", input.intentId)),
+          );
+          if (Option.isSome(clash)) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `intent ${input.intentId} already exists; an intent id is never reused, and a retry of this command needs the operation id, not the intent id`,
+            });
+          }
+
+          const seen = new Set<string>();
+          for (const anchorId of input.anchorObservationIds) {
+            if (seen.has(anchorId)) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `anchor '${anchorId}' is listed twice in anchorObservationIds`,
+              });
+            }
+            seen.add(anchorId);
+            const kinds = yield* classifyAnchor(anchorId).pipe(
+              Effect.mapError(lift("observations", anchorId)),
+            );
+            if (kinds.as_observation_goal === null) {
+              // The instructive refusal §4 asks for: it names what the id *is*, says why
+              // that kind cannot anchor, and gives the way to express a new direction.
+              const what =
+                kinds.as_intent !== null
+                  ? "an intent"
+                  : kinds.as_goal !== null
+                    ? "a goal"
+                    : "nothing recorded in this target";
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `anchor '${anchorId}' is ${what} and cannot anchor an intent. Only a recorded observation may anchor one, never an intent, a goal or a hint, because an intent anchored to another intent is speculation about speculation. Leave anchorObservationIds empty for a new top-level direction.`,
+              });
+            }
+            if (kinds.as_observation_goal !== input.goalId) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `anchor '${anchorId}' is an observation under goal ${kinds.as_observation_goal}, and this intent is under goal ${input.goalId}; an intent anchors to evidence from its own goal`,
+              });
+            }
+          }
+
+          let addressesDimensionId: string | null = null;
+          if (input.addressesDimension !== null) {
+            const parsed = parseDimensionAddress(input.addressesDimension);
+            if (parsed === undefined) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `'${input.addressesDimension}' is not an untested-dimension address; use the exact address from the briefing, e.g. obs_000003_attempt-x#u1`,
+              });
+            }
+            const dimension = yield* findDimensionByPosition({
+              observationId: parsed.observationId,
+              position: parsed.index,
+            }).pipe(
+              Effect.mapError(
+                lift("observation_dimensions", input.addressesDimension),
+              ),
+            );
+            if (Option.isNone(dimension)) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `no untested dimension is recorded at '${input.addressesDimension}'`,
+              });
+            }
+            if (dimension.value.source_goal_id !== input.goalId) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `dimension '${input.addressesDimension}' was raised under goal ${dimension.value.source_goal_id}, and this intent is under goal ${input.goalId}`,
+              });
+            }
+            addressesDimensionId = dimension.value.dimension_id;
+          }
+
+          yield* sql`INSERT INTO intents (
+              id, goal_id, target_id, question, created_at, addresses_dimension
+            ) VALUES (
+              ${input.intentId}, ${input.goalId}, ${host.targetId},
+              ${input.question}, ${createdAt}, ${addressesDimensionId}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          for (const [
+            position,
+            anchorId,
+          ] of input.anchorObservationIds.entries()) {
+            yield* sql`INSERT INTO intent_anchors (
+                intent_id, observation_id, position, created_at
+              ) VALUES (
+                ${input.intentId}, ${anchorId}, ${position}, ${createdAt}
+              )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+          }
+
+          const result: AddIntentResult = {
+            intentId: input.intentId,
+            goalId: input.goalId,
+            anchoredTo: input.anchorObservationIds,
+            addressesDimensionId,
+            topLevel: input.anchorObservationIds.length === 0,
+            replayed: false,
+          };
+
+          yield* sql`INSERT INTO command_receipts (
+              key, caller_scope, operation, operation_id, request_hash, result,
+              created_at
+            ) VALUES (
+              ${key}, ${host.callerScope}, 'add_intent', ${input.operationId},
+              ${requestHash}, ${JSON.stringify(result)}, ${createdAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          // An event, and deliberately **no** outbox request. A new intent implies no
+          // action outside this database: the queue of intents is the database itself
+          // (§4's atomic claim), not a side-effect queue. Writing a request here would
+          // make the outbox look more exercised than it is, and a mutation that was
+          // obliged to write one would be a design error — this is what shows it is not.
+          // Caller authority is the host's own scope, and intent and attempt are null
+          // because a host-created intent has no attempt: there is nothing to fabricate.
+          yield* appendEvent({
+            kind: "intent.added",
+            targetId: host.targetId,
+            callerScope: host.callerScope,
+            intentId: null,
+            attemptId: null,
+            operation: "add_intent",
+            operationId: input.operationId,
+            subjectId: input.intentId,
+            payload: {
+              intentId: input.intentId,
+              goalId: input.goalId,
+              question: input.question,
+              anchoredTo: input.anchorObservationIds,
+              addressesDimensionId,
+              topLevel: result.topLevel,
+            },
+            recordedAt: createdAt,
+          });
+
+          return result;
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
 
   /**
    * Records what the harness said about one running attempt, and settles it accordingly.
@@ -1253,26 +2123,39 @@ const makeStore = Effect.fnUntraced(function* () {
     return yield* Effect.forEach(rows, toObservation);
   });
 
+  /**
+   * Every link that addresses a dimension raised under this intent.
+   *
+   * Two changes from the shape `0005` supported, both from the dimension rows. The join
+   * is now through `observation_dimensions`, so "which dimension" is a key rather than a
+   * parsed position. And the link is selected by the *raising* side, not the addressing
+   * one: since the same-intent rule relaxed to same-goal with declared provenance
+   * (migration `0009`), an observation under a sibling intent can address a dimension of
+   * this one, and selecting by the addressing observation's intent would have silently
+   * hidden exactly the link that relaxation exists to allow.
+   *
+   * Ordered by the raising observation's sequence then the addressing one's, so a reader
+   * sees questions in graph order and, under each, the order work landed in.
+   */
   const selectLinksForIntent = SqlSchema.findAll({
     Request: Schema.String,
     Result: DimensionLinkRow,
     execute: (intentId) =>
-      sql`SELECT links.observation_id, links.address, links.source_observation_id,
-            links.dimension_index, links.created_at
+      sql`SELECT links.observation_id, links.dimension_id, links.address,
+            links.created_at,
+            addressing.sequence AS addressing_sequence,
+            addressing.outcome AS addressing_outcome
           FROM observation_dimension_links AS links
+          INNER JOIN observation_dimensions AS dimensions
+            ON dimensions.id = links.dimension_id
+          INNER JOIN observations AS raising
+            ON raising.id = dimensions.observation_id
           INNER JOIN observations AS addressing
             ON addressing.id = links.observation_id
-          WHERE addressing.intent_id = ${intentId}
-          ORDER BY addressing.sequence, links.address`,
+          WHERE raising.intent_id = ${intentId}
+          ORDER BY raising.sequence, dimensions.position, addressing.sequence`,
   });
 
-  /**
-   * The follow-up links recorded by this intent's observations.
-   *
-   * Which intent a link belongs to is its addressing observation's intent, so this
-   * joins rather than reading a duplicated column. Ordered by the addressing
-   * observation's sequence so a reader sees the order work was taken on in.
-   */
   const dimensionLinksForIntent = Effect.fn(
     "ObservationStore.dimensionLinksForIntent",
   )(function* (intentId: string) {
@@ -1283,9 +2166,101 @@ const makeStore = Effect.fnUntraced(function* () {
     );
     return rows.map((row): DimensionLink => ({
       observationId: row.observation_id,
+      dimensionId: row.dimension_id,
       address: row.address,
-      sourceObservationId: row.source_observation_id,
-      dimensionIndex: row.dimension_index,
+      addressingSequence: row.addressing_sequence,
+      addressingOutcome: row.addressing_outcome,
+    }));
+  });
+
+  const selectDimensionsForIntent = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: StoredDimensionRow,
+    execute: (intentId) =>
+      sql`SELECT dimensions.id, dimensions.observation_id, dimensions.position,
+            dimensions.text, dimensions.created_at
+          FROM observation_dimensions AS dimensions
+          INNER JOIN observations AS raising
+            ON raising.id = dimensions.observation_id
+          WHERE raising.intent_id = ${intentId}
+          ORDER BY raising.sequence, dimensions.position`,
+  });
+
+  /**
+   * Every dimension raised under one intent, in graph order.
+   *
+   * This is what a briefing reads, rather than re-deriving the list from each
+   * observation's JSON column, so what a planner is shown is the same identity the write
+   * boundary resolves an alias to. The alias is derived here from the row's own
+   * observation and position.
+   */
+  const dimensionsForIntent = Effect.fn("ObservationStore.dimensionsForIntent")(
+    function* (intentId: string) {
+      const rows = yield* selectDimensionsForIntent(intentId).pipe(
+        Effect.mapError(lift("observation_dimensions", `intent:${intentId}`)),
+      );
+      return rows.map((row): StoredDimension => ({
+        dimensionId: row.id,
+        observationId: row.observation_id,
+        position: row.position,
+        text: row.text,
+        address: dimensionAddress(row.observation_id, row.position),
+      }));
+    },
+  );
+
+  /**
+   * Intents that declared they address a dimension raised under one intent, with how
+   * much of their work is still outstanding.
+   *
+   * `attempts_open` counts attempts in the two statuses no definite answer has been
+   * reached about, which is the same pair `unsettledAttempts` sweeps. It is what keeps
+   * `scheduled` from becoming a state a question enters and never leaves: when the count
+   * reaches zero and no addressing observation landed, the question is open again
+   * (DECISIONS.md §17). An intent with no attempt at all reports `attempts_total = 0`,
+   * and the caller reads that as "nothing has been dispatched yet" rather than as
+   * "everything finished" — see `scheduleOf` in the briefing.
+   */
+  const selectSchedulesForIntent = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      dimension_id: Schema.String,
+      intent_id: Schema.String,
+      question: Schema.String,
+      attempts_total: Schema.Int,
+      attempts_open: Schema.Int,
+    }),
+    execute: (intentId) =>
+      sql`SELECT declaring.addresses_dimension AS dimension_id,
+            declaring.id AS intent_id,
+            declaring.question AS question,
+            COUNT(attempts.id) AS attempts_total,
+            COALESCE(SUM(
+              CASE WHEN attempts.status IN ('running', 'uncertain') THEN 1 ELSE 0 END
+            ), 0) AS attempts_open
+          FROM intents AS declaring
+          INNER JOIN observation_dimensions AS dimensions
+            ON dimensions.id = declaring.addresses_dimension
+          INNER JOIN observations AS raising
+            ON raising.id = dimensions.observation_id
+          LEFT JOIN attempts ON attempts.intent_id = declaring.id
+          WHERE raising.intent_id = ${intentId}
+          GROUP BY declaring.id, declaring.addresses_dimension, declaring.question
+          ORDER BY declaring.created_at, declaring.id`,
+  });
+
+  const dimensionSchedulesForIntent = Effect.fn(
+    "ObservationStore.dimensionSchedulesForIntent",
+  )(function* (intentId: string) {
+    const rows = yield* selectSchedulesForIntent(intentId).pipe(
+      Effect.mapError(lift("intents", `addresses_dimension:${intentId}`)),
+    );
+    return rows.map((row): DimensionScheduleRow => ({
+      dimensionId: row.dimension_id,
+      intentId: row.intent_id,
+      question: row.question,
+      attemptsTotal: row.attempts_total,
+      attemptsOpen: row.attempts_open,
     }));
   });
 
@@ -1473,8 +2448,257 @@ const makeStore = Effect.fnUntraced(function* () {
     );
   });
 
+  const EventRow = Schema.Struct({
+    id: Schema.String,
+    sequence: Schema.Int,
+    target_id: Schema.String,
+    kind: Schema.String,
+    payload: Schema.String,
+    caller_scope: Schema.NullOr(Schema.String),
+    intent_id: Schema.NullOr(Schema.String),
+    attempt_id: Schema.NullOr(Schema.String),
+    operation: Schema.String,
+    operation_id: Schema.NullOr(Schema.String),
+    subject_id: Schema.String,
+    recorded_at: Schema.Finite,
+  });
+
+  const selectEvents = SqlSchema.findAll({
+    Request: Schema.Struct({ after: Schema.Int, limit: Schema.Int }),
+    Result: EventRow,
+    execute: (request) =>
+      sql`SELECT id, sequence, target_id, kind, payload, caller_scope, intent_id,
+            attempt_id, operation, operation_id, subject_id, recorded_at
+          FROM events
+          WHERE sequence > ${request.after}
+          ORDER BY sequence
+          LIMIT ${request.limit}`,
+  });
+
+  /**
+   * Committed events in ascending sequence order after a cursor.
+   *
+   * This is the read §8 specifies, and it is here so that what Sprint 02 writes can be
+   * proven readable in order — including across a restart. It is **not** the durable
+   * consumer §8 describes: there is no stored cursor, no acknowledgement, no PubSub
+   * wake-up and no catch-up sweep. Those are Sprint 03, and this is the query they will
+   * be built on.
+   *
+   * `payload` is handed back as decoded JSON rather than a validated shape, because the
+   * event schema is ours and grows: a reader tolerates fields it does not declare
+   * (`unknownField`) instead of failing on an event a later build wrote.
+   */
+  const eventsAfter = Effect.fn("ObservationStore.eventsAfter")(function* (
+    after = 0,
+    limit = 500,
+  ) {
+    const rows = yield* selectEvents({ after, limit }).pipe(
+      Effect.mapError(lift("events", `after:${String(after)}`)),
+    );
+    return yield* Effect.forEach(rows, (row) =>
+      Effect.map(
+        Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+          row.payload,
+        ).pipe(
+          Effect.mapError(
+            (issue) =>
+              new StoredRowError({
+                table: "events",
+                rowId: row.id,
+                detail: "payload is not JSON",
+                cause: issue,
+              }),
+          ),
+        ),
+        (payload): RecordedEvent => ({
+          eventId: row.id,
+          sequence: row.sequence,
+          targetId: row.target_id,
+          kind: row.kind,
+          payload,
+          callerScope: row.caller_scope,
+          intentId: row.intent_id,
+          attemptId: row.attempt_id,
+          operation: row.operation,
+          operationId: row.operation_id,
+          subjectId: row.subject_id,
+          recordedAt: row.recorded_at,
+        }),
+      ),
+    );
+  });
+
+  const OutboxRow = Schema.Struct({
+    id: Schema.String,
+    sequence: Schema.Int,
+    target_id: Schema.String,
+    request_type: Schema.String,
+    payload: Schema.String,
+    recovery_policy: Schema.String,
+    caused_by_event_id: Schema.String,
+    status: Schema.String,
+    attempts: Schema.Int,
+    lease_owner: Schema.NullOr(Schema.String),
+    lease_expires_at: Schema.NullOr(Schema.Finite),
+    next_attempt_at: Schema.NullOr(Schema.Finite),
+    last_error: Schema.NullOr(Schema.String),
+    enqueued_at: Schema.Finite,
+    completed_at: Schema.NullOr(Schema.Finite),
+  });
+
+  const outboxColumns = Object.keys(OutboxRow.fields).join(", ");
+
+  const selectPending = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: OutboxRow,
+    execute: () =>
+      sql.unsafe(
+        `SELECT ${outboxColumns} FROM outbox WHERE status = 'pending'
+         ORDER BY sequence`,
+        [],
+      ),
+  });
+
+  /**
+   * Undispatched side-effect requests, oldest first.
+   *
+   * A read, and only a read: nothing here claims a row, takes a lease or marks one
+   * in flight. This sprint's claim is that a committed obligation survives a crash, and
+   * this is how that is checked. Dispatching is Sprint 03.
+   */
+  const pendingRequests = Effect.fn("ObservationStore.pendingRequests")(
+    function* () {
+      const rows = yield* selectPending().pipe(
+        Effect.mapError(lift("outbox", "status:pending")),
+      );
+      return yield* Effect.forEach(rows, (row) =>
+        Effect.map(
+          Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+            row.payload,
+          ).pipe(
+            Effect.mapError(
+              (issue) =>
+                new StoredRowError({
+                  table: "outbox",
+                  rowId: row.id,
+                  detail: "payload is not JSON",
+                  cause: issue,
+                }),
+            ),
+          ),
+          (payload): OutboxEntry => ({
+            outboxId: row.id,
+            sequence: row.sequence,
+            targetId: row.target_id,
+            requestType: row.request_type,
+            payload,
+            recoveryPolicy: row.recovery_policy,
+            causedByEventId: row.caused_by_event_id,
+            status: row.status,
+            attempts: row.attempts,
+            leaseOwner: row.lease_owner,
+            leaseExpiresAt: row.lease_expires_at,
+            nextAttemptAt: row.next_attempt_at,
+            lastError: row.last_error,
+            enqueuedAt: row.enqueued_at,
+            completedAt: row.completed_at,
+          }),
+        ),
+      );
+    },
+  );
+
+  const selectAnchors = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      observation_id: Schema.String,
+      position: Schema.Int,
+    }),
+    execute: (intentId) =>
+      sql`SELECT observation_id, position FROM intent_anchors
+          WHERE intent_id = ${intentId} ORDER BY position`,
+  });
+
+  /** The observations one intent is anchored to, in the order the caller gave. */
+  const anchorsForIntent = Effect.fn("ObservationStore.anchorsForIntent")(
+    function* (intentId: string) {
+      const rows = yield* selectAnchors(intentId).pipe(
+        Effect.mapError(lift("intent_anchors", intentId)),
+      );
+      return rows.map((row) => row.observation_id);
+    },
+  );
+
+  const AssetRow = Schema.Struct({
+    id: Schema.String,
+    target_id: Schema.String,
+    kind: Schema.String,
+    identity: Schema.String,
+    host: Schema.String,
+    port: Schema.Int,
+    scheme: Schema.NullOr(Schema.String),
+    method: Schema.NullOr(Schema.String),
+    path: Schema.NullOr(Schema.String),
+    first_seen_at: Schema.Finite,
+  });
+  const assetColumns = Object.keys(AssetRow.fields).join(", ");
+
+  const selectAssets = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: AssetRow,
+    execute: () =>
+      sql.unsafe(
+        `SELECT ${assetColumns} FROM assets ORDER BY first_seen_at, identity`,
+        [],
+      ),
+  });
+
+  /** Every asset recorded in this target's file, oldest first. */
+  const assets = Effect.fn("ObservationStore.assets")(function* () {
+    return yield* selectAssets().pipe(Effect.mapError(lift("assets", "all")));
+  });
+
+  const DiscoveryRow = Schema.Struct({
+    asset_id: Schema.String,
+    operation_id: Schema.String,
+    caller_scope: Schema.String,
+    intent_id: Schema.String,
+    attempt_id: Schema.String,
+    discovered_as: Schema.String,
+    note: Schema.String,
+    discovered_at: Schema.Finite,
+  });
+  const discoveryColumns = Object.keys(DiscoveryRow.fields).join(", ");
+
+  const selectDiscoveries = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: DiscoveryRow,
+    execute: (assetId) =>
+      sql.unsafe(
+        `SELECT ${discoveryColumns} FROM asset_discoveries WHERE asset_id = ?
+         ORDER BY discovered_at, operation_id`,
+        [assetId],
+      ),
+  });
+
+  /** Every discovery of one asset, in the order they were recorded. */
+  const discoveriesOfAsset = Effect.fn("ObservationStore.discoveriesOfAsset")(
+    function* (assetId: string) {
+      return yield* selectDiscoveries(assetId).pipe(
+        Effect.mapError(lift("asset_discoveries", assetId)),
+      );
+    },
+  );
+
   return ObservationStore.of({
     seedAttempt,
+    recordAsset,
+    addIntent,
+    eventsAfter,
+    pendingRequests,
+    anchorsForIntent,
+    assets,
+    discoveriesOfAsset,
     settleAttempt,
     bindSessionToAttempt,
     recordObservation,
@@ -1482,6 +2706,8 @@ const makeStore = Effect.fnUntraced(function* () {
     openReplacementAttempt,
     observationsForIntent,
     dimensionLinksForIntent,
+    dimensionsForIntent,
+    dimensionSchedulesForIntent,
     currentSequence,
     loadIntent,
     loadAttempt,
@@ -1553,6 +2779,44 @@ export class ObservationStore extends Context.Service<
     readonly seedAttempt: (
       input: SeedInput,
     ) => Effect.Effect<AttemptAuthority, DatabaseError | StoredRowError>;
+    readonly recordAsset: (
+      caller: CallerContext,
+      input: RecordAssetInput,
+    ) => Effect.Effect<
+      RecordAssetResult,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    readonly addIntent: (
+      host: HostContext,
+      input: AddIntentInput,
+    ) => Effect.Effect<
+      AddIntentResult,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    readonly eventsAfter: (
+      after?: number,
+      limit?: number,
+    ) => Effect.Effect<
+      readonly RecordedEvent[],
+      DatabaseError | StoredRowError
+    >;
+    readonly pendingRequests: () => Effect.Effect<
+      readonly OutboxEntry[],
+      DatabaseError | StoredRowError
+    >;
+    readonly anchorsForIntent: (
+      intentId: string,
+    ) => Effect.Effect<readonly string[], DatabaseError | StoredRowError>;
+    readonly assets: () => Effect.Effect<
+      readonly StoredAsset[],
+      DatabaseError | StoredRowError
+    >;
+    readonly discoveriesOfAsset: (
+      assetId: string,
+    ) => Effect.Effect<
+      readonly StoredAssetDiscovery[],
+      DatabaseError | StoredRowError
+    >;
     readonly settleAttempt: (
       attemptId: string,
       status: AttemptTerminalStatus,
@@ -1584,6 +2848,18 @@ export class ObservationStore extends Context.Service<
       intentId: string,
     ) => Effect.Effect<
       readonly DimensionLink[],
+      DatabaseError | StoredRowError
+    >;
+    readonly dimensionsForIntent: (
+      intentId: string,
+    ) => Effect.Effect<
+      readonly StoredDimension[],
+      DatabaseError | StoredRowError
+    >;
+    readonly dimensionSchedulesForIntent: (
+      intentId: string,
+    ) => Effect.Effect<
+      readonly DimensionScheduleRow[],
       DatabaseError | StoredRowError
     >;
     readonly currentSequence: Effect.Effect<number, DatabaseError>;

@@ -7,8 +7,12 @@ MCP tool a delegated worker records evidence through, a local rate-limit fixture
 test against, deterministic briefings built from stored rows, and startup
 reconciliation of attempts no definite outcome has been recorded for.
 
-The planner, the exploration graph, evidence capture, concurrency and the UI are not
-implemented. One worker at a time; see `DECISIONS.md` for what is deliberately absent.
+Persistence is two tiers: `control.sqlite` holds the settings and the target registry,
+and each target's graph, events and outbox live in `targets/<id>/hunt.sqlite`.
+
+The planner, evidence capture, concurrency and the UI are not implemented, and nothing
+yet _consumes_ the events or the outbox. One worker at a time, one target served at a
+time; see `DECISIONS.md` for what is deliberately absent.
 
 ## Run
 
@@ -56,17 +60,61 @@ The simulated target under test keeps its **own** listener
 (`apps/server/src/fixture/server.ts`). It is not part of this API and must not be
 served from this origin.
 
-Set `DATABASE_PATH` for a persistent connection (an in-memory database otherwise) and
-`PORT` to change the listen port — and update the Vite proxy to match in development.
-`RECONCILE_ON_START=0` skips startup reconciliation.
+Set `HUNT_ROOT` to the fleet directory (default `.runtime/hunt`), `TARGET_ID` to the
+target this process serves (default `fixture-local`, registered on demand), and `PORT` to
+change the listen port — and update the Vite proxy to match in development.
+`RECONCILE_ON_START=0` skips startup reconciliation. There is no in-memory mode: the
+layout is a filesystem guarantee, and an in-memory fleet would be a different thing
+wearing the same name.
 
 ## Persistence
 
+```
+<HUNT_ROOT>/
+  control.sqlite              settings and the target registry
+  targets/<target-id>/
+    hunt.sqlite               the graph, its events and its outbox
+    evidence/                 content-hashed blobs, out of SQLite
+```
+
+Per-target files, because `rm -rf targets/<id>/` is provable evidence destruction where
+`DELETE` plus `VACUUM` is not, because scope isolation is then a filesystem guarantee
+rather than a `WHERE` clause, and because traffic capture is heavy. The accepted cost is
+that migrations run against N files: startup migrates the control database, then iterates
+the registry and migrates each target's own file. A target whose file does not migrate is
+marked unavailable and refused by name; its neighbours are served, and only a failure of
+the control database itself fails startup.
+
+Sequences are per target, because the counter lives in the target's file. Existing ids are
+never renumbered: an observation's id carries its sequence and every dimension address a
+briefing has printed is built from it.
+
 `effect/sql` with the official Bun SQLite driver. No ORM: parameterised tagged-template
-SQL, rows decoded through Effect Schema, and `effect/sql/Migrator` over a statically
-imported, append-only `MIGRATIONS` record. Migrations run to completion before the store
-is available, so a failed migration fails startup instead of exposing a partial schema.
-There is no `down` and no `redo`; a migration is retracted by a new forward one.
+SQL, rows decoded through Effect Schema, and `effect/sql/Migrator` over statically
+imported, append-only migration records — one chain per tier. Migrations run to completion
+before a store is available, so a failed migration fails startup instead of exposing a
+partial schema. There is no `down` and no `redo`; a migration is retracted by a new
+forward one, migration ids must strictly increase, and a skipped id can never be filled
+in afterwards.
+
+Every mutation — recording an asset, adding an intent, recording an observation — writes
+its domain rows, its command receipt, its event and any side-effect request it implies in
+**one** SQLite transaction. So an exact retry of an operation id replays the original
+result and writes no second event and no second request; the same id with changed input is
+refused and writes nothing at all; and a process killed inside an uncommitted transaction
+leaves none of it behind, which is demonstrated by actually killing one
+(`src/spike/persistenceProof.ts`).
+
+An intent may anchor only to a recorded observation — never to another intent, a goal or a
+hint — and the refusal says so rather than failing bare. Anchoring is enforced in the
+store rather than in a tool, because a planner round has no execution attempt to
+authenticate with; the planner-facing surface waits until there is a planner loop.
+
+The event log is append-only in the database, not only by convention: triggers refuse an
+`UPDATE` and a `DELETE`. The outbox is a durable queue of side-effect requests, each
+carrying an explicit recovery policy, and it does **not** provide exactly-once remote
+execution. Nothing reads either yet — cursors, wake-ups, claiming, leases and retry
+scheduling are the next slice.
 
 A transaction body is an ordinary Effect and may yield, but must do no harness, HTTP or
 filesystem work: SQLite holds one write lock for its duration.
@@ -94,10 +142,15 @@ attempt; a harness that reports the session live does not reopen it, because its
 authority is already revoked — carrying the work on means a new attempt that records
 which one it replaces.
 
-Each untested dimension an observation records becomes an addressable open question. A
-later observation can say which one it took on, by exact address; nothing is matched by
+Each untested dimension an observation records is a row with its own identity, and an
+addressable open question. `<observationId>#u<index>` is the address a briefing prints and
+a worker copies; it is resolved to that identity on the way in, so nothing is matched by
 wording. "Addressed" is not "resolved", and the briefing distinguishes uninvestigated,
-addressed-but-inconclusive and addressed-with-evidence rather than collapsing them.
+scheduled, addressed-but-inconclusive and addressed-with-evidence rather than collapsing
+them. `scheduled` means an intent was created saying it addresses that dimension and its
+work has not settled; once every attempt on that intent settles with no answer recorded,
+the question is open again, carrying the record that somebody tried. Nothing closes a
+question: there is no closure authority here.
 
 A briefing grows by appending. Observations are chosen newest-first, so truncation keeps
 the evidence that qualifies the rest, and then listed oldest-first; everything that

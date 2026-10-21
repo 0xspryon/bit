@@ -35,9 +35,9 @@
  * which they are looking at.
  */
 import {
-  dimensionsOf,
   type Briefing,
   type CaseBasedObservation,
+  type DimensionSchedule,
   type FollowUpStatus,
   type Observation,
   type ObservationReference,
@@ -47,7 +47,12 @@ import {
 } from "@bit/contracts";
 import { Effect, Schema } from "effect";
 
-import { ObservationStore, type DimensionLink } from "../persistence/store";
+import {
+  ObservationStore,
+  type DimensionLink,
+  type DimensionScheduleRow,
+  type StoredDimension,
+} from "../persistence/store";
 
 /**
  * The heading that separates the stable part of a rendered briefing from the rest.
@@ -102,7 +107,9 @@ export const buildBriefing = Effect.fn("buildBriefing")(function* (
     return yield* new BriefingError({ reason: "unknown_intent", intentId });
   }
   const all = yield* store.observationsForIntent(intentId);
+  const dimensions = yield* store.dimensionsForIntent(intentId);
   const links = yield* store.dimensionLinksForIntent(intentId);
+  const schedules = yield* store.dimensionSchedulesForIntent(intentId);
   const sequence = yield* store.currentSequence;
 
   // Selection is newest-first: a later observation qualifies an earlier one, so when a
@@ -130,25 +137,36 @@ export const buildBriefing = Effect.fn("buildBriefing")(function* (
     truncated: omitted.length > 0,
     // Over everything the intent holds, not just what fitted: truncating the body
     // must not drop a question.
-    openQuestions: openQuestionsOf(all, links, includedIds),
+    openQuestions: openQuestionsOf(
+      all,
+      dimensions,
+      links,
+      schedules,
+      includedIds,
+    ),
   } satisfies Briefing;
 });
 
 /**
  * Every recorded untested dimension under one intent, with what has been recorded
- * against it.
+ * against it and what has been scheduled for it.
  *
- * Three properties this has that the string list it replaces did not:
+ * Four properties this has that the string list it replaces did not:
  *
- * - **Each question has an address**, so a later observation can name exactly the one
- *   it took on and the write boundary can check that the address resolves.
+ * - **Each question is a row with its own identity** (migration `0008`), printed under
+ *   the wire alias a worker copies, so a later observation can name exactly the one it
+ *   took on and the write boundary can resolve the alias to that identity.
  * - **Nothing is matched by wording.** A dimension is addressed when a stored link says
  *   so and never otherwise. Two observations that happened to record the same sentence
  *   recorded two separate questions and stay two, because collapsing them would decide
  *   on a planner's behalf that they mean the same thing.
  * - **Addressed is not resolved.** `addressedWithEvidence` means a later observation
- *   named this address and reached a positive or negative result relative to *its own*
+ *   named this dimension and reached a positive or negative result relative to *its own*
  *   claim. Whether that settles this question is a judgement nothing here makes.
+ * - **Scheduled is not addressed.** An intent that declared this dimension makes it
+ *   `scheduled`: work is out for it. That is derived from the declaration and the
+ *   declaring intent's attempts on every read, never stored, so it cannot be left
+ *   standing after the work it describes has finished.
  *
  * Order is graph order — newest raising observation first, then position — and is
  * deliberately independent of status, so the array does not reshuffle as work lands.
@@ -156,7 +174,9 @@ export const buildBriefing = Effect.fn("buildBriefing")(function* (
  */
 export const openQuestionsOf = (
   observations: readonly Observation[],
+  dimensions: readonly StoredDimension[],
   links: readonly DimensionLink[],
+  schedules: readonly DimensionScheduleRow[] = [],
   includedIds: ReadonlySet<string> = new Set(
     observations.map((item) => item.observationId),
   ),
@@ -173,51 +193,104 @@ export const openQuestionsOf = (
 
   const addressedBy = new Map<string, ObservationReference[]>();
   for (const link of links) {
-    const addressing = byId.get(link.observationId);
-    // A link whose addressing observation is not in this intent's rows cannot happen —
-    // the query joins on exactly that — so a miss here is silently skipped rather than
-    // reported as a question nobody raised.
-    if (addressing === undefined) continue;
-    const existing = addressedBy.get(link.address);
-    if (existing === undefined) {
-      addressedBy.set(link.address, [reference(addressing)]);
-    } else {
-      existing.push(reference(addressing));
-    }
+    // Built from the link's own join, not from a lookup in this intent's rows. Since the
+    // same-intent rule relaxed (migration `0009`) an observation under a *sibling*
+    // intent may address a dimension of this one, and it is not among these rows — a
+    // reader that resolved the addresser locally would drop that link and report the
+    // question as untouched, which is the opposite of what happened.
+    const existing = addressedBy.get(link.dimensionId) ?? [];
+    existing.push({
+      observationId: link.observationId,
+      sequence: link.addressingSequence,
+      outcome: link.addressingOutcome,
+      includedInBriefing: includedIds.has(link.observationId),
+    });
+    addressedBy.set(link.dimensionId, existing);
   }
 
-  const ordered = [...observations].sort((a, b) => b.sequence - a.sequence);
-  return ordered.flatMap((observation) =>
-    dimensionsOf(observation).map(({ address, dimension }): OpenQuestion => {
-      const addressers = [...(addressedBy.get(address) ?? [])].sort(
-        (a, b) => a.sequence - b.sequence,
-      );
-      return {
-        address,
-        dimension,
-        raisedBy: reference(observation),
-        status: statusOf(addressers),
-        addressedBy: addressers,
-      };
-    }),
+  const scheduledBy = new Map<string, DimensionSchedule[]>();
+  for (const schedule of schedules) {
+    const existing = scheduledBy.get(schedule.dimensionId) ?? [];
+    existing.push(scheduleOf(schedule));
+    scheduledBy.set(schedule.dimensionId, existing);
+  }
+
+  const sequenceOf = (observationId: string) =>
+    byId.get(observationId)?.sequence ?? 0;
+  const ordered = [...dimensions].sort(
+    (a, b) =>
+      sequenceOf(b.observationId) - sequenceOf(a.observationId) ||
+      a.position - b.position,
   );
+
+  return ordered.flatMap((dimension): readonly OpenQuestion[] => {
+    const raising = byId.get(dimension.observationId);
+    // Cannot happen — the query joins dimensions to this intent's observations — so a
+    // miss is skipped rather than rendered as a question with no provenance.
+    if (raising === undefined) return [];
+    const addressers = [...(addressedBy.get(dimension.dimensionId) ?? [])].sort(
+      (a, b) => a.sequence - b.sequence,
+    );
+    const scheduled = scheduledBy.get(dimension.dimensionId) ?? [];
+    return [
+      {
+        address: dimension.address,
+        dimension: dimension.text,
+        raisedBy: reference(raising),
+        status: statusOf(addressers, scheduled),
+        addressedBy: addressers,
+        scheduledBy: scheduled,
+      },
+    ];
+  });
 };
 
 /**
- * The status of one question from its addressing observations alone.
+ * One declaration, with the count turned into the fact a reader needs.
  *
- * An `inconclusive` addressing observation is work that happened and decided nothing,
- * which is a different state from untouched and must not be reported as progress on the
- * claim. One addresser with a positive or negative outcome is enough to move the
- * question to `addressedWithEvidence`; several inconclusive ones never are.
+ * `attemptsOpen` is true while an attempt on the declaring intent is `running` or
+ * `uncertain` — the two statuses no definite answer has been reached about — **and** for
+ * an intent with no attempt at all. The second case is deliberate and is the reading
+ * §17 leaves open: an intent created and not yet dispatched has work outstanding, not
+ * work that finished. Treating zero attempts as "all settled" would publish a question
+ * as open the moment a planner scheduled it, which is the duplicate-intent round this
+ * column exists to prevent. The cost is stated as a limitation: nothing here expires an
+ * intent that is never dispatched.
+ */
+const scheduleOf = (row: DimensionScheduleRow): DimensionSchedule => ({
+  intentId: row.intentId,
+  question: row.question,
+  attemptsOpen: row.attemptsTotal === 0 || row.attemptsOpen > 0,
+  attemptsTotal: row.attemptsTotal,
+});
+
+/**
+ * The status of one question from its addressers and its declarations alone.
+ *
+ * Addressing wins over scheduling: once an observation has named the dimension, what it
+ * found is more informative than the fact that somebody set out to find it. An
+ * `inconclusive` addressing observation is work that happened and decided nothing, which
+ * is a different state from untouched and must not be reported as progress on the claim.
+ * One addresser with a positive or negative outcome is enough to move the question to
+ * `addressedWithEvidence`; several inconclusive ones never are.
+ *
+ * With no addresser, a declaration whose work is still outstanding makes it `scheduled`.
+ * A declaration whose every attempt has settled without an addressing observation does
+ * **not**: the question falls back to `uninvestigated`, carrying the declarations in
+ * `scheduledBy` so a reader can see somebody tried.
  */
 const statusOf = (
   addressers: readonly ObservationReference[],
+  scheduled: readonly DimensionSchedule[] = [],
 ): FollowUpStatus => {
-  if (addressers.length === 0) return "uninvestigated";
-  return addressers.some((item) => item.outcome !== "inconclusive")
-    ? "addressedWithEvidence"
-    : "addressedInconclusive";
+  if (addressers.length > 0) {
+    return addressers.some((item) => item.outcome !== "inconclusive")
+      ? "addressedWithEvidence"
+      : "addressedInconclusive";
+  }
+  return scheduled.some((item) => item.attemptsOpen)
+    ? "scheduled"
+    : "uninvestigated";
 };
 
 const list = (values: readonly string[], fallback = "none recorded"): string =>
@@ -396,7 +469,12 @@ const STATUS_HEADINGS: ReadonlyArray<
   [
     "uninvestigated",
     "Uninvestigated",
-    "nothing has been recorded against these.",
+    "nothing has been recorded against these. Where one names an intent below, that intent tried and settled without recording an answer \u2014 so the question is open again, not untouched.",
+  ],
+  [
+    "scheduled",
+    "Scheduled",
+    "an intent was created saying it addresses these, and its work has not settled. Nothing has been recorded against them yet, so do not treat them as answered \u2014 but another intent for the same question would duplicate work already out.",
   ],
   [
     "addressedInconclusive",
@@ -458,6 +536,16 @@ const renderOpenQuestions = (
         lines.push(
           `  addressed by ${addresser.observationId} (sequence ${String(addresser.sequence)}, outcome ${addresser.outcome})` +
             `${addresser.includedInBriefing ? "" : " \u2014 omitted from this briefing"}`,
+        );
+      }
+      // Printed under both `scheduled` and `uninvestigated`, because the same fact means
+      // different things in the two places: work is out, or work was out and came back
+      // with nothing. A declaration that is neither is not a state this derives.
+      for (const schedule of question.scheduledBy) {
+        lines.push(
+          `  ${schedule.attemptsOpen ? "work is out" : "was taken on"} under intent ${schedule.intentId}` +
+            ` (${String(schedule.attemptsTotal)} attempt${schedule.attemptsTotal === 1 ? "" : "s"}` +
+            `${schedule.attemptsOpen ? ", not settled" : ", all settled with no answer recorded"}): ${schedule.question}`,
         );
       }
     }

@@ -8,13 +8,30 @@
  * demos bring up. The health route is a route on the control plane now, so there is one
  * router, one port and one shutdown path in this process too.
  *
+ * **Two tiers, from here down** (DECISIONS.md §3). `<HUNT_ROOT>/control.sqlite` holds the
+ * settings and the target registry; each target's graph is `targets/<id>/hunt.sqlite`.
+ * Startup migrates the control database, then **iterates the registry** and migrates
+ * every unarchived target's own file. A target whose file does not migrate is marked
+ * unavailable and refused by name; its neighbours are served. The reasoning for that
+ * policy, and its cost, are recorded on `persistence/fleet.ts`.
+ *
+ * **This process serves one target at a time**, named by `TARGET_ID` and registered on
+ * demand if the registry does not hold it. That is a deliberate stop short of what the
+ * layout allows: dispatching an MCP request to the right target's store needs a
+ * per-target store resolver at the mutation boundary, and the only reason to build one is
+ * to run work against several targets at once — which is concurrency, and is not this
+ * sprint. What the layout buys today is real regardless: separate files, provable
+ * deletion, a per-target sequence, and no query path from one target's connection to
+ * another's rows.
+ *
  * What this entrypoint owns, in one scope, released in reverse on every exit including
  * `SIGINT`:
  *
- * 1. The store, which opens the database and brings the schema up to date before
- *    anything can read it.
- * 2. The listener.
- * 3. **Startup reconciliation**, before any work is dispatched. Attempts left `running`
+ * 1. The fleet: the control database, migrated, and the registry sweep across targets.
+ * 2. The served target's store, which brings its own schema up to date before anything
+ *    can read it.
+ * 3. The listener.
+ * 4. **Startup reconciliation**, before any work is dispatched. Attempts left `running`
  *    by a previous process are reconciled against the harness, which revokes their
  *    write authority durably. It needs a harness to ask, and this process does not own
  *    one: with no harness configured every unsettled attempt reconciles to `uncertain`,
@@ -32,11 +49,14 @@
  * so until something does, every MCP request to this process is a `401`. An empty
  * credential registry is a closed door, not an open one.
  */
+import { join } from "node:path";
+
 import { Effect, Layer } from "effect";
 
 import { ControlPlaneEndpoint } from "./http/controlPlane";
 import { McpCredentials } from "./mcp/credentials";
 import { McpCallCounter } from "./mcp/server";
+import { FleetStore, targetStoreLayer } from "./persistence/fleet";
 import { ObservationStore } from "./persistence/store";
 import { DEFAULT_POLICY, PolicyDecisions } from "./policy/service";
 import { HarnessSessionStatus } from "./recovery/harnessStatus";
@@ -45,10 +65,63 @@ import {
   renderReconciliation,
 } from "./recovery/reconcile";
 
-const DATABASE_PATH = process.env["DATABASE_PATH"] ?? ":memory:";
+/**
+ * Where the fleet lives.
+ *
+ * A directory, not a file: the control database and every target's directory sit under
+ * it. There is deliberately no in-memory default any more — the layout is a filesystem
+ * guarantee, and an in-memory fleet would be a different thing wearing the same name.
+ * The default is under the gitignored `.runtime/`.
+ */
+const HUNT_ROOT =
+  process.env["HUNT_ROOT"] ?? join(process.cwd(), ".runtime", "hunt");
+const TARGET_ID = process.env["TARGET_ID"] ?? "fixture-local";
 const PORT = Number(process.env["PORT"] ?? 3000);
 
-const store = ObservationStore.layer(DATABASE_PATH);
+const fleet = FleetStore.layer(HUNT_ROOT);
+
+/**
+ * Brings the fleet up to date and makes sure the served target is registered.
+ *
+ * Registration is idempotent in effect rather than by `ON CONFLICT`: `register` refuses a
+ * duplicate id, which is right — an id is a directory of somebody's evidence — so this
+ * asks first. The scope note is a placeholder an operator is expected to replace; it is
+ * advisory prose and never enforcement (§4's `task_constraints` layer).
+ */
+const prepareFleet = Effect.gen(function* () {
+  const store = yield* FleetStore;
+  const existing = yield* store.target(TARGET_ID);
+  if (existing === undefined) {
+    yield* store.register({
+      targetId: TARGET_ID,
+      name: TARGET_ID,
+      scopeNote:
+        "Registered automatically at startup. Replace this with the engagement's own scope note.",
+    });
+    console.log(`registered target ${TARGET_ID} in ${HUNT_ROOT}`);
+  }
+  const swept = yield* store.migrateFleet();
+  console.log(`fleet: ${String(swept.length)} target(s) in ${HUNT_ROOT}`);
+  for (const outcome of swept) {
+    console.log(
+      `  ${outcome.targetId}: ${outcome.state}` +
+        ` (schema ${outcome.appliedThrough ?? "unknown"}) — ${outcome.detail}`,
+    );
+  }
+  const unavailable = swept.filter((outcome) => outcome.state !== "ready");
+  if (unavailable.length > 0) {
+    // Loud, and not fatal. The policy and its cost are recorded on `fleet.ts`: one
+    // unreadable file must not stop work on an unrelated engagement, and the targets it
+    // does affect are refused by name rather than served as empty graphs.
+    console.error(
+      `fleet: ${String(unavailable.length)} target(s) unavailable until a forward migration fixes them: ${unavailable
+        .map((outcome) => outcome.targetId)
+        .join(", ")}`,
+    );
+  }
+});
+
+const store = targetStoreLayer(TARGET_ID).pipe(Layer.provide(fleet));
 
 const endpoint = ControlPlaneEndpoint.layer({
   policy: DEFAULT_POLICY,
@@ -96,6 +169,7 @@ const program = Effect.gen(function* () {
   console.log(`bit control plane: ${control.healthUrl}`);
   console.log(`  mcp (bearer required):  ${control.mcpUrl}`);
   console.log(`  policy (unauthenticated): ${control.policyUrl}`);
+  console.log(`  serving target: ${TARGET_ID}`);
   yield* Effect.callback<void>((resume) => {
     const stop = () => resume(Effect.void);
     process.once("SIGINT", stop);
@@ -107,10 +181,20 @@ const program = Effect.gen(function* () {
   });
 });
 
+// The fleet is prepared *before* the layer graph that opens a target's store is built,
+// because `targetStoreLayer` asks the registry whether that target migrated and refuses
+// it when nothing has swept it. Running the sweep as part of the same layer would make
+// that ordering a matter of luck.
 await Effect.runPromise(
   Effect.scoped(
-    program.pipe(
-      Effect.provide(Layer.mergeAll(endpoint, store, harnessStatus)),
+    Effect.andThen(
+      prepareFleet.pipe(Effect.provide(fleet)),
+      program.pipe(
+        Effect.provide(Layer.mergeAll(endpoint, store, harnessStatus)),
+      ),
     ),
   ),
 );
+
+/** Re-exported so the entrypoint's own dependencies are visible to a reader. */
+export type { ObservationStore };

@@ -14,14 +14,24 @@ import { Observation, ObservationOutcome } from "./observation";
 /**
  * How far a recorded untested dimension has actually been taken.
  *
- * - `uninvestigated` — nothing has been recorded against this dimension's address.
- * - `addressedInconclusive` — one or more later observations named this address, and
+ * - `uninvestigated` — nothing has been recorded against this dimension, and no intent
+ *   that declared it still has work outstanding.
+ * - `scheduled` — an intent declared this dimension as the one it addresses, and no
+ *   addressing observation has landed yet. This says work is *out* for the question, as
+ *   distinct from nobody having looked at it.
+ * - `addressedInconclusive` — one or more later observations named this dimension, and
  *   every one of them came back `inconclusive`. Work happened; it decided nothing.
- * - `addressedWithEvidence` — at least one later observation named this address and
+ * - `addressedWithEvidence` — at least one later observation named this dimension and
  *   reached `positive` or `negative` relative to its own tested claim.
  *
+ * **`scheduled` is not a state a question can enter and never leave.** Once every
+ * attempt on every intent that declared it has settled with no addressing observation,
+ * it falls back to `uninvestigated` — carrying, in `scheduledBy`, the record that
+ * somebody tried (DECISIONS.md §17, "`scheduled` must not become §22's
+ * forever-`uncertain`").
+ *
  * **`addressedWithEvidence` is not `resolved`, and there is deliberately no such
- * value.** These three say what has been *recorded against* a question. Deciding that a
+ * value.** These four say what has been *recorded against* a question. Deciding that a
  * question is settled is a disposition somebody has to take, and nothing in this
  * codebase takes it: there is no finding subsystem, no approval workflow and no
  * closure authority here. A planner reading `addressedWithEvidence` still has to read
@@ -29,10 +39,38 @@ import { Observation, ObservationOutcome } from "./observation";
  */
 export const FollowUpStatus = Schema.Literals([
   "uninvestigated",
+  "scheduled",
   "addressedInconclusive",
   "addressedWithEvidence",
 ]);
 export type FollowUpStatus = typeof FollowUpStatus.Type;
+
+/**
+ * An intent that declared it addresses one dimension, and whether its work is done.
+ *
+ * `addresses_dimension` is stated by whoever creates the intent and recorded as lineage
+ * (migration `0009`). It is what makes `scheduled` derivable rather than a stored flag,
+ * and it is also what lets a planner answer a dimension with a *new* intent instead of
+ * another attempt on the raising one.
+ *
+ * `attemptsOpen` is the honest half. An intent that declared a dimension and whose every
+ * attempt has since settled without recording an addressing observation has *tried*, and
+ * the question is open again; this field is how a reader tells that apart from work still
+ * running. `attemptsTotal` of zero with `attemptsOpen` true is an intent nothing has been
+ * dispatched for yet.
+ */
+export const DimensionSchedule = Schema.Struct({
+  intentId: Schema.String,
+  question: Schema.String,
+  /**
+   * Whether any work on this intent could still produce an addressing observation:
+   * true while an attempt is `running` or `uncertain`, and true for an intent that has
+   * no attempt yet because nothing has been dispatched for it.
+   */
+  attemptsOpen: Schema.Boolean,
+  attemptsTotal: Schema.Int,
+});
+export type DimensionSchedule = typeof DimensionSchedule.Type;
 
 /**
  * One observation named in a follow-up relationship, with enough of itself to be
@@ -72,6 +110,13 @@ export const OpenQuestion = Schema.Struct({
   status: FollowUpStatus,
   /** Later observations that explicitly named this address, oldest first. */
   addressedBy: Schema.Array(ObservationReference),
+  /**
+   * Intents that declared they address this dimension, oldest first.
+   *
+   * Non-empty with `status: "uninvestigated"` means somebody tried and the question
+   * came back open, which is not the same fact as nobody having looked.
+   */
+  scheduledBy: Schema.Array(DimensionSchedule),
 });
 export type OpenQuestion = typeof OpenQuestion.Type;
 

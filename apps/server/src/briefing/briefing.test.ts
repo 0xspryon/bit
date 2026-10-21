@@ -523,3 +523,223 @@ describe("briefings over an upgraded database", () => {
     );
   });
 });
+
+/**
+ * `scheduled`, and the one property that makes it safe to have: it can be left.
+ *
+ * §17 is explicit that `scheduled` "must not become §22's forever-`uncertain`" — once
+ * every attempt on the declaring intent has settled with no addressing observation, the
+ * question is open again, carrying the history that somebody tried. All four of these
+ * read the state off real rows rather than setting a flag.
+ */
+describe("a dimension an intent declared it addresses", () => {
+  const HOST_CONTEXT = { callerScope: "host/target-1", targetId: "target-1" };
+
+  /**
+   * Seeds one raising observation, then a sibling intent declaring its first dimension.
+   * `dispatch` decides whether that sibling gets an attempt at all.
+   */
+  const withDeclaration = <A, E>(
+    dispatch: "none" | "running" | "settled",
+    use: (
+      store: ObservationStore["Service"],
+      context: { raiserId: string; address: string },
+    ) => Effect.Effect<A, E, ObservationStore>,
+  ) =>
+    Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const store = yield* ObservationStore;
+          yield* store.seedAttempt({
+            targetId: "target-1",
+            goalId: "goal-1",
+            goal: "Determine whether authentication rate limits can be bypassed.",
+            intentId: "intent-1",
+            question: "Probe the per-client limiter on POST /login.",
+            attemptId: "attempt-1",
+            workerId: "worker-1",
+            providerId: "openai",
+            modelId: "gpt-5.6-sol",
+            harnessSessionId: "ses_abc",
+          });
+          const raiser = yield* store.recordObservation(
+            CALLER,
+            input({
+              untestedDimensions: [
+                "The per-account limit was never approached.",
+                "No window rollover was measured.",
+              ],
+            }),
+          );
+          const address = `${raiser.observationId}#u0`;
+          yield* store.addIntent(HOST_CONTEXT, {
+            operationId: "declare",
+            goalId: "goal-1",
+            intentId: "intent-account-limit",
+            question: "Measure the per-account limiter directly.",
+            anchorObservationIds: [raiser.observationId],
+            addressesDimension: address,
+          });
+          if (dispatch !== "none") {
+            yield* store.seedAttempt({
+              targetId: "target-1",
+              goalId: "goal-1",
+              goal: "Determine whether authentication rate limits can be bypassed.",
+              intentId: "intent-account-limit",
+              question: "Measure the per-account limiter directly.",
+              attemptId: "attempt-account",
+              workerId: "worker-1",
+              providerId: "openai",
+              modelId: "gpt-5.6-sol",
+              harnessSessionId: "ses_account",
+            });
+            if (dispatch === "settled") {
+              yield* store.settleAttempt("attempt-account", "succeeded");
+            }
+          }
+          return yield* use(store, {
+            raiserId: raiser.observationId,
+            address,
+          });
+        }).pipe(Effect.provide(ObservationStore.layer(newDatabasePath()))),
+      ),
+    );
+
+  test("is scheduled while the declaring intent has work outstanding", async () => {
+    const outcome = await withDeclaration("running", (_store, { address }) =>
+      Effect.map(buildBriefing("intent-1"), (briefing) => ({
+        briefing,
+        question: briefing.openQuestions.find(
+          (item) => item.address === address,
+        ),
+        rendered: renderBriefing(briefing),
+      })),
+    );
+
+    expect(outcome.question?.status).toBe("scheduled");
+    expect(outcome.question?.scheduledBy).toEqual([
+      {
+        intentId: "intent-account-limit",
+        question: "Measure the per-account limiter directly.",
+        attemptsOpen: true,
+        attemptsTotal: 1,
+      },
+    ]);
+    // The sibling dimension of the same observation is untouched, so a declaration
+    // reaches exactly the dimension it named.
+    const sibling = outcome.briefing.openQuestions.find(
+      (item) => item.address !== outcome.question?.address,
+    );
+    expect(sibling?.status).toBe("uninvestigated");
+    expect(sibling?.scheduledBy).toEqual([]);
+    // A planner is told work is out, and under which intent, so it does not open a
+    // second intent for the same question.
+    expect(outcome.rendered).toContain("### Scheduled (1)");
+    expect(outcome.rendered).toContain(
+      "work is out under intent intent-account-limit",
+    );
+  });
+
+  test("is scheduled for a declaring intent nothing has been dispatched for yet", async () => {
+    const outcome = await withDeclaration("none", (_store, { address }) =>
+      Effect.map(buildBriefing("intent-1"), (briefing) =>
+        briefing.openQuestions.find((item) => item.address === address),
+      ),
+    );
+    // Zero attempts is "nothing has started", not "everything finished". Reading it the
+    // other way would publish the question as open the moment a planner scheduled it,
+    // which is the duplicate round the declaration exists to prevent.
+    expect(outcome?.status).toBe("scheduled");
+    expect(outcome?.scheduledBy[0]).toEqual({
+      intentId: "intent-account-limit",
+      question: "Measure the per-account limiter directly.",
+      attemptsOpen: true,
+      attemptsTotal: 0,
+    });
+  });
+
+  test("falls back to uninvestigated once every attempt settled with no answer", async () => {
+    const outcome = await withDeclaration("settled", (_store, { address }) =>
+      Effect.map(buildBriefing("intent-1"), (briefing) => ({
+        question: briefing.openQuestions.find(
+          (item) => item.address === address,
+        ),
+        rendered: renderBriefing(briefing),
+      })),
+    );
+
+    // The property §17 demands: a state that can be entered can be left.
+    expect(outcome.question?.status).toBe("uninvestigated");
+    // And it carries the history that somebody tried, which is not the same fact as
+    // nobody having looked.
+    expect(outcome.question?.scheduledBy).toEqual([
+      {
+        intentId: "intent-account-limit",
+        question: "Measure the per-account limiter directly.",
+        attemptsOpen: false,
+        attemptsTotal: 1,
+      },
+    ]);
+    expect(outcome.rendered).not.toContain("### Scheduled");
+    expect(outcome.rendered).toContain(
+      "was taken on under intent intent-account-limit",
+    );
+    expect(outcome.rendered).toContain("all settled with no answer recorded");
+  });
+
+  test("an addressing observation wins over the declaration", async () => {
+    const outcome = await withDeclaration("running", (store, { address }) =>
+      Effect.gen(function* () {
+        yield* store.recordObservation(
+          {
+            ...CALLER,
+            callerScope: "target-1/attempt-account",
+            intentId: "intent-account-limit",
+            attemptId: "attempt-account",
+          },
+          input({
+            operationId: "answered",
+            outcome: "negative",
+            addressesDimensions: [address],
+          }),
+        );
+        const briefing = yield* buildBriefing("intent-1");
+        return {
+          question: briefing.openQuestions.find(
+            (item) => item.address === address,
+          ),
+          rendered: renderBriefing(briefing),
+        };
+      }),
+    );
+
+    // What was found is more informative than the fact somebody set out to find it —
+    // and this is the path §17 opened: an observation under a *different* intent of the
+    // same goal closed a question raised by this one.
+    expect(outcome.question?.status).toBe("addressedWithEvidence");
+    expect(outcome.question?.addressedBy).toHaveLength(1);
+    expect(outcome.question?.addressedBy[0]?.outcome).toBe("negative");
+    // The addressing observation is not one of this intent's rows, so the briefing says
+    // so rather than pretending it is above.
+    expect(outcome.question?.addressedBy[0]?.includedInBriefing).toBe(false);
+    expect(outcome.rendered).toContain("### Addressed with evidence (1)");
+  });
+
+  test("the stable prefix still names no dimension and no status", async () => {
+    const outcome = await withDeclaration("running", (_store, { address }) =>
+      Effect.map(buildBriefing("intent-1"), (briefing) => ({
+        prefix: stablePrefixOf(renderBriefing(briefing)),
+        rendered: renderBriefing(briefing),
+        address,
+      })),
+    );
+    // §22's property, re-checked now that a fourth status exists: everything that
+    // restates the record stays below the heading.
+    expect(outcome.prefix).not.toContain(outcome.address);
+    expect(outcome.prefix).not.toContain("scheduled");
+    expect(outcome.prefix).not.toContain("Scheduled");
+    expect(outcome.prefix).not.toContain("intent-account-limit");
+    expect(outcome.rendered).toContain(PREPARATION_HEADING);
+    expect(outcome.rendered).toContain(outcome.address);
+  });
+});

@@ -37,8 +37,12 @@ A fifth phase on `milestoneProof.ts`, or a sibling proof driven from `spike/phas
 
 1. Two targets exist in `control.sqlite`'s registry; migrations run across both.
 2. Work on target A records an asset, an intent anchored to an existing observation, and
-   an observation — each writing domain row, receipt, event and outbox entry in **one**
-   transaction.
+   an observation — each writing its domain row, receipt and event in **one** transaction,
+   with an outbox entry where the change implies an obligation outside the database.
+   Corrected 2026-10-21: the first draft said all three carry one. Creating an intent has
+   no external effect, and §6 defines the outbox as a queue of side-effect _requests_, so
+   writing an empty obligation would be noise. A later notification is driven from the
+   event.
 3. The process is killed between two mutations.
 4. On restart: the event log reads back in sequence order, the outbox still holds its
    undispatched obligations, the attempt is reconciled, and target B's file is untouched
@@ -126,7 +130,7 @@ claims, leases, delivery state and retry scheduling are all Sprint 03. Sprint 02
 ## Sequencing note
 
 Do §17's now-half — `0008_observation_dimensions` and
-`0010_intent_dimension_provenance` — **before** the target split. `0008`'s backfill is a
+`0009_intent_dimension_provenance` — **before** the target split. `0008`'s backfill is a
 `json_each` statement far easier to validate against one file than against a registry of
 N, and it changes dimension identity, which briefings print, so it wants to settle before
 anything else moves underneath it.

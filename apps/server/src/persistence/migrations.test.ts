@@ -108,6 +108,49 @@ const primaryKeyOf = (sql: SqlClient.SqlClient, table: string) =>
         .map((row) => row.name),
   );
 
+/**
+ * The ids the chain declares, in order, as `[id, name]` and as plain numbers.
+ *
+ * Derived from {@link MIGRATIONS} rather than written out, so appending an entry does
+ * not mean editing every full-chain assertion. Assertions about a *subset* — which
+ * entries one upgrade applied — are still written out, because that is the part a
+ * derived list could not check.
+ */
+const CHAIN = Object.keys(MIGRATIONS).map((key) => {
+  const match = /^(\d+)_(.+)$/.exec(key);
+  if (match === null) throw new Error(`migration key ${key} has no id`);
+  return [Number(match[1]), match[2] ?? ""] as const;
+});
+const CHAIN_IDS = CHAIN.map(([id]) => id);
+const CHAIN_LABELS = CHAIN.map(([id, name]) => `${String(id)}_${name}`);
+
+/**
+ * An id far above the chain, for the deliberately broken entries.
+ *
+ * It has to be above every real id or the migrator would skip it (it applies only ids
+ * greater than the highest applied), and it must not collide with an id the chain may
+ * grow into, which is why it is 99 rather than "one more than the last one".
+ */
+const BROKEN_ID = "0099";
+
+/**
+ * The real chain truncated at one id, as a loader.
+ *
+ * Needed because the migrator applies only ids *above* the highest applied one: a loader
+ * built by removing one entry from the middle of {@link MIGRATIONS} would apply
+ * everything after it and then never be able to apply the hole. Every "a database
+ * already at NNNN" test therefore takes a file to that id and migrates forward from
+ * there, which is also what a real upgrade does.
+ */
+const chainThrough = (highestId: number): SqliteMigrator.Loader =>
+  SqliteMigrator.fromRecord(
+    Object.fromEntries(
+      Object.entries(MIGRATIONS).filter(
+        ([key]) => Number(key.slice(0, key.indexOf("_"))) <= highestId,
+      ),
+    ),
+  );
+
 const tablesOf = (sql: SqlClient.SqlClient) =>
   Effect.map(
     sql<{ name: string }>`SELECT name FROM sqlite_master WHERE type = 'table'
@@ -131,27 +174,25 @@ describe("a fresh database", () => {
       }),
     );
 
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "1_delegation_memory_slice",
-      "2_observation_cases",
-      "3_observation_record_format",
-      "4_attempt_recovery",
-      "5_dimension_followups",
-      "6_recovery_state_key",
-      "7_planner_lineage",
-    ]);
-    expect(outcome.journal.map((row) => row.migration_id)).toEqual([
-      1, 2, 3, 4, 5, 6, 7,
-    ]);
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual(
+      CHAIN_LABELS,
+    );
+    expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.tables).toEqual([
+      "asset_discoveries",
+      "assets",
       "attempt_recoveries",
       "attempts",
       "command_receipts",
       "effect_sql_migrations",
+      "events",
       "goals",
+      "intent_anchors",
       "intents",
       "observation_dimension_links",
+      "observation_dimensions",
       "observations",
+      "outbox",
       "planner_lineages",
       "sequence_cursor",
     ]);
@@ -234,9 +275,7 @@ describe("a database that is already current", () => {
     // run of either would destroy every observation written since the first.
     expect(second).toEqual([]);
     expect(third.applied).toEqual([]);
-    expect(third.journal.map((row) => row.migration_id)).toEqual([
-      1, 2, 3, 4, 5, 6, 7,
-    ]);
+    expect(third.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
   });
 
   test("rows written after migrating survive a later migrate call", async () => {
@@ -300,10 +339,8 @@ describe("adopting a first-slice database", () => {
 
     // `0001` is a no-op against the existing tables; the later entries do the work.
     // Every entry is journalled, so a database created from scratch ends up identical.
-    expect(outcome.applied.map(([id]) => id)).toEqual([1, 2, 3, 4, 5, 6, 7]);
-    expect(outcome.journal.map((row) => row.migration_id)).toEqual([
-      1, 2, 3, 4, 5, 6, 7,
-    ]);
+    expect(outcome.applied.map(([id]) => id)).toEqual(CHAIN_IDS);
+    expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
 
     const observation = outcome.observations[0];
     expect(outcome.observations).toHaveLength(1);
@@ -427,10 +464,14 @@ describe("a database already at 0002", () => {
       "5_dimension_followups",
       "6_recovery_state_key",
       "7_planner_lineage",
+      "8_observation_dimensions",
+      "9_intent_dimension_provenance",
+      "10_assets",
+      "11_intent_anchors",
+      "12_event_log",
+      "13_outbox",
     ]);
-    expect(outcome.journal.map((row) => row.migration_id)).toEqual([
-      1, 2, 3, 4, 5, 6, 7,
-    ]);
+    expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
     expect(outcome.columns).not.toContain("schema_version");
 
@@ -691,6 +732,12 @@ describe("a database already at 0005", () => {
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "6_recovery_state_key",
       "7_planner_lineage",
+      "8_observation_dimensions",
+      "9_intent_dimension_provenance",
+      "10_assets",
+      "11_intent_anchors",
+      "12_event_log",
+      "13_outbox",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -822,7 +869,7 @@ describe("a database already at 0005", () => {
   /** The real chain plus one entry that fails, appended past the last real entry. */
   const brokenAfterRebuild = SqliteMigrator.fromRecord({
     ...MIGRATIONS,
-    "0008_broken_after_rebuild": Effect.gen(function* () {
+    [`${BROKEN_ID}_broken_after_rebuild`]: Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`SELECT * FROM attempt_recoveires`;
     }),
@@ -848,9 +895,7 @@ describe("a database already at 0005", () => {
 
     // The rollback takes the pending migration with it and nothing else: `0006` is
     // still journalled and the rebuilt table still holds every row.
-    expect(after.journal.map((row) => row.migration_id)).toEqual([
-      1, 2, 3, 4, 5, 6, 7,
-    ]);
+    expect(after.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(after.key).toContain("prior_status");
     expect(after.rows).toHaveLength(OLD_ROWS.length);
     expect(after.rows.map((row) => row.times)).toEqual(
@@ -860,29 +905,23 @@ describe("a database already at 0005", () => {
 });
 
 describe("a database already at 0006", () => {
-  /** Everything except the planner lineage table, which is the state `0007` upgrades. */
-  const upToRecoveryStateKey = SqliteMigrator.fromRecord(
-    Object.fromEntries(
-      Object.entries(MIGRATIONS).filter(
-        ([key]) => key !== "0007_planner_lineage",
-      ),
-    ),
-  );
-
-  test("0007 adds the lineage table and touches nothing else", async () => {
-    const path = newDatabasePath();
-    await Effect.runPromise(
+  const runThrough = (path: string, highestId: number) =>
+    Effect.runPromise(
       Effect.scoped(
-        runMigrations({ loader: upToRecoveryStateKey }).pipe(
+        runMigrations({ loader: chainThrough(highestId) }).pipe(
           Effect.provide(sqliteLayer(path)),
         ),
       ),
     );
 
+  test("0007 adds the lineage table and touches nothing else", async () => {
+    const path = newDatabasePath();
+    await runThrough(path, 6);
+
     const before = await withSql(path, (sql) => tablesOf(sql));
     expect(before).not.toContain("planner_lineages");
 
-    const applied = await withSql(path, () => migrate);
+    const applied = await runThrough(path, 7);
     expect(applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "7_planner_lineage",
     ]);
@@ -918,11 +957,458 @@ describe("a database already at 0006", () => {
   });
 });
 
+/**
+ * The pre-`0008` backfill, against a file the real migration bodies took to `0007`.
+ *
+ * This is the path a development database actually walks: it holds observations whose
+ * untested dimensions are a JSON array inside the row, and follow-up links keyed by
+ * `(address, dimension_index)`. Nothing about it can be checked against a fresh database,
+ * because a fresh one has no rows to unnest — so every assertion here is about data that
+ * existed before the migration ran.
+ */
+describe("a database already at 0007", () => {
+  const runThrough = (path: string, highestId: number) =>
+    Effect.runPromise(
+      Effect.scoped(
+        runMigrations({ loader: chainThrough(highestId) }).pipe(
+          Effect.provide(sqliteLayer(path)),
+        ),
+      ),
+    );
+
+  const RAISER = "obs_000001_attempt-a";
+  const ADDRESSER = "obs_000002_attempt-b";
+  /** Three dimensions, including one whose text would break a concatenated statement. */
+  const RAISED = [
+    "the per-account limit was never approached",
+    `a second tenant was never tried; the operator said "it's fine"); DROP TABLE x; --`,
+    "no window rollover was measured",
+  ];
+
+  /** Takes a file to `0007` and fills it with the shapes `0008` has to carry across. */
+  const seedAtZeroSeven = async (path: string) => {
+    await runThrough(path, 7);
+    await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
+          VALUES ('goal-1', 'fixture-local', 'Can rate limits be bypassed?', 1)`;
+        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
+          VALUES ('intent-1', 'goal-1', 'fixture-local', 'Probe the limiter.', 1)`;
+        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
+            harness_session_id, provider_id, model_id, status, started_at, write_fence)
+          VALUES ('attempt-a', 'intent-1', 'fixture-local', 'worker-1', 'ses_a',
+                  'openai', 'gpt-5.6-sol', 'succeeded', 1, 1)`;
+        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
+            harness_session_id, provider_id, model_id, status, started_at, write_fence)
+          VALUES ('attempt-b', 'intent-1', 'fixture-local', 'worker-1', 'ses_b',
+                  'openai', 'gpt-5.6-sol', 'succeeded', 2, 1)`;
+        // The raiser carries three dimensions; the addresser carries none, so the
+        // backfill has to cope with an empty array as well as a populated one.
+        yield* sql`INSERT INTO observations (
+            id, sequence, record_format, target_id, intent_id, attempt_id,
+            harness_session_id, worker_id, tested_claim, outcome, interpretation,
+            limitations, untested_dimensions, recorded_at,
+            summary_conditions, summary_observed_behavior, summary_evidence_refs
+          ) VALUES (
+            ${RAISER}, 1, 'summary', 'fixture-local', 'intent-1', 'attempt-a',
+            'ses_a', 'worker-1', 'Header rotation evades the limit.', 'positive',
+            'Keys on the header value.', '[]', ${JSON.stringify(RAISED)}, 1000,
+            '{}', 'seen', '[]'
+          )`;
+        yield* sql`INSERT INTO observations (
+            id, sequence, record_format, target_id, intent_id, attempt_id,
+            harness_session_id, worker_id, tested_claim, outcome, interpretation,
+            limitations, untested_dimensions, recorded_at,
+            summary_conditions, summary_observed_behavior, summary_evidence_refs
+          ) VALUES (
+            ${ADDRESSER}, 2, 'summary', 'fixture-local', 'intent-1', 'attempt-b',
+            'ses_b', 'worker-1', 'The account limit is 100.', 'negative',
+            'Not reproduced.', '[]', '[]', 2000, '{}', 'seen', '[]'
+          )`;
+        // A link in `0005`'s shape: keyed by the printed address and the parsed index.
+        yield* sql`INSERT INTO observation_dimension_links (
+            observation_id, address, source_observation_id, dimension_index, created_at
+          ) VALUES (${ADDRESSER}, ${`${RAISER}#u0`}, ${RAISER}, 0, 2000)`;
+      }),
+    );
+  };
+
+  test("0008 unnests every dimension in position order, with the raiser's own clock", async () => {
+    const path = newDatabasePath();
+    await seedAtZeroSeven(path);
+
+    const applied = await runThrough(path, 8);
+    expect(applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "8_observation_dimensions",
+    ]);
+
+    const after = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        return {
+          dimensions: yield* sql<{
+            id: string;
+            observation_id: string;
+            position: number;
+            text: string;
+            created_at: number;
+          }>`SELECT id, observation_id, position, text, created_at
+             FROM observation_dimensions ORDER BY observation_id, position`,
+          key: yield* primaryKeyOf(sql, "observation_dimension_links"),
+          links: yield* sql<{
+            observation_id: string;
+            dimension_id: string;
+            address: string;
+            created_at: number;
+          }>`SELECT observation_id, dimension_id, address, created_at
+             FROM observation_dimension_links`,
+          columns: yield* columnsOf(sql, "observation_dimension_links"),
+        };
+      }),
+    );
+
+    // One row per element, in position order, with the text byte for byte.
+    expect(
+      after.dimensions.map((row) => [row.position, row.text] as const),
+    ).toEqual(RAISED.map((text, index) => [index, text] as const));
+    expect(after.dimensions.every((row) => row.observation_id === RAISER)).toBe(
+      true,
+    );
+    // The addresser recorded an empty array, so it contributes nothing: `json_each` over
+    // `[]` yields no rows rather than one null row.
+    expect(after.dimensions).toHaveLength(RAISED.length);
+    // Stamped with the raising observation's `recorded_at`, not the migration's clock.
+    expect(after.dimensions.map((row) => row.created_at)).toEqual([
+      1000, 1000, 1000,
+    ]);
+    // Ids are opaque: not the alias, and not anything containing the position.
+    for (const row of after.dimensions) {
+      expect(row.id).toMatch(/^dim_[0-9a-f]{32}$/);
+      expect(row.id).not.toContain(RAISER);
+      expect(row.id).not.toContain("#u");
+    }
+    expect(new Set(after.dimensions.map((row) => row.id)).size).toBe(
+      RAISED.length,
+    );
+
+    // The link is repointed onto the dimension's id, keeps its address verbatim and its
+    // own timestamp, and the parsed-position columns are gone.
+    const dimensionZero = after.dimensions.find((row) => row.position === 0);
+    expect(after.links).toEqual([
+      {
+        observation_id: ADDRESSER,
+        dimension_id: dimensionZero?.id ?? "missing",
+        address: `${RAISER}#u0`,
+        created_at: 2000,
+      },
+    ]);
+    expect(after.key).toEqual(["observation_id", "dimension_id"]);
+    expect(after.columns).not.toContain("source_observation_id");
+    expect(after.columns).not.toContain("dimension_index");
+  });
+
+  test("0009 adds a nullable dimension reference to intents and nothing else", async () => {
+    const path = newDatabasePath();
+    await seedAtZeroSeven(path);
+    await runThrough(path, 8);
+
+    const before = await withSql(path, (sql) => columnsOf(sql, "intents"));
+    expect(before).not.toContain("addresses_dimension");
+
+    const applied = await runThrough(path, 9);
+    expect(applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "9_intent_dimension_provenance",
+    ]);
+
+    const after = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        const asMigrated = yield* sql<{
+          addresses_dimension: string | null;
+        }>`SELECT addresses_dimension FROM intents WHERE id = 'intent-1'`;
+        const dimension = yield* sql<{
+          id: string;
+        }>`SELECT id FROM observation_dimensions WHERE position = 1`;
+        const id = dimension[0]?.id ?? "missing";
+        yield* sql`UPDATE intents SET addresses_dimension = ${id}
+          WHERE id = 'intent-1'`;
+        const refused = yield* Effect.result(
+          sql`INSERT INTO intents (id, goal_id, target_id, question, created_at,
+                addresses_dimension)
+              VALUES ('intent-2', 'goal-1', 'fixture-local', 'q', 3, 'dim_nope')`,
+        );
+        return {
+          columns: yield* columnsOf(sql, "intents"),
+          declared: yield* sql<{
+            addresses_dimension: string | null;
+          }>`SELECT addresses_dimension FROM intents WHERE id = 'intent-1'`,
+          refused: refused._tag,
+          asMigrated:
+            asMigrated[0] === undefined
+              ? "row missing"
+              : asMigrated[0].addresses_dimension,
+          existing: yield* sql<{
+            count: number;
+          }>`SELECT COUNT(*) AS count FROM intents`,
+          dimensionId: id,
+        };
+      }),
+    );
+
+    expect(after.columns).toContain("addresses_dimension");
+    // The migration invented no provenance: the existing intent arrived null, and the
+    // value read back here is the one this test then declared on it.
+    expect(after.asMigrated).toBeNull();
+    expect(after.declared[0]?.addresses_dimension).toBe(after.dimensionId);
+    // The reference is a real foreign key, so an id no dimension holds is refused.
+    expect(after.refused).toBe("Failure");
+    expect(after.existing[0]?.count).toBe(1);
+  });
+
+  test("0008 refuses to drop a link whose dimension does not exist", async () => {
+    const path = newDatabasePath();
+    await seedAtZeroSeven(path);
+    // An index past the end of the stored list. `0005`'s write boundary made this
+    // impossible, so this is a guard against what we have not thought of — and an
+    // INNER JOIN would have dropped the row silently instead of failing.
+    await withSql(
+      path,
+      (sql) =>
+        sql`INSERT INTO observation_dimension_links (
+          observation_id, address, source_observation_id, dimension_index, created_at
+        ) VALUES (${ADDRESSER}, ${`${RAISER}#u9`}, ${RAISER}, 9, 2000)`,
+    );
+
+    const failure = await runChain(path, chainThrough(8));
+    expect(failure._tag).toBe("Failure");
+    if (failure._tag === "Failure") {
+      expect((failure.failure as DatabaseError).reason).toContain(
+        "8_observation_dimensions",
+      );
+    }
+
+    // Rolled back whole: no dimensions table, the old link columns intact, both links
+    // still there, and the journal unchanged.
+    const after = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        return {
+          tables: yield* tablesOf(sql),
+          columns: yield* columnsOf(sql, "observation_dimension_links"),
+          links: yield* sql<{
+            count: number;
+          }>`SELECT COUNT(*) AS count FROM observation_dimension_links`,
+          journal: yield* journalOf(sql),
+        };
+      }),
+    );
+    expect(after.tables).not.toContain("observation_dimensions");
+    expect(after.columns).toContain("dimension_index");
+    expect(after.links[0]?.count).toBe(2);
+    expect(after.journal.map((row) => row.migration_id)).toEqual([
+      1, 2, 3, 4, 5, 6, 7,
+    ]);
+  });
+
+  test("0008 refuses an untested_dimensions column that is not a JSON array", async () => {
+    const path = newDatabasePath();
+    await seedAtZeroSeven(path);
+    await withSql(
+      path,
+      (sql) =>
+        sql`UPDATE observations SET untested_dimensions = '"not an array"'
+        WHERE id = ${ADDRESSER}`,
+    );
+
+    const failure = await runChain(path, chainThrough(8));
+    expect(failure._tag).toBe("Failure");
+
+    const after = await withSql(path, (sql) => tablesOf(sql));
+    expect(after).not.toContain("observation_dimensions");
+  });
+});
+
+/**
+ * The tables Day 2 adds, each checked for what it enforces rather than for existing.
+ */
+describe("a database already at 0009", () => {
+  const runThrough = (path: string, highestId: number) =>
+    Effect.runPromise(
+      Effect.scoped(
+        runMigrations({ loader: chainThrough(highestId) }).pipe(
+          Effect.provide(sqliteLayer(path)),
+        ),
+      ),
+    );
+
+  test("0010 refuses an asset whose columns contradict its kind", async () => {
+    const path = newDatabasePath();
+    await runThrough(path, 9);
+    const applied = await runThrough(path, 10);
+    expect(applied.map(([id, name]) => `${id}_${name}`)).toEqual(["10_assets"]);
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        const insert = (
+          id: string,
+          kind: string,
+          scheme: string | null,
+          method: string | null,
+          path_: string | null,
+        ) =>
+          Effect.result(
+            sql`INSERT INTO assets (id, target_id, kind, identity, host, port,
+                  scheme, method, path, first_seen_at)
+                VALUES (${id}, 't', ${kind}, ${id}, 'h', 80, ${scheme}, ${method},
+                        ${path_}, 1)`,
+          );
+        return {
+          hostOk: (yield* insert("a", "host", null, null, null))._tag,
+          hostWithMethod: (yield* insert("b", "host", null, "GET", null))._tag,
+          endpointOk: (yield* insert("c", "endpoint", "http:", "GET", "/x"))
+            ._tag,
+          endpointWithoutMethod: (yield* insert(
+            "d",
+            "endpoint",
+            "http:",
+            null,
+            "/x",
+          ))._tag,
+          duplicateIdentity: (yield* Effect.result(
+            sql`INSERT INTO assets (id, target_id, kind, identity, host, port,
+                  scheme, method, path, first_seen_at)
+                VALUES ('e', 't', 'host', 'a', 'h', 80, NULL, NULL, NULL, 1)`,
+          ))._tag,
+          otherTargetSameIdentity: (yield* Effect.result(
+            sql`INSERT INTO assets (id, target_id, kind, identity, host, port,
+                  scheme, method, path, first_seen_at)
+                VALUES ('f', 'other', 'host', 'a', 'h', 80, NULL, NULL, NULL, 1)`,
+          ))._tag,
+        };
+      }),
+    );
+
+    expect(outcome.hostOk).toBe("Success");
+    expect(outcome.endpointOk).toBe("Success");
+    // The `CHECK` is what stops a row claiming to be a host with a method, or an
+    // endpoint without one, whatever a handler believes it is writing.
+    expect(outcome.hostWithMethod).toBe("Failure");
+    expect(outcome.endpointWithoutMethod).toBe("Failure");
+    // Identity is unique within a target and kind, which is where the domain merge
+    // happens — and it does not reach across targets, which it must not.
+    expect(outcome.duplicateIdentity).toBe("Failure");
+    expect(outcome.otherTargetSameIdentity).toBe("Success");
+  });
+
+  test("0012 makes a recorded event immutable and undeletable in the database", async () => {
+    const path = newDatabasePath();
+    await runThrough(path, 12);
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO events (id, sequence, target_id, kind, payload,
+            operation, subject_id, recorded_at)
+          VALUES ('evt_000001', 1, 't', 'asset.recorded', '{}', 'record_asset',
+                  'asset-1', 1)`;
+        const updated = yield* Effect.result(
+          sql`UPDATE events SET kind = 'something.else' WHERE id = 'evt_000001'`,
+        );
+        const deleted = yield* Effect.result(
+          sql`DELETE FROM events WHERE id = 'evt_000001'`,
+        );
+        const duplicateSequence = yield* Effect.result(
+          sql`INSERT INTO events (id, sequence, target_id, kind, payload,
+              operation, subject_id, recorded_at)
+            VALUES ('evt_000002', 1, 't', 'asset.recorded', '{}', 'record_asset',
+                    'asset-2', 2)`,
+        );
+        return {
+          updated: updated._tag,
+          deleted: deleted._tag,
+          duplicateSequence: duplicateSequence._tag,
+          rows: yield* sql<{
+            id: string;
+            kind: string;
+          }>`SELECT id, kind FROM events`,
+        };
+      }),
+    );
+
+    // Not "we never wrote an UPDATE": the database refuses one.
+    expect(outcome.updated).toBe("Failure");
+    expect(outcome.deleted).toBe("Failure");
+    expect(outcome.duplicateSequence).toBe("Failure");
+    expect(outcome.rows).toEqual([
+      { id: "evt_000001", kind: "asset.recorded" },
+    ]);
+  });
+
+  test("0013 refuses an unknown status, an unknown policy and an orphan request", async () => {
+    const path = newDatabasePath();
+    await runThrough(path, 13);
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO events (id, sequence, target_id, kind, payload,
+            operation, subject_id, recorded_at)
+          VALUES ('evt_000001', 1, 't', 'asset.recorded', '{}', 'record_asset',
+                  'asset-1', 1)`;
+        const enqueue = (
+          id: string,
+          sequence: number,
+          status: string,
+          policy: string,
+          eventId: string,
+        ) =>
+          Effect.result(
+            sql`INSERT INTO outbox (id, sequence, target_id, request_type, payload,
+                  recovery_policy, caused_by_event_id, status, attempts, enqueued_at)
+                VALUES (${id}, ${sequence}, 't', 'asset.enrich', '{}', ${policy},
+                        ${eventId}, ${status}, 0, 1)`,
+          );
+        return {
+          ok: (yield* enqueue(
+            "out_1",
+            1,
+            "pending",
+            "safe_to_retry",
+            "evt_000001",
+          ))._tag,
+          badStatus: (yield* enqueue(
+            "out_2",
+            2,
+            "queued",
+            "safe_to_retry",
+            "evt_000001",
+          ))._tag,
+          badPolicy: (yield* enqueue(
+            "out_3",
+            3,
+            "pending",
+            "just_retry",
+            "evt_000001",
+          ))._tag,
+          orphan: (yield* enqueue(
+            "out_4",
+            4,
+            "pending",
+            "safe_to_retry",
+            "evt_999999",
+          ))._tag,
+        };
+      }),
+    );
+
+    expect(outcome.ok).toBe("Success");
+    expect(outcome.badStatus).toBe("Failure");
+    expect(outcome.badPolicy).toBe("Failure");
+    // An obligation with no event behind it is an obligation nobody can explain.
+    expect(outcome.orphan).toBe("Failure");
+  });
+});
+
 describe("a failing migration", () => {
   /** The real chain plus one migration that breaks part-way through. */
   const brokenLoader = SqliteMigrator.fromRecord({
     ...MIGRATIONS,
-    "0008_broken": Effect.gen(function* () {
+    [`${BROKEN_ID}_broken`]: Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       // Succeeds, so there is a schema change that must be rolled back.
       yield* sql`ALTER TABLE observations ADD COLUMN half_applied TEXT`;
@@ -935,7 +1421,7 @@ describe("a failing migration", () => {
   /** The corrective migration: forward-only, because the migrator has no `down`. */
   const fixedLoader = SqliteMigrator.fromRecord({
     ...MIGRATIONS,
-    "0008_broken": Effect.gen(function* () {
+    [`${BROKEN_ID}_broken`]: Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`ALTER TABLE observations ADD COLUMN half_applied TEXT`;
     }),
@@ -953,7 +1439,7 @@ describe("a failing migration", () => {
       expect(failure.failure).toBeInstanceOf(DatabaseError);
       expect((failure.failure as DatabaseError).operation).toBe("migrate");
       expect((failure.failure as DatabaseError).reason).toContain("Failed");
-      expect((failure.failure as DatabaseError).reason).toContain("8_broken");
+      expect((failure.failure as DatabaseError).reason).toContain("99_broken");
     }
   });
 
@@ -961,7 +1447,7 @@ describe("a failing migration", () => {
     const path = newDatabasePath();
     await writeFirstSliceDatabase(path);
     const applied = await withSql(path, () => migrate);
-    expect(applied.map(([id]) => id)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(applied.map(([id]) => id)).toEqual(CHAIN_IDS);
 
     await runChain(path, brokenLoader);
 
@@ -976,9 +1462,7 @@ describe("a failing migration", () => {
     );
 
     // No journal row for the broken entry, and no half-applied column.
-    expect(after.journal.map((row) => row.migration_id)).toEqual([
-      1, 2, 3, 4, 5, 6, 7,
-    ]);
+    expect(after.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(after.columns).not.toContain("half_applied");
     // The migrations that had already succeeded are untouched, data included.
     expect(after.columns).toContain("record_format");
@@ -1029,9 +1513,10 @@ describe("a failing migration", () => {
     );
 
     // Only the corrected migration is outstanding; the real chain is not re-applied.
-    expect(recovered.applied.map(([id]) => id)).toEqual([8]);
+    expect(recovered.applied.map(([id]) => id)).toEqual([Number(BROKEN_ID)]);
     expect(recovered.journal.map((row) => row.migration_id)).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8,
+      ...CHAIN_IDS,
+      Number(BROKEN_ID),
     ]);
     expect(recovered.columns).toContain("half_applied");
     expect(recovered.rows.map((row) => row.id)).toEqual([

@@ -390,7 +390,7 @@ const phaseThree = (target: OpenQuestion) =>
     console.log(`\n-- recorded follow-up links (${links.length}) --`);
     for (const link of links) {
       console.log(
-        `  ${link.observationId} addresses ${link.address} (source ${link.sourceObservationId}#${String(link.dimensionIndex)})`,
+        `  ${link.observationId} addresses ${link.address} (dimension ${link.dimensionId})`,
       );
     }
     console.log(`\n-- open questions after the follow-up --`);

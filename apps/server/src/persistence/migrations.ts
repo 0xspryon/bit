@@ -546,10 +546,380 @@ const addPlannerLineages = statements(
 );
 
 /**
+ * `0008` — an untested dimension is a row with its own identity, and a link points at it.
+ *
+ * §22 recorded the limit this removes: a dimension address is positional, which "is only
+ * sound while observations are immutable", and anything that ever edits, merges or
+ * rewords a recorded dimension "needs its own identity scheme rather than this one
+ * stretched to fit". So the dimensions stored as a JSON array inside each observation
+ * become rows, each with an id that does not encode where it sits.
+ *
+ * **The backfill is an unnest, not a parse.** `json_each` is available in the SQLite
+ * that `bun:sqlite` links (3.53.4 here), and its `key` column is the array index as an
+ * integer, so one `INSERT ... SELECT` reproduces exactly the positions every address
+ * already implied. Ordering by `(sequence, key)` is cosmetic — the `rowid`s then run in
+ * graph order — because `(observation_id, position)` is what anything reads by.
+ *
+ * Three ways this refuses to lose data quietly rather than three ways it could:
+ *
+ * - An observation whose `untested_dimensions` is a JSON scalar rather than an array
+ *   yields a row with a `NULL` key, which the `NOT NULL` on `position` aborts on.
+ *   Malformed JSON makes `json_each` itself raise. Either way the migration fails, rolls
+ *   back and fails startup, which is what a corrupt list deserves.
+ * - The links rebuild joins with a **`LEFT JOIN` into a `NOT NULL` column**. A link whose
+ *   `(source_observation_id, dimension_index)` has no dimension row produces a `NULL`
+ *   `dimension_id` and aborts the whole migration. An `INNER JOIN` would have dropped
+ *   that link silently, which is the one outcome a repoint must not have. No such link
+ *   can exist — `0005`'s write boundary bounds-checked the index against the stored list
+ *   — so this is a guard against what we have not thought of rather than against a known
+ *   case, and `migrations.test.ts` manufactures one to prove the guard fires.
+ * - `UNIQUE (observation_id, position)` means the same position cannot be unnested twice.
+ *
+ * The ids are random rather than derived from `(observation_id, position)`, and that is
+ * the point of the whole migration: an id spelled `obs_x#u1` would make position the
+ * identity again and the table would be decoration. `<observationId>#u<index>` survives
+ * as the **wire alias** — it is what a briefing prints and what a worker copies — and is
+ * resolved to a `dimension_id` at the write boundary. Nothing worker-facing changes.
+ *
+ * `created_at` is the raising observation's own `recorded_at`, not the migration's clock:
+ * the dimension was recorded when its observation was, and stamping it "now" would make
+ * every backfilled row claim to have been created during an upgrade.
+ *
+ * The links table is rebuilt rather than altered because SQLite cannot change a foreign
+ * key in place, in the manner of `0006`. It drops `source_observation_id` and
+ * `dimension_index`, which are now the dimension row's own columns: duplicating them here
+ * would be a second answer to a question that already has one, exactly as `0005` argued
+ * about the intent column. `address` stays, verbatim as the worker submitted it, because
+ * that is a fact about the request rather than derived state.
+ */
+const addObservationDimensionRows = statements(
+  `CREATE TABLE observation_dimensions (
+    id TEXT PRIMARY KEY,
+    observation_id TEXT NOT NULL REFERENCES observations(id),
+    position INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (observation_id, position),
+    CHECK (position >= 0)
+  )`,
+  `INSERT INTO observation_dimensions (id, observation_id, position, text, created_at)
+   SELECT 'dim_' || lower(hex(randomblob(16))), o.id, j.key, j.value, o.recorded_at
+   FROM observations AS o, json_each(o.untested_dimensions) AS j
+   ORDER BY o.sequence, j.key`,
+  `CREATE TABLE observation_dimension_links_by_id (
+    observation_id TEXT NOT NULL REFERENCES observations(id),
+    dimension_id TEXT NOT NULL REFERENCES observation_dimensions(id),
+    address TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (observation_id, dimension_id)
+  )`,
+  `INSERT INTO observation_dimension_links_by_id
+     (observation_id, dimension_id, address, created_at)
+   SELECT links.observation_id, dimensions.id, links.address, links.created_at
+   FROM observation_dimension_links AS links
+   LEFT JOIN observation_dimensions AS dimensions
+     ON dimensions.observation_id = links.source_observation_id
+    AND dimensions.position = links.dimension_index
+   ORDER BY links.rowid`,
+  `DROP TABLE observation_dimension_links`,
+  `ALTER TABLE observation_dimension_links_by_id
+     RENAME TO observation_dimension_links`,
+  `CREATE INDEX IF NOT EXISTS observation_dimension_links_dimension_idx
+     ON observation_dimension_links(dimension_id)`,
+);
+
+/**
+ * `0009` — an intent may declare which dimension it addresses.
+ *
+ * One nullable column, added rather than rebuilt: a foreign key whose default is `NULL`
+ * is the one kind `ALTER TABLE ADD COLUMN` accepts, and no `CHECK` is involved.
+ *
+ * It buys three things (DECISIONS.md §17, "one derivation, not a stored flag"). The
+ * briefing state `scheduled` becomes *derivable* — a later round can tell "nobody has
+ * looked at this" from "work is out for this" — rather than being a flag somebody has to
+ * remember to clear. Duplicate-intent detection becomes a join rather than the prose
+ * matching §4 warns against. And it is the recorded lineage that lets the write boundary
+ * relax its same-intent rule to *same goal, when the caller's own intent declares that
+ * dimension*, so a planner can answer a dimension with a new intent — which is a path no
+ * worker could close before.
+ *
+ * `NULL` is the ordinary case and means only that the intent did not say; it is never
+ * "this intent addresses nothing".
+ *
+ * **This id was `0010` while `0009` was reserved for dispositions, and was moved down.**
+ * §17's plan reserved `0009_dimension_dispositions`, which waits for Sprint 07 because a
+ * planner round has no attempt to authenticate with. Leaving the hole would have burned
+ * the id: the migrator reads the highest id *this database's* journal holds and skips
+ * everything at or below it, so a `0009` added later applies to a fresh database and
+ * never to one already past it — the two then disagree about their schema and nothing
+ * says so. The chain is contiguous instead, and dispositions take the next free id.
+ */
+const addIntentDimensionProvenance = statements(
+  `ALTER TABLE intents ADD COLUMN addresses_dimension TEXT
+     REFERENCES observation_dimensions(id)`,
+  `CREATE INDEX IF NOT EXISTS intents_addresses_dimension_idx
+     ON intents(addresses_dimension)`,
+);
+
+/**
+ * `0010` — assets, with type-specific identity and every discovery kept.
+ *
+ * This is §6's **domain identity**, which is the third of the three questions at the
+ * mutation boundary and the one the other two cannot answer: two distinct operations may
+ * discover the same canonical asset, and the right outcome is one asset with two
+ * discovery records — not two assets, and not one discovery silently overwriting the
+ * other.
+ *
+ * So `assets` is the merged identity and `asset_discoveries` is append-only provenance.
+ * `UNIQUE (target_id, kind, identity)` is where the merge happens, in the schema rather
+ * than in a handler that might forget: a second discovery of the same canonical identity
+ * cannot create a second row even if a caller tries.
+ *
+ * **Identity is type-specific and deliberately small** (DECISIONS.md §17, "concrete asset
+ * identity rules"), covering only the two kinds the fixture presents:
+ *
+ * - `host` — `host:port`, lowercased, with the scheme's default port made explicit so
+ *   `http://x` and `http://x:80` are one host rather than two.
+ * - `endpoint` — `METHOD scheme://host:port/path`. Query and fragment are **excluded**:
+ *   including them mints a new asset per parameter value and turns a surface inventory
+ *   into a request log. The full submission is kept verbatim on every discovery row, so
+ *   nothing is lost — it is just not identity.
+ *
+ * **Role is not part of endpoint identity, and that is a decision with a reason.** The
+ * same URL and method tested as an administrator and as an anonymous caller is one
+ * endpoint; splitting it by role would make the coverage denominator §17 warns about
+ * lie — two assets where one exists — and would mean "we probed /admin unauthenticated"
+ * never counted as having touched `/admin` at all. Role is a property of the test, not of
+ * the thing tested, and it is already recorded where it belongs: on an observation's
+ * actors. The cost is stated as a limitation: an endpoint that is genuinely two different
+ * endpoints depending on who calls it is one row here, and only its observations
+ * distinguish them.
+ *
+ * The columns are nullable per kind and paired by a `CHECK`, the way `0003` pairs the two
+ * observation formats, so a row cannot claim to be a host and carry a method. `identity`
+ * is stored rather than computed on read because it is what the unique index is on, and a
+ * normalisation rule that changed would otherwise silently re-partition existing rows.
+ *
+ * `asset_discoveries` is keyed `(asset_id, operation_id)`: one discovery per operation, so
+ * a replayed command adds nothing and two genuinely different operations that found the
+ * same asset both survive. It records the intent and attempt that found it, which is the
+ * provenance §6 requires retaining through a merge.
+ */
+const addAssets = statements(
+  `CREATE TABLE assets (
+    id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    scheme TEXT,
+    method TEXT,
+    path TEXT,
+    first_seen_at INTEGER NOT NULL,
+    UNIQUE (target_id, kind, identity),
+    CHECK (
+      (kind = 'host'
+        AND scheme IS NULL AND method IS NULL AND path IS NULL)
+      OR
+      (kind = 'endpoint'
+        AND scheme IS NOT NULL AND method IS NOT NULL AND path IS NOT NULL)
+    )
+  )`,
+  `CREATE TABLE asset_discoveries (
+    asset_id TEXT NOT NULL REFERENCES assets(id),
+    operation_id TEXT NOT NULL,
+    caller_scope TEXT NOT NULL,
+    intent_id TEXT NOT NULL REFERENCES intents(id),
+    attempt_id TEXT NOT NULL REFERENCES attempts(id),
+    discovered_as TEXT NOT NULL,
+    note TEXT NOT NULL,
+    discovered_at INTEGER NOT NULL,
+    PRIMARY KEY (asset_id, operation_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS asset_discoveries_intent_idx
+     ON asset_discoveries(intent_id)`,
+);
+
+/**
+ * `0011` — an intent anchors to the observations it came out of.
+ *
+ * §4 calls intent anchoring "the single most valuable idea here" and says to implement it
+ * before anything else that writes to the graph: an intent may anchor only to existing
+ * recorded evidence, never to another intent, a goal or a hint. That is what keeps a
+ * multi-week hunt from drifting into speculation, and T3Code has no equivalent.
+ *
+ * An anchor is an edge, so it is a table with real foreign keys both ways rather than a
+ * column holding a list. `position` keeps the order the caller gave, because a first
+ * parent is usually the one the direction came from and the rest qualify it.
+ *
+ * **What this schema can and cannot enforce.** The foreign key is to `observations(id)`,
+ * so an anchor *cannot* name an intent or a goal — those ids are in other tables and the
+ * constraint refuses them outright. What it cannot check is the same-goal rule, which
+ * needs a two-table join; that is enforced in the write transaction, with the instructive
+ * refusal §4 asks for.
+ *
+ * ScopeWeaver's rule reserves anchoring for `confirmed` fact and finding nodes. We have
+ * no dismissal state and no finding subsystem, so every stored observation is recorded
+ * evidence and anchorable — including an `inconclusive` one, which is a real result about
+ * a real test and a legitimate thing to build a direction on. **If a dismissal state is
+ * ever added, this check must gain it**, or a dismissed observation would keep anchoring
+ * new work.
+ */
+const addIntentAnchors = statements(
+  `CREATE TABLE intent_anchors (
+    intent_id TEXT NOT NULL REFERENCES intents(id),
+    observation_id TEXT NOT NULL REFERENCES observations(id),
+    position INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (intent_id, observation_id),
+    CHECK (position >= 0)
+  )`,
+  `CREATE INDEX IF NOT EXISTS intent_anchors_observation_idx
+     ON intent_anchors(observation_id)`,
+);
+
+/**
+ * `0012` — the append-only event log, with its own per-target sequence.
+ *
+ * §3 says immutable rows, stable ids and a store-assigned monotonic sequence, "decided at
+ * schema time, not later", because retrofitting append-only onto a mutable store is
+ * painful and it costs nothing now. §8 says what the sequence is *for*: a consumer reads
+ * committed events in ascending sequence order after its cursor, and a PubSub wake-up is
+ * advisory rather than the delivery guarantee. Sprint 02 writes these rows; Sprint 03
+ * reads them.
+ *
+ * **The sequence is per target because the file is per target.** It is allocated from this
+ * file's own `sequence_cursor`, under the name `events`, inside the writing transaction.
+ * §8 is explicit that "cursors belong to a particular target event log, not a global
+ * sequence across independent target files", and that also removes the coupling §22
+ * flagged, where one global counter meant a write anywhere moved every briefing's
+ * `preparedAtSequence`.
+ *
+ * **The observation sequence is a different counter and is not renumbered.** An
+ * observation's id is `obs_<sequence>_<attemptId>` and dimension aliases are built from
+ * it, so renumbering per target would rewrite primary keys and every address a briefing
+ * has already printed. Each file keeps the counter it has; `events` starts at 1 in each
+ * file because nothing has ever written one.
+ *
+ * **The three identities are three sets of columns, not one `actor` string** (§6):
+ *
+ * - *Caller authority* — `caller_scope`, plus `attempt_id` and `intent_id` when the write
+ *   came from an authenticated worker. All three are `NULL` for a host-originated
+ *   mutation, which is an honest answer rather than a fabricated attempt.
+ * - *Operation identity* — `operation` and `operation_id`, the same pair the receipt is
+ *   keyed on, so an event can be matched to the command that produced it.
+ * - *Domain identity* — `subject_id`, the row the event is about. Not a foreign key: it
+ *   names rows in several tables, and a column that pointed at one of them would be
+ *   wrong for the others.
+ *
+ * `payload` is JSON and readers are expected to tolerate fields they do not know
+ * (§6, `unknownField`). Nothing here reads it.
+ *
+ * **Immutability is enforced by the database.** Two triggers raise on `UPDATE` and on
+ * `DELETE`, so "the rows are immutable" is a constraint a confused handler cannot get
+ * round rather than a property of the statements we happen to have written — the same
+ * argument §4 makes for putting the per-kind state machine in a `CHECK`. Note the one
+ * thing they do not stop: a future migration that rebuilds the table the way `0006` did
+ * would have to drop and recreate them, and should say so loudly.
+ */
+const addEventLog = statements(
+  `CREATE TABLE events (
+    id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    target_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    caller_scope TEXT,
+    intent_id TEXT REFERENCES intents(id),
+    attempt_id TEXT REFERENCES attempts(id),
+    operation TEXT NOT NULL,
+    operation_id TEXT,
+    subject_id TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX events_sequence_idx ON events(sequence)`,
+  `CREATE INDEX events_kind_idx ON events(kind)`,
+  `CREATE TRIGGER events_are_immutable BEFORE UPDATE ON events
+   BEGIN
+     SELECT RAISE(ABORT, 'events are immutable: record a new event instead');
+   END`,
+  `CREATE TRIGGER events_are_append_only BEFORE DELETE ON events
+   BEGIN
+     SELECT RAISE(ABORT, 'events are append-only: a recorded event is never deleted');
+   END`,
+);
+
+/**
+ * `0013` — the transactional outbox: a durable queue of side-effect requests.
+ *
+ * §6 is precise about what this is and is not. It is a queue of *side-effect requests*
+ * with execution metadata, committed in the same transaction as the domain change that
+ * implies them, so a committed finding cannot lose its notification obligation merely
+ * because the process died before dispatch. It is **not** the store of all commands and
+ * their results — receipts deduplicate commands and the domain tables hold state — and it
+ * does **not** provide exactly-once remote execution: if a remote action succeeds and we
+ * crash before recording that, the outcome is ambiguous and no local row fixes it.
+ *
+ * That is why `recovery_policy` is a column and not a default. §6 requires an explicit
+ * policy per effect type, and the four it names are the four values allowed here:
+ * `safe_to_retry`, `idempotency_key`, `reconcile_first`, `do_not_repeat`. A dispatcher
+ * that cannot tell them apart would either lose work or repeat an unrepeatable action.
+ *
+ * **Sprint 02 writes `pending` rows and nothing moves them.** The execution columns —
+ * `status`, `attempts`, the lease pair, `next_attempt_at`, `last_error` — are declared
+ * now because §3's append-only-at-schema-time argument applies to them too and because a
+ * dispatcher that had to add a lease column later would have to rebuild the table. They
+ * are inert in this sprint: claiming, leasing, retry scheduling and delivery state are
+ * Sprint 03, which is also where the `in_flight` and terminal statuses first get written.
+ *
+ * `caused_by_event_id` is a real foreign key to `events(id)`. Every request exists because
+ * something was recorded, and a request with no event behind it would be an obligation
+ * nobody can explain. `sequence` gives the queue a deterministic order from the same
+ * per-target counter the events use, so "oldest pending first" is well defined without
+ * relying on a timestamp two commits can share.
+ */
+const addOutbox = statements(
+  `CREATE TABLE outbox (
+    id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    target_id TEXT NOT NULL,
+    request_type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    recovery_policy TEXT NOT NULL,
+    caused_by_event_id TEXT NOT NULL REFERENCES events(id),
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    next_attempt_at INTEGER,
+    last_error TEXT,
+    enqueued_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    CHECK (status IN ('pending', 'in_flight', 'succeeded', 'failed', 'cancelled')),
+    CHECK (recovery_policy IN ('safe_to_retry', 'idempotency_key',
+                               'reconcile_first', 'do_not_repeat')),
+    CHECK (attempts >= 0)
+  )`,
+  `CREATE UNIQUE INDEX outbox_sequence_idx ON outbox(sequence)`,
+  `CREATE INDEX outbox_pending_idx ON outbox(status, sequence)
+     WHERE status = 'pending'`,
+  `CREATE INDEX outbox_event_idx ON outbox(caused_by_event_id)`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
  * renaming a key changes what the journal reports for an already-applied migration.
+ *
+ * **The ids must increase, and leaving a gap is worse than it looks.** `Migrator.run`
+ * reads the highest id *this database's* journal holds (`effect/src/sql/Migrator.ts`,
+ * `latestMigrationId`, resolved once per run) and skips every resolved id at or below it,
+ * while the loader sorts by id (`fromRecord`, `Arr.sort(migrationOrder)`). So an id
+ * dropped into a gap later runs on a fresh database, in the right order, and never on a
+ * database already past it: the two diverge and the journal reports both as current.
+ * There is no gap here. Append with a number above every key.
  */
 export const MIGRATIONS: Record<
   string,
@@ -562,6 +932,12 @@ export const MIGRATIONS: Record<
   "0005_dimension_followups": addDimensionFollowUps,
   "0006_recovery_state_key": keyRecoveriesByState,
   "0007_planner_lineage": addPlannerLineages,
+  "0008_observation_dimensions": addObservationDimensionRows,
+  "0009_intent_dimension_provenance": addIntentDimensionProvenance,
+  "0010_assets": addAssets,
+  "0011_intent_anchors": addIntentAnchors,
+  "0012_event_log": addEventLog,
+  "0013_outbox": addOutbox,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

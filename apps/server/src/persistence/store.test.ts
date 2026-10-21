@@ -12,6 +12,7 @@
  * receipt claims are exactly what an in-memory double would let us get wrong.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,8 @@ import {
   dimensionAddress,
   dimensionsOf,
   parseDimensionAddress,
+  unknownNumber,
+  unknownString,
   type Observation,
   type RecordObservationInput as Input,
 } from "@bit/contracts";
@@ -1066,8 +1069,16 @@ describe("addressing an earlier untested dimension", () => {
             addressesDimensions: [dimensionAddress(raiserId, 1)],
           }),
         );
+        const dimensions = yield* store.dimensionsForIntent("intent-1");
         return {
           follow,
+          dimensions,
+          dimensionId:
+            dimensions.find(
+              (dimension) =>
+                dimension.observationId === "obs_000001_attempt-1" &&
+                dimension.position === 1,
+            )?.dimensionId ?? "no such dimension",
           links: yield* store.dimensionLinksForIntent("intent-1"),
         };
       }),
@@ -1076,12 +1087,24 @@ describe("addressing an earlier untested dimension", () => {
     expect(outcome.links).toEqual([
       {
         observationId: outcome.follow.observationId,
-        address: `${outcome.links[0]?.sourceObservationId ?? ""}#u1`,
-        sourceObservationId: outcome.links[0]?.sourceObservationId ?? "",
-        dimensionIndex: 1,
+        dimensionId: outcome.dimensionId,
+        address: "obs_000001_attempt-1#u1",
+        addressingSequence: outcome.follow.sequence,
+        addressingOutcome: "positive",
       },
     ]);
-    expect(outcome.links[0]?.sourceObservationId).toBe("obs_000001_attempt-1");
+    // The link points at the dimension row the alias resolved to, and that row is the
+    // one position 1 of the raising observation holds — checked through the table rather
+    // than by re-deriving the address.
+    expect(
+      outcome.dimensions.find(
+        (dimension) => dimension.dimensionId === outcome.dimensionId,
+      ),
+    ).toMatchObject({
+      observationId: "obs_000001_attempt-1",
+      position: 1,
+      address: "obs_000001_attempt-1#u1",
+    });
   });
 
   test("an address naming an observation that does not exist is refused, and nothing is written", async () => {
@@ -1210,8 +1233,14 @@ describe("addressing an earlier untested dimension", () => {
 
     expect(outcome.refused._tag).toBe("Failure");
     if (outcome.refused._tag === "Failure") {
+      // The refusal names what is missing rather than only what is wrong: these two
+      // intents share a goal, so the one thing that would have allowed this is a
+      // declaration on the caller's own intent (migration `0009`).
       expect((outcome.refused.failure as MutationError).detail).toContain(
-        "belongs to intent intent-other",
+        "was raised by intent intent-other, not intent-1",
+      );
+      expect((outcome.refused.failure as MutationError).detail).toContain(
+        "does not declare that it addresses it",
       );
     }
     expect(outcome.links).toHaveLength(0);
@@ -1498,5 +1527,1210 @@ describe("the planner session lineage", () => {
 
     expect(after.observations).toEqual(before);
     expect(after.lineage).toBeUndefined();
+  });
+});
+
+describe("recording an asset", () => {
+  const HOST = "http://127.0.0.1:41317/";
+  const LOGIN = "http://127.0.0.1:41317/login";
+
+  const assetInput = (
+    overrides: Partial<{
+      operationId: string;
+      kind: "host" | "endpoint";
+      url: string;
+      method: string | null;
+      note: string;
+    }> = {},
+  ) => ({
+    operationId: "asset-1",
+    kind: "endpoint" as const,
+    url: LOGIN,
+    method: "post",
+    note: `Found in the fixture's own route table; ${AWKWARD_TEXT}`,
+    ...overrides,
+  });
+
+  const withSeeded = <A, E>(use: (store: Store) => Effect.Effect<A, E>) => {
+    const path = newDatabasePath();
+    return withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        return yield* use(store);
+      }),
+    );
+  };
+
+  test("canonicalises an endpoint, and merges a second discovery of it", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        const first = yield* store.recordAsset(CALLER, assetInput());
+        // The same endpoint written three other ways: a different method case, an
+        // explicit default-looking port already present, a query string, and a
+        // fragment. All of it is one asset.
+        const second = yield* store.recordAsset(
+          CALLER,
+          assetInput({
+            operationId: "asset-2",
+            method: "POST",
+            url: `${LOGIN}?attempt=3#top`,
+          }),
+        );
+        return {
+          first,
+          second,
+          assets: yield* store.assets(),
+          discoveries: yield* store.discoveriesOfAsset(first.assetId),
+        };
+      }),
+    );
+
+    expect(outcome.first.identity).toBe("POST http://127.0.0.1:41317/login");
+    expect(outcome.first.created).toBe(true);
+    expect(outcome.first.discoveries).toBe(1);
+    // A different operation that found the same canonical asset is new provenance about
+    // a known thing, not a new asset and not a replay.
+    expect(outcome.second.assetId).toBe(outcome.first.assetId);
+    expect(outcome.second.created).toBe(false);
+    expect(outcome.second.replayed).toBe(false);
+    expect(outcome.second.discoveries).toBe(2);
+    expect(outcome.assets).toHaveLength(1);
+    expect(outcome.assets[0]).toMatchObject({
+      kind: "endpoint",
+      identity: "POST http://127.0.0.1:41317/login",
+      host: "127.0.0.1",
+      port: 41_317,
+      scheme: "http:",
+      method: "POST",
+      path: "/login",
+    });
+    // Both discoveries survive the merge, each keeping the URL as submitted — so the
+    // query string excluded from identity is still visible in provenance.
+    expect(outcome.discoveries.map((row) => row.discovered_as)).toEqual([
+      LOGIN,
+      `${LOGIN}?attempt=3#top`,
+    ]);
+    expect(outcome.discoveries.map((row) => row.operation_id)).toEqual([
+      "asset-1",
+      "asset-2",
+    ]);
+    expect(outcome.discoveries[0]?.attempt_id).toBe("attempt-1");
+  });
+
+  test("a host is identified by host and port, with the default port made explicit", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        const explicit = yield* store.recordAsset(
+          CALLER,
+          assetInput({
+            operationId: "host-1",
+            kind: "host",
+            url: "http://Example.COM.:80/anything",
+            method: null,
+          }),
+        );
+        const implicit = yield* store.recordAsset(
+          CALLER,
+          assetInput({
+            operationId: "host-2",
+            kind: "host",
+            url: "http://example.com/other/path",
+            method: null,
+          }),
+        );
+        const secure = yield* store.recordAsset(
+          CALLER,
+          assetInput({
+            operationId: "host-3",
+            kind: "host",
+            url: "https://example.com/",
+            method: null,
+          }),
+        );
+        return {
+          explicit,
+          implicit,
+          secure,
+          assets: yield* store.assets(),
+        };
+      }),
+    );
+
+    // Case, the trailing dot and an omitted default port are all one host.
+    expect(outcome.explicit.identity).toBe("example.com:80");
+    expect(outcome.implicit.identity).toBe("example.com:80");
+    expect(outcome.implicit.assetId).toBe(outcome.explicit.assetId);
+    // A different port is a different host, which is the over-normalisation line.
+    expect(outcome.secure.identity).toBe("example.com:443");
+    expect(outcome.secure.assetId).not.toBe(outcome.explicit.assetId);
+    expect(outcome.assets).toHaveLength(2);
+    expect(outcome.assets.every((row) => row.method === null)).toBe(true);
+  });
+
+  test("a trailing slash is two paths, and two methods are two endpoints", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        const bare = yield* store.recordAsset(
+          CALLER,
+          assetInput({ operationId: "p1", url: `${HOST}login` }),
+        );
+        const slashed = yield* store.recordAsset(
+          CALLER,
+          assetInput({ operationId: "p2", url: `${HOST}login/` }),
+        );
+        const other = yield* store.recordAsset(
+          CALLER,
+          assetInput({ operationId: "p3", url: `${HOST}login`, method: "GET" }),
+        );
+        // `URL` resolves `..` and percent-encoding, so one path cannot have two
+        // spellings — that much normalisation is safe and is all there is.
+        const traversed = yield* store.recordAsset(
+          CALLER,
+          assetInput({ operationId: "p4", url: `${HOST}x/../login` }),
+        );
+        return { bare, slashed, other, traversed };
+      }),
+    );
+    expect(outcome.slashed.assetId).not.toBe(outcome.bare.assetId);
+    expect(outcome.other.assetId).not.toBe(outcome.bare.assetId);
+    expect(outcome.traversed.assetId).toBe(outcome.bare.assetId);
+  });
+
+  test("role is not part of identity, because role is a property of the test", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        const asAdmin = yield* store.recordAsset(
+          CALLER,
+          assetInput({ operationId: "r1", note: "probed as administrator" }),
+        );
+        const asAnonymous = yield* store.recordAsset(
+          CALLER,
+          assetInput({ operationId: "r2", note: "probed unauthenticated" }),
+        );
+        return {
+          asAdmin,
+          asAnonymous,
+          assets: yield* store.assets(),
+          discoveries: yield* store.discoveriesOfAsset(asAdmin.assetId),
+        };
+      }),
+    );
+    // One endpoint, two discoveries. Splitting by role would double-count the surface
+    // and make "we probed /login unauthenticated" not count as touching /login.
+    expect(outcome.asAnonymous.assetId).toBe(outcome.asAdmin.assetId);
+    expect(outcome.assets).toHaveLength(1);
+    expect(outcome.discoveries.map((row) => row.note)).toEqual([
+      "probed as administrator",
+      "probed unauthenticated",
+    ]);
+  });
+
+  test("an unusable URL and a kind that contradicts its method are refused", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        const relative = yield* Effect.result(
+          store.recordAsset(
+            CALLER,
+            assetInput({ operationId: "bad-1", url: "/login" }),
+          ),
+        );
+        const noPort = yield* Effect.result(
+          store.recordAsset(
+            CALLER,
+            assetInput({
+              operationId: "bad-2",
+              kind: "host",
+              url: "ssh://example.com/",
+              method: null,
+            }),
+          ),
+        );
+        const endpointWithoutMethod = yield* Effect.result(
+          store.recordAsset(
+            CALLER,
+            assetInput({ operationId: "bad-3", method: null }),
+          ),
+        );
+        return {
+          relative,
+          noPort,
+          endpointWithoutMethod,
+          assets: yield* store.assets(),
+          events: yield* store.eventsAfter(),
+          pending: yield* store.pendingRequests(),
+        };
+      }),
+    );
+    expect(outcome.relative._tag).toBe("Failure");
+    expect(outcome.noPort._tag).toBe("Failure");
+    if (outcome.noPort._tag === "Failure") {
+      expect((outcome.noPort.failure as MutationError).detail).toContain(
+        "include the port",
+      );
+    }
+    expect(outcome.endpointWithoutMethod._tag).toBe("Failure");
+    // Nothing written on any refusal: no asset, no event, no obligation.
+    expect(outcome.assets).toEqual([]);
+    expect(outcome.events).toEqual([]);
+    expect(outcome.pending).toEqual([]);
+  });
+
+  test("an asset cannot be recorded under a settled attempt's revoked authority", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.settleAttempt("attempt-1", "succeeded");
+        const refused = yield* Effect.result(
+          store.recordAsset(CALLER, assetInput()),
+        );
+        return { refused, assets: yield* store.assets() };
+      }),
+    );
+    expect(outcome.refused._tag).toBe("Failure");
+    if (outcome.refused._tag === "Failure") {
+      expect((outcome.refused.failure as MutationError).reason).toBe("stale");
+    }
+    expect(outcome.assets).toEqual([]);
+  });
+});
+
+describe("intent anchoring", () => {
+  const HOST_CONTEXT = { callerScope: "host/target-1", targetId: "target-1" };
+
+  const addIntentInput = (
+    overrides: Partial<{
+      operationId: string;
+      goalId: string;
+      intentId: string;
+      question: string;
+      anchorObservationIds: readonly string[];
+      addressesDimension: string | null;
+    }> = {},
+  ) => ({
+    operationId: "add-1",
+    goalId: "goal-1",
+    intentId: "intent-2",
+    question: "Measure the per-account limiter on POST /login.",
+    anchorObservationIds: [] as readonly string[],
+    addressesDimension: null,
+    ...overrides,
+  });
+
+  /** A seeded store holding one observation with two untested dimensions. */
+  const withEvidence = <A, E>(
+    use: (store: Store, observationId: string) => Effect.Effect<A, E>,
+  ) => {
+    const path = newDatabasePath();
+    return withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        const raiser = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "evidence",
+            untestedDimensions: [
+              "the per-account limit was never approached",
+              "no window rollover was measured",
+            ],
+          }),
+        );
+        return yield* use(store, raiser.observationId);
+      }),
+    );
+  };
+
+  test("an empty anchor list is a new top-level direction", async () => {
+    const outcome = await withEvidence((store) =>
+      Effect.gen(function* () {
+        const added = yield* store.addIntent(HOST_CONTEXT, addIntentInput());
+        return {
+          added,
+          anchors: yield* store.anchorsForIntent("intent-2"),
+          intent: yield* store.loadIntent("intent-2"),
+        };
+      }),
+    );
+    expect(outcome.added.topLevel).toBe(true);
+    expect(outcome.added.anchoredTo).toEqual([]);
+    expect(outcome.anchors).toEqual([]);
+    expect(outcome.intent?.question).toContain("per-account limiter");
+  });
+
+  test("an observation anchors an intent, and the order given is kept", async () => {
+    const outcome = await withEvidence((store, observationId) =>
+      Effect.gen(function* () {
+        const second = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "evidence-2" }),
+        );
+        const added = yield* store.addIntent(
+          HOST_CONTEXT,
+          addIntentInput({
+            anchorObservationIds: [second.observationId, observationId],
+          }),
+        );
+        return {
+          added,
+          anchors: yield* store.anchorsForIntent("intent-2"),
+          secondId: second.observationId,
+          firstId: observationId,
+        };
+      }),
+    );
+    expect(outcome.added.topLevel).toBe(false);
+    // Position order, not sequence order: a first parent is usually where the direction
+    // came from, and the rest qualify it.
+    expect(outcome.anchors).toEqual([outcome.secondId, outcome.firstId]);
+  });
+
+  test("an intent cannot anchor an intent, and the refusal says what to do instead", async () => {
+    const outcome = await withEvidence((store) =>
+      Effect.gen(function* () {
+        const refused = yield* Effect.result(
+          store.addIntent(
+            HOST_CONTEXT,
+            addIntentInput({ anchorObservationIds: ["intent-1"] }),
+          ),
+        );
+        return {
+          refused,
+          intent: yield* store.loadIntent("intent-2"),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+    expect(outcome.refused._tag).toBe("Failure");
+    if (outcome.refused._tag === "Failure") {
+      const detail = (outcome.refused.failure as MutationError).detail;
+      // Instructive, not a bare failure: what it is, why that cannot anchor, and the
+      // way to express a new direction (DECISIONS.md §4).
+      expect(detail).toContain("is an intent and cannot anchor an intent");
+      expect(detail).toContain("Only a recorded observation may anchor one");
+      expect(detail).toContain(
+        "Leave anchorObservationIds empty for a new top-level direction",
+      );
+    }
+    // Refused inside the transaction, so no intent row and no event.
+    expect(outcome.intent).toBeUndefined();
+    expect(outcome.events.filter((e) => e.kind === "intent.added")).toEqual([]);
+  });
+
+  test("a goal, and an id nothing recorded, are each refused by what they are", async () => {
+    const outcome = await withEvidence((store) =>
+      Effect.gen(function* () {
+        const onGoal = yield* Effect.result(
+          store.addIntent(
+            HOST_CONTEXT,
+            addIntentInput({ anchorObservationIds: ["goal-1"] }),
+          ),
+        );
+        const onNothing = yield* Effect.result(
+          store.addIntent(
+            HOST_CONTEXT,
+            addIntentInput({ anchorObservationIds: ["obs_999999_nope"] }),
+          ),
+        );
+        return {
+          onGoal,
+          onNothing,
+          intent: yield* store.loadIntent("intent-2"),
+        };
+      }),
+    );
+    expect(outcome.onGoal._tag).toBe("Failure");
+    if (outcome.onGoal._tag === "Failure") {
+      expect((outcome.onGoal.failure as MutationError).detail).toContain(
+        "is a goal and cannot anchor an intent",
+      );
+    }
+    expect(outcome.onNothing._tag).toBe("Failure");
+    if (outcome.onNothing._tag === "Failure") {
+      expect((outcome.onNothing.failure as MutationError).detail).toContain(
+        "is nothing recorded in this target",
+      );
+    }
+    expect(outcome.intent).toBeUndefined();
+  });
+
+  test("an anchor from another goal is refused, and a duplicate anchor is not collapsed", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        const mine = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "mine" }),
+        );
+        // A second goal, with its own intent, attempt and observation.
+        yield* store.seedAttempt({
+          targetId: "target-1",
+          goalId: "goal-other",
+          goal: "A different objective entirely.",
+          intentId: "intent-other",
+          question: "Something else.",
+          attemptId: "attempt-other",
+          workerId: "worker-1",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          harnessSessionId: "ses_other",
+        });
+        const theirs = yield* store.recordObservation(
+          {
+            ...CALLER,
+            callerScope: "target-1/attempt-other",
+            intentId: "intent-other",
+            attemptId: "attempt-other",
+          },
+          multiCaseInput({ operationId: "theirs" }),
+        );
+        const crossGoal = yield* Effect.result(
+          store.addIntent(
+            HOST_CONTEXT,
+            addIntentInput({ anchorObservationIds: [theirs.observationId] }),
+          ),
+        );
+        const duplicate = yield* Effect.result(
+          store.addIntent(
+            HOST_CONTEXT,
+            addIntentInput({
+              anchorObservationIds: [mine.observationId, mine.observationId],
+            }),
+          ),
+        );
+        return {
+          crossGoal,
+          duplicate,
+          intent: yield* store.loadIntent("intent-2"),
+        };
+      }),
+    );
+    expect(outcome.crossGoal._tag).toBe("Failure");
+    if (outcome.crossGoal._tag === "Failure") {
+      expect((outcome.crossGoal.failure as MutationError).detail).toContain(
+        "an intent anchors to evidence from its own goal",
+      );
+    }
+    expect(outcome.duplicate._tag).toBe("Failure");
+    if (outcome.duplicate._tag === "Failure") {
+      expect((outcome.duplicate.failure as MutationError).detail).toContain(
+        "is listed twice",
+      );
+    }
+    expect(outcome.intent).toBeUndefined();
+  });
+
+  test("a goal from another target, and a reused intent id, are refused", async () => {
+    const outcome = await withEvidence((store) =>
+      Effect.gen(function* () {
+        const wrongTarget = yield* Effect.result(
+          store.addIntent(
+            { callerScope: "host/target-2", targetId: "target-2" },
+            addIntentInput(),
+          ),
+        );
+        const reused = yield* Effect.result(
+          store.addIntent(
+            HOST_CONTEXT,
+            addIntentInput({ intentId: "intent-1" }),
+          ),
+        );
+        const noGoal = yield* Effect.result(
+          store.addIntent(
+            HOST_CONTEXT,
+            addIntentInput({ goalId: "goal-missing" }),
+          ),
+        );
+        return { wrongTarget, reused, noGoal };
+      }),
+    );
+    expect(outcome.wrongTarget._tag).toBe("Failure");
+    if (outcome.wrongTarget._tag === "Failure") {
+      expect((outcome.wrongTarget.failure as MutationError).reason).toBe(
+        "unauthorized",
+      );
+    }
+    expect(outcome.reused._tag).toBe("Failure");
+    if (outcome.reused._tag === "Failure") {
+      expect((outcome.reused.failure as MutationError).detail).toContain(
+        "already exists",
+      );
+    }
+    expect(outcome.noGoal._tag).toBe("Failure");
+  });
+
+  test("an exact retry replays, and conflicting reuse is refused", async () => {
+    const outcome = await withEvidence((store, observationId) =>
+      Effect.gen(function* () {
+        const first = yield* store.addIntent(
+          HOST_CONTEXT,
+          addIntentInput({ anchorObservationIds: [observationId] }),
+        );
+        const replay = yield* store.addIntent(
+          HOST_CONTEXT,
+          addIntentInput({ anchorObservationIds: [observationId] }),
+        );
+        const conflict = yield* Effect.result(
+          store.addIntent(
+            HOST_CONTEXT,
+            addIntentInput({
+              anchorObservationIds: [observationId],
+              question: "A different question under the same operation id.",
+            }),
+          ),
+        );
+        return {
+          first,
+          replay,
+          conflict,
+          events: yield* store.eventsAfter(),
+          anchors: yield* store.anchorsForIntent("intent-2"),
+        };
+      }),
+    );
+    expect(outcome.first.replayed).toBe(false);
+    expect(outcome.replay.replayed).toBe(true);
+    expect(outcome.replay.intentId).toBe(outcome.first.intentId);
+    expect(outcome.conflict._tag).toBe("Failure");
+    if (outcome.conflict._tag === "Failure") {
+      expect((outcome.conflict.failure as MutationError).reason).toBe(
+        "conflict",
+      );
+    }
+    // One anchor row and one event, from three calls.
+    expect(outcome.anchors).toHaveLength(1);
+    expect(
+      outcome.events.filter((e) => e.kind === "intent.added"),
+    ).toHaveLength(1);
+  });
+});
+
+describe("answering another intent's dimension", () => {
+  const HOST_CONTEXT = { callerScope: "host/target-1", targetId: "target-1" };
+
+  /**
+   * One raising observation under `intent-1`, plus a sibling intent of the same goal
+   * with its own running attempt. The sibling declares the dimension or does not,
+   * depending on what each test needs.
+   */
+  const withSibling = <A, E>(
+    declare: boolean,
+    use: (
+      store: Store,
+      context: { raiserId: string; sibling: CallerContext },
+    ) => Effect.Effect<A, E>,
+  ) => {
+    const path = newDatabasePath();
+    return withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        const raiser = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "raiser",
+            untestedDimensions: [
+              "the per-account limit was never approached",
+              "no window rollover was measured",
+            ],
+          }),
+        );
+        yield* store.addIntent(HOST_CONTEXT, {
+          operationId: "add-sibling",
+          goalId: "goal-1",
+          intentId: "intent-sibling",
+          question: "Measure the per-account limiter directly.",
+          anchorObservationIds: [raiser.observationId],
+          addressesDimension: declare
+            ? dimensionAddress(raiser.observationId, 0)
+            : null,
+        });
+        yield* store.seedAttempt({
+          targetId: "target-1",
+          goalId: "goal-1",
+          goal: "Determine whether authentication rate limits can be bypassed.",
+          intentId: "intent-sibling",
+          question: "Measure the per-account limiter directly.",
+          attemptId: "attempt-sibling",
+          workerId: "worker-1",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          harnessSessionId: "ses_sibling",
+        });
+        const sibling: CallerContext = {
+          ...CALLER,
+          callerScope: "target-1/attempt-sibling",
+          intentId: "intent-sibling",
+          attemptId: "attempt-sibling",
+        };
+        return yield* use(store, { raiserId: raiser.observationId, sibling });
+      }),
+    );
+  };
+
+  test("a declaring intent may answer it; an undeclared sibling may not", async () => {
+    const allowed = await withSibling(true, (store, { raiserId, sibling }) =>
+      Effect.gen(function* () {
+        const answered = yield* store.recordObservation(
+          sibling,
+          multiCaseInput({
+            operationId: "answer",
+            addressesDimensions: [dimensionAddress(raiserId, 0)],
+          }),
+        );
+        return {
+          answered,
+          links: yield* store.dimensionLinksForIntent("intent-1"),
+          questions: yield* store.dimensionsForIntent("intent-1"),
+        };
+      }),
+    );
+    // The relaxation, in one assertion: the link exists even though the addressing
+    // observation belongs to a different intent of the same goal.
+    expect(allowed.links).toHaveLength(1);
+    expect(allowed.links[0]?.observationId).toBe(
+      allowed.answered.observationId,
+    );
+    expect(allowed.links[0]?.address).toBe(`${allowed.questions[0]?.address}`);
+
+    const refused = await withSibling(false, (store, { raiserId, sibling }) =>
+      Effect.gen(function* () {
+        const outcome = yield* Effect.result(
+          store.recordObservation(
+            sibling,
+            multiCaseInput({
+              operationId: "answer",
+              addressesDimensions: [dimensionAddress(raiserId, 0)],
+            }),
+          ),
+        );
+        return {
+          outcome,
+          links: yield* store.dimensionLinksForIntent("intent-1"),
+        };
+      }),
+    );
+    expect(refused.outcome._tag).toBe("Failure");
+    if (refused.outcome._tag === "Failure") {
+      expect((refused.outcome.failure as MutationError).detail).toContain(
+        "does not declare that it addresses it",
+      );
+    }
+    expect(refused.links).toEqual([]);
+  });
+
+  test("the declaration authorises exactly one dimension, not the sibling beside it", async () => {
+    const outcome = await withSibling(true, (store, { raiserId, sibling }) =>
+      Effect.gen(function* () {
+        const refused = yield* Effect.result(
+          store.recordObservation(
+            sibling,
+            multiCaseInput({
+              operationId: "answer-other",
+              // Position 1, where the declaration named position 0.
+              addressesDimensions: [dimensionAddress(raiserId, 1)],
+            }),
+          ),
+        );
+        return {
+          refused,
+          links: yield* store.dimensionLinksForIntent("intent-1"),
+        };
+      }),
+    );
+    expect(outcome.refused._tag).toBe("Failure");
+    if (outcome.refused._tag === "Failure") {
+      expect((outcome.refused.failure as MutationError).detail).toContain(
+        "does not declare that it addresses it",
+      );
+    }
+    expect(outcome.links).toEqual([]);
+  });
+
+  test("a declaration cannot be made for a dimension of another goal", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        const raiser = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "raiser",
+            untestedDimensions: ["a question under goal-1"],
+          }),
+        );
+        yield* store.seedAttempt({
+          targetId: "target-1",
+          goalId: "goal-other",
+          goal: "A different objective.",
+          intentId: "intent-other",
+          question: "Something else.",
+          attemptId: "attempt-other",
+          workerId: "worker-1",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          harnessSessionId: "ses_other",
+        });
+        return yield* Effect.result(
+          store.addIntent(
+            { callerScope: "host/target-1", targetId: "target-1" },
+            {
+              operationId: "add-cross",
+              goalId: "goal-other",
+              intentId: "intent-cross",
+              question: "Answer goal-1's question from goal-other.",
+              anchorObservationIds: [],
+              addressesDimension: dimensionAddress(raiser.observationId, 0),
+            },
+          ),
+        );
+      }),
+    );
+    expect(outcome._tag).toBe("Failure");
+    if (outcome._tag === "Failure") {
+      expect((outcome.failure as MutationError).detail).toContain(
+        "was raised under goal goal-1",
+      );
+    }
+  });
+
+  test("a declaration naming no recorded dimension is refused", async () => {
+    const outcome = await withEvidenceless((store) =>
+      Effect.result(
+        store.addIntent(
+          { callerScope: "host/target-1", targetId: "target-1" },
+          {
+            operationId: "add-ghost",
+            goalId: "goal-1",
+            intentId: "intent-ghost",
+            question: "Answer a question nobody raised.",
+            anchorObservationIds: [],
+            addressesDimension: "obs_999999_attempt-1#u0",
+          },
+        ),
+      ),
+    );
+    expect(outcome._tag).toBe("Failure");
+    if (outcome._tag === "Failure") {
+      expect((outcome.failure as MutationError).detail).toContain(
+        "no untested dimension is recorded at",
+      );
+    }
+  });
+});
+
+/** A seeded store with a goal, intent and attempt but no observation. */
+const withEvidenceless = <A, E>(use: (store: Store) => Effect.Effect<A, E>) => {
+  const path = newDatabasePath();
+  return withStore(path, (store) =>
+    Effect.gen(function* () {
+      yield* migrated(store);
+      return yield* use(store);
+    }),
+  );
+};
+
+describe("one transaction per mutation", () => {
+  const HOST_CONTEXT = { callerScope: "host/target-1", targetId: "target-1" };
+
+  const assetInput = (
+    operationId: string,
+    note = "the fixture's login route",
+  ) => ({
+    operationId,
+    kind: "endpoint" as const,
+    url: "http://127.0.0.1:41317/login",
+    method: "POST",
+    note,
+  });
+
+  const withSeeded = <A, E>(
+    path: string,
+    use: (store: Store) => Effect.Effect<A, E>,
+  ) =>
+    withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        return yield* use(store);
+      }),
+    );
+
+  test("every mutation writes its domain row, receipt and event together", async () => {
+    const outcome = await withSeeded(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        const asset = yield* store.recordAsset(CALLER, assetInput("a-1"));
+        const observation = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "o-1" }),
+        );
+        const intent = yield* store.addIntent(HOST_CONTEXT, {
+          operationId: "i-1",
+          goalId: "goal-1",
+          intentId: "intent-2",
+          question: "Measure the per-account limiter.",
+          anchorObservationIds: [observation.observationId],
+          addressesDimension: null,
+        });
+        return {
+          asset,
+          observation,
+          intent,
+          events: yield* store.eventsAfter(),
+          pending: yield* store.pendingRequests(),
+        };
+      }),
+    );
+
+    // One event per mutation, in commit order, with a dense sequence starting at 1.
+    expect(outcome.events.map((event) => event.kind)).toEqual([
+      "asset.recorded",
+      "observation.recorded",
+      "intent.added",
+    ]);
+    expect(outcome.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(outcome.events.map((event) => event.eventId)).toEqual([
+      "evt_000001",
+      "evt_000002",
+      "evt_000003",
+    ]);
+
+    // Domain identity on each event is the row it is about.
+    expect(outcome.events[0]?.subjectId).toBe(outcome.asset.assetId);
+    expect(outcome.events[1]?.subjectId).toBe(
+      outcome.observation.observationId,
+    );
+    expect(outcome.events[2]?.subjectId).toBe("intent-2");
+
+    // Operation identity is the pair the receipt is keyed on.
+    expect(
+      outcome.events.map((event) => [event.operation, event.operationId]),
+    ).toEqual([
+      ["record_asset", "a-1"],
+      ["record_observation", "o-1"],
+      ["add_intent", "i-1"],
+    ]);
+
+    // Caller authority is separate again, and a host-created intent carries no attempt
+    // rather than a fabricated one.
+    expect(outcome.events[0]?.callerScope).toBe(CALLER.callerScope);
+    expect(outcome.events[0]?.attemptId).toBe("attempt-1");
+    expect(outcome.events[0]?.intentId).toBe("intent-1");
+    expect(outcome.events[2]?.callerScope).toBe("host/target-1");
+    expect(outcome.events[2]?.attemptId).toBeNull();
+    expect(outcome.events[2]?.intentId).toBeNull();
+
+    // Two of the three kinds carry an obligation; adding an intent carries none,
+    // because a new intent implies no action outside this database.
+    expect(
+      outcome.pending.map((entry) => [
+        entry.requestType,
+        entry.recoveryPolicy,
+        entry.status,
+        entry.attempts,
+      ]),
+    ).toEqual([
+      ["asset.enrich", "safe_to_retry", "pending", 0],
+      ["notification.deliver", "reconcile_first", "pending", 0],
+    ]);
+    // Each request names the event that explains it.
+    expect(outcome.pending.map((entry) => entry.causedByEventId)).toEqual([
+      "evt_000001",
+      "evt_000002",
+    ]);
+    // Nothing in this sprint claims a row.
+    expect(
+      outcome.pending.every(
+        (entry) => entry.leaseOwner === null && entry.completedAt === null,
+      ),
+    ).toBe(true);
+  });
+
+  test("an exact retry replays and writes no second event and no second request", async () => {
+    const outcome = await withSeeded(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        const first = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "once" }),
+        );
+        const asset = yield* store.recordAsset(
+          CALLER,
+          assetInput("asset-once"),
+        );
+        const replayObservation = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "once" }),
+        );
+        const replayAsset = yield* store.recordAsset(
+          CALLER,
+          assetInput("asset-once"),
+        );
+        return {
+          first,
+          asset,
+          replayObservation,
+          replayAsset,
+          events: yield* store.eventsAfter(),
+          pending: yield* store.pendingRequests(),
+          observations: yield* store.observationsForIntent("intent-1"),
+          assets: yield* store.assets(),
+          discoveries: yield* store.discoveriesOfAsset(asset.assetId),
+          sequence: yield* store.currentSequence,
+        };
+      }),
+    );
+
+    expect(outcome.replayObservation).toEqual({
+      ...outcome.first,
+      replayed: true,
+    });
+    expect(outcome.replayAsset).toEqual({ ...outcome.asset, replayed: true });
+    // One of everything. A replay hands back a committed result and writes nothing:
+    // not a row, not an event, not an obligation, and not a sequence number.
+    expect(outcome.observations).toHaveLength(1);
+    expect(outcome.assets).toHaveLength(1);
+    expect(outcome.discoveries).toHaveLength(1);
+    expect(outcome.events).toHaveLength(2);
+    expect(outcome.pending).toHaveLength(2);
+    expect(outcome.sequence).toBe(1);
+  });
+
+  test("a conflicting retry is refused and writes no event and no request either", async () => {
+    const outcome = await withSeeded(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "clash" }),
+        );
+        yield* store.recordAsset(CALLER, assetInput("asset-clash"));
+        const before = {
+          events: yield* store.eventsAfter(),
+          pending: yield* store.pendingRequests(),
+        };
+        const observationConflict = yield* Effect.result(
+          store.recordObservation(
+            CALLER,
+            multiCaseInput({
+              operationId: "clash",
+              interpretation:
+                "A different reading under the same operation id.",
+            }),
+          ),
+        );
+        const assetConflict = yield* Effect.result(
+          store.recordAsset(
+            CALLER,
+            assetInput("asset-clash", "a different note"),
+          ),
+        );
+        return {
+          before,
+          observationConflict,
+          assetConflict,
+          events: yield* store.eventsAfter(),
+          pending: yield* store.pendingRequests(),
+          observations: yield* store.observationsForIntent("intent-1"),
+          sequence: yield* store.currentSequence,
+        };
+      }),
+    );
+
+    expect(outcome.observationConflict._tag).toBe("Failure");
+    expect(outcome.assetConflict._tag).toBe("Failure");
+    if (outcome.observationConflict._tag === "Failure") {
+      expect(
+        (outcome.observationConflict.failure as MutationError).reason,
+      ).toBe("conflict");
+    }
+    // The point of the single transaction: a refusal that happens *after* the receipt
+    // check and before the commit leaves nothing behind on any of the four writes.
+    expect(outcome.events).toEqual(outcome.before.events);
+    expect(outcome.pending).toEqual(outcome.before.pending);
+    expect(outcome.events).toHaveLength(2);
+    expect(outcome.pending).toHaveLength(2);
+    expect(outcome.observations).toHaveLength(1);
+    // And no sequence gap, because the bump is inside the rolled-back transaction.
+    expect(outcome.sequence).toBe(1);
+  });
+
+  test("a refused mutation leaves no event sequence gap for the next one to skip", async () => {
+    const outcome = await withSeeded(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.recordAsset(CALLER, assetInput("first"));
+        yield* Effect.result(
+          store.recordAsset(CALLER, { ...assetInput("bad"), url: "not a url" }),
+        );
+        yield* store.recordAsset(CALLER, {
+          ...assetInput("second"),
+          url: "http://127.0.0.1:41317/health",
+          method: "GET",
+        });
+        return { events: yield* store.eventsAfter() };
+      }),
+    );
+    // 1 then 2, not 1 then 3. A gap is the one thing a consumer reading
+    // `WHERE sequence > cursor` cannot tell apart from a lost event.
+    expect(outcome.events.map((event) => event.sequence)).toEqual([1, 2]);
+  });
+
+  test("events and obligations read back in order after the file is closed and reopened", async () => {
+    const path = newDatabasePath();
+    await withSeeded(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.recordAsset(CALLER, assetInput("a-1"));
+        yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "o-1" }),
+        );
+      }),
+    );
+
+    const after = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        return {
+          all: yield* store.eventsAfter(),
+          afterFirst: yield* store.eventsAfter(1),
+          bounded: yield* store.eventsAfter(0, 1),
+          pending: yield* store.pendingRequests(),
+        };
+      }),
+    );
+
+    expect(after.all.map((event) => event.sequence)).toEqual([1, 2]);
+    // The cursor read §8 specifies: strictly after, ascending, and bounded.
+    expect(after.afterFirst.map((event) => event.sequence)).toEqual([2]);
+    expect(after.bounded.map((event) => event.sequence)).toEqual([1]);
+    // The obligations are still undispatched, which is the crash-survival claim.
+    expect(after.pending.map((entry) => entry.status)).toEqual([
+      "pending",
+      "pending",
+    ]);
+    // Payloads survive as JSON a reader can interrogate without a declared shape.
+    expect(unknownString(after.all[0]?.payload, "identity")).toBe(
+      "POST http://127.0.0.1:41317/login",
+    );
+    expect(
+      unknownString(after.all[0]?.payload, "nothing_declared_this"),
+    ).toBeUndefined();
+    expect(unknownNumber(after.all[1]?.payload, "sequence")).toBe(1);
+  });
+
+  test("a superseded attempt cannot write, across a restart, and writes no event", async () => {
+    const path = newDatabasePath();
+    await withSeeded(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.recordAsset(CALLER, assetInput("before-fence"));
+        // Reconciliation revokes authority by moving the fence, which is a column and
+        // therefore survives the process that wrote it.
+        yield* store.recordRecovery({
+          attemptId: "attempt-1",
+          observed: "missing",
+          proposedStatus: "uncertain",
+          detail: "the harness has never heard of this session",
+        });
+      }),
+    );
+
+    const after = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const attempt = yield* store.loadAttempt("attempt-1", "target-1");
+        const asset = yield* Effect.result(
+          store.recordAsset(CALLER, assetInput("after-fence")),
+        );
+        const observation = yield* Effect.result(
+          store.recordObservation(
+            CALLER,
+            multiCaseInput({ operationId: "after-fence" }),
+          ),
+        );
+        // The same credential, reissued against the *current* fence, is still refused:
+        // the attempt is no longer running, which is a separate rule from the fence.
+        const refreshed = yield* Effect.result(
+          store.recordAsset(
+            { ...CALLER, attemptFence: attempt?.write_fence ?? 0 },
+            assetInput("refreshed"),
+          ),
+        );
+        // A replay of the operation that committed *before* the fence moved is still
+        // answered, because it writes nothing and creates no external effect.
+        const replay = yield* store.recordAsset(
+          CALLER,
+          assetInput("before-fence"),
+        );
+        return {
+          fence: attempt?.write_fence,
+          status: attempt?.status,
+          asset,
+          observation,
+          refreshed,
+          replay,
+          events: yield* store.eventsAfter(),
+          pending: yield* store.pendingRequests(),
+          assets: yield* store.assets(),
+        };
+      }),
+    );
+
+    expect(after.fence).toBe(1);
+    expect(after.status).toBe("uncertain");
+    expect(after.asset._tag).toBe("Failure");
+    if (after.asset._tag === "Failure") {
+      expect((after.asset.failure as MutationError).reason).toBe("stale");
+      expect((after.asset.failure as MutationError).detail).toContain(
+        "its write authority ended",
+      );
+    }
+    expect(after.observation._tag).toBe("Failure");
+    expect(after.refreshed._tag).toBe("Failure");
+    expect(after.replay.replayed).toBe(true);
+    // One event and one obligation, from before the fence moved. Nothing a revoked
+    // credential attempted reached the log.
+    expect(after.events).toHaveLength(1);
+    expect(after.pending).toHaveLength(1);
+    expect(after.assets).toHaveLength(1);
+  });
+
+  test("a failure inside the transaction takes the whole mutation with it", async () => {
+    const path = newDatabasePath();
+    await withSeeded(path, () => Effect.void);
+    // A trigger that aborts the receipt insert, which is the *last* write in the
+    // mutation. So the asset, its discovery, the event and the outbox row have all been
+    // written by the time it fires — and must all disappear. Installed from outside the
+    // store's own connection, so nothing about the store is special-cased for the test.
+    const sqlite = new Database(path);
+    sqlite.run(
+      `CREATE TRIGGER no_receipts BEFORE INSERT ON command_receipts
+       BEGIN SELECT RAISE(ABORT, 'forced failure for the atomicity test'); END`,
+    );
+    sqlite.close();
+
+    const refused = await withStore(path, (store) =>
+      Effect.result(store.recordAsset(CALLER, assetInput("aborted"))),
+    );
+
+    const dropped = new Database(path);
+    dropped.run(`DROP TRIGGER no_receipts`);
+    dropped.close();
+
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const afterRepair = yield* store.recordAsset(
+          CALLER,
+          assetInput("aborted"),
+        );
+        return {
+          refused,
+          afterRepair,
+          assets: yield* store.assets(),
+          events: yield* store.eventsAfter(),
+          pending: yield* store.pendingRequests(),
+        };
+      }),
+    );
+
+    expect(outcome.refused._tag).toBe("Failure");
+    // Not a half-written mutation: the asset that was inserted before the abort is gone
+    // along with its event and its obligation, and the same call then succeeds.
+    expect(outcome.afterRepair.created).toBe(true);
+    expect(outcome.afterRepair.discoveries).toBe(1);
+    expect(outcome.assets).toHaveLength(1);
+    expect(outcome.events.map((event) => event.sequence)).toEqual([1]);
+    expect(outcome.pending).toHaveLength(1);
   });
 });

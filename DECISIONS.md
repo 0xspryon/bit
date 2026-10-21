@@ -1982,8 +1982,16 @@ graph.
 Append-only, in order, each independently reviewable:
 
 - `0008_observation_dimensions` — the table, the backfill, the links rebuild.
-- `0009_dimension_dispositions` — dispositions and their cited basis.
-- `0010_intent_dimension_provenance` — `intents.addresses_dimension`.
+- `0009_intent_dimension_provenance` — `intents.addresses_dimension`.
+- dispositions and their cited basis take **the next free id**, not a reserved one.
+
+Revised 2026-10-21, after §23 implemented the first two. The original plan reserved
+`0009` for dispositions and gave provenance `0010`. Reserving an id for work that waits
+for a later sprint does not work: the migrator reads the highest id _this database's_
+journal holds and skips every id at or below it, while the loader sorts by id, so a
+migration dropped into a reserved gap later applies to a fresh database and never to one
+already past it. The two diverge, and each journal reports itself as current. Ids are
+therefore assigned when a migration is written, never in advance.
 
 Reason: a planner needs a brief that narrows as questions are settled, and the record
 needs to say who settled each one and on what basis. Keeping those apart — a view that
@@ -3822,3 +3830,573 @@ development database was not touched; `0007` is pending for it. Nothing was comm
 - **A lineage row can point at a session the harness has forgotten.** It is confirmed
   before use and replaced when it cannot be, so the failure is one uncached round — but
   the row is stale in the meantime and nothing cleans it up on a schedule.
+
+## 23. Two tiers, the graph written through the store, and one transaction per mutation
+
+Recorded 2026-10-21, at the operator's direction, as the Sprint 02 slice. Nothing below
+widens the architecture: there is still no planner loop, no finding subsystem, no
+concurrency and no UI, and nothing yet _consumes_ an event or an outbox row — this slice
+writes them and the next one reads them. The scope is still one worker at a time, and now
+one served target at a time.
+
+### `FIX` — an untested dimension is a row, and the address becomes a wire alias
+
+§22 recorded the limit this removes: a dimension address is positional, which "is only
+sound while observations are immutable", and anything that ever edits, merges or rewords a
+recorded dimension "needs its own identity scheme rather than this one stretched to fit".
+Migration `0008_observation_dimensions` is that scheme.
+
+`observation_dimensions(id, observation_id, position, text, created_at)` is backfilled by
+unnesting each observation's stored `untested_dimensions` array with `json_each`, whose
+`key` column is the array index as an integer. `json_each` is available in the SQLite
+`bun:sqlite` links — 3.53.4 on this machine, checked before the migration was written
+rather than after — so the backfill is one `INSERT ... SELECT` and every existing
+dimension keeps the identity its address already implied.
+
+**The ids are random, and that is the entire point.** `dim_` plus sixteen random bytes,
+not `obs_…#u1` and not anything derived from `(observation_id, position)`: an id that
+encoded the position would make position the identity again and the table would be
+decoration. `created_at` is the raising observation's own `recorded_at`, not the
+migration's clock, because the dimension was recorded when its observation was and
+stamping it "now" would make every backfilled row claim to have been created during an
+upgrade.
+
+`observation_dimension_links` is rebuilt onto `dimension_id` — a table rebuild in the
+manner of `0006`, because SQLite cannot change a foreign key in place. It **drops**
+`source_observation_id` and `dimension_index`, which are now the dimension row's own
+columns; keeping them would be a second answer to a question that already has one, which
+is the argument `0005` itself makes about the intent column. `address` stays, verbatim as
+submitted, because that is a fact about the request rather than derived state.
+
+**The repoint joins with a `LEFT JOIN` into a `NOT NULL` column, deliberately.** A link
+whose `(source_observation_id, dimension_index)` has no dimension row produces a `NULL`
+`dimension_id` and aborts the whole migration; an `INNER JOIN` would have dropped that
+link silently, which is the one outcome a repoint must not have. No such link can exist —
+`0005`'s write boundary bounds-checked the index against the stored list — so this guards
+against what we have not thought of, and `migrations.test.ts` manufactures one to prove
+the guard fires. An `untested_dimensions` column holding a JSON scalar rather than an
+array aborts the same way, on the `NOT NULL` on `position`.
+
+**`<observationId>#u<index>` survives as the wire alias and nothing worker-facing
+changed.** It is what a briefing prints and what a worker copies; `resolveAddress`
+resolves it to a `dimension_id` on the way in, `parseDimensionAddress` still refuses a
+non-canonical index, and `RecordObservationInput` is untouched.
+
+The observation's `untested_dimensions` JSON column is still written and still read. The
+two cannot disagree: `recordObservation` writes the rows from the same list inside the
+same transaction as the observation, and nothing updates an observation afterwards. The
+column is that observation's own immutable record of what it declared; the rows are the
+addressable identities derived from it.
+
+### `FIX` — an intent may declare the dimension it addresses, and `scheduled` is derived
+
+Migration `0009_intent_dimension_provenance` adds one nullable
+`intents.addresses_dimension`, referencing `observation_dimensions(id)`. A foreign key
+whose default is `NULL` is the one kind `ALTER TABLE ADD COLUMN` accepts, so no rebuild is
+needed. `NULL` means only that the caller did not say; it never means "this intent
+addresses nothing".
+
+It buys the three things §17 says it should. `scheduled` becomes **derived** rather than
+stored: `dimensionSchedulesForIntent` counts the declaring intent's attempts in the two
+statuses no definite answer has been reached about, and `statusOf` reports `scheduled`
+only while that work is outstanding. Duplicate-intent detection becomes a join. And the
+same-intent constraint in `resolveAddress` relaxes to _same goal, when the caller's own
+intent declares that dimension_ — so an observation recorded under a **new** intent can
+answer a question raised by a sibling one, which is a path no worker could close before.
+Authority is still checked; it is checked against recorded lineage instead of an
+assumption, and the caller's claim about its own intent is read from the row rather than
+from the payload.
+
+The relaxation is narrow in a way worth stating: a declaration authorises exactly the one
+dimension it names. A sibling intent that declares position 0 cannot address position 1 of
+the same observation, which `store.test.ts` pins.
+
+**`scheduled` falls back to `uninvestigated`**, carrying `scheduledBy` so a reader can see
+somebody tried. §17 requires that — "a state that can be entered and never left is a lie
+with a long half-life" — and it is asserted on real rows rather than argued.
+
+**One reading §17 leaves open, decided here: an intent with zero attempts is
+`scheduled`.** The fallback is written as "once every attempt on the declaring intent has
+settled", and zero attempts satisfies that vacuously. Reading it that way would publish
+the question as open the moment a planner scheduled it, which is exactly the duplicate
+round this column exists to prevent — so `attemptsOpen` is true for an intent that has no
+attempt yet, and `attemptsTotal` of zero is how a reader tells "nothing dispatched" from
+"everything finished". Its cost is in the limitations below.
+
+### `SKIP` — dispositions wait for Sprint 07, and their id is not reserved
+
+The dimension-disposition migration and the planner disposition tool are **not**
+implemented.
+§17 explains why: a planner round has no attempt to authenticate with, so there is nothing
+for `checkAuthority` to validate, and the tool needs a planner loop to belong to. The
+comment in `renderBriefing` that marks the text which changes when it lands is left where
+it is, and the briefing still says in as many words that nothing here closes a question.
+
+**So §17's reserved `0009` is not reserved, and the chain is contiguous.** The first pass
+of this work gave provenance `0010` and left `0009` empty for dispositions, which looked
+like a courtesy and was a trap. `latestMigrationId` is resolved **once per run, from the
+journal of the database being migrated** (`effect/src/sql/Migrator.ts:243-249`), and every
+resolved id at or below it is skipped (`:265`, `if (currentId <= latestMigrationId)
+continue`); the loader sorts by id (`:410-423`, `Arr.sort(migrationOrder)`). A `0009`
+written later would therefore apply **to a fresh database, in the correct position, and
+never to a database already at `0010`** — the opposite of harmless. The two schemas
+diverge, both journals report themselves as current, and nothing detects it.
+
+Provenance was therefore renumbered to `0009` and the rest of this sprint's chain moved
+down with it, while it was still safe: no database held `0008` or above, and no `.sqlite`
+is tracked in git, so nothing applied was edited. Dispositions will take the next free id
+when they are written. **An id is assigned when a migration is written, never reserved in
+advance** — `MIGRATIONS` says so where the next author will read it.
+
+`migrations.test.ts` also builds every "already at NNNN" fixture with `chainThrough(id)`
+rather than by removing an entry from the middle of the record. The old arrangement only
+worked while the removed entry was last, and would have manufactured exactly the
+divergence described above.
+
+### `PORT` — two tiers, with the migration runner iterating the registry from day one
+
+`<HUNT_ROOT>/control.sqlite` holds the settings and the target registry;
+`targets/<id>/hunt.sqlite` holds one target's graph, events and outbox; `targets/<id>/
+evidence/` is created for blobs that stay out of SQLite. §3's three reasons are the
+reasons: provable deletion, because `rm -rf targets/<id>/` is demonstrable where `DELETE`
+plus `VACUUM` is not; scope isolation as a filesystem guarantee rather than a `WHERE`
+clause we might forget; and size.
+
+The control database has **its own chain** (`controlMigrations.ts`, `CONTROL_MIGRATIONS`),
+numbered from `0001` again in its own journal, holding `targets`, `target_schema_state` and
+`settings`. The two chains must never meet, and `FleetStore` is what keeps them apart by
+being the only thing that opens either; `fleet.test.ts` asserts the control file holds no
+graph table.
+
+`FleetStore.migrateFleet` is the runner §3 says to build on day one. It iterates the
+registry in registration order, skipping archived targets — whose directories may
+legitimately have been deleted, and migrating one would recreate an empty file. Each
+target's file is opened, migrated and **closed** before its state row is written to
+control: no database is nested inside a transaction on another, and the directory creation
+that precedes it is filesystem work, which §3 forbids inside a transaction body.
+
+**A target id is a directory name, so it is validated before it reaches a path.**
+`isTargetId` allows 1–64 characters of lowercase alphanumerics, hyphen and underscore,
+starting with an alphanumeric — which excludes `.`, `..`, separators, a leading hyphen,
+whitespace, the control file's own name, and case variants a case-insensitive filesystem
+would fold onto an existing id. It is checked at registration and **again** on every open,
+because a registry row can arrive from a file somebody edited. `fleetPaths` throws rather
+than returning a traversing path, so a caller that ignored a typed refusal cannot get a
+working path outside the fleet.
+
+`targetStoreLayer` is the only sanctioned way to a target's graph: it validates the id,
+asks the registry whether that target exists and migrated, and only then opens a file. A
+caller cannot assemble a path and get a store.
+
+**This process serves one target at a time**, named by `TARGET_ID` and registered on
+demand. That is a deliberate stop short of what the layout allows, and the reason is
+recorded in `main.ts`: dispatching an MCP request to the right target's store needs a
+per-target store resolver at the mutation boundary, and the only motive for one is running
+work against several targets at once — which is concurrency, and is not this slice. What
+the layout buys today is real regardless, and is asserted: separate files, provable
+deletion, per-target sequences, and no query path from one target's connection to
+another's rows.
+
+### `FIX` — a partial fleet migration serves what migrated and refuses the rest
+
+The open question the brief names, decided: **serve the targets that migrated, mark the
+rest unavailable, and fail startup only when the control database itself cannot be
+migrated.** Four reasons, in order of weight:
+
+1. The alternative couples availability globally, which throws away the isolation the file
+   split exists to provide. One unreadable file would stop work on every unrelated
+   engagement, and scope isolation as a filesystem guarantee is the thematic point of §3.
+2. A failed migration is rolled back by the migrator's own transaction, so the file sits
+   at its last completed id. That is a safe state to refuse to open and to retry from.
+3. It is recorded rather than tolerated. `target_schema_state` holds the state
+   `unavailable` with the failure text and the `applied_through` read from that file's
+   own journal, and `huntFileFor` refuses the target by name quoting the failure. Nothing
+   silently returns an empty graph for it, and `main.ts` prints the list to stderr.
+4. Control is genuinely different. Without the registry there is no list of targets to
+   serve, so there is nothing to degrade _to_; that case fails layer acquisition.
+
+`applied_through` is per target rather than one global schema version, because two targets
+can legitimately sit at different ids — one migrated cleanly and one failed half way up —
+and a single number would be a lie about a fleet.
+
+### `FIX` — asset identity is URL plus method, and role is not part of it
+
+This resolves §17's `SPIKE` for the two kinds the fixture presents, and no more, because
+an asset kind nothing records is an identity rule nothing has tested.
+
+- **`host`** — `host:port`, lowercased, trailing dot removed, with the scheme's default
+  port made explicit so `http://x` and `http://x:80` are one host. That is the narrow
+  answer to §17's "duplicate representations of one host".
+- **`endpoint`** — `METHOD scheme://host:port/path`, method upper-cased, path as `URL`
+  normalised it, which resolves `.` and `..` and percent-encoding so one path cannot have
+  two spellings.
+
+**Query and fragment are excluded from identity.** Including a query string mints one
+asset per parameter value, which turns an inventory of a surface into a log of requests and
+makes any coverage denominator meaningless. The accepted cost is the other direction of
+§17's warning: two endpoints differing only by a query parameter merge into one row. The
+full URL as submitted is kept on every discovery record, so the distinction survives in
+provenance even though it is not identity. ScopeWeaver's own rule is the same and carries
+no role either — `uq_av2_endpoint ... ON assets(url, method) WHERE type = 'endpoint'`
+(`scopeweaver/db/schema.sql:91`, read for the domain rule only; no code was copied). Its
+host-shaped kinds key on the address alone (`:84`) or on the URL (`:88`), which is the
+precedent for excluding the query string too.
+
+**A trailing slash is two paths**, not one. A server is free to treat `/x` and `/x/`
+differently, and merging them would be the over-normalisation §17 names.
+
+**Role is deliberately not part of endpoint identity**, which is the second half of the
+open question the brief poses. An endpoint tested as an administrator and as an anonymous
+caller is one endpoint. Splitting by role would make the coverage denominator §17 warns
+about lie — two assets where one exists — and would mean "we probed `/login`
+unauthenticated" never counted as having touched `/login` at all. Role is a property of the
+test rather than of the thing tested, and it is already recorded where it belongs, on an
+observation's actors. Roles are also open-ended text, so using them in identity would mint
+a new asset for every new spelling.
+
+Enforcement is at the store level, not in a tool. `UNIQUE (target_id, kind, identity)` is
+where the merge happens, so a second discovery of the same canonical identity cannot create
+a second row even if a caller tries, and a `CHECK` pairs the kind-specific columns the way
+`0003` pairs the two observation formats — a host cannot carry a method. The merge is
+`ON CONFLICT DO NOTHING` followed by a read, so the schema decides identity rather than a
+handler's control flow.
+
+**`asset_discoveries` is append-only provenance, keyed `(asset_id, operation_id)`.** This
+is §6's domain identity: two distinct operations may discover the same canonical asset, and
+the right outcome is one asset with two discovery records. `created` and `replayed` are
+separate booleans because they answer different questions — `created: false` with
+`replayed: false` is a new command that found a known asset, which is new knowledge about
+where it was seen and no new asset.
+
+**`record_asset` is not an MCP tool.** That is the brief's first drop, taken: the identity
+rules and the store-level enforcement are what matter, and the tool surface is a later
+decision about what a worker should be allowed to assert.
+
+### `PORT` — intent anchoring, enforced in the store
+
+§4 calls this "the single most valuable idea here" and says to implement it before anything
+else that writes to the graph. `addIntent` enforces it: an intent anchors only to a stored
+observation, never to another intent, a goal or a hint, and an empty list is a new
+top-level direction. `intent_anchors` is an edge table with real foreign keys both ways and
+a `position`, so the order a caller gave survives — a first parent is usually where the
+direction came from and the rest qualify it.
+
+**The refusal is instructive, as §4 requires.** It names what the id actually is, says why
+that kind cannot anchor, and gives the way to express a new direction. The schema does half
+the work on its own: the foreign key is to `observations(id)`, so an intent id or a goal id
+is refused outright; what it cannot check is the same-goal rule, which needs a two-table
+join and is enforced in the write transaction.
+
+**Why the store and not a planner tool.** Intents are planner-generated and a planner round
+has no execution attempt, so `CallerContext` cannot be built and `checkAuthority` would
+refuse every planner. The host creates intents as it does today, and the planner-facing
+surface waits for Sprint 07. What this buys is that the rule cannot be bypassed by writing
+an intent some other way, because there is no other way. The host's own authority is still
+not the payload's: `HostContext` supplies the target, and the goal's own `target_id` is
+checked against it.
+
+**Two deviations from ScopeWeaver's rule, both because we have less, not more.** It
+reserves anchoring for `confirmed` fact and finding nodes; we have no dismissal state and
+no finding subsystem, so every stored observation is recorded evidence and anchorable —
+including an `inconclusive` one, which is a real result about a real test. If a dismissal
+state is ever added this check must gain it, which `0011`'s docstring says. And there is no
+`hint` kind to refuse, so the refusal names the three kinds that exist here.
+
+### `PORT` — the append-only event log, with the three identities kept apart
+
+`events` is immutable rows, stable ids and a store-assigned monotonic per-target
+`sequence`, decided at schema time as §3 requires rather than retrofitted. §8 is what the
+sequence is for: a consumer reads committed events in ascending sequence order after its
+cursor, and PubSub carries an advisory wake-up rather than the payload or the guarantee.
+`eventsAfter` is that read, and it is explicitly **not** the durable consumer §8 describes
+— there is no stored cursor, no acknowledgement, no wake-up and no catch-up sweep.
+
+**The three identities are three sets of columns, not one `actor` string** (§6). Caller
+authority is `caller_scope` with `intent_id` and `attempt_id`, all three `NULL` together
+for a host-originated mutation — an honest absence rather than a fabricated attempt.
+Operation identity is `operation` with `operation_id`, the same pair the receipt is keyed
+on. Domain identity is `subject_id`, which is not a foreign key because it names rows in
+several tables and a column pointing at one would be wrong for the others. The proof
+asserts all three separately.
+
+**Immutability is enforced by the database**, not by the absence of a statement: two
+triggers raise on `UPDATE` and on `DELETE`, which is the argument §4 makes for putting the
+per-kind state machine in a `CHECK` rather than in application logic. `migrations.test.ts`
+proves both fire. The one thing they do not stop is a future migration that rebuilds the
+table the way `0006` did, which `0012`'s docstring flags.
+
+**Events and the outbox have separate counters**, and neither shares the observation
+counter. Sharing would mean a transaction writing one event and one request consumed two
+numbers, leaving the event sequence with gaps — and a gap is the one thing a consumer
+reading `WHERE sequence > cursor` cannot tell apart from a loss. A refused mutation leaves
+no gap either, because the bump is inside the rolled-back transaction; there is a test for
+exactly that.
+
+### `FIX` — sequences are per target, and nothing is renumbered
+
+§8: "cursors belong to a particular target event log, not a global sequence across
+independent target files." The file split delivers that for the observation counter with no
+work, because `sequence_cursor` lives in the target's own file — which also removes the
+coupling §22 flagged, where one global counter meant a write anywhere moved every
+briefing's `preparedAtSequence`.
+
+**Existing ids are not renumbered, decided on day one as the brief asks.** An observation's
+id is `obs_<sequence>_<attemptId>` and every dimension alias a briefing has printed is
+built from it, so renumbering per target would rewrite primary keys and invalidate
+addresses already in circulation. Each file carries the counter it has, forward. The
+visible consequence is that two targets both have an `obs_000001_…`, which is correct: an
+observation id is unique within the target it belongs to, and the target is the file.
+
+### `COPY` — the transactional outbox, and what it does not promise
+
+`outbox` is a durable queue of side-effect requests, written in the same transaction as the
+domain change that implies them, with `caused_by_event_id` a real foreign key to
+`events(id)` — a request with no event behind it would be an obligation nobody can explain.
+
+**`recovery_policy` is a column with a `CHECK`, not a default.** §6 requires an explicit
+policy per effect type, and the four it names are the four allowed values. A dispatcher
+with one blanket policy either loses work or repeats something unrepeatable. Each request
+type's policy is declared once in `OUTBOX_RECOVERY_POLICIES`, not passed per call, so two
+writers cannot disagree about whether the same remote action may be repeated.
+
+Two request types, both grounded in an accepted §18 entry rather than invented to exercise
+the mechanism: `asset.enrich` is §18's "deterministic asset enrichment with explicit
+policy" and is `safe_to_retry`, because enrichment is a read of external state;
+`notification.deliver` is §18's notification subsystem, which §18 says to build "using the
+existing transactional outbox", and is `reconcile_first` — a notification is visible to a
+person, and a crash between sending and recording the send leaves it genuinely unknown
+whether it arrived. It is deliberately not `idempotency_key`, because no receiver is wired
+and claiming a key the other side honours would be a claim about a system that does not
+exist here.
+
+**Adding an intent writes no outbox request, and that is a deviation from the brief's §2
+worth stating plainly.** The brief says each of the three mutations writes "domain row,
+receipt, event and outbox entry". A new intent implies no action outside this database: the
+queue of intents _is_ the database (§4's atomic claim), not a side-effect queue. Writing a
+request would make the outbox look more exercised than it is, and a mutation that was
+_obliged_ to write one would be a design error — so this is also what demonstrates it is
+not. The brief's own drop order permits "outbox entries for all but one event kind"; two of
+three carry one.
+
+**Sprint 02 writes `pending` rows and nothing moves them.** `status`, `attempts`, the lease
+pair, `next_attempt_at` and `last_error` are declared now because §3's
+append-only-at-schema-time argument applies to them and because a dispatcher that had to
+add a lease column later would have to rebuild the table. They are inert here: claiming,
+leasing, retry scheduling and delivery state are the next slice. `pendingRequests` is a
+read and only a read.
+
+**An outbox does not provide exactly-once remote execution**, which is unchanged from §6
+and worth not drifting on: if a remote action succeeds and the process dies before
+recording that, the outcome is ambiguous and no local row fixes it.
+
+### `FIX` — one transaction per mutation, and the receipt is decoded rather than cast
+
+Every mutation — `recordAsset`, `addIntent`, `recordObservation` — runs its receipt
+lookup, its authority check, its validation, its domain writes, its receipt insert, its
+event and any request it implies inside one `sql.withTransaction`. A refusal short-circuits
+by failing _inside_ it, which rolls the whole thing back. So a conflicting retry writes no
+event and no outbox row not because the code checks for one, but because there is no path
+to the commit that is not committing everything.
+
+**Receipt before authority, preserved from §22 and for its stated reason**: a replay writes
+nothing and creates no external effect, so refusing it would make a transport retry that
+crossed a settlement boundary look like lost evidence. A _new_ write is where authority is
+enforced. The proof exercises both halves against the same attempt after its fence moved.
+
+**The receipt's stored result is decoded through the operation's own schema.** One table now
+holds receipts for three operations, so the single `RecordObservationResult` codec on the
+query had to go; what replaced it is `replayResult`, which decodes through the codec the
+caller names and reports a `StoredRowError` against the receipt when the stored JSON no
+longer matches. What was deliberately not done is `JSON.parse(text) as A`, which §20
+already records as not a typed boundary.
+
+`hashRequest` covers the caller **and** the input, not the input alone: the receipt key
+already namespaces an operation id to one caller scope, so this is the finer check that the
+same id under a different attempt, session or worker is a different request rather than one
+answered with provenance nothing recorded.
+
+### `COPY` — `unknownField`
+
+Implemented rather than dropped, because it is two lines of idea and the event log is
+exactly what it is for: a payload is JSON written by whichever build recorded it, the set
+of kinds and fields only grows, and a reader that threw on an unexpected field would turn
+"this event has something extra" into "this consumer is stuck". A field that is absent,
+null or of the wrong type reads as `undefined`, and the three are deliberately not told
+apart — a caller that needs to distinguish them is reading a shape it should be decoding.
+It is not a decoder and not a substitute for one; where a shape is ours and declared,
+Effect Schema and a typed failure are still the answer.
+
+### Verification actually run
+
+**Automated, uncached.** `bun run typecheck --force`, `bun run build --force` and
+`bun run lint` pass. `bun run test --force` — **290 tests, 0 failures, 1221 `expect()`
+calls** (242 before this slice). `bun run test:persistence --force` — **185** of those
+against real SQLite files (136 before). `bun run format:check` reports only
+`sprint-roadmap.html`, which is pre-existing and untouched; `prettier --check` passes on
+every file this slice changed. `git diff --check` is clean and **nothing was committed**.
+
+The 48 new tests, each pinned where it can actually fail:
+
+- **Migration `0008`, against a file the real migration bodies took to `0007`** and then
+  filled with the shapes the backfill has to carry: three dimensions including one whose
+  text would break a concatenated statement, one observation with an empty array, and one
+  link in `0005`'s `(address, dimension_index)` shape. Asserted: one row per element in
+  position order with the text byte for byte, the empty array contributing nothing, the
+  raising observation's own `recorded_at` on every row, ids matching `dim_[0-9a-f]{32}` and
+  containing neither the observation id nor `#u`, the link repointed onto the right
+  dimension with its address and timestamp intact, the new primary key, and the two dropped
+  columns gone. Plus both guards: a link whose dimension does not exist aborts the
+  migration and leaves the journal at `7` with both links and the old columns intact, and a
+  non-array `untested_dimensions` aborts it too.
+- **Migration `0009`**: the column arrives `NULL` on an existing intent, accepts a real
+  dimension id, and refuses one no dimension holds — so the reference is a live foreign
+  key rather than a text column.
+- **Migrations `0010`, `0012`, `0013`**: a host row carrying a method and an endpoint row
+  without one are each refused by the `CHECK`; a duplicate identity within one target is
+  refused and the same identity under a different target is accepted; a recorded event
+  refuses `UPDATE` and `DELETE` and a duplicate sequence; an unknown outbox status, an
+  unknown recovery policy and a request naming no event are each refused.
+- **The fleet, against files on disk** (`fleet.test.ts`, 12 tests): the id rules, including
+  that `fleetPaths` throws on `../..` rather than returning a traversing path; registration
+  creating both directories and refusing a duplicate id; the registry and settings
+  surviving a reopen; archiving being idempotent and skipped by the sweep; two targets
+  migrated into their own files with a second sweep applying nothing; **the partial-failure
+  policy produced by breaking one target's file for real** — `observations` replaced with a
+  table `0002`'s rebuild cannot select, so the chain fails inside a real migration body
+  rather than in a stub — with the sweep running to the end, the broken target refused by
+  name quoting the failure, and its neighbours served; an unswept target refused rather
+  than migrated by whoever opens it; a repaired target becoming available on the next
+  sweep; two targets keeping their own rows and their own counters, with target A's intent
+  and observations simply absent from B's connection rather than filtered out; `rm -rf` on
+  one target leaving the other intact; and the control file holding no graph table.
+- **Assets** (`store.test.ts`): the canonical endpoint identity with a second discovery
+  merging onto it and both `discovered_as` values kept; a host identified by host and port
+  across case, a trailing dot and an omitted default port, with a different port a
+  different host; a trailing slash two paths, two methods two endpoints, and `..` resolved;
+  role not part of identity, asserted as one asset with two discoveries; a relative URL, a
+  scheme with no default port and an endpoint with no method each refused with no asset, no
+  event and no obligation written; and an asset refused under a settled attempt.
+- **Anchoring**: an empty list is top-level; two anchors keep the order given; an intent, a
+  goal and an unrecorded id are each refused by what they are, with the instructive text
+  asserted phrase by phrase; an anchor from another goal and a duplicate anchor in one call
+  are refused; a goal from another target is `unauthorized` and a reused intent id is
+  refused; and an exact retry replays while conflicting reuse is a conflict, leaving one
+  anchor row and one event from three calls.
+- **The relaxation**: a declaring sibling intent may answer the dimension and the link is
+  recorded; an undeclared sibling may not; the declaration authorises exactly the one
+  dimension it names and not the one beside it; a declaration cannot name a dimension of
+  another goal; and a declaration naming no recorded dimension is refused.
+- **One transaction**: one event per mutation in commit order with the three identities
+  asserted separately and the two obligations naming their events; an exact retry of both
+  an observation and an asset replaying with no second row, event, obligation or sequence
+  number; a conflicting retry of both refused with the event and outbox lists compared
+  field by field against their pre-call values; a refused mutation leaving no sequence gap
+  for the next one to skip; events and obligations reading back in order after the file is
+  closed and reopened, with the cursor read and the bound both exercised and the payload
+  interrogated through `unknownField`; a superseded attempt refused across a restart, with
+  reminting against the current fence still refused and the pre-fence replay still
+  answered; and **a trigger that aborts the receipt insert** — the last write in the
+  mutation — proving the asset, its discovery, the event and the obligation all disappear
+  together, and that the same call succeeds once the trigger is gone.
+- **`scheduled`** (`briefing.test.ts`): scheduled while the declaring intent's work is
+  outstanding, with the sibling dimension untouched and the rendered group naming the
+  intent; scheduled for an intent nothing has been dispatched for; **falling back to
+  `uninvestigated`** once every attempt settled with no answer, still carrying the history;
+  an addressing observation winning over the declaration, through the cross-intent path;
+  and §22's prefix-stability property re-checked now that a fourth status exists.
+
+**Live, in this environment.** `src/spike/persistenceProof.ts`, six phases: **23/23 exact
+checks passed** (`apps/server/.runtime/persistence-proof-122609.log`, whose fleet is left
+at `.runtime/persistence-proof-20261021112609/`). Two targets registered
+and both migrated to schema `14`; asset, anchored intent and observation each in one
+transaction with three events and two obligations; **two child processes genuinely killed
+by `SIGKILL`** — signal asserted, not assumed — one between two mutations and one _inside_
+an uncommitted transaction after a complete mutation had been handed to SQLite, with the
+first surviving and the second leaving no asset, discovery, receipt, event or outbox row;
+then a restart in which the events read back `1, 2, 3, 4` with the cursor read returning
+only what follows, three obligations still `pending` with zero attempts, both abandoned
+attempts reconciled `running -> uncertain` with the fence moved, provenance intact, target
+B holding nothing and A's connection unable to reach a row under B's id; a replayed
+operation id returning its committed result with no new event or obligation and the same id
+with changed input refused; and the revoked credential refused twice over.
+
+`src/spike/crashStep.ts` uses `process.kill(process.pid, "SIGKILL")` rather than
+`process.exit`, a thrown error or an interrupt, because all three of those run finalizers,
+which would close the database in an orderly way and prove nothing about a crash. It shares
+one `SqlClient` with the store through `layerWithClient`, because two connections would
+mean two transactions and the outer would block on SQLite's write lock rather than
+containing the inner.
+
+**The server entrypoint, by hand**, against a fresh `HUNT_ROOT`: the control chain applied
+`1_control_registry`, `fixture-local` was registered on demand, the sweep reported it
+`ready` at schema `14` listing all thirteen hunt migrations, startup reconciliation found
+nothing unsettled, and the three route postures held on one port — `200 {"status":"ok"}` on
+health, `401` on MCP with no bearer, `200` with a typed denial on the unauthenticated policy
+route, `404` off-route. The directory tree afterwards was `control.sqlite` plus
+`targets/fixture-local/{hunt.sqlite,evidence/}`.
+
+**Not run.** No live model demo and no new live worker run: this slice changed the write
+path and the file layout, and the live evidence from §22 is left as recorded. The
+development database was not touched — migrations `0008` and `0009` through `0013` have not
+been applied to it, and will be by whatever opens it next, which under the new layout means
+it is no longer the file `main.ts` opens at all.
+
+### Remaining limitations
+
+- **The running server serves one target, not the fleet.** The registry is iterated for
+  migrations and the files are genuinely separate, but `main.ts` opens exactly one target's
+  store and the MCP boundary has no per-target resolver. Nothing cross-target has been
+  exercised through the control plane, only through the store.
+- **Nothing reads an event or an outbox row.** There is no durable cursor, no
+  acknowledgement, no PubSub wake-up, no catch-up sweep, no claiming, no lease, no retry
+  schedule and no dispatcher. `eventsAfter` and `pendingRequests` are reads that prove the
+  rows are there and ordered; they are not the consumer §8 describes, and the outbox's
+  execution columns have never held anything but their initial values.
+- **The crash-window proof covers a transaction, not every interleaving.** One `SIGKILL`
+  inside one uncommitted transaction after one complete mutation is strong evidence that a
+  mutation cannot be half-written. It is not a search over kill points: nothing here kills
+  between the event insert and the outbox insert specifically, or during SQLite's own
+  commit, and no WAL-corruption case was manufactured.
+- **An intent that declares a dimension and is never dispatched holds it `scheduled`
+  indefinitely.** The fallback is keyed on attempts settling, and an intent with no attempt
+  has none to settle. Nothing in this slice expires or garbage-collects such an intent,
+  because nothing in this slice dispatches; a planner that created intents and failed to
+  dispatch them would accumulate questions that look like work in flight.
+- **Nothing stops a future author from reserving an id again.** The hole this sprint
+  briefly opened was closed while no database held `0008` or above, and `MIGRATIONS` now
+  says why ids are assigned rather than reserved — but that is a comment, not a check.
+  `migrations.test.ts` asserts the chain it is given is contiguous and increasing; it
+  cannot assert anything about a chain somebody intended, and a gap introduced once a
+  database has passed it is not repairable.
+- **Asset identity merges two endpoints that differ only by a query parameter.** Accepted
+  for the reason recorded above, and visible in `discovered_as` rather than in identity. It
+  will be wrong for a target that routes on a query string, and the fix is a new identity
+  rule for a new kind rather than a widening of this one.
+- **Asset identity has only ever seen the fixture's shapes.** Two kinds, loopback hosts and
+  three paths. No IPv6 literal, no internationalised domain, no non-HTTP scheme beyond the
+  refusal path, and no real target.
+- **An observation's untested dimensions are stored twice.** The JSON column and the
+  dimension rows are written from one list in one transaction and nothing updates an
+  observation, so they cannot drift today — but it is two copies of one fact, and anything
+  that ever edits an observation has to update both or the alias and the row will disagree.
+- **A dimension id is random, so it is meaningless outside its file.** That is correct for
+  per-target files and will need thought if a roll-up table in `control.sqlite` ever has to
+  name a dimension across targets.
+- **Anchoring cannot exclude a dismissed observation**, because there is no dismissal state
+  and no finding subsystem. Every stored observation is anchorable. When either arrives,
+  this check is a place that must change, and nothing enforces that it will be noticed.
+- **The event-immutability triggers do not survive a table rebuild.** A future migration
+  doing what `0006` did would drop them with the table, and only a docstring says so.
+- **`register` is two commits, not one.** The directories are created and then the registry
+  row is written, because filesystem work must not happen inside a transaction. A failure in
+  between leaves a directory with no registry row — inert, and adopted by a re-registration
+  — but the two are not atomic and nothing cleans up the orphan.
+- **An unavailable target is retried only by another startup.** There is no backoff, no
+  schedule and no way to ask for one target to be re-swept while the process runs.
+- **The `0008` orphan-link guard is proven by a manufactured row.** No database in this
+  repository holds one, which was checked rather than assumed; the guard's behaviour is
+  therefore proven by `migrations.test.ts` and not by live data, exactly as `0006`'s
+  conflated row was.
+- **Nothing closes a question, still.** Dispositions are not implemented, so a brief only
+  grows. `scheduled` narrows what a planner should act on but retires nothing, and the
+  rendered briefing continues to say in as many words that nothing here settles anything.
