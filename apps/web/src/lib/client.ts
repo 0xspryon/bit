@@ -1,0 +1,199 @@
+/**
+ * The control plane, as the browser sees it.
+ *
+ * Named `client.ts` rather than `server.ts` because SvelteKit reserves the latter: a
+ * module called `server` under `$lib` is treated as server-only and refused to any code
+ * that runs in the browser. This is the opposite — it is the browser's half.
+ *
+ * Nothing in here describes an endpoint. Every path, payload, status code and error
+ * member comes from `@bit/contracts`, and the client is *derived* from that declaration
+ * by `HttpApiClient.make` — so renaming an endpoint or changing a field breaks this file
+ * at compile time instead of at click time. That is the whole reason the API is declared
+ * once rather than written as a route table on one side and a `fetch` wrapper on the
+ * other.
+ *
+ * **Three things this module owns, and nothing else does.**
+ *
+ * 1. **The bearer.** The session token lives here, in one module-level variable, and the
+ *    client middleware reads it on every request. Not in Svelte state: a reactive
+ *    dependency would make "which token did that request use" depend on when the effect
+ *    happened to run, and the answer has to be "whatever is current", always.
+ * 2. **`sessionStorage`.** Chosen over `localStorage` deliberately — a session that
+ *    outlives the tab is a credential sitting on disk for a tool whose whole point is
+ *    handling other people's systems. Closing the tab ends it, and the server's own
+ *    registry is in memory too, so restarting the server ends it from the other side.
+ * 3. **Classifying a failure.** The one judgement the browser is allowed to make: a
+ *    `SessionRefused` is an answer from the server, and *anything else* — a refused
+ *    connection, a dev-proxy 502, a body that will not decode — is "no server answered
+ *    at this address". The Connect screen renders those against two different fields, and
+ *    a client that guessed which one would be attaching a reason to the wrong input.
+ *
+ * `baseUrl` is the page's own origin by default, because the browser reaches the server
+ * same-origin: through the Vite dev server's `/api` proxy in development, and from the
+ * server itself in a packaged deployment. The control plane serves no CORS headers on
+ * purpose — the only way to add them is `HttpRouter.cors`, which is global and would
+ * change what `/api/v1/mcp` and `/api/v1/policy/decide` answer to a cross-origin caller.
+ */
+import { BitApi, SessionGuard, type TargetDraft } from "@bit/contracts";
+import { Effect, Layer, Result } from "effect";
+import { FetchHttpClient, HttpClientRequest } from "effect/http";
+import { HttpApiClient, HttpApiMiddleware } from "effect/http-api";
+
+/** Where the token is parked so a reload can find it. */
+const TOKEN_KEY = "bit.session.token";
+
+/** The live bearer. `undefined` means "not signed in". */
+let bearer: string | undefined;
+
+/**
+ * `sessionStorage` can throw — a private window, blocked site data, an embedded
+ * context — so every touch of it is guarded and the app works without it. The cost of
+ * losing it is one extra sign-in after a reload, which is not worth a crash.
+ */
+const readStoredToken = (): string | undefined => {
+  try {
+    return globalThis.sessionStorage?.getItem(TOKEN_KEY) ?? undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const writeStoredToken = (token: string | undefined): void => {
+  try {
+    if (token === undefined) globalThis.sessionStorage?.removeItem(TOKEN_KEY);
+    else globalThis.sessionStorage?.setItem(TOKEN_KEY, token);
+  } catch {
+    /* no storage: the session simply does not survive a reload. */
+  }
+};
+
+/** The token a reload should try, before anything has been verified. */
+export const storedToken = (): string | undefined => readStoredToken();
+
+/** Holds a token in memory and in `sessionStorage`. `undefined` signs out. */
+export const setToken = (token: string | undefined): void => {
+  bearer = token;
+  writeStoredToken(token);
+};
+
+/**
+ * The client half of {@link SessionGuard}.
+ *
+ * Declared `requiredForClient` in the contract, so this is not optional: without it the
+ * generated client would not compile. A request made while signed out goes out with no
+ * `Authorization` header at all, and the server reports `missing` rather than `unknown` —
+ * which is what lets the UI tell a first visit from a stale token.
+ */
+const guardClient = HttpApiMiddleware.layerClient(
+  SessionGuard,
+  ({ next, request }) =>
+    next(
+      bearer === undefined
+        ? request
+        : HttpClientRequest.bearerToken(request, bearer),
+    ),
+);
+
+const clientLayer = Layer.mergeAll(guardClient, FetchHttpClient.layer);
+
+const client = (baseUrl: string) =>
+  HttpApiClient.make(BitApi, { baseUrl }).pipe(Effect.provide(clientLayer));
+
+/**
+ * What a call to the server came back as.
+ *
+ * `Refused` carries the server's own typed error; `Unreachable` is everything else, with
+ * whatever the transport said kept for the console. Two cases rather than an error union
+ * because the screens branch on exactly this distinction.
+ */
+export type Call<A, E> =
+  | { readonly _tag: "Ok"; readonly value: A }
+  | { readonly _tag: "Refused"; readonly error: E }
+  | { readonly _tag: "Unreachable"; readonly detail: string };
+
+/** Tags the server defines. Anything else in the error channel is transport trouble. */
+const REFUSAL_TAGS = new Set([
+  "SessionRefused",
+  "Unauthenticated",
+  "PathRefused",
+  "PathNotFound",
+  "TargetRefused",
+]);
+
+const isRefusal = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "_tag" in error &&
+  typeof (error as { _tag: unknown })._tag === "string" &&
+  REFUSAL_TAGS.has((error as { _tag: string })._tag);
+
+/**
+ * Runs one call and sorts the outcome into {@link Call}.
+ *
+ * `Effect.result` rather than letting the promise reject, so a refusal is a value the
+ * caller must look at rather than an exception it might forget to catch. A defect — a
+ * bug in this file, or a 500 from the server — is reported as unreachable with its text,
+ * because from the operator's seat a server that answers with a stack trace and a server
+ * that does not answer are the same problem.
+ */
+const run = async <A, E>(
+  effect: Effect.Effect<A, E, never>,
+): Promise<Call<A, E>> => {
+  try {
+    const result = await Effect.runPromise(Effect.result(effect));
+    if (Result.isSuccess(result)) {
+      return { _tag: "Ok", value: result.success };
+    }
+    const error = result.failure;
+    return isRefusal(error)
+      ? { _tag: "Refused", error }
+      : {
+          _tag: "Unreachable",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+  } catch (cause) {
+    return {
+      _tag: "Unreachable",
+      detail: cause instanceof Error ? cause.message : String(cause),
+    };
+  }
+};
+
+/**
+ * Every call the three screens make, each already sorted into {@link Call}.
+ *
+ * The error type of each is left to inference rather than narrowed with a cast: it is the
+ * union the contract declares plus whatever the transport can raise, and a caller that
+ * wants one member of it tests `_tag`. Asserting a narrower type here would be claiming
+ * the transport cannot fail.
+ */
+export const server = {
+  /** Exchanges the password for a token. Does not store it — the caller decides. */
+  openSession: (baseUrl: string, password: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.session.open({ payload: { password } }),
+      ),
+    ),
+
+  /** Confirms the current bearer still opens a session. */
+  probe: (baseUrl: string) =>
+    run(Effect.flatMap(client(baseUrl), (api) => api.fleet.probe())),
+
+  targets: (baseUrl: string) =>
+    run(Effect.flatMap(client(baseUrl), (api) => api.fleet.targets())),
+
+  folders: (baseUrl: string, path?: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.folders({ query: path === undefined ? {} : { path } }),
+      ),
+    ),
+
+  createTarget: (baseUrl: string, draft: TargetDraft) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.createTarget({ payload: draft }),
+      ),
+    ),
+};

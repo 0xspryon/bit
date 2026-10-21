@@ -218,6 +218,47 @@ describe("the registry", () => {
     expect(after.absent).toBeUndefined();
   });
 
+  test("records the folder an engagement is about, or none, and keeps it", async () => {
+    const root = newRoot();
+    const workspace = newRoot();
+    await withFleet(root, (fleet) =>
+      Effect.gen(function* () {
+        yield* fleet.register({
+          targetId: "alpha",
+          name: "Target alpha",
+          scopeNote: AWKWARD_TEXT,
+          workspacePath: workspace,
+        });
+        // No folder: the shape `main.ts` registers a fixture target with.
+        yield* register(fleet, "beta");
+      }),
+    );
+    const after = await withFleet(root, (fleet) => fleet.targets());
+    expect(after.map((row) => row.targetId)).toEqual(["alpha", "beta"]);
+    expect(after[0]?.workspacePath).toBe(workspace);
+    // `NULL`, not `""`: "no folder was recorded" has to be distinguishable from a
+    // folder whose path is the empty string, which is not a path at all.
+    expect(after[1]?.workspacePath).toBeUndefined();
+
+    // Read straight out of the file, so the column really is in the schema rather than
+    // only in the decoder: a `SELECT` of a column that does not exist is a SQL error,
+    // and nothing above would have caught it if the decode had defaulted.
+    const database = new Database(join(root, CONTROL_FILE), { readonly: true });
+    try {
+      const rows = database
+        .query<{ id: string; workspace_path: string | null }, []>(
+          "SELECT id, workspace_path FROM targets ORDER BY id",
+        )
+        .all();
+      expect(rows).toEqual([
+        { id: "alpha", workspace_path: workspace },
+        { id: "beta", workspace_path: null },
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
   test("archiving is idempotent and keeps the row", async () => {
     const root = newRoot();
     const outcome = await withFleet(root, (fleet) =>

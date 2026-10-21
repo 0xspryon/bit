@@ -1,5 +1,5 @@
 /**
- * The one HTTP endpoint this control plane serves.
+ * The one HTTP listener this control plane serves.
  *
  * There were two listeners and, in a separate process, a third hand-written one: the MCP
  * endpoint the worker calls back into, the policy endpoint the harness-side hook
@@ -24,6 +24,14 @@
  *
  * Sharing a port does not blur that: a request is routed by path first, and each route
  * carries whatever admission its own layer declared.
+ *
+ * **The browser-facing API arrives the same way**, through `extraRoutes`. It is declared
+ * once in `@bit/contracts` with `effect/http-api` and implemented in `browserApi.ts`,
+ * and it carries its own guard — `HttpApiMiddleware` with `HttpApiSecurity.bearer`,
+ * resolved against the browser session registry, which is a *different* registry from the
+ * MCP credentials this file's `/api/v1/mcp` route uses. The three routes below are not
+ * re-posted through that API and are not wrapped by it: merging happens on the router, so
+ * each route still carries only what its own layer declared.
  *
  * **The fixture is not here, deliberately.** `fixture/server.ts` is the simulated target
  * under test and keeps its own listener. Putting it on this port would mean the worker
@@ -73,7 +81,32 @@ const healthRoutes = Layer.effectDiscard(
   }),
 );
 
+/**
+ * Extra routes to register on the same router.
+ *
+ * This is how the browser-facing `HttpApi` gets onto this listener: `main.ts` builds
+ * `browserApiRoutes(...)`, provides it everything but the router, and hands it in. It is
+ * a parameter rather than a merge inside this module for two reasons. The services those
+ * routes need — the fleet registry, the browser session map — are not services this
+ * endpoint has any other use for, and making them hard requirements would oblige every
+ * existing caller (the spike demos, three test suites) to stand up a fleet in order to
+ * serve `/api/v1/health`. And a caller that passes nothing gets exactly the three routes
+ * this file has always served, which is what keeps the merge from changing what was
+ * already here.
+ *
+ * The layer must already have everything resolved except the router. Whatever it
+ * registers carries its own admission posture; nothing here wraps it, and it cannot wrap
+ * the three routes below.
+ */
+export type ControlPlaneRoutes = Layer.Layer<
+  never,
+  never,
+  HttpRouter.HttpRouter
+>;
+
 export interface ControlPlaneHandle {
+  /** `http://127.0.0.1:<port>`, the one origin every route below sits on. */
+  readonly origin: string;
   /** Where the worker's MCP client connects. */
   readonly mcpUrl: string;
   /** Where the harness-side policy hook posts. */
@@ -101,6 +134,8 @@ export class ControlPlaneEndpoint extends Context.Service<
   static readonly layer = (options: {
     readonly policy: PolicyConfig;
     readonly port?: number;
+    /** Merged onto the same router. See {@link ControlPlaneRoutes}. */
+    readonly extraRoutes?: ControlPlaneRoutes | undefined;
   }) =>
     Layer.effect(
       ControlPlaneEndpoint,
@@ -118,6 +153,7 @@ export class ControlPlaneEndpoint extends Context.Service<
           McpApplicationLayer,
           policyRoutes(options.policy),
           healthRoutes,
+          options.extraRoutes ?? Layer.empty,
         ).pipe(
           Layer.provideMerge(Layer.succeed(ObservationStore, store)),
           Layer.provideMerge(Layer.succeed(McpCredentials, credentials)),
@@ -145,6 +181,7 @@ export class ControlPlaneEndpoint extends Context.Service<
 
         const origin = `http://127.0.0.1:${server.port}`;
         return ControlPlaneEndpoint.of({
+          origin,
           mcpUrl: `${origin}${MCP_PATH}`,
           policyUrl: `${origin}${POLICY_DECIDE_PATH}`,
           healthUrl: `${origin}${HEALTH_PATH}`,

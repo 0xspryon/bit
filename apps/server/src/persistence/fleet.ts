@@ -42,6 +42,26 @@
  * sweep happens at startup. A target that fails to migrate stays out until the process is
  * restarted with a fixed forward migration.
  *
+ * **Ratified for creation, not only for startup** (`sprint-02.md` §4 left this open; it is
+ * closed here). `POST /api/v1/targets` registers a target and then migrates that one
+ * file. When that migration fails, the registry row **stays**, the target is listed as
+ * unavailable with the failure text, and every other target keeps serving. The
+ * registration is not rolled back and the request is not an error:
+ *
+ * - The row is the only record that the operator asked for this engagement, and the
+ *   directory it names already exists on disk. Deleting the row would leave an orphaned
+ *   directory and no way to find it from the UI, which is worse than a dimmed row that
+ *   says exactly what went wrong.
+ * - The same policy at startup and at creation means one state machine, not two. A
+ *   target created today and swept tomorrow reaches `unavailable` by the same path and is
+ *   refused by {@link FleetStore.huntFileFor} by the same check.
+ * - Failing the request would tell the operator the target does not exist while its
+ *   directory, its registry row and its half-migrated file all do.
+ *
+ * So the HTTP surface has no "migration failed" error member: it returns the created
+ * target with `available: false` and a reason. The UI's migration-failed state is driven
+ * by that, which is why the two cannot disagree.
+ *
  * **A target id is a directory name**, so it is validated before it reaches a path, not
  * after. {@link isTargetId} is the only gate, and every path in this module is built
  * through {@link fleetPaths} from an id that passed it.
@@ -145,12 +165,23 @@ export interface TargetRegistration {
   readonly name: string;
   /** Prose the operator wrote about what is in scope. Advisory, never enforcement. */
   readonly scopeNote: string;
+  /**
+   * The folder on the operator's machine this engagement is about.
+   *
+   * Not where the target's data lives — that is always `targets/<id>/`, built from the
+   * id by {@link fleetPaths} and never from anything a caller supplies. This is the
+   * folder chosen in the New target dialog, recorded so the rail can show it and so a
+   * second registration against the same folder can be refused by name. Optional, and
+   * absent for a target registered by a process that has no operator behind it.
+   */
+  readonly workspacePath?: string | undefined;
 }
 
 export interface TargetRow {
   readonly targetId: string;
   readonly name: string;
   readonly scopeNote: string;
+  readonly workspacePath: string | undefined;
   readonly createdAt: number;
   readonly archivedAt: number | undefined;
 }
@@ -179,6 +210,7 @@ const TargetRecord = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
   scope_note: Schema.String,
+  workspace_path: Schema.NullOr(Schema.String),
   created_at: Schema.Finite,
   archived_at: Schema.NullOr(Schema.Finite),
 });
@@ -199,6 +231,7 @@ const toTarget = (row: typeof TargetRecord.Type): TargetRow => ({
   targetId: row.id,
   name: row.name,
   scopeNote: row.scope_note,
+  workspacePath: row.workspace_path ?? undefined,
   createdAt: row.created_at,
   archivedAt: row.archived_at ?? undefined,
 });
@@ -261,7 +294,7 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
     Request: Schema.Void,
     Result: TargetRecord,
     execute: () =>
-      sql`SELECT id, name, scope_note, created_at, archived_at
+      sql`SELECT id, name, scope_note, workspace_path, created_at, archived_at
           FROM targets ORDER BY created_at, id`,
   });
 
@@ -269,7 +302,7 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
     Request: Schema.String,
     Result: TargetRecord,
     execute: (targetId) =>
-      sql`SELECT id, name, scope_note, created_at, archived_at
+      sql`SELECT id, name, scope_note, workspace_path, created_at, archived_at
           FROM targets WHERE id = ${targetId}`,
   });
 
@@ -392,14 +425,16 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
       input.targetId,
     );
     const now = yield* Clock.currentTimeMillis;
-    yield* sql`INSERT INTO targets (id, name, scope_note, created_at)
-      VALUES (${input.targetId}, ${input.name}, ${input.scopeNote}, ${now})`.pipe(
+    yield* sql`INSERT INTO targets (id, name, scope_note, workspace_path, created_at)
+      VALUES (${input.targetId}, ${input.name}, ${input.scopeNote},
+              ${input.workspacePath ?? null}, ${now})`.pipe(
       Effect.mapError(query),
     );
     return {
       targetId: input.targetId,
       name: input.name,
       scopeNote: input.scopeNote,
+      workspacePath: input.workspacePath,
       createdAt: now,
       archivedAt: undefined,
     } satisfies TargetRow;

@@ -91,12 +91,41 @@ const createRegistry = statements(
   )`,
 );
 
+/**
+ * `0002` — the folder the operator picked for an engagement.
+ *
+ * A target's *data* has always lived at `<root>/targets/<id>/`, and that is not what this
+ * column holds. This is the folder on the operator's machine that the engagement is
+ * about: the one chosen in the New target dialog, the one shown in the target rail, and
+ * the one whose absence is a reason to dim a row. The two are separate because they have
+ * separate lifetimes — `rm -rf targets/<id>/` destroys the recorded evidence, while
+ * deleting the workspace folder destroys nothing we hold and must not remove a target
+ * from the list.
+ *
+ * It is a new column rather than an edit to `0001` because `0001` has been applied: the
+ * chain is append-only, there is no `down`, and the migrator only applies ids above the
+ * highest already applied. It is nullable rather than `NOT NULL DEFAULT ''` so that "no
+ * folder was recorded" is a value a reader can test for, which is the honest state of
+ * every row created before this migration — including the target `main.ts` registers at
+ * startup, which exists to serve a fixture and has no operator-chosen folder at all.
+ *
+ * Nothing enforces uniqueness in the schema. Registering two targets against one folder
+ * is refused above this table, where the refusal can name the target already holding it;
+ * a `UNIQUE` constraint would surface the same mistake as a driver fault with nothing
+ * useful to tell the operator, and would also forbid the several `NULL`s that are
+ * legitimate here.
+ */
+const addWorkspacePath = statements(
+  `ALTER TABLE targets ADD COLUMN workspace_path TEXT`,
+);
+
 /** The ordered control chain. Append only; ids must increase and a gap is permanent. */
 export const CONTROL_MIGRATIONS: Record<
   string,
   Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient>
 > = {
   "0001_control_registry": createRegistry,
+  "0002_target_workspace_path": addWorkspacePath,
 };
 
 export const controlMigrationLoader =

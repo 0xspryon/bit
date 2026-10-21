@@ -1,0 +1,208 @@
+/**
+ * Flow A design tokens.
+ *
+ * Derived from `docs/design/flow-a-getting-in.md` §6, with the monochrome
+ * direction applied: the nine-colour badge palette is reduced to neutral tones
+ * and the accent is neutral, so colour appears only in state. Errors keep red
+ * and an unavailable target keeps amber — those were kept deliberately.
+ *
+ * Dark is the default. `data-theme="light"` on <html> switches.
+ */
+
+:root {
+  /* ── Grey ramp ── */
+  --grey-50: #ffffff;
+  --grey-100: #fafafa;
+  --grey-200: #f2f2f2;
+  --grey-300: #eeeeee;
+  --grey-400: #dbdbdb;
+  --grey-500: #aeaeae;
+  --grey-600: #808080;
+  --grey-700: #5c5c5c;
+  --grey-800: #3a3a3a;
+  --grey-900: #2e2e2e;
+  --grey-1000: #242424;
+  --grey-1100: #161616;
+  --grey-1200: #080808;
+
+  /* ── Type ── */
+  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono:
+    "IBM Plex Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  --lh-tight: 12px;
+  --lh-compact: 16px;
+  --lh-base: 20px;
+
+  /* ── Radius ── */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+
+  /* ── Elevation ── */
+  --elevation-raised:
+    0 2px 4px #0000000a, 0 1px 2px -1px #00000014, 0 0 0 0.5px #0000001f;
+  --elevation-floating:
+    0 8px 16px #0000000a, 0 4px 8px #00000014, 0 0 0 0.5px #0000001f;
+  --elevation-overlay:
+    0 16px 32px #0000000a, 0 8px 16px #00000014, 0 0 0 0.5px #0000001f;
+
+  /* ── Motion ── */
+  --ease-panel: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-panel: 240ms;
+  --dur-fade: 180ms;
+  --dur-hover: 120ms;
+
+  /* ── Shell metrics ── */
+  --titlebar-h: 38px;
+  --rail-w: 280px;
+}
+
+/* ── Dark (default) ── */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg-base: var(--grey-1000);
+  --bg-deep: var(--grey-1100);
+  --bg-layer-01: var(--grey-900);
+  --bg-layer-02: var(--grey-800);
+  --bg-layer-03: var(--grey-700);
+  --bg-inverse: var(--grey-100);
+
+  --text-base: var(--grey-200);
+  --text-muted: var(--grey-500);
+  --text-faint: var(--grey-600);
+  --text-inverse: var(--grey-1000);
+
+  --icon-base: var(--grey-400);
+  --icon-muted: var(--grey-600);
+  --icon-faint: var(--grey-700);
+
+  --border-muted: #ffffff14;
+  --border-base: #ffffff1a;
+  --border-strong: #ffffff33;
+  --border-focus: var(--grey-400);
+
+  --overlay-hover: #ffffff0f;
+  --overlay-pressed: #ffffff1a;
+  --overlay-scrim: #000000a6;
+
+  --badge-bg: var(--grey-800);
+  --badge-fg: var(--grey-300);
+  --badge-border: var(--grey-700);
+
+  --state-bg-danger: #461516;
+  --state-fg-danger: #f17471;
+  --state-border-danger: #97252b;
+  --state-bg-warning: #4b4025;
+  --state-fg-warning: #f2cf76;
+  --state-border-warning: #ac8833;
+  --state-bg-success: #14361d;
+  --state-fg-success: #6bd586;
+  --state-border-success: #1d783c;
+}
+
+/* ── Light ── */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-base: var(--grey-50);
+  --bg-deep: var(--grey-100);
+  --bg-layer-01: var(--grey-100);
+  --bg-layer-02: var(--grey-200);
+  --bg-layer-03: var(--grey-300);
+  --bg-inverse: var(--grey-1100);
+
+  --text-base: var(--grey-1100);
+  --text-muted: var(--grey-700);
+  --text-faint: var(--grey-600);
+  --text-inverse: var(--grey-50);
+
+  --icon-base: var(--grey-800);
+  --icon-muted: var(--grey-600);
+  --icon-faint: var(--grey-500);
+
+  --border-muted: #00000014;
+  --border-base: #0000001a;
+  --border-strong: #00000033;
+  --border-focus: var(--grey-700);
+
+  --overlay-hover: #0000000a;
+  --overlay-pressed: #00000014;
+  --overlay-scrim: #00000066;
+
+  --badge-bg: var(--grey-300);
+  --badge-fg: var(--grey-800);
+  --badge-border: var(--grey-400);
+
+  --state-bg-danger: #fcecebff;
+  --state-fg-danger: #b82d35;
+  --state-border-danger: #f2bbb7;
+  --state-bg-warning: #fefaec;
+  --state-fg-warning: #8e7231;
+  --state-border-warning: #f7e5b5;
+  --state-bg-success: #e7f9ea;
+  --state-fg-success: #198b43;
+  --state-border-success: #b8e9c1;
+}
+
+/* ── Base ── */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-base);
+  color: var(--text-base);
+  font: 400 13px/var(--lh-base) var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/**
+ * A transition whose value comes from a custom property does not re-resolve
+ * when that property changes at the root — the element stays latched on the
+ * old colour. Transitions are suppressed for one frame while the theme
+ * switches, so every element picks up the new value directly.
+ */
+:root.theme-switching *,
+:root.theme-switching *::before,
+:root.theme-switching *::after {
+  transition: none !important;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
