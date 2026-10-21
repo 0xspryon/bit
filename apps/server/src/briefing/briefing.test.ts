@@ -312,6 +312,35 @@ describe("buildBriefing", () => {
     expect(rendered).toContain("Uninvestigated (1)");
   });
 
+  test("an observation's own block names none of its dimensions, so retiring one cannot rewrite it", async () => {
+    // The precondition for disposing of a question at all (§17). A dimension's text is
+    // immutable, but its *visibility* is not: addressing or retiring one changes whether
+    // it is shown. Printed inside an observation's block, that would rewrite a block
+    // earlier briefings already emitted — so every dimension is rendered once, in the
+    // volatile tail, and the stable prefix must be able to say nothing about it.
+    const rendered = await withSeeded(
+      () => Effect.map(buildBriefing("intent-1"), renderBriefing),
+      [
+        input({
+          operationId: "a",
+          untestedDimensions: ["the per-account limit", "IPv6 /64 rotation"],
+        }),
+      ],
+    );
+
+    const stable = stablePrefixOf(rendered);
+    expect(stable).toContain("### obs_000001_attempt-1");
+    for (const address of [
+      "obs_000001_attempt-1#u0",
+      "obs_000001_attempt-1#u1",
+    ]) {
+      expect(stable).not.toContain(address);
+      expect(rendered).toContain(address);
+    }
+    // Not an accident of truncation: the evidence's own caveats stay in the block.
+    expect(stable).toContain("- limitations:");
+  });
+
   test("a briefing with one more observation extends the previous one byte for byte", async () => {
     // The property the layout exists for: everything above the preparation heading is
     // the intent plus the observations recorded under it, oldest first, so a later

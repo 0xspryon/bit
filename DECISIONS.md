@@ -1879,6 +1879,32 @@ and what a worker copies, resolved to a `dimension_id` on the way in.
 `parseDimensionAddress` keeps refusing a non-canonical index, no worker-facing payload
 changes, and the identity behind the alias stops depending on position.
 
+#### Rendered once, in the tail — implemented 2026-10-21
+
+The rest of this entry is a plan; this part is built, because it is the precondition for
+any of it. `renderBriefing` printed every dimension twice: inside its observation's block
+and again, with status and addressers, in the volatile section below
+`PREPARATION_HEADING`.
+
+That duplication was harmless only while a dimension's visibility was fixed. A
+disposition changes it, which left no good option: filter the block too and a briefing
+rewrites observation text that earlier rounds already emitted, destroying the byte-for-byte
+prefix §22 built the planner lineage for; leave the block alone and a retired dimension is
+still in the brief, so retiring it shrinks nothing and the tool is decorative.
+
+So an observation's block now ends at `limitations` and names no dimension. The division
+is not merely mechanical: `limitations` qualifies what that observation established, so it
+is evidence and immutable with it, while an untested dimension is forward work whose state
+changes as it is addressed or retired. Evidence above the heading, derived state below it.
+`briefing.test.ts` asserts the stable prefix contains neither address, and that both are
+still in the rendered text — a test that fails if a well-meaning edit puts them back.
+
+Grouping in the tail stays by status (uninvestigated, addressed-inconclusive,
+addressed-with-evidence, and in due course the retired count), not by raising observation:
+status is what a planner acts on and what visibly shrinks as questions are settled. A
+by-observation view belongs in the UI, where a reader browsing one observation wants its
+own caveats together.
+
 #### A planner's judgement is not a test result
 
 The tool does not mark a dimension `tested`. §4 and §15 reserve that vocabulary for what

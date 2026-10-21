@@ -354,17 +354,13 @@ export const renderBriefing = (briefing: Briefing): string => {
         ? renderCaseBased(observation)
         : renderSummary(observation)),
       `- worker interpretation (not established fact): ${observation.interpretation}`,
+      // `limitations` is the last line of a block deliberately. It qualifies what this
+      // observation established, so it is part of the evidence and immutable with it.
+      // The dimensions it left untested are *forward* work, their visibility changes as
+      // they are addressed or disposed of, and they are therefore rendered once in the
+      // volatile tail — see `renderOpenQuestions` and the note above
+      // `PREPARATION_HEADING`.
       `- limitations: ${list(observation.limitations)}`,
-      // Addresses, not bare prose: the body and the open-questions section below name
-      // the same thing the same way, so a reader never has to match them up by wording.
-      ...(observation.untestedDimensions.length === 0
-        ? [`- untested dimensions: none recorded`]
-        : [
-            `- untested dimensions, with the address to cite when addressing one:`,
-            ...dimensionsOf(observation).map(
-              ({ address, dimension }) => `    [${address}] ${dimension}`,
-            ),
-          ]),
     );
   }
 

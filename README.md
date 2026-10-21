@@ -102,9 +102,11 @@ addressed-but-inconclusive and addressed-with-evidence rather than collapsing th
 A briefing grows by appending. Observations are chosen newest-first, so truncation keeps
 the evidence that qualifies the rest, and then listed oldest-first; everything that
 restates the record — the graph sequence, the counts, the disclosed omissions and the open
-questions — sits below one heading at the end. So a briefing built after another
-observation lands begins with the previous one, byte for byte, until the truncation window
-slides. Planner rounds on a target are opened under one anchor session for the same
+questions — sits below one heading at the end. An observation's block therefore ends at
+its `limitations` and names none of the dimensions it left untested: those are forward
+work whose state changes as they are addressed, so they are rendered once, below that
+heading. So a briefing built after another observation lands begins with the previous one,
+byte for byte, until the truncation window slides. Planner rounds on a target are opened under one anchor session for the same
 reason: a harness that caches by session lineage can then reuse what it has already been
 sent. Each round is still a fresh session that reads the briefing and nothing else.
 
