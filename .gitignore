@@ -19,3 +19,6 @@ secrets/
 *.log
 .DS_Store
 .runtime/
+
+# Visual brainstorming scratch
+.superpowers/
