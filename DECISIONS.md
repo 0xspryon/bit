@@ -1849,6 +1849,126 @@ conditions, and known gaps over a percentage. Define the denominator (assets, cl
 roles, methods, time windows, etc.) before adopting any coverage metric. Reason: a narrow
 positive or negative result must not imply broad coverage, as the rate-limit example shows.
 
+### `FIX` — untested dimensions are rows, and a planner may dispose of one
+
+**Accepted 2026-10-21**, unlike the three recommendations above, which remain pending.
+It sits in this section because it closes the open half of the briefing-selection
+`SPIKE` — what a fresh planner is shown, and what it is spared — and because Sprint 07,
+the first planner loop, cannot be built on the current shape. None of it is a `PORT`:
+ScopeWeaver has no untested-dimension concept. Its "untested" is asset-level
+(`list_untested_assets`, `agent/tools_insert.go:490`) with exactly the approximate
+coverage percentage the entry above warns against.
+
+#### Dimensions become rows
+
+§22 recorded the limit this removes. A dimension address is positional, which is "only
+sound while observations are immutable", and "anything that ever edits, merges or rewords
+a recorded dimension needs its own identity scheme rather than this one stretched to
+fit."
+
+`observation_dimensions(id, observation_id, position, text, created_at)`, backfilled by
+unnesting each observation's stored `untested_dimensions` array in position order, so
+every existing dimension keeps the identity its address already implied.
+`observation_dimension_links` repoints from `(address, dimension_index)` onto
+`dimension_id`; it already stores `source_observation_id` and `dimension_index` as real
+columns, so the repoint is a join rather than a parse. SQLite cannot change a foreign key
+in place, so this is a table rebuild in the manner of `0006`.
+
+`<observationId>#u<index>` survives as the **wire alias**: it is what a briefing prints
+and what a worker copies, resolved to a `dimension_id` on the way in.
+`parseDimensionAddress` keeps refusing a non-canonical index, no worker-facing payload
+changes, and the identity behind the alias stops depending on position.
+
+#### A planner's judgement is not a test result
+
+The tool does not mark a dimension `tested`. §4 and §15 reserve that vocabulary for what
+a bounded test established against an explicit `tested_claim`; it is the same rule that
+makes a timeout not a negative result. A planner disposing of a dimension has executed
+nothing — it has decided the question is no longer worth asking. Spelling that `tested`
+would reintroduce precisely the conflation the observation contract exists to prevent,
+and no later reader could tell a dimension somebody measured from one somebody dropped.
+
+Two dispositions, both of which remove a dimension from the planner's open questions:
+
+- `subsumed` — other recorded observations already cover it. **Must cite them.**
+- `withdrawn` — not worth testing: out of scope, impractical, or overtaken by the goal.
+  **Must give a reason.**
+
+#### Bounded closure authority, attributed and reversible
+
+This changes §22's position that nothing closes a question and no closure authority
+exists, and the change is deliberate: a question nothing can retire accumulates for
+ever, and a brief that only grows eventually buries what matters. What does not change is
+that closure is a judgement rather than a derivation — so it is attributed, evidenced and
+reversible.
+
+The authority goes to the planner, whose own workload shrinks every time it exercises it.
+That incentive is the reason for each constraint below rather than a hypothetical:
+
+- `dimension_dispositions(id, dimension_id, disposition, reason, planner_session_id,
+round, created_at)`, with `dimension_disposition_basis(disposition_id,
+observation_id)` for the cited evidence.
+- Validated inside the write transaction, as `resolveAddress` already validates an
+  address: the dimension exists; a `subsumed` basis is non-empty and every cited
+  observation exists and belongs to the same goal; a `withdrawn` reason is a non-empty
+  string; a duplicate citation in one call is refused rather than collapsed.
+- At most one live disposition per dimension.
+- Author and round are recorded, so a round that retired nine questions is visible as one
+  round having retired nine questions.
+- Dispositions per planner round are capped under the same budget §4 already requires for
+  intent expansion.
+- **Nothing is deleted.** A dispositioned dimension leaves the brief, not the record: it
+  still renders on request and in reports, and a later observation or a human can reopen
+  it. A wrong disposition is recoverable rather than invisible.
+
+#### One derivation, not a stored flag
+
+A dimension's briefing state is computed over the links, the dispositions and intent
+provenance:
+
+| State                                             | Means                                                               |
+| ------------------------------------------------- | ------------------------------------------------------------------- |
+| `uninvestigated`                                  | no addressing observation, no live disposition, no intent naming it |
+| `scheduled`                                       | an intent names it; no addressing observation has landed yet        |
+| `addressedInconclusive` / `addressedWithEvidence` | as §22 defines them, from the addressers' own outcomes              |
+| `subsumed` / `withdrawn`                          | a live disposition; excluded from the planner's open questions      |
+
+`intents` gains a nullable `addresses_dimension`, stated by the planner as it creates the
+intent. It buys three things. `scheduled` becomes derivable, so a later round can tell
+"nobody has looked at this" from "work is out for this". Duplicate-intent detection
+becomes a join rather than the prose matching §4 warns against. And the same-intent
+constraint in `resolveAddress` can relax to _same goal, when the caller's own intent
+declares that dimension_ — so a planner may answer a dimension with a **new intent**,
+which today is a path no worker can close. Authority is still checked; it is checked
+against recorded lineage instead of an assumption.
+
+`scheduled` must not become §22's forever-`uncertain`. Once every attempt on the
+declaring intent has settled with no addressing observation, the dimension falls back to
+`uninvestigated`, carrying the history that somebody tried. A state that can be entered
+and never left is a lie with a long half-life.
+
+The count of dispositioned dimensions is disclosed in the brief the way truncated
+observations already are. A shorter brief must not be able to masquerade as a smaller
+graph.
+
+#### Migration plan
+
+Append-only, in order, each independently reviewable:
+
+- `0008_observation_dimensions` — the table, the backfill, the links rebuild.
+- `0009_dimension_dispositions` — dispositions and their cited basis.
+- `0010_intent_dimension_provenance` — `intents.addresses_dimension`.
+
+Reason: a planner needs a brief that narrows as questions are settled, and the record
+needs to say who settled each one and on what basis. Keeping those apart — a view that
+narrows, a record that only grows — is what stops a bounded test result and a planner's
+judgement from being spelled the same way.
+
+Still open, and not decided here: **when** a planner should answer a dimension with a new
+intent rather than another attempt on the raising one — this entry makes the first
+possible, not preferred — and whether anything below an observation, a case or an action
+or one concrete payload, needs its own identity so that a finding or a steer can cite it.
+
 ---
 
 ## 18. ScopeWeaver subsystems not yet represented
