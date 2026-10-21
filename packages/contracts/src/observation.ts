@@ -337,6 +337,17 @@ const recordObservationInputFields = {
   untestedDimensions: stringList(
     "Dimensions no case covered, left open for follow-up.",
   ),
+  /**
+   * Addresses of earlier observations' untested dimensions that this observation
+   * investigates. Explicit, never inferred: see {@link dimensionAddress}.
+   *
+   * This is submitted but is not a field of a stored {@link Observation}. It is a
+   * *relationship* between two observations, so it is persisted as one — the same way
+   * `operationId` is submitted and does not become part of the record it writes.
+   */
+  addressesDimensions: stringList(
+    "Addresses of untested dimensions from earlier observations that this observation investigates, exactly as the briefing printed them (for example obs_000003_attempt-x#u1). Empty when this observation addresses none. Addresses are never guessed: an unknown one is refused.",
+  ),
 };
 
 export const RecordObservationInput = Schema.Struct(
@@ -361,6 +372,7 @@ export const RecordObservationInputWire = Schema.Struct({
       operationId: "operation_id",
       testedClaim: "tested_claim",
       untestedDimensions: "untested_dimensions",
+      addressesDimensions: "addresses_dimensions",
     }),
   );
 
@@ -513,3 +525,70 @@ export const RecordObservationResultWire = Schema.Struct({
     }),
   ),
 }).pipe(Schema.encodeKeys({ observationId: "observation_id" }));
+
+/**
+ * The separator between an observation id and the index of one of its untested
+ * dimensions.
+ *
+ * `#` cannot occur in an observation id — they are built as
+ * `obs_<zero-padded sequence>_<attempt id>` — so an address splits unambiguously, and a
+ * reader can see which observation a question came from without consulting anything.
+ */
+export const DIMENSION_ADDRESS_SEPARATOR = "#u";
+
+/**
+ * The stable address of one untested dimension.
+ *
+ * **Why an index is sound here.** `untestedDimensions` is written once, inside the same
+ * transaction as the observation row, and nothing in this codebase updates an
+ * observation afterwards: there is no `UPDATE observations` statement and no path that
+ * rewrites the list. So position `n` of observation `o` names the same recorded
+ * sentence for as long as that row exists, which is what an address has to guarantee.
+ * The alternative — hashing the text — would make two identically worded dimensions one
+ * address and would silently change identity if the wording were ever corrected.
+ *
+ * The address is *not* the question's identity across rewording or merging. There is no
+ * rewording or merging; if either is ever introduced it needs its own identity scheme
+ * rather than this one stretched to cover it.
+ */
+export const dimensionAddress = (
+  observationId: string,
+  index: number,
+): string => `${observationId}${DIMENSION_ADDRESS_SEPARATOR}${String(index)}`;
+
+/**
+ * Parses an address back into the row and position it names, or `undefined`.
+ *
+ * Deliberately strict: the index must be a canonical non-negative integer, so
+ * `obs_1#u01` and `obs_1#u1` cannot both address the same dimension under two spellings.
+ * Nothing here checks that the observation or the position *exists* — that is a
+ * database question, answered at the write boundary against the caller's own intent.
+ */
+export const parseDimensionAddress = (
+  address: string,
+): { readonly observationId: string; readonly index: number } | undefined => {
+  const separator = address.lastIndexOf(DIMENSION_ADDRESS_SEPARATOR);
+  if (separator <= 0) return undefined;
+  const observationId = address.slice(0, separator);
+  const indexText = address.slice(
+    separator + DIMENSION_ADDRESS_SEPARATOR.length,
+  );
+  if (!/^(0|[1-9][0-9]*)$/.test(indexText)) return undefined;
+  const index = Number(indexText);
+  return Number.isSafeInteger(index) ? { observationId, index } : undefined;
+};
+
+/**
+ * One recorded untested dimension, with its address.
+ *
+ * Derived from a stored observation rather than stored separately, so an address can
+ * never name a dimension the row does not hold.
+ */
+export const dimensionsOf = (observation: {
+  readonly observationId: string;
+  readonly untestedDimensions: readonly string[];
+}): ReadonlyArray<{ readonly address: string; readonly dimension: string }> =>
+  observation.untestedDimensions.map((dimension, index) => ({
+    address: dimensionAddress(observation.observationId, index),
+    dimension,
+  }));

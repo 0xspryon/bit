@@ -24,6 +24,17 @@ export class HarnessTransportError extends Schema.TaggedError<HarnessTransportEr
     operation: Schema.String,
     /** HTTP status, or `undefined` when no response was received at all. */
     status: Schema.UndefinedOr(Schema.Int),
+    /**
+     * The generated client's own tag for the failure, when it had one.
+     *
+     * Kept because one distinction downstream genuinely needs it: "this session does
+     * not exist" (`SessionNotFoundError`) is a different fact from "we could not ask",
+     * and recovery maps the two to different dispositions. It is the client's
+     * vocabulary, not ours — a value we recognise, never one we invent — so it is a
+     * plain string rather than a union this build would have to keep in step with
+     * `@opencode/protocol`, which is not a declared dependency here.
+     */
+    tag: Schema.UndefinedOr(Schema.String),
     detail: Schema.String,
     cause: Schema.Defect(),
   },

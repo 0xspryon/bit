@@ -18,6 +18,9 @@ import { join } from "node:path";
 
 import {
   RecordObservationInput,
+  dimensionAddress,
+  dimensionsOf,
+  parseDimensionAddress,
   type Observation,
   type RecordObservationInput as Input,
 } from "@bit/contracts";
@@ -27,6 +30,7 @@ import { SqlClient } from "effect/sql";
 
 import {
   AWKWARD_TEXT,
+  RUNNING_ATTEMPT_ID,
   SUMMARY_CONDITIONS,
   SUMMARY_OBSERVATION_ID,
   multiCaseInput,
@@ -83,6 +87,8 @@ const CALLER: CallerContext = {
   attemptId: "attempt-1",
   harnessSessionId: "ses_abc",
   workerId: "worker-1",
+  // The fence a credential minted against a freshly seeded attempt carries.
+  attemptFence: 0,
 };
 
 const OTHER_CALLER: CallerContext = {
@@ -315,9 +321,9 @@ describe("recordObservation", () => {
     expect(sequences).toEqual([1, 2, 3, 4, 5]);
   });
 
-  test("an observation naming an attempt that does not exist is refused", async () => {
-    // The foreign keys in the migration are only worth having if they are enforced;
-    // `pragmaLayer` is what makes this a refusal rather than an orphan row.
+  test("an observation naming an attempt that does not exist is refused as unauthorized", async () => {
+    // The authority check reaches this before the foreign key does, and says something
+    // more useful: an unregistered attempt is a caller problem, not a storage fault.
     const path = newDatabasePath();
     const outcome = await withStore(path, (store) =>
       Effect.gen(function* () {
@@ -336,11 +342,48 @@ describe("recordObservation", () => {
 
     expect(outcome.failure._tag).toBe("Failure");
     if (outcome.failure._tag === "Failure") {
-      expect(outcome.failure.failure._tag).toBe("DatabaseError");
+      expect(outcome.failure.failure).toBeInstanceOf(MutationError);
+      expect((outcome.failure.failure as MutationError).reason).toBe(
+        "unauthorized",
+      );
     }
     expect(outcome.stored).toHaveLength(0);
-    // The sequence bump happened before the refused insert, in the same transaction.
+    // Refused before the sequence was touched, so no gap is burned on a rejected call.
     expect(outcome.sequence).toBe(0);
+  });
+
+  test("the foreign key still backs the authority check", async () => {
+    // Belt and braces, and worth proving separately: the authority check is what a
+    // caller sees, but `pragmaLayer`'s `foreign_keys = ON` is what makes an orphan
+    // observation impossible even for a statement that bypassed it.
+    const path = newDatabasePath();
+    const outcome = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const store = yield* ObservationStore;
+          yield* migrated(store);
+          const sql = yield* SqlClient.SqlClient;
+          return yield* Effect.result(
+            sql`INSERT INTO observations (
+              id, sequence, record_format, target_id, intent_id, attempt_id,
+              harness_session_id, worker_id, tested_claim, outcome, interpretation,
+              limitations, untested_dimensions, recorded_at, setup, cases,
+              summary_conditions, summary_observed_behavior, summary_evidence_refs
+            ) VALUES ('orphan', 99, 'case_based', 'target-1', 'intent-1',
+              'attempt-never-seeded', 's', 'w', 'c', 'positive', 'i', '[]', '[]', 1,
+              'setup', '[]', NULL, NULL, NULL)`,
+          );
+        }).pipe(
+          Effect.provide(ObservationStore.layerWithClient),
+          Effect.provide(sqliteLayer(path)),
+        ),
+      ),
+    );
+
+    expect(outcome._tag).toBe("Failure");
+    if (outcome._tag === "Failure") {
+      expect(outcome.failure.reason._tag).toBe("ConstraintError");
+    }
   });
 });
 
@@ -657,12 +700,15 @@ describe("summary-format observations", () => {
       Effect.gen(function* () {
         yield* store.recordObservation(
           {
-            callerScope: "fixture-local/attempt-summary",
+            // The adopted database's *running* attempt. `attempt-summary` is settled,
+            // and a settled attempt is exactly what the authority check must refuse.
+            callerScope: `fixture-local/${RUNNING_ATTEMPT_ID}`,
             targetId: "fixture-local",
             intentId: "intent-per-client-limiter",
-            attemptId: "attempt-summary",
+            attemptId: RUNNING_ATTEMPT_ID,
             harnessSessionId: "ses_new",
             workerId: "worker-1",
+            attemptFence: 0,
           },
           multiCaseInput({ operationId: "op-after-upgrade" }),
         );
@@ -692,6 +738,7 @@ describe("summary-format observations", () => {
               attemptId: "attempt-summary",
               harnessSessionId: "ses_new",
               workerId: "worker-1",
+              attemptFence: 0,
             },
             multiCaseInput({ operationId: "summary-op-1" }),
           ),
@@ -941,5 +988,515 @@ describe("recorded time", () => {
     );
 
     expect(stored[0]?.provenance.recordedAt).toBe(1_700_000_000_000);
+  });
+});
+
+/**
+ * The address helpers are contract code, tested here.
+ *
+ * They belong to `@bit/contracts`, which deliberately cannot import `bun:test` — the
+ * lint boundary that keeps that package browser-safe forbids every `bun:*` and `node:*`
+ * import, and weakening it for a test file would weaken the guarantee it exists for. So
+ * they are exercised in the suite that depends on them, next to the validation they
+ * feed.
+ */
+describe("dimension addresses", () => {
+  test("an address round-trips, and only in its canonical spelling", () => {
+    expect(dimensionAddress("obs_000003_attempt-x", 1)).toBe(
+      "obs_000003_attempt-x#u1",
+    );
+    expect(parseDimensionAddress("obs_000003_attempt-x#u1")).toEqual({
+      observationId: "obs_000003_attempt-x",
+      index: 1,
+    });
+    expect(parseDimensionAddress("obs_000003_attempt-x#u0")).toEqual({
+      observationId: "obs_000003_attempt-x",
+      index: 0,
+    });
+    // Two spellings of one position would be two addresses for one question.
+    expect(parseDimensionAddress("obs_1#u01")).toBeUndefined();
+    expect(parseDimensionAddress("obs_1#u-1")).toBeUndefined();
+    expect(parseDimensionAddress("obs_1#u")).toBeUndefined();
+    expect(parseDimensionAddress("obs_1")).toBeUndefined();
+    expect(parseDimensionAddress("#u1")).toBeUndefined();
+    expect(parseDimensionAddress("")).toBeUndefined();
+  });
+
+  test("dimensionsOf pairs each recorded dimension with its own address", () => {
+    expect(
+      dimensionsOf({
+        observationId: "obs_000001_a",
+        untestedDimensions: ["first", "second"],
+      }),
+    ).toEqual([
+      { address: "obs_000001_a#u0", dimension: "first" },
+      { address: "obs_000001_a#u1", dimension: "second" },
+    ]);
+  });
+});
+
+describe("addressing an earlier untested dimension", () => {
+  /** Writes one observation with two untested dimensions, and returns its id. */
+  const withRaiser = <A, E>(
+    use: (store: Store, raiserId: string) => Effect.Effect<A, E>,
+  ) => {
+    const path = newDatabasePath();
+    return withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        const raiser = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "raiser",
+            untestedDimensions: ["the per-account limit", "window rollover"],
+          }),
+        );
+        return yield* use(store, raiser.observationId);
+      }),
+    );
+  };
+
+  test("a valid address is recorded as a link, with the position it resolved to", async () => {
+    const outcome = await withRaiser((store, raiserId) =>
+      Effect.gen(function* () {
+        const follow = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "follow-up",
+            addressesDimensions: [dimensionAddress(raiserId, 1)],
+          }),
+        );
+        return {
+          follow,
+          links: yield* store.dimensionLinksForIntent("intent-1"),
+        };
+      }),
+    );
+
+    expect(outcome.links).toEqual([
+      {
+        observationId: outcome.follow.observationId,
+        address: `${outcome.links[0]?.sourceObservationId ?? ""}#u1`,
+        sourceObservationId: outcome.links[0]?.sourceObservationId ?? "",
+        dimensionIndex: 1,
+      },
+    ]);
+    expect(outcome.links[0]?.sourceObservationId).toBe("obs_000001_attempt-1");
+  });
+
+  test("an address naming an observation that does not exist is refused, and nothing is written", async () => {
+    const outcome = await withRaiser((store) =>
+      Effect.gen(function* () {
+        const refused = yield* Effect.result(
+          store.recordObservation(
+            CALLER,
+            multiCaseInput({
+              operationId: "ghost-address",
+              addressesDimensions: ["obs_999999_attempt-1#u0"],
+            }),
+          ),
+        );
+        return {
+          refused,
+          stored: yield* store.observationsForIntent("intent-1"),
+          links: yield* store.dimensionLinksForIntent("intent-1"),
+          sequence: yield* store.currentSequence,
+        };
+      }),
+    );
+
+    expect(outcome.refused._tag).toBe("Failure");
+    if (outcome.refused._tag === "Failure") {
+      expect(outcome.refused.failure).toBeInstanceOf(MutationError);
+      expect((outcome.refused.failure as MutationError).reason).toBe("invalid");
+    }
+    // Atomic: the refused call left no observation, no link and no sequence gap.
+    expect(outcome.stored).toHaveLength(1);
+    expect(outcome.links).toHaveLength(0);
+    expect(outcome.sequence).toBe(1);
+  });
+
+  test("an address pointing past the recorded dimensions is refused", async () => {
+    const outcome = await withRaiser((store, raiserId) =>
+      Effect.result(
+        store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "out-of-range",
+            // The raiser recorded two dimensions, so index 2 does not exist.
+            addressesDimensions: [dimensionAddress(raiserId, 2)],
+          }),
+        ),
+      ),
+    );
+
+    expect(outcome._tag).toBe("Failure");
+    if (outcome._tag === "Failure") {
+      expect((outcome.failure as MutationError).detail).toContain(
+        "recorded 2 untested dimensions",
+      );
+    }
+  });
+
+  test("a malformed address is refused with the spelling it expected", async () => {
+    const outcome = await withRaiser((store) =>
+      Effect.result(
+        store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "malformed",
+            addressesDimensions: ["the per-account limit"],
+          }),
+        ),
+      ),
+    );
+
+    expect(outcome._tag).toBe("Failure");
+    if (outcome._tag === "Failure") {
+      expect((outcome.failure as MutationError).detail).toContain(
+        "is not an untested-dimension address",
+      );
+    }
+  });
+
+  test("an address belonging to another intent is refused", async () => {
+    // Addresses are not a global namespace a worker can reach across. An intent's
+    // worker must not be able to claim progress on someone else's question.
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        yield* store.seedAttempt({
+          targetId: "target-1",
+          goalId: "goal-1",
+          goal: "Determine whether authentication rate limits can be bypassed.",
+          intentId: "intent-other",
+          question: "A different direction entirely.",
+          attemptId: "attempt-other",
+          workerId: "worker-1",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          harnessSessionId: "ses_other",
+        });
+        const elsewhere = yield* store.recordObservation(
+          {
+            ...CALLER,
+            callerScope: "target-1/attempt-other",
+            intentId: "intent-other",
+            attemptId: "attempt-other",
+          },
+          multiCaseInput({
+            operationId: "elsewhere",
+            untestedDimensions: ["a question under another intent"],
+          }),
+        );
+        const refused = yield* Effect.result(
+          store.recordObservation(
+            CALLER,
+            multiCaseInput({
+              operationId: "cross-intent",
+              addressesDimensions: [
+                dimensionAddress(elsewhere.observationId, 0),
+              ],
+            }),
+          ),
+        );
+        return {
+          refused,
+          links: yield* store.dimensionLinksForIntent("intent-1"),
+        };
+      }),
+    );
+
+    expect(outcome.refused._tag).toBe("Failure");
+    if (outcome.refused._tag === "Failure") {
+      expect((outcome.refused.failure as MutationError).detail).toContain(
+        "belongs to intent intent-other",
+      );
+    }
+    expect(outcome.links).toHaveLength(0);
+  });
+
+  test("the same address listed twice in one call is refused rather than collapsed", async () => {
+    const outcome = await withRaiser((store, raiserId) =>
+      Effect.result(
+        store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "duplicate-address",
+            addressesDimensions: [
+              dimensionAddress(raiserId, 0),
+              dimensionAddress(raiserId, 0),
+            ],
+          }),
+        ),
+      ),
+    );
+
+    expect(outcome._tag).toBe("Failure");
+    if (outcome._tag === "Failure") {
+      expect((outcome.failure as MutationError).detail).toContain(
+        "is listed twice",
+      );
+    }
+  });
+
+  test("an exact retry replays and writes no second link", async () => {
+    // The receipt covers the whole call, links included: the hash is over the input,
+    // so the address list is part of what makes a retry exact.
+    const outcome = await withRaiser((store, raiserId) =>
+      Effect.gen(function* () {
+        const input = multiCaseInput({
+          operationId: "idempotent-follow-up",
+          addressesDimensions: [dimensionAddress(raiserId, 0)],
+        });
+        const first = yield* store.recordObservation(CALLER, input);
+        const second = yield* store.recordObservation(CALLER, input);
+        const conflict = yield* Effect.result(
+          store.recordObservation(CALLER, {
+            ...input,
+            addressesDimensions: [dimensionAddress(raiserId, 1)],
+          }),
+        );
+        return {
+          first,
+          second,
+          conflict,
+          links: yield* store.dimensionLinksForIntent("intent-1"),
+        };
+      }),
+    );
+
+    expect(outcome.second.replayed).toBe(true);
+    expect(outcome.links).toHaveLength(1);
+    // Changing the address list under the same operation ID is a conflict, like any
+    // other change to the input.
+    expect(outcome.conflict._tag).toBe("Failure");
+    if (outcome.conflict._tag === "Failure") {
+      expect((outcome.conflict.failure as MutationError).reason).toBe(
+        "conflict",
+      );
+    }
+  });
+
+  test("links survive a reopen and come back in the order work was taken on", async () => {
+    const path = newDatabasePath();
+    const raiserId = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        const raiser = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "raiser",
+            untestedDimensions: ["first gap", "second gap"],
+          }),
+        );
+        yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "follow-a",
+            addressesDimensions: [dimensionAddress(raiser.observationId, 0)],
+          }),
+        );
+        yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({
+            operationId: "follow-b",
+            addressesDimensions: [dimensionAddress(raiser.observationId, 1)],
+          }),
+        );
+        return raiser.observationId;
+      }),
+    );
+
+    const links = await withStore(path, (store) =>
+      store.dimensionLinksForIntent("intent-1"),
+    );
+
+    expect(links.map((link) => link.address)).toEqual([
+      dimensionAddress(raiserId, 0),
+      dimensionAddress(raiserId, 1),
+    ]);
+    expect(links.map((link) => link.observationId)).toEqual([
+      "obs_000002_attempt-1",
+      "obs_000003_attempt-1",
+    ]);
+  });
+});
+
+describe("settling an attempt", () => {
+  test("settlement moves a running attempt once and reports that it did", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        const first = yield* store.settleAttempt("attempt-1", "succeeded");
+        const second = yield* store.settleAttempt("attempt-1", "failed");
+        return {
+          first,
+          second,
+          attempt: yield* store.loadAttempt("attempt-1", "target-1"),
+        };
+      }),
+    );
+
+    expect(outcome.first).toEqual({
+      requested: "succeeded",
+      effective: "succeeded",
+      changed: true,
+    });
+    // A second settlement does not overwrite the first. A worker settling late must not
+    // be able to undo what reconciliation decided, and vice versa.
+    expect(outcome.second).toEqual({
+      requested: "failed",
+      effective: "succeeded",
+      changed: false,
+    });
+    expect(outcome.attempt?.status).toBe("succeeded");
+  });
+
+  test("settling an attempt that does not exist reports no effective status", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        return yield* store.settleAttempt("attempt-never", "succeeded");
+      }),
+    );
+
+    expect(outcome).toEqual({
+      requested: "succeeded",
+      effective: undefined,
+      changed: false,
+    });
+  });
+
+  test("the unsettled set is running and uncertain, and nothing else", async () => {
+    // The statuses reconciliation has rules for, named by the query rather than derived
+    // as "not final": a row holding something else is left alone instead of being fed
+    // to a decision that would read it as `running` and move it.
+    const path = newDatabasePath();
+    await withStore(path, (store) =>
+      Effect.gen(function* () {
+        for (const attemptId of [
+          "attempt-live",
+          "attempt-unknown",
+          "attempt-uncertain",
+          "attempt-done",
+        ]) {
+          yield* seed(store, attemptId);
+        }
+        yield* store.settleAttempt("attempt-done", "succeeded");
+        yield* store.settleAttempt("attempt-uncertain", "uncertain");
+      }),
+    );
+    const sqlite = new (await import("bun:sqlite")).Database(path);
+    sqlite.run(
+      `UPDATE attempts SET status = 'something_else' WHERE id = 'attempt-unknown'`,
+    );
+    sqlite.close();
+
+    const unsettled = await withStore(path, (store) =>
+      store.unsettledAttempts(),
+    );
+
+    expect(
+      unsettled.map((attempt) => [attempt.id, attempt.status]).sort(),
+    ).toEqual([
+      ["attempt-live", "running"],
+      ["attempt-uncertain", "uncertain"],
+    ]);
+  });
+});
+
+describe("the planner session lineage", () => {
+  test("a target with no recorded lineage is undefined, not an error", async () => {
+    // The first planner round on a target has nothing to join, and that is an ordinary
+    // answer rather than a missing row to report.
+    const lineage = await withStore(newDatabasePath(), (store) =>
+      store.plannerLineage("target-1"),
+    );
+    expect(lineage).toBeUndefined();
+  });
+
+  test("a recorded lineage survives a reopen, and is per target", async () => {
+    // Surviving the process is the entire point: within one run a caller could hold the
+    // session id in memory, and a hunt is not one run.
+    const path = newDatabasePath();
+    await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.recordPlannerLineage("target-1", "ses_one");
+        yield* store.recordPlannerLineage("target-2", "ses_two");
+      }),
+    );
+
+    const reopened = await withStore(path, (store) =>
+      Effect.all({
+        first: store.plannerLineage("target-1"),
+        second: store.plannerLineage("target-2"),
+        absent: store.plannerLineage("target-3"),
+      }),
+    );
+
+    expect(reopened).toEqual({
+      first: "ses_one",
+      second: "ses_two",
+      absent: undefined,
+    });
+  });
+
+  test("recording again replaces the lineage instead of adding a second one", async () => {
+    // What happens when the harness has forgotten the session we recorded: the next
+    // round opens a new one and this is the write that retires the old id. Two current
+    // lineages for one target would make "which session do rounds join" unanswerable.
+    const path = newDatabasePath();
+    const after = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.recordPlannerLineage("target-1", "ses_gone");
+        yield* store.recordPlannerLineage("target-1", "ses_fresh");
+        return yield* store.plannerLineage("target-1");
+      }),
+    );
+    expect(after).toBe("ses_fresh");
+
+    const sqlite = new (await import("bun:sqlite")).Database(path);
+    const rows = sqlite
+      .query(
+        `SELECT target_id, harness_session_id FROM planner_lineages ORDER BY target_id`,
+      )
+      .all();
+    sqlite.close();
+    expect(rows).toEqual([
+      { target_id: "target-1", harness_session_id: "ses_fresh" },
+    ]);
+  });
+
+  test("the lineage holds no knowledge: dropping it changes no briefing", async () => {
+    // Stated as a test because it is the justification for the table existing at all.
+    // It is a cache hint, so losing it may cost one uncached round and must cost
+    // nothing else.
+    const path = newDatabasePath();
+    const before = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store);
+        yield* store.recordObservation(CALLER, multiCaseInput());
+        yield* store.recordPlannerLineage("target-1", "ses_one");
+        return yield* store.observationsForIntent("intent-1");
+      }),
+    );
+
+    const sqlite = new (await import("bun:sqlite")).Database(path);
+    sqlite.run(`DELETE FROM planner_lineages`);
+    sqlite.close();
+
+    const after = await withStore(path, (store) =>
+      Effect.all({
+        observations: store.observationsForIntent("intent-1"),
+        lineage: store.plannerLineage("target-1"),
+      }),
+    );
+
+    expect(after.observations).toEqual(before);
+    expect(after.lineage).toBeUndefined();
   });
 });

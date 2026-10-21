@@ -21,6 +21,12 @@
  * The token is `Redacted` so it cannot reach a log line or an error rendering by
  * accident; `Redacted.value` is required to use it, and the only place that does is the
  * single registration call that delivers it.
+ *
+ * **The grant carries the attempt's write fence.** A credential is authority *as of* a
+ * moment: the fence is read from the attempt row when the credential is minted, and the
+ * store refuses a write whose fence has since been superseded. That is what makes
+ * revocation outlive this registry — the map is per-process and a restart forgets it,
+ * while the fence is a column.
  */
 import { Clock, Context, Effect, Layer, Redacted, type Scope } from "effect";
 
@@ -59,6 +65,16 @@ export class McpCredentials extends Context.Service<
     readonly resolve: (token: string) => Effect.Effect<Grant | undefined>;
     /** Revokes early. Idempotent, and also what the scope finalizer calls. */
     readonly revoke: (token: Redacted.Redacted<string>) => Effect.Effect<void>;
+    /**
+     * Revokes every live grant bound to one attempt, returning how many there were.
+     *
+     * This is the in-memory half of fencing a recovered attempt: the durable half is
+     * the attempt's `write_fence`, which survives a restart. Both exist because they
+     * cover different windows — the fence stops a credential minted before a restart,
+     * and this stops one still held in *this* process by a session we have just given
+     * up on. Idempotent: a second call finds nothing and returns 0.
+     */
+    readonly revokeAttempt: (attemptId: string) => Effect.Effect<number>;
     /** Live grants. Used by tests to prove nothing outlived its scope. */
     readonly size: Effect.Effect<number>;
   }
@@ -97,6 +113,19 @@ export class McpCredentials extends Context.Service<
       );
     });
 
+    const revokeAttempt: McpCredentials["Service"]["revokeAttempt"] = (
+      attemptId: string,
+    ) =>
+      Effect.sync(() => {
+        let revoked = 0;
+        for (const [key, grant] of [...grants]) {
+          if (grant.attemptId !== attemptId) continue;
+          grants.delete(key);
+          revoked += 1;
+        }
+        return revoked;
+      });
+
     const resolve: McpCredentials["Service"]["resolve"] = Effect.fnUntraced(
       function* (token: string) {
         const key = hash(token);
@@ -115,6 +144,7 @@ export class McpCredentials extends Context.Service<
       issue,
       resolve,
       revoke,
+      revokeAttempt,
       size: Effect.sync(() => grants.size),
     });
   });

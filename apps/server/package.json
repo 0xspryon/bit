@@ -8,7 +8,7 @@
     "start": "bun dist/main.js",
     "typecheck": "tsc -p tsconfig.json",
     "test": "bun test",
-    "test:persistence": "bun test src/persistence src/briefing"
+    "test:persistence": "bun test src/persistence src/briefing src/recovery"
   },
   "dependencies": {
     "@bit/contracts": "workspace:*",

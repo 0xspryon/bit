@@ -172,10 +172,29 @@ export class OpenCodeClient extends Context.Service<
         readonly directory: string;
       },
     ) => Effect.Effect<void, HarnessTransportError | HarnessDecodeError>;
+    /**
+     * Opens a session, optionally inside an existing session's lineage.
+     *
+     * `parentSessionId` exists for provider prompt caching and nothing else. OpenCode
+     * derives one cache key per lineage — `parentID ?? fork.sessionID ?? id`
+     * (`core/src/session/affinity.ts`), sent as `prompt_cache_key` and as the
+     * `x-session-affinity` header (`core/src/session/model-request.ts`) — so sessions
+     * that name the same parent are routed to the same cached prefix, and separately
+     * created top-level sessions never are, however identical their prompts.
+     *
+     * A child is **not** a fork: only the fork path copies messages across
+     * (`core/src/session/projector.ts`), so the new session starts empty and a briefing
+     * remains the only thing in it. What a parent does change is crash recovery —
+     * OpenCode resumes only parentless sessions (`SessionStore.listSuspended`) and
+     * merely releases a child's claim — which is why this is passed for planner rounds,
+     * whose state is the graph, and not for worker sessions, whose interruption is
+     * reconciled by us and should stay resumable by the harness.
+     */
     readonly createSession: (input: {
       readonly title: string;
       readonly model: ModelRef;
       readonly directory: string;
+      readonly parentSessionId?: string | undefined;
     }) => Effect.Effect<SessionRef, HarnessTransportError | HarnessDecodeError>;
     readonly prompt: (
       sessionId: string,
@@ -264,6 +283,7 @@ export class OpenCodeClient extends Context.Service<
             : new HarnessTransportError({
                 operation,
                 status,
+                tag,
                 detail: `${tag}: ${detail}`,
                 cause,
               });
@@ -284,6 +304,7 @@ export class OpenCodeClient extends Context.Service<
                 new HarnessTransportError({
                   operation,
                   status: undefined,
+                  tag: "TimeoutError",
                   detail:
                     "request exceeded its transport bound and was aborted; " +
                     "this does not mean the harness stopped working",
@@ -316,11 +337,11 @@ export class OpenCodeClient extends Context.Service<
                     type: "remote",
                     url: config.url,
                     // Pinned, not negotiated: our endpoint serves only the stateless
-                    // 2026-07-28 revision, and this client's default ("legacy") would
-                    // open with an `initialize` handshake the server does not
-                    // implement. "auto" would probe and silently fall back; there is
-                    // nothing to fall back to. Typed by the schema, so a typo here is
-                    // a compile error rather than a connection failure at run time.
+                    // 2026-07-28 revision, and this field's default value would open
+                    // with an `initialize` handshake the server does not implement.
+                    // "auto" would probe and silently fall back; there is nothing to
+                    // fall back to. Typed by the schema, so a typo here is a compile
+                    // error rather than a connection failure at run time.
                     protocol: "2026-07-28",
                     // Unwrapped only here, at the one call that delivers it.
                     headers: Object.fromEntries(
@@ -357,6 +378,13 @@ export class OpenCodeClient extends Context.Service<
                   id: Schema.decodeUnknownSync(ModelID)(input.model.id),
                 },
                 location: { directory: directoryOf(input.directory) },
+                // Spread rather than passed as `undefined` so the call site reads as
+                // "no parent" rather than "parent: nothing". On the wire both are the
+                // same: the generated client encodes an absent optional as an explicit
+                // `null`, which is what the server reads as parentless.
+                ...(input.parentSessionId === undefined
+                  ? {}
+                  : { parentID: input.parentSessionId as Session.ID }),
               }),
             );
             return { id: session.id };

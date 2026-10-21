@@ -1,11 +1,12 @@
 /**
  * The one HTTP endpoint this control plane serves.
  *
- * There were two listeners: the MCP endpoint the worker calls back into, and the policy
- * endpoint the harness-side hook consults before a tool runs. They answered on separate
- * ports, with separate `Bun.serve` instances, separate scopes and separately hand-rolled
- * request handling. They are one listener now — one port, one origin policy, one
- * shutdown path, one base URL to hand out.
+ * There were two listeners and, in a separate process, a third hand-written one: the MCP
+ * endpoint the worker calls back into, the policy endpoint the harness-side hook
+ * consults before a tool runs, and `main.ts`'s own `Bun.serve` answering the health
+ * route out of a bare `fetch` callback. They are one listener now — one port, one origin
+ * policy, one shutdown path, one base URL to hand out — and `main.ts` serves *this*
+ * rather than a second composition of its own.
  *
  * **The routes keep their own postures, and that is the point of merging on a router
  * rather than in a `fetch` handler.** `McpServer.layerHttp` applies its bearer
@@ -15,6 +16,11 @@
  *   `401` before any protocol handling, tool list or dispatch.
  * - `/api/v1/policy/decide` is deliberately unauthenticated, at the operator's
  *   direction. The reasoning and its cost are recorded on `policyRoutes` itself.
+ * - `/api/v1/health` is unauthenticated and says one word. It is a liveness answer for
+ *   the browser app and a proxy, and it deliberately reports nothing about the store,
+ *   the harness or any attempt: a health endpoint that leaks internal state is a
+ *   reconnaissance surface, and one that fails when a subsystem is degraded cannot be
+ *   used to tell "the process is up" from "the database is slow".
  *
  * Sharing a port does not blur that: a request is routed by path first, and each route
  * carries whatever admission its own layer declared.
@@ -29,8 +35,9 @@
  * method handling, `415` on the wrong content type, `406` on the wrong accept header and
  * origin checks, none of which the hand-written policy handler did.
  */
+import { apiPath, type Health } from "@bit/contracts";
 import { Context, Effect, Layer } from "effect";
-import { HttpRouter } from "effect/http";
+import { HttpRouter, HttpServerResponse } from "effect/http";
 
 import { McpCredentials } from "../mcp/credentials";
 import { MCP_PATH, McpApplicationLayer, McpCallCounter } from "../mcp/server";
@@ -44,11 +51,35 @@ import {
   type PolicyRequest,
 } from "../policy/service";
 
+/** The one path the health route answers on, under the shared API prefix. */
+export const HEALTH_PATH = apiPath("health");
+
+/**
+ * Registers `GET {@link HEALTH_PATH}` on the ambient router.
+ *
+ * Built per request rather than once at registration: a response value is cheap, and a
+ * handler that returns a shared instance invites a later edit to start mutating it.
+ */
+const healthRoutes = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const router = yield* HttpRouter.HttpRouter;
+    yield* router.add(
+      "GET",
+      HEALTH_PATH,
+      Effect.sync(() =>
+        HttpServerResponse.jsonUnsafe({ status: "ok" } satisfies Health),
+      ),
+    );
+  }),
+);
+
 export interface ControlPlaneHandle {
   /** Where the worker's MCP client connects. */
   readonly mcpUrl: string;
   /** Where the harness-side policy hook posts. */
   readonly policyUrl: string;
+  /** Liveness, on the same origin as the other two. */
+  readonly healthUrl: string;
   /** Authenticated MCP requests served, for asserting the worker really reached us. */
   readonly callCount: Effect.Effect<number>;
   /** Policy decisions answered, in order. */
@@ -86,6 +117,7 @@ export class ControlPlaneEndpoint extends Context.Service<
         const application = Layer.mergeAll(
           McpApplicationLayer,
           policyRoutes(options.policy),
+          healthRoutes,
         ).pipe(
           Layer.provideMerge(Layer.succeed(ObservationStore, store)),
           Layer.provideMerge(Layer.succeed(McpCredentials, credentials)),
@@ -115,6 +147,7 @@ export class ControlPlaneEndpoint extends Context.Service<
         return ControlPlaneEndpoint.of({
           mcpUrl: `${origin}${MCP_PATH}`,
           policyUrl: `${origin}${POLICY_DECIDE_PATH}`,
+          healthUrl: `${origin}${HEALTH_PATH}`,
           callCount: counter.count,
           decisions: decisions.all,
         });

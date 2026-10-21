@@ -29,7 +29,7 @@
  * a live `opencode serve` and a policy listener on exactly the runs where you most want
  * a clean machine.
  */
-import { mkdirSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { Effect, Layer } from "effect";
@@ -42,7 +42,7 @@ import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { ObservationStore } from "../persistence/store";
 import { runMain } from "./main";
-import { RUNTIME_DIR, WORKER_MODEL } from "./runtime";
+import { prepareWorkspace, RUNTIME_DIR, WORKER_MODEL } from "./runtime";
 
 const IN_SCOPE = "in-scope.txt";
 const OUT_OF_SCOPE = "out-of-scope-secret.txt";
@@ -106,66 +106,6 @@ const runProbe = Effect.fn("runProbe")(function* (name: string, task: string) {
 });
 
 /**
- * Lays out the workspace: the plugin, a config that loads it, and the two files.
- *
- * A *configured* local plugin must point at a DIRECTORY with an `index`/`server`
- * entrypoint, not a bare file — opencode logs "configured plugin path must be a
- * directory" and skips it otherwise (`packages/plugin/src/host.ts:17-42`).
- * Deliberately not named `plugin/`, which is auto-discovered and would load a second
- * copy with no options (`packages/core/src/plugin/source-directory.ts:9`).
- */
-const prepareWorkspace = Effect.fn("prepareWorkspace")(function* (
-  policyUrl: string,
-) {
-  yield* Effect.promise(async () => {
-    mkdirSync(join(WORKSPACE, ".opencode", "policy"), { recursive: true });
-    writeFileSync(join(WORKSPACE, IN_SCOPE), "in-scope content: SAFE-MARKER\n");
-    writeFileSync(
-      join(WORKSPACE, OUT_OF_SCOPE),
-      "out-of-scope content: FORBIDDEN-MARKER\n",
-    );
-    writeFileSync(AUDIT_PATH, "");
-    const plugin = await Bun.file(
-      join(import.meta.dir, "..", "..", "plugins", "policyHook.ts"),
-    ).text();
-    await Bun.write(join(WORKSPACE, ".opencode", "policy", "index.ts"), plugin);
-    await Bun.write(
-      join(WORKSPACE, ".opencode", "policy", "package.json"),
-      `${JSON.stringify(
-        {
-          name: "bit-policy-hook",
-          private: true,
-          type: "module",
-          main: "index.ts",
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    await Bun.write(
-      join(WORKSPACE, ".opencode", "opencode.json"),
-      `${JSON.stringify(
-        {
-          $schema: "https://opencode.ai/config.json",
-          // `plugins` (not `plugin`) is the key that accepts the object form.
-          // The superseded `plugin` key takes a string or a `[package, options]` tuple,
-          // and an object there is silently skipped as malformed
-          // (opencode `packages/core/src/config/normalize.ts:185-190`).
-          plugins: [
-            {
-              package: "./policy",
-              options: { policyUrl, auditPath: AUDIT_PATH },
-            },
-          ],
-        },
-        null,
-        2,
-      )}\n`,
-    );
-  });
-});
-
-/**
  * The workspace the harness needs, written against a live policy endpoint.
  *
  * This is a layer, not a step inside the probe, because the plugin config it writes has
@@ -175,7 +115,22 @@ const prepareWorkspace = Effect.fn("prepareWorkspace")(function* (
  */
 const policyWorkspace = Layer.effectDiscard(
   Effect.flatMap(ControlPlaneEndpoint, (endpoint) =>
-    prepareWorkspace(endpoint.policyUrl),
+    // The same workspace preparation the worker run uses, which is the point: this
+    // probe and the real run must load the identical hook the identical way, or what
+    // this proves says nothing about what that enforces.
+    prepareWorkspace({
+      workspace: WORKSPACE,
+      files: {
+        [IN_SCOPE]: "in-scope content: SAFE-MARKER\n",
+        [OUT_OF_SCOPE]: "out-of-scope content: FORBIDDEN-MARKER\n",
+      },
+      hook: {
+        policyUrl: endpoint.policyUrl,
+        auditPath: AUDIT_PATH,
+        // One scope, one run, one audit file: this probe's output is the file.
+        freshAudit: true,
+      },
+    }),
   ),
 ).pipe(Layer.provide(workspaceExists));
 

@@ -14,7 +14,7 @@ import { join } from "node:path";
 
 import { Context, Effect, Layer, ManagedRuntime, Redacted } from "effect";
 
-import { ControlPlaneEndpoint } from "./controlPlane";
+import { ControlPlaneEndpoint, HEALTH_PATH } from "./controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { ObservationStore } from "../persistence/store";
@@ -47,6 +47,7 @@ class TestCredential extends Context.Service<
         attemptId: "a",
         workerId: "w",
         harnessSessionId: "ses_cp",
+        attemptFence: 0,
       }),
     ),
   );
@@ -69,6 +70,7 @@ const runtime = ManagedRuntime.make(testLayer);
 
 let mcpUrl = "";
 let policyUrl = "";
+let healthUrl = "";
 let token = "";
 
 beforeAll(async () => {
@@ -78,6 +80,7 @@ beforeAll(async () => {
       const credential = yield* TestCredential;
       mcpUrl = endpoint.mcpUrl;
       policyUrl = endpoint.policyUrl;
+      healthUrl = endpoint.healthUrl;
       token = Redacted.value(credential.token);
     }),
   );
@@ -119,11 +122,14 @@ const callMcp = (headers: Record<string, string> = {}) =>
   });
 
 describe("one listener", () => {
-  test("both routes are served from the same origin", () => {
+  test("all three routes are served from the same origin", () => {
     // The whole point of the merge. Two origins here means two listeners again.
     expect(new URL(mcpUrl).origin).toBe(new URL(policyUrl).origin);
+    expect(new URL(healthUrl).origin).toBe(new URL(mcpUrl).origin);
     expect(new URL(mcpUrl).pathname).toBe("/api/v1/mcp");
     expect(new URL(policyUrl).pathname).toBe("/api/v1/policy/decide");
+    expect(new URL(healthUrl).pathname).toBe("/api/v1/health");
+    expect(HEALTH_PATH).toBe("/api/v1/health");
   });
 
   test("an unrouted path on the shared port is a 404, not either route", async () => {
@@ -184,6 +190,40 @@ describe("the postures stay separate on the shared port", () => {
   });
 });
 
+describe("the health route", () => {
+  test("answers the contract's shape, with no credential", async () => {
+    // `main.ts` used to serve this from its own `Bun.serve` with a hand-written `fetch`.
+    // It is a route on the one router now, so it gets the same method, content-type and
+    // origin handling as everything else on the port.
+    const response = await fetch(healthUrl);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(await response.json()).toEqual({ status: "ok" });
+  });
+
+  test("a bearer token is neither required nor rejected", async () => {
+    const response = await fetch(healthUrl, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(200);
+  });
+
+  test("the wrong method on the health path is refused by the router", async () => {
+    // The replaced hand-written handler answered any method that matched the path.
+    const response = await fetch(healthUrl, { method: "POST" });
+    expect(response.status).not.toBe(200);
+  });
+
+  test("health says nothing about the store, the harness or any attempt", async () => {
+    // A liveness answer that reports internal state is a reconnaissance surface, and
+    // one that fails when a subsystem is slow cannot be used for liveness at all.
+    const body = await (await fetch(healthUrl)).text();
+    expect(Object.keys(JSON.parse(body) as Record<string, unknown>)).toEqual([
+      "status",
+    ]);
+  });
+});
+
 describe("accounting", () => {
   test("policy requests are recorded, and are not counted as MCP calls", async () => {
     const before = await runtime.runPromise(
@@ -203,6 +243,13 @@ describe("accounting", () => {
     // The MCP counter exists to prove the worker reached our tools; a policy decision
     // is not that, and inflating it would make the demo's report a lie.
     expect(after.calls).toBe(before);
+    // Neither is a health check, which anything on loopback can send at any rate.
+    await fetch(healthUrl);
+    expect(
+      await runtime.runPromise(
+        Effect.flatMap(ControlPlaneEndpoint, (endpoint) => endpoint.callCount),
+      ),
+    ).toBe(before);
     expect(after.decisions.length).toBeGreaterThan(0);
     expect(after.decisions.at(-1)?.tool).toBe("shell");
   });

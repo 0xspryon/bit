@@ -2528,8 +2528,8 @@ the harness spawns into it (the first `policyDemo` run after this refactor faile
 checkable instead of remembered), the store before the endpoint serving a tool that
 writes to it, and all of it down in reverse order on any exit.
 
-Error channels name what a caller can act on. `store.ts:206` was
-`MutationError | Error` and `briefing.ts:38` was `Effect<Briefing, Error>`; both erased
+Error channels name what a caller can act on. `store.ts`'s mutation boundary was
+`MutationError | Error` and `briefing.ts` was `Effect<Briefing, Error>`; both erased
 the distinctions that make recovery possible. Now: `MutationError` (domain refusal),
 `DatabaseError` (SQLite), `StoredRowError` (data integrity), `BriefingError`
 (tagged, `reason: "unknown_intent"`), `HarnessTransportError` / `HarnessDecodeError` /
@@ -2784,7 +2784,7 @@ were removed. The low-level runner remains available for migration replay and ro
 tests; the raw `sqliteLayer` remains connection-only so those tests can construct old
 and deliberately broken schemas. Real SQLite store tests verify automatic fresh startup,
 reopening, first-slice upgrades and failure before consumer execution
-(`apps/server/src/persistence/store.test.ts:110`). Persistence/briefing verification:
+(`apps/server/src/persistence/store.test.ts`, "automatic store migrations"). Persistence/briefing verification:
 68 tests passed; typecheck passed.
 
 ### `FIX` — one contract version, two record formats (2026-10-20)
@@ -2807,14 +2807,14 @@ development. `0002` is the second such change, not evidence of a second released
 stated at the top of `apps/server/src/persistence/migrations.ts` so the next reader does
 not re-derive the wrong conclusion from a journal row.
 
-**The two formats** (`ObservationRecordFormat`, `observation.ts:419`):
+**The two formats** (`ObservationRecordFormat`, `contracts/observation.ts`):
 
 - `caseBased` — `setup` plus one or more `ObservationTestCase`, each with actors,
-  ownership facts and ordered actions (`CaseBasedObservation`, `observation.ts:430`).
-  Everything writes this; `OBSERVATION_WRITE_FORMAT` (`observation.ts:426`) is the only
+  ownership facts and ordered actions (`CaseBasedObservation`).
+  Everything writes this; `OBSERVATION_WRITE_FORMAT` is the only
   value the store inserts, and it is the only format `RecordObservationInput` expresses.
 - `summary` — one flattened `conditions` struct and one prose `observedBehavior`
-  (`SummaryObservation`, `observation.ts:470`). Read-only. The name describes the data: a
+  (`SummaryObservation`). Read-only. The name describes the data: a
   single summary of one run, where a case-based record would have several cases.
 
 The `_tag` **is** the record format, so the redundant per-arm version literal is gone. A
@@ -2829,7 +2829,7 @@ for being superseded are renamed after the format they belong to (`summary_condi
 `RENAME COLUMN` because the `CHECK` that enforces the format/columns pairing names the old
 column and SQLite cannot replace a `CHECK` in place; renaming alone would leave a
 constraint written in the old vocabulary behind it. `STORED_FORMAT`
-(`apps/server/src/persistence/store.ts:152`) is the one place the snake_case stored values
+(`apps/server/src/persistence/store.ts`) is the one place the snake_case stored values
 and the camelCase tags are mapped.
 
 This is development evolution inside v1, **not** a production compatibility lifecycle.
@@ -2844,7 +2844,8 @@ statements stay as applied, and `0003` is what reconciles them. The identifiers 
 are a record of how that one file reached its current state. **After `0003` no database —
 fresh or upgraded — has a column by those names**, and the only other place they appear is
 the one test that writes a row in `0002`'s vocabulary to prove `0003` maps it rather than
-dropping it (`apps/server/src/persistence/migrations.test.ts:400`). Both sites are called
+dropping it ("a case-based row written at 0002 keeps its cases through the rename",
+`apps/server/src/persistence/migrations.test.ts`). Both sites are called
 out as frozen history in the source. Nothing in the active contract, store, briefing,
 MCP surface, fixtures or docs uses the old wording.
 
@@ -2857,7 +2858,7 @@ persistence and briefing subset (`bun run test:persistence`). `bun run typecheck
 alone.
 
 Two migration tests were added for the path the development file actually takes
-(`migrations.test.ts:317`): a database brought only to `0002` by the real migration
+(`migrations.test.ts`, "a database already at 0002"): a database brought only to `0002` by the real migration
 bodies, then migrated, keeps its observation, its idempotency receipt and its sequence
 cursor and reaches the renamed schema; and a case-based row inserted in `0002`'s
 vocabulary comes through `0003` as `record_format = 'case_based'` with its `setup` and
@@ -2910,12 +2911,12 @@ method, and for routed methods an `Mcp-Name` header matching `params.name` (`too
 requests, so there is no session table to expire or reconcile.
 
 **The client must be pinned, and that is not optional.** OpenCode's remote MCP config
-takes `protocol: "legacy" | "auto" | "2026-07-28"` and **defaults to `"legacy"`**, which
-opens with the initialize handshake and speaks revisions only up to 2025-11-25.
-`openCodeClient.ts:281` therefore sends `protocol: "2026-07-28"` on the server config.
-`"auto"` was rejected: it probes and silently falls back, and there is nothing to fall
-back to, so a misconfiguration would surface as a confusing discovery failure instead of a
-loud one.
+has a `protocol` field with three accepted values (`@opencode/schema`'s `Mcp.Protocol`),
+and **its default is the handshake-based one**, which opens with `initialize` and speaks
+revisions only up to 2025-11-25. `openCodeClient.ts` therefore sends
+`protocol: "2026-07-28"` on the server config. `"auto"` was rejected: it probes and
+silently falls back, and there is nothing to fall back to, so a misconfiguration would
+surface as a confusing discovery failure instead of a loud one.
 
 **`FIX` — an invalid payload is now a tool error, not a JSON-RPC error.** Under this
 revision a schema-invalid `tools/call` returns HTTP 200 with `result.isError: true` and
@@ -2946,8 +2947,8 @@ call and no provider credential are involved, so this isolates the handshake:
 - Pinned to `"2026-07-28"`: `{"name":"bit","status":{"status":"connected"}}`, with **3
   authenticated requests** served by our endpoint — discovery completed over the stateless
   transport.
-- **Negative control**, the same probe with the pin removed so the client used its default
-  `"legacy"`: `{"status":"failed","error":"Error POSTing to endpoint:
+- **Negative control**, the same probe with the pin removed so the client used its
+  handshake-based default: `{"status":"failed","error":"Error POSTing to endpoint:
 {\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32020,\"message\":\"MCP-Protocol-Version
 header is required\"}} (HTTP 400)"}`, with 1 request served and no discovery. The pin is
   load-bearing, and its absence fails loudly at connection time rather than mid-run.
@@ -3048,7 +3049,7 @@ recording, but not yet by a real model turn.
 The MCP endpoint and the policy endpoint were two `Bun.serve` instances on two ports,
 with two scopes and two hand-written request handlers. At the operator's direction they
 are one listener: `ControlPlaneEndpoint`
-(`apps/server/src/http/controlPlane.ts:66`) builds both route sets into one
+(`apps/server/src/http/controlPlane.ts`) builds both route sets into one
 `HttpRouter`, serves them from one port, and publishes `mcpUrl` and `policyUrl` off the
 same origin.
 
@@ -3104,7 +3105,7 @@ two files edited outside this change.
 
 Eight of the new tests are `http/controlPlane.test.ts`, which asserts only what merging
 created — each route's own behaviour stays in its own suite. The ones that matter are in
-"the postures stay separate on the shared port" (`controlPlane.test.ts:137`): both URLs
+"the postures stay separate on the shared port" (`controlPlane.test.ts`): both URLs
 resolve to one origin; an unrouted path on that port is a `404` rather than either route;
 the MCP route is `401` without a credential and `200` with one; the policy route answers
 `200` with no credential at all and still denies on its own boundaries; a bearer on the
@@ -3122,3 +3123,556 @@ recorded. No model call, so this isolates the transport and both admission paths
 **Not run.** No full `workerDemo` or `policyDemo` round trip, both of which need a live
 provider session. The policy hook's own fail-closed behaviour is unchanged by this and
 was proven in §19 Checkpoint 5.
+
+---
+
+## 22. Reliable single worker — control plane, recovery, and explicit follow-up
+
+Recorded 2026-10-21, at the operator's direction, as one milestone in four parts. Nothing
+below widens the architecture: no planner, no finding subsystem, no approval workflow, no
+concurrency. The scope is still one worker, one attempt at a time, against the local
+fixture.
+
+### `FIX` — the health route is a route, and `main.ts` serves the control plane
+
+§21 recorded the health endpoint as "mergeable on the same terms but left alone". It is
+merged now. `GET /api/v1/health` is registered on the one router
+(`healthRoutes`, `http/controlPlane.ts`) and published off the same origin as the other
+two (`ControlPlaneEndpoint.layer`), and `main.ts` builds `ControlPlaneEndpoint` instead of its own
+`Bun.serve` with a hand-written `fetch`. There is one router, one port and one shutdown
+path in the server process too.
+
+What that removed was a second, differently-behaved HTTP composition: the old handler
+answered any method on the matched path and `404`'d everything else, with no content-type
+or origin handling. The merged route gets the router's.
+
+The three postures stay separate, and that is asserted rather than argued
+(`controlPlane.test.ts`): health answers `200` with no credential and refuses a `POST`;
+the MCP route is still `401` before any dispatch; the policy route still answers
+unauthenticated and still denies on its own boundaries. Health is deliberately
+**one word**: a liveness answer that reports store or harness state is a reconnaissance
+surface, and one that fails when a subsystem is degraded cannot be used to tell "the
+process is up" from "the database is slow". A test pins the response to exactly
+`{"status":"ok"}` for that reason.
+
+**`SKIP` — the fixture keeps its own listener**, unchanged from §21 and for the same
+reasons: the simulated target must not be served from the control plane's origin, and a
+fixture fault must not take down the endpoint the worker records through.
+
+### `FIX` — the worker runs under the policy hook, not only a probe
+
+The pre-execution gate was proven in §19 Checkpoint 5 by a dedicated probe and then not
+used: `workerDemo` ran with no hook loaded, so the policy endpoint sat there answering
+nobody while the run it was supposed to constrain went unenforced. The workspace
+preparation that installs the hook is now shared (`prepareWorkspace`,
+`spike/runtime.ts`) and on by default for any spike run (`SpikeOptions.policyHook`), writing the
+plugin config against the live `policyUrl` before the harness spawns — expressed as a
+layer dependency so the ordering is checked, not remembered.
+
+`WORKER_POLICY` (`spike/phases.ts`) names boundaries that are real and narrow: loopback
+only, and two forbidden fragments the task would never legitimately touch (our own
+control-plane database, and anything marked out-of-scope). Deliberately not more:
+constraints the task _does_ need would turn a misconfiguration into something that looks
+like a boundary holding.
+
+Every tool call the worker makes — including its own `record_observation` calls — now
+round-trips to the control plane before it runs. The audit trail written by the hook is
+the evidence, and it lands outside the workspace: a worker that can read its own audit
+log can read the shape of the boundary it is inside.
+
+### `FIX` — interrupted attempts are reconciled, and uncertainty is recorded as uncertainty
+
+§20 recorded this as "the largest open gap", with two attempts in the development
+database left at `status: "running"` and real session IDs nothing would ever settle.
+
+The reconciler asks a **harness-status abstraction** (`recovery/harnessStatus.ts`) one
+question per attempt and gets an answer that includes the cases where there is no answer.
+Its vocabulary (`HarnessObservedStatus`, `harnessStatus.ts`) is seven values: the harness's own four, plus
+`unbound` (no session was ever recorded), `missing` (we asked; it has never heard of it)
+and `unreachable` (we could not ask). The query's error channel is `never` by design — a
+reconciler that fails when the harness is unreachable has not reconciled anything.
+
+`mapObserved` (`recovery/reconcile.ts`) sends all three of ours to `uncertain`. There
+is no path from "we do not know" to a definite execution status, and in particular none
+to `failed`.
+
+The write rules live in one pure function, `decideRecovery`
+(`persistence/store.ts`), so the whole state space is readable in one place and
+enumerable in a test without a connection. Line references into our own files are given
+as symbols from here on: this section has already been read against a moved line once.
+
+- A `succeeded`/`failed`/`interrupted` attempt is **never moved**. A contradicting
+  harness answer is still recorded, as `already_final`, because "we asked again and it
+  said something else" is worth having.
+- `uncertain` is terminal for _authority_ but refineable: a later definite answer refines
+  it (`refined`), and an answer of "still running" does **not** reopen it
+  (`unresumable`). Replacement work gets a new attempt identity
+  (`openReplacementAttempt`, `store.ts`), which refuses a running predecessor, a
+  predecessor from another target or intent, and any attempt id that is already in use.
+- Leaving `running` is the one transition that revokes authority.
+- **Every startup asks again about `running` and `uncertain`, and never about a settled
+  attempt.** The sweep reads `unsettledAttempts`, not a running-only query; see the
+  correction below, where it did not.
+
+**`NEW` — write authority is fenced.** `attempts.write_fence` (migration `0004`) is the
+attempt's authority epoch; a credential carries the value it was minted against
+(`CallerContext.attemptFence`), and `checkAuthority` (`store.ts`) refuses a new write
+whose fence has been superseded or whose attempt has stopped running. The in-memory half
+is `McpCredentials.revokeAttempt` (`mcp/credentials.ts`), called by the reconciler after
+the fence moves. Both exist
+because they cover different windows: the registry is per-process and a restart forgets
+it, while the fence is a column.
+
+**Receipt semantics are preserved, deliberately, by checking the receipt before the
+authority.** A matching receipt is answered even under revoked authority, because a
+replay writes nothing and creates no external effect — it hands back a result this store
+already committed, to the only caller whose scope can name it. Refusing it would make a
+transport retry that crossed a settlement boundary look like lost evidence, which is the
+one thing a worker must never be told wrongly. A _new_ write is where authority is
+enforced, because that is where something would change. A conflicting reuse is still a
+conflict.
+
+`settleAttempt` is now guarded to `status = 'running'` and reports whether it changed
+anything (`store.ts`), so the terminal-regression rule holds from the worker's side too:
+a late settlement cannot overwrite what recovery decided.
+
+**What is recorded, and what is not inferred.** `attempt_recoveries` keeps the harness's
+answer verbatim, the prior status, the resulting status, the disposition, the fence
+before and after, and the detail text. Its key is the whole reconciliation state
+(migration `0006`; `0004`'s three-column key was wrong, and the correction below says
+how), so repeating the same state updates one row rather than manufacturing history and
+`times` keeps the repeat visible, while a pass that decided something different gets its
+own row. `observations_at_recovery` is recorded as a fact about
+our own store at that instant and is **never** an input to the disposition — it is even
+read after the decision, for exactly that reason. A worker can issue requests against a
+target and die before recording anything, and the target does not roll back.
+
+No HTTP happens inside a transaction: the harness is asked, then one transaction writes.
+One attempt is one ask plus one transaction, so the write lock is never held across a
+network round trip or across several attempts.
+
+### `FIX` — untested dimensions are addressable, and progress on them is explicit
+
+An untested dimension used to be free text that reappeared in every briefing forever.
+Nothing could say "that one, I took it on", so progress could only be guessed at by
+matching words — and `briefingDemo` had to score lexical overlap and admit it was an
+indicator only.
+
+Each recorded dimension now has an address, `<observationId>#u<index>`
+(`dimensionAddress`, `contracts/observation.ts`). The index is sound because `untestedDimensions` is
+written once, inside the same transaction as its row, and nothing in this codebase
+updates an observation afterwards — there is no `UPDATE observations` statement and no
+path that rewrites the list. Parsing is strict (`parseDimensionAddress`): a non-canonical
+index is refused, so one position cannot have two spellings. Hashing the text was
+rejected — it would make two identically worded dimensions one address, and would change
+identity if wording were ever corrected.
+
+`RecordObservationInput` gains `addressesDimensions` (`contracts/observation.ts`,
+`addresses_dimensions` on the wire). It is validated against stored state inside the
+write transaction (`resolveAddress`, `store.ts`): the address parses, the observation
+it names exists, that observation belongs to **the caller's authenticated intent**, and
+the position is within the list that row actually holds. A duplicate in one call is
+refused rather than collapsed. Links are rows in `observation_dimension_links`
+(migration `0005`) with real foreign keys both ways, written in the
+same transaction as the observation, so a half-linked observation cannot exist. There is
+no fuzzy match anywhere and no inference from wording: an address a worker invents,
+rewords or truncates is refused and nothing is stored.
+
+**Addressed is not resolved, and there is deliberately no `resolved` value.**
+`FollowUpStatus` (`contracts/briefing.ts`) is `uninvestigated`,
+`addressedInconclusive` and `addressedWithEvidence`, derived from the recorded links and
+outcomes alone (`statusOf`, `briefing/briefing.ts`). An `inconclusive` follow-up is work that
+happened and decided nothing, which is a third state and not progress on the claim.
+Deciding a question is settled is a disposition somebody has to take, and nothing here
+takes it: closure authority is not implemented, and the rendered briefing says so in as
+many words.
+
+Questions are computed over **all** of the intent's observations, not just the ones a
+briefing had room for, so truncating the body cannot drop a question; a question raised
+or addressed by an omitted observation is labelled as such. They are **not** deduplicated
+by text: two observations that recorded the same sentence recorded two separate
+questions, and collapsing them would be exactly the matching this mechanism exists to
+avoid — and would mean addressing one silently closed the other. Old rows keep their
+dimensions and gain no links, so nothing is retro-fitted with a relationship nobody
+recorded.
+
+### `PORT` — one proof path, three entrypoints
+
+`spike/phases.ts` holds the worker leg and the planner leg as functions;
+`workerDemo.ts`, `briefingDemo.ts` and `milestoneProof.ts` all drive them. A proof that
+re-implemented the worker leg would be proving its own copy.
+
+**A hazard worth recording, because it cost a run.** Every entrypoint in `src/spike/`
+calls `runMain` at module scope, so importing one _runs it_. The first version of
+`milestoneProof.ts` imported a shared constant from `workerDemo.ts` and thereby ran the
+worker demo concurrently with its own phase 1 — against the development database, since
+that is `workerDemo`'s default — and then `process.exit`'d from the demo's teardown while
+the proof's harness scope was still open, leaking a detached `opencode serve` that had to
+be reaped by hand. Nothing was lost (one extra attempt and two observations landed in
+`hunt.sqlite`, and the two abandoned rows were untouched), but the fix is structural:
+nothing imports an entrypoint, everything reusable lives in `phases.ts`, and each
+entrypoint now says so at the top.
+
+### `FIX` — correction round after review (2026-10-21)
+
+The four parts above were reviewed and four defects came back. Each was a real fault in
+the code, not a wording problem, and each is fixed here with tests against a real SQLite
+file rather than an argument about why it was tolerable.
+
+**1. `openReplacementAttempt` was not atomic, and believed what it found.** It read the
+predecessor, called `seedAttempt` — which is one transaction — and then wrote
+`replaces_attempt_id` in a separate statement outside it. A failure between the two left
+a replacement attempt that recorded nothing about what it replaced, which is
+indistinguishable from a worker simply starting fresh. Worse, `seedAttempt` inserts with
+`ON CONFLICT DO NOTHING`, so an `attemptId` that already existed — another intent's
+attempt, somebody else's predecessor — came back as a successful seed and was then
+relinked. Nothing checked that predecessor and replacement shared a target and an intent
+either, so the link could assert a continuity that did not exist.
+
+It is now one transaction containing every check and one purpose-built `INSERT` that
+carries the link as a column of the new row. It takes a dedicated `ReplacementInput`
+rather than `SeedInput`, because a replacement is opened under the goal and intent the
+predecessor already belongs to and has no business re-declaring either; the new row hangs
+off the predecessor's own `intent_id`. Four refusals, none of which writes anything: no
+such predecessor, a predecessor still `running`, a predecessor from a different target or
+intent, and an `attemptId` already in use. That last one is deliberately **not**
+idempotent — an existing attempt is never adopted, because a replacement is new work and
+needs an identity nothing has written under.
+
+**2. `attempt_recoveries` conflated dispositions.** `0004` keyed the table
+`(attempt_id, observed_status, resulting_status)`. Settle a running attempt whose harness
+says `succeeded` and the pass is `settled`, `running -> succeeded`, fence `0 -> 1`; ask
+again and the pass is `already_final`, `succeeded -> succeeded`, fence `1 -> 1`. Those
+three columns are identical, so the second upsert landed on the first row: the persisted
+`disposition` stayed `settled` over a `detail` text that said `already_final`, and the
+caller was handed the first pass's fence movement as if it were its own.
+
+Migration `0006` rebuilds the table keyed by the whole reconciliation state —
+`(attempt_id, observed_status, prior_status, resulting_status, disposition, fence_before,
+fence_after)`. Repeating that exact state still increments `times`; a pass that decided
+anything different gets its own row. Because the fences are part of the key, the row
+`recordRecovery` reads back is the row it wrote, so what a caller is told and what the
+table holds cannot drift apart. `RecoveryOutcome` gained `priorStatus` for the same
+reason: "running became uncertain" and "uncertain stayed uncertain" are different events
+and `status` alone cannot tell them apart.
+
+`0004` is applied and stays untouched; `0006` appends. Every existing row is carried
+across with its `times`, timestamps, fences, detail and disposition, and `prior_status`
+is **derived rather than guessed**: `already_final` can only have been decided about an
+attempt already in its resulting status, `refined` and `unresumable` are only reachable
+from `uncertain`, `still_running` and `settled` only from `running`, and a disposition of
+`uncertain` is told apart by the fence, which moves exactly when an attempt leaves
+`running`. A disposition nothing writes is carried across as `prior_status =
+'unrecorded'` rather than filed under a status it may not have held. What the migration
+does **not** do is un-conflate a row the old key already merged: a `settled` row with
+`times = 2` whose second pass was really `already_final` arrives as recorded, because
+splitting it would mean inventing the `first_reconciled_at` the overwrite destroyed.
+**There is no such row here**, which was checked rather than assumed, on copies of the
+files and read-only: the development database holds two recovery rows, both single
+settles with the fence moving `0 -> 1`, and the only repeated row in the proof evidence
+(`times = 2`) is a `still_running` pass, which the new key keeps as one row anyway. The
+preservation and derivation paths are therefore proven by `migrations.test.ts`, which
+builds a database at `0005` with one row per disposition, the conflated case
+included — and not by the live files.
+
+**3. An `uncertain` attempt could not be refined in practice.** The rules allowed
+refinement and a test exercised it, but only by calling `recordRecovery` directly. The
+startup sweep read running attempts, and the first pass moved the row out of `running` —
+so no later startup ever looked at it again, and a harness that came back with a definite
+answer had no way to deliver it. The sweep now reads both statuses no answer has been
+reached about (`unsettledAttempts`, and the sweep is `reconcileUnsettledAttempts`); the
+old names said something the code did not do. Final statuses are never swept. The two
+statuses are named in the query rather than derived as "not final", because they are
+exactly the two `decideRecovery` has rules for — a row holding anything else is left
+alone instead of being read as `running` and moved.
+
+What the widened sweep may and may not conclude is unchanged: `uncertain` plus a definite
+answer is `refined`, and `uncertain` plus a harness reporting the session live is
+`unresumable` — the fence stays where it was, the session still cannot write, and
+carrying the work on means a new attempt identity.
+
+**4. The word, and the stale references.** The removal recorded in §21 had left four
+prose occurrences describing OpenCode's `protocol` field by quoting its default value;
+they are rephrased to describe the behaviour instead (the handshake-based default, which
+speaks revisions only up to 2025-11-25 — `@opencode/schema`'s `Mcp.Protocol`). A
+case-insensitive search of the repository, excluding dependencies, build output and
+`.runtime/`, now returns **12 lines — 18 identifier occurrences — and nothing else**:
+11 lines in `migrations.ts` (the three columns `0002` created, in its `CREATE TABLE`, its
+two `CHECK` branches and its `INSERT` list, plus the `SELECT` in `0003` that reads them)
+and one line in `migrations.test.ts`, the row written in `0002`'s vocabulary to prove
+`0003` maps it rather than dropping it. Those are identifiers in applied migrations, and
+the append-only rule is what freezes them.
+
+Separately, this section cited line numbers into our own files and the review was read
+against several that had moved. References to our own code are symbols and paths from
+here on; the numeric ones that remain (`mcp/server.ts:139`, `store.ts:291`,
+`migrations.ts:246`, `contracts/observation.ts:404`, `policy/service.ts`) were re-checked
+against the files.
+
+### Verification actually run for the correction round
+
+**Automated, uncached.** `bun run test --force` — **231 tests, 0 failures** (220 before
+this round). `bun run test:persistence --force` — **128** of those against real SQLite
+files (117 before). `bun run typecheck --force`, `bun run build --force` and
+`bun run lint` pass; `format:check` reports only `sprint-roadmap.html`, which is
+pre-existing and untouched.
+
+The 11 new tests are the four objections, each pinned where it can actually fail:
+
+- **Replacement**: a trigger that aborts the insert proves the transaction leaves
+  nothing behind — no replacement row, no attempt that exists without saying what it
+  replaced — and that the same call succeeds once the trigger is gone, with the link
+  intact after a reopen; an `attemptId` that already belongs to an unrelated attempt is
+  refused and that
+  attempt is untouched; a predecessor from another intent, from another target, and one
+  that does not exist are each refused with no row written; a refused replacement of a
+  running attempt leaves no half-seeded row and does not relink the predecessor; an
+  `uncertain` predecessor can be replaced and keeps its own status and fence.
+- **Recovery identity**: a settle followed by an already-final pass with the same
+  observed and resulting status produces two rows with their own dispositions and fences,
+  and every returned outcome is compared field by field with the row that holds it; three
+  sweeps with one answer produce two states and `times = 2` on the repeat, in first-seen
+  order.
+- **Migration `0006`**: a database taken to `0005` by the real migration bodies and
+  loaded with one row per disposition — including the conflated one and a disposition
+  nothing writes — reaches the new key with every count, timestamp, fence and detail
+  intact and the derived `prior_status` asserted row by row; the rebuilt key then accepts
+  the pass the old one collapsed and refuses an exact duplicate; a fresh replay ends up
+  with the same key; and a migration that fails after `0006` rolls back without taking
+  the rebuilt table or its rows with it.
+- **Refinement through the sweep**: `unreachable` and then `succeeded` across two
+  ordinary startup sweeps with the database closed and reopened between them —
+  `recordRecovery` is not called by that test at all — ending `succeeded`/`refined` with
+  the fence still where the first sweep left it, and a third startup not sweeping it at
+  all; plus an `uncertain` attempt the harness reports live, which is swept, recorded
+  `unresumable`, and still refuses a write under its old credential.
+
+**Not run.** No live model demo and no new live run: this round changed the control
+plane's write rules, and the live evidence from the first pass
+(`.runtime/milestone-proof-003637.log`, `.runtime/recovery-live-003300.log`) is left as
+recorded. The development database was not touched — migration `0006` has not been
+applied to it, and will be by whatever opens it next. Nothing was committed.
+
+### Verification actually run for the first pass
+
+These are the figures from the first pass, before the correction round above. `bun run
+test` — **220 tests, 0 failures** (up from 166), stable across three consecutive runs.
+`bun run test:persistence` — 117 of those, every one against a real SQLite file.
+`bun run typecheck`, `bun run build` and `bun run lint` pass; `format:check` reports only
+`sprint-roadmap.html`, which is pre-existing and untouched.
+
+`recovery/reconcile.test.ts` — 30 tests then, 37 now — runs against real SQLite with a
+scripted harness. The harness is scripted on purpose: `missing` and `unreachable` are
+the answers a live harness will not produce on demand, and a recovery path exercised
+only on the
+answers you can arrange is the one that breaks later. They cover every mapping, the
+no-regression rule across the whole `(current, proposed)` space, refinement of
+`uncertain`, the refusal to reopen it, the idempotent repeat (one row at `times = 2`
+then; two rows with the repeat on the second since `0006`), stale
+authority on a live attempt, stale authority surviving a reopen of the file, credential
+revocation being per-attempt, replay still working after settlement, replacement attempt
+rules, and the live adapter's own 404-versus-no-status mapping with a stub client.
+
+`persistence/store.test.ts` adds the address rules: a valid address becomes a link with
+the position it resolved to; a non-existent observation, an out-of-range index, a
+malformed address, a cross-intent address and a duplicate in one call are each refused
+with nothing written and no sequence gap; an exact retry replays and writes no second
+link; a changed address list under one operation ID is a conflict; links survive a
+reopen. `briefing.test.ts` adds the three statuses, the sibling dimension that is _not_
+swept along, and the question raised by a truncated observation that is still listed and
+labelled. `migrations.test.ts` replays the chain from nothing — six entries since
+`0006` — adopts a first-slice database, and still proves rollback, with the deliberately
+broken migration
+appended past the real chain (`0007`) rather than colliding with it.
+
+**Live, on this stack** (`opencode` v2.1.0, subscription OAuth, `@opencode/client` 2.1.0,
+`effect` 4.0.5):
+
+- `src/spike/milestoneProof.ts`, four phases in four scopes:
+  **22/22 exact checks passed** (`.runtime/milestone-proof-003637.log`). Phase 1: a real
+  worker made 25 HTTP requests against the fixture under the loaded hook, every tool call
+  decided by the control plane first, 5 authenticated MCP requests served, 2 observations
+  persisted and provenance-bound, attempt settled `succeeded`, credential stopped
+  resolving. Phase 2: a new process and session, given only the database-derived
+  briefing, cited both observation IDs and one real address and invented none, answering
+  all five sections. Phase 3: a second worker took on
+  `obs_000002_…#u0` by address from a third process; the link was recorded, the question
+  moved `uninvestigated -> addressedWithEvidence`, the addressing observation and its
+  outcome are shown, the other eight questions stayed open, and it raised a sharper new
+  one. Phase 4: the abandoned attempt was reconciled, both settled attempts were
+  untouched, and a repeated sweep produced `times = 2` on one row.
+- **The development database's two abandoned attempts are reconciled**, through
+  `recordRecovery` and nothing else (`.runtime/recovery-live-003300.log`). Backed up
+  first, byte-identical plus a `VACUUM INTO` copy, under `.runtime/backups/`. A freshly
+  spawned `opencode serve` **still knew both sessions** — opencode persists them — and
+  answered `succeeded` for `ses_eac55532…` and `interrupted` for `ses_eac54aad9…`. So
+  both became `settled` with definite statuses, fence `0 -> 1`, and both hold zero
+  observations: an attempt that recorded nothing was still recorded as having succeeded,
+  because the harness said so and because absent evidence is not evidence of absence. The
+  other five attempts were not touched.
+- **The uncertain path, end to end**: `main.ts` against a _copy_ of that database with no
+  harness configured answered `missing` for both sessions and settled them `uncertain`
+  with the fence bumped, before serving — which is also the adoption path, since it
+  applied only migrations `0004` and `0005` to an already-`0003` file.
+- **Fail-closed, re-proven on this harness version.** The hook source is unchanged from
+  §19, but "a thrown `execute.before` refuses the call" is the harness's behaviour, not
+  ours. With the policy URL pointed at a dead port: the read was denied, the denial cited
+  connectivity, the marker never reached the model, and the hook logged
+  `denied_failclosed`.
+- The server entrypoint, by hand: `200 {"status":"ok"}` on health, `401` on MCP with no
+  bearer, `200 {"effect":"allow"}` on the unauthenticated policy route, `404` off-route —
+  all on one port.
+- No `opencode serve` was left behind by any of it.
+
+### `FIX` — the briefing is stable under append, and planner rounds share a cache lineage (2026-10-21)
+
+Two changes with one motivation. A briefing is already a pure function of stored rows, so
+two planner rounds over unchanged state render identical text — but nothing made the
+_growth_ of that text append-only, and nothing made two rounds reuse a provider's cached
+prefix even when it was.
+
+**What the rendering did wrong.** The graph sequence sat on line 3 and the observation
+count sat in the first heading, both above every observation. `preparedAtSequence` comes
+from the global cursor, which any observation write under any intent bumps, so a number
+roughly forty tokens into the prompt changed whenever anything was recorded anywhere. And
+observations were rendered newest-first, so a new row changed the _top_ of the list.
+Between them, one write invalidated the whole document.
+
+Selection and presentation are now separate decisions. `buildBriefing` still chooses
+newest-first — a later observation qualifies an earlier one, and that is what should
+survive truncation — and then renders the chosen rows oldest-first. Everything that
+restates the record as a whole moved below a named heading, `PREPARATION_HEADING`: the
+sequence, the counts, the disclosed omissions, and the open questions with their
+statuses. So the text above that line grows by whole observation blocks and never
+rewrites the ones already there, and `stablePrefixOf` is how a caller or a test gets
+exactly that part. The property is asserted on bytes, not on "the same strings appear
+somewhere", because the failure mode is a well-meaning edit that moves a count upward.
+
+**Why a lineage, and what it is not.** OpenCode derives one provider cache key per
+session lineage — `parentID ?? fork.sessionID ?? id` (`core/src/session/affinity.ts`),
+sent as `prompt_cache_key` and as the `x-session-affinity` header
+(`core/src/session/model-request.ts`). Two separately created top-level sessions
+therefore never share a cached prefix however identical their prompts, which is what
+`runPlannerPhase` was doing on every round. It now opens each round under one anchor
+session per target, recorded in `planner_lineages` by migration `0007`.
+
+Three things this deliberately is not. It is **not** a persistent planner: each round is
+still a fresh session with no transcript, the anchor is created and never prompted, and
+a child is not a fork — only the fork path copies messages across
+(`core/src/session/projector.ts`). Keeping it that way is the point, because a planner
+that remembered its own earlier rounds would hold investigation state that no observation
+records, which is the transcript-derived knowledge §17 exists to refuse. It is **not**
+applied to worker sessions: OpenCode resumes only parentless sessions after a crash
+(`SessionStore.listSuspended`, which filters `isNull(parent_id)`) and merely releases a
+child's claim, so a worker — whose interruption we reconcile and whose session the
+harness may legitimately resume — stays top-level. And the table holds **no knowledge**:
+drop it and every briefing and observation is unchanged, which is asserted rather than
+asserted-to-be-obvious.
+
+A recorded lineage is a hint, not a fact. It names a row in OpenCode's storage, which can
+be cleared without ours changing, so `runPlannerPhase` confirms the session before using
+it and records a replacement when it cannot. The cost of being wrong is one uncached
+round.
+
+**What this does not buy.** Prompt caching on the OpenAI path is implicit: OpenCode skips
+breakpoint injection for protocols that ignore inline hints (`packages/ai/src/cache-policy.ts`),
+so there is no explicit cache write and nothing here extends an entry's lifetime. A
+provider's implicit cache expires in minutes, and a planner round separated from the last
+one by a worker phase will miss whatever we do. The lineage makes a hit _possible_ for
+rounds close together; it does not make one certain, and no claim here rests on a measured
+hit rate, because none was measured.
+
+### Verification actually run for the briefing-stability change
+
+**Automated, uncached.** `bun run test --force` — **241 tests, 0 failures** (231 before
+this change). `bun run test:persistence --force` — **136** against real SQLite files (128
+before). `bun run typecheck --force`, `bun run build --force` and `bun run lint` pass;
+`format:check` reports only `sprint-roadmap.html`.
+
+The 10 new tests:
+
+- **Prefix stability**: a briefing rendered after another observation lands starts with
+  the previous briefing's stable part byte for byte, with the growth and the changed tail
+  both asserted so the check cannot pass vacuously; nothing above the heading mentions
+  the sequence, the counts, the omissions or the questions, while the tail still carries
+  all four; and the honest limit — once the truncation window slides, the stable part is
+  rewritten from its first block, which the test asserts rather than hides.
+- **Ordering**: truncation keeps the newest rows and lists them oldest-first, with the
+  omitted id named; the upgraded-database briefing has the adopted summary-format row
+  leading and the case-based one following.
+- **The lineage, against real SQLite**: an unrecorded target answers `undefined` rather
+  than failing; a recorded lineage survives a reopen and is per target; recording again
+  replaces the row instead of adding a second, checked directly against the file; and
+  deleting the whole table leaves `observationsForIntent` byte-identical.
+- **Migration `0007`**: a database at `0006` gains exactly one table, keyed on
+  `target_id`, arriving empty, with every other table unchanged.
+- **The wire**: a parent session id reaches `session.create` as `parentID`, asserted on
+  the request body rather than on our own input; and a parentless create sends
+  `parentID: null`, because the generated client encodes an absent optional as an
+  explicit null — which the first version of this note got wrong until the body was
+  printed.
+
+**Not run.** No live model demo, so no measured cache hit: the harness reports
+`tokens.cache.read` per session and `PlannerPhaseResult` does not yet surface it. The
+development database was not touched; `0007` is pending for it. Nothing was committed.
+
+### Remaining limitations
+
+- **The abandoned-attempt leg of the proof lands on `still_running`, not `uncertain`.**
+  A restarted `opencode serve` knows the sessions a previous one created, which is good
+  news and means the live runs never needed the uncertain path. `uncertain` is proven by
+  the deterministic tests and by the no-harness run above, not by a live harness that had
+  genuinely forgotten a session.
+- **The worker's tool catalogue is wider than what we register.** The spawned harness
+  reads the user's own opencode configuration, which on this machine declares other MCP
+  servers; the audit shows our gate deciding on one of their tools too. That the gate
+  covers them is the property that matters, but we do not control what is in the
+  catalogue, and a globally configured server named `bit` sits one character away from
+  colliding with our per-attempt `bit-<attemptId>` registration.
+- **The hook's coverage limit is unchanged** and must not be restated as broader: it
+  gates tool _input_, and a shell command that assembles a forbidden path at runtime
+  still reaches the file (§19 Checkpoint 5 probe 4). Not re-tested here.
+- **One worker, one attempt at a time.** The fence and the per-attempt revocation are the
+  primitives concurrency will need, but nothing here runs two workers, and the
+  same-workspace MCP registration hazard is unchanged — `api.mcp.add` is a runtime
+  registration and does not persist into the workspace config, which is why repeated
+  phases did not accumulate stale servers, but two _concurrent_ attempts in one workspace
+  would still be registering into the same harness.
+- **`observations_at_recovery` is a number nobody should reason from**, and the only thing
+  stopping that is a comment and a test. There is no type-level guard against a future
+  caller treating it as evidence.
+- **An `uncertain` attempt is asked about at every startup, for ever.** There is no
+  backoff, no attempt limit and no way to mark one as "stop asking": each sweep adds a
+  `times` increment to one row. That is cheap and visible, but it is an open loop, and a
+  deployment that accumulates unanswerable attempts will sweep all of them on every
+  start.
+- **A recovery row written before `0006` keeps the disposition it was recorded with.**
+  No database here holds a conflated one, but the migration cannot repair one if it
+  arrives: the overwritten `first_reconciled_at` is gone and nothing invents it. The new
+  key prevents it recurring.
+- **The replacement attempt's id check is a read in the same transaction, not a lock.**
+  Two concurrent opens of the same id both find it free and the second fails on the
+  primary key, so it surfaces as a `DatabaseError` rather than the `MutationError` a
+  sequential caller gets. Nothing is written either way, and nothing runs two
+  openers today.
+- **A dimension address is positional, and that is only sound while observations are
+  immutable.** Nothing updates one today. Anything that ever edits, merges or rewords a
+  recorded dimension needs its own identity scheme rather than this one stretched to fit.
+- **`addressedWithEvidence` is derived from outcomes, not from judgement.** A follow-up
+  that cites an address and reaches a positive result relative to its _own_ narrow claim
+  moves the question, whether or not that claim really bears on it. Phase 3's semantic
+  check exists because nothing automated can make that call.
+- **Nothing closes a question or validates an observation**, by design: no finding
+  subsystem, no approval workflow, no closure authority. A briefing says what has been
+  recorded, and a human decides what it means.
+- **Prefix stability ends where truncation begins.** With more than `limit` observations
+  under one intent, each new row drops the oldest included one and rewrites the stable
+  part from its first block. Nothing is lost from the graph and the omission is disclosed
+  as always, but the append-only property covers the growing phase only.
+- **No cache hit has been measured.** The lineage makes one possible and the rendering
+  makes one worth having; whether either pays off on a real run is unknown, because no
+  live round has been executed since the change and `tokens.cache.read` is decoded but
+  not reported.
+- **A lineage row can point at a session the harness has forgotten.** It is confirmed
+  before use and replaced when it cannot be, so the failure is one uncached round — but
+  the row is stale in the meantime and nothing cleans it up on a schedule.

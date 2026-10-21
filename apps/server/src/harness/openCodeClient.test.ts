@@ -41,6 +41,8 @@ const FAKE_SERVER = {
 interface Recorded {
   readonly signals: AbortSignal[];
   readonly urls: string[];
+  /** Request bodies as sent, so a test can assert on what reached the wire. */
+  readonly bodies: string[];
 }
 
 /** Builds a client whose transport is the given fetch stub. */
@@ -51,7 +53,7 @@ const clientWith = (
     recorded: Recorded,
   ) => Promise<Response>,
 ) => {
-  const recorded: Recorded = { signals: [], urls: [] };
+  const recorded: Recorded = { signals: [], urls: [], bodies: [] };
   const fetchStub = Object.assign(
     (input: URL | RequestInfo, init?: RequestInit) => {
       const url = String(input instanceof Request ? input.url : input);
@@ -59,6 +61,10 @@ const clientWith = (
         input instanceof Request ? input.signal : (init?.signal ?? undefined);
       recorded.urls.push(url);
       if (signal) recorded.signals.push(signal);
+      const body = input instanceof Request ? undefined : init?.body;
+      if (typeof body === "string") recorded.bodies.push(body);
+      else if (body instanceof Uint8Array)
+        recorded.bodies.push(new TextDecoder().decode(body));
       return stub(url, init ?? undefined, recorded);
     },
     // `typeof fetch` includes `preconnect`; nothing under test calls it.
@@ -103,6 +109,70 @@ const json = (body: unknown, status = 200) =>
       headers: { "content-type": "application/json" },
     }),
   );
+
+describe("session lineage", () => {
+  /**
+   * A planner round opened inside an existing lineage sends that session as its parent.
+   *
+   * This is the whole mechanism behind sharing a provider cache partition: OpenCode
+   * derives its cache key from `parentID ?? fork.sessionID ?? id`, so the field either
+   * reaches the wire or the rounds are routed separately however alike their prompts.
+   * Asserted on the request body rather than on our own input, because that is the part
+   * that can silently go missing.
+   */
+  test("a parent session id is sent as parentID", async () => {
+    const { layer, recorded } = clientWith(() => json(sessionInfo()));
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(OpenCodeClient, (client) =>
+            client.createSession({
+              title: "bit planner: fresh session",
+              model: { providerID: "openai", id: "m" },
+              directory: "/tmp",
+              parentSessionId: "ses_lineage",
+            }),
+          ),
+          layer,
+        ),
+      ),
+    );
+
+    expect(recorded.bodies).toHaveLength(1);
+    expect(JSON.parse(recorded.bodies[0] ?? "{}")).toMatchObject({
+      parentID: "ses_lineage",
+      title: "bit planner: fresh session",
+    });
+  });
+
+  test("no parent is sent as an explicit null parentID", async () => {
+    // Worth pinning rather than assuming: the generated client encodes every absent
+    // optional as `null`, so a parentless session is a `parentID: null` on the wire
+    // rather than a missing key. Worker sessions are deliberately parentless — OpenCode
+    // resumes only parentless sessions after a crash.
+    const { layer, recorded } = clientWith(() => json(sessionInfo()));
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(OpenCodeClient, (client) =>
+            client.createSession({
+              title: "bit worker",
+              model: { providerID: "openai", id: "m" },
+              directory: "/tmp",
+            }),
+          ),
+          layer,
+        ),
+      ),
+    );
+
+    expect(recorded.bodies).toHaveLength(1);
+    expect(JSON.parse(recorded.bodies[0] ?? "{}")).toMatchObject({
+      parentID: null,
+      title: "bit worker",
+    });
+  });
+});
 
 describe("cancellation", () => {
   test("the request is handed an AbortSignal", async () => {

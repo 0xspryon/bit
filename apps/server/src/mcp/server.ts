@@ -23,12 +23,13 @@
  * keep, expire or reconcile, and a request either carries everything it needs or is
  * refused.
  *
- * **The client has to be pinned to match.** OpenCode's remote MCP config takes
- * `protocol: "legacy" | "auto" | "2026-07-28"` and defaults to `"legacy"`, which opens
- * with the handshake and speaks revisions only up to 2025-11-25. A default-configured
- * client against this endpoint fails, by design: `openCodeClient.ts` sends
- * `protocol: "2026-07-28"` on the remote server config, and the two have to move
- * together. Nothing is served for older revisions — there is no fallback path to drift.
+ * **The client has to be pinned to match.** OpenCode's remote MCP config has a
+ * `protocol` field with three accepted values, and its default is the handshake-based
+ * one, which opens with `initialize` and speaks revisions only up to 2025-11-25
+ * (`@opencode/schema`'s `Mcp.Protocol`). A default-configured client against this
+ * endpoint fails, by design: `openCodeClient.ts` sends `protocol: "2026-07-28"` on the
+ * remote server config, and the two have to move together. Nothing is served for
+ * earlier revisions — there is no fallback path to drift.
  *
  * **This module no longer serves.** It builds {@link McpApplicationLayer} — tools,
  * handlers, protocol and the auth middleware — as routes on an ambient `HttpRouter`.

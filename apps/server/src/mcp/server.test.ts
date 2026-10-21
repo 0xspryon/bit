@@ -48,6 +48,14 @@ const BINDING = {
 } as const;
 
 /**
+ * What a credential is minted against: the binding plus the attempt's write fence.
+ *
+ * `0` is the fence a freshly seeded attempt carries, so this is the live authority for
+ * `attempt-1` throughout this suite.
+ */
+const CREDENTIAL = { ...BINDING, attemptFence: 0 } as const;
+
+/**
  * The suite's credential, issued into the *layer's* scope.
  *
  * That is not a convenience: it is the behaviour under test in
@@ -59,13 +67,53 @@ class TestCredential extends Context.Service<
 >()("test/TestCredential") {
   static readonly layer = Layer.effect(
     TestCredential,
-    Effect.flatMap(McpCredentials, (credentials) => credentials.issue(BINDING)),
+    Effect.flatMap(McpCredentials, (credentials) =>
+      credentials.issue(CREDENTIAL),
+    ),
+  );
+}
+
+/**
+ * A credential for an attempt that has already been settled.
+ *
+ * Issued from a layer for the same reason {@link TestCredential} is — `issue` puts the
+ * grant in the caller's scope, so issuing it inside a bare effect would revoke it before
+ * the request goes out. The attempt is seeded and settled here too, so the credential is
+ * genuinely valid-but-superseded rather than simply unknown: the registry resolves it,
+ * and the store is what refuses the write.
+ */
+class StaleCredential extends Context.Service<
+  StaleCredential,
+  IssuedCredential
+>()("test/StaleCredential") {
+  static readonly layer = Layer.effect(
+    StaleCredential,
+    Effect.gen(function* () {
+      const store = yield* ObservationStore;
+      yield* store.seedAttempt({
+        ...BINDING,
+        attemptId: "attempt-settled",
+        goalId: "goal-1",
+        goal: "Determine whether authentication rate limits can be bypassed.",
+        question: "Probe the per-client limiter.",
+        providerId: "openai",
+        modelId: "gpt-5.6-sol",
+      });
+      yield* store.settleAttempt("attempt-settled", "interrupted");
+      const credentials = yield* McpCredentials;
+      return yield* credentials.issue({
+        ...BINDING,
+        attemptId: "attempt-settled",
+        attemptFence: 0,
+      });
+    }),
   );
 }
 
 const testLayer = Layer.mergeAll(
   ControlPlaneEndpoint.layer({ policy: DEFAULT_POLICY }),
   TestCredential.layer,
+  StaleCredential.layer,
   McpCredentials.layer,
   McpCallCounter.layer,
   PolicyDecisions.layer,
@@ -81,6 +129,7 @@ const runtime = ManagedRuntime.make(testLayer);
 
 let url = "";
 let token = "";
+let staleToken = "";
 
 beforeAll(async () => {
   await runtime.runPromise(
@@ -98,6 +147,7 @@ beforeAll(async () => {
       const credential = yield* TestCredential;
       url = endpoint.mcpUrl;
       token = Redacted.value(credential.token);
+      staleToken = Redacted.value((yield* StaleCredential).token);
     }),
   );
 });
@@ -379,7 +429,7 @@ describe("credential lifetime", () => {
       Effect.scoped(
         Effect.gen(function* () {
           const credentials = yield* McpCredentials;
-          const issued = yield* credentials.issue(BINDING, 1_000);
+          const issued = yield* credentials.issue(CREDENTIAL, 1_000);
           const raw = Redacted.value(issued.token);
           const live = yield* credentials.resolve(raw);
           yield* Effect.sleep(1_100);
@@ -402,7 +452,7 @@ describe("credential lifetime", () => {
         yield* Effect.result(
           Effect.scoped(
             Effect.gen(function* () {
-              const issued = yield* credentials.issue(BINDING);
+              const issued = yield* credentials.issue(CREDENTIAL);
               raw = Redacted.value(issued.token);
               return yield* Effect.fail("registration blew up");
             }),
@@ -426,7 +476,7 @@ describe("credential lifetime", () => {
         const fiber = yield* Effect.forkChild(
           Effect.scoped(
             Effect.gen(function* () {
-              const issued = yield* credentials.issue(BINDING);
+              const issued = yield* credentials.issue(CREDENTIAL);
               raw = Redacted.value(issued.token);
               yield* Effect.never;
             }),
@@ -450,7 +500,7 @@ describe("credential lifetime", () => {
       Effect.scoped(
         Effect.gen(function* () {
           const credentials = yield* McpCredentials;
-          const issued = yield* credentials.issue(BINDING);
+          const issued = yield* credentials.issue(CREDENTIAL);
           // `Redacted` also keeps it out of any accidental rendering.
           return {
             raw: Redacted.value(issued.token),
@@ -494,6 +544,7 @@ describe("advertised schema parity", () => {
     expect(advertised).toEqual(decoded);
     expect(advertised).toContain("operation_id");
     expect(advertised).toContain("untested_dimensions");
+    expect(advertised).toContain("addresses_dimensions");
     expect(advertised).toContain("setup");
     expect(advertised).toContain("cases");
     // The fields the multi-case shape replaced must be gone from the advertised schema,
@@ -681,6 +732,72 @@ describe("record_observation over MCP", () => {
     expect(rpcError).toContain("cases");
   });
 
+  test("a follow-up address that does not resolve is returned as a refusal", async () => {
+    // The worker is told exactly what was wrong, because the address is the one thing
+    // it cannot derive: it has to have come from a briefing.
+    const { isError, data } = payloadOf(
+      (
+        await callTool(
+          args({
+            operation_id: "op-bad-address",
+            addresses_dimensions: ["obs_999999_attempt-1#u0"],
+          }),
+        )
+      ).body,
+    );
+
+    expect(isError).toBe(true);
+    expect(data["reason"]).toBe("invalid");
+    expect(String(data["detail"])).toContain("obs_999999_attempt-1#u0");
+  });
+
+  test("a real follow-up address is accepted and recorded", async () => {
+    const first = payloadOf(
+      (
+        await callTool(
+          args({
+            operation_id: "op-raises",
+            untested_dimensions: ["a gap worth addressing"],
+          }),
+        )
+      ).body,
+    );
+    const raiser = String(first.data["observation_id"]);
+
+    const { isError } = payloadOf(
+      (
+        await callTool(
+          args({
+            operation_id: "op-addresses",
+            addresses_dimensions: [`${raiser}#u0`],
+          }),
+        )
+      ).body,
+    );
+    const links = await runtime.runPromise(
+      Effect.flatMap(ObservationStore, (store) =>
+        store.dimensionLinksForIntent("intent-1"),
+      ),
+    );
+
+    expect(isError).toBe(false);
+    expect(links.map((link) => link.address)).toContain(`${raiser}#u0`);
+  });
+
+  test("an observation under a settled attempt is refused as stale over the wire", async () => {
+    // The refusal a worker has to be able to act on: its attempt is no longer the live
+    // one, so nothing further will be recorded — and what it already recorded is safe.
+    const { isError, data } = payloadOf(
+      (await callTool(args({ operation_id: "op-stale" }), staleToken)).body,
+    );
+
+    // The credential itself is still live: the 401 boundary let it through, and the
+    // store refused the write. Those are different failures and must stay so.
+    expect(isError).toBe(true);
+    expect(data["reason"]).toBe("stale");
+    expect(String(data["detail"])).toContain("interrupted");
+  });
+
   test("an unknown tool name is refused", async () => {
     const response = await rpc("tools/call", {
       name: "drop_everything",
@@ -696,8 +813,9 @@ describe("record_observation over MCP", () => {
         store.observationsForIntent("intent-1"),
       ),
     );
-    // op-http-1, op-http-spoof, op-retry, op-conflict: four accepted operations.
-    expect(stored).toHaveLength(4);
+    // op-http-1, op-http-spoof, op-retry, op-conflict, op-raises, op-addresses:
+    // six accepted operations, all under the one live attempt.
+    expect(stored).toHaveLength(6);
     expect(stored.every((o) => o.provenance.attemptId === "attempt-1")).toBe(
       true,
     );

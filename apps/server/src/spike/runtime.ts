@@ -16,6 +16,8 @@ import { dirname, join } from "node:path";
 
 import { Context, Effect, Layer, Redacted } from "effect";
 
+import { HarnessSessionStatus } from "../recovery/harnessStatus";
+
 import { FixtureEndpoint } from "../fixture/server";
 import { DEFAULT_CONFIG, type RateLimitConfig } from "../fixture/rateLimit";
 import {
@@ -51,10 +53,24 @@ export const WORKER_MODEL: ModelRef = {
 
 export const RUNTIME_DIR = join(process.cwd(), ".runtime");
 
+/** The policy hook's source, loaded into whichever workspace needs it. */
+export const POLICY_HOOK_SOURCE = join(
+  import.meta.dir,
+  "..",
+  "..",
+  "plugins",
+  "policyHook.ts",
+);
+
 /** Paths the demos report and read back. Values, not a service's business. */
 export class SpikePaths extends Context.Service<
   SpikePaths,
-  { readonly workspace: string; readonly databaseFile: string }
+  {
+    readonly workspace: string;
+    readonly databaseFile: string;
+    /** Where the harness-side hook appends its decisions. Outside the workspace. */
+    readonly auditFile: string;
+  }
 >()("bit/spike/SpikePaths") {}
 
 export interface SpikeOptions {
@@ -66,48 +82,140 @@ export interface SpikeOptions {
   readonly workspaceFiles?: Readonly<Record<string, string>>;
   /** Boundaries the policy route enforces. Defaults to {@link DEFAULT_POLICY}. */
   readonly policy?: PolicyConfig;
+  /**
+   * Load the pre-execution policy hook into the worker's workspace.
+   *
+   * On by default, which is the change this milestone makes: the policy gate used to be
+   * exercised only by a dedicated probe, so the worker demo ran *unenforced* while the
+   * endpoint it would have consulted sat there answering nobody. A run with the hook off
+   * is a run with no pre-execution boundary, and has to say so.
+   */
+  readonly policyHook?: boolean;
+  /**
+   * Empty the policy audit file when the workspace is prepared. Defaults to `true`.
+   *
+   * A program that builds this layer more than once — once per phase, in separate
+   * scopes — must pass `false`, or each phase starts by deleting the record of the
+   * previous one.
+   */
+  readonly freshAudit?: boolean;
 }
 
-const prepareWorkspace = Effect.fnUntraced(function* (
-  workspace: string,
-  files: Readonly<Record<string, string>>,
-) {
+/**
+ * Lays out the worker's workspace, including the policy hook when one is wanted.
+ *
+ * A *configured* local plugin must point at a DIRECTORY with an `index`/`server`
+ * entrypoint, not a bare file — opencode logs "configured plugin path must be a
+ * directory" and skips it otherwise (`packages/plugin/src/host.ts:17-42`). Deliberately
+ * not named `plugin/`, which is auto-discovered and would load a second copy with no
+ * options (`packages/core/src/plugin/source-directory.ts:9`).
+ *
+ * The audit file is written *outside* the workspace on purpose: it records what the
+ * worker was allowed and denied, and a worker that can read its own audit trail can
+ * read the shape of the boundary it is inside.
+ */
+export const prepareWorkspace = Effect.fnUntraced(function* (input: {
+  readonly workspace: string;
+  readonly files: Readonly<Record<string, string>>;
+  readonly hook?: {
+    readonly policyUrl: string;
+    readonly auditPath: string;
+    /**
+     * Empty the audit file first.
+     *
+     * Required rather than defaulted, because both answers are wrong somewhere. A
+     * single-scope demo wants a file describing this run and nothing else. A program
+     * with several scopes — the milestone proof has four — would wipe its own evidence
+     * at the start of every phase, which is exactly what it did before this was a
+     * decision a caller had to make.
+     */
+    readonly freshAudit: boolean;
+  };
+}) {
   yield* Effect.sync(() => {
-    mkdirSync(workspace, { recursive: true });
+    mkdirSync(input.workspace, { recursive: true });
   });
-  yield* Effect.forEach(Object.entries(files), ([name, content]) =>
+  yield* Effect.forEach(Object.entries(input.files), ([name, content]) =>
     Effect.promise(async () => {
-      const target = join(workspace, name);
+      const target = join(input.workspace, name);
       mkdirSync(dirname(target), { recursive: true });
       await Bun.write(target, content);
     }),
   );
+  const hook = input.hook;
+  if (hook === undefined) return;
+  yield* Effect.promise(async () => {
+    const directory = join(input.workspace, ".opencode", "policy");
+    mkdirSync(directory, { recursive: true });
+    if (hook.freshAudit || !(await Bun.file(hook.auditPath).exists())) {
+      await Bun.write(hook.auditPath, "");
+    }
+    await Bun.write(
+      join(directory, "index.ts"),
+      await Bun.file(POLICY_HOOK_SOURCE).text(),
+    );
+    await Bun.write(
+      join(directory, "package.json"),
+      `${JSON.stringify(
+        {
+          name: "bit-policy-hook",
+          private: true,
+          type: "module",
+          main: "index.ts",
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await Bun.write(
+      join(input.workspace, ".opencode", "opencode.json"),
+      `${JSON.stringify(
+        {
+          $schema: "https://opencode.ai/config.json",
+          // `plugins` (not `plugin`) is the key that accepts the object form. The
+          // superseded `plugin` key takes a string or a `[package, options]` tuple, and
+          // an object there is silently skipped as malformed
+          // (opencode `packages/core/src/config/normalize.ts:185-190`).
+          plugins: [
+            {
+              package: "./policy",
+              options: {
+                policyUrl: hook.policyUrl,
+                auditPath: hook.auditPath,
+              },
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  });
 });
 
 /**
  * The spike's application layer.
  *
- * `ObservationStore.layer` is passed to the MCP endpoint *and* merged into the result;
- * layer memoisation builds it once, so there is one database connection and one scope
- * owning it.
+ * The ordering constraints here are real, which is why this is a layer graph and not a
+ * `bootstrap` function: the control plane must exist before the workspace can be written
+ * (the hook's config has to carry the live policy URL), the workspace must exist before
+ * the harness spawns into it, the store must exist before the MCP endpoint can serve a
+ * tool that writes to it, and *all* of it must come down in reverse order on any exit.
+ *
+ * `store` and `endpoint` are each referenced from two places in that graph; layer
+ * memoisation builds each once, so there is one database connection and one listener,
+ * owned by one scope.
  */
 export const spikeLayer = (options: SpikeOptions = {}) => {
-  const workspace = join(RUNTIME_DIR, options.workspaceName ?? "workspace");
+  const name = options.workspaceName ?? "workspace";
+  const workspace = join(RUNTIME_DIR, name);
   const databaseFile = join(RUNTIME_DIR, options.databaseName ?? "hunt.sqlite");
+  const auditFile = join(RUNTIME_DIR, `${name}-policy-audit.log`);
 
   const store = ObservationStore.layer(databaseFile);
 
-  const workspaceReady = Layer.effectDiscard(
-    prepareWorkspace(workspace, options.workspaceFiles ?? {}),
-  );
-
-  const harness = OpenCodeClient.layer(options.timeouts).pipe(
-    Layer.provideMerge(OpenCodeServer.layer({ cwd: workspace })),
-    Layer.provide(workspaceReady),
-  );
-
-  // One listener for both control-plane surfaces: the MCP route the worker calls back
-  // into and the policy route the harness-side hook consults.
+  // One listener for all three control-plane surfaces: health, the MCP route the worker
+  // calls back into, and the policy route the harness-side hook consults.
   const endpoint = ControlPlaneEndpoint.layer({
     policy: options.policy ?? DEFAULT_POLICY,
   }).pipe(
@@ -117,12 +225,38 @@ export const spikeLayer = (options: SpikeOptions = {}) => {
     Layer.provide(store),
   );
 
+  const workspaceReady = Layer.effectDiscard(
+    Effect.flatMap(ControlPlaneEndpoint, (control) =>
+      prepareWorkspace({
+        workspace,
+        files: options.workspaceFiles ?? {},
+        ...(options.policyHook === false
+          ? {}
+          : {
+              hook: {
+                policyUrl: control.policyUrl,
+                auditPath: auditFile,
+                freshAudit: options.freshAudit ?? true,
+              },
+            }),
+      }),
+    ),
+  ).pipe(Layer.provide(endpoint));
+
+  const harness = OpenCodeClient.layer(options.timeouts).pipe(
+    Layer.provideMerge(OpenCodeServer.layer({ cwd: workspace })),
+    Layer.provide(workspaceReady),
+  );
+
   return Layer.mergeAll(
     store,
     endpoint,
     FixtureEndpoint.layer(options.fixtureConfig ?? DEFAULT_CONFIG),
     harness,
-    Layer.succeed(SpikePaths, { workspace, databaseFile }),
+    // Recovery asks the live harness, so it is wired from the same client the worker
+    // runs on rather than from a second connection to the same server.
+    HarnessSessionStatus.layer.pipe(Layer.provide(harness)),
+    Layer.succeed(SpikePaths, { workspace, databaseFile, auditFile }),
   );
 };
 
@@ -161,7 +295,7 @@ export const openWorkerSession = Effect.fn("openWorkerSession")(function* (
   const endpoint = yield* ControlPlaneEndpoint;
   const paths = yield* SpikePaths;
 
-  yield* store.seedAttempt({
+  const authority = yield* store.seedAttempt({
     ...binding,
     providerId: WORKER_MODEL.providerID,
     modelId: WORKER_MODEL.id,
@@ -181,6 +315,9 @@ export const openWorkerSession = Effect.fn("openWorkerSession")(function* (
     attemptId: binding.attemptId,
     harnessSessionId: session.id,
     workerId: binding.workerId,
+    // Authority as of now. If recovery fences this attempt while the worker is out,
+    // the credential stops working even though the registry still holds it.
+    attemptFence: authority.writeFence,
   });
 
   yield* client.registerMcpServer(`bit-${binding.attemptId}`, {
@@ -195,5 +332,5 @@ export const openWorkerSession = Effect.fn("openWorkerSession")(function* (
     directory: paths.workspace,
   });
 
-  return { session, credential };
+  return { session, credential, authority };
 });

@@ -120,6 +120,7 @@ export const multiCaseInput = (
     "The limiter keys on the header value, so rotating it admits requests the exhausted value no longer gets.",
   limitations: ["A request header is not a network address."],
   untestedDimensions: ["The per-account limit was never approached."],
+  addressesDimensions: [],
   ...overrides,
 });
 
@@ -170,6 +171,7 @@ export const multiCaseWireArgs = (
   interpretation: "The limiter keys on the header value.",
   limitations: ["A request header is not a network address."],
   untested_dimensions: ["The per-account limit was never approached."],
+  addresses_dimensions: [],
   ...overrides,
 });
 
@@ -197,6 +199,9 @@ export const SUMMARY_CONDITIONS = {
 };
 
 export const SUMMARY_OBSERVATION_ID = "obs_000001_attempt-summary";
+/** An attempt the first-slice database left running, as the real one was found. */
+export const RUNNING_ATTEMPT_ID = "attempt-abandoned";
+export const RUNNING_ATTEMPT_SESSION = "ses_abandoned";
 export const SUMMARY_RECEIPT_KEY =
   "fixture-local/attempt-summary:record_observation:summary-op-1";
 
@@ -279,6 +284,33 @@ export const writeFirstSliceDatabase = async (
         "succeeded",
         1,
         2,
+      ],
+    );
+    /**
+     * A second attempt, still running.
+     *
+     * The first-slice database has to carry one, for two reasons. Write authority is
+     * now checked against the attempt's status, so a test that records a *new*
+     * observation against an adopted database needs a live attempt to record it under —
+     * `attempt-summary` is settled, and settled is exactly what must be refused. And
+     * reconciliation needs a real adopted `running` row to reconcile, which is the
+     * state the development database was actually found in.
+     */
+    database.run(
+      `INSERT INTO attempts (id, intent_id, target_id, worker_id, harness_session_id,
+         provider_id, model_id, status, started_at, ended_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        RUNNING_ATTEMPT_ID,
+        "intent-per-client-limiter",
+        "fixture-local",
+        "worker-1",
+        RUNNING_ATTEMPT_SESSION,
+        "openai",
+        "gpt-5.6-sol",
+        "running",
+        3,
+        null,
       ],
     );
     database.run(

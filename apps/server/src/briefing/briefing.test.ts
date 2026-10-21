@@ -14,13 +14,20 @@ import type { RecordObservationInput } from "@bit/contracts";
 import { Effect } from "effect";
 
 import {
+  RUNNING_ATTEMPT_ID,
   SUMMARY_CONDITIONS,
   SUMMARY_OBSERVATION_ID,
   multiCaseInput,
   writeFirstSliceDatabase,
 } from "../persistence/fixtures";
 import { ObservationStore, type CallerContext } from "../persistence/store";
-import { BriefingError, buildBriefing, renderBriefing } from "./briefing";
+import {
+  BriefingError,
+  PREPARATION_HEADING,
+  buildBriefing,
+  renderBriefing,
+  stablePrefixOf,
+} from "./briefing";
 
 const directories: string[] = [];
 
@@ -45,6 +52,7 @@ const CALLER: CallerContext = {
   attemptId: "attempt-1",
   harnessSessionId: "ses_abc",
   workerId: "worker-1",
+  attemptFence: 0,
 };
 
 const input = multiCaseInput;
@@ -152,14 +160,20 @@ describe("buildBriefing", () => {
     expect(briefing.truncated).toBe(true);
     expect(briefing.observations).toHaveLength(2);
     expect(briefing.omittedObservationIds).toHaveLength(1);
-    // Most recent first: a later observation qualifies an earlier one.
-    expect(briefing.observations[0]?.sequence).toBe(3);
+    // Selection keeps the most recent, because a later observation qualifies an earlier
+    // one; the kept ones are then listed oldest first.
+    expect(briefing.observations.map((item) => item.sequence)).toEqual([2, 3]);
+    expect(briefing.omittedObservationIds).toEqual(["obs_000001_attempt-1"]);
     expect(renderBriefing(briefing)).toContain(
       "Their absence above does not mean the graph lacks them",
     );
   });
 
-  test("open questions are the recorded untested dimensions, deduplicated", async () => {
+  test("every recorded dimension is its own addressable question, including repeated wording", async () => {
+    // Deliberately not deduplicated by text. Two observations that recorded the same
+    // sentence recorded two separate questions, and collapsing them would be the fuzzy
+    // matching addresses exist to avoid — it would also mean addressing one silently
+    // closed the other.
     const briefing = await withSeeded(
       () => buildBriefing("intent-1"),
       [
@@ -167,7 +181,236 @@ describe("buildBriefing", () => {
         input({ operationId: "b", untestedDimensions: ["y", "z"] }),
       ],
     );
-    expect([...briefing.openQuestions]).toEqual(["y", "z", "x"]);
+
+    expect(
+      briefing.openQuestions.map((question) => [
+        question.address,
+        question.dimension,
+        question.status,
+      ]),
+    ).toEqual([
+      // Newest raising observation first, then recorded position.
+      ["obs_000002_attempt-1#u0", "y", "uninvestigated"],
+      ["obs_000002_attempt-1#u1", "z", "uninvestigated"],
+      ["obs_000001_attempt-1#u0", "x", "uninvestigated"],
+      ["obs_000001_attempt-1#u1", "y", "uninvestigated"],
+    ]);
+    expect(
+      briefing.openQuestions.every(
+        (question) => question.addressedBy.length === 0,
+      ),
+    ).toBe(true);
+  });
+
+  test("a later observation that cites an address moves that question, and only that one", async () => {
+    const briefing = await withSeeded(
+      (store) =>
+        Effect.gen(function* () {
+          // The first write is already in place from `withSeeded`'s own list.
+          yield* store.recordObservation(
+            CALLER,
+            input({
+              operationId: "follow-up",
+              outcome: "negative",
+              testedClaim: "The per-account limit refuses at 100.",
+              untestedDimensions: [],
+              addressesDimensions: ["obs_000001_attempt-1#u1"],
+            }),
+          );
+          return yield* buildBriefing("intent-1");
+        }),
+      [input({ operationId: "raiser", untestedDimensions: ["x", "y"] })],
+    );
+
+    const addressed = briefing.openQuestions.find(
+      (question) => question.address === "obs_000001_attempt-1#u1",
+    );
+    const untouched = briefing.openQuestions.find(
+      (question) => question.address === "obs_000001_attempt-1#u0",
+    );
+
+    // A negative outcome is still evidence relative to its own claim.
+    expect(addressed?.status).toBe("addressedWithEvidence");
+    expect(addressed?.addressedBy.map((item) => item.observationId)).toEqual([
+      "obs_000002_attempt-1",
+    ]);
+    expect(addressed?.addressedBy[0]?.outcome).toBe("negative");
+    // The sibling dimension of the same observation is not swept along with it.
+    expect(untouched?.status).toBe("uninvestigated");
+    expect(untouched?.addressedBy).toHaveLength(0);
+  });
+
+  test("an inconclusive follow-up is addressed but still undecided", async () => {
+    const briefing = await withSeeded(
+      (store) =>
+        Effect.gen(function* () {
+          yield* store.recordObservation(
+            CALLER,
+            input({
+              operationId: "inconclusive-follow-up",
+              outcome: "inconclusive",
+              untestedDimensions: [],
+              addressesDimensions: ["obs_000001_attempt-1#u0"],
+            }),
+          );
+          return yield* buildBriefing("intent-1");
+        }),
+      [input({ operationId: "raiser", untestedDimensions: ["x"] })],
+    );
+
+    const question = briefing.openQuestions.find(
+      (item) => item.address === "obs_000001_attempt-1#u0",
+    );
+    // Work happened and decided nothing. That is not progress on the claim, and it is
+    // not the same state as untouched.
+    expect(question?.status).toBe("addressedInconclusive");
+    expect(question?.addressedBy).toHaveLength(1);
+
+    const rendered = renderBriefing(briefing);
+    expect(rendered).toContain("Addressed, still undecided");
+    expect(rendered).toContain("Nothing in this system closes a question");
+  });
+
+  test("a question raised by a truncated observation is still listed, and labelled as omitted", async () => {
+    // Truncating the body must not drop the question: the briefing would otherwise
+    // forget an open dimension purely because the briefing was full.
+    const briefing = await withSeeded(
+      () => buildBriefing("intent-1", 1),
+      [
+        input({ operationId: "old", untestedDimensions: ["from the old one"] }),
+        input({ operationId: "new", untestedDimensions: ["from the new one"] }),
+      ],
+    );
+
+    expect(briefing.truncated).toBe(true);
+    expect(briefing.observations).toHaveLength(1);
+    const fromOmitted = briefing.openQuestions.find(
+      (question) => question.dimension === "from the old one",
+    );
+    expect(fromOmitted).toBeDefined();
+    expect(fromOmitted?.raisedBy.includedInBriefing).toBe(false);
+    expect(renderBriefing(briefing)).toContain(
+      "it is omitted from this briefing, not absent from the graph",
+    );
+  });
+
+  test("the rendered briefing prints the address a worker has to cite", async () => {
+    const rendered = await withSeeded(
+      () => Effect.map(buildBriefing("intent-1"), renderBriefing),
+      [
+        input({
+          operationId: "a",
+          untestedDimensions: ["the per-account limit"],
+        }),
+      ],
+    );
+
+    expect(rendered).toContain(
+      "[obs_000001_attempt-1#u0] the per-account limit",
+    );
+    expect(rendered).toContain("addresses_dimensions");
+    expect(rendered).toContain("Uninvestigated (1)");
+  });
+
+  test("a briefing with one more observation extends the previous one byte for byte", async () => {
+    // The property the layout exists for: everything above the preparation heading is
+    // the intent plus the observations recorded under it, oldest first, so a later
+    // briefing starts with the earlier one. A count or a sequence number above that
+    // heading would break this, which is why the assertion is on bytes and not on
+    // whether the same strings are present somewhere.
+    const [before, after] = await withSeeded(
+      (store) =>
+        Effect.gen(function* () {
+          const first = yield* Effect.map(
+            buildBriefing("intent-1"),
+            renderBriefing,
+          );
+          yield* store.recordObservation(
+            CALLER,
+            input({
+              operationId: "second",
+              testedClaim: "The per-account limit refuses at 100.",
+            }),
+          );
+          const second = yield* Effect.map(
+            buildBriefing("intent-1"),
+            renderBriefing,
+          );
+          return [first, second] as const;
+        }),
+      [input({ operationId: "first" })],
+    );
+
+    const stable = stablePrefixOf(before);
+    expect(stable).toContain("### obs_000001_attempt-1");
+    expect(after.startsWith(stable)).toBe(true);
+    // Not vacuous: the second briefing really did grow, and the volatile tail really
+    // did change rather than being identical by accident.
+    expect(stablePrefixOf(after).length).toBeGreaterThan(stable.length);
+    expect(stablePrefixOf(after)).toContain("### obs_000002_attempt-1");
+    expect(after).toContain("graph sequence 2");
+    expect(before).toContain("graph sequence 1");
+  });
+
+  test("nothing above the preparation heading depends on how much was recorded", async () => {
+    // Stated as its own check because the failure mode is a well-meaning edit: moving a
+    // count or the sequence into a heading reads better and silently costs the property
+    // above. Everything that restates the record belongs below the line.
+    const rendered = await withSeeded(
+      () => Effect.map(buildBriefing("intent-1", 1), renderBriefing),
+      [
+        input({ operationId: "a", untestedDimensions: ["x"] }),
+        input({ operationId: "b", untestedDimensions: ["y"] }),
+      ],
+    );
+
+    const head = stablePrefixOf(rendered);
+    expect(head).not.toContain("graph sequence");
+    expect(head).not.toContain("Observations above:");
+    expect(head).not.toContain("Disclosed omissions");
+    expect(head).not.toContain("Open questions");
+    // And the tail still carries all of it, so nothing was dropped on the way down.
+    const tail = rendered.slice(rendered.indexOf(PREPARATION_HEADING));
+    expect(tail).toContain("graph sequence 2");
+    expect(tail).toContain(
+      "Observations above: 1 of 2 recorded for this intent.",
+    );
+    expect(tail).toContain("## Disclosed omissions");
+    expect(tail).toContain("Open questions carried forward (2)");
+  });
+
+  test("the stable part is rewritten once the truncation window slides, and that is said plainly", async () => {
+    // The honest limit of the property. With a window of two, a third observation drops
+    // the oldest included one, so the stable part no longer starts where it did. A
+    // planner round after that point pays for a full prefix again; nothing is lost from
+    // the graph, and the omission is disclosed as always.
+    const [twoRows, threeRows] = await withSeeded(
+      (store) =>
+        Effect.gen(function* () {
+          const first = yield* Effect.map(
+            buildBriefing("intent-1", 2),
+            renderBriefing,
+          );
+          yield* store.recordObservation(
+            CALLER,
+            input({ operationId: "third" }),
+          );
+          const second = yield* Effect.map(
+            buildBriefing("intent-1", 2),
+            renderBriefing,
+          );
+          return [first, second] as const;
+        }),
+      [input({ operationId: "first" }), input({ operationId: "second" })],
+    );
+
+    expect(threeRows.startsWith(stablePrefixOf(twoRows))).toBe(false);
+    expect(stablePrefixOf(twoRows)).toContain("### obs_000001_attempt-1");
+    expect(stablePrefixOf(threeRows)).not.toContain("### obs_000001_attempt-1");
+    expect(threeRows).toContain("- obs_000001_attempt-1");
+    expect(threeRows).toContain(
+      "Their absence above does not mean the graph lacks them",
+    );
   });
 
   test("the briefing records the sequence it was prepared at", async () => {
@@ -221,12 +464,14 @@ describe("briefings over an upgraded database", () => {
       Effect.gen(function* () {
         yield* store.recordObservation(
           {
-            callerScope: "fixture-local/attempt-summary",
+            // The adopted database's running attempt: a settled one has no authority.
+            callerScope: `fixture-local/${RUNNING_ATTEMPT_ID}`,
             targetId: "fixture-local",
             intentId: "intent-per-client-limiter",
-            attemptId: "attempt-summary",
+            attemptId: RUNNING_ATTEMPT_ID,
             harnessSessionId: "ses_new",
             workerId: "worker-1",
+            attemptFence: 0,
           },
           input({ operationId: "op-after-upgrade" }),
         );
@@ -237,12 +482,15 @@ describe("briefings over an upgraded database", () => {
       }),
     );
 
-    expect(rendered).toContain("Recorded observations (2)");
+    expect(rendered).toContain(
+      "Observations above: 2 of 2 recorded for this intent.",
+    );
     expect(rendered).toContain("RECORD FORMAT: summary");
     expect(rendered).toContain("cases (2)");
-    // Newest first, so the case-based one leads and the summary one follows.
-    expect(rendered.indexOf("cases (2)")).toBeLessThan(
-      rendered.indexOf("RECORD FORMAT: summary"),
+    // Oldest first, so the summary-format row this database was adopted with leads and
+    // the case-based one recorded after the upgrade follows it.
+    expect(rendered.indexOf("RECORD FORMAT: summary")).toBeLessThan(
+      rendered.indexOf("cases (2)"),
     );
   });
 });
