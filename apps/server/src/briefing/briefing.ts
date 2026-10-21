@@ -433,6 +433,12 @@ const renderOpenQuestions = (
     `resolve is refused, and nothing is inferred from wording \u2014 if you do not name it,`,
     `it stays open.`,
     ``,
+    // True until §17's `0009_dimension_dispositions` lands, and false the moment it
+    // does: a planner will then be able to retire a question as `subsumed` or
+    // `withdrawn`. Rewrite this to say that a retired question leaves this list but not
+    // the record — naming who retired it, on what basis, and that a later observation
+    // or a human can reopen it. A retirement nothing discloses is indistinguishable
+    // from a question that was never raised.
     `Nothing in this system closes a question. These groupings say what has been recorded`,
     `against each one, not whether it is settled.`,
   ];
