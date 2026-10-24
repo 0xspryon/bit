@@ -26,7 +26,15 @@
   --grey-1200: #080808;
 
   /* ── Type ── */
-  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  /**
+   * Both families are bundled (see `routes/+layout.svelte`), so the stacks below
+   * are a fallback for a failed load rather than a hope that the machine has them.
+   * `Inter Variable` is the family name Fontsource's variable build declares; plain
+   * `Inter` follows it so a locally installed static Inter is still preferred over
+   * a system face.
+   */
+  --font-sans:
+    "Inter Variable", Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono:
     "IBM Plex Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
   --lh-tight: 12px;
