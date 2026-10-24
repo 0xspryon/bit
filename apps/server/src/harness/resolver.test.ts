@@ -61,7 +61,12 @@ const working = (driver: DriverKind, models?: readonly string[]) =>
       stubHarness({
         instance: instanceFor(
           driver,
-          models === undefined ? {} : { models, defaultModel: models[0] ?? "" },
+          models === undefined
+            ? {}
+            : {
+                models: models.map((id) => ({ id })),
+                defaultModel: models[0] ?? "",
+              },
         ),
       }),
     ),
@@ -217,8 +222,8 @@ describe("the listing", () => {
   test("a working candidate reports its own models, not the placeholder's", async () => {
     await withResolver([working(ALPHA, ["a/one", "a/two"])], (resolver) => {
       expect(resolver.instances[0]?.instance.models).toEqual([
-        "a/one",
-        "a/two",
+        { id: "a/one" },
+        { id: "a/two" },
       ]);
       expect(resolver.instances[0]?.instance.defaultModel).toBe("a/one");
     });

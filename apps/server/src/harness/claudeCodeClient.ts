@@ -84,9 +84,16 @@
  *   Claude Code 2.1.211+).
  */
 import {
+  MODEL_OPTION_DEFAULT_CHOICE,
+  type HarnessModelView,
+  type ModelOptionDescriptor,
+  type ModelOptionSelection,
+} from "@bit/contracts";
+import {
   getSessionInfo as sdkGetSessionInfo,
   getSessionMessages as sdkGetSessionMessages,
   query as sdkQuery,
+  type EffortLevel,
   type McpServerConfig,
   type Options,
   type Query,
@@ -137,6 +144,69 @@ import {
 export const CLAUDE_CODE_DEFAULT_MODEL = "claude-sonnet-5";
 
 /**
+ * The option id a run carries for Claude Code's reasoning choice: the SDK's own word.
+ *
+ * `effort` because that is the option's name on the SDK's `Options` —
+ * `effort?: EffortLevel` — and the id a selection names is the harness's rather than ours
+ * (`@bit/contracts`'s `modelOption.ts`). Deliberately **not** `maxThinkingTokens`: the SDK
+ * deprecates it in favour of `thinking`, treats it as on/off on current models, and a
+ * token count is a number rather than a level, so it would not fit a `select` descriptor
+ * honestly. If a budget ever has to be settable, it wants a numeric descriptor type and
+ * not this one stretched.
+ */
+export const CLAUDE_CODE_EFFORT_OPTION = "effort";
+
+/**
+ * The reasoning levels this harness offers, and the one caveat worth stating.
+ *
+ * The five are the SDK's own `EffortLevel` union verbatim, so the ladder moves when the
+ * dependency does. **Which models accept one is written down rather than observed**, for
+ * the same reason the model list itself is: the SDK reports `supportsEffort` and
+ * `supportedEffortLevels` on a *live query*'s model descriptor, so reading it at
+ * layer-build time would mean starting a CLI session and prompting nothing to ask. The
+ * honest consequence is recorded instead of hidden — the Claude 5 models carry this
+ * descriptor and the 4-5 models carry none, and an operator who needs effort on a model
+ * not listed with it can still get it from the harness's own configuration rather than
+ * from a control this server offered on a guess.
+ */
+const CLAUDE_CODE_EFFORT: ModelOptionDescriptor = {
+  id: CLAUDE_CODE_EFFORT_OPTION,
+  label: "Reasoning",
+  type: "select",
+  options: [
+    // Absence is how the SDK is told "your default", so this choice is dropped at the
+    // edge rather than sent — see {@link claudeCodeEffortOf}.
+    { id: MODEL_OPTION_DEFAULT_CHOICE, label: "Default", isDefault: true },
+    { id: "low", label: "Low" },
+    { id: "medium", label: "Medium" },
+    { id: "high", label: "High" },
+    { id: "xhigh", label: "Extra high" },
+    { id: "max", label: "Maximum" },
+  ],
+};
+
+/**
+ * The `effort` one session runs at, from the resolved selections.
+ *
+ * `undefined` for the default choice as well as for no choice at all, because the SDK has
+ * no value meaning "your default" — absence *is* that value. The cast is confined to this
+ * function: the ids above are the SDK's union members, and this is the one place where
+ * that correspondence is asserted rather than inferred.
+ */
+const claudeCodeEffortOf = (
+  options: readonly ModelOptionSelection[] | undefined,
+): EffortLevel | undefined => {
+  const value = options?.find(
+    (option) => option.id === CLAUDE_CODE_EFFORT_OPTION,
+  )?.value;
+  if (value === undefined || value === MODEL_OPTION_DEFAULT_CHOICE)
+    return undefined;
+  return CLAUDE_CODE_EFFORT.options.some((choice) => choice.id === value)
+    ? (value as EffortLevel)
+    : undefined;
+};
+
+/**
  * The models this harness offers the picker.
  *
  * **Written down, and that is the honest shape here.** The SDK's own listing —
@@ -154,11 +224,13 @@ export const CLAUDE_CODE_DEFAULT_MODEL = "claude-sonnet-5";
  * ran and not which build — and `model_id` is provenance. An operator who wants an alias
  * can still name one: the list is what the picker offers, never what the harness accepts.
  */
-export const CLAUDE_CODE_MODELS: readonly string[] = [
-  CLAUDE_CODE_DEFAULT_MODEL,
-  "claude-opus-5",
-  "claude-sonnet-4-5",
-  "claude-haiku-4-5",
+export const CLAUDE_CODE_MODELS: readonly HarnessModelView[] = [
+  { id: CLAUDE_CODE_DEFAULT_MODEL, optionDescriptors: [CLAUDE_CODE_EFFORT] },
+  { id: "claude-opus-5", optionDescriptors: [CLAUDE_CODE_EFFORT] },
+  // No descriptor on the 4-5 models: see {@link CLAUDE_CODE_EFFORT} on why that is a
+  // written-down answer rather than an observed one.
+  { id: "claude-sonnet-4-5" },
+  { id: "claude-haiku-4-5" },
 ];
 
 /**
@@ -241,6 +313,14 @@ interface SessionRecord {
   readonly sessionId: string;
   readonly title: string;
   readonly model: string;
+  /**
+   * The reasoning level this session runs at, or nothing for the model's own.
+   *
+   * Held with the rest of the session's configuration rather than applied on creation,
+   * because `createSession` here starts nothing: the SDK's `query()` is what takes it, and
+   * that call does not happen until the prompt arrives. Same reason `model` is here.
+   */
+  readonly effort: EffortLevel | undefined;
   readonly directory: string;
   /** Per-attempt MCP registrations. One session's, never another's. */
   readonly mcpServers: Record<string, McpServerConfig>;
@@ -466,8 +546,10 @@ export const claudeCodeHarness = (
         // The default first and never twice, so a caller that configured its own default
         // gets a pickable list rather than one that omits the model it will actually use.
         models: [
-          defaultModel,
-          ...CLAUDE_CODE_MODELS.filter((name) => name !== defaultModel),
+          CLAUDE_CODE_MODELS.find((model) => model.id === defaultModel) ?? {
+            id: defaultModel,
+          },
+          ...CLAUDE_CODE_MODELS.filter((model) => model.id !== defaultModel),
         ],
       };
 
@@ -630,6 +712,12 @@ export const claudeCodeHarness = (
                   cwd: record.directory,
                   model: record.model,
                   sessionId: record.sessionId,
+                  // Spread rather than passed as `undefined`: the SDK reads an absent
+                  // `effort` as "whatever this model does", and an explicit `undefined`
+                  // is the same thing said less clearly.
+                  ...(record.effort === undefined
+                    ? {}
+                    : { effort: record.effort }),
                   // The gate lives in `.claude/settings.local.json` in `cwd`; stated
                   // rather than defaulted so a future default cannot un-gate a run.
                   settingSources: ["user", "project", "local"],
@@ -711,6 +799,7 @@ export const claudeCodeHarness = (
           sessionId,
           title: input.title,
           model: input.model,
+          effort: claudeCodeEffortOf(input.options),
           directory: input.directory,
           mcpServers: {},
           narration,

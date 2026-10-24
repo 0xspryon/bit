@@ -47,6 +47,7 @@
  * cannot tell", which is exactly what `recovery/harnessStatus.ts` records. Storing the
  * driver would have turned that into a confident answer about a harness nobody can ask.
  */
+import type { HarnessModelView } from "@bit/contracts";
 import { Schema } from "effect";
 
 /**
@@ -167,8 +168,14 @@ export interface HarnessInstance {
    * "we could not read the catalogue" must not become "this instance can run nothing".
    * An operator may still name a model that is not here — the harness refuses it, and that
    * refusal is the harness's to give rather than ours to guess at.
+   *
+   * **Entries carry what each model offers**, not just its name: a model's option
+   * descriptors are observed in the same breath as the model itself and belong to it
+   * (`@bit/contracts`'s `modelOption.ts`). The contract's shape is reused verbatim here
+   * rather than restated, because this list is passed to the browser unchanged and a
+   * second declaration would be a second thing to keep true.
    */
-  readonly models: readonly string[];
+  readonly models: readonly HarnessModelView[];
 }
 
 /**

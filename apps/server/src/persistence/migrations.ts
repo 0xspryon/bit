@@ -947,6 +947,42 @@ const addAttemptHarnessInstance = statements(
 );
 
 /**
+ * `0015` — what was chosen *of* the model an attempt ran on.
+ *
+ * `0014` answered "which harness" and `provider_id`/`model_id` answer "which model". What
+ * none of them answer is how hard that model was asked to think — and reasoning depth
+ * changes what a run does, so leaving it out puts a hole in the one thing an attempt row
+ * exists for. "The same prompt at a different effort" is a plausible explanation for two
+ * attempts disagreeing, and until now nobody could check it.
+ *
+ * **One column, holding what was dispatched.** The canonical JSON of the selections the
+ * run actually carried — `[{"id":"effort","value":"high"}]` — sorted by id so two
+ * identical choices are byte-identical and comparable. Not a side table: the ids are the
+ * *harness's* (`variant` on OpenCode, `effort` on Claude Code, and whatever a third
+ * brings), so a schema that named them would be a schema that had to change with every
+ * harness release, and nothing in this application queries by one.
+ *
+ * **What was dispatched, never what the picker displayed.** A descriptor's default is
+ * shown to an operator and deliberately not sent (`@bit/contracts`'s `modelOption.ts`,
+ * rule 3), so a row reading `effort: medium` because that is the catalogue default would
+ * be a fabricated answer to a question nobody asked. `NULL` is the honest value for "the
+ * operator set nothing, and the harness applied its own default" — which is also the
+ * common case.
+ *
+ * **Nullable, with no backfill**, for `0014`'s reason exactly: every row written before
+ * this migration was written by a process that could not dispatch an option at all, and
+ * `NULL` says "this was not recorded" rather than "nothing was chosen". The two are
+ * indistinguishable here, and that is the honest degradation — an invented `[]` would
+ * have made an old row claim an answer it never had.
+ *
+ * No index. The column is read off a row somebody already found, and a partial index on
+ * a JSON blob nothing filters by would be a cost with no reader.
+ */
+const addAttemptModelOptions = statements(
+  `ALTER TABLE attempts ADD COLUMN model_options TEXT`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -978,6 +1014,7 @@ export const MIGRATIONS: Record<
   "0012_event_log": addEventLog,
   "0013_outbox": addOutbox,
   "0014_attempt_harness_instance": addAttemptHarnessInstance,
+  "0015_attempt_model_options": addAttemptModelOptions,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

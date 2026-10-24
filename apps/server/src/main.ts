@@ -339,7 +339,9 @@ const CANDIDATES: readonly HarnessCandidate[] = [
       installed: false,
       auth: "unknown",
       defaultModel: OPENCODE_DEFAULT_MODEL,
-      models: [OPENCODE_DEFAULT_MODEL],
+      // One entry and no option descriptors: a harness that never came up reported no
+      // catalogue, so there is nothing it can be asked about either.
+      models: [{ id: OPENCODE_DEFAULT_MODEL }],
     },
   },
   {
@@ -356,7 +358,7 @@ const CANDIDATES: readonly HarnessCandidate[] = [
       installed: false,
       auth: "unknown",
       defaultModel: CLAUDE_CODE_DEFAULT_MODEL,
-      models: [CLAUDE_CODE_DEFAULT_MODEL],
+      models: [{ id: CLAUDE_CODE_DEFAULT_MODEL }],
     },
   },
 ];

@@ -157,7 +157,27 @@ export const harnessInstance = (
   auth: "authenticated",
   isDefault: true,
   defaultModel: "claude-sonnet-5",
-  models: ["claude-sonnet-5", "claude-opus-5"],
+  // Model *views*, since that is what the contract carries: a name plus whatever that
+  // model offers. The second one carries a reasoning descriptor so a test can exercise
+  // the option rules without inventing a shape the server would not send.
+  models: [
+    { id: "claude-sonnet-5" },
+    {
+      id: "claude-opus-5",
+      optionDescriptors: [
+        {
+          id: "effort",
+          label: "Reasoning",
+          type: "select" as const,
+          options: [
+            { id: "default", label: "Default", isDefault: true },
+            { id: "low", label: "Low" },
+            { id: "high", label: "High" },
+          ],
+        },
+      ],
+    },
+  ],
   ...over,
 });
 

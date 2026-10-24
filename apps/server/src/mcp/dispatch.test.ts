@@ -237,6 +237,7 @@ beforeAll(async () => {
             harnessInstanceId: "opencode",
             providerId: "openai",
             modelId: "gpt-5.6-sol",
+            modelOptions: null,
           }),
         );
       }

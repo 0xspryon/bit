@@ -623,6 +623,13 @@ const fleetHandlers = HttpApiBuilder.group(
             ? {}
             : { instanceId: payload.instanceId }),
           ...(payload.model === undefined ? {} : { model: payload.model }),
+          // Forwarded as sent and resolved by the supervisor against the model's own
+          // descriptors, not here: this route has no harness and so cannot know what the
+          // named model offers. Absent stays absent, which is how a harness is told to
+          // apply its own default rather than one we chose for it.
+          ...(payload.modelOptions === undefined
+            ? {}
+            : { modelOptions: payload.modelOptions }),
           // Where the settled attempt's transcript lands. The same directory the audit
           // file below sits in, and outside the workspace for the same reason.
           evidenceDirectory: fleet.paths.evidenceDirectory(row.targetId),

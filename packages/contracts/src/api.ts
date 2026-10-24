@@ -38,6 +38,7 @@ import {
 } from "effect/http-api";
 
 import { API_PREFIX, apiPath } from "./http";
+import { HarnessModelView, ModelOptionSelection } from "./modelOption";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
@@ -428,6 +429,23 @@ export const RunDraft = Schema.Struct({
    * answer to give.
    */
   model: Schema.optional(Schema.String),
+  /**
+   * What was chosen *of* that model: reasoning depth, and whatever else a model offers.
+   *
+   * Each entry names an option by the harness's own id — `variant` on OpenCode, `effort`
+   * on Claude Code — and carries one value. `@bit/contracts`'s `modelOption.ts` holds the
+   * shapes and the resolution rules, and both this field's producer and its consumer use
+   * them, so a browser cannot normalise a value differently from the server that runs it.
+   *
+   * **Absent rather than `[]` when nothing was chosen**, and that distinction is
+   * load-bearing: a selection is only here if an operator *set* it, so an empty list would
+   * claim an opinion where there is none and would stop a model from applying its own
+   * default. Options the named model does not offer are dropped on arrival rather than
+   * refused — a browser holding a stale catalogue is the expected case, not a client
+   * error — and a value outside a descriptor's choices falls back to that descriptor's
+   * default.
+   */
+  modelOptions: Schema.optional(Schema.Array(ModelOptionSelection)),
 });
 export type RunDraft = typeof RunDraft.Type;
 
@@ -664,8 +682,13 @@ export const HarnessInstanceView = Schema.Struct({
    * to the harness's catalogue since then is not here until a restart — and an operator may
    * still name one that is not listed, because whether a model runs is the harness's answer
    * rather than this list's.
+   *
+   * Each entry carries its own `optionDescriptors`: what that model can be asked for
+   * beyond itself. They are per *model* rather than per instance because that is where
+   * they come from — OpenCode reports a variant list per model and two models of one
+   * provider genuinely differ — see `modelOption.ts`.
    */
-  models: Schema.Array(Schema.String),
+  models: Schema.Array(HarnessModelView),
 });
 export type HarnessInstanceView = typeof HarnessInstanceView.Type;
 

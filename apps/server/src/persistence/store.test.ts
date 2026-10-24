@@ -112,6 +112,7 @@ const seed = (store: Store, attemptId = "attempt-1") =>
     harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
+    modelOptions: null,
     harnessSessionId: null,
   });
 
@@ -1245,6 +1246,7 @@ describe("addressing an earlier untested dimension", () => {
           harnessInstanceId: "opencode",
           providerId: "openai",
           modelId: "gpt-5.6-sol",
+          modelOptions: null,
           harnessSessionId: "ses_other",
         });
         const elsewhere = yield* store.recordObservation(
@@ -2021,6 +2023,7 @@ describe("intent anchoring", () => {
           harnessInstanceId: "opencode",
           providerId: "openai",
           modelId: "gpt-5.6-sol",
+          modelOptions: null,
           harnessSessionId: "ses_other",
         });
         const theirs = yield* store.recordObservation(
@@ -2203,6 +2206,7 @@ describe("answering another intent's dimension", () => {
           harnessInstanceId: "opencode",
           providerId: "openai",
           modelId: "gpt-5.6-sol",
+          modelOptions: null,
           harnessSessionId: "ses_sibling",
         });
         const sibling: CallerContext = {
@@ -2318,6 +2322,7 @@ describe("answering another intent's dimension", () => {
           harnessInstanceId: "opencode",
           providerId: "openai",
           modelId: "gpt-5.6-sol",
+          modelOptions: null,
           harnessSessionId: "ses_other",
         });
         return yield* Effect.result(
@@ -2839,5 +2844,133 @@ describe("one transaction per mutation", () => {
       "asset.recorded",
     ]);
     expect(outcome.pending).toHaveLength(1);
+  });
+});
+
+/**
+ * What an attempt row says about *how* its model was asked to work.
+ *
+ * `harness_instance_id` says which harness and `provider_id`/`model_id` say which model.
+ * This is the third part of the same answer: an option that changes how a model reasons
+ * is part of what ran, and a system whose claim is that it can say what happened cannot
+ * leave it out. "The same prompt at a different effort" is a plausible explanation for
+ * two attempts disagreeing, and these are what make it checkable.
+ *
+ * Executed against a real file, like everything else here: nothing checks a column name
+ * or a placeholder at compile time, so migration `0015` and the two inserts that write
+ * through it only exist once they have run.
+ */
+describe("what an attempt records of its model's options", () => {
+  const seedWith = (
+    store: Store,
+    modelOptions: readonly { id: string; value: string }[] | null,
+    attemptId = "attempt-1",
+  ) =>
+    store.seedAttempt({
+      targetId: "target-1",
+      goalId: "goal-1",
+      goal: "Determine whether authentication rate limits can be bypassed.",
+      intentId: "intent-1",
+      question: "Probe the per-client limiter on POST /login.",
+      attemptId,
+      workerId: "worker-1",
+      harnessInstanceId: "opencode",
+      providerId: "openai",
+      modelId: "gpt-5.6-sol",
+      modelOptions,
+      harnessSessionId: "ses_one",
+    });
+
+  test("what was dispatched is on the row and in the event, in one canonical order", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        // Deliberately out of alphabetical order, and deliberately two of them: the
+        // order a resolution happened to produce is not a fact about the run, so it must
+        // not be what distinguishes one stored row from another.
+        yield* seedWith(store, [
+          { id: "variant", value: "high" },
+          { id: "effort", value: "low" },
+        ]);
+        return {
+          attempt: yield* store.loadAttempt("attempt-1", "target-1"),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+
+    expect(outcome.attempt?.model_options).toBe(
+      '[{"id":"effort","value":"low"},{"id":"variant","value":"high"}]',
+    );
+    // The event log and the row are written from the same canonical value, so a reader
+    // following the log cannot conclude something different from a reader of the row.
+    expect(outcome.events[0]?.kind).toBe("attempt.started");
+    expect(outcome.events[0]?.payload).toMatchObject({
+      attemptId: "attempt-1",
+      modelOptions: [
+        { id: "effort", value: "low" },
+        { id: "variant", value: "high" },
+      ],
+    });
+  });
+
+  test("nothing chosen is NULL, and so is an empty list", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* seedWith(store, null, "attempt-1");
+        yield* seedWith(store, [], "attempt-2");
+        return {
+          absent: yield* store.loadAttempt("attempt-1", "target-1"),
+          empty: yield* store.loadAttempt("attempt-2", "target-1"),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+
+    // `null` and `[]` are the same fact — the operator set nothing and the harness
+    // applied its own default — so they are stored the same way. An empty list on the row
+    // would claim an opinion, exactly as it would on the wire.
+    expect(outcome.absent?.model_options).toBeNull();
+    expect(outcome.empty?.model_options).toBeNull();
+    expect(outcome.events[0]?.payload).toMatchObject({ modelOptions: null });
+    expect(outcome.events[1]?.payload).toMatchObject({ modelOptions: null });
+  });
+
+  test("a replacement attempt records its own, not the attempt it replaces", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* seedWith(store, [{ id: "effort", value: "max" }]);
+        // A replacement is only opened against an attempt that has stopped; this is the
+        // ordinary path into one, not part of what is being asserted.
+        yield* store.settleAttempt("attempt-1", "interrupted");
+        yield* store.openReplacementAttempt({
+          replacesAttemptId: "attempt-1",
+          targetId: "target-1",
+          intentId: "intent-1",
+          attemptId: "attempt-2",
+          workerId: "worker-2",
+          harnessInstanceId: "claude-code",
+          providerId: "anthropic",
+          modelId: "claude-sonnet-5",
+          // Lower, on another harness: carrying the abandoned attempt's choice over would
+          // record something nobody chose for this one.
+          modelOptions: [{ id: "effort", value: "low" }],
+          harnessSessionId: null,
+        });
+        return {
+          replaced: yield* store.loadAttempt("attempt-1", "target-1"),
+          replacement: yield* store.loadAttempt("attempt-2", "target-1"),
+        };
+      }),
+    );
+
+    expect(outcome.replaced?.model_options).toBe(
+      '[{"id":"effort","value":"max"}]',
+    );
+    expect(outcome.replacement?.model_options).toBe(
+      '[{"id":"effort","value":"low"}]',
+    );
   });
 });

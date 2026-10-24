@@ -78,6 +78,7 @@ const withSeeded = <A, E>(
           harnessInstanceId: "opencode",
           providerId: "openai",
           modelId: "gpt-5.6-sol",
+          modelOptions: null,
           harnessSessionId: "ses_abc",
         });
         for (const write of writes) {
@@ -562,6 +563,7 @@ describe("a dimension an intent declared it addresses", () => {
             harnessInstanceId: "opencode",
             providerId: "openai",
             modelId: "gpt-5.6-sol",
+            modelOptions: null,
             harnessSessionId: "ses_abc",
           });
           const raiser = yield* store.recordObservation(
@@ -594,6 +596,7 @@ describe("a dimension an intent declared it addresses", () => {
               harnessInstanceId: "opencode",
               providerId: "openai",
               modelId: "gpt-5.6-sol",
+              modelOptions: null,
               harnessSessionId: "ses_account",
             });
             if (dispatch === "settled") {

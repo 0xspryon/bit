@@ -20,12 +20,16 @@
  * scenario is the shortcut rather than the only way in.
  */
 
-import type {
-  AttemptTranscript,
-  HarnessInstanceView,
-  RunningAttempt,
-  TargetCounts,
-  TargetSummary,
+import {
+  droppedModelOptionIds,
+  explicitModelOptionSelections,
+  modelOptionDescriptors,
+  type AttemptTranscript,
+  type HarnessInstanceView,
+  type ModelOptionSelection,
+  type RunningAttempt,
+  type TargetCounts,
+  type TargetSummary,
 } from "@bit/contracts";
 
 import { initialTargets, previewCounts, type Target } from "./mock";
@@ -239,6 +243,23 @@ export class App {
   pickerOpen = $state(false);
   /** What the model list is being filtered by. Reset when the popover closes. */
   modelQuery = $state("");
+  /**
+   * What the operator has chosen *of* a model — reasoning depth, today — kept per model.
+   *
+   * **Keyed by instance *and* model, and that is the whole of three of the transition
+   * rules.** Switching model does not carry the outgoing model's choices over, because a
+   * different key is read; coming back to a model restores what was set on it, because
+   * the key is still there; and switching harness cannot mix one instance's options into
+   * another's, because the instance is in the key. None of that needs code to happen —
+   * which is the point of keying it this way rather than holding one "current options"
+   * list and trying to remember when to clear it.
+   *
+   * What is stored is only what an operator *set*. Picking a model's own default removes
+   * the entry rather than storing the default as a value: see {@link pickModelOption}.
+   */
+  modelOptionsByModel = $state<Record<string, readonly ModelOptionSelection[]>>(
+    {},
+  );
 
   /** The instance a run would go to right now, as far as this tab can tell. */
   pickedInstance = $derived(
@@ -256,6 +277,45 @@ export class App {
     this.pickedModel === ""
       ? (this.pickedInstance?.defaultModel ?? "")
       : this.pickedModel,
+  );
+  /**
+   * That model's catalogue entry, when the instance lists it.
+   *
+   * Absent for a model an operator named that this server's catalogue does not have —
+   * which is allowed, because whether a model runs is the harness's answer. Such a model
+   * offers nothing to choose as far as this tab can tell, and the picker says so rather
+   * than offering controls it cannot stand behind.
+   */
+  pickedModelView = $derived(
+    this.pickedInstance?.models.find(
+      (entry) => entry.id === this.effectiveModel,
+    ),
+  );
+  /** What that model can be asked for beyond its name. Empty for most models. */
+  modelDescriptors = $derived(modelOptionDescriptors(this.pickedModelView));
+  /**
+   * The bucket {@link modelOptionsByModel} keeps this instance-and-model's choices in.
+   *
+   * Built from the *resolved* instance and model rather than the raw picks, so "the
+   * server's default instance" and that instance named explicitly are one bucket and not
+   * two. `\u0000` separates them because it cannot occur in either id.
+   */
+  modelOptionKey = $derived(
+    `${this.pickedInstance?.instanceId ?? ""}\u0000${this.effectiveModel}`,
+  );
+  /** What the operator has set on the model a run would use. Nothing, usually. */
+  pickedModelOptions = $derived(
+    this.modelOptionsByModel[this.modelOptionKey] ?? [],
+  );
+  /**
+   * Choices this model has no descriptor for, so they will be dropped.
+   *
+   * The signal T3Code's version does not have. It is normally empty; it fills when a
+   * harness comes back from a restart with a changed catalogue, and the picker renders it
+   * as a sentence rather than leaving a setting to stop working quietly.
+   */
+  droppedModelOptions = $derived(
+    droppedModelOptionIds(this.modelDescriptors, this.pickedModelOptions),
   );
   /**
    * Whether anything on this server can run at all.
@@ -799,6 +859,16 @@ export class App {
             ? {}
             : { instanceId: this.pickedInstanceId }),
           ...(this.pickedModel === "" ? {} : { model: this.pickedModel }),
+          // Normalised against the descriptors this tab is holding, and absent when
+          // nothing was set — the same function the server resolves with, so a run cannot
+          // be dispatched with a value the picker was not showing.
+          ...(() => {
+            const options = explicitModelOptionSelections(
+              this.modelDescriptors,
+              this.pickedModelOptions,
+            );
+            return options === undefined ? {} : { modelOptions: options };
+          })(),
         },
       );
       if (call._tag === "Unreachable") {
@@ -938,11 +1008,53 @@ export class App {
     this.modelQuery = "";
   }
 
-  /** Picks a model inside the picked instance. `""` means the instance's default. */
+  /**
+   * Picks a model inside the picked instance. `""` means the instance's default.
+   *
+   * **The popover stays open**, because the model is no longer the last thing chosen in
+   * it: the reasoning column to the right is about the model just picked, and closing on
+   * the model would mean reopening to use it. Choosing a reasoning level does not close it
+   * either — see {@link pickModelOption} — so the popover is dismissed the way it always
+   * was, by Escape or by clicking outside.
+   *
+   * Nothing is cleared here. Whatever was set on the *new* model is restored and whatever
+   * was set on the old one stays where it was, which is what keying the store by model
+   * buys: switching away and back is not a way to lose a choice.
+   */
   pickModel(model: string) {
     this.pickedModel = model;
-    this.pickerOpen = false;
-    this.modelQuery = "";
+  }
+
+  /**
+   * Sets one of the picked model's options, or takes the setting off.
+   *
+   * Picking the choice the model marks as its default **removes** the entry instead of
+   * storing `"default"` as a value. The two are indistinguishable downstream — only what
+   * was explicitly set is dispatched, and the harness clients drop the default choice
+   * before it reaches a provider — so keeping them apart here would be a distinction with
+   * no effect, and one more state for the picker to render differently for no reason.
+   *
+   * An id this model has no descriptor for is refused rather than stored: the only way to
+   * reach that is a stale screen, and storing it would add to the pile this already has to
+   * report as dropped.
+   */
+  pickModelOption(descriptorId: string, value: string) {
+    const descriptor = this.modelDescriptors.find(
+      (entry) => entry.id === descriptorId,
+    );
+    if (descriptor === undefined) return;
+    const key = this.modelOptionKey;
+    const kept = (this.modelOptionsByModel[key] ?? []).filter(
+      (selection) => selection.id !== descriptorId,
+    );
+    const isDefault =
+      descriptor.options.find((choice) => choice.id === value)?.isDefault ===
+      true;
+    const next = isDefault ? kept : [...kept, { id: descriptorId, value }];
+    this.modelOptionsByModel = {
+      ...this.modelOptionsByModel,
+      [key]: next,
+    };
   }
 
   togglePicker() {
@@ -1084,6 +1196,7 @@ export class App {
     this.pickedModel = "";
     this.pickerOpen = false;
     this.modelQuery = "";
+    this.modelOptionsByModel = {};
     this.transcript = undefined;
     this.transcriptAttemptId = "";
     this.transcriptLoading = false;

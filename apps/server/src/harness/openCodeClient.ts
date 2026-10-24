@@ -53,9 +53,18 @@
  * environment the agent's own shell commands inherit (DECISIONS.md §6 "credentials off
  * argv").
  */
+import {
+  MODEL_OPTION_DEFAULT_CHOICE,
+  type HarnessModelView,
+  type ModelOptionDescriptor,
+  type ModelOptionSelection,
+} from "@bit/contracts";
 import { OpenCode } from "@opencode/client/effect";
 import { Mcp } from "@opencode/schema/mcp";
-import { ID as ModelID } from "@opencode/schema/model";
+import {
+  ID as ModelID,
+  VariantID as ModelVariantID,
+} from "@opencode/schema/model";
 import { ID as ProviderID } from "@opencode/schema/provider";
 import { AbsolutePath } from "@opencode/schema/schema";
 import { ID as SessionID, type Session } from "@opencode/schema/session";
@@ -123,6 +132,92 @@ export const openCodeModelProvenance = (model: string): ModelProvenance => {
   return slash === -1
     ? { providerId: "unknown", modelId: model }
     : { providerId: model.slice(0, slash), modelId: model.slice(slash + 1) };
+};
+
+/**
+ * The option id a run carries for OpenCode's reasoning choice: OpenCode's own word.
+ *
+ * `variant` and not `reasoningEffort`, because that is what the API field is called
+ * (`Model.Ref.variant`) and the id a selection names is the harness's rather than ours —
+ * see `@bit/contracts`'s `modelOption.ts`. The value is a variant id and nothing else:
+ * OpenCode keeps the settings overlay server-side and merges it per request
+ * (`core/src/model-resolver.ts`'s `withVariant`), so sending the overlay would be sending
+ * it the thing it is about to look up.
+ */
+export const OPENCODE_VARIANT_OPTION = "variant";
+
+/**
+ * What the picker shows for each variant id.
+ *
+ * OpenCode's own composer labels a variant with its raw id, and the ids are minted from
+ * provider *reasoning* support (`core/src/variant.ts` builds them out of
+ * `ConfigProvider.Reasoning`: the effort ladder, or a `none`/`thinking` toggle), which is
+ * what makes "Reasoning" an honest label for the descriptor rather than an interpretation.
+ *
+ * An id this map does not know is shown **verbatim**. A provider that mints a variant for
+ * something other than reasoning would therefore read as itself rather than being dressed
+ * up as a level — and that is the signal to revisit the descriptor's label, not something
+ * to paper over here.
+ */
+const OPENCODE_VARIANT_LABELS: Readonly<Record<string, string>> = {
+  none: "None",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+  max: "Maximum",
+  thinking: "Thinking",
+};
+
+/**
+ * One model's catalogue entry, as the picker reads it.
+ *
+ * A model with no variants gets no descriptor at all rather than a descriptor with one
+ * choice: "this model offers nothing to choose" and "this model offers only its default"
+ * are the same fact, and the second spelling would put an inert control on the screen.
+ */
+const openCodeModelView = (
+  id: string,
+  variants: readonly { readonly id: string }[],
+): HarnessModelView => {
+  if (variants.length === 0) return { id };
+  const descriptor: ModelOptionDescriptor = {
+    id: OPENCODE_VARIANT_OPTION,
+    label: "Reasoning",
+    type: "select",
+    options: [
+      // The way back to the model's own behaviour, and OpenCode's own spelling for it:
+      // `withVariant` reads `"default"` as "no variant" (`core/src/model-resolver.ts`).
+      { id: MODEL_OPTION_DEFAULT_CHOICE, label: "Default", isDefault: true },
+      ...variants.map((variant) => ({
+        id: variant.id,
+        label: OPENCODE_VARIANT_LABELS[variant.id] ?? variant.id,
+      })),
+    ],
+  };
+  return { id, optionDescriptors: [descriptor] };
+};
+
+/**
+ * The variant a session should be created on, from the resolved selections.
+ *
+ * Returns nothing for the default choice rather than passing it through. OpenCode would
+ * accept `"default"` and read it as "no variant", but a request that names no variant is
+ * the honest expression of "the operator did not pin one", and it is also what keeps the
+ * session's stored `ModelRef` free of a value an operator never chose.
+ */
+const openCodeVariantOf = (
+  options: readonly ModelOptionSelection[] | undefined,
+): { variant?: typeof ModelVariantID.Type } => {
+  const value = options?.find(
+    (option) => option.id === OPENCODE_VARIANT_OPTION,
+  )?.value;
+  return value === undefined || value === MODEL_OPTION_DEFAULT_CHOICE
+    ? {}
+    : // Branded here rather than cast, like every other id this client puts on the wire:
+      // whatever validation the brand carries now or later actually runs, and a bad value
+      // fails with the value in the message instead of inside a request body.
+      { variant: Schema.decodeUnknownSync(ModelVariantID)(value) };
 };
 
 /**
@@ -389,13 +484,23 @@ export const openCodeHarness = (
       }
       const catalogue =
         listed._tag === "Success"
-          ? listed.success.data.map(
-              (model) => `${model.providerID}/${model.id}`,
+          ? listed.success.data.map((model) =>
+              openCodeModelView(
+                `${model.providerID}/${model.id}`,
+                model.variants,
+              ),
             )
           : [];
-      const models = [
-        defaultModel,
-        ...catalogue.filter((name) => name !== defaultModel).sort(),
+      // The default's own entry when the catalogue has one, so the model a run gets when
+      // it names none carries its variants like any other; a bare entry when the
+      // catalogue could not be read, which offers nothing rather than guessing.
+      const models: readonly HarnessModelView[] = [
+        catalogue.find((model) => model.id === defaultModel) ?? {
+          id: defaultModel,
+        },
+        ...catalogue
+          .filter((model) => model.id !== defaultModel)
+          .sort((left, right) => left.id.localeCompare(right.id)),
       ];
 
       const instance: HarnessInstance = {
@@ -492,7 +597,14 @@ export const openCodeHarness = (
           timeouts.control,
           api.session.create({
             title: input.title,
-            model: modelOf(input.model),
+            // The variant rides on the session's model reference, which is where OpenCode
+            // keeps it: `session.create` takes it here and `session.switchModel` is the
+            // only other way in. A prompt carries no model at all, so there is nothing
+            // per-turn to set and nothing to re-send before each prompt.
+            model: {
+              ...modelOf(input.model),
+              ...openCodeVariantOf(input.options),
+            },
             location: { directory: directoryOf(input.directory) },
             // Spread rather than passed as `undefined` so the call site reads as "no
             // parent" rather than "parent: nothing". On the wire both are the same: the

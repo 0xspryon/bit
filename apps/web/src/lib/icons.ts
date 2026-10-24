@@ -28,6 +28,8 @@ export { default as IconSun } from "line-awesome/svg/sun-solid.svg?component";
 
 export { default as IconWarning } from "line-awesome/svg/exclamation-triangle-solid.svg?component";
 export { default as IconAngleRight } from "line-awesome/svg/angle-right-solid.svg?component";
+export { default as IconAngleDown } from "line-awesome/svg/angle-down-solid.svg?component";
+export { default as IconArrowUp } from "line-awesome/svg/arrow-up-solid.svg?component";
 export { default as IconLevelUp } from "line-awesome/svg/level-up-alt-solid.svg?component";
 export { default as IconCrosshairs } from "line-awesome/svg/crosshairs-solid.svg?component";
 export { default as IconStream } from "line-awesome/svg/stream-solid.svg?component";

@@ -47,6 +47,7 @@ import {
   isAssetIdentityRefusal,
   parseDimensionAddress,
   type AddIntentInput,
+  type ModelOptionSelection,
   type ObservationProvenance,
   type ObservationRecordFormat,
   type OutboxEntry,
@@ -164,6 +165,19 @@ export interface SeedInput {
    */
   readonly providerId: string;
   readonly modelId: string;
+  /**
+   * What was chosen *of* that model, as the run actually carried it.
+   *
+   * The dispatched selections — already resolved against the model's descriptors by the
+   * caller — and never what a picker displayed: a descriptor's default is shown and
+   * deliberately not sent, so a row claiming one would be answering a question nobody
+   * asked. `null` is both "the operator set nothing" and, on a row older than migration
+   * `0015_attempt_model_options`, "this was not recorded"; the two are indistinguishable
+   * and saying so is better than inventing an empty list for either.
+   *
+   * An empty array is stored as `null` for the same reason it is omitted on the wire.
+   */
+  readonly modelOptions: readonly ModelOptionSelection[] | null;
   readonly harnessSessionId: string | null;
 }
 
@@ -186,6 +200,14 @@ export interface ReplacementInput {
   readonly harnessInstanceId: string | null;
   readonly providerId: string;
   readonly modelId: string;
+  /**
+   * See {@link SeedInput.modelOptions}. A replacement carries its own.
+   *
+   * Not copied from the predecessor: a replacement is a new attempt that may run on
+   * another instance, another model, and at another depth, so inheriting the abandoned
+   * attempt's choices would record something nobody chose.
+   */
+  readonly modelOptions: readonly ModelOptionSelection[] | null;
   readonly harnessSessionId: string | null;
 }
 
@@ -506,6 +528,15 @@ const AttemptRow = Schema.Struct({
   harness_instance_id: Schema.NullOr(Schema.String),
   provider_id: Schema.String,
   model_id: Schema.String,
+  /**
+   * What was dispatched of the model, as canonical JSON. `null` before migration `0015`.
+   *
+   * Kept as the stored text rather than decoded here, like `record_format` and for the
+   * same reason: this schema's job is to say what the column holds, and an adopted
+   * database with something unexpected in it has to be reportable *against the row*
+   * rather than failing the read of every attempt beside it.
+   */
+  model_options: Schema.NullOr(Schema.String),
   status: Schema.String,
   started_at: Schema.Finite,
   ended_at: Schema.NullOr(Schema.Finite),
@@ -518,6 +549,24 @@ export type AttemptRow = typeof AttemptRow.Type;
 
 /** Derived like {@link observationColumns}, and for the same reason. */
 const attemptColumns = Object.keys(AttemptRow.fields).join(", ");
+
+/**
+ * One attempt's dispatched options, in the one order they are ever stored in.
+ *
+ * Sorted by id, so the same two choices are the same bytes however the descriptors
+ * happened to be ordered when they were resolved — which makes "did these two attempts
+ * run the same way" a comparison rather than a parse. Empty becomes `null`, because an
+ * empty list would claim an opinion exactly as it would on the wire.
+ *
+ * The column and the `attempt.started` payload are both written from this, so the event
+ * log and the row cannot disagree about what ran.
+ */
+const canonicalModelOptions = (
+  options: readonly ModelOptionSelection[] | null,
+): readonly ModelOptionSelection[] | null =>
+  options === null || options.length === 0
+    ? null
+    : [...options].sort((left, right) => left.id.localeCompare(right.id));
 
 /**
  * One durable record of what the harness said about an attempt and what we did.
@@ -828,13 +877,16 @@ const makeStore = Effect.fnUntraced(function* () {
             ON CONFLICT(id) DO NOTHING`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
           );
+          const modelOptions = canonicalModelOptions(input.modelOptions);
           yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
               harness_session_id, harness_instance_id, provider_id, model_id,
-              status, started_at, write_fence)
+              model_options, status, started_at, write_fence)
             VALUES (${input.attemptId}, ${input.intentId}, ${input.targetId},
                     ${input.workerId}, ${input.harnessSessionId},
                     ${input.harnessInstanceId},
-                    ${input.providerId}, ${input.modelId}, 'running', ${now}, 0)
+                    ${input.providerId}, ${input.modelId},
+                    ${modelOptions === null ? null : JSON.stringify(modelOptions)},
+                    'running', ${now}, 0)
             ON CONFLICT(id) DO NOTHING`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
           );
@@ -853,6 +905,7 @@ const makeStore = Effect.fnUntraced(function* () {
                 harnessInstanceId: input.harnessInstanceId,
                 providerId: input.providerId,
                 modelId: input.modelId,
+                modelOptions,
                 harnessSessionId: input.harnessSessionId,
                 replacesAttemptId: null,
               },
@@ -2247,13 +2300,16 @@ const makeStore = Effect.fnUntraced(function* () {
           // The predecessor's own intent and target, not the caller's copy of them:
           // they have just been checked to be equal, and the stored row is the one the
           // foreign key is against.
+          const modelOptions = canonicalModelOptions(input.modelOptions);
           yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
               harness_session_id, harness_instance_id, provider_id, model_id,
-              status, started_at, write_fence, replaces_attempt_id)
+              model_options, status, started_at, write_fence, replaces_attempt_id)
             VALUES (${input.attemptId}, ${replaced.intent_id}, ${replaced.target_id},
                     ${input.workerId}, ${input.harnessSessionId},
                     ${input.harnessInstanceId},
-                    ${input.providerId}, ${input.modelId}, 'running', ${now}, 0,
+                    ${input.providerId}, ${input.modelId},
+                    ${modelOptions === null ? null : JSON.stringify(modelOptions)},
+                    'running', ${now}, 0,
                     ${input.replacesAttemptId})`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
           );
@@ -2276,6 +2332,7 @@ const makeStore = Effect.fnUntraced(function* () {
               harnessInstanceId: input.harnessInstanceId,
               providerId: input.providerId,
               modelId: input.modelId,
+              modelOptions,
               harnessSessionId: input.harnessSessionId,
               replacesAttemptId: input.replacesAttemptId,
             },

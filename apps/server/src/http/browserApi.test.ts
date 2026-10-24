@@ -855,7 +855,7 @@ describe("the harness listing", () => {
       setup?: string;
       isDefault: boolean;
       defaultModel: string;
-      models: readonly string[];
+      models: readonly { id: string }[];
       auth: string;
     }>;
     expect(listed.map((entry) => entry.instanceId)).toEqual([
@@ -867,8 +867,11 @@ describe("the harness listing", () => {
     expect(working?.ready).toBe(true);
     expect(working?.isDefault).toBe(true);
     expect(working?.reason).toBeUndefined();
-    // The catalogue the picker searches, and the default is in it.
-    expect(working?.models).toContain(working?.defaultModel ?? "");
+    // The catalogue the picker searches, and the default is in it. Entries are model
+    // *views* — a name plus whatever that model offers — so the name is read off `id`.
+    expect(working?.models.map((model) => model.id)).toContain(
+      working?.defaultModel ?? "",
+    );
     // `unknown` is a real answer and the only one either harness can give: neither offers
     // a non-destructive "am I logged in" probe, so `ready` deliberately does not fold it
     // in. See `harness/resolver.ts`.

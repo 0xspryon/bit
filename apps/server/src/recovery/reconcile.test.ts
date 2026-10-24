@@ -91,6 +91,7 @@ const seed = (
     harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
+    modelOptions: null,
     harnessSessionId,
   });
 
@@ -933,6 +934,7 @@ describe("replacement work", () => {
     harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
+    modelOptions: null,
     harnessSessionId: null,
   } as const;
 
@@ -1115,6 +1117,7 @@ describe("replacement work", () => {
           harnessInstanceId: "opencode",
           providerId: "openai",
           modelId: "gpt-5.6-sol",
+          modelOptions: null,
           harnessSessionId: null,
         });
         yield* store.settleAttempt("other-attempt", "interrupted");

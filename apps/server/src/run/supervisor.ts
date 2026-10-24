@@ -81,6 +81,10 @@
  */
 import {
   RunRefused,
+  droppedModelOptionIds,
+  explicitModelOptionSelections,
+  modelOptionDescriptors,
+  type ModelOptionSelection,
   type RunStarted,
   type RunningAttempt,
   type RunStopped,
@@ -231,6 +235,20 @@ export interface RunInput {
    * model can actually run is the harness's answer to give rather than ours to guess at.
    */
   readonly model?: string | undefined;
+  /**
+   * What the caller chose *of* that model: reasoning depth, and whatever else it offers.
+   *
+   * Resolved here rather than trusted: the browser's catalogue can be older than this
+   * process's, so a selection naming an option the model does not offer is **dropped**
+   * and a value outside a descriptor's choices **falls back** to that descriptor's
+   * default (`@bit/contracts`'s `modelOption.ts`, which is the same code the picker
+   * normalises with). A stale client is the expected case here and not a client error —
+   * refusing the run over it would make a harness restart look like a bug in the browser.
+   *
+   * Dropped ids are logged, because a selection that silently stops having an effect is
+   * exactly the kind of quiet loss this product keeps refusing to ship.
+   */
+  readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
   /** What the engagement is after. Advisory prose; never enforcement (§4). */
   readonly goal: string;
   /** The narrower question this run is against. */
@@ -814,6 +832,25 @@ const make = Effect.fnUntraced(function* (options?: {
     // model through a named provider of its own, Claude Code has one — and asked here
     // rather than taken from `createSession`'s answer because the row is written first.
     const provenance = harness.modelProvenance(model);
+    // Against *this* model's descriptors, from the catalogue this process observed. A
+    // model the catalogue does not list offers nothing as far as we can tell, so every
+    // selection for it is dropped — which is the honest answer rather than forwarding a
+    // value to a harness that never said it would take one.
+    const descriptors = modelOptionDescriptors(
+      harness.instance.models.find((entry) => entry.id === model),
+    );
+    const requestedOptions = input.modelOptions ?? [];
+    const dropped = droppedModelOptionIds(descriptors, requestedOptions);
+    if (dropped.length > 0) {
+      yield* Effect.logWarning(
+        "the run named model options this model does not offer; they were dropped rather than forwarded",
+        { model, dropped: dropped.join(", ") },
+      );
+    }
+    const modelOptions = explicitModelOptionSelections(
+      descriptors,
+      requestedOptions,
+    );
 
     const authority = yield* store.seedAttempt({
       targetId: input.targetId,
@@ -828,6 +865,11 @@ const make = Effect.fnUntraced(function* (options?: {
       harnessInstanceId: harness.instance.instanceId,
       providerId: provenance.providerId,
       modelId: provenance.modelId,
+      // What the run will actually carry, not what the caller asked for: the same
+      // resolved list `createSession` is handed below, so the row cannot record an option
+      // that was dropped or a value that fell back. `undefined` here means the operator
+      // set nothing and the harness applies its own default, which the row stores as NULL.
+      modelOptions: modelOptions ?? null,
       harnessSessionId,
     });
 
@@ -836,6 +878,9 @@ const make = Effect.fnUntraced(function* (options?: {
       model,
       directory: input.workspace,
       sessionId: harnessSessionId,
+      // Absent rather than `[]` when nothing was explicitly chosen, so the harness
+      // applies its own default instead of being pinned to today's answer.
+      ...(modelOptions === undefined ? {} : { options: modelOptions }),
     });
     if (session.id !== harnessSessionId) {
       yield* Effect.logWarning(

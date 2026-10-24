@@ -34,7 +34,12 @@
  * purpose — the only way to add them is `HttpRouter.cors`, which is global and would
  * change what `/api/v1/mcp` and `/api/v1/policy/decide` answer to a cross-origin caller.
  */
-import { BitApi, SessionGuard, type TargetDraft } from "@bit/contracts";
+import {
+  BitApi,
+  SessionGuard,
+  type ModelOptionSelection,
+  type TargetDraft,
+} from "@bit/contracts";
 import { Effect, Layer, Result } from "effect";
 import { FetchHttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient, HttpApiMiddleware } from "effect/http-api";
@@ -256,7 +261,18 @@ export const server = {
      * "no instance" where it means "whatever you would choose". The response says which
      * were actually used either way.
      */
-    pick?: { readonly instanceId?: string; readonly model?: string },
+    pick?: {
+      readonly instanceId?: string;
+      readonly model?: string;
+      /**
+       * What was chosen of the model, already resolved against its descriptors.
+       *
+       * Omitted rather than sent empty when nothing was set, for the reason the contract
+       * states: an empty list would claim an opinion, and a harness told nothing is the
+       * only one free to apply its own default.
+       */
+      readonly modelOptions?: readonly ModelOptionSelection[];
+    },
   ) =>
     run(
       Effect.flatMap(client(baseUrl), (api) =>
@@ -268,6 +284,9 @@ export const server = {
               ? {}
               : { instanceId: pick.instanceId }),
             ...(pick?.model === undefined ? {} : { model: pick.model }),
+            ...(pick?.modelOptions === undefined
+              ? {}
+              : { modelOptions: pick.modelOptions }),
           },
         }),
       ),

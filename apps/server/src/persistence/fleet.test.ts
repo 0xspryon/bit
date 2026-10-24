@@ -107,6 +107,7 @@ const seed = (store: ObservationStore["Service"], targetId: string) =>
     harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
+    modelOptions: null,
     harnessSessionId: null,
   });
 

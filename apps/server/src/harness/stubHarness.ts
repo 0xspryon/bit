@@ -48,7 +48,27 @@ export const STUB_INSTANCE: HarnessInstance = {
   installed: true,
   auth: "unknown",
   defaultModel: "scripted/model",
-  models: ["scripted/model", "scripted/other"],
+  // Model *views*: a name plus what that model offers. The first one carries a reasoning
+  // descriptor so a test can drive the option path without inventing a shape the real
+  // harnesses would not report; the second offers nothing, which is the common case.
+  models: [
+    {
+      id: "scripted/model",
+      optionDescriptors: [
+        {
+          id: "effort",
+          label: "Reasoning",
+          type: "select",
+          options: [
+            { id: "default", label: "Default", isDefault: true },
+            { id: "low", label: "Low" },
+            { id: "high", label: "High" },
+          ],
+        },
+      ],
+    },
+    { id: "scripted/other" },
+  ],
 };
 
 export type StubHarness = AgentHarness["Service"];

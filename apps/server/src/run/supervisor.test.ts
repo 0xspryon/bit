@@ -32,6 +32,7 @@
  * narration bus and the supervisor itself. The attempt rows these tests read are rows in
  * files on disk, which is why this suite is part of `test:persistence`.
  */
+import type { ModelOptionSelection } from "@bit/contracts";
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -136,6 +137,8 @@ interface Recorder {
   readonly registrations: { name: string; url: string; bearer: string }[];
   readonly interrupts: string[];
   readonly created: string[];
+  /** What each `createSession` was handed of the model, after the supervisor resolved it. */
+  readonly sessionOptions: (readonly ModelOptionSelection[] | undefined)[];
 }
 
 const transport = (operation: string, detail: string) =>
@@ -208,6 +211,7 @@ const fakeClient = (
           // test for the case where it does *not* is below, and overrides this.
           const id = input.sessionId ?? "ses_chosen_by_harness";
           recorder.created.push(id);
+          recorder.sessionOptions.push(input.options);
           return { id };
         }),
       prompt: (sessionId, text) =>
@@ -258,6 +262,7 @@ const emptyRecorder = (): Recorder => ({
   registrations: [],
   interrupts: [],
   created: [],
+  sessionOptions: [],
 });
 
 /**
@@ -343,8 +348,16 @@ const readAfterShutdown = (root: string, targetId: string) => {
   try {
     return {
       attempts: database
-        .query<{ id: string; status: string; ended_at: number | null }, []>(
-          "SELECT id, status, ended_at FROM attempts ORDER BY started_at",
+        .query<
+          {
+            id: string;
+            status: string;
+            ended_at: number | null;
+            model_options: string | null;
+          },
+          []
+        >(
+          "SELECT id, status, ended_at, model_options FROM attempts ORDER BY started_at",
         )
         .all(),
       events: database
@@ -1988,7 +2001,7 @@ describe("two configured instances", () => {
     driver,
     displayName: `${driver} harness`,
     defaultModel: `${driver}/default`,
-    models: [`${driver}/default`, `${driver}/other`],
+    models: [{ id: `${driver}/default` }, { id: `${driver}/other` }],
   });
 
   /** Which instance each prompt went to, which is what "pinned" has to be read off. */
@@ -2504,5 +2517,152 @@ describe("the transcript at settlement", () => {
     expect(elapsed).toBeLessThan(TRANSCRIPT_WAIT_CEILING);
     const rows = readAfterShutdown(root, "alpha");
     expect(rows.attempts[0]?.status).toBe("succeeded");
+  });
+});
+
+/**
+ * What a run carries *of* its model, and what it refuses to carry.
+ *
+ * The rules themselves are `@bit/contracts`'s `modelOption.ts` and are shared with the
+ * picker; what is checked here is the half only the server can be wrong about — that the
+ * supervisor resolves against **this process's** catalogue rather than trusting the
+ * caller, and that what survives reaches `createSession` and nothing else does.
+ *
+ * The scripted harness's `scripted/model` reports one `select` descriptor, `effort`, with
+ * `default`/`low`/`high`; `scripted/other` reports none. That asymmetry is the fixture:
+ * every case below is a selection meeting one of those two models.
+ */
+describe("the model options a run is dispatched with", () => {
+  const dispatched = async (
+    modelOptions: readonly ModelOptionSelection[],
+    model?: string,
+  ) => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        yield* supervisor.start({
+          ...draft(root, "alpha", "probe it"),
+          ...(model === undefined ? {} : { model }),
+          modelOptions,
+        });
+      }).pipe(Effect.orDie),
+    );
+    await runtime.dispose();
+    return recorder.sessionOptions[0];
+  };
+
+  test("a choice the model offers reaches the harness", async () => {
+    expect(await dispatched([{ id: "effort", value: "low" }])).toEqual([
+      { id: "effort", value: "low" },
+    ]);
+  });
+
+  test("nothing chosen is absent rather than empty", async () => {
+    // The distinction the contract insists on: a harness handed nothing applies its own
+    // default and stays free to change it, and `[]` would have claimed an opinion.
+    expect(await dispatched([])).toBeUndefined();
+  });
+
+  test("an option this model does not offer is dropped, not forwarded", async () => {
+    // `scripted/other` reports no descriptors at all, so there is nothing for the
+    // selection to resolve against. This is the ordinary case after a harness restart
+    // changes a catalogue, not a client error, so the run proceeds without it.
+    expect(
+      await dispatched([{ id: "effort", value: "low" }], "scripted/other"),
+    ).toBeUndefined();
+  });
+
+  test("an option no descriptor matches is dropped even on a model with options", async () => {
+    expect(
+      await dispatched([
+        { id: "effort", value: "high" },
+        { id: "madeUp", value: "yes" },
+      ]),
+    ).toEqual([{ id: "effort", value: "high" }]);
+  });
+
+  test("a value outside the choices falls back to the descriptor's default", async () => {
+    // Not refused and not passed through: the caller did set this option, so it is still
+    // dispatched — at the value the descriptor says it falls back to. The harness client
+    // is what turns that default into "send nothing" at the edge.
+    expect(await dispatched([{ id: "effort", value: "ludicrous" }])).toEqual([
+      { id: "effort", value: "default" },
+    ]);
+  });
+
+  test("what was dispatched is what the attempt row records", async () => {
+    // The loop closed: the row an operator reads afterwards says what the run carried,
+    // resolved against this process's catalogue rather than copied from the request. A
+    // row is the only place this is answerable once the process is gone.
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        yield* supervisor.start({
+          ...draft(root, "alpha", "probe it"),
+          modelOptions: [
+            { id: "effort", value: "high" },
+            // Dropped on the way, and so absent from the row too: what is recorded is
+            // what ran, never what was asked for.
+            { id: "madeUp", value: "yes" },
+          ],
+        });
+      }).pipe(Effect.orDie),
+    );
+    await runtime.dispose();
+
+    const rows = readAfterShutdown(root, "alpha");
+    expect(rows.attempts[0]?.model_options).toBe(
+      '[{"id":"effort","value":"high"}]',
+    );
+  });
+
+  test("a run that chose nothing records nothing, rather than a default", async () => {
+    // `NULL`, not the descriptor's default: a row reading `effort: default` would be a
+    // fabricated answer, and it would also be indistinguishable from an operator who
+    // pinned that value on purpose.
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        yield* supervisor.start(draft(root, "alpha", "probe it"));
+      }).pipe(Effect.orDie),
+    );
+    await runtime.dispose();
+
+    expect(
+      readAfterShutdown(root, "alpha").attempts[0]?.model_options,
+    ).toBeNull();
+  });
+
+  test("a model this server's catalogue does not list offers nothing", async () => {
+    // An operator may name a model the catalogue has never heard of — whether it runs is
+    // the harness's answer — but nothing is known about what it offers, so a selection
+    // for it cannot be resolved and is not guessed at.
+    expect(
+      await dispatched([{ id: "effort", value: "low" }], "scripted/unlisted"),
+    ).toBeUndefined();
   });
 });

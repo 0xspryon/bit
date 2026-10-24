@@ -5,6 +5,7 @@ export type Health = typeof Health.Type;
 
 export * from "./http";
 export * from "./api";
+export * from "./modelOption";
 export * from "./observation";
 export * from "./briefing";
 export * from "./asset";

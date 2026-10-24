@@ -275,6 +275,8 @@ export const openWorkerSession = Effect.fn("openWorkerSession")(function* (
     harnessInstanceId: client.instance.instanceId,
     providerId: openCodeModelProvenance(WORKER_MODEL).providerId,
     modelId: openCodeModelProvenance(WORKER_MODEL).modelId,
+    // The spikes dispatch no model options, so there is nothing to record.
+    modelOptions: null,
     harnessSessionId: null,
   });
 

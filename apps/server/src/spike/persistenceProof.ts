@@ -286,6 +286,8 @@ const phaseTwo = async () => {
         harnessInstanceId: "opencode",
         providerId: "openai",
         modelId: "gpt-5.6-sol",
+        // The spikes dispatch no model options, so there is nothing to record.
+        modelOptions: null,
         harnessSessionId: "ses_phase_two",
       });
       const context = caller(TARGET_A, "attempt-phase-two");

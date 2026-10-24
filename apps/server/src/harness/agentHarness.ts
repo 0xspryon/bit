@@ -74,6 +74,7 @@
  * Had this been a free function the supervisor chose between, the supervisor would branch
  * on driver kind, which is the one thing this slice is trying to make impossible.
  */
+import type { ModelOptionSelection } from "@bit/contracts";
 import {
   Context,
   type Effect,
@@ -242,6 +243,23 @@ export class AgentHarness extends Context.Service<
       readonly parentSessionId?: string | undefined;
       /** The id to create the session under, from {@link newSessionId}. */
       readonly sessionId?: string | undefined;
+      /**
+       * What was chosen *of* that model: reasoning depth, and whatever else it offers.
+       *
+       * Already resolved against the model's own descriptors by the caller, so an
+       * implementation may take each `{ id, value }` at face value: every id here is one
+       * this harness reported for this model, and every value is one of that descriptor's
+       * choices. What an implementation still owns is the *translation* — which request
+       * field the value belongs in, and what to do with
+       * `MODEL_OPTION_DEFAULT_CHOICE` — because that is the part the two harnesses do not
+       * share: OpenCode carries a variant id on the session's model reference, and the
+       * Claude Agent SDK takes an `effort` level in the query's options.
+       *
+       * Absent means "nothing was chosen", which is **not** the same as the default: a
+       * harness that is told nothing applies its own default and may change what that is,
+       * and a harness told the default explicitly has been pinned to today's answer.
+       */
+      readonly options?: readonly ModelOptionSelection[] | undefined;
     }) => Effect.Effect<SessionRef, HarnessFailure>;
     /**
      * Makes our MCP endpoint reachable from one session, under one credential.

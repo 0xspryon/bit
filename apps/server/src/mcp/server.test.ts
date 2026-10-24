@@ -100,6 +100,7 @@ class StaleCredential extends Context.Service<
         harnessInstanceId: "opencode",
         providerId: "openai",
         modelId: "gpt-5.6-sol",
+        modelOptions: null,
       });
       yield* store.settleAttempt("attempt-settled", "interrupted");
       const credentials = yield* McpCredentials;
@@ -153,6 +154,7 @@ beforeAll(async () => {
         harnessInstanceId: "opencode",
         providerId: "openai",
         modelId: "gpt-5.6-sol",
+        modelOptions: null,
       });
       const endpoint = yield* ControlPlaneEndpoint;
       const credential = yield* TestCredential;

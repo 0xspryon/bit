@@ -24,12 +24,60 @@
    * and nothing settles when it runs out: settlement is the harness's to decide
    * (DECISIONS.md §5), and a progress bar would be an invented estimate of something
    * genuinely unbounded.
+   *
+   * ## One box, with the controls inside it
+   *
+   * The arrangement is OpenCode's composer (MIT), measured rather than approximated: a
+   * single bordered container, the text filling it, and a 44px control strip along the
+   * bottom *inside* the same border — `+` and the model selector from the left, the
+   * submit arrow in a 28px square against the right edge. The numbers that carry the
+   * look are in the style block with the OpenCode measurement each one came from.
+   *
+   * What was deliberately **not** taken is everything above the geometry. OpenCode's
+   * composer is coloured — an accent submit, syntax colours on mentions, a provider
+   * glyph per model — and this app is monochrome by decision: colour here means state,
+   * and a composer is not a state. So the submit is `--bg-inverse` on `--text-inverse`
+   * like every other primary action in {@link Button}, the radii come from our scale
+   * (10px, not their 12px), and the type is ours. Their drag-and-drop, slash-command
+   * popover, shell mode, mention parsing, attachment rail and queue/steer delivery are
+   * features rather than shape, and none of them exists on this server.
+   *
+   * ## One control with nothing behind it
+   *
+   * `+` is rendered, positioned, and unavailable. There is no attachment anywhere in
+   * this product: a run carries `instruction`, and optionally which harness and which
+   * model (`RunDraft` in `@bit/contracts`). Rendering it as a live control would be a
+   * promise nothing keeps, and leaving it out would make the composer's shape a lie about
+   * what is coming — so it is here, dimmed, with the reason readable by pointer and by
+   * screen reader.
+   *
+   * **Reasoning depth is not one of these.** It started as a second dead control and is
+   * now real: it is a `select` option a model reports, it reaches the harness, and it
+   * lives in {@link HarnessPicker}'s third column because it is a setting *of the model*
+   * rather than of the composer — see that component's header.
+   *
+   * `+` is `aria-disabled` rather than `disabled`, which is the same choice the picker
+   * makes for an unusable harness instance: the row stays visible, stays reachable, and
+   * carries the sentence that says why. A `disabled` attribute would take it out of the
+   * tab order and — in Chrome — suppress the `title` tooltip along with every other
+   * pointer event, so the reason would be unreadable by exactly the two routes it has to
+   * be readable by. Nothing is wired to it, so activating it does nothing at all.
    */
   import Button from "./Button.svelte";
   import HarnessPicker from "./HarnessPicker.svelte";
+  import { IconArrowUp, IconPlus } from "../icons";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
+
+  /**
+   * Why the one placeholder control will not do anything, in the product's own terms.
+   *
+   * It reads as a fact about this server rather than as an apology, and it names the
+   * thing that is missing: an operator who reads it knows there is nothing to look for.
+   */
+  const attachUnavailable =
+    "Attachments are not supported yet: a run carries the instruction you type and nothing else.";
 
   /**
    * A ticking clock, so the elapsed time is live rather than frozen at render.
@@ -103,6 +151,26 @@
   }
 
   /**
+   * The field grows with the instruction, up to the cap, and then scrolls.
+   *
+   * OpenCode's editor is a `contenteditable` inside a scroll view bounded at 60–180px,
+   * which grows as you type; a textarea does not do that on its own, so the height is
+   * written from the content's own `scrollHeight`. The floor is CSS (`min-height`), which
+   * wins over an inline height smaller than it, so this only ever has to handle growth.
+   * Resetting to `auto` first is what lets it shrink again when a line is deleted.
+   */
+  let field = $state<HTMLTextAreaElement | null>(null);
+  const fieldMaxHeight = 180;
+  $effect(() => {
+    // Touched so this reruns on every edit, including a programmatic clear.
+    void app.instruction;
+    const element = field;
+    if (element === null) return;
+    element.style.height = "auto";
+    element.style.height = `${String(Math.min(element.scrollHeight, fieldMaxHeight))}px`;
+  });
+
+  /**
    * Enter submits, Shift+Enter breaks the line.
    *
    * The convention an operator will expect from the shape of the control, and the reason
@@ -141,26 +209,68 @@
       authority.
     </p>
   {:else}
-    <div class="row">
+    <!--
+      One container. The textarea has no border of its own and the strip has no
+      background of its own: the border below belongs to the box, and everything inside
+      it reads as one control. `overflow` is deliberately not clipped here — the harness
+      picker's popover rises out of the strip, and clipping the box would cut it off.
+    -->
+    <div class="box">
       <textarea
         class="input"
-        rows="2"
+        rows="1"
         placeholder={ready
           ? "What should this run find out?"
           : "This target cannot be opened, so nothing can run against it."}
         disabled={!ready || app.starting}
+        bind:this={field}
         bind:value={app.instruction}
         {onkeydown}></textarea>
-      <div class="controls">
-        <HarnessPicker {app} />
-        <Button
-          variant="primary"
-          loading={app.starting}
+
+      <div class="strip">
+        <div class="strip-controls">
+          <!--
+            Rendered, positioned, and honest about being unavailable: the sentence is the
+            `title` for a pointer and the accessible description for a screen reader, and
+            the control keeps its place in the tab order so both routes reach it.
+          -->
+          <button
+            class="square ghost unavailable"
+            type="button"
+            aria-disabled="true"
+            aria-label="Attach a file"
+            aria-describedby="compose-attach-why"
+            title={attachUnavailable}
+          >
+            <IconPlus width="13" height="13" />
+          </button>
+          <span id="compose-attach-why" class="visually-hidden"
+            >{attachUnavailable}</span
+          >
+
+          <!--
+            Reasoning depth is not a control here. It is the picker's third column: it is
+            a setting *of the model*, so it belongs where the model is chosen and has to
+            change when the model does. A separate strip control would have had to be
+            cleared, restored and relabelled in step with this one anyway.
+          -->
+          <HarnessPicker {app} />
+        </div>
+
+        <button
+          class="square submit"
+          type="button"
           disabled={!canSubmit}
+          aria-label="Start run"
+          title="Start run"
           onclick={() => void app.startRun()}
         >
-          Start run
-        </Button>
+          {#if app.starting}
+            <span class="spinner" aria-hidden="true"></span>
+          {:else}
+            <IconArrowUp width="14" height="14" />
+          {/if}
+        </button>
       </div>
     </div>
   {/if}
@@ -188,21 +298,53 @@
     border-top: 1px solid var(--border-base);
     background: var(--bg-layer-01);
   }
-  .row {
+
+  /**
+   * The box. OpenCode: `rounded-xl` on a 12px scale; ours tops out at 10px, which is the
+   * token rather than their number because the radius is part of the design language and
+   * the proportion is what was borrowed. No explicit minimum height: the field's 60px
+   * floor and the strip's 44px already set it, which is also true of OpenCode's inert
+   * `min-h-[96px]`.
+   */
+  .box {
     display: flex;
-    gap: 10px;
-    align-items: flex-end;
-  }
-  .input {
-    flex: 1;
-    min-width: 0;
-    padding: 8px 10px;
+    flex-direction: column;
     border: 1px solid var(--border-base);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-xl);
     background: var(--bg-base);
+    transition:
+      border-color var(--dur-hover) ease-out,
+      box-shadow var(--dur-hover) ease-out;
+  }
+  /*
+    The focus ring is the box's, not the textarea's: an outline drawn inside a border
+    1px away from it reads as a mistake. Border and ring together, so the indicator
+    survives a forced-colours or high-contrast rendering of one of them.
+  */
+  .box:focus-within {
+    border-color: var(--border-focus);
+    box-shadow: 0 0 0 1px var(--border-focus);
+  }
+
+  /**
+   * The text area fills the box. OpenCode: 60px floor, 180px cap, `px-4 pt-4 pb-2`
+   * (16px sides, 16px above, 8px below — the strip's own padding carries the rest), and
+   * 13px/20px type, which is this app's body size already.
+   */
+  .input {
+    min-height: 60px;
+    max-height: 180px;
+    padding: 16px 16px 8px;
+    border: 0;
+    background: transparent;
     color: var(--text-base);
     font: 400 13px/var(--lh-base) var(--font-sans);
-    resize: vertical;
+    /* The height is written from the content; a drag handle would fight it. */
+    resize: none;
+    overflow-y: auto;
+  }
+  .input:focus-visible {
+    outline: none;
   }
   .input::placeholder {
     color: var(--text-faint);
@@ -211,11 +353,78 @@
     cursor: not-allowed;
     opacity: 0.6;
   }
-  .controls {
+
+  /**
+   * The control strip, inside the same border. OpenCode: `h-11 items-center px-2` — 44px
+   * tall, 8px from each edge — with 4px between the controls on the left and 12px of
+   * clear space (`me-3`) before the submit button.
+   */
+  .strip {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
+    height: 44px;
+    padding: 0 8px;
   }
+  .strip-controls {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    align-items: center;
+    gap: 4px;
+  }
+
+  /* 28px square, 6px radius: OpenCode's `size-7 rounded-md`, and their large icon button. */
+  .square {
+    display: inline-flex;
+    width: 28px;
+    height: 28px;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition:
+      background var(--dur-hover) ease-out,
+      opacity var(--dur-hover) ease-out;
+  }
+  .ghost {
+    background: transparent;
+    color: var(--icon-muted);
+  }
+  .ghost:hover:not(.unavailable) {
+    background: var(--overlay-hover);
+    color: var(--icon-base);
+  }
+  /*
+    Visibly unavailable: dimmed to the same degree as a disabled Button, and the cursor
+    says so before the tooltip arrives. Still focusable, still readable — see the note at
+    the top for why that is `aria-disabled` and not `disabled`.
+  */
+  .unavailable {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /*
+    Monochrome primary, exactly as `Button`'s: a light fill on dark and the reverse on
+    light. OpenCode's submit is an accent colour, which is the one thing about it that
+    could not come across.
+  */
+  .submit {
+    background: var(--bg-inverse);
+    color: var(--text-inverse);
+  }
+  .submit:hover:not(:disabled) {
+    opacity: 0.88;
+  }
+  .submit:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
   .status {
     display: flex;
     align-items: center;
@@ -254,6 +463,20 @@
     }
     50% {
       opacity: 0.35;
+    }
+  }
+  /* The same spinner as `Button`'s, because this is the same waiting. */
+  .spinner {
+    width: 13px;
+    height: 13px;
+    border: 1.5px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 700ms linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
     }
   }
   .note,

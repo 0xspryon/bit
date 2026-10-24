@@ -137,6 +137,8 @@ const program = Effect.gen(function* () {
     harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
+    // The spikes dispatch no model options, so there is nothing to record.
+    modelOptions: null,
     harnessSessionId: "ses_crash",
   });
 
