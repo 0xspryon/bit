@@ -96,10 +96,23 @@ export class BriefingError extends Schema.TaggedError<BriefingError>()(
  *
  * `limit` caps included observations; anything dropped is listed in
  * `omittedObservationIds` and flips `truncated`.
+ *
+ * **The default is 100, raised from 20.** Twenty was chosen when a target held a
+ * handful of observations and the question was whether a briefing rendered at all.
+ * It is the wrong number now for a reason the briefing itself makes visible: past the
+ * cap an observation is reduced to an id in `omittedObservationIds`, so a session is
+ * told that something was recorded and not what it said. A fresh session choosing a
+ * sensible follow-up is the thing this function exists for, and it cannot do that
+ * against ids. A hundred is still a bound rather than "everything" — `truncated`
+ * keeps meaning what it means, and a target that exceeds it wants summarisation,
+ * which is a different mechanism than a larger number.
+ *
+ * Callers that need a tighter briefing pass one; nothing in the application does, and
+ * the tests that exercise truncation pass 1 or 2 so they stay independent of this.
  */
 export const buildBriefing = Effect.fn("buildBriefing")(function* (
   intentId: string,
-  limit = 20,
+  limit = 100,
 ) {
   const store = yield* ObservationStore;
   const intent = yield* store.loadIntent(intentId);
