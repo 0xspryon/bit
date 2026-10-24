@@ -51,7 +51,7 @@
  */
 import { Context, Effect, Layer, PubSub, Stream } from "effect";
 
-import type { HarnessNarration } from "../harness/openCodeClient";
+import type { HarnessNarration } from "../harness/agentHarness";
 
 /**
  * How many entries are held for a subscriber that is behind.

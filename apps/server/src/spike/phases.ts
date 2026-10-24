@@ -18,10 +18,10 @@ import { Effect, Redacted } from "effect";
 import { buildBriefing, renderBriefing } from "../briefing/briefing";
 import { FixtureEndpoint } from "../fixture/server";
 import {
+  AgentHarness,
   finalAssistantText,
   firstError,
-  OpenCodeClient,
-} from "../harness/openCodeClient";
+} from "../harness/agentHarness";
 import { OpenCodeServer } from "../harness/openCodeServer";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
@@ -111,7 +111,7 @@ export const runWorkerPhase = Effect.fn("runWorkerPhase")(function* (
 ) {
   const store = yield* ObservationStore;
   const { server, diagnostics } = yield* OpenCodeServer;
-  const client = yield* OpenCodeClient;
+  const client = yield* AgentHarness;
   const fixture = yield* FixtureEndpoint;
   const control = yield* ControlPlaneEndpoint;
   const credentials = yield* McpCredentials;
@@ -233,7 +233,7 @@ const SECTION_MARKERS = [
  */
 const plannerLineage = Effect.fnUntraced(function* (targetId: string) {
   const store = yield* ObservationStore;
-  const client = yield* OpenCodeClient;
+  const client = yield* AgentHarness;
   const paths = yield* SpikePaths;
 
   const recorded = yield* store.plannerLineage(targetId);
@@ -266,7 +266,7 @@ export const runPlannerPhase = Effect.fn("runPlannerPhase")(function* (
   intentId: string,
 ) {
   const store = yield* ObservationStore;
-  const client = yield* OpenCodeClient;
+  const client = yield* AgentHarness;
   const paths = yield* SpikePaths;
 
   const briefing = yield* buildBriefing(intentId);

@@ -1,40 +1,54 @@
 /**
- * Installing the pre-execution policy hook into a workspace the harness will run in.
+ * Installing a pre-execution policy gate into a workspace a harness will run in.
  *
- * `policy/service.ts` owns the *decision*; `plugins/policyHook.ts` is the plugin that
- * asks and enforces. This is the third piece: getting that plugin into the directory
- * `opencode serve` will load it from, with the control plane's URL in its options.
+ * `policy/service.ts` owns the *decision*. This file owns what every harness's gate has to
+ * be true of, and the OpenCode installation of it; `policy/claudeCodeGate.ts` is the
+ * second one. The decision and the endpoint are **harness-agnostic and unchanged**: what
+ * varies is how a harness is told to consult it and how its hook reports back.
  *
- * It was inside `spike/runtime.ts`'s `prepareWorkspace`, which only the spike calls, and
- * so a browser-started run had **no gate at all** — the endpoint sat there answering
- * nobody. Separating it is what lets both paths install the same hook; what stayed behind
- * in `prepareWorkspace` is the part that is genuinely the spike's, which is writing
- * fixture files into a scratch directory.
+ * ## The six properties, which are the actual contract
+ *
+ * A second harness is what turned these from "how the OpenCode installer happens to
+ * behave" into a specification, so they are written here once rather than twice:
+ *
+ * 1. **It fails closed on policy outage**, and that denial is audited *distinctly* from an
+ *    ordinary one (`denied_failclosed`, not `denied`). An outage and a boundary are
+ *    different facts and a screen that showed them identically would hide the one worth
+ *    seeing.
+ * 2. **The audit line records the decision basis** — `unrestricted`, `hosts_allowed`,
+ *    `no_host_named` — verbatim as the control plane decided it, never re-derived.
+ * 3. **The audit file lives outside the workspace** the worker can read. Enforced at the
+ *    call site, because the path is a fleet-layout question; see {@link GateInstall}.
+ * 4. **An existing configuration of the operator's is merged, not clobbered**, and one we
+ *    cannot parse **refuses the run**. Unparseable to us is not the same as meaningless to
+ *    them, and the one thing a security tool must not do is destroy a file in somebody's
+ *    project that it did not understand. {@link mergeableConfigAt} is that step, shared,
+ *    so the two installers cannot drift on it.
+ * 5. **Installing is idempotent**: a second run into the same workspace replaces our entry
+ *    rather than stacking a second beside it. Two copies of the gate would mean two policy
+ *    round trips per tool call and an audit file with everything in it twice.
+ * 6. **A failure refuses the run.** Nothing has been prompted at the point this is called,
+ *    so refusing costs an error message, while permitting would cost a worker running
+ *    against somebody's systems with no record of what it was allowed to do.
+ *
+ * ## Why the two gates cannot share code, only shape
+ *
+ * Both hook scripts are written without imports and copied into the workspace, because
+ * each is loaded as a standalone entrypoint *by the harness* and must not depend on
+ * anything resolvable only from our own node_modules. So the ~60 lines that POST to the
+ * policy endpoint and append an audit line are duplicated between
+ * `plugins/policyHook.ts` and `plugins/claudeCodeGate.ts`. That is deliberate: the
+ * alternative is a build step that bundles a shared module into two generated files, which
+ * trades a readable duplicate for an opaque artefact in somebody else's project directory.
+ * What is *not* duplicated is the vocabulary — both write the same four audit outcomes —
+ * so one reader handles either harness's trail.
  *
  * ## A real workspace is somebody else's directory
  *
- * The spike installs into a scratch folder it created. A browser-started run installs
- * into the folder an operator picked for the engagement, and that changes what is
- * acceptable:
- *
- * - **An existing `opencode.json` is merged into, never replaced.** An operator may well
- *   have their own opencode configuration in a project they are testing, and a security
- *   tool that silently overwrote it would be the worst kind of surprise. Our plugin entry
- *   is added to `plugins`, any previous entry for the same package is replaced so a
- *   second run does not stack duplicates, and every other key is left exactly as it was.
- * - **An `opencode.json` we cannot parse stops the install** rather than being
- *   overwritten. Unparseable to us is not the same as meaningless to them, and the one
- *   thing we must not do is destroy a file we did not understand.
- * - **No fixture files.** Nothing here writes anything into the workspace except the
- *   plugin and the configuration that loads it.
- *
- * ## The audit file lives outside the workspace
- *
- * `auditPath` is a caller's decision and both callers put it outside the directory the
- * worker runs in, for the reason `spike/runtime.ts` already recorded: a worker that can
- * read its own audit trail can read the shape of the boundary it is inside. For a
- * browser-started run that means the target's own `evidence/` directory, which is where
- * things that are not database rows already go.
+ * A browser-started run installs into the folder an operator picked for the engagement,
+ * which may already hold their own harness configuration. Nothing here writes anything
+ * into the workspace except the gate and the configuration that loads it: no fixture
+ * files, no reformatting of keys we do not own.
  */
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -42,32 +56,49 @@ import { join } from "node:path";
 import { Effect, Schema } from "effect";
 
 /**
- * What the hook's audit file is called inside a target's `evidence/` directory.
+ * What the gate's audit file is called inside a target's `evidence/` directory.
  *
  * Named here rather than at the call site because two things have to agree on it: the
- * server that configures the hook, and anything that later reads the record back.
+ * server that configures the gate, and anything that later reads the record back. It is
+ * the same name for every harness — the audit is the target's, not the driver's.
  */
 export const POLICY_AUDIT_FILE = "policy-audit.log";
 
-/** The plugin's source, copied into whichever workspace needs it. */
-export const POLICY_HOOK_SOURCE = join(
-  import.meta.dir,
-  "..",
-  "..",
-  "plugins",
-  "policyHook.ts",
-);
+/** What installing a pre-execution gate into one workspace needs. */
+export interface GateInstall {
+  /** The directory the harness session will run in. Somebody else's project. */
+  readonly workspace: string;
+  /** Where the harness-side gate posts each decision request. */
+  readonly policyUrl: string;
+  /**
+   * Where the gate appends its decisions.
+   *
+   * Outside {@link workspace}, by convention enforced at the call site: a worker that can
+   * read its own audit trail can read the shape of the boundary it is inside. For a
+   * browser-started run that means the target's own `evidence/` directory, which is where
+   * things that are not database rows already go.
+   */
+  readonly auditPath: string;
+  /**
+   * Empty the audit file first.
+   *
+   * Required rather than defaulted, because both answers are wrong somewhere. A
+   * single-scope demo wants a file describing this run and nothing else; a target
+   * accumulating a record across runs would wipe its own evidence every time.
+   */
+  readonly freshAudit: boolean;
+}
 
 /**
- * The package name our plugin is configured under.
+ * The one shape every harness's gate installer has.
  *
- * A *configured* local plugin must point at a DIRECTORY with an `index`/`server`
- * entrypoint, not a bare file — opencode logs "configured plugin path must be a
- * directory" and skips it otherwise (`packages/plugin/src/host.ts:17-42`). Deliberately
- * not named `plugin/`, which is auto-discovered and would load a second copy with no
- * options (`packages/core/src/plugin/source-directory.ts:9`).
+ * It is this, and not a free function the supervisor picks between, because the supervisor
+ * must not know which harness it is driving: this type is what
+ * `AgentHarness.installGate` is declared as.
  */
-export const POLICY_PLUGIN_PACKAGE = "./policy";
+export type GateInstaller = (
+  input: GateInstall,
+) => Effect.Effect<void, PolicyHookNotInstalled>;
 
 /**
  * A workspace the gate could not be installed into.
@@ -89,13 +120,188 @@ export class PolicyHookNotInstalled extends Schema.TaggedError<PolicyHookNotInst
   }
 }
 
-interface OpencodeConfig {
+/** A JSON object somebody else may own, as read for merging. */
+export interface MergeableConfig {
   readonly [key: string]: unknown;
+}
+
+/**
+ * Reads a configuration file we are about to merge into, or refuses.
+ *
+ * Property 4 of this module's header, as one function, shared by both installers because
+ * it is the step with the judgement in it:
+ *
+ * - absent, or present but empty → `undefined`, meaning "write ours fresh";
+ * - present and a JSON object → that object, to merge into;
+ * - present and anything else → {@link PolicyHookNotInstalled}, which refuses the run.
+ *
+ * A JSON *array* is refused along with unparseable text, and that is not pedantry: both
+ * harnesses' configuration files are objects, so an array there means the file is not what
+ * we think it is, and writing an object over it would destroy whatever it was.
+ *
+ * Throws rather than returning an Effect because both callers run inside one
+ * `Effect.tryPromise` whose `catch` recognises this error; see {@link installOpenCodeGate}.
+ */
+export const mergeableConfigAt = async (
+  workspace: string,
+  configPath: string,
+): Promise<MergeableConfig | undefined> => {
+  const file = Bun.file(configPath);
+  if (!(await file.exists())) return undefined;
+  const text = await file.text();
+  if (text.trim().length === 0) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      throw new Error("it is not a JSON object");
+    }
+    return parsed as MergeableConfig;
+  } catch (cause) {
+    throw new PolicyHookNotInstalled({
+      workspace,
+      detail: `${configPath} already exists and could not be read as JSON (${String(cause)}); refusing to overwrite somebody else's configuration`,
+    });
+  }
+};
+
+/**
+ * Creates the audit file if it is wanted fresh or is not there yet.
+ *
+ * Shared because the rule is the target's, not the harness's, and because a gate installed
+ * against a path nothing has created yet would fail its first append — which, being
+ * best-effort inside the hook, would be a silently unaudited run.
+ */
+export const prepareAudit = async (input: GateInstall): Promise<void> => {
+  if (input.freshAudit || !(await Bun.file(input.auditPath).exists())) {
+    await Bun.write(input.auditPath, "");
+  }
+};
+
+/**
+ * Keeps the files *we* create out of the operator's commits.
+ *
+ * ## Why this exists at all
+ *
+ * Installing a gate writes into somebody's project directory. The choice of
+ * `.claude/settings.local.json` over their committed `.claude/settings.json` was made so
+ * our entry would stay out of their repository — and that only holds if the file is
+ * actually ignored. Nothing makes it so: Claude Code adds its own local settings to the
+ * git excludes when *it* first writes them, which says nothing about a file this server
+ * wrote instead. Without this, a `git add -A` after a run commits our hook configuration
+ * and a copy of our gate script into their history. Small, and exactly the kind of small
+ * thing that annoys people.
+ *
+ * ## `.git/info/exclude`, not a `.gitignore`
+ *
+ * A `.gitignore` is itself a file in their repository, which is the problem rather than
+ * the fix. `.git/info/exclude` is per clone, cannot be committed by construction, and is
+ * the mechanism git provides for exactly this. A `.git` that is a *file* — a worktree or a
+ * submodule — is followed through its `gitdir:` pointer.
+ *
+ * ## Only what we own
+ *
+ * The paths passed in are the ones an installer creates: `.claude/bit-policy/`,
+ * `.claude/settings.local.json`, `.opencode/policy/`. **Not** `.opencode/opencode.json`,
+ * which may be the operator's own configuration that we merged into and that they may well
+ * want tracked. Excluding a file we did not create would be a second kind of surprise.
+ *
+ * ## Best effort, deliberately
+ *
+ * A failure here is swallowed. Not being in a git repository is the ordinary case rather
+ * than an error, and an unwritable `.git/info/exclude` is untidy rather than unsafe — so it
+ * must not be able to refuse a run whose gate is otherwise installed. The exposure when it
+ * does fail is that our files show up in the operator's `git status`.
+ */
+export const excludeFromGit = async (
+  workspace: string,
+  paths: readonly string[],
+): Promise<void> => {
+  try {
+    const marker =
+      "# bit: the policy gate this server installs, which is not yours to keep";
+    const gitPath = join(workspace, ".git");
+
+    // A directory is not readable as text, so "is `.git` a pointer file" is asked by
+    // trying to read it rather than by stat'ing a type.
+    let gitDirectory = gitPath;
+    const pointer = await Bun.file(gitPath)
+      .text()
+      .catch(() => undefined);
+    if (pointer !== undefined) {
+      const named = /^gitdir:\s*(.+)$/m.exec(pointer)?.[1]?.trim();
+      if (named === undefined) return;
+      gitDirectory = named.startsWith("/") ? named : join(workspace, named);
+    }
+
+    const excludePath = join(gitDirectory, "info", "exclude");
+    const existing = await Bun.file(excludePath)
+      .text()
+      .catch(() => undefined);
+    // `undefined` means there is no `.git/info/exclude` to append to, so this is not a
+    // git working tree we can exclude anything in. Nothing to do, and not a problem.
+    if (existing === undefined) return;
+
+    const lines = existing.split("\n");
+    const missing = paths.filter((path) => !lines.includes(path));
+    if (missing.length === 0) return;
+
+    const prefix = existing.length === 0 || existing.endsWith("\n") ? "" : "\n";
+    const header = lines.includes(marker) ? "" : `${marker}\n`;
+    await Bun.write(
+      excludePath,
+      `${existing}${prefix}${header}${missing.join("\n")}\n`,
+    );
+  } catch {
+    // See the header: untidy, not unsafe.
+  }
+};
+
+/**
+ * Turns anything thrown inside an installer into this module's typed refusal.
+ *
+ * Shared so a thrown {@link PolicyHookNotInstalled} is never re-wrapped and loses the
+ * sentence an operator needs, and so an `EACCES` from a directory we may not write still
+ * arrives as a refusal rather than a defect.
+ */
+export const asRefusal =
+  (workspace: string) =>
+  (cause: unknown): PolicyHookNotInstalled =>
+    cause instanceof PolicyHookNotInstalled
+      ? cause
+      : new PolicyHookNotInstalled({ workspace, detail: String(cause) });
+
+/* ── OpenCode ────────────────────────────────────────────────────────────────── */
+
+/** The OpenCode plugin's source, copied into whichever workspace needs it. */
+export const POLICY_HOOK_SOURCE = join(
+  import.meta.dir,
+  "..",
+  "..",
+  "plugins",
+  "policyHook.ts",
+);
+
+/**
+ * The package name our OpenCode plugin is configured under.
+ *
+ * A *configured* local plugin must point at a DIRECTORY with an `index`/`server`
+ * entrypoint, not a bare file — opencode logs "configured plugin path must be a
+ * directory" and skips it otherwise (`packages/plugin/src/host.ts:17-42`). Deliberately
+ * not named `plugin/`, which is auto-discovered and would load a second copy with no
+ * options (`packages/core/src/plugin/source-directory.ts:9`).
+ */
+export const POLICY_PLUGIN_PACKAGE = "./policy";
+
+interface OpencodeConfig extends MergeableConfig {
   readonly plugins?: unknown;
 }
 
 /**
- * Our plugin entry merged into whatever configuration is already there.
+ * Our plugin entry merged into whatever OpenCode configuration is already there.
  *
  * Exported so the merge can be tested without a filesystem: it is the part with the
  * judgement in it, and "does this preserve the operator's other keys" is a question worth
@@ -133,62 +339,30 @@ export const withPolicyPlugin = (
 };
 
 /**
- * Writes the hook, its package manifest and the configuration that loads it.
+ * Writes the OpenCode plugin, its package manifest and the configuration that loads it.
  *
  * Fails with {@link PolicyHookNotInstalled} rather than dying, so a caller starting a run
- * can refuse that run: a workspace whose configuration we will not touch is a reason not
- * to start an ungated worker in it, not a reason to start an ungated worker and hope.
+ * can refuse that run.
  */
-export const installPolicyHook = Effect.fnUntraced(function* (input: {
-  readonly workspace: string;
-  /** Where the harness-side hook posts each decision request. */
-  readonly policyUrl: string;
-  /** Where the hook appends its decisions. Outside {@link workspace}, by convention. */
-  readonly auditPath: string;
-  /**
-   * Empty the audit file first.
-   *
-   * Required rather than defaulted, because both answers are wrong somewhere. A
-   * single-scope demo wants a file describing this run and nothing else; a program with
-   * several scopes — or a target accumulating a record across runs — would wipe its own
-   * evidence every time.
-   */
-  readonly freshAudit: boolean;
-}) {
+export const installOpenCodeGate: GateInstaller = Effect.fnUntraced(function* (
+  input: GateInstall,
+) {
   return yield* Effect.tryPromise({
     try: async () => {
       const opencodeDirectory = join(input.workspace, ".opencode");
       const pluginDirectory = join(opencodeDirectory, "policy");
       const configPath = join(opencodeDirectory, "opencode.json");
 
-      const configFile = Bun.file(configPath);
-      let existing: OpencodeConfig | undefined;
-      if (await configFile.exists()) {
-        const text = await configFile.text();
-        if (text.trim().length > 0) {
-          try {
-            const parsed: unknown = JSON.parse(text);
-            if (
-              typeof parsed !== "object" ||
-              parsed === null ||
-              Array.isArray(parsed)
-            ) {
-              throw new Error("it is not a JSON object");
-            }
-            existing = parsed as OpencodeConfig;
-          } catch (cause) {
-            throw new PolicyHookNotInstalled({
-              workspace: input.workspace,
-              detail: `${configPath} already exists and could not be read as JSON (${String(cause)}); refusing to overwrite somebody else's configuration`,
-            });
-          }
-        }
-      }
+      const existing = (await mergeableConfigAt(
+        input.workspace,
+        configPath,
+      )) as OpencodeConfig | undefined;
+      // Captured before we write it: afterwards there is no way to tell whether the
+      // config file is ours or theirs.
+      const configIsOurs = existing === undefined;
 
       mkdirSync(pluginDirectory, { recursive: true });
-      if (input.freshAudit || !(await Bun.file(input.auditPath).exists())) {
-        await Bun.write(input.auditPath, "");
-      }
+      await prepareAudit(input);
       await Bun.write(
         join(pluginDirectory, "index.ts"),
         await Bun.file(POLICY_HOOK_SOURCE).text(),
@@ -217,14 +391,13 @@ export const installPolicyHook = Effect.fnUntraced(function* (input: {
           2,
         )}\n`,
       );
-      return { configPath, pluginDirectory };
+      await excludeFromGit(input.workspace, [
+        ".opencode/policy/",
+        // Only when there was nothing there and this install created it; see
+        // `excludeFromGit`. An operator's own opencode config stays theirs to commit.
+        ...(configIsOurs ? [".opencode/opencode.json"] : []),
+      ]);
     },
-    catch: (cause) =>
-      cause instanceof PolicyHookNotInstalled
-        ? cause
-        : new PolicyHookNotInstalled({
-            workspace: input.workspace,
-            detail: String(cause),
-          }),
+    catch: asRefusal(input.workspace),
   });
 });

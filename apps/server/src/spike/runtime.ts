@@ -20,11 +20,17 @@ import { HarnessSessionStatus } from "../recovery/harnessStatus";
 
 import { FixtureEndpoint } from "../fixture/server";
 import { DEFAULT_CONFIG, type RateLimitConfig } from "../fixture/rateLimit";
-import { OpenCodeClient, type ClientTimeouts } from "../harness/openCodeClient";
+import { AgentHarness } from "../harness/agentHarness";
+import {
+  openCodeHarness,
+  OPENCODE_DEFAULT_MODEL,
+  openCodeModelProvenance,
+  type ClientTimeouts,
+} from "../harness/openCodeClient";
 import { OpenCodeServer } from "../harness/openCodeServer";
 import { McpCredentials } from "../mcp/credentials";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
-import { installPolicyHook } from "../policy/install";
+import { installOpenCodeGate } from "../policy/install";
 import {
   DEFAULT_POLICY,
   PolicyDecisions,
@@ -41,8 +47,15 @@ import { TargetStores } from "../persistence/targetStores";
  * lives on `run/model.ts` so there is one answer for both, and the attempt rows a demo
  * writes name the same provider and model as the ones a browser-started run writes.
  */
-export { WORKER_MODEL } from "../run/model";
-import { WORKER_MODEL } from "../run/model";
+/**
+ * The model the spike's demos run on.
+ *
+ * Re-exported from the OpenCode harness rather than from a `run/model.ts` constant of its
+ * own: the model a run gets when it names none belongs to the *instance*, because
+ * `openai/gpt-5.6-sol` is not something a second harness could run. The spike drives
+ * OpenCode specifically, so it names OpenCode's default specifically.
+ */
+export const WORKER_MODEL = OPENCODE_DEFAULT_MODEL;
 
 export const RUNTIME_DIR = join(process.cwd(), ".runtime");
 
@@ -135,7 +148,7 @@ export const prepareWorkspace = Effect.fnUntraced(function* (input: {
   // `orDie` here and not in the server: a demo whose workspace it created cannot have an
   // `opencode.json` it did not write, so a refusal would be a defect in this file.
   yield* Effect.orDie(
-    installPolicyHook({
+    installOpenCodeGate({
       workspace: input.workspace,
       policyUrl: hook.policyUrl,
       auditPath: hook.auditPath,
@@ -197,7 +210,9 @@ export const spikeLayer = (options: SpikeOptions = {}) => {
     ),
   ).pipe(Layer.provide(endpoint));
 
-  const harness = OpenCodeClient.layer(options.timeouts).pipe(
+  const harness = openCodeHarness(
+    options.timeouts === undefined ? {} : { timeouts: options.timeouts },
+  ).pipe(
     Layer.provideMerge(OpenCodeServer.layer({ cwd: workspace })),
     Layer.provide(workspaceReady),
   );
@@ -244,15 +259,16 @@ export const openWorkerSession = Effect.fn("openWorkerSession")(function* (
   title: string,
 ) {
   const store = yield* ObservationStore;
-  const client = yield* OpenCodeClient;
+  const client = yield* AgentHarness;
   const credentials = yield* McpCredentials;
   const endpoint = yield* ControlPlaneEndpoint;
   const paths = yield* SpikePaths;
 
   const authority = yield* store.seedAttempt({
     ...binding,
-    providerId: WORKER_MODEL.providerID,
-    modelId: WORKER_MODEL.id,
+    harnessInstanceId: client.instance.instanceId,
+    providerId: openCodeModelProvenance(WORKER_MODEL).providerId,
+    modelId: openCodeModelProvenance(WORKER_MODEL).modelId,
     harnessSessionId: null,
   });
 
@@ -274,7 +290,7 @@ export const openWorkerSession = Effect.fn("openWorkerSession")(function* (
     attemptFence: authority.writeFence,
   });
 
-  yield* client.registerMcpServer(`bit-${binding.attemptId}`, {
+  yield* client.registerMcpServer(session.id, `bit-${binding.attemptId}`, {
     url: endpoint.mcpUrl,
     // Unwrapped and immediately re-wrapped: this is the one place the raw token is
     // touched, to put it in the header of the one request that delivers it.

@@ -98,13 +98,7 @@ import {
   type Duration,
 } from "effect";
 
-import { installPolicyHook } from "../policy/install";
-import {
-  newHarnessSessionId,
-  OpenCodeClient,
-  type ModelRef,
-  type TerminalOutcome,
-} from "../harness/openCodeClient";
+import { AgentHarness, type TerminalOutcome } from "../harness/agentHarness";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import * as identifier from "../persistence/identifier";
@@ -211,7 +205,17 @@ export interface RunInput {
    * `opencode serve` drive two targets in two folders.
    */
   readonly workspace: string;
-  readonly model: ModelRef;
+  /**
+   * Which model, inside the harness instance this process is driving.
+   *
+   * A harness-scoped name (`openai/gpt-5.6-sol`, `claude-sonnet-5`) and optional: there is
+   * no picker yet, so a caller that names none gets the instance's configured default.
+   * The *instance* is deliberately not a parameter — this process drives one, and an
+   * attempt is pinned to it the moment it starts. Choosing between instances is slice C's
+   * work and would arrive as a resolver in front of {@link AgentHarness}, not as a field
+   * here.
+   */
+  readonly model?: string | undefined;
   /** What the engagement is after. Advisory prose; never enforcement (§4). */
   readonly goal: string;
   /** The narrower question this run is against. */
@@ -343,13 +347,21 @@ export const SETTLEMENT_ASK_TIMEOUT = "10 seconds";
 const SETTLEMENT_MEMORY = 64;
 
 /**
- * What one running attempt's supervisor is holding, for `running` to report.
+ * What one running attempt's supervisor is holding.
  *
- * The contract's own shape, aliased rather than restated: what this process knows about a
- * run it is supervising is exactly what the API answers about it, and a second declaration
- * would be a place for the two to drift.
+ * The contract's own shape, extended rather than restated: what this process answers about
+ * a run it is supervising is exactly {@link RunningAttempt}, and a second declaration of
+ * those fields would be a place for the two to drift.
+ *
+ * The one addition is `workspace`, which is **not** on the contract and should not be. It
+ * is here because {@link workspaceClaim} needs to answer "is anything already running in
+ * that directory" from this map, and because publishing the server's filesystem layout to
+ * a browser would be telling it something it has no use for. {@link RunSupervisor.running}
+ * projects it back off.
  */
-type Supervised = RunningAttempt;
+interface Supervised extends RunningAttempt {
+  readonly workspace: string;
+}
 
 export class RunSupervisor extends Context.Service<
   RunSupervisor,
@@ -385,7 +397,7 @@ export class RunSupervisor extends Context.Service<
   static readonly layer: Layer.Layer<
     RunSupervisor,
     never,
-    | OpenCodeClient
+    | AgentHarness
     | TargetStores
     | McpCredentials
     | WorkerEndpoints
@@ -411,7 +423,7 @@ export class RunSupervisor extends Context.Service<
   }): Layer.Layer<
     RunSupervisor,
     never,
-    | OpenCodeClient
+    | AgentHarness
     | TargetStores
     | McpCredentials
     | WorkerEndpoints
@@ -426,10 +438,10 @@ export class RunSupervisor extends Context.Service<
    * A supervisor for a process that has no harness to drive.
    *
    * Every start is refused `no_harness` with a sentence an operator can act on. This
-   * exists so that a server whose `opencode` is missing or unauthenticated still boots,
-   * still serves the browser API, still sweeps the fleet and still reconciles — rather
-   * than failing to start because one subsystem is unavailable. `running` is empty and
-   * `stop` refuses, both of which are true.
+   * exists so that a server whose configured harness is missing or unauthenticated still
+   * boots, still serves the browser API, still sweeps the fleet and still reconciles —
+   * rather than failing to start because one subsystem is unavailable. `running` is empty
+   * and `stop` refuses, both of which are true.
    */
   static readonly unavailable: Layer.Layer<RunSupervisor> = Layer.succeed(
     RunSupervisor,
@@ -439,7 +451,7 @@ export class RunSupervisor extends Context.Service<
           new RunRefused({
             reason: "no_harness",
             detail:
-              "this server has no agent harness, so there is nothing to run a worker in: either `opencode serve` could not be started, or it was switched off with HARNESS=0. Check that opencode is installed and authenticated, then restart.",
+              "this server has no agent harness, so there is nothing to run a worker in: either the harness HARNESS names could not be started, or it was switched off with HARNESS=0. Check that the harness is installed and authenticated, then restart.",
           }),
         ),
       stop: (attemptId) =>
@@ -498,7 +510,7 @@ const make = Effect.fnUntraced(function* (options?: {
   readonly askTimeout?: Duration.Input | undefined;
 }) {
   const askTimeout = options?.askTimeout ?? SETTLEMENT_ASK_TIMEOUT;
-  const client = yield* OpenCodeClient;
+  const harness = yield* AgentHarness;
   const stores = yield* TargetStores;
   const credentials = yield* McpCredentials;
   const endpoints = yield* WorkerEndpoints;
@@ -530,6 +542,100 @@ const make = Effect.fnUntraced(function* (options?: {
 
   /** What each supervisor registers so `running` can answer without asking a fiber. */
   const supervised = new Map<string, Supervised>();
+  /**
+   * The engagement folders runs are in flight in, so a second one can be refused.
+   *
+   * ## Why a directory can hold only one run at a time
+   *
+   * **Both harnesses configure their pre-execution gate per workspace, not per attempt.**
+   * `installGate` writes `.opencode/opencode.json` or `.claude/settings.local.json` in the
+   * session's directory, carrying that run's policy URL and *that target's* audit path. A
+   * second run installing into the same folder replaces those options — so the first run's
+   * tool calls start being audited into a different target's file, and the audit stops
+   * being a record of what that worker was allowed to do.
+   *
+   * **And on OpenCode the MCP registration is per directory too.** `api.mcp.add` takes a
+   * `location: { directory }`, so two attempts in one folder each register
+   * `bit-<attemptId>` into it and **both workers see both servers**. A tool call through
+   * the wrong one writes under the wrong attempt's credential: an observation attributed
+   * to an attempt that never made it. Provenance is the thing this system exists to get
+   * right, so a path that can silently misattribute a write is worse than one that
+   * refuses.
+   *
+   * **One rule, both harnesses, deliberately.** Claude Code's MCP registration *is* per
+   * session — `claudeCodeClient.ts` has a test proving one session's registration is not
+   * reachable from another's — so the second hazard is OpenCode's alone and the refusal
+   * could have been scoped to it. It is not, because the *first* hazard is not: the gate's
+   * audit path is per workspace on both. Two rules where one will do is two things to
+   * reason about, and here the single rule is also the correct one for each.
+   *
+   * Two workers cooperating on one engagement is later work. Until the gate and the MCP
+   * registration are per attempt, refusing is the honest answer.
+   *
+   * ## Keyed by workspace, and claimed before anything is forked
+   *
+   * **By workspace, not by target.** The hazard is the shared directory. A target's
+   * workspace comes from its registry row, so same target implies same workspace — but a
+   * target registered without a folder falls back to the picker root, and two of those
+   * would collide while being different targets. Keying on the directory covers both; the
+   * refusal still names the target holding it, because that is what an operator
+   * recognises.
+   *
+   * **By what is actually running**, which is this map, rather than by rows saying
+   * `running`: a row left behind by a process that died has no worker in that folder, and
+   * refusing on its account would make a crash permanently block an engagement. The
+   * startup sweep is what settles those.
+   *
+   * **Claimed in `start`, synchronously, before the fiber is forked.** Checking
+   * `supervised` would be a race: a supervisor registers itself *inside* the forked fiber,
+   * so two starts arriving in the same tick would both look, both see nothing and both
+   * proceed. `Effect.sync` does not yield, so the check and the claim below are one
+   * indivisible step.
+   *
+   * Path comparison is textual. Two registry rows naming one directory by different paths
+   * — through a symlink, say — would not collide here. Registration already refuses a
+   * folder that is some other target's, and `realpath`ing on every start would be
+   * filesystem work on the request path to close a case the registry has already closed.
+   */
+  const claimedWorkspaces = new Map<
+    string,
+    { readonly attemptId: string; readonly targetId: string }
+  >();
+
+  /**
+   * Claims a workspace for one attempt, or reports who already holds it.
+   *
+   * Returns `undefined` on success. Releasing is {@link releaseWorkspace}, which the
+   * supervisor's own finalizer calls on every exit.
+   */
+  const workspaceClaim = (
+    workspace: string,
+    claim: { readonly attemptId: string; readonly targetId: string },
+  ): Effect.Effect<RunRefused | undefined> =>
+    Effect.sync(() => {
+      const held = claimedWorkspaces.get(workspace);
+      if (held !== undefined) {
+        return new RunRefused({
+          reason: "workspace_busy",
+          detail: `attempt ${held.attemptId} is already running in ${workspace} (target '${held.targetId}'). Only one run at a time may use an engagement's folder: both harnesses configure their pre-execution policy gate per folder, and OpenCode registers its MCP endpoint per folder, so a second worker there could be audited against the wrong target or record an observation under the wrong attempt. Stop that run, or wait for it to settle, and start this one after.`,
+        });
+      }
+      claimedWorkspaces.set(workspace, claim);
+      return undefined;
+    });
+
+  /** Gives a workspace back. Idempotent, and safe to call for a claim we never made. */
+  const releaseWorkspace = (
+    workspace: string,
+    attemptId: string,
+  ): Effect.Effect<void> =>
+    Effect.sync(() => {
+      // Only our own claim: a release that fired late must not hand away a folder a
+      // *later* run has since claimed.
+      if (claimedWorkspaces.get(workspace)?.attemptId === attemptId) {
+        claimedWorkspaces.delete(workspace);
+      }
+    });
   /**
    * What each run settled to, written by the supervisor's finalizer.
    *
@@ -603,19 +709,26 @@ const make = Effect.fnUntraced(function* (options?: {
      * The pre-execution gate, into the workspace, before the session exists.
      *
      * **First, before even the attempt row.** Two reasons, and they are different. The
-     * hook is loaded from the session's own directory, so installing it after
+     * gate is loaded from the session's own directory, so installing it after
      * `createSession` would leave a window — possibly the whole run — in which the worker
      * executed tools no gate had seen. And doing it before `seedAttempt` means a refusal
      * writes *nothing at all*: no row to settle, nothing for a sweep to find, no record
      * of a run that never happened.
      *
-     * A failure here **refuses the run**. A workspace whose `opencode.json` we will not
+     * A failure here **refuses the run**. A workspace whose configuration we will not
      * overwrite is a reason not to start an ungated worker in it, not a reason to start
      * one and hope: nothing has been prompted at this point, so refusing costs an error
      * message, and permitting would cost a worker running against somebody's systems with
      * no record of what it was allowed to do.
+     *
+     * **The harness installs it, and that is why this line has no `switch` in it.**
+     * OpenCode's gate is a plugin in `.opencode/opencode.json`; Claude Code's is a
+     * `PreToolUse` command hook in `.claude/settings.local.json`, with a different
+     * payload, a different way of saying "deny" and a different failure default. The one
+     * thing they share is this call. `policy/install.ts` records the six properties every
+     * implementation of it has to keep.
      */
-    yield* installPolicyHook({
+    yield* harness.installGate({
       workspace: input.workspace,
       policyUrl: urls.policy,
       auditPath: input.auditPath,
@@ -624,7 +737,15 @@ const make = Effect.fnUntraced(function* (options?: {
       freshAudit: false,
     });
 
-    const harnessSessionId = newHarnessSessionId();
+    // Minted by the harness, in the harness's own format: OpenCode brands a `ses_`-prefixed
+    // id and the Claude Agent SDK requires a UUID. Neither is ours to invent, and the
+    // decision to mint one *before* the row is written is what closes the window below.
+    const harnessSessionId = harness.newSessionId();
+    const model = input.model ?? harness.instance.defaultModel;
+    // Which provider and model the evidence records. Harness-specific — OpenCode routes a
+    // model through a named provider of its own, Claude Code has one — and asked here
+    // rather than taken from `createSession`'s answer because the row is written first.
+    const provenance = harness.modelProvenance(model);
 
     const authority = yield* store.seedAttempt({
       targetId: input.targetId,
@@ -634,14 +755,17 @@ const make = Effect.fnUntraced(function* (options?: {
       question: input.question,
       attemptId: ids.attemptId,
       workerId: ids.workerId,
-      providerId: input.model.providerID,
-      modelId: input.model.id,
+      // Pinned here and never updated: moving work to another harness is a replacement
+      // attempt, not a retarget.
+      harnessInstanceId: harness.instance.instanceId,
+      providerId: provenance.providerId,
+      modelId: provenance.modelId,
       harnessSessionId,
     });
 
-    const session = yield* client.createSession({
+    const session = yield* harness.createSession({
       title: input.title,
-      model: input.model,
+      model,
       directory: input.workspace,
       sessionId: harnessSessionId,
     });
@@ -664,7 +788,7 @@ const make = Effect.fnUntraced(function* (options?: {
       attemptFence: authority.writeFence,
     });
 
-    yield* client.registerMcpServer(`bit-${ids.attemptId}`, {
+    yield* harness.registerMcpServer(session.id, `bit-${ids.attemptId}`, {
       url: urls.mcp,
       // Unwrapped and immediately re-wrapped: this is the one place the raw token is
       // touched, to put it in the header of the one request that delivers it. It never
@@ -678,7 +802,7 @@ const make = Effect.fnUntraced(function* (options?: {
       directory: input.workspace,
     });
 
-    return { store, harnessSessionId: session.id };
+    return { store, harnessSessionId: session.id, provenance };
   });
 
   /**
@@ -717,7 +841,7 @@ const make = Effect.fnUntraced(function* (options?: {
     report: { narrated: TerminalOutcome | undefined },
   ) {
     const outcome = yield* Effect.result(
-      Stream.runForEach(client.sessionEvents(harnessSessionId), (entry) =>
+      Stream.runForEach(harness.sessionEvents(harnessSessionId), (entry) =>
         Effect.andThen(
           narrations.publish({
             targetId,
@@ -782,14 +906,16 @@ const make = Effect.fnUntraced(function* (options?: {
       // checked rather than assumed — removing the bound makes
       // "a harness that will not answer during shutdown" hang, which is the point of
       // that test.
-      Effect.timeout(client.sessionStatus(input.harnessSessionId), askTimeout),
+      Effect.timeout(harness.sessionStatus(input.harnessSessionId), askTimeout),
     );
-    const harness =
+    // Named `harnessSaid` rather than `harness`, which is the service: what the harness
+    // *said* and the harness itself are different things and the shadowing read badly.
+    const harnessSaid =
       asked._tag === "Success" ? asked.success.outcome : undefined;
     const status = settlementFor({
       end: input.end,
       narrated: input.narrated,
-      harness,
+      harness: harnessSaid,
     });
 
     const settlement = yield* Effect.result(
@@ -814,7 +940,7 @@ const make = Effect.fnUntraced(function* (options?: {
       attemptId: input.attemptId,
       harnessSessionId: input.harnessSessionId,
       end: renderEnd(input.end),
-      harnessSaid: harness ?? "nothing definite",
+      harnessSaid: harnessSaid ?? "nothing definite",
       narrationSaid: input.narrated ?? "nothing definite",
       status,
       changed:
@@ -854,7 +980,7 @@ const make = Effect.fnUntraced(function* (options?: {
           yield* Deferred.fail(gate, refuse(opened.failure));
           return;
         }
-        const { store, harnessSessionId } = opened.success;
+        const { store, harnessSessionId, provenance } = opened.success;
         const startedAt = Date.now();
 
         /**
@@ -881,6 +1007,11 @@ const make = Effect.fnUntraced(function* (options?: {
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             supervised.delete(ids.attemptId);
+            // Given back here rather than in `start`, because the claim has to outlive the
+            // request: it is held for as long as a worker is in that folder, and this
+            // finalizer runs on every exit — success, failure and the interruption a stop
+            // or a shutdown causes.
+            yield* releaseWorkspace(input.workspace, ids.attemptId);
             // Only when we are the reason it is over. A session that reported its own
             // outcome has already stopped, and asking it to stop again would be a
             // pointless round trip on every clean run.
@@ -889,7 +1020,7 @@ const make = Effect.fnUntraced(function* (options?: {
                 // Bounded for the reason on the `sessionStatus` ask in `settle`: this
                 // also runs in a finalizer, and a dying harness answers neither.
                 Effect.timeout(
-                  client.interruptSession(harnessSessionId),
+                  harness.interruptSession(harnessSessionId),
                   askTimeout,
                 ),
               );
@@ -926,8 +1057,9 @@ const make = Effect.fnUntraced(function* (options?: {
           intentId: ids.intentId,
           goalId: ids.goalId,
           harnessSessionId,
-          providerId: input.model.providerID,
-          modelId: input.model.id,
+          instanceId: harness.instance.instanceId,
+          providerId: provenance.providerId,
+          modelId: provenance.modelId,
           startedAt,
         };
         supervised.set(ids.attemptId, {
@@ -936,6 +1068,7 @@ const make = Effect.fnUntraced(function* (options?: {
           intentId: ids.intentId,
           harnessSessionId,
           startedAt,
+          workspace: input.workspace,
         });
         // Subscribed before prompted, which is the whole reason the prompt is here and
         // not in `startHalf`. `event.subscribe()` replays nothing, so narration published
@@ -951,7 +1084,7 @@ const make = Effect.fnUntraced(function* (options?: {
         );
 
         const prompted = yield* Effect.result(
-          client.prompt(harnessSessionId, input.task),
+          harness.prompt(harnessSessionId, input.task),
         );
         if (prompted._tag === "Failure") {
           // Nothing ran. The attempt row exists and is `running`, so the honest thing is
@@ -978,7 +1111,7 @@ const make = Effect.fnUntraced(function* (options?: {
          * never resubmitted**, on this path or any other.
          */
         const waited = yield* Effect.result(
-          client.waitForIdle(harnessSessionId),
+          harness.waitForIdle(harnessSessionId),
         );
         ending =
           waited._tag === "Failure"
@@ -1024,6 +1157,20 @@ const make = Effect.fnUntraced(function* (options?: {
       attemptId: identifier.newAttemptId(),
       workerId: identifier.prefixed("wk"),
     };
+    /**
+     * The folder, claimed before anything else happens.
+     *
+     * First, and synchronously: the reasoning is on {@link claimedWorkspaces}. Refusing
+     * here means a second concurrent run in one engagement's folder writes *nothing at
+     * all* — no gate installed over the first run's, no attempt row, nothing for a sweep
+     * to find.
+     */
+    const busy = yield* workspaceClaim(input.workspace, {
+      attemptId: ids.attemptId,
+      targetId: input.targetId,
+    });
+    if (busy !== undefined) return yield* busy;
+
     const gate = yield* Deferred.make<RunStarted, RunRefused>();
     // Forked, not run: this is the line that detaches the run from the request. The
     // fiber is a daemon of the layer's scope rather than a child of this fiber, so
@@ -1051,12 +1198,18 @@ const make = Effect.fnUntraced(function* (options?: {
         Effect.flatMap(Deferred.isDone(gate), (done) =>
           done
             ? Deferred.await(gate)
-            : Effect.fail(
-                new RunRefused({
-                  reason: "store_unavailable",
-                  detail:
-                    "this server is shutting down and is no longer starting runs; nothing was prompted",
-                }),
+            : // The one path `supervise`'s body never reached, so its finalizer never ran
+              // and the claim above is still held. Given back here, or a shutting-down
+              // server would leave the folder claimed by a run that never started.
+              Effect.andThen(
+                releaseWorkspace(input.workspace, ids.attemptId),
+                Effect.fail(
+                  new RunRefused({
+                    reason: "store_unavailable",
+                    detail:
+                      "this server is shutting down and is no longer starting runs; nothing was prompted",
+                  }),
+                ),
               ),
         ),
       ),
@@ -1095,6 +1248,16 @@ const make = Effect.fnUntraced(function* (options?: {
   return RunSupervisor.of({
     start,
     stop,
-    running: Effect.sync(() => [...supervised.values()]),
+    running: Effect.sync(() =>
+      // Projected rather than returned whole: `Supervised` carries the workspace, which is
+      // this process's filesystem layout and not something a browser has any use for.
+      [...supervised.values()].map((held): RunningAttempt => ({
+        attemptId: held.attemptId,
+        targetId: held.targetId,
+        intentId: held.intentId,
+        harnessSessionId: held.harnessSessionId,
+        startedAt: held.startedAt,
+      })),
+    ),
   });
 });

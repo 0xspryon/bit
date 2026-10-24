@@ -76,7 +76,7 @@ const program = Effect.gen(function* () {
   line("opencode version", result.harnessVersion);
   line("health route", `${String(result.health.status)} ${result.health.body}`);
   line("fixture url", result.fixtureUrl);
-  line("model", `${WORKER_MODEL.providerID}/${WORKER_MODEL.id}`);
+  line("model", WORKER_MODEL);
   line("session id", result.sessionId);
   line("attempt id", result.attemptId);
   line("write fence", result.writeFence);

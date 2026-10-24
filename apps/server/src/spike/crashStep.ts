@@ -134,6 +134,7 @@ const program = Effect.gen(function* () {
       "Probe the per-client request limiter on POST /login; leave any per-account limit untested.",
     attemptId: ATTEMPT_ID,
     workerId: "worker-crash",
+    harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
     harnessSessionId: "ses_crash",

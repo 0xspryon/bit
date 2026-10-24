@@ -1,52 +1,57 @@
 /**
- * A typed client over the OpenCode 2 HTTP API.
+ * The OpenCode implementation of {@link AgentHarness}: a typed client over the OpenCode 2
+ * HTTP API, plus the identity and the gate installer that go with it.
  *
- * Built on Effect's own `HttpClient` (`effect/http`), not on bare `fetch`. That is
- * what makes two properties true rather than aspirational:
+ * This used to *be* the harness seam. It declared `OpenCodeClient` as the service the
+ * supervisor required, and so OpenCode's vocabulary — a `{ providerID, id }` model pair, a
+ * `ses_`-prefixed session id, a remote-MCP registration body with headers — was the
+ * application's vocabulary too. A second harness moved the seam to
+ * `harness/agentHarness.ts` and left this as one implementation of it. Nothing about the
+ * wire changed; what changed is that none of the three shapes above is visible above this
+ * file any more.
+ *
+ * Built on Effect's own `HttpClient` (`effect/http`), not on bare `fetch`. That is what
+ * makes two properties true rather than aspirational:
  *
  * - **Cancellation reaches the socket.** `FetchHttpClient` passes the fiber's
  *   `AbortSignal` into `fetch`, so interrupting a client fiber — or letting a timeout
- *   interrupt it — aborts the in-flight request. The previous `Effect.promise(() =>
- *   fetch(...))` ignored the signal entirely: the fiber moved on and the request kept
- *   running. Cancelling *our* request still says nothing about whether the harness
- *   stopped working; see {@link waitForIdle}.
+ *   interrupt it — aborts the in-flight request. Cancelling *our* request still says
+ *   nothing about whether the harness stopped working; see `waitForIdle`.
  * - **The typed boundary is real.** Every response body is decoded through an Effect
- *   Schema. A 2xx answer in an unexpected shape is a typed {@link HarnessDecodeError},
- *   not a cast that lies about what we have and dies somewhere downstream.
+ *   Schema. A 2xx answer in an unexpected shape is a typed {@link HarnessDecodeError}, not
+ *   a cast that lies about what we have and dies somewhere downstream.
  *
  * **Routes and payload shapes are the generated client's, not ours.**
- * `@opencode/client/effect` is the Effect client OpenCode publishes from the same
- * source as the server, and it is what T3Code uses
+ * `@opencode/client/effect` is the Effect client OpenCode publishes from the same source
+ * as the server, and it is what T3Code uses
  * (`packages/provider-opencode/src/server/v2/OpenCode2Client.ts:1-15`). The six routes
- * this service needs were previously hand-written against the binary's OpenAPI
- * document, with a narrow schema per response; they are now `api.session.create`,
- * `api.session.prompt`, `api.session.wait`, `api.session.get`, `api.message.list` and
- * `api.mcp.add`. Pinning a URL or re-deriving a response shape is no longer our job, so
- * it can no longer drift from the server we are talking to.
+ * this service needs are `api.session.create`, `api.session.prompt`, `api.session.wait`,
+ * `api.session.get`, `api.message.list` and `api.mcp.add`. Pinning a URL or re-deriving a
+ * response shape is no longer our job, so it can no longer drift from the server we are
+ * talking to.
  *
- * What stays ours is everything above the wire, and it is the reason this is a service
- * rather than a re-export:
+ * What stays ours is everything above the wire:
  *
  * - **The authenticated, bounded transport.** We build the `HttpClient` the generated
- *   client runs on, so the Basic credential, the base URL and the per-operation
- *   timeouts below apply to every call it makes — including any we have not wrapped.
- * - **Our error taxonomy.** The client's failures are its own tagged errors; `fail`
- *   below collapses them into {@link HarnessTransportError} and
- *   {@link HarnessDecodeError}, keeping "the transport broke" distinct from "the answer
- *   was not the shape we were promised". Callers and tests depend on that distinction.
- * - **The narrow surface.** Six operations with domain-shaped results, not 200 routes.
+ *   client runs on, so the Basic credential, the base URL and the per-operation timeouts
+ *   below apply to every call it makes — including any we have not wrapped.
+ * - **Our error taxonomy.** The client's failures are its own tagged errors; `fail` below
+ *   collapses them into {@link HarnessTransportError} and {@link HarnessDecodeError},
+ *   keeping "the transport broke" distinct from "the answer was not the shape we were
+ *   promised". Callers and tests depend on that distinction.
+ * - **The narrow surface.** Nine operations with domain-shaped results, not 200 routes.
  *
  * One dependency note, because it cost an afternoon to find: the package declares
- * `effect: "4.0.1"` as an **exact** peer. Without intervention bun installs a second
- * copy of Effect, and Schema internals from two instances interleave and throw
- * (`s.startsWith is not a function` out of `SchemaAST`). The root `package.json`
- * therefore pins `overrides: { effect: "4.0.5" }` so one copy is resolved for the whole
- * workspace. Check that override on any Effect or client upgrade.
+ * `effect: "4.0.1"` as an **exact** peer. Without intervention bun installs a second copy
+ * of Effect, and Schema internals from two instances interleave and throw
+ * (`s.startsWith is not a function` out of `SchemaAST`). The root `package.json` therefore
+ * pins `overrides: { effect: "4.0.5" }` so one copy is resolved for the whole workspace.
+ * Check that override on any Effect or client upgrade.
  *
- * `POST /api/experimental/mcp/{server}` — now `api.mcp.add` — is how our bearer
- * credential reaches the harness: in a request body, never in the server's argv and
- * never in the environment the agent's own shell commands inherit (DECISIONS.md §6
- * "credentials off argv").
+ * `POST /api/experimental/mcp/{server}` — `api.mcp.add` — is how our bearer credential
+ * reaches the harness: in a request body, never in the server's argv and never in the
+ * environment the agent's own shell commands inherit (DECISIONS.md §6 "credentials off
+ * argv").
  */
 import { OpenCode } from "@opencode/client/effect";
 import { Mcp } from "@opencode/schema/mcp";
@@ -55,7 +60,6 @@ import { ID as ProviderID } from "@opencode/schema/provider";
 import { AbsolutePath } from "@opencode/schema/schema";
 import { ID as SessionID, type Session } from "@opencode/schema/session";
 import {
-  Context,
   Effect,
   Layer,
   Redacted,
@@ -72,69 +76,54 @@ import {
   HttpClientRequest,
 } from "effect/http";
 
+import { installOpenCodeGate } from "../policy/install";
+import {
+  AgentHarness,
+  TerminalOutcome,
+  type HarnessNarration,
+  type MessageEntry,
+} from "./agentHarness";
 import { HarnessDecodeError, HarnessTransportError } from "./errors";
+import {
+  defaultInstanceIdForDriver,
+  OPENCODE_DRIVER,
+  type HarnessInstance,
+  type ModelProvenance,
+} from "./identity";
 import { OpenCodeServer } from "./openCodeServer";
 
-export const TerminalOutcome = Schema.Literals([
-  "succeeded",
-  "failed",
-  "interrupted",
-]);
-export type TerminalOutcome = typeof TerminalOutcome.Type;
+/**
+ * The model a worker runs on when nothing names one.
+ *
+ * `openai` here is OpenCode's OAuth-authenticated ChatGPT subscription provider, which the
+ * spawned server reads from the user's own stored credentials. No API key is read, passed
+ * or held by this process (DECISIONS.md §12).
+ *
+ * Verified on 2026-10-19 against opencode v2.0.32, and again on 2026-10-24 against v2.1.2:
+ * `gpt-5.6-sol` and `gpt-6-astra` complete; `gpt-5.5` and `gpt-5.3-codex-spark` are
+ * refused by the provider with "not supported when using Codex with a ChatGPT account", so
+ * model availability is narrower than the catalogue suggests.
+ *
+ * Written in OpenCode's own `provider/model` form, which is the form its configuration
+ * files use, so that one string is the whole of what a caller has to name — the harness
+ * splits it for the wire and for provenance (see {@link openCodeModelProvenance}).
+ */
+export const OPENCODE_DEFAULT_MODEL = "openai/gpt-5.6-sol";
 
 /**
- * The session fields this application reads.
+ * Splits OpenCode's `provider/model` into the two columns an attempt row records.
  *
- * Still declared here, and still narrow, because it is a *domain* shape rather than a
- * transport one: the generated client returns the server's whole `Session.Info`, and
- * everything past these three fields is noise a caller should not come to depend on.
- * Nothing is decoded from JSON any more — these are read off an already-decoded value.
+ * On the first slash, not the last: a model id may contain slashes and a provider id may
+ * not. A string with no slash has no provider to name, and `unknown` is recorded rather
+ * than an empty string, because an empty provider column reads as a bug and this is a
+ * configuration mistake with a name.
  */
-export interface SessionStatus {
-  readonly outcome?: TerminalOutcome | undefined;
-  readonly cost?: number | undefined;
-  readonly tokens?: Record<string, unknown> | undefined;
-}
-
-export interface SessionRef {
-  readonly id: string;
-}
-
-export interface MessageEntry {
-  readonly type: string;
-  readonly text: string;
-  readonly error: string | undefined;
-}
-
-/**
- * One narrated moment of a session, reduced to what this application reads.
- *
- * **Deliberately four fields and no content.** A transcript needs the text of a reply,
- * the arguments of a tool call and a shape to render them in; choosing that shape is the
- * next slice's work, and a field invented here would be the format that slice inherits
- * without having decided it. So this carries the harness's own event `type` verbatim, its
- * own cursor, when it happened, and the one thing a supervisor has to act on.
- *
- * `type` is a plain `string` rather than a union of the ~50 entry kinds the client
- * declares. Which kinds exist is the harness's business and the set grows with its
- * releases; a union here would make an upgrade a compile error in a module that only
- * forwards the value.
- *
- * `outcome` is the exception, and it is the whole reason this is not an opaque blob:
- * `session.execution.succeeded`, `.failed` and `.interrupted` are the harness stating a
- * terminal outcome, which is a *definite answer* and must be told apart from the stream
- * merely ending. It is `undefined` on every other entry.
- */
-export interface HarnessNarration {
-  /** The harness's own event type, unmapped. */
-  readonly type: string;
-  /** `durable.seq`: the harness's cursor, for resuming a log without replaying it. */
-  readonly sequence: number | undefined;
-  /** When the harness recorded it, in epoch milliseconds. */
-  readonly at: number;
-  /** Set only by a terminal `session.execution.*` entry. Never inferred. */
-  readonly outcome: TerminalOutcome | undefined;
-}
+export const openCodeModelProvenance = (model: string): ModelProvenance => {
+  const slash = model.indexOf("/");
+  return slash === -1
+    ? { providerId: "unknown", modelId: model }
+    : { providerId: model.slice(0, slash), modelId: model.slice(slash + 1) };
+};
 
 /**
  * The three log entries that state an outcome, mapped to this application's vocabulary.
@@ -179,8 +168,7 @@ const sessionOf = (event: unknown): string | undefined => {
  *
  * Reads defensively off an already-decoded value, for the same reason {@link flatten}
  * does: the entry union is wide and version-specific, and re-asserting a shape the
- * generated client has already validated would only add a second place for it to be
- * wrong.
+ * generated client has already validated would only add a second place for it to be wrong.
  */
 const narrate = (entry: unknown): HarnessNarration => {
   const record = (entry ?? {}) as {
@@ -197,11 +185,6 @@ const narrate = (entry: unknown): HarnessNarration => {
     outcome: EXECUTION_OUTCOMES[type],
   };
 };
-
-export interface ModelRef {
-  readonly providerID: string;
-  readonly id: string;
-}
 
 /**
  * Reduces one inbox entry to the three fields a caller uses.
@@ -256,462 +239,375 @@ export const DEFAULT_TIMEOUTS: ClientTimeouts = {
   wait: "30 minutes",
 };
 
-export class OpenCodeClient extends Context.Service<
-  OpenCodeClient,
-  {
-    readonly registerMcpServer: (
-      name: string,
-      config: {
-        readonly url: string;
-        readonly headers: Readonly<Record<string, Redacted.Redacted<string>>>;
-        readonly directory: string;
-      },
-    ) => Effect.Effect<void, HarnessTransportError | HarnessDecodeError>;
-    /**
-     * Opens a session, optionally inside an existing session's lineage.
-     *
-     * `parentSessionId` exists for provider prompt caching and nothing else. OpenCode
-     * derives one cache key per lineage — `parentID ?? fork.sessionID ?? id`
-     * (`core/src/session/affinity.ts`), sent as `prompt_cache_key` and as the
-     * `x-session-affinity` header (`core/src/session/model-request.ts`) — so sessions
-     * that name the same parent are routed to the same cached prefix, and separately
-     * created top-level sessions never are, however identical their prompts.
-     *
-     * A child is **not** a fork: only the fork path copies messages across
-     * (`core/src/session/projector.ts`), so the new session starts empty and a briefing
-     * remains the only thing in it. What a parent does change is crash recovery —
-     * OpenCode resumes only parentless sessions (`SessionStore.listSuspended`) and
-     * merely releases a child's claim — which is why this is passed for planner rounds,
-     * whose state is the graph, and not for worker sessions, whose interruption is
-     * reconciled by us and should stay resumable by the harness.
-     */
-    readonly createSession: (input: {
-      readonly title: string;
-      readonly model: ModelRef;
-      readonly directory: string;
-      readonly parentSessionId?: string | undefined;
-      /**
-       * The id to create the session under, instead of one the harness picks.
-       *
-       * This closes a real window. Opening a worker session is `seedAttempt({
-       * harnessSessionId: null })` → `createSession` → `bindSessionToAttempt`, and a
-       * process that dies between the second and third steps leaves a live harness
-       * session that no attempt row points at: recovery sweeps attempts, so it never
-       * looks at it, and nothing else knows it exists. Minting the id first and writing
-       * it with the seed means the row names the session *before* the session exists —
-       * the worst case becomes a recorded id for a session that was never created, which
-       * recovery already handles (it asks the harness, is told `missing`, and records
-       * `uncertain`).
-       *
-       * **Verified, not assumed.** `SessionCreateInput.id` is `Session.ID | undefined` in
-       * `@opencode/client@2.1.0`, and the harness returning the id it was handed was
-       * checked against a live `opencode serve` rather than inferred from the type.
-       * `@opencode/schema`'s `Session.ID` is `isStartingWith("ses")` plus a brand, with
-       * `ID.create()` minting one; {@link newHarnessSessionId} is where this application
-       * calls it, so the format stays the harness's to define.
-       */
-      readonly sessionId?: string | undefined;
-    }) => Effect.Effect<SessionRef, HarnessTransportError | HarnessDecodeError>;
-    readonly prompt: (
-      sessionId: string,
-      text: string,
-    ) => Effect.Effect<void, HarnessTransportError | HarnessDecodeError>;
-    readonly waitForIdle: (
-      sessionId: string,
-    ) => Effect.Effect<void, HarnessTransportError | HarnessDecodeError>;
-    readonly sessionStatus: (
-      sessionId: string,
-    ) => Effect.Effect<
-      SessionStatus,
-      HarnessTransportError | HarnessDecodeError
-    >;
-    readonly messages: (
-      sessionId: string,
-    ) => Effect.Effect<
-      readonly MessageEntry[],
-      HarnessTransportError | HarnessDecodeError
-    >;
-    /**
-     * Asks the harness to stop whatever the session is doing.
-     *
-     * Reports whether the harness says it interrupted something: `false` for a session
-     * that was already idle, which is not a failure and is worth being able to tell
-     * apart. `resume` is deliberately not exposed — nothing in this application resumes
-     * a session, because carrying work on after an interruption means a new attempt
-     * identity (DECISIONS.md §15, and `store.openReplacementAttempt`).
-     */
-    readonly interruptSession: (
-      sessionId: string,
-    ) => Effect.Effect<boolean, HarnessTransportError | HarnessDecodeError>;
-    /**
-     * The harness's event stream, filtered to one session.
-     *
-     * ## Why `event.subscribe()` and not `session.log`
-     *
-     * The brief for this slice expected the opposite, and the harness settled it. Both
-     * calls exist on the generated client; `session.log({ sessionID, follow: true })` is
-     * per session by construction and replays a durable log, which on paper makes it the
-     * unambiguous choice. Against a live `opencode` 2.1.2 it carries **no narration at
-     * all**: a session that was prompted, ran, replied and settled `succeeded` produced
-     * exactly one entry, `log.synced`, both while following and on a non-following replay
-     * afterwards. That build's durable per-session log is simply not where execution is
-     * written. Checked on 2026-10-24; the probe is reproducible with two prompts and two
-     * subscriptions side by side.
-     *
-     * `event.subscribe()` carries all of it — `session.execution.started`,
-     * `session.inbox.*`, `session.step.*`, `session.text.*`, `session.tool.*`,
-     * `session.usage.updated` and the terminal `session.execution.{succeeded,failed,
-     * interrupted}`.
-     *
-     * **And the ambiguity the brief worried about is not there.** It is one stream for the
-     * whole server, so events have to be attributed, but the attribution is a single field
-     * read at the same position in every event: the manifest gives every `session.*` event
-     * `data.sessionID`, and every event also carries `durable.aggregateID`, which for a
-     * session event is that same id. Two sessions prompted a moment apart were separated
-     * cleanly on both fields. So this reads `data.sessionID` and falls back to
-     * `durable.aggregateID`, and an event carrying neither is dropped rather than guessed
-     * at — a misattributed entry would publish one target's narration under another's key,
-     * which is the one failure worth being strict about.
-     *
-     * **One subscription per watched session, not one shared and demultiplexed.** N
-     * concurrent runs open N streams to a local server, which is a cost worth paying for
-     * the lifetime it buys: each belongs to one supervisor fiber, is cancelled at the
-     * socket when that fiber is interrupted, and cannot be kept alive by, or taken down
-     * by, another run. A shared subscription would be a reference-counted resource whose
-     * failure is every supervisor's problem at once.
-     *
-     * **It is live-only, so it has a startup race `session.log` would not have had.** An
-     * event published between prompting and the subscription being established is gone.
-     * That is why the supervisor does not take its *settlement* from this stream alone —
-     * see `run/supervisor.ts` on why `waitForIdle` is still what says the session is over.
-     *
-     * **No transport bound.** Every other operation here is wrapped in a timeout; this
-     * one deliberately is not, because it is meant to stay open for as long as the session
-     * runs, which is unbounded by design (DECISIONS.md §5, "no deadline-triggered worker
-     * settlement"). The consuming fiber owns its lifetime instead: interrupting that fiber
-     * aborts the request at the socket, because the client is built on `FetchHttpClient`
-     * and the fiber's `AbortSignal` reaches `fetch`.
-     *
-     * **A stream that ends is not an outcome** (DECISIONS.md §15). This one ends whenever
-     * the harness restarts or the socket drops — in the probe above, with an `ECONNRESET`
-     * at teardown — so a consumer must reconcile against {@link SessionStatus} rather than
-     * conclude anything from the end of it. What *is* an outcome is an entry, and
-     * {@link HarnessNarration.outcome} carries that and nothing else.
-     */
-    readonly sessionEvents: (
-      sessionId: string,
-    ) => Stream.Stream<
-      HarnessNarration,
-      HarnessTransportError | HarnessDecodeError
-    >;
-  }
->()("bit/harness/OpenCodeClient") {
-  static readonly layer = (timeouts: ClientTimeouts = DEFAULT_TIMEOUTS) =>
-    Layer.effect(
-      OpenCodeClient,
-      Effect.gen(function* () {
-        const { server } = yield* OpenCodeServer;
+/**
+ * A session id this application mints, in OpenCode's own format.
+ *
+ * `@opencode/schema`'s `Session.ID.create()` rather than a string of our own: the format is
+ * `ses_` plus the harness's descending identifier, the brand's check enforces the prefix,
+ * and a value built by hand would be our guess at someone else's id scheme. This is the
+ * only place it is called, so if the scheme changes there is one line to follow.
+ *
+ * Minting an id here is only useful because the harness honours it. `SessionCreateInput.id`
+ * is `Session.ID | undefined` in `@opencode/client@2.1.0`, and `opencode` 2.1.2 returning
+ * the id it is handed was checked against a live `opencode serve` rather than inferred
+ * from the type.
+ */
+export const newOpenCodeSessionId = (): string => SessionID.create();
 
-        /**
-         * The transport every generated call runs on.
-         *
-         * The credential is attached here, once, rather than per call: the generated
-         * client builds its own requests, so an operation we have not wrapped is
-         * authenticated too. `filterStatusOk` is deliberately **not** applied — the
-         * client reads non-2xx bodies to produce its own tagged errors, and discarding
-         * them here would flatten `UnauthorizedError` and friends into a bare status.
-         */
-        const http = (yield* HttpClient.HttpClient).pipe(
-          HttpClient.mapRequest((request) =>
-            request.pipe(
-              HttpClientRequest.setHeader(
-                "authorization",
-                Redacted.value(server.authorization),
-              ),
-              HttpClientRequest.acceptJson,
-            ),
-          ),
-        );
-
-        const api = yield* OpenCode.make({ baseUrl: server.baseUrl }).pipe(
-          Effect.provideService(HttpClient.HttpClient, http),
-        );
-
-        /**
-         * Collapses the client's failures into this application's two.
-         *
-         * The distinction that has to survive is transport versus shape, because they
-         * mean different things to a caller: a transport failure leaves the harness's
-         * state *uncertain*, while a decode failure means we are talking to something
-         * that does not answer the way this build expects. A `SchemaError` — raised
-         * directly or wrapped in the client's `ClientError` — is the second kind;
-         * everything else is the first.
-         */
-        const fail = (operation: string) => (cause: unknown) => {
-          // The client wraps a transport or schema failure in its own `ClientError`,
-          // so the useful one is a level down. Unwrap exactly one level — more would
-          // be guessing at a chain whose shape is not ours.
-          const outer = cause as { readonly cause?: unknown };
-          const inner = outer.cause ?? cause;
-          const status = HttpClientError.isHttpClientError(inner)
-            ? inner.response?.status
-            : undefined;
-          const tag = (inner as { _tag?: string })._tag ?? "error";
-          const detail =
-            (inner as { message?: string }).message ?? String(inner);
-
-          // Official predicates rather than tag strings: a decode failure is whatever
-          // Effect calls a decode failure, in this version and the next.
-          return Schema.isSchemaError(inner)
-            ? new HarnessDecodeError({
-                operation,
-                status,
-                detail,
-                cause,
-              })
-            : new HarnessTransportError({
-                operation,
-                status,
-                tag,
-                detail: `${tag}: ${detail}`,
-                cause,
-              });
-        };
-
-        /** Applies this application's transport bound to one generated call. */
-        const bounded = <A>(
-          operation: string,
-          timeout: Duration.Input,
-          effect: Effect.Effect<A, unknown>,
-        ): Effect.Effect<A, HarnessTransportError | HarnessDecodeError> =>
-          effect.pipe(
-            Effect.mapError(fail(operation)),
-            Effect.timeout(timeout),
-            Effect.catchTag(
-              "TimeoutError",
-              (cause) =>
-                new HarnessTransportError({
-                  operation,
-                  status: undefined,
-                  tag: "TimeoutError",
-                  detail:
-                    "request exceeded its transport bound and was aborted; " +
-                    "this does not mean the harness stopped working",
-                  cause,
-                }),
-            ),
-          );
-
-        /**
-         * Brands a directory as the absolute path the client's types require.
-         *
-         * `AbsolutePath` is a branded string, so this is the one place the brand is
-         * applied; `decodeUnknownSync` rather than a cast so that whatever validation
-         * the brand carries now or later actually runs, and a bad path fails here with
-         * the path in the message instead of somewhere inside a request body.
-         */
-        const directoryOf = (directory: string) =>
-          Schema.decodeUnknownSync(AbsolutePath)(directory);
-
-        const registerMcpServer: OpenCodeClient["Service"]["registerMcpServer"] =
-          Effect.fn("OpenCodeClient.registerMcpServer")(
-            function* (name, config) {
-              yield* bounded(
-                "mcp.add",
-                timeouts.control,
-                api.mcp.add({
-                  server: name,
-                  location: { directory: directoryOf(config.directory) },
-                  config: new Mcp.RemoteConfig({
-                    type: "remote",
-                    url: config.url,
-                    // Pinned, not negotiated: our endpoint serves only the stateless
-                    // 2026-07-28 revision, and this field's default value would open
-                    // with an `initialize` handshake the server does not implement.
-                    // "auto" would probe and silently fall back; there is nothing to
-                    // fall back to. Typed by the schema, so a typo here is a compile
-                    // error rather than a connection failure at run time.
-                    protocol: "2026-07-28",
-                    // Unwrapped only here, at the one call that delivers it.
-                    headers: Object.fromEntries(
-                      Object.entries(config.headers).map(([key, value]) => [
-                        key,
-                        Redacted.value(value),
-                      ]),
-                    ),
-                    timeout: new Mcp.TimeoutConfig({
-                      startup: 20_000,
-                      catalog: 20_000,
-                      execution: 60_000,
-                    }),
-                  }),
-                }),
-              );
-            },
-          );
-
-        const createSession: OpenCodeClient["Service"]["createSession"] =
-          Effect.fn("OpenCodeClient.createSession")(function* (input) {
-            const session = yield* bounded(
-              "session.create",
-              timeouts.control,
-              api.session.create({
-                title: input.title,
-                // The client brands these; `ModelRef` is this application's own shape
-                // and the ids inside it come from our configuration, so they are
-                // branded at the boundary rather than threaded through the codebase.
-                model: {
-                  providerID: Schema.decodeUnknownSync(ProviderID)(
-                    input.model.providerID,
-                  ),
-                  id: Schema.decodeUnknownSync(ModelID)(input.model.id),
-                },
-                location: { directory: directoryOf(input.directory) },
-                // Spread rather than passed as `undefined` so the call site reads as
-                // "no parent" rather than "parent: nothing". On the wire both are the
-                // same: the generated client encodes an absent optional as an explicit
-                // `null`, which is what the server reads as parentless.
-                ...(input.parentSessionId === undefined
-                  ? {}
-                  : { parentID: input.parentSessionId as Session.ID }),
-                ...(input.sessionId === undefined
-                  ? {}
-                  : { id: input.sessionId as Session.ID }),
-              }),
-            );
-            return { id: session.id };
-          });
-
-        const prompt: OpenCodeClient["Service"]["prompt"] = Effect.fn(
-          "OpenCodeClient.prompt",
-        )(function* (sessionId, text) {
-          yield* bounded(
-            "session.prompt",
-            timeouts.control,
-            api.session.prompt({
-              sessionID: sessionId as Session.ID,
-              text,
-            }),
-          );
-        });
-
-        /**
-         * Blocks until the session settles.
-         *
-         * A failure here means the outcome is **uncertain**, not that execution
-         * stopped: the wait call losing its connection, or being interrupted, says
-         * nothing about the harness (DECISIONS.md §15 "Recovery"). Callers must
-         * reconcile against `sessionStatus` and must never resubmit the prompt.
-         */
-        const waitForIdle: OpenCodeClient["Service"]["waitForIdle"] = Effect.fn(
-          "OpenCodeClient.waitForIdle",
-        )(function* (sessionId) {
-          yield* bounded(
-            "session.wait",
-            timeouts.wait,
-            api.session.wait({ sessionID: sessionId as Session.ID }),
-          );
-        });
-
-        const sessionStatus: OpenCodeClient["Service"]["sessionStatus"] =
-          Effect.fn("OpenCodeClient.sessionStatus")(function* (sessionId) {
-            const session = yield* bounded(
-              "session.get",
-              timeouts.control,
-              api.session.get({ sessionID: sessionId as Session.ID }),
-            );
-            const outcome = (session as { outcome?: unknown }).outcome;
-            return {
-              outcome: Schema.is(TerminalOutcome)(outcome)
-                ? outcome
-                : undefined,
-              cost: session.cost,
-              tokens: session.tokens as Record<string, unknown> | undefined,
-            };
-          });
-
-        const messages: OpenCodeClient["Service"]["messages"] = Effect.fn(
-          "OpenCodeClient.messages",
-        )(function* (sessionId) {
-          const listed = yield* bounded(
-            "message.list",
-            timeouts.control,
-            api.message.list({ sessionID: sessionId as Session.ID }),
-          );
-          return listed.data.map(flatten);
-        });
-
-        const interruptSession: OpenCodeClient["Service"]["interruptSession"] =
-          Effect.fn("OpenCodeClient.interruptSession")(function* (sessionId) {
-            const result = yield* bounded(
-              "session.interrupt",
-              timeouts.control,
-              api.session.interrupt({ sessionID: sessionId as Session.ID }),
-            );
-            return result.interrupted;
-          });
-
-        /**
-         * The generated subscription, filtered and reduced.
-         *
-         * `Stream.mapError` rather than the `bounded` helper the others use: `bounded`
-         * applies `Effect.timeout`, which is the one thing a followed stream must not
-         * have. The failure mapping is the same `fail` the rest of this service uses, so a
-         * consumer sees the same two errors here as everywhere else.
-         *
-         * `filterMap` rather than `filter` then `map`: an event belonging to another
-         * session and an event with no session on it are both dropped by the same step
-         * that reads the id, so there is no second place for the two to disagree.
-         */
-        const sessionEvents: OpenCodeClient["Service"]["sessionEvents"] = (
-          sessionId,
-        ) =>
-          api.event
-            .subscribe()
-            .pipe(
-              Stream.mapError(fail("event.subscribe")),
-              Stream.filterMap(
-                Filter.make((event: unknown) =>
-                  sessionOf(event) === sessionId
-                    ? Result.succeed(narrate(event))
-                    : Result.fail(event),
-                ),
-              ),
-            );
-
-        return OpenCodeClient.of({
-          registerMcpServer,
-          createSession,
-          prompt,
-          waitForIdle,
-          sessionStatus,
-          messages,
-          interruptSession,
-          sessionEvents,
-        });
-      }),
-    ).pipe(Layer.provide(FetchHttpClient.layer));
+/** What a caller may vary about this harness. */
+export interface OpenCodeHarnessOptions {
+  readonly timeouts?: ClientTimeouts;
+  /** The model a run gets when it names none. OpenCode's `provider/model` form. */
+  readonly defaultModel?: string;
 }
 
 /**
- * A session id this application mints, in the harness's own format.
+ * The OpenCode harness over an already-running `opencode serve`.
  *
- * `@opencode/schema`'s `Session.ID.create()` rather than a string of our own: the format
- * is `ses_` plus the harness's descending identifier, the brand's check enforces the
- * prefix, and a value built by hand would be our guess at someone else's id scheme. This
- * is the only place it is called, so if the scheme changes there is one line to follow.
- *
- * Minting an id here is only useful because the harness honours it; see
- * `createSession`'s `sessionId` for the window that closes and how it was verified.
+ * Requires {@link OpenCodeServer}, which is what makes "this deployment can start runs" a
+ * layer question rather than a runtime one: a process whose harness will not spawn never
+ * builds this, and `main.ts` serves without it.
  */
-export const newHarnessSessionId = (): string => SessionID.create();
+export const openCodeHarness = (
+  options: OpenCodeHarnessOptions = {},
+): Layer.Layer<AgentHarness, never, OpenCodeServer> => {
+  const timeouts = options.timeouts ?? DEFAULT_TIMEOUTS;
+  const defaultModel = options.defaultModel ?? OPENCODE_DEFAULT_MODEL;
+  return Layer.effect(
+    AgentHarness,
+    Effect.gen(function* () {
+      const { server } = yield* OpenCodeServer;
 
-/** The assistant's final text, or an empty string when it produced none. */
-export const finalAssistantText = (entries: readonly MessageEntry[]): string =>
-  entries.find((entry) => entry.type === "assistant")?.text ?? "";
+      const instance: HarnessInstance = {
+        instanceId: defaultInstanceIdForDriver(OPENCODE_DRIVER),
+        driver: OPENCODE_DRIVER,
+        displayName: "OpenCode",
+        // Read off `/api/info` during readiness, so it is the build that answered rather
+        // than the one on the PATH when somebody last looked.
+        version: server.version,
+        installed: true,
+        // See `identity.ts` on why this is not probed: `opencode serve` starts without
+        // provider credentials and only fails at prompt time, so anything else here would
+        // be a guess.
+        auth: "unknown",
+        defaultModel,
+      };
 
-/** The first error any entry reported, used to explain a `failed` outcome. */
-export const firstError = (
-  entries: readonly MessageEntry[],
-): string | undefined =>
-  entries.find((entry) => entry.error !== undefined)?.error;
+      /**
+       * The transport every generated call runs on.
+       *
+       * The credential is attached here, once, rather than per call: the generated client
+       * builds its own requests, so an operation we have not wrapped is authenticated too.
+       * `filterStatusOk` is deliberately **not** applied — the client reads non-2xx bodies
+       * to produce its own tagged errors, and discarding them here would flatten
+       * `UnauthorizedError` and friends into a bare status.
+       */
+      const http = (yield* HttpClient.HttpClient).pipe(
+        HttpClient.mapRequest((request) =>
+          request.pipe(
+            HttpClientRequest.setHeader(
+              "authorization",
+              Redacted.value(server.authorization),
+            ),
+            HttpClientRequest.acceptJson,
+          ),
+        ),
+      );
+
+      const api = yield* OpenCode.make({ baseUrl: server.baseUrl }).pipe(
+        Effect.provideService(HttpClient.HttpClient, http),
+      );
+
+      /**
+       * Collapses the client's failures into this application's two.
+       *
+       * The distinction that has to survive is transport versus shape, because they mean
+       * different things to a caller: a transport failure leaves the harness's state
+       * *uncertain*, while a decode failure means we are talking to something that does not
+       * answer the way this build expects. A `SchemaError` — raised directly or wrapped in
+       * the client's `ClientError` — is the second kind; everything else is the first.
+       */
+      const fail = (operation: string) => (cause: unknown) => {
+        // The client wraps a transport or schema failure in its own `ClientError`, so the
+        // useful one is a level down. Unwrap exactly one level — more would be guessing at
+        // a chain whose shape is not ours.
+        const outer = cause as { readonly cause?: unknown };
+        const inner = outer.cause ?? cause;
+        const status = HttpClientError.isHttpClientError(inner)
+          ? inner.response?.status
+          : undefined;
+        const tag = (inner as { _tag?: string })._tag ?? "error";
+        const detail = (inner as { message?: string }).message ?? String(inner);
+
+        // Official predicates rather than tag strings: a decode failure is whatever Effect
+        // calls a decode failure, in this version and the next.
+        return Schema.isSchemaError(inner)
+          ? new HarnessDecodeError({ operation, status, detail, cause })
+          : new HarnessTransportError({
+              operation,
+              status,
+              tag,
+              detail: `${tag}: ${detail}`,
+              cause,
+            });
+      };
+
+      /** Applies this application's transport bound to one generated call. */
+      const bounded = <A>(
+        operation: string,
+        timeout: Duration.Input,
+        effect: Effect.Effect<A, unknown>,
+      ): Effect.Effect<A, HarnessTransportError | HarnessDecodeError> =>
+        effect.pipe(
+          Effect.mapError(fail(operation)),
+          Effect.timeout(timeout),
+          Effect.catchTag(
+            "TimeoutError",
+            (cause) =>
+              new HarnessTransportError({
+                operation,
+                status: undefined,
+                tag: "TimeoutError",
+                detail:
+                  "request exceeded its transport bound and was aborted; " +
+                  "this does not mean the harness stopped working",
+                cause,
+              }),
+          ),
+        );
+
+      /**
+       * Brands a directory as the absolute path the client's types require.
+       *
+       * `AbsolutePath` is a branded string, so this is the one place the brand is applied;
+       * `decodeUnknownSync` rather than a cast so that whatever validation the brand
+       * carries now or later actually runs, and a bad path fails here with the path in the
+       * message instead of somewhere inside a request body.
+       */
+      const directoryOf = (directory: string) =>
+        Schema.decodeUnknownSync(AbsolutePath)(directory);
+
+      /**
+       * Brands a `provider/model` string as the pair the wire wants.
+       *
+       * `decodeUnknownSync` dies on a malformed id rather than failing, and that is
+       * correct here: the model is *configuration*, not a request payload, so a bad one is
+       * a deployment mistake to be surfaced loudly and not a condition a run should report
+       * as "the harness is unreachable".
+       */
+      const modelOf = (model: string) => {
+        const { providerId, modelId } = openCodeModelProvenance(model);
+        return {
+          providerID: Schema.decodeUnknownSync(ProviderID)(providerId),
+          id: Schema.decodeUnknownSync(ModelID)(modelId),
+        };
+      };
+
+      const registerMcpServer: AgentHarness["Service"]["registerMcpServer"] =
+        Effect.fn("openCodeHarness.registerMcpServer")(
+          // `_sessionId` is unused, and that is the whole point of the parameter: OpenCode
+          // registers an MCP server into a directory and has no per-session channel, so
+          // the session the credential is for is implicit here. The interface takes it
+          // anyway because Claude Code cannot register without it; see
+          // `AgentHarness.registerMcpServer` for what this implementation is therefore
+          // wider than.
+          function* (_sessionId, name, config) {
+            yield* bounded(
+              "mcp.add",
+              timeouts.control,
+              api.mcp.add({
+                server: name,
+                location: { directory: directoryOf(config.directory) },
+                config: new Mcp.RemoteConfig({
+                  type: "remote",
+                  url: config.url,
+                  // Pinned, not negotiated: our endpoint serves only the stateless
+                  // 2026-07-28 revision, and this field's default value would open with an
+                  // `initialize` handshake the server does not implement. "auto" would
+                  // probe and silently fall back; there is nothing to fall back to. Typed
+                  // by the schema, so a typo here is a compile error rather than a
+                  // connection failure at run time.
+                  protocol: "2026-07-28",
+                  // Unwrapped only here, at the one call that delivers it.
+                  headers: Object.fromEntries(
+                    Object.entries(config.headers).map(([key, value]) => [
+                      key,
+                      Redacted.value(value),
+                    ]),
+                  ),
+                  timeout: new Mcp.TimeoutConfig({
+                    startup: 20_000,
+                    catalog: 20_000,
+                    execution: 60_000,
+                  }),
+                }),
+              }),
+            );
+          },
+        );
+
+      const createSession: AgentHarness["Service"]["createSession"] = Effect.fn(
+        "openCodeHarness.createSession",
+      )(function* (input) {
+        const session = yield* bounded(
+          "session.create",
+          timeouts.control,
+          api.session.create({
+            title: input.title,
+            model: modelOf(input.model),
+            location: { directory: directoryOf(input.directory) },
+            // Spread rather than passed as `undefined` so the call site reads as "no
+            // parent" rather than "parent: nothing". On the wire both are the same: the
+            // generated client encodes an absent optional as an explicit `null`, which is
+            // what the server reads as parentless.
+            //
+            // `parentSessionId` exists for provider prompt caching: OpenCode derives one
+            // cache key per lineage — `parentID ?? fork.sessionID ?? id`
+            // (`core/src/session/affinity.ts`) — so sessions naming the same parent reach
+            // the same cached prefix. A child is *not* a fork: only the fork path copies
+            // messages across, so the new session starts empty.
+            ...(input.parentSessionId === undefined
+              ? {}
+              : { parentID: input.parentSessionId as Session.ID }),
+            ...(input.sessionId === undefined
+              ? {}
+              : { id: input.sessionId as Session.ID }),
+          }),
+        );
+        return { id: session.id };
+      });
+
+      const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
+        "openCodeHarness.prompt",
+      )(function* (sessionId, text) {
+        yield* bounded(
+          "session.prompt",
+          timeouts.control,
+          api.session.prompt({ sessionID: sessionId as Session.ID, text }),
+        );
+      });
+
+      /**
+       * Blocks until the session settles.
+       *
+       * A failure here means the outcome is **uncertain**, not that execution stopped: the
+       * wait call losing its connection, or being interrupted, says nothing about the
+       * harness (DECISIONS.md §15 "Recovery"). Callers must reconcile against
+       * `sessionStatus` and must never resubmit the prompt.
+       */
+      const waitForIdle: AgentHarness["Service"]["waitForIdle"] = Effect.fn(
+        "openCodeHarness.waitForIdle",
+      )(function* (sessionId) {
+        yield* bounded(
+          "session.wait",
+          timeouts.wait,
+          api.session.wait({ sessionID: sessionId as Session.ID }),
+        );
+      });
+
+      const sessionStatus: AgentHarness["Service"]["sessionStatus"] = Effect.fn(
+        "openCodeHarness.sessionStatus",
+      )(function* (sessionId) {
+        const session = yield* bounded(
+          "session.get",
+          timeouts.control,
+          api.session.get({ sessionID: sessionId as Session.ID }),
+        );
+        const outcome = (session as { outcome?: unknown }).outcome;
+        return {
+          outcome: Schema.is(TerminalOutcome)(outcome) ? outcome : undefined,
+          cost: session.cost,
+          tokens: session.tokens as Record<string, unknown> | undefined,
+        };
+      });
+
+      const messages: AgentHarness["Service"]["messages"] = Effect.fn(
+        "openCodeHarness.messages",
+      )(function* (sessionId) {
+        const listed = yield* bounded(
+          "message.list",
+          timeouts.control,
+          api.message.list({ sessionID: sessionId as Session.ID }),
+        );
+        return listed.data.map(flatten);
+      });
+
+      const interruptSession: AgentHarness["Service"]["interruptSession"] =
+        Effect.fn("openCodeHarness.interruptSession")(function* (sessionId) {
+          const result = yield* bounded(
+            "session.interrupt",
+            timeouts.control,
+            api.session.interrupt({ sessionID: sessionId as Session.ID }),
+          );
+          return result.interrupted;
+        });
+
+      /**
+       * The generated subscription, filtered and reduced.
+       *
+       * ## Why `event.subscribe()` and not `session.log`
+       *
+       * Both calls exist on the generated client; `session.log({ sessionID, follow: true })`
+       * is per session by construction and replays a durable log, which on paper makes it
+       * the unambiguous choice. Against a live `opencode` 2.1.2 it carries **no narration
+       * at all**: a session that was prompted, ran, replied and settled `succeeded`
+       * produced exactly one entry, `log.synced`, both while following and on a
+       * non-following replay afterwards. That build's durable per-session log is simply not
+       * where execution is written. Checked on 2026-10-24.
+       *
+       * `event.subscribe()` carries all of it — `session.execution.started`,
+       * `session.inbox.*`, `session.step.*`, `session.text.*`, `session.tool.*`,
+       * `session.usage.updated` and the terminal
+       * `session.execution.{succeeded,failed,interrupted}`.
+       *
+       * It is one stream for the whole server, so events have to be attributed, but the
+       * attribution is a single field read at the same position in every event; see
+       * {@link sessionOf}. An event carrying neither field is dropped rather than guessed
+       * at — a misattributed entry would publish one target's narration under another's
+       * key, which is the one failure worth being strict about.
+       *
+       * **One subscription per watched session, not one shared and demultiplexed.** N
+       * concurrent runs open N streams to a local server, which is a cost worth paying for
+       * the lifetime it buys: each belongs to one supervisor fiber and is cancelled at the
+       * socket when that fiber is interrupted.
+       *
+       * `Stream.mapError` rather than the `bounded` helper the others use: `bounded`
+       * applies `Effect.timeout`, which is the one thing a followed stream must not have.
+       *
+       * `filterMap` rather than `filter` then `map`: an event belonging to another session
+       * and an event with no session on it are both dropped by the same step that reads the
+       * id, so there is no second place for the two to disagree.
+       */
+      const sessionEvents: AgentHarness["Service"]["sessionEvents"] = (
+        sessionId,
+      ) =>
+        api.event
+          .subscribe()
+          .pipe(
+            Stream.mapError(fail("event.subscribe")),
+            Stream.filterMap(
+              Filter.make((event: unknown) =>
+                sessionOf(event) === sessionId
+                  ? Result.succeed(narrate(event))
+                  : Result.fail(event),
+              ),
+            ),
+          );
+
+      return AgentHarness.of({
+        instance,
+        newSessionId: newOpenCodeSessionId,
+        modelProvenance: openCodeModelProvenance,
+        installGate: installOpenCodeGate,
+        registerMcpServer,
+        createSession,
+        prompt,
+        waitForIdle,
+        sessionStatus,
+        messages,
+        interruptSession,
+        sessionEvents,
+      });
+    }),
+  ).pipe(Layer.provide(FetchHttpClient.layer));
+};

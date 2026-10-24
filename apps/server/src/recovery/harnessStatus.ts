@@ -21,7 +21,7 @@
  */
 import { Context, Effect, Layer } from "effect";
 
-import { OpenCodeClient } from "../harness/openCodeClient";
+import { AgentHarness, SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
 
 /**
  * What the harness said about one session.
@@ -36,7 +36,9 @@ import { OpenCodeClient } from "../harness/openCodeClient";
  *   may have been cleared, or this is a different machine. Says nothing about what the
  *   session did while it existed.
  * - `unreachable` — we could not get an answer at all: no harness, a transport failure,
- *   or a reply we cannot decode.
+ *   a reply we cannot decode, or an attempt that ran on a harness instance this process
+ *   does not configure. The last of those is new with the second harness and is the
+ *   reason this takes an instance id at all; see {@link HarnessSessionStatus.of}.
  *
  * All three of ours mean *uncertain*. They are kept apart because the operator reading
  * the recovery record needs to know which one it was.
@@ -56,18 +58,6 @@ export interface HarnessSessionReport {
   readonly detail: string;
 }
 
-/**
- * The client's tag for "no such session".
- *
- * A string compare against the generated client's own vocabulary
- * (`@opencode/protocol`'s `SessionNotFoundError`, surfaced through
- * `HarnessTransportError.tag`), checked alongside a plain `404` so either signal is
- * enough. `@opencode/protocol` is a transitive dependency of the client and not a
- * declared one here, so importing the class to compare against would mean depending on
- * hoisting.
- */
-const SESSION_NOT_FOUND_TAG = "SessionNotFoundError";
-
 export class HarnessSessionStatus extends Context.Service<
   HarnessSessionStatus,
   {
@@ -76,64 +66,87 @@ export class HarnessSessionStatus extends Context.Service<
      *
      * Takes the stored session id, nullable, because that is what an attempt row holds:
      * an attempt with no session id is a real state and has its own answer.
+     *
+     * Takes the stored **instance** id for the same reason, and it is the one thing a
+     * second harness changed here. An attempt that ran on an instance this process does
+     * not configure cannot be asked about — and asking the harness we *do* have would get
+     * a confident `missing` for a session that may be alive somewhere else, which recovery
+     * would then record as `uncertain` and fence. So a foreign instance answers
+     * `unreachable` with both ids in the detail, which is the honest answer and the only
+     * one an operator can act on.
+     *
+     * `null` is *not* foreign: it is a row written before instances were recorded, by a
+     * process that had exactly one harness, so asking the one we have is the best
+     * available answer rather than a guess (migration `0014_attempt_harness_instance`).
      */
     readonly of: (
       harnessSessionId: string | null,
+      harnessInstanceId: string | null,
     ) => Effect.Effect<HarnessSessionReport>;
   }
 >()("bit/recovery/HarnessSessionStatus") {
   /**
-   * The live adapter over a running `opencode serve`.
+   * The live adapter over whichever harness this process configures.
    *
-   * Note what the three branches mean. A session that exists but reports no outcome is
-   * genuinely still running, and is left alone. A session the harness has never heard
-   * of is `missing` — which after a restart is the expected answer, because a new
-   * server process is not guaranteed to know an old process's sessions. Anything else
-   * is `unreachable`, including a decode failure: being unable to understand the answer
+   * Note what the four branches mean. A session that exists but reports no outcome is
+   * genuinely still running, and is left alone. A session the harness has never heard of
+   * is `missing` — which after a restart is the expected answer, because a new harness
+   * process is not guaranteed to know an old process's sessions. An attempt belonging to
+   * another instance is `unreachable` without anything being asked. Anything else is
+   * `unreachable` too, including a decode failure: being unable to understand the answer
    * is not the same as being told nothing happened.
    */
   static readonly layer = Layer.effect(
     HarnessSessionStatus,
     Effect.gen(function* () {
-      const client = yield* OpenCodeClient;
+      const harness = yield* AgentHarness;
+      const ours = harness.instance.instanceId;
       return HarnessSessionStatus.of({
-        of: Effect.fn("HarnessSessionStatus.of")(function* (harnessSessionId) {
-          if (harnessSessionId === null || harnessSessionId === "") {
-            return {
-              observed: "unbound",
-              detail:
-                "the attempt has no harness session recorded, so there is nothing to query; this does not establish that no work was done",
-            } satisfies HarnessSessionReport;
-          }
-          const result = yield* Effect.result(
-            client.sessionStatus(harnessSessionId),
-          );
-          if (result._tag === "Success") {
-            const outcome = result.success.outcome;
-            return outcome === undefined
+        of: Effect.fn("HarnessSessionStatus.of")(
+          function* (harnessSessionId, harnessInstanceId) {
+            if (harnessSessionId === null || harnessSessionId === "") {
+              return {
+                observed: "unbound",
+                detail:
+                  "the attempt has no harness session recorded, so there is nothing to query; this does not establish that no work was done",
+              } satisfies HarnessSessionReport;
+            }
+            if (harnessInstanceId !== null && harnessInstanceId !== ours) {
+              return {
+                observed: "unreachable",
+                detail: `the attempt ran on harness instance '${harnessInstanceId}' and this process configures '${ours}', so there is nothing here that can be asked about session ${harnessSessionId}`,
+              } satisfies HarnessSessionReport;
+            }
+            const result = yield* Effect.result(
+              harness.sessionStatus(harnessSessionId),
+            );
+            if (result._tag === "Success") {
+              const outcome = result.success.outcome;
+              return outcome === undefined
+                ? ({
+                    observed: "running",
+                    detail: `session ${harnessSessionId} exists and has not reported a terminal outcome`,
+                  } satisfies HarnessSessionReport)
+                : ({
+                    observed: outcome,
+                    detail: `session ${harnessSessionId} reported outcome '${outcome}'`,
+                  } satisfies HarnessSessionReport);
+            }
+            const failure = result.failure;
+            const notFound =
+              failure._tag === "HarnessTransportError" &&
+              (failure.tag === SESSION_NOT_FOUND_TAG || failure.status === 404);
+            return notFound
               ? ({
-                  observed: "running",
-                  detail: `session ${harnessSessionId} exists and has not reported a terminal outcome`,
+                  observed: "missing",
+                  detail: `the harness does not know session ${harnessSessionId}: ${failure.message}`,
                 } satisfies HarnessSessionReport)
               : ({
-                  observed: outcome,
-                  detail: `session ${harnessSessionId} reported outcome '${outcome}'`,
+                  observed: "unreachable",
+                  detail: `could not ask the harness about session ${harnessSessionId}: ${failure.message}`,
                 } satisfies HarnessSessionReport);
-          }
-          const failure = result.failure;
-          const notFound =
-            failure._tag === "HarnessTransportError" &&
-            (failure.tag === SESSION_NOT_FOUND_TAG || failure.status === 404);
-          return notFound
-            ? ({
-                observed: "missing",
-                detail: `the harness does not know session ${harnessSessionId}: ${failure.message}`,
-              } satisfies HarnessSessionReport)
-            : ({
-                observed: "unreachable",
-                detail: `could not ask the harness about session ${harnessSessionId}: ${failure.message}`,
-              } satisfies HarnessSessionReport);
-        }),
+          },
+        ),
       });
     }),
   );
@@ -153,6 +166,8 @@ export class HarnessSessionStatus extends Context.Service<
     Layer.succeed(
       HarnessSessionStatus,
       HarnessSessionStatus.of({
+        // The instance is accepted and ignored: a scripted answer is keyed by session id,
+        // and a test that wants the foreign-instance branch wants the live layer.
         of: (harnessSessionId) =>
           Effect.succeed(
             harnessSessionId === null || harnessSessionId === ""

@@ -13,8 +13,10 @@
  * - {@link HarnessDecodeError} — the harness answered 2xx with a body that does not match
  *   the contract we decode. The status and the schema issue are both kept, because
  *   "200 with an unexpected shape" is a different diagnosis from "503".
- * - {@link HarnessProcessError} — the owned `opencode serve` process itself: spawn,
- *   readiness, or termination.
+ * - {@link HarnessProcessError} — the harness as a *program* rather than as a
+ *   conversation: spawning it, waiting for it, stopping it, or finding it unfit to use.
+ *   Raised while a harness layer is being built, which is why `main.ts` can catch it and
+ *   serve without an agent instead of failing to boot.
  */
 import { Schema } from "effect";
 
@@ -72,14 +74,31 @@ export class HarnessDecodeError extends Schema.TaggedError<HarnessDecodeError>()
 export class HarnessProcessError extends Schema.TaggedError<HarnessProcessError>()(
   "HarnessProcessError",
   {
-    operation: Schema.Literals(["spawn", "port", "readiness", "termination"]),
+    /**
+     * Which part of owning the harness failed.
+     *
+     * `version` is not about a process at all: it is a harness that is present and
+     * runnable but **too old to make a guarantee we depend on**. It joins this error
+     * rather than getting one of its own because the disposition is identical — the layer
+     * does not build, `main.ts` logs it and serves without an agent — and because a
+     * second error type would be a second branch there for the same outcome.
+     */
+    operation: Schema.Literals([
+      "spawn",
+      "port",
+      "readiness",
+      "termination",
+      "version",
+    ]),
     detail: Schema.String,
     /** Tail of the process's own stderr/stdout, when we have one. */
     diagnostics: Schema.String,
   },
 ) {
   override get message(): string {
-    return `opencode ${this.operation}: ${this.detail}${this.diagnostics === "" ? "" : `\n${this.diagnostics}`}`;
+    // No harness named: this error used to be OpenCode's alone and said so, which would
+    // now be a confidently wrong prefix on a Claude Code failure.
+    return `harness ${this.operation}: ${this.detail}${this.diagnostics === "" ? "" : `\n${this.diagnostics}`}`;
   }
 }
 

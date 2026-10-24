@@ -30,9 +30,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Effect, Layer, Redacted, Stream } from "effect";
+import { Effect, Layer, Redacted } from "effect";
 
-import { OpenCodeClient } from "../harness/openCodeClient";
+import { AgentHarness } from "../harness/agentHarness";
+import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
+import {
+  defaultInstanceIdForDriver,
+  OPENCODE_DRIVER,
+} from "../harness/identity";
 import { HarnessTransportError } from "../harness/errors";
 import { McpCredentials } from "../mcp/credentials";
 import { multiCaseInput } from "../persistence/fixtures";
@@ -82,6 +87,7 @@ const seed = (
     question: "Probe the per-client limiter on POST /login.",
     attemptId,
     workerId: "worker-1",
+    harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
     harnessSessionId,
@@ -923,6 +929,7 @@ describe("replacement work", () => {
     targetId: TARGET,
     intentId: INTENT,
     workerId: "worker-1",
+    harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
     harnessSessionId: null,
@@ -1104,6 +1111,7 @@ describe("replacement work", () => {
           question: "A different question.",
           attemptId: "other-attempt",
           workerId: "worker-9",
+          harnessInstanceId: "opencode",
           providerId: "openai",
           modelId: "gpt-5.6-sol",
           harnessSessionId: null,
@@ -1274,6 +1282,15 @@ describe("recovery state survives a restart", () => {
   });
 });
 
+/**
+ * The instance the seeded rows in this file name.
+ *
+ * The adapter refuses to ask about an attempt that ran on another instance, so a stub that
+ * claimed to be `stub` while the rows said `opencode` would exercise that branch on every
+ * assertion instead of the mapping these tests are about.
+ */
+const OPENCODE_INSTANCE = defaultInstanceIdForDriver(OPENCODE_DRIVER);
+
 describe("the live harness adapter's own mapping", () => {
   /** A client that answers one way, so the adapter's branches are the thing under test. */
   const clientLayer = (
@@ -1283,19 +1300,12 @@ describe("the live harness adapter's own mapping", () => {
     >,
   ) =>
     Layer.succeed(
-      OpenCodeClient,
-      OpenCodeClient.of({
-        registerMcpServer: () => Effect.void,
-        createSession: () => Effect.succeed({ id: "ses_new" }),
-        prompt: () => Effect.void,
-        waitForIdle: () => Effect.void,
+      AgentHarness,
+      // Only `sessionStatus` is scripted: what is under test is the adapter's mapping of
+      // one answer, and every other member answering dully is what makes that legible.
+      stubHarness({
+        instance: { ...STUB_INSTANCE, instanceId: OPENCODE_INSTANCE },
         sessionStatus: () => answer,
-        messages: () => Effect.succeed([]),
-        // Never drained here: what is under test is the adapter's mapping of a
-        // `sessionStatus` answer, and an empty stream is the narrowest stand-in that
-        // satisfies the service shape without implying this path reads one.
-        sessionEvents: () => Stream.empty,
-        interruptSession: () => Effect.succeed(false),
       }),
     );
 
@@ -1308,7 +1318,7 @@ describe("the live harness adapter's own mapping", () => {
     Effect.runPromise(
       Effect.scoped(
         Effect.flatMap(HarnessSessionStatus, (harness) =>
-          harness.of("ses_old"),
+          harness.of("ses_old", "opencode"),
         ).pipe(
           Effect.provide(
             HarnessSessionStatus.layer.pipe(Layer.provide(clientLayer(answer))),

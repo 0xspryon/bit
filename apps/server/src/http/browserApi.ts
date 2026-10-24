@@ -63,7 +63,6 @@ import {
 } from "../persistence/fleet";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { POLICY_AUDIT_FILE } from "../policy/install";
-import { WORKER_MODEL } from "../run/model";
 import { RunSupervisor } from "../run/supervisor";
 
 /** What the browser API needs to know about this installation. */
@@ -592,6 +591,19 @@ const fleetHandlers = HttpApiBuilder.group(
        * the harness session, the credential and the prompt are all in place, with a fiber
        * in the server's own scope owning the rest. This handler has no part in how the
        * run ends.
+       *
+       * **One run per engagement folder.** A second concurrent start against a folder a
+       * run is already in is refused `workspace_busy`. The guard is in the supervisor
+       * rather than here, because it has to hold for every caller and because it must key
+       * off what is actually running rather than off rows saying so; the reasoning is on
+       * `RunSupervisor`'s `claimedWorkspaces`.
+       *
+       * **No model and no harness named.** This used to pass a pinned `WORKER_MODEL`,
+       * which was an OpenCode provider-and-model pair and so could not be right for a
+       * second harness. The supervisor takes the configured instance's own default
+       * instead, and the response reports which instance and which model actually ran. A
+       * route that let an operator choose is slice C's; a field this handler filled in and
+       * the server then ignored would be worse than its absence.
        */
       startRun: Effect.fn(function* ({ params, payload }) {
         const row = yield* openableTarget(fleet, params.targetId);
@@ -603,7 +615,6 @@ const fleetHandlers = HttpApiBuilder.group(
           // the workspace the worker runs in, so the worker cannot read the record of
           // what it was allowed to do.
           auditPath: `${fleet.paths.evidenceDirectory(row.targetId)}/${POLICY_AUDIT_FILE}`,
-          model: WORKER_MODEL,
           // One instruction becomes all three, because that is all the operator has given
           // us. The shortfall is recorded on the contract's `RunDraft`: choosing which
           // intent a run belongs to is the work of the flow that shows intents.

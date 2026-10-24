@@ -470,6 +470,7 @@ describe("a database already at 0002", () => {
       "11_intent_anchors",
       "12_event_log",
       "13_outbox",
+      "14_attempt_harness_instance",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -738,6 +739,7 @@ describe("a database already at 0005", () => {
       "11_intent_anchors",
       "12_event_log",
       "13_outbox",
+      "14_attempt_harness_instance",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",

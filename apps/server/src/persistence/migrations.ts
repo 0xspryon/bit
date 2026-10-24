@@ -908,6 +908,45 @@ const addOutbox = statements(
 );
 
 /**
+ * `0014` — which configured harness ran an attempt.
+ *
+ * A second harness made "which agent ran this" a real question. Until now there was one,
+ * so `provider_id` and `model_id` were the whole of a run's provenance and they described
+ * the *model*: `openai` and `gpt-5.6-sol`, as OpenCode names them. They still do. What
+ * they never said is whether the thing driving that model was `opencode serve` or the
+ * Claude Agent SDK — and from a row holding `anthropic` / `claude-sonnet-5` there is no
+ * way to tell, because OpenCode can route Anthropic models too.
+ *
+ * So one column: the **instance**, which is the identity everything routes by
+ * (`harness/identity.ts`). An attempt is pinned to it the moment it starts; changing
+ * harness is a new attempt, not a retarget, which is why nothing ever updates this.
+ *
+ * **The driver is deliberately not a column.** It is derivable from the instance in the
+ * process's current configuration, and a stored copy would be a second version of the same
+ * fact, free to disagree with the first after an operator reconfigures. The cost is stated
+ * rather than hidden: an attempt whose instance this process does not configure has no
+ * derivable driver, and `recovery/harnessStatus.ts` answers "we cannot tell" there instead
+ * of asking the wrong harness. That is the honest answer, and a `driver` column would have
+ * replaced it with a confident one about a harness nobody can reach.
+ *
+ * **Nullable, with no backfill.** Every row written before this migration was written by a
+ * process that had exactly one harness — but *which* one is not recorded anywhere, so
+ * filling in `opencode` would be inventing provenance. `NULL` means "written before
+ * instances existed", which recovery and the API both read as unknown rather than as a
+ * default.
+ *
+ * The index exists because the one query that will want it is "what did this instance
+ * run", which is how a quota or a rate-limit sweep finds its attempts; it is partial so an
+ * installation that never records an instance pays nothing for it.
+ */
+const addAttemptHarnessInstance = statements(
+  `ALTER TABLE attempts ADD COLUMN harness_instance_id TEXT`,
+  `CREATE INDEX IF NOT EXISTS attempts_harness_instance_idx
+     ON attempts(harness_instance_id)
+     WHERE harness_instance_id IS NOT NULL`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -938,6 +977,7 @@ export const MIGRATIONS: Record<
   "0011_intent_anchors": addIntentAnchors,
   "0012_event_log": addEventLog,
   "0013_outbox": addOutbox,
+  "0014_attempt_harness_instance": addAttemptHarnessInstance,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

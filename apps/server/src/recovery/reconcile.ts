@@ -104,7 +104,10 @@ export const reconcileAttempt = Effect.fn("reconcileAttempt")(function* (
   const credentials = yield* Effect.serviceOption(McpCredentials);
 
   // Outside any transaction, deliberately: this is the HTTP call.
-  const report = yield* harness.of(attempt.harness_session_id);
+  const report = yield* harness.of(
+    attempt.harness_session_id,
+    attempt.harness_instance_id,
+  );
   const proposed = mapObserved(report.observed);
 
   const outcome = yield* store.recordRecovery({

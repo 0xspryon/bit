@@ -28,7 +28,7 @@ import { join } from "node:path";
 
 import { Effect, Layer } from "effect";
 
-import { OpenCodeClient } from "../harness/openCodeClient";
+import { openCodeHarness } from "../harness/openCodeClient";
 import { OpenCodeServer } from "../harness/openCodeServer";
 import { McpCredentials } from "../mcp/credentials";
 import { ObservationStore } from "../persistence/store";
@@ -122,7 +122,7 @@ const program = Effect.gen(function* () {
 const harnessLayer = WITH_HARNESS
   ? HarnessSessionStatus.layer.pipe(
       Layer.provide(
-        OpenCodeClient.layer().pipe(
+        openCodeHarness().pipe(
           Layer.provideMerge(OpenCodeServer.layer({ cwd: WORKSPACE })),
           Layer.provide(
             Layer.effectDiscard(

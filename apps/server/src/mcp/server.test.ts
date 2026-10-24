@@ -97,6 +97,7 @@ class StaleCredential extends Context.Service<
         goalId: "goal-1",
         goal: "Determine whether authentication rate limits can be bypassed.",
         question: "Probe the per-client limiter.",
+        harnessInstanceId: "opencode",
         providerId: "openai",
         modelId: "gpt-5.6-sol",
       });
@@ -149,6 +150,7 @@ beforeAll(async () => {
         goalId: "goal-1",
         goal: "Determine whether authentication rate limits can be bypassed.",
         question: "Probe the per-client limiter.",
+        harnessInstanceId: "opencode",
         providerId: "openai",
         modelId: "gpt-5.6-sol",
       });

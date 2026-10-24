@@ -19,7 +19,8 @@ import { describe, expect, test } from "bun:test";
 import { Effect, Fiber, Layer, Redacted } from "effect";
 import { FetchHttpClient } from "effect/http";
 
-import { OpenCodeClient } from "./openCodeClient";
+import { AgentHarness } from "./agentHarness";
+import { openCodeHarness } from "./openCodeClient";
 import { OpenCodeServer } from "./openCodeServer";
 
 const FAKE_SERVER = {
@@ -70,9 +71,8 @@ const clientWith = (
     // `typeof fetch` includes `preconnect`; nothing under test calls it.
     { preconnect: () => {} },
   ) satisfies typeof globalThis.fetch;
-  const layer = OpenCodeClient.layer({
-    control: "1 second",
-    wait: "1 second",
+  const layer = openCodeHarness({
+    timeouts: { control: "1 second", wait: "1 second" },
   }).pipe(
     Layer.provideMerge(Layer.succeed(OpenCodeServer, FAKE_SERVER)),
     Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetchStub)),
@@ -125,10 +125,10 @@ describe("session lineage", () => {
     await Effect.runPromise(
       Effect.scoped(
         Effect.provide(
-          Effect.flatMap(OpenCodeClient, (client) =>
+          Effect.flatMap(AgentHarness, (client) =>
             client.createSession({
               title: "bit planner: fresh session",
-              model: { providerID: "openai", id: "m" },
+              model: "openai/m",
               directory: "/tmp",
               parentSessionId: "ses_lineage",
             }),
@@ -154,10 +154,10 @@ describe("session lineage", () => {
     await Effect.runPromise(
       Effect.scoped(
         Effect.provide(
-          Effect.flatMap(OpenCodeClient, (client) =>
+          Effect.flatMap(AgentHarness, (client) =>
             client.createSession({
               title: "bit worker",
-              model: { providerID: "openai", id: "m" },
+              model: "openai/m",
               directory: "/tmp",
             }),
           ),
@@ -180,10 +180,10 @@ describe("cancellation", () => {
     await Effect.runPromise(
       Effect.scoped(
         Effect.provide(
-          Effect.flatMap(OpenCodeClient, (client) =>
+          Effect.flatMap(AgentHarness, (client) =>
             client.createSession({
               title: "t",
-              model: { providerID: "openai", id: "m" },
+              model: "openai/m",
               directory: "/tmp",
             }),
           ),
@@ -213,7 +213,7 @@ describe("cancellation", () => {
       Effect.scoped(
         Effect.provide(
           Effect.gen(function* () {
-            const client = yield* OpenCodeClient;
+            const client = yield* AgentHarness;
             const fiber = yield* Effect.forkChild(
               client.sessionStatus("ses_1"),
             );
@@ -237,7 +237,7 @@ describe("cancellation", () => {
       Effect.scoped(
         Effect.provide(
           Effect.result(
-            Effect.flatMap(OpenCodeClient, (client) =>
+            Effect.flatMap(AgentHarness, (client) =>
               client.waitForIdle("ses_1"),
             ),
           ),
@@ -268,10 +268,10 @@ describe("typed decoding", () => {
     const exit = await Effect.runPromiseExit(
       Effect.scoped(
         Effect.provide(
-          Effect.flatMap(OpenCodeClient, (client) =>
+          Effect.flatMap(AgentHarness, (client) =>
             client.createSession({
               title: "t",
-              model: { providerID: "openai", id: "m" },
+              model: "openai/m",
               directory: "/tmp",
             }),
           ),
@@ -304,7 +304,7 @@ describe("typed decoding", () => {
       Effect.scoped(
         Effect.provide(
           Effect.result(
-            Effect.flatMap(OpenCodeClient, (client) =>
+            Effect.flatMap(AgentHarness, (client) =>
               client.sessionStatus("ses_1"),
             ),
           ),
@@ -324,9 +324,7 @@ describe("typed decoding", () => {
       Effect.scoped(
         Effect.provide(
           Effect.result(
-            Effect.flatMap(OpenCodeClient, (client) =>
-              client.messages("ses_1"),
-            ),
+            Effect.flatMap(AgentHarness, (client) => client.messages("ses_1")),
           ),
           layer,
         ),
@@ -349,7 +347,7 @@ describe("typed decoding", () => {
       Effect.scoped(
         Effect.provide(
           Effect.result(
-            Effect.flatMap(OpenCodeClient, (client) =>
+            Effect.flatMap(AgentHarness, (client) =>
               client.waitForIdle("ses_1"),
             ),
           ),
@@ -372,8 +370,8 @@ describe("requests", () => {
       Effect.scoped(
         Effect.provide(
           Effect.result(
-            Effect.flatMap(OpenCodeClient, (client) =>
-              client.registerMcpServer("bit-attempt-1", {
+            Effect.flatMap(AgentHarness, (client) =>
+              client.registerMcpServer("ses_1", "bit-attempt-1", {
                 url: "http://127.0.0.1:1234/mcp",
                 headers: { authorization: Redacted.make("Bearer s3cret") },
                 directory: "/tmp/ws",
@@ -398,7 +396,7 @@ describe("requests", () => {
       Effect.scoped(
         Effect.provide(
           Effect.result(
-            Effect.flatMap(OpenCodeClient, (client) =>
+            Effect.flatMap(AgentHarness, (client) =>
               client.sessionStatus("ses/../admin"),
             ),
           ),

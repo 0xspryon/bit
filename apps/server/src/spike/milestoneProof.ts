@@ -42,7 +42,7 @@ import type { OpenQuestion } from "@bit/contracts";
 import { Effect } from "effect";
 
 import { FixtureEndpoint } from "../fixture/server";
-import { OpenCodeClient } from "../harness/openCodeClient";
+import { AgentHarness } from "../harness/agentHarness";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { ObservationStore } from "../persistence/store";
 import {
@@ -351,7 +351,7 @@ const phaseThree = (target: OpenQuestion) =>
   Effect.gen(function* () {
     const fixture = yield* FixtureEndpoint;
     const store = yield* ObservationStore;
-    const client = yield* OpenCodeClient;
+    const client = yield* AgentHarness;
 
     line("addressing", target.address);
     line("question", target.dimension);

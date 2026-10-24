@@ -104,6 +104,7 @@ const seed = (store: ObservationStore["Service"], targetId: string) =>
     question: "Probe the per-client limiter on POST /login.",
     attemptId: `attempt-${targetId}`,
     workerId: "worker-1",
+    harnessInstanceId: "opencode",
     providerId: "openai",
     modelId: "gpt-5.6-sol",
     harnessSessionId: null,

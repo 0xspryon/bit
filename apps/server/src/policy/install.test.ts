@@ -47,7 +47,7 @@ import { McpCallCounter } from "../mcp/server";
 import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import {
-  installPolicyHook,
+  installOpenCodeGate,
   POLICY_PLUGIN_PACKAGE,
   withPolicyPlugin,
 } from "./install";
@@ -143,7 +143,7 @@ describe("installing into a workspace", () => {
   test("writes the plugin, its manifest and a config that loads it", async () => {
     const paths = scratch();
     await Effect.runPromise(
-      installPolicyHook({
+      installOpenCodeGate({
         workspace: paths.workspace,
         policyUrl: "http://127.0.0.1:9/api/v1/policy/decide",
         auditPath: paths.auditPath,
@@ -182,7 +182,7 @@ describe("installing into a workspace", () => {
 
     const refusal = await Effect.runPromise(
       Effect.result(
-        installPolicyHook({
+        installOpenCodeGate({
           workspace: paths.workspace,
           policyUrl: "http://127.0.0.1:9/p",
           auditPath: paths.auditPath,
@@ -204,7 +204,7 @@ describe("installing into a workspace", () => {
     const paths = scratch();
     await Bun.write(paths.auditPath, '{"from":"an earlier run"}\n');
     await Effect.runPromise(
-      installPolicyHook({
+      installOpenCodeGate({
         workspace: paths.workspace,
         policyUrl: "http://127.0.0.1:9/p",
         auditPath: paths.auditPath,
@@ -313,7 +313,7 @@ describe("the installed gate is reached", () => {
       Effect.map(ControlPlaneEndpoint, (endpoint) => endpoint.policyUrl),
     );
     await Effect.runPromise(
-      installPolicyHook({
+      installOpenCodeGate({
         workspace: paths.workspace,
         policyUrl,
         auditPath: paths.auditPath,
@@ -369,7 +369,7 @@ describe("the installed gate is reached", () => {
         Effect.map(ControlPlaneEndpoint, (endpoint) => endpoint.policyUrl),
       );
       await Effect.runPromise(
-        installPolicyHook({
+        installOpenCodeGate({
           workspace: paths.workspace,
           policyUrl,
           auditPath: paths.auditPath,
@@ -404,7 +404,7 @@ describe("the installed gate is reached", () => {
     // was, so an outage is not mistaken for a boundary.
     const paths = scratch();
     await Effect.runPromise(
-      installPolicyHook({
+      installOpenCodeGate({
         workspace: paths.workspace,
         // A port nothing is listening on.
         policyUrl: "http://127.0.0.1:1/api/v1/policy/decide",

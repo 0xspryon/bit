@@ -42,8 +42,8 @@ import {
   Stream,
 } from "effect";
 
-import { OpenCodeClient } from "../harness/openCodeClient";
-import { WORKER_MODEL } from "../run/model";
+import { AgentHarness } from "../harness/agentHarness";
+import { stubHarness } from "../harness/stubHarness";
 import { RunNarrations } from "../run/narration";
 import { RunSupervisor, WorkerEndpoints } from "../run/supervisor";
 
@@ -142,20 +142,18 @@ const credentials = McpCredentials.layer;
  */
 const minted: { token?: string } = {};
 const fakeHarness = Layer.succeed(
-  OpenCodeClient,
-  OpenCodeClient.of({
-    createSession: (input) =>
-      Effect.succeed({ id: input.sessionId ?? "ses_fake" }),
-    registerMcpServer: (_name, config) =>
+  AgentHarness,
+  stubHarness({
+    // The one member this file is about: the side that receives the MCP registration.
+    registerMcpServer: (_sessionId, _name, config) =>
       Effect.sync(() => {
         minted.token = Redacted.value(
           config.headers["authorization"] ?? Redacted.make(""),
         ).replace(/^Bearer /, "");
       }),
-    prompt: () => Effect.void,
+    // Never returns, which keeps the run — and therefore its credential — live for the
+    // length of the test.
     waitForIdle: () => Effect.never,
-    sessionStatus: () => Effect.succeed({}),
-    messages: () => Effect.succeed([]),
     interruptSession: () => Effect.succeed(true),
     sessionEvents: () => Stream.never,
   }),
@@ -233,6 +231,7 @@ beforeAll(async () => {
             goalId: `goal-${targetId}`,
             goal: "Determine whether authentication rate limits can be bypassed.",
             question: "Probe the per-client limiter on POST /login.",
+            harnessInstanceId: "opencode",
             providerId: "openai",
             modelId: "gpt-5.6-sol",
           }),
@@ -472,7 +471,6 @@ describe("one endpoint, two targets", () => {
           // pre-execution policy gate into it before creating the session.
           workspace: workspaceFor("alpha"),
           auditPath: join(directory, "alpha-policy-audit.log"),
-          model: WORKER_MODEL,
           goal: "Work out what alpha does under load.",
           question: "Probe alpha's limiter.",
           task: "probe it",

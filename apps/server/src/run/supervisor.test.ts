@@ -49,16 +49,26 @@ import {
   type Duration,
 } from "effect";
 
-import { HarnessTransportError } from "../harness/errors";
 import {
+  AgentHarness,
   type HarnessNarration,
-  OpenCodeClient,
   type TerminalOutcome,
-} from "../harness/openCodeClient";
+} from "../harness/agentHarness";
+import { newClaudeCodeSessionId } from "../harness/claudeCodeClient";
+import { HarnessTransportError } from "../harness/errors";
+import { newOpenCodeSessionId } from "../harness/openCodeClient";
+import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
+import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
+import { McpCallCounter } from "../mcp/server";
 import { FleetStore } from "../persistence/fleet";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
-import { WORKER_MODEL } from "./model";
+import {
+  CLAUDE_SETTINGS_PATH,
+  installClaudeCodeGate,
+} from "../policy/claudeCodeGate";
+import { installOpenCodeGate, POLICY_PLUGIN_PACKAGE } from "../policy/install";
+import { PERMISSIVE_POLICY, PolicyDecisions } from "../policy/service";
 import { RunNarrations, type RunNarration } from "./narration";
 import {
   WorkerEndpoints,
@@ -152,11 +162,30 @@ const narration = (
 const fakeClient = (
   scriptFor: (sessionId: string) => Script,
   recorder: Recorder,
-): Layer.Layer<OpenCodeClient> =>
+  options?: {
+    /**
+     * The gate installer to use, and the only thing these tests vary per harness.
+     *
+     * Defaults to the stub's no-op, which is what most of this file wants: the gate has
+     * its own suite and a filesystem write per test would be noise. The
+     * "same supervisor, both harnesses" block below passes the two **real** installers,
+     * which is how the claim that neither needs a branch here is actually checked.
+     */
+    readonly installGate?: AgentHarness["Service"]["installGate"];
+    /** Mints ids in a given harness's format, so a test can see which one ran. */
+    readonly newSessionId?: () => string;
+  },
+): Layer.Layer<AgentHarness> =>
   Layer.succeed(
-    OpenCodeClient,
-    OpenCodeClient.of({
-      registerMcpServer: (name, config) =>
+    AgentHarness,
+    stubHarness({
+      ...(options?.installGate === undefined
+        ? {}
+        : { installGate: options.installGate }),
+      ...(options?.newSessionId === undefined
+        ? {}
+        : { newSessionId: options.newSessionId }),
+      registerMcpServer: (_sessionId, name, config) =>
         Effect.sync(() => {
           recorder.registrations.push({
             name,
@@ -168,8 +197,8 @@ const fakeClient = (
         }),
       createSession: (input) =>
         Effect.sync(() => {
-          // Honours the id it is handed, like the real harness was verified to do. A test
-          // for the case where it does *not* is below, and overrides this.
+          // Honours the id it is handed, like both real harnesses were verified to do. A
+          // test for the case where it does *not* is below, and overrides this.
           const id = input.sessionId ?? "ses_chosen_by_harness";
           recorder.created.push(id);
           return { id };
@@ -338,7 +367,6 @@ const draft = (root: string, targetId: string, task: string): RunInput => {
     targetId,
     workspace: base,
     auditPath: join(root, "..", "work", `${targetId}-policy-audit.log`),
-    model: WORKER_MODEL,
     goal: `Work out what ${targetId} does under load.`,
     question: `Probe ${targetId}'s limiter.`,
     task,
@@ -465,7 +493,9 @@ describe("starting a run", () => {
         const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
 
-        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const started = yield* supervisor.start(
+          draft(root, "alpha", "probe it"),
+        );
 
         // The assertion that matters, and it is a state rather than a duration: nothing
         // has settled this attempt, because nothing has let the harness's long poll
@@ -530,7 +560,9 @@ describe("starting a run", () => {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
-        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const started = yield* supervisor.start(
+          draft(root, "alpha", "probe it"),
+        );
 
         // Let the long poll return, then wait for the supervisor to be gone from the
         // map — which only happens after its finalizer has settled and revoked.
@@ -599,8 +631,8 @@ describe("starting a run", () => {
     const fleet = FleetStore.layer(root);
     const stores = TargetStores.layer.pipe(Layer.provide(fleet));
     const stubborn = Layer.succeed(
-      OpenCodeClient,
-      OpenCodeClient.of({
+      AgentHarness,
+      AgentHarness.of({
         ...fakeHarnessShape(scriptFor, recorder),
         createSession: () => Effect.succeed({ id: "ses_the_harness_chose" }),
       }),
@@ -644,7 +676,9 @@ describe("starting a run", () => {
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         const resolver = yield* TargetStores;
-        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const started = yield* supervisor.start(
+          draft(root, "alpha", "probe it"),
+        );
         yield* release(started.harnessSessionId);
         yield* settled(supervisor, started.attemptId);
         const row = yield* withTargetStore(resolver, "alpha", (store) =>
@@ -671,7 +705,11 @@ describe("two runs at once, against two targets", () => {
       stream: "open",
       status: "succeeded",
     });
-    const { root, runtime, ready } = world(["alpha", "beta"], scriptFor, recorder);
+    const { root, runtime, ready } = world(
+      ["alpha", "beta"],
+      scriptFor,
+      recorder,
+    );
     await ready;
 
     const observed = await runtime.runPromise(
@@ -753,14 +791,20 @@ describe("two runs at once, against two targets", () => {
       stream: "open",
       status: undefined,
     });
-    const { root, runtime, ready } = world(["alpha", "beta"], scriptFor, recorder);
+    const { root, runtime, ready } = world(
+      ["alpha", "beta"],
+      scriptFor,
+      recorder,
+    );
     await ready;
 
     const observed = await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
-        const alpha = yield* supervisor.start(draft(root, "alpha", "probe alpha"));
+        const alpha = yield* supervisor.start(
+          draft(root, "alpha", "probe alpha"),
+        );
         const beta = yield* supervisor.start(draft(root, "beta", "probe beta"));
         const stopped = yield* supervisor.stop(alpha.attemptId);
         return {
@@ -807,7 +851,9 @@ describe("stopping a run", () => {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
-        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const started = yield* supervisor.start(
+          draft(root, "alpha", "probe it"),
+        );
         const before = yield* credentials.size;
 
         const stopped = yield* supervisor.stop(started.attemptId);
@@ -870,7 +916,9 @@ describe("stopping a run", () => {
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
-        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const started = yield* supervisor.start(
+          draft(root, "alpha", "probe it"),
+        );
         yield* supervisor.stop(started.attemptId);
         return yield* withTargetStore(stores, "alpha", (store) =>
           store.loadAttempt(started.attemptId, "alpha"),
@@ -930,7 +978,9 @@ describe("when the harness stops being readable", () => {
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
-        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const started = yield* supervisor.start(
+          draft(root, "alpha", "probe it"),
+        );
         // The stream has already failed by now. Nothing has settled.
         const during = yield* withTargetStore(stores, "alpha", (store) =>
           store.loadAttempt(started.attemptId, "alpha"),
@@ -966,7 +1016,9 @@ describe("when the harness stops being readable", () => {
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
-        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const started = yield* supervisor.start(
+          draft(root, "alpha", "probe it"),
+        );
         // Break the long poll. Our request losing its answer says nothing about the
         // harness, so the supervisor has to go and ask.
         yield* release(
@@ -1002,7 +1054,9 @@ describe("when the harness stops being readable", () => {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
-        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const started = yield* supervisor.start(
+          draft(root, "alpha", "probe it"),
+        );
         yield* release(
           started.harnessSessionId,
           transport("session.wait", "the harness went away"),
@@ -1048,8 +1102,8 @@ describe("when the harness stops being readable", () => {
     const fleet = FleetStore.layer(root);
     const stores = TargetStores.layer.pipe(Layer.provide(fleet));
     const refusing = Layer.succeed(
-      OpenCodeClient,
-      OpenCodeClient.of({
+      AgentHarness,
+      AgentHarness.of({
         ...fakeHarnessShape(scriptFor, recorder),
         prompt: () =>
           Effect.fail(
@@ -1180,7 +1234,9 @@ describe("shutting the process down", () => {
     const started = await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
-        const alpha = yield* supervisor.start(draft(root, "alpha", "probe alpha"));
+        const alpha = yield* supervisor.start(
+          draft(root, "alpha", "probe alpha"),
+        );
         const beta = yield* supervisor.start(draft(root, "beta", "probe beta"));
         return {
           alpha,
@@ -1317,7 +1373,11 @@ describe("the narration bus", () => {
       stream: "open",
       status: "succeeded",
     });
-    const { root, runtime, ready } = world(["alpha", "beta"], scriptFor, recorder);
+    const { root, runtime, ready } = world(
+      ["alpha", "beta"],
+      scriptFor,
+      recorder,
+    );
     await ready;
 
     const observed = await runtime.runPromise(
@@ -1327,7 +1387,9 @@ describe("the narration bus", () => {
 
         // No subscribers yet, deliberately: this run's narration is published into a bus
         // nobody is listening to, and it must not fail, block or settle differently.
-        const alpha = yield* supervisor.start(draft(root, "alpha", "probe alpha"));
+        const alpha = yield* supervisor.start(
+          draft(root, "alpha", "probe alpha"),
+        );
         const unwatched = yield* narrations.subscriberCount;
 
         // Now one subscriber, asking for `beta` only.
@@ -1408,11 +1470,11 @@ const settled = (
 const fakeHarnessShape = (
   scriptFor: (sessionId: string) => Script,
   recorder: Recorder,
-): OpenCodeClient["Service"] => {
-  let captured: OpenCodeClient["Service"] | undefined;
+): AgentHarness["Service"] => {
+  let captured: AgentHarness["Service"] | undefined;
   Effect.runSync(
     Effect.provide(
-      Effect.map(OpenCodeClient, (service) => {
+      Effect.map(AgentHarness, (service) => {
         captured = service;
       }),
       fakeClient(scriptFor, recorder),
@@ -1421,3 +1483,469 @@ const fakeHarnessShape = (
   if (captured === undefined) throw new Error("the fake client did not build");
   return captured;
 };
+
+/* ── One supervisor, two harnesses ───────────────────────────────────────────── */
+
+/**
+ * The claim this slice is actually making, as a test.
+ *
+ * Everything above drives *a* harness. This block drives **both**, through the same
+ * `RunSupervisor.layer`, and the only thing that differs between the two runs is which
+ * implementation of `AgentHarness` is provided. There is no parameter in the supervisor to
+ * set, no `switch` to exercise and no driver kind reachable from it — the supervisor's
+ * requirement is one service, so a branch on driver would have had nothing to branch on.
+ *
+ * Each run is asserted end to end, and the chain is the point:
+ *
+ * 1. the supervisor calls `installGate`, and that harness's real installer writes its real
+ *    artefacts into the workspace — an OpenCode plugin plus `.opencode/opencode.json`, or a
+ *    Claude Code hook script plus `.claude/settings.local.json`;
+ * 2. the gate is then **invoked the way that harness invokes it** — an imported plugin
+ *    module for one, a spawned process for the other — against the **real policy route on
+ *    a real listener**;
+ * 3. the control plane records a decision, which is what proves the gate was consulted
+ *    rather than merely configured;
+ * 4. the run settles, and the attempt row says `succeeded` and names the instance it ran
+ *    on.
+ *
+ * The session id is minted by each harness in its own format, so the row also shows which
+ * one ran: `ses_…` for OpenCode, a UUID for Claude Code.
+ */
+describe("one supervisor, two harnesses", () => {
+  /**
+   * A world with a real control plane, so the policy URL the gate is handed works.
+   *
+   * Separate from {@link world} above, which has no listener because nothing else in this
+   * file needs one — and a listener per test in a suite this size would be a port per
+   * test for no assertion.
+   */
+  const gatedWorld = (
+    targetId: string,
+    scriptFor: (sessionId: string) => Script,
+    recorder: Recorder,
+    harness: {
+      readonly installGate: AgentHarness["Service"]["installGate"];
+      readonly newSessionId: () => string;
+    },
+  ) => {
+    const root = newRoot();
+    const fleet = FleetStore.layer(root);
+    const stores = TargetStores.layer.pipe(Layer.provide(fleet));
+    const credentials = McpCredentials.layer;
+    const endpoint = ControlPlaneEndpoint.layer({
+      policy: PERMISSIVE_POLICY,
+    }).pipe(
+      Layer.provideMerge(credentials),
+      Layer.provideMerge(McpCallCounter.layer),
+      Layer.provideMerge(PolicyDecisions.layer),
+      Layer.provide(stores),
+    );
+    const layer = Layer.mergeAll(
+      fleet,
+      stores,
+      endpoint,
+      RunSupervisor.layer.pipe(
+        Layer.provide(
+          fakeClient(scriptFor, recorder, {
+            installGate: harness.installGate,
+            newSessionId: harness.newSessionId,
+          }),
+        ),
+        Layer.provide(stores),
+        Layer.provide(credentials),
+        Layer.provide(RunNarrations.layer),
+        Layer.provide(
+          WorkerEndpoints.fromEndpoint.pipe(Layer.provide(endpoint)),
+        ),
+      ),
+    );
+    const runtime = ManagedRuntime.make(layer);
+    const ready = runtime.runPromise(
+      Effect.gen(function* () {
+        const registry = yield* FleetStore;
+        yield* registry.register({
+          targetId,
+          name: targetId,
+          scopeNote: "the local fixture only",
+        });
+        yield* registry.migrateFleet();
+      }).pipe(Effect.orDie),
+    );
+    return { root, runtime, ready };
+  };
+
+  /**
+   * Calls the OpenCode plugin the supervisor installed, the way `opencode serve` does.
+   *
+   * A dynamic import of the file in the workspace — not of `plugins/policyHook.ts` — so a
+   * broken copy, a bad path, or a plugin that no longer default-exports `{ id, setup }` is
+   * caught here rather than silently producing an ungated run.
+   */
+  const invokeOpenCodeGate = async (workspace: string, tool: string) => {
+    const configPath = join(workspace, ".opencode", "opencode.json");
+    const config = JSON.parse(await Bun.file(configPath).text()) as {
+      plugins: { package: string; options: Record<string, unknown> }[];
+    };
+    const entry = config.plugins.find(
+      (plugin) => plugin.package === POLICY_PLUGIN_PACKAGE,
+    );
+    if (entry === undefined) throw new Error("no plugin entry was installed");
+    const hookPath = join(workspace, ".opencode", "policy", "index.ts");
+    const module = (await import(`${hookPath}?v=${String(Date.now())}`)) as {
+      default: {
+        setup: (ctx: {
+          options: Record<string, unknown>;
+          tool: {
+            hook: (
+              name: "execute.before",
+              handler: (event: {
+                tool: string;
+                sessionID: string;
+                input: unknown;
+              }) => Promise<void>,
+            ) => void;
+          };
+        }) => Promise<void>;
+      };
+    };
+    let before:
+      | ((event: {
+          tool: string;
+          sessionID: string;
+          input: unknown;
+        }) => Promise<void>)
+      | undefined;
+    await module.default.setup({
+      options: entry.options,
+      tool: {
+        hook: (_name, handler) => {
+          before = handler;
+        },
+      },
+    });
+    if (before === undefined) throw new Error("the hook registered no handler");
+    // It must not throw: this scope permits.
+    await before({
+      tool,
+      sessionID: "ses_gated",
+      input: { url: "https://x.test/" },
+    });
+  };
+
+  /**
+   * Spawns the Claude Code hook the supervisor installed, the way the CLI does.
+   *
+   * The command and argv come out of the settings we wrote, so an entry pointing at a file
+   * we did not write, or carrying argv the script does not parse, fails here instead of
+   * producing an ungated run.
+   */
+  const invokeClaudeCodeGate = async (workspace: string, tool: string) => {
+    const settings = JSON.parse(
+      await Bun.file(join(workspace, CLAUDE_SETTINGS_PATH)).text(),
+    ) as {
+      hooks: { PreToolUse: { hooks: { command: string; args: string[] }[] }[] };
+    };
+    const entry = settings.hooks.PreToolUse[0]?.hooks[0];
+    if (entry === undefined) throw new Error("no hook entry was installed");
+    const child = Bun.spawn([entry.command, ...entry.args], {
+      stdin: new TextEncoder().encode(
+        JSON.stringify({
+          hook_event_name: "PreToolUse",
+          tool_name: tool,
+          session_id: "11111111-0000-4000-8000-00000000gate".replace(
+            "gate",
+            "0001",
+          ),
+          tool_input: { url: "https://x.test/" },
+        }),
+      ),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const code = await child.exited;
+    // 0, not 2: this scope permits, and anything but 0 would mean the gate refused.
+    if (code !== 0) {
+      throw new Error(
+        `the installed Claude Code gate exited ${String(code)}: ${await new Response(child.stderr).text()}`,
+      );
+    }
+  };
+
+  const harnesses = [
+    {
+      driver: "opencode",
+      installGate: installOpenCodeGate,
+      newSessionId: newOpenCodeSessionId,
+      sessionShape: /^ses_/,
+      invoke: invokeOpenCodeGate,
+      tool: "webfetch",
+    },
+    {
+      driver: "claude-code",
+      installGate: installClaudeCodeGate,
+      newSessionId: newClaudeCodeSessionId,
+      sessionShape:
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      invoke: invokeClaudeCodeGate,
+      tool: "WebFetch",
+    },
+  ] as const;
+
+  for (const harness of harnesses) {
+    test(`a run on ${harness.driver} settles, and its gate is consulted`, async () => {
+      const targetId = `target-${harness.driver}`;
+      const recorder = emptyRecorder();
+      const { scriptFor, release, held } = scripts({
+        narration: [],
+        stream: "open",
+        status: "succeeded",
+      });
+      const { root, runtime, ready } = gatedWorld(
+        targetId,
+        scriptFor,
+        recorder,
+        harness,
+      );
+      await ready;
+      try {
+        const input = draft(root, targetId, "probe the limiter");
+        const started = await runtime.runPromise(
+          Effect.flatMap(RunSupervisor, (supervisor) =>
+            supervisor.start(input),
+          ).pipe(Effect.orDie),
+        );
+
+        // The session id is the harness's own format, which is what makes "which harness
+        // ran this" readable from the row rather than inferred from the configuration.
+        expect(started.harnessSessionId).toMatch(harness.sessionShape);
+        // And the attempt is pinned to the instance that ran it.
+        expect(started.instanceId).toBe(STUB_INSTANCE.instanceId);
+
+        // The gate the supervisor installed, invoked the way this harness invokes it,
+        // against the real policy route.
+        await harness.invoke(input.workspace, harness.tool);
+
+        const decisions = await runtime.runPromise(
+          Effect.flatMap(PolicyDecisions, (recorded) => recorded.all),
+        );
+        // A decision *row*, not a config assertion: the control plane decided this call.
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]).toMatchObject({
+          tool: harness.tool,
+          effect: "allow",
+          // The same basis vocabulary from both gates, so one reader handles either trail.
+          basis: "unrestricted",
+        });
+
+        // And the audit line, outside the workspace the worker runs in.
+        const audit = await Bun.file(input.auditPath).text();
+        expect(JSON.parse(audit.trim())).toMatchObject({
+          tool: harness.tool,
+          outcome: "allowed",
+          basis: "unrestricted",
+        });
+        // Not *inside* the workspace: compared with a separator, because the audit sits
+        // beside the workspace and a bare prefix check would read `…/work/t-audit.log` as
+        // being under `…/work/t`.
+        expect(input.auditPath.startsWith(`${input.workspace}/`)).toBe(false);
+
+        // Settlement, from the harness's own answer.
+        await runtime.runPromise(release(started.harnessSessionId));
+        await runtime.runPromise(
+          Effect.flatMap(RunSupervisor, (supervisor) =>
+            settled(supervisor, started.attemptId),
+          ),
+        );
+      } finally {
+        await runtime.runPromise(releaseAll(held));
+        await runtime.dispose();
+      }
+
+      const rows = readAfterShutdown(root, targetId);
+      expect(rows.attempts).toHaveLength(1);
+      expect(rows.attempts[0]?.status).toBe("succeeded");
+      expect(rows.events.map((event) => event.kind)).toEqual([
+        "attempt.started",
+        "attempt.settled",
+      ]);
+    });
+  }
+
+  test("a second concurrent run in the same folder is refused, not queued", async () => {
+    // Nothing else enforces one run at a time: slice A detached runs so they outlive the
+    // request, and neither the route nor `start` had a guard. Two workers in one folder can
+    // misattribute each other's writes — both harnesses configure the gate per folder, so
+    // the second install repoints the first run's audit, and OpenCode registers its MCP
+    // endpoint per folder, so each worker would see the other's. Provenance is the thing
+    // this system exists to get right, so this refuses.
+    const targetId = "target-busy";
+    const recorder = emptyRecorder();
+    const { scriptFor, release, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = gatedWorld(targetId, scriptFor, recorder, {
+      installGate: installOpenCodeGate,
+      newSessionId: newOpenCodeSessionId,
+    });
+    await ready;
+    try {
+      const input = draft(root, targetId, "probe the limiter");
+      const first = await runtime.runPromise(
+        Effect.flatMap(RunSupervisor, (supervisor) =>
+          supervisor.start(input),
+        ).pipe(Effect.orDie),
+      );
+
+      const second = await runtime.runPromise(
+        Effect.result(
+          Effect.flatMap(RunSupervisor, (supervisor) =>
+            supervisor.start(input),
+          ),
+        ),
+      );
+      expect(second._tag).toBe("Failure");
+      if (second._tag === "Failure") {
+        expect(second.failure.reason).toBe("workspace_busy");
+        // Names the run holding it and the folder, so an operator reads why rather than
+        // guessing.
+        expect(second.failure.detail).toContain(first.attemptId);
+        expect(second.failure.detail).toContain(input.workspace);
+      }
+      // Nothing of the second run exists: no session created, nothing prompted, and — the
+      // part that matters — no second gate installed over the first run's.
+      expect(recorder.created).toHaveLength(1);
+      expect(recorder.prompts).toHaveLength(1);
+
+      // Keyed on what is *running*, so settling the first frees the folder.
+      await runtime.runPromise(release(first.harnessSessionId));
+      await runtime.runPromise(
+        Effect.flatMap(RunSupervisor, (supervisor) =>
+          settled(supervisor, first.attemptId),
+        ),
+      );
+      const third = await runtime.runPromise(
+        Effect.result(
+          Effect.flatMap(RunSupervisor, (supervisor) =>
+            supervisor.start(input),
+          ),
+        ),
+      );
+      expect(third._tag).toBe("Success");
+      if (third._tag === "Success") {
+        await runtime.runPromise(release(third.success.harnessSessionId));
+      }
+    } finally {
+      await runtime.runPromise(releaseAll(held));
+      await runtime.dispose();
+    }
+
+    // Two attempt rows, not three: the refused start wrote nothing at all.
+    const rows = readAfterShutdown(root, targetId);
+    expect(rows.attempts).toHaveLength(2);
+  });
+
+  test("a different folder is not blocked by a run in another one", async () => {
+    // The claim is on the directory, not on the process: one engagement being worked on
+    // must not stop another. This is the case a guard keyed on "any run at all" would get
+    // wrong.
+    const recorder = emptyRecorder();
+    const { scriptFor, release, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = gatedWorld(
+      "target-one",
+      scriptFor,
+      recorder,
+      { installGate: installOpenCodeGate, newSessionId: newOpenCodeSessionId },
+    );
+    await ready;
+    try {
+      const registry = await runtime.runPromise(FleetStore);
+      await runtime.runPromise(
+        registry
+          .register({
+            targetId: "target-two",
+            name: "target-two",
+            scopeNote: "the local fixture only",
+          })
+          .pipe(Effect.andThen(registry.migrateFleet()), Effect.orDie),
+      );
+      const started = [];
+      for (const targetId of ["target-one", "target-two"]) {
+        const outcome = await runtime.runPromise(
+          Effect.result(
+            Effect.flatMap(RunSupervisor, (supervisor) =>
+              // `draft` gives each target its own folder, which is the point.
+              supervisor.start(draft(root, targetId, "probe")),
+            ),
+          ),
+        );
+        expect(outcome._tag).toBe("Success");
+        if (outcome._tag === "Success") started.push(outcome.success);
+      }
+      expect(started).toHaveLength(2);
+      for (const run of started) {
+        await runtime.runPromise(release(run.harnessSessionId));
+      }
+    } finally {
+      await runtime.runPromise(releaseAll(held));
+      await runtime.dispose();
+    }
+  });
+
+  test("a Claude Code workspace whose settings we cannot parse refuses the run", async () => {
+    // The gate is load-bearing: a workspace that cannot be gated refuses the run rather
+    // than starting an ungated worker in it. Nothing has been prompted at that point, so
+    // refusing costs an error message — and because the refusal happens before
+    // `seedAttempt`, it writes *nothing at all*: no row to settle and nothing for a sweep
+    // to find.
+    const targetId = "target-unparseable";
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = gatedWorld(targetId, scriptFor, recorder, {
+      installGate: installClaudeCodeGate,
+      newSessionId: newClaudeCodeSessionId,
+    });
+    await ready;
+    try {
+      const input = draft(root, targetId, "probe the limiter");
+      mkdirSync(join(input.workspace, ".claude"), { recursive: true });
+      const theirs = "{ not json, and possibly precious\n";
+      await Bun.write(join(input.workspace, CLAUDE_SETTINGS_PATH), theirs);
+
+      const refusal = await runtime.runPromise(
+        Effect.result(
+          Effect.flatMap(RunSupervisor, (supervisor) =>
+            supervisor.start(input),
+          ),
+        ),
+      );
+      expect(refusal._tag).toBe("Failure");
+      if (refusal._tag === "Failure") {
+        expect(refusal.failure.reason).toBe("workspace_ungated");
+      }
+      // Their file is untouched, and nothing was prompted.
+      expect(
+        await Bun.file(join(input.workspace, CLAUDE_SETTINGS_PATH)).text(),
+      ).toBe(theirs);
+      expect(recorder.prompts).toEqual([]);
+      expect(recorder.created).toEqual([]);
+    } finally {
+      await runtime.runPromise(releaseAll(held));
+      await runtime.dispose();
+    }
+
+    // No attempt row at all: the refusal is earlier than the seed, deliberately.
+    const rows = readAfterShutdown(root, targetId);
+    expect(rows.attempts).toEqual([]);
+    expect(rows.events).toEqual([]);
+  });
+});

@@ -420,6 +420,25 @@ export const RunStarted = Schema.Struct({
   goalId: Schema.String,
   /** The harness's own session id, which is also what observations record as provenance. */
   harnessSessionId: Schema.String,
+  /**
+   * Which configured harness ran it — one account or configuration of one agent harness.
+   *
+   * The identity everything routes by, and what the attempt row is pinned to: changing
+   * harness is a new attempt, not a retarget. The *driver* (`opencode`, `claude-code`) is
+   * deliberately not here and is not stored either; it is derived from this id against the
+   * server's current configuration, so a reconfigured instance cannot leave two copies of
+   * the same fact disagreeing.
+   *
+   * A stock single-account installation reports the driver's own slug here, which is why
+   * this reads as `opencode` or `claude-code` today.
+   */
+  instanceId: Schema.String,
+  /**
+   * The *model's* provider and the model, inside that instance.
+   *
+   * Not the harness: OpenCode can route Anthropic models too, so `anthropic` here does not
+   * mean Claude Code ran it. `instanceId` is the field that says which harness did.
+   */
   providerId: Schema.String,
   modelId: Schema.String,
   startedAt: EpochMillis,
@@ -498,6 +517,23 @@ export class RunRefused extends Schema.TaggedError<RunRefused>()(
       "no_harness",
       "target_unavailable",
       "workspace_ungated",
+      /**
+       * Another run is already going in this engagement's folder.
+       *
+       * **Refused rather than queued, and refused rather than permitted**, because two
+       * workers in one directory can misattribute each other's writes. Both harnesses
+       * configure their pre-execution gate *per workspace*, so a second run's gate
+       * installation repoints the first run's audit at a different target's file; and
+       * OpenCode registers an MCP server per *directory*, so each worker would see the
+       * other's `bit-<attemptId>` server and a call through the wrong one would record an
+       * observation under an attempt that never made it. Provenance is the thing this
+       * system exists to get right, so a path that can silently misattribute a write is
+       * worse than one that refuses.
+       *
+       * Two workers cooperating on one engagement is later work. Until the gate and the
+       * MCP registration are per attempt, this is the honest answer.
+       */
+      "workspace_busy",
       "harness_unreachable",
       "store_unavailable",
       "unknown_attempt",

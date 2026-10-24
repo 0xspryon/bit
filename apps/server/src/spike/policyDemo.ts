@@ -34,7 +34,8 @@ import { join } from "node:path";
 
 import { Effect, Layer } from "effect";
 
-import { finalAssistantText, OpenCodeClient } from "../harness/openCodeClient";
+import { AgentHarness, finalAssistantText } from "../harness/agentHarness";
+import { openCodeHarness } from "../harness/openCodeClient";
 import { OpenCodeServer } from "../harness/openCodeServer";
 import { PolicyDecisions, type PolicyConfig } from "../policy/service";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
@@ -79,13 +80,13 @@ const workspaceExists = Layer.effectDiscard(
   }),
 );
 
-const harnessLayer = OpenCodeClient.layer().pipe(
+const harnessLayer = openCodeHarness().pipe(
   Layer.provideMerge(OpenCodeServer.layer({ cwd: WORKSPACE })),
   Layer.provide(workspaceExists),
 );
 
 const runProbe = Effect.fn("runProbe")(function* (name: string, task: string) {
-  const client = yield* OpenCodeClient;
+  const client = yield* AgentHarness;
   const session = yield* client.createSession({
     title: `policy probe: ${name}`,
     model: WORKER_MODEL,

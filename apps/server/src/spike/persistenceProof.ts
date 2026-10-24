@@ -283,6 +283,7 @@ const phaseTwo = async () => {
           "Probe the per-client request limiter on POST /login; leave any per-account limit untested.",
         attemptId: "attempt-phase-two",
         workerId: "worker-proof",
+        harnessInstanceId: "opencode",
         providerId: "openai",
         modelId: "gpt-5.6-sol",
         harnessSessionId: "ses_phase_two",

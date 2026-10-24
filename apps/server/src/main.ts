@@ -86,7 +86,11 @@ import { browserApiRoutes } from "./http/browserApi";
 import { BrowserSessions, ensureServerPassword } from "./http/browserSessions";
 import { ControlPlaneEndpoint } from "./http/controlPlane";
 import { resolveRoot } from "./http/folders";
-import { OpenCodeClient } from "./harness/openCodeClient";
+import { AgentHarness } from "./harness/agentHarness";
+import { claudeCodeHarness } from "./harness/claudeCodeClient";
+import type { HarnessProcessError } from "./harness/errors";
+import { CLAUDE_CODE_DRIVER, OPENCODE_DRIVER } from "./harness/identity";
+import { openCodeHarness } from "./harness/openCodeClient";
 import { OpenCodeServer } from "./harness/openCodeServer";
 import { McpCredentials } from "./mcp/credentials";
 import { McpCallCounter } from "./mcp/server";
@@ -94,6 +98,7 @@ import { FleetStore } from "./persistence/fleet";
 import { ObservationStore } from "./persistence/store";
 import { TargetStores } from "./persistence/targetStores";
 import { PERMISSIVE_POLICY, PolicyDecisions } from "./policy/service";
+import { harnessSelection, KNOWN_DRIVERS } from "./run/model";
 import { RunNarrations } from "./run/narration";
 import { RunSupervisor, WorkerEndpoints } from "./run/supervisor";
 import { HarnessSessionStatus } from "./recovery/harnessStatus";
@@ -231,7 +236,17 @@ const credentials = McpCredentials.layer;
 const workerEndpoints = WorkerEndpoints.pending();
 
 /**
- * The agent harness: an `opencode serve` this process owns, and a client over it.
+ * Which agent harness this process drives, from `HARNESS`.
+ *
+ * Read once, here, and reported in the startup log, because a server that silently drove a
+ * different agent than the operator named would be writing provenance nobody could trust.
+ * The mapping, including why an unset variable still means OpenCode and why a typo is not
+ * a fallback, is on `run/model.ts`.
+ */
+const SELECTED_HARNESS = harnessSelection(process.env["HARNESS"]);
+
+/**
+ * The OpenCode harness: an `opencode serve` this process owns, and a client over it.
  *
  * Spawned with `WORKSPACE_ROOT` as its working directory rather than the fleet root,
  * because the fleet root holds what we recorded and the harness should be nowhere near it
@@ -242,9 +257,37 @@ const workerEndpoints = WorkerEndpoints.pending();
  * The server runs as the user and so reads the user's own stored provider credentials; we
  * never read, copy or pass those (DECISIONS.md §12).
  */
-const harness = OpenCodeClient.layer().pipe(
+const openCode = openCodeHarness().pipe(
   Layer.provideMerge(OpenCodeServer.layer({ cwd: WORKSPACE_ROOT })),
 );
+
+/**
+ * The Claude Code harness, over the Claude Agent SDK.
+ *
+ * **No process of ours, and no `cwd` here.** The SDK spawns and owns the CLI per session,
+ * and the directory is a per-session argument, so this layer has nothing of
+ * `OpenCodeServer`'s shape to set up — which is exactly the asymmetry
+ * `harness/agentHarness.ts` refuses to put on the interface. It reads the user's own
+ * Claude Code login, the same way `opencode serve` reads theirs.
+ */
+const claudeCode = claudeCodeHarness();
+
+/**
+ * The layer for the selected driver, or `undefined` when there is nothing to build.
+ *
+ * Annotated rather than inferred: the two branches have different error channels — only
+ * OpenCode's can fail, with a `HarnessProcessError` from spawning its child — and the
+ * recovery below has to be written against the wider of the two.
+ */
+const selectedHarness:
+  Layer.Layer<AgentHarness, HarnessProcessError> | undefined =
+  SELECTED_HARNESS._tag !== "driver"
+    ? undefined
+    : SELECTED_HARNESS.driver === OPENCODE_DRIVER
+      ? openCode
+      : SELECTED_HARNESS.driver === CLAUDE_CODE_DRIVER
+        ? claudeCode
+        : undefined;
 
 /**
  * What this process can do without a harness: serve, sweep, reconcile, and refuse to run.
@@ -263,50 +306,65 @@ const withoutHarness = Layer.mergeAll(
 /**
  * The supervisor and the recovery adapter, over a harness if there is one.
  *
- * **A harness that will not start is not fatal, and that is a decision.** `opencode` may
- * be missing, the wrong version, or unauthenticated, and on any of those this process
- * still has a job: serving the browser the evidence earlier runs recorded, sweeping the
- * fleet, and reconciling attempts a previous process left unsettled. Refusing to boot
- * would make a missing agent into an inability to read what the agent already found.
+ * **A harness that will not start is not fatal, and that is a decision.** `opencode` may be
+ * missing, the wrong version or unauthenticated, and the Claude Agent SDK may be unable to
+ * spawn its CLI; on any of those this process still has a job: serving the browser the
+ * evidence earlier runs recorded, sweeping the fleet, and reconciling attempts a previous
+ * process left unsettled. Refusing to boot would make a missing agent into an inability to
+ * read what the agent already found.
  *
  * **The recovery covers the harness build and nothing else**, which is the whole shape of
- * this expression. `Layer.build(harness)` is wrapped in `Effect.result` — so a
- * `HarnessProcessError` from spawning or waiting for `opencode serve` is caught, and a
- * failure or defect anywhere *else* in this graph propagates and fails startup the way it
- * should. The arrangement this replaces put `Layer.catchCause` around the whole composed
- * layer, after `targetStores`, `credentials`, the narration bus and the MCP endpoint had
- * been provided to it. A fault in any of those was then reported to the operator as "no
- * agent harness", with "install opencode" as the suggested fix — a confidently wrong
- * diagnosis for a bug in our own code, leaving a server that silently refuses every run
- * while the browser API keeps working through its own path to the same services.
+ * this expression. `Layer.build` is wrapped in `Effect.result` — so a `HarnessProcessError`
+ * from spawning or waiting for `opencode serve` is caught, and a failure or defect anywhere
+ * *else* in this graph propagates and fails startup the way it should. The arrangement this
+ * replaces put `Layer.catchCause` around the whole composed layer, after `targetStores`,
+ * `credentials`, the narration bus and the MCP endpoint had been provided to it. A fault in
+ * any of those was then reported to the operator as "no agent harness", with "install
+ * opencode" as the suggested fix — a confidently wrong diagnosis for a bug in our own code,
+ * leaving a server that silently refuses every run while the browser API keeps working
+ * through its own path to the same services.
  *
  * Only typed failures are recovered from. A *defect* in the harness build is a bug in our
  * spawn path rather than a missing binary, and it still takes the process down, because
  * there is nothing an operator can usefully do about it and a server that hid it would be
  * harder to diagnose than one that stopped.
  *
- * The built context is handed on with `Layer.succeedContext`, so the harness process's
- * lifetime belongs to this layer's scope exactly as it did before: `Layer.build` acquires
- * into the ambient build scope, and `Layer.unwrap` satisfies that `Scope` requirement from
- * it. The memo map is forked from the ambient one, so nothing here is built twice.
+ * The built context is handed on with `Layer.succeedContext`, so the harness's lifetime
+ * belongs to this layer's scope: `Layer.build` acquires into the ambient build scope, and
+ * `Layer.unwrap` satisfies that `Scope` requirement from it. For OpenCode that scope owns a
+ * child process; for Claude Code it owns the open sessions' queries. The memo map is forked
+ * from the ambient one, so nothing here is built twice.
  *
- * Startup reconciliation gets the *real* harness when there is one, which is new: this
- * entrypoint used to answer `missing` for every session because it owned none. An attempt
- * a previous process left `running` can now be reconciled to what the harness actually
- * says about its session rather than to `uncertain` by default.
+ * **Nothing below this line knows which harness it got**, and that is the point of the
+ * slice. `RunSupervisor.layer` and `HarnessSessionStatus.layer` require `AgentHarness`, the
+ * selection above is the only place a driver is named, and neither the supervisor nor
+ * recovery can reach the other implementation to branch on it.
  *
- * `HARNESS=0` skips the attempt entirely, for an operator who wants the server without a
- * child process.
+ * `HARNESS=0` skips the attempt entirely, for an operator who wants the server without an
+ * agent. An unrecognised `HARNESS` does the same and says so by name rather than falling
+ * back to a harness the operator did not ask for.
  */
 const agent =
-  process.env["HARNESS"] === "0"
-    ? withoutHarness
+  selectedHarness === undefined
+    ? Layer.effectDiscard(
+        SELECTED_HARNESS._tag === "unknown"
+          ? Effect.logError(
+              "HARNESS names a harness this build does not have, so this server will serve and reconcile but will refuse to start runs",
+              {
+                asked: SELECTED_HARNESS.value,
+                known: [...KNOWN_DRIVERS, "0"].join(", "),
+              },
+            )
+          : Effect.logInfo(
+              "no agent harness (HARNESS=0): this server will serve and reconcile but will refuse to start runs",
+            ),
+      ).pipe(Layer.merge(withoutHarness))
     : Layer.unwrap(
-        Effect.map(Effect.result(Layer.build(harness)), (built) =>
+        Effect.map(Effect.result(Layer.build(selectedHarness)), (built) =>
           built._tag === "Failure"
             ? Layer.effectDiscard(
                 Effect.logWarning(
-                  "no agent harness: `opencode serve` would not start, so this server will serve and reconcile but will refuse to start runs",
+                  "no agent harness: the harness HARNESS names would not start, so this server will serve and reconcile but will refuse to start runs",
                   { detail: built.failure.message },
                 ),
               ).pipe(Layer.merge(withoutHarness))
@@ -473,6 +531,15 @@ const program = Effect.gen(function* () {
   );
   console.log(`  browser api (session bearer): ${control.origin}${API_PREFIX}`);
   console.log(`  folder picker root: ${WORKSPACE_ROOT}`);
+  // Which agent ran a run is provenance, so which agent this process *can* run is worth
+  // one line at startup rather than a guess from the absence of an error.
+  console.log(
+    SELECTED_HARNESS._tag === "driver"
+      ? `  harness: ${SELECTED_HARNESS.driver} (HARNESS)`
+      : SELECTED_HARNESS._tag === "none"
+        ? "  harness: none (HARNESS=0) — every run is refused"
+        : `  harness: none — HARNESS='${SELECTED_HARNESS.value}' is not one of ${[...KNOWN_DRIVERS, "0"].join(", ")}`,
+  );
   const supervisor = yield* RunSupervisor;
   const alreadyRunning = yield* supervisor.running;
   console.log(

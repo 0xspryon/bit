@@ -146,6 +146,22 @@ export interface SeedInput {
   readonly question: string;
   readonly attemptId: string;
   readonly workerId: string;
+  /**
+   * Which configured harness ran this, from `harness/identity.ts`.
+   *
+   * An attempt is **pinned** to its instance the moment it starts: nothing updates this
+   * column, and moving work to another harness means opening a replacement attempt rather
+   * than retargeting this one. `null` only for a row written before instances existed;
+   * see migration `0014_attempt_harness_instance` on why there is no backfill.
+   */
+  readonly harnessInstanceId: string | null;
+  /**
+   * Which provider and model ran, inside that instance.
+   *
+   * Still the *model's* provenance and not the harness's — `openai` / `gpt-5.6-sol`, or
+   * `anthropic` / `claude-sonnet-5` — which is why it does not identify the harness and
+   * {@link harnessInstanceId} is a separate column.
+   */
   readonly providerId: string;
   readonly modelId: string;
   readonly harnessSessionId: string | null;
@@ -166,6 +182,8 @@ export interface ReplacementInput {
   readonly intentId: string;
   readonly attemptId: string;
   readonly workerId: string;
+  /** See {@link SeedInput.harnessInstanceId}. A replacement may run on another instance. */
+  readonly harnessInstanceId: string | null;
   readonly providerId: string;
   readonly modelId: string;
   readonly harnessSessionId: string | null;
@@ -478,6 +496,14 @@ const AttemptRow = Schema.Struct({
   target_id: Schema.String,
   worker_id: Schema.String,
   harness_session_id: Schema.NullOr(Schema.String),
+  /**
+   * The configured harness this attempt is pinned to. `null` before migration `0014`.
+   *
+   * Nullable rather than defaulted, because a row written when there was one harness does
+   * not record which, and filling in a guess would be inventing provenance. Everything
+   * that reads it — the API, and `recovery/harnessStatus.ts` — treats `null` as unknown.
+   */
+  harness_instance_id: Schema.NullOr(Schema.String),
   provider_id: Schema.String,
   model_id: Schema.String,
   status: Schema.String,
@@ -803,9 +829,11 @@ const makeStore = Effect.fnUntraced(function* () {
             Effect.mapError(asDatabaseError("transaction")),
           );
           yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
-              harness_session_id, provider_id, model_id, status, started_at, write_fence)
+              harness_session_id, harness_instance_id, provider_id, model_id,
+              status, started_at, write_fence)
             VALUES (${input.attemptId}, ${input.intentId}, ${input.targetId},
                     ${input.workerId}, ${input.harnessSessionId},
+                    ${input.harnessInstanceId},
                     ${input.providerId}, ${input.modelId}, 'running', ${now}, 0)
             ON CONFLICT(id) DO NOTHING`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
@@ -822,6 +850,7 @@ const makeStore = Effect.fnUntraced(function* () {
                 intentId: input.intentId,
                 goalId: input.goalId,
                 workerId: input.workerId,
+                harnessInstanceId: input.harnessInstanceId,
                 providerId: input.providerId,
                 modelId: input.modelId,
                 harnessSessionId: input.harnessSessionId,
@@ -2219,10 +2248,11 @@ const makeStore = Effect.fnUntraced(function* () {
           // they have just been checked to be equal, and the stored row is the one the
           // foreign key is against.
           yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
-              harness_session_id, provider_id, model_id, status, started_at,
-              write_fence, replaces_attempt_id)
+              harness_session_id, harness_instance_id, provider_id, model_id,
+              status, started_at, write_fence, replaces_attempt_id)
             VALUES (${input.attemptId}, ${replaced.intent_id}, ${replaced.target_id},
                     ${input.workerId}, ${input.harnessSessionId},
+                    ${input.harnessInstanceId},
                     ${input.providerId}, ${input.modelId}, 'running', ${now}, 0,
                     ${input.replacesAttemptId})`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
@@ -2243,6 +2273,7 @@ const makeStore = Effect.fnUntraced(function* () {
               intentId: replaced.intent_id,
               goalId: null,
               workerId: input.workerId,
+              harnessInstanceId: input.harnessInstanceId,
               providerId: input.providerId,
               modelId: input.modelId,
               harnessSessionId: input.harnessSessionId,
