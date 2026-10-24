@@ -9,6 +9,7 @@
       "persistent": true,
       "passThroughEnv": [
         "BIT_PASSWORD",
+        "BIT_SERVER_URL",
         "HUNT_ROOT",
         "WORKSPACE_ROOT",
         "PORT",
