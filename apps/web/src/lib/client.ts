@@ -68,10 +68,10 @@ const writeStoredToken = (token: string | undefined): void => {
 };
 
 /** The token a reload should try, before anything has been verified. */
-export const storedToken = (): string | undefined => readStoredToken();
+const storedToken = (): string | undefined => readStoredToken();
 
 /** Holds a token in memory and in `sessionStorage`. `undefined` signs out. */
-export const setToken = (token: string | undefined): void => {
+const setToken = (token: string | undefined): void => {
   bearer = token;
   writeStoredToken(token);
 };
@@ -179,6 +179,21 @@ const run = async <A, E>(
  * the transport cannot fail.
  */
 export const server = {
+  /**
+   * The token a reload should try, before anything has been verified.
+   *
+   * On the same seam as the calls, not beside it, because it is the same fact: the
+   * bearer is whatever this client will put on the next request, and `sessionStorage` is
+   * only where this particular client happens to park it. A caller that reached past the
+   * client to a module-level setter would be asserting that *every* client stores its
+   * token in the tab — which is exactly what a test one does not do, and the reason
+   * classifying a wrong password used to need a working `sessionStorage`.
+   */
+  storedToken,
+
+  /** Holds a token in memory and in `sessionStorage`. `undefined` signs out. */
+  setToken,
+
   /** Exchanges the password for a token. Does not store it — the caller decides. */
   openSession: (baseUrl: string, password: string) =>
     run(
@@ -298,3 +313,22 @@ export const server = {
   runs: (baseUrl: string) =>
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.runs())),
 };
+
+/**
+ * What {@link App} needs from a control plane, which is exactly what {@link server} is.
+ *
+ * Written as `typeof server` rather than spelled out as an interface, and that is the
+ * honest choice rather than the lazy one. Each method's error channel is *inferred*: it
+ * is the union the contract declares for that endpoint plus whatever the transport can
+ * raise, and nobody has written it down anywhere — on purpose, as the comment above
+ * {@link server} says. Spelling it out here would mean restating a union that only the
+ * compiler knows, and the restatement would be the thing that rots when an endpoint gains
+ * an error member, in the one place a compile error would not point at it.
+ *
+ * Deriving it has the variance working for a fake too. {@link Call} holds its error
+ * covariantly, so a hand-written double may answer with just the one refusal a test is
+ * about — `Refused` carrying a `SessionRefused` and nothing else — and still satisfy a
+ * method whose real error channel is six members wide. What it cannot do is invent a
+ * success shape, because those are the contract's own types, named and checked.
+ */
+export type ServerClient = typeof server;

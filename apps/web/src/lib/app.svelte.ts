@@ -29,7 +29,7 @@ import type {
 } from "@bit/contracts";
 
 import { initialTargets, previewCounts, type Target } from "./mock";
-import { server, setToken, storedToken } from "./client";
+import { server, type ServerClient } from "./client";
 
 export type Screen = "connect" | "welcome" | "target";
 /**
@@ -95,6 +95,26 @@ export const fromSummary = (summary: TargetSummary, now: number): Target => ({
 });
 
 export class App {
+  /**
+   * The control plane this instance talks to.
+   *
+   * Not reactive, and deliberately not: it is handed in once and never changes, and a
+   * `$state` field here would make "which client did that call go to" a question about
+   * when an effect ran. It holds the session token too — see {@link ServerClient} — so
+   * everything that reaches the network, including signing out, goes through this one
+   * reference and a test needs no second seam to intercept it.
+   */
+  readonly client: ServerClient;
+
+  /**
+   * Defaults to the live client, so `new App()` is unchanged for the route that mounts
+   * it. The parameter exists for the tests, which hand in a hand-written double; it is
+   * not a configuration point and there is no second real implementation.
+   */
+  constructor(client: ServerClient = server) {
+    this.client = client;
+  }
+
   screen = $state<Screen>("connect");
   theme = $state<Theme>("dark");
 
@@ -325,7 +345,7 @@ export class App {
         this.connectDetail = "simulated by the state picker";
         return;
       }
-      const call = await server.openSession(this.serverUrl, this.password);
+      const call = await this.client.openSession(this.serverUrl, this.password);
       if (call._tag === "Refused") {
         this.connectError = "password";
         this.password = "";
@@ -336,7 +356,7 @@ export class App {
         this.connectDetail = call.detail;
         return;
       }
-      setToken(call.value.token);
+      this.client.setToken(call.value.token);
       this.connectError = "none";
       this.password = "";
       this.screen = "welcome";
@@ -364,10 +384,10 @@ export class App {
    * Connect screen with the unreachable state, not a spurious "your session ended".
    */
   async restore() {
-    const token = storedToken();
+    const token = this.client.storedToken();
     if (token === undefined) return;
-    setToken(token);
-    const call = await server.probe(this.serverUrl);
+    this.client.setToken(token);
+    const call = await this.client.probe(this.serverUrl);
     if (call._tag === "Ok") {
       this.dialogRoot = call.value.workspaceRoot;
       this.screen = "welcome";
@@ -379,7 +399,7 @@ export class App {
       return;
     }
     if (call._tag === "Refused") {
-      setToken(undefined);
+      this.client.setToken(undefined);
       this.screen = "connect";
       this.connectError = "expired";
       return;
@@ -390,7 +410,7 @@ export class App {
   }
 
   signOut(reason: ConnectError = "none") {
-    setToken(undefined);
+    this.client.setToken(undefined);
     this.screen = "connect";
     this.password = "";
     this.connectError = reason;
@@ -417,7 +437,7 @@ export class App {
    * is for — "what you see below is the last known state".
    */
   async loadTargets() {
-    const call = await server.targets(this.serverUrl);
+    const call = await this.client.targets(this.serverUrl);
     if (call._tag === "Refused") {
       this.signOut("expired");
       return;
@@ -453,7 +473,12 @@ export class App {
    * The screen switches first and the counts follow, so the frame is up while the request
    * is in flight rather than the operator waiting on a blank page for a file to be opened.
    * The header shows its loading state for that moment and never shows the previous
-   * target's numbers, because {@link loadTarget} clears them before it asks.
+   * target's numbers, because {@link refreshTarget} clears them before it asks.
+   *
+   * **This is where {@link viewTargetId} moves, and the only place.** Navigating is a
+   * decision the operator made; reading a target's counts is a consequence of one. When
+   * the same method did both, a read that finished late could move the view to a target
+   * nobody had asked for — see {@link refreshTarget}.
    */
   openTarget(id: string) {
     this.select(id);
@@ -462,14 +487,31 @@ export class App {
     this.detailOpen = false;
     this.instruction = "";
     this.runDetail = "";
-    void this.loadTarget(id);
+    this.viewTargetId = id;
+    void this.refreshTarget(id);
     // Asked on every open, because a run started in another tab — or by this one before a
     // reload — is a fact about the server that this screen has no other way to learn.
     void this.loadRuns();
   }
 
   /**
-   * Reads one target: its row and the counts from its own `hunt.sqlite`.
+   * Refreshes the open target: its row and the counts from its own `hunt.sqlite`.
+   *
+   * **It reads. It does not navigate.** {@link viewTargetId} belongs to
+   * {@link openTarget}, and this method only ever asks about the target that field
+   * already names. That division is load-bearing rather than tidy-minded, because this
+   * method used to assign `viewTargetId` as its first statement — which made the guard
+   * below useless to anyone but itself. A guard cannot protect a value from the call
+   * that sets it, so `startRun` and `stopRun` refreshing at their tails could land a
+   * target the operator had already navigated away from: the header blanked, but the
+   * composer went on showing *that* target's run, offering *that* target's transcript,
+   * and pointing its Stop button at *that* target's attempt while a different target was
+   * on screen. A Stop that acts on something not on screen is misattribution at the UI
+   * layer, which is the one thing this product may not do.
+   *
+   * So a refresh of a target that is not in view has nothing to refresh, and says so by
+   * doing nothing. The guard after the request then does the job it was written for: an
+   * answer about a target the operator has since left.
    *
    * Three refusals, each landing somewhere different, because they are different facts:
    *
@@ -486,8 +528,11 @@ export class App {
    * came from: a deep link into a cold tab has a name and a scope note before the list
    * has loaded.
    */
-  async loadTarget(id: string) {
-    this.viewTargetId = id;
+  async refreshTarget(id: string) {
+    // Asked before anything is written, so a refresh for a target that has gone off
+    // screen cannot clear the counts of the one that replaced it, cannot show it a
+    // loading state, and does not spend a request it would only discard below.
+    if (this.viewTargetId !== id) return;
     // Cleared before the request, not after it: between two targets there is a moment
     // where the only honest answer is "reading", and stale counts in that moment are the
     // exact thing this screen must never show.
@@ -495,7 +540,7 @@ export class App {
     this.viewDetail = "";
     this.viewState = "loading";
 
-    const call = await server.target(this.serverUrl, id);
+    const call = await this.client.target(this.serverUrl, id);
     // A second open may have overtaken this one. Whatever came back is about a target the
     // operator has already left, so it is dropped rather than rendered.
     if (this.viewTargetId !== id) return;
@@ -612,7 +657,7 @@ export class App {
   async browseTo(path?: string) {
     this.dialogBusy = true;
     try {
-      const call = await server.folders(this.serverUrl, path);
+      const call = await this.client.folders(this.serverUrl, path);
       if (call._tag === "Ok") {
         this.dialogPathError = "";
         this.dialogRoot = call.value.root;
@@ -673,7 +718,7 @@ export class App {
     if (this.dialogChosen === "" || this.dialogName === "") return;
     this.createState = "creating";
     this.createDetail = "";
-    const call = await server.createTarget(this.serverUrl, {
+    const call = await this.client.createTarget(this.serverUrl, {
       workspacePath: this.dialogChosen,
       name: this.dialogName,
       scopeNote: this.dialogScope,
@@ -742,7 +787,7 @@ export class App {
     this.starting = true;
     this.runDetail = "";
     try {
-      const call = await server.startRun(
+      const call = await this.client.startRun(
         this.serverUrl,
         targetId,
         this.instruction.trim(),
@@ -794,8 +839,10 @@ export class App {
         },
       ];
       // The counts moved: a run writes a goal, an intent and an attempt before it is
-      // answered, so the header would otherwise be stale until the next open.
-      await this.loadTarget(targetId);
+      // answered, so the header would otherwise be stale until the next open. A refresh
+      // and not a navigation — if the operator opened something else while the start was
+      // in flight, the right number of targets to move them back to is none.
+      await this.refreshTarget(targetId);
     } finally {
       this.starting = false;
     }
@@ -815,7 +862,7 @@ export class App {
     this.stopping = true;
     this.runDetail = "";
     try {
-      const call = await server.stopRun(
+      const call = await this.client.stopRun(
         this.serverUrl,
         running.targetId,
         running.attemptId,
@@ -841,7 +888,7 @@ export class App {
         return;
       }
       await this.loadRuns();
-      await this.loadTarget(running.targetId);
+      await this.refreshTarget(running.targetId);
     } finally {
       this.stopping = false;
     }
@@ -856,7 +903,7 @@ export class App {
    * better than a picker full of guesses.
    */
   async loadHarnesses() {
-    const call = await server.harnesses(this.serverUrl);
+    const call = await this.client.harnesses(this.serverUrl);
     if (call._tag === "Refused") {
       if (call.error._tag === "Unauthenticated") this.signOut("expired");
       return;
@@ -917,7 +964,11 @@ export class App {
     this.transcriptDetail = "";
     this.transcript = undefined;
     try {
-      const call = await server.transcript(this.serverUrl, targetId, attemptId);
+      const call = await this.client.transcript(
+        this.serverUrl,
+        targetId,
+        attemptId,
+      );
       // A second request may have overtaken this one. Whatever came back is about an
       // attempt that is no longer on screen, so it is dropped rather than shown.
       if (this.transcriptAttemptId !== attemptId) return;
@@ -974,7 +1025,7 @@ export class App {
 
   /** Replaces the running list with what the server is supervising. */
   async loadRuns() {
-    const call = await server.runs(this.serverUrl);
+    const call = await this.client.runs(this.serverUrl);
     if (call._tag === "Refused") {
       if (call.error._tag === "Unauthenticated") this.signOut("expired");
       return;
