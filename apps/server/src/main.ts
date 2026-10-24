@@ -83,7 +83,12 @@ import { API_PREFIX } from "@bit/contracts";
 import { Effect, Layer } from "effect";
 
 import { browserApiRoutes } from "./http/browserApi";
-import { BrowserSessions, ensureServerPassword } from "./http/browserSessions";
+import {
+  BrowserSessions,
+  PASSWORD_ENV_VAR,
+  ensureServerPassword,
+  takeConfiguredPassword,
+} from "./http/browserSessions";
 import { ControlPlaneEndpoint } from "./http/controlPlane";
 import { resolveRoot } from "./http/folders";
 import { AgentHarness } from "./harness/agentHarness";
@@ -135,6 +140,18 @@ const HUNT_ROOT =
 const PORT = Number(process.env["PORT"] ?? 3000);
 
 /**
+ * The configured server password, read and **removed from this process's environment**
+ * at module scope.
+ *
+ * Deliberately the first thing this file does with the environment, and deliberately not
+ * inside an effect: it has to happen before anything can spawn a child, and a child
+ * inherits what is in `process.env` at the moment it is spawned. The reasoning is on
+ * `http/browserSessions.ts`; the short version is that the child here is an agent running
+ * model-chosen shell commands, and `env` is a command.
+ */
+const CONFIGURED_PASSWORD = takeConfiguredPassword();
+
+/**
  * The only directory the browser's folder picker may look inside.
  *
  * Configuration, and the perimeter of Day 3's boundary: "the folder picker runs
@@ -170,12 +187,15 @@ const fleet = FleetStore.layer(HUNT_ROOT);
 const prepareFleet = Effect.gen(function* () {
   const store = yield* FleetStore;
 
-  // The server password, before anything is served. Generated on the first boot against
-  // this fleet root, stored in `control.sqlite` as an argon2id hash, and printed here
-  // exactly once — nothing keeps the plaintext, so nothing can print it again. The
-  // reasoning, including why this is not an environment variable, is on
-  // `http/browserSessions.ts`.
-  const password = yield* ensureServerPassword;
+  // The server password, before anything is served. `BIT_PASSWORD` wins if it is set;
+  // otherwise one is generated on the first boot against this fleet root, stored in
+  // `control.sqlite` as an argon2id hash, and printed here exactly once — nothing keeps
+  // the plaintext, so nothing can print it again. Why the variable is read and deleted
+  // before anything spawns a child is on `http/browserSessions.ts`.
+  const password = yield* ensureServerPassword(CONFIGURED_PASSWORD);
+  if (CONFIGURED_PASSWORD !== undefined) {
+    console.log(`server password: taken from ${PASSWORD_ENV_VAR}`);
+  }
   if (password.generated !== undefined) {
     console.log("");
     console.log(
@@ -475,7 +495,11 @@ const endpoint = Layer.unwrap(
         extraRoutes: browserApiRoutes({
           workspaceRoot: WORKSPACE_ROOT,
         }).pipe(
-          Layer.provide(BrowserSessions.layer),
+          Layer.provide(
+            CONFIGURED_PASSWORD === undefined
+              ? BrowserSessions.layer
+              : BrowserSessions.layerWithPassword(CONFIGURED_PASSWORD),
+          ),
           Layer.provide(Layer.succeedContext(shared)),
           // `Layer.orDie` rather than a failure that propagates, and the reason is the
           // ordering below: `prepareFleet` has already opened and migrated

@@ -85,42 +85,93 @@ const generatePassword = (): string => {
 const hashToken = (token: string): string =>
   new Bun.CryptoHasher("sha256").update(token).digest("hex");
 
+/**
+ * The variable an operator may set the server password with.
+ *
+ * Named after this application rather than after the harness, because
+ * `OPENCODE_PASSWORD` is a *different* secret that `harness/openCodeServer.ts` mints and
+ * hands to the child it spawns. Two passwords in one process is already a thing to be
+ * careful about, and one name covering both would be the way they got confused.
+ */
+export const PASSWORD_ENV_VAR = "BIT_PASSWORD";
+
+/**
+ * Reads {@link PASSWORD_ENV_VAR} and **removes it from this process's environment**.
+ *
+ * The removal is the point, not a tidy-up. This server spawns an agent that runs
+ * model-chosen shell commands, and a child inherits its parent's environment — so a
+ * password left in `process.env` is a password the worker can read out of its own
+ * environment with `env`, and from there present to our own browser API. OpenCode guards
+ * the same hazard the same way (`cli/src/env.ts` filters its two password variables out
+ * of the environment it hands a session, and `cli/src/server-process.ts` deletes one from
+ * its own), which is where this approach comes from.
+ *
+ * Deleting here rather than scrubbing at each spawn site is deliberate: there are three
+ * places today that start a child — `openCodeServer.ts`, the Claude Agent SDK's CLI, and
+ * the policy hook — and only the first has an environment hook we control. A list of
+ * spawn sites to remember is a list somebody will fail to add to.
+ *
+ * Call this **once, at startup, before any harness is built.** Idempotent: a second call
+ * finds nothing and returns `undefined`, which is also what an unset variable gives, and
+ * the two are indistinguishable by design — there is nothing a caller should do
+ * differently.
+ */
+export const takeConfiguredPassword = (): string | undefined => {
+  const configured = process.env[PASSWORD_ENV_VAR];
+  delete process.env[PASSWORD_ENV_VAR];
+  return configured !== undefined && configured.length > 0
+    ? configured
+    : undefined;
+};
+
 /** What the first boot produced, if it produced anything. */
 export interface ServerPasswordState {
   /**
    * The plaintext, present only on the boot that generated it.
    *
-   * `undefined` on every later boot. A caller that wants to show the operator their
-   * password after the fact cannot: there is nothing to show.
+   * `undefined` on every later boot, and whenever a password was configured — there is
+   * nothing to print that the operator did not already set. A caller that wants to show
+   * them a generated password after the fact cannot: nothing keeps it.
    */
   readonly generated: string | undefined;
 }
 
 /**
- * Makes sure a password hash exists, generating one on first boot.
+ * Makes sure a password is in play, generating one on first boot if none is configured.
  *
- * Idempotent: a second call finds the row and generates nothing. There is deliberately
- * no reset path here — regenerating a password is an operator action with consequences
- * for anybody holding a session, and it belongs on a settings screen rather than in a
- * startup helper that could be called twice.
+ * **A configured password wins and is never stored.** It is configuration, so the
+ * environment is the authority on every boot and a hash written on some earlier run must
+ * not shadow it. Nothing is written to `settings`, which also means unsetting the
+ * variable falls back to whatever the installation generated rather than to a stale copy
+ * of a password the operator has since changed.
+ *
+ * Without one: idempotent as before. A second call finds the row and generates nothing.
+ * There is deliberately no reset path here — regenerating a password has consequences for
+ * anybody holding a session, and belongs on a settings screen rather than in a startup
+ * helper that could be called twice.
  */
-export const ensureServerPassword: Effect.Effect<
-  ServerPasswordState,
-  DatabaseError,
-  FleetStore
-> = Effect.gen(function* () {
-  const fleet = yield* FleetStore;
-  const existing = yield* fleet.setting(PASSWORD_SETTING_KEY);
-  if (existing !== undefined && existing.length > 0) {
-    return { generated: undefined } satisfies ServerPasswordState;
-  }
-  const password = generatePassword();
-  const hash = yield* Effect.promise(() =>
-    Bun.password.hash(password, { algorithm: "argon2id" }),
-  );
-  yield* fleet.setSetting(PASSWORD_SETTING_KEY, hash);
-  return { generated: password } satisfies ServerPasswordState;
-});
+export const ensureServerPassword = (
+  configured?: string | undefined,
+): Effect.Effect<ServerPasswordState, DatabaseError, FleetStore> =>
+  Effect.gen(function* () {
+    // Configured wins, and nothing is written: the environment is the authority on every
+    // boot, so generating a password nothing will check would leave a stored hash to
+    // shadow it the day the variable is unset.
+    if (configured !== undefined) {
+      return { generated: undefined } satisfies ServerPasswordState;
+    }
+    const fleet = yield* FleetStore;
+    const existing = yield* fleet.setting(PASSWORD_SETTING_KEY);
+    if (existing !== undefined && existing.length > 0) {
+      return { generated: undefined } satisfies ServerPasswordState;
+    }
+    const password = generatePassword();
+    const hash = yield* Effect.promise(() =>
+      Bun.password.hash(password, { algorithm: "argon2id" }),
+    );
+    yield* fleet.setSetting(PASSWORD_SETTING_KEY, hash);
+    return { generated: password } satisfies ServerPasswordState;
+  });
 
 /** One granted session. Holds no password and no secret beyond its own id. */
 export interface BrowserSession {
@@ -149,17 +200,21 @@ export interface IssuedSession {
   readonly session: BrowserSession;
 }
 
-const makeSessions = Effect.fnUntraced(function* () {
+const makeSessions = Effect.fnUntraced(function* (
+  configuredHash?: string | undefined,
+) {
   const fleet = yield* FleetStore;
   const sessions = new Map<string, BrowserSession>();
 
   /**
    * Verifies a password and mints a session, or refuses with a reason.
    *
-   * The hash is read from the settings table on every attempt rather than cached at
-   * layer construction, so the stored value stays authoritative: when something later
-   * changes the password, sessions opened after that change are checked against the new
-   * one without a restart.
+   * **A configured password is held here; a generated one is read fresh each time.** The
+   * difference follows from which is authoritative. `BIT_PASSWORD` is settled at startup
+   * and changing it means restarting, so caching its hash costs nothing and keeps the
+   * plaintext from living any longer than one hash call. The stored hash is state
+   * something else may change, so it is read from `settings` on every attempt and a
+   * change takes effect without a restart.
    *
    * A missing or empty hash refuses every password rather than accepting any. That is
    * the fail-closed direction, and it is reachable — a fleet root whose `settings` row
@@ -169,12 +224,12 @@ const makeSessions = Effect.fnUntraced(function* () {
   const open: BrowserSessions["Service"]["open"] = Effect.fn(
     "BrowserSessions.open",
   )(function* (password: string) {
-    const hash = yield* fleet.setting(PASSWORD_SETTING_KEY);
+    const hash = configuredHash ?? (yield* fleet.setting(PASSWORD_SETTING_KEY));
     if (hash === undefined || hash.length === 0) {
       return yield* new SessionRefused({
         reason: "no_password_set",
         detail:
-          "this installation has no server password recorded; restart the server so it can generate one",
+          "this installation has no server password recorded; restart the server so it can generate one, or set BIT_PASSWORD",
       });
     }
     const accepted = yield* Effect.promise(() =>
@@ -245,4 +300,21 @@ export class BrowserSessions extends Context.Service<
 >()("bit/http/BrowserSessions") {
   static readonly layer: Layer.Layer<BrowserSessions, never, FleetStore> =
     Layer.effect(BrowserSessions, makeSessions());
+
+  /**
+   * The registry over a password supplied by configuration rather than generated.
+   *
+   * Hashes once here, at layer construction, and holds only the hash — so the plaintext
+   * `takeConfiguredPassword` read stops being reachable as soon as the graph is built,
+   * and `open` has one verification path whatever the password's source.
+   */
+  static readonly layerWithPassword = (
+    password: string,
+  ): Layer.Layer<BrowserSessions, never, FleetStore> =>
+    Layer.effect(
+      BrowserSessions,
+      Effect.promise(() =>
+        Bun.password.hash(password, { algorithm: "argon2id" }),
+      ).pipe(Effect.flatMap((hash) => makeSessions(hash))),
+    );
 }

@@ -18,8 +18,10 @@ import { TestClock } from "effect/testing";
 import {
   BrowserSessions,
   DEFAULT_SESSION_LIFETIME_MS,
+  PASSWORD_ENV_VAR,
   PASSWORD_SETTING_KEY,
   ensureServerPassword,
+  takeConfiguredPassword,
 } from "./browserSessions";
 import { FleetStore } from "../persistence/fleet";
 
@@ -43,13 +45,17 @@ const newRoot = () => {
 const withRoot = <A, E>(
   root: string,
   use: Effect.Effect<A, E, BrowserSessions | FleetStore>,
-  options?: { readonly testClock?: boolean },
+  options?: {
+    readonly testClock?: boolean;
+    /** The registry under test, when it is not the generated-password one. */
+    readonly sessions?: Layer.Layer<BrowserSessions, never, FleetStore>;
+  },
 ): Promise<A> =>
   Effect.runPromise(
     Effect.scoped(
       use.pipe(
         Effect.provide(
-          BrowserSessions.layer.pipe(
+          (options?.sessions ?? BrowserSessions.layer).pipe(
             Layer.provideMerge(FleetStore.layer(root)),
           ),
         ),
@@ -66,7 +72,7 @@ describe("the server password", () => {
     const first = await withRoot(
       root,
       Effect.gen(function* () {
-        const state = yield* ensureServerPassword;
+        const state = yield* ensureServerPassword();
         const fleet = yield* FleetStore;
         return {
           generated: state.generated,
@@ -86,7 +92,7 @@ describe("the server password", () => {
     const second = await withRoot(
       root,
       Effect.gen(function* () {
-        const state = yield* ensureServerPassword;
+        const state = yield* ensureServerPassword();
         const fleet = yield* FleetStore;
         return {
           generated: state.generated,
@@ -96,6 +102,60 @@ describe("the server password", () => {
     );
     expect(second.generated).toBeUndefined();
     expect(second.stored).toBe(first.stored);
+  });
+
+  test("a configured password wins and is never stored", async () => {
+    const root = newRoot();
+    // Configuration, not state: the environment is the authority on every boot, so
+    // writing a hash here would leave something to shadow it the day the variable is
+    // unset — and would also mean generating a password nothing is going to check.
+    const state = await withRoot(
+      root,
+      Effect.gen(function* () {
+        const result = yield* ensureServerPassword("set-by-the-operator");
+        const fleet = yield* FleetStore;
+        return {
+          generated: result.generated,
+          stored: yield* fleet.setting(PASSWORD_SETTING_KEY),
+        };
+      }),
+    );
+    expect(state.generated).toBeUndefined();
+    expect(state.stored).toBeUndefined();
+  });
+
+  test("a configured password opens a session and a wrong one is refused", async () => {
+    const root = newRoot();
+    const observed = await withRoot(
+      root,
+      Effect.gen(function* () {
+        const sessions = yield* BrowserSessions;
+        const refusal = yield* Effect.flip(sessions.open("not-it"));
+        const issued = yield* sessions.open("set-by-the-operator");
+        return {
+          refusal,
+          lookup: yield* sessions.resolve(Redacted.value(issued.token)),
+        };
+      }),
+      { sessions: BrowserSessions.layerWithPassword("set-by-the-operator") },
+    );
+    expect(observed.refusal._tag).toBe("SessionRefused");
+    expect(observed.lookup._tag).toBe("Active");
+  });
+
+  test("reading the configured password removes it from the environment", () => {
+    // The removal is the whole point: this process spawns an agent that runs
+    // model-chosen shell commands, a child inherits what is in `process.env` at spawn
+    // time, and `env` is a command. Nothing downstream should be able to find it.
+    process.env[PASSWORD_ENV_VAR] = "set-by-the-operator";
+    expect(takeConfiguredPassword()).toBe("set-by-the-operator");
+    expect(process.env[PASSWORD_ENV_VAR]).toBeUndefined();
+    // Idempotent, and an unset variable is indistinguishable from an already-taken one.
+    expect(takeConfiguredPassword()).toBeUndefined();
+    // An empty value is not a password. It must not become one that opens everything.
+    process.env[PASSWORD_ENV_VAR] = "";
+    expect(takeConfiguredPassword()).toBeUndefined();
+    expect(process.env[PASSWORD_ENV_VAR]).toBeUndefined();
   });
 
   test("refuses every password when no hash is recorded, rather than accepting any", async () => {
@@ -121,7 +181,7 @@ describe("opening a session", () => {
       root,
       Effect.gen(function* () {
         const sessions = yield* BrowserSessions;
-        const password = (yield* ensureServerPassword).generated ?? "";
+        const password = (yield* ensureServerPassword()).generated ?? "";
         const refusal = yield* Effect.flip(sessions.open(`${password}x`));
         const afterRefusal = yield* sessions.size;
         const issued = yield* sessions.open(password);
@@ -153,7 +213,7 @@ describe("opening a session", () => {
       root,
       Effect.gen(function* () {
         const sessions = yield* BrowserSessions;
-        yield* ensureServerPassword;
+        yield* ensureServerPassword();
         return {
           empty: yield* sessions.resolve(""),
           unrecognised: yield* sessions.resolve("f".repeat(64)),
@@ -174,7 +234,7 @@ describe("opening a session", () => {
       root,
       Effect.gen(function* () {
         const sessions = yield* BrowserSessions;
-        yield* ensureServerPassword;
+        yield* ensureServerPassword();
         return {
           refusal: yield* Effect.flip(sessions.open("")),
           size: yield* sessions.size,
@@ -193,7 +253,7 @@ describe("a session's lifetime", () => {
       root,
       Effect.gen(function* () {
         const sessions = yield* BrowserSessions;
-        const password = (yield* ensureServerPassword).generated ?? "";
+        const password = (yield* ensureServerPassword()).generated ?? "";
         const issued = yield* sessions.open(password);
         const token = Redacted.value(issued.token);
         const fresh = yield* sessions.resolve(token);
@@ -218,7 +278,7 @@ describe("a session's lifetime", () => {
       root,
       Effect.gen(function* () {
         const sessions = yield* BrowserSessions;
-        const password = (yield* ensureServerPassword).generated ?? "";
+        const password = (yield* ensureServerPassword()).generated ?? "";
         const issued = yield* sessions.open(password);
         yield* sessions.close(issued.token);
         const first = yield* sessions.resolve(Redacted.value(issued.token));
@@ -236,7 +296,7 @@ describe("a session's lifetime", () => {
       root,
       Effect.gen(function* () {
         const sessions = yield* BrowserSessions;
-        const password = (yield* ensureServerPassword).generated ?? "";
+        const password = (yield* ensureServerPassword()).generated ?? "";
         const one = yield* sessions.open(password);
         const two = yield* sessions.open(password);
         yield* sessions.close(one.token);

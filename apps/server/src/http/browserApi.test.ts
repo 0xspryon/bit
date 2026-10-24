@@ -217,7 +217,7 @@ beforeAll(async () => {
   // suite signs in with is the one the first boot generated.
   password = await Effect.runPromise(
     Effect.scoped(
-      Effect.map(ensureServerPassword, (state) => state.generated ?? "").pipe(
+      Effect.map(ensureServerPassword(), (state) => state.generated ?? "").pipe(
         Effect.provide(fleet),
         Effect.orDie,
       ),
