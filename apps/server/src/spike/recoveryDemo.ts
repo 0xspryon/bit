@@ -32,6 +32,7 @@ import { openCodeHarness } from "../harness/openCodeClient";
 import { OpenCodeServer } from "../harness/openCodeServer";
 import { McpCredentials } from "../mcp/credentials";
 import { ObservationStore } from "../persistence/store";
+import { HarnessResolver } from "../harness/resolver";
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
 import {
   reconcileUnsettledAttempts,
@@ -121,6 +122,8 @@ const program = Effect.gen(function* () {
  */
 const harnessLayer = WITH_HARNESS
   ? HarnessSessionStatus.layer.pipe(
+      // One instance, so the resolver is a wrapper here rather than a choice.
+      Layer.provide(HarnessResolver.single),
       Layer.provide(
         openCodeHarness().pipe(
           Layer.provideMerge(OpenCodeServer.layer({ cwd: WORKSPACE })),

@@ -43,6 +43,7 @@ import {
 } from "effect";
 
 import { AgentHarness } from "../harness/agentHarness";
+import { HarnessResolver } from "../harness/resolver";
 import { stubHarness } from "../harness/stubHarness";
 import { RunNarrations } from "../run/narration";
 import { RunSupervisor, WorkerEndpoints } from "../run/supervisor";
@@ -169,6 +170,8 @@ const fakeHarness = Layer.succeed(
  * browser routes.
  */
 const supervisorLayer = RunSupervisor.layer.pipe(
+  // One instance, so the resolver in front of the seam is a wrapper here and not a choice.
+  Layer.provide(HarnessResolver.single),
   Layer.provide(fakeHarness),
   Layer.provide(RunNarrations.layer),
   Layer.provide(WorkerEndpoints.fromEndpoint),
@@ -471,6 +474,7 @@ describe("one endpoint, two targets", () => {
           // pre-execution policy gate into it before creating the session.
           workspace: workspaceFor("alpha"),
           auditPath: join(directory, "alpha-policy-audit.log"),
+          evidenceDirectory: join(directory, "alpha-evidence"),
           goal: "Work out what alpha does under load.",
           question: "Probe alpha's limiter.",
           task: "probe it",

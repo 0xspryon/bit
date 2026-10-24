@@ -144,10 +144,31 @@ export interface HarnessInstance {
   /**
    * The model a run gets when the caller names none.
    *
-   * Configuration rather than capability, and required rather than optional: there is no
-   * picker yet, so an instance that could not answer "which model" could not run anything.
+   * Configuration rather than capability, and required rather than optional: an instance
+   * that could not answer "which model" could not run anything, and the picker's initial
+   * selection for a newly chosen instance is this.
    */
   readonly defaultModel: string;
+  /**
+   * Every model name this instance will accept, in the form a run names one.
+   *
+   * **A value this process observed while building the harness, like {@link version}** —
+   * which is why it is here rather than a thirteenth operation on `AgentHarness`. The
+   * picker needs a list to search; the *seam* needs nothing of the sort, and a `models`
+   * member on it would be a round trip per repaint for a fact that only changes when the
+   * harness's own configuration does.
+   *
+   * What that costs, stated rather than hidden: a model added to the harness's catalogue
+   * while this process is running is not in this list until a restart. For OpenCode that
+   * means logging into a new provider needs a restart before its models can be picked; for
+   * Claude Code the list is the SDK's own and does not move at all.
+   *
+   * Never empty: an instance that could not be asked reports `[defaultModel]`, because
+   * "we could not read the catalogue" must not become "this instance can run nothing".
+   * An operator may still name a model that is not here — the harness refuses it, and that
+   * refusal is the harness's to give rather than ours to guess at.
+   */
+  readonly models: readonly string[];
 }
 
 /**

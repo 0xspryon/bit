@@ -125,6 +125,10 @@ const REFUSAL_TAGS = new Set([
   // Starting and stopping a run: every reason the server gives is an answer the compose
   // box shows next to itself, not transport trouble.
   "RunRefused",
+  // Asking for a transcript: an attempt this target does not hold is an answer. A
+  // transcript nobody kept is *not* in this list, because it is not an error at all — it
+  // comes back `200` with `source: "absent"`.
+  "AttemptNotFound",
 ]);
 
 const isRefusal = (error: unknown): boolean =>
@@ -225,13 +229,56 @@ export const server = {
    * however long the run turns out to be. The attempt id it hands back is the handle for
    * stopping it and for recognising it in {@link runs} after a reload.
    */
-  startRun: (baseUrl: string, targetId: string, instruction: string) =>
+  startRun: (
+    baseUrl: string,
+    targetId: string,
+    instruction: string,
+    /**
+     * Which harness and model, when the operator has picked.
+     *
+     * Both optional and both omitted rather than sent as `undefined`: the contract's
+     * fields are optional, and an explicitly-null field would be the browser asserting
+     * "no instance" where it means "whatever you would choose". The response says which
+     * were actually used either way.
+     */
+    pick?: { readonly instanceId?: string; readonly model?: string },
+  ) =>
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.startRun({
           params: { targetId },
-          payload: { instruction },
+          payload: {
+            instruction,
+            ...(pick?.instanceId === undefined
+              ? {}
+              : { instanceId: pick.instanceId }),
+            ...(pick?.model === undefined ? {} : { model: pick.model }),
+          },
         }),
+      ),
+    ),
+
+  /**
+   * Which agent harnesses the server configures, ready or not.
+   *
+   * Includes the unusable ones with their reason, which is the whole point: the picker
+   * keeps a configured harness visible and says why it cannot be used, rather than
+   * leaving an operator to wonder where it went.
+   */
+  harnesses: (baseUrl: string) =>
+    run(Effect.flatMap(client(baseUrl), (api) => api.fleet.harnesses())),
+
+  /**
+   * One past attempt's transcript — the server's own copy, or the harness's.
+   *
+   * `source` says which, and `ephemeral` says whether it can disappear. A transcript
+   * nobody kept comes back as a success with `source: "absent"`, because for an older
+   * attempt that is the expected answer rather than a fault.
+   */
+  transcript: (baseUrl: string, targetId: string, attemptId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.transcript({ params: { targetId, attemptId } }),
       ),
     ),
 

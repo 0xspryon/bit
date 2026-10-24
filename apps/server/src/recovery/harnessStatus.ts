@@ -21,7 +21,8 @@
  */
 import { Context, Effect, Layer } from "effect";
 
-import { AgentHarness, SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
+import { SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
+import { HarnessResolver } from "../harness/resolver";
 
 /**
  * What the harness said about one session.
@@ -36,9 +37,9 @@ import { AgentHarness, SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
  *   may have been cleared, or this is a different machine. Says nothing about what the
  *   session did while it existed.
  * - `unreachable` — we could not get an answer at all: no harness, a transport failure,
- *   a reply we cannot decode, or an attempt that ran on a harness instance this process
- *   does not configure. The last of those is new with the second harness and is the
- *   reason this takes an instance id at all; see {@link HarnessSessionStatus.of}.
+ *   a reply we cannot decode, an attempt that ran on a harness instance this process
+ *   does not configure, or one whose instance *is* configured and did not come up. The
+ *   last two are why this takes an instance id at all; see {@link HarnessSessionStatus.of}.
  *
  * All three of ours mean *uncertain*. They are kept apart because the operator reading
  * the recovery record needs to know which one it was.
@@ -86,21 +87,33 @@ export class HarnessSessionStatus extends Context.Service<
   }
 >()("bit/recovery/HarnessSessionStatus") {
   /**
-   * The live adapter over whichever harness this process configures.
+   * The live adapter over whichever harnesses this process configures.
    *
-   * Note what the four branches mean. A session that exists but reports no outcome is
+   * Note what the branches mean. A session that exists but reports no outcome is
    * genuinely still running, and is left alone. A session the harness has never heard of
    * is `missing` — which after a restart is the expected answer, because a new harness
-   * process is not guaranteed to know an old process's sessions. An attempt belonging to
-   * another instance is `unreachable` without anything being asked. Anything else is
-   * `unreachable` too, including a decode failure: being unable to understand the answer
-   * is not the same as being told nothing happened.
+   * process is not guaranteed to know an old process's sessions. An attempt whose instance
+   * this process cannot give a harness for is `unreachable` without anything being asked.
+   * Anything else is `unreachable` too, including a decode failure: being unable to
+   * understand the answer is not the same as being told nothing happened.
+   *
+   * **The instance is resolved rather than compared**, which is the one thing more than
+   * one configured instance changed here. Slice B held a single harness and could tell
+   * foreign from ours with a string comparison; now `HarnessResolver` answers it, and it
+   * answers two cases the comparison could not: an instance this process does not
+   * configure *at all*, and one it does configure whose harness did not come up. Both are
+   * `unreachable`, both carry the resolver's own sentence, and both stay apart from
+   * `missing` — because asking the wrong harness would get a confident "no such session"
+   * for a session that may be alive somewhere else, which recovery would then fence.
+   *
+   * A `null` instance is still not foreign: it is a row written before instances were
+   * recorded, by a process that had exactly one harness, so the resolver's default is the
+   * best available answer rather than a guess (migration `0014`).
    */
   static readonly layer = Layer.effect(
     HarnessSessionStatus,
     Effect.gen(function* () {
-      const harness = yield* AgentHarness;
-      const ours = harness.instance.instanceId;
+      const resolver = yield* HarnessResolver;
       return HarnessSessionStatus.of({
         of: Effect.fn("HarnessSessionStatus.of")(
           function* (harnessSessionId, harnessInstanceId) {
@@ -111,14 +124,29 @@ export class HarnessSessionStatus extends Context.Service<
                   "the attempt has no harness session recorded, so there is nothing to query; this does not establish that no work was done",
               } satisfies HarnessSessionReport;
             }
-            if (harnessInstanceId !== null && harnessInstanceId !== ours) {
+            const resolved = yield* Effect.result(
+              resolver.resolve(harnessInstanceId ?? undefined),
+            );
+            if (resolved._tag === "Failure") {
               return {
                 observed: "unreachable",
-                detail: `the attempt ran on harness instance '${harnessInstanceId}' and this process configures '${ours}', so there is nothing here that can be asked about session ${harnessSessionId}`,
+                detail: `${resolved.failure.message} — so there is nothing here that can be asked about session ${harnessSessionId}`,
+              } satisfies HarnessSessionReport;
+            }
+            // The resolver hands back the default when asked for `undefined`, so a row
+            // naming an instance has to be checked against what came back: a default that
+            // is a *different* instance must not be asked about a foreign session.
+            if (
+              harnessInstanceId !== null &&
+              resolved.success.instance.instanceId !== harnessInstanceId
+            ) {
+              return {
+                observed: "unreachable",
+                detail: `the attempt ran on harness instance '${harnessInstanceId}' and this process resolved '${resolved.success.instance.instanceId}', so there is nothing here that can be asked about session ${harnessSessionId}`,
               } satisfies HarnessSessionReport;
             }
             const result = yield* Effect.result(
-              harness.sessionStatus(harnessSessionId),
+              resolved.success.harness.sessionStatus(harnessSessionId),
             );
             if (result._tag === "Success") {
               const outcome = result.success.outcome;

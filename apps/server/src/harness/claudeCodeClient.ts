@@ -131,12 +131,35 @@ import {
 /**
  * The model a Claude Code worker runs on when nothing names one.
  *
- * A pin and not a choice, exactly as OpenCode's is: letting an operator pick is slice C's
- * work, and a server that offered a field it ignored would be worse than one that states
- * its default. Checked against the installed build's own catalogue rather than taken from
- * a document.
+ * The *default*, now that an operator can pick: what a run gets when it names no model.
+ * Checked against the installed build's own catalogue rather than taken from a document.
  */
 export const CLAUDE_CODE_DEFAULT_MODEL = "claude-sonnet-5";
+
+/**
+ * The models this harness offers the picker.
+ *
+ * **Written down, and that is the honest shape here.** The SDK's own listing —
+ * `supportedModels()` — hangs off a *live query* object, exactly like `accountInfo()`
+ * does, so reading it at layer-build time would mean spawning a CLI session and prompting
+ * nothing just to ask what models exist. `identity.ts` already refuses to probe `auth` for
+ * that reason and this is the same obstacle, so it gets the same answer: state what is
+ * known, do not invent a probe.
+ *
+ * Every id here appears in the installed `@anthropic-ai/claude-agent-sdk` build, so the
+ * list moves when the dependency does rather than when somebody remembers to edit it.
+ *
+ * **Ids rather than the `sonnet`/`opus`/`haiku` aliases the SDK also accepts.** An alias
+ * resolves inside the harness, so an attempt row that recorded one would say which family
+ * ran and not which build — and `model_id` is provenance. An operator who wants an alias
+ * can still name one: the list is what the picker offers, never what the harness accepts.
+ */
+export const CLAUDE_CODE_MODELS: readonly string[] = [
+  CLAUDE_CODE_DEFAULT_MODEL,
+  "claude-opus-5",
+  "claude-sonnet-4-5",
+  "claude-haiku-4-5",
+];
 
 /**
  * The provider every Claude Code model runs on.
@@ -440,6 +463,12 @@ export const claudeCodeHarness = (
         // mean starting one per process just to ask.
         auth: "unknown",
         defaultModel,
+        // The default first and never twice, so a caller that configured its own default
+        // gets a pickable list rather than one that omits the model it will actually use.
+        models: [
+          defaultModel,
+          ...CLAUDE_CODE_MODELS.filter((name) => name !== defaultModel),
+        ],
       };
 
       /**

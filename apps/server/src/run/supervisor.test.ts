@@ -57,6 +57,12 @@ import {
 import { newClaudeCodeSessionId } from "../harness/claudeCodeClient";
 import { HarnessTransportError } from "../harness/errors";
 import { newOpenCodeSessionId } from "../harness/openCodeClient";
+import {
+  DriverKind,
+  defaultInstanceIdForDriver,
+  type HarnessInstance,
+} from "../harness/identity";
+import { HarnessResolver } from "../harness/resolver";
 import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
@@ -77,6 +83,7 @@ import {
   type RunInput,
   type SupervisionEnd,
 } from "./supervisor";
+import { readRecordedTranscript, transcriptFilesFor } from "./transcript";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -279,6 +286,10 @@ const world = (
     McpCredentials.layer,
     RunNarrations.layer,
     supervisor.pipe(
+      // One instance in most of this file: the resolver in front of the seam is a wrapper
+      // here rather than a choice, which is the point — nothing in the supervisor changed
+      // shape when the choice arrived. The two-instance cases are in their own block.
+      Layer.provide(HarnessResolver.single),
       Layer.provide(fakeClient(scriptFor, recorder)),
       Layer.provide(stores),
       Layer.provide(McpCredentials.layer),
@@ -367,6 +378,9 @@ const draft = (root: string, targetId: string, task: string): RunInput => {
     targetId,
     workspace: base,
     auditPath: join(root, "..", "work", `${targetId}-policy-audit.log`),
+    // The target's own `evidence/` directory, where a settled attempt's transcript lands.
+    // Beside the workspace for the same reason the audit path is: outside it.
+    evidenceDirectory: join(root, "targets", targetId, "evidence"),
     goal: `Work out what ${targetId} does under load.`,
     question: `Probe ${targetId}'s limiter.`,
     task,
@@ -642,6 +656,7 @@ describe("starting a run", () => {
         fleet,
         stores,
         RunSupervisor.layer.pipe(
+          Layer.provide(HarnessResolver.single),
           Layer.provide(stubborn),
           Layer.provide(stores),
           Layer.provide(McpCredentials.layer),
@@ -1118,6 +1133,7 @@ describe("when the harness stops being readable", () => {
         stores,
         credentials,
         RunSupervisor.layer.pipe(
+          Layer.provide(HarnessResolver.single),
           Layer.provide(refusing),
           Layer.provide(stores),
           Layer.provide(credentials),
@@ -1545,6 +1561,7 @@ describe("one supervisor, two harnesses", () => {
       stores,
       endpoint,
       RunSupervisor.layer.pipe(
+        Layer.provide(HarnessResolver.single),
         Layer.provide(
           fakeClient(scriptFor, recorder, {
             installGate: harness.installGate,
@@ -1947,5 +1964,545 @@ describe("one supervisor, two harnesses", () => {
     const rows = readAfterShutdown(root, targetId);
     expect(rows.attempts).toEqual([]);
     expect(rows.events).toEqual([]);
+  });
+});
+
+/* ── More than one instance, and the run pinned to the one it started on ─────── */
+
+/**
+ * Two configured harnesses, one supervisor, and nothing in the supervisor branching on them.
+ *
+ * This is the claim slice C makes about the picker: the choice arrives as a resolver *in
+ * front of* `AgentHarness`, so the supervisor still requires one harness it cannot see a
+ * second of. What the tests below check is the consequence — a run goes to the instance it
+ * named, its row records that instance, and naming one this server cannot give is refused
+ * before anything is written.
+ */
+describe("two configured instances", () => {
+  const ALPHA_HARNESS = DriverKind.make("alpha");
+  const BETA_HARNESS = DriverKind.make("beta");
+
+  const instanceOf = (driver: DriverKind): HarnessInstance => ({
+    ...STUB_INSTANCE,
+    instanceId: defaultInstanceIdForDriver(driver),
+    driver,
+    displayName: `${driver} harness`,
+    defaultModel: `${driver}/default`,
+    models: [`${driver}/default`, `${driver}/other`],
+  });
+
+  /** Which instance each prompt went to, which is what "pinned" has to be read off. */
+  interface Routed {
+    readonly prompted: { instanceId: string; model: string }[];
+  }
+
+  const harnessFor = (
+    driver: DriverKind,
+    scriptFor: (sessionId: string) => Script,
+    recorder: Recorder,
+    routed: Routed,
+  ): AgentHarness["Service"] => {
+    const instance = instanceOf(driver);
+    const base = fakeHarnessShape(scriptFor, recorder);
+    return AgentHarness.of({
+      ...base,
+      instance,
+      // Minted in a shape that names the instance, so the attempt row and the recorder
+      // both say which harness actually created the session.
+      newSessionId: () => `ses_${driver}_${String(Math.random()).slice(2, 8)}`,
+      modelProvenance: (model) => ({ providerId: driver, modelId: model }),
+      createSession: (input) =>
+        Effect.sync(() => {
+          routed.prompted.push({
+            instanceId: instance.instanceId,
+            model: input.model,
+          });
+          const id = input.sessionId ?? "ses_chosen_by_harness";
+          recorder.created.push(id);
+          return { id };
+        }),
+    });
+  };
+
+  const twoInstanceWorld = (
+    scriptFor: (sessionId: string) => Script,
+    recorder: Recorder,
+    routed: Routed,
+    options?: { readonly betaBroken?: string },
+  ) => {
+    const root = newRoot();
+    const fleet = FleetStore.layer(root);
+    const stores = TargetStores.layer.pipe(Layer.provide(fleet));
+    const credentials = McpCredentials.layer;
+    const alpha = harnessFor(ALPHA_HARNESS, scriptFor, recorder, routed);
+    const resolver = Layer.succeed(
+      HarnessResolver,
+      HarnessResolver.fromEntries([
+        { instance: alpha.instance, harness: alpha },
+        options?.betaBroken === undefined
+          ? (() => {
+              const beta = harnessFor(
+                BETA_HARNESS,
+                scriptFor,
+                recorder,
+                routed,
+              );
+              return { instance: beta.instance, harness: beta };
+            })()
+          : {
+              instance: instanceOf(BETA_HARNESS),
+              harness: undefined,
+              reason: options.betaBroken,
+              setup: "install beta",
+            },
+      ]),
+    );
+    const layer = Layer.mergeAll(
+      fleet,
+      stores,
+      credentials,
+      RunSupervisor.layer.pipe(
+        Layer.provide(resolver),
+        Layer.provide(stores),
+        Layer.provide(credentials),
+        Layer.provide(RunNarrations.layer),
+        Layer.provide(
+          Layer.succeed(
+            WorkerEndpoints,
+            WorkerEndpoints.of({
+              urls: Effect.succeed({
+                mcp: "http://127.0.0.1:9/api/v1/mcp",
+                policy: "http://127.0.0.1:9/api/v1/policy/decide",
+              }),
+            }),
+          ),
+        ),
+      ),
+    );
+    const runtime = ManagedRuntime.make(layer);
+    const ready = runtime.runPromise(
+      Effect.gen(function* () {
+        const registry = yield* FleetStore;
+        for (const targetId of ["alpha-target", "beta-target"]) {
+          yield* registry.register({
+            targetId,
+            name: targetId,
+            scopeNote: "the local fixture only",
+          });
+        }
+        yield* registry.migrateFleet();
+      }).pipe(Effect.orDie),
+    );
+    return { root, runtime, ready };
+  };
+
+  /**
+   * A run on each instance, each pinned to the one it named.
+   *
+   * Read off the attempt row rather than off the start response, because the row is what
+   * recovery and the transcript read path both use — and `0014` stores the instance with
+   * nothing that updates it.
+   */
+  test("a run on each instance is pinned to it, in its row and in its provenance", async () => {
+    const recorder = emptyRecorder();
+    const routed: Routed = { prompted: [] };
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = twoInstanceWorld(
+      scriptFor,
+      recorder,
+      routed,
+    );
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+
+        const onAlpha = yield* supervisor.start({
+          ...draft(root, "alpha-target", "probe alpha"),
+          instanceId: "alpha",
+        });
+        yield* release(onAlpha.harnessSessionId);
+        const onBeta = yield* supervisor.start({
+          ...draft(root, "beta-target", "probe beta"),
+          instanceId: "beta",
+          model: "beta/other",
+        });
+        yield* release(onBeta.harnessSessionId);
+
+        const alphaRow = yield* withTargetStore(
+          stores,
+          "alpha-target",
+          (store) => store.loadAttempt(onAlpha.attemptId, "alpha-target"),
+        );
+        const betaRow = yield* withTargetStore(stores, "beta-target", (store) =>
+          store.loadAttempt(onBeta.attemptId, "beta-target"),
+        );
+        return { onAlpha, onBeta, alphaRow, betaRow };
+      }).pipe(Effect.orDie),
+    );
+
+    // The response says which instance ran it, and the row agrees.
+    expect(observed.onAlpha.instanceId).toBe("alpha");
+    expect(observed.alphaRow?.harness_instance_id).toBe("alpha");
+    expect(observed.onBeta.instanceId).toBe("beta");
+    expect(observed.betaRow?.harness_instance_id).toBe("beta");
+
+    // The session ids are in each harness's own format, so the *right* harness created
+    // each session rather than one of them answering for both.
+    expect(observed.onAlpha.harnessSessionId).toContain("ses_alpha_");
+    expect(observed.onBeta.harnessSessionId).toContain("ses_beta_");
+
+    // A model named goes through; a model not named takes that instance's own default,
+    // and not the other instance's.
+    expect(routed.prompted).toEqual([
+      { instanceId: "alpha", model: "alpha/default" },
+      { instanceId: "beta", model: "beta/other" },
+    ]);
+    expect(observed.onAlpha.providerId).toBe("alpha");
+    expect(observed.onBeta.modelId).toBe("beta/other");
+
+    await runtime.dispose();
+  });
+
+  test("a run that names no instance lands on the server's default", async () => {
+    const recorder = emptyRecorder();
+    const routed: Routed = { prompted: [] };
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = twoInstanceWorld(
+      scriptFor,
+      recorder,
+      routed,
+    );
+    await ready;
+
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const run = yield* supervisor.start(
+          draft(root, "alpha-target", "probe it"),
+        );
+        yield* release(run.harnessSessionId);
+        return run;
+      }).pipe(Effect.orDie),
+    );
+    // The first configured instance, which is what makes `HARNESS` a preference order.
+    expect(started.instanceId).toBe("alpha");
+    await runtime.dispose();
+  });
+
+  /**
+   * An unusable instance is refused before anything is written, with its own reason.
+   *
+   * **Nothing at all**: no attempt row and no workspace claim, which is why a second run
+   * on the working instance in the same folder still starts. The refusal is
+   * `harness_not_ready` rather than `harness_unreachable` because nothing was asked.
+   */
+  test("naming an instance that would not start is refused, and writes nothing", async () => {
+    const recorder = emptyRecorder();
+    const routed: Routed = { prompted: [] };
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = twoInstanceWorld(
+      scriptFor,
+      recorder,
+      routed,
+      { betaBroken: "beta would not start: no such binary" },
+    );
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const input = draft(root, "alpha-target", "probe it");
+        const refused = yield* Effect.result(
+          supervisor.start({ ...input, instanceId: "beta" }),
+        );
+        // The folder is free, so a run on the working instance in the same folder starts:
+        // the refusal above claimed nothing.
+        const after = yield* supervisor.start({
+          ...input,
+          instanceId: "alpha",
+        });
+        yield* release(after.harnessSessionId);
+        return { refused, after };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.refused._tag).toBe("Failure");
+    if (observed.refused._tag === "Failure") {
+      expect(observed.refused.failure.reason).toBe("harness_not_ready");
+      expect(observed.refused.failure.detail).toContain("no such binary");
+    }
+    expect(observed.after.instanceId).toBe("alpha");
+    // Exactly one session was created: the refused run never reached a harness.
+    expect(recorder.created).toHaveLength(1);
+    await runtime.dispose();
+  });
+
+  test("naming an instance this server does not configure is refused by name", async () => {
+    const recorder = emptyRecorder();
+    const routed: Routed = { prompted: [] };
+    const { scriptFor, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = twoInstanceWorld(
+      scriptFor,
+      recorder,
+      routed,
+    );
+    await ready;
+
+    const refused = await runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(RunSupervisor, (supervisor) =>
+          supervisor.start({
+            ...draft(root, "alpha-target", "probe it"),
+            instanceId: "nonesuch",
+          }),
+        ),
+      ).pipe(Effect.orDie),
+    );
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure.reason).toBe("harness_not_ready");
+      expect(refused.failure.detail).toContain("'alpha'");
+      expect(refused.failure.detail).toContain("'beta'");
+    }
+    expect(recorder.created).toEqual([]);
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+});
+
+/* ── The transcript, written at settlement ───────────────────────────────────── */
+
+/**
+ * The ceiling the bounded-fetch test asserts under.
+ *
+ * Generous — it is a machine running a real SQLite write and a scoped teardown — and still
+ * far below what an *unbounded* fetch would cost: a harness that never answers would hold
+ * the finalizer open for as long as the test runner allowed.
+ */
+const TRANSCRIPT_WAIT_CEILING = 5_000;
+
+/**
+ * What a settled attempt leaves beside its row, and what happens when it cannot.
+ *
+ * The three properties the brief put above the format, each as a behaviour:
+ *
+ * 1. **Settle first, then write.** The row and the `attempt.settled` event are there in
+ *    every case below, including the two where no transcript is.
+ * 2. **The fetch is bounded and cannot block.** A harness that never answers `messages`
+ *    settles anyway, promptly.
+ * 3. **It comes from `messages`, not from the drained stream.** The scripted narration and
+ *    the scripted message log are deliberately different here, and the file holds the
+ *    second.
+ */
+describe("the transcript at settlement", () => {
+  const transcriptWorld = (
+    scriptFor: (sessionId: string) => Script,
+    recorder: Recorder,
+    messages: AgentHarness["Service"]["messages"],
+  ) => {
+    const root = newRoot();
+    const fleet = FleetStore.layer(root);
+    const stores = TargetStores.layer.pipe(Layer.provide(fleet));
+    const credentials = McpCredentials.layer;
+    const harness = Layer.succeed(
+      AgentHarness,
+      AgentHarness.of({ ...fakeHarnessShape(scriptFor, recorder), messages }),
+    );
+    const layer = Layer.mergeAll(
+      fleet,
+      stores,
+      credentials,
+      RunSupervisor.layerWith({
+        askTimeout: "100 millis",
+        transcriptTimeout: "100 millis",
+      }).pipe(
+        Layer.provide(HarnessResolver.single),
+        Layer.provide(harness),
+        Layer.provide(stores),
+        Layer.provide(credentials),
+        Layer.provide(RunNarrations.layer),
+        Layer.provide(
+          Layer.succeed(
+            WorkerEndpoints,
+            WorkerEndpoints.of({
+              urls: Effect.succeed({
+                mcp: "http://127.0.0.1:9/api/v1/mcp",
+                policy: "http://127.0.0.1:9/api/v1/policy/decide",
+              }),
+            }),
+          ),
+        ),
+      ),
+    );
+    const runtime = ManagedRuntime.make(layer);
+    const ready = runtime.runPromise(
+      Effect.gen(function* () {
+        const registry = yield* FleetStore;
+        yield* registry.register({
+          targetId: "alpha",
+          name: "alpha",
+          scopeNote: "the local fixture only",
+        });
+        yield* registry.migrateFleet();
+      }).pipe(Effect.orDie),
+    );
+    return { root, runtime, ready };
+  };
+
+  /** The evidence directory `draft` points the run at, so a test can read the artefact. */
+  const evidenceOf = (root: string) =>
+    join(root, "targets", "alpha", "evidence");
+
+  test("a settled attempt's transcript is written from the harness's message log", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      // The narration says one thing and the message log says another, on purpose: the
+      // file must hold the *log*, because the stream has a gap between subscribing and
+      // prompting and `messages` does not.
+      narration: [narration("session.text.delta", 1)],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = transcriptWorld(scriptFor, recorder, () =>
+      Effect.succeed([
+        {
+          type: "assistant",
+          text: "what the harness retained",
+          error: undefined,
+        },
+        { type: "tool", text: "a tool call", error: undefined },
+      ]),
+    );
+    await ready;
+
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const run = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        yield* release(run.harnessSessionId);
+        // Settled: `stop` awaits the finalizer, which settles and then writes.
+        yield* Effect.result(supervisor.stop(run.attemptId));
+        return run;
+      }).pipe(Effect.orDie),
+    );
+
+    const read = await runtime.runPromise(
+      readRecordedTranscript({
+        directory: evidenceOf(root),
+        attemptId: started.attemptId,
+      }),
+    );
+    expect(read).toBeDefined();
+    expect(read?.source).toBe("recorded");
+    expect(read?.entries.map((entry) => entry.text)).toEqual([
+      "what the harness retained",
+      "a tool call",
+    ]);
+
+    // And the row is settled, which is the thing the transcript must never be allowed to
+    // come before.
+    const rows = readAfterShutdown(root, "alpha");
+    expect(rows.attempts[0]?.status).toBe("succeeded");
+    await runtime.dispose();
+  });
+
+  /**
+   * A fetch that fails does not prevent or delay the settlement.
+   *
+   * The row says `succeeded`, the `attempt.settled` event is in the log, and there is no
+   * transcript — which the read path reports as normal rather than as an error.
+   */
+  test("a settlement still happens when the transcript fetch fails", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = transcriptWorld(scriptFor, recorder, () =>
+      Effect.fail(transport("message.list", "the harness is gone")),
+    );
+    await ready;
+
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const run = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        yield* release(run.harnessSessionId);
+        yield* Effect.result(supervisor.stop(run.attemptId));
+        return run;
+      }).pipe(Effect.orDie),
+    );
+    await runtime.dispose();
+
+    const rows = readAfterShutdown(root, "alpha");
+    expect(rows.attempts[0]?.status).toBe("succeeded");
+    expect(rows.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "attempt.settled",
+    ]);
+    expect(
+      transcriptFilesFor(evidenceOf(root), started.attemptId),
+    ).toHaveLength(0);
+  });
+
+  /**
+   * A fetch that never answers is cut short, and the settlement is prompt.
+   *
+   * This is the shutdown case: the finalizer runs while the harness child is being torn
+   * down, and an unbounded ask there would wedge the exit. The `askTimeout` above is
+   * 100ms, and the transcript's own bound is separate; what is asserted is that the whole
+   * settlement still finishes in well under the real five-second default.
+   */
+  test("a transcript fetch that never answers does not block settlement", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = transcriptWorld(
+      scriptFor,
+      recorder,
+      () => Effect.never,
+    );
+    await ready;
+
+    const started = Date.now();
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const run = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        yield* release(run.harnessSessionId);
+        yield* Effect.result(supervisor.stop(run.attemptId));
+      }).pipe(Effect.orDie),
+    );
+    const elapsed = Date.now() - started;
+    await runtime.dispose();
+
+    // The real bound is five seconds; a settlement that waited it out per run would make
+    // a shutdown with three runs in flight a quarter of a minute of nothing.
+    expect(elapsed).toBeLessThan(TRANSCRIPT_WAIT_CEILING);
+    const rows = readAfterShutdown(root, "alpha");
+    expect(rows.attempts[0]?.status).toBe("succeeded");
   });
 });

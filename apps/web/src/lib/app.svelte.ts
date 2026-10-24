@@ -21,6 +21,8 @@
  */
 
 import type {
+  AttemptTranscript,
+  HarnessInstanceView,
   RunningAttempt,
   TargetCounts,
   TargetSummary,
@@ -190,6 +192,86 @@ export class App {
     this.runs.find((entry) => entry.targetId === this.viewTargetId),
   );
 
+  /* ── The harness and model picker ─────────────────────────────────────────── */
+  /**
+   * Every harness instance the server configures, ready or not.
+   *
+   * Server-fed and read once per session: it is the server's configuration plus what it
+   * observed bringing each harness up, so it does not move while the server runs.
+   *
+   * **The unusable ones are kept.** `ready` is false on them and `reason` says why, and
+   * the picker shows them with that sentence instead of dropping them — a configured
+   * harness that silently vanished would leave an operator with nothing to act on.
+   */
+  harnesses = $state<HarnessInstanceView[]>([]);
+  /**
+   * Which instance the operator has picked, or `""` for the server's default.
+   *
+   * `""` is not the same as the default instance's id, and the difference is deliberate:
+   * it means "whatever this server would choose", so the request omits the field and the
+   * server's own preference order answers it. An operator who picks explicitly gets
+   * exactly that instance or a refusal, never a substitution.
+   */
+  pickedInstanceId = $state("");
+  /** Which model, or `""` for the picked instance's own default. */
+  pickedModel = $state("");
+  /** Whether the composer's picker popover is open. */
+  pickerOpen = $state(false);
+  /** What the model list is being filtered by. Reset when the popover closes. */
+  modelQuery = $state("");
+
+  /** The instance a run would go to right now, as far as this tab can tell. */
+  pickedInstance = $derived(
+    this.harnesses.find(
+      (entry) =>
+        entry.instanceId ===
+        (this.pickedInstanceId === ""
+          ? (this.harnesses.find((candidate) => candidate.isDefault)
+              ?.instanceId ?? "")
+          : this.pickedInstanceId),
+    ),
+  );
+  /** The model a run would use, resolved through the instance's default. */
+  effectiveModel = $derived(
+    this.pickedModel === ""
+      ? (this.pickedInstance?.defaultModel ?? "")
+      : this.pickedModel,
+  );
+  /**
+   * Whether anything on this server can run at all.
+   *
+   * Distinct from "the picked one is ready": the composer disables submission on this,
+   * and the picker explains the per-instance case. A server with two configured harnesses
+   * and neither usable shows both rows with both reasons.
+   */
+  anyHarnessReady = $derived(this.harnesses.some((entry) => entry.ready));
+
+  /* ── Transcripts ──────────────────────────────────────────────────────────── */
+  /**
+   * The last attempt this tab started, per target.
+   *
+   * **The only handle a browser has on a settled attempt today**, and worth being honest
+   * about why. A run leaves {@link runs} the moment it settles — that list is what the
+   * server is *supervising* — so without this there would be nothing to ask a transcript
+   * about until the flow that lists an engagement's attempts exists, which is Flow B's.
+   * Keyed by target so switching tabs does not offer one target's attempt under another's.
+   *
+   * It does not survive a reload, and that is not papered over: the transcript is on the
+   * server either way, and inventing a list of past attempts here would be inventing the
+   * screen Flow B owns.
+   */
+  lastAttempts = $state<Record<string, string>>({});
+  /** The attempt a transcript can be read for on the open target, if this tab started one. */
+  readableAttemptId = $derived(this.lastAttempts[this.viewTargetId] ?? "");
+
+  /** The transcript last read, with where it came from. */
+  transcript = $state<AttemptTranscript | undefined>(undefined);
+  /** Which attempt {@link transcript} is about, so a stale read is never shown. */
+  transcriptAttemptId = $state("");
+  transcriptLoading = $state(false);
+  /** Unreachable-server text for the transcript panel. Refusals arrive in the value. */
+  transcriptDetail = $state("");
+
   /* New target */
   dialogOpen = $state(false);
   /** Server-fed: the folder currently being listed. */
@@ -259,6 +341,9 @@ export class App {
       this.password = "";
       this.screen = "welcome";
       await this.loadTargets();
+      // Once per session, with the target list: the harness configuration does not move
+      // while a server runs, and the composer on every open target reads the same answer.
+      await this.loadHarnesses();
       this.openRequested();
     } finally {
       this.connecting = false;
@@ -287,6 +372,7 @@ export class App {
       this.dialogRoot = call.value.workspaceRoot;
       this.screen = "welcome";
       await this.loadTargets();
+      await this.loadHarnesses();
       // A deep link resumes into the target it named, which is the whole point of the
       // URL carrying one: reloading the tab must not drop you back on the list.
       this.openRequested();
@@ -660,6 +746,15 @@ export class App {
         this.serverUrl,
         targetId,
         this.instruction.trim(),
+        // Omitted when the operator has not picked, which means "whatever this server
+        // would choose" rather than any particular instance. The response says which it
+        // used, so provenance comes back either way.
+        {
+          ...(this.pickedInstanceId === ""
+            ? {}
+            : { instanceId: this.pickedInstanceId }),
+          ...(this.pickedModel === "" ? {} : { model: this.pickedModel }),
+        },
       );
       if (call._tag === "Unreachable") {
         this.runDetail = "No server answered at this address.";
@@ -678,6 +773,12 @@ export class App {
         return;
       }
       this.instruction = "";
+      // Remembered so its transcript is readable once it settles: a run leaves `runs` at
+      // settlement, and nothing else a browser holds survives that.
+      this.lastAttempts = {
+        ...this.lastAttempts,
+        [targetId]: call.value.attemptId,
+      };
       // Pushed from the response rather than waited for in a list refresh: the run is
       // going, and the screen should say so on the same tick the server said it.
       this.runs = [
@@ -746,6 +847,131 @@ export class App {
     }
   }
 
+  /**
+   * Reads which harnesses this server configures.
+   *
+   * A failure leaves the list empty, which the composer reads as "nothing to pick from"
+   * and falls back to letting the server choose — the run still starts, and the refusal
+   * if there is no harness comes from the server with its own words. An empty picker is
+   * better than a picker full of guesses.
+   */
+  async loadHarnesses() {
+    const call = await server.harnesses(this.serverUrl);
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") this.signOut("expired");
+      return;
+    }
+    if (call._tag === "Unreachable") return;
+    this.harnesses = call.value.map((entry) => ({ ...entry }));
+    // A picked instance the server no longer configures is dropped back to the default
+    // rather than kept and refused later: this runs on a fresh session, so the only way
+    // to be holding a stale id is a server that was reconfigured under us.
+    if (
+      this.pickedInstanceId !== "" &&
+      !this.harnesses.some(
+        (entry) => entry.instanceId === this.pickedInstanceId,
+      )
+    ) {
+      this.pickedInstanceId = "";
+      this.pickedModel = "";
+    }
+  }
+
+  /**
+   * Picks a harness instance, and resets the model with it.
+   *
+   * The model is cleared rather than carried across, because a model name is meaningful
+   * only inside one instance: `gpt-5.6-sol` is OpenCode's and `claude-sonnet-5` is Claude
+   * Code's, and carrying one over would hand the new harness a name it will refuse.
+   * `""` means that instance's own default.
+   */
+  pickInstance(instanceId: string) {
+    this.pickedInstanceId = instanceId;
+    this.pickedModel = "";
+    this.modelQuery = "";
+  }
+
+  /** Picks a model inside the picked instance. `""` means the instance's default. */
+  pickModel(model: string) {
+    this.pickedModel = model;
+    this.pickerOpen = false;
+    this.modelQuery = "";
+  }
+
+  togglePicker() {
+    this.pickerOpen = !this.pickerOpen;
+    if (!this.pickerOpen) this.modelQuery = "";
+  }
+
+  /**
+   * Reads one attempt's transcript: ours if the server kept one, the harness's if not.
+   *
+   * **An absent transcript is a success, not a failure.** The server answers `200` with
+   * `source: "absent"` for an attempt nobody kept one for, because that is the normal end
+   * state of anything old enough — harnesses delete their own after a while — and
+   * `transcriptDetail` is reserved for a server that did not answer at all.
+   */
+  async loadTranscript(targetId: string, attemptId: string) {
+    this.transcriptAttemptId = attemptId;
+    this.transcriptLoading = true;
+    this.transcriptDetail = "";
+    this.transcript = undefined;
+    try {
+      const call = await server.transcript(this.serverUrl, targetId, attemptId);
+      // A second request may have overtaken this one. Whatever came back is about an
+      // attempt that is no longer on screen, so it is dropped rather than shown.
+      if (this.transcriptAttemptId !== attemptId) return;
+      if (call._tag === "Unreachable") {
+        this.transcriptDetail = "No server answered at this address.";
+        return;
+      }
+      if (call._tag === "Refused") {
+        const error = call.error;
+        if (error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        this.transcriptDetail =
+          "message" in error && typeof error.message === "string"
+            ? error.message
+            : "That transcript could not be read.";
+        return;
+      }
+      this.transcript = call.value;
+
+      /**
+       * A recorded transcript is proof the attempt settled, so stop claiming it is running.
+       *
+       * The server writes its own artefact inside the settlement finalizer, *after* the
+       * attempt row and its `attempt.settled` event — so `source: "recorded"` cannot exist
+       * for a run that is still going. This tab's running list is refreshed on open, on
+       * start and on stop and nowhere else, so a run that settled on its own leaves the
+       * composer showing "Running for Ns" beside a transcript of the finished run: a
+       * screen contradicting itself, where the part that looks wrong is the part that is
+       * right.
+       *
+       * **This is not a live feed.** There is no interval, no poll and no subscription —
+       * Day 6 owns those. It is one refetch, on evidence already in hand, declining to keep
+       * showing data it has just been told is stale.
+       *
+       * **Only for `recorded`.** A `harness` source says the harness still holds the
+       * session, which says nothing about whether the run finished; and `absent` is also
+       * what a foreign instance and an attempt with no session return, so neither supports
+       * the inference. Guarded on the composer actually showing it, so a read of an old
+       * attempt costs no request.
+       */
+      if (
+        call.value.source === "recorded" &&
+        this.runs.some((entry) => entry.attemptId === attemptId)
+      ) {
+        await this.loadRuns();
+      }
+    } finally {
+      if (this.transcriptAttemptId === attemptId)
+        this.transcriptLoading = false;
+    }
+  }
+
   /** Replaces the running list with what the server is supervising. */
   async loadRuns() {
     const call = await server.runs(this.serverUrl);
@@ -800,6 +1026,18 @@ export class App {
     this.starting = false;
     this.stopping = false;
     this.runDetail = "";
+    // The harness list is *not* cleared: it is this server's configuration, not a screen
+    // state, and a scenario that emptied it would make the composer claim a server has no
+    // harness when it has two. The *selection* is cleared, because that is a screen state.
+    this.pickedInstanceId = "";
+    this.pickedModel = "";
+    this.pickerOpen = false;
+    this.modelQuery = "";
+    this.transcript = undefined;
+    this.transcriptAttemptId = "";
+    this.transcriptLoading = false;
+    this.transcriptDetail = "";
+    this.lastAttempts = {};
   }
 }
 

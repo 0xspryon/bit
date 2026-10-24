@@ -18,9 +18,12 @@
    * page look decided.
    *
    * What is new is {@link ComposeBox} beneath the frame: a run can be started
-   * and stopped against the open target. The transcript it would produce is
-   * deliberately absent — the run narrates to an in-process bus with no
-   * subscriber yet, and the next slice owns both the stream and the format.
+   * and stopped against the open target, on a harness and model the operator
+   * picks. The *live* transcript is still deliberately absent — the run narrates
+   * to an in-process bus with no subscriber yet, and Day 6 owns the stream — but
+   * {@link TranscriptPanel} reads back what a settled attempt left behind, which
+   * is a different thing: the server's own artefact when it has one, and the
+   * harness's own copy, labelled as the thing that may be gone, when it does not.
    */
   import Badge from "../components/Badge.svelte";
   import Button from "../components/Button.svelte";
@@ -28,6 +31,7 @@
   import PageFrame from "../components/PageFrame.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import TargetHeader from "../components/TargetHeader.svelte";
+  import TranscriptPanel from "../components/TranscriptPanel.svelte";
   import { IconSearch } from "../icons";
   import { navGroups } from "../mock";
   import type { App } from "../app.svelte";
@@ -136,6 +140,13 @@
       control for Findings and Traffic too.
     -->
     {#if app.navItem === "hunts"}
+      <!--
+        The transcript sits above the composer and below the frame, for the same reason the
+        composer does: it is about the target rather than about whichever page is showing.
+        It renders nothing at all until this tab has started a run here, which is the only
+        handle a browser has on a settled attempt until Flow B lists them.
+      -->
+      <TranscriptPanel {app} />
       <ComposeBox {app} />
     {/if}
   </div>

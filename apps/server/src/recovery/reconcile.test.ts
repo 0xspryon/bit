@@ -33,6 +33,7 @@ import { join } from "node:path";
 import { Effect, Layer, Redacted } from "effect";
 
 import { AgentHarness } from "../harness/agentHarness";
+import { HarnessResolver } from "../harness/resolver";
 import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
 import {
   defaultInstanceIdForDriver,
@@ -1321,7 +1322,13 @@ describe("the live harness adapter's own mapping", () => {
           harness.of("ses_old", "opencode"),
         ).pipe(
           Effect.provide(
-            HarnessSessionStatus.layer.pipe(Layer.provide(clientLayer(answer))),
+            HarnessSessionStatus.layer.pipe(
+              // One configured instance, which is what the slice-B comparison was; the
+              // foreign-instance case now goes through the resolver and is covered in
+              // `harness/resolver.test.ts`.
+              Layer.provide(HarnessResolver.single),
+              Layer.provide(clientLayer(answer)),
+            ),
           ),
         ),
       ),

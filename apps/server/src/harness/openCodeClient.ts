@@ -278,21 +278,6 @@ export const openCodeHarness = (
     Effect.gen(function* () {
       const { server } = yield* OpenCodeServer;
 
-      const instance: HarnessInstance = {
-        instanceId: defaultInstanceIdForDriver(OPENCODE_DRIVER),
-        driver: OPENCODE_DRIVER,
-        displayName: "OpenCode",
-        // Read off `/api/info` during readiness, so it is the build that answered rather
-        // than the one on the PATH when somebody last looked.
-        version: server.version,
-        installed: true,
-        // See `identity.ts` on why this is not probed: `opencode serve` starts without
-        // provider credentials and only fails at prompt time, so anything else here would
-        // be a guess.
-        auth: "unknown",
-        defaultModel,
-      };
-
       /**
        * The transport every generated call runs on.
        *
@@ -375,6 +360,59 @@ export const openCodeHarness = (
               }),
           ),
         );
+
+      /**
+       * The catalogue, read once, as the strings a run actually names a model with.
+       *
+       * `api.model.list()` answers every model this server's configured providers expose,
+       * and `providerID/id` is the one form that is also what `createSession` is handed
+       * and what `openCodeModelProvenance` splits — so the picker, the attempt row and the
+       * wire all agree on one spelling with nothing in between to get it wrong.
+       *
+       * **A failure degrades to the default model and does not refuse the harness.** A
+       * catalogue is for choosing with; being unable to read it is a reason the picker has
+       * one entry, not a reason this deployment cannot run anything. Contrast
+       * `claudeCodeClient.ts`'s version read, which *does* refuse — because that one is the
+       * evidence for a safety property rather than a convenience.
+       *
+       * The default is kept at the front and deduplicated into the list, so the model a
+       * run gets when it names none is always pickable and never listed twice.
+       */
+      const listed = yield* Effect.result(
+        bounded("model.list", timeouts.control, api.model.list()),
+      );
+      if (listed._tag === "Failure") {
+        yield* Effect.logWarning(
+          "could not read OpenCode's model catalogue; the picker will offer this instance's default model only",
+          { detail: listed.failure.message },
+        );
+      }
+      const catalogue =
+        listed._tag === "Success"
+          ? listed.success.data.map(
+              (model) => `${model.providerID}/${model.id}`,
+            )
+          : [];
+      const models = [
+        defaultModel,
+        ...catalogue.filter((name) => name !== defaultModel).sort(),
+      ];
+
+      const instance: HarnessInstance = {
+        instanceId: defaultInstanceIdForDriver(OPENCODE_DRIVER),
+        driver: OPENCODE_DRIVER,
+        displayName: "OpenCode",
+        // Read off `/api/info` during readiness, so it is the build that answered rather
+        // than the one on the PATH when somebody last looked.
+        version: server.version,
+        installed: true,
+        // See `identity.ts` on why this is not probed: `opencode serve` starts without
+        // provider credentials and only fails at prompt time, so anything else here would
+        // be a guess.
+        auth: "unknown",
+        defaultModel,
+        models,
+      };
 
       /**
        * Brands a directory as the absolute path the client's types require.

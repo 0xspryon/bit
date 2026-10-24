@@ -28,6 +28,7 @@ import {
   type ClientTimeouts,
 } from "../harness/openCodeClient";
 import { OpenCodeServer } from "../harness/openCodeServer";
+import { HarnessResolver } from "../harness/resolver";
 import { McpCredentials } from "../mcp/credentials";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { installOpenCodeGate } from "../policy/install";
@@ -224,7 +225,12 @@ export const spikeLayer = (options: SpikeOptions = {}) => {
     harness,
     // Recovery asks the live harness, so it is wired from the same client the worker
     // runs on rather than from a second connection to the same server.
-    HarnessSessionStatus.layer.pipe(Layer.provide(harness)),
+    // `HarnessResolver.single` is the one-instance resolver: the spike drives one harness
+    // and chooses nothing, so the resolver is a wrapper here rather than a decision.
+    HarnessSessionStatus.layer.pipe(
+      Layer.provide(HarnessResolver.single),
+      Layer.provide(harness),
+    ),
     Layer.succeed(SpikePaths, { workspace, databaseFile, auditFile }),
   );
 };

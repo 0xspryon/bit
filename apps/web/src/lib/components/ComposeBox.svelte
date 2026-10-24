@@ -8,11 +8,17 @@
    * one of them at a time per target, the control flips to Stop while it runs, and nothing
    * here pretends to show what the agent is doing.
    *
-   * **There is deliberately no transcript.** The run narrates — the server publishes every
-   * step of it onto an in-process bus — and nothing subscribes yet. The next slice adds the
-   * stream and the transcript, and a format invented here would be the one that slice
-   * inherited without having chosen it. What this shows instead is the honest minimum: that
-   * a run is going, how long it has been going, and the attempt it is going under.
+   * **There is deliberately no *live* transcript.** The run narrates — the server publishes
+   * every step of it onto an in-process bus — and nothing subscribes yet; the stream is
+   * Day 6's. What a *settled* attempt left behind is readable, and that is a different
+   * thing: the server writes the harness's own log into the target's `evidence/` directory
+   * when the attempt settles, and {@link TranscriptPanel} reads it back. What this box
+   * shows while a run is going is still the honest minimum: that it is going, how long it
+   * has been going, and the attempt it is going under.
+   *
+   * **The harness and the model are chosen here.** {@link HarnessPicker} is a popover on
+   * this row, which is why it is here rather than in the shell: the choice belongs to the
+   * thing being submitted, and it must not disturb the Level 2 frame behind it.
    *
    * **The elapsed time is a fact about the request, not a deadline.** Nothing counts down
    * and nothing settles when it runs out: settlement is the harness's to decide
@@ -20,6 +26,7 @@
    * genuinely unbounded.
    */
   import Button from "./Button.svelte";
+  import HarnessPicker from "./HarnessPicker.svelte";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
@@ -55,11 +62,36 @@
    * a refusal would be worse than showing the refusal the header already carries.
    */
   let ready = $derived(app.viewState === "ready");
+  /**
+   * Whether the harness the operator picked will take a run.
+   *
+   * Read off the picker's own answer rather than guessed: an instance that is configured
+   * and unusable is *visible* and not *ready*, and submitting into it would produce a
+   * refusal the server has already told us about. The sentence under the box says which,
+   * so the disabled button is never unexplained.
+   */
+  let harnessReady = $derived(app.pickedInstance?.ready === true);
   let canSubmit = $derived(
     ready &&
+      harnessReady &&
       running === undefined &&
       !app.starting &&
       app.instruction.trim().length > 0,
+  );
+  /**
+   * Why the box will not submit, when the reason is the harness rather than the text.
+   *
+   * The picked instance's own reason when there is one, the server's "nothing configured"
+   * when there is not. Never a generic "cannot run": a refusal an operator cannot act on
+   * is the thing this product keeps refusing to render.
+   */
+  let harnessNote = $derived(
+    harnessReady
+      ? ""
+      : app.harnesses.length === 0
+        ? "This server configures no agent harness, so it will refuse every run."
+        : (app.pickedInstance?.reason ??
+          "The harness this run would use is not usable on this server."),
   );
 
   function formatElapsed(ms: number): string {
@@ -120,13 +152,7 @@
         bind:value={app.instruction}
         {onkeydown}></textarea>
       <div class="controls">
-        <!--
-          The model is shown and not chosen. This server pins one; a picker is a later
-          slice, and a dropdown that the server ignored would be worse than a label.
-        -->
-        <span class="model mono" title="This server pins one model.">
-          gpt-5.6-sol
-        </span>
+        <HarnessPicker {app} />
         <Button
           variant="primary"
           loading={app.starting}
@@ -137,6 +163,15 @@
         </Button>
       </div>
     </div>
+  {/if}
+
+  {#if harnessNote !== "" && running === undefined}
+    <!--
+      Not `role="alert"`: this is a standing condition of the server rather than a response
+      to something the operator just did, and announcing it on every repaint would be
+      noise. The refusal below *is* an alert, because it is an answer.
+    -->
+    <p class="note">{harnessNote}</p>
   {/if}
 
   {#if app.runDetail !== ""}
@@ -180,10 +215,6 @@
     display: flex;
     align-items: center;
     gap: 10px;
-  }
-  .model {
-    font-size: 11px;
-    color: var(--text-faint);
   }
   .status {
     display: flex;

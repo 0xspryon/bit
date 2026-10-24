@@ -52,6 +52,8 @@ export const SESSION_PATH = apiPath("session");
 export const TARGETS_PATH = apiPath("targets");
 /** The server-side folder picker. */
 export const FOLDERS_PATH = apiPath("folders");
+/** Which agent harnesses this server configures, and what each will run. */
+export const HARNESSES_PATH = apiPath("harnesses");
 
 /* ── Session ─────────────────────────────────────────────────────────────────── */
 
@@ -396,12 +398,36 @@ export const RUNS_PATH = apiPath("runs");
  * first place — and a `intentId` field here would be a contract the UI could not yet fill
  * honestly.
  *
- * Which model runs it is deliberately absent too: this server pins one, and a picker is
- * two slices away. A field the server ignored would be worse than no field.
+ * What is *not* a shortfall any more is which agent runs it. Both fields below are
+ * optional and both mean the same thing when absent: "whatever this server would pick".
+ * The server's pick is the first ready instance in its own configuration order and that
+ * instance's default model, and the response says which it actually used — so a client that
+ * sends neither still gets provenance back rather than having to assume it.
  */
 export const RunDraft = Schema.Struct({
   /** What the operator wants done. Becomes the prompt verbatim. */
   instruction: Schema.NonEmptyString,
+  /**
+   * Which configured harness to run on. Absent means the server's default.
+   *
+   * The id from {@link HarnessInstanceView}, never a driver slug: a driver names an
+   * implementation and an instance names a configuration of one, and only the second is
+   * something a run can be pinned to. An id this server does not configure, or one whose
+   * harness did not come up, is refused `harness_not_ready` — never silently swapped for a
+   * working one, because an attempt records which instance ran it and a quiet substitution
+   * would make that record a lie.
+   */
+  instanceId: Schema.optional(Schema.String),
+  /**
+   * Which model, inside that instance. Absent means the instance's default.
+   *
+   * Meaningful only against an instance: `gpt-5.6-sol` is a name OpenCode's catalogue
+   * gives and `claude-sonnet-5` is one Claude Code's does, and neither resolves without
+   * knowing which harness was asked. Not validated against the instance's listed models —
+   * that list is what the picker *offers*, and whether a model can run is the harness's
+   * answer to give.
+   */
+  model: Schema.optional(Schema.String),
 });
 export type RunDraft = typeof RunDraft.Type;
 
@@ -485,7 +511,7 @@ export type RunStopped = typeof RunStopped.Type;
 /**
  * A run this server will not start or stop.
  *
- * One error with five reasons rather than five errors, because the browser does one thing
+ * One error with several reasons rather than one error type each, because the browser does one thing
  * with all of them — shows the sentence next to the compose box — and the reasons differ
  * only in what an operator does next:
  *
@@ -499,12 +525,15 @@ export type RunStopped = typeof RunStopped.Type;
  *   will not overwrite. The run is refused rather than started ungated: a worker running
  *   against somebody's systems with no record of what it was allowed to do is worse than
  *   a run that did not start.
+ * - `harness_not_ready` — the instance the run named is not configured on this server, or
+ *   is configured and would not start. Nothing at all was written: not a folder claim, not
+ *   a row. The operator picks a different harness, or installs the one they picked.
  * - `harness_unreachable` — the harness did not answer while the run was being set up.
  *   Nothing was prompted; if an attempt row was written it is left for the startup sweep.
  * - `store_unavailable` — the target's database could not be written to.
  * - `unknown_attempt` — nothing is running under that id *in this process*.
  *
- * `409` for all five. Each has a defensible status of its own — `503` for `no_harness`,
+ * `409` for all of them. Each has a defensible status of its own — `503` for `no_harness`,
  * `404` for `unknown_attempt` — and a tagged error carries one, so the choice is between
  * five error types the client must handle separately and one status that is honest for
  * every case: the server is not in a state to do what was asked. The reason is in the
@@ -534,6 +563,19 @@ export class RunRefused extends Schema.TaggedError<RunRefused>()(
        * MCP registration are per attempt, this is the honest answer.
        */
       "workspace_busy",
+      /**
+       * The harness instance this run named is not one this server can give it.
+       *
+       * Kept apart from `harness_unreachable` because **nothing was asked**. That one
+       * means a harness was there and did not answer while a run was being set up; this
+       * one means the instance is not configured here at all, or is configured and did not
+       * come up — a fact about this server's configuration, with a different fix. The
+       * detail names the instance and lists the ones this server is driving.
+       *
+       * Never a fallback onto a working harness. An attempt records the instance that ran
+       * it, and quietly substituting another would make that record wrong.
+       */
+      "harness_not_ready",
       "harness_unreachable",
       "store_unavailable",
       "unknown_attempt",
@@ -544,6 +586,167 @@ export class RunRefused extends Schema.TaggedError<RunRefused>()(
 ) {
   override get message(): string {
     return `${this.reason}: ${this.detail}`;
+  }
+}
+
+/* ── Harnesses ───────────────────────────────────────────────────────────────── */
+
+/**
+ * One configured harness instance, as the picker sees it.
+ *
+ * ## The two eligibility predicates, and why this carries both answers
+ *
+ * `enabled` and `ready` are kept apart on the server (`harness/resolver.ts`, adopted from
+ * T3Code) because disabling is immediate while an observation lingers: `enabled` is what
+ * the operator says now, `ready` folds in what the last look said. The server already
+ * applies the weaker one — every row here is one it is *configured* to drive — so what
+ * travels is the stronger answer plus its reason.
+ *
+ * **The consequence is the rule: an unusable instance stays listed.** A picker that dropped
+ * a harness the operator had configured would answer "why is OpenCode missing?" with
+ * silence. So an instance that will not start is here, not offered, and says what it said.
+ *
+ * ## What `ready` can honestly mean
+ *
+ * **Not "authenticated".** `opencode serve` starts with no provider credentials and only
+ * fails at prompt time; the Claude Agent SDK's `accountInfo()` needs a live session. So
+ * `auth` is `unknown` on every instance today and folding it into `ready` would make every
+ * working installation read as broken. `ready` means the server built the harness and is
+ * holding it: the binary is there, the version floor is met, and a run can be handed over.
+ *
+ * The cost is stated rather than hidden: **an instance that is installed but not logged in
+ * reads as ready**, and the first thing an operator sees is a refused run. The alternative
+ * was a probe whose answer would be a guess, and a guess here would say a login is fine
+ * when it is not.
+ */
+export const HarnessInstanceView = Schema.Struct({
+  /** What a run names, and what an attempt row is pinned to. */
+  instanceId: Schema.String,
+  /**
+   * Which implementation this is a configuration of: `opencode`, `claude-code`.
+   *
+   * Shown, never routed by. It is re-derived from the instance against this server's
+   * current configuration and is deliberately not stored against a run (migration `0014`),
+   * so a browser that dispatched on it would be dispatching on something the server has
+   * refused to persist.
+   */
+  driver: Schema.String,
+  /** For the operator's screen. Never an identity. */
+  displayName: Schema.String,
+  /** The harness's own version string, as it reported it. */
+  version: Schema.String,
+  /** Whether a run may be sent here. See this struct's header on what it means. */
+  ready: Schema.Boolean,
+  /**
+   * Why not, when it is not ready. Always set when `ready` is false.
+   *
+   * The harness's own words about why it would not start, so a row that is visible always
+   * has something to say for itself.
+   */
+  reason: Schema.optional(Schema.String),
+  /** What to do about it: install something, upgrade something. */
+  setup: Schema.optional(Schema.String),
+  /**
+   * Whether the harness says it can reach its provider.
+   *
+   * `unknown` is the answer on every instance today and is a real answer rather than a
+   * missing one — see this struct's header.
+   */
+  auth: Schema.Literals(["authenticated", "unauthenticated", "unknown"]),
+  /** Whether a run that names no instance lands here. */
+  isDefault: Schema.Boolean,
+  /** The model a run on this instance gets when it names none. Always in `models`. */
+  defaultModel: Schema.String,
+  /**
+   * Every model this instance offers, in the form a run names one.
+   *
+   * What the picker searches. Observed when the server built the harness, so a model added
+   * to the harness's catalogue since then is not here until a restart — and an operator may
+   * still name one that is not listed, because whether a model runs is the harness's answer
+   * rather than this list's.
+   */
+  models: Schema.Array(Schema.String),
+});
+export type HarnessInstanceView = typeof HarnessInstanceView.Type;
+
+/* ── Transcripts ─────────────────────────────────────────────────────────────── */
+
+/**
+ * Where one attempt's transcript came from. Never collapsed into "we have a transcript".
+ *
+ * - `recorded` — **ours**, written into the target's `evidence/` directory when the attempt
+ *   settled, content-hashed and keyed to the attempt. The system of record: still there in
+ *   a year.
+ * - `harness` — the harness's own log of that session, asked for now. The richer view while
+ *   it lasts, and it lasts exactly as long as the harness feels like keeping it.
+ * - `absent` — neither. Not an error: for an older attempt it is the expected answer.
+ */
+export const TranscriptSource = Schema.Literals([
+  "recorded",
+  "harness",
+  "absent",
+]);
+export type TranscriptSource = typeof TranscriptSource.Type;
+
+/** One message of a transcript, as this application reads one. */
+export const TranscriptEntry = Schema.Struct({
+  index: Schema.Int,
+  /** The harness's own entry type, unmapped: `assistant`, `tool`, `result`. */
+  type: Schema.String,
+  text: Schema.String,
+  error: Schema.optional(Schema.String),
+});
+export type TranscriptEntry = typeof TranscriptEntry.Type;
+
+/**
+ * One attempt's transcript, with where it came from attached.
+ *
+ * **Both sources are wanted and they are not equal-status.** Ours is the record and is
+ * preferred whenever we have one; the harness's is the fallback and the live-poking view.
+ * {@link ephemeral} is the field that keeps a screen from presenting them as the same kind
+ * of thing — Claude Code deletes its local transcripts after `cleanupPeriodDays`, 30 by
+ * default, and an OpenCode session lives in a server process that restarts.
+ *
+ * So a harness-sourced transcript must read as **"from the harness, may be gone"**, and an
+ * absent one must read as **normal** rather than as a failure. That is why this is a 200
+ * with `source: "absent"` and not a 404: "we did not keep one and the harness has forgotten
+ * it" is the ordinary end state of every attempt old enough, and an error status would make
+ * a browser treat the common case as a fault.
+ */
+export const AttemptTranscript = Schema.Struct({
+  attemptId: Schema.String,
+  targetId: Schema.String,
+  source: TranscriptSource,
+  /** True only for `harness`: what is shown can disappear. */
+  ephemeral: Schema.Boolean,
+  /** A sentence for the operator, set on every source including a successful read. */
+  note: Schema.String,
+  entries: Schema.Array(TranscriptEntry),
+  /** Entries this answer stopped short of. A transcript can be very long. */
+  truncated: Schema.Boolean,
+  /** Where our own artefact is on the server. Set only for `recorded`. */
+  path: Schema.optional(Schema.String),
+  /** The content hash in that artefact's filename. Set only for `recorded`. */
+  contentHash: Schema.optional(Schema.String),
+  /** When we wrote it. Set only for `recorded`. */
+  writtenAt: Schema.optional(EpochMillis),
+});
+export type AttemptTranscript = typeof AttemptTranscript.Type;
+
+/**
+ * An attempt that is not in the target this request named.
+ *
+ * Its own refusal rather than an empty transcript, because the two are different mistakes:
+ * a transcript nobody kept is normal, and an attempt id that does not belong to this target
+ * is a request built from the wrong pieces.
+ */
+export class AttemptNotFound extends Schema.TaggedError<AttemptNotFound>()(
+  "AttemptNotFound",
+  { targetId: Schema.String, attemptId: Schema.String },
+  { httpApiStatus: 404 },
+) {
+  override get message(): string {
+    return `no attempt '${this.attemptId}' is recorded in target '${this.targetId}'`;
   }
 }
 
@@ -718,6 +921,41 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
     HttpApiEndpoint.get("runs", "/runs", {
       success: Schema.Array(RunningAttempt),
     }),
+    /**
+     * Which agent harnesses this server configures, ready or not.
+     *
+     * A fact about the *process* and not about any target, like `runs`: the picker on every
+     * open target's composer shows the same list, and one request answers all of them.
+     *
+     * **It lists unusable instances too**, with their reason — see
+     * {@link HarnessInstanceView}. A client filters by `ready` to decide what to offer and
+     * shows the rest with what they said, which is the one behaviour this endpoint exists
+     * to make possible.
+     */
+    HttpApiEndpoint.get("harnesses", "/harnesses", {
+      success: Schema.Array(HarnessInstanceView),
+    }),
+    /**
+     * One past attempt's transcript: ours if we kept one, the harness's if we did not.
+     *
+     * The attempt is under its target in the path because that is where it is recorded —
+     * attempt rows live in the target's own `hunt.sqlite` and our transcript artefact lives
+     * in that target's `evidence/` directory, so neither is findable without the target id.
+     *
+     * **Answers 200 with `source: "absent"` rather than 404 when there is nothing.** For an
+     * attempt old enough that is the expected end state: we may not have written one, and
+     * the harness deletes its own. `AttemptNotFound` is reserved for the different mistake
+     * of naming an attempt this target does not hold.
+     */
+    HttpApiEndpoint.get(
+      "transcript",
+      "/targets/:targetId/attempts/:attemptId/transcript",
+      {
+        params: { targetId: Schema.String, attemptId: Schema.String },
+        success: AttemptTranscript,
+        error: [AttemptNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
   )
   .middleware(SessionGuard) {}
 

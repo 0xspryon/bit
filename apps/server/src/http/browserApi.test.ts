@@ -42,6 +42,9 @@ import { McpCallCounter } from "../mcp/server";
 import { FleetStore, HUNT_FILE } from "../persistence/fleet";
 import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
+import { InstanceId } from "../harness/identity";
+import { HarnessResolver } from "../harness/resolver";
+import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
 import { RunSupervisor } from "../run/supervisor";
 import { PolicyDecisions, type PolicyConfig } from "../policy/service";
 
@@ -90,6 +93,34 @@ const browserApi = browserApiRoutes({ workspaceRoot }).pipe(
   // route, its guard and its typed refusal — and standing up an agent to check a 409
   // would make this suite depend on a provider login.
   Layer.provide(RunSupervisor.unavailable),
+  /**
+   * Two configured instances, one of which would not start.
+   *
+   * No harness is *driven* here — `RunSupervisor.unavailable` refuses every start — and
+   * that is the point of splitting the two: the harness **listing** is configuration plus
+   * what a server observed, and it has to answer correctly on a server that cannot run
+   * anything. The broken entry is what proves the route keeps an unusable instance visible
+   * with its reason rather than filtering it out.
+   */
+  Layer.provide(
+    Layer.succeed(
+      HarnessResolver,
+      HarnessResolver.fromEntries([
+        { instance: STUB_INSTANCE, harness: stubHarness() },
+        {
+          instance: {
+            ...STUB_INSTANCE,
+            instanceId: InstanceId.make("absent-harness"),
+            displayName: "Absent harness",
+            installed: false,
+          },
+          harness: undefined,
+          reason: "no such binary on this server's PATH",
+          setup: "install it and log in",
+        },
+      ]),
+    ),
+  ),
   Layer.orDie,
 );
 
@@ -800,5 +831,147 @@ describe("availability in the list", () => {
         Number(row["createdAt"]),
       );
     }
+  });
+});
+
+/* ── The harness listing and the transcript, on the wire ─────────────────────── */
+
+/**
+ * The two routes slice C added, asserted through `fetch` like everything else here.
+ *
+ * What is worth checking on the wire rather than in the service: that an unusable instance
+ * survives serialisation with its reason attached, and that an attempt with no transcript
+ * is a **200** rather than a 404. The second is a decision rather than an accident — "we
+ * kept none and the harness has forgotten it" is the ordinary end state of every attempt
+ * old enough, and an error status would make a browser treat the common case as a fault.
+ */
+describe("the harness listing", () => {
+  test("every configured instance is listed, including one that will not start", async () => {
+    const listed = (await read(await signedIn("/harnesses")))
+      .body as unknown as ReadonlyArray<{
+      instanceId: string;
+      ready: boolean;
+      reason?: string;
+      setup?: string;
+      isDefault: boolean;
+      defaultModel: string;
+      models: readonly string[];
+      auth: string;
+    }>;
+    expect(listed.map((entry) => entry.instanceId)).toEqual([
+      "stub",
+      "absent-harness",
+    ]);
+
+    const working = listed[0];
+    expect(working?.ready).toBe(true);
+    expect(working?.isDefault).toBe(true);
+    expect(working?.reason).toBeUndefined();
+    // The catalogue the picker searches, and the default is in it.
+    expect(working?.models).toContain(working?.defaultModel ?? "");
+    // `unknown` is a real answer and the only one either harness can give: neither offers
+    // a non-destructive "am I logged in" probe, so `ready` deliberately does not fold it
+    // in. See `harness/resolver.ts`.
+    expect(working?.auth).toBe("unknown");
+
+    // Visible with a reason, which is the rule. Not filtered out, not a 404, not silence.
+    const broken = listed[1];
+    expect(broken?.ready).toBe(false);
+    expect(broken?.reason).toContain("no such binary");
+    expect(broken?.setup).toContain("install it");
+    expect(broken?.isDefault).toBe(false);
+  });
+
+  test("the listing needs a session like everything else", async () => {
+    const refused = await read(await call("/harnesses"));
+    expect(refused.status).toBe(401);
+    expect(refused.body["_tag"]).toBe("Unauthenticated");
+  });
+});
+
+describe("reading an attempt's transcript", () => {
+  const targetId = "transcripts";
+  const attemptId = "at_no_transcript";
+
+  /**
+   * One target of this block's own, with one attempt row and nothing else.
+   *
+   * A target of its own because the blocks above deliberately break `acme-corp`'s folder
+   * and its data directory to test the availability states, and a transcript read starts by
+   * opening the target.
+   *
+   * The attempt row goes in with `bun:sqlite`, which is the pattern this file already uses
+   * for a fixture: the store's own writer wants a goal, an intent, a credential and a write
+   * fence, and none of that is what a transcript read is about. `harness_session_id` is
+   * null on purpose — the cheapest honest version of "there is nothing to ask about".
+   */
+  beforeAll(async () => {
+    mkdirSync(join(workspaceRoot, "transcripts"), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: {
+          workspacePath: join(workspaceRoot, "transcripts"),
+          name: "transcripts",
+          scopeNote: "",
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+    const database = new Database(
+      join(fleetRoot, "targets", targetId, HUNT_FILE),
+    );
+    try {
+      database.run(
+        `INSERT INTO attempts
+           (id, intent_id, target_id, worker_id, harness_session_id,
+            harness_instance_id, provider_id, model_id, status, started_at, write_fence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          attemptId,
+          "in_t",
+          targetId,
+          "wk_t",
+          null,
+          "stub",
+          "stub",
+          "scripted/model",
+          "succeeded",
+          1,
+          0,
+        ],
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  test("an attempt this target does not hold is a typed 404", async () => {
+    const refused = await read(
+      await signedIn(`/targets/${targetId}/attempts/at_nope/transcript`),
+    );
+    expect(refused.status).toBe(404);
+    expect(refused.body["_tag"]).toBe("AttemptNotFound");
+    expect(refused.body["attemptId"]).toBe("at_nope");
+  });
+
+  /**
+   * An attempt with no transcript answers 200 and says so.
+   *
+   * Not a 404: "we kept none and the harness has forgotten it" is the ordinary end state
+   * of every attempt old enough, and an error status would make a browser treat the common
+   * case as a fault. The sentence is the server's own, not the browser's guess.
+   */
+  test("an attempt with no transcript is a success that says there is none", async () => {
+    const answered = await read(
+      await signedIn(`/targets/${targetId}/attempts/${attemptId}/transcript`),
+    );
+    expect(answered.status).toBe(200);
+    expect(answered.body["source"]).toBe("absent");
+    expect(answered.body["ephemeral"]).toBe(false);
+    expect(String(answered.body["note"])).toContain(
+      "no harness session recorded",
+    );
+    expect(answered.body["entries"]).toEqual([]);
   });
 });

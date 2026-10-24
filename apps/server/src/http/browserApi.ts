@@ -32,6 +32,7 @@
  * unreachable, which is visible and honest, rather than being quietly permitted.
  */
 import {
+  AttemptNotFound,
   BitApi,
   RunRefused,
   SessionActor,
@@ -40,6 +41,8 @@ import {
   TargetRefused,
   TargetUnavailable,
   Unauthenticated,
+  type AttemptTranscript,
+  type HarnessInstanceView,
   type TargetCounts,
   type TargetSummary,
 } from "@bit/contracts";
@@ -63,7 +66,9 @@ import {
 } from "../persistence/fleet";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { POLICY_AUDIT_FILE } from "../policy/install";
+import { HarnessResolver, isReady } from "../harness/resolver";
 import { RunSupervisor } from "../run/supervisor";
+import { readTranscript } from "../run/transcript";
 
 /** What the browser API needs to know about this installation. */
 export interface BrowserApiConfig {
@@ -349,6 +354,9 @@ const fleetHandlers = HttpApiBuilder.group(
     // Same reason, same place: the supervisor holds the fiber map for the whole process,
     // so resolving it per request would be asking for a second one.
     const supervisor = yield* RunSupervisor;
+    // And the resolver holds the built harnesses — for OpenCode, a child process. One per
+    // process, resolved here, for exactly the reason the two above are.
+    const harnesses = yield* HarnessResolver;
 
     const summaries = Effect.fnUntraced(function* () {
       const rows = yield* fleet.targets();
@@ -598,18 +606,26 @@ const fleetHandlers = HttpApiBuilder.group(
        * off what is actually running rather than off rows saying so; the reasoning is on
        * `RunSupervisor`'s `claimedWorkspaces`.
        *
-       * **No model and no harness named.** This used to pass a pinned `WORKER_MODEL`,
-       * which was an OpenCode provider-and-model pair and so could not be right for a
-       * second harness. The supervisor takes the configured instance's own default
-       * instead, and the response reports which instance and which model actually ran. A
-       * route that let an operator choose is slice C's; a field this handler filled in and
-       * the server then ignored would be worse than its absence.
+       * **The harness and the model are the operator's now, and both are optional.**
+       * Passed through verbatim rather than validated here: whether an instance can be run
+       * on is the resolver's answer (`harness_not_ready`, naming what it said) and whether
+       * a model exists is the harness's, and a second copy of either check in this handler
+       * would be a second thing to keep in step. Absent means the server's own default
+       * instance and that instance's default model, and the response says which were used
+       * either way — so a client that sends neither still gets provenance back.
        */
       startRun: Effect.fn(function* ({ params, payload }) {
         const row = yield* openableTarget(fleet, params.targetId);
         const started = yield* supervisor.start({
           targetId: row.targetId,
           workspace: row.workspacePath ?? config.workspaceRoot,
+          ...(payload.instanceId === undefined
+            ? {}
+            : { instanceId: payload.instanceId }),
+          ...(payload.model === undefined ? {} : { model: payload.model }),
+          // Where the settled attempt's transcript lands. The same directory the audit
+          // file below sits in, and outside the workspace for the same reason.
+          evidenceDirectory: fleet.paths.evidenceDirectory(row.targetId),
           // The target's own `evidence/` directory, which the registry already creates
           // for things that are not database rows — and which is deliberately *outside*
           // the workspace the worker runs in, so the worker cannot read the record of
@@ -648,6 +664,89 @@ const fleetHandlers = HttpApiBuilder.group(
 
       /** Every run this process is supervising. See the contract for why it is not scoped. */
       runs: () => supervisor.running,
+
+      /**
+       * Which harnesses this server configures, ready or not.
+       *
+       * Straight off the resolver, which settled the list when the layer was built: it is
+       * configuration plus what this process observed bringing each one up, so there is
+       * nothing to ask and no failure mode.
+       *
+       * **Unusable instances are included, with their reason.** `isReady` decides the
+       * `ready` flag and nothing filters on it, which is the point: a picker that dropped
+       * a configured harness would leave an operator with no way to find out why it is
+       * missing. The `reason` is the harness's own sentence about why it would not start.
+       */
+      harnesses: () =>
+        Effect.succeed(
+          harnesses.instances.map((listing): HarnessInstanceView => ({
+            instanceId: listing.instance.instanceId,
+            driver: listing.instance.driver,
+            displayName: listing.instance.displayName,
+            version: listing.instance.version,
+            ready: isReady(listing),
+            ...(listing.reason === undefined ? {} : { reason: listing.reason }),
+            ...(listing.setup === undefined ? {} : { setup: listing.setup }),
+            auth: listing.instance.auth,
+            isDefault: listing.isDefault,
+            defaultModel: listing.instance.defaultModel,
+            models: listing.instance.models,
+          })),
+        ),
+
+      /**
+       * One past attempt's transcript: ours if we kept one, the harness's if we did not.
+       *
+       * The attempt row is read first, for two reasons that are not the same. It is where
+       * the harness session id and the pinned instance live, which is what the fallback
+       * needs. And it is what tells an attempt this target does not hold — a genuine
+       * mistake, refused — from an attempt with no transcript, which is the *normal* end
+       * state of anything old enough and answers 200 with `source: "absent"`.
+       *
+       * Everything after that is `run/transcript.ts`: prefer our own artefact, fall back to
+       * the harness and label it as the thing that may be gone, and never present the two
+       * as equal-status data.
+       */
+      transcript: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const attempt = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.loadAttempt(params.attemptId, row.targetId),
+        ).pipe(Effect.orDie);
+        if (attempt === undefined) {
+          return yield* new AttemptNotFound({
+            targetId: row.targetId,
+            attemptId: params.attemptId,
+          });
+        }
+        const read = yield* readTranscript({
+          resolver: harnesses,
+          directory: fleet.paths.evidenceDirectory(row.targetId),
+          attemptId: params.attemptId,
+          harnessSessionId: attempt.harness_session_id,
+          harnessInstanceId: attempt.harness_instance_id,
+        });
+        return {
+          attemptId: params.attemptId,
+          targetId: row.targetId,
+          source: read.source,
+          ephemeral: read.ephemeral,
+          note: read.note,
+          entries: read.entries.map((entry) => ({
+            index: entry.index,
+            type: entry.type,
+            text: entry.text,
+            ...(entry.error === undefined ? {} : { error: entry.error }),
+          })),
+          truncated: read.truncated,
+          ...(read.path === undefined ? {} : { path: read.path }),
+          ...(read.contentHash === undefined
+            ? {}
+            : { contentHash: read.contentHash }),
+          ...(read.writtenAt === undefined
+            ? {}
+            : { writtenAt: read.writtenAt }),
+        } satisfies AttemptTranscript;
+      }),
     });
   }),
 );

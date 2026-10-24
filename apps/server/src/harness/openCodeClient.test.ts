@@ -60,12 +60,23 @@ const clientWith = (
       const url = String(input instanceof Request ? input.url : input);
       const signal =
         input instanceof Request ? input.signal : (init?.signal ?? undefined);
-      recorded.urls.push(url);
-      if (signal) recorded.signals.push(signal);
-      const body = input instanceof Request ? undefined : init?.body;
-      if (typeof body === "string") recorded.bodies.push(body);
-      else if (body instanceof Uint8Array)
-        recorded.bodies.push(new TextDecoder().decode(body));
+      // The model catalogue is read once while the layer is built — it is what the picker
+      // searches, and `identity.ts` keeps it on `HarnessInstance` beside `version` for
+      // that reason. It is deliberately *not* recorded here: every assertion in this file
+      // is about the request one named operation makes, and a build-time read would shift
+      // every index and every count without any of them being about it. The stub still
+      // answers it, with whatever that test answers everything, so the degradation path —
+      // an unreadable catalogue leaves the instance offering its default model and does
+      // not refuse the harness — is exercised by every test in this file.
+      const startup = url.includes("/api/model");
+      if (!startup) {
+        recorded.urls.push(url);
+        if (signal) recorded.signals.push(signal);
+        const body = input instanceof Request ? undefined : init?.body;
+        if (typeof body === "string") recorded.bodies.push(body);
+        else if (body instanceof Uint8Array)
+          recorded.bodies.push(new TextDecoder().decode(body));
+      }
       return stub(url, init ?? undefined, recorded);
     },
     // `typeof fetch` includes `preconnect`; nothing under test calls it.

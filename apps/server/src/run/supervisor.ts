@@ -99,6 +99,7 @@ import {
 } from "effect";
 
 import { AgentHarness, type TerminalOutcome } from "../harness/agentHarness";
+import { HarnessResolver, type ResolvedHarness } from "../harness/resolver";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import * as identifier from "../persistence/identifier";
@@ -108,6 +109,7 @@ import type {
 } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { RunNarrations } from "./narration";
+import { captureTranscript } from "./transcript";
 
 /**
  * Where a worker calls back into, as something that can be asked later.
@@ -206,14 +208,27 @@ export interface RunInput {
    */
   readonly workspace: string;
   /**
-   * Which model, inside the harness instance this process is driving.
+   * Which configured harness to run on, or the server's default.
    *
-   * A harness-scoped name (`openai/gpt-5.6-sol`, `claude-sonnet-5`) and optional: there is
-   * no picker yet, so a caller that names none gets the instance's configured default.
-   * The *instance* is deliberately not a parameter — this process drives one, and an
-   * attempt is pinned to it the moment it starts. Choosing between instances is slice C's
-   * work and would arrive as a resolver in front of {@link AgentHarness}, not as a field
-   * here.
+   * Slice B said this would arrive "as a resolver in front of {@link AgentHarness}, not as
+   * a field here", and both halves of that happened: the field is an *id*, and what turns
+   * it into a harness is {@link HarnessResolver}, before anything below this is forked. The
+   * supervisor never sees a set of harnesses and cannot ask which driver it got.
+   *
+   * **Pinned the moment the run starts and never re-pointed.** The attempt row stores it
+   * (migration `0014`) and nothing updates it: moving work to another harness is a
+   * replacement attempt, not a retarget (DECISIONS.md §15). An id this server does not
+   * configure, or one whose harness did not come up, is refused `harness_not_ready` before
+   * a row is written.
+   */
+  readonly instanceId?: string | undefined;
+  /**
+   * Which model, inside the chosen harness instance.
+   *
+   * A harness-scoped name (`openai/gpt-5.6-sol`, `claude-sonnet-5`) and optional: a caller
+   * that names none gets that instance's configured default. Not validated against the
+   * instance's catalogue here — the catalogue is what the picker *offers*, and whether a
+   * model can actually run is the harness's answer to give rather than ours to guess at.
    */
   readonly model?: string | undefined;
   /** What the engagement is after. Advisory prose; never enforcement (§4). */
@@ -231,6 +246,17 @@ export interface RunInput {
    * audit trail can read the shape of the boundary it is inside.
    */
   readonly auditPath: string;
+  /**
+   * The target's own `evidence/` directory, where the settled attempt's transcript lands.
+   *
+   * Supplied by the caller for exactly the reason {@link auditPath} is: it is a *fleet
+   * layout* question and the supervisor does not hold the registry. The two come from the
+   * same place and are two fields rather than one because `auditPath` names a file the
+   * *harness-side gate* appends to and this names a directory *we* write into — one is
+   * handed to another process, the other is not, and collapsing them would make the gate's
+   * configuration depend on where we happen to put transcripts.
+   */
+  readonly evidenceDirectory: string;
   /** Shown as the session's title in the harness's own UI. */
   readonly title: string;
 }
@@ -388,16 +414,24 @@ export class RunSupervisor extends Context.Service<
   }
 >()("bit/run/RunSupervisor") {
   /**
-   * The supervisor over one harness.
+   * The supervisor over whichever harnesses a server configures.
    *
-   * Requires a client, which is what makes "this deployment can start runs" a layer
-   * question rather than a runtime one. A process with no harness provides
-   * {@link RunSupervisor.unavailable} instead and refuses every start by name.
+   * Requires a {@link HarnessResolver}, which is what keeps "this deployment can start
+   * runs" a layer question rather than a runtime one. A process with no harness at all
+   * provides {@link RunSupervisor.unavailable} instead and refuses every start by name; a
+   * process whose *configured* harnesses did not come up builds this and refuses each start
+   * naming the instance and what it said, which is the more useful answer.
+   *
+   * **The requirement moved up a level and nothing below it changed.** `startHalf`, the
+   * narration drain, the settlement and the interrupt are still written against one
+   * {@link AgentHarness} taken from context, so none of them can enumerate instances or
+   * branch on a driver. {@link supervise} resolves once and provides it; see the note
+   * there.
    */
   static readonly layer: Layer.Layer<
     RunSupervisor,
     never,
-    | AgentHarness
+    | HarnessResolver
     | TargetStores
     | McpCredentials
     | WorkerEndpoints
@@ -420,10 +454,20 @@ export class RunSupervisor extends Context.Service<
    */
   static readonly layerWith = (options: {
     readonly askTimeout: Duration.Input;
+    /**
+     * The bound on fetching a settled attempt's transcript, when it should not be the
+     * default.
+     *
+     * A separate knob from `askTimeout` because they are separate bounds with separate
+     * reasoning — one is on deciding an outcome, the other on an artefact that is allowed
+     * to be absent — and because a test that watched a settlement *not* wait for a
+     * transcript would otherwise sit out `TRANSCRIPT_FETCH_TIMEOUT` per run.
+     */
+    readonly transcriptTimeout?: Duration.Input | undefined;
   }): Layer.Layer<
     RunSupervisor,
     never,
-    | AgentHarness
+    | HarnessResolver
     | TargetStores
     | McpCredentials
     | WorkerEndpoints
@@ -497,6 +541,16 @@ const refuse = (error: {
         reason: "harness_unreachable",
         detail: error.message ?? "the agent harness did not answer",
       });
+    // Kept apart from `harness_unreachable` because nothing was asked: naming an instance
+    // this server does not configure, or one whose harness did not come up, is a fact
+    // about our configuration, and reporting it as "the harness did not answer" would send
+    // an operator to look at the wrong thing.
+    case "HarnessNotReady":
+      return new RunRefused({
+        reason: "harness_not_ready",
+        detail:
+          error.message ?? "that harness instance is not usable on this server",
+      });
     default:
       return new RunRefused({
         reason: "store_unavailable",
@@ -508,9 +562,19 @@ const refuse = (error: {
 
 const make = Effect.fnUntraced(function* (options?: {
   readonly askTimeout?: Duration.Input | undefined;
+  readonly transcriptTimeout?: Duration.Input | undefined;
 }) {
   const askTimeout = options?.askTimeout ?? SETTLEMENT_ASK_TIMEOUT;
-  const harness = yield* AgentHarness;
+  const transcriptTimeout = options?.transcriptTimeout;
+  /**
+   * The only thing in this file that knows there is more than one harness.
+   *
+   * It is read here and used in exactly one place — {@link start}, before a workspace is
+   * claimed — and the harness it answers with is provided to the run's body. Nothing else
+   * below can reach it, which is what keeps every step of a run written against a single
+   * {@link AgentHarness} it cannot branch on.
+   */
+  const resolver = yield* HarnessResolver;
   const stores = yield* TargetStores;
   const credentials = yield* McpCredentials;
   const endpoints = yield* WorkerEndpoints;
@@ -702,6 +766,10 @@ const make = Effect.fnUntraced(function* (options?: {
       readonly workerId: string;
     },
   ) {
+    // From context, not from a parameter and not from the layer: `supervise` provides the
+    // one instance this run was resolved to, so this function is written against a single
+    // harness and has no way to reach another.
+    const harness = yield* AgentHarness;
     const store = yield* stores.open(input.targetId);
     const urls = yield* endpoints.urls;
 
@@ -840,6 +908,7 @@ const make = Effect.fnUntraced(function* (options?: {
     harnessSessionId: string,
     report: { narrated: TerminalOutcome | undefined },
   ) {
+    const harness = yield* AgentHarness;
     const outcome = yield* Effect.result(
       Stream.runForEach(harness.sessionEvents(harnessSessionId), (entry) =>
         Effect.andThen(
@@ -895,6 +964,7 @@ const make = Effect.fnUntraced(function* (options?: {
       readonly narrated: TerminalOutcome | undefined;
     },
   ) {
+    const harness = yield* AgentHarness;
     // Best effort, bounded, and outside any transaction. A failure here is not an
     // outcome; it just means the harness's own view is unavailable, which
     // `settlementFor` reads as "no answer" and resolves from the narration, or to
@@ -962,6 +1032,13 @@ const make = Effect.fnUntraced(function* (options?: {
    * causes — and they run uninterruptibly, so a stop cannot interrupt the settlement it
    * asked for. `ending` is a mutable local because the finalizer has to see what the drain
    * concluded, and the drain may never have run.
+   *
+   * **`resolved` is where the one harness comes in, and it comes in once.**
+   * `Effect.provideService` at the bottom hands this run's instance to the whole body, so
+   * every step below reads `AgentHarness` from context exactly as it did when a process
+   * drove one — the resolution happened in {@link start}, before a workspace was claimed,
+   * and nothing here can ask for a different one. That is what "a resolver in front of
+   * `AgentHarness`" means in code: the requirement did not widen, the provider moved.
    */
   const supervise = (
     input: RunInput,
@@ -972,6 +1049,7 @@ const make = Effect.fnUntraced(function* (options?: {
       readonly workerId: string;
     },
     gate: Deferred.Deferred<RunStarted, RunRefused>,
+    resolved: ResolvedHarness,
   ) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1016,6 +1094,7 @@ const make = Effect.fnUntraced(function* (options?: {
             // outcome has already stopped, and asking it to stop again would be a
             // pointless round trip on every clean run.
             if (ending._tag === "stopped") {
+              const harness = yield* AgentHarness;
               const interrupted = yield* Effect.result(
                 // Bounded for the reason on the `sessionStatus` ask in `settle`: this
                 // also runs in a finalizer, and a dying harness answers neither.
@@ -1039,15 +1118,53 @@ const make = Effect.fnUntraced(function* (options?: {
                 },
               );
             }
-            remember(
-              ids.attemptId,
-              yield* settle(store, {
+            const settled = yield* settle(store, {
+              attemptId: ids.attemptId,
+              harnessSessionId,
+              end: ending,
+              narrated: report.narrated,
+            });
+            remember(ids.attemptId, settled);
+
+            /**
+             * The transcript, **after** the settlement and never in its way.
+             *
+             * Three properties, in the order they matter:
+             *
+             * 1. **Settle first.** The attempt row and its `attempt.settled` event are the
+             *    durable record and both are written above. This is an artefact beside
+             *    them, so it runs after and its failure is logged rather than raised —
+             *    `captureTranscript` swallows its own, which is why there is no
+             *    `Effect.result` here.
+             * 2. **Bounded, and it cannot block a shutdown.** The ask is cut short by
+             *    `TRANSCRIPT_FETCH_TIMEOUT`, for the same reason
+             *    {@link SETTLEMENT_ASK_TIMEOUT} exists: this runs in a finalizer, which on
+             *    a `SIGINT` means asking a harness child that is being torn down at the
+             *    same moment. An absence is recorded as normal, not as an error.
+             * 3. **It is the harness's own log, not the drained stream.** See
+             *    `run/transcript.ts`: `sessionEvents` has a gap between subscribing and
+             *    prompting and `messages` does not.
+             */
+            yield* captureTranscript({
+              directory: input.evidenceDirectory,
+              ...(transcriptTimeout === undefined
+                ? {}
+                : { fetchTimeout: transcriptTimeout }),
+              header: {
                 attemptId: ids.attemptId,
+                targetId: input.targetId,
                 harnessSessionId,
-                end: ending,
-                narrated: report.narrated,
-              }),
-            );
+                instanceId: resolved.instance.instanceId,
+                // Re-derived from the instance rather than read off a column, because
+                // there is no driver column and there is not going to be one: it is a fact
+                // about configuration, and a stored copy would be free to disagree
+                // (migration `0014`).
+                driver: resolved.instance.driver,
+                providerId: provenance.providerId,
+                modelId: provenance.modelId,
+                status: settled.status,
+              },
+            });
           }),
         );
 
@@ -1057,7 +1174,7 @@ const make = Effect.fnUntraced(function* (options?: {
           intentId: ids.intentId,
           goalId: ids.goalId,
           harnessSessionId,
-          instanceId: harness.instance.instanceId,
+          instanceId: resolved.instance.instanceId,
           providerId: provenance.providerId,
           modelId: provenance.modelId,
           startedAt,
@@ -1083,6 +1200,7 @@ const make = Effect.fnUntraced(function* (options?: {
           ),
         );
 
+        const harness = yield* AgentHarness;
         const prompted = yield* Effect.result(
           harness.prompt(harnessSessionId, input.task),
         );
@@ -1146,6 +1264,10 @@ const make = Effect.fnUntraced(function* (options?: {
           }),
         ),
       ),
+      // The one harness this run was resolved to, handed to everything above. Provided
+      // here rather than passed down, so no step of a run has a second harness-shaped
+      // value in reach — see this function's header.
+      Effect.provideService(AgentHarness, resolved.harness),
     );
 
   const start: RunSupervisor["Service"]["start"] = Effect.fn(
@@ -1158,9 +1280,24 @@ const make = Effect.fnUntraced(function* (options?: {
       workerId: identifier.prefixed("wk"),
     };
     /**
+     * Which harness this run gets, decided before anything is claimed or written.
+     *
+     * **First, ahead of the workspace claim**, so a run that names an instance this server
+     * cannot give it leaves nothing behind: no folder held, no attempt row, nothing for a
+     * sweep to find. That is the same disposition the gate installation already has in
+     * `startHalf` and for the same reason.
+     *
+     * A refusal names the instance. It is never a fallback onto a different harness:
+     * running on one the operator did not pick would write provenance nobody could trust,
+     * which is the whole reason migration `0014` records the instance at all.
+     */
+    const resolved = yield* Effect.result(resolver.resolve(input.instanceId));
+    if (resolved._tag === "Failure") return yield* refuse(resolved.failure);
+
+    /**
      * The folder, claimed before anything else happens.
      *
-     * First, and synchronously: the reasoning is on {@link claimedWorkspaces}. Refusing
+     * Synchronously: the reasoning is on {@link claimedWorkspaces}. Refusing
      * here means a second concurrent run in one engagement's folder writes *nothing at
      * all* — no gate installed over the first run's, no attempt row, nothing for a sweep
      * to find.
@@ -1175,7 +1312,10 @@ const make = Effect.fnUntraced(function* (options?: {
     // Forked, not run: this is the line that detaches the run from the request. The
     // fiber is a daemon of the layer's scope rather than a child of this fiber, so
     // writing the response below cannot interrupt it.
-    const fiber = fork(ids.attemptId, supervise(input, ids, gate));
+    const fiber = fork(
+      ids.attemptId,
+      supervise(input, ids, gate, resolved.success),
+    );
     /**
      * Wait for the gate, but never longer than the fiber lives.
      *

@@ -48,6 +48,7 @@ export const STUB_INSTANCE: HarnessInstance = {
   installed: true,
   auth: "unknown",
   defaultModel: "scripted/model",
+  models: ["scripted/model", "scripted/other"],
 };
 
 export type StubHarness = AgentHarness["Service"];
