@@ -381,6 +381,136 @@ export class TargetRefused extends Schema.TaggedError<TargetRefused>()(
   }
 }
 
+/* ── Runs ────────────────────────────────────────────────────────────────────── */
+
+/** Where a browser starts a run against one target, and lists what is running. */
+export const RUNS_PATH = apiPath("runs");
+
+/**
+ * What the compose box submits.
+ *
+ * One field, and the shortfall is deliberate. A run needs a goal, an intent's question
+ * and a prompt; today all three come from the one thing the operator typed, and the server
+ * mints the goal, intent and attempt ids for it. Letting the browser choose which existing
+ * intent a run belongs to is Flow B's work — it is the screen that shows intents in the
+ * first place — and a `intentId` field here would be a contract the UI could not yet fill
+ * honestly.
+ *
+ * Which model runs it is deliberately absent too: this server pins one, and a picker is
+ * two slices away. A field the server ignored would be worse than no field.
+ */
+export const RunDraft = Schema.Struct({
+  /** What the operator wants done. Becomes the prompt verbatim. */
+  instruction: Schema.NonEmptyString,
+});
+export type RunDraft = typeof RunDraft.Type;
+
+/**
+ * A started run, answered before the run is anywhere near finished.
+ *
+ * This is the whole point of the endpoint: the response says "it is running and here is
+ * its name", not "here is what it found". Everything in it is already durable by the time
+ * it is sent — the attempt row exists, the harness session exists and has been prompted —
+ * so an operator who reloads immediately can find the run by this `attemptId`.
+ */
+export const RunStarted = Schema.Struct({
+  attemptId: Schema.String,
+  targetId: Schema.String,
+  intentId: Schema.String,
+  goalId: Schema.String,
+  /** The harness's own session id, which is also what observations record as provenance. */
+  harnessSessionId: Schema.String,
+  providerId: Schema.String,
+  modelId: Schema.String,
+  startedAt: EpochMillis,
+});
+export type RunStarted = typeof RunStarted.Type;
+
+/**
+ * One run this server is supervising right now.
+ *
+ * **Per process, not per database.** This is read from the supervisor's own fiber map, so
+ * it answers "what is this server driving" — which is a different question from "which
+ * attempt rows say `running`". A row left `running` by a process that died is not here,
+ * because nothing is running it; the startup sweep is what settles those.
+ */
+export const RunningAttempt = Schema.Struct({
+  attemptId: Schema.String,
+  targetId: Schema.String,
+  intentId: Schema.String,
+  harnessSessionId: Schema.String,
+  startedAt: EpochMillis,
+});
+export type RunningAttempt = typeof RunningAttempt.Type;
+
+/**
+ * A stopped run, with what stopping it actually did.
+ *
+ * `status` and `credentialsRevoked` are reported rather than assumed because a stop makes
+ * two promises beyond "the fiber is gone": the attempt is settled, and its write authority
+ * is withdrawn. An operator — and a test — can read both here instead of taking them on
+ * trust.
+ */
+export const RunStopped = Schema.Struct({
+  attemptId: Schema.String,
+  targetId: Schema.String,
+  harnessSessionId: Schema.String,
+  /** What the attempt row holds now. `uncertain` when settling could not be confirmed. */
+  status: Schema.String,
+  /** Live MCP grants dropped for this attempt. Zero is normal on a second stop. */
+  credentialsRevoked: Schema.Int,
+  stoppedAt: EpochMillis,
+});
+export type RunStopped = typeof RunStopped.Type;
+
+/**
+ * A run this server will not start or stop.
+ *
+ * One error with five reasons rather than five errors, because the browser does one thing
+ * with all of them — shows the sentence next to the compose box — and the reasons differ
+ * only in what an operator does next:
+ *
+ * - `no_harness` — this server has no `opencode` to run a worker in. It still serves
+ *   everything else, which is why this is a refused request rather than a server that
+ *   would not boot.
+ * - `target_unavailable` — that target's own database could not be opened. The same
+ *   condition {@link TargetUnavailable} describes, reached from the write side.
+ * - `workspace_ungated` — the pre-execution policy gate could not be installed into the
+ *   engagement's folder, usually because it already holds an `opencode.json` this server
+ *   will not overwrite. The run is refused rather than started ungated: a worker running
+ *   against somebody's systems with no record of what it was allowed to do is worse than
+ *   a run that did not start.
+ * - `harness_unreachable` — the harness did not answer while the run was being set up.
+ *   Nothing was prompted; if an attempt row was written it is left for the startup sweep.
+ * - `store_unavailable` — the target's database could not be written to.
+ * - `unknown_attempt` — nothing is running under that id *in this process*.
+ *
+ * `409` for all five. Each has a defensible status of its own — `503` for `no_harness`,
+ * `404` for `unknown_attempt` — and a tagged error carries one, so the choice is between
+ * five error types the client must handle separately and one status that is honest for
+ * every case: the server is not in a state to do what was asked. The reason is in the
+ * body, typed, which is what the client branches on.
+ */
+export class RunRefused extends Schema.TaggedError<RunRefused>()(
+  "RunRefused",
+  {
+    reason: Schema.Literals([
+      "no_harness",
+      "target_unavailable",
+      "workspace_ungated",
+      "harness_unreachable",
+      "store_unavailable",
+      "unknown_attempt",
+    ]),
+    detail: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {
+  override get message(): string {
+    return `${this.reason}: ${this.detail}`;
+  }
+}
+
 /* ── Folders ─────────────────────────────────────────────────────────────────── */
 
 export const FolderEntry = Schema.Struct({
@@ -504,6 +634,53 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       query: { path: Schema.optional(Schema.String) },
       success: FolderListing,
       error: [PathRefused, PathNotFound],
+    }),
+    /**
+     * Starts a run against one target, and answers immediately.
+     *
+     * **The response must not wait for the run**, which is the property this endpoint
+     * exists to have. A run takes minutes or hours; the request returns as soon as the
+     * attempt row, the harness session, the credential and the prompt are all in place,
+     * and a supervisor fiber in the server's own scope owns everything after that.
+     *
+     * The target is a path parameter for the same reason as `target` above: it identifies
+     * the resource the run writes to, and it is the id the write boundary dispatches on.
+     * `TargetNotFound` and `TargetUnavailable` are the same refusals opening the target
+     * gives, from the same checks, so the compose box cannot disagree with the rail about
+     * whether a target can be worked on.
+     */
+    HttpApiEndpoint.post("startRun", "/targets/:targetId/runs", {
+      params: { targetId: Schema.String },
+      payload: RunDraft,
+      success: RunStarted,
+      error: [RunRefused, TargetNotFound, TargetUnavailable],
+    }),
+    /**
+     * Stops one run: interrupts it, settles its attempt, revokes its authority.
+     *
+     * A `POST` to a sub-resource rather than a `DELETE` on the run, because it does not
+     * remove anything — the attempt row and everything the run recorded stay, settled.
+     * Deleting evidence is not a thing this API does.
+     */
+    HttpApiEndpoint.post("stopRun", "/targets/:targetId/runs/:attemptId/stop", {
+      params: { targetId: Schema.String, attemptId: Schema.String },
+      success: RunStopped,
+      error: [RunRefused],
+    }),
+    /**
+     * Every run this server is supervising, across all targets.
+     *
+     * Not under `/targets/:id` because it is a fact about the *process*: the supervisor
+     * holds one fiber map for the whole server, and a browser showing two open targets
+     * wants both answered in one request rather than one per tab. A client that wants one
+     * target's runs filters by `targetId`.
+     *
+     * It is what lets a reloaded tab find the run it started: the start response is the
+     * only other place an `attemptId` appears, and a browser that lost it would otherwise
+     * have no way back to a run that is still going.
+     */
+    HttpApiEndpoint.get("runs", "/runs", {
+      success: Schema.Array(RunningAttempt),
     }),
   )
   .middleware(SessionGuard) {}

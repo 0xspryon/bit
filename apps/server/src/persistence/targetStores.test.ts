@@ -31,6 +31,7 @@ import { join } from "node:path";
 import { Duration, Effect, Layer, ManagedRuntime } from "effect";
 
 import { FleetStore, HUNT_FILE } from "./fleet";
+import { ObservationStore } from "./store";
 import { TargetStores } from "./targetStores";
 
 const scratch = mkdtempSync(join(tmpdir(), "bit-target-stores-"));
@@ -202,39 +203,6 @@ describe("the lifetime of a handle", () => {
     expect(observed.counts.intents).toBe(1);
   });
 
-  test("a pinned layer holds its borrow for the layer's scope, not the request's", async () => {
-    // What `pinnedLayerFor` is *for*, asserted rather than documented: the MCP route takes
-    // its store as a layer requirement, and the entry has to survive past the idle TTL
-    // because the layer is alive, not because anyone is currently reading. The borrow ends
-    // with the layer's scope and not before.
-    const pinned = await runtime.runPromise(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const stores = yield* TargetStores;
-          const scope = yield* Effect.scope;
-          yield* Layer.buildWithScope(
-            stores.pinnedLayerFor("alpha", "test: a layer-shaped consumer"),
-            scope,
-          );
-          yield* Effect.sleep(PAST_TTL);
-          return [...(yield* stores.openTargetIds)];
-        }),
-      ).pipe(Effect.orDie),
-    );
-    expect(pinned).toEqual(["alpha"]);
-
-    // And released once that scope closes, after the idle TTL — a pin is a long borrow,
-    // not an exemption from reference counting.
-    const afterwards = await runtime.runPromise(
-      Effect.gen(function* () {
-        const stores = yield* TargetStores;
-        yield* Effect.sleep(PAST_TTL);
-        return [...(yield* stores.openTargetIds)];
-      }),
-    );
-    expect(afterwards).toEqual([]);
-  });
-
   test("a released store is kept warm, then closed once the TTL passes", async () => {
     const timeline = await runtime.runPromise(
       Effect.gen(function* () {
@@ -266,6 +234,54 @@ describe("the lifetime of a handle", () => {
     );
 
     expect(after).not.toContain("beta");
+  });
+});
+
+describe("a resolver over one already-open store", () => {
+  // `TargetStores.ofStore` replaced `pinnedLayerFor`, and the two are not the same thing
+  // in opposite notation: the pin handed one store to a consumer that asked for a store,
+  // so dispatch did not happen. This hands a *resolver* to a consumer that asks for a
+  // resolver, so dispatch still happens and an id it does not hold is refused. These two
+  // tests are what makes that difference a property rather than a paragraph.
+  const oneTarget = TargetStores.ofStore("alpha").pipe(
+    Layer.provide(ObservationStore.layer(":memory:")),
+  );
+
+  test("answers its own id", async () => {
+    const observed = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const resolver = yield* TargetStores;
+          const store = yield* resolver.open("alpha");
+          return {
+            counts: yield* store.counts(),
+            open: [...(yield* resolver.openTargetIds)],
+          };
+        }),
+      ).pipe(Effect.provide(oneTarget), Effect.orDie),
+    );
+    expect(observed.counts.attempts).toBe(0);
+    expect(observed.open).toEqual(["alpha"]);
+  });
+
+  test("refuses any other id rather than serving its one store", async () => {
+    const refusal = await Effect.runPromise(
+      Effect.scoped(
+        Effect.result(
+          Effect.flatMap(TargetStores, (resolver) => resolver.open("beta")),
+        ),
+      ).pipe(Effect.provide(oneTarget)),
+    );
+    expect(refusal._tag).toBe("Failure");
+    if (refusal._tag === "Failure") {
+      expect(refusal.failure._tag).toBe("FleetError");
+      if (refusal.failure._tag === "FleetError") {
+        // The same reason the fleet-backed resolver gives for an unregistered target, so
+        // a caller handles one failure rather than two that mean the same thing.
+        expect(refusal.failure.reason).toBe("unknown_target");
+        expect(refusal.failure.targetId).toBe("beta");
+      }
+    }
   });
 });
 

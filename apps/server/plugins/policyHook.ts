@@ -27,6 +27,15 @@ interface HookEvent {
 interface Decision {
   readonly effect?: string;
   readonly reason?: string;
+  /**
+   * Why an `allow` was an allow, as the control plane decided it.
+   *
+   * Written to the audit verbatim and never interpreted here. "Permitted because this
+   * engagement has no host boundary" and "permitted because the host was in the list"
+   * are different facts, and an audit line that said only `allowed` would have thrown
+   * away the one worth reading.
+   */
+  readonly basis?: string;
 }
 
 export default {
@@ -114,7 +123,11 @@ export default {
         );
       }
 
-      await audit({ tool: event.tool, outcome: "allowed" });
+      await audit({
+        tool: event.tool,
+        outcome: "allowed",
+        basis: decision.basis ?? null,
+      });
     });
   },
 };

@@ -18,13 +18,14 @@ import { ControlPlaneEndpoint, HEALTH_PATH } from "./controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { ObservationStore } from "../persistence/store";
-import { PolicyDecisions } from "../policy/service";
+import { TargetStores } from "../persistence/targetStores";
+import { PolicyDecisions, type PolicyConfig } from "../policy/service";
 
 const directory = mkdtempSync(join(tmpdir(), "bit-control-plane-"));
 
-const POLICY = {
+const POLICY: PolicyConfig = {
   forbiddenPathFragments: ["out-of-scope/"],
-  allowedHosts: ["127.0.0.1"],
+  hostScope: { _tag: "hosts", allowed: ["127.0.0.1"] },
 };
 
 /**
@@ -63,7 +64,14 @@ const testLayer = Layer.mergeAll(
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
   Layer.provideMerge(PolicyDecisions.layer),
-  Layer.provide(ObservationStore.layer(join(directory, "cp.sqlite"))),
+  // The MCP route takes the per-target resolver now, not one target's store. One entry over
+  // the file below: dispatch is still real, and a credential naming another target is
+  // refused by name.
+  Layer.provide(
+    TargetStores.ofStore("t").pipe(
+      Layer.provide(ObservationStore.layer(join(directory, "cp.sqlite"))),
+    ),
+  ),
 );
 
 const runtime = ManagedRuntime.make(testLayer);
@@ -161,7 +169,12 @@ describe("the postures stay separate on the shared port", () => {
       input: { filePath: "in-scope.txt" },
     });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ effect: "allow" });
+    // `basis` as well as `effect`: the response says *why* it was allowed, which is what
+    // lets a reader tell a scope that checked and matched from one that checks nothing.
+    expect(await response.json()).toEqual({
+      effect: "allow",
+      basis: "no_host_named",
+    });
   });
 
   test("the policy route still denies on its own boundaries", async () => {

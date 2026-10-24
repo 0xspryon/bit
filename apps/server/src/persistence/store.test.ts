@@ -1813,9 +1813,12 @@ describe("recording an asset", () => {
       );
     }
     expect(outcome.endpointWithoutMethod._tag).toBe("Failure");
-    // Nothing written on any refusal: no asset, no event, no obligation.
+    // Nothing written on any refusal: no asset, no obligation, and no event beyond the
+    // `attempt.started` the seed wrote before any of this was attempted.
     expect(outcome.assets).toEqual([]);
-    expect(outcome.events).toEqual([]);
+    expect(outcome.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+    ]);
     expect(outcome.pending).toEqual([]);
   });
 
@@ -2423,29 +2426,39 @@ describe("one transaction per mutation", () => {
     );
 
     // One event per mutation, in commit order, with a dense sequence starting at 1.
+    //
+    // `attempt.started` is first because seeding the attempt is the first mutation this
+    // database sees — the seed helper every test here runs is itself a mutation now, and
+    // the log says so rather than starting at whatever the test happened to call next.
     expect(outcome.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
       "asset.recorded",
       "observation.recorded",
       "intent.added",
     ]);
-    expect(outcome.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(outcome.events.map((event) => event.sequence)).toEqual([1, 2, 3, 4]);
     expect(outcome.events.map((event) => event.eventId)).toEqual([
       "evt_000001",
       "evt_000002",
       "evt_000003",
+      "evt_000004",
     ]);
 
     // Domain identity on each event is the row it is about.
-    expect(outcome.events[0]?.subjectId).toBe(outcome.asset.assetId);
-    expect(outcome.events[1]?.subjectId).toBe(
+    expect(outcome.events[0]?.subjectId).toBe("attempt-1");
+    expect(outcome.events[1]?.subjectId).toBe(outcome.asset.assetId);
+    expect(outcome.events[2]?.subjectId).toBe(
       outcome.observation.observationId,
     );
-    expect(outcome.events[2]?.subjectId).toBe("intent-2");
+    expect(outcome.events[3]?.subjectId).toBe("intent-2");
 
-    // Operation identity is the pair the receipt is keyed on.
+    // Operation identity is the pair the receipt is keyed on. An attempt's lifecycle has
+    // no receipt — there is no operation id to retry it under, because starting a run is
+    // not a command a worker sends — so the pair is the operation alone.
     expect(
       outcome.events.map((event) => [event.operation, event.operationId]),
     ).toEqual([
+      ["seed_attempt", null],
       ["record_asset", "a-1"],
       ["record_observation", "o-1"],
       ["add_intent", "i-1"],
@@ -2453,12 +2466,25 @@ describe("one transaction per mutation", () => {
 
     // Caller authority is separate again, and a host-created intent carries no attempt
     // rather than a fabricated one.
-    expect(outcome.events[0]?.callerScope).toBe(CALLER.callerScope);
-    expect(outcome.events[0]?.attemptId).toBe("attempt-1");
-    expect(outcome.events[0]?.intentId).toBe("intent-1");
-    expect(outcome.events[2]?.callerScope).toBe("host/target-1");
-    expect(outcome.events[2]?.attemptId).toBeNull();
-    expect(outcome.events[2]?.intentId).toBeNull();
+    expect(outcome.events[1]?.callerScope).toBe(CALLER.callerScope);
+    expect(outcome.events[1]?.attemptId).toBe("attempt-1");
+    expect(outcome.events[1]?.intentId).toBe("intent-1");
+    expect(outcome.events[3]?.callerScope).toBe("host/target-1");
+    expect(outcome.events[3]?.attemptId).toBeNull();
+    expect(outcome.events[3]?.intentId).toBeNull();
+
+    // And `attempt.started` carries none of the three, which is the invariant
+    // `contracts/event.ts` states: they are caller authority, and no credential for this
+    // attempt existed when its own beginning was recorded. The attempt is the event's
+    // subject, above, not its author.
+    expect(outcome.events[0]?.callerScope).toBeNull();
+    expect(outcome.events[0]?.attemptId).toBeNull();
+    expect(outcome.events[0]?.intentId).toBeNull();
+    expect(outcome.events[0]?.payload).toMatchObject({
+      attemptId: "attempt-1",
+      intentId: "intent-1",
+      replacesAttemptId: null,
+    });
 
     // Two of the three kinds carry an obligation; adding an intent carries none,
     // because a new intent implies no action outside this database.
@@ -2475,8 +2501,8 @@ describe("one transaction per mutation", () => {
     ]);
     // Each request names the event that explains it.
     expect(outcome.pending.map((entry) => entry.causedByEventId)).toEqual([
-      "evt_000001",
       "evt_000002",
+      "evt_000003",
     ]);
     // Nothing in this sprint claims a row.
     expect(
@@ -2530,7 +2556,9 @@ describe("one transaction per mutation", () => {
     expect(outcome.observations).toHaveLength(1);
     expect(outcome.assets).toHaveLength(1);
     expect(outcome.discoveries).toHaveLength(1);
-    expect(outcome.events).toHaveLength(2);
+    // Three events: the attempt starting, then one per mutation. A replay hands back a
+    // committed result and adds nothing to any of them.
+    expect(outcome.events).toHaveLength(3);
     expect(outcome.pending).toHaveLength(2);
     expect(outcome.sequence).toBe(1);
   });
@@ -2586,7 +2614,7 @@ describe("one transaction per mutation", () => {
     // check and before the commit leaves nothing behind on any of the four writes.
     expect(outcome.events).toEqual(outcome.before.events);
     expect(outcome.pending).toEqual(outcome.before.pending);
-    expect(outcome.events).toHaveLength(2);
+    expect(outcome.events).toHaveLength(3);
     expect(outcome.pending).toHaveLength(2);
     expect(outcome.observations).toHaveLength(1);
     // And no sequence gap, because the bump is inside the rolled-back transaction.
@@ -2608,9 +2636,15 @@ describe("one transaction per mutation", () => {
         return { events: yield* store.eventsAfter() };
       }),
     );
-    // 1 then 2, not 1 then 3. A gap is the one thing a consumer reading
-    // `WHERE sequence > cursor` cannot tell apart from a lost event.
-    expect(outcome.events.map((event) => event.sequence)).toEqual([1, 2]);
+    // 2 then 3, not 2 then 4 — the seed's own `attempt.started` is 1. A gap is the one
+    // thing a consumer reading `WHERE sequence > cursor` cannot tell apart from a lost
+    // event, and a refusal must not leave one.
+    expect(outcome.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(outcome.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "asset.recorded",
+      "asset.recorded",
+    ]);
   });
 
   test("events and obligations read back in order after the file is closed and reopened", async () => {
@@ -2636,9 +2670,14 @@ describe("one transaction per mutation", () => {
       }),
     );
 
-    expect(after.all.map((event) => event.sequence)).toEqual([1, 2]);
+    expect(after.all.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(after.all.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "asset.recorded",
+      "observation.recorded",
+    ]);
     // The cursor read §8 specifies: strictly after, ascending, and bounded.
-    expect(after.afterFirst.map((event) => event.sequence)).toEqual([2]);
+    expect(after.afterFirst.map((event) => event.sequence)).toEqual([2, 3]);
     expect(after.bounded.map((event) => event.sequence)).toEqual([1]);
     // The obligations are still undispatched, which is the crash-survival claim.
     expect(after.pending.map((entry) => entry.status)).toEqual([
@@ -2646,13 +2685,13 @@ describe("one transaction per mutation", () => {
       "pending",
     ]);
     // Payloads survive as JSON a reader can interrogate without a declared shape.
-    expect(unknownString(after.all[0]?.payload, "identity")).toBe(
+    expect(unknownString(after.all[1]?.payload, "identity")).toBe(
       "POST http://127.0.0.1:41317/login",
     );
     expect(
-      unknownString(after.all[0]?.payload, "nothing_declared_this"),
+      unknownString(after.all[1]?.payload, "nothing_declared_this"),
     ).toBeUndefined();
-    expect(unknownNumber(after.all[1]?.payload, "sequence")).toBe(1);
+    expect(unknownNumber(after.all[2]?.payload, "sequence")).toBe(1);
   });
 
   test("a superseded attempt cannot write, across a restart, and writes no event", async () => {
@@ -2723,9 +2762,22 @@ describe("one transaction per mutation", () => {
     expect(after.observation._tag).toBe("Failure");
     expect(after.refreshed._tag).toBe("Failure");
     expect(after.replay.replayed).toBe(true);
-    // One event and one obligation, from before the fence moved. Nothing a revoked
-    // credential attempted reached the log.
-    expect(after.events).toHaveLength(1);
+    // One obligation and one asset, from before the fence moved: nothing a revoked
+    // credential attempted reached the log. Three events, and none of them is a write the
+    // stale credential made — the attempt starting, the one asset it recorded while it
+    // still had authority, and recovery settling it, which is the mutation that moved the
+    // fence in the first place.
+    expect(after.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "asset.recorded",
+      "attempt.settled",
+    ]);
+    expect(after.events[2]?.subjectId).toBe("attempt-1");
+    expect(after.events[2]?.payload).toMatchObject({
+      status: "uncertain",
+      priorStatus: "running",
+      settledBy: "recovery",
+    });
     expect(after.pending).toHaveLength(1);
     expect(after.assets).toHaveLength(1);
   });
@@ -2774,7 +2826,13 @@ describe("one transaction per mutation", () => {
     expect(outcome.afterRepair.created).toBe(true);
     expect(outcome.afterRepair.discoveries).toBe(1);
     expect(outcome.assets).toHaveLength(1);
-    expect(outcome.events.map((event) => event.sequence)).toEqual([1]);
+    // Sequence 2, after the seed's own `attempt.started`: the aborted attempt's event
+    // rolled back with it and left no number behind.
+    expect(outcome.events.map((event) => event.sequence)).toEqual([1, 2]);
+    expect(outcome.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "asset.recorded",
+    ]);
     expect(outcome.pending).toHaveLength(1);
   });
 });

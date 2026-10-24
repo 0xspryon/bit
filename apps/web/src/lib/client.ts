@@ -122,6 +122,9 @@ const REFUSAL_TAGS = new Set([
   // answers from the server, not transport trouble, and the hunt view says which.
   "TargetNotFound",
   "TargetUnavailable",
+  // Starting and stopping a run: every reason the server gives is an answer the compose
+  // box shows next to itself, not transport trouble.
+  "RunRefused",
 ]);
 
 const isRefusal = (error: unknown): boolean =>
@@ -214,4 +217,37 @@ export const server = {
         api.fleet.createTarget({ payload: draft }),
       ),
     ),
+
+  /**
+   * Starts a run against one target.
+   *
+   * It answers as soon as the run is going, not when it finishes, so this call is short
+   * however long the run turns out to be. The attempt id it hands back is the handle for
+   * stopping it and for recognising it in {@link runs} after a reload.
+   */
+  startRun: (baseUrl: string, targetId: string, instruction: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.startRun({
+          params: { targetId },
+          payload: { instruction },
+        }),
+      ),
+    ),
+
+  stopRun: (baseUrl: string, targetId: string, attemptId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.stopRun({ params: { targetId, attemptId } }),
+      ),
+    ),
+
+  /**
+   * What the server is running right now, across every target.
+   *
+   * The only way a reloaded tab finds a run it started: the start response is the one
+   * other place an attempt id appears, and it does not survive a refresh.
+   */
+  runs: (baseUrl: string) =>
+    run(Effect.flatMap(client(baseUrl), (api) => api.fleet.runs())),
 };

@@ -776,6 +776,12 @@ const makeStore = Effect.fnUntraced(function* () {
    * lets a demo be re-run against an existing database. The fence is read back rather
    * than assumed to be zero, so re-seeding an attempt that recovery has already fenced
    * hands out the *current* authority instead of a superseded one.
+   *
+   * **`attempt.started` is appended only when a row was really inserted.** The attempt is
+   * read before the insert for exactly that reason: re-seeding is idempotent, so an
+   * unconditional append would write a second `started` for an attempt that started once,
+   * and a reader counting starts would over-count every re-run. Idempotence in the domain
+   * table and a duplicate in the log would be the worst of both.
    */
   const seedAttempt = Effect.fn("ObservationStore.seedAttempt")(function* (
     input: SeedInput,
@@ -784,6 +790,7 @@ const makeStore = Effect.fnUntraced(function* () {
     return yield* sql
       .withTransaction(
         Effect.gen(function* () {
+          const before = yield* attemptOrFail(input.attemptId);
           yield* sql`INSERT INTO goals (id, target_id, description, created_at)
             VALUES (${input.goalId}, ${input.targetId}, ${input.goal}, ${now})
             ON CONFLICT(id) DO NOTHING`.pipe(
@@ -804,6 +811,25 @@ const makeStore = Effect.fnUntraced(function* () {
             Effect.mapError(asDatabaseError("transaction")),
           );
           const attempt = yield* attemptOrFail(input.attemptId);
+          if (before === undefined && attempt !== undefined) {
+            yield* appendAttemptEvent({
+              kind: "attempt.started",
+              targetId: input.targetId,
+              attemptId: input.attemptId,
+              operation: "seed_attempt",
+              payload: {
+                attemptId: input.attemptId,
+                intentId: input.intentId,
+                goalId: input.goalId,
+                workerId: input.workerId,
+                providerId: input.providerId,
+                modelId: input.modelId,
+                harnessSessionId: input.harnessSessionId,
+                replacesAttemptId: null,
+              },
+              recordedAt: now,
+            });
+          }
           return {
             attemptId: input.attemptId,
             writeFence: attempt?.write_fence ?? 0,
@@ -827,6 +853,11 @@ const makeStore = Effect.fnUntraced(function* () {
    * to overwrite what reconciliation already decided about it — that would be the
    * terminal-regression this milestone exists to prevent, arriving from the other
    * direction. `changed: false` tells the caller it was already settled, and by what.
+   *
+   * **`attempt.settled` is appended only when the status actually moved.** `changed:
+   * false` means this call wrote nothing, and an event with no domain change behind it
+   * would break the one property that makes the log trustworthy. The settlement that did
+   * happen already has its own event, written by whoever caused it.
    */
   const settleAttempt = Effect.fn("ObservationStore.settleAttempt")(function* (
     attemptId: string,
@@ -855,6 +886,25 @@ const makeStore = Effect.fnUntraced(function* () {
             WHERE id = ${attemptId} AND status = 'running'`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
           );
+          yield* appendAttemptEvent({
+            kind: "attempt.settled",
+            targetId: before.target_id,
+            attemptId,
+            operation: "settle_attempt",
+            payload: {
+              attemptId,
+              intentId: before.intent_id,
+              harnessSessionId: before.harness_session_id,
+              status,
+              priorStatus: before.status,
+              // Said plainly, because the two writers of this event mean different
+              // things: a supervisor that watched the run settle it, or a sweep that
+              // found the row afterwards and could only reconcile it.
+              settledBy: "supervisor",
+              disposition: null,
+            },
+            recordedAt: endedAt,
+          });
           return {
             requested: status,
             effective: status,
@@ -961,6 +1011,51 @@ const makeStore = Effect.fnUntraced(function* () {
         ${input.subjectId}, ${input.recordedAt}
       )`.pipe(Effect.mapError(asDatabaseError("transaction")));
     return { eventId, sequence };
+  });
+
+  /**
+   * Appends one attempt-lifecycle event, in the caller's transaction.
+   *
+   * A thin wrapper over {@link appendEvent} that exists to make one decision once instead
+   * of at three call sites: **the three caller-authority columns are all `null`, and the
+   * attempt id goes in `subject_id`.**
+   *
+   * That looks wrong at a glance — an event about an attempt with a null `attempt_id` —
+   * so the reasoning is here rather than in a reviewer's head. Those three columns are
+   * *whose authority wrote this*, not *what it is about* (§6, and `contracts/event.ts`
+   * states the invariant: for a host-originated mutation they are absent together). Both
+   * of these are host-originated. `attempt.started` is written before any credential for
+   * that attempt exists — the attempt row has to be there for a credential to be minted
+   * against its fence — and `attempt.settled` is written by the supervisor or by the
+   * recovery sweep, neither of which presents a worker credential. Filling the columns in
+   * would claim the attempt wrote the record of its own beginning and end, which is
+   * exactly the conflation the separation exists to prevent.
+   *
+   * Nothing is lost: the attempt is the event's *subject*, which is what `subject_id` is
+   * for, and the payload carries the intent and the rest. A reader asking "what happened
+   * to attempt X" matches `subject_id`, and the same query finds the row whether the
+   * supervisor or the sweep wrote it.
+   */
+  const appendAttemptEvent = Effect.fnUntraced(function* (input: {
+    readonly kind: "attempt.started" | "attempt.settled";
+    readonly targetId: string;
+    readonly attemptId: string;
+    readonly operation: string;
+    readonly payload: Record<string, unknown>;
+    readonly recordedAt: number;
+  }) {
+    return yield* appendEvent({
+      kind: input.kind,
+      targetId: input.targetId,
+      callerScope: null,
+      intentId: null,
+      attemptId: null,
+      operation: input.operation,
+      operationId: null,
+      subjectId: input.attemptId,
+      payload: input.payload,
+      recordedAt: input.recordedAt,
+    });
   });
 
   /**
@@ -1936,6 +2031,32 @@ const makeStore = Effect.fnUntraced(function* () {
               write.attemptId,
             ).pipe(Effect.mapError(lift("observations", write.attemptId)));
 
+            // The sweep settles attempts a dead process left behind, so it is the other
+            // writer of `attempt.settled` — without this an attempt whose supervisor was
+            // killed would carry a `started` with no answer for the life of the log, and
+            // "still running" and "the process died" would read the same. Only when the
+            // status really moved out of `running`: a repeat pass over an `uncertain` row
+            // that learns nothing new changes no state and must not append.
+            if (decided.status !== current && decided.status !== "running") {
+              yield* appendAttemptEvent({
+                kind: "attempt.settled",
+                targetId: attempt.target_id,
+                attemptId: write.attemptId,
+                operation: "record_recovery",
+                payload: {
+                  attemptId: write.attemptId,
+                  intentId: attempt.intent_id,
+                  harnessSessionId: attempt.harness_session_id,
+                  status: decided.status,
+                  priorStatus: current,
+                  settledBy: "recovery",
+                  disposition: decided.disposition,
+                  observed: write.observed,
+                },
+                recordedAt: now,
+              });
+            }
+
             if (decided.status !== current) {
               yield* sql`UPDATE attempts
                   SET status = ${decided.status},
@@ -2109,6 +2230,26 @@ const makeStore = Effect.fnUntraced(function* () {
           // Read back rather than assumed: the row was just inserted in this
           // transaction, and this is the fence a credential for it must carry.
           const opened = yield* attemptOrFail(input.attemptId);
+          // A replacement is a new attempt and starts like any other. The predecessor is
+          // named in the payload rather than left to be joined for, so a reader following
+          // one slice's history does not have to know the column exists.
+          yield* appendAttemptEvent({
+            kind: "attempt.started",
+            targetId: replaced.target_id,
+            attemptId: input.attemptId,
+            operation: "open_replacement_attempt",
+            payload: {
+              attemptId: input.attemptId,
+              intentId: replaced.intent_id,
+              goalId: null,
+              workerId: input.workerId,
+              providerId: input.providerId,
+              modelId: input.modelId,
+              harnessSessionId: input.harnessSessionId,
+              replacesAttemptId: input.replacesAttemptId,
+            },
+            recordedAt: now,
+          });
           return {
             attemptId: input.attemptId,
             writeFence: opened?.write_fence ?? 0,

@@ -23,14 +23,26 @@
  * goes through it per request, which is what makes "open each of two targets in turn" a
  * thing this process can do without a restart.
  *
- * **One pin is left, and it is the mutation boundary.** `/api/v1/mcp` still takes its
- * store as a layer requirement, so this entrypoint resolves `TARGET_ID` once and hands it
- * over. Dispatching an MCP write to the target named by its own credential is a change at
- * the write boundary — the credential already carries a `targetId` — and it belongs with
- * the slice that starts runs from the browser, not with the one that reads a header. Note
- * what has changed even so: that store now comes out of the same resolver as everything
- * else, so the MCP route and a browser reading the same target share one connection and
- * one write lock rather than contending with two.
+ * **The last pin is gone, and with it `TARGET_ID`.** `/api/v1/mcp` used to take one
+ * target's store as a layer requirement, so this entrypoint resolved one id at startup and
+ * every authenticated write in the process went there. The write boundary dispatches by
+ * credential now (`mcp/tools.ts`): the route takes the resolver, and the tool handler
+ * reaches a store with the `targetId` the presented credential carries — which is derived
+ * from the credential and never from anything the model said. Three things went with it:
+ * the `TARGET_ID` environment variable, the pinned store, and the startup registration of
+ * that target.
+ *
+ * **Losing the auto-registration is the point, not a side effect.** This process used to
+ * register `fixture-local` on first boot if it was not there, which meant a fresh
+ * installation never had an empty registry — and the "first run, no targets" screen the
+ * design brief specifies was unreachable against a real server. A fresh fleet now has no
+ * targets until an operator creates one.
+ *
+ * **This process can start runs.** It owns an `opencode serve` and a client over it, and
+ * `run/supervisor.ts` turns a request into a detached run: the request returns an attempt
+ * id as soon as the prompt is accepted, and a fiber in this process's scope owns the rest.
+ * A harness that will not start is **not** fatal — see `harness` below — because a server
+ * that would not boot without one could not be used to look at what earlier runs recorded.
  *
  * What this entrypoint owns, in one scope, released in reverse on every exit including
  * `SIGINT`:
@@ -74,12 +86,16 @@ import { browserApiRoutes } from "./http/browserApi";
 import { BrowserSessions, ensureServerPassword } from "./http/browserSessions";
 import { ControlPlaneEndpoint } from "./http/controlPlane";
 import { resolveRoot } from "./http/folders";
+import { OpenCodeClient } from "./harness/openCodeClient";
+import { OpenCodeServer } from "./harness/openCodeServer";
 import { McpCredentials } from "./mcp/credentials";
 import { McpCallCounter } from "./mcp/server";
 import { FleetStore } from "./persistence/fleet";
 import { ObservationStore } from "./persistence/store";
 import { TargetStores } from "./persistence/targetStores";
-import { DEFAULT_POLICY, PolicyDecisions } from "./policy/service";
+import { PERMISSIVE_POLICY, PolicyDecisions } from "./policy/service";
+import { RunNarrations } from "./run/narration";
+import { RunSupervisor, WorkerEndpoints } from "./run/supervisor";
 import { HarnessSessionStatus } from "./recovery/harnessStatus";
 import {
   reconcileUnsettledAttempts,
@@ -96,7 +112,6 @@ import {
  */
 const HUNT_ROOT =
   process.env["HUNT_ROOT"] ?? join(process.cwd(), ".runtime", "hunt");
-const TARGET_ID = process.env["TARGET_ID"] ?? "fixture-local";
 const PORT = Number(process.env["PORT"] ?? 3000);
 
 /**
@@ -120,12 +135,17 @@ const WORKSPACE_ROOT = resolveRoot(
 const fleet = FleetStore.layer(HUNT_ROOT);
 
 /**
- * Brings the fleet up to date and makes sure the served target is registered.
+ * Brings the fleet up to date.
  *
- * Registration is idempotent in effect rather than by `ON CONFLICT`: `register` refuses a
- * duplicate id, which is right — an id is a directory of somebody's evidence — so this
- * asks first. The scope note is a placeholder an operator is expected to replace; it is
- * advisory prose and never enforcement (§4's `task_constraints` layer).
+ * It no longer registers anything. This used to create `TARGET_ID` if the registry did not
+ * hold it, which made a first boot against an empty fleet produce a target nobody asked
+ * for — and made the designed "first run, no targets" screen unreachable against a real
+ * server. Targets are created by an operator through `POST /api/v1/targets`, which is the
+ * only path that asks which folder the engagement is about.
+ *
+ * What is left is the sweep, and its partial-failure policy: a target whose file does not
+ * migrate is marked unavailable and refused by name while its neighbours are served. The
+ * reasoning and its cost are recorded on `persistence/fleet.ts`.
  */
 const prepareFleet = Effect.gen(function* () {
   const store = yield* FleetStore;
@@ -150,18 +170,13 @@ const prepareFleet = Effect.gen(function* () {
     console.log("");
   }
 
-  const existing = yield* store.target(TARGET_ID);
-  if (existing === undefined) {
-    yield* store.register({
-      targetId: TARGET_ID,
-      name: TARGET_ID,
-      scopeNote:
-        "Registered automatically at startup. Replace this with the engagement's own scope note.",
-    });
-    console.log(`registered target ${TARGET_ID} in ${HUNT_ROOT}`);
-  }
   const swept = yield* store.migrateFleet();
   console.log(`fleet: ${String(swept.length)} target(s) in ${HUNT_ROOT}`);
+  if (swept.length === 0) {
+    console.log(
+      "  no targets are registered yet; the browser app's New target dialog is how the first one is created",
+    );
+  }
   for (const outcome of swept) {
     console.log(
       `  ${outcome.targetId}: ${outcome.state}` +
@@ -192,112 +207,277 @@ const prepareFleet = Effect.gen(function* () {
 const targetStores = TargetStores.layer.pipe(Layer.provide(fleet));
 
 /**
- * The store the MCP route is pinned to, resolved through the resolver like everything else.
+ * The MCP credential registry, as one layer shared by everything that needs it.
  *
- * `/api/v1/mcp` declares `ObservationStore` as a layer requirement, so it gets one target
- * for the life of the process rather than one per request. The borrow is held by this
- * layer's scope, which is the process's scope, so this entry is never idle and the idle
- * TTL never applies to it.
- *
- * A refusal here is fatal, and should be: `TARGET_ID` is registered and swept by
- * `prepareFleet` immediately above, so a target that will not open at this point is not a
- * partial-fleet case — it is the one target this process was told to serve, and starting
- * without it would mean accepting MCP writes with nowhere to put them.
- *
- * **The pin outlives archival, and that is a decision rather than an oversight.** This
- * borrow is taken once and held by the process's scope, so archiving this target while
- * the process runs would not close its file: the MCP route would keep writing to a target
- * the registry has retired, and `TargetStores.invalidate` would not help — it stops an
- * entry being handed to anyone *new* and never interrupts a borrower. Nothing in this
- * process can reach that state today, because no route archives: `FleetStore.archive`
- * exists and the browser API does not expose it. The constraint is therefore recorded
- * here rather than defended against. **When an archive route is added, archiving
- * `TARGET_ID` has to be refused while this process serves it** — a running MCP endpoint
- * pinned to a retired target is a worse answer than telling the operator to stop the
- * server first.
+ * It was built inline where the listener was composed, which was fine while the listener
+ * was the only thing that touched it. The supervisor mints credentials now and the
+ * reconciler revokes them, so a second `McpCredentials.layer` anywhere in this graph would
+ * be a second in-memory map — and a token minted in one would be unknown to the other,
+ * which is a `401` that no amount of reading the code would explain.
  */
-const servedStore = TargetStores.pinned(
-  TARGET_ID,
-  "the MCP route declares ObservationStore as a layer requirement, so the mutation boundary serves one target until it learns to dispatch by credential",
-).pipe(Layer.provide(targetStores));
+const credentials = McpCredentials.layer;
 
 /**
- * The browser API, resolved down to the router it will be registered on.
+ * Where a worker calls back into, answered once the listener exists.
  *
- * Everything it needs is provided here — the fleet registry it reads targets out of, the
- * per-target store resolver it opens one target's database with, and the browser session
- * registry its guard resolves against — so what reaches the control plane is a layer with
- * one requirement left: `HttpRouter`. That is what lets it share the listener without this
- * entrypoint knowing how the control plane builds its router, and without the control
- * plane knowing what a target is.
- *
- * The session registry is provided to the API and *not* merged outward, so nothing else
- * in this process can reach it. The MCP credentials next to it are a separate service
- * with a separate map; neither resolver can see the other's tokens.
+ * The cycle this breaks is recorded on {@link WorkerEndpoints}: the browser API needs the
+ * supervisor, the supervisor needs these URLs — the MCP endpoint for the credential it
+ * hands the harness, and the policy endpoint for the gate it installs into the workspace
+ * — and both belong to the listener the browser API is merged onto. `publish` is called
+ * in `program` below, before anything else, so the gap between the listener accepting
+ * requests and workers being able to be told where to call back is as small as this
+ * process can make it.
  */
-const browserApi = browserApiRoutes({ workspaceRoot: WORKSPACE_ROOT }).pipe(
-  Layer.provide(BrowserSessions.layer),
-  Layer.provide(targetStores),
-  Layer.provide(fleet),
-  // `Layer.orDie` rather than a failure that propagates, and the reason is the ordering
-  // below: `prepareFleet` has already opened and migrated `control.sqlite` by the time
-  // this layer is built, so a `DatabaseError` here is not "the control database is
-  // unmigratable" — that case has already failed startup with its own message. It is the
-  // same file failing to open a second time, which nothing in this process can report
-  // more usefully than a defect.
-  Layer.orDie,
+const workerEndpoints = WorkerEndpoints.pending();
+
+/**
+ * The agent harness: an `opencode serve` this process owns, and a client over it.
+ *
+ * Spawned with `WORKSPACE_ROOT` as its working directory rather than the fleet root,
+ * because the fleet root holds what we recorded and the harness should be nowhere near it
+ * by default. Which directory a *run* happens in is a per-session decision — the
+ * engagement's own folder, from the target's registry row — so this only sets where the
+ * server process itself starts and where it discovers its configuration.
+ *
+ * The server runs as the user and so reads the user's own stored provider credentials; we
+ * never read, copy or pass those (DECISIONS.md §12).
+ */
+const harness = OpenCodeClient.layer().pipe(
+  Layer.provideMerge(OpenCodeServer.layer({ cwd: WORKSPACE_ROOT })),
 );
 
-const endpoint = ControlPlaneEndpoint.layer({
-  policy: DEFAULT_POLICY,
-  port: PORT,
-  extraRoutes: browserApi,
-}).pipe(
-  Layer.provideMerge(McpCredentials.layer),
+/**
+ * What this process can do without a harness: serve, sweep, reconcile, and refuse to run.
+ *
+ * `RunSupervisor.unavailable` refuses every start with `no_harness` and a sentence naming
+ * the fix. `HarnessSessionStatus.fromAnswers({})` answers `missing` for every session id,
+ * which is exactly what a process with no harness knows — and `missing` maps to
+ * `uncertain`, never to `failed`. A server that guessed would be worse than one that
+ * admits it cannot tell.
+ */
+const withoutHarness = Layer.mergeAll(
+  RunSupervisor.unavailable,
+  HarnessSessionStatus.fromAnswers({}),
+);
+
+/**
+ * The supervisor and the recovery adapter, over a harness if there is one.
+ *
+ * **A harness that will not start is not fatal, and that is a decision.** `opencode` may
+ * be missing, the wrong version, or unauthenticated, and on any of those this process
+ * still has a job: serving the browser the evidence earlier runs recorded, sweeping the
+ * fleet, and reconciling attempts a previous process left unsettled. Refusing to boot
+ * would make a missing agent into an inability to read what the agent already found.
+ *
+ * **The recovery covers the harness build and nothing else**, which is the whole shape of
+ * this expression. `Layer.build(harness)` is wrapped in `Effect.result` — so a
+ * `HarnessProcessError` from spawning or waiting for `opencode serve` is caught, and a
+ * failure or defect anywhere *else* in this graph propagates and fails startup the way it
+ * should. The arrangement this replaces put `Layer.catchCause` around the whole composed
+ * layer, after `targetStores`, `credentials`, the narration bus and the MCP endpoint had
+ * been provided to it. A fault in any of those was then reported to the operator as "no
+ * agent harness", with "install opencode" as the suggested fix — a confidently wrong
+ * diagnosis for a bug in our own code, leaving a server that silently refuses every run
+ * while the browser API keeps working through its own path to the same services.
+ *
+ * Only typed failures are recovered from. A *defect* in the harness build is a bug in our
+ * spawn path rather than a missing binary, and it still takes the process down, because
+ * there is nothing an operator can usefully do about it and a server that hid it would be
+ * harder to diagnose than one that stopped.
+ *
+ * The built context is handed on with `Layer.succeedContext`, so the harness process's
+ * lifetime belongs to this layer's scope exactly as it did before: `Layer.build` acquires
+ * into the ambient build scope, and `Layer.unwrap` satisfies that `Scope` requirement from
+ * it. The memo map is forked from the ambient one, so nothing here is built twice.
+ *
+ * Startup reconciliation gets the *real* harness when there is one, which is new: this
+ * entrypoint used to answer `missing` for every session because it owned none. An attempt
+ * a previous process left `running` can now be reconciled to what the harness actually
+ * says about its session rather than to `uncertain` by default.
+ *
+ * `HARNESS=0` skips the attempt entirely, for an operator who wants the server without a
+ * child process.
+ */
+const agent =
+  process.env["HARNESS"] === "0"
+    ? withoutHarness
+    : Layer.unwrap(
+        Effect.map(Effect.result(Layer.build(harness)), (built) =>
+          built._tag === "Failure"
+            ? Layer.effectDiscard(
+                Effect.logWarning(
+                  "no agent harness: `opencode serve` would not start, so this server will serve and reconcile but will refuse to start runs",
+                  { detail: built.failure.message },
+                ),
+              ).pipe(Layer.merge(withoutHarness))
+            : Layer.mergeAll(
+                RunSupervisor.layer,
+                HarnessSessionStatus.layer,
+              ).pipe(
+                Layer.provide(Layer.succeedContext(built.success)),
+                Layer.provide(targetStores),
+                Layer.provide(credentials),
+                Layer.provide(RunNarrations.layer),
+                Layer.provide(workerEndpoints.layer),
+              ),
+        ),
+      );
+
+/**
+ * The listener, with the browser API's routes on it and the services it shares with the
+ * rest of this process handed in as values rather than as layers.
+ *
+ * **This indirection fixes a real bug and closes a class of it, so it is worth reading
+ * rather than skipping.** `ControlPlaneEndpoint` builds the router's application layer
+ * through `HttpRouter.toWebHandler`, which builds it **in its own scope with its own memo
+ * map** (`effect/src/http/HttpEffect.ts`, `toWebHandlerLayerWith`: it takes an optional
+ * `memoMap` and is given none). So a layer *provided to* `extraRoutes` is built a second
+ * time, independently of this graph — layer memoisation does not cross that boundary,
+ * because the two builds do not share a memo map.
+ *
+ * That is why `ControlPlaneEndpoint.layer` yields its own services and re-provides them
+ * with `Layer.succeed`: it is passing *instances* across the boundary rather than letting
+ * them be rebuilt. Anything the browser API shares with the rest of the process has to
+ * arrive the same way, and the failure when it does not is silent and bad.
+ *
+ * Observed against a live server before this was written. `browserApiRoutes` had
+ * `Layer.provide(agent)`, so the supervisor the compose box started runs through was a
+ * *second* instance with a *second* `McpCredentials` map. It minted a credential into its
+ * own map; the MCP route's auth middleware resolved against this graph's. The harness
+ * connected with a perfectly good token and was answered `401 unknown_or_expired`, so the
+ * worker had no `record_observation` tool at all — and nothing failed loudly, because a
+ * worker with no tools is a worker that simply never records anything. The same mechanism
+ * was already giving the browser API its own `TargetStores`, which is a second set of
+ * SQLite handles on the same files; the comment on `targetStores` claimed one instance per
+ * process and was wrong before this slice touched it.
+ *
+ * `Layer.unwrap` over `Effect.context` is how the instances get in: the three services the
+ * browser API shares are read out of *this* graph and handed to its routes as a context,
+ * so there is exactly one of each in the process and the compose box drives the same
+ * supervisor whose credentials the MCP route accepts.
+ *
+ * `BrowserSessions` is deliberately **not** in that set and is still provided inside. It
+ * is shared with nothing, and keeping it there is what makes "nothing else in this process
+ * can reach the browser session registry" true rather than merely intended; being built in
+ * the inner memo map is harmless for a service only the guard uses. The MCP credentials
+ * beside it are a separate service with a separate map, and neither resolver can see the
+ * other's tokens.
+ */
+const endpoint = Layer.unwrap(
+  Effect.map(
+    Effect.context<FleetStore | TargetStores | RunSupervisor>(),
+    (shared) =>
+      ControlPlaneEndpoint.layer({
+        policy: PERMISSIVE_POLICY,
+        port: PORT,
+        extraRoutes: browserApiRoutes({
+          workspaceRoot: WORKSPACE_ROOT,
+        }).pipe(
+          Layer.provide(BrowserSessions.layer),
+          Layer.provide(Layer.succeedContext(shared)),
+          // `Layer.orDie` rather than a failure that propagates, and the reason is the
+          // ordering below: `prepareFleet` has already opened and migrated
+          // `control.sqlite` by the time this is built, so a `DatabaseError` here is not
+          // "the control database is unmigratable" — that case has already failed startup
+          // with its own message. It is the same file failing to open a second time, which
+          // nothing in this process can report more usefully than a defect.
+          Layer.orDie,
+        ),
+      }),
+  ),
+).pipe(
+  Layer.provideMerge(credentials),
   Layer.provideMerge(McpCallCounter.layer),
   Layer.provideMerge(PolicyDecisions.layer),
-  Layer.provide(servedStore),
+  Layer.provide(targetStores),
 );
 
 /**
- * The harness this process can ask about an abandoned session: none.
+ * Startup reconciliation, now across the whole fleet rather than one target.
  *
- * `fromAnswers({})` answers `missing` for every session id, which is exactly what a
- * process with no harness knows — and `missing` maps to `uncertain`, never to `failed`.
- * A server that guessed would be worse than one that admits it cannot tell. A deployment
- * that owns a harness provides `HarnessSessionStatus.layer` instead and gets real
- * answers from it.
+ * This is a consequence of losing the pin, and it is a fix rather than a cost. The sweep
+ * reads `attempts` out of a target's own `hunt.sqlite`, and this process used to hold
+ * exactly one of those — so a process serving three engagements reconciled one of them and
+ * left the other two's rows `running` forever, with their write fences never bumped. There
+ * is no single `ObservationStore` to provide any more, so the only way to write this is
+ * the right way: ask the registry what targets there are, and sweep each one's file.
+ *
+ * Archived targets are skipped. An archived engagement is one nobody is working on, so an
+ * attempt row inside it is not a question about what is running now; opening its file to
+ * ask would also undo the point of archiving it.
+ *
+ * **One target that will not open does not stop the others.** That is the fleet's
+ * partial-failure policy (`persistence/fleet.ts`) applied to recovery: a refusal is logged
+ * by name and the sweep carries on, because a missing folder in one engagement must not
+ * leave another engagement's attempts unreconciled.
+ *
+ * It runs after the layer graph is built, so the listener is accepting while it works.
+ * That window is narrower than it looks: this process mints credentials only through the
+ * supervisor, and the supervisor cannot be asked for one until the MCP URL is published —
+ * which happens on the line above the call to this.
  */
-const harnessStatus = HarnessSessionStatus.fromAnswers({});
-
 const reconcile = Effect.gen(function* () {
   if (process.env["RECONCILE_ON_START"] === "0") {
     console.log("startup reconciliation skipped (RECONCILE_ON_START=0)");
     return;
   }
-  const reconciled = yield* reconcileUnsettledAttempts();
-  if (reconciled.length === 0) {
-    console.log(
-      "startup reconciliation: no attempt was left running or uncertain",
+  const registry = yield* FleetStore;
+  const stores = yield* TargetStores;
+  const rows = yield* registry.targets();
+  let swept = 0;
+  let total = 0;
+  for (const row of rows) {
+    if (row.archivedAt !== undefined) continue;
+    const outcome = yield* Effect.result(
+      Effect.scoped(
+        Effect.flatMap(stores.open(row.targetId), (store) =>
+          reconcileUnsettledAttempts().pipe(
+            Effect.provideService(ObservationStore, store),
+          ),
+        ),
+      ),
     );
-    return;
+    if (outcome._tag === "Failure") {
+      console.error(
+        `startup reconciliation: ${row.targetId} could not be reconciled — ${outcome.failure.message}`,
+      );
+      continue;
+    }
+    swept += 1;
+    total += outcome.success.length;
+    for (const entry of outcome.success)
+      console.log(`  ${row.targetId}: ${renderReconciliation(entry)}`);
   }
   console.log(
-    `startup reconciliation: ${String(reconciled.length)} attempt(s)`,
+    total === 0
+      ? `startup reconciliation: no attempt was left running or uncertain across ${String(swept)} target(s)`
+      : `startup reconciliation: ${String(total)} attempt(s) across ${String(swept)} target(s)`,
   );
-  for (const entry of reconciled)
-    console.log(`  ${renderReconciliation(entry)}`);
 });
 
 const program = Effect.gen(function* () {
-  yield* reconcile;
   const control = yield* ControlPlaneEndpoint;
+  // Before reconciliation, deliberately. The listener is already accepting by the time
+  // this runs, so the sooner the URL is answerable the smaller the window in which a start
+  // would have to wait for it. Reconciliation can take as long as the harness takes to
+  // answer about every unsettled attempt.
+  yield* workerEndpoints.publish({
+    mcp: control.mcpUrl,
+    policy: control.policyUrl,
+  });
+  yield* reconcile;
   console.log(`bit control plane: ${control.healthUrl}`);
   console.log(`  mcp (bearer required):  ${control.mcpUrl}`);
-  console.log(`  policy (unauthenticated): ${control.policyUrl}`);
+  console.log(
+    `  policy (unauthenticated): ${control.policyUrl} — gate installed per run, host scope: ${PERMISSIVE_POLICY.hostScope._tag}`,
+  );
   console.log(`  browser api (session bearer): ${control.origin}${API_PREFIX}`);
   console.log(`  folder picker root: ${WORKSPACE_ROOT}`);
-  console.log(`  serving target: ${TARGET_ID}`);
+  const supervisor = yield* RunSupervisor;
+  const alreadyRunning = yield* supervisor.running;
+  console.log(
+    `  runs supervised right now: ${String(alreadyRunning.length)} (a fresh process supervises none; rows left by an old one are the sweep's)`,
+  );
   yield* Effect.callback<void>((resume) => {
     const stop = () => resume(Effect.void);
     process.once("SIGINT", stop);
@@ -318,7 +498,17 @@ await Effect.runPromise(
     Effect.andThen(
       prepareFleet.pipe(Effect.provide(fleet)),
       program.pipe(
-        Effect.provide(Layer.mergeAll(endpoint, servedStore, harnessStatus)),
+        Effect.provide(
+          // The endpoint *requires* the three shared services now, because it hands them
+          // to the browser API's routes as values rather than letting the router's own
+          // build make its own copies. `provideMerge` satisfies that requirement and keeps
+          // them reachable by `program`, which reconciles the fleet through the same
+          // instances the browser and the MCP route use.
+          Layer.provideMerge(
+            endpoint,
+            Layer.mergeAll(agent, targetStores, fleet),
+          ),
+        ),
       ),
     ),
   ),

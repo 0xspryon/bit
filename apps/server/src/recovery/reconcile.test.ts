@@ -30,7 +30,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Effect, Layer, Redacted } from "effect";
+import { Effect, Layer, Redacted, Stream } from "effect";
 
 import { OpenCodeClient } from "../harness/openCodeClient";
 import { HarnessTransportError } from "../harness/errors";
@@ -1291,6 +1291,11 @@ describe("the live harness adapter's own mapping", () => {
         waitForIdle: () => Effect.void,
         sessionStatus: () => answer,
         messages: () => Effect.succeed([]),
+        // Never drained here: what is under test is the adapter's mapping of a
+        // `sessionStatus` answer, and an empty stream is the narrowest stand-in that
+        // satisfies the service shape without implying this path reads one.
+        sessionEvents: () => Stream.empty,
+        interruptSession: () => Effect.succeed(false),
       }),
     );
 

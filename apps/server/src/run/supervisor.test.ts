@@ -1,0 +1,1423 @@
+/**
+ * Real-SQLite tests for the detached run.
+ *
+ * Every claim here is a *behaviour* rather than a type, and each one was a property the
+ * single-effect `runWorkerPhase` could not have:
+ *
+ * 1. **A start returns before the run finishes.** Asserted against a session that is still
+ *    going when the start call has already answered, not against a timing measurement.
+ * 2. **Two runs against two targets write to their own files, at once.** The reason this is
+ *    the interesting concurrency case and not two runs against one target: it is what the
+ *    pinned MCP store made impossible, so it is the thing dispatch-by-credential buys.
+ * 3. **A stop settles and revokes.** Both, read back from the attempt row and the
+ *    credential registry rather than taken from the response.
+ * 4. **A supervisor whose stream dies reconciles rather than infers.** Three versions of
+ *    it, because "nothing to infer from" has three shapes: the narration stream fails, the
+ *    long poll fails, and both fail with the harness unable to say anything either.
+ * 5. **Lifecycle events land in sequence order.** `attempt.started` then
+ *    `attempt.settled`, in one target's own log, with the three caller-authority columns
+ *    null on both.
+ *
+ * ## The harness is a fake, and the fake is the point
+ *
+ * The supervisor's job is everything *around* the agent: what is forked where, what the
+ * attempt row says afterwards, which credential still resolves, what reaches the
+ * narration bus. A real `opencode` would make each of those assertions wait on a model
+ * and a provider login, and — worse — would make "the stream died" and "the harness cannot
+ * answer" states a test could not produce on demand. So the client is a fake whose every
+ * answer a test chooses, and the real harness is exercised separately against a live
+ * server.
+ *
+ * What is **not** faked: the fleet, the two target databases, the credential registry, the
+ * narration bus and the supervisor itself. The attempt rows these tests read are rows in
+ * files on disk, which is why this suite is part of `test:persistence`.
+ */
+import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  Deferred,
+  Effect,
+  Fiber,
+  Layer,
+  ManagedRuntime,
+  Redacted,
+  Stream,
+  type Duration,
+} from "effect";
+
+import { HarnessTransportError } from "../harness/errors";
+import {
+  type HarnessNarration,
+  OpenCodeClient,
+  type TerminalOutcome,
+} from "../harness/openCodeClient";
+import { McpCredentials } from "../mcp/credentials";
+import { FleetStore } from "../persistence/fleet";
+import { TargetStores, withTargetStore } from "../persistence/targetStores";
+import { WORKER_MODEL } from "./model";
+import { RunNarrations, type RunNarration } from "./narration";
+import {
+  WorkerEndpoints,
+  RunSupervisor,
+  settlementFor,
+  type RunInput,
+  type SupervisionEnd,
+} from "./supervisor";
+
+const directories: string[] = [];
+afterEach(() => {
+  while (directories.length > 0) {
+    const directory = directories.pop();
+    if (directory !== undefined)
+      rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+const newRoot = (): string => {
+  const directory = mkdtempSync(join(tmpdir(), "bit-supervisor-"));
+  directories.push(directory);
+  return join(directory, "fleet");
+};
+
+/* ── The fake harness ────────────────────────────────────────────────────────── */
+
+/**
+ * What one scripted session does, and what a test can watch it do.
+ *
+ * `settle` is a `Deferred` the test completes to let `waitForIdle` return, which is how a
+ * test holds a run open for as long as it needs to assert that the start call has already
+ * come back. `narrate` is a queue the test pushes entries onto. Neither has a timer in
+ * it: a test that slept would be asserting about a schedule rather than about the
+ * supervisor.
+ */
+interface Script {
+  /** Resolved by the test to let the long poll return. Fail it to break the poll. */
+  readonly settle: Deferred.Deferred<void, HarnessTransportError>;
+  /** Entries the narration stream emits, then it stays open until interrupted. */
+  readonly narration: readonly HarnessNarration[];
+  /** How the narration stream ends: `open` stays up, `fail` breaks it. */
+  readonly stream: "open" | "fail";
+  /** What `session.get` answers. `undefined` is "no outcome on the session". */
+  readonly status: TerminalOutcome | undefined;
+  /** When true, `session.get` fails: the harness cannot be asked at all. */
+  readonly statusUnreachable?: boolean;
+  /**
+   * When true, `session.get` never answers.
+   *
+   * Different from `statusUnreachable` in the way that matters to a bound: a failure
+   * returns, a silence does not, and only the second can hang a shutdown.
+   */
+  readonly statusHangs?: boolean;
+}
+
+interface Recorder {
+  readonly prompts: string[];
+  readonly registrations: { name: string; url: string; bearer: string }[];
+  readonly interrupts: string[];
+  readonly created: string[];
+}
+
+const transport = (operation: string, detail: string) =>
+  new HarnessTransportError({
+    operation,
+    status: undefined,
+    tag: "TestError",
+    detail,
+    cause: detail,
+  });
+
+const narration = (
+  type: string,
+  sequence: number,
+  outcome?: TerminalOutcome,
+): HarnessNarration => ({
+  type,
+  sequence,
+  at: 1_700_000_000_000 + sequence,
+  outcome,
+});
+
+/**
+ * A client that answers from a script, keyed by session id.
+ *
+ * `scriptFor` is a function rather than a map so a test can hand one script to every
+ * session without naming the ids the supervisor is about to mint — the supervisor mints
+ * them, which is the behaviour under test in §5 of the brief, so a test cannot know them
+ * in advance.
+ */
+const fakeClient = (
+  scriptFor: (sessionId: string) => Script,
+  recorder: Recorder,
+): Layer.Layer<OpenCodeClient> =>
+  Layer.succeed(
+    OpenCodeClient,
+    OpenCodeClient.of({
+      registerMcpServer: (name, config) =>
+        Effect.sync(() => {
+          recorder.registrations.push({
+            name,
+            url: config.url,
+            bearer: Redacted.value(
+              config.headers["authorization"] ?? Redacted.make(""),
+            ),
+          });
+        }),
+      createSession: (input) =>
+        Effect.sync(() => {
+          // Honours the id it is handed, like the real harness was verified to do. A test
+          // for the case where it does *not* is below, and overrides this.
+          const id = input.sessionId ?? "ses_chosen_by_harness";
+          recorder.created.push(id);
+          return { id };
+        }),
+      prompt: (sessionId, text) =>
+        Effect.sync(() => {
+          recorder.prompts.push(`${sessionId}:${text}`);
+        }),
+      waitForIdle: (sessionId) => Deferred.await(scriptFor(sessionId).settle),
+      sessionStatus: (sessionId) => {
+        const script = scriptFor(sessionId);
+        if (script.statusHangs === true) return Effect.never;
+        return script.statusUnreachable === true
+          ? Effect.fail(transport("session.get", "the harness is unreachable"))
+          : Effect.succeed(
+              script.status === undefined ? {} : { outcome: script.status },
+            );
+      },
+      messages: () => Effect.succeed([]),
+      interruptSession: (sessionId) =>
+        Effect.andThen(
+          Effect.sync(() => {
+            recorder.interrupts.push(sessionId);
+          }),
+          // A harness that will not answer `session.get` will not answer this either, so
+          // the script's silence covers both asks the finalizer makes.
+          scriptFor(sessionId).statusHangs === true
+            ? Effect.never
+            : Effect.succeed(true),
+        ),
+      sessionEvents: (sessionId) => {
+        const script = scriptFor(sessionId);
+        const emitted = Stream.fromIterable(script.narration);
+        return script.stream === "fail"
+          ? Stream.concat(
+              emitted,
+              Stream.fail(transport("event.subscribe", "the socket dropped")),
+            )
+          : // Stays open after the scripted entries, like a real subscription does: it
+            // ends when the consuming fiber is interrupted and not before.
+            Stream.concat(emitted, Stream.never);
+      },
+    }),
+  );
+
+/* ── The world under test ────────────────────────────────────────────────────── */
+
+const emptyRecorder = (): Recorder => ({
+  prompts: [],
+  registrations: [],
+  interrupts: [],
+  created: [],
+});
+
+/**
+ * A fleet with the given targets registered and swept, and a supervisor over it.
+ *
+ * `TargetStores.layer` and a real `FleetStore`, not `ofStore`: the point of two targets is
+ * that the resolver has to pick between two files, and a resolver holding one entry could
+ * not be wrong in the way this is checking it is not.
+ */
+const world = (
+  targets: readonly string[],
+  scriptFor: (sessionId: string) => Script,
+  recorder: Recorder,
+  options?: { readonly askTimeout?: Duration.Input | undefined },
+) => {
+  const root = newRoot();
+  const fleet = FleetStore.layer(root);
+  const stores = TargetStores.layer.pipe(Layer.provide(fleet));
+  const supervisor =
+    options?.askTimeout === undefined
+      ? RunSupervisor.layer
+      : RunSupervisor.layerWith({ askTimeout: options.askTimeout });
+  const layer = Layer.mergeAll(
+    fleet,
+    stores,
+    McpCredentials.layer,
+    RunNarrations.layer,
+    supervisor.pipe(
+      Layer.provide(fakeClient(scriptFor, recorder)),
+      Layer.provide(stores),
+      Layer.provide(McpCredentials.layer),
+      Layer.provide(RunNarrations.layer),
+      Layer.provide(
+        Layer.succeed(
+          WorkerEndpoints,
+          WorkerEndpoints.of({
+            urls: Effect.succeed({
+              mcp: "http://127.0.0.1:9/api/v1/mcp",
+              policy: "http://127.0.0.1:9/api/v1/policy/decide",
+            }),
+          }),
+        ),
+      ),
+    ),
+  );
+  const runtime = ManagedRuntime.make(layer);
+  const ready = runtime.runPromise(
+    Effect.gen(function* () {
+      const registry = yield* FleetStore;
+      for (const targetId of targets) {
+        yield* registry.register({
+          targetId,
+          name: targetId,
+          scopeNote: "the local fixture only",
+        });
+      }
+      yield* registry.migrateFleet();
+    }).pipe(Effect.orDie),
+  );
+  /**
+   * The credential registry as a value, so a test can read it after `dispose()`.
+   *
+   * The service is a closure over a plain `Map`, so `size` runs with no context and keeps
+   * answering once the layer's scope is gone — which is the only way to assert that a
+   * shutdown revoked what it was supposed to.
+   */
+  const registry = runtime.runPromise(Effect.map(McpCredentials, (it) => it));
+  return { root, runtime, ready, registry };
+};
+
+/** One target's rows, read straight off the file after the runtime is gone. */
+const readAfterShutdown = (root: string, targetId: string) => {
+  const database = new Database(
+    join(root, "targets", targetId, "hunt.sqlite"),
+    {
+      readonly: true,
+    },
+  );
+  try {
+    return {
+      attempts: database
+        .query<{ id: string; status: string; ended_at: number | null }, []>(
+          "SELECT id, status, ended_at FROM attempts ORDER BY started_at",
+        )
+        .all(),
+      events: database
+        .query<{ kind: string; subject_id: string }, []>(
+          "SELECT kind, subject_id FROM events ORDER BY sequence",
+        )
+        .all(),
+    };
+  } finally {
+    database.close();
+  }
+};
+
+/**
+ * One run's input, with a scratch workspace of its own.
+ *
+ * The workspace is real and per-target because starting a run now *writes* to it — the
+ * pre-execution policy gate is installed there before the session is created — so a
+ * shared `/tmp` would have every test in this file installing over every other, and
+ * would leave a `.opencode` directory behind on the machine. `afterEach` removes the
+ * whole temp root.
+ *
+ * The audit path sits beside the workspace rather than inside it, which is the same
+ * arrangement the server uses for a real run and the same reason: a worker that can read
+ * its own audit trail can read the shape of the boundary it is inside.
+ */
+const draft = (root: string, targetId: string, task: string): RunInput => {
+  const base = join(root, "..", "work", targetId);
+  mkdirSync(base, { recursive: true });
+  return {
+    targetId,
+    workspace: base,
+    auditPath: join(root, "..", "work", `${targetId}-policy-audit.log`),
+    model: WORKER_MODEL,
+    goal: `Work out what ${targetId} does under load.`,
+    question: `Probe ${targetId}'s limiter.`,
+    task,
+    title: `bit: ${targetId}`,
+  };
+};
+
+/** The scripts a test wires in, with a settle gate per session created on demand. */
+const scripts = (defaults: Omit<Script, "settle">) => {
+  const held = new Map<string, Script>();
+  const scriptFor = (sessionId: string): Script => {
+    const existing = held.get(sessionId);
+    if (existing !== undefined) return existing;
+    const made: Script = {
+      ...defaults,
+      settle: Deferred.makeUnsafe<void, HarnessTransportError>(),
+    };
+    held.set(sessionId, made);
+    return made;
+  };
+
+  /**
+   * Lets the long poll for one session return, or fail.
+   *
+   * **Keyed by the session the test started, not by iterating what the map happens to
+   * hold.** Iterating was a race: `scriptFor` creates an entry when the fake client is
+   * first asked about a session, so a test that resolved "every script so far" could run
+   * before the supervisor had asked about one — and the supervisor would then create a
+   * *second*, unresolved entry and wait on it forever. Naming the session is
+   * deterministic either way round, because `scriptFor` creates-or-gets.
+   */
+  const release = (
+    sessionId: string,
+    failure?: HarnessTransportError,
+  ): Effect.Effect<void> =>
+    Effect.asVoid(
+      failure === undefined
+        ? Deferred.succeed(scriptFor(sessionId).settle, undefined)
+        : Deferred.fail(scriptFor(sessionId).settle, failure),
+    );
+
+  return { scriptFor, held, release };
+};
+
+/**
+ * Lets every long poll the supervisor has actually opened return.
+ *
+ * Only for teardown, where the point is to let a runtime close without interrupting a
+ * live run — not to drive a settlement a test then asserts on. Iterating is safe here
+ * precisely because nothing is waiting on the result.
+ */
+const releaseAll = (held: ReadonlyMap<string, Script>): Effect.Effect<void> =>
+  Effect.forEach(
+    [...held.values()],
+    (script) => Deferred.succeed(script.settle, undefined),
+    { discard: true },
+  );
+
+/* ── The settlement table, on its own ────────────────────────────────────────── */
+
+describe("what one ending settles to", () => {
+  const ends: readonly SupervisionEnd[] = [
+    { _tag: "waited" },
+    { _tag: "waitFailed", detail: "the socket dropped" },
+    { _tag: "stopped" },
+    { _tag: "startFailed" },
+  ];
+
+  test("the harness's own session state wins whenever it has one", () => {
+    for (const end of ends) {
+      expect(
+        settlementFor({ end, narrated: "failed", harness: "succeeded" }),
+      ).toBe("succeeded");
+    }
+  });
+
+  test("a narrated terminal event is used when the session state has none", () => {
+    // Not a fallback for completeness: `opencode` 2.1.2's `session.get` carries no
+    // `outcome` on a session that has not finished, so this is the common path.
+    for (const end of ends) {
+      expect(
+        settlementFor({ end, narrated: "failed", harness: undefined }),
+      ).toBe("failed");
+    }
+  });
+
+  test("a stop with nothing else to go on is `interrupted`, not `failed`", () => {
+    // The one status we know first-hand. `failed` would be a claim about the work.
+    expect(
+      settlementFor({
+        end: { _tag: "stopped" },
+        narrated: undefined,
+        harness: undefined,
+      }),
+    ).toBe("interrupted");
+  });
+
+  test("everything else with nothing to go on is `uncertain`, never `failed`", () => {
+    for (const end of ends) {
+      if (end._tag === "stopped") continue;
+      expect(
+        settlementFor({ end, narrated: undefined, harness: undefined }),
+      ).toBe("uncertain");
+    }
+  });
+});
+
+/* ── The detached run ────────────────────────────────────────────────────────── */
+
+describe("starting a run", () => {
+  test("returns while the run is still going", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [narration("session.execution.started", 1)],
+      stream: "open",
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const credentials = yield* McpCredentials;
+
+        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+
+        // The assertion that matters, and it is a state rather than a duration: nothing
+        // has settled this attempt, because nothing has let the harness's long poll
+        // return. If `start` had waited for the run, this row could not say `running`.
+        const row = yield* withTargetStore(stores, "alpha", (store) =>
+          store.loadAttempt(started.attemptId, "alpha"),
+        );
+        return {
+          started,
+          status: row?.status,
+          session: row?.harness_session_id,
+          supervising: yield* supervisor.running,
+          liveCredentials: yield* credentials.size,
+          prompts: [...recorder.prompts],
+          registrations: [...recorder.registrations],
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.status).toBe("running");
+    expect(observed.supervising.map((entry) => entry.attemptId)).toEqual([
+      observed.started.attemptId,
+    ]);
+    // The row names the session the harness was asked to create, which is the id we
+    // minted — written before `createSession` was called, so a crash in that window
+    // leaves a row pointing at a session recovery can ask about.
+    expect(observed.session).toBe(observed.started.harnessSessionId);
+    expect(recorder.created).toEqual([observed.started.harnessSessionId]);
+    // Prompted, which is what makes this a run rather than an open session.
+    expect(observed.prompts).toEqual([
+      `${observed.started.harnessSessionId}:probe it`,
+    ]);
+    // One credential, delivered in the registration body and nowhere else.
+    expect(observed.liveCredentials).toBe(1);
+    expect(observed.registrations).toHaveLength(1);
+    expect(observed.registrations[0]?.name).toBe(
+      `bit-${observed.started.attemptId}`,
+    );
+    expect(observed.registrations[0]?.bearer).toMatch(/^Bearer [0-9a-f]{64}$/);
+
+    // Let it finish, so the runtime's teardown is not interrupting a live run.
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("settles from the harness once the run ends, and logs the pair in order", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [
+        narration("session.execution.started", 1),
+        narration("session.text.ended", 2),
+        narration("session.execution.succeeded", 3, "succeeded"),
+      ],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const credentials = yield* McpCredentials;
+        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+
+        // Let the long poll return, then wait for the supervisor to be gone from the
+        // map — which only happens after its finalizer has settled and revoked.
+        yield* release(started.harnessSessionId);
+        yield* settled(supervisor, started.attemptId);
+
+        const row = yield* withTargetStore(stores, "alpha", (store) =>
+          store.loadAttempt(started.attemptId, "alpha"),
+        );
+        const events = yield* withTargetStore(stores, "alpha", (store) =>
+          store.eventsAfter(),
+        );
+        return {
+          started,
+          status: row?.status,
+          ended: row?.ended_at,
+          events,
+          liveCredentials: yield* credentials.size,
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.status).toBe("succeeded");
+    expect(observed.ended).not.toBeNull();
+    // Revoked by the fiber's scope closing, with no stop and nothing explicit asked for.
+    expect(observed.liveCredentials).toBe(0);
+
+    // The pair, in sequence order, in this target's own log.
+    expect(observed.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "attempt.settled",
+    ]);
+    expect(observed.events.map((event) => event.sequence)).toEqual([1, 2]);
+    expect(observed.events.map((event) => event.subjectId)).toEqual([
+      observed.started.attemptId,
+      observed.started.attemptId,
+    ]);
+    // Caller authority absent on both, which is the invariant `contracts/event.ts`
+    // states: neither is written by a worker presenting a credential.
+    for (const event of observed.events) {
+      expect(event.callerScope).toBeNull();
+      expect(event.intentId).toBeNull();
+      expect(event.attemptId).toBeNull();
+      expect(event.targetId).toBe("alpha");
+    }
+    expect(observed.events[1]?.payload).toMatchObject({
+      status: "succeeded",
+      priorStatus: "running",
+      settledBy: "supervisor",
+    });
+    await runtime.dispose();
+  });
+
+  test("rebinds and says so when the harness ignores the id it was handed", async () => {
+    // Defence against a future harness, not against this one: `opencode` 2.1.2 honours a
+    // supplied id, and the pre-assignment that closes the orphan-session window depends on
+    // that. If a later build stops honouring it, the row must name the session that
+    // actually exists rather than the one we asked for.
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const root = newRoot();
+    const fleet = FleetStore.layer(root);
+    const stores = TargetStores.layer.pipe(Layer.provide(fleet));
+    const stubborn = Layer.succeed(
+      OpenCodeClient,
+      OpenCodeClient.of({
+        ...fakeHarnessShape(scriptFor, recorder),
+        createSession: () => Effect.succeed({ id: "ses_the_harness_chose" }),
+      }),
+    );
+    const runtime = ManagedRuntime.make(
+      Layer.mergeAll(
+        fleet,
+        stores,
+        RunSupervisor.layer.pipe(
+          Layer.provide(stubborn),
+          Layer.provide(stores),
+          Layer.provide(McpCredentials.layer),
+          Layer.provide(RunNarrations.layer),
+          Layer.provide(
+            Layer.succeed(
+              WorkerEndpoints,
+              WorkerEndpoints.of({
+                urls: Effect.succeed({
+                  mcp: "http://127.0.0.1:9/api/v1/mcp",
+                  policy: "http://127.0.0.1:9/api/v1/policy/decide",
+                }),
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const registry = yield* FleetStore;
+        yield* registry.register({
+          targetId: "alpha",
+          name: "alpha",
+          scopeNote: "",
+        });
+        yield* registry.migrateFleet();
+      }).pipe(Effect.orDie),
+    );
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const resolver = yield* TargetStores;
+        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        yield* release(started.harnessSessionId);
+        yield* settled(supervisor, started.attemptId);
+        const row = yield* withTargetStore(resolver, "alpha", (store) =>
+          store.loadAttempt(started.attemptId, "alpha"),
+        );
+        return { started, bound: row?.harness_session_id };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.started.harnessSessionId).toBe("ses_the_harness_chose");
+    expect(observed.bound).toBe("ses_the_harness_chose");
+    await runtime.dispose();
+  });
+});
+
+describe("two runs at once, against two targets", () => {
+  test("each writes to its own file and neither can see the other's", async () => {
+    // The case the pinned MCP store made impossible. Both runs are in flight at the same
+    // time — neither has been let settle when the rows are read — and each one's attempt,
+    // goal, intent and events are in that target's own database.
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [narration("session.execution.started", 1)],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = world(["alpha", "beta"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const credentials = yield* McpCredentials;
+
+        const [alpha, beta] = yield* Effect.all(
+          [
+            supervisor.start(draft(root, "alpha", "probe alpha")),
+            supervisor.start(draft(root, "beta", "probe beta")),
+          ],
+          { concurrency: 2 },
+        );
+
+        const read = (targetId: string) =>
+          withTargetStore(stores, targetId, (store) =>
+            Effect.gen(function* () {
+              return {
+                counts: yield* store.counts(),
+                unsettled: yield* store.unsettledAttempts(),
+                events: yield* store.eventsAfter(),
+              };
+            }),
+          );
+
+        return {
+          alpha,
+          beta,
+          inAlpha: yield* read("alpha"),
+          inBeta: yield* read("beta"),
+          supervising: yield* supervisor.running,
+          liveCredentials: yield* credentials.size,
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    // Two distinct runs, each supervised.
+    expect(observed.alpha.attemptId).not.toBe(observed.beta.attemptId);
+    expect(observed.liveCredentials).toBe(2);
+    expect(
+      [...observed.supervising]
+        .map((entry) => entry.targetId)
+        .sort((a, b) => a.localeCompare(b)),
+    ).toEqual(["alpha", "beta"]);
+
+    // One attempt in each file, and it is that target's own.
+    expect(observed.inAlpha.counts.attempts).toBe(1);
+    expect(observed.inBeta.counts.attempts).toBe(1);
+    expect(observed.inAlpha.unsettled.map((row) => row.id)).toEqual([
+      observed.alpha.attemptId,
+    ]);
+    expect(observed.inBeta.unsettled.map((row) => row.id)).toEqual([
+      observed.beta.attemptId,
+    ]);
+    // Both still running when the files were read, which is what makes this concurrent
+    // rather than two runs in sequence.
+    expect(observed.inAlpha.unsettled[0]?.status).toBe("running");
+    expect(observed.inBeta.unsettled[0]?.status).toBe("running");
+
+    // Separate sequence counters, because they are separate files. Each log holds one
+    // `attempt.started` for its own attempt and nothing of the other's.
+    expect(observed.inAlpha.events.map((event) => event.sequence)).toEqual([1]);
+    expect(observed.inBeta.events.map((event) => event.sequence)).toEqual([1]);
+    expect(observed.inAlpha.events[0]?.subjectId).toBe(
+      observed.alpha.attemptId,
+    );
+    expect(observed.inBeta.events[0]?.subjectId).toBe(observed.beta.attemptId);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("stopping one leaves the other running", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha", "beta"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const alpha = yield* supervisor.start(draft(root, "alpha", "probe alpha"));
+        const beta = yield* supervisor.start(draft(root, "beta", "probe beta"));
+        const stopped = yield* supervisor.stop(alpha.attemptId);
+        return {
+          alpha,
+          beta,
+          stopped,
+          supervising: yield* supervisor.running,
+          alphaRow: yield* withTargetStore(stores, "alpha", (store) =>
+            store.loadAttempt(alpha.attemptId, "alpha"),
+          ),
+          betaRow: yield* withTargetStore(stores, "beta", (store) =>
+            store.loadAttempt(beta.attemptId, "beta"),
+          ),
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.alphaRow?.status).toBe("interrupted");
+    expect(observed.betaRow?.status).toBe("running");
+    expect(observed.supervising.map((entry) => entry.attemptId)).toEqual([
+      observed.beta.attemptId,
+    ]);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+});
+
+describe("stopping a run", () => {
+  test("settles the attempt, revokes its authority and tells the harness", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [],
+      stream: "open",
+      // The harness has nothing to say about it, which is the honest state for a session
+      // that was still working when it was told to stop.
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const credentials = yield* McpCredentials;
+        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const before = yield* credentials.size;
+
+        const stopped = yield* supervisor.stop(started.attemptId);
+
+        return {
+          started,
+          stopped,
+          before,
+          after: yield* credentials.size,
+          row: yield* withTargetStore(stores, "alpha", (store) =>
+            store.loadAttempt(started.attemptId, "alpha"),
+          ),
+          events: yield* withTargetStore(stores, "alpha", (store) =>
+            store.eventsAfter(),
+          ),
+          supervising: yield* supervisor.running,
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    // Settled, honestly: we interrupted it, so `interrupted` is first-hand rather than
+    // inferred — and it is not `failed`, which would be a claim about the work.
+    expect(observed.row?.status).toBe("interrupted");
+    expect(observed.stopped.status).toBe("interrupted");
+    // Authority withdrawn. Both halves: the in-memory grant is gone, and the response
+    // says how many were dropped so a caller does not have to take it on trust.
+    expect(observed.before).toBe(1);
+    expect(observed.after).toBe(0);
+    expect(observed.stopped.credentialsRevoked).toBe(1);
+    // And the harness was told to stop, so "stop" means the agent stops touching the
+    // target rather than that we stopped watching it.
+    expect(recorder.interrupts).toEqual([observed.started.harnessSessionId]);
+    // No fiber left behind.
+    expect(observed.supervising).toEqual([]);
+    // Both lifecycle events, in order.
+    expect(observed.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "attempt.settled",
+    ]);
+    expect(observed.events[1]?.payload).toMatchObject({
+      status: "interrupted",
+      settledBy: "supervisor",
+    });
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("prefers the harness's answer when the session finished just before the stop", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const row = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        yield* supervisor.stop(started.attemptId);
+        return yield* withTargetStore(stores, "alpha", (store) =>
+          store.loadAttempt(started.attemptId, "alpha"),
+        );
+      }).pipe(Effect.orDie),
+    );
+
+    // Not `interrupted`: the harness says it succeeded, and recording what it says is
+    // more accurate than recording what we did about it.
+    expect(row?.status).toBe("succeeded");
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("refuses an attempt this process is not running", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    const { runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const refusal = await runtime.runPromise(
+      Effect.flatMap(RunSupervisor, (supervisor) =>
+        Effect.result(supervisor.stop("att_nobody_is_running")),
+      ),
+    );
+
+    expect(refusal._tag).toBe("Failure");
+    if (refusal._tag === "Failure") {
+      expect(refusal.failure.reason).toBe("unknown_attempt");
+      // Points at the sweep rather than pretending it did something, because a row left
+      // `running` by a dead process is the sweep's to settle, not a stop's.
+      expect(refusal.failure.detail).toContain("startup sweep");
+    }
+    await runtime.dispose();
+  });
+});
+
+describe("when the harness stops being readable", () => {
+  test("a narration stream that dies does not settle the run", async () => {
+    // The clearest form of "a stream ending is not an outcome": the stream fails
+    // immediately and the run carries on, settled later by the harness's own answer.
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [narration("session.execution.started", 1)],
+      stream: "fail",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        // The stream has already failed by now. Nothing has settled.
+        const during = yield* withTargetStore(stores, "alpha", (store) =>
+          store.loadAttempt(started.attemptId, "alpha"),
+        );
+        yield* release(started.harnessSessionId);
+        yield* settled(supervisor, started.attemptId);
+        return {
+          started,
+          during: during?.status,
+          after: yield* withTargetStore(stores, "alpha", (store) =>
+            store.loadAttempt(started.attemptId, "alpha"),
+          ),
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.during).toBe("running");
+    expect(observed.after?.status).toBe("succeeded");
+    await runtime.dispose();
+  });
+
+  test("a wait that loses its answer reconciles against the session, not against silence", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "failed",
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const row = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        // Break the long poll. Our request losing its answer says nothing about the
+        // harness, so the supervisor has to go and ask.
+        yield* release(
+          started.harnessSessionId,
+          transport("session.wait", "the long poll lost its answer"),
+        );
+        yield* settled(supervisor, started.attemptId);
+        return yield* withTargetStore(stores, "alpha", (store) =>
+          store.loadAttempt(started.attemptId, "alpha"),
+        );
+      }).pipe(Effect.orDie),
+    );
+
+    // `failed`, because the harness said so — not because our wait broke. A broken wait
+    // on its own is never grounds for `failed`; the next test is that case.
+    expect(row?.status).toBe("failed");
+    await runtime.dispose();
+  });
+
+  test("nothing to ask and nothing narrated records `uncertain`, never `failed`", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "fail",
+      status: undefined,
+      statusUnreachable: true,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const credentials = yield* McpCredentials;
+        const started = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        yield* release(
+          started.harnessSessionId,
+          transport("session.wait", "the harness went away"),
+        );
+        yield* settled(supervisor, started.attemptId);
+        return {
+          started,
+          row: yield* withTargetStore(stores, "alpha", (store) =>
+            store.loadAttempt(started.attemptId, "alpha"),
+          ),
+          recoveries: yield* withTargetStore(stores, "alpha", (store) =>
+            store.recoveriesForAttempt(started.attemptId),
+          ),
+          liveCredentials: yield* credentials.size,
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    // Three sources, none of which could say anything: the stream broke, the wait broke,
+    // and the harness could not be asked. `uncertain` is the only honest answer, and the
+    // attempt is left where a later definite answer can still refine it.
+    expect(observed.row?.status).toBe("uncertain");
+    // Authority is revoked anyway, which is the half of recovery that must not wait for
+    // certainty: we do not know what happened, so the credential must not keep working.
+    expect(observed.liveCredentials).toBe(0);
+    // And no recovery record: the supervisor settles its own attempt, and filing that as
+    // a recovery would make the sweep's table over-report every run it watched.
+    expect(observed.recoveries).toEqual([]);
+    // The prompt is never resubmitted on any of these paths.
+    expect(recorder.prompts).toHaveLength(1);
+    await runtime.dispose();
+  });
+
+  test("a prompt that is refused settles the attempt rather than leaving it running", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+      statusUnreachable: true,
+    });
+    const root = newRoot();
+    const fleet = FleetStore.layer(root);
+    const stores = TargetStores.layer.pipe(Layer.provide(fleet));
+    const refusing = Layer.succeed(
+      OpenCodeClient,
+      OpenCodeClient.of({
+        ...fakeHarnessShape(scriptFor, recorder),
+        prompt: () =>
+          Effect.fail(
+            transport("session.prompt", "the model is not available"),
+          ),
+      }),
+    );
+    const credentials = McpCredentials.layer;
+    const runtime = ManagedRuntime.make(
+      Layer.mergeAll(
+        fleet,
+        stores,
+        credentials,
+        RunSupervisor.layer.pipe(
+          Layer.provide(refusing),
+          Layer.provide(stores),
+          Layer.provide(credentials),
+          Layer.provide(RunNarrations.layer),
+          Layer.provide(
+            Layer.succeed(
+              WorkerEndpoints,
+              WorkerEndpoints.of({
+                urls: Effect.succeed({
+                  mcp: "http://127.0.0.1:9/api/v1/mcp",
+                  policy: "http://127.0.0.1:9/api/v1/policy/decide",
+                }),
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const registry = yield* FleetStore;
+        yield* registry.register({
+          targetId: "alpha",
+          name: "alpha",
+          scopeNote: "",
+        });
+        yield* registry.migrateFleet();
+      }).pipe(Effect.orDie),
+    );
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const resolver = yield* TargetStores;
+        const registry = yield* McpCredentials;
+        const refusal = yield* Effect.result(
+          supervisor.start(draft(root, "alpha", "probe it")),
+        );
+        // The finalizer settles on its own fiber, so wait for the supervisor to let go
+        // before reading the row. Not a sleep: the condition is the thing being waited
+        // for, and `start` has already returned its refusal by this point.
+        yield* waitFor(supervisor.running, (running) => running.length === 0);
+        const rows = yield* withTargetStore(resolver, "alpha", (store) =>
+          store.unsettledAttempts(),
+        );
+        const all = yield* withTargetStore(resolver, "alpha", (store) =>
+          store.counts(),
+        );
+        return {
+          refusal,
+          rows,
+          attempts: all.attempts,
+          supervising: yield* supervisor.running,
+          liveCredentials: yield* registry.size,
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.refusal._tag).toBe("Failure");
+    if (observed.refusal._tag === "Failure") {
+      expect(observed.refusal.failure.reason).toBe("harness_unreachable");
+    }
+    // The row was written before the prompt was sent, so it exists — and it is out of
+    // `running` rather than left for the sweep to find, because this process watched the
+    // prompt be refused.
+    //
+    // `uncertain` and not `interrupted`, because nobody interrupted anything; and not
+    // `failed`, because a transport failure on `prompt` genuinely leaves it unknown
+    // whether the harness accepted it before the answer was lost. It is still returned by
+    // `unsettledAttempts` — that sweep reads `running` *and* `uncertain` on purpose, since
+    // `uncertain` is an admission a later definite answer may refine — so the claim here
+    // is about the status and the end time, not about the row being invisible.
+    expect(observed.attempts).toBe(1);
+    expect(observed.rows.map((row) => row.status)).toEqual(["uncertain"]);
+    expect(observed.rows[0]?.ended_at).not.toBeNull();
+    expect(observed.supervising).toEqual([]);
+    expect(observed.liveCredentials).toBe(0);
+    await runtime.dispose();
+  });
+});
+
+describe("shutting the process down", () => {
+  test("closing the supervisor's scope settles every run in flight and revokes it", async () => {
+    /**
+     * The other half of "the fiber is the ephemeral record", and the half `kill -9` does
+     * not cover.
+     *
+     * A `SIGINT` closes the layer's scope, which runs the fiber map's finalizer, which
+     * interrupts every entry; each interruption runs that supervisor's own finalizer,
+     * which settles and revokes. Worth a test rather than an assumption for two reasons:
+     * the fibers are forked as **daemons**, so it is not obvious they are still owned by
+     * the map rather than detached from everything, and the difference it makes is a
+     * restart finding settled attempts instead of a pile of `running` rows.
+     *
+     * Two runs, against two targets, neither let settle — so both are genuinely in flight
+     * when the scope closes.
+     */
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({
+      narration: [],
+      stream: "open",
+      // The harness has nothing to say: the honest state for a session that was still
+      // working when the server was asked to stop.
+      status: undefined,
+    });
+    const { root, runtime, ready, registry } = world(
+      ["alpha", "beta"],
+      scriptFor,
+      recorder,
+    );
+    await ready;
+    const credentials = await registry;
+
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const alpha = yield* supervisor.start(draft(root, "alpha", "probe alpha"));
+        const beta = yield* supervisor.start(draft(root, "beta", "probe beta"));
+        return {
+          alpha,
+          beta,
+          supervising: (yield* supervisor.running).length,
+          grants: yield* credentials.size,
+        };
+      }).pipe(Effect.orDie),
+    );
+    expect(started.supervising).toBe(2);
+    expect(started.grants).toBe(2);
+
+    // The shutdown. Bounded so a regression is a failing test rather than a hung suite.
+    const began = Date.now();
+    await Promise.race([
+      runtime.dispose(),
+      new Promise((_, reject) =>
+        setTimeout(() => {
+          reject(new Error("shutdown did not finish within 20s"));
+        }, 20_000),
+      ),
+    ]);
+    const took = Date.now() - began;
+
+    // Both authorities withdrawn, read off the registry the layer is no longer holding.
+    expect(await Effect.runPromise(credentials.size)).toBe(0);
+    // And the harness was told to stop both sessions, because a server shutting down
+    // should stop the agents it started rather than merely stop watching them.
+    expect([...recorder.interrupts].sort((a, b) => a.localeCompare(b))).toEqual(
+      [started.alpha.harnessSessionId, started.beta.harnessSessionId].sort(
+        (a, b) => a.localeCompare(b),
+      ),
+    );
+
+    for (const [targetId, run] of [
+      ["alpha", started.alpha],
+      ["beta", started.beta],
+    ] as const) {
+      const stored = readAfterShutdown(root, targetId);
+      expect(stored.attempts).toHaveLength(1);
+      // `interrupted`, not `running` and not `uncertain`: we interrupted it, which is
+      // first-hand knowledge, and the row is settled before the process is gone.
+      expect(stored.attempts[0]?.status).toBe("interrupted");
+      expect(stored.attempts[0]?.id).toBe(run.attemptId);
+      expect(stored.attempts[0]?.ended_at).not.toBeNull();
+      // Both lifecycle events, in order, in that target's own file.
+      expect(stored.events.map((event) => event.kind)).toEqual([
+        "attempt.started",
+        "attempt.settled",
+      ]);
+      expect(
+        stored.events.every((event) => event.subject_id === run.attemptId),
+      ).toBe(true);
+    }
+
+    // Nothing left for the sweep: a clean stop leaves no questions behind.
+    expect(took).toBeLessThan(20_000);
+  });
+
+  test("a harness that will not answer during shutdown records `uncertain`, promptly", async () => {
+    /**
+     * The failure mode the bound exists for.
+     *
+     * Settling asks the harness over HTTP, and on shutdown that happens while the harness
+     * child is itself being torn down — so the call may simply never come back. Without a
+     * bound the client's own 30-second ceiling applies per call, per run, inside a scope
+     * finalizer, and a `SIGINT` takes minutes.
+     *
+     * The ask is also made `interruptible` inside the finalizer, which this covers too: a
+     * finalizer is an uninterruptible region, so a `timeout` that could not interrupt what
+     * it bounds would not bound anything and this would hang.
+     *
+     * 150ms rather than the ten seconds a server uses, for the reason `layerWith` exists.
+     */
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+      // Never answers — not a failure, a silence, which is the harder case.
+      statusHangs: true,
+    });
+    const { root, runtime, ready, registry } = world(
+      ["alpha"],
+      scriptFor,
+      recorder,
+      { askTimeout: "150 millis" },
+    );
+    await ready;
+    const credentials = await registry;
+
+    const started = await runtime.runPromise(
+      Effect.flatMap(RunSupervisor, (supervisor) =>
+        supervisor.start(draft(root, "alpha", "probe it")),
+      ).pipe(Effect.orDie),
+    );
+
+    const began = Date.now();
+    await Promise.race([
+      runtime.dispose(),
+      new Promise((_, reject) =>
+        setTimeout(() => {
+          reject(new Error("shutdown hung on an unanswering harness"));
+        }, 10_000),
+      ),
+    ]);
+    const took = Date.now() - began;
+
+    const stored = readAfterShutdown(root, "alpha");
+    // `interrupted` and not `uncertain`, even with the harness silent: we are the ones
+    // who stopped it, so that much is first-hand. `settlementFor` only reaches
+    // `uncertain` when nobody interrupted anything.
+    expect(stored.attempts[0]?.id).toBe(started.attemptId);
+    expect(stored.attempts[0]?.status).toBe("interrupted");
+    expect(stored.attempts[0]?.ended_at).not.toBeNull();
+    expect(await Effect.runPromise(credentials.size)).toBe(0);
+    // Promptly: two bounded asks at 150ms each, not two unbounded ones. Generous enough
+    // not to be flaky on a loaded machine, tight enough that losing the bound fails it.
+    expect(took).toBeLessThan(5_000);
+  });
+});
+
+describe("the narration bus", () => {
+  test("publishes with no subscribers, and keyed so one attempt can be asked for", async () => {
+    // Both halves of what this slice actually promises: a run narrates correctly into a
+    // PubSub nobody is reading — which is the state the whole slice runs in — and a
+    // subscriber asking for one attempt is handed that attempt's entries and no other's.
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [
+        narration("session.execution.started", 1),
+        narration("session.text.ended", 2),
+      ],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = world(["alpha", "beta"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const narrations = yield* RunNarrations;
+
+        // No subscribers yet, deliberately: this run's narration is published into a bus
+        // nobody is listening to, and it must not fail, block or settle differently.
+        const alpha = yield* supervisor.start(draft(root, "alpha", "probe alpha"));
+        const unwatched = yield* narrations.subscriberCount;
+
+        // Now one subscriber, asking for `beta` only.
+        const collected = yield* Effect.forkChild(
+          Stream.runCollect(
+            Stream.take(narrations.subscribe({ targetId: "beta" }), 2),
+          ),
+        );
+        // Yield until the subscription is registered, so the run below cannot publish
+        // into the gap. Not a sleep: a check on the state that matters.
+        yield* waitFor(narrations.subscriberCount, (n) => n === 1);
+
+        const beta = yield* supervisor.start(draft(root, "beta", "probe beta"));
+        const received: readonly RunNarration[] = yield* Fiber.join(collected);
+        return { alpha, beta, unwatched, received };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.unwatched).toBe(0);
+    // Everything it got is beta's, by both keys, and in the order the harness said it.
+    expect(observed.received.map((item) => item.targetId)).toEqual([
+      "beta",
+      "beta",
+    ]);
+    expect(observed.received.map((item) => item.attemptId)).toEqual([
+      observed.beta.attemptId,
+      observed.beta.attemptId,
+    ]);
+    expect(observed.received.map((item) => item.entry.type)).toEqual([
+      "session.execution.started",
+      "session.text.ended",
+    ]);
+    expect(observed.received[0]?.harnessSessionId).toBe(
+      observed.beta.harnessSessionId,
+    );
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+});
+
+/* ── Small waits on state, rather than on the clock ──────────────────────────── */
+
+/**
+ * Polls one effect until a predicate holds.
+ *
+ * A short sleep in a loop rather than a `Deferred`, because what is being waited for is a
+ * *consequence* of a fiber the test does not own — a supervisor's finalizer finishing, a
+ * subscription registering — and there is no handle to await. Bounded so a broken
+ * expectation fails the test instead of hanging the suite.
+ */
+const waitFor = <A>(
+  read: Effect.Effect<A>,
+  holds: (value: A) => boolean,
+  attempts = 400,
+): Effect.Effect<A> =>
+  Effect.gen(function* () {
+    for (let index = 0; index < attempts; index += 1) {
+      const value = yield* read;
+      if (holds(value)) return value;
+      yield* Effect.sleep("5 millis");
+    }
+    return yield* read;
+  });
+
+/** Waits until the supervisor no longer holds a fiber for this attempt. */
+const settled = (
+  supervisor: RunSupervisor["Service"],
+  attemptId: string,
+): Effect.Effect<void> =>
+  Effect.asVoid(
+    waitFor(supervisor.running, (running) =>
+      running.every((entry) => entry.attemptId !== attemptId),
+    ),
+  );
+
+/** The fake client's methods, for a test that overrides exactly one of them. */
+const fakeHarnessShape = (
+  scriptFor: (sessionId: string) => Script,
+  recorder: Recorder,
+): OpenCodeClient["Service"] => {
+  let captured: OpenCodeClient["Service"] | undefined;
+  Effect.runSync(
+    Effect.provide(
+      Effect.map(OpenCodeClient, (service) => {
+        captured = service;
+      }),
+      fakeClient(scriptFor, recorder),
+    ),
+  );
+  if (captured === undefined) throw new Error("the fake client did not build");
+  return captured;
+};

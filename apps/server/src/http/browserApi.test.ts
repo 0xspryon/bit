@@ -42,7 +42,8 @@ import { McpCallCounter } from "../mcp/server";
 import { FleetStore, HUNT_FILE } from "../persistence/fleet";
 import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
-import { PolicyDecisions } from "../policy/service";
+import { RunSupervisor } from "../run/supervisor";
+import { PolicyDecisions, type PolicyConfig } from "../policy/service";
 
 const scratch = mkdtempSync(join(tmpdir(), "bit-browser-api-"));
 /** `realpath` because the OS temporary directory is itself a link on some systems. */
@@ -51,9 +52,9 @@ const fleetRoot = join(base, "fleet");
 const workspaceRoot = join(base, "workspace");
 const outside = join(base, "outside");
 
-const POLICY = {
+const POLICY: PolicyConfig = {
   forbiddenPathFragments: ["out-of-scope/"],
-  allowedHosts: ["127.0.0.1"],
+  hostScope: { _tag: "hosts", allowed: ["127.0.0.1"] },
 };
 
 /** One MCP grant, so "an MCP bearer is not a session" can be asserted rather than assumed. */
@@ -84,6 +85,11 @@ const browserApi = browserApiRoutes({ workspaceRoot }).pipe(
   // the one that opens a target's own file, so a stub here would test the stub.
   Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
   Layer.provide(fleet),
+  // No harness in this suite, so the supervisor is the one a server without `opencode`
+  // runs: it refuses every start by name. That is the behaviour under test here — the
+  // route, its guard and its typed refusal — and standing up an agent to check a 409
+  // would make this suite depend on a provider login.
+  Layer.provide(RunSupervisor.unavailable),
   Layer.orDie,
 );
 
@@ -97,7 +103,14 @@ const testLayer = Layer.mergeAll(
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
   Layer.provideMerge(PolicyDecisions.layer),
-  Layer.provide(ObservationStore.layer(join(base, "served.sqlite"))),
+  // The MCP route on this listener dispatches by credential, so it takes a resolver. The
+  // browser API has its own, fleet-backed, provided above; this one is for the MCP route
+  // and holds the one target `TestCredential` names.
+  Layer.provide(
+    TargetStores.ofStore("t").pipe(
+      Layer.provide(ObservationStore.layer(join(base, "served.sqlite"))),
+    ),
+  ),
 );
 
 const runtime = ManagedRuntime.make(testLayer);

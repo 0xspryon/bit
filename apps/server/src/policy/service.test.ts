@@ -6,6 +6,7 @@ import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { ObservationStore } from "../persistence/store";
+import { TargetStores } from "../persistence/targetStores";
 import {
   POLICY_DECIDE_PATH,
   PolicyDecisions,
@@ -15,7 +16,7 @@ import {
 
 const CONFIG: PolicyConfig = {
   forbiddenPathFragments: ["out-of-scope-secret.txt", "out-of-scope/"],
-  allowedHosts: ["127.0.0.1", "localhost"],
+  hostScope: { _tag: "hosts", allowed: ["127.0.0.1", "localhost"] },
 };
 
 const request = (tool: string, input: unknown) => ({
@@ -25,15 +26,81 @@ const request = (tool: string, input: unknown) => ({
 });
 
 describe("policy decisions", () => {
-  test("allows ordinary work by default", () => {
+  test("allows ordinary work by default, saying the host rule did not apply", () => {
     // Permissive with explicit boundaries: autonomy is the posture, not an exception.
+    // `no_host_named` rather than a bare "allow": neither of these inputs names a host,
+    // so the host rule had nothing to decide, and that is a different fact from one whose
+    // hosts were checked and matched.
     expect(
       decide(CONFIG, request("read", { filePath: "in-scope.txt" })),
     ).toEqual({
       effect: "allow",
+      basis: "no_host_named",
     });
     expect(decide(CONFIG, request("shell", { command: "ls -la" }))).toEqual({
       effect: "allow",
+      basis: "no_host_named",
+    });
+  });
+
+  test("an allowed host is told apart from no host at all", () => {
+    expect(
+      decide(
+        CONFIG,
+        request("webfetch", { url: "http://127.0.0.1:41317/login" }),
+      ),
+    ).toEqual({ effect: "allow", basis: "hosts_allowed" });
+  });
+
+  describe("an unrestricted host scope", () => {
+    /**
+     * The scope a browser-started run is gated by: installed, recorded, permitting.
+     *
+     * The thing these three tests pin down is that "unrestricted" is a *decision the gate
+     * makes*, not the gate being absent — it is reached, it is distinguishable, and it
+     * does not switch off the boundary that is not about hosts.
+     */
+    const unrestricted: PolicyConfig = {
+      forbiddenPathFragments: ["hunt.sqlite"],
+      hostScope: {
+        _tag: "unrestricted",
+        because: "no structured scope to derive an allowlist from",
+      },
+    };
+
+    test("permits a host that a listed scope would refuse, and says why", () => {
+      const remote = request("webfetch", { url: "https://example.test/admin" });
+      // The same call, under the two scopes, decided differently — which is what makes
+      // this a configuration difference rather than a missing check.
+      expect(decide(CONFIG, remote).effect).toBe("deny");
+      expect(decide(unrestricted, remote)).toEqual({
+        effect: "allow",
+        basis: "unrestricted",
+      });
+    });
+
+    test("is told apart from a host that was allowed by matching", () => {
+      // Both are `allow`; only the basis says whether anything was actually checked.
+      const local = request("webfetch", { url: "http://127.0.0.1:8080/" });
+      expect(decide(CONFIG, local)).toEqual({
+        effect: "allow",
+        basis: "hosts_allowed",
+      });
+      expect(decide(unrestricted, local)).toEqual({
+        effect: "allow",
+        basis: "unrestricted",
+      });
+    });
+
+    test("does not switch off the forbidden-path boundary", () => {
+      // Two boundaries, and only one of them is about hosts. A scope that wants neither
+      // has to say so twice.
+      const decision = decide(
+        unrestricted,
+        request("read", { filePath: "/var/bit/hunt.sqlite" }),
+      );
+      expect(decision.effect).toBe("deny");
+      expect(decision).toHaveProperty("reason");
     });
   });
 
@@ -77,7 +144,10 @@ describe("policy decisions", () => {
   });
 
   test("an IPv6 loopback literal is recognised", () => {
-    const config: PolicyConfig = { ...CONFIG, allowedHosts: ["::1"] };
+    const config: PolicyConfig = {
+      ...CONFIG,
+      hostScope: { _tag: "hosts", allowed: ["::1"] },
+    };
     expect(
       decide(
         config,
@@ -136,7 +206,14 @@ describe("the policy HTTP boundary", () => {
     Layer.provideMerge(McpCredentials.layer),
     Layer.provideMerge(McpCallCounter.layer),
     Layer.provideMerge(PolicyDecisions.layer),
-    Layer.provide(ObservationStore.layer(":memory:")),
+    // The MCP route takes the per-target resolver now, not one target's store. One entry over
+    // the file below: dispatch is still real, and a credential naming another target is
+    // refused by name.
+    Layer.provide(
+      TargetStores.ofStore("t").pipe(
+        Layer.provide(ObservationStore.layer(":memory:")),
+      ),
+    ),
   );
 
   /** Runs the real endpoint in a scope and posts raw bodies at it. */

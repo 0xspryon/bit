@@ -132,7 +132,7 @@ import {
   Scope,
 } from "effect";
 
-import { FleetStore, targetStoreLayer, type FleetError } from "./fleet";
+import { FleetError, FleetStore, targetStoreLayer } from "./fleet";
 import { ObservationStore } from "./store";
 import type { DatabaseError } from "./sql";
 
@@ -182,16 +182,6 @@ const make = Effect.fnUntraced(function* (options?: {
         // failure — retry semantics, not an amplification of them.
         Effect.tapError(() => stores.invalidate(targetId)),
       ),
-    pinnedLayerFor: (targetId, reason) =>
-      stores
-        .get(targetId)
-        .pipe(
-          Layer.tap(() =>
-            Effect.logDebug(
-              `pinned target store '${targetId}' for the process lifetime: ${reason}`,
-            ),
-          ),
-        ),
     invalidate: (targetId) => stores.invalidate(targetId),
     openTargetIds: Effect.map(RcMap.keys(stores.rcMap), (keys) => [...keys]),
   });
@@ -223,30 +213,6 @@ export class TargetStores extends Context.Service<
       Scope.Scope
     >;
     /**
-     * **Pins** one target's store for the lifetime of the returned layer's scope.
-     *
-     * For a consumer whose requirement is `ObservationStore` and whose lifetime is a
-     * layer rather than a request — today, only the MCP route, which is pinned to one
-     * target until the mutation boundary learns to dispatch by credential. The reference
-     * is held for as long as the layer is alive, so this entry is never idle and never
-     * released while the process runs. That is the reference count doing its job, not a
-     * leak — but it *is* a pin, and a pin is a decision rather than a detail.
-     *
-     * The name says "pinned" and `reason` is required for that: this used to be
-     * `layerFor`, and the only thing standing between it and a request-shaped caller
-     * pinning one target for the process was a paragraph of documentation. A caller now
-     * has to state why a process-lifetime borrow is the right shape, and the reason is
-     * logged when the pin is taken, so `openTargetIds` showing a target that nobody
-     * appears to be using has an explanation in the log rather than in someone's memory.
-     *
-     * Prefer {@link open} for anything request-shaped: a pinned borrow cannot be keyed by
-     * what a particular request is about.
-     */
-    readonly pinnedLayerFor: (
-      targetId: string,
-      reason: string,
-    ) => Layer.Layer<ObservationStore, FleetError | DatabaseError>;
-    /**
      * Drops the cached entry for a target, so the next {@link open} re-reads the registry
      * and re-opens the file.
      *
@@ -269,24 +235,6 @@ export class TargetStores extends Context.Service<
     Layer.effect(TargetStores, make());
 
   /**
-   * Pins one target's store, resolved from whichever resolver is in context.
-   *
-   * The convenience form of {@link TargetStores.pinnedLayerFor} for a composition root,
-   * where the resolver is a layer rather than a value in hand. It carries the same
-   * `reason` requirement and the same warning: this is a process-lifetime borrow, and
-   * anything request-shaped wants {@link TargetStores.open} instead.
-   */
-  static readonly pinned = (
-    targetId: string,
-    reason: string,
-  ): Layer.Layer<ObservationStore, FleetError | DatabaseError, TargetStores> =>
-    Layer.unwrap(
-      Effect.map(TargetStores, (stores) =>
-        stores.pinnedLayerFor(targetId, reason),
-      ),
-    );
-
-  /**
    * The resolver with a different idle TTL.
    *
    * Exists for tests that have to watch an idle handle go: sixty seconds is the right
@@ -297,6 +245,51 @@ export class TargetStores extends Context.Service<
     readonly idleTimeToLive: Duration.Input;
   }): Layer.Layer<TargetStores, never, FleetStore> =>
     Layer.effect(TargetStores, make(options));
+
+  /**
+   * A resolver over one already-open store, for a caller that has a database and no
+   * fleet.
+   *
+   * **This is not the pin that used to live here, and the direction is the difference.**
+   * `pinnedLayerFor` took a resolver and produced an `ObservationStore`, so a consumer
+   * whose requirement was a store got *one* target regardless of what any credential
+   * said — the MCP write boundary served `TARGET_ID` and nothing else. This takes a store
+   * and produces a *resolver*: dispatch still happens, and an id other than `targetId` is
+   * refused as `unknown_target` exactly as the fleet-backed resolver refuses an
+   * unregistered one. A credential for another target cannot write here; it gets a
+   * refusal naming the id it asked for.
+   *
+   * Who uses it: the spike, whose evidence is one `hunt.sqlite` with no fleet around it,
+   * and the suites that stand up a listener over a single file. For those, one target *is*
+   * the whole truth, so a resolver holding exactly one entry is not a shortcut past
+   * dispatch — it is the registry they have.
+   *
+   * The store's lifetime belongs to whoever provided it. Nothing is cached, nothing is
+   * reference counted and `invalidate` has nothing to drop, so it is a no-op rather than
+   * a lie about having re-read something.
+   */
+  static readonly ofStore = (
+    targetId: string,
+  ): Layer.Layer<TargetStores, never, ObservationStore> =>
+    Layer.effect(
+      TargetStores,
+      Effect.map(ObservationStore, (store) =>
+        TargetStores.of({
+          open: (asked) =>
+            asked === targetId
+              ? Effect.succeed(store)
+              : Effect.fail(
+                  new FleetError({
+                    reason: "unknown_target",
+                    targetId: asked,
+                    detail: `this resolver holds one target, '${targetId}'; nothing is registered under '${asked}'`,
+                  }),
+                ),
+          invalidate: () => Effect.void,
+          openTargetIds: Effect.succeed([targetId]),
+        }),
+      ),
+    );
 }
 
 /**

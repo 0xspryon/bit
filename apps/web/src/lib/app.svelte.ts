@@ -20,7 +20,11 @@
  * scenario is the shortcut rather than the only way in.
  */
 
-import type { TargetCounts, TargetSummary } from "@bit/contracts";
+import type {
+  RunningAttempt,
+  TargetCounts,
+  TargetSummary,
+} from "@bit/contracts";
 
 import { initialTargets, previewCounts, type Target } from "./mock";
 import { server, setToken, storedToken } from "./client";
@@ -155,6 +159,37 @@ export class App {
   detailOpen = $state(false);
   detailRow = $state(0);
 
+  /* ── Runs ─────────────────────────────────────────────────────────────────── */
+  /**
+   * What the operator has typed into the compose box.
+   *
+   * One field, because one field is all the server takes: the instruction becomes the
+   * goal, the intent's question and the prompt. Which existing intent a run belongs to is
+   * the work of the flow that shows intents, and a picker here would be choosing on its
+   * behalf.
+   */
+  instruction = $state("");
+  /** True from submitting until the server has answered, which is not the run's length. */
+  starting = $state(false);
+  /** True from asking to stop until the server confirms it settled. */
+  stopping = $state(false);
+  /**
+   * Runs the server is supervising, as it last told us.
+   *
+   * Server-fed and process-wide, so a reloaded tab finds a run it started — the attempt id
+   * appears nowhere else that survives a refresh. Not a live feed: it is refreshed on
+   * open, on start and on stop, and the transcript that would make it live is the next
+   * slice's.
+   */
+  runs = $state<RunningAttempt[]>([]);
+  /** The server's own words for a refused start or stop. */
+  runDetail = $state("");
+
+  /** The run against the target currently on screen, if this server has one. */
+  activeRun = $derived(
+    this.runs.find((entry) => entry.targetId === this.viewTargetId),
+  );
+
   /* New target */
   dialogOpen = $state(false);
   /** Server-fed: the folder currently being listed. */
@@ -280,6 +315,9 @@ export class App {
     this.counts = undefined;
     this.viewState = "empty";
     this.viewDetail = "";
+    this.runs = [];
+    this.instruction = "";
+    this.runDetail = "";
   }
 
   /* ── Targets ─────────────────────────────────────────────────────────────── */
@@ -336,7 +374,12 @@ export class App {
     this.screen = "target";
     this.navItem = "hunts";
     this.detailOpen = false;
+    this.instruction = "";
+    this.runDetail = "";
     void this.loadTarget(id);
+    // Asked on every open, because a run started in another tab — or by this one before a
+    // reload — is a fact about the server that this screen has no other way to learn.
+    void this.loadRuns();
   }
 
   /**
@@ -595,6 +638,125 @@ export class App {
     this.select(created.id);
   }
 
+  /**
+   * Starts a run against the open target.
+   *
+   * The compose box is cleared only once the server has accepted it. A box emptied
+   * optimistically loses what the operator typed on every refusal, and a refusal here is
+   * a normal answer — no harness, an unavailable target, a database that will not open.
+   *
+   * It does **not** wait for the run. The server answers when the run is going, and what
+   * this method then does is refresh the running list so the screen shows a run in
+   * progress rather than a submitted form.
+   */
+  async startRun() {
+    const targetId = this.viewTargetId;
+    if (targetId === "" || this.instruction.trim().length === 0) return;
+    if (this.starting) return;
+    this.starting = true;
+    this.runDetail = "";
+    try {
+      const call = await server.startRun(
+        this.serverUrl,
+        targetId,
+        this.instruction.trim(),
+      );
+      if (call._tag === "Unreachable") {
+        this.runDetail = "No server answered at this address.";
+        return;
+      }
+      if (call._tag === "Refused") {
+        const error = call.error;
+        if (error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        this.runDetail =
+          "detail" in error && typeof error.detail === "string"
+            ? error.detail
+            : "That run was refused.";
+        return;
+      }
+      this.instruction = "";
+      // Pushed from the response rather than waited for in a list refresh: the run is
+      // going, and the screen should say so on the same tick the server said it.
+      this.runs = [
+        ...this.runs.filter(
+          (entry) => entry.attemptId !== call.value.attemptId,
+        ),
+        {
+          attemptId: call.value.attemptId,
+          targetId: call.value.targetId,
+          intentId: call.value.intentId,
+          harnessSessionId: call.value.harnessSessionId,
+          startedAt: call.value.startedAt,
+        },
+      ];
+      // The counts moved: a run writes a goal, an intent and an attempt before it is
+      // answered, so the header would otherwise be stale until the next open.
+      await this.loadTarget(targetId);
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  /**
+   * Stops the run on the open target.
+   *
+   * The server settles the attempt and revokes its authority before it answers, so by the
+   * time this returns the run is over in every sense the database records. The running
+   * list is then refreshed from the server rather than edited here, because what stopping
+   * left behind is the server's answer and not ours to assume.
+   */
+  async stopRun() {
+    const running = this.activeRun;
+    if (running === undefined || this.stopping) return;
+    this.stopping = true;
+    this.runDetail = "";
+    try {
+      const call = await server.stopRun(
+        this.serverUrl,
+        running.targetId,
+        running.attemptId,
+      );
+      if (call._tag === "Unreachable") {
+        this.runDetail = "No server answered at this address.";
+        return;
+      }
+      if (call._tag === "Refused") {
+        const error = call.error;
+        if (error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        this.runDetail =
+          "detail" in error && typeof error.detail === "string"
+            ? error.detail
+            : "That run could not be stopped.";
+        // Refreshed anyway: the most likely refusal is `unknown_attempt`, which means
+        // this tab was holding a run the server has already finished, and the honest
+        // response is to stop showing it.
+        await this.loadRuns();
+        return;
+      }
+      await this.loadRuns();
+      await this.loadTarget(running.targetId);
+    } finally {
+      this.stopping = false;
+    }
+  }
+
+  /** Replaces the running list with what the server is supervising. */
+  async loadRuns() {
+    const call = await server.runs(this.serverUrl);
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") this.signOut("expired");
+      return;
+    }
+    if (call._tag === "Unreachable") return;
+    this.runs = call.value.map((entry) => ({ ...entry }));
+  }
+
   toggleTheme() {
     this.theme = this.theme === "dark" ? "light" : "dark";
   }
@@ -633,6 +795,11 @@ export class App {
     this.viewState = "empty";
     this.viewDetail = "";
     this.requestedTargetId = "";
+    this.runs = [];
+    this.instruction = "";
+    this.starting = false;
+    this.stopping = false;
+    this.runDetail = "";
   }
 }
 

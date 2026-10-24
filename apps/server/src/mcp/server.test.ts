@@ -30,6 +30,7 @@ import { API_PREFIX } from "@bit/contracts";
 
 import { multiCaseWireArgs } from "../persistence/fixtures";
 import { ObservationStore } from "../persistence/store";
+import { TargetStores } from "../persistence/targetStores";
 import { McpCredentials, type IssuedCredential } from "./credentials";
 import { MCP_PATH, McpCallCounter } from "./server";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
@@ -123,6 +124,14 @@ const testLayer = Layer.mergeAll(
   Layer.provideMerge(McpCallCounter.layer),
   Layer.provideMerge(PolicyDecisions.layer),
   Layer.provideMerge(ObservationStore.layer(databaseFile)),
+  // The MCP write boundary resolves a store by the target id its credential carries, so
+  // what the endpoint needs is a resolver. One entry over the file above, which is the
+  // whole truth here: `BINDING.targetId` is the only target these credentials name.
+  Layer.provideMerge(
+    TargetStores.ofStore(BINDING.targetId).pipe(
+      Layer.provide(ObservationStore.layer(databaseFile)),
+    ),
+  ),
 );
 
 const runtime = ManagedRuntime.make(testLayer);

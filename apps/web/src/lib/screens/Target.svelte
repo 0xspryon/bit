@@ -16,9 +16,15 @@
    * keep their placeholder rows: a count there is the prototype's, and
    * swapping in a number this screen cannot source would make an undesigned
    * page look decided.
+   *
+   * What is new is {@link ComposeBox} beneath the frame: a run can be started
+   * and stopped against the open target. The transcript it would produce is
+   * deliberately absent — the run narrates to an in-process bus with no
+   * subscriber yet, and the next slice owns both the stream and the format.
    */
   import Badge from "../components/Badge.svelte";
   import Button from "../components/Button.svelte";
+  import ComposeBox from "../components/ComposeBox.svelte";
   import PageFrame from "../components/PageFrame.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import TargetHeader from "../components/TargetHeader.svelte";
@@ -121,6 +127,17 @@
         </dl>
       {/snippet}
     </PageFrame>
+
+    <!--
+      The compose box sits under the frame rather than inside it, on the Hunts section
+      only. Starting a run is an action on the *target*, so it belongs to the pane and
+      not to whichever page is showing; and it is only on Hunts because that is the
+      section a run produces. Putting it under every section would make it look like a
+      control for Findings and Traffic too.
+    -->
+    {#if app.navItem === "hunts"}
+      <ComposeBox {app} />
+    {/if}
   </div>
 </div>
 

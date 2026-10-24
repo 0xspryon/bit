@@ -29,18 +29,72 @@ export type PolicyRequest = typeof PolicyRequest.Type;
 
 const decodeRequest = Schema.decodeUnknownResult(PolicyRequest);
 
+/**
+ * Why a call was allowed.
+ *
+ * Carried on the decision, in the response body, and into the hook's audit line, because
+ * "allowed" on its own is three different facts wearing one word — and a screen that
+ * showed them identically would be hiding the one an operator most needs to see.
+ *
+ * - `unrestricted` — this engagement's scope places **no** host restriction, so the host
+ *   rule did not run. Permitted by configuration, not by matching anything.
+ * - `hosts_allowed` — the input named one or more hosts and every one of them is in the
+ *   scope's list. Permitted by matching.
+ * - `no_host_named` — the input named no host at all, so the host rule had nothing to
+ *   decide. Kept apart from `hosts_allowed` because "it was in scope" is a claim, and a
+ *   tool call with no URL in it has not made that claim either way.
+ */
+export const AllowBasis = Schema.Literals([
+  "unrestricted",
+  "hosts_allowed",
+  "no_host_named",
+]);
+export type AllowBasis = typeof AllowBasis.Type;
+
 export type PolicyDecision =
-  | { readonly effect: "allow" }
+  | { readonly effect: "allow"; readonly basis: AllowBasis }
   | { readonly effect: "deny"; readonly reason: string };
+
+/**
+ * Which hosts a worker may reach.
+ *
+ * A tagged union rather than a list, because "every host" has no honest representation as
+ * a list. `allowedHosts: []` is **deny everything** — {@link decide} refuses any host not
+ * in the list — so an empty list is the opposite of unrestricted, and a sentinel string
+ * like `"*"` would sit in a host list waiting to be read as a hostname. Making it a tag
+ * means a reader of the config, of a decision, or of an audit line can tell the two apart
+ * without knowing a convention.
+ */
+export type HostScope =
+  | {
+      readonly _tag: "hosts";
+      /** The hosts a worker may reach. Anything else named in a tool input is refused. */
+      readonly allowed: readonly string[];
+    }
+  | {
+      readonly _tag: "unrestricted";
+      /**
+       * Why this engagement has no host boundary. Recorded, not enforced.
+       *
+       * Required rather than optional: an unrestricted scope is a decision somebody made,
+       * and a config that said so without saying why would be indistinguishable from one
+       * where a list went missing.
+       */
+      readonly because: string;
+    };
 
 export interface PolicyConfig {
   /**
    * Path fragments that are out of scope. A tool call whose serialised input mentions
    * one is refused before the tool runs.
+   *
+   * **Independent of {@link hostScope}.** An unrestricted host scope does not switch this
+   * off: they are two boundaries and only one of them is about hosts. A scope that wants
+   * neither declares both.
    */
   readonly forbiddenPathFragments: readonly string[];
-  /** Hosts the worker may reach. Anything else named in a tool input is refused. */
-  readonly allowedHosts: readonly string[];
+  /** Which hosts the worker may reach, as a boundary or as its documented absence. */
+  readonly hostScope: HostScope;
 }
 
 /**
@@ -50,10 +104,47 @@ export interface PolicyConfig {
  * this foundation: the fixture is the only target, and inventing forbidden fragments
  * here would make a run look more constrained than it is. A demo that wants real
  * boundaries states them (`spike/policyDemo.ts`).
+ *
+ * **Unchanged by the permissive scope below.** The spike and its tests depend on a
+ * localhost-only scope and that is still the right default for them; what a
+ * browser-started run gets is a different config, chosen explicitly by `main.ts`.
  */
 export const DEFAULT_POLICY: PolicyConfig = {
   forbiddenPathFragments: [],
-  allowedHosts: ["127.0.0.1", "localhost"],
+  hostScope: { _tag: "hosts", allowed: ["127.0.0.1", "localhost"] },
+};
+
+/**
+ * The scope a browser-started run is gated by today: recorded, and permitting.
+ *
+ * **The gate is installed and consulted; it just does not deny.** That is a deliberate
+ * product decision rather than an unhooked path, and the difference matters: every tool
+ * call still round-trips to the control plane before it runs, every decision is recorded,
+ * and a control plane that cannot be reached still fails the call closed. What is absent
+ * is a *rule*, not the mechanism.
+ *
+ * Why no rule yet. The engine's host boundary is an allowlist, and the only thing this
+ * application knows about an engagement's scope is `scopeNote` — free text an operator
+ * wrote for another human. There is no way to derive an allowlist from it, so the choice
+ * was between permitting and denying every remote target; a gate that refused every
+ * engagement would not be protecting anything, it would be unusable.
+ *
+ * What changes when scope becomes structured: this constant gains a derived `hosts`
+ * scope. Installing the hook now rather than later is what makes that a **config change
+ * instead of a wiring change** — the plumbing, the audit trail and the fail-closed
+ * behaviour are already in place and under test.
+ *
+ * `forbiddenPathFragments` is empty for the same reason, and the reasoning recorded on
+ * `WORKER_POLICY` applies: a constraint invented here would make a denial look like a
+ * boundary when it was really a misconfiguration.
+ */
+export const PERMISSIVE_POLICY: PolicyConfig = {
+  forbiddenPathFragments: [],
+  hostScope: {
+    _tag: "unrestricted",
+    because:
+      "this installation has no structured engagement scope to derive a host allowlist from; the gate records every decision and denies on policy outage, but places no host boundary",
+  },
 };
 
 /**
@@ -82,12 +173,19 @@ export const decide = (
     }
   }
 
-  for (const authority of hostsIn(serialised)) {
+  // An unrestricted scope skips the host rule entirely and says so in the basis, rather
+  // than running a check it would always pass. The path rule above still applied.
+  if (config.hostScope._tag === "unrestricted") {
+    return { effect: "allow", basis: "unrestricted" };
+  }
+
+  const authorities = hostsIn(serialised);
+  for (const authority of authorities) {
     // Compare the host alone. The fixture binds to an arbitrary free port, so a port
     // is not part of host identity here; a scope that needs per-port rules would add
     // them explicitly rather than inherit this behaviour by accident.
     const host = hostOf(authority);
-    if (!config.allowedHosts.includes(host)) {
+    if (!config.hostScope.allowed.includes(host)) {
       return {
         effect: "deny",
         reason: `host '${host}' is not in the engagement scope`,
@@ -95,7 +193,10 @@ export const decide = (
     }
   }
 
-  return { effect: "allow" };
+  return {
+    effect: "allow",
+    basis: authorities.length === 0 ? "no_host_named" : "hosts_allowed",
+  };
 };
 
 /** Authorities appearing in `http(s)://host[:port]` form inside the input text. */

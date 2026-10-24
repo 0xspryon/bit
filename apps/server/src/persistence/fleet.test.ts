@@ -483,7 +483,16 @@ describe("per-target isolation", () => {
     // Not "a WHERE clause filtered it out": there is no row to filter.
     expect(beta.alphaIntent).toBeUndefined();
     expect(beta.alphaObservations).toEqual([]);
-    expect(beta.events.map((event) => event.targetId)).toEqual(["beta"]);
+    // Two events in beta's file, both beta's: its attempt starting and its one
+    // observation. Nothing alpha wrote is reachable from this connection.
+    expect(beta.events.map((event) => event.targetId)).toEqual([
+      "beta",
+      "beta",
+    ]);
+    expect(beta.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "observation.recorded",
+    ]);
 
     // And alpha still holds exactly its own two, read back after beta's writes.
     const alphaAgain = await withTarget(root, "alpha", (store) =>

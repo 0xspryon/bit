@@ -33,6 +33,7 @@
  */
 import {
   BitApi,
+  RunRefused,
   SessionActor,
   SessionGuard,
   TargetNotFound,
@@ -61,6 +62,9 @@ import {
   type TargetRow,
 } from "../persistence/fleet";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
+import { POLICY_AUDIT_FILE } from "../policy/install";
+import { WORKER_MODEL } from "../run/model";
+import { RunSupervisor } from "../run/supervisor";
 
 /** What the browser API needs to know about this installation. */
 export interface BrowserApiConfig {
@@ -241,6 +245,47 @@ export const describeTarget = Effect.fnUntraced(function* (
   } satisfies TargetSummary;
 });
 
+/**
+ * The registry row for a target that can be opened, or the refusal that says why not.
+ *
+ * Extracted because two routes now have to agree about it — `GET /targets/:id` and
+ * `POST /targets/:id/runs` — and "reading a target is refused for these reasons but
+ * writing to it is refused for those" is a divergence nobody would notice until an
+ * operator hit it. The order is the one recorded on the `target` handler: the id before
+ * any path is built, the registry before the filesystem, and {@link describeTarget}'s own
+ * answer before anything is opened.
+ */
+const openableTarget = Effect.fnUntraced(function* (
+  fleet: FleetStore["Service"],
+  targetId: string,
+) {
+  if (!isTargetId(targetId)) {
+    return yield* new TargetNotFound({
+      reason: "invalid_target_id",
+      targetId,
+      detail:
+        "a target id is 1-64 characters of lowercase a-z, 0-9, '-' or '_', starting with a letter or digit; this cannot name a target",
+    });
+  }
+  const row = yield* fleet.target(targetId).pipe(Effect.orDie);
+  if (row === undefined) {
+    return yield* new TargetNotFound({
+      reason: "unknown_target",
+      targetId,
+      detail: `no target '${targetId}' is registered on this server`,
+    });
+  }
+  const described = yield* describeTarget(fleet, row).pipe(Effect.orDie);
+  if (!described.available) {
+    return yield* new TargetUnavailable({
+      reason: described.unavailableReason ?? "schema_unavailable",
+      targetId,
+      detail: described.detail,
+    });
+  }
+  return row;
+});
+
 /* ── Deriving an id ──────────────────────────────────────────────────────────── */
 
 /**
@@ -302,6 +347,9 @@ const fleetHandlers = HttpApiBuilder.group(
     // resolved per request becomes a per-request requirement of the route; resolved here
     // it is a layer requirement, which is what the caller provides once at startup.
     const stores = yield* TargetStores;
+    // Same reason, same place: the supervisor holds the fiber map for the whole process,
+    // so resolving it per request would be asking for a second one.
+    const supervisor = yield* RunSupervisor;
 
     const summaries = Effect.fnUntraced(function* () {
       const rows = yield* fleet.targets();
@@ -522,6 +570,73 @@ const fleetHandlers = HttpApiBuilder.group(
           root: config.workspaceRoot,
           ...(query.path === undefined ? {} : { path: query.path }),
         }),
+
+      /**
+       * Starts a run against one target, and answers without waiting for it.
+       *
+       * The checks before the supervisor is asked are the *same* checks `target` runs,
+       * in the same order and with the same words: a string that cannot name a target, a
+       * well-formed id nothing is registered under, and a target the filesystem or the
+       * schema says cannot be opened. Writing to a target has to be refused for exactly
+       * the reasons reading it is refused, or the compose box and the rail disagree about
+       * whether an engagement can be worked on.
+       *
+       * The engagement's own folder is where the harness session runs. It is read from the
+       * registry row rather than taken from the request — the folder is a fact about the
+       * target, recorded when the operator picked it — and a target registered without one
+       * falls back to the picker's root, which is the only other directory this server has
+       * been told it may look at.
+       *
+       * Everything after that belongs to {@link RunSupervisor}: by the time it returns,
+       * the pre-execution policy gate is installed in the workspace, and the attempt row,
+       * the harness session, the credential and the prompt are all in place, with a fiber
+       * in the server's own scope owning the rest. This handler has no part in how the
+       * run ends.
+       */
+      startRun: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const started = yield* supervisor.start({
+          targetId: row.targetId,
+          workspace: row.workspacePath ?? config.workspaceRoot,
+          // The target's own `evidence/` directory, which the registry already creates
+          // for things that are not database rows — and which is deliberately *outside*
+          // the workspace the worker runs in, so the worker cannot read the record of
+          // what it was allowed to do.
+          auditPath: `${fleet.paths.evidenceDirectory(row.targetId)}/${POLICY_AUDIT_FILE}`,
+          model: WORKER_MODEL,
+          // One instruction becomes all three, because that is all the operator has given
+          // us. The shortfall is recorded on the contract's `RunDraft`: choosing which
+          // intent a run belongs to is the work of the flow that shows intents.
+          goal: payload.instruction,
+          question: payload.instruction,
+          task: payload.instruction,
+          title: `bit: ${row.name}`,
+        });
+        return started;
+      }),
+
+      /**
+       * Stops one run.
+       *
+       * The target id in the path is checked against the run the supervisor is holding
+       * rather than used to find it. Attempt ids are unique across targets, so the path
+       * does not need it to resolve the run — but a stop aimed at the wrong target is a
+       * mistake worth refusing rather than silently honouring, because the two ids
+       * together are what a browser tab believes it is looking at.
+       */
+      stopRun: Effect.fn(function* ({ params }) {
+        const stopped = yield* supervisor.stop(params.attemptId);
+        if (stopped.targetId !== "" && stopped.targetId !== params.targetId) {
+          return yield* new RunRefused({
+            reason: "unknown_attempt",
+            detail: `${params.attemptId} is running against target '${stopped.targetId}', not '${params.targetId}'`,
+          });
+        }
+        return stopped;
+      }),
+
+      /** Every run this process is supervising. See the contract for why it is not scoped. */
+      runs: () => supervisor.running,
     });
   }),
 );

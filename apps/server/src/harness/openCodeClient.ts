@@ -53,15 +53,18 @@ import { Mcp } from "@opencode/schema/mcp";
 import { ID as ModelID } from "@opencode/schema/model";
 import { ID as ProviderID } from "@opencode/schema/provider";
 import { AbsolutePath } from "@opencode/schema/schema";
-import type { Session } from "@opencode/schema/session";
+import { ID as SessionID, type Session } from "@opencode/schema/session";
 import {
   Context,
   Effect,
   Layer,
   Redacted,
+  Result,
   Schema,
+  Stream,
   type Duration,
 } from "effect";
+import { Filter } from "effect";
 import {
   FetchHttpClient,
   HttpClient,
@@ -102,6 +105,98 @@ export interface MessageEntry {
   readonly text: string;
   readonly error: string | undefined;
 }
+
+/**
+ * One narrated moment of a session, reduced to what this application reads.
+ *
+ * **Deliberately four fields and no content.** A transcript needs the text of a reply,
+ * the arguments of a tool call and a shape to render them in; choosing that shape is the
+ * next slice's work, and a field invented here would be the format that slice inherits
+ * without having decided it. So this carries the harness's own event `type` verbatim, its
+ * own cursor, when it happened, and the one thing a supervisor has to act on.
+ *
+ * `type` is a plain `string` rather than a union of the ~50 entry kinds the client
+ * declares. Which kinds exist is the harness's business and the set grows with its
+ * releases; a union here would make an upgrade a compile error in a module that only
+ * forwards the value.
+ *
+ * `outcome` is the exception, and it is the whole reason this is not an opaque blob:
+ * `session.execution.succeeded`, `.failed` and `.interrupted` are the harness stating a
+ * terminal outcome, which is a *definite answer* and must be told apart from the stream
+ * merely ending. It is `undefined` on every other entry.
+ */
+export interface HarnessNarration {
+  /** The harness's own event type, unmapped. */
+  readonly type: string;
+  /** `durable.seq`: the harness's cursor, for resuming a log without replaying it. */
+  readonly sequence: number | undefined;
+  /** When the harness recorded it, in epoch milliseconds. */
+  readonly at: number;
+  /** Set only by a terminal `session.execution.*` entry. Never inferred. */
+  readonly outcome: TerminalOutcome | undefined;
+}
+
+/**
+ * The three log entries that state an outcome, mapped to this application's vocabulary.
+ *
+ * A table rather than string surgery on the entry type, so adding a fourth is a change
+ * here and a `session.execution.something_else` we have not met stays `undefined` — which
+ * is the honest answer, and leaves the consumer reconciling against the harness's own
+ * session state instead of guessing from a name.
+ */
+const EXECUTION_OUTCOMES: Readonly<Record<string, TerminalOutcome>> = {
+  "session.execution.succeeded": "succeeded",
+  "session.execution.failed": "failed",
+  "session.execution.interrupted": "interrupted",
+};
+
+/**
+ * The session an event belongs to, or `undefined` if it names none.
+ *
+ * Two fields are read because the harness provides both and they agree: every `session.*`
+ * event in `@opencode/schema`'s manifest carries `data.sessionID`, and every event carries
+ * `durable.aggregateID`, which for a session event is that same id. Reading the first and
+ * falling back to the second costs nothing and means a build that stops populating one of
+ * them is a dropped event rather than a misattributed one.
+ *
+ * `undefined` is returned rather than a guess for anything that names no session — the
+ * stream also carries `server.connected`, `provider.updated`, `mcp.status.changed` and a
+ * dozen other process-wide events, none of which belong to anybody's run.
+ */
+const sessionOf = (event: unknown): string | undefined => {
+  const record = (event ?? {}) as {
+    data?: { sessionID?: unknown } | undefined;
+    durable?: { aggregateID?: unknown } | undefined;
+  };
+  const fromData = record.data?.sessionID;
+  if (typeof fromData === "string") return fromData;
+  const fromDurable = record.durable?.aggregateID;
+  return typeof fromDurable === "string" ? fromDurable : undefined;
+};
+
+/**
+ * Reduces one log entry to {@link HarnessNarration}.
+ *
+ * Reads defensively off an already-decoded value, for the same reason {@link flatten}
+ * does: the entry union is wide and version-specific, and re-asserting a shape the
+ * generated client has already validated would only add a second place for it to be
+ * wrong.
+ */
+const narrate = (entry: unknown): HarnessNarration => {
+  const record = (entry ?? {}) as {
+    type?: unknown;
+    created?: unknown;
+    durable?: { seq?: unknown } | undefined;
+  };
+  const type = typeof record.type === "string" ? record.type : "unknown";
+  const sequence = record.durable?.seq;
+  return {
+    type,
+    sequence: typeof sequence === "number" ? sequence : undefined,
+    at: typeof record.created === "number" ? record.created : 0,
+    outcome: EXECUTION_OUTCOMES[type],
+  };
+};
 
 export interface ModelRef {
   readonly providerID: string;
@@ -195,6 +290,27 @@ export class OpenCodeClient extends Context.Service<
       readonly model: ModelRef;
       readonly directory: string;
       readonly parentSessionId?: string | undefined;
+      /**
+       * The id to create the session under, instead of one the harness picks.
+       *
+       * This closes a real window. Opening a worker session is `seedAttempt({
+       * harnessSessionId: null })` → `createSession` → `bindSessionToAttempt`, and a
+       * process that dies between the second and third steps leaves a live harness
+       * session that no attempt row points at: recovery sweeps attempts, so it never
+       * looks at it, and nothing else knows it exists. Minting the id first and writing
+       * it with the seed means the row names the session *before* the session exists —
+       * the worst case becomes a recorded id for a session that was never created, which
+       * recovery already handles (it asks the harness, is told `missing`, and records
+       * `uncertain`).
+       *
+       * **Verified, not assumed.** `SessionCreateInput.id` is `Session.ID | undefined` in
+       * `@opencode/client@2.1.0`, and the harness returning the id it was handed was
+       * checked against a live `opencode serve` rather than inferred from the type.
+       * `@opencode/schema`'s `Session.ID` is `isStartingWith("ses")` plus a brand, with
+       * `ID.create()` minting one; {@link newHarnessSessionId} is where this application
+       * calls it, so the format stays the harness's to define.
+       */
+      readonly sessionId?: string | undefined;
     }) => Effect.Effect<SessionRef, HarnessTransportError | HarnessDecodeError>;
     readonly prompt: (
       sessionId: string,
@@ -213,6 +329,79 @@ export class OpenCodeClient extends Context.Service<
       sessionId: string,
     ) => Effect.Effect<
       readonly MessageEntry[],
+      HarnessTransportError | HarnessDecodeError
+    >;
+    /**
+     * Asks the harness to stop whatever the session is doing.
+     *
+     * Reports whether the harness says it interrupted something: `false` for a session
+     * that was already idle, which is not a failure and is worth being able to tell
+     * apart. `resume` is deliberately not exposed — nothing in this application resumes
+     * a session, because carrying work on after an interruption means a new attempt
+     * identity (DECISIONS.md §15, and `store.openReplacementAttempt`).
+     */
+    readonly interruptSession: (
+      sessionId: string,
+    ) => Effect.Effect<boolean, HarnessTransportError | HarnessDecodeError>;
+    /**
+     * The harness's event stream, filtered to one session.
+     *
+     * ## Why `event.subscribe()` and not `session.log`
+     *
+     * The brief for this slice expected the opposite, and the harness settled it. Both
+     * calls exist on the generated client; `session.log({ sessionID, follow: true })` is
+     * per session by construction and replays a durable log, which on paper makes it the
+     * unambiguous choice. Against a live `opencode` 2.1.2 it carries **no narration at
+     * all**: a session that was prompted, ran, replied and settled `succeeded` produced
+     * exactly one entry, `log.synced`, both while following and on a non-following replay
+     * afterwards. That build's durable per-session log is simply not where execution is
+     * written. Checked on 2026-10-24; the probe is reproducible with two prompts and two
+     * subscriptions side by side.
+     *
+     * `event.subscribe()` carries all of it — `session.execution.started`,
+     * `session.inbox.*`, `session.step.*`, `session.text.*`, `session.tool.*`,
+     * `session.usage.updated` and the terminal `session.execution.{succeeded,failed,
+     * interrupted}`.
+     *
+     * **And the ambiguity the brief worried about is not there.** It is one stream for the
+     * whole server, so events have to be attributed, but the attribution is a single field
+     * read at the same position in every event: the manifest gives every `session.*` event
+     * `data.sessionID`, and every event also carries `durable.aggregateID`, which for a
+     * session event is that same id. Two sessions prompted a moment apart were separated
+     * cleanly on both fields. So this reads `data.sessionID` and falls back to
+     * `durable.aggregateID`, and an event carrying neither is dropped rather than guessed
+     * at — a misattributed entry would publish one target's narration under another's key,
+     * which is the one failure worth being strict about.
+     *
+     * **One subscription per watched session, not one shared and demultiplexed.** N
+     * concurrent runs open N streams to a local server, which is a cost worth paying for
+     * the lifetime it buys: each belongs to one supervisor fiber, is cancelled at the
+     * socket when that fiber is interrupted, and cannot be kept alive by, or taken down
+     * by, another run. A shared subscription would be a reference-counted resource whose
+     * failure is every supervisor's problem at once.
+     *
+     * **It is live-only, so it has a startup race `session.log` would not have had.** An
+     * event published between prompting and the subscription being established is gone.
+     * That is why the supervisor does not take its *settlement* from this stream alone —
+     * see `run/supervisor.ts` on why `waitForIdle` is still what says the session is over.
+     *
+     * **No transport bound.** Every other operation here is wrapped in a timeout; this
+     * one deliberately is not, because it is meant to stay open for as long as the session
+     * runs, which is unbounded by design (DECISIONS.md §5, "no deadline-triggered worker
+     * settlement"). The consuming fiber owns its lifetime instead: interrupting that fiber
+     * aborts the request at the socket, because the client is built on `FetchHttpClient`
+     * and the fiber's `AbortSignal` reaches `fetch`.
+     *
+     * **A stream that ends is not an outcome** (DECISIONS.md §15). This one ends whenever
+     * the harness restarts or the socket drops — in the probe above, with an `ECONNRESET`
+     * at teardown — so a consumer must reconcile against {@link SessionStatus} rather than
+     * conclude anything from the end of it. What *is* an outcome is an entry, and
+     * {@link HarnessNarration.outcome} carries that and nothing else.
+     */
+    readonly sessionEvents: (
+      sessionId: string,
+    ) => Stream.Stream<
+      HarnessNarration,
       HarnessTransportError | HarnessDecodeError
     >;
   }
@@ -385,6 +574,9 @@ export class OpenCodeClient extends Context.Service<
                 ...(input.parentSessionId === undefined
                   ? {}
                   : { parentID: input.parentSessionId as Session.ID }),
+                ...(input.sessionId === undefined
+                  ? {}
+                  : { id: input.sessionId as Session.ID }),
               }),
             );
             return { id: session.id };
@@ -449,6 +641,44 @@ export class OpenCodeClient extends Context.Service<
           return listed.data.map(flatten);
         });
 
+        const interruptSession: OpenCodeClient["Service"]["interruptSession"] =
+          Effect.fn("OpenCodeClient.interruptSession")(function* (sessionId) {
+            const result = yield* bounded(
+              "session.interrupt",
+              timeouts.control,
+              api.session.interrupt({ sessionID: sessionId as Session.ID }),
+            );
+            return result.interrupted;
+          });
+
+        /**
+         * The generated subscription, filtered and reduced.
+         *
+         * `Stream.mapError` rather than the `bounded` helper the others use: `bounded`
+         * applies `Effect.timeout`, which is the one thing a followed stream must not
+         * have. The failure mapping is the same `fail` the rest of this service uses, so a
+         * consumer sees the same two errors here as everywhere else.
+         *
+         * `filterMap` rather than `filter` then `map`: an event belonging to another
+         * session and an event with no session on it are both dropped by the same step
+         * that reads the id, so there is no second place for the two to disagree.
+         */
+        const sessionEvents: OpenCodeClient["Service"]["sessionEvents"] = (
+          sessionId,
+        ) =>
+          api.event
+            .subscribe()
+            .pipe(
+              Stream.mapError(fail("event.subscribe")),
+              Stream.filterMap(
+                Filter.make((event: unknown) =>
+                  sessionOf(event) === sessionId
+                    ? Result.succeed(narrate(event))
+                    : Result.fail(event),
+                ),
+              ),
+            );
+
         return OpenCodeClient.of({
           registerMcpServer,
           createSession,
@@ -456,10 +686,25 @@ export class OpenCodeClient extends Context.Service<
           waitForIdle,
           sessionStatus,
           messages,
+          interruptSession,
+          sessionEvents,
         });
       }),
     ).pipe(Layer.provide(FetchHttpClient.layer));
 }
+
+/**
+ * A session id this application mints, in the harness's own format.
+ *
+ * `@opencode/schema`'s `Session.ID.create()` rather than a string of our own: the format
+ * is `ses_` plus the harness's descending identifier, the brand's check enforces the
+ * prefix, and a value built by hand would be our guess at someone else's id scheme. This
+ * is the only place it is called, so if the scheme changes there is one line to follow.
+ *
+ * Minting an id here is only useful because the harness honours it; see
+ * `createSession`'s `sessionId` for the window that closes and how it was verified.
+ */
+export const newHarnessSessionId = (): string => SessionID.create();
 
 /** The assistant's final text, or an empty string when it produced none. */
 export const finalAssistantText = (entries: readonly MessageEntry[]): string =>

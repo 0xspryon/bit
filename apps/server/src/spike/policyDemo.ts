@@ -41,6 +41,7 @@ import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { ObservationStore } from "../persistence/store";
+import { TargetStores } from "../persistence/targetStores";
 import { runMain } from "./main";
 import { prepareWorkspace, RUNTIME_DIR, WORKER_MODEL } from "./runtime";
 
@@ -51,7 +52,7 @@ const AUDIT_PATH = join(RUNTIME_DIR, "policy-audit.log");
 
 const POLICY: PolicyConfig = {
   forbiddenPathFragments: [OUT_OF_SCOPE, "out-of-scope/"],
-  allowedHosts: ["127.0.0.1", "localhost"],
+  hostScope: { _tag: "hosts", allowed: ["127.0.0.1", "localhost"] },
 };
 
 const line = (label: string, value: unknown) =>
@@ -237,7 +238,14 @@ const program = Effect.gen(function* () {
     Layer.provideMerge(McpCredentials.layer),
     Layer.provideMerge(McpCallCounter.layer),
     Layer.provideMerge(PolicyDecisions.layer),
-    Layer.provide(ObservationStore.layer(":memory:")),
+    // The MCP route takes the per-target resolver now, not one target's store. One entry over
+    // the file below: dispatch is still real, and a credential naming another target is
+    // refused by name.
+    Layer.provide(
+      TargetStores.ofStore("fixture-local").pipe(
+        Layer.provide(ObservationStore.layer(":memory:")),
+      ),
+    ),
   );
   const main = yield* Effect.scoped(
     Effect.provide(

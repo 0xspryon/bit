@@ -33,6 +33,14 @@
  * re-posted through that API and are not wrapped by it: merging happens on the router, so
  * each route still carries only what its own layer declared.
  *
+ * **The MCP route no longer carries one target's store.** It takes
+ * {@link TargetStores} — the per-target resolver — and the tool handler reaches a store
+ * with the target id its credential carries (`mcp/tools.ts`). What this file used to do
+ * was yield one `ObservationStore` and provide it to the MCP application layer, which
+ * meant every authenticated write in this process landed in whichever database the
+ * entrypoint had resolved at startup. A caller with a single database and no fleet builds
+ * the resolver over it with `TargetStores.ofStore`.
+ *
  * **The fixture is not here, deliberately.** `fixture/server.ts` is the simulated target
  * under test and keeps its own listener. Putting it on this port would mean the worker
  * probing "the target" was probing the control plane's own origin, would collapse the
@@ -49,7 +57,7 @@ import { HttpRouter, HttpServerResponse } from "effect/http";
 
 import { McpCredentials } from "../mcp/credentials";
 import { MCP_PATH, McpApplicationLayer, McpCallCounter } from "../mcp/server";
-import { ObservationStore } from "../persistence/store";
+import { TargetStores } from "../persistence/targetStores";
 import {
   POLICY_DECIDE_PATH,
   PolicyDecisions,
@@ -141,7 +149,11 @@ export class ControlPlaneEndpoint extends Context.Service<
       ControlPlaneEndpoint,
       Effect.gen(function* () {
         const counter = yield* McpCallCounter;
-        const store = yield* ObservationStore;
+        // The MCP route dispatches each write to the target its credential names, so what
+        // this listener carries is the *resolver*, not one target's store. It used to be
+        // `ObservationStore` and the swap is the whole point of the change: one yield of a
+        // store here was what made this process serve one target.
+        const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
         const decisions = yield* PolicyDecisions;
 
@@ -155,7 +167,7 @@ export class ControlPlaneEndpoint extends Context.Service<
           healthRoutes,
           options.extraRoutes ?? Layer.empty,
         ).pipe(
-          Layer.provideMerge(Layer.succeed(ObservationStore, store)),
+          Layer.provideMerge(Layer.succeed(TargetStores, stores)),
           Layer.provideMerge(Layer.succeed(McpCredentials, credentials)),
           Layer.provideMerge(Layer.succeed(McpCallCounter, counter)),
           Layer.provideMerge(Layer.succeed(PolicyDecisions, decisions)),

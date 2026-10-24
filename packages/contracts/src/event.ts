@@ -28,12 +28,43 @@ import { Schema } from "effect";
  * One per mutation, named `<subject>.<what happened>` in the past tense, because an event
  * records something that is already true. A reader must tolerate a kind it does not know
  * rather than failing: the set only grows, and a Sprint 03 consumer will meet events
- * written by a later build.
+ * written by a later build. {@link RecordedEvent}'s `kind` is therefore `Schema.String`
+ * and not this union — this is what *we* write, not what a reader may receive.
+ *
+ * **The first two that are not content mutations.** `asset.recorded`, `intent.added` and
+ * `observation.recorded` all say that something was added to the graph.
+ * `attempt.started` and `attempt.settled` say that a run happened, which nothing in the
+ * log used to record: an attempt row carried its own status and the log was silent about
+ * the one thing an operator most often asks after the fact — when work ran, under which
+ * intent, and what became of it.
+ *
+ * They are a pair and the pairing is the point. Every `attempt.started` is answered by at
+ * least one `attempt.settled`, written either by the supervisor that owned the run or, if
+ * that process died, by the recovery sweep that reconciled the row it left behind. A
+ * `started` with no `settled` therefore means one thing only: that attempt is still
+ * running, or no sweep has reached it yet.
+ *
+ * **At least one, not exactly one**, and the extra case is worth knowing about rather than
+ * being surprised by. `uncertain` is terminal for authority but not for knowledge, so a
+ * later sweep that gets a definite answer refines it — and that refinement is a second
+ * state change, so it appends a second `attempt.settled`. Observed end to end: a process
+ * killed mid-run left its attempt `running`; a restart with no harness recorded
+ * `uncertain` (`settledBy: "recovery"`, `disposition: "uncertain"`); a restart with one
+ * recorded `succeeded` (`settledBy: "recovery"`, `disposition: "refined"`). A reader that
+ * wants the current answer takes the **last** `attempt.settled` for a subject, and the
+ * earlier ones are the record of what was known when.
+ *
+ * Neither carries an outbox request. Starting a run obliges nothing outside this
+ * database — the harness session is created before the row is written, not because of it
+ * — and §6 defines the outbox as a queue of side-effect *requests*. An empty obligation
+ * would be a row a dispatcher had to learn to skip.
  */
 export const EventKind = Schema.Literals([
   "asset.recorded",
   "intent.added",
   "observation.recorded",
+  "attempt.started",
+  "attempt.settled",
 ]);
 export type EventKind = typeof EventKind.Type;
 

@@ -27,7 +27,7 @@ import { Effect, Schema } from "effect";
 import { Tool, Toolkit } from "effect/ai";
 
 import { McpInvocation } from "./invocation";
-import { ObservationStore } from "../persistence/store";
+import { TargetStores, withTargetStore } from "../persistence/targetStores";
 
 export const RECORD_OBSERVATION_DESCRIPTION = [
   "Record one bounded observation as durable evidence.",
@@ -121,14 +121,45 @@ export const DomainToolkit = Toolkit.make(RecordObservation);
  * Provenance comes from {@link McpInvocation}, which the transport's auth middleware
  * provides per request from the presented credential. Nothing the model sent can reach
  * it, which is the whole point of the credential boundary.
+ *
+ * **The write is dispatched to the target the credential names.** This layer used to
+ * yield `ObservationStore` once, here, at construction — and that single yield *was* the
+ * pin that limited the whole process to one target: every authenticated write went to
+ * whichever database the entrypoint had resolved at startup, whatever the credential
+ * said. What replaces it is {@link TargetStores}, yielded in the same place, with the
+ * store reached inside the handler by `withTargetStore(stores, caller.targetId, …)`.
+ *
+ * Three things make that safe rather than merely more flexible:
+ *
+ * - **`caller.targetId` is not the model's to choose.** It comes from
+ *   {@link McpInvocation}, which the auth middleware builds from the presented bearer and
+ *   nothing else. A worker that names another target in its arguments is describing a
+ *   resource it has no way to address; there is no argument here that reaches the
+ *   resolver.
+ * - **The resolver is still one instance.** It is yielded at layer construction, not per
+ *   request, so this route shares the same reference-counted handles as the browser API
+ *   reading the same target — one connection and one write lock per file, rather than two
+ *   contending.
+ * - **The borrow is request-shaped.** `withTargetStore` holds the reference for the
+ *   length of the write and returns it, which is what the resolver is for. The handle
+ *   stays warm for the idle TTL, so a worker recording twenty observations opens the file
+ *   once.
+ *
+ * It also adds a failure this handler did not have: the credential can name a target
+ * whose database will not open. That is reported as `unavailable` with the resolver's own
+ * words, for the reason the `DatabaseError` case below already gives — a worker that
+ * cannot tell its observation was not stored is a worker that carries on as though it
+ * had.
  */
 export const DomainToolkitLayer = DomainToolkit.toLayer(
   Effect.gen(function* () {
-    const store = yield* ObservationStore;
+    const stores = yield* TargetStores;
     return DomainToolkit.of({
       record_observation: Effect.fn("record_observation")(function* (input) {
         const caller = yield* McpInvocation;
-        return yield* store.recordObservation(caller, input).pipe(
+        return yield* withTargetStore(stores, caller.targetId, (store) =>
+          store.recordObservation(caller, input),
+        ).pipe(
           Effect.catchTag("MutationError", (error) =>
             Effect.fail(
               new RecordObservationRefused({
@@ -151,6 +182,34 @@ export const DomainToolkitLayer = DomainToolkit.toLayer(
            * opaque internal error would leave it unable to tell. So it is returned as
            * a refusal and logged here, where the cause is still structured.
            */
+          /**
+           * The credential names a target this server cannot open.
+           *
+           * Only reachable through a credential, so it is not a model error and not an
+           * argument problem: the attempt was authorised against a target whose database
+           * has since become unopenable — archived, moved, or left unmigrated by the last
+           * sweep. Reported with the resolver's own sentence, because the operator fixing
+           * it is the one who moved the folder.
+           */
+          Effect.catchTag("FleetError", (error) =>
+            Effect.logError(
+              "record_observation could not resolve the caller's target",
+              {
+                targetId: error.targetId,
+                reason: error.reason,
+                detail: error.detail,
+              },
+            ).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new RecordObservationRefused({
+                    reason: "unavailable",
+                    detail: `the store for target '${error.targetId}' could not be opened, so this observation was NOT recorded: ${error.detail}`,
+                  }),
+                ),
+              ),
+            ),
+          ),
           Effect.catchTag("DatabaseError", (error) =>
             Effect.logError("record_observation could not reach the store", {
               operation: error.operation,

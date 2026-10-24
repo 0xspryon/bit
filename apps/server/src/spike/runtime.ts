@@ -20,14 +20,11 @@ import { HarnessSessionStatus } from "../recovery/harnessStatus";
 
 import { FixtureEndpoint } from "../fixture/server";
 import { DEFAULT_CONFIG, type RateLimitConfig } from "../fixture/rateLimit";
-import {
-  OpenCodeClient,
-  type ClientTimeouts,
-  type ModelRef,
-} from "../harness/openCodeClient";
+import { OpenCodeClient, type ClientTimeouts } from "../harness/openCodeClient";
 import { OpenCodeServer } from "../harness/openCodeServer";
 import { McpCredentials } from "../mcp/credentials";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
+import { installPolicyHook } from "../policy/install";
 import {
   DEFAULT_POLICY,
   PolicyDecisions,
@@ -35,32 +32,22 @@ import {
 } from "../policy/service";
 import { McpCallCounter } from "../mcp/server";
 import { ObservationStore } from "../persistence/store";
+import { TargetStores } from "../persistence/targetStores";
 
 /**
  * The provider and model the worker is pinned to.
  *
- * `openai` here is OpenCode's OAuth-authenticated ChatGPT subscription provider, which
- * the spawned server reads from the user's own stored credentials. No API key is read,
- * passed or held by this process. Verified on 2026-10-19 against opencode v2.0.32:
- * `gpt-5.6-sol` and `gpt-6-astra` complete; `gpt-5.5` and `gpt-5.3-codex-spark` are
- * refused by the provider with "not supported when using Codex with a ChatGPT
- * account", so model availability is narrower than the catalogue suggests.
+ * Re-exported rather than declared, now that the server starts runs too: the constant
+ * lives on `run/model.ts` so there is one answer for both, and the attempt rows a demo
+ * writes name the same provider and model as the ones a browser-started run writes.
  */
-export const WORKER_MODEL: ModelRef = {
-  providerID: "openai",
-  id: "gpt-5.6-sol",
-};
+export { WORKER_MODEL } from "../run/model";
+import { WORKER_MODEL } from "../run/model";
 
 export const RUNTIME_DIR = join(process.cwd(), ".runtime");
 
-/** The policy hook's source, loaded into whichever workspace needs it. */
-export const POLICY_HOOK_SOURCE = join(
-  import.meta.dir,
-  "..",
-  "..",
-  "plugins",
-  "policyHook.ts",
-);
+/** The policy hook's source. Re-exported; it lives with the installer now. */
+export { POLICY_HOOK_SOURCE } from "../policy/install";
 
 /** Paths the demos report and read back. Values, not a service's business. */
 export class SpikePaths extends Context.Service<
@@ -74,6 +61,16 @@ export class SpikePaths extends Context.Service<
 >()("bit/spike/SpikePaths") {}
 
 export interface SpikeOptions {
+  /**
+   * Which target this one `hunt.sqlite` holds the evidence for.
+   *
+   * The MCP write boundary dispatches by the target id its credential carries, so the
+   * endpoint needs a resolver rather than a store. The spike has one database and no
+   * fleet around it, so the resolver is `TargetStores.ofStore` over that file — one
+   * entry, and a credential for any other target is refused by name. Every demo here
+   * binds to `fixture-local`, which is why it is the default.
+   */
+  readonly targetId?: string;
   readonly databaseName?: string;
   readonly workspaceName?: string;
   readonly fixtureConfig?: RateLimitConfig;
@@ -104,15 +101,14 @@ export interface SpikeOptions {
 /**
  * Lays out the worker's workspace, including the policy hook when one is wanted.
  *
- * A *configured* local plugin must point at a DIRECTORY with an `index`/`server`
- * entrypoint, not a bare file — opencode logs "configured plugin path must be a
- * directory" and skips it otherwise (`packages/plugin/src/host.ts:17-42`). Deliberately
- * not named `plugin/`, which is auto-discovered and would load a second copy with no
- * options (`packages/core/src/plugin/source-directory.ts:9`).
+ * The hook-installing half moved to `policy/install.ts`, because a browser-started run
+ * needs exactly that and needs none of this: the fixture files below are the spike's own,
+ * written into a scratch directory, and a server must never write them into a folder an
+ * operator picked. What is left here is the spike's part, with the shared part delegated.
  *
  * The audit file is written *outside* the workspace on purpose: it records what the
- * worker was allowed and denied, and a worker that can read its own audit trail can
- * read the shape of the boundary it is inside.
+ * worker was allowed and denied, and a worker that can read its own audit trail can read
+ * the shape of the boundary it is inside.
  */
 export const prepareWorkspace = Effect.fnUntraced(function* (input: {
   readonly workspace: string;
@@ -120,15 +116,7 @@ export const prepareWorkspace = Effect.fnUntraced(function* (input: {
   readonly hook?: {
     readonly policyUrl: string;
     readonly auditPath: string;
-    /**
-     * Empty the audit file first.
-     *
-     * Required rather than defaulted, because both answers are wrong somewhere. A
-     * single-scope demo wants a file describing this run and nothing else. A program
-     * with several scopes — the milestone proof has four — would wipe its own evidence
-     * at the start of every phase, which is exactly what it did before this was a
-     * decision a caller had to make.
-     */
+    /** Empty the audit file first. See `policy/install.ts` for why this is required. */
     readonly freshAudit: boolean;
   };
 }) {
@@ -144,53 +132,16 @@ export const prepareWorkspace = Effect.fnUntraced(function* (input: {
   );
   const hook = input.hook;
   if (hook === undefined) return;
-  yield* Effect.promise(async () => {
-    const directory = join(input.workspace, ".opencode", "policy");
-    mkdirSync(directory, { recursive: true });
-    if (hook.freshAudit || !(await Bun.file(hook.auditPath).exists())) {
-      await Bun.write(hook.auditPath, "");
-    }
-    await Bun.write(
-      join(directory, "index.ts"),
-      await Bun.file(POLICY_HOOK_SOURCE).text(),
-    );
-    await Bun.write(
-      join(directory, "package.json"),
-      `${JSON.stringify(
-        {
-          name: "bit-policy-hook",
-          private: true,
-          type: "module",
-          main: "index.ts",
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    await Bun.write(
-      join(input.workspace, ".opencode", "opencode.json"),
-      `${JSON.stringify(
-        {
-          $schema: "https://opencode.ai/config.json",
-          // `plugins` (not `plugin`) is the key that accepts the object form. The
-          // superseded `plugin` key takes a string or a `[package, options]` tuple, and
-          // an object there is silently skipped as malformed
-          // (opencode `packages/core/src/config/normalize.ts:185-190`).
-          plugins: [
-            {
-              package: "./policy",
-              options: {
-                policyUrl: hook.policyUrl,
-                auditPath: hook.auditPath,
-              },
-            },
-          ],
-        },
-        null,
-        2,
-      )}\n`,
-    );
-  });
+  // `orDie` here and not in the server: a demo whose workspace it created cannot have an
+  // `opencode.json` it did not write, so a refusal would be a defect in this file.
+  yield* Effect.orDie(
+    installPolicyHook({
+      workspace: input.workspace,
+      policyUrl: hook.policyUrl,
+      auditPath: hook.auditPath,
+      freshAudit: hook.freshAudit,
+    }),
+  );
 });
 
 /**
@@ -213,6 +164,9 @@ export const spikeLayer = (options: SpikeOptions = {}) => {
   const auditFile = join(RUNTIME_DIR, `${name}-policy-audit.log`);
 
   const store = ObservationStore.layer(databaseFile);
+  const resolver = TargetStores.ofStore(
+    options.targetId ?? "fixture-local",
+  ).pipe(Layer.provide(store));
 
   // One listener for all three control-plane surfaces: health, the MCP route the worker
   // calls back into, and the policy route the harness-side hook consults.
@@ -222,7 +176,7 @@ export const spikeLayer = (options: SpikeOptions = {}) => {
     Layer.provideMerge(McpCredentials.layer),
     Layer.provideMerge(McpCallCounter.layer),
     Layer.provideMerge(PolicyDecisions.layer),
-    Layer.provide(store),
+    Layer.provide(resolver),
   );
 
   const workspaceReady = Layer.effectDiscard(

@@ -321,7 +321,7 @@ export const runPlannerPhase = Effect.fn("runPlannerPhase")(function* (
  */
 export const WORKER_POLICY: PolicyConfig = {
   forbiddenPathFragments: ["hunt.sqlite", "out-of-scope"],
-  allowedHosts: ["127.0.0.1", "localhost"],
+  hostScope: { _tag: "hosts", allowed: ["127.0.0.1", "localhost"] },
 };
 
 /**
