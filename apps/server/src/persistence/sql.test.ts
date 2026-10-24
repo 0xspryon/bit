@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Effect, Fiber, Latch } from "effect";
+import { Context, Effect, Fiber, Latch, Layer } from "effect";
 import { SqlClient } from "effect/sql";
 
 import { AWKWARD_TEXT } from "./fixtures";
@@ -55,6 +55,43 @@ test("the pragmas the schema depends on are actually in force", async () => {
   expect(pragmas.journalMode).toBe("wal");
   expect(pragmas.busyTimeout).toBe(5_000);
   expect(pragmas.journalSizeLimit).toBe(33_554_432);
+});
+
+test("two files built through one MemoMap both get their pragmas", async () => {
+  // The regression this exists for. `Layer.MemoMap` memoizes by layer *object identity*
+  // (`effect/src/Layer.ts:414`), and `LayerMap` — which `persistence/targetStores.ts` uses
+  // to hold one connection per target — builds every entry through a single shared
+  // MemoMap. While the pragma step was a module-level `Layer` constant, the second file
+  // opened that way silently came up with `foreign_keys = 0`: the layer produces no
+  // service, so there was nothing missing to notice. Measured here on two live
+  // connections rather than argued about.
+  const first = newDatabasePath();
+  const second = newDatabasePath();
+
+  const pragmas = await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const memoMap = yield* Layer.makeMemoMap;
+        const scope = yield* Effect.scope;
+        const build = (path: string) =>
+          Effect.flatMap(
+            Layer.buildWithMemoMap(sqliteLayer(path), memoMap, scope),
+            (context) =>
+              Effect.provideService(
+                currentPragmas,
+                SqlClient.SqlClient,
+                Context.get(context, SqlClient.SqlClient),
+              ),
+          );
+        return [yield* build(first), yield* build(second)];
+      }),
+    ).pipe(Effect.orDie),
+  );
+
+  expect(pragmas.map((state) => state.foreignKeys)).toEqual([1, 1]);
+  expect(pragmas.map((state) => state.journalSizeLimit)).toEqual([
+    33_554_432, 33_554_432,
+  ]);
 });
 
 test("a foreign key violation is a typed failure, not an accepted row", async () => {

@@ -20,12 +20,21 @@
  * scenario is the shortcut rather than the only way in.
  */
 
-import type { TargetSummary } from "@bit/contracts";
+import type { TargetCounts, TargetSummary } from "@bit/contracts";
 
-import { initialTargets, type Target } from "./mock";
+import { initialTargets, previewCounts, type Target } from "./mock";
 import { server, setToken, storedToken } from "./client";
 
 export type Screen = "connect" | "welcome" | "target";
+/**
+ * What the hunt view knows about the target it is showing.
+ *
+ * `loading` is a real state rather than "counts are zero": a fresh target genuinely holds
+ * zero of everything, so a header cannot use `0` to mean "not read yet" without lying in
+ * the one case it is most likely to be looked at.
+ */
+export type TargetViewState =
+  "empty" | "loading" | "ready" | "unavailable" | "unreachable";
 export type Theme = "dark" | "light";
 export type ConnectError = "none" | "password" | "unreachable" | "expired";
 export type CreateState =
@@ -118,6 +127,30 @@ export class App {
 
   /* Level 2 — inside an open target */
   navItem = $state("hunts");
+  /**
+   * Which target {@link counts} were read for.
+   *
+   * Carried next to the counts rather than assumed to be `selectedId`, because they are
+   * written at different times: the id changes the moment a target is opened and the
+   * counts arrive one round trip later. The header renders counts only when these agree,
+   * which is what makes "no data from one target appears while viewing the other" a
+   * property of the screen rather than a property of how fast the server answered.
+   */
+  viewTargetId = $state("");
+  /** Server-fed: what the open target's own database holds. */
+  counts = $state<TargetCounts | undefined>(undefined);
+  viewState = $state<TargetViewState>("empty");
+  /** The server's own words for a refusal, shown instead of the counts. */
+  viewDetail = $state("");
+  /**
+   * A target named in the URL that could not be opened yet.
+   *
+   * A deep link arrives before there is a session, so the id is parked here and acted on
+   * once the target list is in hand. Cleared whether or not it resolves — a link to a
+   * target that no longer exists should leave the operator on the list, once, rather than
+   * re-asking on every refresh of it.
+   */
+  requestedTargetId = $state("");
   sidebarCollapsed = $state(false);
   detailOpen = $state(false);
   detailRow = $state(0);
@@ -191,6 +224,7 @@ export class App {
       this.password = "";
       this.screen = "welcome";
       await this.loadTargets();
+      this.openRequested();
     } finally {
       this.connecting = false;
     }
@@ -218,6 +252,9 @@ export class App {
       this.dialogRoot = call.value.workspaceRoot;
       this.screen = "welcome";
       await this.loadTargets();
+      // A deep link resumes into the target it named, which is the whole point of the
+      // URL carrying one: reloading the tab must not drop you back on the list.
+      this.openRequested();
       return;
     }
     if (call._tag === "Refused") {
@@ -239,6 +276,10 @@ export class App {
     this.targets = [];
     this.openTargetIds = [];
     this.selectedId = "";
+    this.viewTargetId = "";
+    this.counts = undefined;
+    this.viewState = "empty";
+    this.viewDetail = "";
   }
 
   /* ── Targets ─────────────────────────────────────────────────────────────── */
@@ -282,12 +323,127 @@ export class App {
     }
   }
 
-  /** Opens a target: Level 1 gives way to Level 2. */
+  /**
+   * Opens a target: Level 1 gives way to Level 2, and the server opens a database.
+   *
+   * The screen switches first and the counts follow, so the frame is up while the request
+   * is in flight rather than the operator waiting on a blank page for a file to be opened.
+   * The header shows its loading state for that moment and never shows the previous
+   * target's numbers, because {@link loadTarget} clears them before it asks.
+   */
   openTarget(id: string) {
     this.select(id);
     this.screen = "target";
     this.navItem = "hunts";
     this.detailOpen = false;
+    void this.loadTarget(id);
+  }
+
+  /**
+   * Reads one target: its row and the counts from its own `hunt.sqlite`.
+   *
+   * Three refusals, each landing somewhere different, because they are different facts:
+   *
+   * - `TargetNotFound` — the link is stale or the id is not an id. Back to the list; there
+   *   is nothing to show a header for.
+   * - `TargetUnavailable` — the target exists and will not open. The header stays, saying
+   *   so in the server's own words, which are the same words the rail dims the row with.
+   *   It is deliberately *not* a bounce to the list: the operator asked about this target
+   *   and the answer is about this target.
+   * - `Unauthenticated` — the session went while we were looking. Sign out as expired
+   *   rather than leave a screen that cannot be refreshed.
+   *
+   * The response carries the target's own row, so this also refreshes the rail entry it
+   * came from: a deep link into a cold tab has a name and a scope note before the list
+   * has loaded.
+   */
+  async loadTarget(id: string) {
+    this.viewTargetId = id;
+    // Cleared before the request, not after it: between two targets there is a moment
+    // where the only honest answer is "reading", and stale counts in that moment are the
+    // exact thing this screen must never show.
+    this.counts = undefined;
+    this.viewDetail = "";
+    this.viewState = "loading";
+
+    const call = await server.target(this.serverUrl, id);
+    // A second open may have overtaken this one. Whatever came back is about a target the
+    // operator has already left, so it is dropped rather than rendered.
+    if (this.viewTargetId !== id) return;
+
+    if (call._tag === "Unreachable") {
+      this.viewState = "unreachable";
+      this.viewDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      const error = call.error;
+      const detail =
+        "detail" in error && typeof error.detail === "string"
+          ? error.detail
+          : "";
+      if (error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      if (error._tag === "TargetNotFound") {
+        this.viewState = "empty";
+        this.screen = "welcome";
+        await this.loadTargets();
+        return;
+      }
+      this.viewState = "unavailable";
+      this.viewDetail = detail;
+      return;
+    }
+
+    const now = Date.now();
+    const row = fromSummary(call.value.target, now);
+    this.targets = this.targets.some((target) => target.id === row.id)
+      ? this.targets.map((target) => (target.id === row.id ? row : target))
+      : [...this.targets, row];
+    this.counts = call.value.counts;
+    this.viewState = "ready";
+  }
+
+  /**
+   * Opens a target with the prototype's counts and no request, for the state picker.
+   *
+   * The picker's job is to reach a UI state without reproducing the conditions that cause
+   * it, and its rows are mock rows that no server has heard of — so asking the server
+   * about one would land on `TargetNotFound` and bounce back to the list. This is the same
+   * shortcut `reset()` is: real where it can be, declared where it cannot.
+   */
+  previewTarget(id: string) {
+    this.select(id);
+    this.screen = "target";
+    this.detailOpen = false;
+    this.viewTargetId = id;
+    this.counts = previewCounts;
+    this.viewState = "ready";
+    this.viewDetail = "";
+  }
+
+  /** Remembers a target named in the URL, to open once there is a session. */
+  requestTarget(id: string) {
+    this.requestedTargetId = id;
+  }
+
+  /**
+   * Opens the target a URL asked for, if it is one this server has.
+   *
+   * Called after the list is loaded, by both ways in — a fresh sign-in and a resumed
+   * session — because a link should land in the same place either way. An id the registry
+   * does not hold is dropped silently *here* and reported by the route if the operator
+   * tries again: the list is already on screen, and it is the honest answer to "that
+   * target is not on this server".
+   */
+  openRequested() {
+    const id = this.requestedTargetId;
+    this.requestedTargetId = "";
+    if (id === "") return;
+    if (!this.targets.some((target) => target.id === id)) return;
+    this.openTarget(id);
   }
 
   toSettings() {
@@ -472,6 +628,11 @@ export class App {
     this.sidebarCollapsed = false;
     this.detailOpen = false;
     this.passwordVisible = false;
+    this.viewTargetId = "";
+    this.counts = undefined;
+    this.viewState = "empty";
+    this.viewDetail = "";
+    this.requestedTargetId = "";
   }
 }
 
@@ -593,7 +754,7 @@ export const scenarios: Scenario[] = [
     label: "Open target",
     apply: (a) => {
       a.reset();
-      a.openTarget("acme-corp");
+      a.previewTarget("acme-corp");
     },
   },
   {
@@ -602,7 +763,7 @@ export const scenarios: Scenario[] = [
     label: "Detail panel open",
     apply: (a) => {
       a.reset();
-      a.openTarget("acme-corp");
+      a.previewTarget("acme-corp");
       a.navItem = "findings";
       a.detailRow = 0;
       a.detailOpen = true;
@@ -614,7 +775,7 @@ export const scenarios: Scenario[] = [
     label: "Collapsed icon rail",
     apply: (a) => {
       a.reset();
-      a.openTarget("acme-corp");
+      a.previewTarget("acme-corp");
       a.navItem = "blockers";
       a.sidebarCollapsed = true;
     },
@@ -625,7 +786,7 @@ export const scenarios: Scenario[] = [
     label: "Section with nothing in it",
     apply: (a) => {
       a.reset();
-      a.openTarget("acme-corp");
+      a.previewTarget("acme-corp");
       a.navItem = "traffic";
     },
   },

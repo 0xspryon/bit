@@ -104,34 +104,48 @@ export const currentPragmas: Effect.Effect<
  * that the driver leaves alone, then fails if they did not take.
  *
  * `foreign_keys` matters most: with it off, every `REFERENCES` clause in the migrations
- * is decoration. It is a per-connection setting and there is exactly one connection
- * here, so applying it once at layer construction covers every later statement. It is
- * applied *before* the migrator runs, so the migrations' own inserts are checked too.
+ * is decoration. It is a per-connection setting, so it is applied once per connection at
+ * layer construction and covers every later statement on that connection. It is applied
+ * *before* the migrator runs, so the migrations' own inserts are checked too.
+ *
+ * **A function, and it must stay one.** This used to be a module-level `Layer` constant,
+ * which was correct while one process opened one file and became silently wrong the
+ * moment several files were opened through a *shared* `Layer.MemoMap` — which is exactly
+ * what `persistence/targetStores.ts` does, because that is how `LayerMap` builds its
+ * entries. A `MemoMap` memoizes by layer **object identity**
+ * (`effect/src/Layer.ts:414` and `MemoMapImpl.map`), so one constant appearing in two
+ * composed graphs is built once: the first file got `foreign_keys = ON` and every
+ * subsequent file got `0`, with no failure anywhere, because this layer's output is
+ * `never` and there was nothing for the second build to produce. Measured, not reasoned
+ * about — the probe read `PRAGMA foreign_keys` back as `1` then `0`, and
+ * `targetStores.test.ts` now asserts it on two live target stores.
+ *
+ * The filename is a parameter only so the refusal can name the file it is about; the
+ * reason it is a function is the identity above.
  */
-export const pragmaLayer: Layer.Layer<
-  never,
-  DatabaseError,
-  SqlClient.SqlClient
-> = Layer.effectDiscard(
-  Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    yield* sql.unsafe("PRAGMA foreign_keys = ON");
-    yield* sql.unsafe("PRAGMA journal_size_limit = 33554432");
-    const state = yield* readPragmas(sql);
-    if (state.foreignKeys !== 1) {
-      return yield* new DatabaseError({
-        operation: "open",
-        reason: "foreign_keys did not take effect",
-        cause: state,
-      });
-    }
-    return state;
-  }).pipe(
-    Effect.mapError((error) =>
-      error instanceof DatabaseError ? error : asDatabaseError("open")(error),
+export const pragmaLayer = (
+  filename: string,
+): Layer.Layer<never, DatabaseError, SqlClient.SqlClient> =>
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql.unsafe("PRAGMA foreign_keys = ON");
+      yield* sql.unsafe("PRAGMA journal_size_limit = 33554432");
+      const state = yield* readPragmas(sql);
+      if (state.foreignKeys !== 1) {
+        return yield* new DatabaseError({
+          operation: "open",
+          reason: `foreign_keys did not take effect on ${filename}`,
+          cause: state,
+        });
+      }
+      return state;
+    }).pipe(
+      Effect.mapError((error) =>
+        error instanceof DatabaseError ? error : asDatabaseError("open")(error),
+      ),
     ),
-  ),
-);
+  );
 
 /**
  * The configured SQLite client for one database file, owned by the surrounding scope.
@@ -139,22 +153,36 @@ export const pragmaLayer: Layer.Layer<
  * Provides both `SqlClient` (what the store and the migrator depend on) and the driver's
  * own `SqliteClient`. The pragmas are part of the layer, so there is no way to obtain a
  * client that has not had them applied.
+ *
+ * Every layer in the returned graph is a fresh object, so two calls share nothing even
+ * when they are built through one `MemoMap`. See {@link pragmaLayer} for what sharing one
+ * did.
  */
 export const sqliteLayer = (
   filename: string,
 ): Layer.Layer<
   SqlClient.SqlClient | SqliteClient.SqliteClient,
   DatabaseError
-> => pragmaLayer.pipe(Layer.provideMerge(clientLayer(filename)));
+> => pragmaLayer(filename).pipe(Layer.provideMerge(clientLayer(filename)));
 
 /**
  * The driver's client as a layer whose failure is a {@link DatabaseError}.
  *
- * This is `SqliteClient.layer` with one change: the driver's own layer leaves `SqlError`
+ * This is `SqliteClient.layer` with two changes: the driver's own layer leaves `SqlError`
  * in the error channel, and `Layer` has no `mapError`, so the layer is assembled from
  * `SqliteClient.make` here in order to map it. Everything else — the two service tags it
  * provides, the `Reactivity` dependency, the scope that owns the open file — is the
  * driver's (`@effect/sql-sqlite-bun/src/SqliteClient.ts:329-337`).
+ *
+ * The second change is that `Reactivity` is built per connection rather than taken from
+ * the module-level `Reactivity.layer`. `Reactivity` is keyed invalidation — "process-local
+ * invalidation for connecting writes to dependent reads" — and its keys are table names,
+ * which are *identical* in every target's file. One shared instance would therefore let a
+ * write to one target invalidate a reactive read on another, which is the one thing the
+ * file-per-target layout exists to make impossible (`persistence/fleet.ts`). Nothing calls
+ * `sql.reactive` today; this keeps that from becoming a cross-target leak the day
+ * something does. It is also the same object-identity hazard as {@link pragmaLayer}: a
+ * shared `MemoMap` builds a module-level constant once.
  */
 const clientLayer = (
   filename: string,
@@ -171,4 +199,4 @@ const clientLayer = (
       ),
       Effect.mapError(asDatabaseError("open")),
     ),
-  ).pipe(Layer.provide(Reactivity.layer));
+  ).pipe(Layer.provide(Layer.effect(Reactivity.Reactivity, Reactivity.make)));

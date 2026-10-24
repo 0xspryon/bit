@@ -15,21 +15,29 @@
  * unavailable and refused by name; its neighbours are served. The reasoning for that
  * policy, and its cost, are recorded on `persistence/fleet.ts`.
  *
- * **This process serves one target at a time**, named by `TARGET_ID` and registered on
- * demand if the registry does not hold it. That is a deliberate stop short of what the
- * layout allows: dispatching an MCP request to the right target's store needs a
- * per-target store resolver at the mutation boundary, and the only reason to build one is
- * to run work against several targets at once — which is concurrency, and is not this
- * sprint. What the layout buys today is real regardless: separate files, provable
- * deletion, a per-target sequence, and no query path from one target's connection to
- * another's rows.
+ * **This process reads any target on demand.** It used to bind one target's store into
+ * the layer graph at startup and serve that target only; what replaces that is
+ * `persistence/targetStores.ts`, a resolver that opens `targets/<id>/hunt.sqlite` when
+ * something asks for that id, shares one handle between everything holding it, and closes
+ * it once nothing has used it for a minute. The browser's `GET /api/v1/targets/:targetId`
+ * goes through it per request, which is what makes "open each of two targets in turn" a
+ * thing this process can do without a restart.
+ *
+ * **One pin is left, and it is the mutation boundary.** `/api/v1/mcp` still takes its
+ * store as a layer requirement, so this entrypoint resolves `TARGET_ID` once and hands it
+ * over. Dispatching an MCP write to the target named by its own credential is a change at
+ * the write boundary — the credential already carries a `targetId` — and it belongs with
+ * the slice that starts runs from the browser, not with the one that reads a header. Note
+ * what has changed even so: that store now comes out of the same resolver as everything
+ * else, so the MCP route and a browser reading the same target share one connection and
+ * one write lock rather than contending with two.
  *
  * What this entrypoint owns, in one scope, released in reverse on every exit including
  * `SIGINT`:
  *
  * 1. The fleet: the control database, migrated, and the registry sweep across targets.
- * 2. The served target's store, which brings its own schema up to date before anything
- *    can read it.
+ * 2. The per-target store resolver, and through it the store the MCP route is pinned to,
+ *    which brings its own schema up to date before anything can read it.
  * 3. The listener.
  * 4. **Startup reconciliation**, before any work is dispatched. Attempts left `running`
  *    by a previous process are reconciled against the harness, which revokes their
@@ -68,8 +76,9 @@ import { ControlPlaneEndpoint } from "./http/controlPlane";
 import { resolveRoot } from "./http/folders";
 import { McpCredentials } from "./mcp/credentials";
 import { McpCallCounter } from "./mcp/server";
-import { FleetStore, targetStoreLayer } from "./persistence/fleet";
+import { FleetStore } from "./persistence/fleet";
 import { ObservationStore } from "./persistence/store";
+import { TargetStores } from "./persistence/targetStores";
 import { DEFAULT_POLICY, PolicyDecisions } from "./policy/service";
 import { HarnessSessionStatus } from "./recovery/harnessStatus";
 import {
@@ -172,16 +181,55 @@ const prepareFleet = Effect.gen(function* () {
   }
 });
 
-const store = targetStoreLayer(TARGET_ID).pipe(Layer.provide(fleet));
+/**
+ * The one per-target store resolver in this process.
+ *
+ * One instance, because it caches open database handles: a second resolver would be a
+ * second set of connections to the same files, and a SQLite file has one write lock to
+ * share. Everything that needs a target's store — the browser API per request, the MCP
+ * route for the length of the process — takes it from here.
+ */
+const targetStores = TargetStores.layer.pipe(Layer.provide(fleet));
+
+/**
+ * The store the MCP route is pinned to, resolved through the resolver like everything else.
+ *
+ * `/api/v1/mcp` declares `ObservationStore` as a layer requirement, so it gets one target
+ * for the life of the process rather than one per request. The borrow is held by this
+ * layer's scope, which is the process's scope, so this entry is never idle and the idle
+ * TTL never applies to it.
+ *
+ * A refusal here is fatal, and should be: `TARGET_ID` is registered and swept by
+ * `prepareFleet` immediately above, so a target that will not open at this point is not a
+ * partial-fleet case — it is the one target this process was told to serve, and starting
+ * without it would mean accepting MCP writes with nowhere to put them.
+ *
+ * **The pin outlives archival, and that is a decision rather than an oversight.** This
+ * borrow is taken once and held by the process's scope, so archiving this target while
+ * the process runs would not close its file: the MCP route would keep writing to a target
+ * the registry has retired, and `TargetStores.invalidate` would not help — it stops an
+ * entry being handed to anyone *new* and never interrupts a borrower. Nothing in this
+ * process can reach that state today, because no route archives: `FleetStore.archive`
+ * exists and the browser API does not expose it. The constraint is therefore recorded
+ * here rather than defended against. **When an archive route is added, archiving
+ * `TARGET_ID` has to be refused while this process serves it** — a running MCP endpoint
+ * pinned to a retired target is a worse answer than telling the operator to stop the
+ * server first.
+ */
+const servedStore = TargetStores.pinned(
+  TARGET_ID,
+  "the MCP route declares ObservationStore as a layer requirement, so the mutation boundary serves one target until it learns to dispatch by credential",
+).pipe(Layer.provide(targetStores));
 
 /**
  * The browser API, resolved down to the router it will be registered on.
  *
- * Everything it needs is provided here — the fleet registry it reads targets out of and
- * the browser session registry its guard resolves against — so what reaches the control
- * plane is a layer with one requirement left: `HttpRouter`. That is what lets it share
- * the listener without this entrypoint knowing how the control plane builds its router,
- * and without the control plane knowing what a target is.
+ * Everything it needs is provided here — the fleet registry it reads targets out of, the
+ * per-target store resolver it opens one target's database with, and the browser session
+ * registry its guard resolves against — so what reaches the control plane is a layer with
+ * one requirement left: `HttpRouter`. That is what lets it share the listener without this
+ * entrypoint knowing how the control plane builds its router, and without the control
+ * plane knowing what a target is.
  *
  * The session registry is provided to the API and *not* merged outward, so nothing else
  * in this process can reach it. The MCP credentials next to it are a separate service
@@ -189,6 +237,7 @@ const store = targetStoreLayer(TARGET_ID).pipe(Layer.provide(fleet));
  */
 const browserApi = browserApiRoutes({ workspaceRoot: WORKSPACE_ROOT }).pipe(
   Layer.provide(BrowserSessions.layer),
+  Layer.provide(targetStores),
   Layer.provide(fleet),
   // `Layer.orDie` rather than a failure that propagates, and the reason is the ordering
   // below: `prepareFleet` has already opened and migrated `control.sqlite` by the time
@@ -207,7 +256,7 @@ const endpoint = ControlPlaneEndpoint.layer({
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
   Layer.provideMerge(PolicyDecisions.layer),
-  Layer.provide(store),
+  Layer.provide(servedStore),
 );
 
 /**
@@ -269,7 +318,7 @@ await Effect.runPromise(
     Effect.andThen(
       prepareFleet.pipe(Effect.provide(fleet)),
       program.pipe(
-        Effect.provide(Layer.mergeAll(endpoint, store, harnessStatus)),
+        Effect.provide(Layer.mergeAll(endpoint, servedStore, harnessStatus)),
       ),
     ),
   ),

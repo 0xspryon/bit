@@ -6,11 +6,22 @@
    * the frame — sidebar, page header, filter row, scrolling body, detail
    * panel — not to design the pages that will fill it. Those are Flows B
    * through G, and inventing them here would make them look decided.
+   *
+   * What is real now is the frame's header: {@link TargetHeader} shows the
+   * open target's name, its scope note and the counts read from that
+   * target's own database. And the hunts section's body is driven by the
+   * real intent count rather than by a prototype number, so a target with
+   * nothing in it shows an empty transcript — which is what every target
+   * shows today, because nothing can start a run yet. The other sections
+   * keep their placeholder rows: a count there is the prototype's, and
+   * swapping in a number this screen cannot source would make an undesigned
+   * page look decided.
    */
   import Badge from "../components/Badge.svelte";
   import Button from "../components/Button.svelte";
   import PageFrame from "../components/PageFrame.svelte";
   import Sidebar from "../components/Sidebar.svelte";
+  import TargetHeader from "../components/TargetHeader.svelte";
   import { IconSearch } from "../icons";
   import { navGroups } from "../mock";
   import type { App } from "../app.svelte";
@@ -20,8 +31,22 @@
   let item = $derived(
     navGroups.flatMap((g) => g.items).find((i) => i.id === app.navItem),
   );
+  /**
+   * How many rows this section has, and where that number comes from.
+   *
+   * `hunts` is answered from the open target's own database — and only when the
+   * counts on hand are that target's, so a switch cannot show the previous
+   * target's length. Every other section falls back to the prototype's count,
+   * which is what keeps an undesigned page looking like a prototype instead of
+   * like an empty real one.
+   */
+  let count = $derived(
+    app.navItem === "hunts"
+      ? ((app.viewTargetId === app.selected?.id ? app.counts?.intents : 0) ?? 0)
+      : (item?.count ?? 0),
+  );
   let rows = $derived(
-    Array.from({ length: Math.min(item?.count ?? 0, 9) }, (_, index) => ({
+    Array.from({ length: Math.min(count, 9) }, (_, index) => ({
       id: `${app.navItem}-${index}`,
       index,
     })),
@@ -31,74 +56,86 @@
 <div class="level2">
   <Sidebar {app} />
 
-  <PageFrame
-    title={item?.label ?? ""}
-    description="Placeholder content. This page is designed in a later flow — what Flow A settles is the frame around it."
-    detailTitle="{item?.label ?? ''} detail"
-    detailOpen={app.detailOpen}
-    onclosedetail={() => (app.detailOpen = false)}
-  >
-    {#snippet actions()}
-      <Button size="sm">Export</Button>
-      <Button size="sm" variant="primary">New</Button>
-    {/snippet}
+  <div class="pane">
+    <TargetHeader {app} />
 
-    {#snippet filters()}
-      <span class="search-wrap">
-        <IconSearch class="search-icon" width="13" height="13" />
-        <input class="search" placeholder="Filter {item?.label ?? ''}" />
-      </span>
-      <Button size="sm" variant="quiet">All statuses</Button>
-      <Button size="sm" variant="quiet">Any time</Button>
-    {/snippet}
+    <PageFrame
+      title={item?.label ?? ""}
+      description="Placeholder content. This page is designed in a later flow — what Flow A settles is the frame around it."
+      detailTitle="{item?.label ?? ''} detail"
+      detailOpen={app.detailOpen}
+      onclosedetail={() => (app.detailOpen = false)}
+    >
+      {#snippet actions()}
+        <Button size="sm">Export</Button>
+        <Button size="sm" variant="primary">New</Button>
+      {/snippet}
 
-    {#snippet body()}
-      {#if rows.length === 0}
-        <p class="empty">Nothing recorded here yet.</p>
-      {:else}
-        <ul class="rows">
-          {#each rows as row (row.id)}
-            <li>
-              <button
-                class="row"
-                onclick={() => {
-                  app.detailRow = row.index;
-                  app.detailOpen = true;
-                }}
-              >
-                <Badge name={app.selected?.name ?? "?"} size={16} />
-                <span class="row-title">
-                  {item?.label ?? ""} row {row.index + 1}
-                </span>
-                <span class="row-meta mono">placeholder</span>
-              </button>
-            </li>
-          {/each}
-        </ul>
-      {/if}
-    {/snippet}
+      {#snippet filters()}
+        <span class="search-wrap">
+          <IconSearch class="search-icon" width="13" height="13" />
+          <input class="search" placeholder="Filter {item?.label ?? ''}" />
+        </span>
+        <Button size="sm" variant="quiet">All statuses</Button>
+        <Button size="sm" variant="quiet">Any time</Button>
+      {/snippet}
 
-    {#snippet detail()}
-      <p class="detail-lead">
-        The panel reflows the list beside it rather than covering it, so you
-        keep your place. Below 1280px it overlays instead.
-      </p>
-      <dl>
-        <dt>Row</dt>
-        <dd>{(app.detailRow ?? 0) + 1}</dd>
-        <dt>Target</dt>
-        <dd class="mono">{app.selected?.name ?? ""}</dd>
-        <dt>Section</dt>
-        <dd>{item?.label ?? ""}</dd>
-      </dl>
-    {/snippet}
-  </PageFrame>
+      {#snippet body()}
+        {#if rows.length === 0}
+          <p class="empty">Nothing recorded here yet.</p>
+        {:else}
+          <ul class="rows">
+            {#each rows as row (row.id)}
+              <li>
+                <button
+                  class="row"
+                  onclick={() => {
+                    app.detailRow = row.index;
+                    app.detailOpen = true;
+                  }}
+                >
+                  <Badge name={app.selected?.name ?? "?"} size={16} />
+                  <span class="row-title">
+                    {item?.label ?? ""} row {row.index + 1}
+                  </span>
+                  <span class="row-meta mono">placeholder</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {/snippet}
+
+      {#snippet detail()}
+        <p class="detail-lead">
+          The panel reflows the list beside it rather than covering it, so you
+          keep your place. Below 1280px it overlays instead.
+        </p>
+        <dl>
+          <dt>Row</dt>
+          <dd>{(app.detailRow ?? 0) + 1}</dd>
+          <dt>Target</dt>
+          <dd class="mono">{app.selected?.name ?? ""}</dd>
+          <dt>Section</dt>
+          <dd>{item?.label ?? ""}</dd>
+        </dl>
+      {/snippet}
+    </PageFrame>
+  </div>
 </div>
 
 <style>
   .level2 {
     display: flex;
     flex: 1;
+    min-height: 0;
+  }
+  /* The header does not scroll and the frame below it owns the scrolling. */
+  .pane {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
     min-height: 0;
   }
   .search-wrap {

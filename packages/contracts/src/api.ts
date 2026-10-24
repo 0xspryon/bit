@@ -209,10 +209,11 @@ export type TargetUnavailableReason = typeof TargetUnavailableReason.Type;
 /**
  * One row of the target rail.
  *
- * Everything here is answerable from the control tier plus a `stat`, which is why no
- * field counts hunts or findings: those live in the target's own `hunt.sqlite`, opening
- * one per request needs the per-target store resolver, and that is a later day's work.
- * A field that would have to lie until then is better absent.
+ * Everything here is answerable from the control tier plus a `stat`, and it stays that
+ * way now that the per-target store resolver exists. Counting what one target holds means
+ * opening that target's file; a list of N targets would open N databases to draw one
+ * screen. So the rail opens nothing, and the counts arrive with {@link TargetView} when a
+ * target is actually opened.
  */
 export const TargetSummary = Schema.Struct({
   id: Schema.String,
@@ -240,6 +241,108 @@ export const TargetSummary = Schema.Struct({
   appliedThrough: Schema.NullOr(Schema.Int),
 });
 export type TargetSummary = typeof TargetSummary.Type;
+
+/**
+ * How much one target's own database holds.
+ *
+ * These are the numbers the hunt view's header shows, and the first numbers in this
+ * application that come from a target's own `hunt.sqlite` rather than from the registry.
+ * Reading them means opening that file, which is why {@link TargetSummary} — one row per
+ * target in a list of all of them — still has none of them: the rail answers from
+ * `control.sqlite` plus a `stat` and opens nothing, and opening N databases to draw a
+ * list would make the cheap screen the expensive one.
+ *
+ * **Every field is named after the table it counts.** The sidebar says "Hunts" and
+ * "Findings"; the schema has `intents` and no findings table at all. Which stored thing
+ * those labels name is a question the flow that designs those screens answers, and a
+ * field called `findings` would have to be filled with something — so there isn't one. A
+ * screen showing a number it cannot source is the one failure an operator cannot see
+ * through.
+ *
+ * A snapshot, not a subscription: a running attempt may have added to the file between
+ * this being read and being rendered.
+ */
+export const TargetCounts = Schema.Struct({
+  goals: Schema.Int,
+  intents: Schema.Int,
+  attempts: Schema.Int,
+  /** Attempts still `running` or `uncertain` — the only count here that can fall. */
+  unsettledAttempts: Schema.Int,
+  observations: Schema.Int,
+  assets: Schema.Int,
+  events: Schema.Int,
+});
+export type TargetCounts = typeof TargetCounts.Type;
+
+/**
+ * One opened target: the row the rail already had, plus what its own file holds.
+ *
+ * The summary is repeated rather than referenced so a deep link works on a cold start.
+ * Opening `?target=<id>` in a fresh tab has no rail to read a name and a scope note out
+ * of, and a header that waited for the list before it could render would show an empty
+ * frame first. One request answers the whole header.
+ */
+export const TargetView = Schema.Struct({
+  target: TargetSummary,
+  counts: TargetCounts,
+});
+export type TargetView = typeof TargetView.Type;
+
+/**
+ * No target under that id.
+ *
+ * `invalid_target_id` is distinguished from `unknown_target` because they are different
+ * facts: the first is a string that could never name a target — a target id becomes a
+ * directory name, and the rule is on `persistence/fleet.ts` — and the second is a
+ * well-formed id nothing is registered under. A deep link to a target that was never
+ * created and a deep link someone truncated are different mistakes.
+ */
+export class TargetNotFound extends Schema.TaggedError<TargetNotFound>()(
+  "TargetNotFound",
+  {
+    reason: Schema.Literals(["unknown_target", "invalid_target_id"]),
+    targetId: Schema.String,
+    detail: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {
+  override get message(): string {
+    return `${this.reason} (${this.targetId}): ${this.detail}`;
+  }
+}
+
+/**
+ * The target is registered, and it will not open.
+ *
+ * This is the partial-failure policy of `persistence/fleet.ts` arriving at the HTTP
+ * surface: a target whose directory is gone, whose database is missing or whose schema
+ * did not migrate is refused **by name, on its own route**, while every other target
+ * keeps being served from the same listener. One unreadable file is one failed request,
+ * never a failed process.
+ *
+ * `reason` is {@link TargetUnavailableReason}, the same vocabulary the rail dims a row
+ * with, and `detail` is the same sentence. That is deliberate: the list and this route
+ * cannot disagree about why a target cannot be opened, because they are reading the same
+ * check.
+ *
+ * `409` rather than `404` — the row exists — and rather than `503`, which is about the
+ * server rather than about one of the things it holds. It is a conflict between what the
+ * registry records and what is on disk, and it is the operator's to resolve: put the
+ * folder back, or restart so the next sweep re-migrates the file.
+ */
+export class TargetUnavailable extends Schema.TaggedError<TargetUnavailable>()(
+  "TargetUnavailable",
+  {
+    reason: TargetUnavailableReason,
+    targetId: Schema.String,
+    detail: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {
+  override get message(): string {
+    return `${this.reason} (${this.targetId}): ${this.detail}`;
+  }
+}
 
 /** What the New target dialog submits. */
 export const TargetDraft = Schema.Struct({
@@ -372,6 +475,25 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
     }),
     HttpApiEndpoint.get("targets", "/targets", {
       success: Schema.Array(TargetSummary),
+    }),
+    /**
+     * One target, with what its own database holds.
+     *
+     * The id is a path parameter rather than a query one because it identifies the
+     * resource rather than filtering it, and because that is the URL a deep link to a
+     * target is built from. `params` is where `effect/http-api` declares a path
+     * parameter's schema (`HttpApiEndpoint.make`'s options in `effect@4.0.5`), and the
+     * generated client takes it as `{ params: { targetId } }` — so a caller cannot build
+     * this URL by string concatenation and cannot omit the id.
+     *
+     * It is in the guarded group with everything else: opening a target reads an
+     * engagement's recorded evidence, which is the last thing that should answer without
+     * a session.
+     */
+    HttpApiEndpoint.get("target", "/targets/:targetId", {
+      params: { targetId: Schema.String },
+      success: TargetView,
+      error: [TargetNotFound, TargetUnavailable],
     }),
     HttpApiEndpoint.post("createTarget", "/targets", {
       payload: TargetDraft,

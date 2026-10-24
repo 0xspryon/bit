@@ -118,6 +118,10 @@ const REFUSAL_TAGS = new Set([
   "PathRefused",
   "PathNotFound",
   "TargetRefused",
+  // Opening a target: a stale deep link and a target whose file will not open are both
+  // answers from the server, not transport trouble, and the hunt view says which.
+  "TargetNotFound",
+  "TargetUnavailable",
 ]);
 
 const isRefusal = (error: unknown): boolean =>
@@ -182,6 +186,20 @@ export const server = {
 
   targets: (baseUrl: string) =>
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.targets())),
+
+  /**
+   * Opens one target: its row, and the counts from its own database.
+   *
+   * The id travels as a path parameter the generated client fills in, so there is no
+   * place here to build a URL out of string pieces — which is what keeps an id that
+   * could not name a target from reaching the server as a path at all.
+   */
+  target: (baseUrl: string, targetId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.target({ params: { targetId } }),
+      ),
+    ),
 
   folders: (baseUrl: string, path?: string) =>
     run(

@@ -41,6 +41,7 @@ import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { FleetStore, HUNT_FILE } from "../persistence/fleet";
 import { ObservationStore } from "../persistence/store";
+import { TargetStores } from "../persistence/targetStores";
 import { PolicyDecisions } from "../policy/service";
 
 const scratch = mkdtempSync(join(tmpdir(), "bit-browser-api-"));
@@ -79,6 +80,9 @@ const fleet = FleetStore.layer(fleetRoot);
 
 const browserApi = browserApiRoutes({ workspaceRoot }).pipe(
   Layer.provide(BrowserSessions.layer),
+  // The same resolver the server builds, over the same registry: the route under test is
+  // the one that opens a target's own file, so a stub here would test the stub.
+  Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
   Layer.provide(fleet),
   Layer.orDie,
 );
@@ -271,6 +275,7 @@ describe("the guard", () => {
       ["/session", "GET"],
       ["/targets", "GET"],
       ["/targets", "POST"],
+      ["/targets/acme-corp", "GET"],
       ["/folders", "GET"],
     ] as const) {
       const response = await read(await call(path, { method, body: {} }));
@@ -581,6 +586,153 @@ describe("creating a target", () => {
       expect.arrayContaining(["acme-corp", "internal-api"]),
     );
     expect(listed.find((row) => row.id === "broken")?.available).toBe(false);
+  });
+});
+
+/**
+ * Opening a target: the one route that opens a target's own database.
+ *
+ * Everything above this point is answerable from `control.sqlite` plus a `stat`. These
+ * tests are the first that make the server open `targets/<id>/hunt.sqlite`, through the
+ * per-target resolver, and they are written as two targets *in turn* rather than as one,
+ * because the claim worth proving is not that a count can be read — it is that the count
+ * read for one target is that target's.
+ */
+describe("opening a target", () => {
+  /**
+   * Asymmetric fixture data, written to one target's file and not the other's.
+   *
+   * Inserted with `bun:sqlite` rather than through the store, deliberately: the store's
+   * own writers demand an attempt, a credential and a write fence, and none of that is
+   * what this is about. Two rows in one file and none in its neighbour is the smallest
+   * fixture that can tell a cross-target read from a correct one — with both files empty,
+   * reading the wrong one looks exactly like reading the right one.
+   */
+  beforeAll(() => {
+    const database = new Database(
+      join(fleetRoot, "targets", "acme-corp", HUNT_FILE),
+    );
+    try {
+      database.run(
+        "INSERT INTO goals (id, target_id, description, created_at) VALUES (?, ?, ?, ?)",
+        ["goal_seed", "acme-corp", "seeded for the counts test", 1],
+      );
+      database.run(
+        `INSERT INTO intents (id, goal_id, target_id, question, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        ["intent_seed", "goal_seed", "acme-corp", "does it hold?", 2],
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  test("it answers with the target's own row and the counts from its own file", async () => {
+    const response = await read(await signedIn("/targets/acme-corp"));
+    expect(response.status).toBe(200);
+    const body = response.body as {
+      target: Record<string, unknown>;
+      counts: Record<string, number>;
+    };
+    // The header's name and scope come from this one request, so a deep link into a cold
+    // tab has everything it needs without the list.
+    expect(body.target).toMatchObject({
+      id: "acme-corp",
+      name: "Acme Corp",
+      scopeNote: "*.acme.test",
+      available: true,
+    });
+    expect(body.counts).toEqual({
+      goals: 1,
+      intents: 1,
+      attempts: 0,
+      unsettledAttempts: 0,
+      observations: 0,
+      assets: 0,
+      events: 0,
+    });
+  });
+
+  test("the neighbour's counts are the neighbour's", async () => {
+    const response = await read(await signedIn("/targets/internal-api"));
+    expect(response.status).toBe(200);
+    const body = response.body as {
+      target: Record<string, unknown>;
+      counts: Record<string, number>;
+    };
+    expect(body.target["id"]).toBe("internal-api");
+    expect(body.target["scopeNote"]).toBe("api.internal.test");
+    // Nothing was seeded here. If the resolver had handed back the entry cached for
+    // `acme-corp` a moment ago — the exact failure a key-by-anything-else resolver has —
+    // these would read 1 and 1.
+    expect(body.counts["goals"]).toBe(0);
+    expect(body.counts["intents"]).toBe(0);
+  });
+
+  test("two targets open at once keep their own rows", async () => {
+    // Concurrent rather than sequential: both entries are live in the resolver at the
+    // same moment, which is when a shared connection or a shared cache entry would show.
+    const [acme, internal] = await Promise.all([
+      read(await signedIn("/targets/acme-corp")),
+      read(await signedIn("/targets/internal-api")),
+    ]);
+    expect([acme.status, internal.status]).toEqual([200, 200]);
+    expect(
+      (acme.body as { counts: Record<string, number> }).counts["intents"],
+    ).toBe(1);
+    expect(
+      (internal.body as { counts: Record<string, number> }).counts["intents"],
+    ).toBe(0);
+  });
+
+  test("an id nothing is registered under is a 404 that names it", async () => {
+    const response = await read(await signedIn("/targets/not-a-target"));
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({
+      _tag: "TargetNotFound",
+      reason: "unknown_target",
+      targetId: "not-a-target",
+    });
+  });
+
+  test("an id that could never name a target is refused as that, before any path", async () => {
+    // Uppercase cannot be a target id: ids are directory names, and a case-insensitive
+    // filesystem would fold this onto another one. Refused for being unusable rather than
+    // for being absent, because they are different mistakes.
+    const response = await read(await signedIn("/targets/Acme-Corp"));
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({
+      _tag: "TargetNotFound",
+      reason: "invalid_target_id",
+    });
+  });
+
+  test("a target whose file will not migrate is refused by name, and only it", async () => {
+    const refused = await read(await signedIn("/targets/broken"));
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({
+      _tag: "TargetUnavailable",
+      reason: "schema_unavailable",
+      targetId: "broken",
+    });
+    expect(String(refused.body["detail"])).toContain("Migration");
+
+    // The whole partial-failure policy, in two requests: the refusal names one target,
+    // and the next request for a different one is served from the same listener by the
+    // same resolver.
+    const served = await read(await signedIn("/targets/acme-corp"));
+    expect(served.status).toBe(200);
+  });
+
+  test("the list still opens nothing", async () => {
+    // `GET /targets` is the cheap screen and has to stay cheap: it answers from the
+    // registry plus a `stat`, so no count appears on a rail row however many targets
+    // have been opened individually.
+    const rows = (await read(await signedIn("/targets")))
+      .body as unknown as ReadonlyArray<Record<string, unknown>>;
+    for (const row of rows) {
+      expect(row["counts"]).toBeUndefined();
+    }
   });
 });
 

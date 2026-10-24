@@ -58,6 +58,7 @@ import {
 import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import { SqlClient, SqlSchema } from "effect/sql";
 
+import * as identifier from "./identifier";
 import { migrate } from "./migrations";
 import { DatabaseError, asDatabaseError, sqliteLayer } from "./sql";
 import type { HarnessObservedStatus } from "../recovery/harnessStatus";
@@ -349,20 +350,16 @@ const hashRequest = (
     .update(canonical({ caller, input }))
     .digest("hex");
 
-/** 16 random bytes as hex, for the ids nothing may derive from a position or a name. */
-const randomId = (prefix: string): string =>
-  `${prefix}_${Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("")}`;
-
 /**
  * A dimension's id.
  *
- * Random, not derived from `(observation_id, position)`. An id that encoded the position
- * would reintroduce the positional identity migration `0008` exists to remove: the alias
- * is positional and resolved on the way in, and what it resolves *to* must not be.
+ * Not derived from `(observation_id, position)`. An id that encoded the position would
+ * reintroduce the positional identity migration `0008` exists to remove: the alias is
+ * positional and resolved on the way in, and what it resolves *to* must not be. Sortable
+ * by creation time is a different thing from derived-from-position, and the first is
+ * useful to a reader in a way the second is dangerous.
  */
-const newDimensionId = (): string => randomId("dim");
+const newDimensionId = identifier.newDimensionId;
 
 /** JSON text columns, declared once so reads and writes cannot disagree. */
 const jsonList = Schema.fromJsonString(Schema.Array(Schema.String));
@@ -715,6 +712,30 @@ const storedRow =
   (table: string, rowId: string) =>
   (cause: { readonly message: string }): StoredRowError =>
     new StoredRowError({ table, rowId, detail: cause.message, cause });
+
+/**
+ * How much of each thing one target's file holds.
+ *
+ * Every field is named after the table it counts, and there is a field for each table the
+ * hunt chain creates that an operator would recognise as content. Nothing here is a
+ * derived or interpreted figure: the UI's own vocabulary ("hunts", "findings") is a
+ * naming question the flow that designs those screens settles, and a count invented to
+ * match a label the schema does not have would be the first lie on the first screen that
+ * claims to show real numbers.
+ *
+ * `unsettledAttempts` is the one count that is a predicate rather than a table: attempts
+ * still `running` or `uncertain`, which is what recovery works on and the only one of
+ * these numbers that can go *down*.
+ */
+export interface StoredCounts {
+  readonly goals: number;
+  readonly intents: number;
+  readonly attempts: number;
+  readonly unsettledAttempts: number;
+  readonly observations: number;
+  readonly assets: number;
+  readonly events: number;
+}
 
 const makeStore = Effect.fnUntraced(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -1496,7 +1517,7 @@ const makeStore = Effect.fnUntraced(function* () {
               id, target_id, kind, identity, host, port, scheme, method, path,
               first_seen_at
             ) VALUES (
-              ${randomId("asset")}, ${caller.targetId}, ${identity.kind},
+              ${identifier.newAssetId()}, ${caller.targetId}, ${identity.kind},
               ${identity.identity}, ${identity.host}, ${identity.port},
               ${identity.scheme}, ${identity.method}, ${identity.path},
               ${recordedAt}
@@ -2690,7 +2711,66 @@ const makeStore = Effect.fnUntraced(function* () {
     },
   );
 
+  const CountsRow = Schema.Struct({
+    goals: Schema.Int,
+    intents: Schema.Int,
+    attempts: Schema.Int,
+    unsettled_attempts: Schema.Int,
+    observations: Schema.Int,
+    assets: Schema.Int,
+    events: Schema.Int,
+  });
+
+  /**
+   * One statement, seven scalar subqueries.
+   *
+   * It is one round trip rather than seven because every number is read for the same
+   * screen at the same moment, and seven statements could not see the same snapshot of
+   * the file without a transaction — which would take SQLite's single write lock for a
+   * read nobody is writing against. `COUNT(*)` on a table with no `WHERE` is answered
+   * from the table itself; the only predicate here is the unsettled one, which has
+   * `attempts_status_idx` behind it.
+   */
+  const selectCounts = SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: CountsRow,
+    execute: () =>
+      sql`SELECT
+            (SELECT COUNT(*) FROM goals) AS goals,
+            (SELECT COUNT(*) FROM intents) AS intents,
+            (SELECT COUNT(*) FROM attempts) AS attempts,
+            (SELECT COUNT(*) FROM attempts
+              WHERE status IN ('running', 'uncertain')) AS unsettled_attempts,
+            (SELECT COUNT(*) FROM observations) AS observations,
+            (SELECT COUNT(*) FROM assets) AS assets,
+            (SELECT COUNT(*) FROM events) AS events`,
+  });
+
+  /**
+   * How much this target's file holds, for the header of its own screen.
+   *
+   * Read-only and transaction-free, which is what makes it safe to call on every open:
+   * it takes no write lock, so it cannot be the thing that blocks a worker mid-write on
+   * the same file. The counts are a snapshot and are not claimed to be anything else —
+   * by the time they reach a browser a running attempt may have added to them.
+   */
+  const counts = Effect.fn("ObservationStore.counts")(function* () {
+    const row = yield* selectCounts().pipe(
+      Effect.mapError(lift("sqlite_schema", "counts")),
+    );
+    return {
+      goals: row.goals,
+      intents: row.intents,
+      attempts: row.attempts,
+      unsettledAttempts: row.unsettled_attempts,
+      observations: row.observations,
+      assets: row.assets,
+      events: row.events,
+    } satisfies StoredCounts;
+  });
+
   return ObservationStore.of({
+    counts,
     seedAttempt,
     recordAsset,
     addIntent,
@@ -2776,6 +2856,11 @@ export const decideRecovery = (
 export class ObservationStore extends Context.Service<
   ObservationStore,
   {
+    /** How much this file holds. One read-only statement, no transaction. */
+    readonly counts: () => Effect.Effect<
+      StoredCounts,
+      DatabaseError | StoredRowError
+    >;
     readonly seedAttempt: (
       input: SeedInput,
     ) => Effect.Effect<AttemptAuthority, DatabaseError | StoredRowError>;

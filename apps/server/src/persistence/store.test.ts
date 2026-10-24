@@ -959,6 +959,50 @@ describe("the remaining repository operations", () => {
     expect(sequence).toBe(0);
   });
 
+  test("counts answer for the file they are read on, before and after a write", async () => {
+    // The statement behind the hunt view's header. Seven scalar subqueries in one read,
+    // so every number is from the same look at the file; executed here against a real
+    // one because nothing checks a table or column name until it runs.
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const fresh = yield* store.counts();
+        yield* migrated(store);
+        const seeded = yield* store.counts();
+        yield* store.recordObservation(CALLER, multiCaseInput());
+        const written = yield* store.counts();
+        yield* store.settleAttempt("attempt-1", "succeeded");
+        const settled = yield* store.counts();
+        return { fresh, seeded, written, settled };
+      }),
+    );
+
+    // A migrated, empty file: zeros rather than a failure, and no row invented for a
+    // table that happens to be empty.
+    expect(outcome.fresh).toEqual({
+      goals: 0,
+      intents: 0,
+      attempts: 0,
+      unsettledAttempts: 0,
+      observations: 0,
+      assets: 0,
+      events: 0,
+    });
+    expect(outcome.seeded).toMatchObject({
+      goals: 1,
+      intents: 1,
+      attempts: 1,
+      // Seeded `running`, so it is unsettled — the one count here that can fall.
+      unsettledAttempts: 1,
+      observations: 0,
+    });
+    expect(outcome.written.observations).toBe(1);
+    // The observation's own event landed in the same transaction.
+    expect(outcome.written.events).toBeGreaterThan(0);
+    expect(outcome.settled.unsettledAttempts).toBe(0);
+    expect(outcome.settled.attempts).toBe(1);
+  });
+
   test("observationsForIntent returns nothing for an intent with no observations", async () => {
     const path = newDatabasePath();
     const stored = await withStore(path, (store) =>

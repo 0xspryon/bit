@@ -14,6 +14,26 @@
  * the browser never reads the filesystem.
  */
 
+import type { TargetCounts } from "@bit/contracts";
+
+/**
+ * Counts for the state picker's open target.
+ *
+ * The hunt view's header reads real numbers from the server. A scenario has no server, so
+ * it needs some, and these are deliberately the same ones the prototype's Level 2
+ * navigation shows — a picker that disagreed with itself would be worse than one that is
+ * visibly a prototype. Nothing outside `scenarios` reads this.
+ */
+export const previewCounts: TargetCounts = {
+  goals: 2,
+  intents: 6,
+  attempts: 8,
+  unsettledAttempts: 1,
+  observations: 148,
+  assets: 37,
+  events: 212,
+};
+
 export type TargetStatus = "ready" | "missing" | "migrating" | "failed";
 
 export interface Target {

@@ -13,12 +13,15 @@
  * postures untouched, because this API's guard is attached to this API's endpoints by the
  * contract rather than to the router.
  *
- * **What is deliberately absent.** No endpoint here opens a target's `hunt.sqlite`.
- * Everything the target rail shows is answerable from `control.sqlite` plus a `stat`,
- * which is what lets this run against a single `SqlClient` on the control file. Serving a
- * target's own graph needs a per-target store resolver at the request boundary, and that
- * is a later day's work; a field that needed one would have had to be faked, and a faked
- * count on the first screen is a lie the operator cannot see through.
+ * **Where a target's own database is opened, and where it is not.** The target rail is
+ * answerable from `control.sqlite` plus a `stat`, and still is: `GET /targets` opens no
+ * target file, because a list of N targets would otherwise open N databases to draw one
+ * screen. `GET /targets/:targetId` is the one route that opens one, and it does it
+ * through `persistence/targetStores.ts` — a reference-counted resolver keyed by target id,
+ * borrowed for the length of the request. `ObservationStore` is deliberately **not** in
+ * this file's context: the only way to reach a target's store here is to pass a target id
+ * to that resolver, so "which target is this handler reading?" is answered by the type
+ * rather than by care.
  *
  * **No CORS, deliberately.** The browser reaches these routes same-origin: in
  * development through the Vite dev server's `/api` proxy, and in a packaged deployment
@@ -32,8 +35,11 @@ import {
   BitApi,
   SessionActor,
   SessionGuard,
+  TargetNotFound,
   TargetRefused,
+  TargetUnavailable,
   Unauthenticated,
+  type TargetCounts,
   type TargetSummary,
 } from "@bit/contracts";
 import { Context, Effect, Layer, Redacted } from "effect";
@@ -54,6 +60,7 @@ import {
   isTargetId,
   type TargetRow,
 } from "../persistence/fleet";
+import { TargetStores, withTargetStore } from "../persistence/targetStores";
 
 /** What the browser API needs to know about this installation. */
 export interface BrowserApiConfig {
@@ -291,6 +298,10 @@ const fleetHandlers = HttpApiBuilder.group(
   Effect.fn(function* (handlers) {
     const fleet = yield* FleetStore;
     const config = yield* BrowserApiSettings;
+    // Yielded once, here, where the group is built — not inside a handler. A requirement
+    // resolved per request becomes a per-request requirement of the route; resolved here
+    // it is a layer requirement, which is what the caller provides once at startup.
+    const stores = yield* TargetStores;
 
     const summaries = Effect.fnUntraced(function* () {
       const rows = yield* fleet.targets();
@@ -320,6 +331,101 @@ const fleetHandlers = HttpApiBuilder.group(
 
       /** Every registered target, archived ones included, with real availability. */
       targets: () => summaries().pipe(Effect.orDie),
+
+      /**
+       * Opens one target and reads what its own database holds.
+       *
+       * The order is the point of this handler, and each step rules out the next step's
+       * ambiguity:
+       *
+       * 1. **The id, before any path exists.** `isTargetId` is the only gate on a string
+       *    that is about to become a directory name, and it runs here so nothing — not
+       *    even a `stat` — is attempted against whatever arrived in the URL.
+       * 2. **The registry.** A well-formed id nothing is registered under is a `404`
+       *    naming the id, which is what a stale deep link deserves.
+       * 3. **Availability, from the same check the rail uses.** {@link describeTarget}
+       *    answers the filesystem and the schema questions, and an unavailable target is
+       *    refused with *that* reason and *that* sentence. The list and this route cannot
+       *    disagree about why a target will not open, because there is one check.
+       * 4. **Then, and only then, a file is opened** — through the resolver, keyed by this
+       *    target, borrowed for the length of the read and returned when it finishes.
+       *
+       * Step 4 can still fail: the registry can change between step 3 and step 4, and
+       * `huntFileFor` re-checks. That race is reported as `schema_unavailable` with the
+       * resolver's own words rather than as a `500`, because from the operator's seat it
+       * is the same situation step 3 reports, discovered a moment later.
+       *
+       * A `DatabaseError` from the *read* is a different thing and is a defect: the file
+       * opened, migrated and then failed to answer `SELECT COUNT(*)`. Nothing an operator
+       * can do with that belongs on this screen.
+       */
+      target: Effect.fn(function* ({ params }) {
+        const targetId = params.targetId;
+        if (!isTargetId(targetId)) {
+          return yield* new TargetNotFound({
+            reason: "invalid_target_id",
+            targetId,
+            detail:
+              "a target id is 1-64 characters of lowercase a-z, 0-9, '-' or '_', starting with a letter or digit; this cannot name a target",
+          });
+        }
+
+        const row = yield* fleet.target(targetId).pipe(Effect.orDie);
+        if (row === undefined) {
+          return yield* new TargetNotFound({
+            reason: "unknown_target",
+            targetId,
+            detail: `no target '${targetId}' is registered on this server`,
+          });
+        }
+
+        const target = yield* describeTarget(fleet, row).pipe(Effect.orDie);
+        if (!target.available) {
+          return yield* new TargetUnavailable({
+            // `describeTarget` sets a reason whenever it sets `available: false`; the
+            // fallback keeps the two in step without a non-null assertion.
+            reason: target.unavailableReason ?? "schema_unavailable",
+            targetId,
+            detail: target.detail,
+          });
+        }
+
+        const counts = yield* withTargetStore(stores, targetId, (store) =>
+          store.counts(),
+        ).pipe(
+          Effect.catchTag("FleetError", (error) =>
+            Effect.fail(
+              new TargetUnavailable({
+                reason:
+                  error.reason === "unknown_target"
+                    ? "database_missing"
+                    : "schema_unavailable",
+                targetId,
+                detail: error.detail,
+              }),
+            ),
+          ),
+          Effect.catchTag("DatabaseError", Effect.die),
+          Effect.catchTag("StoredRowError", Effect.die),
+        );
+
+        return {
+          target,
+          // Field by field rather than by spreading the store's own shape. The contract
+          // and the store are allowed to diverge — the store counts tables, the contract
+          // describes a screen — and this is where a divergence becomes a compile error
+          // instead of a silently missing number.
+          counts: {
+            goals: counts.goals,
+            intents: counts.intents,
+            attempts: counts.attempts,
+            unsettledAttempts: counts.unsettledAttempts,
+            observations: counts.observations,
+            assets: counts.assets,
+            events: counts.events,
+          } satisfies TargetCounts,
+        };
+      }),
 
       /**
        * Registers a target, migrates its file, and reports what that produced.
@@ -425,8 +531,14 @@ const fleetHandlers = HttpApiBuilder.group(
  *
  * Requires only `HttpRouter.HttpRouter`: the platform services `HttpApiBuilder` needs
  * (`Path`, `HttpPlatform`, `FileSystem`, `Etag.Generator`) are provided here, and the
- * handler groups' own dependencies are provided by the caller through `FleetStore` and
- * `BrowserSessions`.
+ * handler groups' own dependencies are provided by the caller through `FleetStore`,
+ * `BrowserSessions` and `TargetStores`.
+ *
+ * {@link TargetStores} is a requirement rather than something built here, because the
+ * resolver caches open database handles and must therefore be *one* instance owned by the
+ * process's scope. Building it inside this function would give the HTTP layer a private
+ * set of handles on the same files as everyone else's — two writers per target, which is
+ * the one thing a single-writer database makes expensive.
  */
 export const browserApiRoutes = (options: BrowserApiConfig) =>
   HttpApiBuilder.layer(BitApi).pipe(
