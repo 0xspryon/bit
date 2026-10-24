@@ -6,7 +6,15 @@
     },
     "dev": {
       "cache": false,
-      "persistent": true
+      "persistent": true,
+      "passThroughEnv": [
+        "BIT_PASSWORD",
+        "HUNT_ROOT",
+        "WORKSPACE_ROOT",
+        "PORT",
+        "HARNESS",
+        "RECONCILE_ON_START"
+      ]
     },
     "build": {
       "dependsOn": ["^build"],
