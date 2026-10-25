@@ -28,6 +28,7 @@ import { Effect, Fiber } from "effect";
 
 import {
   drain,
+  HARNESS_ENVIRONMENT_ALLOWLIST,
   LineRing,
   OpenCodeServer,
   serverEnvironment,
@@ -170,8 +171,89 @@ const holder = Bun.spawn({
 recordPid(holder.pid);
 `;
 
+/**
+ * Records, beside the pid file, what the spawned child was actually handed: its argv,
+ * its own view of the environment, and whether fd 0 is a pipe.
+ *
+ * `serverEnvironment` can be tested as a function, but *that the spawn uses it* — and
+ * that `--stdio`, which is what makes OpenCode scrub the password from its own
+ * environment, is really on the command line — is only observable from inside the child.
+ */
+const RECORDS_ITS_LAUNCH = `
+import { fstatSync, writeFileSync } from "node:fs";
+writeFileSync(pidFile + ".argv", JSON.stringify(Bun.argv));
+writeFileSync(pidFile + ".env", JSON.stringify(process.env));
+const zero = fstatSync(0);
+writeFileSync(
+  pidFile + ".stdin",
+  zero.isCharacterDevice() ? "null" : zero.isSocket() || zero.isFIFO() ? "pipe" : "other",
+);
+`;
+
 const spawn = (options: Parameters<typeof spawnServer>[0]) =>
   spawnServer(options);
+
+describe("the password scrub at the spawn boundary", () => {
+  test("the child is launched with --stdio and a piped stdin, and sees only the allowlist", async () => {
+    // `--stdio` is the whole fix for the server password: OpenCode reads
+    // `OPENCODE_PASSWORD` and then deletes it from its own `process.env`
+    // (`cli/src/server-process.ts:85-89`), so the `{...process.env, …}` environment it
+    // later hands every shell it spawns no longer carries it. Plain `serve` does not
+    // scrub, which is how a worker's bash tool could read the credential to our API.
+    // The lease that comes with `--stdio` is why fd 0 has to be a pipe we hold open.
+    const fake = readyServer(RECORDS_ITS_LAUNCH);
+    const inheritedSecret = `operator-secret-${String(Date.now())}`;
+    // Three shapes of inherited secret: a provider key OpenCode itself reads, a live
+    // credential handle, and an `OPENCODE_`-prefixed one that a prefix passthrough would
+    // have let through.
+    process.env["ANTHROPIC_API_KEY"] = inheritedSecret;
+    process.env["SSH_AUTH_SOCK"] = inheritedSecret;
+    process.env["OPENCODE_API_KEY"] = inheritedSecret;
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* spawn({
+              binary: fake.path,
+              cwd: fake.cwd,
+              extraArgs: fake.extraArgs,
+            });
+          }),
+        ),
+      );
+    } finally {
+      delete process.env["ANTHROPIC_API_KEY"];
+      delete process.env["SSH_AUTH_SOCK"];
+      delete process.env["OPENCODE_API_KEY"];
+    }
+
+    const argv = JSON.parse(
+      readFileSync(`${fake.pidFile}.argv`, "utf8"),
+    ) as string[];
+    expect(argv).toContain("serve");
+    expect(argv).toContain("--stdio");
+    // Bun implements a piped stdin as a socketpair rather than a FIFO; either way it is
+    // a channel whose close the child sees as EOF, which is what the lease needs.
+    // `stdin: "ignore"` would hand it `/dev/null`, a character device, and the server
+    // would read EOF at once and exit.
+    expect(readFileSync(`${fake.pidFile}.stdin`, "utf8")).toBe("pipe");
+
+    const seen = JSON.parse(
+      readFileSync(`${fake.pidFile}.env`, "utf8"),
+    ) as Record<string, string>;
+    // The password has to be in the child's *initial* environment — that is the only
+    // interface `serve` has for it — and `--stdio` is what gets it back out again.
+    expect(seen["OPENCODE_PASSWORD"]).toBeString();
+    expect(seen["OPENCODE_SERVER_PASSWORD"]).toBeUndefined();
+    expect(Object.values(seen)).not.toContain(inheritedSecret);
+    expect(seen["ANTHROPIC_API_KEY"]).toBeUndefined();
+    expect(seen["SSH_AUTH_SOCK"]).toBeUndefined();
+    expect(seen["OPENCODE_API_KEY"]).toBeUndefined();
+    // And the harness can still find its credential store and run a program.
+    expect(seen["HOME"]).toBe(process.env["HOME"]);
+    expect(seen["PATH"]).toBe(process.env["PATH"]);
+  });
+});
 
 describe("serverEnvironment", () => {
   test("sets the 2.x password variable", () => {
@@ -202,6 +284,94 @@ describe("serverEnvironment", () => {
     // separate credential and must never be placed here (DECISIONS.md §6).
     const environment = serverEnvironment({}, "server-password");
     expect(Object.keys(environment)).toEqual(["OPENCODE_PASSWORD"]);
+  });
+
+  test("the operator's own exported secrets are not inherited", () => {
+    // The hole this closes is wider than one variable: `process.env` carries whatever
+    // the operator's shell exported, and a worker shell inherits all of it.
+    const environment = serverEnvironment(
+      {
+        ANTHROPIC_API_KEY: "sk-ant-operator",
+        AWS_SECRET_ACCESS_KEY: "aws-operator",
+        GITHUB_TOKEN: "ghp-operator",
+        GITLAB_TOKEN: "glpat-operator",
+        OPENAI_API_KEY: "sk-operator",
+        SSH_AUTH_SOCK: "/run/user/1000/keyring/ssh",
+      },
+      "ours",
+    );
+    expect(Object.keys(environment)).toEqual(["OPENCODE_PASSWORD"]);
+  });
+
+  test("what the harness needs to find its credentials and run programs survives", () => {
+    // Each of these roots something: the XDG variables and `HOME` locate OpenCode's own
+    // credential store, which is where provider authentication comes from
+    // (DECISIONS.md §12), and `PATH`/`SHELL` are how a tool call runs at all. An
+    // allowlist that lost one of these would surface as a provider failing mid-run.
+    const inherited = {
+      HOME: "/home/operator",
+      LANG: "en_GB.UTF-8",
+      PATH: "/usr/bin",
+      SHELL: "/bin/bash",
+      TMPDIR: "/tmp",
+      XDG_CACHE_HOME: "/home/operator/.cache",
+      XDG_CONFIG_HOME: "/home/operator/.config",
+      XDG_DATA_HOME: "/home/operator/.local/share",
+      XDG_STATE_HOME: "/home/operator/.local/state",
+    };
+    const environment = serverEnvironment(inherited, "ours");
+    for (const [name, value] of Object.entries(inherited)) {
+      expect(environment[name]).toBe(value);
+    }
+  });
+
+  test("the operator's egress path and TLS trust survive", () => {
+    // Dropping these does not fail at startup; it fails when the provider is first
+    // called, which is the hardest failure to attribute to an environment change.
+    const inherited = {
+      HTTPS_PROXY: "http://proxy.corp:3128",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/corp.pem",
+      NO_PROXY: "localhost,127.0.0.1",
+    };
+    const environment = serverEnvironment(inherited, "ours");
+    for (const [name, value] of Object.entries(inherited)) {
+      expect(environment[name]).toBe(value);
+    }
+  });
+
+  test("no inherited OPENCODE_ variable reaches the child, by prefix", () => {
+    // Not a prefix passthrough on purpose. Some of these names are secrets, and
+    // `OPENCODE_CONFIG_PROJECT_DISABLE` is worse than a secret: it would stop the server
+    // reading the project configuration that loads our pre-execution policy gate, so an
+    // inherited one turns a boundary off with no sign in the run.
+    const environment = serverEnvironment(
+      {
+        OPENCODE_API_KEY: "oc-operator",
+        OPENCODE_CONFIG_DIR: "/home/operator/.config/opencode",
+        OPENCODE_CONFIG_PROJECT_DISABLE: "1",
+        OPENCODE_SSH_ASKPASS_TOKEN: "askpass-operator",
+      },
+      "ours",
+    );
+    const inheritedOpenCode = Object.keys(environment).filter(
+      (name) => name.startsWith("OPENCODE_") && name !== "OPENCODE_PASSWORD",
+    );
+    expect(inheritedOpenCode).toEqual([]);
+  });
+
+  test("the allowlist names no variable twice", () => {
+    expect(new Set(HARNESS_ENVIRONMENT_ALLOWLIST).size).toBe(
+      HARNESS_ENVIRONMENT_ALLOWLIST.length,
+    );
+  });
+
+  test("the allowlist is a list of what is needed, not of what is a secret", () => {
+    // A guard on the list itself rather than on one call: a name added here that carries
+    // a credential would be a hole no `serverEnvironment` test would notice.
+    const credentialShaped = HARNESS_ENVIRONMENT_ALLOWLIST.filter((name) =>
+      /PASSWORD|SECRET|TOKEN|API_KEY|AUTH_SOCK|CREDENTIAL/i.test(name),
+    );
+    expect(credentialShaped).toEqual([]);
   });
 });
 

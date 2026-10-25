@@ -46,11 +46,27 @@
  * interrupt could leak the child. The readiness wait sits *outside* that region and
  * stays interruptible.
  *
- * Verified against the installed binary, opencode v2.0.32:
+ * Verified against the installed binary, opencode v2.0.32, and re-verified on v2.1.4:
  * - `OPENCODE_PASSWORD` is the server password in 2.x and takes precedence over the
- *   inherited 1.x `OPENCODE_SERVER_PASSWORD`, which we therefore drop.
+ *   inherited 1.x `OPENCODE_SERVER_PASSWORD`, which we therefore never set.
  * - `GET /api/info` is the only readiness signal that proves an OpenCode 2 server;
  *   `/doc` answers 200 with the web UI's HTML on any version.
+ * - **`serve --stdio` reads the password from the environment and then deletes it**
+ *   (`cli/src/server-process.ts:85-89`): `Env.password` is read first, so our generated
+ *   password is still the one the server adopts, and the two password variables are gone
+ *   from the child's `process.env` before it serves a request. Plain `serve` — which
+ *   `commands/handlers/serve.ts:11` maps to `mode: "default"` — does *not* scrub, and a
+ *   worker's shell is spawned with `{...process.env, TERM, OPENCODE_TERMINAL}`
+ *   (`core/src/shell.ts:268-282`), so under plain `serve` the agent could read the
+ *   server password out of its own environment and act as a full client of this API —
+ *   every session in every Location, in every workspace this one process serves. Why
+ *   that is fixed here rather than per session is on {@link serverEnvironment} and
+ *   {@link HARNESS_ENVIRONMENT_ALLOWLIST}; the measured before and after is
+ *   `spike/shellEnvironmentProof.ts`.
+ * - The cost of `--stdio` is that stdin becomes an ownership lease (EOF ends the
+ *   server) and that readiness is announced as `{"url":…}` on stdout instead of a prose
+ *   line. We depend on neither: the pipe is held open below, and readiness is still the
+ *   `/api/info` probe, which is also what yields the version.
  *
  * Known limit of detaching: a detached child does not receive the terminal's `SIGINT`
  * with us, and does not die if *this* process is `SIGKILL`ed. Cleanup is ours alone.
@@ -355,18 +371,164 @@ const generatePassword = (): string => {
 };
 
 /**
- * The spawned server's environment. The 1.x password variable is removed so our
- * generated password is the only one in play.
+ * Every variable the harness child is allowed to inherit from this process.
+ *
+ * This is an **allowlist, not a denylist**, and the reason is a counted one. OpenCode
+ * reads roughly sixty provider API keys straight out of the environment —
+ * `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`,
+ * `GITLAB_TOKEN`, `AZURE_OPENAI_API_KEY`, and so on down a list that grows with every
+ * provider it adds (`packages/ai/src/providers/*.ts`, each `Auth.config("…_API_KEY")`).
+ * A denylist would have to name all of them, stay ahead of that list, *and* also name
+ * whatever the operator exports for their own work — `SSH_AUTH_SOCK`, a company token,
+ * the credential a colleague's `.envrc` sets. A list of secrets to remember is a list
+ * somebody fails to add to, which is the same argument commit `2ebba0e` made about a
+ * list of spawn sites to remember, and it points the same way: scrub once, centrally,
+ * by naming what is *needed* rather than what is dangerous.
+ *
+ * What makes an allowlist affordable here rather than crippling is DECISIONS.md §12:
+ * the server runs as the user and reads the user's **own stored credentials**, and we
+ * never read, copy or pass those. Model authentication comes out of OpenCode's
+ * credential store under `HOME`/`XDG_DATA_HOME`, and the environment keys are only its
+ * fallback (`Auth.optional(...).orElse(Auth.config("ANTHROPIC_API_KEY"))` — stored
+ * credential first). Before this list, §12's "never pass" was not actually true: we
+ * passed every one of those keys by spreading `process.env`. The list is what makes the
+ * recorded decision match the code.
+ *
+ * Each group below is here because something established it, not because it looked
+ * plausible:
+ *
+ * - **`HOME`, `XDG_*`, `TMPDIR`** root every global path, including the credential
+ *   store (`@opencode/util/global-roots.ts:4-18` — `os.homedir()`, the four XDG
+ *   variables, `os.tmpdir()`). Dropping one of these is exactly the failure mode that
+ *   surfaces as a provider refusing to authenticate mid-run rather than as a startup
+ *   error, so they come first.
+ * - **`PATH`, `SHELL`** resolve the interpreter every shell tool runs through
+ *   (`core/src/shell/select.ts:173,182` reads `SHELL`; `PATH` is how `bash`, `git` and
+ *   the provider CLIs are found at all).
+ * - **Locale, `TZ`, `TERM`, `COLORTERM`, `NO_COLOR`** decide how tool output is
+ *   encoded, dated and coloured. Omitting them does not break a run, it silently
+ *   changes what the worker reads back from its own commands.
+ * - **Proxy and TLS-trust variables** are the operator's egress path. An operator
+ *   behind a corporate proxy or a custom CA whose harness cannot reach the provider has
+ *   a harness that does not work, and the symptom would be an authentication failure
+ *   with no visible cause. A proxy URL can itself carry a credential; that is accepted
+ *   here, because it is an egress credential the worker's own HTTP traffic already
+ *   travels through, and the alternative is not supporting proxied operators.
+ * - **The Windows group** is unverified on this platform and included for the same
+ *   reason: without `SystemRoot`, `COMSPEC` and `USERPROFILE` a Windows child cannot
+ *   locate its own home or spawn a shell, which would be a total failure rather than a
+ *   subtle one. Both spellings of the case-insensitive names are listed because
+ *   `process.env` preserves whichever case the parent used.
+ *
+ * Three deliberate exclusions, because each is a question somebody will ask:
+ *
+ * - **`SSH_AUTH_SOCK`** is a live credential — a worker holding it can authenticate as
+ *   the operator to anything their agent holds a key for. A worker that needs to push
+ *   over SSH is a worker that has to be given that explicitly.
+ * - **Nothing matching `OPENCODE_*` is inherited**, tempting as a prefix rule is. Some
+ *   of those names are secrets (`OPENCODE_API_KEY`, `OPENCODE_SSH_ASKPASS_TOKEN`,
+ *   `OPENCODE_SERVER_USERNAME` beside the two passwords), and one of them is worse than
+ *   a secret: an inherited `OPENCODE_CONFIG_PROJECT_DISABLE` would stop the server
+ *   reading the project configuration that loads our pre-execution policy gate
+ *   (`policy/install.ts`), turning a boundary off from outside with no sign in the run.
+ *   The harness's OpenCode configuration is ours, not the ambient shell's.
+ * - **Our own variables** — `HUNT_ROOT`, `PORT`, `WORKSPACE_ROOT`, `HARNESS`,
+ *   `TARGET_ID` — are this process's configuration and mean nothing to the child, and
+ *   `PORT` in particular is a name OpenCode also reads.
+ *
+ * Adding a name here is a deliberate act: it says the harness needs it and that a
+ * worker reading it out of its own environment is acceptable.
+ */
+export const HARNESS_ENVIRONMENT_ALLOWLIST: readonly string[] = [
+  // Global paths, which is where the credential store lives.
+  "HOME",
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "TMPDIR",
+  // Finding and running programs.
+  "PATH",
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  // How tool output comes back.
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_COLLATE",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "LC_NUMERIC",
+  "LC_TIME",
+  "TZ",
+  "TERM",
+  "COLORTERM",
+  "NO_COLOR",
+  // Egress and TLS trust: the "fails to authenticate mid-run" class.
+  "ALL_PROXY",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "all_proxy",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "CURL_CA_BUNDLE",
+  "NODE_EXTRA_CA_CERTS",
+  "NODE_USE_SYSTEM_CA",
+  "REQUESTS_CA_BUNDLE",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  // Windows: unverified here, and a total failure without them.
+  "ALLUSERSPROFILE",
+  "APPDATA",
+  "COMSPEC",
+  "ComSpec",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LOCALAPPDATA",
+  "NUMBER_OF_PROCESSORS",
+  "PATHEXT",
+  "PROCESSOR_ARCHITECTURE",
+  "PUBLIC",
+  "Path",
+  "PathExt",
+  "ProgramData",
+  "ProgramFiles",
+  "ProgramFiles(x86)",
+  "ProgramW6432",
+  "SystemDrive",
+  "SystemRoot",
+  "TEMP",
+  "TMP",
+  "USERDOMAIN",
+  "USERNAME",
+  "USERPROFILE",
+  "windir",
+];
+
+/**
+ * The spawned server's environment: {@link HARNESS_ENVIRONMENT_ALLOWLIST} filtered out
+ * of what we inherited, plus our generated password.
+ *
+ * `OPENCODE_PASSWORD` is set here and `OPENCODE_SERVER_PASSWORD` is never set at all, so
+ * exactly one credential is live whichever variable the installed version honours. The
+ * password still has to reach the child's initial environment — that is the only
+ * interface `opencode serve` has for it — which is why the spawn passes `--stdio`: the
+ * child deletes both password variables from its own `process.env` before it serves
+ * anything, so no shell it later starts can read them. See {@link spawnServer}.
  */
 export const serverEnvironment = (
   inherited: Record<string, string | undefined>,
   password: string,
-): Record<string, string | undefined> => {
-  const environment: Record<string, string | undefined> = {
-    ...inherited,
-    OPENCODE_PASSWORD: password,
-  };
-  delete environment["OPENCODE_SERVER_PASSWORD"];
+): Record<string, string> => {
+  const environment: Record<string, string> = {};
+  for (const name of HARNESS_ENVIRONMENT_ALLOWLIST) {
+    const value = inherited[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  environment["OPENCODE_PASSWORD"] = password;
   return environment;
 };
 
@@ -504,14 +666,19 @@ export const spawnServer = Effect.fnUntraced(function* (options: SpawnOptions) {
               "serve",
               `--hostname=${hostname}`,
               `--port=${String(port)}`,
+              // The password scrub. See the note on `stdin` below.
+              "--stdio",
               ...(options.extraArgs ?? []),
             ],
             cwd: options.cwd,
-            env: serverEnvironment(process.env, password) as Record<
-              string,
-              string
-            >,
-            stdin: "ignore",
+            env: serverEnvironment(process.env, password),
+            // `--stdio` makes this pipe the server's ownership lease, so it is piped
+            // rather than ignored and then held open, unwritten, for the scope's life.
+            // Closing it is a shutdown request; `terminate` below signals instead, and
+            // the pipe closing when this process dies is a free second path to the same
+            // end — including the `SIGKILL` the module header calls out as beyond our
+            // reach. Nothing in `ownedProcesses.ts` is relaxed on the strength of it.
+            stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",
             // `setsid()`, so the server and the shells it starts form a group we can

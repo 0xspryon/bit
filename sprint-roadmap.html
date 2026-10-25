@@ -15,14 +15,14 @@
 </head>
 <body>
 <div class="wrap">
-  <div class="top"><div class="brand">Hunt<span> / </span>Platform</div><span class="status">Planning preview · 21 October 2026</span></div>
+  <div class="top"><div class="brand">Hunt<span> / </span>Platform</div><span class="status">Planning preview · 25 October 2026</span></div>
   <header>
     <div class="eyebrow">Control plane for autonomous security testing</div>
     <h1>One screen.<br>One server slice.<br><em>One day at a time.</em></h1>
     <p class="intro">Build the application front to back, in the order a user meets it. Every day ends with something you can click in the browser and check for yourself — no development scripts, no direct database access.</p>
     <div class="facts">
       <div class="fact"><strong>1-day slices</strong><span>A planning budget, not a delivery guarantee</span></div>
-      <div class="fact"><strong>26 days, A → G</strong><span>Strict front-to-back order through the app</span></div>
+      <div class="fact"><strong>29 days, A → G</strong><span>Each slice supplies what the next one needs</span></div>
       <div class="fact"><strong>Clickable every day</strong><span>If you cannot test it in the UI, it is not done</span></div>
     </div>
   </header>
@@ -30,11 +30,12 @@
   <aside class="note">
     <p><strong>Planning rule:</strong> every day ends with one screen you can open in a browser and one click-through that proves it works. Server work does not get its own days — it arrives as the thinnest cut that lights up the day's screen.</p>
     <p><strong>What this replaces:</strong> the previous risk-ordered breakdown, which front-loaded unknowns and deferred the browser to the last two slices. Caido access and quota recovery have since been verified as reachable, which removes the reason to lead with them.</p>
+    <p><strong>Dependency rule:</strong> Days 1–8 prove an operator-directed attempt, not an autonomous hunt. Observations precede the intent frontier; the frontier precedes the planner; one bounded planner/worker loop precedes findings, reports and N-worker scheduling. Fixture and lab runs are not proof of a general execution perimeter. Day numbers are planning slices, not claims that every capability already exists.</p>
   </aside>
   <main>
 
     <section class="phase" aria-labelledby="foundation-title">
-      <div class="phase-head"><div><div class="eyebrow">Already standing</div><h2 id="foundation-title">What the first screen is built on.</h2><p>Banked during Sprints 01–02 and the §22 milestone. Stated here so it is not re-planned: it is what these days draw on, not work still to do.</p></div></div>
+      <div class="phase-head"><div><div class="eyebrow">Foundation at roadmap drafting</div><h2 id="foundation-title">What the first screen was built on.</h2><p>Banked during Sprints 01–02 and the §22 milestone. This is the starting dependency baseline, not a live implementation checklist; consult the code and current tests for what has landed since.</p></div></div>
       <div class="backlog">
         <div class="backlog-row heading"><div>Capability</div><div>Where it lives</div></div>
         <div class="backlog-row"><strong>Delegated execution through a real harness</strong><span>Owned OpenCode server and session, per-attempt credentials, server-side execution hook.</span></div>
@@ -43,7 +44,7 @@
         <div class="backlog-row"><strong>Fail-closed policy</strong><span>A policy outage denies rather than permits; denied fixture actions do not execute.</span></div>
         <div class="backlog-row"><strong>Briefing and recovery</strong><span>A fresh session is told what is known and untested; unsettled attempts reconcile honestly across restart.</span></div>
       </div>
-      <p class="scope"><strong>What is not standing:</strong> the browser app is an empty SvelteKit route, and the control plane serves three paths — health, MCP and the policy decision. Every read and write the UI needs is new.</p>
+      <p class="scope"><strong>At the original draft:</strong> the browser app was an empty SvelteKit route and the control plane served only health, MCP and policy decisions. Later slices have since landed; this roadmap orders capabilities and does not claim their current completion status.</p>
     </section>
 
     <section class="phase" id="a" aria-labelledby="a-title">
@@ -78,7 +79,7 @@
     </section>
 
     <section class="phase" id="b" aria-labelledby="b-title">
-      <div class="phase-head"><div><div class="eyebrow">Phase B / Days 4–8</div><h2 id="b-title">The hunt.</h2><p>Opening a target drops you into the hunt interface. By the end of this phase you can run an investigation from the browser and read what it did.</p></div></div>
+      <div class="phase-head"><div><div class="eyebrow">Phase B / Days 4–8</div><h2 id="b-title">The hunt.</h2><p>Opening a target drops you into the hunt interface. By the end of this phase you can start, watch and re-read an operator-directed attempt; autonomous follow-up comes later.</p></div></div>
       <div class="grid">
         <article class="card">
           <div class="card-number"><span class="number">DAY 04</span><span>Hunt shell</span></div>
@@ -95,7 +96,7 @@
           <p class="screen">Compose box · model picker · running state · stop control</p>
           <div class="done"><span class="label">Test by</span>Aim an instruction at the rate-limit fixture and start it. OpenCode launches, an attempt row is created, and the fixture receives traffic. Stop ends it, and the attempt settles honestly rather than hanging.</div>
           <p class="slice"><b>Server slice:</b> an HTTP route onto the existing harness launch and attempt creation. Credentials are minted per attempt exactly as they are today.</p>
-          <p class="boundary">Boundary: from this day the agent executes real actions on your machine, and <strong>nothing constrains where they go</strong>. The policy gate is installed and recording, but it is configured to permit, because the gate it implements is a host allowlist and a target's scope is still a free-text note — a gate derived from nothing would refuse every remote target rather than protect anything. The perimeter day is Day 21 and structured scope is further out. Until one of them lands, a run reaches whatever its instruction names. Accepted deliberately for fixture, lab and CTF work; revisit before pointing this at anything else.</p>
+          <p class="boundary">Boundary: from this day the agent executes real actions on your machine, and <strong>nothing constrains where they go</strong>. The policy gate is installed and recording, but it is configured to permit, because the gate it implements is a host allowlist and a target's scope is still a free-text note — a gate derived from nothing would refuse every remote target rather than protect anything. The supported perimeter is Day 22. Until then, a run reaches whatever its instruction names. Accepted deliberately for fixture, lab and CTF work; do not treat it as safe for other targets.</p>
         </article>
         <article class="card">
           <div class="card-number"><span class="number">DAY 06</span><span>Transcript</span></div>
@@ -118,34 +119,59 @@
           <h3>Read past hunts and the briefing</h3>
           <p>The session list for this target, and the panel showing exactly what a fresh session is told before it starts.</p>
           <p class="screen">Session list grouped by day · session search · briefing panel</p>
-          <div class="done"><span class="label">Test by</span>Open a finished hunt and read it end to end. Open the briefing on a fresh session: it names what is known, what is still untested, and a next action that follows from recorded observations rather than from the prompt.</div>
+          <div class="done"><span class="label">Test by</span>Open a finished attempt and read it end to end. Open the briefing on a fresh session: it names what is known, what is still untested, and a suggested next action that follows from recorded observations rather than from the prompt. Nothing is scheduled automatically yet.</div>
           <p class="slice"><b>Server slice:</b> the briefing already exists and is already tested. This day renders it and adds the session query.</p>
         </article>
       </div>
-      <div class="checkpoint"><div class="eyebrow">Checkpoint A</div><div><p>You can start, watch, interrupt and re-read an investigation entirely in the browser.</p><small>If this loop is awkward to use, fix it here. Everything after this phase assumes it is pleasant.</small></div></div>
+      <div class="checkpoint"><div class="eyebrow">Checkpoint A</div><div><p>You can start, watch, interrupt, reconnect to and re-read a manually directed attempt entirely in the browser.</p><small>No planner or autonomous follow-up exists yet. If this loop is awkward to use, fix it here.</small></div></div>
     </section>
 
     <section class="phase" id="c" aria-labelledby="c-title">
-      <div class="phase-head"><div><div class="eyebrow">Phase C / Days 9–13</div><h2 id="c-title">What it learned.</h2><p>The knowledge graph, made visible. Observations, findings, assets, and the frontier of what has not been tried.</p></div></div>
+      <div class="phase-head"><div><div class="eyebrow">Phase C / Days 9–16</div><h2 id="c-title">What it learned, and what it tries next.</h2><p>Recorded observations become a visible frontier, then a bounded planner chooses persisted work for one worker. Findings and assets have explicit creation paths instead of appearing from nowhere.</p></div></div>
       <div class="grid">
         <article class="card">
           <div class="card-number"><span class="number">DAY 09</span><span>Observations</span></div>
           <h3>Every result, including the dull ones</h3>
           <p>A negative result is as valuable as a positive one, and the list treats it that way.</p>
           <p class="screen">Observation list · dimension chips · observation detail</p>
-          <div class="done"><span class="label">Test by</span>Every observation from a completed hunt is listed in sequence order with its dimensions. A negative result is as visible as a positive one. Each row traces back to the attempt that recorded it.</div>
-          <p class="slice"><b>Server slice:</b> a paged read over the append-only table. No write path exists and none is added.</p>
+          <div class="done"><span class="label">Test by</span>Every observation from a completed attempt is listed in sequence order with its dimensions. A negative result is as visible as a positive one. Each row traces back to the attempt that recorded it.</div>
+          <p class="slice"><b>Server slice:</b> a paged read over the append-only table. Observation writes already exist; no new write path is added this day.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 10</span><span>Findings</span></div>
+          <div class="card-number"><span class="number">DAY 10</span><span>Intent frontier</span></div>
+          <h3>See the work before automating it</h3>
+          <p>The goal, its open and settled intents, their evidence anchors, assigned slices and untested dimensions are visible. Add one follow-up intent by hand before a planner can.</p>
+          <p class="screen">Goal and intent list · intent detail · add-intent control · untested dimensions</p>
+          <div class="done"><span class="label">Test by</span>Record an observation, add an intent anchored to its confirmed fact or finding, and reload: the intent is still open under the right goal. An anchor to another intent or a hint is refused. An untested dimension is not shown as a negative result.</div>
+          <p class="slice"><b>Server slice:</b> persisted intent creation and reads with anchoring, scope and duplicate checks. No worker claims and no planner writes yet.</p>
+        </article>
+        <article class="card">
+          <div class="card-number"><span class="number">DAY 11</span><span>Planner round</span></div>
+          <h3>Choose bounded next work</h3>
+          <p>One explicit planner round reads the objective, briefing and graph, and may commit a small number of anchored intents. Its disposition is a recorded decision, not a claim inferred from a quiet worker.</p>
+          <p class="screen">Plan-next control · proposed intents and rationale · budget · round disposition</p>
+          <div class="done"><span class="label">Test by</span>Run a round after the fixture observation: it adds only bounded, nonduplicate follow-ups supported by recorded evidence. Run it again unchanged: it does not expand forever. Show actionable work, waiting, no useful next action or objective met with a reason; no worker starts yet.</div>
+          <p class="slice"><b>Server slice:</b> one persisted planner round, deterministic budgets and equivalence checks, and an atomic command to record its intents and disposition. Planner authority is not borrowed from a worker attempt.</p>
+        </article>
+        <article class="card">
+          <div class="card-number"><span class="number">DAY 12</span><span>Single-worker loop</span></div>
+          <h3>Turn a planned intent into an attempt</h3>
+          <p>Claim one open intent, run one worker against its assigned slice, record scoped observations, settle the attempt, and reassess. Keep the existing same-workspace refusal.</p>
+          <p class="screen">Claimed-intent state · current worker · result and follow-up round</p>
+          <div class="done"><span class="label">Test by</span>Plan one rate-limit fixture intent and start the loop. Exactly one worker claims it and records an observation under that intent. Its completion releases the claim and triggers one bounded reassessment; a failed or uncertain attempt does not become a negative result or an achieved objective.</div>
+          <p class="slice"><b>Server slice:</b> transactional claim, one supervised worker, attempt settlement and planner wake-up. Persist the queue in the target store; do not introduce N-worker scheduling or same-workspace concurrency here.</p>
+          <p class="boundary">Boundary: autonomous continuation is limited to explicitly approved fixture and lab targets until Day 22 proves a supported perimeter. The planner's budget limits work volume, not where commands or traffic can go.</p>
+        </article>
+        <article class="card">
+          <div class="card-number"><span class="number">DAY 13</span><span>Findings</span></div>
           <h3>The list that matters</h3>
           <p>Severity, status, confidence, and which target. The screen you open when someone asks what you found.</p>
-          <p class="screen">Finding list · severity and status filters · empty state</p>
-          <div class="done"><span class="label">Test by</span>Findings from a completed hunt appear with severity and status. Filtering by status narrows the list and survives a reload. A target with no findings says so plainly.</div>
-          <p class="slice"><b>Server slice:</b> the finding record and its read path. First new domain table since Sprint 02.</p>
+          <p class="screen">Finding list · promote-observation control · severity and status filters · empty state</p>
+          <div class="done"><span class="label">Test by</span>Review an observation and promote a supported claim to a finding with limitations; it appears with severity and status. Filtering survives a reload. A negative observation does not silently become a finding; a target with none says so plainly.</div>
+          <p class="slice"><b>Server slice:</b> the finding record, explicit reviewed creation path and read path. First new domain table since Sprint 02.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 11</span><span>Finding detail</span></div>
+          <div class="card-number"><span class="number">DAY 14</span><span>Finding detail</span></div>
           <h3>Why you believe it</h3>
           <p>The claim, the observations underneath it, its limitations, and what changed between revisions.</p>
           <p class="screen">Finding detail · supporting observations · limitations · revision drawer · conflict dialog</p>
@@ -153,39 +179,40 @@
           <p class="slice"><b>Server slice:</b> whole-finding revisions with conflict rejection. New limitations cannot be silently overwritten.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 12</span><span>Assets</span></div>
+          <div class="card-number"><span class="number">DAY 15</span><span>Assets</span></div>
           <h3>What exists, and what you tested on it</h3>
           <p>Hosts, endpoints and parameters discovered so far, each showing its own testing history.</p>
-          <p class="screen">Asset list · asset detail · coverage column</p>
-          <div class="done"><span class="label">Test by</span>Run a hunt twice over the same endpoint. One row, not two. Each asset shows what has been tested on it and what has not.</div>
-          <p class="slice"><b>Server slice:</b> surface the type-specific identity rules. Endpoint identity is where over-normalisation bites first — URL plus method, against URL plus method plus role — and this screen is where a wrong choice becomes obvious.</p>
+          <p class="screen">Asset list · record-asset control · asset detail · coverage column</p>
+          <div class="done"><span class="label">Test by</span>Record the same endpoint twice under the same role: one asset row, not two. A meaningfully different role stays distinct. Link the relevant observation so the asset shows what has been tested and what remains untested.</div>
+          <p class="slice"><b>Server slice:</b> provide a real asset write path and surface the type-specific identity rules. Endpoint identity includes the request role where it changes the tested slice; an empty asset list is not evidence that none exist.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 13</span><span>Frontier</span></div>
+          <div class="card-number"><span class="number">DAY 16</span><span>Frontier</span></div>
           <h3>What it has not tried yet</h3>
           <p>Untested dimensions, each appearing once, each saying why it is still open.</p>
           <p class="screen">Frontier list · disposition reason · planner budget indicator</p>
           <div class="done"><span class="label">Test by</span>After a bounded hunt, each untested dimension appears exactly once with a reason you can read. The planner's disposition stays inside its budget rather than enumerating the whole space.</div>
-          <p class="slice"><b>Server slice:</b> largely banked — untested dimensions already render once in the briefing's volatile tail. This day gives them a screen.</p>
+          <p class="slice"><b>Server slice:</b> combine the briefing's already-deduplicated untested tail with the persisted intent states and Day 11 planner dispositions. Do not turn missing observations into negative evidence.</p>
         </article>
       </div>
-      <div class="checkpoint"><div class="eyebrow">Checkpoint B</div><div><p>Everything the agent learns is visible, traceable to its source, and honest about what it has not covered.</p><small>A useful workbench for manually driven hunts, well before autonomous operation is ready.</small></div></div>
+      <div class="checkpoint"><div class="eyebrow">Single-worker checkpoint · Day 12</div><div><p>One bounded planner/worker cycle makes evidence-informed progress from a persisted intent, with no concurrent attempts in one workspace.</p><small>Proved only on the approved fixture or lab, not on arbitrary targets.</small></div></div>
+      <div class="checkpoint"><div class="eyebrow">Checkpoint B</div><div><p>Everything the agent learns is visible, traceable to its source, and honest about what it has not covered.</p><small>Findings and assets have tested creation paths; an open frontier is not a vulnerability verdict.</small></div></div>
     </section>
 
     <section class="phase" id="d" aria-labelledby="d-title">
-      <div class="phase-head"><div><div class="eyebrow">Phase D / Days 14–16</div><h2 id="d-title">Evidence.</h2><p>Caido runs locally with a GraphQL API that already exposes requests, responses, findings and scope. This is a fetch, a hash and a write — not a spike.</p></div></div>
+      <div class="phase-head"><div><div class="eyebrow">Phase D / Days 17–19</div><h2 id="d-title">Evidence.</h2><p>Caido runs locally with a GraphQL API that already exposes requests and responses. Import only explicitly selected or reliably matched flows; a free-text scope note is not a target filter.</p></div></div>
       <div class="grid">
         <article class="card">
-          <div class="card-number"><span class="number">DAY 14</span><span>Traffic</span></div>
+          <div class="card-number"><span class="number">DAY 17</span><span>Traffic</span></div>
           <h3>See the target's traffic</h3>
           <p>Flows pulled from Caido for this target, filterable by host, status and method.</p>
           <p class="screen">Traffic list · host/status/method filters · Caido-unavailable state</p>
-          <div class="done"><span class="label">Test by</span>With Caido running, flows for the target list and page correctly. Stop Caido: the screen says the source is unavailable rather than showing an empty list that looks like no traffic.</div>
-          <p class="slice"><b>Server slice:</b> a GraphQL client against the local Caido instance, reading its bearer token at runtime. Paging over <code>requestsByOffset</code>.</p>
-          <p class="boundary">Boundary: confirm Caido's licence permits programmatic access before this ships. It is a legal check, not a technical unknown, and it does not gate the build.</p>
+          <div class="done"><span class="label">Test by</span>With Caido running, explicitly linked or reliably matched flows for the target list and page correctly; an unrelated host does not appear. Stop Caido: the screen says the source is unavailable rather than showing an empty list that looks like no traffic.</div>
+          <p class="slice"><b>Server slice:</b> a GraphQL client against the local Caido instance, reading its bearer token at runtime, paging over <code>requestsByOffset</code>, and an explicit target-to-flow selection or matching rule.</p>
+          <p class="boundary">Boundary: confirm Caido's licence permits programmatic access before this ships. If scope cannot be reliably matched, require explicit selection rather than asserting that a free-text scope note filters flows.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 15</span><span>Flow detail</span></div>
+          <div class="card-number"><span class="number">DAY 18</span><span>Flow detail</span></div>
           <h3>Capture a flow as evidence</h3>
           <p>Read the raw exchange, then take a copy that no longer depends on Caido keeping it.</p>
           <p class="screen">Flow detail · raw request/response panes · capture control · capture-failed state</p>
@@ -193,7 +220,7 @@
           <p class="slice"><b>Server slice:</b> evidence write with content hashing. Evidence stays out of the database, as the architecture requires.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 16</span><span>Evidence locker</span></div>
+          <div class="card-number"><span class="number">DAY 19</span><span>Evidence locker</span></div>
           <h3>Evidence that outlives its source</h3>
           <p>The whole point of capturing rather than linking.</p>
           <p class="screen">Evidence list · artefact viewer · incomplete-capture state</p>
@@ -205,10 +232,10 @@
     </section>
 
     <section class="phase" id="e" aria-labelledby="e-title">
-      <div class="phase-head"><div><div class="eyebrow">Phase E / Days 17–18</div><h2 id="e-title">Output.</h2><p>The thing you actually hand over, and the honesty mechanism that keeps it from lying as the investigation moves on.</p></div></div>
+      <div class="phase-head"><div><div class="eyebrow">Phase E / Days 20–21</div><h2 id="e-title">Output.</h2><p>Reviewed findings and captured evidence now exist. Freeze them for handoff, then show when later investigation makes that snapshot stale.</p></div></div>
       <div class="grid two">
         <article class="card">
-          <div class="card-number"><span class="number">DAY 17</span><span>Report</span></div>
+          <div class="card-number"><span class="number">DAY 20</span><span>Report</span></div>
           <h3>Generate a report you could send</h3>
           <p>Built from a frozen snapshot of a finding and its evidence, so it says the same thing tomorrow.</p>
           <p class="screen">Report generation · report view · export</p>
@@ -216,7 +243,7 @@
           <p class="slice"><b>Server slice:</b> snapshot the finding and evidence set, then render from the snapshot — never from live state.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 18</span><span>Freshness</span></div>
+          <div class="card-number"><span class="number">DAY 21</span><span>Freshness</span></div>
           <h3>A report knows when it went stale</h3>
           <p>The investigation keeps moving. The report should admit when it has been left behind.</p>
           <p class="screen">Stale badge on report · report version list · regenerate flow</p>
@@ -224,70 +251,71 @@
           <p class="slice"><b>Server slice:</b> a qualifying revision marks dependent reports stale. Versioned report text, not dependency propagation across the graph.</p>
         </article>
       </div>
-      <div class="checkpoint"><div class="eyebrow">Checkpoint C</div><div><p>A hunt now produces something you could hand to someone else, with evidence behind it and a visible shelf life.</p><small>Everything after this makes the tool run unattended. Nothing after this is needed to get value from it.</small></div></div>
+      <div class="checkpoint"><div class="eyebrow">Checkpoint C</div><div><p>A bounded fixture or lab hunt now produces something you could hand to someone else, with evidence behind it and a visible shelf life.</p><small>The supported perimeter comes next; this checkpoint does not authorize unattended work on arbitrary targets.</small></div></div>
     </section>
 
     <section class="phase" id="f" aria-labelledby="f-title">
-      <div class="phase-head"><div><div class="eyebrow">Phase F / Days 19–23</div><h2 id="f-title">Keeping it running.</h2><p>Unattended operation, made inspectable. Who is working, what is stuck, where the agent may go, and what happens when capacity runs out.</p></div></div>
+      <div class="phase-head"><div><div class="eyebrow">Phase F / Days 22–27</div><h2 id="f-title">Keeping it running.</h2><p>Prove a supported perimeter and recoverable blockers before unattended work; show eligible harnesses before quota recovery; isolate attempt authority before adding a second worker.</p></div></div>
       <div class="grid">
         <article class="card">
-          <div class="card-number"><span class="number">DAY 19</span><span>Workers</span></div>
-          <h3>Two workers, visible lanes</h3>
-          <p>Who is working on what, right now, and a stop button that actually stops.</p>
-          <p class="screen">Worker lanes · claim indicator · stop control · concurrency setting</p>
-          <div class="done"><span class="label">Test by</span>Run two attempts. The lanes show who holds which intent, and neither can claim the other's. Stop one: it settles and can no longer make authoritative changes. The other is unaffected.</div>
-          <p class="slice"><b>Server slice:</b> persisted claiming, attempt-local workspaces, a concurrency limit. Attempt authority and the write fence already enforce the stopping half.</p>
-        </article>
-        <article class="card">
-          <div class="card-number"><span class="number">DAY 20</span><span>Blockers</span></div>
-          <h3>Why nothing is happening</h3>
-          <p>The screen you open when the app is quiet and you cannot tell whether that is good news.</p>
-          <p class="screen">Blocker list · blocker detail · resolve action</p>
-          <div class="done"><span class="label">Test by</span>Induce a blocker — a policy denial, a missing credential — and it appears with a reason specific enough to act on. Resolve it and the work continues without a restart.</div>
-          <p class="slice"><b>Server slice:</b> a blocker projection over existing state. No new truth, just a question the store cannot currently answer quickly.</p>
-        </article>
-        <article class="card">
-          <div class="card-number"><span class="number">DAY 21</span><span>Perimeter</span></div>
-          <h3>Constrain where the agent may go</h3>
-          <p>Sixteen days after the agent began executing real actions. The one genuinely unproven item on this roadmap.</p>
+          <div class="card-number"><span class="number">DAY 22</span><span>Perimeter</span></div>
+          <h3>Constrain the supported execution path</h3>
+          <p>The gate already records decisions, but until now it has no structured boundary to enforce. Define the supported target scope and say which paths are actually constrained.</p>
           <p class="screen">Supported-paths panel · perimeter violation state · policy-change notice</p>
-          <div class="done"><span class="label">Test by</span>Fixture tests cover redirects, subprocesses and a policy change taking effect mid-run. The screen states plainly which execution paths are constrained and which are not.</div>
-          <p class="slice"><b>Server slice:</b> constrain the selected execution path beyond its initial tool arguments. Which paths those are follows from what Days 5–8 actually built.</p>
+          <div class="done"><span class="label">Test by</span>Fixture tests cover redirects, subprocesses and a policy change taking effect mid-run. The screen states plainly which paths are constrained and which are not; an unsupported path is refused or explicitly marked outside the guarantee.</div>
+          <p class="slice"><b>Server slice:</b> structured supported scope and enforcement beyond initial tool arguments on the selected execution path. Gate non-lab unattended operation on what this actually proves.</p>
           <p class="boundary">Boundary: a universal sandbox is not reachable in a day, and may not be reachable at all. If it is not, ship a constrained supported path at ScopeWeaver's level of strictness and say so on the screen. An honest limit is worth more than a claimed perimeter.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 22</span><span>Quota</span></div>
+          <div class="card-number"><span class="number">DAY 23</span><span>Blockers</span></div>
+          <h3>Why nothing is happening</h3>
+          <p>The screen you open when the app is quiet and you cannot tell whether that is good news.</p>
+          <p class="screen">Blocker list · blocker detail · resolve action</p>
+          <div class="done"><span class="label">Test by</span>Induce a blocker — a policy denial or missing credential — and it appears with a reason specific enough to act on. Resolve it and only eligible open work is claimed again; an interrupted or uncertain attempt is never silently resumed.</div>
+          <p class="slice"><b>Server slice:</b> persist any blocker state needed for a durable resolve action, project the rest from existing attempt and policy state, and revalidate the claim before new execution.</p>
+        </article>
+        <article class="card">
+          <div class="card-number"><span class="number">DAY 24</span><span>Harnesses &amp; tools</span></div>
+          <h3>Models, harnesses and MCP servers</h3>
+          <p>What the agent can run on, and what it can reach. Model eligibility is visible before automatic capacity recovery depends on it.</p>
+          <p class="screen">Harness status · model eligibility · MCP server list with health and exposed tools</p>
+          <div class="done"><span class="label">Test by</span>Connected MCP servers list with their tools. Stop one: it shows unhealthy within a tick rather than staying green. Marking a model ineligible keeps the next claim off it.</div>
+          <p class="slice"><b>Server slice:</b> read-only harness/tool status and a persisted model eligibility setting, checked at dispatch. This is not yet external MCP configuration.</p>
+        </article>
+        <article class="card">
+          <div class="card-number"><span class="number">DAY 25</span><span>Workers</span></div>
+          <h3>Two workers, visible lanes</h3>
+          <p>Who holds which persisted intent, with a stop control that affects only its own attempt.</p>
+          <p class="screen">Worker lanes · claim indicator · stop control · concurrency setting</p>
+          <div class="done"><span class="label">Test by</span>Run two read-only attempts in the same target folder, each holding a distinct intent. Neither session can discover or invoke the other's Bit authority or overwrite its policy configuration. Stop one: its writes are fenced and the other is unaffected. Two mutating attempts sharing that folder are still refused.</div>
+          <p class="slice"><b>Server slice:</b> atomic claims, an N-worker capacity limit, explicit shared-read versus exclusive-mutation workspace claims, and attempt-isolated MCP authority and policy gates. Preserve <code>workspace_busy</code> for shared mutation until isolated checkouts or another safe access mode exist.</p>
+          <p class="boundary">Entry gate: native session-scoped MCP registration or a tested alternative must isolate credential use; a shared tool list or model-supplied session ID alone is not proof. If isolation or workspace coordination fails, keep one worker and mark this day blocked rather than relaxing the guard.</p>
+        </article>
+        <article class="card">
+          <div class="card-number"><span class="number">DAY 26</span><span>Quota</span></div>
           <h3>Wait out a usage limit and resume</h3>
           <p>Capacity runs out at 2am. The hunt should pick itself back up without you.</p>
           <p class="screen">Usage windows per provider · reset countdown · resume-when-reset toggle · snooze</p>
-          <div class="done"><span class="label">Test by</span>With a recorded quota fixture, the run fails as a usage limit carrying a reset time, and the screen shows the window. Enable resume-when-reset, restart the server, and the continuation still fires after the reset — with no timer to restore.</div>
-          <p class="slice"><b>Server slice:</b> persist the recovery <em>decision</em> rather than a timer; derive due work from an indexed query on a shared slow tick; make command ids deterministic so replays dedupe; re-validate everything at fire time. The sweep is a read plus a dispatch, so it never holds the write lock while waiting.</p>
+          <div class="done"><span class="label">Test by</span>With a recorded quota fixture, the attempt stops as a usage limit carrying a reset time, and the screen shows the window. Enable resume-when-reset, restart the server, and a new eligible attempt claims the work after reset — never the settled attempt replaying its prompt.</div>
+          <p class="slice"><b>Server slice:</b> persist the recovery <em>decision</em> rather than a timer; derive due work from an indexed query on a shared slow tick; make command ids deterministic so replays dedupe; revalidate eligibility, scope, claim and attempt authority at fire time. The sweep holds no write lock while waiting.</p>
           <p class="boundary">Boundary: wait-and-resume only. Switching to another model on exhaustion has no reference implementation anywhere we can draw on, and sits in the backlog below. Use recorded fixtures; do not exhaust a real subscription to test this.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 23</span><span>Policy</span></div>
+          <div class="card-number"><span class="number">DAY 27</span><span>Policy</span></div>
           <h3>See what is allowed and what was refused</h3>
           <p>The fail-closed hook already decides. This is the day you can finally read its decisions.</p>
-          <p class="screen">Policy rules · decision log · pending approvals · policy-outage state</p>
+          <p class="screen">Policy rules · decision log · policy-outage state</p>
           <div class="done"><span class="label">Test by</span>A denied action from a real run appears in the log with its reason. Take the policy service down: the screen shows an outage and actions are denied — never silently permitted.</div>
-          <p class="slice"><b>Server slice:</b> the decision path exists and is tested. This renders it and records decisions for later reading.</p>
+          <p class="slice"><b>Server slice:</b> the decision path exists and is tested. Persist the decisions needed for later reading and render them; an approval workflow is separate future work.</p>
         </article>
       </div>
     </section>
 
     <section class="phase" id="g" aria-labelledby="g-title">
-      <div class="phase-head"><div><div class="eyebrow">Phase G / Days 24–26</div><h2 id="g-title">System.</h2><p>Settings-shaped screens. Each is small, and each one removes a reason to open a terminal.</p></div></div>
+      <div class="phase-head"><div><div class="eyebrow">Phase G / Days 28–29</div><h2 id="g-title">System.</h2><p>Notifications and the raw event log, after the findings and event sources they consume already exist.</p></div></div>
       <div class="grid">
         <article class="card">
-          <div class="card-number"><span class="number">DAY 24</span><span>Harnesses &amp; tools</span></div>
-          <h3>Models, harnesses and MCP servers</h3>
-          <p>What the agent can run on, and what it can reach.</p>
-          <p class="screen">Harness status · model eligibility · MCP server list with health and exposed tools</p>
-          <div class="done"><span class="label">Test by</span>Connected MCP servers list with their tools. Stop one: it shows unhealthy within a tick rather than staying green. Marking a model ineligible keeps the next run off it.</div>
-          <p class="slice"><b>Server slice:</b> read-only status, plus the eligibility flag the quota day already needs.</p>
-        </article>
-        <article class="card">
-          <div class="card-number"><span class="number">DAY 25</span><span>Notifications</span></div>
+          <div class="card-number"><span class="number">DAY 28</span><span>Notifications</span></div>
           <h3>Route findings to Discord</h3>
           <p>The first thing that leaves the machine, driven off the outbox written since Sprint 02.</p>
           <p class="screen">Channel routing · delivery log · failed-delivery state</p>
@@ -295,7 +323,7 @@
           <p class="slice"><b>Server slice:</b> outbox dispatch with leases and retry scheduling, and a Discord sink. The outbox is a queue of side-effect requests; it does not promise exactly-once remote delivery, and the screen should not imply it does.</p>
         </article>
         <article class="card">
-          <div class="card-number"><span class="number">DAY 26</span><span>Event log</span></div>
+          <div class="card-number"><span class="number">DAY 29</span><span>Event log</span></div>
           <h3>The raw stream, and settings</h3>
           <p>The last screen that removes a reason to open the database by hand.</p>
           <p class="screen">Event log in sequence order · event detail · settings form</p>
@@ -303,7 +331,7 @@
           <p class="slice"><b>Server slice:</b> a paged event read, and the reader rule that tolerates undeclared fields by returning nothing rather than throwing.</p>
         </article>
       </div>
-      <div class="checkpoint"><div class="eyebrow">Checkpoint D</div><div><p>A usable personal tool: hunts you start and watch, knowledge you can trace, evidence that outlives its source, reports that admit when they are stale, unattended operation you can inspect, and Discord when something matters.</p><small>Expand in response to actual use, not in anticipation of it.</small></div></div>
+      <div class="checkpoint"><div class="eyebrow">Checkpoint D</div><div><p>A usable personal tool: bounded hunts you start and watch, knowledge you can trace, evidence that outlives its source, reports that admit when they are stale, and supported unattended operation you can inspect.</p><small>Two-worker operation is conditional on proven authority, policy and workspace isolation; otherwise the single-worker path remains the supported one.</small></div></div>
     </section>
 
     <section class="phase" id="later" aria-labelledby="later-title">

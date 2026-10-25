@@ -108,8 +108,14 @@ export const PASSWORD_ENV_VAR = "BIT_PASSWORD";
  *
  * Deleting here rather than scrubbing at each spawn site is deliberate: there are three
  * places today that start a child — `openCodeServer.ts`, the Claude Agent SDK's CLI, and
- * the policy hook — and only the first has an environment hook we control. A list of
- * spawn sites to remember is a list somebody will fail to add to.
+ * the policy hook — and a list of spawn sites to remember is a list somebody will fail to
+ * add to. Correction to an earlier version of this note, which said only the first has an
+ * environment hook we control: `openCodeServer.ts` now hands its child an allowlist
+ * rather than `process.env` (`HARNESS_ENVIRONMENT_ALLOWLIST`), and the Agent SDK exposes
+ * an `env` option that *replaces* the subprocess environment, so a second allowlist is
+ * available there and has not been written — the OpenCode harness is the one that had a
+ * proven exploit. None of that makes the deletion here redundant: it is what covers the
+ * policy hook, and what covers whichever spawn site is added next.
  *
  * Call this **once, at startup, before any harness is built.** Idempotent: a second call
  * finds nothing and returns `undefined`, which is also what an unset variable gives, and
