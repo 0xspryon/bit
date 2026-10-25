@@ -108,6 +108,12 @@ import {
 } from "./harness/openCodeClient";
 import { OpenCodeServer } from "./harness/openCodeServer";
 import {
+  ownedProcessDirectory,
+  reapNeedsAttention,
+  reapOwnedProcesses,
+  renderReapOutcome,
+} from "./harness/ownedProcesses";
+import {
   HarnessResolver,
   harnessResolverLayer,
   type HarnessCandidate,
@@ -170,6 +176,49 @@ const WORKSPACE_ROOT = resolveRoot(
 );
 
 const fleet = FleetStore.layer(HUNT_ROOT);
+
+/**
+ * Where this installation records the OS processes it owns.
+ *
+ * Derived from {@link HUNT_ROOT} rather than fixed, which is the whole of the scoping
+ * property: two servers on two fleet roots record into two directories, so neither
+ * installation's startup sweep can see — let alone kill — the other's children.
+ */
+const OWNED_PROCESSES = ownedProcessDirectory(HUNT_ROOT);
+
+/**
+ * Ends `opencode serve` processes a previous run of this process left behind.
+ *
+ * It exists because of one measured fact: `bun --watch` restarts us *in place*, reusing
+ * the pid, and tears the old JavaScript context down in the same tick as the `SIGTERM` it
+ * sends itself. The handler's synchronous body runs and then nothing asynchronous ever
+ * does — no timer, no microtask — so the scope finalizer that owns the harness child never
+ * gets a turn, and every edit under `apps/server/src` used to leave a live
+ * `opencode serve` behind. They accumulated until a fresh one could not answer
+ * `/api/info` inside its readiness bound, at which point the model picker degraded to a
+ * single entry: a symptom nowhere near its cause. The reasoning, the measurement and the
+ * identity check that keeps this from being worse than the leak are on
+ * `harness/ownedProcesses.ts`.
+ *
+ * **Before anything of ours is spawned**, because the record is scoped to the installation
+ * rather than to a process: a sweep running after the harness layer was built would find
+ * our own live child and have no way to tell it from an orphan.
+ *
+ * Quiet when there is nothing to do, and never fatal. A boot that cannot tidy up is
+ * untidy; a boot that refuses because it could not tidy up is unusable.
+ */
+const reapOrphanedHarnesses = Effect.gen(function* () {
+  const outcomes = yield* reapOwnedProcesses(OWNED_PROCESSES);
+  if (outcomes.length === 0) return;
+  console.log(
+    `harness processes: ${String(outcomes.length)} record(s) left by a previous run of this process`,
+  );
+  for (const outcome of outcomes) {
+    const line = `  ${renderReapOutcome(outcome)}`;
+    if (reapNeedsAttention(outcome)) console.error(line);
+    else console.log(line);
+  }
+});
 
 /**
  * Brings the fleet up to date.
@@ -294,7 +343,12 @@ const SELECTED_HARNESS = harnessSelection(process.env["HARNESS"]);
  */
 const openCode: Layer.Layer<AgentHarness, HarnessProcessError> =
   openCodeHarness().pipe(
-    Layer.provide(OpenCodeServer.layer({ cwd: WORKSPACE_ROOT })),
+    Layer.provide(
+      OpenCodeServer.layer({
+        cwd: WORKSPACE_ROOT,
+        recordDirectory: OWNED_PROCESSES,
+      }),
+    ),
   );
 
 /**
@@ -638,14 +692,23 @@ const program = Effect.gen(function* () {
   });
 });
 
-// The fleet is prepared *before* the layer graph that opens a target's store is built,
-// because `targetStoreLayer` asks the registry whether that target migrated and refuses
-// it when nothing has swept it. Running the sweep as part of the same layer would make
-// that ordering a matter of luck.
+// Three steps, in an order that is load-bearing at both joints.
+//
+// Orphaned harness processes go **first**, before anything of ours is spawned: the record
+// they are found in is scoped to the installation, not to a process, so a sweep running
+// any later would see this process's own child and be unable to tell it from a leak.
+//
+// The fleet is then prepared *before* the layer graph that opens a target's store is
+// built, because `targetStoreLayer` asks the registry whether that target migrated and
+// refuses it when nothing has swept it. Running the sweep as part of the same layer would
+// make that ordering a matter of luck.
 await Effect.runPromise(
   Effect.scoped(
     Effect.andThen(
-      prepareFleet.pipe(Effect.provide(fleet)),
+      Effect.andThen(
+        reapOrphanedHarnesses,
+        prepareFleet.pipe(Effect.provide(fleet)),
+      ),
       program.pipe(
         Effect.provide(
           // The endpoint *requires* the three shared services now, because it hands them

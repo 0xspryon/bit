@@ -18,6 +18,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -726,5 +727,66 @@ ${holdsPipeOpen(false)}
     );
     expect(recorded.length).toBe(1);
     expect(await waitAllGone(recorded, 2_000)).toEqual([]);
+  }, 20_000);
+});
+
+/**
+ * The durable record is the half of cleanup that does not depend on this process getting
+ * a turn. `harness/ownedProcesses.test.ts` covers the sweep itself; what is asserted here
+ * is the pairing — that a real spawn writes a record naming the real child, and that a
+ * scope which closes properly leaves nothing for a later boot to act on.
+ */
+describe("the durable record of an owned process", () => {
+  test("names the spawned child while the scope is open, and is gone once it closes", async () => {
+    const fake = readyServer();
+    const records = mkdtempSync(join(SCRATCH_ROOT, "records-"));
+    scratches.push(records);
+
+    const seen = await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(
+          spawn({
+            binary: fake.path,
+            cwd: fake.cwd,
+            extraArgs: fake.extraArgs,
+            recordDirectory: records,
+            bounds: { readiness: 10_000, poll: 25 },
+          }),
+          () => Effect.sync(() => readdirSync(records)),
+        ),
+      ),
+    );
+
+    const recorded = readPids(fake.pidFile);
+    expect(recorded.length).toBe(1);
+    // Named for the pid, which is what makes a record for a pid only ever able to
+    // overwrite a stale one.
+    expect(seen).toEqual([`${String(recorded[0])}.json`]);
+    expect(await waitAllGone(recorded, 3_000)).toEqual([]);
+    // A scope that closed properly leaves the next boot nothing to sweep.
+    expect(readdirSync(records)).toEqual([]);
+  }, 20_000);
+
+  test("records nothing when no directory is given", async () => {
+    const fake = readyServer();
+    const records = mkdtempSync(join(SCRATCH_ROOT, "records-"));
+    scratches.push(records);
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(
+          spawn({
+            binary: fake.path,
+            cwd: fake.cwd,
+            extraArgs: fake.extraArgs,
+            bounds: { readiness: 10_000, poll: 25 },
+          }),
+          () => Effect.void,
+        ),
+      ),
+    );
+
+    expect(readdirSync(records)).toEqual([]);
+    expect(await waitAllGone(readPids(fake.pidFile), 3_000)).toEqual([]);
   }, 20_000);
 });

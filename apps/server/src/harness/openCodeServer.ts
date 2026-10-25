@@ -57,9 +57,14 @@
  * That is the trade for being able to stop the whole owned tree; `runMain` turns
  * `SIGINT`/`SIGTERM` into an interrupt of the main fiber, which runs this scope's
  * finalizer (`spike/main.ts`).
+ *
+ * The other half of that limit is a parent that restarts us without letting the scope
+ * close at all — which is what `bun --watch` does, measured and written up on
+ * `harness/ownedProcesses.ts`. Nothing in this file can help there, because the restart
+ * grants the dying context no asynchronous turn; what covers it is the durable record
+ * written here at spawn ({@link SpawnOptions.recordDirectory}) and swept by the next boot.
+ * The kernel checks both paths depend on live in that module, so the two cannot drift.
  */
-import { readFileSync } from "node:fs";
-
 import type { Subprocess } from "bun";
 import {
   Context,
@@ -75,6 +80,12 @@ import {
 } from "effect";
 
 import { HarnessProcessError } from "./errors";
+import {
+  forgetOwnedProcess,
+  leadsOwnGroup,
+  recordOwnedProcess,
+  signalGroup,
+} from "./ownedProcesses";
 
 /**
  * Process-lifetime bounds.
@@ -374,60 +385,18 @@ export interface SpawnOptions {
    * direct-child-only contract sets it to `false`.
    */
   readonly ownProcessGroup?: boolean;
+  /**
+   * Directory in which to record this process durably, so a boot that follows a restart
+   * the scope never got to close can find it again and end it.
+   *
+   * Scoped to one installation by the caller — `main.ts` derives it from `HUNT_ROOT` —
+   * because two servers on two fleet roots must not be able to reap each other's
+   * children. Omitted means no record is written and nothing will ever be reaped, which
+   * is what a test that is only exercising the in-scope lifetime wants. The mechanism and
+   * the measurement that makes it necessary are on `harness/ownedProcesses.ts`.
+   */
+  readonly recordDirectory?: string;
 }
-
-/**
- * The POSIX process group a pid belongs to, or `undefined` if we cannot tell.
- *
- * `detached: true` *asks* for `setsid()`, and asking is not evidence. We read the
- * kernel's answer, because the cost of being wrong is signalling a group we do not own
- * — which on a shared group id would include this process and everything else the user
- * is running in it.
- */
-const processGroupOf = (pid: number): number | undefined => {
-  const parse = (pgid: number): number | undefined =>
-    Number.isSafeInteger(pgid) && pgid > 0 ? pgid : undefined;
-  try {
-    // `comm` is parenthesised and may itself contain spaces, so the numeric fields are
-    // counted from after the last ")": state, ppid, pgrp.
-    const stat = readFileSync(`/proc/${String(pid)}/stat`, "utf8");
-    return parse(Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2]));
-  } catch {
-    // No procfs. `ps` is POSIX and answers the same question.
-    try {
-      const probe = Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(pid)]);
-      return probe.success
-        ? parse(Number(probe.stdout.toString().trim()))
-        : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-};
-
-/** Whether `pid` leads its own process group, so `kill(-pid)` reaches only our tree. */
-const leadsOwnGroup = (pid: number): boolean =>
-  Number.isSafeInteger(pid) && pid > 1 && processGroupOf(pid) === pid;
-
-/**
- * Signals the owned process group, as T3Code's `signalProcessGroup`
- * (`packages/provider-core/src/server/processGroup.ts`) does.
- *
- * Guarded twice over: callers only reach here for a child verified to lead its own
- * group, and a pid of 0 or 1 is refused outright, because `kill(-0)` signals *this*
- * process's group and `kill(-1)` every process the user owns. Returns whether the
- * group was there to be signalled, so `0` doubles as a liveness probe.
- */
-const signalGroup = (pid: number, signal: NodeJS.Signals | 0): boolean => {
-  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
-  try {
-    process.kill(-pid, signal);
-    return true;
-  } catch {
-    // ESRCH: every member has already gone.
-    return false;
-  }
-};
 
 /**
  * Reads one piped stream to EOF, retaining a bounded tail.
@@ -480,6 +449,12 @@ interface OwnedProcess {
   readonly child: Subprocess;
   /** Verified against the kernel, not assumed from the spawn option. */
   readonly ownsGroup: boolean;
+  /**
+   * Path of the durable record of this process, if one was written. Removed once the
+   * process is confirmed gone — and deliberately *not* removed otherwise, so a process we
+   * failed to end is still the next boot's to finish.
+   */
+  readonly record: string | undefined;
   readonly drains: Fiber.Fiber<void>;
   /** Owns the readers, so closing it cancels them even on a stalled pipe. */
   readonly drainScope: Scope.Closeable;
@@ -552,6 +527,17 @@ export const spawnServer = Effect.fnUntraced(function* (options: SpawnOptions) {
       });
       const ownsGroup =
         options.ownProcessGroup !== false && leadsOwnGroup(child.pid);
+      // Inside the uninterruptible acquire, and synchronous, for the same reason the
+      // finalizer is registered here: the teardown this record guards against — a
+      // `bun --watch` restart — grants the dying context no asynchronous turn, so a
+      // record written from a continuation would be a record sometimes never written.
+      const record =
+        options.recordDirectory === undefined
+          ? undefined
+          : recordOwnedProcess(options.recordDirectory, {
+              pid: child.pid,
+              command: `${binary} serve --port=${String(port)}`,
+            });
       const drainScope = yield* Scope.make();
       const drains = yield* Effect.forkIn(
         Effect.all([drain(child.stdout, stdout), drain(child.stderr, stderr)], {
@@ -560,7 +546,7 @@ export const spawnServer = Effect.fnUntraced(function* (options: SpawnOptions) {
         }),
         drainScope,
       );
-      return { child, ownsGroup, drains, drainScope };
+      return { child, ownsGroup, record, drains, drainScope };
     }),
     (owned: OwnedProcess) => terminate(owned, bounds),
   );
@@ -680,6 +666,13 @@ const terminate = (
     // closing below cancels the readers rather than waiting on a stream that will not
     // end.
     yield* Effect.timeoutOption(Fiber.await(drains), bounds.killGrace);
+
+    // Only once the process is actually gone. A record left behind for a child that
+    // survived everything above is not litter — it is the one thing that lets the next
+    // boot finish the job, and `ownedProcesses.ts` re-verifies identity before it acts on
+    // it, so keeping it cannot turn into signalling a stranger.
+    if (owned.record !== undefined && exited())
+      forgetOwnedProcess(owned.record);
   }).pipe(
     // Unconditional, and after the body: the readers are released even if terminating
     // the process failed, and never before the process has had its chance to close the
