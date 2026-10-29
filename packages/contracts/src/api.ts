@@ -46,6 +46,12 @@ import {
   IntentView,
 } from "./intent";
 import { API_PREFIX, apiPath } from "./http";
+import {
+  PlanRefused,
+  PlanRoundStarted,
+  PlanRoundView,
+  RunningRound,
+} from "./plan";
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
 
@@ -1358,6 +1364,75 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         ],
       },
     ),
+    /**
+     * Opens one planner round on a goal, and answers without waiting for it.
+     *
+     * **No payload at all, and that is the interesting part of this endpoint.** A round's
+     * directory, the audit path its policy gate writes to, and the engagement folder it
+     * must not sit inside are facts about this installation's filesystem layout; a browser
+     * that could name any of them would be choosing where an agent runs. Even the harness
+     * and the model are absent, unlike `startRun`: nothing but the operator has an opinion
+     * about where planning happens, and that opinion is server configuration today rather
+     * than a per-round pick.
+     *
+     * The prompt is the goal's objective plus the goal briefing, assembled server-side. It
+     * answers as soon as the round is durable and prompted, exactly as {@link startRun}
+     * does — a round takes minutes, and a request that waited for it would time out.
+     *
+     * Four refusals and each is a different thing to do about it.
+     * {@link GoalBriefingRefused} is the same error the briefing panel already renders,
+     * with the same two numbers, because "this goal's brief is over the ceiling" is one
+     * fact and the round is refused on it **having started nothing** — no round row, no
+     * directory, no session. {@link PlanRefused} is everything else about the round, the
+     * goal or the harness. The other two are the target.
+     */
+    HttpApiEndpoint.post("plan", "/targets/:targetId/goals/:goalId/plan", {
+      params: { targetId: Schema.String, goalId: Schema.String },
+      success: PlanRoundStarted.pipe(HttpApiSchema.status(201)),
+      error: [
+        PlanRefused,
+        GoalBriefingRefused,
+        GoalNotFound,
+        TargetNotFound,
+        TargetUnavailable,
+      ],
+    }),
+    /**
+     * The planner rounds of one goal, newest first, each with what it concluded.
+     *
+     * The **rows**, which is what makes this a different question from {@link rounds}: a
+     * row that says `running` is a round nothing settled, and a process that died leaves
+     * exactly that. This is where a disposition is read from, and it is the only place a
+     * settled round's answer survives a refresh.
+     *
+     * Wrapped in an object for the reason `goals` is.
+     */
+    HttpApiEndpoint.get(
+      "goalRounds",
+      "/targets/:targetId/goals/:goalId/rounds",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        success: Schema.Struct({ rounds: Schema.Array(PlanRoundView) }),
+        error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * Every planner round this server is supervising right now, across all targets.
+     *
+     * The sibling of {@link runs}, for the same reason and with the same shape: it is a
+     * fact about the *process*, the supervisor holds one fiber map for the whole server,
+     * and a reloaded tab has no other way to find a round it started — the start response
+     * is the only other place a round id appears.
+     *
+     * **Not answerable from {@link goalRounds}.** A round in flight and a row saying
+     * `running` are different claims, and the difference is exactly what decides which
+     * refusal "Plan next" would get: `goal_busy` when a fiber holds the goal, and
+     * `round_conflict` when only a row does. A control that guessed from the rows would
+     * tell an operator to wait for a round that nothing is driving.
+     */
+    HttpApiEndpoint.get("rounds", "/rounds", {
+      success: Schema.Array(RunningRound),
+    }),
     /**
      * One target's live transcript, as Server-Sent Events.
      *

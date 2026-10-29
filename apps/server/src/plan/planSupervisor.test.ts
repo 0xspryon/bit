@@ -58,16 +58,22 @@ import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
 import { stubHarness } from "../harness/stubHarness";
 import { McpCredentials } from "../mcp/credentials";
+import { McpCallCounter } from "../mcp/server";
 import { FleetStore } from "../persistence/fleet";
-import { operatorScope } from "../persistence/store";
+import { ObservationStore, operatorScope } from "../persistence/store";
 import { PolicyHookNotInstalled } from "../policy/install";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { WorkerEndpoints } from "../run/supervisor";
 import {
+  GoalBriefingTooLarge,
+  buildGoalBriefing,
+} from "../briefing/goalBriefing";
+import {
   PlanSupervisor,
-  STUB_ROUND_PROMPT,
   type PlanInput,
+  type PlanRefused,
 } from "./planSupervisor";
+import { assembleRoundPrompt, roundPromptOverhead } from "./roundPrompt";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -111,15 +117,44 @@ interface Recorder {
    */
   readonly order: string[];
   readonly registrations: { name: string; url: string; bearer: string }[];
+  /**
+   * The text of every prompt sent, kept out of {@link order}.
+   *
+   * The prompt is a rendered goal briefing inside the round's framing, so it is thousands
+   * of characters. In `order` it would make the sequence assertion unreadable and would
+   * turn a test about *when* the prompt was sent into one about its wording.
+   */
+  readonly prompts: string[];
   readonly unregistrations: { sessionId: string; name: string }[];
   readonly interrupts: string[];
   /** The `parentSessionId` each `createSession` was handed, so lineage is checkable. */
   readonly parents: (string | undefined)[];
 }
 
+/**
+ * A refusal narrowed to `PlanRefused`.
+ *
+ * `start`'s error channel is `PlanRefused | GoalBriefingTooLarge`: a goal briefing over
+ * the ceiling is refused with the two numbers on it rather than flattened into a reason
+ * that has nowhere to put them. Every assertion below but the ceiling's own is about the
+ * first, so this narrows in one place and throws loudly on the other rather than every
+ * site carrying its own tag check.
+ */
+const planRefused = (
+  failure: PlanRefused | GoalBriefingTooLarge,
+): PlanRefused => {
+  if (failure._tag !== "PlanRefused") {
+    throw new Error(
+      `expected a PlanRefused, got ${failure._tag}: ${failure.message}`,
+    );
+  }
+  return failure;
+};
+
 const emptyRecorder = (): Recorder => ({
   order: [],
   registrations: [],
+  prompts: [],
   unregistrations: [],
   interrupts: [],
   parents: [],
@@ -240,7 +275,12 @@ const fakeClient = (
         scriptFor(sessionId).promptFails === true
           ? Effect.fail(transport("session.prompt", "the harness refused it"))
           : Effect.sync(() => {
-              recorder.order.push(`prompt:${text}`);
+              // The text is recorded separately from the order, because the prompt is now
+              // a rendered goal briefing wrapped in the round's framing — thousands of
+              // characters — and an order assertion carrying it would be unreadable and
+              // would be about the wording rather than the sequence.
+              recorder.order.push("prompt");
+              recorder.prompts.push(text);
             }),
       waitForIdle: (sessionId) => Deferred.await(scriptFor(sessionId).settle),
       sessionStatus: (sessionId) => {
@@ -343,10 +383,20 @@ const world = (
   const fleet = FleetStore.layer(root);
   const stores = TargetStores.layer.pipe(Layer.provide(fleet));
   const credentials = McpCredentials.layer;
+  /**
+   * The real counter, not a stub.
+   *
+   * The supervisor reads it at settlement to say whether a round reached its tool surface,
+   * and a stub returning a fixed number would make that assertion about the stub. This is
+   * the same service the MCP middleware increments in production, and a test drives it the
+   * way the middleware does — by calling `increment` for the round's own caller scope.
+   */
+  const calls = McpCallCounter.layer;
   const layer = Layer.mergeAll(
     fleet,
     stores,
     credentials,
+    calls,
     PlanSupervisor.layerWith({
       ...(options?.askTimeout === undefined
         ? {}
@@ -358,12 +408,14 @@ const world = (
       Layer.provide(stores),
       Layer.provide(fleet),
       Layer.provide(credentials),
+      Layer.provide(calls),
       Layer.provide(
         Layer.succeed(
           WorkerEndpoints,
           WorkerEndpoints.of({
             urls: Effect.succeed({
               mcp: "http://127.0.0.1:9/api/v1/mcp",
+              plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
               policy: "http://127.0.0.1:9/api/v1/policy/decide",
             }),
           }),
@@ -533,6 +585,182 @@ const awaitSettled = (
     ),
   );
 
+/* ── The prompt, and the ceiling that refuses a round before it starts ───────── */
+
+describe("the prompt a round is opened with", () => {
+  test("carries the goal briefing verbatim, and reports both lengths", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder, {
+      budget: 4,
+    });
+    await ready;
+
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_prompt");
+        const planner = yield* PlanSupervisor;
+        return yield* planner.start(input);
+      }).pipe(Effect.orDie),
+    );
+
+    expect(recorder.prompts).toHaveLength(1);
+    const prompt = recorder.prompts[0] ?? "";
+
+    // The briefing is pasted in whole and nothing is inserted into it, which is what lets
+    // the briefing panel claim it shows the same bytes the planner gets.
+    const briefing = await runtime.runPromise(
+      Effect.flatMap(TargetStores, (stores) =>
+        withTargetStore(stores, TARGET, (store) =>
+          buildGoalBriefing("goal_prompt").pipe(
+            Effect.provideService(ObservationStore, store),
+          ),
+        ),
+      ).pipe(Effect.orDie),
+    );
+    expect(prompt.endsWith(briefing.rendered)).toBe(true);
+    expect(prompt).toContain(
+      "Work out whether the login limiter can be bypassed.",
+    );
+
+    // **`sizeChars` bounds the briefing, not the prompt**, and the two numbers say so
+    // rather than leaving it to be inferred. The difference is exactly the framing, which
+    // is what `roundPromptOverhead` computes.
+    expect(started.briefingChars).toBe(briefing.rendered.length);
+    expect(started.promptChars).toBe(prompt.length);
+    expect(started.promptChars).toBeGreaterThan(started.briefingChars);
+    expect(started.promptChars - started.briefingChars).toBe(
+      roundPromptOverhead({ goalId: "goal_prompt", budget: 4 }),
+    );
+
+    // The budget the round was opened under is in the text, because it is the one fact
+    // about *this* round a planner cannot read out of the graph.
+    expect(prompt).toContain("at most 4 intent(s)");
+    // And the disposition is demanded rather than suggested.
+    expect(prompt).toContain("THIS IS NOT OPTIONAL");
+  });
+
+  test("tells the planner what to do if its tools have not reached it yet", async () => {
+    // DECISIONS.md §24.2 caveat 1: an OpenCode registration can be connected and not yet
+    // callable — in 3 of 8 first prompts after a registration the model reported the tool
+    // was not exposed and the endpoint saw no call — and there is **no API to read that
+    // registry**, so a round cannot confirm exposure before prompting. The prompt is never
+    // resubmitted either. So the round tolerates a first-turn absence deliberately: the
+    // planner is told to say so and stop rather than to improvise in prose, which leaves a
+    // round an operator can simply run again.
+    const assembled = assembleRoundPrompt({
+      goalId: "goal_x",
+      budget: 5,
+      briefing: "",
+    });
+    expect(assembled.prompt).toContain("IF YOUR TOOLS ARE NOT THERE");
+    expect(assembled.prompt).toContain("a known timing fault in the harness");
+    expect(assembled.prompt).toContain(
+      "Say plainly that the planner tools\nwere not available and stop",
+    );
+    expect(assembled.prompt).toContain("prose is not\na record");
+    // Never told to retry: a resubmitted prompt would mint fresh operation ids and commit
+    // a second set of intents that `add_intent`'s receipts could not recognise as a replay.
+    expect(assembled.prompt).not.toContain("try again");
+  });
+
+  test("a briefing over the ceiling refuses the round and starts nothing", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder, {
+      budget: 5,
+    });
+    await ready;
+
+    const refused = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_huge");
+        const planner = yield* PlanSupervisor;
+        // A ceiling of one character, so the shortest possible briefing is over it. The
+        // alternative — writing 320 000 characters of observations — would test the same
+        // branch and take a second to set up.
+        return yield* Effect.result(
+          planner.start({ ...input, briefingMaxChars: 1 }),
+        );
+      }),
+    );
+
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag !== "Failure") return;
+    const failure = refused.failure;
+    // **Not a `PlanRefused`**: it carries two numbers no reason on that error has a place
+    // for, and it is the same error the goal-briefing route turns into the
+    // `GoalBriefingRefused` the panel renders — so an operator meets one refusal for one
+    // fact whichever surface they hit it on.
+    expect(failure._tag).toBe("GoalBriefingTooLarge");
+    if (failure._tag !== "GoalBriefingTooLarge") return;
+    expect(failure.maxChars).toBe(1);
+    expect(failure.sizeChars).toBeGreaterThan(1);
+    expect(failure.goalId).toBe("goal_huge");
+
+    // **Started nothing**, which is the requirement and the reason the briefing is built
+    // before the goal is claimed: no row, no directory, no session, no registration, no
+    // prompt. A row would have blocked every later round on this goal until a sweep.
+    expect(recorder.order).toEqual([]);
+    expect(recorder.registrations).toEqual([]);
+    expect(recorder.prompts).toEqual([]);
+    const rows = await runtime.runPromise(
+      Effect.flatMap(TargetStores, (stores) =>
+        withTargetStore(stores, TARGET, (store) =>
+          store.roundsForGoal("goal_huge"),
+        ),
+      ).pipe(Effect.orDie),
+    );
+    expect(rows).toEqual([]);
+
+    // And the goal is free: a second start on it is not refused `goal_busy`, which it
+    // would be if the claim had leaked.
+    const after = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_huge");
+        const planner = yield* PlanSupervisor;
+        return yield* Effect.result(planner.start(input));
+      }),
+    );
+    expect(after._tag).toBe("Success");
+  });
+
+  test("a goal this target does not hold is refused goal_not_found, from the briefing read", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder, {});
+    await ready;
+
+    const refused = await runtime.runPromise(
+      Effect.gen(function* () {
+        const planner = yield* PlanSupervisor;
+        return yield* Effect.result(
+          planner.start({
+            targetId: TARGET,
+            goalId: "goal_absent",
+            workspace,
+            auditPath: join(
+              root,
+              "targets",
+              TARGET,
+              "evidence",
+              "policy-audit.log",
+            ),
+            title: "bit planner: absent",
+          }),
+        );
+      }),
+    );
+
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag !== "Failure") return;
+    // Reported from the briefing read rather than from `openRound`, because the briefing
+    // is now built first — the same fact, the same reason, one step earlier.
+    expect(planRefused(refused.failure).reason).toBe("goal_not_found");
+    expect(recorder.order).toEqual([]);
+  });
+});
+
 /* ── Starting a round ────────────────────────────────────────────────────────── */
 
 describe("opening a planner round", () => {
@@ -582,7 +810,11 @@ describe("opening a planner round", () => {
       `gate:${planning}`,
       `create:${planning}`,
       `register:bit-${started.roundId}`,
-      `prompt:${STUB_ROUND_PROMPT("goal_one")}`,
+      // The real prompt now: the round's framing with the goal briefing pasted in. The
+      // assertion rebuilds it from the same assembler rather than restating the text,
+      // because what is being checked here is the *order* — gate, session, registration,
+      // then prompt — and a literal would make this test about the wording.
+      "prompt",
     ]);
     // Never the workspace. Under OpenCode the directory is the authority boundary
     // (DECISIONS.md §24.2), so a planner session in the workers' folder would see every
@@ -668,13 +900,15 @@ describe("opening a planner round", () => {
     expect(refusals).toHaveLength(1);
     const refused = refusals[0];
     if (refused?._tag !== "Failure") throw new Error("expected a refusal");
-    expect(refused.failure.reason).toBe("goal_busy");
+    expect(planRefused(refused.failure).reason).toBe("goal_busy");
     // Named, not merely refused: a second browser tab's operator has to be told which
     // round is holding the goal (the spec's §5, condition 3).
     const winner = wins[0];
     if (winner?._tag !== "Success") throw new Error("expected a start");
-    expect(refused.failure.detail).toContain(winner.success.roundId);
-    expect(refused.failure.detail).toContain("goal_one");
+    expect(planRefused(refused.failure).detail).toContain(
+      winner.success.roundId,
+    );
+    expect(planRefused(refused.failure).detail).toContain("goal_one");
 
     // And the refusal wrote nothing: one row, one session, one registration.
     expect(recorder.registrations).toHaveLength(1);
@@ -762,9 +996,11 @@ describe("a refused round", () => {
     );
 
     if (outcome.refused._tag !== "Failure") throw new Error("expected refusal");
-    expect(outcome.refused.failure.reason).toBe("harness_not_ready");
+    expect(planRefused(outcome.refused.failure).reason).toBe(
+      "harness_not_ready",
+    );
     if (outcome.again._tag !== "Failure") throw new Error("expected refusal");
-    expect(outcome.again.failure.reason).toBe("harness_not_ready");
+    expect(planRefused(outcome.again.failure).reason).toBe("harness_not_ready");
     // Nothing was asked of a harness and nothing was written.
     expect(recorder.order).toEqual([]);
 
@@ -804,10 +1040,10 @@ describe("a refused round", () => {
     );
 
     if (outcome.refused._tag !== "Failure") throw new Error("expected refusal");
-    expect(outcome.refused.failure.reason).toBe("goal_not_active");
-    expect(outcome.refused.failure.detail).toContain("abandoned");
+    expect(planRefused(outcome.refused.failure).reason).toBe("goal_not_active");
+    expect(planRefused(outcome.refused.failure).detail).toContain("abandoned");
     if (outcome.again._tag !== "Failure") throw new Error("expected refusal");
-    expect(outcome.again.failure.reason).toBe("goal_not_active");
+    expect(planRefused(outcome.again.failure).reason).toBe("goal_not_active");
 
     await runtime.dispose();
     // No row at all, and in particular none that says `running` for a sweep to find.
@@ -831,7 +1067,7 @@ describe("a refused round", () => {
     );
 
     if (refused._tag !== "Failure") throw new Error("expected refusal");
-    expect(refused.failure.reason).toBe("goal_not_found");
+    expect(planRefused(refused.failure).reason).toBe("goal_not_found");
 
     await runtime.dispose();
     expect(readAfterShutdown(root).rounds).toEqual([]);
@@ -907,7 +1143,7 @@ describe("a refused round", () => {
 
       if (outcome.refused._tag !== "Failure")
         throw new Error("expected a refusal");
-      expect(outcome.refused.failure.reason).toBe(fault.reason);
+      expect(planRefused(outcome.refused.failure).reason).toBe(fault.reason);
       expect(outcome.second._tag).toBe("Success");
 
       await runtime.dispose();
@@ -968,7 +1204,7 @@ describe("a refused round", () => {
     // The caller still gets an answer rather than hanging on a deferred the dead fiber will
     // never complete: that is the `ensuring` at the bottom of `supervise`.
     if (refused._tag !== "Failure") throw new Error("expected a refusal");
-    expect(refused.failure.reason).toBe("store_unavailable");
+    expect(planRefused(refused.failure).reason).toBe("store_unavailable");
 
     await runtime.dispose();
     const rows = readAfterShutdown(root);
@@ -1026,7 +1262,7 @@ describe("a refused round", () => {
     );
 
     if (refused._tag !== "Failure") throw new Error("expected refusal");
-    expect(refused.failure.reason).toBe("harness_unreachable");
+    expect(planRefused(refused.failure).reason).toBe("harness_unreachable");
 
     await runtime.dispose();
     const rows = readAfterShutdown(root);
@@ -1050,6 +1286,86 @@ describe("a refused round", () => {
 });
 
 /* ── Stopping, and shutting down ─────────────────────────────────────────────── */
+
+describe("whether a round ever reached its tool surface", () => {
+  /**
+   * The condition this exists for has no other symptom.
+   *
+   * DECISIONS.md §24.2 caveat 1 measured that an OpenCode MCP registration can be
+   * connected and **not yet callable**, and that there is no API to read the tool registry
+   * — so the round cannot confirm exposure before prompting, and the prompt is never
+   * resubmitted. A round that never had its tools settles exactly like a round that had
+   * them and chose to say nothing: `settled`, `disposition: null`. The only thing that
+   * tells them apart is whether the MCP endpoint ever saw a request under the round's own
+   * caller scope.
+   *
+   * These two tests exist because the figure previously had **no reader at all** — the
+   * module documented the diagnostic and nothing consulted the counter, so the distinction
+   * the comment promised was one nobody could make. A review found that. What is asserted
+   * here is that `settle` really reads it, on the one settlement path whose answer a caller
+   * can see; the log line it also writes comes from the same call.
+   */
+  const scopeOf = (roundId: string) => `${TARGET}/round/${roundId}`;
+
+  test("a round whose session called the endpoint reports the calls it made", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder, {
+      askTimeout: "10 millis",
+    });
+    await ready;
+
+    const outcome = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_one");
+        const planner = yield* PlanSupervisor;
+        const started = yield* planner.start(input);
+        // Driven the way the MCP auth middleware drives it: `increment` for the round's own
+        // caller scope, after the bearer has resolved. Three calls, so the assertion is
+        // about the number rather than about zero-versus-not.
+        const calls = yield* McpCallCounter;
+        yield* calls.increment(scopeOf(started.roundId));
+        yield* calls.increment(scopeOf(started.roundId));
+        yield* calls.increment(scopeOf(started.roundId));
+        // Somebody else's scope, so the count is provably this round's and not the total.
+        yield* calls.increment(`${TARGET}/attempt-elsewhere`);
+        return yield* planner.stop(started.roundId);
+      }).pipe(Effect.orDie),
+    );
+
+    expect(outcome.toolCallsSeen).toBe(3);
+  });
+
+  test("a round that never called reports zero, which is the Spike B condition", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder, {
+      askTimeout: "10 millis",
+    });
+    await ready;
+
+    const outcome = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_one");
+        const planner = yield* PlanSupervisor;
+        const started = yield* planner.start(input);
+        const stopped = yield* planner.stop(started.roundId);
+        const stores = yield* TargetStores;
+        const round = yield* withTargetStore(stores, TARGET, (store) =>
+          store.loadRound(started.roundId),
+        );
+        return { stopped, round };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(outcome.stopped.toolCallsSeen).toBe(0);
+    // Zero **and** no disposition is the conjunction the settlement warns about. The row
+    // half of it is asserted here; the warning itself is a log line, which is the honest
+    // extent of where this figure goes — it is not on the round row and not on
+    // `plan.round.settled`, and `settle`'s own comment says so.
+    expect(outcome.round?.disposition).toBeNull();
+  });
+});
 
 describe("stopping a round", () => {
   test("settles `interrupted`, revokes the grant, unregisters and frees the goal", async () => {
@@ -1151,10 +1467,10 @@ describe("stopping a round", () => {
       ),
     );
     if (refused._tag !== "Failure") throw new Error("expected refusal");
-    expect(refused.failure.reason).toBe("unknown_round");
+    expect(planRefused(refused.failure).reason).toBe("unknown_round");
     // The sentence has to point an operator at the sweep, because a row that still says
     // `running` after a crash has no fiber here to interrupt.
-    expect(refused.failure.detail).toContain("startup sweep");
+    expect(planRefused(refused.failure).detail).toContain("startup sweep");
     await runtime.dispose();
   });
 

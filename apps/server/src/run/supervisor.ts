@@ -166,6 +166,20 @@ import { captureTranscript } from "./transcript";
 export interface WorkerUrls {
   /** Where the worker's MCP client connects, carrying its attempt credential. */
   readonly mcp: string;
+  /**
+   * Where a **planner round**'s MCP client connects, carrying its round credential.
+   *
+   * A second URL because the two roles are offered different tool lists and each endpoint
+   * refuses the other's credential (`mcp/server.ts`'s header). It is here rather than in a
+   * service of the plan supervisor's own for the reason both URLs are together in the
+   * first place: all three are answerable at the same instant by the same listener, and a
+   * second gate to publish is a second chance to publish only one.
+   *
+   * The name on this interface is now slightly wrong — a planner is not a worker — and it
+   * is left alone deliberately: renaming `WorkerEndpoints` would touch every call site and
+   * every test for a word, while the comment that says what it holds costs nothing.
+   */
+  readonly plannerMcp: string;
   /** Where the harness-side policy hook posts each decision request. */
   readonly policy: string;
 }
@@ -188,6 +202,7 @@ export class WorkerEndpoints extends Context.Service<
       WorkerEndpoints.of({
         urls: Effect.succeed({
           mcp: endpoint.mcpUrl,
+          plannerMcp: endpoint.plannerMcpUrl,
           policy: endpoint.policyUrl,
         }),
       }),

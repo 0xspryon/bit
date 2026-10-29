@@ -64,6 +64,8 @@ import {
   type RecordAssetInput,
   type RecordedEvent,
   type RecordObservationInput,
+  type RoundDisposition,
+  type RoundStatus,
 } from "@bit/contracts";
 import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import { SqlClient, SqlSchema } from "effect/sql";
@@ -146,6 +148,47 @@ export class ClaimRefused extends Schema.TaggedError<ClaimRefused>()(
 ) {
   override get message(): string {
     return `${this.reason} (${this.intentId}): ${this.detail}`;
+  }
+}
+
+/**
+ * An intent a *planner round* may not add, and exactly why.
+ *
+ * Its own error rather than three more {@link MutationError} reasons, for
+ * {@link ClaimRefused}'s reason: each of these is a different correction and a planner
+ * told `invalid` would have to read a sentence to work out which. They are also the three
+ * refusals that exist **only** on the round path — the host's `addIntent` has no budget,
+ * no live-dimension join and no goal-status check — so keeping them apart from
+ * `MutationError` keeps "what the round path adds" readable as a type.
+ *
+ * - `budget_spent` — the round has already added as many intents as its row allows. The
+ *   detail says so and says what to do instead, because a planner that reads "refused"
+ *   and tries again with a new operation id has learned nothing. **A round whose budget is
+ *   spent may still record its disposition**, which is the whole point of telling it.
+ * - `duplicate` — another live intent of this goal already declares the same untested
+ *   dimension. `duplicateOf` names it and the detail quotes its question, so the planner
+ *   can choose a different dimension rather than guess what it collided with.
+ * - `goal_ended` — the goal is `met` or `abandoned`. Slice 4 left `checkRoundAuthority`
+ *   with four checks and deliberately no goal-status check, because ending a goal
+ *   interrupts nothing: a round in flight is work an operator may have reasons to let
+ *   finish. What ending a goal stops is **dispatch**, and this is the last dispatch-shaped
+ *   gap — adding an intent under a goal nobody wants worked. The detail names the status.
+ *
+ * Nothing is written on any of the three: all are raised inside the transaction, which
+ * rolls back.
+ */
+export class RoundIntentRefused extends Schema.TaggedError<RoundIntentRefused>()(
+  "RoundIntentRefused",
+  {
+    reason: Schema.Literals(["budget_spent", "duplicate", "goal_ended"]),
+    roundId: Schema.String,
+    /** The intent this one would duplicate. Null for every other reason. */
+    duplicateOf: Schema.NullOr(Schema.String),
+    detail: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `${this.reason} (${this.roundId}): ${this.detail}`;
   }
 }
 
@@ -636,35 +679,20 @@ export interface AttemptSettlement {
 }
 
 /**
- * Execution status of a planner round, as persisted.
+ * A round's execution status and its disposition, both the contract's.
  *
- * The attempt vocabulary minus `succeeded` and `failed`, because a round does not pass or
- * fail: it either produced a disposition or it did not, and the disposition is its own
- * column. Like {@link AttemptExecutionStatus} this says whether *execution* finished and
- * how, and never what the planning concluded.
- *
- * - `running` — the round is live. The only status under which its credential writes.
- * - `settled` — the round finished normally, whether or not it recorded a disposition.
- * - `uncertain` — nobody could tell us how it ended (DECISIONS.md §15's third answer).
- * - `interrupted` — it was stopped, by the operator or by shutdown.
+ * These two vocabularies were declared here while a round was not a thing a browser could
+ * see. Slice 7 gives rounds a route, so they are now `@bit/contracts`'s
+ * (`contracts/plan.ts`, where the prose for each value lives) and re-exported from this
+ * module for its own call sites. **Aliases rather than a second copy**: two spellings of
+ * one vocabulary is how a stored value and a wire value come to disagree, and the column
+ * decoders below `satisfies` these types, so a value this store could write that the
+ * contract does not declare is a compile error.
  */
-export type RoundStatus = "running" | "settled" | "uncertain" | "interrupted";
+export type { RoundDisposition, RoundStatus } from "@bit/contracts";
 
 /** The statuses a round can be settled into. */
 export type RoundTerminalStatus = Exclude<RoundStatus, "running">;
-
-/**
- * What a round concluded, in the planner's own four answers.
- *
- * - `actionable` — it added intents worth running.
- * - `waiting` — nothing to add until work already out comes back.
- * - `no_useful_next_action` — a considered "there is nothing worth doing here". A
- *   judgement, and deliberately not the same as having recorded nothing at all.
- * - `objective_met` — the goal's objective is established. The one disposition that ends
- *   a goal (the spec's decision 8); nothing in this slice acts on it.
- */
-export type RoundDisposition =
-  "actionable" | "waiting" | "no_useful_next_action" | "objective_met";
 
 /**
  * What opening a planner round needs. Host-owned ids, like {@link SeedInput}'s.
@@ -724,6 +752,14 @@ export interface StoredRound {
   readonly startedAtSequence: number;
   readonly budget: number;
   readonly disposition: RoundDisposition | null;
+  /**
+   * Why, in the planner's own words, or null when no disposition was recorded.
+   *
+   * Moves with {@link disposition} and never without it (migration `0020`): a disposition
+   * with no rationale is not a state this store writes. A round that predates the column
+   * reads null here whatever its disposition says, which that migration records.
+   */
+  readonly dispositionRationale: string | null;
   readonly startedAt: number;
   readonly endedAt: number | null;
 }
@@ -1226,6 +1262,7 @@ const RoundRow = Schema.Struct({
       "objective_met",
     ] as const satisfies readonly RoundDisposition[]),
   ),
+  disposition_rationale: Schema.NullOr(Schema.String),
   started_at: Schema.Finite,
   ended_at: Schema.NullOr(Schema.Finite),
 });
@@ -1246,6 +1283,7 @@ const toStoredRound = (row: typeof RoundRow.Type): StoredRound => ({
   startedAtSequence: row.started_at_sequence,
   budget: row.budget,
   disposition: row.disposition,
+  dispositionRationale: row.disposition_rationale,
   startedAt: row.started_at,
   endedAt: row.ended_at,
 });
@@ -2164,6 +2202,26 @@ const makeStore = Effect.fnUntraced(function* () {
       ]),
   });
 
+  /**
+   * Every round of one goal, newest first.
+   *
+   * Newest first because a goal's rounds are read to answer "what did the last one
+   * conclude", and the ordering is `started_at` with `id` as the tie-break — round ids are
+   * monotonic within a process, so the pair is a total order even for two rounds opened in
+   * one millisecond.
+   */
+  const selectRoundsForGoal = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: RoundRow,
+    execute: (goalId) =>
+      sql.unsafe(
+        `SELECT ${roundColumns} FROM planner_rounds
+         WHERE goal_id = ?
+         ORDER BY started_at DESC, id DESC`,
+        [goalId],
+      ),
+  });
+
   /** Reads one round inside whatever transaction is in force, or reports the row. */
   const roundOrFail = Effect.fnUntraced(function* (roundId: string) {
     const row = yield* selectRoundById(roundId).pipe(
@@ -2845,6 +2903,93 @@ const makeStore = Effect.fnUntraced(function* () {
   });
 
   /**
+   * How many intents one caller scope has committed, from its own receipts.
+   *
+   * **The receipt table is the count, and it is exact rather than approximate.** A
+   * receipt row is written inside the same transaction as the intent it describes, so
+   * there is no window in which one exists without the other; a replayed `operation_id`
+   * matches an existing receipt and writes neither, so a transport retry does not inflate
+   * the number; and a refused call rolls the transaction back, so nothing is counted for an
+   * intent that was not created.
+   *
+   * It relies on one property, stated because the count is a budget and a budget that
+   * could be spent by somebody else would be a bug: **a caller scope names exactly one
+   * round**. `callerScopeOf` builds it as `<targetId>/round/<roundId>` from ids minted by
+   * `identifier.ts`, never from anything a model or an operator supplied, so no two rounds
+   * share a scope and no other kind of caller can write an `add_intent` receipt into one.
+   *
+   * Preferred to a `created_by_round_id` column on `intents` because that column would be
+   * written and never read: the budget is the only question anybody asks of it, the
+   * receipts already answer that question exactly, and a migration for a write-only column
+   * is a migration that has to be maintained for no reader.
+   */
+  const countScopedIntents = SqlSchema.findOne({
+    Request: Schema.String,
+    Result: Schema.Struct({ added: Schema.Int }),
+    execute: (callerScope) =>
+      sql`SELECT COUNT(*) AS added FROM command_receipts
+          WHERE caller_scope = ${callerScope} AND operation = 'add_intent'`,
+  });
+
+  /**
+   * An intent of this goal that is already out to answer one dimension.
+   *
+   * The duplicate join the spec's decision 10 asks for: `addresses_dimension` against the
+   * goal's intents that are **not finished**. `proposed`, `open` and `claimed` are the
+   * live ones — nobody has concluded them, so a second intent on the same dimension would
+   * be two runs answering one question — and `answered` and `abandoned` are deliberately
+   * *not* duplicates: a question whose first attempt came back, or whose direction the
+   * operator dropped, is a legitimate thing to take on again.
+   *
+   * Oldest first, so the refusal names the intent that got there rather than whichever row
+   * the planner happened to sort to.
+   */
+  const findLiveIntentForDimension = SqlSchema.findOneOption({
+    Request: Schema.Struct({
+      goalId: Schema.String,
+      dimensionId: Schema.String,
+    }),
+    Result: Schema.Struct({
+      id: Schema.String,
+      question: Schema.String,
+      status: IntentStatus,
+    }),
+    execute: (request) =>
+      sql`SELECT id, question, status FROM intents
+          WHERE goal_id = ${request.goalId}
+            AND addresses_dimension = ${request.dimensionId}
+            AND status IN ('proposed', 'open', 'claimed')
+          ORDER BY created_at, id
+          LIMIT 1`,
+  });
+
+  /**
+   * The round-scoped checks `add_intent` makes that the host's own path does not.
+   *
+   * Two hooks rather than one, because the two groups of checks can only be made at
+   * different points in the write below and putting them in one place would mean doing a
+   * read twice or refusing in the wrong order:
+   *
+   * - `beforeValidation` runs immediately after the receipt branch and before anything
+   *   about the payload is checked. The round's authority, its goal's status and its budget
+   *   are facts about the *caller*, and a planner whose budget is spent should be told to
+   *   record its disposition rather than told that the anchor it sent was also wrong.
+   * - `afterDimension` runs once the declared dimension has been resolved to a row,
+   *   because the duplicate join is on the resolved id and resolving it a second time here
+   *   would be a second read with a second chance to disagree.
+   *
+   * Both are `undefined` on the host's path, which is what makes this a widening of
+   * `addIntent` rather than a second implementation of it: there is one copy of the
+   * anchoring rule, the receipt semantics and the event.
+   */
+  interface RoundIntentChecks<E> {
+    readonly beforeValidation: Effect.Effect<void, E>;
+    readonly afterDimension: (
+      addressesDimensionId: string | null,
+    ) => Effect.Effect<void, E>;
+  }
+
+  /**
    * Creates one intent, with §4's anchoring rule enforced here rather than in a tool.
    *
    * §4 calls this the differentiator and says to implement it before anything else that
@@ -2872,137 +3017,166 @@ const makeStore = Effect.fnUntraced(function* () {
    * collapsed, like a duplicate dimension address, because the primary key would swallow
    * it silently and a caller that sent one twice has made a mistake worth hearing about.
    */
-  const addIntent = Effect.fn("ObservationStore.addIntent")(function* (
+  const addIntentWithin = <E = never>(
     host: HostContext,
     input: AddIntentInput,
-  ) {
-    const createdAt = yield* Clock.currentTimeMillis;
+    createdAt: number,
+    /**
+     * Generic in its error, so the host's path does not inherit a failure it cannot
+     * produce. With `checks: undefined`, `E` is inferred `never` and `addIntent`'s error
+     * channel is exactly what it was before this slice — which is the property that makes
+     * widening this function a safe thing to have done.
+     */
+    checks: RoundIntentChecks<E> | undefined,
+  ) => {
     const key = `${host.callerScope}:add_intent:${input.operationId}`;
     const requestHash = hashRequest(
       { callerScope: host.callerScope, targetId: host.targetId },
       input,
     );
-    return yield* sql
-      .withTransaction(
-        Effect.gen(function* () {
-          const existing = yield* findReceipt(key).pipe(
-            Effect.mapError(lift("command_receipts", key)),
-          );
-          if (Option.isSome(existing)) {
-            const receipt = existing.value;
-            if (receipt.request_hash !== requestHash) {
-              return yield* new MutationError({
-                reason: "conflict",
-                detail: `operation ${input.operationId} was already used with different input`,
-              });
-            }
-            const original = yield* replayResult(
-              key,
-              AddIntentResult,
-              receipt.result,
-            );
-            return { ...original, replayed: true };
-          }
+    return Effect.gen(function* () {
+      const existing = yield* findReceipt(key).pipe(
+        Effect.mapError(lift("command_receipts", key)),
+      );
+      if (Option.isSome(existing)) {
+        const receipt = existing.value;
+        if (receipt.request_hash !== requestHash) {
+          return yield* new MutationError({
+            reason: "conflict",
+            detail: `operation ${input.operationId} was already used with different input`,
+          });
+        }
+        const original = yield* replayResult(
+          key,
+          AddIntentResult,
+          receipt.result,
+        );
+        return { ...original, replayed: true };
+      }
 
-          const goal = yield* findGoal(input.goalId).pipe(
-            Effect.mapError(lift("goals", input.goalId)),
-          );
-          if (Option.isNone(goal)) {
-            return yield* new MutationError({
-              reason: "invalid",
-              detail: `no goal ${input.goalId} exists; an intent is always a direction under a goal`,
-            });
-          }
-          if (goal.value.target_id !== host.targetId) {
-            return yield* new MutationError({
-              reason: "unauthorized",
-              detail: `goal ${input.goalId} belongs to target ${goal.value.target_id}, not ${host.targetId}`,
-            });
-          }
-          const clash = yield* findIntentById(input.intentId).pipe(
-            Effect.mapError(lift("intents", input.intentId)),
-          );
-          if (Option.isSome(clash)) {
-            return yield* new MutationError({
-              reason: "invalid",
-              detail: `intent ${input.intentId} already exists; an intent id is never reused, and a retry of this command needs the operation id, not the intent id`,
-            });
-          }
+      /**
+       * The round's own checks, **after** the receipt and before anything else.
+       *
+       * After the receipt for the reason `recordObservation`'s order gives: a replay
+       * writes nothing and hands back what this store already committed, and refusing
+       * it would make a transport retry look like a refused write. It matters more here
+       * than it reads — a round that adds its fifth intent and loses the response would
+       * otherwise be told `budget_spent` for a write that *succeeded*, and would
+       * conclude it had added four.
+       *
+       * Before the payload for the reason on {@link RoundIntentChecks}: a spent budget
+       * and an ended goal are facts about the caller, and the correction for both is to
+       * stop rather than to send a better anchor.
+       */
+      if (checks !== undefined) yield* checks.beforeValidation;
 
-          const seen = new Set<string>();
-          for (const anchorId of input.anchorObservationIds) {
-            if (seen.has(anchorId)) {
-              return yield* new MutationError({
-                reason: "invalid",
-                detail: `anchor '${anchorId}' is listed twice in anchorObservationIds`,
-              });
-            }
-            seen.add(anchorId);
-            const kinds = yield* classifyAnchor(anchorId).pipe(
-              Effect.mapError(lift("observations", anchorId)),
-            );
-            if (kinds.as_observation_goal === null) {
-              // The instructive refusal §4 asks for: it names what the id *is*, says why
-              // that kind cannot anchor, and gives the way to express a new direction.
-              const what =
-                kinds.as_intent !== null
-                  ? "an intent"
-                  : kinds.as_goal !== null
-                    ? "a goal"
-                    : "nothing recorded in this target";
-              return yield* new MutationError({
-                reason: "invalid",
-                detail: `anchor '${anchorId}' is ${what} and cannot anchor an intent. Only a recorded observation may anchor one, never an intent, a goal or a hint, because an intent anchored to another intent is speculation about speculation. Leave anchorObservationIds empty for a new top-level direction.`,
-              });
-            }
-            if (kinds.as_observation_goal !== input.goalId) {
-              return yield* new MutationError({
-                reason: "invalid",
-                detail: `anchor '${anchorId}' is an observation under goal ${kinds.as_observation_goal}, and this intent is under goal ${input.goalId}; an intent anchors to evidence from its own goal`,
-              });
-            }
-          }
+      const goal = yield* findGoal(input.goalId).pipe(
+        Effect.mapError(lift("goals", input.goalId)),
+      );
+      if (Option.isNone(goal)) {
+        return yield* new MutationError({
+          reason: "invalid",
+          detail: `no goal ${input.goalId} exists; an intent is always a direction under a goal`,
+        });
+      }
+      if (goal.value.target_id !== host.targetId) {
+        return yield* new MutationError({
+          reason: "unauthorized",
+          detail: `goal ${input.goalId} belongs to target ${goal.value.target_id}, not ${host.targetId}`,
+        });
+      }
+      const clash = yield* findIntentById(input.intentId).pipe(
+        Effect.mapError(lift("intents", input.intentId)),
+      );
+      if (Option.isSome(clash)) {
+        return yield* new MutationError({
+          reason: "invalid",
+          detail: `intent ${input.intentId} already exists; an intent id is never reused, and a retry of this command needs the operation id, not the intent id`,
+        });
+      }
 
-          let addressesDimensionId: string | null = null;
-          if (input.addressesDimension !== null) {
-            const parsed = parseDimensionAddress(input.addressesDimension);
-            if (parsed === undefined) {
-              return yield* new MutationError({
-                reason: "invalid",
-                detail: `'${input.addressesDimension}' is not an untested-dimension address; use the exact address from the briefing, e.g. obs_000003_attempt-x#u1`,
-              });
-            }
-            const dimension = yield* findDimensionByPosition({
-              observationId: parsed.observationId,
-              position: parsed.index,
-            }).pipe(
-              Effect.mapError(
-                lift("observation_dimensions", input.addressesDimension),
-              ),
-            );
-            if (Option.isNone(dimension)) {
-              return yield* new MutationError({
-                reason: "invalid",
-                detail: `no untested dimension is recorded at '${input.addressesDimension}'`,
-              });
-            }
-            if (dimension.value.source_goal_id !== input.goalId) {
-              return yield* new MutationError({
-                reason: "invalid",
-                detail: `dimension '${input.addressesDimension}' was raised under goal ${dimension.value.source_goal_id}, and this intent is under goal ${input.goalId}`,
-              });
-            }
-            addressesDimensionId = dimension.value.dimension_id;
-          }
+      const seen = new Set<string>();
+      for (const anchorId of input.anchorObservationIds) {
+        if (seen.has(anchorId)) {
+          return yield* new MutationError({
+            reason: "invalid",
+            detail: `anchor '${anchorId}' is listed twice in anchorObservationIds`,
+          });
+        }
+        seen.add(anchorId);
+        const kinds = yield* classifyAnchor(anchorId).pipe(
+          Effect.mapError(lift("observations", anchorId)),
+        );
+        if (kinds.as_observation_goal === null) {
+          // The instructive refusal §4 asks for: it names what the id *is*, says why
+          // that kind cannot anchor, and gives the way to express a new direction.
+          const what =
+            kinds.as_intent !== null
+              ? "an intent"
+              : kinds.as_goal !== null
+                ? "a goal"
+                : "nothing recorded in this target";
+          return yield* new MutationError({
+            reason: "invalid",
+            detail: `anchor '${anchorId}' is ${what} and cannot anchor an intent. Only a recorded observation may anchor one, never an intent, a goal or a hint, because an intent anchored to another intent is speculation about speculation. Leave anchorObservationIds empty for a new top-level direction.`,
+          });
+        }
+        if (kinds.as_observation_goal !== input.goalId) {
+          return yield* new MutationError({
+            reason: "invalid",
+            detail: `anchor '${anchorId}' is an observation under goal ${kinds.as_observation_goal}, and this intent is under goal ${input.goalId}; an intent anchors to evidence from its own goal`,
+          });
+        }
+      }
 
-          // Advisory, and stored as given: nothing reads these as what ran. An empty
-          // option list becomes null for the reason `canonicalModelOptions` says — it
-          // would claim an opinion — and the rest is sorted so the same suggestion is the
-          // same bytes.
-          const suggestedOptions = canonicalModelOptions(
-            input.suggestedModelOptions ?? null,
-          );
-          yield* sql`INSERT INTO intents (
+      let addressesDimensionId: string | null = null;
+      if (input.addressesDimension !== null) {
+        const parsed = parseDimensionAddress(input.addressesDimension);
+        if (parsed === undefined) {
+          return yield* new MutationError({
+            reason: "invalid",
+            detail: `'${input.addressesDimension}' is not an untested-dimension address; use the exact address from the briefing, e.g. obs_000003_attempt-x#u1`,
+          });
+        }
+        const dimension = yield* findDimensionByPosition({
+          observationId: parsed.observationId,
+          position: parsed.index,
+        }).pipe(
+          Effect.mapError(
+            lift("observation_dimensions", input.addressesDimension),
+          ),
+        );
+        if (Option.isNone(dimension)) {
+          return yield* new MutationError({
+            reason: "invalid",
+            detail: `no untested dimension is recorded at '${input.addressesDimension}'`,
+          });
+        }
+        if (dimension.value.source_goal_id !== input.goalId) {
+          return yield* new MutationError({
+            reason: "invalid",
+            detail: `dimension '${input.addressesDimension}' was raised under goal ${dimension.value.source_goal_id}, and this intent is under goal ${input.goalId}`,
+          });
+        }
+        addressesDimensionId = dimension.value.dimension_id;
+      }
+
+      // The duplicate join, on the id the alias just resolved to rather than on the
+      // alias: two briefings can print one dimension under two addresses only if the
+      // row moves, and the row is what the join has to agree with. Host callers skip
+      // it — an operator adding a second intent on one dimension is making a choice,
+      // and a planner doing it is losing track of what it has already proposed.
+      if (checks !== undefined)
+        yield* checks.afterDimension(addressesDimensionId);
+
+      // Advisory, and stored as given: nothing reads these as what ran. An empty
+      // option list becomes null for the reason `canonicalModelOptions` says — it
+      // would claim an opinion — and the rest is sorted so the same suggestion is the
+      // same bytes.
+      const suggestedOptions = canonicalModelOptions(
+        input.suggestedModelOptions ?? null,
+      );
+      yield* sql`INSERT INTO intents (
               id, goal_id, target_id, question, created_at, addresses_dimension,
               status, suggested_instance_id, suggested_model, suggested_model_options
             ) VALUES (
@@ -3013,27 +3187,24 @@ const makeStore = Effect.fnUntraced(function* () {
               ${suggestedOptions === null ? null : JSON.stringify(suggestedOptions)}
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
 
-          for (const [
-            position,
-            anchorId,
-          ] of input.anchorObservationIds.entries()) {
-            yield* sql`INSERT INTO intent_anchors (
+      for (const [position, anchorId] of input.anchorObservationIds.entries()) {
+        yield* sql`INSERT INTO intent_anchors (
                 intent_id, observation_id, position, created_at
               ) VALUES (
                 ${input.intentId}, ${anchorId}, ${position}, ${createdAt}
               )`.pipe(Effect.mapError(asDatabaseError("transaction")));
-          }
+      }
 
-          const result: AddIntentResult = {
-            intentId: input.intentId,
-            goalId: input.goalId,
-            anchoredTo: input.anchorObservationIds,
-            addressesDimensionId,
-            topLevel: input.anchorObservationIds.length === 0,
-            replayed: false,
-          };
+      const result: AddIntentResult = {
+        intentId: input.intentId,
+        goalId: input.goalId,
+        anchoredTo: input.anchorObservationIds,
+        addressesDimensionId,
+        topLevel: input.anchorObservationIds.length === 0,
+        replayed: false,
+      };
 
-          yield* sql`INSERT INTO command_receipts (
+      yield* sql`INSERT INTO command_receipts (
               key, caller_scope, operation, operation_id, request_hash, result,
               created_at
             ) VALUES (
@@ -3041,41 +3212,57 @@ const makeStore = Effect.fnUntraced(function* () {
               ${requestHash}, ${JSON.stringify(result)}, ${createdAt}
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
 
-          // An event, and deliberately **no** outbox request. A new intent implies no
-          // action outside this database: the queue of intents is the database itself
-          // (§4's atomic claim), not a side-effect queue. Writing a request here would
-          // make the outbox look more exercised than it is, and a mutation that was
-          // obliged to write one would be a design error — this is what shows it is not.
-          // Caller authority is the host's own scope, and intent and attempt are null
-          // because a host-created intent has no attempt: there is nothing to fabricate.
-          yield* appendEvent({
-            kind: "intent.added",
-            targetId: host.targetId,
-            callerScope: host.callerScope,
-            intentId: null,
-            attemptId: null,
-            operation: "add_intent",
-            operationId: input.operationId,
-            subjectId: input.intentId,
-            payload: {
-              intentId: input.intentId,
-              goalId: input.goalId,
-              question: input.question,
-              anchoredTo: input.anchorObservationIds,
-              addressesDimensionId,
-              topLevel: result.topLevel,
-              // What the intent hoped to run on, for the record of what was asked. Not
-              // what ran: that is `attempt.started`.
-              suggestedInstanceId: input.suggestedInstanceId ?? null,
-              suggestedModel: input.suggestedModel ?? null,
-              suggestedModelOptions: suggestedOptions,
-            },
-            recordedAt: createdAt,
-          });
+      // An event, and deliberately **no** outbox request. A new intent implies no
+      // action outside this database: the queue of intents is the database itself
+      // (§4's atomic claim), not a side-effect queue. Writing a request here would
+      // make the outbox look more exercised than it is, and a mutation that was
+      // obliged to write one would be a design error — this is what shows it is not.
+      // Caller authority is the host's own scope, and intent and attempt are null
+      // because a host-created intent has no attempt: there is nothing to fabricate.
+      yield* appendEvent({
+        kind: "intent.added",
+        targetId: host.targetId,
+        callerScope: host.callerScope,
+        intentId: null,
+        attemptId: null,
+        operation: "add_intent",
+        operationId: input.operationId,
+        subjectId: input.intentId,
+        payload: {
+          intentId: input.intentId,
+          goalId: input.goalId,
+          question: input.question,
+          anchoredTo: input.anchorObservationIds,
+          addressesDimensionId,
+          topLevel: result.topLevel,
+          // What the intent hoped to run on, for the record of what was asked. Not
+          // what ran: that is `attempt.started`.
+          suggestedInstanceId: input.suggestedInstanceId ?? null,
+          suggestedModel: input.suggestedModel ?? null,
+          suggestedModelOptions: suggestedOptions,
+        },
+        recordedAt: createdAt,
+      });
 
-          return result;
-        }),
-      )
+      return result;
+    });
+  };
+
+  /**
+   * The host's own path: one intent, created by the process that owns the registry.
+   *
+   * Unchanged in behaviour by this slice. It is the browser's `POST /goals/:id/intents`
+   * and the operator's authority, with no budget, no duplicate join and no goal-status
+   * check — because an operator adding an intent to a goal they are about to end, or a
+   * second intent on one dimension, is making a decision rather than losing track.
+   */
+  const addIntent = Effect.fn("ObservationStore.addIntent")(function* (
+    host: HostContext,
+    input: AddIntentInput,
+  ) {
+    const createdAt = yield* Clock.currentTimeMillis;
+    return yield* sql
+      .withTransaction(addIntentWithin(host, input, createdAt, undefined))
       .pipe(
         Effect.mapError((error) =>
           error._tag === "SqlError"
@@ -3084,6 +3271,138 @@ const makeStore = Effect.fnUntraced(function* () {
         ),
       );
   });
+
+  /**
+   * The planner round's path: the same write, under the round's own authority.
+   *
+   * **It wraps {@link addIntentWithin} rather than reimplementing it**, which is what
+   * keeps §4's anchoring rule, the receipt semantics and the `intent.added` event in one
+   * place. What this adds is the three checks on {@link RoundIntentRefused} plus the
+   * authority path, and all of them run inside the one transaction the write does — which
+   * is the reason the budget is enforced here and not in the round's prompt: two tool
+   * calls from one turn would both read "four added" and both commit a fifth if the check
+   * were outside the write.
+   *
+   * `host` is built from the round's own caller, so the receipt key is namespaced
+   * `<targetId>/round/<roundId>` and the `intent.added` event is attributed to the round.
+   * That is not a convenience — it is what makes {@link countScopedIntents} a count of
+   * *this round's* writes.
+   *
+   * **The goal is the credential's, never the payload's.** `input.goalId` is checked
+   * against the round's and refused if it differs, so a tool handler that passed the wrong
+   * one writes nothing. Reads a round makes may be target-scoped; its writes are
+   * goal-scoped, and this is where that is enforced.
+   */
+  const addRoundIntent = Effect.fn("ObservationStore.addRoundIntent")(
+    function* (caller: CallerContext, input: AddIntentInput) {
+      const planner = yield* roundCallerOrFail(caller, "add an intent");
+      const createdAt = yield* Clock.currentTimeMillis;
+      const host: HostContext = {
+        callerScope: planner.callerScope,
+        targetId: planner.targetId,
+      };
+      const checks: RoundIntentChecks<
+        MutationError | RoundIntentRefused | DatabaseError | StoredRowError
+      > = {
+        beforeValidation: Effect.gen(function* () {
+          if (input.goalId !== planner.goalId) {
+            return yield* new MutationError({
+              reason: "unauthorized",
+              detail: `round ${planner.roundId} plans goal ${planner.goalId} and may not add an intent under goal ${input.goalId}; a round's writes are scoped to the goal its credential names, and nothing was recorded`,
+            });
+          }
+          // The round exists, is this target's and this goal's, is still `running`, and
+          // its fence is the credential's. Four checks, and the goal's status is
+          // deliberately not one of them — see `RoundIntentRefused.goal_ended` for why it
+          // is checked here instead.
+          const round = yield* checkRoundAuthority(planner);
+          const goal = yield* goalAuthorityRow(planner.goalId).pipe(
+            Effect.mapError(lift("goals", planner.goalId)),
+          );
+          if (Option.isSome(goal) && goal.value.status !== "active") {
+            return yield* new RoundIntentRefused({
+              reason: "goal_ended",
+              roundId: planner.roundId,
+              duplicateOf: null,
+              detail: `goal ${planner.goalId} is ${goal.value.status}, so no new work is dispatched under it and this intent was NOT created. You may still record this round's disposition; nothing you add now would be run.`,
+            });
+          }
+          const counted = yield* countScopedIntents(planner.callerScope).pipe(
+            Effect.mapError(lift("command_receipts", planner.callerScope)),
+          );
+          if (counted.added >= round.budget) {
+            return yield* new RoundIntentRefused({
+              reason: "budget_spent",
+              roundId: planner.roundId,
+              duplicateOf: null,
+              detail: `this round's budget of ${String(round.budget)} intent(s) is spent — you have already added ${String(counted.added)} — so this one was NOT created. Stop adding intents and record this round's disposition: 'actionable' is the right answer when the intents you did add are worth running. The budget is a property of the round, so a new operation id will not raise it.`,
+            });
+          }
+        }),
+        afterDimension: (addressesDimensionId) =>
+          Effect.gen(function* () {
+            if (addressesDimensionId === null) return;
+            const clash = yield* findLiveIntentForDimension({
+              goalId: planner.goalId,
+              dimensionId: addressesDimensionId,
+            }).pipe(Effect.mapError(lift("intents", addressesDimensionId)));
+            if (Option.isNone(clash)) return;
+            return yield* new RoundIntentRefused({
+              reason: "duplicate",
+              roundId: planner.roundId,
+              duplicateOf: clash.value.id,
+              detail: `intent ${clash.value.id} is already ${clash.value.status} against '${input.addressesDimension ?? addressesDimensionId}' under this goal, asking: ${clash.value.question}. Two live intents on one untested dimension are two runs answering one question, so this one was NOT created. Address a different dimension, or add a top-level direction with no dimension at all.`,
+            });
+          }),
+      };
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const result = yield* addIntentWithin(
+              host,
+              input,
+              createdAt,
+              checks,
+            );
+            /**
+             * The budget, read back **inside the same transaction as the write**.
+             *
+             * Not a second call the handler makes afterwards, and the difference is not
+             * tidiness: a sweep that settled this round between the write and a follow-up
+             * read would make that read refuse `stale`, and the planner would be told its
+             * successful `add_intent` had failed. In here the count sees the receipt this
+             * transaction just wrote — and on a *replay* it sees the one the original
+             * wrote — so the number is right on both paths.
+             */
+            const round = yield* roundOrFail(planner.roundId);
+            const counted = yield* countScopedIntents(planner.callerScope).pipe(
+              Effect.mapError(lift("command_receipts", planner.callerScope)),
+            );
+            if (round === undefined) {
+              // Unreachable: the write above went through the round's authority path,
+              // which reads this row. Reported rather than defaulted, because a budget
+              // invented for a row that is not there is a budget nobody can check.
+              return yield* new MutationError({
+                reason: "stale",
+                detail: `round ${planner.roundId} is no longer recorded in this target; the intent was written but its budget could not be read back`,
+              });
+            }
+            return {
+              ...result,
+              budget: round.budget,
+              intentsAdded: counted.added,
+            };
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "SqlError"
+              ? asDatabaseError("transaction")(error)
+              : error,
+          ),
+        );
+    },
+  );
 
   const selectGoalById = SqlSchema.findOneOption({
     Request: Schema.String,
@@ -3254,82 +3573,94 @@ const makeStore = Effect.fnUntraced(function* () {
    * the loser would refuse by name instead of overwriting the winner's ending and then
    * appending an event describing a change that did not happen.
    */
-  const endGoal = Effect.fn("ObservationStore.endGoal")(function* (
+  /**
+   * Ending a goal, as the body of a transaction somebody else may already have opened.
+   *
+   * Extracted for one caller: {@link recordRoundDisposition}, where a planner's
+   * `objective_met` has to end the goal **in the same transaction** that records the
+   * disposition. Two transactions would leave a window in which a round has concluded
+   * `objective_met` and the goal is still `active`, and a failure in the second would make
+   * that window permanent — a durable claim that the objective was met beside a goal still
+   * taking new work.
+   *
+   * Same arrangement and same reason as {@link addIntentWithin}: one implementation of the
+   * receipt semantics, the status guard and the `goal.ended` event, reachable from two
+   * entry points.
+   */
+  const endGoalWithin = (
     host: HostContext,
     input: EndGoalInput,
-  ) {
-    const endedAt = yield* Clock.currentTimeMillis;
+    endedAt: number,
+  ) => {
     const key = `${host.callerScope}:end_goal:${input.operationId}`;
     const requestHash = hashRequest(
       { callerScope: host.callerScope, targetId: host.targetId },
       input,
     );
-    return yield* sql
-      .withTransaction(
-        Effect.gen(function* () {
-          const existing = yield* findReceipt(key).pipe(
-            Effect.mapError(lift("command_receipts", key)),
-          );
-          if (Option.isSome(existing)) {
-            const receipt = existing.value;
-            if (receipt.request_hash !== requestHash) {
-              return yield* new MutationError({
-                reason: "conflict",
-                detail: `operation ${input.operationId} was already used with different input`,
-              });
-            }
-            const original = yield* replayResult(
-              key,
-              EndGoalResult,
-              receipt.result,
-            );
-            return { ...original, replayed: true };
-          }
+    return Effect.gen(function* () {
+      const existing = yield* findReceipt(key).pipe(
+        Effect.mapError(lift("command_receipts", key)),
+      );
+      if (Option.isSome(existing)) {
+        const receipt = existing.value;
+        if (receipt.request_hash !== requestHash) {
+          return yield* new MutationError({
+            reason: "conflict",
+            detail: `operation ${input.operationId} was already used with different input`,
+          });
+        }
+        const original = yield* replayResult(
+          key,
+          EndGoalResult,
+          receipt.result,
+        );
+        return { ...original, replayed: true };
+      }
 
-          const found = yield* selectGoalById(input.goalId).pipe(
-            Effect.mapError(lift("goals", input.goalId)),
-          );
-          if (Option.isNone(found)) {
-            return yield* new MutationError({
-              reason: "invalid",
-              detail: `no goal ${input.goalId} exists in this target`,
-            });
-          }
-          const goal = found.value;
-          if (goal.target_id !== host.targetId) {
-            return yield* new MutationError({
-              reason: "invalid",
-              detail: `goal ${input.goalId} belongs to target ${goal.target_id}, not ${host.targetId}`,
-            });
-          }
-          if (goal.status !== "active") {
-            return yield* new MutationError({
-              reason: "conflict",
-              detail: `goal ${input.goalId} is already ${goal.status}, ended by ${goal.ended_by ?? "an unrecorded party"}; an ended goal is not ended again, and a different conclusion is a new goal`,
-            });
-          }
+      const found = yield* selectGoalById(input.goalId).pipe(
+        Effect.mapError(lift("goals", input.goalId)),
+      );
+      if (Option.isNone(found)) {
+        return yield* new MutationError({
+          reason: "invalid",
+          detail: `no goal ${input.goalId} exists in this target`,
+        });
+      }
+      const goal = found.value;
+      if (goal.target_id !== host.targetId) {
+        return yield* new MutationError({
+          reason: "invalid",
+          detail: `goal ${input.goalId} belongs to target ${goal.target_id}, not ${host.targetId}`,
+        });
+      }
+      if (goal.status !== "active") {
+        return yield* new MutationError({
+          reason: "conflict",
+          detail: `goal ${input.goalId} is already ${goal.status}, ended by ${goal.ended_by ?? "an unrecorded party"}; an ended goal is not ended again, and a different conclusion is a new goal`,
+        });
+      }
 
-          const updated = yield* sql<{ id: string }>`UPDATE goals
+      const updated = yield* sql<{ id: string }>`UPDATE goals
             SET status = ${input.status}, ended_at = ${endedAt},
                 ended_by = ${input.endedBy}, end_reason = ${input.reason}
             WHERE id = ${input.goalId} AND status = 'active'
             RETURNING id`.pipe(Effect.mapError(asDatabaseError("transaction")));
-          if (updated.length === 0) {
-            return yield* new MutationError({
-              reason: "conflict",
-              detail: `goal ${input.goalId} was ended by another call before this one could be recorded`,
-            });
-          }
+      if (updated.length === 0) {
+        return yield* new MutationError({
+          reason: "conflict",
+          detail: `goal ${input.goalId} was ended by another call before this one could be recorded`,
+        });
+      }
 
-          const result: EndGoalResult = {
-            goalId: input.goalId,
-            status: input.status,
-            endedBy: input.endedBy,
-            endedAt,
-            replayed: false,
-          };
+      const result: EndGoalResult = {
+        goalId: input.goalId,
+        status: input.status,
+        endedBy: input.endedBy,
+        endedAt,
+        replayed: false,
+      };
 
-          yield* sql`INSERT INTO command_receipts (
+      yield* sql`INSERT INTO command_receipts (
               key, caller_scope, operation, operation_id, request_hash, result,
               created_at
             ) VALUES (
@@ -3337,27 +3668,36 @@ const makeStore = Effect.fnUntraced(function* () {
               ${requestHash}, ${JSON.stringify(result)}, ${endedAt}
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
 
-          yield* appendEvent({
-            kind: "goal.ended",
-            targetId: host.targetId,
-            callerScope: host.callerScope,
-            intentId: null,
-            attemptId: null,
-            operation: "end_goal",
-            operationId: input.operationId,
-            subjectId: input.goalId,
-            payload: {
-              goalId: input.goalId,
-              status: input.status,
-              endedBy: input.endedBy,
-              reason: input.reason,
-            },
-            recordedAt: endedAt,
-          });
+      yield* appendEvent({
+        kind: "goal.ended",
+        targetId: host.targetId,
+        callerScope: host.callerScope,
+        intentId: null,
+        attemptId: null,
+        operation: "end_goal",
+        operationId: input.operationId,
+        subjectId: input.goalId,
+        payload: {
+          goalId: input.goalId,
+          status: input.status,
+          endedBy: input.endedBy,
+          reason: input.reason,
+        },
+        recordedAt: endedAt,
+      });
 
-          return result;
-        }),
-      )
+      return result;
+    });
+  };
+
+  /** Ends a goal once, recording who and why. Records state only: it interrupts nothing. */
+  const endGoal = Effect.fn("ObservationStore.endGoal")(function* (
+    host: HostContext,
+    input: EndGoalInput,
+  ) {
+    const endedAt = yield* Clock.currentTimeMillis;
+    return yield* sql
+      .withTransaction(endGoalWithin(host, input, endedAt))
       .pipe(
         Effect.mapError((error) =>
           error._tag === "SqlError"
@@ -5123,10 +5463,8 @@ const makeStore = Effect.fnUntraced(function* () {
   /**
    * Records what one planner round concluded, under the round's own authority.
    *
-   * The store half of slice 7's `record_round_disposition` tool. **Nothing calls it yet**
-   * — there is no planner loop and no tool — and it is here because it is the write that
-   * makes the round authority path real rather than a type: a round credential can write
-   * this, and an attempt or goal credential cannot.
+   * The store half of `record_round_disposition`. A round credential can write this, and
+   * an attempt or goal credential cannot.
    *
    * Two refusals beyond the authority path's own:
    *
@@ -5137,18 +5475,51 @@ const makeStore = Effect.fnUntraced(function* () {
    *   (`unauthorized`), so a late call from a round that has already been swept records
    *   nothing.
    *
+   * **A round whose budget is spent may still record a disposition**, and nothing here has
+   * to do anything for that to be true: the budget lives on the `add_intent` path alone
+   * (`RoundIntentRefused.budget_spent`), and this write consults it nowhere. Said plainly
+   * because it is a requirement, and a requirement satisfied by an absence is one a later
+   * change can break without noticing.
+   *
    * No receipt key, unlike `addIntent` and `record_observation`. A disposition is
    * idempotent by its own rule — the second call is a conflict whether it is a retry or a
    * change of mind — so a receipt would add a second answer to a question the row already
-   * answers. Slice 7 should confirm that still holds when the tool is written.
+   * answers. Re-confirmed now that the tool exists: the tool has no `operation_id` field,
+   * so there is no retry key a planner could think it had.
+   *
+   * ## `objective_met` ends the goal, in this transaction
+   *
+   * The spec's decision 8: a goal ends when the planner records that the objective is met
+   * or when the operator ends it. So this call does both writes or neither —
+   * {@link endGoalWithin} runs inside the same transaction, with `endedBy: "planner"` and
+   * the planner's own rationale as the reason. Two transactions would leave a window where
+   * the round says `objective_met` and the goal is still taking work, and a failure in the
+   * second would make that window permanent.
+   *
+   * The operation id handed to the ending is **derived**, not minted:
+   * `round:<roundId>:objective_met`. A round concludes once, so there is one such ending
+   * per round by construction, and deriving it means a retry that somehow reached the
+   * ending twice replays its receipt rather than conflicting on it.
+   *
+   * A goal that is **already ended** is not a failure here. `endGoalWithin` refuses it as
+   * a `conflict`, and that refusal is swallowed deliberately: the planner's conclusion
+   * about the goal is true whether or not an operator got there first, and failing the
+   * disposition would discard the round's answer over a race the planner cannot see. What
+   * is not swallowed is anything else the ending fails with — those roll the whole
+   * transaction back, so the disposition is not recorded either.
    */
   const recordRoundDisposition = Effect.fn(
     "ObservationStore.recordRoundDisposition",
-  )(function* (caller: CallerContext, disposition: RoundDisposition) {
+  )(function* (
+    caller: CallerContext,
+    disposition: RoundDisposition,
+    rationale: string,
+  ) {
     const planner = yield* roundCallerOrFail(
       caller,
       "record a round disposition",
     );
+    const recordedAt = yield* Clock.currentTimeMillis;
     return yield* sql
       .withTransaction(
         Effect.gen(function* () {
@@ -5159,11 +5530,63 @@ const makeStore = Effect.fnUntraced(function* () {
               detail: `round ${planner.roundId} already recorded the disposition '${round.disposition}'; a round concludes once, so '${disposition}' was NOT recorded`,
             });
           }
-          yield* sql`UPDATE planner_rounds SET disposition = ${disposition}
+          yield* sql`UPDATE planner_rounds
+              SET disposition = ${disposition},
+                  disposition_rationale = ${rationale}
             WHERE id = ${planner.roundId} AND status = 'running'`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
           );
-          return { roundId: planner.roundId, disposition };
+          let goalEnded = false;
+          if (disposition === "objective_met") {
+            const ended = yield* Effect.result(
+              endGoalWithin(
+                {
+                  callerScope: planner.callerScope,
+                  targetId: planner.targetId,
+                },
+                {
+                  operationId: `round:${planner.roundId}:objective_met`,
+                  goalId: planner.goalId,
+                  status: "met",
+                  endedBy: "planner",
+                  reason: rationale,
+                },
+                recordedAt,
+              ),
+            );
+            if (ended._tag === "Success") {
+              goalEnded = true;
+            } else if (
+              ended.failure._tag === "MutationError" &&
+              ended.failure.reason === "conflict"
+            ) {
+              // Already ended, by an operator or by an earlier call. The round's
+              // conclusion stands; see this function's header.
+              yield* Effect.logInfo(
+                "a planner round concluded objective_met on a goal that was already ended",
+                {
+                  roundId: planner.roundId,
+                  goalId: planner.goalId,
+                  detail: ended.failure.detail,
+                },
+              );
+            } else {
+              return yield* ended.failure;
+            }
+          }
+          // In this transaction, for the reason `addRoundIntent`'s count is in its own:
+          // a follow-up read could race a sweep and refuse a call that succeeded.
+          const counted = yield* countScopedIntents(planner.callerScope).pipe(
+            Effect.mapError(lift("command_receipts", planner.callerScope)),
+          );
+          return {
+            roundId: planner.roundId,
+            disposition,
+            rationale,
+            goalEnded,
+            budget: round.budget,
+            intentsAdded: counted.added,
+          };
         }),
       )
       .pipe(
@@ -5173,6 +5596,40 @@ const makeStore = Effect.fnUntraced(function* () {
             : error,
         ),
       );
+  });
+
+  /**
+   * Every round of one goal, newest first, with how much of its budget it spent.
+   *
+   * `intentsAdded` comes from {@link countScopedIntents} over each round's own caller
+   * scope, which is why it is here rather than on {@link loadRound}: the number is a join
+   * against another table and a caller that wanted only the row should not pay for it.
+   *
+   * Read-only, and the rows rather than what this process is supervising. A row that says
+   * `running` is not the same claim as a round in flight — see `RunningRound` in
+   * `@bit/contracts` — and the two answers are deliberately two reads.
+   */
+  const roundsForGoal = Effect.fn("ObservationStore.roundsForGoal")(function* (
+    goalId: string,
+  ) {
+    const rows = yield* selectRoundsForGoal(goalId).pipe(
+      Effect.mapError(lift("planner_rounds", goalId)),
+    );
+    return yield* Effect.forEach(rows, (row) =>
+      Effect.map(
+        countScopedIntents(
+          callerScopeOf({
+            _tag: "round",
+            targetId: row.target_id,
+            roundId: row.id,
+          }),
+        ).pipe(Effect.mapError(lift("command_receipts", row.id))),
+        (counted) => ({
+          ...toStoredRound(row),
+          intentsAdded: counted.added,
+        }),
+      ),
+    );
   });
 
   const EventRow = Schema.Struct({
@@ -5481,6 +5938,7 @@ const makeStore = Effect.fnUntraced(function* () {
     seedAttempt,
     recordAsset,
     addIntent,
+    addRoundIntent,
     openGoal,
     endGoal,
     goals,
@@ -5520,6 +5978,7 @@ const makeStore = Effect.fnUntraced(function* () {
     callerAuthority,
     openRound,
     loadRound,
+    roundsForGoal,
     roundsLeftRunning,
     bindSessionToRound,
     settleRound,
@@ -5607,6 +6066,23 @@ export class ObservationStore extends Context.Service<
     ) => Effect.Effect<
       AddIntentResult,
       MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * The same write under a planner round's own authority, with the three refusals only
+     * a round can earn. Wraps {@link addIntent}'s transaction body; see the
+     * implementation.
+     */
+    readonly addRoundIntent: (
+      caller: CallerContext,
+      input: AddIntentInput,
+    ) => Effect.Effect<
+      AddIntentResult & {
+        /** The round's budget, from its row. */
+        readonly budget: number;
+        /** How many intents it has now added, this one included. */
+        readonly intentsAdded: number;
+      },
+      MutationError | RoundIntentRefused | DatabaseError | StoredRowError
     >;
     /**
      * Creates a goal, receipt-keyed like {@link addIntent}. See the implementation for
@@ -5879,13 +6355,38 @@ export class ObservationStore extends Context.Service<
     /**
      * Records what a round concluded, under the round's own authority. Refuses a caller
      * of any other kind, and a round that already concluded.
+     *
+     * `objective_met` also ends the goal `met`, `endedBy: "planner"`, in the same
+     * transaction. `goalEnded` says whether this call was the one that did it — false when
+     * the goal had already been ended, which is not an error. See the implementation.
      */
     readonly recordRoundDisposition: (
       caller: CallerContext,
       disposition: RoundDisposition,
+      /** Why, in the planner's own words. Stored as given; empty is accepted. */
+      rationale: string,
     ) => Effect.Effect<
-      { readonly roundId: string; readonly disposition: RoundDisposition },
+      {
+        readonly roundId: string;
+        readonly disposition: RoundDisposition;
+        readonly rationale: string;
+        readonly goalEnded: boolean;
+        readonly budget: number;
+        readonly intentsAdded: number;
+      },
       MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * Every round of one goal, newest first, each with how many intents it added.
+     *
+     * The rows, not what this process is supervising: `running` here means the row was
+     * never settled, which a dead process can leave behind.
+     */
+    readonly roundsForGoal: (
+      goalId: string,
+    ) => Effect.Effect<
+      readonly (StoredRound & { readonly intentsAdded: number })[],
+      DatabaseError | StoredRowError
     >;
   }
 >()("bit/persistence/ObservationStore") {

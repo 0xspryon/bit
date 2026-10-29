@@ -1177,6 +1177,38 @@ const keyPlannerLineageByGoal = statements(
 );
 
 /**
+ * `0020` — a round's disposition gets the reasoning that goes with it.
+ *
+ * `0018` gave `planner_rounds` a `disposition` column holding one of four words. Four
+ * words is the whole of what a round concluded, and it is not enough to read: `waiting`
+ * does not say what it is waiting for, and `no_useful_next_action` — the one disposition
+ * that is a judgement rather than an observation — does not say what was considered and
+ * ruled out. The planner is asked for a rationale when it records a disposition, and this
+ * is where that sentence lives.
+ *
+ * **Nullable, and null means exactly one thing: no disposition was recorded.** The two
+ * columns move together — `record_round_disposition` writes both in one statement and
+ * nothing else writes either — so a row with a disposition and no rationale, or a
+ * rationale and no disposition, is not a state this store can produce. No `CHECK`
+ * enforcing that pairing, for the reason `0016` gives: the store owns the invariant, and a
+ * constraint violation surfaces to the writer as an `INSERT` failing for a reason it
+ * cannot see.
+ *
+ * **What an existing row looks like afterwards: null, including a round that already
+ * recorded a disposition.** There is no back-fill and there is nothing to back-fill from —
+ * the rationale was never collected, and inventing one would be putting words in a
+ * planner's mouth. A reader therefore cannot tell "this round gave no reason" from "this
+ * round predates the column", and that is accepted rather than papered over: nothing has
+ * been published, and no round on any existing database has a disposition at all, because
+ * until this slice nothing called `recordRoundDisposition`.
+ *
+ * No index: the column is read only with the row it sits on.
+ */
+const addRoundDispositionRationale = statements(
+  `ALTER TABLE planner_rounds ADD COLUMN disposition_rationale TEXT`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1213,6 +1245,7 @@ export const MIGRATIONS: Record<
   "0017_intent_lifecycle": addIntentLifecycle,
   "0018_planner_rounds": addPlannerRounds,
   "0019_planner_lineage_by_goal": keyPlannerLineageByGoal,
+  "0020_round_disposition_rationale": addRoundDispositionRationale,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

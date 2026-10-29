@@ -56,7 +56,13 @@ import { Context, Effect, Layer } from "effect";
 import { HttpRouter, HttpServerResponse } from "effect/http";
 
 import { McpCredentials } from "../mcp/credentials";
-import { MCP_PATH, McpApplicationLayer, McpCallCounter } from "../mcp/server";
+import {
+  MCP_PATH,
+  PLANNER_MCP_PATH,
+  McpCallCounter,
+  mcpApplicationLayer,
+} from "../mcp/server";
+import type { PlannerHarnesses } from "../mcp/plannerTools";
 import { TargetStores } from "../persistence/targetStores";
 import {
   POLICY_DECIDE_PATH,
@@ -158,8 +164,17 @@ export type ControlPlaneRoutes = Layer.Layer<
 export interface ControlPlaneHandle {
   /** `http://127.0.0.1:<port>`, the one origin every route below sits on. */
   readonly origin: string;
-  /** Where the worker's MCP client connects. */
+  /** Where a **worker attempt**'s MCP client connects. `record_observation` is here. */
   readonly mcpUrl: string;
+  /**
+   * Where a **planner round**'s MCP client connects.
+   *
+   * A second URL rather than the same one, because the two endpoints advertise different
+   * tool lists and each refuses the other's credential. `mcp/server.ts`'s header sets out
+   * why the role boundary is a path *and* a grant check rather than a filter over one
+   * toolkit.
+   */
+  readonly plannerMcpUrl: string;
   /** Where the harness-side policy hook posts. */
   readonly policyUrl: string;
   /** Liveness, on the same origin as the other two. */
@@ -188,6 +203,17 @@ export class ControlPlaneEndpoint extends Context.Service<
     /** Merged onto the same router. See {@link ControlPlaneRoutes}. */
     readonly extraRoutes?: ControlPlaneRoutes | undefined;
     /**
+     * The harness catalogue the planner's `list_harnesses` answers from.
+     *
+     * Passed as a **layer carrying an already-reduced list** rather than as the
+     * `HarnessResolver` itself, for the reason the body below gives about the router's own
+     * memo map: a requirement crossing that boundary is built a second time, and a second
+     * resolver means a second set of built harnesses. Omitted — which is what every test
+     * and every spike does — the planner is told this server configures none, which for a
+     * caller that has not passed one is true.
+     */
+    readonly harnesses?: Layer.Layer<PlannerHarnesses> | undefined;
+    /**
      * Seconds a connection may be idle, overriding {@link CONTROL_PLANE_IDLE_TIMEOUT}.
      *
      * For tests, and only for tests: the claim worth checking is that a heartbeat keeps a
@@ -213,7 +239,11 @@ export class ControlPlaneEndpoint extends Context.Service<
         // rebuilt: the store's connection and the credential registry are the ones the
         // rest of the program already holds.
         const application = Layer.mergeAll(
-          McpApplicationLayer,
+          mcpApplicationLayer(
+            options.harnesses === undefined
+              ? {}
+              : { harnesses: options.harnesses },
+          ),
           policyRoutes(options.policy),
           healthRoutes,
           options.extraRoutes ?? Layer.empty,
@@ -249,6 +279,7 @@ export class ControlPlaneEndpoint extends Context.Service<
         return ControlPlaneEndpoint.of({
           origin,
           mcpUrl: `${origin}${MCP_PATH}`,
+          plannerMcpUrl: `${origin}${PLANNER_MCP_PATH}`,
           policyUrl: `${origin}${POLICY_DECIDE_PATH}`,
           healthUrl: `${origin}${HEALTH_PATH}`,
           callCount: counter.count,

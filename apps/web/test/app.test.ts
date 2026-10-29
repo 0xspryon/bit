@@ -24,6 +24,7 @@ import {
   IntentRefused,
   LIVE_SILENCE_LIMIT_SECONDS,
   PathRefused,
+  PlanRefused,
   RunRefused,
   SessionRefused,
   TargetNotFound,
@@ -47,9 +48,12 @@ import {
   liveItem,
   liveOpened,
   ok,
+  planRoundStarted,
+  planRoundView,
   refused,
   runStarted,
   runningAttempt,
+  runningRound,
   sessionProbe,
   targetSummary,
   targetView,
@@ -1374,6 +1378,238 @@ describe("the goal briefing", () => {
 
     expect(app.goalBriefing?.goalId).toBe("goal_2");
     expect(app.goalBriefing?.rendered).toContain("goal_2");
+  });
+});
+
+describe("planning a goal", () => {
+  /** Signs in, opens a target holding one active goal, and opens that goal. */
+  const onGoal = async (
+    arrange: (fake: FakeServer) => void = () => {},
+  ): Promise<[App, FakeServer]> => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onHarnesses = () => ok([harnessInstance()]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1" })] });
+    arrange(fake);
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+    return [app, fake];
+  };
+
+  test("opening a goal reads its rounds and what the process is driving", async () => {
+    const [app, fake] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({ rounds: [planRoundView({ targetId, goalId })] });
+    });
+
+    expect(app.planRoundsState).toBe("ready");
+    expect(app.planRoundsGoalId).toBe("goal_1");
+    // The newest row is what the screen reports: "the round's disposition once recorded"
+    // is a statement about the last one.
+    expect(app.latestPlanRound?.disposition).toBe("actionable");
+    expect(app.latestPlanRound?.dispositionRationale).toContain("no work out");
+    expect(app.latestPlanRound?.intentsAdded).toBe(2);
+    // Both reads happen, because the rows and what this process is driving are different
+    // questions and only the second can disable the control.
+    expect(fake.calls.map((call) => call.method)).toContain("goalRounds");
+    expect(fake.calls.map((call) => call.method)).toContain("rounds");
+
+    app.closeGoal();
+    expect(app.planRounds).toEqual([]);
+    expect(app.planRoundsGoalId).toBe("");
+    expect(app.planRoundsState).toBe("idle");
+  });
+
+  test("a round in flight is the process's answer, not a row saying running", async () => {
+    // The distinction the control turns on. The row says `running` and nothing is driving
+    // it — a process that died leaves exactly this — so the operator is not told to wait
+    // for a round that will never finish.
+    const [stale] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({
+          rounds: [
+            planRoundView({
+              targetId,
+              goalId,
+              status: "running",
+              disposition: null,
+              dispositionRationale: null,
+              endedAt: null,
+            }),
+          ],
+        });
+      fake.onRounds = () => ok([]);
+    });
+    expect(stale.latestPlanRound?.status).toBe("running");
+    expect(stale.openGoalRunningRound).toBeUndefined();
+
+    const [live] = await onGoal((fake) => {
+      fake.onRounds = () => ok([runningRound({ goalId: "goal_1" })]);
+    });
+    expect(live.openGoalRunningRound?.roundId).toBe("rnd_1");
+  });
+
+  test("Plan next sends no payload and re-reads both lists", async () => {
+    const [app, fake] = await onGoal();
+    fake.calls.length = 0;
+
+    await app.plan();
+    await settle();
+
+    const planned = fake.calls.find((call) => call.method === "plan");
+    // Target and goal, and nothing else: no harness, no model, no directory.
+    expect(planned?.args).toEqual([expect.any(String), "acme-corp", "goal_1"]);
+    expect(app.planDetail).toBe("");
+    expect(app.planStarting).toBe(false);
+    const after = fake.calls.map((call) => call.method);
+    expect(after).toContain("goalRounds");
+    expect(after).toContain("rounds");
+  });
+
+  test("the started round is on screen before the re-reads land", async () => {
+    // The claim the comment on `plan()` makes, and the one the control depends on: the
+    // button is disabled on what this *process* is driving, so waiting for a read to say so
+    // would leave it pressable for a round that has already started. Held reads are what
+    // make "before" observable at all.
+    const [app, fake] = await onGoal((fake) => {
+      fake.onPlan = (_baseUrl, targetId, goalId) =>
+        ok(planRoundStarted({ targetId, goalId, roundId: "rnd_new" }));
+    });
+    const releaseRounds = fake.hold("goalRounds");
+    const releaseRunning = fake.hold("rounds");
+
+    const pending = app.plan();
+    await pending;
+
+    // Both halves, with neither read answered yet.
+    expect(app.latestPlanRound?.roundId).toBe("rnd_new");
+    expect(app.latestPlanRound?.status).toBe("running");
+    // Nothing invented: a round that has just started has concluded nothing and written
+    // nothing.
+    expect(app.latestPlanRound?.disposition).toBeNull();
+    expect(app.latestPlanRound?.dispositionRationale).toBeNull();
+    expect(app.latestPlanRound?.intentsAdded).toBe(0);
+    expect(app.latestPlanRound?.endedAt).toBeNull();
+    // And the control is already in its in-flight state.
+    expect(app.openGoalRunningRound?.roundId).toBe("rnd_new");
+
+    releaseRounds();
+    releaseRunning();
+    await settle();
+    // The server's own answer replaces it rather than being appended beside it.
+    expect(
+      app.planRounds.filter((round) => round.roundId === "rnd_new"),
+    ).toHaveLength(0);
+  });
+
+  test("a round started on a goal the operator has since left is not placed", async () => {
+    const [app, fake] = await onGoal((fake) => {
+      fake.onPlan = (_baseUrl, targetId) =>
+        ok(planRoundStarted({ targetId, goalId: "goal_1" }));
+    });
+    const release = fake.hold("plan");
+    const pending = app.plan();
+    app.closeGoal();
+    release();
+    await pending;
+    await settle();
+
+    expect(app.planRounds).toEqual([]);
+  });
+
+  test("a refusal is the server's sentence, and the world is re-read", async () => {
+    const [app, fake] = await onGoal();
+    fake.onPlan = () =>
+      refused(
+        new PlanRefused({
+          reason: "goal_busy",
+          detail:
+            "round rnd_9 is already planning goal goal_1 (target 'acme-corp'). One planner round works a goal at a time.",
+        }),
+      );
+    fake.calls.length = 0;
+
+    await app.plan();
+    await settle();
+
+    // Shown as written — the sentence names the round holding the goal, which is the one
+    // thing an operator needs — and **not** reported as "no server answered".
+    expect(app.planDetail).toContain("rnd_9 is already planning");
+    expect(app.planRefusalSize).toBeUndefined();
+    // A refusal can mean the world moved, so both are read again.
+    const after = fake.calls.map((call) => call.method);
+    expect(after).toContain("rounds");
+    expect(after).toContain("goal");
+  });
+
+  test("a briefing over the ceiling keeps both numbers and says nothing was started", async () => {
+    const [app, fake] = await onGoal();
+    fake.onPlan = () =>
+      refused(
+        new GoalBriefingRefused({
+          reason: "too_large",
+          goalId: "goal_1",
+          sizeChars: 400_000,
+          maxChars: 320_000,
+          detail:
+            "This goal's briefing renders to 400000 characters, over the 320000-character ceiling, so no planner round was opened and nothing was started.",
+        }),
+      );
+
+    await app.plan();
+    await settle();
+
+    // The same refusal the briefing panel renders, with the same two numbers kept as
+    // numbers so the control can name them without parsing prose.
+    expect(app.planRefusalSize).toBe(400_000);
+    expect(app.planRefusalCeiling).toBe(320_000);
+    expect(app.planDetail).toContain("nothing was started");
+  });
+
+  test("a server that does not answer is said to be unreachable, not a refusal", async () => {
+    const [app, fake] = await onGoal();
+    fake.onPlan = () => unreachable("Unable to connect");
+
+    await app.plan();
+    await settle();
+
+    expect(app.planDetail).toBe("No server answered at this address.");
+    expect(app.planRefusalSize).toBeUndefined();
+  });
+
+  test("a round record on the live stream re-reads the rounds, and nothing else does", async () => {
+    const [, fake] = await onGoal();
+    // History replays on opening a target, so nothing in it may cause a request per item.
+    fake.watch.send(liveOpened({ from: 0, latest: 3 }));
+    fake.watch.send(
+      liveItem({ id: "record:r0", sequence: 1, kind: "plan.round.started" }),
+    );
+    await settle();
+    const replayed = fake.countOf("goalRounds");
+    fake.watch.send(liveCursor({ sequence: 1, caughtUp: true }));
+
+    // Not a round record: `intentsAdded` moves only when the round writes, and a round's
+    // own two records are the siblings of that write.
+    fake.watch.send(
+      liveItem({ id: "record:r1", sequence: 2, kind: "observation.recorded" }),
+    );
+    await settle();
+    expect(fake.countOf("goalRounds")).toBe(replayed);
+
+    const before = fake.countOf("rounds");
+    fake.watch.send(
+      liveItem({ id: "record:r2", sequence: 3, kind: "plan.round.settled" }),
+    );
+    await settle();
+    expect(fake.countOf("goalRounds")).toBe(replayed + 1);
+    // And what the process is driving, because the settled record is what takes the round
+    // out of the supervisor's map — a panel that refreshed only the rows would keep saying
+    // a round was in flight after it had finished.
+    expect(fake.countOf("rounds")).toBe(before + 1);
   });
 });
 

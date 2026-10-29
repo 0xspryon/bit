@@ -77,6 +77,7 @@ import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
 import type { NarrationDetail } from "../harness/agentHarness";
 import { LIVE_HEARTBEAT } from "../run/liveTranscript";
 import { RunNarrations } from "../run/narration";
+import { PlanSupervisor } from "../plan/planSupervisor";
 import { RunSupervisor, type RunInput } from "../run/supervisor";
 import { PolicyDecisions, type PolicyConfig } from "../policy/service";
 
@@ -213,6 +214,10 @@ const endpoint = Layer.unwrap(
         // gate's request carries a harness session id and the live route resolves it against
         // the runs the supervisor is holding. See {@link SUPERVISED}.
         Layer.provide(supervisorHolding),
+        // No harness, so every `POST .../plan` is refused `no_harness` by name — which is
+        // what a server without one really answers, and what the goal screen's control
+        // has to render. A real plan supervisor would need an agent to drive.
+        Layer.provide(PlanSupervisor.unavailable),
         /**
          * Two configured instances, one of which would not start.
          *
@@ -2894,6 +2899,145 @@ describe("a goal's planner briefing", () => {
   });
 });
 
+/* ── The planner routes ──────────────────────────────────────────────────────── */
+
+describe("opening a planner round over HTTP", () => {
+  let counter = 0;
+
+  const freshTarget = async () => {
+    counter += 1;
+    const name = `plan-${String(counter)}`;
+    mkdirSync(join(workspaceRoot, name), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: { workspacePath: join(workspaceRoot, name), name, scopeNote: "" },
+      }),
+    );
+    expect(created.status).toBe(200);
+    return name;
+  };
+
+  const newGoal = async (targetId: string) => {
+    const created = await read(
+      await signedIn(`/targets/${targetId}/goals`, {
+        method: "POST",
+        body: {
+          name: "Login limiter",
+          description: "Can the login limiter be bypassed?",
+        },
+      }),
+    );
+    expect(created.status).toBe(201);
+    return String(created.body["goalId"]);
+  };
+
+  test("there is no payload: the route takes a target and a goal and nothing else", async () => {
+    // Asserted by sending a body that names a harness, a model and a directory, and
+    // getting the *same* refusal as sending nothing. A round's directory and its harness
+    // are the server's; a route that read them from a browser would be letting a browser
+    // choose where an agent runs.
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const path = `/targets/${targetId}/goals/${goalId}/plan`;
+
+    const bare = await read(await signedIn(path, { method: "POST" }));
+    const stuffed = await read(
+      await signedIn(path, {
+        method: "POST",
+        body: {
+          instanceId: "opencode",
+          model: "gpt",
+          workspace: "/etc",
+          briefingMaxChars: 1,
+        },
+      }),
+    );
+    expect(bare.status).toBe(stuffed.status);
+    expect(bare.body["reason"]).toBe(stuffed.body["reason"]);
+  });
+
+  test("a server with no harness refuses by name, as a 409 a client can read", async () => {
+    // This suite drives `PlanSupervisor.unavailable`, which is what a server with
+    // `HARNESS=0` really has. The point of the assertion is the *shape*: `PlanRefused` has
+    // to arrive as a typed answer the goal screen can put in a sentence, not as a 500.
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+
+    const response = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/plan`, {
+        method: "POST",
+      }),
+    );
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      _tag: "PlanRefused",
+      reason: "no_harness",
+    });
+    expect(String(response.body["detail"])).toContain("HARNESS");
+  });
+
+  test("a goal nobody created, and another target's goal, are a 404 before anything is claimed", async () => {
+    const targetId = await freshTarget();
+    const other = await freshTarget();
+    const othersGoal = await newGoal(other);
+    for (const goalId of ["goal_nonesuch", othersGoal]) {
+      const response = await read(
+        await signedIn(`/targets/${targetId}/goals/${goalId}/plan`, {
+          method: "POST",
+        }),
+      );
+      expect(response.status).toBe(404);
+      expect(response.body).toMatchObject({ _tag: "GoalNotFound", goalId });
+    }
+  });
+
+  test("a goal with no rounds answers an empty list, not a 404", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const response = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/rounds`),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ rounds: [] });
+  });
+
+  test("the rounds of a goal this target does not hold are a 404", async () => {
+    const targetId = await freshTarget();
+    const response = await read(
+      await signedIn(`/targets/${targetId}/goals/goal_nonesuch/rounds`),
+    );
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({ _tag: "GoalNotFound" });
+  });
+
+  test("the process-wide round list is a different question from the rows", async () => {
+    // Empty here because this suite's supervisor drives nothing, which is the honest
+    // answer and is exactly the case the control has to tell apart from a row that says
+    // `running`: a row a dead process left behind has no fiber, and nothing will settle it
+    // until the next startup sweep.
+    // Read without {@link read}, which types its body as an object: this endpoint answers
+    // a bare array, like `/runs` does.
+    const response = await signedIn("/rounds");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual([]);
+  });
+
+  test("the planner routes are behind the session guard, like every other fleet route", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    for (const [path, method] of [
+      [`/targets/${targetId}/goals/${goalId}/plan`, "POST"],
+      [`/targets/${targetId}/goals/${goalId}/rounds`, "GET"],
+      ["/rounds", "GET"],
+    ] as const) {
+      const response = await read(await call(path, { method }));
+      expect(response.status).toBe(401);
+      expect(response.body).toMatchObject({ _tag: "Unauthenticated" });
+    }
+  });
+});
+
 describe("a live connection that has nothing to say", () => {
   /** Scaled down together, at a ratio wider than the shipped 60:20. */
   const IDLE_TIMEOUT_SECONDS = 2;
@@ -2932,6 +3076,11 @@ describe("a live connection that has nothing to say", () => {
             Layer.provide(TargetStores.layer.pipe(Layer.provide(ownFleet))),
             Layer.provide(ownFleet),
             Layer.provide(supervisorHolding),
+            Layer.provide(PlanSupervisor.unavailable),
+            // No harness, so every `POST .../plan` is refused `no_harness` by name — which is
+            // what a server without one really answers, and what the goal screen's control
+            // has to render. A real plan supervisor would need an agent to drive.
+            Layer.provide(PlanSupervisor.unavailable),
             Layer.provide(HarnessResolver.empty),
             Layer.provide(Layer.succeedContext(shared)),
             Layer.orDie,

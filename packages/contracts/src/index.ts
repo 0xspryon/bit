@@ -11,6 +11,7 @@ export * from "./briefing";
 export * from "./asset";
 export * from "./intent";
 export * from "./goal";
+export * from "./plan";
 export * from "./event";
 export * from "./live";
 export * from "./unknownField";

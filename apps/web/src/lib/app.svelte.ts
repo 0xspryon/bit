@@ -40,7 +40,10 @@ import {
   type LiveFrame,
   type LiveItem,
   type ModelOptionSelection,
+  type PlanRoundStarted,
+  type PlanRoundView,
   type RunningAttempt,
+  type RunningRound,
   type TargetView,
   type TargetCounts,
   type TargetSummary,
@@ -361,6 +364,61 @@ export class App {
   goalBriefingSize = $state<number | undefined>(undefined);
   /** The ceiling the refusal named. Also `undefined` for a failure that had none. */
   goalBriefingCeiling = $state<number | undefined>(undefined);
+
+  /* ── Planner rounds ───────────────────────────────────────────────────────── */
+  /**
+   * The open goal's planner rounds, newest first, as the server last told us.
+   *
+   * One goal's at a time, like {@link intents} and {@link goalBriefing}:
+   * {@link planRoundsGoalId} says whose, and nothing reads this without agreeing with
+   * {@link openGoalId}. These are the **rows**, which is where a settled round's
+   * disposition lives — the only place it survives a refresh.
+   */
+  planRounds = $state<PlanRoundView[]>([]);
+  planRoundsGoalId = $state("");
+  planRoundsState = $state<GoalsState>("idle");
+  /** The server's own words when the rounds could not be read. */
+  planRoundsDetail = $state("");
+
+  /**
+   * The rounds this server is supervising right now, across every target.
+   *
+   * **A different question from {@link planRounds} and the difference decides what the
+   * control says.** A row saying `running` can be one a dead process left behind, and
+   * nothing will settle it until the next startup sweep; a round in this list has a fiber
+   * driving it. So "a planner is working on this goal — wait for it" is answered from
+   * here, and "the last round concluded X" from the rows.
+   */
+  runningRounds = $state<RunningRound[]>([]);
+
+  /** True while a `POST .../plan` is in flight, so the button can spin exactly once. */
+  planStarting = $state(false);
+  /**
+   * Why a round was refused, in the server's words, shown beside the control.
+   *
+   * Every reason `PlanRefused` carries is a sentence written for an operator, and an
+   * over-the-ceiling briefing arrives as `GoalBriefingRefused` with its two numbers in
+   * {@link planRefusalSize} and {@link planRefusalCeiling} so the control can name them
+   * without parsing the sentence.
+   */
+  planDetail = $state("");
+  planRefusalSize = $state<number | undefined>(undefined);
+  planRefusalCeiling = $state<number | undefined>(undefined);
+
+  /** The round this process is driving on the open goal, if there is one. */
+  openGoalRunningRound = $derived(
+    this.runningRounds.find((round) => round.goalId === this.openGoalId),
+  );
+
+  /**
+   * The open goal's most recent round, by the server's own ordering.
+   *
+   * `planRounds` is newest first, so this is the head. It is what the goal screen reports:
+   * "the round's disposition once recorded" is a statement about the last one.
+   */
+  latestPlanRound = $derived(
+    this.planRoundsGoalId === this.openGoalId ? this.planRounds[0] : undefined,
+  );
 
   /* ── Intents ──────────────────────────────────────────────────────────────── */
   /**
@@ -1043,6 +1101,26 @@ export class App {
     this.goalEndDetail = "";
     this.#clearIntents();
     this.#clearGoalBriefing();
+    this.#clearPlanRounds();
+  }
+
+  /**
+   * Puts every planner-round field back where a fresh goal leaves it.
+   *
+   * {@link runningRounds} is **not** cleared here, for the reason {@link runs} is not: it
+   * is a fact about the process rather than about the goal on screen, and blanking it on
+   * every navigation would make the control forget a round is in flight for as long as the
+   * next poll takes.
+   */
+  #clearPlanRounds() {
+    this.planRounds = [];
+    this.planRoundsGoalId = "";
+    this.planRoundsState = "idle";
+    this.planRoundsDetail = "";
+    this.planStarting = false;
+    this.planDetail = "";
+    this.planRefusalSize = undefined;
+    this.planRefusalCeiling = undefined;
   }
 
   /** Puts every goal-briefing field back where a fresh goal leaves it. */
@@ -1149,9 +1227,15 @@ export class App {
     // same goes for its briefing — which names its own goal in its first lines.
     this.#clearIntents();
     this.#clearGoalBriefing();
+    this.#clearPlanRounds();
     void this.refreshGoal(goalId);
     void this.loadIntents(goalId);
     void this.loadGoalBriefing(goalId);
+    void this.loadPlanRounds(goalId);
+    // What the *process* is driving, which the rows cannot answer. Read on opening a goal
+    // so a reloaded tab knows at once whether a round is in flight rather than finding out
+    // when the button is refused.
+    void this.loadRunningRounds();
   }
 
   closeGoal() {
@@ -1160,6 +1244,7 @@ export class App {
     this.goalEndDetail = "";
     this.#clearIntents();
     this.#clearGoalBriefing();
+    this.#clearPlanRounds();
   }
 
   /** Replaces one goal in the list with the server's current answer about it. */
@@ -1315,6 +1400,186 @@ export class App {
     } finally {
       this.goalEnding = false;
     }
+  }
+
+  /* ── Planner rounds ──────────────────────────────────────────────────────── */
+
+  /**
+   * Reads the open goal's planner rounds into {@link planRounds}.
+   *
+   * **It reads. It does not navigate**, like {@link loadIntents}: it asks about the goal
+   * the view already names, and an answer for a goal or target the operator has since left
+   * is dropped. The list is kept while it reloads *if it is this goal's*, so a refresh
+   * after a round settles does not blank what is on screen.
+   */
+  async loadPlanRounds(goalId: string) {
+    const targetId = this.viewTargetId;
+    if (targetId === "" || this.openGoalId !== goalId) return;
+    if (this.planRoundsGoalId !== goalId) {
+      this.planRounds = [];
+      this.planRoundsGoalId = goalId;
+    }
+    this.planRoundsState = "loading";
+    this.planRoundsDetail = "";
+
+    const call = await this.client.goalRounds(this.serverUrl, targetId, goalId);
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+
+    if (call._tag === "Unreachable") {
+      this.planRoundsState = "failed";
+      this.planRoundsDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.planRoundsState = "failed";
+      this.planRoundsDetail = this.#refusalText(
+        call.error,
+        "This goal's planner rounds could not be read.",
+      );
+      return;
+    }
+    this.planRounds = call.value.rounds.map((round) => ({ ...round }));
+    this.planRoundsState = "ready";
+  }
+
+  /**
+   * Reads what the server is supervising right now into {@link runningRounds}.
+   *
+   * Process-wide and not goal-scoped, so there is nothing to drop an answer against and no
+   * failure to render: a read that did not land leaves the last answer, and the control
+   * falls back to the server's own refusal if it was wrong. The alternative — a banner
+   * saying the round list could not be read — would be a second place to report a
+   * connectivity problem the rest of the page already reports.
+   */
+  async loadRunningRounds() {
+    const call = await this.client.rounds(this.serverUrl);
+    if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+      this.signOut("expired");
+      return;
+    }
+    if (call._tag !== "Ok") return;
+    this.runningRounds = call.value.map((round) => ({ ...round }));
+  }
+
+  /**
+   * Opens a planner round on the open goal.
+   *
+   * It sends no body: the round's directory, its audit path, its harness and its prompt
+   * are all the server's. It returns as soon as the round is prompted, so the button is
+   * released long before the round finishes — what happens after that shows up in
+   * {@link planRounds} and, from slice 8, in the round's own view.
+   *
+   * The two refusals that are not generic are handled by name. `GoalBriefingRefused`
+   * carries the briefing's size and the ceiling, which the control prints: the round
+   * started nothing, so the honest message names both numbers rather than saying the
+   * planner failed. `GoalRefused`-shaped cases arrive inside `PlanRefused` with the
+   * server's sentence, which is written for an operator and is shown as written.
+   */
+  async plan() {
+    const targetId = this.viewTargetId;
+    const goalId = this.openGoalId;
+    if (targetId === "" || goalId === "" || this.planStarting) return;
+    this.planStarting = true;
+    this.planDetail = "";
+    this.planRefusalSize = undefined;
+    this.planRefusalCeiling = undefined;
+    try {
+      const call = await this.client.plan(this.serverUrl, targetId, goalId);
+      if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+      if (call._tag === "Unreachable") {
+        this.planDetail = "No server answered at this address.";
+        return;
+      }
+      if (call._tag === "Refused") {
+        if (call.error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        if (call.error._tag === "GoalBriefingRefused") {
+          this.planRefusalSize = call.error.sizeChars;
+          this.planRefusalCeiling = call.error.maxChars;
+        }
+        this.planDetail = this.#refusalText(
+          call.error,
+          "No planner round was opened.",
+        );
+        // A refusal can mean the world moved: a goal ended in another tab, or a round
+        // already running. Re-reading both says which, and replaces a control that no
+        // longer applies with the state that does.
+        void this.loadRunningRounds();
+        void this.refreshGoal(goalId);
+        return;
+      }
+      // The round the server just started, placed at once rather than after a round trip,
+      // the way `startRun` puts its own answer straight into `runs`. Both halves: the row
+      // list so the round appears, and `runningRounds` so the control switches to the
+      // in-flight state on the same tick — the button is disabled on what this *process* is
+      // driving, and waiting for a read to say so would leave it pressable for a round that
+      // has already started. The reads below then replace both with the server's answer.
+      this.#placePlanRound(call.value);
+      void this.loadRunningRounds();
+      void this.loadPlanRounds(goalId);
+    } finally {
+      this.planStarting = false;
+    }
+  }
+
+  /**
+   * Puts a just-started round at the head of {@link planRounds} and into
+   * {@link runningRounds}.
+   *
+   * **It builds a `PlanRoundView` from a `PlanRoundStarted`, which is a widening and not a
+   * guess.** Every field it fills is one the server has just told us or one that is true of
+   * a round by definition at the instant it starts: `status: "running"`, no disposition and
+   * no rationale (nothing has concluded), `intentsAdded: 0` (the round has not written),
+   * and `endedAt: null`. Nothing is invented and nothing is carried over from a previous
+   * round. The re-read that follows replaces it either way, so the only thing this buys is
+   * the tick between the answer and the read — which is the tick the button is live in.
+   *
+   * Guarded on the goal, like {@link #placeGoal}'s callers: a round must not be placed into
+   * a list the view has since re-pointed at another goal.
+   */
+  #placePlanRound(started: PlanRoundStarted) {
+    if (this.openGoalId !== started.goalId) return;
+    const placed: PlanRoundView = {
+      roundId: started.roundId,
+      goalId: started.goalId,
+      targetId: started.targetId,
+      status: "running",
+      disposition: null,
+      dispositionRationale: null,
+      budget: started.budget,
+      intentsAdded: 0,
+      harnessSessionId: started.harnessSessionId,
+      instanceId: started.instanceId,
+      providerId: started.providerId,
+      modelId: started.modelId,
+      startedAtSequence: started.startedAtSequence,
+      startedAt: started.startedAt,
+      endedAt: null,
+    };
+    this.planRoundsGoalId = started.goalId;
+    this.planRounds = [
+      placed,
+      ...this.planRounds.filter((round) => round.roundId !== placed.roundId),
+    ];
+    this.planRoundsState = "ready";
+    this.runningRounds = [
+      {
+        roundId: started.roundId,
+        targetId: started.targetId,
+        goalId: started.goalId,
+        harnessSessionId: started.harnessSessionId,
+        startedAt: started.startedAt,
+      },
+      ...this.runningRounds.filter(
+        (round) => round.roundId !== started.roundId,
+      ),
+    ];
   }
 
   /* ── Intents ─────────────────────────────────────────────────────────────── */
@@ -2295,6 +2560,7 @@ export class App {
         : next;
     this.#refreshIntentsFor(targetId, frame);
     this.#refreshGoalBriefingFor(targetId, frame);
+    this.#refreshPlanRoundsFor(targetId, frame);
   }
 
   /**
@@ -2337,6 +2603,37 @@ export class App {
    * replays its whole recent record, and a briefing read per historical observation would
    * be a request storm that says nothing one read at the end does not.
    */
+  /**
+   * Re-reads the open goal's rounds when a round record arrives.
+   *
+   * The narrowest trigger of the three: a round's own two records and nothing else. An
+   * intent being added does not move a round row, and an observation certainly does not —
+   * what they move is `intentsAdded`, which comes from the round's receipts and so changes
+   * only when the round writes, which is a `plan.round.*` event's sibling rather than this
+   * frame.
+   *
+   * **It re-reads what is in flight as well, and that is the point.** The settled record
+   * is what takes a round out of the supervisor's map, so a panel that refreshed only the
+   * rows would keep saying "a round has been planning this goal since…" after the round
+   * had finished, with the button still disabled.
+   *
+   * Guarded on `liveCaughtUp` for {@link #refreshGoalBriefingFor}'s reason: opening a
+   * target replays its whole recent record, and one read per historical round would be a
+   * request storm that says nothing the last read does not.
+   */
+  #refreshPlanRoundsFor(targetId: string, frame: LiveItem) {
+    if (!this.liveCaughtUp || this.viewTargetId !== targetId) return;
+    if (this.openGoalId === "") return;
+    if (
+      frame.kind !== "plan.round.started" &&
+      frame.kind !== "plan.round.settled"
+    ) {
+      return;
+    }
+    void this.loadPlanRounds(this.openGoalId);
+    void this.loadRunningRounds();
+  }
+
   #refreshGoalBriefingFor(targetId: string, frame: LiveItem) {
     if (!this.liveCaughtUp || this.viewTargetId !== targetId) return;
     if (this.openGoalId === "") return;

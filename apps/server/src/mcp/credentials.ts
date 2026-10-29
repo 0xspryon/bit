@@ -88,6 +88,17 @@
  * roles, three places, and no role's directory nested inside another's, which is the
  * shape the spike actually tested (siblings, never nesting).
  *
+ * **What the layout does not reach, now measured one step further.** §24.2's caveat 4
+ * recorded that the operator's *global* OpenCode config is visible in every directory.
+ * DECISIONS.md §24.3 measured the rest: OpenCode collects `opencode.json` from **every
+ * ancestor directory up to `/`**, so a role directory nested inside a git repository
+ * inherits that repository's configuration and, per OpenCode's own source, its `AGENTS.md`
+ * as agent instructions. Under the default `HUNT_ROOT` (`<cwd>/.runtime/hunt`) that is
+ * this repository. It does not touch the authority boundary — a session's tools come from
+ * the bearer it was registered with and the endpoint that bearer is accepted at, never
+ * from configuration — but it is the reason "the directory is the boundary" is a statement
+ * about *MCP registrations* and about nothing else.
+ *
  * A goal credential with no clock expiry is containable only because the session holding
  * it is the only session in its directory: a worker cannot reach the goal agent's tools,
  * and the cross-directory control in §24.2 is what says so (the harness refused the name

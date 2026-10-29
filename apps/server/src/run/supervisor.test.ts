@@ -335,6 +335,7 @@ const world = (
             WorkerEndpoints.of({
               urls: Effect.succeed({
                 mcp: "http://127.0.0.1:9/api/v1/mcp",
+                plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                 policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
@@ -893,6 +894,7 @@ describe("starting a run", () => {
               WorkerEndpoints.of({
                 urls: Effect.succeed({
                   mcp: "http://127.0.0.1:9/api/v1/mcp",
+                  plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                   policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
@@ -975,6 +977,7 @@ describe("starting a run", () => {
               WorkerEndpoints.of({
                 urls: Effect.succeed({
                   mcp: "http://127.0.0.1:9/api/v1/mcp",
+                  plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                   policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
@@ -1458,6 +1461,7 @@ describe("when the harness stops being readable", () => {
               WorkerEndpoints.of({
                 urls: Effect.succeed({
                   mcp: "http://127.0.0.1:9/api/v1/mcp",
+                  plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                   policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
@@ -2418,6 +2422,7 @@ describe("two configured instances", () => {
             WorkerEndpoints.of({
               urls: Effect.succeed({
                 mcp: "http://127.0.0.1:9/api/v1/mcp",
+                plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                 policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
@@ -2846,6 +2851,7 @@ describe("the transcript at settlement", () => {
             WorkerEndpoints.of({
               urls: Effect.succeed({
                 mcp: "http://127.0.0.1:9/api/v1/mcp",
+                plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                 policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
@@ -3556,6 +3562,7 @@ describe("running an existing intent", () => {
     await Effect.runPromise(
       pending.publish({
         mcp: "http://127.0.0.1:9/api/v1/mcp",
+        plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
         policy: "http://127.0.0.1:9/api/v1/policy/decide",
       }),
     );

@@ -10,6 +10,9 @@ import type {
   GoalView,
   IntentStatus,
   IntentView,
+  PlanRoundView,
+  RoundDisposition,
+  RoundStatus,
 } from "@bit/contracts";
 
 /**
@@ -119,3 +122,68 @@ export const notRunnableBecause = (
   }
   return null;
 };
+
+/**
+ * The words for a round's execution status.
+ *
+ * It says how the *round* ended and never what the planning concluded — that is the
+ * disposition, and the two are separate on purpose. `uncertain` is "Outcome unknown"
+ * rather than "Failed": nobody could tell us how it ended, which is a weaker and truer
+ * claim than failure, and a round has no word for failing.
+ */
+export const roundStatusLabel = (status: RoundStatus): string => {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "settled":
+      return "Finished";
+    case "uncertain":
+      return "Outcome unknown";
+    case "interrupted":
+      return "Stopped";
+  }
+};
+
+/**
+ * The words for what a round concluded.
+ *
+ * `objective_met` says it ended the goal, because that is the part an operator has to
+ * know: it is the one disposition with a consequence beyond the round.
+ */
+export const dispositionLabel = (disposition: RoundDisposition): string => {
+  switch (disposition) {
+    case "actionable":
+      return "Added work worth running";
+    case "waiting":
+      return "Waiting on work already out";
+    case "no_useful_next_action":
+      return "Nothing worth doing here";
+    case "objective_met":
+      return "Objective met — this ended the goal";
+  }
+};
+
+/**
+ * What a round concluded, as a sentence, including the case where it concluded nothing.
+ *
+ * **A null disposition is a fact rather than a gap, and it is not the same fact as
+ * `no_useful_next_action`.** That one is a planner's considered judgement; null means the
+ * round stopped without recording an answer — it was interrupted, it lost its session, or
+ * its tools never reached it. The wording says so instead of leaving a blank, because a
+ * blank reads as "still thinking" on a round that has finished.
+ */
+export const roundConclusion = (
+  round: Pick<PlanRoundView, "status" | "disposition">,
+): string => {
+  if (round.disposition !== null) return dispositionLabel(round.disposition);
+  if (round.status === "running") return "Still working";
+  return "It recorded no conclusion";
+};
+
+/** "2 of 5 intents added", always both numbers, zero included. */
+export const budgetLine = (
+  round: Pick<PlanRoundView, "budget" | "intentsAdded">,
+): string =>
+  `${String(round.intentsAdded)} of ${String(round.budget)} ${
+    round.budget === 1 ? "intent" : "intents"
+  } added`;

@@ -487,34 +487,42 @@ describe("MCP authorization", () => {
     expect(response.status).toBe(401);
   });
 
-  test("a round credential is authenticated and then refused the write", async () => {
-    // The two halves of the boundary, told apart. The credential is valid, so this is
-    // not a 401: the request reaches the tool, and the *authority path* is what refuses
-    // it, naming the kind of caller it is and the write it attempted.
+  test("a round credential is refused at the worker endpoint, before any tool", async () => {
+    // **This changed in slice 7 and the change is the point.** It used to be a `200` with
+    // a tool refusal: the credential was valid, the request reached the global toolkit, and
+    // `store.recordObservation`'s authority path refused it by name. The authority boundary
+    // held and the tool *list* disagreed with it — a round's session could see
+    // `record_observation`.
+    //
+    // Now the worker endpoint serves one role. A resolved grant of another kind is refused
+    // `401` before protocol dispatch, so a round does not reach the tool, does not get a
+    // tool list, and does not learn that this path exists. The store's refusal is still
+    // there and still tested — `store.test.ts` drives it directly — it is simply no longer
+    // reachable from here, which is what "the tool surface matches the authority" means.
     const response = await callTool(
       args({ operation_id: "op-round-credential" }),
       roundToken,
     );
-    expect(response.status).toBe(200);
-    const { isError, data } = payloadOf(response.body);
-    expect(isError).toBe(true);
-    expect(data["reason"]).toBe("unauthorized");
-    expect(String(data["detail"])).toContain(
-      "round rnd-1 (a planner round on goal goal-1)",
-    );
-    expect(String(data["detail"])).toContain("may not record an observation");
+    expect(response.status).toBe(401);
   });
 
-  test("a goal credential with no expiry is authenticated and then refused the write", async () => {
+  test("a goal credential with no expiry is refused at the worker endpoint too", async () => {
     const response = await callTool(
       args({ operation_id: "op-goal-credential" }),
       goalToken,
     );
-    expect(response.status).toBe(200);
-    const { isError, data } = payloadOf(response.body);
-    expect(isError).toBe(true);
-    expect(data["reason"]).toBe("unauthorized");
-    expect(String(data["detail"])).toContain("the goal agent for goal goal-1");
+    expect(response.status).toBe(401);
+  });
+
+  test("the refusal is indistinguishable from an unknown token, deliberately", async () => {
+    // A distinct status or body for "valid credential, wrong endpoint" would tell a caller
+    // at the wrong door that the credential it holds is real. Both answers are the same
+    // `401` with the same body; the distinction is in the log, where the operator is.
+    const wrongKind = await rpc("tools/list", {}, roundToken);
+    const unknown = await rpc("tools/list", {}, "deadbeef");
+    expect(wrongKind.status).toBe(401);
+    expect(unknown.status).toBe(401);
+    expect(wrongKind.body).toEqual(unknown.body);
   });
 
   test("neither credential of the wrong kind wrote anything", async () => {

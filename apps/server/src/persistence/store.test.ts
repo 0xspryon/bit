@@ -4500,17 +4500,25 @@ describe("a planner round", () => {
         const first = yield* store.recordRoundDisposition(
           roundCallerFor("rnd-1"),
           "actionable",
+          "because the test said so",
         );
         const second = yield* Effect.result(
-          store.recordRoundDisposition(roundCallerFor("rnd-1"), "waiting"),
+          store.recordRoundDisposition(
+            roundCallerFor("rnd-1"),
+            "waiting",
+            "because the test said so",
+          ),
         );
         return { first, second, round: yield* store.loadRound("rnd-1") };
       }),
     );
 
-    expect(outcome.first).toEqual({
+    expect(outcome.first).toMatchObject({
       roundId: "rnd-1",
       disposition: "actionable",
+      rationale: "because the test said so",
+      // `actionable` is not `objective_met`, so no goal was ended by it.
+      goalEnded: false,
     });
     expect(outcome.round?.disposition).toBe("actionable");
     expect(outcome.second._tag).toBe("Failure");
@@ -4526,9 +4534,15 @@ describe("a planner round", () => {
     const outcome = await withSeeded((store) =>
       Effect.gen(function* () {
         yield* store.openRound(HOST, openRoundInput());
+        // `waiting` rather than `objective_met`: this test is about settlement leaving a
+        // disposition alone, and `objective_met` also *ends the goal*, which would make
+        // the second `openRound` below refuse `goal_not_active` for an entirely correct
+        // reason that has nothing to do with what is being checked. The ending itself is
+        // asserted in its own test.
         yield* store.recordRoundDisposition(
           roundCallerFor("rnd-1"),
-          "objective_met",
+          "waiting",
+          "because the test said so",
         );
         const settled = yield* store.settleRound("rnd-1", "settled", {
           _tag: "supervisor",
@@ -4551,7 +4565,7 @@ describe("a planner round", () => {
       effective: "settled",
       changed: true,
     });
-    expect(outcome.first?.disposition).toBe("objective_met");
+    expect(outcome.first?.disposition).toBe("waiting");
     // A round that never concluded settles with none, which is the honest record.
     expect(outcome.second?.status).toBe("interrupted");
     expect(outcome.second?.disposition).toBeNull();
@@ -4657,7 +4671,13 @@ describe("telling three kinds of caller apart", () => {
 
   test("an attempt credential is refused for a round write", async () => {
     const failure = await withRound((store) =>
-      Effect.result(store.recordRoundDisposition(CALLER, "actionable")),
+      Effect.result(
+        store.recordRoundDisposition(
+          CALLER,
+          "actionable",
+          "because the test said so",
+        ),
+      ),
     );
 
     expect(failure._tag).toBe("Failure");
@@ -4707,7 +4727,11 @@ describe("telling three kinds of caller apart", () => {
           store.recordObservation(goalCaller(), multiCaseInput()),
         ),
         disposition: Effect.result(
-          store.recordRoundDisposition(goalCaller(), "actionable"),
+          store.recordRoundDisposition(
+            goalCaller(),
+            "actionable",
+            "because the test said so",
+          ),
         ),
         asset: Effect.result(
           store.recordAsset(goalCaller(), {
@@ -4742,7 +4766,11 @@ describe("telling three kinds of caller apart", () => {
           store.recordObservation(roundCaller(), multiCaseInput()),
         );
         yield* Effect.result(
-          store.recordRoundDisposition(goalCaller(), "actionable"),
+          store.recordRoundDisposition(
+            goalCaller(),
+            "actionable",
+            "because the test said so",
+          ),
         );
         return {
           observations: yield* store.observationsForIntent("intent-1"),
@@ -4792,7 +4820,11 @@ describe("telling three kinds of caller apart", () => {
       Effect.gen(function* () {
         yield* store.settleRound("rnd-1", "settled", { _tag: "supervisor" });
         return yield* Effect.result(
-          store.recordRoundDisposition(roundCaller(), "actionable"),
+          store.recordRoundDisposition(
+            roundCaller(),
+            "actionable",
+            "because the test said so",
+          ),
         );
       }),
     );
@@ -4813,7 +4845,11 @@ describe("telling three kinds of caller apart", () => {
         // The credential still carries fence 0, which is what a grant minted before the
         // sweep would hold. The round is at 1.
         return yield* Effect.result(
-          store.recordRoundDisposition(roundCaller(0), "actionable"),
+          store.recordRoundDisposition(
+            roundCaller(0),
+            "actionable",
+            "because the test said so",
+          ),
         );
       }),
     );
@@ -4837,6 +4873,7 @@ describe("telling three kinds of caller apart", () => {
         return yield* store.recordRoundDisposition(
           roundCaller(fence ?? 0),
           "waiting",
+          "because the test said so",
         );
       }),
     );
@@ -4856,6 +4893,7 @@ describe("telling three kinds of caller apart", () => {
             roundFence: 0,
           },
           "actionable",
+          "because the test said so",
         ),
       ),
     );

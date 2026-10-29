@@ -4755,3 +4755,64 @@ registration is per session.
 lint` pass; `bun run format:check` reports only files outside this spike
 (`sprint-roadmap.html` and others edited elsewhere in the tree). No production code
 changed.
+
+### 24.3 Does OpenCode walk up to a parent git root for configuration? (slice 7)
+
+### `SPIKE` resolved — it walks up to the git root for instructions and **past it, to `/`, for configuration** (2026-10-29)
+
+Spike B's "not tested" list and slice 7's brief both left this open: §24.2 only ever ran
+sessions in directories whose ancestors held no OpenCode configuration, so nothing there
+says what a planner directory **nested inside a git repository** inherits. It is not a
+hypothetical shape — `main.ts` defaults `HUNT_ROOT` to `<cwd>/.runtime/hunt`, so in the
+ordinary development layout `targets/<id>/planning/<roundId>/` sits four levels below this
+repository's own `.git`.
+
+**What was run.** `opencode debug config` ("List configuration sources"), `opencode 2.2.2`,
+in a purpose-built tree under `/tmp` rather than in this repository, so nothing had to be
+written into a git worktree to measure it:
+
+```
+/tmp/bit-gitroot-above/opencode.json          -> instructions: ["ABOVE-MARKER.md"]
+/tmp/bit-gitroot-above/repo/                  -> git init
+/tmp/bit-gitroot-above/repo/opencode.json     -> instructions: ["ROOT-MARKER.md"]
+/tmp/bit-gitroot-above/repo/targets/t1/planning/rnd1/   <- cwd, no config of its own
+```
+
+**Result — POSITIVE, and wider than the question.** Run in `planning/rnd1`, OpenCode
+listed as configuration sources: the operator's `~/.config/opencode/opencode.jsonc`, the
+repository root's `opencode.json` (`ROOT-MARKER.md`) — four directories up, across the git
+boundary — **and `/tmp/bit-gitroot-above/opencode.json` (`ABOVE-MARKER.md`), which is
+outside the repository altogether.** So the configuration walk does not stop at the git
+root: every ancestor directory up to `/` is a configuration source for a planner directory.
+A control run in a sibling directory with no such ancestor listed only the operator's
+global file.
+
+**Instruction files are the narrower case, and the git root is their boundary.** From
+OpenCode's own source rather than measured: `packages/core/src/config/plugin/instruction.ts`
+walks `AGENTS.md` from the session's directory up to `location.project.directory`
+(`fs.up({ targets: ["AGENTS.md"], start, stop })`, where `stop` is the project directory,
+or the user's home when the location sits beneath it), and `packages/core/src/project.ts`
+resolves the project directory as the nearest ancestor holding `.git` or `.hg`
+(`markers = [".git", ".hg"]`, `fs.up({ targets: [".git", ".hg"], mode: "first" })`). So a
+planner directory inside this repository is given **this repository's `AGENTS.md`** as
+agent instructions. That half is read from source and not measured: the behavioural probe
+(`opencode run` in the nested directory, asking the model to echo a token only the root
+instruction file carries) could not complete — the default model answered
+`Error: The usage limit has been reached`.
+
+**Consequences.** This is the same class of leak as §24.2's caveat 4 and strictly larger
+than it: directory splitting separates MCP registrations per role, and it does nothing
+about configuration or instructions, which are inherited from every ancestor. A planner
+round running under the default `HUNT_ROOT` therefore sees this repository's `AGENTS.md`
+and any `opencode.json` at or above it — including, on a developer's machine, whatever
+sits in `/tmp`'s or `$HOME`'s ancestry. **Nothing in slice 7 depends on it being
+otherwise**, and the authority boundary is unaffected: tools come from the registration's
+bearer and the endpoint it points at, not from configuration. What it would change is a
+decision nobody has taken yet — a fleet root placed inside a repository whose config an
+untrusted party can write is a fleet root whose planner inherits that config. The fix, if
+one is ever wanted, is the one caveat 4 already names: set the harness child's
+`XDG_CONFIG_HOME`, and additionally place `HUNT_ROOT` outside any git worktree.
+
+**Not tested.** Whether `AGENTS.md` inheritance behaves as the source says (the model run
+hit a provider usage limit). Claude Code's own configuration discovery. Whether a
+`.gitignore`d ancestor config is treated differently. Any driver other than OpenCode 2.2.2.

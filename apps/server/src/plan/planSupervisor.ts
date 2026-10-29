@@ -19,23 +19,23 @@
  * one thing the two genuinely share — the rule that turns silence into `uncertain` — is
  * now shared as code.
  *
+ * ## The tools, and the endpoint they are on
+ *
+ * A round now has its own tool surface: `add_intent`, `record_round_disposition`, the
+ * three graph reads and `list_harnesses` (`mcp/plannerTools.ts`). What is registered with
+ * the harness is the **planner** MCP endpoint — `WorkerEndpoints.urls.plannerMcp`, not
+ * `urls.mcp` — carrying this round's credential.
+ *
+ * The scoping is per grant, which is what this file's earlier note said slice 7 would have
+ * to deliver, and it is per path as well. `mcp/server.ts` serves two `McpServer`s with two
+ * toolkits, and each one's auth middleware refuses a credential whose tag is not the role
+ * it serves: a round bearer at the worker endpoint is a `401`, and an attempt bearer here
+ * is a `401`. `effect/ai` offers no hook that can filter one toolkit by the caller — the
+ * `EnabledWhen` predicate sees a client profile and cannot yield `McpInvocation` — so a
+ * second endpoint is how the tool *list* is made a function of the grant rather than only
+ * the writes being one. The reasoning in full is on that module.
+ *
  * ## What is not here yet, said plainly
- *
- * **No tools.** Slice 7 is what gives a round `add_intent`, `record_round_disposition` and
- * the graph reads; this slice builds the lifecycle that will own them. What is registered
- * with the harness is the MCP *endpoint* carrying the round's credential, not a tool
- * surface chosen for a round: `mcp/tools.ts`'s toolkit is still one global list holding
- * `record_observation`, so a round's session can *see* that tool and every call it makes
- * is refused `unauthorized` by `store.recordObservation`'s `attemptCallerOrFail` — the
- * authority boundary holds, and the tool list is simply not per-caller yet. Making it
- * per-caller is slice 7's, and this comment is here so that is a decision somebody makes
- * rather than a gap somebody finds. {@link STUB_ROUND_PROMPT} tells the model that, in
- * those terms, rather than claiming there is nothing there.
- *
- * One thing for slice 7 to inherit: the scoping has to be **per grant**, not per directory.
- * The endpoint URL is shared (`WorkerEndpoints.urls.mcp`) and the registration carries only
- * a bearer, so the only thing that can distinguish a round's tool list from a worker's at
- * `tools/list` time is `McpInvocation`'s tag.
  *
  * **No narration published.** The round's harness stream is drained so a terminal
  * `session.execution.*` can be read off it (see {@link narrateRound}), and it is **not**
@@ -75,6 +75,11 @@
  * file does not change.
  */
 import {
+  PlanRefused,
+  type PlanRoundStarted,
+  type RunningRound,
+} from "@bit/contracts";
+import {
   Cause,
   Context,
   Deferred,
@@ -84,22 +89,29 @@ import {
   Layer,
   Option,
   Redacted,
-  Schema,
   Stream,
   type Duration,
 } from "effect";
 
 import { AgentHarness, type TerminalOutcome } from "../harness/agentHarness";
+import {
+  DEFAULT_GOAL_BRIEFING_MAX_CHARS,
+  buildGoalBriefing,
+  type GoalBriefingTooLarge,
+} from "../briefing/goalBriefing";
+import { assembleRoundPrompt, type AssembledRoundPrompt } from "./roundPrompt";
 import { HarnessResolver, type ResolvedHarness } from "../harness/resolver";
 import { FleetStore } from "../persistence/fleet";
 import * as identifier from "../persistence/identifier";
 import {
+  ObservationStore,
+  callerScopeOf,
   operatorScope,
-  type ObservationStore,
   type RoundTerminalStatus,
 } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { McpCredentials } from "../mcp/credentials";
+import { McpCallCounter } from "../mcp/server";
 import { gatedRoleDirectory, type GatedDirectory } from "../policy/install";
 import {
   SETTLEMENT_ASK_TIMEOUT,
@@ -108,45 +120,6 @@ import {
   type SupervisionEnd,
 } from "../run/settlement";
 import { WorkerEndpoints } from "../run/supervisor";
-
-/**
- * The prompt a round is opened with in this slice, and nothing more.
- *
- * It exists so the lifecycle is exercisable end to end — a session that is created,
- * prompted, watched and settled — without pretending to be the planner. **Slice 7 replaces
- * it with the goal's objective and the briefing** (`docs/design/goal-and-planner-flow.md`
- * slices 6 and 7), at which point this constant goes away rather than growing.
- *
- * It names the goal because a round that could not say what it was about would be a
- * session an operator reading the harness's own UI could not place.
- *
- * **What it says about tools is what is true of the endpoint, not what is convenient.** An
- * earlier draft said "this round has no tools", and that was a lie told to a model, which
- * is the one audience it is least useful on: `mcp/tools.ts` registers one global toolkit,
- * so `tools/list` under this round's bearer really does return `record_observation`. What
- * the round cannot do is *write* with it — `store.recordObservation` runs
- * `attemptCallerOrFail` and refuses any non-attempt caller — so a model that was told it
- * had none and then listed one would spend a turn working out which statement to believe.
- * Per-caller tool lists are slice 7's deliverable; until then the honest sentence is that
- * anything visible will refuse this round's credential.
- *
- * A `const` holding a function rather than a template literal, because it has to name the
- * goal and there is one of it.
- */
-export const STUB_ROUND_PROMPT = (goalId: string): string =>
-  [
-    `You are a planner round opened on goal ${goalId} in bit, a security-testing tool.`,
-    "",
-    "You have no planner tools. You cannot add intents, record a disposition or read the",
-    "graph: the host has registered its endpoint and your credential, and the tools that",
-    "endpoint will offer a planner are not built yet.",
-    "",
-    "Any tool you can see is not yours. Every call made under this round's credential is",
-    "refused by the host, so calling one would waste the turn and record nothing.",
-    "",
-    "Reply with one sentence acknowledging that, and stop. Do not call a tool and do not",
-    "ask for one.",
-  ].join("\n");
 
 /**
  * How many intents a round may add when nothing says otherwise.
@@ -246,116 +219,57 @@ export interface PlanInput {
   readonly instanceId?: string | undefined;
   /** Which model, inside that instance. Absent means the instance's own default. */
   readonly model?: string | undefined;
-}
-
-/** What a started round answers with. */
-export interface PlanRoundStarted {
-  readonly roundId: string;
-  readonly targetId: string;
-  readonly goalId: string;
-  readonly harnessSessionId: string;
-  readonly instanceId: string;
-  readonly providerId: string;
-  readonly modelId: string;
-  /** The budget written on the row, which `add_intent` will enforce. */
-  readonly budget: number;
-  /** Provenance only; never a snapshot guarantee (the spec's decision 9). */
-  readonly startedAtSequence: number;
   /**
-   * Whether this round opened the goal's planner lineage or joined one.
+   * The ceiling on the rendered goal briefing, in characters. Defaults to
+   * `DEFAULT_GOAL_BRIEFING_MAX_CHARS`.
    *
-   * Reported because it is the one thing about a round a caller cannot work out: the
-   * lineage is a hint in our own table about a session in the harness's storage, and
-   * "this is the goal's first round" and "this round continues an earlier one's session"
-   * are different facts about what the model has already seen.
+   * Configuration the caller holds — `main.ts` reads `GOAL_BRIEFING_MAX_CHARS` and the
+   * browser API passes the same figure to the briefing panel — rather than something this
+   * supervisor decides, so the number an operator watched on that panel is the number a
+   * round is refused against.
+   *
+   * **It bounds the briefing, not the prompt.** See `plan/roundPrompt.ts`: the round's
+   * framing wraps the briefing, so what the model receives is larger, and both lengths are
+   * reported on the started round rather than left to be inferred.
    */
-  readonly lineage: "opened" | "continued";
-  readonly startedAt: number;
+  readonly briefingMaxChars?: number | undefined;
 }
 
-/** What a stopped round answers with. */
+/**
+ * What a started round answers with, and what one this process is driving looks like.
+ *
+ * **Both now live in `@bit/contracts`, and so does {@link PlanRefused}.** They were
+ * declared here while nothing a browser could reach used them, with this file saying the
+ * decision had an expiry attached to the arrival of `POST /goals/:goalId/plan`. That route
+ * is this slice's, so the three moved; `contracts/plan.ts` carries the prose for every
+ * field and every refusal reason. Re-exported from here so the supervisor's own call sites
+ * and tests do not have to know which side of the boundary each shape sits on.
+ *
+ * `PlanRoundStopped` stayed behind, deliberately: nothing answers with it. Stopping a round
+ * is the planner view's control and arrives with it, and publishing a shape no route
+ * returns is the mistake the move corrects.
+ */
+export { PlanRefused } from "@bit/contracts";
+export type { PlanRoundStarted, RunningRound } from "@bit/contracts";
+
+/** What a stopped round answers with. Server-side; see above. */
 export interface PlanRoundStopped {
   readonly roundId: string;
   readonly targetId: string;
   readonly harnessSessionId: string;
   readonly status: RoundTerminalStatus;
   readonly credentialsRevoked: number;
+  /**
+   * Authenticated MCP requests this round's credential made, from
+   * {@link McpCallCounter.countFor}.
+   *
+   * **Zero means the round never reached its own tool surface**, which is a different fact
+   * from a round that had its tools and chose to say nothing — see {@link settle}, where
+   * the figure is read and where the distinction is made for every settlement path rather
+   * than only for a stop.
+   */
+  readonly toolCallsSeen: number;
   readonly stoppedAt: number;
-}
-
-/** One round this process is driving right now. */
-export interface RunningRound {
-  readonly roundId: string;
-  readonly targetId: string;
-  readonly goalId: string;
-  readonly harnessSessionId: string;
-  readonly startedAt: number;
-}
-
-/**
- * A round this server will not open or stop.
- *
- * **Server-side rather than in `@bit/contracts`, and that is a decision with an expiry.**
- * A contract is a wire shape, and nothing in this slice exposes a route: the planner's
- * `POST /goals/:goalId/plan` arrives in slice 7, which is where this becomes a browser's
- * concern and where it should move — with an HTTP status and the reason list reviewed as
- * part of that surface. Declaring it in the contract now would publish a shape no client
- * can reach, and the `@bit/contracts` header's rule is that contracts are what the browser
- * consumes.
- *
- * Every reason is a decision an operator can act on, and the ones that look alike are kept
- * apart on purpose:
- *
- * - `no_harness` — this server drives no agent at all. Nothing was asked.
- * - `harness_not_ready` — the instance named is not configured here, or did not come up.
- *   Nothing was asked either, which is why it is not `harness_unreachable`.
- * - `harness_unreachable` — a harness was there and did not answer while the round was
- *   being set up. Nothing was prompted, and a row that was written is **settled by the
- *   round's own finalizer** (`uncertain`), not left for the startup sweep: see
- *   {@link supervise} on where that finalizer is registered. The one window in which a
- *   `running` row does survive this process is named there.
- * - `goal_busy` — a round is already running on this goal **in this process**, named in
- *   the detail. The in-memory half of the spec's decision 7.
- * - `round_conflict` — the *store* refused: a round is already running on this goal
- *   according to the rows, or the round id already exists. The durable half. Kept apart
- *   from `goal_busy` because they answer different questions and one can be true without
- *   the other — a row left by a dead process is `round_conflict` with nothing running.
- * - `goal_not_found`, `goal_not_active` — the goal is not this target's, or it has ended.
- *   Ending a goal blocks planner wake-ups (the spec's decision 8).
- * - `planning_directory_unusable` — the round's own directory could not be made. Includes
- *   `FleetError`'s `invalid_role_id`, which is mapped rather than defaulted: round ids are
- *   minted, so this one means a bug here rather than a bad request, and it should read as
- *   a directory problem rather than as a missing target.
- * - `planning_ungated` — the directory exists and the policy gate would not install into
- *   it. A round is refused rather than run ungated, exactly as a worker is.
- * - `target_unavailable`, `store_unavailable` — the target's database.
- * - `unknown_round` — nothing is running under that id *in this process*. Deliberately not
- *   the same question as "is the row `running`": a row left by a dead process has no fiber
- *   to interrupt and the startup sweep is what settles it.
- */
-export class PlanRefused extends Schema.TaggedError<PlanRefused>()(
-  "PlanRefused",
-  {
-    reason: Schema.Literals([
-      "no_harness",
-      "harness_not_ready",
-      "harness_unreachable",
-      "goal_busy",
-      "round_conflict",
-      "goal_not_found",
-      "goal_not_active",
-      "planning_directory_unusable",
-      "planning_ungated",
-      "target_unavailable",
-      "store_unavailable",
-      "unknown_round",
-    ]),
-    detail: Schema.String,
-  },
-) {
-  override get message(): string {
-    return `${this.reason}: ${this.detail}`;
-  }
 }
 
 /**
@@ -439,7 +353,7 @@ export class PlanSupervisor extends Context.Service<
      */
     readonly start: (
       input: PlanInput,
-    ) => Effect.Effect<PlanRoundStarted, PlanRefused>;
+    ) => Effect.Effect<PlanRoundStarted, PlanRefused | GoalBriefingTooLarge>;
     /**
      * Interrupts one round, settles it and revokes its authority.
      *
@@ -468,6 +382,7 @@ export class PlanSupervisor extends Context.Service<
     | TargetStores
     | FleetStore
     | McpCredentials
+    | McpCallCounter
     | WorkerEndpoints
   > = Layer.effect(
     PlanSupervisor,
@@ -493,6 +408,7 @@ export class PlanSupervisor extends Context.Service<
     | TargetStores
     | FleetStore
     | McpCredentials
+    | McpCallCounter
     | WorkerEndpoints
   > =>
     Layer.effect(
@@ -548,6 +464,22 @@ const make = Effect.fnUntraced(function* (options?: {
   const stores = yield* TargetStores;
   const fleet = yield* FleetStore;
   const credentials = yield* McpCredentials;
+  /**
+   * The MCP endpoint's own request tally, read at settlement.
+   *
+   * **A requirement rather than something optional, because a diagnostic nobody reads is
+   * not a diagnostic.** `McpCallCounter` counts authenticated requests per caller scope,
+   * and a round's scope names exactly one round — so the figure answers the one question
+   * Spike B's tool-exposure lag makes unanswerable from anything else: did this round's
+   * session ever reach its tools? See {@link settle}.
+   *
+   * It has to be the **same instance** the MCP middleware increments. `main.ts` provides
+   * one `McpCallCounter.layer` reference to this graph and to the listener's, so layer
+   * memoisation gives both the same map — the argument `McpCredentials` already makes
+   * there, with the same consequence if it were ever two: a count that is always zero
+   * because the middleware is incrementing somebody else's.
+   */
+  const calls = yield* McpCallCounter;
   const endpoints = yield* WorkerEndpoints;
 
   /**
@@ -643,11 +575,15 @@ const make = Effect.fnUntraced(function* (options?: {
    */
   const settlements = new Map<
     string,
-    { status: RoundTerminalStatus; grants: number }
+    { status: RoundTerminalStatus; grants: number; toolCallsSeen: number }
   >();
   const remember = (
     roundId: string,
-    outcome: { status: RoundTerminalStatus; grants: number },
+    outcome: {
+      status: RoundTerminalStatus;
+      grants: number;
+      toolCallsSeen: number;
+    },
   ): void => {
     settlements.set(roundId, outcome);
     while (settlements.size > SETTLEMENT_MEMORY) {
@@ -861,7 +797,13 @@ const make = Effect.fnUntraced(function* (options?: {
     // settled round look unsettled.
     yield* Effect.acquireRelease(
       harness.registerMcpServer(created.id, serverName, {
-        url: urls.mcp,
+        // The **planner** endpoint, not the worker's. This is the line that decides which
+        // tool list this session is offered: `mcp/server.ts` serves one toolkit per path,
+        // and each endpoint's middleware refuses a resolved grant whose tag is not the role
+        // it serves. So a round registered against `urls.mcp` would get a `401` on
+        // `tools/list` — before any tool list is produced — and would have no tools at all
+        // rather than the wrong ones. `server.test.ts` asserts that refusal.
+        url: urls.plannerMcp,
         // Unwrapped and immediately re-wrapped: the one place the raw token is touched, to
         // put it in the header of the one request that delivers it. It never reaches the
         // harness's argv or the environment a shell would inherit (DECISIONS.md §6).
@@ -961,6 +903,7 @@ const make = Effect.fnUntraced(function* (options?: {
     store: ObservationStore["Service"],
     input: {
       readonly roundId: string;
+      readonly targetId: string;
       readonly harnessSessionId: string;
       readonly end: SupervisionEnd;
       readonly narrated: TerminalOutcome | undefined;
@@ -1010,6 +953,69 @@ const make = Effect.fnUntraced(function* (options?: {
         : undefined;
     const grants = yield* credentials.revokeRound(input.roundId);
 
+    /**
+     * Whether this round's session ever reached its own tool surface.
+     *
+     * **This is the one place the per-scope tally is read, and it is read on every
+     * settlement path** — a natural finish, a stop, a shutdown and a start that failed all
+     * come through here. The scope is derived the same way the credential's was
+     * (`callerScopeOf`), so the number is this round's requests and nobody else's.
+     *
+     * It exists because of a measured condition with no other symptom. DECISIONS.md §24.2
+     * caveat 1: an OpenCode MCP registration can be connected and **not yet callable** —
+     * the tool registry reloads behind a lock and a debounce, and in 3 of 8 first prompts
+     * after a registration the model reported the tool was not exposed and the endpoint saw
+     * no call — and there is no API to read that registry, so the round cannot confirm
+     * exposure before prompting and the prompt is never resubmitted. A round that never had
+     * its tools therefore settles exactly like a round that had them and chose to say
+     * nothing: `settled`, `disposition: null`. **Zero requests is what tells them apart.**
+     *
+     * **Where it goes, said precisely: the log line below, and `PlanRoundStopped` for a
+     * stop. It does not reach the durable record.** `plan.round.settled`'s payload is
+     * written by `store.settleRound`, which takes a status and a settler and nothing else;
+     * putting the figure there would mean widening that signature and the event shape, and
+     * the tally is in-process memory anyway — a restart forgets it, so a durable field
+     * would be null for every round a sweep settles. So the distinction is available to an
+     * operator reading logs at the moment it matters, and is **not** recoverable
+     * afterwards from the rows. That is the honest extent of it.
+     */
+    const roundScope = callerScopeOf({
+      _tag: "round",
+      targetId: input.targetId,
+      roundId: input.roundId,
+    });
+    const toolCallsSeen = yield* calls.countFor(roundScope);
+    /**
+     * The row, read back for its disposition, so the zero case can be reported as the
+     * thing it actually is.
+     *
+     * One statement, once per round, outside any transaction. `settleRound` does not
+     * answer with the disposition — it answers with the status change — and "settled with
+     * no disposition **and** no tool calls" is the conjunction worth a warning. A read that
+     * fails leaves `disposition` unknown, and an unknown disposition is not warned about:
+     * a warning about a round whose row could not be read would be a claim nobody checked.
+     */
+    const row = yield* Effect.result(store.loadRound(input.roundId));
+    const disposition =
+      row._tag === "Success" && row.success !== undefined
+        ? row.success.disposition
+        : undefined;
+    if (toolCallsSeen === 0 && disposition === null) {
+      yield* Effect.logWarning(
+        "a planner round settled having concluded nothing and having made no authenticated tool call: its tool surface was never reached, so this is not a planner with nothing to say",
+        {
+          roundId: input.roundId,
+          callerScope: roundScope,
+          harnessSessionId: input.harnessSessionId,
+          status,
+          // Named so an operator reading this line once has the reference without
+          // grepping for it.
+          cause:
+            "DECISIONS.md §24.2 caveat 1: an OpenCode registration can be connected and not yet callable. Open another round on this goal.",
+        },
+      );
+    }
+
     if (settlement._tag === "Failure") {
       // The row could not be written, so the round is left `running` with its authority
       // revoked in memory only. That is exactly the state the startup sweep exists for,
@@ -1039,8 +1045,12 @@ const make = Effect.fnUntraced(function* (options?: {
             ? (fence.success ?? "no row")
             : "unknown",
       grantsRevoked: grants,
+      // Zero is the Spike B condition; the warning above says so when it coincides with no
+      // disposition. Carried on every settled line either way, because the figure is only
+      // useful if it is there before anybody suspects they need it.
+      toolCallsSeen,
     });
-    return { status, grants };
+    return { status, grants, toolCallsSeen };
   });
 
   /**
@@ -1107,6 +1117,13 @@ const make = Effect.fnUntraced(function* (options?: {
     ids: { readonly roundId: string },
     gate: Deferred.Deferred<PlanRoundStarted, PlanRefused>,
     resolved: ResolvedHarness,
+    /**
+     * The prompt, already assembled, and the two lengths that describe it.
+     *
+     * Passed in rather than built here because it is built before the goal is claimed —
+     * see {@link start} on why a briefing over the ceiling has to leave no row behind.
+     */
+    assembled: AssembledRoundPrompt,
   ) => {
     /**
      * What the finalizer will settle from, if the wait never gets to say.
@@ -1209,6 +1226,7 @@ const make = Effect.fnUntraced(function* (options?: {
             }
             const settled = yield* settle(store, {
               roundId: ids.roundId,
+              targetId: input.targetId,
               harnessSessionId: session.id,
               end: ending,
               narrated: report.narrated,
@@ -1258,6 +1276,11 @@ const make = Effect.fnUntraced(function* (options?: {
           budget,
           startedAtSequence: authority.startedAtSequence,
           lineage,
+          // Measured on the string that was actually sent, not computed from the ceiling.
+          // See `plan/roundPrompt.ts`: the briefing is what the ceiling bounds and the
+          // prompt is what the model received, and the two are different numbers.
+          briefingChars: assembled.briefingChars,
+          promptChars: assembled.promptChars,
           startedAt,
         };
         supervised.set(ids.roundId, {
@@ -1278,7 +1301,7 @@ const make = Effect.fnUntraced(function* (options?: {
 
         const harness = yield* AgentHarness;
         const prompted = yield* Effect.result(
-          harness.prompt(harnessSessionId, STUB_ROUND_PROMPT(input.goalId)),
+          harness.prompt(harnessSessionId, assembled.prompt),
         );
         if (prompted._tag === "Failure") {
           // Nothing ran. The round row exists and is `running`, so the honest thing is to
@@ -1417,6 +1440,60 @@ const make = Effect.fnUntraced(function* (options?: {
     const resolved = chosen.success;
 
     /**
+     * The prompt, assembled **before** the goal is claimed and before any row is written.
+     *
+     * The ordering is the requirement: a briefing over the ceiling must refuse the round
+     * and **start nothing**. Built here, a refusal leaves no `planner_rounds` row, no
+     * claimed goal, no planning directory and no harness session — there is nothing for a
+     * sweep to find and nothing blocking the next round on this goal. Built inside
+     * `supervise`, as every other step is, the row would already exist.
+     *
+     * It costs a read of the whole goal before the claim, which is the trade: another
+     * round could claim the goal while this one is rendering. That is a race the claim
+     * below resolves by refusing `goal_busy`, and the loser has still written nothing.
+     *
+     * **A missing goal surfaces as `goal_not_found` from here rather than from
+     * `openRound`.** The briefing builder resolves the goal id against the target's own
+     * file and answers `unknown_goal`, which is the same fact `openRound`'s `unauthorized`
+     * reports a moment later, so it is mapped to the same refusal with the same shape of
+     * sentence. An *ended* goal still reaches `openRound`, which is the authoritative
+     * refusal for it: the briefing is perfectly renderable for a goal that is over.
+     *
+     * `GoalBriefingTooLarge` is **not** mapped into {@link PlanRefused}. It carries two
+     * numbers that no reason on that error has a place for, and it is already the error
+     * the goal-briefing route turns into the `GoalBriefingRefused` the panel renders — so
+     * the plan route turns it into the same one, and an operator sees one refusal for one
+     * fact whichever surface they hit it on.
+     */
+    const prepared = yield* Effect.result(
+      stores.open(input.targetId).pipe(
+        Effect.flatMap((store) =>
+          buildGoalBriefing(
+            input.goalId,
+            input.briefingMaxChars ?? DEFAULT_GOAL_BRIEFING_MAX_CHARS,
+          ).pipe(Effect.provideService(ObservationStore, store)),
+        ),
+        Effect.scoped,
+      ),
+    );
+    if (prepared._tag === "Failure") {
+      const failure = prepared.failure;
+      if (failure._tag === "GoalBriefingTooLarge") return yield* failure;
+      if (failure._tag === "GoalBriefingError") {
+        return yield* new PlanRefused({
+          reason: "goal_not_found",
+          detail: `no goal ${input.goalId} is recorded in target ${input.targetId}, so there is nothing to plan`,
+        });
+      }
+      return yield* refuse(failure);
+    }
+    const assembled = assembleRoundPrompt({
+      goalId: input.goalId,
+      budget,
+      briefing: prepared.success.rendered,
+    });
+
+    /**
      * Made **before** the claim, which narrows the window rather than closing it.
      *
      * With the deferred already in hand there is no `yield*` between the claim and the
@@ -1471,7 +1548,7 @@ const make = Effect.fnUntraced(function* (options?: {
       // answering the caller cannot interrupt it.
       const fiber = fork(
         roundId,
-        supervise(input, { roundId }, gate, resolved),
+        supervise(input, { roundId }, gate, resolved, assembled),
       );
       handedOver = true;
       /**
@@ -1548,6 +1625,9 @@ const make = Effect.fnUntraced(function* (options?: {
       // answer the row would carry.
       status: settled?.status ?? "uncertain",
       credentialsRevoked: settled?.grants ?? 0,
+      // From the same `settle` call that wrote the log line, so a stop reports the figure
+      // the log carries rather than re-reading a counter that has moved on.
+      toolCallsSeen: settled?.toolCallsSeen ?? 0,
       stoppedAt: Date.now(),
     } satisfies PlanRoundStopped;
   });

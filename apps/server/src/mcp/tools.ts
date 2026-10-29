@@ -1,5 +1,14 @@
 /**
- * The application-owned domain toolkit.
+ * The worker attempt's toolkit: `record_observation`, and nothing else.
+ *
+ * **This file used to be "the domain toolkit" and is now one role's.** It held a single
+ * global `Toolkit`, which meant the tool surface was the same whatever credential was
+ * presented: a planner round's session could list `record_observation` and have every
+ * call refused by `store.recordObservation`'s authority path. The authority boundary was
+ * never the gap — the tool *list* was. `mcp/plannerTools.ts` holds the round's toolkit and
+ * `mcp/server.ts` binds each to its own endpoint, so from here on a caller is offered the
+ * tools its authority covers and is refused at the door if it presents the wrong kind of
+ * credential for the endpoint it reached.
  *
  * `record_observation` is defined once, as an Effect `Tool` over the canonical wire
  * schema from `@bit/contracts`. Three things follow from that and used to be three
@@ -113,7 +122,22 @@ export const RecordObservation = Tool.make("record_observation", {
   // every call, which is precisely the property we want to be unable to forget.
 }).addDependency(McpInvocation);
 
-export const DomainToolkit = Toolkit.make(RecordObservation);
+/**
+ * The worker's toolkit, and only the worker's.
+ *
+ * **One tool, and the narrowness is now the point rather than an accident of there being
+ * nothing else yet.** Until this slice `mcp/tools.ts` held one global toolkit, so a
+ * planner round's session could list `record_observation` and every call it made was
+ * refused by the store's authority path. The boundary held; the tool surface simply did
+ * not match it. `mcp/plannerTools.ts` is the sibling for a round, and `mcp/server.ts` is
+ * where each is bound to its own endpoint and its own caller kind.
+ *
+ * So the rule this name carries: **a tool goes in here only if a worker attempt's
+ * credential may use it.** Anything a round or a goal agent writes belongs in that role's
+ * toolkit, because an advertised tool that always refuses is a turn the model spends
+ * finding that out.
+ */
+export const WorkerToolkit = Toolkit.make(RecordObservation);
 
 /**
  * The handler.
@@ -151,10 +175,10 @@ export const DomainToolkit = Toolkit.make(RecordObservation);
  * cannot tell its observation was not stored is a worker that carries on as though it
  * had.
  */
-export const DomainToolkitLayer = DomainToolkit.toLayer(
+export const WorkerToolkitLayer = WorkerToolkit.toLayer(
   Effect.gen(function* () {
     const stores = yield* TargetStores;
-    return DomainToolkit.of({
+    return WorkerToolkit.of({
       record_observation: Effect.fn("record_observation")(function* (input) {
         const caller = yield* McpInvocation;
         return yield* withTargetStore(stores, caller.targetId, (store) =>

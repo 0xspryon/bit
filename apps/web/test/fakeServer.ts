@@ -34,9 +34,12 @@ import type {
   LiveFrame,
   LiveItem,
   LiveOpened,
+  PlanRoundStarted,
+  PlanRoundView,
   RunStarted,
   RunStopped,
   RunningAttempt,
+  RunningRound,
   SessionOpened,
   SessionProbe,
   TargetCounts,
@@ -134,6 +137,67 @@ export const goalView = (over: Partial<GoalView> = {}): GoalView => ({
   endedBy: null,
   endReason: null,
   counts: { intents: 0, attempts: 0, observations: 0 },
+  ...over,
+});
+
+/**
+ * One planner round as the goal screen reads it.
+ *
+ * `settled` with `actionable` and two intents added is the ordinary interesting case: a
+ * round that finished and said what it concluded. `dispositionRationale` moves with the
+ * disposition, so an override that sets one without the other would be a state the server
+ * cannot produce.
+ */
+export const planRoundView = (
+  over: Partial<PlanRoundView> = {},
+): PlanRoundView => ({
+  roundId: "rnd_1",
+  goalId: "goal_1",
+  targetId: "acme-corp",
+  status: "settled",
+  disposition: "actionable",
+  dispositionRationale: "Two dimensions had no work out; both are worth a run.",
+  budget: 5,
+  intentsAdded: 2,
+  harnessSessionId: "ses_1",
+  instanceId: "opencode",
+  providerId: "openai",
+  modelId: "gpt-5.6-sol",
+  startedAtSequence: 4,
+  startedAt: AT,
+  endedAt: AT + 1_000,
+  ...over,
+});
+
+/** A round this process is driving right now. The in-flight half of the pair. */
+export const runningRound = (
+  over: Partial<RunningRound> = {},
+): RunningRound => ({
+  roundId: "rnd_1",
+  targetId: "acme-corp",
+  goalId: "goal_1",
+  harnessSessionId: "ses_1",
+  startedAt: AT,
+  ...over,
+});
+
+/** What a started round answers with. */
+export const planRoundStarted = (
+  over: Partial<PlanRoundStarted> = {},
+): PlanRoundStarted => ({
+  roundId: "rnd_1",
+  targetId: "acme-corp",
+  goalId: "goal_1",
+  harnessSessionId: "ses_1",
+  instanceId: "opencode",
+  providerId: "openai",
+  modelId: "gpt-5.6-sol",
+  budget: 5,
+  startedAtSequence: 4,
+  lineage: "opened",
+  briefingChars: 1_200,
+  promptChars: 3_400,
+  startedAt: AT,
   ...over,
 });
 
@@ -525,6 +589,28 @@ export class FakeServer implements ServerClient {
   ) => Answer<"goalBriefing"> = (_baseUrl, targetId, goalId) =>
     ok(goalBriefingView({ targetId, goalId }));
 
+  onPlan: (...args: Parameters<ServerClient["plan"]>) => Answer<"plan"> = (
+    _baseUrl,
+    targetId,
+    goalId,
+  ) => ok(planRoundStarted({ targetId, goalId }));
+
+  /**
+   * No rounds by default, which is what a goal nobody has planned yet really has.
+   *
+   * The alternative — a plausible settled round — would make every test that does not care
+   * about planning render a disposition, and a test asserting the empty state would have to
+   * override it to get there.
+   */
+  onGoalRounds: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+  ) => Answer<"goalRounds"> = () => ok({ rounds: [] });
+
+  /** Nothing in flight by default, for the reason `onRuns` answers with nothing. */
+  onRounds: (baseUrl: string) => Answer<"rounds"> = () => ok([]);
+
   onCreateIntent: (
     ...args: Parameters<ServerClient["createIntent"]>
   ) => Answer<"createIntent"> = (_baseUrl, _targetId, goalId, draft) =>
@@ -637,6 +723,17 @@ export class FakeServer implements ServerClient {
     this.record("goalBriefing", [baseUrl, targetId, goalId], () =>
       this.onGoalBriefing(baseUrl, targetId, goalId),
     );
+
+  plan = (...args: Parameters<ServerClient["plan"]>) =>
+    this.record("plan", args, () => this.onPlan(...args));
+
+  goalRounds = (baseUrl: string, targetId: string, goalId: string) =>
+    this.record("goalRounds", [baseUrl, targetId, goalId], () =>
+      this.onGoalRounds(baseUrl, targetId, goalId),
+    );
+
+  rounds = (baseUrl: string) =>
+    this.record("rounds", [baseUrl], () => this.onRounds(baseUrl));
 
   createIntent = (...args: Parameters<ServerClient["createIntent"]>) =>
     this.record("createIntent", args, () => this.onCreateIntent(...args));

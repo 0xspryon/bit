@@ -18,17 +18,25 @@
    * is started from a row of that list; the run box sits under the page (see
    * {@link ComposeBox}).
    *
-   * The planner briefing sits below the intents and above the end control, because it is
-   * built *from* them: a reader who has just seen the directions and the counts is in a
-   * position to recognise the text as the record of them. It is read-only — nothing on this
-   * page opens a planner round yet — and it is the one section whose content is the
-   * server's string verbatim (see {@link GoalBriefingPanel}).
+   * The planner sits between the intents and the briefing, and the order is an argument.
+   * "Plan next" is what *produces* intents, so it belongs beside the list it fills rather
+   * than at the bottom of the page; the briefing is what the planner is given, so it reads
+   * as the evidence behind the control above it rather than as a document in its own right.
+   * The end control stays last, because it is what is done to the whole goal.
+   *
+   * The planner panel is the record and not the round's live view: whether a round is in
+   * flight, what the last one concluded, and the refusals of the control itself. Watching a
+   * round think is its own surface and is not on this page.
+   *
+   * The briefing is read-only and is the one section whose content is the server's string
+   * verbatim (see {@link GoalBriefingPanel}).
    */
   import Button from "../components/Button.svelte";
   import GoalBriefingPanel from "../components/GoalBriefingPanel.svelte";
   import GoalStatusChip from "../components/GoalStatusChip.svelte";
   import IntentList from "../components/IntentList.svelte";
   import PageFrame from "../components/PageFrame.svelte";
+  import PlanPanel from "../components/PlanPanel.svelte";
   import { countsLine, goalTitle, whenText } from "../goalFormat";
   import type { App } from "../app.svelte";
 
@@ -74,6 +82,8 @@
         {/if}
 
         <IntentList {app} />
+
+        <PlanPanel {app} />
 
         <GoalBriefingPanel {app} />
 

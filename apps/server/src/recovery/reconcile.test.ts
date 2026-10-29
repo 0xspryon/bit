@@ -1841,6 +1841,7 @@ describe("a planner round a process left running", () => {
               store.recordRoundDisposition(
                 roundCaller("rnd-1", 0),
                 "actionable",
+                "because the test said so",
               ),
             ),
           };

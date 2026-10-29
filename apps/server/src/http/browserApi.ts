@@ -53,6 +53,7 @@ import {
   type GoalView,
   type HarnessInstanceView,
   type IntentView,
+  type PlanRoundView,
   type TargetCounts,
   type TargetSummary,
 } from "@bit/contracts";
@@ -92,10 +93,12 @@ import {
   type MutationError,
   type StoredGoal,
   type StoredIntent,
+  type StoredRound,
 } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
+import { PlanSupervisor } from "../plan/planSupervisor";
 import { liveTranscript } from "../run/liveTranscript";
 import { RunNarrations } from "../run/narration";
 import { RunSupervisor } from "../run/supervisor";
@@ -451,6 +454,33 @@ const intentView = (intent: StoredIntent): IntentView => ({
 });
 
 /**
+ * One stored round as the contract's view of it, field by field.
+ *
+ * Not a spread, for {@link goalView}'s reason. `intentsAdded` is not a column — the store
+ * counts the round's own `add_intent` receipts — which is why it arrives beside the row
+ * rather than on it.
+ */
+const planRoundView = (
+  round: StoredRound & { readonly intentsAdded: number },
+): PlanRoundView => ({
+  roundId: round.roundId,
+  goalId: round.goalId,
+  targetId: round.targetId,
+  status: round.status,
+  disposition: round.disposition,
+  dispositionRationale: round.dispositionRationale,
+  budget: round.budget,
+  intentsAdded: round.intentsAdded,
+  harnessSessionId: round.harnessSessionId,
+  instanceId: round.harnessInstanceId,
+  providerId: round.providerId,
+  modelId: round.modelId,
+  startedAtSequence: round.startedAtSequence,
+  startedAt: round.startedAt,
+  endedAt: round.endedAt,
+});
+
+/**
  * What a refused `addIntent` becomes at the HTTP surface.
  *
  * The handler has already established that the goal exists in this target, so the refusals
@@ -581,6 +611,12 @@ const fleetHandlers = HttpApiBuilder.group(
     // And the resolver holds the built harnesses — for OpenCode, a child process. One per
     // process, resolved here, for exactly the reason the two above are.
     const harnesses = yield* HarnessResolver;
+    // The plan supervisor, for the same reason and in the same place as `RunSupervisor`
+    // above: it holds the fiber map for the whole process, and `main.ts` hands this layer
+    // the instance the rest of the program uses rather than letting a second one be built
+    // inside the router's own memo map — which would be a second credential registry and a
+    // round whose bearer the MCP endpoint rejects.
+    const planner = yield* PlanSupervisor;
     // The two in-process buses the live transcript's activity channel reads. Same place,
     // same reason — and for these two it is load-bearing beyond tidiness: each is a single
     // `PubSub` that the supervisor and the policy route publish into, so a second instance
@@ -1393,6 +1429,115 @@ const fleetHandlers = HttpApiBuilder.group(
         }
         return intentView(abandoned);
       }),
+
+      /**
+       * Opens one planner round on a goal, and answers without waiting for it.
+       *
+       * The checks before the supervisor is asked are `startRun`'s, in the same order and
+       * for the same reason: writing to a target is refused exactly where reading it is.
+       * The goal is then checked here so that "no such goal in this target" is a
+       * {@link GoalNotFound} before anything is claimed — the supervisor's own
+       * `goal_not_found` covers the same case, and having it decided here keeps the 404
+       * and the 409 from both being plausible answers to one mistake.
+       *
+       * Everything after that is {@link PlanSupervisor}: by the time it returns, the goal
+       * briefing has been rendered and measured against the ceiling, the `planner_rounds`
+       * row exists, the goal claim is held, the round's own directory is gated, a
+       * round-scoped credential is minted and the **planner** MCP endpoint is registered
+       * under it, and the prompt has been accepted. This handler has no part in how the
+       * round ends.
+       *
+       * **Nothing in the request chooses where the round runs.** The planning directory
+       * comes from the registry, keyed by the round id the supervisor mints; the audit path
+       * is the target's `evidence/` directory, which is deliberately outside it; and the
+       * workspace is passed only so the containment check can refuse a planning directory
+       * inside the engagement folder. `row.workspacePath ?? undefined` is explicit because
+       * that check does not run for a caller who omits the field — `undefined` here says
+       * "this target has no folder", which is a statement rather than an omission.
+       *
+       * `GoalBriefingTooLarge` is turned into the same {@link GoalBriefingRefused} the
+       * briefing route answers with, so an operator meets one refusal for one fact; the
+       * round started nothing when it is raised. `FleetError`'s `invalid_role_id` reaches
+       * here already mapped — the supervisor's own `refuse` turns it into
+       * `planning_directory_unusable` rather than letting it default to a missing target —
+       * which matters because this file routes an unhandled reason to `Effect.die`.
+       */
+      plan: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const goal = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.loadGoal(params.goalId),
+        ).pipe(Effect.orDie);
+        if (goal === undefined || goal.targetId !== row.targetId) {
+          return yield* new GoalNotFound({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            detail: `no goal '${params.goalId}' is recorded in this target`,
+          });
+        }
+        return yield* planner
+          .start({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            workspace: row.workspacePath ?? undefined,
+            auditPath: `${fleet.paths.evidenceDirectory(row.targetId)}/${POLICY_AUDIT_FILE}`,
+            title: `bit planner: ${row.name}`,
+            briefingMaxChars:
+              config.goalBriefingMaxChars ?? DEFAULT_GOAL_BRIEFING_MAX_CHARS,
+          })
+          .pipe(
+            Effect.catchTag("GoalBriefingTooLarge", (refusal) =>
+              Effect.fail(
+                new GoalBriefingRefused({
+                  reason: "too_large",
+                  goalId: params.goalId,
+                  sizeChars: refusal.sizeChars,
+                  maxChars: refusal.maxChars,
+                  detail:
+                    `This goal's briefing renders to ${String(refusal.sizeChars)} characters, over the ` +
+                    `${String(refusal.maxChars)}-character ceiling, so no planner round was opened and ` +
+                    `nothing was started. A planner is never given a shortened briefing: it would reason ` +
+                    `from a gap it could not see. Either raise GOAL_BRIEFING_MAX_CHARS on the server, or ` +
+                    `split this goal into narrower ones.`,
+                }),
+              ),
+            ),
+          );
+      }),
+
+      /**
+       * The planner rounds of one goal, newest first, with what each concluded.
+       *
+       * The rows, read through the same goal-ownership check the sibling goal routes use.
+       * `intentsAdded` comes with each row from the store, which counts the round's own
+       * `add_intent` receipts — so a round that stopped because its budget ran out is
+       * distinguishable from one that stopped because it had nothing more to say.
+       */
+      goalRounds: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const found = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            const goal = yield* store.loadGoal(params.goalId);
+            if (goal === undefined || goal.targetId !== row.targetId) {
+              return undefined;
+            }
+            return yield* store.roundsForGoal(params.goalId);
+          }),
+        ).pipe(Effect.orDie);
+        if (found === undefined) {
+          return yield* new GoalNotFound({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            detail: `no goal '${params.goalId}' is recorded in this target`,
+          });
+        }
+        return { rounds: found.map(planRoundView) };
+      }),
+
+      /**
+       * Every planner round this process is supervising. See the contract for why it is
+       * not scoped to a target and why it is not the same question as `goalRounds`.
+       */
+      rounds: () => planner.running,
 
       /**
        * One target's live transcript, as Server-Sent Events.

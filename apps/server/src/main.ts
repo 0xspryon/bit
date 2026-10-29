@@ -88,7 +88,7 @@
 import { join } from "node:path";
 
 import { API_PREFIX } from "@bit/contracts";
-import { Effect, Latch, Layer } from "effect";
+import { Context, Effect, Latch, Layer } from "effect";
 
 import { DEFAULT_GOAL_BRIEFING_MAX_CHARS } from "./briefing/goalBriefing";
 import { browserApiRoutes } from "./http/browserApi";
@@ -128,6 +128,7 @@ import {
   type HarnessCandidate,
 } from "./harness/resolver";
 import { McpCredentials } from "./mcp/credentials";
+import { PlannerHarnesses, plannerHarnessesOf } from "./mcp/plannerTools";
 import { DEFAULT_ROUND_BUDGET, PlanSupervisor } from "./plan/planSupervisor";
 import { McpCallCounter } from "./mcp/server";
 import { FleetStore } from "./persistence/fleet";
@@ -415,6 +416,19 @@ const targetStores = TargetStores.layer.pipe(Layer.provide(fleet));
 const credentials = McpCredentials.layer;
 
 /**
+ * The MCP endpoint's request tally, as one layer shared by everything that reads it.
+ *
+ * Here for exactly {@link credentials}'s reason, and the consequence of getting it wrong is
+ * quieter. The MCP auth middleware increments it per caller scope; `PlanSupervisor` reads
+ * it at settlement to say whether a round's session ever reached its own tool surface. Two
+ * instances would not fail — the middleware would count into one map and the supervisor
+ * would read zero out of the other, and every round would be reported as never having had
+ * its tools. One reference, provided to both graphs, is what makes the number mean
+ * something.
+ */
+const callCounter = McpCallCounter.layer;
+
+/**
  * Where a worker calls back into, answered once the listener exists.
  *
  * The cycle this breaks is recorded on {@link WorkerEndpoints}: the browser API needs the
@@ -625,6 +639,9 @@ const agent =
         // supervisor's private dependency, which was right while nothing subscribed.
         Layer.provideMerge(RunNarrations.layer),
         Layer.provide(workerEndpoints.layer),
+        // The same reference the listener below is given, so the supervisor reads the map
+        // the MCP middleware writes. See `callCounter`.
+        Layer.provide(callCounter),
       );
 
 /**
@@ -673,6 +690,13 @@ const endpoint = Layer.unwrap(
       | FleetStore
       | TargetStores
       | RunSupervisor
+      // The plan supervisor, for exactly the reason `RunSupervisor` is here: the browser
+      // API's "Plan next" has to drive the *same* supervisor whose round credentials the
+      // MCP endpoint accepts. A second instance built inside the router's own memo map
+      // would have its own `McpCredentials`, and the planner would connect with a good
+      // token and be answered `401` — the failure the comment above this block describes,
+      // which was observed once already for workers.
+      | PlanSupervisor
       | HarnessResolver
       // The narration bus, for the same reason as the four above and with the same
       // consequence if it were rebuilt instead: the supervisor would publish into one
@@ -684,6 +708,15 @@ const endpoint = Layer.unwrap(
       ControlPlaneEndpoint.layer({
         policy: PERMISSIVE_POLICY,
         port: PORT,
+        // The planner's `list_harnesses`, as a list of values rather than as the resolver.
+        // Read out of *this* graph's context and reduced by `plannerHarnessesOf`, which is
+        // where the "no credential material reaches a planner" claim lives. Handing the
+        // resolver over instead would put a `HarnessResolver` requirement inside the
+        // router's own memo map, and that memo map builds what it is given — which for
+        // OpenCode means a second `opencode serve` child process.
+        harnesses: PlannerHarnesses.listing(
+          plannerHarnessesOf(Context.get(shared, HarnessResolver).instances),
+        ),
         extraRoutes: browserApiRoutes({
           workspaceRoot: WORKSPACE_ROOT,
           goalBriefingMaxChars: GOAL_BRIEFING_MAX_CHARS,
@@ -706,7 +739,7 @@ const endpoint = Layer.unwrap(
   ),
 ).pipe(
   Layer.provideMerge(credentials),
-  Layer.provideMerge(McpCallCounter.layer),
+  Layer.provideMerge(callCounter),
   Layer.provideMerge(PolicyDecisions.layer),
   Layer.provide(targetStores),
 );
@@ -849,11 +882,15 @@ const program = Effect.gen(function* () {
   // answer about every unsettled attempt.
   yield* workerEndpoints.publish({
     mcp: control.mcpUrl,
+    plannerMcp: control.plannerMcpUrl,
     policy: control.policyUrl,
   });
   yield* reconcile;
   console.log(`bit control plane: ${control.healthUrl}`);
-  console.log(`  mcp (bearer required):  ${control.mcpUrl}`);
+  console.log(`  mcp, worker tools (bearer required):  ${control.mcpUrl}`);
+  console.log(
+    `  mcp, planner tools (bearer required): ${control.plannerMcpUrl}`,
+  );
   console.log(
     `  policy (unauthenticated): ${control.policyUrl} — gate installed per run, host scope: ${PERMISSIVE_POLICY.hostScope._tag}`,
   );

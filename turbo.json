@@ -14,7 +14,9 @@
         "WORKSPACE_ROOT",
         "PORT",
         "HARNESS",
-        "RECONCILE_ON_START"
+        "RECONCILE_ON_START",
+        "PLANNER_ROUND_BUDGET",
+        "GOAL_BRIEFING_MAX_CHARS"
       ]
     },
     "build": {

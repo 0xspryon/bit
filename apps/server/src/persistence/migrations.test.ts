@@ -477,6 +477,7 @@ describe("a database already at 0002", () => {
       "17_intent_lifecycle",
       "18_planner_rounds",
       "19_planner_lineage_by_goal",
+      "20_round_disposition_rationale",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -751,6 +752,7 @@ describe("a database already at 0005", () => {
       "17_intent_lifecycle",
       "18_planner_rounds",
       "19_planner_lineage_by_goal",
+      "20_round_disposition_rationale",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1469,6 +1471,7 @@ describe("a database already at 0015", () => {
       "17_intent_lifecycle",
       "18_planner_rounds",
       "19_planner_lineage_by_goal",
+      "20_round_disposition_rationale",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1609,6 +1612,7 @@ describe("a database already at 0016", () => {
       "17_intent_lifecycle",
       "18_planner_rounds",
       "19_planner_lineage_by_goal",
+      "20_round_disposition_rationale",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1778,6 +1782,7 @@ describe("a database already at 0017", () => {
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "18_planner_rounds",
       "19_planner_lineage_by_goal",
+      "20_round_disposition_rationale",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(

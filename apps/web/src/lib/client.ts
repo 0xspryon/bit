@@ -215,6 +215,15 @@ export const REFUSAL_TAGS = new Set([
   // the one instruction an operator needed with a connectivity complaint.
   "IntentNotFound",
   "IntentRefused",
+  // Opening a planner round. **Every reason on `PlanRefused` is a sentence the goal
+  // screen puts next to the "Plan next" button** — a round already working this goal, a
+  // goal that has ended, a harness that is not configured, a directory the policy gate
+  // would not install into. Classifying any of them as transport trouble would replace
+  // "a round is already planning this goal; wait for it or stop it" with "No server
+  // answered at this address", which is both wrong and unactionable. A briefing over the
+  // ceiling comes back as `GoalBriefingRefused`, already listed above, because it is the
+  // same fact the panel reports and the round started nothing.
+  "PlanRefused",
 ]);
 
 /**
@@ -507,6 +516,49 @@ export const server = {
         }),
       ),
     ),
+
+  /**
+   * Opens a planner round on one goal, and answers without waiting for it.
+   *
+   * **There is no payload at all**, which is the shape of this call rather than an
+   * omission: the round's directory, its audit path and the harness it runs on are the
+   * server's, and the prompt is the goal's objective plus the goal briefing assembled
+   * server-side. A browser that could name any of them would be choosing where an agent
+   * runs.
+   *
+   * It returns as soon as the round is durable and prompted, the way {@link startRun}
+   * does. A round takes minutes; the round id it hands back is how a reloaded tab
+   * recognises it in {@link rounds}.
+   */
+  plan: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.plan({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * The planner rounds of one goal, newest first, with what each concluded.
+   *
+   * The rows, which is where a disposition survives a refresh. Not the same question as
+   * {@link rounds}: a row saying `running` can be one a dead process left behind.
+   */
+  goalRounds: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.goalRounds({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * The planner rounds this server is supervising right now, across every target.
+   *
+   * The sibling of {@link runs} and the only way a reloaded tab knows a round is still in
+   * flight on the goal it is looking at — the start response is the one other place a
+   * round id appears, and it does not survive a refresh.
+   */
+  rounds: (baseUrl: string) =>
+    run(Effect.flatMap(client(baseUrl), (api) => api.fleet.rounds())),
 
   /**
    * Which agent harnesses the server configures, ready or not.
