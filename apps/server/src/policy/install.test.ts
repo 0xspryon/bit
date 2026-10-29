@@ -33,8 +33,11 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,11 +47,16 @@ import { Effect, Layer, ManagedRuntime } from "effect";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
+import { FleetStore, UngatedRoleDirectory } from "../persistence/fleet";
 import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import {
+  gatedRoleDirectory,
   installOpenCodeGate,
+  PolicyHookNotInstalled,
   POLICY_PLUGIN_PACKAGE,
+  resolveThroughSymlinks,
+  type GatedDirectory,
   withPolicyPlugin,
 } from "./install";
 import {
@@ -431,5 +439,404 @@ describe("the installed gate is reached", () => {
       tool: "read",
       outcome: "denied_failclosed",
     });
+  });
+});
+
+/* ── Three roles, three directories, one gate each ───────────────────────────── */
+
+/**
+ * The containment layout, with the real registry making the directories.
+ *
+ * Spike B (`spike/mcpIsolationProof.ts`) showed that under OpenCode the directory is the
+ * only thing separating one session's MCP authority from another's. These tests do not
+ * re-prove that; they prove the layout we derived from it: three distinct directories,
+ * each with the gate installed, none of the role ones inside the workspace, and the gate
+ * in the role directories behaving as it does in the workspace — denying — because
+ * "nothing there is expected to act" is the assumption the gate exists to replace.
+ */
+describe("a planner, a goal agent and a worker each run behind the gate", () => {
+  const withFleet = <A, E>(
+    root: string,
+    use: (fleet: FleetStore["Service"]) => Effect.Effect<A, E, FleetStore>,
+  ): Promise<A> =>
+    Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(FleetStore, use).pipe(
+          Effect.provide(FleetStore.layer(root)),
+        ),
+      ),
+    );
+
+  /** A hunt root, a workspace beside it (not inside), and a registered target. */
+  const layout = async () => {
+    const base = mkdtempSync(join(tmpdir(), "bit-roles-"));
+    directories.push(base);
+    const root = join(base, "hunt");
+    const workspace = join(base, "operator-folder");
+    mkdirSync(workspace, { recursive: true });
+    await withFleet(root, (fleet) =>
+      fleet.register({
+        targetId: "alpha",
+        name: "Alpha",
+        scopeNote: "local fixture",
+        workspacePath: workspace,
+      }),
+    );
+    return { base, root, workspace };
+  };
+
+  const gateFiles = (directory: string) => ({
+    config: join(directory, ".opencode", "opencode.json"),
+    hook: join(directory, ".opencode", "policy", "index.ts"),
+  });
+
+  /** All three directories, gated as a supervisor would arrange them. */
+  const gatedThree = async (policyUrl: string) => {
+    const made = await layout();
+    const auditPath = join(
+      made.root,
+      "targets",
+      "alpha",
+      "evidence",
+      "audit.log",
+    );
+    const roles = await withFleet(made.root, (fleet) =>
+      Effect.gen(function* () {
+        mkdirSync(join(made.root, "targets", "alpha", "evidence"), {
+          recursive: true,
+        });
+        yield* installOpenCodeGate({
+          workspace: made.workspace,
+          policyUrl,
+          auditPath,
+          freshAudit: false,
+        });
+        const planning = yield* gatedRoleDirectory({
+          ensure: fleet.ensurePlanningDirectory("alpha", "rnd_1"),
+          install: installOpenCodeGate,
+          policyUrl,
+          auditPath,
+          workspace: made.workspace,
+        });
+        const goal = yield* gatedRoleDirectory({
+          ensure: fleet.ensureGoalDirectory("alpha", "goal_1"),
+          install: installOpenCodeGate,
+          policyUrl,
+          auditPath,
+          workspace: made.workspace,
+        });
+        return { planning, goal };
+      }).pipe(Effect.orDie),
+    );
+    return { ...made, ...roles, auditPath };
+  };
+
+  test("the gate is installed in all three, and they are three directories", async () => {
+    const three = await gatedThree("http://127.0.0.1:9/api/v1/policy/decide");
+    const places = [three.workspace, three.planning, three.goal];
+    expect(new Set(places).size).toBe(3);
+    for (const place of places) {
+      const files = gateFiles(place);
+      expect(existsSync(files.hook)).toBe(true);
+      const config = readJson(files.config);
+      expect(JSON.stringify(config)).toContain(POLICY_PLUGIN_PACKAGE);
+      expect(JSON.stringify(config)).toContain(three.auditPath);
+    }
+  });
+
+  test("a denied action in a planner or goal directory is denied, not permitted", async () => {
+    const strict = listener(DEFAULT_POLICY);
+    try {
+      const policyUrl = await strict.runtime.runPromise(
+        Effect.map(ControlPlaneEndpoint, (endpoint) => endpoint.policyUrl),
+      );
+      const three = await gatedThree(policyUrl);
+      for (const [role, place] of [
+        ["workspace", three.workspace],
+        ["planner", three.planning],
+        ["goal", three.goal],
+      ] as const) {
+        const hook = await loadInstalledHook(gateFiles(place).hook, {
+          policyUrl,
+          auditPath: three.auditPath,
+        });
+        // The call a planner has no business making. It is the gate, not the planner's
+        // good behaviour, that makes this a fact.
+        await expect(
+          hook.before({
+            tool: "webfetch",
+            sessionID: `ses_${role}`,
+            input: { url: "https://example.test/admin" },
+          }),
+        ).rejects.toThrow(/Denied by bit policy/);
+      }
+      const lines = readFileSync(three.auditPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { outcome: string });
+      expect(lines.map((line) => line.outcome)).toEqual([
+        "denied",
+        "denied",
+        "denied",
+      ]);
+    } finally {
+      await strict.runtime.dispose();
+      rmSync(strict.base, { recursive: true, force: true });
+    }
+  });
+
+  test("the fail-closed posture holds in the role directories when the control plane is gone", async () => {
+    const gone = "http://127.0.0.1:1/api/v1/policy/decide";
+    const three = await gatedThree(gone);
+    for (const place of [three.planning, three.goal]) {
+      const hook = await loadInstalledHook(gateFiles(place).hook, {
+        policyUrl: gone,
+        auditPath: three.auditPath,
+      });
+      await expect(
+        hook.before({
+          tool: "read",
+          sessionID: "ses_outage",
+          input: { filePath: "anything.txt" },
+        }),
+      ).rejects.toThrow(/could not be consulted/);
+    }
+    const outcomes = readFileSync(three.auditPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => (JSON.parse(line) as { outcome: string }).outcome);
+    expect(outcomes).toEqual(["denied_failclosed", "denied_failclosed"]);
+  });
+
+  test("the workspace holds nothing of the planner's or the goal agent's", async () => {
+    const three = await gatedThree("http://127.0.0.1:9/api/v1/policy/decide");
+    // The gate is the worker's own and is allowed; nothing else is.
+    const entries = readdirSync(three.workspace, { recursive: true }).map(
+      String,
+    );
+    expect(entries.sort()).toEqual(
+      [
+        ".opencode",
+        ".opencode/opencode.json",
+        ".opencode/policy",
+        ".opencode/policy/index.ts",
+        ".opencode/policy/package.json",
+      ].sort(),
+    );
+    for (const entry of entries) {
+      expect(entry).not.toContain("planning");
+      expect(entry).not.toContain("goal");
+      expect(entry).not.toContain("rnd_1");
+    }
+    // Neither role directory, nor the audit, is inside the workspace.
+    for (const outside of [three.planning, three.goal, three.auditPath]) {
+      expect(outside.startsWith(`${three.workspace}/`)).toBe(false);
+    }
+    // And the worker's config does not name a role directory.
+    const config = readFileSync(gateFiles(three.workspace).config, "utf8");
+    expect(config).not.toContain(three.planning);
+    expect(config).not.toContain(three.goal);
+  });
+
+  test("creating a round's directory twice gates it once, and keeps its audit", async () => {
+    const policyUrl = "http://127.0.0.1:9/api/v1/policy/decide";
+    const three = await gatedThree(policyUrl);
+    await Bun.write(three.auditPath, '{"from":"an earlier session"}\n');
+    const again = await withFleet(three.root, (fleet) =>
+      gatedRoleDirectory({
+        ensure: fleet.ensurePlanningDirectory("alpha", "rnd_1"),
+        install: installOpenCodeGate,
+        policyUrl,
+        auditPath: three.auditPath,
+        workspace: three.workspace,
+      }).pipe(Effect.orDie),
+    );
+    expect(again).toBe(three.planning);
+    const plugins = readJson(gateFiles(again).config)["plugins"] as unknown[];
+    expect(plugins).toHaveLength(1);
+    expect(readFileSync(three.auditPath, "utf8")).toContain(
+      "an earlier session",
+    );
+  });
+
+  test("a role directory inside the workspace is refused before anything is installed", async () => {
+    const made = await layout();
+    const inside = join(made.workspace, "planning", "rnd_1");
+    const link = join(made.base, "link-to-workspace");
+    symlinkSync(made.workspace, link);
+    const auditPath = join(made.base, "audit.log");
+    for (const [directory, workspace] of [
+      [inside, made.workspace],
+      // A symlink to the workspace is the same place under another name.
+      [join(link, "goal", "goal_1"), made.workspace],
+    ] as const) {
+      const refused = await Effect.runPromise(
+        Effect.result(
+          gatedRoleDirectory({
+            ensure: Effect.sync(() => {
+              mkdirSync(directory, { recursive: true });
+              return new UngatedRoleDirectory(directory);
+            }),
+            install: installOpenCodeGate,
+            policyUrl: "http://127.0.0.1:9/p",
+            auditPath,
+            workspace,
+          }),
+        ),
+      );
+      expect(refused._tag).toBe("Failure");
+      if (refused._tag === "Failure") {
+        expect(refused.failure).toBeInstanceOf(PolicyHookNotInstalled);
+      }
+      expect(existsSync(join(directory, ".opencode"))).toBe(false);
+    }
+  });
+
+  test("an audit path inside the role directory is refused", async () => {
+    const made = await layout();
+    const directory = join(made.root, "targets", "alpha", "goal", "goal_1");
+    const refused = await Effect.runPromise(
+      Effect.result(
+        gatedRoleDirectory({
+          ensure: Effect.sync(() => {
+            mkdirSync(directory, { recursive: true });
+            return new UngatedRoleDirectory(directory);
+          }),
+          install: installOpenCodeGate,
+          policyUrl: "http://127.0.0.1:9/p",
+          auditPath: join(directory, "audit.log"),
+          workspace: undefined,
+        }),
+      ),
+    );
+    expect(refused._tag).toBe("Failure");
+    expect(existsSync(join(directory, ".opencode"))).toBe(false);
+  });
+
+  /** Runs `gatedRoleDirectory` over a directory this test creates. */
+  const gateOver = (directory: string, auditPath: string, workspace?: string) =>
+    Effect.runPromise(
+      Effect.result(
+        gatedRoleDirectory({
+          ensure: Effect.sync(() => {
+            mkdirSync(directory, { recursive: true });
+            return new UngatedRoleDirectory(directory);
+          }),
+          install: installOpenCodeGate,
+          policyUrl: "http://127.0.0.1:9/p",
+          auditPath,
+          workspace,
+        }),
+      ),
+    );
+
+  test("an audit path that reaches the role directory through a symlink is refused, though the file does not exist yet", async () => {
+    const made = await layout();
+    const directory = join(made.root, "targets", "alpha", "goal", "goal_1");
+    mkdirSync(directory, { recursive: true });
+    const link = join(made.base, "link-to-role");
+    symlinkSync(directory, link);
+    // The leaf is missing, which is the ordinary state of an audit file: the case a
+    // `realpath` that throws on ENOENT silently degrades to a lexical comparison for.
+    const auditPath = join(link, "audit.log");
+    expect(existsSync(auditPath)).toBe(false);
+    const refused = await gateOver(directory, auditPath, undefined);
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure).toBeInstanceOf(PolicyHookNotInstalled);
+      expect(String(refused.failure)).toContain(
+        "inside the directory it records",
+      );
+    }
+    expect(existsSync(join(directory, ".opencode"))).toBe(false);
+  });
+
+  test("an audit path reached through a missing directory under a symlink is refused too", async () => {
+    const made = await layout();
+    const directory = join(made.root, "targets", "alpha", "goal", "goal_2");
+    mkdirSync(directory, { recursive: true });
+    const link = join(made.base, "link-to-role-2");
+    symlinkSync(directory, link);
+    const refused = await gateOver(
+      directory,
+      join(link, "not", "yet", "audit.log"),
+      undefined,
+    );
+    expect(refused._tag).toBe("Failure");
+    expect(existsSync(join(directory, ".opencode"))).toBe(false);
+  });
+
+  test("a dangling symlink whose target is inside the role directory is refused", async () => {
+    const made = await layout();
+    const directory = join(made.root, "targets", "alpha", "goal", "goal_3");
+    mkdirSync(directory, { recursive: true });
+    // Creating the audit file *through* this link would make it at the target.
+    const dangling = join(made.base, "audit-link.log");
+    symlinkSync(join(directory, "audit.log"), dangling);
+    expect(existsSync(dangling)).toBe(false);
+    const refused = await gateOver(directory, dangling, undefined);
+    expect(refused._tag).toBe("Failure");
+    expect(existsSync(join(directory, ".opencode"))).toBe(false);
+  });
+
+  test("a path that cannot be resolved is refused rather than assumed to be outside", async () => {
+    const made = await layout();
+    const directory = join(made.root, "targets", "alpha", "goal", "goal_4");
+    mkdirSync(directory, { recursive: true });
+    const loop = join(made.base, "loop");
+    symlinkSync(loop, loop);
+    const refused = await gateOver(
+      directory,
+      join(loop, "audit.log"),
+      undefined,
+    );
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(String(refused.failure)).toContain(
+        "refusing rather than guessing",
+      );
+    }
+    expect(existsSync(join(directory, ".opencode"))).toBe(false);
+  });
+
+  test("a legitimate audit path outside the directory still passes, symlinks and all", async () => {
+    const made = await layout();
+    const directory = join(made.root, "targets", "alpha", "goal", "goal_5");
+    const evidence = join(made.root, "targets", "alpha", "evidence");
+    mkdirSync(evidence, { recursive: true });
+    const link = join(made.base, "link-to-evidence");
+    symlinkSync(evidence, link);
+    const gated = await gateOver(
+      directory,
+      join(link, "audit.log"),
+      made.workspace,
+    );
+    expect(gated._tag).toBe("Success");
+    if (gated._tag === "Success") expect(String(gated.success)).toBe(directory);
+  });
+
+  test("resolution follows symlinks through components that do not exist yet", () => {
+    const base = mkdtempSync(join(tmpdir(), "bit-resolve-"));
+    directories.push(base);
+    const real = join(base, "real");
+    mkdirSync(real);
+    symlinkSync(real, join(base, "link"));
+    // `realpath` alone would throw for the last two components.
+    expect(
+      resolveThroughSymlinks(join(base, "link", "missing", "leaf.log")),
+    ).toBe(join(realpathSync(real), "missing", "leaf.log"));
+    // An existing path resolves exactly as `realpath` does.
+    expect(resolveThroughSymlinks(join(base, "link"))).toBe(realpathSync(real));
+  });
+
+  test("a plain string is not a gated directory, and an ungated one is not a string", () => {
+    // Checked by tsc: these are the lines that stop a caller handing a session an
+    // ungated path by accident.
+    // @ts-expect-error a plain string has not been through gatedRoleDirectory
+    const fromString: GatedDirectory = "/some/where";
+    // @ts-expect-error an ungated directory is not a string at all
+    const fromUngated: string = new UngatedRoleDirectory("/some/where");
+    expect(String(fromString)).toBe("/some/where");
+    expect(typeof fromUngated).toBe("object");
   });
 });

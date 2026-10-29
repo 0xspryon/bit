@@ -50,10 +50,20 @@
  * into the workspace except the gate and the configuration that loads it: no fixture
  * files, no reformatting of keys we do not own.
  */
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readlinkSync, realpathSync } from "node:fs";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 
-import { Effect, Schema } from "effect";
+import { Brand, Effect, Schema } from "effect";
+
+import type { UngatedRoleDirectory } from "../persistence/fleet";
 
 /**
  * What the gate's audit file is called inside a target's `evidence/` directory.
@@ -273,6 +283,196 @@ export const asRefusal =
     cause instanceof PolicyHookNotInstalled
       ? cause
       : new PolicyHookNotInstalled({ workspace, detail: String(cause) });
+
+/* ── Role directories ────────────────────────────────────────────────────────── */
+
+/**
+ * An absolute path with the symlinks in its **deepest existing ancestor** followed, for a
+ * path whose final components may not exist yet.
+ *
+ * `realpathSync` alone is not enough: it throws when the final component is missing, and
+ * the audit file is by design a file nothing has created yet. Falling back to a lexical
+ * `resolve` at that point (as an earlier version did) silently skips symlink resolution
+ * for exactly the path that needs it, so a symlink to the role directory defeated the
+ * audit-path refusal. So this resolves the deepest ancestor that exists and appends the
+ * components that do not. Two cases beyond that:
+ *
+ * - **A dangling symlink** is not "a missing component": creating a file through it makes
+ *   the file at its target. When a component fails to resolve but is itself a symlink, its
+ *   target is read and resolution continues from there.
+ * - **Anything other than "does not exist"** (permissions, a loop, more than 40 hops)
+ *   throws. The callers treat a path they cannot resolve as a refusal, because "cannot
+ *   tell whether it is inside" must not read as "is not".
+ *
+ * **What this does not do, and why that was weighed rather than missed.**
+ *
+ * - It does not follow every symlink in the path. The first step is `resolve()`, which
+ *   collapses `..` segments **lexically**, before any link is followed. A path that mixes a
+ *   symlink with `..` (`link/../role/a.log`, where the filesystem would step out of the
+ *   link's *target*, not out of the directory holding the link) therefore resolves to a
+ *   different place than the filesystem would put it, and can be judged inside or outside
+ *   wrongly. This is accepted because every path given to it here is built by the server
+ *   (`fleetPaths`, a validated id, a configured workspace) and none contains `..`; a
+ *   caller that passes a path from anywhere else must not rely on this function.
+ * - It is a check at one moment. A symlink swapped in after the check, or a component
+ *   created as a symlink later, is not seen. That is a race against somebody with write
+ *   access to the fleet root, who could already edit the gate directly, so it is accepted
+ *   rather than defended.
+ */
+export const resolveThroughSymlinks = (path: string): string => {
+  let pending = resolve(path);
+  for (let hops = 0; hops < 40; hops += 1) {
+    const rest: string[] = [];
+    let probe = pending;
+    for (;;) {
+      try {
+        return join(realpathSync(probe), ...rest);
+      } catch (cause) {
+        const code = (cause as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw cause;
+      }
+      const parent = dirname(probe);
+      let link: string | undefined;
+      try {
+        link = readlinkSync(probe);
+      } catch {
+        // Not a symlink (or not there): an ordinary missing component.
+      }
+      if (link !== undefined) {
+        pending = join(resolve(realpathSync(parent), link), ...rest);
+        break;
+      }
+      if (parent === probe) return join(probe, ...rest);
+      rest.unshift(basename(probe));
+      probe = parent;
+    }
+  }
+  throw new Error(`too many levels of symbolic links resolving ${path}`);
+};
+
+/** Whether `child` is `parent` or lies inside it, both resolved as above. */
+const isWithin = (parent: string, child: string): boolean => {
+  const relation = relative(
+    resolveThroughSymlinks(parent),
+    resolveThroughSymlinks(child),
+  );
+  return (
+    relation === "" ||
+    (relation !== ".." &&
+      !relation.startsWith(`..${sep}`) &&
+      !isAbsolute(relation))
+  );
+};
+
+/**
+ * A planner or goal directory that exists and has the gate installed.
+ *
+ * Only {@link gatedRoleDirectory} produces one. It is still a string, so it can be handed
+ * to a harness as one; the brand is what lets a function that creates a session ask for
+ * *this* and so refuse the plain strings and the ungated directories everything else is.
+ */
+export type GatedDirectory = string & Brand.Brand<"GatedDirectory">;
+const asGated = Brand.nominal<GatedDirectory>();
+
+/** What preparing one planner or goal directory needs. */
+export interface GatedRoleDirectory<E> {
+  /**
+   * Makes the directory, idempotently. For the fleet that is
+   * `FleetStore.ensurePlanningDirectory` or `ensureGoalDirectory`; taken as an effect so
+   * this file has no runtime dependence on the persistence layer (the import above is
+   * type-only). What it yields is deliberately not a
+   * string: see {@link UngatedRoleDirectory}.
+   */
+  readonly ensure: Effect.Effect<UngatedRoleDirectory, E>;
+  /** The harness's installer, as `AgentHarness.installGate`. */
+  readonly install: GateInstaller;
+  readonly policyUrl: string;
+  /** The target's audit file, outside every role directory; see {@link GateInstall}. */
+  readonly auditPath: string;
+  /**
+   * The operator's folder, where workers run, or `undefined` for a target that has none.
+   *
+   * **Required, and explicitly `undefined` when there is none**, for the reason
+   * {@link GateInstall.freshAudit} is required: the containment check below is the only
+   * thing in this function that enforces the layout's central rule, and an optional field
+   * is a check that silently does not run for the caller who forgets it. Spelling out
+   * `undefined` makes a caller say "this target has no workspace" rather than say nothing.
+   *
+   * A role directory inside it is refused. Spike B established that a sibling directory is
+   * a separate authority under OpenCode; it did not establish that a *nested* one is, and
+   * a worker could read the planner's machinery from inside the workspace in any case.
+   */
+  readonly workspace: string | undefined;
+}
+
+/**
+ * Makes a planner round's or a goal agent's directory and gates it, in that order, or
+ * refuses.
+ *
+ * **Why the gate goes in a directory where nothing is expected to act.** "The planner does
+ * not run shell commands" and "the goal agent only talks" are assumptions about what a
+ * model will choose to do, and the gate is what turns an assumption into a fact: a planner
+ * that does reach for `bash` or `webfetch` is denied by the same fail-closed path that
+ * stops a worker, and the attempt is audited, rather than relying on nothing having been
+ * asked. A gate missing from exactly the directories where no action is expected is how an
+ * unexpected action goes unrecorded. So all three roles are gated, and this is the single
+ * way to obtain a planner or goal directory that a session may be created in.
+ *
+ * The directory is created first and gated before it is returned, so no caller can
+ * receive a path whose gate has not been installed. Nothing here creates a session or
+ * grants a credential; it is layout and installation only.
+ *
+ * Both containment checks resolve symlinks, including through components that do not
+ * exist yet; see {@link resolveThroughSymlinks} for what that does and does not cover. A
+ * check that cannot resolve a path refuses rather than permits.
+ *
+ * Idempotent, because both steps are: a second call for the same round replaces the gate's
+ * entry (property 5) and appends to the same audit rather than emptying it.
+ */
+export const gatedRoleDirectory = <E>(
+  input: GatedRoleDirectory<E>,
+): Effect.Effect<GatedDirectory, E | PolicyHookNotInstalled> =>
+  Effect.gen(function* () {
+    const directory = (yield* input.ensure).unsafePath();
+    const refuse = (detail: string) =>
+      new PolicyHookNotInstalled({ workspace: directory, detail });
+
+    const auditInside = yield* Effect.try({
+      try: () => isWithin(directory, input.auditPath),
+      catch: (cause) =>
+        refuse(
+          `could not resolve the audit path ${input.auditPath} (${String(cause)}); refusing rather than guessing that it is outside`,
+        ),
+    });
+    if (auditInside) {
+      return yield* refuse(
+        `the audit path ${input.auditPath} is inside the directory it records; a session that can read its own audit trail can read the shape of the boundary it is inside`,
+      );
+    }
+    const workspace = input.workspace;
+    if (workspace !== undefined) {
+      const inWorkspace = yield* Effect.try({
+        try: () => isWithin(workspace, directory),
+        catch: (cause) =>
+          refuse(
+            `could not resolve the workspace ${workspace} (${String(cause)}); refusing rather than guessing that ${directory} is outside it`,
+          ),
+      });
+      if (inWorkspace) {
+        return yield* refuse(
+          `${directory} is inside the workspace ${workspace}, where workers run; a planner or goal directory must be outside it`,
+        );
+      }
+    }
+    yield* input.install({
+      workspace: directory,
+      policyUrl: input.policyUrl,
+      auditPath: input.auditPath,
+      // The audit belongs to the target and accumulates; see the worker's call site.
+      freshAudit: false,
+    });
+    return asGated(directory);
+  });
 
 /* ── OpenCode ────────────────────────────────────────────────────────────────── */
 

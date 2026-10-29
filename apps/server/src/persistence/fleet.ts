@@ -9,7 +9,13 @@
  *     <target-id>/
  *       hunt.sqlite                the graph, its events and its outbox
  *       evidence/                  content-hashed blobs, deliberately not in SQLite
+ *       planning/<round-id>/       one planner round's directory, made on demand
+ *       goal/<goal-id>/            one goal agent's directory, made on demand
  * ```
+ *
+ * The operator's own folder (`workspace_path`, where workers run) is the fourth place and
+ * is not under this tree. `planning/` and `goal/` sit here, and never inside that folder,
+ * for the reason given on {@link FleetPaths.planningDirectory}.
  *
  * **Why per-target files rather than one database.** §3 gives three reasons and they are
  * not stylistic. Provable deletion: `rm -rf targets/<id>/` is complete and demonstrable
@@ -84,6 +90,10 @@ export const TARGETS_DIRECTORY = "targets";
 export const HUNT_FILE = "hunt.sqlite";
 /** Where content-hashed evidence blobs go. Out of SQLite, by §3. */
 export const EVIDENCE_DIRECTORY = "evidence";
+/** Holds one directory per planner round; see {@link FleetPaths.planningDirectory}. */
+export const PLANNING_DIRECTORY = "planning";
+/** Holds one directory per goal agent; see {@link FleetPaths.goalDirectory}. */
+export const GOAL_DIRECTORY = "goal";
 
 /**
  * Whether a string may be used as a target id.
@@ -101,6 +111,53 @@ export const EVIDENCE_DIRECTORY = "evidence";
 export const isTargetId = (value: string): boolean =>
   /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value);
 
+/**
+ * Whether a string may name a planner round's or a goal's directory.
+ *
+ * The same shape as {@link isTargetId} with one difference: upper case is allowed. These
+ * ids are minted (`goal_` plus 26 base62 characters, see `identifier.ts`) rather than
+ * typed, and base62 is mixed-case, so refusing upper case would refuse every real id.
+ *
+ * The cost is stated rather than hidden: on a case-insensitive filesystem two ids that
+ * differ only in case would share one directory, and under OpenCode a shared directory is
+ * a shared authority (see {@link FleetPaths.planningDirectory}). It is accepted because
+ * a minted id begins with fourteen lowercase hex characters of a strictly increasing
+ * timestamp-and-counter, so two ids from one process always differ there and never in
+ * case alone. An id that did not come from `identifier.ts` is not covered by that.
+ */
+export const isRoleDirectoryId = (value: string): boolean =>
+  /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value);
+
+/**
+ * A planner or goal directory that exists and has **not** had the policy gate installed.
+ *
+ * **Why this is an object and not a string.** The rule is that a session is never created
+ * in a role directory the gate is not in, and a comment saying so is not a boundary: a
+ * `string` can be handed to `createSession` as readily as any other. So
+ * {@link FleetStore.ensurePlanningDirectory} and {@link FleetStore.ensureGoalDirectory}
+ * return this instead. It has no string coercion and is not accepted anywhere a path is,
+ * so using it as a directory is a type error, and the one thing that turns it into a path
+ * is `gatedRoleDirectory` (`policy/install.ts`), which installs the gate first and returns
+ * the path branded as gated.
+ *
+ * What this does not do: {@link UngatedRoleDirectory.unsafePath} exists, because the gate
+ * installer and the tests must read the path, and a caller determined to bypass the gate
+ * can call it. The guarantee is that bypassing is a visible, greppable act named `unsafe`,
+ * and never an accident of passing the return value along. The path can also still be
+ * rebuilt from {@link FleetPaths}, as it always could; that is why `FleetPaths` is not
+ * handed to session code.
+ */
+export class UngatedRoleDirectory {
+  readonly #path: string;
+  constructor(path: string) {
+    this.#path = path;
+  }
+  /** The directory, without the gate. Read by `gatedRoleDirectory` and by tests only. */
+  unsafePath(): string {
+    return this.#path;
+  }
+}
+
 /** Every path the fleet layout defines, built from a validated id. */
 export interface FleetPaths {
   readonly root: string;
@@ -108,6 +165,51 @@ export interface FleetPaths {
   readonly targetDirectory: (targetId: string) => string;
   readonly huntFile: (targetId: string) => string;
   readonly evidenceDirectory: (targetId: string) => string;
+  /**
+   * The directory one planner round runs in.
+   *
+   * **One directory per round, and not under the workspace.** The first rule comes from
+   * what Spike B measured (`spike/mcpIsolationProof.ts`, commit `ad4fe94`), and it is
+   * security rather than tidiness:
+   *
+   * Under OpenCode 2.2.1 an MCP registration belongs to a *directory*. Two sessions shared
+   * one directory, each registered under its own name and token. The second was asked to
+   * call the first's server, did, and the write landed under the **first** session's
+   * attempt, carried by the first session's bearer token; the second session's own
+   * credential recorded nothing. A third session in a sibling directory was refused by the
+   * harness ("Unknown tool"), and the recording proxy saw no request at all. So the
+   * directory is the only thing separating one session's tool authority from another's,
+   * and two rounds sharing a directory would see each other's registrations exactly as
+   * those two sessions did. A round's directory is therefore its own, and a worker's
+   * workspace is never also a planner's.
+   *
+   * The second rule is the one `evidence/` already follows: a worker must not be able to
+   * read the machinery that supervises it. The gate, its configuration and the harness's
+   * own per-directory state live in the directory a session runs in, so a planner
+   * directory inside the workspace would put them where the worker can read them.
+   *
+   * What the spike did **not** establish: it compared a shared directory with a *sibling*,
+   * not with a nested one, and it did not try a symlink or a differently spelled path to
+   * the same directory. So no role's directory here is nested inside another's, and
+   * `policy/install.ts` refuses a role directory inside the workspace rather than
+   * trusting the harness to treat a child as separate. Claude Code, by contrast, kept two
+   * live sessions in one directory apart (the second found no tool for the first's
+   * server); that is a property of its session-scoped registration, and this layout does
+   * not lean on it.
+   */
+  readonly planningDirectory: (targetId: string, roundId: string) => string;
+  /**
+   * The directory one goal agent runs in.
+   *
+   * Outside the workspace and distinct from every round's directory, for the reasons on
+   * {@link planningDirectory}. It matters more here: a goal agent's session is long-lived
+   * and its credential has no clock expiry (spec decision 4), so what contains it is the
+   * directory it is registered in. Process death and explicit revocation end the
+   * credential, and a second session placed in this directory would be able to use it
+   * for as long as it lived. Spike B is the evidence that this is a real way to lose
+   * containment under OpenCode rather than a hypothetical one.
+   */
+  readonly goalDirectory: (targetId: string, goalId: string) => string;
 }
 
 /**
@@ -126,6 +228,12 @@ export const fleetPaths = (root: string): FleetPaths => {
     }
     return targetId;
   };
+  const checkedRole = (kind: string, id: string): string => {
+    if (!isRoleDirectoryId(id)) {
+      throw new Error(`refusing to build a path from ${kind} id '${id}'`);
+    }
+    return id;
+  };
   return {
     root,
     controlFile: `${root}/${CONTROL_FILE}`,
@@ -135,6 +243,10 @@ export const fleetPaths = (root: string): FleetPaths => {
       `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${HUNT_FILE}`,
     evidenceDirectory: (targetId) =>
       `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${EVIDENCE_DIRECTORY}`,
+    planningDirectory: (targetId, roundId) =>
+      `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${PLANNING_DIRECTORY}/${checkedRole("round", roundId)}`,
+    goalDirectory: (targetId, goalId) =>
+      `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${GOAL_DIRECTORY}/${checkedRole("goal", goalId)}`,
   };
 };
 
@@ -148,6 +260,7 @@ export const fleetPaths = (root: string): FleetPaths => {
 export class FleetError extends Schema.TaggedError<FleetError>()("FleetError", {
   reason: Schema.Literals([
     "invalid_target_id",
+    "invalid_role_id",
     "unknown_target",
     "duplicate_target",
     "target_unavailable",
@@ -622,6 +735,70 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
     return paths.huntFile(targetId);
   });
 
+  /**
+   * Creates one role's directory on demand and returns it, ungated.
+   *
+   * Idempotent: `mkdir -p`, so creating a round's directory twice is not an error and
+   * leaves whatever the first creation put there. The registry is consulted first so a
+   * typo'd or archived-away id cannot grow a directory tree for a target that does not
+   * exist, and the id is checked here so a bad one is a typed refusal where
+   * {@link fleetPaths} would throw.
+   *
+   * **This makes the directory and does nothing else. It does not install the policy
+   * gate, and so it does not return a path**: it returns an {@link UngatedRoleDirectory},
+   * which nothing that creates a session accepts. The one conversion is
+   * `gatedRoleDirectory` (`policy/install.ts`), which installs the gate and only then
+   * yields a path. The gate is a harness concern and this module knows no harness.
+   *
+   * Outside every transaction, like {@link ensureDirectory} it calls.
+   */
+  const ensureRoleDirectory = Effect.fnUntraced(function* (
+    kind: "round" | "goal",
+    targetId: string,
+    id: string,
+  ) {
+    if (!isTargetId(targetId)) {
+      return yield* new FleetError({
+        reason: "invalid_target_id",
+        targetId,
+        detail: "not a usable target id",
+      });
+    }
+    if (!isRoleDirectoryId(id)) {
+      return yield* new FleetError({
+        reason: "invalid_role_id",
+        targetId,
+        detail: `'${id}' is not usable as a ${kind} directory name: use 1-64 characters of a-z, A-Z, 0-9, '-' or '_', starting with a letter or digit`,
+      });
+    }
+    const row = yield* target(targetId);
+    if (row === undefined) {
+      return yield* new FleetError({
+        reason: "unknown_target",
+        targetId,
+        detail: `no target ${targetId} is registered in ${CONTROL_FILE}`,
+      });
+    }
+    const path =
+      kind === "round"
+        ? paths.planningDirectory(targetId, id)
+        : paths.goalDirectory(targetId, id);
+    yield* ensureDirectory(path, targetId);
+    return new UngatedRoleDirectory(path);
+  });
+
+  const ensurePlanningDirectory = Effect.fn(
+    "FleetStore.ensurePlanningDirectory",
+  )(function* (targetId: string, roundId: string) {
+    return yield* ensureRoleDirectory("round", targetId, roundId);
+  });
+
+  const ensureGoalDirectory = Effect.fn("FleetStore.ensureGoalDirectory")(
+    function* (targetId: string, goalId: string) {
+      return yield* ensureRoleDirectory("goal", targetId, goalId);
+    },
+  );
+
   const setting = Effect.fn("FleetStore.setting")(function* (key: string) {
     const row = yield* selectSetting(key).pipe(
       Effect.mapError(lift("settings", key)),
@@ -655,6 +832,8 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
     migrateTarget,
     migrateFleet,
     huntFileFor,
+    ensurePlanningDirectory,
+    ensureGoalDirectory,
     setting,
     setSetting,
   });
@@ -685,6 +864,14 @@ export class FleetStore extends Context.Service<
     readonly huntFileFor: (
       targetId: string,
     ) => Effect.Effect<string, FleetError | DatabaseError>;
+    readonly ensurePlanningDirectory: (
+      targetId: string,
+      roundId: string,
+    ) => Effect.Effect<UngatedRoleDirectory, FleetError | DatabaseError>;
+    readonly ensureGoalDirectory: (
+      targetId: string,
+      goalId: string,
+    ) => Effect.Effect<UngatedRoleDirectory, FleetError | DatabaseError>;
     readonly setting: (
       key: string,
     ) => Effect.Effect<string | undefined, DatabaseError>;

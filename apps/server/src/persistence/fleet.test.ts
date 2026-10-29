@@ -14,9 +14,15 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 
 import { Effect } from "effect";
 import { SqlClient } from "effect/sql";
@@ -27,6 +33,7 @@ import {
   FleetError,
   FleetStore,
   fleetPaths,
+  isRoleDirectoryId,
   isTargetId,
   targetStoreLayer,
 } from "./fleet";
@@ -615,4 +622,195 @@ const observationInput = (operationId: string) => ({
   limitations: ["A request header is not a network address."],
   untestedDimensions: ["The per-account limit was never approached."],
   addressesDimensions: [],
+});
+
+describe("role directories", () => {
+  /** Every path a target owns, as resolved absolute paths. */
+  const everyPath = (
+    paths: ReturnType<typeof fleetPaths>,
+    targetId: string,
+    workspace: string,
+  ) => ({
+    hunt: resolve(paths.huntFile(targetId)),
+    evidence: resolve(paths.evidenceDirectory(targetId)),
+    planning: resolve(paths.planningDirectory(targetId, "rnd_1")),
+    goal: resolve(paths.goalDirectory(targetId, "goal_1")),
+    workspace: resolve(workspace),
+  });
+
+  const inside = (parent: string, child: string) => {
+    const relation = relative(parent, child);
+    return (
+      relation !== "" && relation !== ".." && !relation.startsWith(`..${sep}`)
+    );
+  };
+
+  test("the planning, goal, evidence, hunt and workspace paths are all distinct", () => {
+    const paths = fleetPaths("/tmp/root");
+    const one = Object.values(everyPath(paths, "alpha", "/tmp/ws/alpha"));
+    const two = Object.values(everyPath(paths, "beta", "/tmp/ws/beta"));
+    expect(new Set(one).size).toBe(one.length);
+    // Across targets too: no path of alpha's is any path of beta's.
+    expect(new Set([...one, ...two]).size).toBe(one.length + two.length);
+
+    const alpha = everyPath(paths, "alpha", "/tmp/ws/alpha");
+    // And neither role directory is nested in the other's or in evidence, which Spike B
+    // never tested: only siblings were compared with a shared directory.
+    expect(inside(alpha.evidence, alpha.planning)).toBe(false);
+    expect(inside(alpha.evidence, alpha.goal)).toBe(false);
+    expect(inside(alpha.planning, alpha.goal)).toBe(false);
+    expect(inside(alpha.goal, alpha.planning)).toBe(false);
+    expect(paths.planningDirectory("alpha", "x")).toBe(
+      "/tmp/root/targets/alpha/planning/x",
+    );
+    expect(paths.goalDirectory("alpha", "x")).toBe(
+      "/tmp/root/targets/alpha/goal/x",
+    );
+    // The same id as a round and as a goal is two directories, not one.
+    expect(paths.planningDirectory("alpha", "same")).not.toBe(
+      paths.goalDirectory("alpha", "same"),
+    );
+  });
+
+  test("two round ids give two directories, and one round id gives one", () => {
+    const paths = fleetPaths("/tmp/root");
+    expect(paths.planningDirectory("alpha", "rnd_a")).not.toBe(
+      paths.planningDirectory("alpha", "rnd_b"),
+    );
+    expect(paths.planningDirectory("alpha", "rnd_a")).toBe(
+      paths.planningDirectory("alpha", "rnd_a"),
+    );
+    expect(paths.goalDirectory("alpha", "goal_a")).not.toBe(
+      paths.goalDirectory("alpha", "goal_b"),
+    );
+  });
+
+  test("a path built for one target never resolves inside another's tree", () => {
+    const paths = fleetPaths("/tmp/root");
+    const tree = (targetId: string) => resolve(paths.targetDirectory(targetId));
+    // A target id that is a prefix of the other's is the case a string prefix test gets
+    // wrong; the resolved relation does not.
+    for (const [a, b] of [
+      ["alpha", "beta"],
+      ["alpha", "alpha-2"],
+      ["alpha-2", "alpha"],
+    ] as const) {
+      for (const built of [
+        resolve(paths.planningDirectory(a, "rnd_1")),
+        resolve(paths.goalDirectory(a, "goal_1")),
+        resolve(paths.evidenceDirectory(a)),
+      ]) {
+        expect(inside(tree(b), built)).toBe(false);
+        expect(inside(tree(a), built)).toBe(true);
+      }
+    }
+    // The ids a role directory is built from cannot climb out of their parent either.
+    for (const bad of [
+      "..",
+      ".",
+      "../beta",
+      "a/b",
+      "a\\b",
+      "",
+      " ",
+      "-x",
+      ".hidden",
+      "x".repeat(65),
+    ]) {
+      expect(isRoleDirectoryId(bad)).toBe(false);
+      expect(() => paths.planningDirectory("alpha", bad)).toThrow();
+      expect(() => paths.goalDirectory("alpha", bad)).toThrow();
+    }
+    expect(() => paths.planningDirectory("../beta", "rnd_1")).toThrow();
+    expect(() => paths.goalDirectory("../beta", "goal_1")).toThrow();
+    // Minted ids are mixed-case base62 and have to be accepted.
+    expect(isRoleDirectoryId("goal_0192a3Fb4C5d6E7f8G9h0I1j2K")).toBe(true);
+  });
+
+  test("creation is on demand and idempotent, and keeps what the first made", async () => {
+    const root = newRoot();
+    const outcome = await withFleet(root, (fleet) =>
+      Effect.gen(function* () {
+        yield* register(fleet, "alpha");
+        const planning = fleet.paths.planningDirectory("alpha", "rnd_1");
+        const goal = fleet.paths.goalDirectory("alpha", "goal_1");
+        const before = {
+          planning: existsSync(planning),
+          goal: existsSync(goal),
+        };
+
+        const first = yield* fleet.ensurePlanningDirectory("alpha", "rnd_1");
+        writeFileSync(join(first.unsafePath(), "left-by-the-first"), "kept");
+        const again = yield* fleet.ensurePlanningDirectory("alpha", "rnd_1");
+        const other = yield* fleet.ensurePlanningDirectory("alpha", "rnd_2");
+        const goalFirst = yield* fleet.ensureGoalDirectory("alpha", "goal_1");
+        const goalAgain = yield* fleet.ensureGoalDirectory("alpha", "goal_1");
+        return {
+          before,
+          first,
+          again,
+          other,
+          goalFirst,
+          goalAgain,
+          planning,
+          goal,
+        };
+      }),
+    );
+
+    // Not made by registering: on demand means the first request makes it.
+    expect(outcome.before).toEqual({ planning: false, goal: false });
+    expect(outcome.first.unsafePath()).toBe(outcome.planning);
+    expect(outcome.again.unsafePath()).toBe(outcome.first.unsafePath());
+    expect(outcome.other.unsafePath()).not.toBe(outcome.first.unsafePath());
+    expect(outcome.goalFirst.unsafePath()).toBe(outcome.goal);
+    expect(outcome.goalAgain.unsafePath()).toBe(outcome.goalFirst.unsafePath());
+    expect(
+      existsSync(join(outcome.first.unsafePath(), "left-by-the-first")),
+    ).toBe(true);
+
+    // The ungated directory is not a path. Handing it to anything that wants a string
+    // (a session's `directory`, say) is a compile error, which `tsc` checks here.
+    // @ts-expect-error an UngatedRoleDirectory is not assignable to string
+    const asString: string = outcome.first;
+    expect(typeof asString).toBe("object");
+    expect(
+      readdirSync(join(root, "targets", "alpha", "planning")).sort(),
+    ).toEqual(["rnd_1", "rnd_2"]);
+    expect(readdirSync(join(root, "targets", "alpha", "goal"))).toEqual([
+      "goal_1",
+    ]);
+  });
+
+  test("an unregistered target or an unusable id is refused, and nothing is created", async () => {
+    const root = newRoot();
+    const outcome = await withFleet(root, (fleet) =>
+      Effect.gen(function* () {
+        yield* register(fleet, "alpha");
+        return {
+          unknown: yield* Effect.result(
+            fleet.ensurePlanningDirectory("ghost", "rnd_1"),
+          ),
+          badTarget: yield* Effect.result(
+            fleet.ensureGoalDirectory("../alpha", "goal_1"),
+          ),
+          badRound: yield* Effect.result(
+            fleet.ensurePlanningDirectory("alpha", "../../evidence"),
+          ),
+          badGoal: yield* Effect.result(
+            fleet.ensureGoalDirectory("alpha", "a/b"),
+          ),
+        };
+      }),
+    );
+    const reason = (result: (typeof outcome)[keyof typeof outcome]) =>
+      result._tag === "Failure" ? (result.failure as FleetError).reason : "ok";
+    expect(reason(outcome.unknown)).toBe("unknown_target");
+    expect(reason(outcome.badTarget)).toBe("invalid_target_id");
+    expect(reason(outcome.badRound)).toBe("invalid_role_id");
+    expect(reason(outcome.badGoal)).toBe("invalid_role_id");
+    expect(existsSync(join(root, "targets", "ghost"))).toBe(false);
+    expect(existsSync(join(root, "targets", "alpha", "planning"))).toBe(false);
+    expect(existsSync(join(root, "targets", "alpha", "goal"))).toBe(false);
+  });
 });
