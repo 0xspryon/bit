@@ -1,5 +1,16 @@
 /**
- * Startup reconciliation of attempts no definite answer has been reached about.
+ * Startup reconciliation of work no definite answer has been reached about.
+ *
+ * Two kinds of row, one register. An **attempt** left `running` or `uncertain` is swept by
+ * {@link reconcileUnsettledAttempts}; a **planner round** left `running` is swept by
+ * {@link reconcileRunningRounds}. Everything this file says about what reconciliation may
+ * conclude applies to both, and the two differences are stated where they are: a round's
+ * vocabulary has no `failed` to be wrong with, and a round has no recovery table, so the
+ * durable trace of a swept round is its `plan.round.settled` event rather than a
+ * `round_recoveries` row. The round sweep's own reason for existing is narrower and worth
+ * naming here: `openRound` refuses a second running round on a goal, so a round left
+ * behind by a dead process means that goal takes no further rounds until something settles
+ * it.
  *
  * A row at `status: 'running'` after a restart is a question, not a fact: the process
  * that owned it is gone, so nothing in memory knows what became of it. Nothing used to
@@ -49,6 +60,9 @@ import {
   type AttemptRow,
   type RecoveryOutcome,
   type ReleasedClaim,
+  type RoundSettlement,
+  type RoundTerminalStatus,
+  type StoredRound,
 } from "../persistence/store";
 import {
   HarnessSessionStatus,
@@ -208,6 +222,180 @@ export const releaseOrphanedClaims = Effect.fn("releaseOrphanedClaims")(
     return released;
   },
 );
+
+/* ── Planner rounds ──────────────────────────────────────────────────────────── */
+
+/**
+ * The status one harness answer proposes for a planner round.
+ *
+ * {@link mapObserved}'s counterpart, read into the round vocabulary, and the reason it is
+ * a second function rather than a cast is `run/settlement.ts`'s `roundSettlementFor`: a
+ * round has no `succeeded` and no `failed`, because it does not pass or fail — what it
+ * concluded is its `disposition` column, which recovery never writes.
+ *
+ * `undefined` for `running`, which is the one answer that is **not** a proposal: the
+ * harness says the session is still going, so there is nothing to record and the row is
+ * left exactly as it is. The other six all end the round, and three of them end it
+ * `uncertain` — which is the point of the mapping: there is no path from "we do not know"
+ * to a definite status.
+ */
+export const mapObservedRound = (
+  observed: HarnessObservedStatus,
+): RoundTerminalStatus | undefined => {
+  switch (observed) {
+    case "running":
+      return undefined;
+    // Both are the harness stating that execution ended, which is all a round's status
+    // claims. A round whose session failed and recorded no disposition is `settled` with a
+    // null disposition, and that pair is the honest record.
+    case "succeeded":
+    case "failed":
+      return "settled";
+    case "interrupted":
+      return "interrupted";
+    case "unbound":
+    case "missing":
+    case "unreachable":
+      return "uncertain";
+  }
+};
+
+export interface RoundReconciliation {
+  readonly round: StoredRound;
+  readonly observed: HarnessObservedStatus;
+  readonly harnessDetail: string;
+  /** Absent when the harness says the session is still running; nothing was written. */
+  readonly settlement: RoundSettlement | undefined;
+  /** The round's write fence after this pass, or `undefined` if nothing moved it. */
+  readonly fenceAfter: number | undefined;
+  /** Live in-memory grants dropped for this round, if a registry was available. */
+  readonly revokedGrants: number;
+}
+
+/**
+ * Reconciles one round: ask, then record.
+ *
+ * {@link reconcileAttempt}'s shape, with three differences that each follow from a round
+ * having no recovery table of its own:
+ *
+ * - **There is no `recordRecovery`.** An attempt's reconciliation is one transaction that
+ *   decides, writes the row, bumps the fence and files an `attempt_recoveries` record. A
+ *   round has `settleRound` and `supersedeRound` and no third table, so this does the two
+ *   writes in order — status first, authority second, for the reason
+ *   `plan/planSupervisor.ts`'s `settle` gives: revoking first would leave the credential
+ *   gone while the row still said the round may write.
+ * - **The durable record of the pass is the event.** `settleRound` appends
+ *   `plan.round.settled` with `settledBy: "recovery"` **and the harness's own answer**,
+ *   which together are what distinguishes a swept round from one a supervisor watched and
+ *   say how much was known. There is no `times` count and no stored disposition, because
+ *   nothing re-sweeps a settled round: `settleRound` is guarded to `running` and
+ *   `roundsLeftRunning` reads only `running`, so a round's sweep count is always one.
+ * - **Settling the round is what releases the goal.** `openRound` refuses a second running
+ *   round on a goal, so a round left `running` by a dead process blocks every later round
+ *   on that goal until this moves it — the same class of bug slice 2 hit when an intent
+ *   claim outlived the process that took it. There is no separate claim to give back: the
+ *   in-process claim died with the process, and the row is the durable half.
+ *
+ * The harness is asked outside any transaction, deliberately: that is the HTTP call.
+ */
+export const reconcileRound = Effect.fn("reconcileRound")(function* (
+  round: StoredRound,
+) {
+  const harness = yield* HarnessSessionStatus;
+  const store = yield* ObservationStore;
+  const credentials = yield* Effect.serviceOption(McpCredentials);
+
+  const report = yield* harness.of(
+    round.harnessSessionId,
+    round.harnessInstanceId,
+  );
+  const proposed = mapObservedRound(report.observed);
+  if (proposed === undefined) {
+    // The harness says the session is live. Left alone, authority intact — this is the
+    // whole reason the sweep does not simply mark what it finds as interrupted. The round
+    // has no fiber in this process driving it, so nothing will settle it until it stops
+    // running and a later sweep asks again.
+    return {
+      round,
+      observed: report.observed,
+      harnessDetail: report.detail,
+      settlement: undefined,
+      fenceAfter: undefined,
+      revokedGrants: 0,
+    } satisfies RoundReconciliation;
+  }
+
+  const settlement = yield* store.settleRound(round.roundId, proposed, {
+    _tag: "recovery",
+    // The harness's answer, carried into the `plan.round.settled` payload rather than
+    // only into the log line below. Three of the seven answers map onto `uncertain`, so
+    // without this the durable record could not tell "the session is gone" (`missing`)
+    // from "we could not ask" (`unreachable`) — a distinction the attempt path keeps on
+    // its own recovery row and a round has no table for. `RoundSettler` is tagged so a
+    // sweep cannot forget to say.
+    observed: report.observed,
+  });
+  // Only once the status has moved. `changed: false` means another writer settled it
+  // between the read and this call, and superseding then would bump a fence for a round
+  // somebody else has already finished accounting for.
+  const fenceAfter = settlement.changed
+    ? yield* store.supersedeRound(round.roundId)
+    : undefined;
+  const revokedGrants =
+    settlement.changed && Option.isSome(credentials)
+      ? yield* credentials.value.revokeRound(round.roundId)
+      : 0;
+
+  return {
+    round,
+    observed: report.observed,
+    harnessDetail: report.detail,
+    settlement,
+    fenceAfter,
+    revokedGrants,
+  } satisfies RoundReconciliation;
+});
+
+/**
+ * Reconciles every planner round a process left `running`.
+ *
+ * Run at startup beside {@link reconcileUnsettledAttempts}, and safe to run repeatedly: a
+ * round this pass settles is no longer `running`, so the next pass does not see it.
+ *
+ * What each row can become:
+ *
+ * - the harness still reports it live → left alone, authority intact.
+ * - a definite answer → `settled` or `interrupted`, authority revoked, the goal free.
+ * - no answer → `uncertain`, authority revoked anyway, the goal free. Never `failed`:
+ *   a round has no such status to reach for, which is the vocabulary doing the work the
+ *   attempt sweep does with a rule.
+ */
+export const reconcileRunningRounds = Effect.fn("reconcileRunningRounds")(
+  function* () {
+    const store = yield* ObservationStore;
+    const running = yield* store.roundsLeftRunning();
+    if (running.length === 0) return [];
+    yield* Effect.logInfo(
+      `reconciling ${String(running.length)} planner round(s) left running: ` +
+        running.map((round) => `${round.roundId}:${round.goalId}`).join(", "),
+    );
+    return yield* Effect.forEach(running, reconcileRound);
+  },
+);
+
+/** One line per reconciled round, in the register of {@link renderReconciliation}. */
+export const renderRoundReconciliation = (entry: RoundReconciliation): string =>
+  [
+    entry.round.roundId,
+    `goal=${entry.round.goalId}`,
+    `session=${entry.round.harnessSessionId ?? "none"}`,
+    `harness=${entry.observed}`,
+    `status=running->${entry.settlement?.effective ?? "left running"}`,
+    `disposition=${entry.round.disposition ?? "none"}`,
+    `fence=${String(entry.round.writeFence)}->${entry.fenceAfter === undefined ? String(entry.round.writeFence) : String(entry.fenceAfter)}`,
+    `grantsRevoked=${String(entry.revokedGrants)}`,
+    `goal=${entry.settlement?.changed === true ? "released" : "still held"}`,
+  ].join("  ");
 
 /** One line per released claim, in the register of {@link renderReconciliation}. */
 export const renderReleasedClaim = (claim: ReleasedClaim): string =>

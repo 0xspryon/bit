@@ -44,6 +44,14 @@
  * A harness that will not start is **not** fatal — see `harness` below — because a server
  * that would not boot without one could not be used to look at what earlier runs recorded.
  *
+ * **And it can open planner rounds.** `plan/planSupervisor.ts` is the second supervisor in
+ * this process and is built beside the first, from the same resolver and the same
+ * credential registry. Nothing calls it yet: there is no route and the round's prompt is a
+ * stub, because a planner with no tools has nothing to plan with until slice 7 gives it
+ * some. What *is* live is the lifecycle — a round in flight is settled when this process
+ * stops, and a round a dead process left `running` is reconciled at the next boot, which is
+ * what keeps a goal from being blocked by a crash.
+ *
  * What this entrypoint owns, in one scope, released in reverse on every exit including
  * `SIGINT`:
  *
@@ -119,6 +127,7 @@ import {
   type HarnessCandidate,
 } from "./harness/resolver";
 import { McpCredentials } from "./mcp/credentials";
+import { DEFAULT_ROUND_BUDGET, PlanSupervisor } from "./plan/planSupervisor";
 import { McpCallCounter } from "./mcp/server";
 import { FleetStore } from "./persistence/fleet";
 import { ObservationStore } from "./persistence/store";
@@ -129,10 +138,12 @@ import { RunNarrations } from "./run/narration";
 import { RunSupervisor, WorkerEndpoints } from "./run/supervisor";
 import { HarnessSessionStatus } from "./recovery/harnessStatus";
 import {
+  reconcileRunningRounds,
   reconcileUnsettledAttempts,
   releaseOrphanedClaims,
   renderReleasedClaim,
   renderReconciliation,
+  renderRoundReconciliation,
 } from "./recovery/reconcile";
 
 /**
@@ -184,6 +195,32 @@ process.on("SIGTERM", requestShutdown);
 const HUNT_ROOT =
   process.env["HUNT_ROOT"] ?? join(process.cwd(), ".runtime", "hunt");
 const PORT = Number(process.env["PORT"] ?? 3000);
+
+/**
+ * How many intents one planner round may add, from `PLANNER_ROUND_BUDGET`.
+ *
+ * **Five by default**, which is `plan/planSupervisor.ts`'s `DEFAULT_ROUND_BUDGET` and a
+ * starting point rather than a finding. It is read here, with the rest of this process's
+ * configuration, and written onto each round's row — so the limit a round was opened under
+ * is a fact about that round and not about whatever this variable happens to say later.
+ * `add_intent` is what enforces it, in slice 7 (the spec's decision 10); nothing enforces
+ * it today, because a round has no tools yet.
+ *
+ * An unparseable or non-positive value falls back to the default and says so, rather than
+ * opening rounds with a budget of `NaN`. A budget is a ceiling on writes, and a ceiling
+ * nobody can read is worse than the default.
+ */
+const PLANNER_ROUND_BUDGET = ((raw: string | undefined): number => {
+  if (raw === undefined) return DEFAULT_ROUND_BUDGET;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.error(
+      `PLANNER_ROUND_BUDGET='${raw}' is not a positive whole number; using the default of ${String(DEFAULT_ROUND_BUDGET)}`,
+    );
+    return DEFAULT_ROUND_BUDGET;
+  }
+  return parsed;
+})(process.env["PLANNER_ROUND_BUDGET"]);
 
 /**
  * The configured server password, read and **removed from this process's environment**
@@ -475,6 +512,9 @@ const configured: readonly HarnessCandidate[] =
  */
 const withoutHarness = Layer.mergeAll(
   RunSupervisor.unavailable,
+  // The same arrangement one supervisor along: a process with no harness still sweeps
+  // rounds left behind by one that had, and refuses every new round by name.
+  PlanSupervisor.unavailable,
   HarnessSessionStatus.fromAnswers({}),
   // An empty resolver rather than no resolver, so the shape of this graph does not depend
   // on whether a harness was configured: the browser's picker asks the same service either
@@ -534,11 +574,20 @@ const agent =
               },
             ),
       ).pipe(Layer.merge(withoutHarness))
-    : Layer.mergeAll(RunSupervisor.layer, HarnessSessionStatus.layer).pipe(
-        // One resolver for the process, provided to both: a second would be a second set
-        // of built harnesses, which for OpenCode means a second child process.
+    : Layer.mergeAll(
+        RunSupervisor.layer,
+        // The budget is configuration and the only thing this root tells the plan
+        // supervisor; everything else it needs is a service below. `FleetStore` is a
+        // requirement `RunSupervisor` does not have, because a round runs in a directory
+        // this installation lays out rather than in the operator's own folder.
+        PlanSupervisor.layerWith({ budget: PLANNER_ROUND_BUDGET }),
+        HarnessSessionStatus.layer,
+      ).pipe(
+        // One resolver for the process, provided to all three: a second would be a second
+        // set of built harnesses, which for OpenCode means a second child process.
         Layer.provideMerge(harnessResolverLayer(configured)),
         Layer.provide(targetStores),
+        Layer.provide(fleet),
         Layer.provide(credentials),
         // `provideMerge`, so the bus the supervisor publishes to is also in this graph's
         // context and can be handed to the browser API below. With `provide` it was the
@@ -631,7 +680,7 @@ const endpoint = Layer.unwrap(
 );
 
 /**
- * Startup reconciliation, now across the whole fleet rather than one target.
+ * Startup reconciliation of attempts **and planner rounds**, across the whole fleet.
  *
  * This is a consequence of losing the pin, and it is a fix rather than a cost. The sweep
  * reads `attempts` out of a target's own `hunt.sqlite`, and this process used to hold
@@ -643,6 +692,13 @@ const endpoint = Layer.unwrap(
  * Archived targets are skipped. An archived engagement is one nobody is working on, so an
  * attempt row inside it is not a question about what is running now; opening its file to
  * ask would also undo the point of archiving it.
+ *
+ * **Rounds are swept here for a reason attempts do not have.** An attempt left `running`
+ * is a question about what happened. A *round* left `running` is also a blockage:
+ * `openRound` refuses a second running round on a goal, so until this sweep moves the row
+ * that goal takes no further rounds at all — the same class of bug an intent claim
+ * outliving its process produced in slice 2. The sweep still reconciles rather than
+ * guesses; what it adds is that an honest `uncertain` also frees the goal.
  *
  * **One target that will not open does not stop the others.** That is the fleet's
  * partial-failure policy (`persistence/fleet.ts`) applied to recovery: a refusal is logged
@@ -663,15 +719,24 @@ const reconcile = Effect.gen(function* () {
   const stores = yield* TargetStores;
   const rows = yield* registry.targets();
   let swept = 0;
-  let total = 0;
+  let attempts = 0;
+  let rounds = 0;
   for (const row of rows) {
     if (row.archivedAt !== undefined) continue;
     const outcome = yield* Effect.result(
       Effect.scoped(
         Effect.flatMap(stores.open(row.targetId), (store) =>
-          reconcileUnsettledAttempts().pipe(
-            Effect.provideService(ObservationStore, store),
-          ),
+          // Both sweeps in one borrow of this target's store, because they answer one
+          // question — what did the last process leave unsettled in this file? — and two
+          // borrows would be two reference counts on the same handle for no gain. The
+          // order between them does not matter: they touch different tables and neither
+          // reads the other's rows.
+          Effect.gen(function* () {
+            return {
+              attempts: yield* reconcileUnsettledAttempts(),
+              rounds: yield* reconcileRunningRounds(),
+            };
+          }).pipe(Effect.provideService(ObservationStore, store)),
         ),
       ),
     );
@@ -682,14 +747,17 @@ const reconcile = Effect.gen(function* () {
       continue;
     }
     swept += 1;
-    total += outcome.success.length;
-    for (const entry of outcome.success)
+    attempts += outcome.success.attempts.length;
+    rounds += outcome.success.rounds.length;
+    for (const entry of outcome.success.attempts)
       console.log(`  ${row.targetId}: ${renderReconciliation(entry)}`);
+    for (const entry of outcome.success.rounds)
+      console.log(`  ${row.targetId}: ${renderRoundReconciliation(entry)}`);
   }
   console.log(
-    total === 0
-      ? `startup reconciliation: no attempt was left running or uncertain across ${String(swept)} target(s)`
-      : `startup reconciliation: ${String(total)} attempt(s) across ${String(swept)} target(s)`,
+    attempts === 0 && rounds === 0
+      ? `startup reconciliation: no attempt or planner round was left unsettled across ${String(swept)} target(s)`
+      : `startup reconciliation: ${String(attempts)} attempt(s) and ${String(rounds)} planner round(s) across ${String(swept)} target(s)`,
   );
 });
 
@@ -784,6 +852,15 @@ const program = Effect.gen(function* () {
   const alreadyRunning = yield* supervisor.running;
   console.log(
     `  runs supervised right now: ${String(alreadyRunning.length)} (a fresh process supervises none; rows left by an old one are the sweep's)`,
+  );
+  // The same claim for the second supervisor, and this line is also what makes the layer
+  // demonstrably *built* in this graph rather than merely merged into it: a plan supervisor
+  // that was never constructed would have no fiber map, so nothing would settle a round in
+  // flight when this process is asked to stop.
+  const planner = yield* PlanSupervisor;
+  const planning = yield* planner.running;
+  console.log(
+    `  planner rounds supervised right now: ${String(planning.length)} (budget per round: ${String(PLANNER_ROUND_BUDGET)} intent(s), from PLANNER_ROUND_BUDGET)`,
   );
   // Already open if the signal landed while we were still booting, in which case this
   // returns straight away. See `shutdownRequested`.

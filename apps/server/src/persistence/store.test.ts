@@ -4427,7 +4427,7 @@ describe("a planner round", () => {
     const outcome = await withSeeded((store) =>
       Effect.gen(function* () {
         yield* store.openRound(HOST, openRoundInput());
-        yield* store.settleRound("rnd-1", "settled");
+        yield* store.settleRound("rnd-1", "settled", { _tag: "supervisor" });
         const second = yield* store.openRound(
           HOST,
           openRoundInput({ roundId: "rnd-2" }),
@@ -4443,7 +4443,7 @@ describe("a planner round", () => {
     const failure = await withSeeded((store) =>
       Effect.gen(function* () {
         yield* store.openRound(HOST, openRoundInput());
-        yield* store.settleRound("rnd-1", "settled");
+        yield* store.settleRound("rnd-1", "settled", { _tag: "supervisor" });
         return yield* Effect.result(store.openRound(HOST, openRoundInput()));
       }),
     );
@@ -4530,9 +4530,13 @@ describe("a planner round", () => {
           roundCallerFor("rnd-1"),
           "objective_met",
         );
-        const settled = yield* store.settleRound("rnd-1", "settled");
+        const settled = yield* store.settleRound("rnd-1", "settled", {
+          _tag: "supervisor",
+        });
         yield* store.openRound(HOST, openRoundInput({ roundId: "rnd-2" }));
-        const interrupted = yield* store.settleRound("rnd-2", "interrupted");
+        const interrupted = yield* store.settleRound("rnd-2", "interrupted", {
+          _tag: "supervisor",
+        });
         return {
           settled,
           interrupted,
@@ -4557,10 +4561,14 @@ describe("a planner round", () => {
     const outcome = await withSeeded((store) =>
       Effect.gen(function* () {
         yield* store.openRound(HOST, openRoundInput());
-        yield* store.settleRound("rnd-1", "uncertain");
+        yield* store.settleRound("rnd-1", "uncertain", { _tag: "supervisor" });
         return {
-          again: yield* store.settleRound("rnd-1", "settled"),
-          missing: yield* store.settleRound("rnd-absent", "settled"),
+          again: yield* store.settleRound("rnd-1", "settled", {
+            _tag: "supervisor",
+          }),
+          missing: yield* store.settleRound("rnd-absent", "settled", {
+            _tag: "supervisor",
+          }),
           round: yield* store.loadRound("rnd-1"),
         };
       }),
@@ -4782,7 +4790,7 @@ describe("telling three kinds of caller apart", () => {
   test("a settled round's credential is refused as stale, naming the status", async () => {
     const failure = await withRound((store) =>
       Effect.gen(function* () {
-        yield* store.settleRound("rnd-1", "settled");
+        yield* store.settleRound("rnd-1", "settled", { _tag: "supervisor" });
         return yield* Effect.result(
           store.recordRoundDisposition(roundCaller(), "actionable"),
         );

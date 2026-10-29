@@ -83,6 +83,27 @@ import { Schema } from "effect";
  * attempt to settle, so the release is its own event: `recovery` is the releaser, the payload
  * names the attempt the claim pointed at and the status that row held (null when it had
  * none), and the intent returns to `open`, never `answered`.
+ *
+ * **`plan.round.started` and `plan.round.settled` are the third started/settled pair, and
+ * they exist for a reason the other two do not have.** A planner round's prose is *not*
+ * recorded anywhere: narration is streamed and never persisted
+ * (`docs/design/goal-and-planner-flow.md` decision 14), so without these two the structure
+ * of a planner conversation would survive nothing — not a reload, not a restart. Decision
+ * 16 is the rule they implement: round boundaries come from records, so a refresh keeps
+ * the shape of what happened even when the words are gone.
+ *
+ * They follow `attempt.*`'s pairing exactly, including "at least one, not exactly one" in
+ * principle — a `settled` with `priorStatus: "running"` is the first and only one a round
+ * gets today, because `settleRound` is guarded to `running` and nothing refines an
+ * `uncertain` round. Both are host-originated, like the attempt pair: a round's beginning
+ * is written before any credential for it exists, and its end is written by the supervisor
+ * or the startup sweep, neither of which presents a round credential. So the three
+ * caller-authority columns are null and the round is the `subjectId`. Neither carries an
+ * outbox request, for `attempt.*`'s reason.
+ *
+ * What is *not* here: the round's disposition. `plan.round.settled` carries the
+ * disposition the round had recorded, if any, as a fact about the row — but a round
+ * recording one is the planner's own write and gets no event of its own in this build.
  */
 export const EventKind = Schema.Literals([
   "asset.recorded",
@@ -94,6 +115,8 @@ export const EventKind = Schema.Literals([
   "goal.ended",
   "intent.abandoned",
   "intent.released",
+  "plan.round.started",
+  "plan.round.settled",
 ]);
 export type EventKind = typeof EventKind.Type;
 

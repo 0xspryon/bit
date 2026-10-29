@@ -47,8 +47,10 @@ import {
   MutationError,
   ObservationStore,
   decideRecovery,
+  operatorScope,
   type AttemptExecutionStatus,
   type AttemptCaller,
+  type RoundCaller,
 } from "../persistence/store";
 import {
   HarnessSessionStatus,
@@ -56,6 +58,8 @@ import {
 } from "./harnessStatus";
 import {
   mapObserved,
+  mapObservedRound,
+  reconcileRunningRounds,
   reconcileUnsettledAttempts,
   releaseOrphanedClaims,
 } from "./reconcile";
@@ -1568,5 +1572,292 @@ describe("an intent claim a dead process left behind", () => {
     ]);
     // It does not read observations: reconciling a lock is not judging the work.
     expect(outcome.after).toEqual({ status: "open", claimedBy: null });
+  });
+});
+
+/* ── Planner rounds the sweep finds ──────────────────────────────────────────── */
+
+/**
+ * The round half of the sweep, and the one claim it makes that the attempt half does not.
+ *
+ * An attempt left `running` is a question about what happened. A round left `running` is
+ * also a *blockage*: `openRound` refuses a second running round on a goal, so a goal whose
+ * planner's process died takes no further rounds until something moves that row. So every
+ * test here asserts the settlement **and** that the goal is free afterwards — or, where the
+ * harness says the session is still live, that it is deliberately not.
+ *
+ * The database is real for `reconcileUnsettledAttempts`'s reason: the fence has to survive
+ * a reopen, and nothing checks a round's SQL at compile time.
+ */
+describe("a planner round a process left running", () => {
+  const HOST = { callerScope: operatorScope(TARGET), targetId: TARGET };
+  const ROUND_SESSION = "ses_round_abandoned";
+
+  const openRound = (
+    store: ObservationStore["Service"],
+    roundId: string,
+    harnessSessionId: string | null = ROUND_SESSION,
+  ) =>
+    store.openRound(HOST, {
+      goalId: "goal-1",
+      roundId,
+      budget: 5,
+      harnessInstanceId: "opencode",
+      providerId: "openai",
+      modelId: "gpt-5.6-sol",
+      harnessSessionId,
+    });
+
+  const roundCaller = (roundId: string, roundFence: number): RoundCaller => ({
+    _tag: "round",
+    callerScope: `${TARGET}/round/${roundId}`,
+    targetId: TARGET,
+    goalId: "goal-1",
+    roundId,
+    roundFence,
+  });
+
+  /** Pure, so the whole state space is enumerable without a connection. */
+  test("the mapping has no `failed` in it, and three answers mean uncertain", () => {
+    // `running` is the one answer that is not a proposal at all: nothing is recorded.
+    expect(mapObservedRound("running")).toBeUndefined();
+    // Both definite non-interrupted answers mean the same thing about a round, because a
+    // round's status says whether execution finished and never how the planning went.
+    expect(mapObservedRound("succeeded")).toBe("settled");
+    expect(mapObservedRound("failed")).toBe("settled");
+    expect(mapObservedRound("interrupted")).toBe("interrupted");
+    expect(mapObservedRound("unbound")).toBe("uncertain");
+    expect(mapObservedRound("missing")).toBe("uncertain");
+    expect(mapObservedRound("unreachable")).toBe("uncertain");
+  });
+
+  test("sweeps to uncertain when the harness cannot answer, and the goal takes a round again", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-1");
+        yield* openRound(store, "rnd-1");
+      }),
+    );
+
+    // A fresh process, a fresh connection, and a harness that has never heard of the
+    // session — which is the expected answer after a restart, not an exception.
+    const outcome = await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        const swept = yield* reconcileRunningRounds();
+        return {
+          swept,
+          round: yield* store.loadRound("rnd-1"),
+          // The question the goal claim actually answers: can this goal be planned again?
+          reopened: yield* Effect.result(openRound(store, "rnd-2")),
+        };
+      }),
+    );
+
+    expect(outcome.swept).toHaveLength(1);
+    expect(outcome.swept[0]?.observed).toBe("missing");
+    expect(outcome.swept[0]?.settlement?.effective).toBe("uncertain");
+    // Never `settled`: "we could not ask" and "it finished" are different facts.
+    expect(outcome.round?.status).toBe("uncertain");
+    // Authority is gone durably as well as in memory, so a credential minted before the
+    // restart is refused after it.
+    expect(outcome.round?.writeFence).toBe(1);
+    expect(outcome.swept[0]?.fenceAfter).toBe(1);
+    expect(outcome.reopened._tag).toBe("Success");
+  });
+
+  test("a definite answer settles it, and a failed session is `settled` with no disposition", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-1");
+        yield* openRound(store, "rnd-1");
+      }),
+    );
+
+    const outcome = await withRecovery(
+      path,
+      { [ROUND_SESSION]: "failed" },
+      (store) =>
+        Effect.gen(function* () {
+          const swept = yield* reconcileRunningRounds();
+          return { swept, round: yield* store.loadRound("rnd-1") };
+        }),
+    );
+
+    expect(outcome.swept[0]?.observed).toBe("failed");
+    // The round vocabulary has no `failed` to reach for, and the disposition column is
+    // where "what did the planner conclude" lives. Null is the honest answer for a round
+    // that never said.
+    expect(outcome.round?.status).toBe("settled");
+    expect(outcome.round?.disposition).toBeNull();
+  });
+
+  test("a session the harness still reports live is left alone, and the goal stays held", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-1");
+        yield* openRound(store, "rnd-1");
+      }),
+    );
+
+    const outcome = await withRecovery(
+      path,
+      { [ROUND_SESSION]: "running" },
+      (store) =>
+        Effect.gen(function* () {
+          const swept = yield* reconcileRunningRounds();
+          return {
+            swept,
+            round: yield* store.loadRound("rnd-1"),
+            reopened: yield* Effect.result(openRound(store, "rnd-2")),
+          };
+        }),
+    );
+
+    // This is the whole reason the sweep does not mark what it finds as interrupted.
+    expect(outcome.swept[0]?.settlement).toBeUndefined();
+    expect(outcome.swept[0]?.fenceAfter).toBeUndefined();
+    expect(outcome.round?.status).toBe("running");
+    expect(outcome.round?.writeFence).toBe(0);
+    // And the goal is still held, deliberately: a planner really is working it.
+    expect(outcome.reopened._tag).toBe("Failure");
+  });
+
+  test("records `plan.round.settled` as the sweep's, not a supervisor's", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-1");
+        yield* openRound(store, "rnd-1");
+      }),
+    );
+
+    const events = await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* reconcileRunningRounds();
+        const all = yield* store.eventsAfter();
+        return all.filter((event) => event.kind.startsWith("plan.round."));
+      }),
+    );
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "plan.round.started",
+      "plan.round.settled",
+    ]);
+    for (const event of events) {
+      // Host-originated, both of them: the three caller-authority columns are absent
+      // together and the round is the subject. See `appendRoundEvent`.
+      expect(event.callerScope).toBeNull();
+      expect(event.intentId).toBeNull();
+      expect(event.attemptId).toBeNull();
+      expect(event.subjectId).toBe("rnd-1");
+    }
+    expect(events[1]?.payload).toMatchObject({
+      roundId: "rnd-1",
+      goalId: "goal-1",
+      status: "uncertain",
+      priorStatus: "running",
+      // The one field that distinguishes this record from the supervisor's, and part of
+      // the only durable trace that this round was reconciled rather than watched: a
+      // round has no `round_recoveries` table.
+      settledBy: "recovery",
+      // The other part. Three harness answers map onto `uncertain`, so without this the
+      // record could not tell "the session is gone" from "we could not ask" — a
+      // distinction the attempt path keeps on its recovery row.
+      observed: "missing",
+      disposition: null,
+    });
+  });
+
+  test("keeps `unreachable` and `missing` apart in the record, though both settle `uncertain`", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-1");
+        yield* openRound(store, "rnd-1");
+      }),
+    );
+
+    // `unreachable` is the answer for a harness instance this process cannot resolve, and
+    // it means something different from `missing`: one says the session is gone, the other
+    // says we could not ask. Both are `uncertain`, which is why the record has to carry
+    // the answer rather than only the status.
+    const outcome = await withRecovery(
+      path,
+      { [ROUND_SESSION]: "unreachable" },
+      (store) =>
+        Effect.gen(function* () {
+          const swept = yield* reconcileRunningRounds();
+          const all = yield* store.eventsAfter();
+          return {
+            swept,
+            settled: all.find((event) => event.kind === "plan.round.settled"),
+          };
+        }),
+    );
+
+    expect(outcome.swept[0]?.settlement?.effective).toBe("uncertain");
+    expect(outcome.settled?.payload).toMatchObject({
+      status: "uncertain",
+      settledBy: "recovery",
+      observed: "unreachable",
+    });
+  });
+
+  test("revokes a live round grant, so a late tool call from that session is refused", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-1");
+        yield* openRound(store, "rnd-1");
+      }),
+    );
+
+    // Written out rather than through `withRecovery`, because issuing a credential needs a
+    // `Scope` the helper's signature does not carry: `issue` is an `acquireRelease`, which
+    // is the property the attempt-side version of this test relies on too.
+    const outcome = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const store = yield* ObservationStore;
+          const credentials = yield* McpCredentials;
+          const issued = yield* credentials.issue({
+            _tag: "round",
+            targetId: TARGET,
+            goalId: "goal-1",
+            roundId: "rnd-1",
+            roundFence: 0,
+          });
+          const swept = yield* reconcileRunningRounds();
+          return {
+            swept,
+            // The in-memory half: the registry the MCP transport resolves against.
+            resolved: yield* credentials.resolve(Redacted.value(issued.token)),
+            // The durable half: a credential carrying the old fence is refused even if
+            // the registry had survived a restart.
+            refused: yield* Effect.result(
+              store.recordRoundDisposition(
+                roundCaller("rnd-1", 0),
+                "actionable",
+              ),
+            ),
+          };
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ObservationStore.layer(path),
+              HarnessSessionStatus.fromAnswers({}),
+              McpCredentials.layer,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(outcome.swept[0]?.revokedGrants).toBe(1);
+    expect(outcome.resolved).toBeUndefined();
+    expect(outcome.refused._tag).toBe("Failure");
   });
 });

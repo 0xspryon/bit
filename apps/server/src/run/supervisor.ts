@@ -78,6 +78,11 @@
  * into a status. A stream that ends or fails with no terminal entry reconciles against
  * `sessionStatus` and records `uncertain` when that cannot answer either. **The prompt is
  * never resubmitted**, on any path.
+ *
+ * Those two — and the bound on asking the harness during settlement — now live in
+ * `run/settlement.ts`, because `plan/planSupervisor.ts` settles a planner round from the
+ * same signals and the one thing this application will not keep two copies of is the rule
+ * that turns silence into `uncertain`. Nothing about them changed in the move.
  */
 import {
   RunRefused,
@@ -120,6 +125,12 @@ import {
 } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { RunNarrations } from "./narration";
+import {
+  SETTLEMENT_ASK_TIMEOUT,
+  renderEnd,
+  settlementFor,
+  type SupervisionEnd,
+} from "./settlement";
 import { captureTranscript } from "./transcript";
 
 /**
@@ -413,109 +424,6 @@ interface Dispatch extends RunInput {
   readonly task: string;
   readonly fallback: HarnessChoice["fallback"];
 }
-
-/**
- * How the supervision loop stopped, before anything is concluded from it.
- *
- * Four cases, kept apart because collapsing any two of them is how a tool starts reporting
- * outcomes it did not observe:
- *
- * - `waited` — the harness's long poll returned. It says the session is no longer running
- *   and says nothing about how it went.
- * - `waitFailed` — our long poll lost its answer, or exceeded its transport bound. Says
- *   nothing at all: cancelling *our* request is not the harness stopping work
- *   (DECISIONS.md §15).
- * - `stopped` — we interrupted it. The only case where we are the source of the answer.
- * - `startFailed` — the run never got as far as being watched.
- */
-export type SupervisionEnd =
-  | { readonly _tag: "waited" }
-  | { readonly _tag: "waitFailed"; readonly detail: string }
-  | { readonly _tag: "stopped" }
-  | { readonly _tag: "startFailed" };
-
-/**
- * Everything the supervisor has to settle from, gathered before it decides.
- *
- * Three sources, and keeping them as three fields rather than folding them as they arrive
- * is the point: each one can be absent, and which one answered is what the log line says.
- */
-export interface Settleable {
-  /** How the loop stopped. */
-  readonly end: SupervisionEnd;
-  /**
-   * A terminal `session.execution.*` the narration stream carried, if any.
-   *
-   * The harness stating an outcome in its own event stream. Absent when the stream was
-   * never established, died early, or simply had not reached the terminal event.
-   */
-  readonly narrated: TerminalOutcome | undefined;
-  /**
-   * What `session.get` says about the session now, if it could be asked.
-   *
-   * Absent when the call failed, and also when it succeeded with no `outcome` on the
-   * session — which `opencode` 2.1.2 does for a session that has not finished.
-   */
-  readonly harness: TerminalOutcome | undefined;
-}
-
-/**
- * The status one ending plus what the harness said settles to.
- *
- * A pure function, exported so the rule can be tested without a harness, a database or a
- * fiber. Three sources ranked, then one fallback:
- *
- * 1. **`session.get`'s own `outcome`**, when it has one. The harness's current view of the
- *    session, and the most recent of the three reads.
- * 2. **A terminal event from the narration stream.** Also the harness saying so, a moment
- *    earlier. Used when `session.get` has no outcome to give, which is the common case
- *    rather than the exception.
- * 3. **`interrupted`, for a stop, and only for a stop.** This is the one status we know
- *    first-hand: the operator asked us to stop, we asked the harness to interrupt the
- *    session, and we revoked the attempt's authority. It is not an inference from silence
- *    — unlike `failed`, which would be a claim about the work.
- * 4. **Otherwise `uncertain`.** Never `failed`: "we could not find out" and "it did not
- *    work" are different facts and only one of them would be in evidence. This covers the
- *    wait returning without the harness ever saying how it went, the wait losing its
- *    answer, and a start that broke before anything was watched.
- */
-export const settlementFor = (input: Settleable): AttemptTerminalStatus =>
-  input.harness ??
-  input.narrated ??
-  (input.end._tag === "stopped" ? "interrupted" : "uncertain");
-
-/** One line an operator or a test can read about how a run ended. */
-export const renderEnd = (end: SupervisionEnd): string =>
-  end._tag === "waited"
-    ? "the harness reported the session is no longer running"
-    : end._tag === "stopped"
-      ? "stopped on request"
-      : end._tag === "startFailed"
-        ? "the run broke before it was being watched"
-        : `our wait lost its answer, which says nothing about the session: ${end.detail}`;
-
-/**
- * How long settlement will wait for the harness to answer, per call.
- *
- * **This is a bound on *asking*, not a deadline on the worker.** DECISIONS.md §5 rules
- * out deadline-triggered settlement, and this is not that: it never decides an outcome, it
- * only decides how long we wait before recording that we could not find one. Exceeding it
- * means `settlementFor` falls through to the narrated outcome, or to `uncertain` — the
- * same answer an unreachable harness already produces, reached sooner.
- *
- * It exists because settlement runs inside a *shutdown* path. A `SIGINT` closes the
- * supervisor's fiber map, every supervisor is interrupted, and each one's finalizer then
- * asks the harness about its session — at exactly the moment the harness child is also
- * being torn down. The client's own per-operation bound is 30 seconds, so without this a
- * server with three runs in flight could take minutes to exit, asking a dying process
- * questions. Ten seconds is generous for an HTTP call to a process on loopback and short
- * enough that shutting down stays a matter of seconds.
- *
- * The *write* is deliberately not bounded by this. It is local SQLite and the thing that
- * must not be skipped: an attempt left `running` because we gave up on a disk write is a
- * row for the next sweep to guess at.
- */
-export const SETTLEMENT_ASK_TIMEOUT = "10 seconds";
 
 /**
  * How many settled runs are kept for a stop response to report.

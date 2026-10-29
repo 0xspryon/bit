@@ -54,6 +54,11 @@
     "goal.ended": "Goal ended",
     "intent.abandoned": "Intent abandoned",
     "intent.released": "Intent released",
+    // A planner round's two records. They appear in a target's own log now, so this
+    // existing transcript would otherwise show them as their raw kind — correct, by the
+    // fallback below, and not words. The planner's own screen is slice 8's.
+    "plan.round.started": "Planner round",
+    "plan.round.settled": "Planner round settled",
     "record.other": "Event",
     "turn.reply": "Reply",
     "tool.call": "Tool call",

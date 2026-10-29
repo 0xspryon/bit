@@ -426,6 +426,68 @@ describe("projecting the record", () => {
     expect(settled.body).toContain("recovery");
   });
 
+  test("a planner round's two records say what they are, with no attempt on them", () => {
+    // Both are host-originated like the attempt pair, and the round is the subject — so
+    // `attemptId` is null and stays null. A round is not an attempt, and the general
+    // subject fallback this projection deliberately does not have is what keeps a round
+    // id out of a field every reader takes to be an attempt's.
+    const started = projectEvent(
+      event({
+        kind: "plan.round.started",
+        attemptId: null,
+        intentId: null,
+        callerScope: null,
+        subjectId: "rnd_live",
+        payload: { roundId: "rnd_live", goalId: "goal-1", budget: 5 },
+      }),
+    );
+    expect(started.kind).toBe("plan.round.started");
+    expect(started.attemptId).toBeNull();
+    // The round id is in the sentence because the contract has no field for it; see
+    // `LIVE_ITEM_KINDS`.
+    expect(started.body).toContain("rnd_live");
+    expect(started.body).toContain("goal-1");
+    expect(started.body).toContain("5 intents");
+    expect(started.outcome).toBeNull();
+
+    const settled = projectEvent(
+      event({
+        kind: "plan.round.settled",
+        attemptId: null,
+        intentId: null,
+        callerScope: null,
+        subjectId: "rnd_live",
+        payload: {
+          roundId: "rnd_live",
+          status: "uncertain",
+          settledBy: "recovery",
+          disposition: null,
+        },
+      }),
+    );
+    expect(settled.kind).toBe("plan.round.settled");
+    expect(settled.outcome).toBe("uncertain");
+    expect(settled.body).toContain("recovery");
+    // The absence of a disposition is said rather than left blank: it is the ordinary
+    // case for an interrupted or uncertain round, and a reader must not read silence as
+    // "the planner concluded nothing was worth doing", which is a disposition of its own.
+    expect(settled.body).toContain("recorded no disposition");
+
+    const concluded = projectEvent(
+      event({
+        kind: "plan.round.settled",
+        attemptId: null,
+        subjectId: "rnd_live",
+        payload: {
+          status: "settled",
+          settledBy: "supervisor",
+          disposition: "actionable",
+        },
+      }),
+    );
+    expect(concluded.body).toContain("actionable");
+  });
+
   test("an asset says whether it was new or already known", () => {
     const made = projectEvent(
       event({

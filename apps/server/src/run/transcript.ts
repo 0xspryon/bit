@@ -103,7 +103,7 @@ export const TRANSCRIPT_MAX_BYTES = 32 * 1024 * 1024;
  * How long the transcript fetch may take.
  *
  * Deliberately the same shape of bound, and for the same reason, as
- * `run/supervisor.ts`'s `SETTLEMENT_ASK_TIMEOUT`: this ask runs after a settlement, which
+ * `run/settlement.ts`'s `SETTLEMENT_ASK_TIMEOUT`: this ask runs after a settlement, which
  * on a shutdown path means the harness child may be dying at the same moment. Shorter than
  * the settlement bound, because by the time this runs the durable record is already
  * written and the only thing left to lose is an artefact whose absence is normal.

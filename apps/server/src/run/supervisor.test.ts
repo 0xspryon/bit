@@ -81,12 +81,15 @@ import { installOpenCodeGate, POLICY_PLUGIN_PACKAGE } from "../policy/install";
 import { PERMISSIVE_POLICY, PolicyDecisions } from "../policy/service";
 import { RunNarrations, type RunNarration } from "./narration";
 import {
+  settlementFor,
+  roundSettlementFor,
+  type SupervisionEnd,
+} from "./settlement";
+import {
   WorkerEndpoints,
   RunSupervisor,
-  settlementFor,
   chooseHarness,
   type RunInput,
-  type SupervisionEnd,
 } from "./supervisor";
 import { readRecordedTranscript, transcriptFilesFor } from "./transcript";
 
@@ -576,6 +579,84 @@ describe("what one ending settles to", () => {
         settlementFor({ end, narrated: undefined, harness: undefined }),
       ).toBe("uncertain");
     }
+  });
+
+  /**
+   * The round table is asserted here, beside the attempt one, deliberately.
+   *
+   * Both read the same three sources in the same order and the whole risk in having two of
+   * them is that one drifts. Keeping them in one block means a change to the ranking has
+   * to be made twice in the same screen, and `plan/planSupervisor.test.ts` is then free to
+   * be about a round's lifecycle rather than about this table.
+   */
+  describe("the same table, in a round's vocabulary", () => {
+    test("a stated outcome ends the round, and neither answer is `failed`", () => {
+      for (const end of ends) {
+        // A round does not pass or fail: both of the harness's definite non-interrupted
+        // answers mean execution ended, which is all a round's status claims. What the
+        // planner concluded is its disposition, which settlement never writes.
+        expect(
+          roundSettlementFor({
+            end,
+            narrated: undefined,
+            harness: "succeeded",
+          }),
+        ).toBe("settled");
+        expect(
+          roundSettlementFor({ end, narrated: undefined, harness: "failed" }),
+        ).toBe("settled");
+        expect(
+          roundSettlementFor({
+            end,
+            narrated: undefined,
+            harness: "interrupted",
+          }),
+        ).toBe("interrupted");
+      }
+    });
+
+    test("the harness's own session state still wins over the narration", () => {
+      for (const end of ends) {
+        expect(
+          roundSettlementFor({
+            end,
+            narrated: "interrupted",
+            harness: "succeeded",
+          }),
+        ).toBe("settled");
+      }
+    });
+
+    test("a narrated terminal event is used when the session state has none", () => {
+      for (const end of ends) {
+        expect(
+          roundSettlementFor({
+            end,
+            narrated: "succeeded",
+            harness: undefined,
+          }),
+        ).toBe("settled");
+      }
+    });
+
+    test("a stop with nothing else to go on is `interrupted`", () => {
+      expect(
+        roundSettlementFor({
+          end: { _tag: "stopped" },
+          narrated: undefined,
+          harness: undefined,
+        }),
+      ).toBe("interrupted");
+    });
+
+    test("everything else with nothing to go on is `uncertain`", () => {
+      for (const end of ends) {
+        if (end._tag === "stopped") continue;
+        expect(
+          roundSettlementFor({ end, narrated: undefined, harness: undefined }),
+        ).toBe("uncertain");
+      }
+    });
   });
 });
 

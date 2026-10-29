@@ -170,6 +170,24 @@ export const LIVE_ITEM_KINDS = [
   "goal.ended",
   "intent.abandoned",
   "intent.released",
+  /**
+   * A planner round beginning and ending.
+   *
+   * **These two carry more weight than the kinds around them.** Every other item here is
+   * a second rendering of something durable: an observation, an asset, an intent. A
+   * planner round's own content is narration, which this build does not persist at all
+   * (`docs/design/goal-and-planner-flow.md` decision 14), so these are the *only* record
+   * that a round happened — which is what decision 16 means by round boundaries coming
+   * from records. A planner transcript reloaded after a restart is these two items and
+   * nothing between them, and that is the honest degradation rather than an empty screen.
+   *
+   * `attemptId` is null on both, and not because it was unavailable: a round is not an
+   * attempt and has no attempt behind it. The round's own id is in the item's `body`
+   * rather than in a field of its own, because adding one would be designing the planner
+   * screen's filter before the screen exists.
+   */
+  "plan.round.started",
+  "plan.round.settled",
   "record.other",
   /* Live activity. */
   "turn.reply",

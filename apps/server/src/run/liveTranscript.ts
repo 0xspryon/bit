@@ -372,6 +372,44 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
         outcome: null,
       };
     }
+    case "plan.round.started": {
+      const budget = count(event.payload, "budget");
+      // The round id is in the sentence because there is no field for it: `LiveItem` has
+      // one domain handle, `attemptId`, and a round is not an attempt. The alternative was
+      // a `roundId` on the contract, which would be designing the planner screen's filter
+      // one slice before that screen exists.
+      return {
+        ...base,
+        kind: "plan.round.started",
+        headline: "Planner round started",
+        body: `Round ${event.subjectId} opened on goal ${text(event.payload, "goalId")}, with a budget of ${String(budget)} intent${budget === 1 ? "" : "s"}.`,
+        outcome: null,
+      };
+    }
+    case "plan.round.settled": {
+      const status = text(event.payload, "status");
+      const settledBy = text(event.payload, "settledBy");
+      const disposition = text(event.payload, "disposition");
+      // Three facts and they are different facts, which is why all three are in the
+      // sentence. The status says whether *execution* finished and how; the disposition
+      // says what the planner concluded, and its absence is the ordinary case for an
+      // interrupted or uncertain round rather than an error; `settledBy` says how much is
+      // known, as it does on `run.settled`.
+      const sentence =
+        settledBy === ""
+          ? `Round ${event.subjectId} ended as ${status}.`
+          : `Round ${event.subjectId} ended as ${status}, settled by ${settledBy}.`;
+      return {
+        ...base,
+        kind: "plan.round.settled",
+        headline: "Planner round settled",
+        body:
+          disposition === ""
+            ? `${sentence} It recorded no disposition.`
+            : `${sentence} It concluded ${disposition}.`,
+        outcome: status === "" ? null : status,
+      };
+    }
     case "intent.released": {
       const held = text(event.payload, "attemptStatus");
       const attempt = text(event.payload, "claimedByAttemptId");

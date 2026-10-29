@@ -729,6 +729,36 @@ export interface StoredRound {
 }
 
 /**
+ * Who settled a round, and what they knew when they did.
+ *
+ * The same distinction `attempt.settled`'s `settledBy` carries, and the same reason for
+ * carrying it: "a supervisor watched this round finish" and "a sweep found the row after
+ * the process that owned it died" are different facts about how much is known, and a
+ * reader of the log alone has no other way to tell them apart.
+ *
+ * It is a parameter of {@link ObservationStore.settleRound} rather than two functions,
+ * because the write is identical. Attempts split the two paths (`settleAttempt` and
+ * `recordRecovery`) only because recovery there writes an `attempt_recoveries` row as
+ * well, and a round has no such table.
+ *
+ * **Tagged, so that `observed` is present exactly when it means something.** A sweep asked
+ * the harness and has its answer; a supervisor's three sources are a `TerminalOutcome` and
+ * an interruption it caused, which is not a harness observation. Carrying it durably
+ * matters because the round vocabulary collapses three of those answers into one status:
+ * `uncertain` from `missing` ("the session is gone") and `uncertain` from `unreachable`
+ * ("we could not ask") are different facts, and without this the distinction would survive
+ * only in a log line a restart loses. An optional field would have let a sweep forget to
+ * say, which is the same objection that makes `settledBy` itself required.
+ */
+export type RoundSettler =
+  | { readonly _tag: "supervisor" }
+  | {
+      readonly _tag: "recovery";
+      /** The harness abstraction's answer, verbatim, as `RecoveryWrite.observed` is. */
+      readonly observed: HarnessObservedStatus;
+    };
+
+/**
  * The result of settling a round. The shape of {@link AttemptSettlement}, for the reason
  * that one has it: a caller has to tell "I settled it" from "it was already settled"
  * without comparing statuses and guessing.
@@ -1857,6 +1887,43 @@ const makeStore = Effect.fnUntraced(function* () {
       operation: input.operation,
       operationId: null,
       subjectId: input.attemptId,
+      payload: input.payload,
+      recordedAt: input.recordedAt,
+    });
+  });
+
+  /**
+   * Appends one round-lifecycle event, in the caller's transaction.
+   *
+   * {@link appendAttemptEvent}'s decision, for the same reason and with the same shape:
+   * the three caller-authority columns are null and the **round** id goes in `subject_id`.
+   * A round's beginning is written before a credential for it exists — the row has to be
+   * there for one to be minted against its fence — and its end is written by the plan
+   * supervisor or by the startup sweep, neither of which presents a round credential.
+   * Filling the columns in would claim the round wrote the record of its own beginning and
+   * end.
+   *
+   * There is deliberately no `intentId` either, even though a round's whole purpose is to
+   * create intents. A round is not *about* one intent, and `intent_id` on this table means
+   * "the intent whose authority wrote this".
+   */
+  const appendRoundEvent = Effect.fnUntraced(function* (input: {
+    readonly kind: "plan.round.started" | "plan.round.settled";
+    readonly targetId: string;
+    readonly roundId: string;
+    readonly operation: string;
+    readonly payload: Record<string, unknown>;
+    readonly recordedAt: number;
+  }) {
+    return yield* appendEvent({
+      kind: input.kind,
+      targetId: input.targetId,
+      callerScope: null,
+      intentId: null,
+      attemptId: null,
+      operation: input.operation,
+      operationId: null,
+      subjectId: input.roundId,
       payload: input.payload,
       recordedAt: input.recordedAt,
     });
@@ -4555,11 +4622,13 @@ const makeStore = Effect.fnUntraced(function* () {
    *   before the fiber forks — is the `FiberMap` slice 5 adds, and it is what stops two
    *   starts in the same process racing before either row exists. Neither half replaces
    *   the other, and the index on `(goal_id, status)` is what makes this one cheap.
-   * - **It writes no event.** `plan.round.started` and `plan.round.settled` are slice 5's,
-   *   together with the supervisor that will write them and the live-item kinds that
-   *   render them. A round row is visible to nothing yet, and minting the event kinds in
-   *   one slice while the thing that emits them lands in another would put two halves of
-   *   one record in different places.
+   * - **It appends `plan.round.started`, unconditionally.** Unlike {@link seedAttempt},
+   *   which reads the row first because re-seeding is idempotent, this is not idempotent
+   *   at all: a round id that already exists is refused above, so reaching the insert
+   *   means a round really began and exactly one event says so. The pair matters more for
+   *   a round than for an attempt — a round's prose is never persisted, so these two
+   *   records are the only durable trace that it happened at all (the spec's decisions 14
+   *   and 16).
    *
    * An ended goal is refused: ending a goal blocks new dispatch and planner wake-ups
    * (decision 8), and opening a round is a planner wake-up.
@@ -4616,6 +4685,26 @@ const makeStore = Effect.fnUntraced(function* () {
                     ${input.budget}, NULL, ${now}, NULL)`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
           );
+          yield* appendRoundEvent({
+            kind: "plan.round.started",
+            targetId: host.targetId,
+            roundId: input.roundId,
+            operation: "open_round",
+            payload: {
+              roundId: input.roundId,
+              goalId: input.goalId,
+              harnessSessionId: input.harnessSessionId,
+              harnessInstanceId: input.harnessInstanceId,
+              providerId: input.providerId,
+              modelId: input.modelId,
+              budget: input.budget,
+              // Provenance, and said to be provenance: see
+              // {@link RoundAuthority.startedAtSequence}. A reader must not take it for
+              // the state the round saw.
+              startedAtSequence,
+            },
+            recordedAt: now,
+          });
           return {
             roundId: input.roundId,
             writeFence: 0,
@@ -4649,6 +4738,64 @@ const makeStore = Effect.fnUntraced(function* () {
     return row === undefined ? undefined : toStoredRound(row);
   });
 
+  const selectRunningRounds = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: RoundRow,
+    execute: () =>
+      sql.unsafe(
+        `SELECT ${roundColumns} FROM planner_rounds
+         WHERE status = 'running'
+         ORDER BY started_at, id`,
+        [],
+      ),
+  });
+
+  /**
+   * Rounds a process left `running`. The startup sweep's entry point for rounds.
+   *
+   * **Narrower than {@link unsettledAttempts}, deliberately, and the asymmetry is a
+   * consequence rather than an oversight.** That one also reads `uncertain`, because
+   * `recordRecovery` lets a later definite answer *refine* an `uncertain` attempt and a
+   * sweep that read only `running` could never deliver one. A round has no such path:
+   * {@link settleRound} is guarded to `status = 'running'`, there is no
+   * `round_recoveries` table and nothing is allowed to move a round that has already left
+   * `running`. So an `uncertain` round is final here, and reading it would be reading rows
+   * the sweep could do nothing with.
+   *
+   * What that costs is worth stating: a round swept to `uncertain` while the harness was
+   * unreachable stays `uncertain` even if the harness could answer a minute later. Its
+   * authority is already gone — the fence has moved and the goal is free for another round
+   * — so the cost is a less precise record and never a blocked goal.
+   */
+  const roundsLeftRunning = Effect.fn("ObservationStore.roundsLeftRunning")(
+    function* () {
+      const rows = yield* selectRunningRounds().pipe(
+        Effect.mapError(lift("planner_rounds", "status:running")),
+      );
+      return rows.map(toStoredRound);
+    },
+  );
+
+  /**
+   * Points a round's row at the session the harness actually created.
+   *
+   * {@link bindSessionToAttempt}'s counterpart, for the same window and with the same
+   * reasoning: the plan supervisor mints the session id and writes it into the round row
+   * *before* the session exists, so a process that died in between leaves a row naming a
+   * session that was never created — which the sweep handles by asking and being told
+   * `missing` — rather than a live session no row points at. This is the repair for the
+   * one case that breaks: a harness that ignores the id it was handed. Both real drivers
+   * were measured to honour it, and a row naming a session nobody has would be worse than
+   * a rebind plus a warning.
+   */
+  const bindSessionToRound = Effect.fn("ObservationStore.bindSessionToRound")(
+    function* (roundId: string, harnessSessionId: string) {
+      yield* sql`UPDATE planner_rounds SET harness_session_id = ${harnessSessionId}
+        WHERE id = ${roundId}`.pipe(Effect.mapError(asDatabaseError("query")));
+      return harnessSessionId;
+    },
+  );
+
   /**
    * Records the round's terminal status.
    *
@@ -4660,11 +4807,27 @@ const makeStore = Effect.fnUntraced(function* () {
    * The disposition is **not** touched here. A round that recorded one keeps it, and a
    * round that recorded none settles with `disposition` still null — which is the honest
    * record of a round that was interrupted or could not say what it concluded. Writing a
-   * disposition at settlement would be the host inventing the planner's answer.
+   * disposition at settlement would be the host inventing the planner's answer. It is
+   * carried into the event as a fact about the row, so a reader of the log alone can tell
+   * a round that concluded something from one that did not.
+   *
+   * **`plan.round.settled` is appended only when the status actually moved**, which is
+   * {@link settleAttempt}'s rule and the property that makes the log trustworthy: an event
+   * with no domain change behind it would say something happened twice.
+   *
+   * `settledBy` is a parameter rather than a constant because this one function has two
+   * callers that mean different things — the supervisor that watched the round, and the
+   * startup sweep that found the row a dead process left. `settleAttempt` hard-codes
+   * `"supervisor"` and the sweep writes its own event through `recordRecovery`; a round has
+   * no `recordRecovery`, no `round_recoveries` table and no refinement path, so the one
+   * place the distinction can live is here. Required rather than defaulted: a default would
+   * make a sweep that forgot to say so file itself as a supervisor. It is tagged, so a
+   * sweep also cannot forget to record *what the harness said*; see {@link RoundSettler}.
    */
   const settleRound = Effect.fn("ObservationStore.settleRound")(function* (
     roundId: string,
     status: RoundTerminalStatus,
+    settledBy: RoundSettler,
   ) {
     const endedAt = yield* Clock.currentTimeMillis;
     return yield* sql
@@ -4690,6 +4853,29 @@ const makeStore = Effect.fnUntraced(function* () {
             WHERE id = ${roundId} AND status = 'running'`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
           );
+          yield* appendRoundEvent({
+            kind: "plan.round.settled",
+            targetId: before.target_id,
+            roundId,
+            operation: "settle_round",
+            payload: {
+              roundId,
+              goalId: before.goal_id,
+              harnessSessionId: before.harness_session_id,
+              status,
+              priorStatus: before.status,
+              settledBy: settledBy._tag,
+              // What the harness said, when the settler asked one. Null for a supervisor's
+              // own settlement, which is an honest absence rather than a missing field:
+              // see {@link RoundSettler}.
+              observed:
+                settledBy._tag === "recovery" ? settledBy.observed : null,
+              // The row's own disposition, untouched by this write. Null is the honest
+              // record of a round that never said what it concluded.
+              disposition: before.disposition,
+            },
+            recordedAt: endedAt,
+          });
           return {
             requested: status,
             effective: status,
@@ -5129,6 +5315,8 @@ const makeStore = Effect.fnUntraced(function* () {
     callerAuthority,
     openRound,
     loadRound,
+    roundsLeftRunning,
+    bindSessionToRound,
     settleRound,
     supersedeRound,
     recordRoundDisposition,
@@ -5425,10 +5613,27 @@ export class ObservationStore extends Context.Service<
     readonly loadRound: (
       roundId: string,
     ) => Effect.Effect<StoredRound | undefined, DatabaseError | StoredRowError>;
-    /** Records a round's terminal status. Guarded to `running`, like `settleAttempt`. */
+    /**
+     * Rounds a process left `running`, for the startup sweep. Narrower than
+     * `unsettledAttempts`: see the implementation for why an `uncertain` round is final.
+     */
+    readonly roundsLeftRunning: () => Effect.Effect<
+      readonly StoredRound[],
+      DatabaseError | StoredRowError
+    >;
+    /** Points a round at the session the harness created, when it ignored ours. */
+    readonly bindSessionToRound: (
+      roundId: string,
+      harnessSessionId: string,
+    ) => Effect.Effect<string, DatabaseError>;
+    /**
+     * Records a round's terminal status. Guarded to `running`, like `settleAttempt`, and
+     * appends `plan.round.settled` only when the status really moved.
+     */
     readonly settleRound: (
       roundId: string,
       status: RoundTerminalStatus,
+      settledBy: RoundSettler,
     ) => Effect.Effect<RoundSettlement, DatabaseError | StoredRowError>;
     /**
      * Supersedes a round's write authority and returns its new fence. `undefined` when
