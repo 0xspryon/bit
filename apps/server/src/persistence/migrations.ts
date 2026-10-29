@@ -983,6 +983,54 @@ const addAttemptModelOptions = statements(
 );
 
 /**
+ * `0016` — a goal becomes something with a lifecycle.
+ *
+ * Until now a goal was a row `seedAttempt` minted as a side effect of starting a run: an
+ * id, a target, a description and a time, with no way to say it was over. This adds the
+ * columns that let an operator create one on purpose and end it on purpose.
+ *
+ * - **`name`** is the short label a list row shows. The objective is not a new column: it
+ *   is `description`, which has always held the text a goal was created with, and a
+ *   second field for the same thing would be a schema that disagrees with itself the first
+ *   time the two differ. `NOT NULL DEFAULT ''` — an empty name means none was given, which
+ *   is a statement about the operator and not a missing value.
+ * - **`status`** is `active`, `met` or `abandoned`. `NOT NULL DEFAULT 'active'`, because
+ *   every goal that exists when this runs is a real objective somebody was working
+ *   towards, and "still open" is the only claim about it that is true. Defaulting to
+ *   anything else would have retired work the operator never ended.
+ * - **`ended_at`, `ended_by`, `end_reason`** are the record of an ending: when, by whom
+ *   (`planner` or `operator`) and why. All three are nullable and are null exactly while
+ *   the goal is `active`. They are not defaulted to a placeholder because a placeholder
+ *   ("unknown", `0`) would read as a recorded ending of an open goal; null is the honest
+ *   absence. `end_reason` may be the empty string for a goal ended with no reason, which
+ *   is a different fact from null.
+ *
+ * No `CHECK` on the vocabularies, for the reason `attempts.status` has none: the contract
+ * (`contracts/goal.ts`) owns the set, every read decodes through it, and a stored value
+ * outside it surfaces as a `StoredRowError` naming the row rather than as an `INSERT`
+ * failing for a reason the writer cannot see.
+ *
+ * **What an existing row looks like afterwards:** `name = ''`, `status = 'active'`, the
+ * three ending columns null. A goal minted by `seedAttempt` before this migration is
+ * therefore listed as an open, unnamed goal whose objective is its description — correct,
+ * intended, and not rewritten by anything here. It has no `goal.added` event, since the
+ * log did not exist to witness it.
+ *
+ * The index serves the one question a list asks, "this target's goals, by state". A goal
+ * table is small and the index is cheap; it is there so that "active goals of a target",
+ * which a dispatcher will ask on every wake-up, never becomes a scan of every goal ever
+ * created.
+ */
+const addGoalLifecycle = statements(
+  `ALTER TABLE goals ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE goals ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`,
+  `ALTER TABLE goals ADD COLUMN ended_at INTEGER`,
+  `ALTER TABLE goals ADD COLUMN ended_by TEXT`,
+  `ALTER TABLE goals ADD COLUMN end_reason TEXT`,
+  `CREATE INDEX IF NOT EXISTS goals_target_status_idx ON goals(target_id, status)`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1015,6 +1063,7 @@ export const MIGRATIONS: Record<
   "0013_outbox": addOutbox,
   "0014_attempt_harness_instance": addAttemptHarnessInstance,
   "0015_attempt_model_options": addAttemptModelOptions,
+  "0016_goal_lifecycle": addGoalLifecycle,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

@@ -35,6 +35,17 @@
 
   let { app }: { app: App } = $props();
 
+  /**
+   * The count an item shows, from where it really comes from.
+   *
+   * Goals is the one item with real rows behind it, so its number is the open target's
+   * goal count; every other item keeps the prototype's figure. `undefined` hides the count
+   * entirely, which is what Goals does until it has a number for *this* target.
+   */
+  function countOf(item: (typeof navGroups)[number]["items"][number]) {
+    return item.id === "goals" ? app.goalCount : item.count;
+  }
+
   const glyphs: Record<string, typeof IconBug> = {
     stream: IconStream,
     bug: IconBug,
@@ -82,11 +93,16 @@
         {/if}
         {#each group.items as item (item.id)}
           {@const Glyph = glyphs[item.icon]}
+          {@const count = countOf(item)}
           <button
             class={["item", app.navItem === item.id && "active"]}
             aria-current={app.navItem === item.id ? "page" : undefined}
             title={app.sidebarCollapsed ? item.label : undefined}
-            onclick={() => (app.navItem = item.id)}
+            onclick={() => {
+              app.navItem = item.id;
+              // Choosing Goals from inside one goal means the list, not the same page.
+              if (item.id === "goals") app.closeGoal();
+            }}
           >
             <span class="glyph">
               {#if Glyph}<Glyph width="15" height="15" />{/if}
@@ -96,15 +112,15 @@
             </span>
             {#if !app.sidebarCollapsed}
               <span class="item-label">{item.label}</span>
-              {#if item.count !== undefined}
+              {#if count !== undefined}
                 <span class={["count", item.attention && "attention"]}>
-                  {item.count}
+                  {count}
                 </span>
               {/if}
             {/if}
             {#if app.sidebarCollapsed}
               <span class="visually-hidden">
-                {item.label}{item.count !== undefined ? `, ${item.count}` : ""}
+                {item.label}{count !== undefined ? `, ${count}` : ""}
               </span>
             {/if}
           </button>

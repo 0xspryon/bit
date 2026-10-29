@@ -37,6 +37,8 @@
 import {
   BitApi,
   SessionGuard,
+  type GoalDraft,
+  type GoalEndDraft,
   type LiveFrame,
   type ModelOptionSelection,
   type TargetDraft,
@@ -182,6 +184,10 @@ const REFUSAL_TAGS = new Set([
   // transcript nobody kept is *not* in this list, because it is not an error at all — it
   // comes back `200` with `source: "absent"`.
   "AttemptNotFound",
+  // Goals: a goal this target does not hold, and a goal that is already ended, are both
+  // answers the goals screen puts in a sentence next to the control that caused them.
+  "GoalNotFound",
+  "GoalRefused",
 ]);
 
 const isRefusal = (error: unknown): boolean =>
@@ -337,6 +343,56 @@ export const server = {
               : { modelOptions: pick.modelOptions }),
           },
         }),
+      ),
+    ),
+
+  /**
+   * The open target's goals, newest first, each with its counts.
+   *
+   * An object with a `goals` field rather than a bare array, because that is what the
+   * contract declares and a client that unwrapped it here would be a second place to learn
+   * the shape.
+   */
+  goals: (baseUrl: string, targetId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.goals({ params: { targetId } }),
+      ),
+    ),
+
+  /**
+   * Creates a goal. The draft carries an objective and an optional label and **no id**:
+   * the server mints the goal id and the operation id, and this client has no way to name
+   * either.
+   */
+  createGoal: (baseUrl: string, targetId: string, draft: GoalDraft) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.createGoal({ params: { targetId }, payload: draft }),
+      ),
+    ),
+
+  /** One goal, with its counts. Refused if the target does not hold it. */
+  goal: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.goal({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * Ends a goal as the operator. Records that it is over and stops nothing: a run already
+   * going under it is left alone.
+   */
+  endGoal: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+    draft: GoalEndDraft,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.endGoal({ params: { targetId, goalId }, payload: draft }),
       ),
     ),
 

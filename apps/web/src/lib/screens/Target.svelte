@@ -2,34 +2,34 @@
   /**
    * Level 2: the full shell inside an open target.
    *
-   * The page content here is deliberately generic. Flow A's job is to prove
-   * the frame — sidebar, page header, filter row, scrolling body, detail
-   * panel — not to design the pages that will fill it. Those are Flows B
-   * through G, and inventing them here would make them look decided.
+   * The page content here is deliberately generic for every section but one. Flow A's
+   * job was to prove the frame — sidebar, page header, filter row, scrolling body,
+   * detail panel — not to design the pages that will fill it, and inventing them would
+   * make them look decided.
    *
-   * What is real now is the frame's header: {@link TargetHeader} shows the
-   * open target's name, its scope note and the counts read from that
-   * target's own database. And the hunts section's body is driven by the
-   * real intent count rather than by a prototype number, so a target with
-   * nothing in it shows an empty transcript — which is what every target
-   * shows today, because nothing can start a run yet. The other sections
-   * keep their placeholder rows: a count there is the prototype's, and
-   * swapping in a number this screen cannot source would make an undesigned
-   * page look decided.
+   * **Goals is the exception, and the only real section.** {@link Goals} and
+   * {@link Goal} read, create and end the open target's goals through the server, inside
+   * the same {@link PageFrame}. Every other section keeps its placeholder rows: a count
+   * there is the prototype's, and swapping in a number this screen cannot source would
+   * make an undesigned page look decided.
    *
-   * What is new is {@link ComposeBox} beneath the frame: a run can be started
-   * and stopped against the open target, on a harness and model the operator
-   * picks. The *live* transcript is now here: {@link LiveTranscript} shows the
-   * target's own event log, read in store-assigned order behind a cursor, next to
-   * the harness's narration and the policy gate's denials as live activity — and
-   * says which is which. {@link TranscriptPanel} remains the different thing
-   * beside it: what a *settled* attempt left behind, the server's own artefact
-   * when it has one, and the harness's own copy, labelled as the thing that may
-   * be gone, when it does not.
+   * What is real in the frame itself: {@link TargetHeader} shows the open target's name,
+   * its scope note and the counts read from that target's own database.
+   *
+   * {@link ComposeBox} sits beneath the Goals list: a run can be started and stopped
+   * against the open target, on a harness and model the operator picks. The *live*
+   * transcript is here too: {@link LiveTranscript} shows the target's own event log, read
+   * in store-assigned order behind a cursor, next to the harness's narration and the
+   * policy gate's denials as live activity — and says which is which.
+   * {@link TranscriptPanel} remains the different thing beside it: what a *settled*
+   * attempt left behind, the server's own artefact when it has one, and the harness's own
+   * copy, labelled as the thing that may be gone, when it does not.
    */
   import Badge from "../components/Badge.svelte";
   import Button from "../components/Button.svelte";
   import ComposeBox from "../components/ComposeBox.svelte";
+  import Goal from "./Goal.svelte";
+  import Goals from "./Goals.svelte";
   import LiveTranscript from "../components/LiveTranscript.svelte";
   import PageFrame from "../components/PageFrame.svelte";
   import Sidebar from "../components/Sidebar.svelte";
@@ -45,19 +45,13 @@
     navGroups.flatMap((g) => g.items).find((i) => i.id === app.navItem),
   );
   /**
-   * How many rows this section has, and where that number comes from.
+   * How many placeholder rows this section shows.
    *
-   * `hunts` is answered from the open target's own database — and only when the
-   * counts on hand are that target's, so a switch cannot show the previous
-   * target's length. Every other section falls back to the prototype's count,
-   * which is what keeps an undesigned page looking like a prototype instead of
-   * like an empty real one.
+   * Only the prototype sections reach this: Goals renders its own real rows. The count is
+   * the prototype's, which is what keeps an undesigned page looking like a prototype
+   * instead of like an empty real one.
    */
-  let count = $derived(
-    app.navItem === "hunts"
-      ? ((app.viewTargetId === app.selected?.id ? app.counts?.intents : 0) ?? 0)
-      : (item?.count ?? 0),
-  );
+  let count = $derived(item?.count ?? 0);
   let rows = $derived(
     Array.from({ length: Math.min(count, 9) }, (_, index) => ({
       id: `${app.navItem}-${index}`,
@@ -72,77 +66,86 @@
   <div class="pane">
     <TargetHeader {app} />
 
-    <PageFrame
-      title={item?.label ?? ""}
-      description="Placeholder content. This page is designed in a later flow — what Flow A settles is the frame around it."
-      detailTitle="{item?.label ?? ''} detail"
-      detailOpen={app.detailOpen}
-      onclosedetail={() => (app.detailOpen = false)}
-    >
-      {#snippet actions()}
-        <Button size="sm">Export</Button>
-        <Button size="sm" variant="primary">New</Button>
-      {/snippet}
+    {#if app.navItem === "goals"}
+      {#if app.openGoalId === ""}
+        <Goals {app} />
+      {:else}
+        <Goal {app} />
+      {/if}
+    {:else}
+      <PageFrame
+        title={item?.label ?? ""}
+        description="Placeholder content. This page is designed in a later flow — what Flow A settles is the frame around it."
+        detailTitle="{item?.label ?? ''} detail"
+        detailOpen={app.detailOpen}
+        onclosedetail={() => (app.detailOpen = false)}
+      >
+        {#snippet actions()}
+          <Button size="sm">Export</Button>
+          <Button size="sm" variant="primary">New</Button>
+        {/snippet}
 
-      {#snippet filters()}
-        <span class="search-wrap">
-          <IconSearch class="search-icon" width="13" height="13" />
-          <input class="search" placeholder="Filter {item?.label ?? ''}" />
-        </span>
-        <Button size="sm" variant="quiet">All statuses</Button>
-        <Button size="sm" variant="quiet">Any time</Button>
-      {/snippet}
+        {#snippet filters()}
+          <span class="search-wrap">
+            <IconSearch class="search-icon" width="13" height="13" />
+            <input class="search" placeholder="Filter {item?.label ?? ''}" />
+          </span>
+          <Button size="sm" variant="quiet">All statuses</Button>
+          <Button size="sm" variant="quiet">Any time</Button>
+        {/snippet}
 
-      {#snippet body()}
-        {#if rows.length === 0}
-          <p class="empty">Nothing recorded here yet.</p>
-        {:else}
-          <ul class="rows">
-            {#each rows as row (row.id)}
-              <li>
-                <button
-                  class="row"
-                  onclick={() => {
-                    app.detailRow = row.index;
-                    app.detailOpen = true;
-                  }}
-                >
-                  <Badge name={app.selected?.name ?? "?"} size={16} />
-                  <span class="row-title">
-                    {item?.label ?? ""} row {row.index + 1}
-                  </span>
-                  <span class="row-meta mono">placeholder</span>
-                </button>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      {/snippet}
+        {#snippet body()}
+          {#if rows.length === 0}
+            <p class="empty">Nothing recorded here yet.</p>
+          {:else}
+            <ul class="rows">
+              {#each rows as row (row.id)}
+                <li>
+                  <button
+                    class="row"
+                    onclick={() => {
+                      app.detailRow = row.index;
+                      app.detailOpen = true;
+                    }}
+                  >
+                    <Badge name={app.selected?.name ?? "?"} size={16} />
+                    <span class="row-title">
+                      {item?.label ?? ""} row {row.index + 1}
+                    </span>
+                    <span class="row-meta mono">placeholder</span>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        {/snippet}
 
-      {#snippet detail()}
-        <p class="detail-lead">
-          The panel reflows the list beside it rather than covering it, so you
-          keep your place. Below 1280px it overlays instead.
-        </p>
-        <dl>
-          <dt>Row</dt>
-          <dd>{(app.detailRow ?? 0) + 1}</dd>
-          <dt>Target</dt>
-          <dd class="mono">{app.selected?.name ?? ""}</dd>
-          <dt>Section</dt>
-          <dd>{item?.label ?? ""}</dd>
-        </dl>
-      {/snippet}
-    </PageFrame>
+        {#snippet detail()}
+          <p class="detail-lead">
+            The panel reflows the list beside it rather than covering it, so you
+            keep your place. Below 1280px it overlays instead.
+          </p>
+          <dl>
+            <dt>Row</dt>
+            <dd>{(app.detailRow ?? 0) + 1}</dd>
+            <dt>Target</dt>
+            <dd class="mono">{app.selected?.name ?? ""}</dd>
+            <dt>Section</dt>
+            <dd>{item?.label ?? ""}</dd>
+          </dl>
+        {/snippet}
+      </PageFrame>
+    {/if}
 
     <!--
-      The compose box sits under the frame rather than inside it, on the Hunts section
-      only. Starting a run is an action on the *target*, so it belongs to the pane and
-      not to whichever page is showing; and it is only on Hunts because that is the
-      section a run produces. Putting it under every section would make it look like a
-      control for Findings and Traffic too.
+      The compose box sits under the frame rather than inside it, on the Goals list only.
+      Starting a run is an action on the *target*, so it belongs to the pane and not to
+      whichever page is showing; and it is only on the Goals list because that is where a
+      run's goal appears. Putting it under every section would make it look like a control
+      for Findings and Traffic too, and under one goal's page would make it look like a run
+      *of that goal*, which it is not yet: a run still mints the goal it runs under.
     -->
-    {#if app.navItem === "hunts"}
+    {#if app.navItem === "goals" && app.openGoalId === ""}
       <!--
         The transcripts sit above the composer and below the frame, for the same reason the
         composer does: they are about the target rather than about whichever page is showing.

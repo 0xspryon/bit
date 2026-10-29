@@ -34,6 +34,8 @@
 import {
   AttemptNotFound,
   BitApi,
+  GoalNotFound,
+  GoalRefused,
   RunRefused,
   SessionActor,
   SessionGuard,
@@ -42,6 +44,7 @@ import {
   TargetUnavailable,
   Unauthenticated,
   type AttemptTranscript,
+  type GoalView,
   type HarnessInstanceView,
   type TargetCounts,
   type TargetSummary,
@@ -71,6 +74,12 @@ import {
   isTargetId,
   type TargetRow,
 } from "../persistence/fleet";
+import * as identifier from "../persistence/identifier";
+import type {
+  MutationError,
+  ObservationStore,
+  StoredGoal,
+} from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
@@ -314,6 +323,93 @@ const openableTarget = Effect.fnUntraced(function* (
   }
   return row;
 });
+
+/* ── Goals ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * Who a goal mutation made through the browser is recorded as.
+ *
+ * `<targetId>/operator` follows the scope namespacing the spec settles — `targetId/<attemptId>`
+ * for a worker, and later `targetId/round/…` and `targetId/goal/…` for the planner and the
+ * goal agent — so the operator is one more author in the same space and cannot collide with
+ * an attempt: attempt ids are `att_…`. It is the host's own authority and is supplied here,
+ * by the process that owns the session guard, never read from a payload.
+ */
+const operatorScope = (targetId: string): string => `${targetId}/operator`;
+
+/**
+ * One stored goal as the contract's view of it, field by field.
+ *
+ * Not a spread: the store describes what a file holds and the contract describes a
+ * screen, and a field added to either should be a compile error here instead of a number
+ * that silently never arrives.
+ */
+const goalView = (goal: StoredGoal): GoalView => ({
+  goalId: goal.goalId,
+  targetId: goal.targetId,
+  name: goal.name,
+  description: goal.description,
+  status: goal.status,
+  createdAt: goal.createdAt,
+  endedAt: goal.endedAt,
+  endedBy: goal.endedBy,
+  endReason: goal.endReason,
+  counts: {
+    intents: goal.intentCount,
+    attempts: goal.attemptCount,
+    observations: goal.observationCount,
+  },
+});
+
+/**
+ * What a refused mutation becomes at the HTTP surface, for the goal routes.
+ *
+ * `invalid` is "no such goal here" — a missing id or one from another target.
+ *
+ * `conflict` is **not** taken to mean "already ended", because the store raises it for two
+ * different things: a goal that is already `met` or `abandoned`, and an operation id
+ * reused with different input. The error carries only a reason and a sentence, and
+ * matching on the sentence would be the kind of check that rots silently, so the claim is
+ * checked against the row instead: the goal is read again, and `already_ended` is said
+ * only if it really is no longer active (ending is one-way, so a conflict that was about
+ * the ending is always still true when it is re-read). The other `conflict` is unreachable
+ * today, because the handler mints a fresh operation id for every request; if that ever
+ * stops being true it arrives here as a defect, which is honest, rather than as a 409 that
+ * tells an operator their goal was already ended when it was not.
+ *
+ * The other two reasons cannot be reached from these routes: `unauthorized` and `stale`
+ * are about a worker's credential, and a browser has none. They are defects if they ever
+ * appear, because mapping them to a refusal an operator can act on would be inventing a
+ * situation.
+ *
+ * Exported for its test: the unreachable branch cannot be driven over HTTP.
+ */
+export const goalRefusal = (
+  store: Pick<ObservationStore["Service"], "loadGoal">,
+  targetId: string,
+  goalId: string,
+  error: MutationError,
+) =>
+  Effect.gen(function* () {
+    if (error.reason === "invalid") {
+      return yield* new GoalNotFound({
+        targetId,
+        goalId,
+        detail: error.detail,
+      });
+    }
+    if (error.reason === "conflict") {
+      const goal = yield* store.loadGoal(goalId);
+      if (goal !== undefined && goal.status !== "active") {
+        return yield* new GoalRefused({
+          reason: "already_ended",
+          goalId,
+          detail: error.detail,
+        });
+      }
+    }
+    return yield* Effect.die(error);
+  });
 
 /* ── Deriving an id ──────────────────────────────────────────────────────────── */
 
@@ -798,6 +894,139 @@ const fleetHandlers = HttpApiBuilder.group(
             ? {}
             : { writtenAt: read.writtenAt }),
         } satisfies AttemptTranscript;
+      }),
+
+      /**
+       * The open target's goals, newest first.
+       *
+       * Filtered by `targetId` after the read, not trusted from the file. A target's goals
+       * live in that target's own database, so the filter removes nothing on a healthy
+       * file; what it guards is a misfiled row, which becomes a missing goal rather than
+       * another engagement's objective on this engagement's screen.
+       */
+      goals: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const goals = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.goals(),
+        ).pipe(Effect.orDie);
+        return {
+          goals: goals
+            .filter((goal) => goal.targetId === row.targetId)
+            .map(goalView),
+        };
+      }),
+
+      /**
+       * Creates a goal, minting both of the identities the store needs.
+       *
+       * The goal id and the operation id are generated here, not taken from the request:
+       * see `GoalDraft`. Because the operation id is fresh per request, the store's
+       * receipt protects against a transaction being applied twice, not against an
+       * operator pressing the button twice — which is two goals, as it should be.
+       *
+       * A refusal from the store is a defect here. The only ones it can give a freshly
+       * minted id are a collision with an existing goal id (never reused, and
+       * time-sortable ids do not repeat) or a receipt conflict (the operation id is also
+       * fresh), so either one is this server being broken rather than anything the
+       * operator did.
+       */
+      createGoal: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const goalId = identifier.newGoalId();
+        const created = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            yield* store.openGoal(
+              {
+                callerScope: operatorScope(row.targetId),
+                targetId: row.targetId,
+              },
+              {
+                operationId: identifier.prefixed("op"),
+                goalId,
+                name: payload.name ?? "",
+                description: payload.description,
+              },
+            );
+            return yield* store.loadGoal(goalId);
+          }),
+        ).pipe(Effect.orDie);
+        if (created === undefined) {
+          return yield* Effect.die(
+            new Error(`goal ${goalId} was written and could not be read back`),
+          );
+        }
+        return goalView(created);
+      }),
+
+      /** One goal. A goal another target holds is not found here. */
+      goal: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const goal = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.loadGoal(params.goalId),
+        ).pipe(Effect.orDie);
+        if (goal === undefined || goal.targetId !== row.targetId) {
+          return yield* new GoalNotFound({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            detail: `no goal '${params.goalId}' is recorded in this target`,
+          });
+        }
+        return goalView(goal);
+      }),
+
+      /**
+       * Ends a goal as the operator.
+       *
+       * `endedBy` is the literal `"operator"` and nothing in the payload can change it:
+       * the planner's way of ending a goal arrives with the planner and does not go through
+       * this route. The store does the refusing — missing goal, another target's goal,
+       * already ended — and this handler only translates, so the three can never drift
+       * from what the store enforces.
+       *
+       * Nothing here touches the supervisor. Ending a goal records that it is over; a run
+       * already going under it is left alone, and stopping one is `stopRun`'s job.
+       */
+      endGoal: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const ended = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            yield* store
+              .endGoal(
+                {
+                  callerScope: operatorScope(row.targetId),
+                  targetId: row.targetId,
+                },
+                {
+                  operationId: identifier.prefixed("op"),
+                  goalId: params.goalId,
+                  status: payload.status,
+                  endedBy: "operator",
+                  reason: payload.reason,
+                },
+              )
+              .pipe(
+                Effect.catchTag("MutationError", (error) =>
+                  goalRefusal(store, row.targetId, params.goalId, error),
+                ),
+              );
+            return yield* store.loadGoal(params.goalId);
+          }),
+        ).pipe(
+          // Not `orDie`: that would turn the two refusals just produced into defects too.
+          // What is left to die is what an operator can do nothing about — the target's
+          // file failing to open or to answer, after `openableTarget` said it could.
+          Effect.catchTag("FleetError", Effect.die),
+          Effect.catchTag("DatabaseError", Effect.die),
+          Effect.catchTag("StoredRowError", Effect.die),
+        );
+        if (ended === undefined) {
+          return yield* Effect.die(
+            new Error(
+              `goal ${params.goalId} was ended and could not be read back`,
+            ),
+          );
+        }
+        return goalView(ended);
       }),
 
       /**

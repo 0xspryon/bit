@@ -457,6 +457,44 @@ describe("projecting the record", () => {
     expect(item.body).toBe("Probe the account limiter.");
   });
 
+  test("a goal being added reads as its objective, with no attempt borrowed from its subject", () => {
+    const item = projectEvent(
+      event({
+        kind: "goal.added",
+        callerScope: "host",
+        attemptId: null,
+        intentId: null,
+        subjectId: "goal-7",
+        payload: { goalId: "goal-7", name: "", description: "Map the API." },
+      }),
+    );
+    expect(item.kind).toBe("goal.added");
+    expect(item.body).toBe("Map the API.");
+    // `subject_id` is the goal here, and a goal is not an attempt.
+    expect(item.attemptId).toBeNull();
+  });
+
+  test("a goal being ended says how, by whom and why", () => {
+    const withReason = projectEvent(
+      event({
+        kind: "goal.ended",
+        payload: { status: "met", endedBy: "operator", reason: "Confirmed." },
+      }),
+    );
+    expect(withReason.kind).toBe("goal.ended");
+    expect(withReason.outcome).toBe("met");
+    expect(withReason.body).toBe(
+      "The goal ended as met, ended by operator. Confirmed.",
+    );
+    const bare = projectEvent(
+      event({
+        kind: "goal.ended",
+        payload: { status: "abandoned", endedBy: "operator", reason: "" },
+      }),
+    );
+    expect(bare.body).toBe("The goal ended as abandoned, ended by operator.");
+  });
+
   test("an event kind this build has never seen still appears, by name and in place", () => {
     const item = projectEvent(
       event({

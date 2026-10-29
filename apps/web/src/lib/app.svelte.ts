@@ -8,16 +8,21 @@
  * field marked below as server-fed is written only from a response, and the shapes it is
  * written from are the ones declared in `@bit/contracts`.
  *
- * **What is still static, and why.** The hunt list is mock data. Hunts live in a target's
- * own `hunt.sqlite`, reading one per request needs the per-target store resolver, and that
- * is a later day's work. A screen that invented a hunt count would be a lie the operator
- * cannot see through, so the list stays visibly a prototype until there is a real one.
+ * **What is still static, and why.** Every Level 2 section except Goals. A goal is a real
+ * row in the open target's own `hunt.sqlite` and the Goals section reads, creates and ends
+ * them through the server; the rest of the sidebar is the prototype it was, and a screen
+ * that invented a count for them would be a lie the operator cannot see through, so they
+ * stay visibly prototypes until there is something real behind each.
  *
  * **The scenario picker still works.** `reset()` loads the mock rows on purpose: a
  * scenario's job is to reach a UI state without reproducing the conditions that cause
  * it. Where a state can now come from the server — a refused password, an unavailable
  * target, a duplicate folder, a failed migration — the real path produces it too, and the
  * scenario is the shortcut rather than the only way in.
+ *
+ * That includes the Goals page. A scenario has no server to read goals from, so
+ * {@link App.previewTarget} declares the prototype's two (`mock.ts`'s `previewGoals`)
+ * rather than leaving the page waiting for an answer nothing will send.
  */
 
 import {
@@ -26,6 +31,8 @@ import {
   modelOptionDescriptors,
   type AttemptTranscript,
   LIVE_SILENCE_LIMIT_SECONDS,
+  type GoalEndStatus,
+  type GoalView,
   type HarnessInstanceView,
   type LiveFrame,
   type LiveItem,
@@ -36,7 +43,12 @@ import {
   type TargetSummary,
 } from "@bit/contracts";
 
-import { initialTargets, previewCounts, type Target } from "./mock";
+import {
+  initialTargets,
+  previewCounts,
+  previewGoals,
+  type Target,
+} from "./mock";
 import { server, type ServerClient } from "./client";
 
 /**
@@ -77,6 +89,14 @@ export type Theme = "dark" | "light";
 export type ConnectError = "none" | "password" | "unreachable" | "expired";
 export type CreateState =
   "idle" | "creating" | "failed" | "duplicate" | "denied";
+/**
+ * What the goals list knows about the target it is showing.
+ *
+ * `loading` is a state of its own for the reason {@link TargetViewState} gives: a fresh
+ * target genuinely has no goals, so an empty list cannot also mean "not read yet" without
+ * the empty-state sentence flashing up before the answer arrives.
+ */
+export type GoalsState = "idle" | "loading" | "ready" | "failed";
 
 export interface Scenario {
   readonly id: string;
@@ -198,7 +218,7 @@ export class App {
   passwordVisible = $state(false);
 
   /* Level 2 — inside an open target */
-  navItem = $state("hunts");
+  navItem = $state("goals");
   /**
    * Which target {@link counts} were read for.
    *
@@ -256,6 +276,62 @@ export class App {
   /** The run against the target currently on screen, if this server has one. */
   activeRun = $derived(
     this.runs.find((entry) => entry.targetId === this.viewTargetId),
+  );
+
+  /* ── Goals ────────────────────────────────────────────────────────────────── */
+  /**
+   * The open target's goals, newest first, as the server last told us.
+   *
+   * Server-fed and one target's at a time: {@link goalsTargetId} says whose, and nothing
+   * reads {@link goals} without agreeing with it, for the reason {@link viewTargetId} sits
+   * beside {@link counts}. Switching targets clears it before the new answer is asked for,
+   * so one target's objectives are never on screen under another's name.
+   */
+  goals = $state<GoalView[]>([]);
+  /** Which target {@link goals} were read for. Empty until the first answer. */
+  goalsTargetId = $state("");
+  goalsState = $state<GoalsState>("idle");
+  /** The server's own words for a failed read. */
+  goalsDetail = $state("");
+  /** The goal being looked at, or `""` for the list. */
+  openGoalId = $state("");
+
+  /* The New goal dialog */
+  goalDialogOpen = $state(false);
+  goalName = $state("");
+  goalObjective = $state("");
+  goalCreating = $state(false);
+  /** A refusal of the create, in the server's words. Shown inside the dialog. */
+  goalCreateDetail = $state("");
+
+  /* Ending the open goal */
+  /** Whether the end form is showing. Ending is deliberate, so it is never one click. */
+  goalEndOpen = $state(false);
+  goalEndStatus = $state<GoalEndStatus>("met");
+  goalEndReason = $state("");
+  goalEnding = $state(false);
+  /** A refusal of the end, in the server's words. Shown beside the control. */
+  goalEndDetail = $state("");
+
+  /** The goal being looked at, from the list. Absent if it has left the list. */
+  openGoalView = $derived(
+    this.goals.find((goal) => goal.goalId === this.openGoalId),
+  );
+
+  /**
+   * How many goals the sidebar says the open target has.
+   *
+   * The list's own length once it has been read for this target, since that is the number
+   * of rows the section will show; before that, the count the target header read from the
+   * target's file; and `undefined` when neither is this target's, so the sidebar shows no
+   * number rather than another target's. Never the intent count it used to borrow.
+   */
+  goalCount = $derived(
+    this.goalsTargetId === this.viewTargetId && this.goalsState === "ready"
+      ? this.goals.length
+      : this.counts !== undefined && this.viewTargetId === this.selectedId
+        ? this.counts.goals
+        : undefined,
   );
 
   /* ── The harness and model picker ─────────────────────────────────────────── */
@@ -613,6 +689,7 @@ export class App {
     this.runs = [];
     this.instruction = "";
     this.runDetail = "";
+    this.#clearGoals();
     // The connection carries a bearer that has just been dropped, so it has to go with it:
     // a stream left open on a signed-out session is a credential still in use. What it
     // showed goes too — this is one of the exits where it belongs to a session that no
@@ -677,12 +754,16 @@ export class App {
   openTarget(id: string) {
     this.select(id);
     this.screen = "target";
-    this.navItem = "hunts";
+    this.navItem = "goals";
     this.detailOpen = false;
     this.instruction = "";
     this.runDetail = "";
     this.viewTargetId = id;
+    // Cleared before the read, like the counts: between two targets the only honest
+    // answer is "reading", and the previous target's objectives must not be on screen.
+    this.#clearGoals();
     void this.refreshTarget(id);
+    void this.loadGoals(id);
     // Asked on every open, because a run started in another tab — or by this one before a
     // reload — is a fact about the server that this screen has no other way to learn.
     void this.loadRuns();
@@ -784,7 +865,8 @@ export class App {
   }
 
   /**
-   * Opens a target with the prototype's counts and no request, for the state picker.
+   * Opens a target with the prototype's counts and goals and no request, for the state
+   * picker.
    *
    * The picker's job is to reach a UI state without reproducing the conditions that cause
    * it, and its rows are mock rows that no server has heard of — so asking the server
@@ -799,6 +881,14 @@ export class App {
     this.counts = previewCounts;
     this.viewState = "ready";
     this.viewDetail = "";
+    // Declared, not read: this target is a mock row, so asking the server for its goals
+    // would land on `TargetNotFound`, and not asking would leave the Goals page reading
+    // for ever. Marked `ready` for the target on screen, with the two rows `previewCounts`
+    // says it has.
+    this.#clearGoals();
+    this.goals = previewGoals(id);
+    this.goalsTargetId = id;
+    this.goalsState = "ready";
   }
 
   /** Remembers a target named in the URL, to open once there is a session. */
@@ -829,6 +919,258 @@ export class App {
 
   closeTab(id: string) {
     this.openTargetIds = this.openTargetIds.filter((t) => t !== id);
+  }
+
+  /* ── Goals ───────────────────────────────────────────────────────────────── */
+
+  /** Puts every goal field back where a fresh target leaves it. */
+  #clearGoals() {
+    this.goals = [];
+    this.goalsTargetId = "";
+    this.goalsState = "idle";
+    this.goalsDetail = "";
+    this.openGoalId = "";
+    this.goalDialogOpen = false;
+    this.goalName = "";
+    this.goalObjective = "";
+    this.goalCreating = false;
+    this.goalCreateDetail = "";
+    this.goalEndOpen = false;
+    this.goalEndStatus = "met";
+    this.goalEndReason = "";
+    this.goalEnding = false;
+    this.goalEndDetail = "";
+  }
+
+  /**
+   * The sentence for a refusal the server sent, or the fallback when it sent none.
+   *
+   * A signed-out session is not a sentence: it leaves the screen, so the caller checks
+   * for it first and this is only reached by the refusals that stay on the page.
+   */
+  #refusalText(error: object, fallback: string): string {
+    return "detail" in error && typeof error.detail === "string"
+      ? error.detail
+      : fallback;
+  }
+
+  /**
+   * Reads the target's goals into {@link goals}.
+   *
+   * **It reads. It does not navigate**, and for the same reason {@link refreshTarget}
+   * does not: it asks about the target the view already names, and an answer for a target
+   * the operator has since left is dropped rather than rendered. `goalsState` goes to
+   * `loading` first and the list is kept while it does *if it is this target's*, so a
+   * refresh after creating a goal does not blank the page the operator is looking at.
+   */
+  async loadGoals(id: string) {
+    if (this.viewTargetId !== id) return;
+    if (this.goalsTargetId !== id) {
+      this.goals = [];
+      this.goalsTargetId = id;
+    }
+    this.goalsState = "loading";
+    this.goalsDetail = "";
+
+    const call = await this.client.goals(this.serverUrl, id);
+    if (this.viewTargetId !== id) return;
+
+    if (call._tag === "Unreachable") {
+      this.goalsState = "failed";
+      this.goalsDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.goalsState = "failed";
+      this.goalsDetail = this.#refusalText(
+        call.error,
+        "This target's goals could not be read.",
+      );
+      return;
+    }
+    this.goals = call.value.goals.map((goal) => ({ ...goal }));
+    this.goalsState = "ready";
+  }
+
+  /**
+   * Opens one goal from the list, and asks the server for its current counts.
+   *
+   * The row on hand is shown at once rather than after the round trip, since it is the
+   * same goal a moment ago; the read then replaces it, because a run that finished since
+   * the list was loaded has changed the numbers under it.
+   */
+  openGoal(goalId: string) {
+    this.openGoalId = goalId;
+    this.goalEndOpen = false;
+    this.goalEndStatus = "met";
+    this.goalEndReason = "";
+    this.goalEndDetail = "";
+    void this.refreshGoal(goalId);
+  }
+
+  closeGoal() {
+    this.openGoalId = "";
+    this.goalEndOpen = false;
+    this.goalEndDetail = "";
+  }
+
+  /** Replaces one goal in the list with the server's current answer about it. */
+  async refreshGoal(goalId: string) {
+    const targetId = this.viewTargetId;
+    const call = await this.client.goal(this.serverUrl, targetId, goalId);
+    if (this.viewTargetId !== targetId) return;
+    if (call._tag === "Ok") {
+      this.#placeGoal(call.value);
+      return;
+    }
+    if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+      this.signOut("expired");
+    }
+    // Any other failure leaves the row already on screen: it was true when it was read,
+    // and an operator looking at a goal is not helped by it vanishing because a refresh
+    // failed. The next action says what is wrong.
+  }
+
+  /** Puts a goal into the list in place, or at the top if the list has not got it. */
+  #placeGoal(goal: GoalView) {
+    this.goals = this.goals.some((entry) => entry.goalId === goal.goalId)
+      ? this.goals.map((entry) => (entry.goalId === goal.goalId ? goal : entry))
+      : [goal, ...this.goals];
+  }
+
+  openGoalDialog() {
+    this.goalDialogOpen = true;
+    this.goalName = "";
+    this.goalObjective = "";
+    this.goalCreateDetail = "";
+  }
+
+  closeGoalDialog() {
+    if (this.goalCreating) return;
+    this.goalDialogOpen = false;
+  }
+
+  /**
+   * Creates a goal from the dialog.
+   *
+   * The objective is required and checked here only to save a round trip and say it in the
+   * dialog's own words; the server refuses an empty one too, and that is the check that
+   * counts. Neither an id nor an operation id is sent — the server mints both.
+   */
+  async createGoal() {
+    const targetId = this.viewTargetId;
+    const description = this.goalObjective.trim();
+    if (targetId === "" || this.goalCreating) return;
+    if (description === "") {
+      this.goalCreateDetail =
+        "A goal needs an objective: say what it is trying to establish.";
+      return;
+    }
+    this.goalCreating = true;
+    this.goalCreateDetail = "";
+    try {
+      const call = await this.client.createGoal(this.serverUrl, targetId, {
+        name: this.goalName.trim(),
+        description,
+      });
+      if (this.viewTargetId !== targetId) return;
+      if (call._tag === "Unreachable") {
+        this.goalCreateDetail = "No server answered at this address.";
+        return;
+      }
+      if (call._tag === "Refused") {
+        if (call.error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        this.goalCreateDetail = this.#refusalText(
+          call.error,
+          "That goal was refused.",
+        );
+        return;
+      }
+      // The server's answer goes straight into the list, so the new row is on screen on
+      // the tick the dialog closes; the list is only re-read when something else may have
+      // changed it.
+      this.goalsTargetId = targetId;
+      this.#placeGoal(call.value);
+      this.goalsState = "ready";
+      this.goalDialogOpen = false;
+      // The header's counts moved: creating a goal wrote an event, and the transcript
+      // below shows that record while a stale header would still say there are none. A
+      // refresh and not a navigation, like `startRun`'s — it is not awaited, so the
+      // dialog's button is released as soon as the list has the row.
+      void this.refreshTarget(targetId);
+    } finally {
+      this.goalCreating = false;
+    }
+  }
+
+  openGoalEnd() {
+    this.goalEndOpen = true;
+    this.goalEndStatus = "met";
+    this.goalEndReason = "";
+    this.goalEndDetail = "";
+  }
+
+  cancelGoalEnd() {
+    if (this.goalEnding) return;
+    this.goalEndOpen = false;
+    this.goalEndDetail = "";
+  }
+
+  /**
+   * Ends the open goal as met or abandoned.
+   *
+   * It records that the goal is over and nothing more: a run already going under it is not
+   * stopped, and the screen says so before the operator commits. When another tab got
+   * there first, the refusal names what ended the goal and the row is re-read, so the
+   * page then shows the ending that stands instead of a control that no longer applies.
+   */
+  async endGoal() {
+    const targetId = this.viewTargetId;
+    const goalId = this.openGoalId;
+    if (targetId === "" || goalId === "" || this.goalEnding) return;
+    this.goalEnding = true;
+    this.goalEndDetail = "";
+    try {
+      const call = await this.client.endGoal(this.serverUrl, targetId, goalId, {
+        status: this.goalEndStatus,
+        reason: this.goalEndReason.trim(),
+      });
+      if (this.viewTargetId !== targetId) return;
+      if (call._tag === "Unreachable") {
+        this.goalEndDetail = "No server answered at this address.";
+        return;
+      }
+      if (call._tag === "Refused") {
+        if (call.error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        this.goalEndDetail = this.#refusalText(
+          call.error,
+          "That goal could not be ended.",
+        );
+        if (call.error._tag === "GoalRefused") {
+          // Already ended elsewhere: show the ending that stands.
+          this.goalEndOpen = false;
+          await this.refreshGoal(goalId);
+        }
+        return;
+      }
+      this.#placeGoal(call.value);
+      this.goalEndOpen = false;
+      this.goalEndReason = "";
+      // Ending writes an event too, for the reason `createGoal` refreshes.
+      void this.refreshTarget(targetId);
+    } finally {
+      this.goalEnding = false;
+    }
   }
 
   /* ── New target ──────────────────────────────────────────────────────────── */
@@ -1056,6 +1398,9 @@ export class App {
       // and not a navigation — if the operator opened something else while the start was
       // in flight, the right number of targets to move them back to is none.
       await this.refreshTarget(targetId);
+      // And the goals: a run mints the goal it runs under until intents arrive, so the
+      // list the operator is looking at is now missing a row.
+      void this.loadGoals(targetId);
     } finally {
       this.starting = false;
     }
@@ -1604,7 +1949,8 @@ export class App {
     this.createDetail = "";
     this.duplicateOf = "";
     this.dialogPathError = "";
-    this.navItem = "hunts";
+    this.navItem = "goals";
+    this.#clearGoals();
     this.sidebarCollapsed = false;
     this.detailOpen = false;
     this.passwordVisible = false;

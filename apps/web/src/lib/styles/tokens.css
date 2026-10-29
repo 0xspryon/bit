@@ -110,6 +110,9 @@
   --state-bg-success: #14361d;
   --state-fg-success: #6bd586;
   --state-border-success: #1d783c;
+  --state-bg-info: #021945;
+  --state-fg-info: #7698fd;
+  --state-border-info: #2c47c8;
 }
 
 /* ── Light ── */
@@ -154,6 +157,9 @@
   --state-bg-success: #e7f9ea;
   --state-fg-success: #198b43;
   --state-border-success: #b8e9c1;
+  --state-bg-info: #ecf1fe;
+  --state-fg-info: #3250df;
+  --state-border-info: #c3d4fd;
 }
 
 /* ── Base ── */

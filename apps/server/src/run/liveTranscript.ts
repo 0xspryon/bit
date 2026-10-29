@@ -315,6 +315,37 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
         body: text(event.payload, "question"),
         outcome: null,
       };
+    case "goal.added":
+      return {
+        ...base,
+        kind: "goal.added",
+        headline: "Goal added",
+        // The objective rather than the label: the label is a handle for a list row, and
+        // a transcript is read for what was being attempted. An unnamed goal is the
+        // ordinary case, so the name is not worth a sentence of its own here.
+        body: text(event.payload, "description"),
+        outcome: null,
+      };
+    case "goal.ended": {
+      const status = text(event.payload, "status");
+      const endedBy = text(event.payload, "endedBy");
+      const reason = text(event.payload, "reason");
+      // Who is in the sentence for the reason `attempt.settled` carries `settledBy`: a
+      // person ending a goal and the planner concluding it are different facts. The
+      // reason follows when there is one, and an ending with none says nothing rather
+      // than a placeholder.
+      const sentence =
+        endedBy === ""
+          ? `The goal ended as ${status}.`
+          : `The goal ended as ${status}, ended by ${endedBy}.`;
+      return {
+        ...base,
+        kind: "goal.ended",
+        headline: "Goal ended",
+        body: reason === "" ? sentence : `${sentence} ${reason}`,
+        outcome: status === "" ? null : status,
+      };
+    }
     default:
       return {
         ...base,

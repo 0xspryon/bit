@@ -1,10 +1,9 @@
 /**
  * Static data for the Flow A prototype.
  *
- * What is left here is what has no server behind it yet: the hunt list, the Level 2
- * navigation, and the rows the state picker loads. Hunts live in a target's own
- * `hunt.sqlite` and reading one per request needs the per-target store resolver, so they
- * stay visibly a prototype rather than becoming a fabricated count on a real screen.
+ * What is left here is what has no server behind it yet: the prototype hunt list, the
+ * Level 2 navigation, and the rows the state picker loads — including the two goals its
+ * open target shows, since a scenario has no server to read real ones from.
  *
  * The target rail is **not** fed from here any more: `app.svelte.ts` fills it from
  * `GET /api/v1/targets`. The rows below survive only because the state picker loads
@@ -14,7 +13,7 @@
  * the browser never reads the filesystem.
  */
 
-import type { TargetCounts } from "@bit/contracts";
+import type { GoalView, TargetCounts } from "@bit/contracts";
 
 /**
  * Counts for the state picker's open target.
@@ -33,6 +32,43 @@ export const previewCounts: TargetCounts = {
   assets: 37,
   events: 212,
 };
+
+/**
+ * The goals the state picker's open target shows.
+ *
+ * A scenario has no server, so the Goals page cannot read any, and left alone it would sit
+ * at "reading" for ever. These are declared instead, and there are as many as
+ * {@link previewCounts} says there are (two), for the reason that object's own comment
+ * gives: a picker that disagreed with itself would be worse than one that is visibly a
+ * prototype. One is open and one is ended, so both states of the page can be compared
+ * without a server in either. Called with the target's id so the rows belong to it.
+ */
+export const previewGoals = (targetId: string): GoalView[] => [
+  {
+    goalId: "goal_preview_open",
+    targetId,
+    name: "Auth bypass",
+    description: "Find out whether the login limiter can be bypassed.",
+    status: "active",
+    createdAt: 1_700_000_000_000,
+    endedAt: null,
+    endedBy: null,
+    endReason: null,
+    counts: { intents: 4, attempts: 5, observations: 90 },
+  },
+  {
+    goalId: "goal_preview_met",
+    targetId,
+    name: "",
+    description: "Map the unauthenticated surface of the API.",
+    status: "met",
+    createdAt: 1_699_000_000_000,
+    endedAt: 1_699_500_000_000,
+    endedBy: "operator",
+    endReason: "Every route is listed.",
+    counts: { intents: 2, attempts: 3, observations: 58 },
+  },
+];
 
 export type TargetStatus = "ready" | "missing" | "migrating" | "failed";
 
@@ -178,7 +214,10 @@ export const navGroups: ReadonlyArray<{
   {
     label: "Investigation",
     items: [
-      { id: "hunts", label: "Hunts", icon: "stream", count: 6 },
+      // The one Level 2 item driven by real rows. It has no `count` here on purpose: the
+      // number comes from the open target's goals (`App.goalCount`), and a prototype figure
+      // in this record would be the thing shown whenever that one was unavailable.
+      { id: "goals", label: "Goals", icon: "stream" },
       {
         id: "findings",
         label: "Findings",

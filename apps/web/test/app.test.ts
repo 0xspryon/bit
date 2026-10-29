@@ -18,6 +18,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  GoalRefused,
   LIVE_SILENCE_LIMIT_SECONDS,
   PathRefused,
   RunRefused,
@@ -34,6 +35,7 @@ import {
   AT,
   FakeServer,
   attemptTranscript,
+  goalView,
   harnessInstance,
   liveActivity,
   liveCursor,
@@ -597,6 +599,287 @@ describe("runs", () => {
  * against, so both call sites are pinned here rather than just the one that is easier to
  * provoke.
  */
+describe("goals", () => {
+  /** Signs in and opens one target, with the goals the server is told to hold. */
+  const onTarget = async (
+    held: Parameters<typeof goalView>[0][] = [],
+    id = "acme-corp",
+  ): Promise<[App, FakeServer]> => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id, name: id })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: held.map((over) => goalView({ targetId, ...over })) });
+    await signIn(app);
+    app.openTarget(id);
+    await settle();
+    return [app, fake];
+  };
+
+  test("opening a target lands on Goals and reads that target's goals", async () => {
+    const [app, fake] = await onTarget([
+      { goalId: "goal_a", name: "Auth" },
+      { goalId: "goal_b" },
+    ]);
+    expect(app.navItem).toBe("goals");
+    expect(app.goalsState).toBe("ready");
+    expect(app.goals.map((goal) => goal.goalId)).toEqual(["goal_a", "goal_b"]);
+    expect(app.goalsTargetId).toBe("acme-corp");
+    // The sidebar's number is the list's length, not the intent count it used to borrow.
+    expect(app.goalCount).toBe(2);
+    expect(fake.countOf("goals")).toBe(1);
+  });
+
+  test("a target with no goals is an empty ready list, not a loading one", async () => {
+    const [app] = await onTarget([]);
+    expect(app.goalsState).toBe("ready");
+    expect(app.goals).toEqual([]);
+    expect(app.goalCount).toBe(0);
+  });
+
+  test("a failed read says so and keeps the sentence", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = () =>
+      refused(
+        new TargetUnavailable({
+          reason: "database_missing",
+          targetId: "acme-corp",
+          detail: "hunt.sqlite is not there",
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    expect(app.goalsState).toBe("failed");
+    expect(app.goalsDetail).toBe("hunt.sqlite is not there");
+  });
+
+  test("another target's goals are cleared before the new answer, and never shown under it", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () =>
+      ok([targetSummary({ id: "alpha" }), targetSummary({ id: "beta" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({
+        goals: [goalView({ targetId, goalId: `goal_of_${targetId}` })],
+      });
+    await signIn(app);
+    app.openTarget("alpha");
+    await settle();
+    expect(app.goals.map((goal) => goal.goalId)).toEqual(["goal_of_alpha"]);
+
+    const release = fake.hold("goals");
+    app.openTarget("beta");
+    // Between the two answers there is nothing of alpha's on screen.
+    expect(app.goals).toEqual([]);
+    expect(app.goalCount).not.toBe(1);
+    release();
+    await settle();
+    expect(app.goals.map((goal) => goal.goalId)).toEqual(["goal_of_beta"]);
+    expect(app.goalsTargetId).toBe("beta");
+  });
+
+  test("an answer for a target the operator has left is dropped", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () =>
+      ok([targetSummary({ id: "alpha" }), targetSummary({ id: "beta" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: `goal_of_${targetId}` })] });
+    await signIn(app);
+    const release = fake.hold("goals");
+    app.openTarget("alpha");
+    app.openTarget("beta");
+    release();
+    await settle();
+    expect(app.goals.map((goal) => goal.goalId)).toEqual(["goal_of_beta"]);
+  });
+
+  test("creating a goal sends the objective trimmed and no id, and the row appears at once", async () => {
+    const [app, fake] = await onTarget([{ goalId: "goal_old" }]);
+    app.openGoalDialog();
+    app.goalName = "  Auth bypass ";
+    app.goalObjective = "  Can the limiter be bypassed?  ";
+    fake.onCreateGoal = (_baseUrl, targetId, draft) =>
+      ok(
+        goalView({
+          goalId: "goal_new",
+          targetId,
+          ...draft,
+          name: "Auth bypass",
+        }),
+      );
+
+    await app.createGoal();
+
+    const sent = fake.calls.find((call) => call.method === "createGoal");
+    expect(sent?.args[1]).toBe("acme-corp");
+    expect(sent?.args[2]).toEqual({
+      name: "Auth bypass",
+      description: "Can the limiter be bypassed?",
+    });
+    expect(app.goalDialogOpen).toBe(false);
+    expect(app.goals.map((goal) => goal.goalId)).toEqual([
+      "goal_new",
+      "goal_old",
+    ]);
+    expect(app.goalCount).toBe(2);
+  });
+
+  test("an empty objective asks the server nothing and keeps the dialog open", async () => {
+    const [app, fake] = await onTarget();
+    app.openGoalDialog();
+    app.goalObjective = "   ";
+    await app.createGoal();
+    expect(fake.countOf("createGoal")).toBe(0);
+    expect(app.goalDialogOpen).toBe(true);
+    expect(app.goalCreateDetail).toContain("objective");
+  });
+
+  test("a refused create keeps what was typed and says why", async () => {
+    const [app, fake] = await onTarget();
+    app.openGoalDialog();
+    app.goalObjective = "Something";
+    fake.onCreateGoal = () =>
+      refused(
+        new TargetUnavailable({
+          reason: "schema_unavailable",
+          targetId: "acme-corp",
+          detail: "the schema did not migrate",
+        }),
+      );
+    await app.createGoal();
+    expect(app.goalDialogOpen).toBe(true);
+    expect(app.goalObjective).toBe("Something");
+    expect(app.goalCreateDetail).toBe("the schema did not migrate");
+    expect(app.goalCreating).toBe(false);
+  });
+
+  test("ending a goal sends the operator's choice and replaces the row", async () => {
+    const [app, fake] = await onTarget([{ goalId: "goal_a" }]);
+    app.openGoal("goal_a");
+    await settle();
+    app.openGoalEnd();
+    app.goalEndStatus = "abandoned";
+    app.goalEndReason = "  out of scope ";
+    await app.endGoal();
+
+    const sent = fake.calls.find((call) => call.method === "endGoal");
+    expect(sent?.args.slice(1, 3)).toEqual(["acme-corp", "goal_a"]);
+    expect(sent?.args[3]).toEqual({
+      status: "abandoned",
+      reason: "out of scope",
+    });
+    expect(app.openGoalView?.status).toBe("abandoned");
+    expect(app.openGoalView?.endedBy).toBe("operator");
+    expect(app.goalEndOpen).toBe(false);
+    expect(app.goalEnding).toBe(false);
+  });
+
+  test("a goal already ended elsewhere shows the ending that stands", async () => {
+    const [app, fake] = await onTarget([{ goalId: "goal_a" }]);
+    app.openGoal("goal_a");
+    await settle();
+    app.openGoalEnd();
+    fake.onEndGoal = () =>
+      refused(
+        new GoalRefused({
+          reason: "already_ended",
+          goalId: "goal_a",
+          detail: "goal goal_a is already met, ended by operator",
+        }),
+      );
+    // What the re-read finds: the other tab's ending.
+    fake.onGoal = (_baseUrl, targetId, goalId) =>
+      ok(
+        goalView({
+          targetId,
+          goalId,
+          status: "met",
+          endedAt: AT + 5,
+          endedBy: "operator",
+          endReason: "done in the other tab",
+        }),
+      );
+    await app.endGoal();
+
+    expect(app.goalEndDetail).toBe(
+      "goal goal_a is already met, ended by operator",
+    );
+    expect(app.goalEndOpen).toBe(false);
+    expect(app.openGoalView?.status).toBe("met");
+    expect(app.openGoalView?.endReason).toBe("done in the other tab");
+  });
+
+  test("an expired session while ending signs out", async () => {
+    const [app, fake] = await onTarget([{ goalId: "goal_a" }]);
+    app.openGoal("goal_a");
+    await settle();
+    app.openGoalEnd();
+    fake.onEndGoal = () => refused(new Unauthenticated({ reason: "expired" }));
+    await app.endGoal();
+    expect(app.screen).toBe("connect");
+    expect(app.goals).toEqual([]);
+  });
+
+  test("the state picker's open target has goals to show and asks the server for none", async () => {
+    const { app, fake } = open();
+    app.reset();
+    app.previewTarget("acme-corp");
+    // Not "reading": a scenario has no server, so nothing would ever answer.
+    expect(app.goalsState).toBe("ready");
+    expect(app.goalsTargetId).toBe("acme-corp");
+    expect(app.goals).toHaveLength(2);
+    expect(app.goals.every((goal) => goal.targetId === "acme-corp")).toBe(true);
+    // Agrees with the sidebar's number and with the counts the same scenario declares.
+    expect(app.goalCount).toBe(2);
+    expect(app.counts?.goals).toBe(2);
+    expect(fake.countOf("goals")).toBe(0);
+  });
+
+  test("creating a goal refreshes the header's counts", async () => {
+    const [app, fake] = await onTarget([]);
+    let events = 0;
+    fake.onTarget = (_baseUrl, id) => {
+      const view = targetView(targetSummary({ id, name: id }), { events });
+      return ok(view);
+    };
+    await app.refreshTarget("acme-corp");
+    expect(app.counts?.events).toBe(0);
+
+    app.openGoalDialog();
+    app.goalObjective = "A new objective";
+    // The server has recorded `goal.added` by the time it answers the create.
+    events = 1;
+    await app.createGoal();
+    await settle();
+
+    expect(app.counts?.events).toBe(1);
+    expect(app.goals).toHaveLength(1);
+  });
+
+  test("ending a goal refreshes the header's counts", async () => {
+    const [app, fake] = await onTarget([{ goalId: "goal_a" }]);
+    let events = 0;
+    fake.onTarget = (_baseUrl, id) =>
+      ok(targetView(targetSummary({ id, name: id }), { events }));
+    await app.refreshTarget("acme-corp");
+    app.openGoal("goal_a");
+    await settle();
+    app.openGoalEnd();
+    events = 2;
+    await app.endGoal();
+    await settle();
+    expect(app.counts?.events).toBe(2);
+  });
+
+  test("choosing Goals again from inside a goal returns to the list", async () => {
+    const [app] = await onTarget([{ goalId: "goal_a" }]);
+    app.openGoal("goal_a");
+    expect(app.openGoalId).toBe("goal_a");
+    app.closeGoal();
+    expect(app.openGoalId).toBe("");
+  });
+});
+
 describe("a round trip that outlives the view it started in", () => {
   /** Two targets with distinguishable counts, open on alpha, signed in. */
   const onAlpha = async (): Promise<{ app: App; fake: FakeServer }> => {

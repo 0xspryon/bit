@@ -10,6 +10,7 @@ export * from "./observation";
 export * from "./briefing";
 export * from "./asset";
 export * from "./intent";
+export * from "./goal";
 export * from "./event";
 export * from "./live";
 export * from "./unknownField";

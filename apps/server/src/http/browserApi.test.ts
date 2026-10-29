@@ -44,12 +44,13 @@ import {
   Context,
   Duration,
   Effect,
+  Exit,
   Layer,
   ManagedRuntime,
   Redacted,
 } from "effect";
 
-import { browserApiRoutes } from "./browserApi";
+import { browserApiRoutes, goalRefusal } from "./browserApi";
 import { CONTROL_PLANE_IDLE_TIMEOUT } from "./controlPlane";
 import { BrowserSessions, ensureServerPassword } from "./browserSessions";
 import { ControlPlaneEndpoint } from "./controlPlane";
@@ -57,7 +58,11 @@ import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { FleetStore, HUNT_FILE } from "../persistence/fleet";
 import { multiCaseInput } from "../persistence/fixtures";
-import { ObservationStore } from "../persistence/store";
+import {
+  MutationError,
+  ObservationStore,
+  type StoredGoal,
+} from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { InstanceId } from "../harness/identity";
 import { HarnessResolver } from "../harness/resolver";
@@ -1727,6 +1732,365 @@ describe("the live transcript's activity channel, on the wire", () => {
  * asserts that the server does close it. Together they say: the timeout is real, and the
  * heartbeat is what defeats it.
  */
+describe("a target's goals", () => {
+  const first = "goals-one";
+  const second = "goals-two";
+
+  const register = async (name: string) => {
+    mkdirSync(join(workspaceRoot, name), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: {
+          workspacePath: join(workspaceRoot, name),
+          name,
+          scopeNote: "",
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+  };
+
+  beforeAll(async () => {
+    await register(first);
+    await register(second);
+  });
+
+  const create = (targetId: string, body: unknown) =>
+    signedIn(`/targets/${targetId}/goals`, { method: "POST", body });
+
+  test("create, list, open and end make one round trip", async () => {
+    const empty = await read(await signedIn(`/targets/${first}/goals`));
+    expect(empty.status).toBe(200);
+    expect(empty.body).toEqual({ goals: [] });
+
+    const created = await read(
+      await create(first, {
+        name: "Auth bypass",
+        description: "  Can the login limiter be bypassed?  ",
+      }),
+    );
+    // A resource exists that did not, and the objective was trimmed on the way in.
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({
+      targetId: first,
+      name: "Auth bypass",
+      description: "Can the login limiter be bypassed?",
+      status: "active",
+      endedAt: null,
+      endedBy: null,
+      endReason: null,
+      counts: { intents: 0, attempts: 0, observations: 0 },
+    });
+    const goalId = String(created.body["goalId"]);
+    // The server minted it; the browser sent no id.
+    expect(goalId).toStartWith("goal_");
+
+    const listed = await read(await signedIn(`/targets/${first}/goals`));
+    expect(
+      (listed.body["goals"] as ReadonlyArray<{ goalId: string }>).map(
+        (goal) => goal.goalId,
+      ),
+    ).toEqual([goalId]);
+
+    const opened = await read(
+      await signedIn(`/targets/${first}/goals/${goalId}`),
+    );
+    expect(opened.status).toBe(200);
+    expect(opened.body).toMatchObject({ goalId, status: "active" });
+
+    const ended = await read(
+      await signedIn(`/targets/${first}/goals/${goalId}/end`, {
+        method: "POST",
+        body: { status: "met", reason: "Shown with 40 rapid requests." },
+      }),
+    );
+    expect(ended.status).toBe(200);
+    expect(ended.body).toMatchObject({
+      goalId,
+      status: "met",
+      // The route is the operator's, and the payload had no say in it.
+      endedBy: "operator",
+      endReason: "Shown with 40 rapid requests.",
+    });
+    expect(ended.body["endedAt"]).toBeNumber();
+
+    // And it is the same goal when read again, which is what surviving a reload means.
+    const reread = await read(
+      await signedIn(`/targets/${first}/goals/${goalId}`),
+    );
+    expect(reread.body).toEqual(ended.body);
+  });
+
+  test("a name is optional", async () => {
+    const created = await read(
+      await create(first, { description: "Map the unauthenticated surface." }),
+    );
+    expect(created.status).toBe(201);
+    expect(created.body["name"]).toBe("");
+  });
+
+  test("an empty or blank objective is refused before anything is written", async () => {
+    const before = await read(await signedIn(`/targets/${second}/goals`));
+    for (const description of ["", "   \n\t "]) {
+      const refused = await create(second, { description });
+      expect(refused.status).toBe(400);
+    }
+    const missing = await create(second, { name: "no objective" });
+    expect(missing.status).toBe(400);
+
+    const after = await read(await signedIn(`/targets/${second}/goals`));
+    expect(after.body).toEqual(before.body);
+    // Nor did the refused request reach the event log: a target with no goal has none.
+    const database = new Database(
+      join(fleetRoot, "targets", second, HUNT_FILE),
+      { readonly: true },
+    );
+    try {
+      expect(database.query("SELECT COUNT(*) AS n FROM events").get()).toEqual({
+        n: 0,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("ending is refused by name the second time, and the first ending stands", async () => {
+    const created = await read(
+      await create(first, { description: "Enumerate tenant ids." }),
+    );
+    const goalId = String(created.body["goalId"]);
+    const end = (status: string, reason: string) =>
+      signedIn(`/targets/${first}/goals/${goalId}/end`, {
+        method: "POST",
+        body: { status, reason },
+      });
+
+    expect((await end("abandoned", "out of scope")).status).toBe(200);
+    const again = await read(await end("met", "never mind"));
+    expect(again.status).toBe(409);
+    expect(again.body).toMatchObject({
+      _tag: "GoalRefused",
+      reason: "already_ended",
+      goalId,
+    });
+    expect(String(again.body["detail"])).toContain("already abandoned");
+    expect(String(again.body["detail"])).toContain("operator");
+
+    const after = await read(
+      await signedIn(`/targets/${first}/goals/${goalId}`),
+    );
+    expect(after.body).toMatchObject({
+      status: "abandoned",
+      endReason: "out of scope",
+    });
+  });
+
+  test("an end status other than met or abandoned is not accepted", async () => {
+    const created = await read(
+      await create(first, { description: "A goal that stays open." }),
+    );
+    const refused = await signedIn(
+      `/targets/${first}/goals/${String(created.body["goalId"])}/end`,
+      { method: "POST", body: { status: "active", reason: "" } },
+    );
+    expect(refused.status).toBe(400);
+  });
+
+  test("two targets keep their own goals", async () => {
+    const mine = await read(
+      await create(second, { description: "Only the second target has this." }),
+    );
+    const secondGoals = await read(await signedIn(`/targets/${second}/goals`));
+    const firstGoals = await read(await signedIn(`/targets/${first}/goals`));
+    const secondIds = (
+      secondGoals.body["goals"] as ReadonlyArray<{ goalId: string }>
+    ).map((goal) => goal.goalId);
+    const firstIds = (
+      firstGoals.body["goals"] as ReadonlyArray<{ goalId: string }>
+    ).map((goal) => goal.goalId);
+
+    expect(secondIds).toEqual([String(mine.body["goalId"])]);
+    expect(firstIds).not.toContain(String(mine.body["goalId"]));
+
+    // A goal is a handle into one target's file: asked for through the other, it is not
+    // found, and ending it through the other is refused the same way.
+    const crossRead = await read(
+      await signedIn(`/targets/${first}/goals/${String(mine.body["goalId"])}`),
+    );
+    expect(crossRead.status).toBe(404);
+    expect(crossRead.body).toMatchObject({
+      _tag: "GoalNotFound",
+      targetId: first,
+    });
+    const crossEnd = await read(
+      await signedIn(
+        `/targets/${first}/goals/${String(mine.body["goalId"])}/end`,
+        { method: "POST", body: { status: "met", reason: "" } },
+      ),
+    );
+    expect(crossEnd.status).toBe(404);
+    const untouched = await read(
+      await signedIn(`/targets/${second}/goals/${String(mine.body["goalId"])}`),
+    );
+    expect(untouched.body["status"]).toBe("active");
+  });
+
+  test("a goal nobody created is a 404 that names it", async () => {
+    const response = await read(
+      await signedIn(`/targets/${first}/goals/goal_nowhere`),
+    );
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({
+      _tag: "GoalNotFound",
+      goalId: "goal_nowhere",
+    });
+    const end = await read(
+      await signedIn(`/targets/${first}/goals/goal_nowhere/end`, {
+        method: "POST",
+        body: { status: "met", reason: "" },
+      }),
+    );
+    expect(end.status).toBe(404);
+  });
+
+  test("an unopenable target refuses all four routes the way every other route does", async () => {
+    const unknown = "no-such-target";
+    const paths: ReadonlyArray<
+      readonly [method: string, path: string, body?: unknown]
+    > = [
+      ["GET", `/targets/${unknown}/goals`],
+      ["POST", `/targets/${unknown}/goals`, { description: "x" }],
+      ["GET", `/targets/${unknown}/goals/goal_1`],
+      [
+        "POST",
+        `/targets/${unknown}/goals/goal_1/end`,
+        { status: "met", reason: "" },
+      ],
+    ];
+    for (const [method, path, body] of paths) {
+      const response = await read(
+        await signedIn(path, {
+          method,
+          ...(body === undefined ? {} : { body }),
+        }),
+      );
+      expect(response.status).toBe(404);
+      expect(response.body).toMatchObject({
+        _tag: "TargetNotFound",
+        reason: "unknown_target",
+      });
+    }
+    // And a target whose folder is gone is the other refusal, from the same check.
+    const gone = "goals-gone";
+    await register(gone);
+    rmSync(join(fleetRoot, "targets", gone), { recursive: true, force: true });
+    const unavailable = await read(await signedIn(`/targets/${gone}/goals`));
+    expect(unavailable.status).toBe(409);
+    expect(unavailable.body).toMatchObject({
+      _tag: "TargetUnavailable",
+      reason: "folder_missing",
+    });
+    const refusedWrite = await create(gone, { description: "x" });
+    expect(refusedWrite.status).toBe(409);
+  });
+
+  test("the routes need a session like everything else", async () => {
+    const response = await call(`/targets/${first}/goals`);
+    expect(response.status).toBe(401);
+    const write = await call(`/targets/${first}/goals`, {
+      method: "POST",
+      body: { description: "x" },
+    });
+    expect(write.status).toBe(401);
+  });
+
+  test("goals created and ended appear in the target's record", async () => {
+    const database = new Database(
+      join(fleetRoot, "targets", first, HUNT_FILE),
+      { readonly: true },
+    );
+    try {
+      const kinds = database
+        .query<{ kind: string }, []>(
+          "SELECT kind FROM events ORDER BY sequence",
+        )
+        .all()
+        .map((row) => row.kind);
+      expect(kinds).toContain("goal.added");
+      expect(kinds).toContain("goal.ended");
+    } finally {
+      database.close();
+    }
+  });
+});
+
+describe("what a goal refusal is allowed to claim", () => {
+  const stored = (status: StoredGoal["status"]): StoredGoal => ({
+    goalId: "goal_x",
+    targetId: "t",
+    name: "",
+    description: "d",
+    status,
+    createdAt: 1,
+    endedAt: status === "active" ? null : 2,
+    endedBy: status === "active" ? null : "operator",
+    endReason: status === "active" ? null : "",
+    intentCount: 0,
+    attemptCount: 0,
+    observationCount: 0,
+  });
+  const storeHolding = (goal: StoredGoal | undefined) => ({
+    loadGoal: () => Effect.succeed(goal),
+  });
+  const conflict = new MutationError({
+    reason: "conflict",
+    detail: "operation op_1 was already used with different input",
+  });
+
+  test("a conflict about a goal that is ended is already_ended", async () => {
+    const exit = await Effect.runPromiseExit(
+      goalRefusal(storeHolding(stored("met")), "t", "goal_x", conflict),
+    );
+    expect(Exit.isFailure(exit)).toBe(true);
+    expect(JSON.stringify(exit)).toContain("already_ended");
+  });
+
+  test("a conflict about a goal that is still active is not claimed to be an ending", async () => {
+    // A reused operation id with different input: the store says `conflict`, and the goal
+    // is open. Naming that `already_ended` would be a 409 that misdescribes what happened.
+    const exit = await Effect.runPromiseExit(
+      goalRefusal(storeHolding(stored("active")), "t", "goal_x", conflict),
+    );
+    expect(Exit.hasDies(exit)).toBe(true);
+    expect(JSON.stringify(exit)).not.toContain("already_ended");
+  });
+
+  test("a conflict about a goal that cannot be read is not claimed either", async () => {
+    const exit = await Effect.runPromiseExit(
+      goalRefusal(storeHolding(undefined), "t", "goal_x", conflict),
+    );
+    expect(Exit.hasDies(exit)).toBe(true);
+  });
+
+  test("an invalid refusal is a GoalNotFound carrying the store's sentence", async () => {
+    const exit = await Effect.runPromiseExit(
+      goalRefusal(
+        storeHolding(undefined),
+        "t",
+        "goal_x",
+        new MutationError({
+          reason: "invalid",
+          detail: "no goal goal_x exists",
+        }),
+      ),
+    );
+    expect(Exit.isFailure(exit)).toBe(true);
+    expect(JSON.stringify(exit)).toContain("GoalNotFound");
+    expect(JSON.stringify(exit)).toContain("no goal goal_x exists");
+  });
+});
+
 describe("a live connection that has nothing to say", () => {
   /** Scaled down together, at a ratio wider than the shipped 60:20. */
   const IDLE_TIMEOUT_SECONDS = 2;

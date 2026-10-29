@@ -472,6 +472,7 @@ describe("a database already at 0002", () => {
       "13_outbox",
       "14_attempt_harness_instance",
       "15_attempt_model_options",
+      "16_goal_lifecycle",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -742,6 +743,7 @@ describe("a database already at 0005", () => {
       "13_outbox",
       "14_attempt_harness_instance",
       "15_attempt_model_options",
+      "16_goal_lifecycle",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1405,6 +1407,138 @@ describe("a database already at 0009", () => {
     expect(outcome.badPolicy).toBe("Failure");
     // An obligation with no event behind it is an obligation nobody can explain.
     expect(outcome.orphan).toBe("Failure");
+  });
+});
+
+describe("a database already at 0015", () => {
+  /**
+   * Goals as `seedAttempt` minted them before goals had a lifecycle, in a file at `0015`.
+   *
+   * Inserted with a plain `INSERT` that names only the four columns that existed then, so
+   * the rows are what the old code wrote and the defaults are what has to supply the rest.
+   * Two targets, so "every existing goal becomes active" is not satisfied by one row.
+   */
+  const seedGoalsAtZeroFifteen = (path: string) =>
+    withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* runMigrations({ loader: chainThrough(15) });
+        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
+          VALUES ('goal_old_a', 'acme-corp', 'find auth bypasses', 100)`;
+        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
+          VALUES ('goal_old_b', 'internal-api', 'probe tenant isolation', 200)`;
+        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
+          VALUES ('intent_old', 'goal_old_a', 'acme-corp', 'does login rate-limit?', 101)`;
+      }),
+    );
+
+  test("leaves existing goals readable, active and unnamed", async () => {
+    const path = newDatabasePath();
+    await seedGoalsAtZeroFifteen(path);
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        return {
+          applied: yield* migrate,
+          goals: yield* sql<{
+            id: string;
+            description: string;
+            created_at: number;
+            name: string;
+            status: string;
+            ended_at: number | null;
+            ended_by: string | null;
+            end_reason: string | null;
+          }>`SELECT id, description, created_at, name, status, ended_at, ended_by,
+                    end_reason
+             FROM goals ORDER BY id`,
+          intents: yield* sql<{ goal_id: string }>`SELECT goal_id FROM intents`,
+        };
+      }),
+    );
+
+    // Only the new entry is outstanding.
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "16_goal_lifecycle",
+    ]);
+    // The old columns are untouched; the new ones took the defaults the migration
+    // documents: an open goal, no name, and no ending recorded.
+    expect(outcome.goals).toEqual([
+      {
+        id: "goal_old_a",
+        description: "find auth bypasses",
+        created_at: 100,
+        name: "",
+        status: "active",
+        ended_at: null,
+        ended_by: null,
+        end_reason: null,
+      },
+      {
+        id: "goal_old_b",
+        description: "probe tenant isolation",
+        created_at: 200,
+        name: "",
+        status: "active",
+        ended_at: null,
+        ended_by: null,
+        end_reason: null,
+      },
+    ]);
+    // The goal-to-intent link is the thing a rebuilt table would lose.
+    expect(outcome.intents).toEqual([{ goal_id: "goal_old_a" }]);
+  });
+
+  test("adds the index a target's goal list reads through", async () => {
+    const path = newDatabasePath();
+    await withSql(path, () => migrate);
+
+    const index = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        const rows = yield* sql.unsafe<{ name: string }>(
+          `PRAGMA index_list(goals)`,
+        );
+        const columns = yield* sql.unsafe<{ seqno: number; name: string }>(
+          `PRAGMA index_info(goals_target_status_idx)`,
+        );
+        return {
+          present: rows.map((row) => row.name),
+          columns: [...columns]
+            .sort((a, b) => a.seqno - b.seqno)
+            .map((column) => column.name),
+        };
+      }),
+    );
+
+    expect(index.present).toContain("goals_target_status_idx");
+    expect(index.columns).toEqual(["target_id", "status"]);
+  });
+
+  test("a fresh database has the same goal columns as an upgraded one", async () => {
+    const upgraded = newDatabasePath();
+    await seedGoalsAtZeroFifteen(upgraded);
+    await withSql(upgraded, () => migrate);
+    const fresh = newDatabasePath();
+    await withSql(fresh, () => migrate);
+
+    const [fromUpgrade, fromScratch] = await Promise.all([
+      withSql(upgraded, (sql) => columnsOf(sql, "goals")),
+      withSql(fresh, (sql) => columnsOf(sql, "goals")),
+    ]);
+
+    expect(fromScratch).toEqual(fromUpgrade);
+    expect(fromScratch).toEqual(
+      [
+        "id",
+        "target_id",
+        "description",
+        "created_at",
+        "name",
+        "status",
+        "ended_at",
+        "ended_by",
+        "end_reason",
+      ].sort(),
+    );
   });
 });
 

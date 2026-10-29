@@ -42,12 +42,18 @@ import {
   RecordObservationResult,
   SummaryObservationConditions,
   AddIntentResult,
+  EndGoalResult,
+  GoalEndedBy,
+  GoalStatus,
+  OpenGoalResult,
   assetIdentityOf,
   dimensionAddress,
   isAssetIdentityRefusal,
   parseDimensionAddress,
   type AddIntentInput,
+  type EndGoalInput,
   type ModelOptionSelection,
+  type OpenGoalInput,
   type ObservationProvenance,
   type ObservationRecordFormat,
   type OutboxEntry,
@@ -271,6 +277,33 @@ export interface IntentRow {
   readonly question: string;
   readonly targetId: string;
   readonly goal: string;
+}
+
+/**
+ * One goal as the store reads it: the row, and how much hangs under it.
+ *
+ * Deliberately not the contract's `GoalView`. The store describes what the file holds and
+ * the contract describes a screen; they are allowed to diverge, and the browser API maps
+ * one to the other field by field so that a divergence is a compile error rather than a
+ * silently missing value. Today they happen to carry the same fields.
+ *
+ * `status` is decoded through the contract's vocabulary, so a row holding anything else
+ * is a {@link StoredRowError} naming it rather than a string the rest of the program has
+ * to distrust. The three ending fields are null together, while the goal is `active`.
+ */
+export interface StoredGoal {
+  readonly goalId: string;
+  readonly targetId: string;
+  readonly name: string;
+  readonly description: string;
+  readonly status: GoalStatus;
+  readonly createdAt: number;
+  readonly endedAt: number | null;
+  readonly endedBy: GoalEndedBy | null;
+  readonly endReason: string | null;
+  readonly intentCount: number;
+  readonly attemptCount: number;
+  readonly observationCount: number;
 }
 
 /** An attempt's identity plus the write-authority epoch a credential must carry. */
@@ -503,6 +536,66 @@ const IntentJoinRow = Schema.Struct({
   question: Schema.String,
   target_id: Schema.String,
   goal: Schema.String,
+});
+
+/**
+ * A goal row with its counts, as one statement returns it.
+ *
+ * `status` and `ended_by` are decoded through the contract's literals rather than left as
+ * strings. That is the opposite choice to `AttemptRow.status`, and deliberately: an
+ * attempt's status has a recovery vocabulary that an adopted database might extend, while
+ * a goal's has exactly three values and nothing else writes the column — a fourth is
+ * corruption, and corruption belongs in a typed error naming the row.
+ */
+const GoalRow = Schema.Struct({
+  id: Schema.String,
+  target_id: Schema.String,
+  name: Schema.String,
+  description: Schema.String,
+  status: GoalStatus,
+  created_at: Schema.Finite,
+  ended_at: Schema.NullOr(Schema.Finite),
+  ended_by: Schema.NullOr(GoalEndedBy),
+  end_reason: Schema.NullOr(Schema.String),
+  intent_count: Schema.Int,
+  attempt_count: Schema.Int,
+  observation_count: Schema.Int,
+});
+
+/**
+ * The columns {@link GoalRow} names, as one `SELECT` list.
+ *
+ * Counts are correlated subqueries rather than joins: a join across intents, attempts
+ * and observations multiplies rows (three attempts under an intent with five observations
+ * is fifteen), and `COUNT(DISTINCT …)` over that product is the kind of thing that is
+ * right until the day it is not. Each subquery counts one table once. Observations and
+ * attempts both hang off an intent, so both are reached through `intents.goal_id`.
+ */
+const goalSelect = `SELECT goals.id AS id, goals.target_id AS target_id, goals.name AS name,
+    goals.description AS description, goals.status AS status,
+    goals.created_at AS created_at, goals.ended_at AS ended_at,
+    goals.ended_by AS ended_by, goals.end_reason AS end_reason,
+    (SELECT COUNT(*) FROM intents WHERE intents.goal_id = goals.id) AS intent_count,
+    (SELECT COUNT(*) FROM attempts INNER JOIN intents ON intents.id = attempts.intent_id
+       WHERE intents.goal_id = goals.id) AS attempt_count,
+    (SELECT COUNT(*) FROM observations INNER JOIN intents
+         ON intents.id = observations.intent_id
+       WHERE intents.goal_id = goals.id) AS observation_count
+  FROM goals`;
+
+const toStoredGoal = (row: typeof GoalRow.Type): StoredGoal => ({
+  goalId: row.id,
+  targetId: row.target_id,
+  name: row.name,
+  description: row.description,
+  status: row.status,
+  createdAt: row.created_at,
+  endedAt: row.ended_at,
+  endedBy: row.ended_by,
+  endReason: row.end_reason,
+  intentCount: row.intent_count,
+  attemptCount: row.attempt_count,
+  observationCount: row.observation_count,
 });
 
 /**
@@ -2058,6 +2151,318 @@ const makeStore = Effect.fnUntraced(function* () {
       );
   });
 
+  const selectGoalById = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: GoalRow,
+    execute: (goalId) =>
+      sql.unsafe(`${goalSelect} WHERE goals.id = ?`, [goalId]),
+  });
+
+  const selectGoals = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: GoalRow,
+    execute: () =>
+      sql.unsafe(`${goalSelect} ORDER BY goals.created_at DESC, goals.id`, []),
+  });
+
+  /**
+   * Creates one goal, on purpose and as a recorded act.
+   *
+   * Before this a goal was a row `seedAttempt` minted as a side effect of starting a run:
+   * no operation identity, no event, nothing to say who wanted it. This is the same
+   * discipline `addIntent` has, applied to the node above it — and it is copied in
+   * discipline rather than in text, so each rule below is here because a goal needs it:
+   *
+   * 1. **The receipt is read before anything else.** A retry must answer from what was
+   *    committed, not from whatever the world looks like now; after the first call the
+   *    goal exists, and a check for "does this goal already exist" that ran first would
+   *    refuse the very retry it should replay.
+   * 2. **The same operation id with different input is a `conflict`, and nothing is
+   *    written.** The request hash covers the host's scope and target as well as the
+   *    payload, so a retry from another scope is a different request.
+   * 3. **`host.targetId` is the target, and the payload does not get a say.** The input
+   *    has no target field at all: a goal belongs to the file's target by construction,
+   *    and a caller that could name another one would be one typo from writing evidence
+   *    into the wrong engagement.
+   * 4. **A goal id is never reused.** An existing goal under that id is refused as
+   *    `invalid` with a sentence pointing at the operation id, which is what a retry
+   *    needs and the goal id is not.
+   *
+   * The goal row, the receipt and the `goal.added` event commit in one transaction, so
+   * the log can never say a goal was created that is not there, nor the reverse. There
+   * is no outbox request: opening a goal obliges nothing outside this database, and a
+   * mutation that wrote one anyway would make the outbox look more exercised than it is.
+   *
+   * It is `active` from the first instant. There is no draft state to leave, and no
+   * second call that makes it real.
+   */
+  const openGoal = Effect.fn("ObservationStore.openGoal")(function* (
+    host: HostContext,
+    input: OpenGoalInput,
+  ) {
+    const createdAt = yield* Clock.currentTimeMillis;
+    const key = `${host.callerScope}:open_goal:${input.operationId}`;
+    const requestHash = hashRequest(
+      { callerScope: host.callerScope, targetId: host.targetId },
+      input,
+    );
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const existing = yield* findReceipt(key).pipe(
+            Effect.mapError(lift("command_receipts", key)),
+          );
+          if (Option.isSome(existing)) {
+            const receipt = existing.value;
+            if (receipt.request_hash !== requestHash) {
+              return yield* new MutationError({
+                reason: "conflict",
+                detail: `operation ${input.operationId} was already used with different input`,
+              });
+            }
+            const original = yield* replayResult(
+              key,
+              OpenGoalResult,
+              receipt.result,
+            );
+            return { ...original, replayed: true };
+          }
+
+          const clash = yield* findGoal(input.goalId).pipe(
+            Effect.mapError(lift("goals", input.goalId)),
+          );
+          if (Option.isSome(clash)) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `goal ${input.goalId} already exists; a goal id is never reused, and a retry of this command needs the operation id, not the goal id`,
+            });
+          }
+
+          yield* sql`INSERT INTO goals (
+              id, target_id, name, description, status, created_at
+            ) VALUES (
+              ${input.goalId}, ${host.targetId}, ${input.name},
+              ${input.description}, 'active', ${createdAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          const result: OpenGoalResult = {
+            goalId: input.goalId,
+            replayed: false,
+          };
+
+          yield* sql`INSERT INTO command_receipts (
+              key, caller_scope, operation, operation_id, request_hash, result,
+              created_at
+            ) VALUES (
+              ${key}, ${host.callerScope}, 'open_goal', ${input.operationId},
+              ${requestHash}, ${JSON.stringify(result)}, ${createdAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          // Intent and attempt are null because a host-originated goal has neither: an
+          // honest absence, not a gap. The caller scope is the host's own.
+          yield* appendEvent({
+            kind: "goal.added",
+            targetId: host.targetId,
+            callerScope: host.callerScope,
+            intentId: null,
+            attemptId: null,
+            operation: "open_goal",
+            operationId: input.operationId,
+            subjectId: input.goalId,
+            payload: {
+              goalId: input.goalId,
+              name: input.name,
+              description: input.description,
+            },
+            recordedAt: createdAt,
+          });
+
+          return result;
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
+  /**
+   * Ends one goal, once, and records who did it and why.
+   *
+   * Receipt discipline is {@link openGoal}'s, in the same order. The refusals are then
+   * three, none of which writes anything, and each names what it found so the sentence
+   * can be shown to an operator as written:
+   *
+   * - **No such goal** — `invalid`, naming the id.
+   * - **A goal from another target** — `invalid`, saying so. The goal's own `target_id`
+   *   is compared with `host.targetId`; the payload has no target to trust.
+   * - **A goal already ended** — `conflict`, naming its current status and who ended it.
+   *   Ending is a one-way door: the first ending is the record of what was concluded, and
+   *   a second call that overwrote it would erase that. Someone who wants a different
+   *   conclusion wants a new goal. This is a refusal and not a replay because the replay
+   *   case is already handled above — an exact retry of the *same* operation finds its
+   *   receipt first and answers with the original ending.
+   *
+   * **What ending does not do is stop anything.** It records that the goal is over, which
+   * is what a dispatcher will check before it starts new work under the goal and what the
+   * planner's wake-ups will check before they begin another round. It does not interrupt
+   * an attempt that is running (the spec's decision 8): that work was started by an
+   * operator who may want its result, and the way to stop an attempt is the stop control,
+   * not a goal changing state under it. There is nothing here to cancel, and no code in
+   * this function reaches for the supervisor.
+   *
+   * The `UPDATE` carries `AND status = 'active'` and is checked through `RETURNING`.
+   * Inside this transaction the read above already established the goal is active, so
+   * the guard cannot normally fail; it is there so that if a second writer ever existed,
+   * the loser would refuse by name instead of overwriting the winner's ending and then
+   * appending an event describing a change that did not happen.
+   */
+  const endGoal = Effect.fn("ObservationStore.endGoal")(function* (
+    host: HostContext,
+    input: EndGoalInput,
+  ) {
+    const endedAt = yield* Clock.currentTimeMillis;
+    const key = `${host.callerScope}:end_goal:${input.operationId}`;
+    const requestHash = hashRequest(
+      { callerScope: host.callerScope, targetId: host.targetId },
+      input,
+    );
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const existing = yield* findReceipt(key).pipe(
+            Effect.mapError(lift("command_receipts", key)),
+          );
+          if (Option.isSome(existing)) {
+            const receipt = existing.value;
+            if (receipt.request_hash !== requestHash) {
+              return yield* new MutationError({
+                reason: "conflict",
+                detail: `operation ${input.operationId} was already used with different input`,
+              });
+            }
+            const original = yield* replayResult(
+              key,
+              EndGoalResult,
+              receipt.result,
+            );
+            return { ...original, replayed: true };
+          }
+
+          const found = yield* selectGoalById(input.goalId).pipe(
+            Effect.mapError(lift("goals", input.goalId)),
+          );
+          if (Option.isNone(found)) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `no goal ${input.goalId} exists in this target`,
+            });
+          }
+          const goal = found.value;
+          if (goal.target_id !== host.targetId) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `goal ${input.goalId} belongs to target ${goal.target_id}, not ${host.targetId}`,
+            });
+          }
+          if (goal.status !== "active") {
+            return yield* new MutationError({
+              reason: "conflict",
+              detail: `goal ${input.goalId} is already ${goal.status}, ended by ${goal.ended_by ?? "an unrecorded party"}; an ended goal is not ended again, and a different conclusion is a new goal`,
+            });
+          }
+
+          const updated = yield* sql<{ id: string }>`UPDATE goals
+            SET status = ${input.status}, ended_at = ${endedAt},
+                ended_by = ${input.endedBy}, end_reason = ${input.reason}
+            WHERE id = ${input.goalId} AND status = 'active'
+            RETURNING id`.pipe(Effect.mapError(asDatabaseError("transaction")));
+          if (updated.length === 0) {
+            return yield* new MutationError({
+              reason: "conflict",
+              detail: `goal ${input.goalId} was ended by another call before this one could be recorded`,
+            });
+          }
+
+          const result: EndGoalResult = {
+            goalId: input.goalId,
+            status: input.status,
+            endedBy: input.endedBy,
+            endedAt,
+            replayed: false,
+          };
+
+          yield* sql`INSERT INTO command_receipts (
+              key, caller_scope, operation, operation_id, request_hash, result,
+              created_at
+            ) VALUES (
+              ${key}, ${host.callerScope}, 'end_goal', ${input.operationId},
+              ${requestHash}, ${JSON.stringify(result)}, ${endedAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          yield* appendEvent({
+            kind: "goal.ended",
+            targetId: host.targetId,
+            callerScope: host.callerScope,
+            intentId: null,
+            attemptId: null,
+            operation: "end_goal",
+            operationId: input.operationId,
+            subjectId: input.goalId,
+            payload: {
+              goalId: input.goalId,
+              status: input.status,
+              endedBy: input.endedBy,
+              reason: input.reason,
+            },
+            recordedAt: endedAt,
+          });
+
+          return result;
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
+  /**
+   * Every goal in this file, newest first, with the counts that hang under each.
+   *
+   * "This target's goals" is true by construction: a target's goals live in that target's
+   * own `hunt.sqlite` and nowhere else, which is what the per-target file is for. The
+   * rows still carry `target_id`, and the browser API checks it against the target it
+   * opened rather than trusting the file — a misfiled row is then a missing goal, not
+   * another engagement's objective on this one's screen.
+   *
+   * Read-only and transaction-free, like {@link counts}: it takes no write lock, so a
+   * list refresh cannot be the thing that blocks a worker mid-write.
+   */
+  const goals = Effect.fn("ObservationStore.goals")(function* () {
+    const rows = yield* selectGoals().pipe(Effect.mapError(lift("goals", "*")));
+    return rows.map(toStoredGoal);
+  });
+
+  /** One goal by id, or `undefined`. Which target it belongs to is on the result. */
+  const loadGoal = Effect.fn("ObservationStore.loadGoal")(function* (
+    goalId: string,
+  ) {
+    const row = yield* selectGoalById(goalId).pipe(
+      Effect.mapError(lift("goals", goalId)),
+    );
+    return Option.match(row, {
+      onNone: () => undefined,
+      onSome: toStoredGoal,
+    });
+  });
+
   /**
    * Records what the harness said about one running attempt, and settles it accordingly.
    *
@@ -3057,6 +3462,10 @@ const makeStore = Effect.fnUntraced(function* () {
     seedAttempt,
     recordAsset,
     addIntent,
+    openGoal,
+    endGoal,
+    goals,
+    loadGoal,
     eventsAfter,
     pendingRequests,
     anchorsForIntent,
@@ -3162,6 +3571,35 @@ export class ObservationStore extends Context.Service<
       AddIntentResult,
       MutationError | DatabaseError | StoredRowError
     >;
+    /**
+     * Creates a goal, receipt-keyed like {@link addIntent}. See the implementation for
+     * the refusals.
+     */
+    readonly openGoal: (
+      host: HostContext,
+      input: OpenGoalInput,
+    ) => Effect.Effect<
+      OpenGoalResult,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * Ends a goal once, recording who and why. Records state only: it interrupts nothing.
+     */
+    readonly endGoal: (
+      host: HostContext,
+      input: EndGoalInput,
+    ) => Effect.Effect<
+      EndGoalResult,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /** Every goal in this file with its counts, newest first. Read-only. */
+    readonly goals: () => Effect.Effect<
+      readonly StoredGoal[],
+      DatabaseError | StoredRowError
+    >;
+    readonly loadGoal: (
+      goalId: string,
+    ) => Effect.Effect<StoredGoal | undefined, DatabaseError | StoredRowError>;
     readonly eventsAfter: (
       after?: number,
       limit?: number,

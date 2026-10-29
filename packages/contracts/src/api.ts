@@ -38,6 +38,7 @@ import {
   HttpApiSecurity,
 } from "effect/http-api";
 
+import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
 import { API_PREFIX, apiPath } from "./http";
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
@@ -624,6 +625,53 @@ export class RunRefused extends Schema.TaggedError<RunRefused>()(
   }
 }
 
+/* ── Goals ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * No goal under that id in this target.
+ *
+ * One refusal for the two ways a goal can fail to be there, because to a browser they are
+ * the same answer: the id names nothing *in the target it asked about*. A goal that exists
+ * in another target's file is not found here — a goal id is a handle into one target's
+ * evidence, and a request that crossed targets has been built from the wrong pieces, not
+ * from a goal the operator should be told about.
+ *
+ * `404`, with the sentence the store or the handler produced in `detail`.
+ */
+export class GoalNotFound extends Schema.TaggedError<GoalNotFound>()(
+  "GoalNotFound",
+  { targetId: Schema.String, goalId: Schema.String, detail: Schema.String },
+  { httpApiStatus: 404 },
+) {
+  override get message(): string {
+    return `no goal '${this.goalId}' in target '${this.targetId}': ${this.detail}`;
+  }
+}
+
+/**
+ * A goal change the server will not make.
+ *
+ * - `already_ended` — the goal is `met` or `abandoned` already. Ending is one-way, so this
+ *   is a refusal and never an overwrite; `detail` names the status it holds and who ended
+ *   it, which is the sentence a second tab's operator needs to see.
+ *
+ * `409`, like {@link RunRefused}: the request is well formed and the state of the world is
+ * what stops it.
+ */
+export class GoalRefused extends Schema.TaggedError<GoalRefused>()(
+  "GoalRefused",
+  {
+    reason: Schema.Literals(["already_ended"]),
+    goalId: Schema.String,
+    detail: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {
+  override get message(): string {
+    return `${this.reason} (${this.goalId}): ${this.detail}`;
+  }
+}
+
 /* ── Harnesses ───────────────────────────────────────────────────────────────── */
 
 /**
@@ -996,6 +1044,58 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         error: [AttemptNotFound, TargetNotFound, TargetUnavailable],
       },
     ),
+    /**
+     * The goals of one target, newest first, each with what hangs under it.
+     *
+     * Wrapped in an object rather than a bare array so a field can be added beside `goals`
+     * without breaking every client. Read-only and cheap: one statement over the target's
+     * own file, so a list refresh costs a worker nothing.
+     */
+    HttpApiEndpoint.get("goals", "/targets/:targetId/goals", {
+      params: { targetId: Schema.String },
+      success: Schema.Struct({ goals: Schema.Array(GoalView) }),
+      error: [TargetNotFound, TargetUnavailable],
+    }),
+    /**
+     * Creates a goal under one target.
+     *
+     * `201`, because a resource now exists that did not. The body is {@link GoalDraft}: a
+     * browser sends the objective and an optional label, and **the server mints the goal
+     * id and the operation id** — see the draft for why neither is the browser's to name.
+     * An objective that is empty after trimming is refused by the payload decoder before
+     * a handler runs, so nothing is written for it.
+     */
+    HttpApiEndpoint.post("createGoal", "/targets/:targetId/goals", {
+      params: { targetId: Schema.String },
+      payload: GoalDraft,
+      success: GoalView.pipe(HttpApiSchema.status(201)),
+      error: [TargetNotFound, TargetUnavailable],
+    }),
+    /** One goal, with its counts. Refused as {@link GoalNotFound} if this target lacks it. */
+    HttpApiEndpoint.get("goal", "/targets/:targetId/goals/:goalId", {
+      params: { targetId: Schema.String, goalId: Schema.String },
+      success: GoalView,
+      error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+    }),
+    /**
+     * Ends a goal as `met` or `abandoned`, as the operator.
+     *
+     * A `POST` to a sub-resource rather than a `DELETE` or a `PATCH`, for the reason
+     * {@link stopRun} is one: nothing is removed, and this is a recorded act with a reason
+     * rather than an edit of a field. The ender is not in the body — this route is the
+     * operator's, so `endedBy` is `operator` by construction.
+     *
+     * **It stops nothing.** An attempt already running under the goal keeps running; ending
+     * blocks new dispatch and planner wake-ups, and the stop control remains the only way to
+     * stop an attempt. A goal that is already ended is refused as {@link GoalRefused}, naming
+     * what ended it.
+     */
+    HttpApiEndpoint.post("endGoal", "/targets/:targetId/goals/:goalId/end", {
+      params: { targetId: Schema.String, goalId: Schema.String },
+      payload: GoalEndDraft,
+      success: GoalView,
+      error: [GoalNotFound, GoalRefused, TargetNotFound, TargetUnavailable],
+    }),
     /**
      * One target's live transcript, as Server-Sent Events.
      *

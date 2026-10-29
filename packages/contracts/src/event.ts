@@ -58,6 +58,16 @@ import { Schema } from "effect";
  * database — the harness session is created before the row is written, not because of it
  * — and §6 defines the outbox as a queue of side-effect *requests*. An empty obligation
  * would be a row a dispatcher had to learn to skip.
+ *
+ * **`goal.added` and `goal.ended` are the other pair, and they are not a started/settled
+ * pair.** A goal is ended at most once — a second ending is refused, not appended — so
+ * `goal.ended` is never a refinement of an earlier one the way a later `attempt.settled`
+ * can be. A `goal.added` with no `goal.ended` means the goal is still active. Goals that
+ * predate these events (minted by `seedAttempt` before goals had a lifecycle) have neither:
+ * the log does not claim to have witnessed their creation. Both are host-originated, so
+ * `intentId` and `attemptId` are null and `callerScope` is the host's own, as for
+ * `intent.added`, and neither carries an outbox request — creating or ending a goal
+ * obliges nothing outside this database.
  */
 export const EventKind = Schema.Literals([
   "asset.recorded",
@@ -65,6 +75,8 @@ export const EventKind = Schema.Literals([
   "observation.recorded",
   "attempt.started",
   "attempt.settled",
+  "goal.added",
+  "goal.ended",
 ]);
 export type EventKind = typeof EventKind.Type;
 

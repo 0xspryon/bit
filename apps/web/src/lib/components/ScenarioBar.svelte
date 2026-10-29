@@ -30,10 +30,12 @@
    * Whether the compose box is on screen, and therefore whether to sit above it.
    *
    * The same condition `Target.svelte` renders it under — the open target's
-   * Hunts section — rather than a guess from the viewport, because what has to
+   * Goals list — rather than a guess from the viewport, because what has to
    * be cleared is that component and not a width.
    */
-  let lifted = $derived(app.screen === "target" && app.navItem === "hunts");
+  let lifted = $derived(
+    app.screen === "target" && app.navItem === "goals" && app.openGoalId === "",
+  );
 
   let groups = $derived([...new Set(scenarios.map((s) => s.group))]);
 

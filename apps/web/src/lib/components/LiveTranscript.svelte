@@ -50,6 +50,8 @@
     "observation.recorded": "Observation",
     "asset.recorded": "Asset",
     "intent.added": "Intent",
+    "goal.added": "Goal",
+    "goal.ended": "Goal ended",
     "record.other": "Event",
     "turn.reply": "Reply",
     "tool.call": "Tool call",
@@ -79,6 +81,7 @@
       case "succeeded":
       case "ok":
       case "positive":
+      case "met":
         return "success";
       case "negative":
       case "inconclusive":

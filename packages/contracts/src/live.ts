@@ -166,6 +166,8 @@ export const LIVE_ITEM_KINDS = [
   "observation.recorded",
   "asset.recorded",
   "intent.added",
+  "goal.added",
+  "goal.ended",
   "record.other",
   /* Live activity. */
   "turn.reply",

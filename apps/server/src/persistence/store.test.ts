@@ -3061,3 +3061,506 @@ describe("what an attempt records of its model's options", () => {
     );
   });
 });
+
+describe("goals", () => {
+  const HOST = { callerScope: "host/target-1", targetId: "target-1" };
+
+  const openInput = (
+    overrides: Partial<{
+      operationId: string;
+      goalId: string;
+      name: string;
+      description: string;
+    }> = {},
+  ) => ({
+    operationId: "open-1",
+    goalId: "goal-new",
+    name: "Auth bypass",
+    description: "Determine whether the login limiter can be bypassed.",
+    ...overrides,
+  });
+
+  const endInput = (
+    overrides: Partial<{
+      operationId: string;
+      goalId: string;
+      status: "met" | "abandoned";
+      endedBy: "planner" | "operator";
+      reason: string;
+    }> = {},
+  ) => ({
+    operationId: "end-1",
+    goalId: "goal-new",
+    status: "met" as const,
+    endedBy: "operator" as const,
+    reason: "The limiter was shown to be bypassable.",
+    ...overrides,
+  });
+
+  /** The reason a failed result carries, or fails the test if it did not fail. */
+  const refusalOf = (result: {
+    readonly _tag: string;
+    readonly failure?: unknown;
+  }): MutationError => {
+    expect(result._tag).toBe("Failure");
+    return result.failure as MutationError;
+  };
+
+  test("opening a goal writes the goal and a goal.added event together", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        const opened = yield* store.openGoal(HOST, openInput());
+        return {
+          opened,
+          goals: yield* store.goals(),
+          loaded: yield* store.loadGoal("goal-new"),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+
+    expect(outcome.opened).toEqual({ goalId: "goal-new", replayed: false });
+    expect(outcome.goals).toHaveLength(1);
+    expect(outcome.loaded).toMatchObject({
+      goalId: "goal-new",
+      targetId: "target-1",
+      name: "Auth bypass",
+      description: "Determine whether the login limiter can be bypassed.",
+      status: "active",
+      endedAt: null,
+      endedBy: null,
+      endReason: null,
+      intentCount: 0,
+      attemptCount: 0,
+      observationCount: 0,
+    });
+    expect(outcome.events).toHaveLength(1);
+    const event = outcome.events[0];
+    expect(event?.kind).toBe("goal.added");
+    expect(event?.subjectId).toBe("goal-new");
+    expect([event?.operation, event?.operationId]).toEqual([
+      "open_goal",
+      "open-1",
+    ]);
+    // Host-originated: the scope is the host's own, and there is no attempt or intent to
+    // fabricate.
+    expect(event?.callerScope).toBe("host/target-1");
+    expect(event?.attemptId).toBeNull();
+    expect(event?.intentId).toBeNull();
+    expect(event?.payload).toMatchObject({
+      goalId: "goal-new",
+      name: "Auth bypass",
+      description: "Determine whether the login limiter can be bypassed.",
+    });
+  });
+
+  test("a goal and its event are one transaction: a failed event rolls the goal back", async () => {
+    const path = newDatabasePath();
+    // Create the file and schema first, then break the one thing the transaction must
+    // also write. A trigger is the smallest way to make the event insert fail without
+    // changing the store.
+    await withStore(path, (store) => store.goals());
+    const database = new Database(path);
+    try {
+      database.run(
+        `CREATE TRIGGER no_events BEFORE INSERT ON events
+         BEGIN SELECT RAISE(ABORT, 'events are closed for this test'); END`,
+      );
+    } finally {
+      database.close();
+    }
+
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const failed = yield* Effect.result(store.openGoal(HOST, openInput()));
+        return {
+          failed,
+          goals: yield* store.goals(),
+        };
+      }),
+    );
+
+    expect(outcome.failed._tag).toBe("Failure");
+    // Neither the goal nor its receipt survived, so a retry is a first attempt.
+    expect(outcome.goals).toEqual([]);
+    const after = new Database(path, { readonly: true });
+    try {
+      expect(
+        after.query("SELECT COUNT(*) AS n FROM command_receipts").get(),
+      ).toEqual({ n: 0 });
+    } finally {
+      after.close();
+    }
+  });
+
+  test("an exact retry replays and writes nothing", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        const first = yield* store.openGoal(HOST, openInput());
+        const retry = yield* store.openGoal(HOST, openInput());
+        return {
+          first,
+          retry,
+          goals: yield* store.goals(),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+
+    expect(outcome.first.replayed).toBe(false);
+    expect(outcome.retry).toEqual({ goalId: "goal-new", replayed: true });
+    expect(outcome.goals).toHaveLength(1);
+    expect(outcome.events).toHaveLength(1);
+  });
+
+  test("the same operation id with different input is a conflict and writes nothing", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        const conflict = yield* Effect.result(
+          store.openGoal(
+            HOST,
+            openInput({ description: "A different objective entirely." }),
+          ),
+        );
+        return {
+          conflict,
+          goals: yield* store.goals(),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+
+    expect(refusalOf(outcome.conflict).reason).toBe("conflict");
+    expect(outcome.goals).toHaveLength(1);
+    expect(outcome.goals[0]?.description).toBe(
+      "Determine whether the login limiter can be bypassed.",
+    );
+    expect(outcome.events).toHaveLength(1);
+  });
+
+  test("a goal id is never reused under a new operation id", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        const reused = yield* Effect.result(
+          store.openGoal(HOST, openInput({ operationId: "open-2" })),
+        );
+        return { reused, events: yield* store.eventsAfter() };
+      }),
+    );
+
+    const refusal = refusalOf(outcome.reused);
+    expect(refusal.reason).toBe("invalid");
+    expect(refusal.detail).toContain("goal-new already exists");
+    expect(outcome.events).toHaveLength(1);
+  });
+
+  test("ending a goal sets its status, time, ender and reason, and appends goal.ended", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        const ended = yield* store.endGoal(HOST, endInput());
+        return {
+          ended,
+          goal: yield* store.loadGoal("goal-new"),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+
+    expect(outcome.ended).toMatchObject({
+      goalId: "goal-new",
+      status: "met",
+      endedBy: "operator",
+      replayed: false,
+    });
+    expect(outcome.goal).toMatchObject({
+      status: "met",
+      endedBy: "operator",
+      endReason: "The limiter was shown to be bypassable.",
+      endedAt: outcome.ended.endedAt,
+    });
+    expect(outcome.events.map((event) => event.kind)).toEqual([
+      "goal.added",
+      "goal.ended",
+    ]);
+    const event = outcome.events[1];
+    expect(event?.subjectId).toBe("goal-new");
+    expect([event?.operation, event?.operationId]).toEqual([
+      "end_goal",
+      "end-1",
+    ]);
+    expect(event?.callerScope).toBe("host/target-1");
+    expect(event?.attemptId).toBeNull();
+    expect(event?.intentId).toBeNull();
+    expect(event?.payload).toMatchObject({
+      goalId: "goal-new",
+      status: "met",
+      endedBy: "operator",
+      reason: "The limiter was shown to be bypassable.",
+    });
+  });
+
+  test("an ending with no reason is stored as empty, not as absent", async () => {
+    const goal = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        yield* store.endGoal(
+          HOST,
+          endInput({ status: "abandoned", reason: "" }),
+        );
+        return yield* store.loadGoal("goal-new");
+      }),
+    );
+    expect(goal?.status).toBe("abandoned");
+    expect(goal?.endReason).toBe("");
+  });
+
+  test("an exact retry of an ending replays the original, even after the goal is ended", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        const first = yield* store.endGoal(HOST, endInput());
+        const retry = yield* store.endGoal(HOST, endInput());
+        return { first, retry, events: yield* store.eventsAfter() };
+      }),
+    );
+
+    expect(outcome.retry).toEqual({ ...outcome.first, replayed: true });
+    expect(outcome.events.filter((e) => e.kind === "goal.ended")).toHaveLength(
+      1,
+    );
+  });
+
+  test("ending an already-ended goal is a conflict that names the ending, and overwrites nothing", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        yield* store.endGoal(HOST, endInput());
+        const second = yield* Effect.result(
+          store.endGoal(
+            HOST,
+            endInput({
+              operationId: "end-2",
+              status: "abandoned",
+              endedBy: "planner",
+              reason: "changed my mind",
+            }),
+          ),
+        );
+        return {
+          second,
+          goal: yield* store.loadGoal("goal-new"),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+
+    const refusal = refusalOf(outcome.second);
+    expect(refusal.reason).toBe("conflict");
+    expect(refusal.detail).toContain("already met");
+    expect(refusal.detail).toContain("ended by operator");
+    // The first ending stands, field for field.
+    expect(outcome.goal).toMatchObject({
+      status: "met",
+      endedBy: "operator",
+      endReason: "The limiter was shown to be bypassable.",
+    });
+    expect(outcome.events.filter((e) => e.kind === "goal.ended")).toHaveLength(
+      1,
+    );
+  });
+
+  test("the same operation id with different ending input is a conflict", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        yield* store.endGoal(HOST, endInput());
+        return yield* Effect.result(
+          store.endGoal(HOST, endInput({ status: "abandoned" })),
+        );
+      }),
+    );
+    expect(refusalOf(outcome).detail).toContain("already used with different");
+  });
+
+  test("ending a goal that does not exist is invalid and names the id", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        const missing = yield* Effect.result(
+          store.endGoal(HOST, endInput({ goalId: "goal-nowhere" })),
+        );
+        return { missing, events: yield* store.eventsAfter() };
+      }),
+    );
+    const refusal = refusalOf(outcome.missing);
+    expect(refusal.reason).toBe("invalid");
+    expect(refusal.detail).toContain("goal-nowhere");
+    expect(outcome.events).toEqual([]);
+  });
+
+  test("a goal from another target cannot be ended from this one", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        const crossed = yield* Effect.result(
+          store.endGoal(
+            { callerScope: "host/target-2", targetId: "target-2" },
+            endInput(),
+          ),
+        );
+        return {
+          crossed,
+          goal: yield* store.loadGoal("goal-new"),
+          events: yield* store.eventsAfter(),
+        };
+      }),
+    );
+
+    const refusal = refusalOf(outcome.crossed);
+    expect(refusal.reason).toBe("invalid");
+    expect(refusal.detail).toContain("belongs to target target-1");
+    expect(outcome.goal?.status).toBe("active");
+    expect(outcome.events).toHaveLength(1);
+  });
+
+  test("ending a goal interrupts nothing: a running attempt under it is still running", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        // The seeded goal is `goal-1`, with one intent and one running attempt.
+        yield* migrated(store);
+        yield* store.endGoal(HOST, endInput({ goalId: "goal-1" }));
+        return {
+          attempt: yield* store.loadAttempt("attempt-1", "target-1"),
+          goal: yield* store.loadGoal("goal-1"),
+        };
+      }),
+    );
+    expect(outcome.goal?.status).toBe("met");
+    expect(outcome.attempt?.status).toBe("running");
+  });
+
+  test("a goal that seedAttempt minted is active, unnamed, and counted", async () => {
+    const goal = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        yield* store.recordObservation(CALLER, multiCaseInput());
+        return yield* store.loadGoal("goal-1");
+      }),
+    );
+    expect(goal).toMatchObject({
+      goalId: "goal-1",
+      targetId: "target-1",
+      name: "",
+      status: "active",
+      intentCount: 1,
+      attemptCount: 1,
+      observationCount: 1,
+    });
+  });
+
+  test("counts are per goal, not multiplied across the tables that join them", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        // Two observations and a second attempt under goal-1's one intent: a join across
+        // all three tables would report four of something here.
+        yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "o-1" }),
+        );
+        yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "o-2" }),
+        );
+        yield* seed(store, "attempt-2");
+        yield* store.openGoal(HOST, openInput());
+        return yield* store.goals();
+      }),
+    );
+
+    const byId = Object.fromEntries(outcome.map((goal) => [goal.goalId, goal]));
+    expect(byId["goal-1"]).toMatchObject({
+      intentCount: 1,
+      attemptCount: 2,
+      observationCount: 2,
+    });
+    // Nothing is under the new goal, and nothing leaks across from the other.
+    expect(byId["goal-new"]).toMatchObject({
+      intentCount: 0,
+      attemptCount: 0,
+      observationCount: 0,
+    });
+  });
+
+  test("goals() returns this file's goals only, newest first", async () => {
+    const [here, elsewhere] = await Promise.all([
+      withStore(newDatabasePath(), (store) =>
+        Effect.gen(function* () {
+          yield* store.openGoal(HOST, openInput({ goalId: "goal-a" }));
+          yield* store.openGoal(
+            HOST,
+            openInput({ operationId: "open-2", goalId: "goal-b" }),
+          );
+          return yield* store.goals();
+        }),
+      ),
+      withStore(newDatabasePath(), (store) =>
+        Effect.gen(function* () {
+          yield* store.openGoal(
+            { callerScope: "host/target-2", targetId: "target-2" },
+            openInput({ operationId: "open-9", goalId: "goal-z" }),
+          );
+          return yield* store.goals();
+        }),
+      ),
+    ]);
+
+    // Each target's own file holds its own goals and nothing of the other's.
+    expect(here.map((goal) => goal.goalId).sort()).toEqual([
+      "goal-a",
+      "goal-b",
+    ]);
+    expect(here.every((goal) => goal.targetId === "target-1")).toBe(true);
+    expect(elsewhere.map((goal) => goal.goalId)).toEqual(["goal-z"]);
+    expect(elsewhere[0]?.targetId).toBe("target-2");
+  });
+
+  test("a goal survives closing and reopening the file", async () => {
+    const path = newDatabasePath();
+    await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, openInput());
+        yield* store.endGoal(HOST, endInput({ status: "abandoned" }));
+      }),
+    );
+    const goal = await withStore(path, (store) => store.loadGoal("goal-new"));
+    expect(goal).toMatchObject({
+      status: "abandoned",
+      endedBy: "operator",
+    });
+  });
+
+  test("a stored status outside the vocabulary is a typed error naming the row", async () => {
+    const path = newDatabasePath();
+    await withStore(path, (store) => store.openGoal(HOST, openInput()));
+    const database = new Database(path);
+    try {
+      database.run(
+        "UPDATE goals SET status = 'finished' WHERE id = 'goal-new'",
+      );
+    } finally {
+      database.close();
+    }
+
+    const failed = await withStore(path, (store) =>
+      Effect.result(store.loadGoal("goal-new")),
+    );
+    expect(failed._tag).toBe("Failure");
+    if (failed._tag === "Failure") {
+      expect(failed.failure).toBeInstanceOf(StoredRowError);
+      expect((failed.failure as StoredRowError).rowId).toBe("goal-new");
+    }
+  });
+});

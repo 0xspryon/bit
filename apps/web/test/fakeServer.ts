@@ -26,6 +26,7 @@
 import type {
   AttemptTranscript,
   FolderListing,
+  GoalView,
   HarnessInstanceView,
   LiveCursor,
   LiveFrame,
@@ -119,6 +120,20 @@ export const targetView = (
   target: TargetSummary,
   counts: Partial<TargetCounts> = {},
 ): TargetView => ({ target, counts: targetCounts(counts), recoveries: [] });
+
+export const goalView = (over: Partial<GoalView> = {}): GoalView => ({
+  goalId: "goal_1",
+  targetId: "acme-corp",
+  name: "",
+  description: "Find out whether the login limiter can be bypassed.",
+  status: "active",
+  createdAt: AT,
+  endedAt: null,
+  endedBy: null,
+  endReason: null,
+  counts: { intents: 0, attempts: 0, observations: 0 },
+  ...over,
+});
 
 export const sessionOpened = (
   over: Partial<SessionOpened> = {},
@@ -428,6 +443,41 @@ export class FakeServer implements ServerClient {
   ) => Answer<"stopRun"> = (_baseUrl, targetId, attemptId) =>
     ok(runStopped({ targetId, attemptId }));
 
+  onGoals: (baseUrl: string, targetId: string) => Answer<"goals"> = () =>
+    ok({ goals: [] });
+
+  onCreateGoal: (
+    ...args: Parameters<ServerClient["createGoal"]>
+  ) => Answer<"createGoal"> = (_baseUrl, targetId, draft) =>
+    ok(
+      goalView({
+        targetId,
+        name: draft.name ?? "",
+        description: draft.description,
+      }),
+    );
+
+  onGoal: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+  ) => Answer<"goal"> = (_baseUrl, targetId, goalId) =>
+    ok(goalView({ targetId, goalId }));
+
+  onEndGoal: (
+    ...args: Parameters<ServerClient["endGoal"]>
+  ) => Answer<"endGoal"> = (_baseUrl, targetId, goalId, draft) =>
+    ok(
+      goalView({
+        targetId,
+        goalId,
+        status: draft.status,
+        endedAt: AT + 1,
+        endedBy: "operator",
+        endReason: draft.reason,
+      }),
+    );
+
   onHarnesses: (baseUrl: string) => Answer<"harnesses"> = () => ok([]);
 
   onTranscript: (
@@ -485,6 +535,22 @@ export class FakeServer implements ServerClient {
     this.record("stopRun", [baseUrl, targetId, attemptId], () =>
       this.onStopRun(baseUrl, targetId, attemptId),
     );
+
+  goals = (baseUrl: string, targetId: string) =>
+    this.record("goals", [baseUrl, targetId], () =>
+      this.onGoals(baseUrl, targetId),
+    );
+
+  createGoal = (...args: Parameters<ServerClient["createGoal"]>) =>
+    this.record("createGoal", args, () => this.onCreateGoal(...args));
+
+  goal = (baseUrl: string, targetId: string, goalId: string) =>
+    this.record("goal", [baseUrl, targetId, goalId], () =>
+      this.onGoal(baseUrl, targetId, goalId),
+    );
+
+  endGoal = (...args: Parameters<ServerClient["endGoal"]>) =>
+    this.record("endGoal", args, () => this.onEndGoal(...args));
 
   harnesses = (baseUrl: string) =>
     this.record("harnesses", [baseUrl], () => this.onHarnesses(baseUrl));
