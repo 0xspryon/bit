@@ -288,6 +288,7 @@ export const openWorkerSession = Effect.fn("openWorkerSession")(function* (
   yield* store.bindSessionToAttempt(binding.attemptId, session.id);
 
   const credential = yield* credentials.issue({
+    _tag: "attempt",
     targetId: binding.targetId,
     intentId: binding.intentId,
     attemptId: binding.attemptId,

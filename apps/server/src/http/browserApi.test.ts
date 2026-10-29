@@ -66,6 +66,7 @@ import { multiCaseInput } from "../persistence/fixtures";
 import {
   MutationError,
   ObservationStore,
+  type AttemptCaller,
   type StoredGoal,
   type StoredIntent,
 } from "../persistence/store";
@@ -100,6 +101,7 @@ class TestCredential extends Context.Service<
     TestCredential,
     Effect.flatMap(McpCredentials, (credentials) =>
       credentials.issue({
+        _tag: "attempt",
         targetId: "t",
         intentId: "i",
         attemptId: "a",
@@ -1280,7 +1282,8 @@ describe("watching a target's live transcript", () => {
             modelOptions: null,
             harnessSessionId: "ses_live",
           });
-          const caller = {
+          const caller: AttemptCaller = {
+            _tag: "attempt",
             callerScope: `${targetId}/at_live`,
             targetId,
             intentId: "intent-live",
@@ -2309,6 +2312,7 @@ describe("a goal's intents", () => {
         });
         const recorded = yield* store.recordObservation(
           {
+            _tag: "attempt",
             callerScope: `${targetId}/att_seed`,
             targetId,
             intentId: "int_seed",

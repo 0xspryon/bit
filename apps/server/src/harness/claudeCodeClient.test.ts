@@ -468,6 +468,82 @@ describe("the MCP credential", () => {
     expect(outcome.launched?.closes).toBeGreaterThan(0);
   });
 
+  test("unregistering before the prompt means the name never reaches the CLI", async () => {
+    // Complete in this direction: `launch` builds the one `mcp_set_servers` request from
+    // the record, so a name taken off the record is a name the session never had.
+    const sessionId = newClaudeCodeSessionId();
+    const seen = await withHarness({}, (harness, launched) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId,
+        });
+        yield* harness.registerMcpServer(sessionId, "bit-a", registration());
+        yield* harness.registerMcpServer(sessionId, "bit-b", registration());
+        yield* harness.unregisterMcpServer(sessionId, "bit-a");
+        yield* harness.prompt(sessionId, "go");
+        return launched[0];
+      }),
+    );
+
+    expect(Object.keys(seen?.registered[0] ?? {})).toEqual(["bit-b"]);
+  });
+
+  test("unregistering after the prompt pushes the remaining set over the control channel", async () => {
+    // Spike B measured that a *late registration* never reaches the CLI through this
+    // seam; whether the CLI drops an already-connected server on a later
+    // `mcp_set_servers` was not measured. What is asserted here is only what this
+    // adapter does: it makes the request, with the removed name absent.
+    const sessionId = newClaudeCodeSessionId();
+    const seen = await withHarness({}, (harness, launched) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId,
+        });
+        yield* harness.registerMcpServer(sessionId, "bit-a", registration());
+        yield* harness.registerMcpServer(sessionId, "bit-b", registration());
+        yield* harness.prompt(sessionId, "go");
+        yield* harness.unregisterMcpServer(sessionId, "bit-a");
+        return launched[0];
+      }),
+    );
+
+    // Two control requests: the one `launch` made, and this one. Only the second is
+    // read, because `launch` hands the SDK the live record and the fake keeps that
+    // reference — so the first entry is not a snapshot of what was sent at the time.
+    expect(seen?.registered).toHaveLength(2);
+    expect(Object.keys(seen?.registered[1] ?? {})).toEqual(["bit-b"]);
+  });
+
+  test("unregistering an unknown name or session is a no-op", async () => {
+    // Called from the release side of a scope, where a failure would turn tidy-up into
+    // an outcome: there is nothing of ours to remove, so there is nothing to report.
+    const sessionId = newClaudeCodeSessionId();
+    const seen = await withHarness({}, (harness, launched) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId,
+        });
+        yield* harness.registerMcpServer(sessionId, "bit-a", registration());
+        yield* harness.unregisterMcpServer(sessionId, "bit-never-registered");
+        yield* harness.unregisterMcpServer(newClaudeCodeSessionId(), "bit-a");
+        yield* harness.prompt(sessionId, "go");
+        return launched[0];
+      }),
+    );
+
+    expect(Object.keys(seen?.registered[0] ?? {})).toEqual(["bit-a"]);
+    expect(seen?.registered).toHaveLength(1);
+  });
+
   test("one session's registration is not reachable from another's", async () => {
     const first = newClaudeCodeSessionId();
     const second = newClaudeCodeSessionId();

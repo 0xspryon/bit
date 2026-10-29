@@ -20,7 +20,7 @@ import {
   multiCaseInput,
   writeFirstSliceDatabase,
 } from "../persistence/fixtures";
-import { ObservationStore, type CallerContext } from "../persistence/store";
+import { ObservationStore, type AttemptCaller } from "../persistence/store";
 import {
   BriefingError,
   PREPARATION_HEADING,
@@ -45,7 +45,8 @@ const newDatabasePath = () => {
   return join(directory, "hunt.sqlite");
 };
 
-const CALLER: CallerContext = {
+const CALLER: AttemptCaller = {
+  _tag: "attempt",
   callerScope: "target-1/attempt-1",
   targetId: "target-1",
   intentId: "intent-1",
@@ -496,6 +497,7 @@ describe("briefings over an upgraded database", () => {
         yield* store.recordObservation(
           {
             // The adopted database's running attempt: a settled one has no authority.
+            _tag: "attempt",
             callerScope: `fixture-local/${RUNNING_ATTEMPT_ID}`,
             targetId: "fixture-local",
             intentId: "intent-per-client-limiter",
@@ -699,6 +701,7 @@ describe("a dimension an intent declared it addresses", () => {
         yield* store.recordObservation(
           {
             ...CALLER,
+            _tag: "attempt",
             callerScope: "target-1/attempt-account",
             intentId: "intent-account-limit",
             attemptId: "attempt-account",

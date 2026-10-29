@@ -967,6 +967,68 @@ export const claudeCodeHarness = (
           };
         });
 
+      /**
+       * Takes a registration off this session's record, and off the live session when
+       * there is one.
+       *
+       * Two cases, and they are not equally well established:
+       *
+       * - **Before the prompt**, this is complete: the record is the only place the
+       *   registration exists, and `launch` reads it to build the one
+       *   `mcp_set_servers` request the session ever receives. A name removed here never
+       *   reaches the CLI at all.
+       * - **After the prompt**, this pushes the remaining set over the same control
+       *   channel `launch` used. That is the capability not being foreclosed, and it is
+       *   **not** something Spike B measured. What §24.2 (question 2) did measure is
+       *   narrower: a *late* `registerMcpServer` through this seam reaches the CLI not at
+       *   all, because the seam writes the record and nothing re-pushes it. Whether the
+       *   CLI drops an already-connected server when a later `mcp_set_servers` omits it
+       *   was not tested, so this is written to be harmless either way: the credential is
+       *   revoked by the caller regardless, and a Claude Code registration is
+       *   session-scoped (§24.2 question 3), so the entry dies with the session even if
+       *   the request changes nothing.
+       *
+       * A name that was never registered, or a session this process does not hold, is a
+       * no-op: there is nothing of ours to remove, and reporting a failure would make
+       * tidy-up an outcome.
+       */
+      const unregisterMcpServer: AgentHarness["Service"]["unregisterMcpServer"] =
+        Effect.fn("claudeCodeHarness.unregisterMcpServer")(
+          function* (sessionId, name) {
+            const record = sessions.get(sessionId);
+            if (record === undefined) return;
+            if (!(name in record.mcpServers)) return;
+            delete record.mcpServers[name];
+            const live = record.query;
+            if (live === undefined || record.closed) return;
+            const pushed = yield* Effect.result(
+              Effect.timeout(
+                Effect.tryPromise({
+                  // A copy: the SDK is handed a snapshot of what the session should have,
+                  // not the live record it would then see every later change to.
+                  try: () => live.setMcpServers({ ...record.mcpServers }),
+                  catch: (cause) =>
+                    transport(
+                      "mcp_set_servers",
+                      `the session would not accept the removal of its MCP registration: ${String(cause)}`,
+                    ),
+                }),
+                controlTimeout,
+              ),
+            );
+            if (pushed._tag === "Failure") {
+              // Logged, not raised. The record no longer carries the registration and the
+              // credential behind it is revoked by the caller; a control request the CLI
+              // would not take is worth knowing about and is not worth failing a settled
+              // run over.
+              yield* Effect.logWarning(
+                "a Claude Code session would not take the removal of its MCP registration; the credential is revoked either way",
+                { sessionId, name },
+              );
+            }
+          },
+        );
+
       const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
         "claudeCodeHarness.prompt",
       )(function* (sessionId, text) {
@@ -1123,6 +1185,7 @@ export const claudeCodeHarness = (
         installGate: installClaudeCodeGate,
         createSession,
         registerMcpServer,
+        unregisterMcpServer,
         prompt,
         waitForIdle,
         sessionStatus,

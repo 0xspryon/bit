@@ -150,16 +150,37 @@ export class ClaimRefused extends Schema.TaggedError<ClaimRefused>()(
 }
 
 /**
- * The authenticated caller. Every field is derived from the bearer credential the
- * host issued when it created the session, never from anything the model said. A
- * worker cannot name a different intent, attempt or target by asking.
+ * The authenticated caller, as one of three kinds of authority.
+ *
+ * Every field is derived from the bearer credential the host issued before it created the
+ * session, never from anything the model said. A worker cannot name a different intent,
+ * attempt or target by asking; a planner round cannot name a different goal; a goal agent
+ * cannot name a different target.
+ *
+ * **A tagged union, not one struct with optional fields** (the spec's decision 2). The
+ * three kinds can make genuinely different checks — an attempt is checked against a live
+ * attempt row, a round against a live round row, a goal against a goal that has not ended
+ * — and a struct carrying `attemptId?` and `roundId?` would let a call site read a field
+ * that is absent for the caller it is actually holding and receive `undefined` where it
+ * expected an identity. With a tag, every call site has to say which kind of caller it is
+ * holding and the compiler is what tells it, which is the only form of this that a
+ * reviewer can check by reading types rather than by reading every write.
+ *
+ * What each kind may write is in {@link callerScopeOf}'s table, in one place, beside the
+ * scope string it is attributed under.
+ */
+export type CallerContext = AttemptCaller | RoundCaller | GoalCaller;
+
+/**
+ * A worker attempt: one execution of one intent.
  *
  * `attemptFence` is the write-authority epoch the credential was minted against. It is
  * compared against the attempt's current `write_fence` on every new write, so authority
  * revoked by recovery stays revoked across a restart — unlike the in-memory credential
  * registry, which simply forgets.
  */
-export interface CallerContext {
+export interface AttemptCaller {
+  readonly _tag: "attempt";
   readonly callerScope: string;
   readonly targetId: string;
   readonly intentId: string;
@@ -170,13 +191,90 @@ export interface CallerContext {
 }
 
 /**
- * The host's own authority, for a mutation no worker makes.
+ * A planner round: one bounded unit of planning work on one goal.
  *
- * An intent is created by the host, not by a worker: a planner round has no execution
- * attempt, so there is nothing for it to present and no {@link CallerContext} to build
- * (DECISIONS.md §4's planner-authority gap, recorded in `contracts/intent.ts`). This is
- * the smaller thing that is still true — which target, and whose receipts — and it is
- * supplied by the process that owns the registry, never by a payload.
+ * `roundFence` is the same mechanism as {@link AttemptCaller.attemptFence} and exists for
+ * the same reason (the spec's decision 5, ruling 5 of the slice brief): a round outlives
+ * the individual tool calls made under it, and a recovery sweep may supersede one while
+ * its credential is still out. There is no `intentId` — a round *creates* intents rather
+ * than working one — and no `harnessSessionId`, because a round's credential is minted
+ * before its session is prompted and the round row is where the session id is recorded.
+ */
+export interface RoundCaller {
+  readonly _tag: "round";
+  readonly callerScope: string;
+  readonly targetId: string;
+  readonly goalId: string;
+  readonly roundId: string;
+  readonly roundFence: number;
+}
+
+/**
+ * A goal agent: the long-horizon, operator-facing conversation about one goal.
+ *
+ * **No fence, deliberately** (ruling 4 of the slice brief, the spec's decision 4). A
+ * fence defends against one thing: a credential minted before a restart being replayed
+ * afterwards. Grants live only in `mcp/credentials.ts`'s in-memory map, so a goal
+ * credential cannot survive a restart to be replayed — the process that could have
+ * resolved it is gone. What stops a goal credential is the goal's own ending: an ended
+ * goal refuses every write under it, and that is a column. This absence is recorded here
+ * because it is the kind of thing a later reader would otherwise take for an oversight
+ * and "fix" by adding a column nothing can use.
+ */
+export interface GoalCaller {
+  readonly _tag: "goal";
+  readonly callerScope: string;
+  readonly targetId: string;
+  readonly goalId: string;
+}
+
+/** An {@link AttemptCaller} before its scope is derived. What a credential is minted from. */
+export type AttemptBinding = Omit<AttemptCaller, "callerScope">;
+/** A {@link RoundCaller} before its scope is derived. */
+export type RoundBinding = Omit<RoundCaller, "callerScope">;
+/** A {@link GoalCaller} before its scope is derived. */
+export type GoalBinding = Omit<GoalCaller, "callerScope">;
+
+/**
+ * What a credential may be minted against: one binding per caller tag.
+ *
+ * `callerScope` is absent from all three on purpose. It is **derived** from the binding by
+ * {@link callerScopeOf} rather than passed in, so there is no call site that can mint a
+ * credential whose scope disagrees with the identity it carries — which would be a
+ * credential whose receipts and events are filed under somebody else's name.
+ */
+export type CallerBinding = AttemptBinding | RoundBinding | GoalBinding;
+
+/** Just enough of a caller to name its scope. See {@link callerScopeOf}. */
+export type CallerIdentity =
+  | {
+      readonly _tag: "attempt";
+      readonly targetId: string;
+      readonly attemptId: string;
+    }
+  | {
+      readonly _tag: "round";
+      readonly targetId: string;
+      readonly roundId: string;
+    }
+  | {
+      readonly _tag: "goal";
+      readonly targetId: string;
+      readonly goalId: string;
+    };
+
+/**
+ * The host's own authority, for a mutation no agent makes.
+ *
+ * A goal and an intent are created by the host today: there is no planner loop to
+ * authenticate yet, so `addIntent`, `openGoal`, `endGoal` and `abandonIntent` take this —
+ * the smaller thing that is still true, which target and whose receipts — supplied by the
+ * process that owns the registry and never by a payload.
+ *
+ * **This is no longer a gap in the authority model, only in its wiring.** A planner round
+ * now has a {@link RoundCaller} it could present (slice 4), and slice 7 is where
+ * `add_intent` becomes a round-scoped tool and takes one. Until then the host is what
+ * calls it, and `contracts/intent.ts` says the same.
  */
 export interface HostContext {
   readonly callerScope: string;
@@ -184,15 +282,108 @@ export interface HostContext {
 }
 
 /**
+ * The four caller scopes, and what each may write.
+ *
+ * A caller scope namespaces command receipts and attributes events, so two callers cannot
+ * collide on or address each other's operation ids. There are exactly four shapes, and
+ * this is the one place they are defined (the spec's decision 3; ruling 2 of the slice
+ * brief, which blesses the operator scope as the fourth rather than renaming it):
+ *
+ * | Scope                        | Caller          | May write                                        |
+ * | ---------------------------- | --------------- | ------------------------------------------------ |
+ * | `<targetId>/<attemptId>`     | a worker attempt | `record_observation`, `record_asset`             |
+ * | `<targetId>/round/<roundId>` | a planner round  | a round disposition; `add_intent` from slice 7   |
+ * | `<targetId>/goal/<goalId>`   | a goal agent     | nothing yet; steer, wake and `end_goal` in slice 9 |
+ * | `<targetId>/operator`        | the host, acting for the operator | goals, intents, claims, abandonments |
+ *
+ * The right-hand column is what the **store** enforces through the authority paths, not a
+ * description of a tool list: a credential of the wrong kind is refused by
+ * `recordObservation` and by `recordRoundDisposition` whatever tools its session happens
+ * to have been registered with. The tool lists are the second half of the same boundary
+ * and are per-directory (the spec's decision 5, demonstrated in DECISIONS.md §24.2).
+ *
+ * **Why the four cannot collide.** The last three are namespaced by a reserved segment,
+ * and an attempt scope is two segments. A collision would need an attempt id spelled
+ * `round/…`, `goal/…` or `operator`, and every id in a scope is minted by
+ * `identifier.ts` as `<prefix>_<26 chars>` — never operator-supplied, never
+ * model-supplied, and never containing a `/`. `store.test.ts` asserts that over
+ * constructed scopes rather than by inspection of this comment.
+ *
+ * It takes the **identifying** fields only, not a whole {@link CallerBinding}: a scope is
+ * a target and one id, and a function that demanded a fence in order to build a string
+ * would make every caller that needs a scope on its own invent one. Every binding is
+ * assignable to it.
+ */
+export const callerScopeOf = (binding: CallerIdentity): string => {
+  switch (binding._tag) {
+    case "attempt":
+      return `${binding.targetId}/${binding.attemptId}`;
+    case "round":
+      return `${binding.targetId}/round/${binding.roundId}`;
+    case "goal":
+      return `${binding.targetId}/goal/${binding.goalId}`;
+  }
+};
+
+/**
+ * How a caller is named in a refusal it reads.
+ *
+ * Says the kind first and the identity second, because the kind is the correctable part:
+ * a planner round told "you are a planner round and this is a worker's write" knows what
+ * to do, where a bare id tells it only that something did not match.
+ */
+export const describeCaller = (caller: CallerContext): string => {
+  switch (caller._tag) {
+    case "attempt":
+      return `attempt ${caller.attemptId} (a worker)`;
+    case "round":
+      return `round ${caller.roundId} (a planner round on goal ${caller.goalId})`;
+    case "goal":
+      return `the goal agent for goal ${caller.goalId}`;
+  }
+};
+
+/**
+ * What the store established about a caller's authority, by kind.
+ *
+ * Deliberately not the rows the checks read. A handler asking "is this credential still
+ * good?" wants the identity it may act under, and handing it a row would invite it to
+ * read a column the authority model does not promise.
+ */
+export type CallerAuthority =
+  | {
+      readonly _tag: "attempt";
+      readonly attemptId: string;
+      readonly intentId: string;
+      readonly targetId: string;
+      /** The attempt's current `write_fence`, which equals the credential's. */
+      readonly fence: number;
+    }
+  | {
+      readonly _tag: "round";
+      readonly roundId: string;
+      readonly goalId: string;
+      readonly targetId: string;
+      /** The round's current `write_fence`, which equals the credential's. */
+      readonly fence: number;
+    }
+  | {
+      readonly _tag: "goal";
+      readonly goalId: string;
+      readonly targetId: string;
+    };
+
+/**
  * Who a mutation the operator makes through the browser is recorded as.
  *
- * `<targetId>/operator` follows the scope namespacing the spec settles — `targetId/<attemptId>`
- * for a worker, and later `targetId/round/…` and `targetId/goal/…` for the planner and the
- * goal agent — so the operator is one more author in the same space and cannot collide with
- * an attempt: attempt ids are `att_…`. It is the host's own authority, supplied by the
- * process that owns the session guard, never read from a payload. One definition, because
- * the browser API and the run supervisor both act as the operator and a second spelling of
- * the string is a receipt key that stops matching.
+ * The fourth of the four scopes in {@link callerScopeOf}'s table, and the only one with
+ * no credential behind it: it is the host's own authority, supplied by the process that
+ * owns the session guard and never read from a payload. It is therefore built by its own
+ * function rather than from a {@link CallerBinding} — there is no binding to build, which
+ * is precisely what distinguishes it from the other three.
+ *
+ * One definition, because the browser API and the run supervisor both act as the operator
+ * and a second spelling of the string is a receipt key that stops matching.
  */
 export const operatorScope = (targetId: string): string =>
   `${targetId}/operator`;
@@ -444,6 +635,110 @@ export interface AttemptSettlement {
   readonly changed: boolean;
 }
 
+/**
+ * Execution status of a planner round, as persisted.
+ *
+ * The attempt vocabulary minus `succeeded` and `failed`, because a round does not pass or
+ * fail: it either produced a disposition or it did not, and the disposition is its own
+ * column. Like {@link AttemptExecutionStatus} this says whether *execution* finished and
+ * how, and never what the planning concluded.
+ *
+ * - `running` — the round is live. The only status under which its credential writes.
+ * - `settled` — the round finished normally, whether or not it recorded a disposition.
+ * - `uncertain` — nobody could tell us how it ended (DECISIONS.md §15's third answer).
+ * - `interrupted` — it was stopped, by the operator or by shutdown.
+ */
+export type RoundStatus = "running" | "settled" | "uncertain" | "interrupted";
+
+/** The statuses a round can be settled into. */
+export type RoundTerminalStatus = Exclude<RoundStatus, "running">;
+
+/**
+ * What a round concluded, in the planner's own four answers.
+ *
+ * - `actionable` — it added intents worth running.
+ * - `waiting` — nothing to add until work already out comes back.
+ * - `no_useful_next_action` — a considered "there is nothing worth doing here". A
+ *   judgement, and deliberately not the same as having recorded nothing at all.
+ * - `objective_met` — the goal's objective is established. The one disposition that ends
+ *   a goal (the spec's decision 8); nothing in this slice acts on it.
+ */
+export type RoundDisposition =
+  "actionable" | "waiting" | "no_useful_next_action" | "objective_met";
+
+/**
+ * What opening a planner round needs. Host-owned ids, like {@link SeedInput}'s.
+ *
+ * No `targetId`: the {@link HostContext} that opens the round carries it, and a second
+ * copy here would be a field a caller could set to a different target from the one whose
+ * authority it is acting under.
+ */
+export interface OpenRoundInput {
+  readonly goalId: string;
+  readonly roundId: string;
+  /**
+   * How many intents this round may add. Stored so the limit a round was opened under is
+   * a fact about the round; `add_intent` enforces it in slice 7 (the spec's decision 10).
+   */
+  readonly budget: number;
+  /** See {@link SeedInput.harnessInstanceId}: null until a session exists. */
+  readonly harnessInstanceId: string | null;
+  readonly providerId: string | null;
+  readonly modelId: string | null;
+  readonly harnessSessionId: string | null;
+}
+
+/** A round's identity plus the write-authority epoch a credential must carry. */
+export interface RoundAuthority {
+  readonly roundId: string;
+  readonly writeFence: number;
+  /**
+   * Where this target's graph stood when the round opened. **Provenance, not a snapshot.**
+   *
+   * The planner reads the graph live and sees its own writes inside the round (the spec's
+   * decision 9), so this records only where it started. Nothing may read it as "the state
+   * this round saw", and nothing compares a later read against it to decide staleness.
+   */
+  readonly startedAtSequence: number;
+}
+
+/**
+ * One planner round as the store reads it.
+ *
+ * `status` and `disposition` are decoded through this module's vocabularies, like
+ * {@link StoredGoal}'s are through the contract's: nothing but this store writes either
+ * column, so a value outside the set is corruption and belongs in a typed error naming
+ * the row.
+ */
+export interface StoredRound {
+  readonly roundId: string;
+  readonly goalId: string;
+  readonly targetId: string;
+  readonly status: RoundStatus;
+  readonly writeFence: number;
+  readonly harnessSessionId: string | null;
+  readonly harnessInstanceId: string | null;
+  readonly providerId: string | null;
+  readonly modelId: string | null;
+  /** See {@link RoundAuthority.startedAtSequence}. Provenance. */
+  readonly startedAtSequence: number;
+  readonly budget: number;
+  readonly disposition: RoundDisposition | null;
+  readonly startedAt: number;
+  readonly endedAt: number | null;
+}
+
+/**
+ * The result of settling a round. The shape of {@link AttemptSettlement}, for the reason
+ * that one has it: a caller has to tell "I settled it" from "it was already settled"
+ * without comparing statuses and guessing.
+ */
+export interface RoundSettlement {
+  readonly requested: RoundTerminalStatus;
+  readonly effective: RoundStatus | undefined;
+  readonly changed: boolean;
+}
+
 /** What a reconciler asks the store to record about one attempt. */
 export interface RecoveryWrite {
   readonly attemptId: string;
@@ -532,12 +827,34 @@ const canonical = (value: unknown): string => {
  * that nothing recorded. `canonical` sorts keys so a retry that serialises its fields in
  * another order still hashes identically.
  */
+/**
+ * What a receipt hash covers about the caller.
+ *
+ * The **authority fields, not the discriminant.** `_tag` carries nothing `callerScope`
+ * does not already — the four scope shapes are distinct by construction
+ * ({@link callerScopeOf}) — and leaving it out keeps an attempt caller's digest
+ * byte-identical to what it was before {@link CallerContext} became a union, so a receipt
+ * written by an earlier build still *replays* on an upgraded database instead of reading
+ * as a conflict. A receipt that stops matching is the one failure mode a worker cannot
+ * tell from lost evidence, so it is worth this much care.
+ *
+ * Every kind's own identity fields are in the digest, which is what makes the hash a
+ * statement about who asked as well as what they asked for.
+ */
+const callerDigest = (
+  caller: CallerContext | HostContext,
+): Record<string, unknown> => {
+  const fields: Record<string, unknown> = { ...caller };
+  delete fields["_tag"];
+  return fields;
+};
+
 const hashRequest = (
   caller: CallerContext | HostContext,
   input: unknown,
 ): string =>
   new Bun.CryptoHasher("sha256")
-    .update(canonical({ caller, input }))
+    .update(canonical({ caller: callerDigest(caller), input }))
     .digest("hex");
 
 /**
@@ -837,6 +1154,71 @@ export type AttemptRow = typeof AttemptRow.Type;
 
 /** Derived like {@link observationColumns}, and for the same reason. */
 const attemptColumns = Object.keys(AttemptRow.fields).join(", ");
+
+/**
+ * How a planner round row is stored.
+ *
+ * `status` and `disposition` **are** decoded through their literal vocabularies, which is
+ * the opposite choice to {@link AttemptRow.status} and deliberate for the reason
+ * {@link GoalRow} gives: an attempt's status vocabulary is one an adopted database might
+ * have extended, while `planner_rounds` was created by migration `0018` in this build and
+ * nothing but this store has ever written to it. A value outside the set is corruption,
+ * and corruption belongs in a typed error naming the row rather than in a string the rest
+ * of the program has to distrust.
+ *
+ * The four harness columns are nullable because a round row exists before its session
+ * does: the row is what the credential is minted against, and the credential is minted
+ * before the session is prompted. A round that never reached a harness holds nulls, which
+ * is the honest record rather than a hole.
+ */
+const RoundRow = Schema.Struct({
+  id: Schema.String,
+  goal_id: Schema.String,
+  target_id: Schema.String,
+  status: Schema.Literals([
+    "running",
+    "settled",
+    "uncertain",
+    "interrupted",
+  ] as const satisfies readonly RoundStatus[]),
+  write_fence: Schema.Int,
+  harness_session_id: Schema.NullOr(Schema.String),
+  harness_instance_id: Schema.NullOr(Schema.String),
+  provider_id: Schema.NullOr(Schema.String),
+  model_id: Schema.NullOr(Schema.String),
+  started_at_sequence: Schema.Int,
+  budget: Schema.Int,
+  disposition: Schema.NullOr(
+    Schema.Literals([
+      "actionable",
+      "waiting",
+      "no_useful_next_action",
+      "objective_met",
+    ] as const satisfies readonly RoundDisposition[]),
+  ),
+  started_at: Schema.Finite,
+  ended_at: Schema.NullOr(Schema.Finite),
+});
+
+/** Derived like {@link attemptColumns}, and for the same reason. */
+const roundColumns = Object.keys(RoundRow.fields).join(", ");
+
+const toStoredRound = (row: typeof RoundRow.Type): StoredRound => ({
+  roundId: row.id,
+  goalId: row.goal_id,
+  targetId: row.target_id,
+  status: row.status,
+  writeFence: row.write_fence,
+  harnessSessionId: row.harness_session_id,
+  harnessInstanceId: row.harness_instance_id,
+  providerId: row.provider_id,
+  modelId: row.model_id,
+  startedAtSequence: row.started_at_sequence,
+  budget: row.budget,
+  disposition: row.disposition,
+  startedAt: row.started_at,
+  endedAt: row.ended_at,
+});
 
 /**
  * One attempt's dispatched options, in the one order they are ever stored in.
@@ -1635,7 +2017,7 @@ const makeStore = Effect.fnUntraced(function* () {
    * does not resolve is a refusal the worker can read and correct.
    */
   const resolveAddress = Effect.fnUntraced(function* (
-    caller: CallerContext,
+    caller: AttemptCaller,
     address: string,
   ) {
     const parsed = parseDimensionAddress(address);
@@ -1706,15 +2088,72 @@ const makeStore = Effect.fnUntraced(function* () {
     return { address, dimensionId: dimension.dimension_id, ...parsed };
   });
 
+  const selectRoundById = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: RoundRow,
+    execute: (id) =>
+      sql.unsafe(`SELECT ${roundColumns} FROM planner_rounds WHERE id = ?`, [
+        id,
+      ]),
+  });
+
+  /** Reads one round inside whatever transaction is in force, or reports the row. */
+  const roundOrFail = Effect.fnUntraced(function* (roundId: string) {
+    const row = yield* selectRoundById(roundId).pipe(
+      Effect.mapError((error) =>
+        error._tag === "SqlError"
+          ? asDatabaseError("query")(error)
+          : storedRow("planner_rounds", roundId)(error),
+      ),
+    );
+    return Option.getOrUndefined(row);
+  });
+
   /**
-   * Checks the caller still holds write authority over the attempt it claims.
+   * A goal's ownership and lifecycle, which is all an authority check needs.
    *
-   * Three separate refusals, because they mean different things to a worker: the
-   * attempt is not registered for that target and intent at all; the attempt has
-   * settled, so no new evidence can be filed under it; or the fence has moved, so this
-   * credential's authority was explicitly revoked while it was out.
+   * Not {@link goalSelect}: that carries three correlated count subqueries for a list
+   * row, and an authority check that paid for them would be paying to count observations
+   * in order to answer "is this goal yours".
    */
-  const checkAuthority = Effect.fnUntraced(function* (caller: CallerContext) {
+  const goalAuthorityRow = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      id: Schema.String,
+      target_id: Schema.String,
+      status: GoalStatus,
+    }),
+    execute: (goalId) =>
+      sql`SELECT id, target_id, status FROM goals WHERE id = ${goalId}`,
+  });
+
+  /* ── The authority paths ──────────────────────────────────────────────────────
+   *
+   * One path per {@link CallerContext} tag (the spec's decision 2), each making the
+   * checks that kind of authority can actually make:
+   *
+   * - **attempt** — the attempt is registered for this target *and* intent, it is still
+   *   `running`, and its fence is the one the credential carries.
+   * - **round** — the round exists, belongs to this target *and* goal, is still
+   *   `running`, and its fence is the one the credential carries.
+   * - **goal** — the goal exists, belongs to this target, and has not ended. There is no
+   *   fence to check: an ended goal is the thing that stops a goal credential, which is
+   *   why the column does not exist (see {@link GoalCaller}).
+   *
+   * Each path is reached through a wrapper that takes the **union** and refuses a caller
+   * of the wrong kind first, naming the write it refused. That order matters: "you are
+   * not that kind of caller" is a different correction from "your authority has expired",
+   * and a round credential presented for an observation deserves the first, not a
+   * confusing report about a round it never named.
+   *
+   * Refusals keep the register the existing ones use: second person, saying what was
+   * refused and what that means for the write just attempted.
+   */
+
+  /** Checks a worker attempt still holds write authority over the attempt it claims. */
+  const checkAttemptAuthority = Effect.fnUntraced(function* (
+    caller: AttemptCaller,
+  ) {
     const attempt = yield* attemptOrFail(caller.attemptId);
     if (
       attempt === undefined ||
@@ -1740,6 +2179,172 @@ const makeStore = Effect.fnUntraced(function* () {
     }
     return attempt;
   });
+
+  /**
+   * Checks a planner round still holds write authority over the round it claims.
+   *
+   * Four checks and no fifth: the round exists, it is this target's and this goal's, it is
+   * `running`, and its fence is the one the credential carries.
+   *
+   * **It does not read `goals.status`, so a round authenticated before its goal ended
+   * keeps writing until it settles.** Written down because it is exactly the kind of
+   * absence a later reader would take for an oversight. It is the attempt rule, not an
+   * omission: ending a goal records state and interrupts nothing (the spec's decision 8),
+   * and {@link settleAttempt}'s authority check does not consult the goal either. A
+   * planner round in flight is the same kind of thing as an attempt in flight — work the
+   * operator may have reasons to let finish — and tearing its authority out from under it
+   * mid-call would make a goal ending look to the planner like a broken server.
+   *
+   * What stops the work is **dispatch**, not this check. {@link openRound} refuses to open
+   * a round under an ended goal, `claimIntent` refuses an intent whose goal has ended, and
+   * `endGoal` is what makes both true. So an ended goal takes no new rounds and no new
+   * attempts; the one round that was already running finishes and settles.
+   *
+   * The gap that leaves is narrow and real: that running round may still add intents under
+   * a goal nobody wants worked. **Slice 7 closes it inside `add_intent`**, which is where
+   * the budget and duplicate rules already live and the only place a round actually writes
+   * to the graph. Until then nothing calls `add_intent` with a round caller at all, so the
+   * gap is reachable only through `recordRoundDisposition`, which records what the round
+   * concluded about a goal that has ended — a true statement, and harmless.
+   */
+  const checkRoundAuthority = Effect.fnUntraced(function* (
+    caller: RoundCaller,
+  ) {
+    const round = yield* roundOrFail(caller.roundId);
+    if (
+      round === undefined ||
+      round.target_id !== caller.targetId ||
+      round.goal_id !== caller.goalId
+    ) {
+      return yield* new MutationError({
+        reason: "unauthorized",
+        detail: `round ${caller.roundId} is not registered for target ${caller.targetId} and goal ${caller.goalId}`,
+      });
+    }
+    if (round.status !== "running") {
+      return yield* new MutationError({
+        reason: "stale",
+        detail: `round ${caller.roundId} is ${round.status}; its write authority ended when it stopped running, so nothing was recorded`,
+      });
+    }
+    if (round.write_fence !== caller.roundFence) {
+      return yield* new MutationError({
+        reason: "stale",
+        detail: `write authority for round ${caller.roundId} was revoked: this credential carries fence ${String(caller.roundFence)} and the round is at ${String(round.write_fence)}`,
+      });
+    }
+    return round;
+  });
+
+  /**
+   * Checks a goal agent's goal still exists, is this target's, and has not ended.
+   *
+   * Two refusals, not three. There is no fence because a goal credential has none, and
+   * the reason is {@link GoalCaller}'s: grants live in memory, so one cannot survive a
+   * restart to be replayed. An ended goal is what revokes this authority durably, and
+   * ending a goal is exactly the act an operator or a planner performs to do it.
+   */
+  const checkGoalAuthority = Effect.fnUntraced(function* (caller: GoalCaller) {
+    const goal = yield* goalAuthorityRow(caller.goalId).pipe(
+      Effect.mapError(lift("goals", caller.goalId)),
+    );
+    if (Option.isNone(goal) || goal.value.target_id !== caller.targetId) {
+      return yield* new MutationError({
+        reason: "unauthorized",
+        detail: `goal ${caller.goalId} is not registered for target ${caller.targetId}`,
+      });
+    }
+    if (goal.value.status !== "active") {
+      return yield* new MutationError({
+        reason: "stale",
+        detail: `goal ${caller.goalId} is ${goal.value.status}; its authority ended when the goal ended, so nothing was recorded`,
+      });
+    }
+    return goal.value;
+  });
+
+  /**
+   * Narrows the caller to a worker attempt and checks that attempt's authority.
+   *
+   * `write` is the thing being attempted, in the words the refusal should use ("record an
+   * observation"). The kind check happens before any read, so a caller of the wrong kind
+   * costs nothing and is told the one true thing: that this is not a write its authority
+   * covers.
+   *
+   * It runs **before** the receipt lookup in the callers below, which looks like a
+   * departure from their documented "receipt first, then authority" order and is not: a
+   * receipt key is namespaced to `callerScope`, and no round or goal scope can ever hold
+   * an observation receipt, so there is no replay this can refuse.
+   */
+  const attemptCallerOrFail = Effect.fnUntraced(function* (
+    caller: CallerContext,
+    write: string,
+  ) {
+    if (caller._tag !== "attempt") {
+      return yield* new MutationError({
+        reason: "unauthorized",
+        detail: `${describeCaller(caller)} may not ${write}: that is a worker attempt's write, and nothing was recorded`,
+      });
+    }
+    return caller;
+  });
+
+  /** Narrows the caller to a planner round. The round's own authority is checked after. */
+  const roundCallerOrFail = Effect.fnUntraced(function* (
+    caller: CallerContext,
+    write: string,
+  ) {
+    if (caller._tag !== "round") {
+      return yield* new MutationError({
+        reason: "unauthorized",
+        detail: `${describeCaller(caller)} may not ${write}: that is a planner round's write, and nothing was recorded`,
+      });
+    }
+    return caller;
+  });
+
+  /**
+   * What kind of authority this caller holds, checked against stored state.
+   *
+   * The public face of the three paths above, and the one place a later slice's tool
+   * handler should ask "is this credential still good?" before it does anything on the
+   * caller's behalf. The answer is tagged, so a handler that wants an attempt cannot read
+   * a round's answer as one.
+   */
+  const callerAuthority = Effect.fn("ObservationStore.callerAuthority")(
+    function* (caller: CallerContext) {
+      switch (caller._tag) {
+        case "attempt": {
+          const attempt = yield* checkAttemptAuthority(caller);
+          return {
+            _tag: "attempt",
+            attemptId: attempt.id,
+            intentId: attempt.intent_id,
+            targetId: attempt.target_id,
+            fence: attempt.write_fence,
+          } satisfies CallerAuthority;
+        }
+        case "round": {
+          const round = yield* checkRoundAuthority(caller);
+          return {
+            _tag: "round",
+            roundId: round.id,
+            goalId: round.goal_id,
+            targetId: round.target_id,
+            fence: round.write_fence,
+          } satisfies CallerAuthority;
+        }
+        case "goal": {
+          const goal = yield* checkGoalAuthority(caller);
+          return {
+            _tag: "goal",
+            goalId: goal.id,
+            targetId: goal.target_id,
+          } satisfies CallerAuthority;
+        }
+      }
+    },
+  );
 
   /**
    * Writes one observation under the authenticated caller's identity.
@@ -1768,9 +2373,16 @@ const makeStore = Effect.fnUntraced(function* () {
    */
   const recordObservation = Effect.fn("ObservationStore.recordObservation")(
     function* (caller: CallerContext, input: RecordObservationInput) {
+      // The kind check first, so a planner round or a goal agent presenting a credential
+      // here is told the one true thing: this is a worker's write. See
+      // `attemptCallerOrFail` on why that may precede the receipt lookup.
+      const worker = yield* attemptCallerOrFail(
+        caller,
+        "record an observation",
+      );
       const recordedAt = yield* Clock.currentTimeMillis;
-      const key = `${caller.callerScope}:record_observation:${input.operationId}`;
-      const requestHash = hashRequest(caller, input);
+      const key = `${worker.callerScope}:record_observation:${input.operationId}`;
+      const requestHash = hashRequest(worker, input);
 
       return yield* sql
         .withTransaction(
@@ -1795,7 +2407,7 @@ const makeStore = Effect.fnUntraced(function* () {
               return { ...original, replayed: true };
             }
 
-            yield* checkAuthority(caller);
+            yield* checkAttemptAuthority(worker);
 
             // Duplicates are refused rather than collapsed: the primary key would
             // swallow the second silently, and a worker that sent the same address
@@ -1812,7 +2424,7 @@ const makeStore = Effect.fnUntraced(function* () {
             }
             const addressed = yield* Effect.forEach(
               input.addressesDimensions,
-              (address) => resolveAddress(caller, address),
+              (address) => resolveAddress(worker, address),
             );
 
             // Allocated inside the transaction, so a sequence gap cannot outlive a rollback.
@@ -1821,13 +2433,13 @@ const makeStore = Effect.fnUntraced(function* () {
             );
             const sequence = cursor.value;
 
-            const observationId = `obs_${sequence.toString().padStart(6, "0")}_${caller.attemptId}`;
+            const observationId = `obs_${sequence.toString().padStart(6, "0")}_${worker.attemptId}`;
             const provenance: ObservationProvenance = {
-              targetId: caller.targetId,
-              intentId: caller.intentId,
-              attemptId: caller.attemptId,
-              harnessSessionId: caller.harnessSessionId,
-              workerId: caller.workerId,
+              targetId: worker.targetId,
+              intentId: worker.intentId,
+              attemptId: worker.attemptId,
+              harnessSessionId: worker.harnessSessionId,
+              workerId: worker.workerId,
               recordedAt,
             };
 
@@ -1838,8 +2450,8 @@ const makeStore = Effect.fnUntraced(function* () {
               summary_conditions, summary_observed_behavior, summary_evidence_refs
             ) VALUES (
               ${observationId}, ${sequence}, ${STORED_FORMAT[OBSERVATION_WRITE_FORMAT]},
-              ${caller.targetId}, ${caller.intentId}, ${caller.attemptId},
-              ${caller.harnessSessionId}, ${caller.workerId},
+              ${worker.targetId}, ${worker.intentId}, ${worker.attemptId},
+              ${worker.harnessSessionId}, ${worker.workerId},
               ${input.testedClaim}, ${input.outcome}, ${input.interpretation},
               ${JSON.stringify(input.limitations)},
               ${JSON.stringify(input.untestedDimensions)},
@@ -1883,7 +2495,7 @@ const makeStore = Effect.fnUntraced(function* () {
             yield* sql`INSERT INTO command_receipts (
               key, caller_scope, operation, operation_id, request_hash, result, created_at
             ) VALUES (
-              ${key}, ${caller.callerScope}, 'record_observation',
+              ${key}, ${worker.callerScope}, 'record_observation',
               ${input.operationId}, ${requestHash}, ${JSON.stringify(result)},
               ${recordedAt}
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
@@ -1895,10 +2507,10 @@ const makeStore = Effect.fnUntraced(function* () {
             // committing everything.
             const event = yield* appendEvent({
               kind: "observation.recorded",
-              targetId: caller.targetId,
-              callerScope: caller.callerScope,
-              intentId: caller.intentId,
-              attemptId: caller.attemptId,
+              targetId: worker.targetId,
+              callerScope: worker.callerScope,
+              intentId: worker.intentId,
+              attemptId: worker.attemptId,
               operation: "record_observation",
               operationId: input.operationId,
               subjectId: observationId,
@@ -1916,11 +2528,11 @@ const makeStore = Effect.fnUntraced(function* () {
             });
             yield* enqueueRequest({
               requestType: "notification.deliver",
-              targetId: caller.targetId,
+              targetId: worker.targetId,
               payload: {
                 subject: "observation.recorded",
                 observationId,
-                intentId: caller.intentId,
+                intentId: worker.intentId,
                 outcome: input.outcome,
                 testedClaim: input.testedClaim,
               },
@@ -1992,9 +2604,10 @@ const makeStore = Effect.fnUntraced(function* () {
     caller: CallerContext,
     input: RecordAssetInput,
   ) {
+    const worker = yield* attemptCallerOrFail(caller, "record an asset");
     const recordedAt = yield* Clock.currentTimeMillis;
-    const key = `${caller.callerScope}:record_asset:${input.operationId}`;
-    const requestHash = hashRequest(caller, input);
+    const key = `${worker.callerScope}:record_asset:${input.operationId}`;
+    const requestHash = hashRequest(worker, input);
     return yield* sql
       .withTransaction(
         Effect.gen(function* () {
@@ -2020,7 +2633,7 @@ const makeStore = Effect.fnUntraced(function* () {
             return { ...original, replayed: true };
           }
 
-          yield* checkAuthority(caller);
+          yield* checkAttemptAuthority(worker);
 
           const identity = assetIdentityOf(input);
           if (isAssetIdentityRefusal(identity)) {
@@ -2034,7 +2647,7 @@ const makeStore = Effect.fnUntraced(function* () {
               id, target_id, kind, identity, host, port, scheme, method, path,
               first_seen_at
             ) VALUES (
-              ${identifier.newAssetId()}, ${caller.targetId}, ${identity.kind},
+              ${identifier.newAssetId()}, ${worker.targetId}, ${identity.kind},
               ${identity.identity}, ${identity.host}, ${identity.port},
               ${identity.scheme}, ${identity.method}, ${identity.path},
               ${recordedAt}
@@ -2043,7 +2656,7 @@ const makeStore = Effect.fnUntraced(function* () {
             Effect.mapError(asDatabaseError("transaction")),
           );
           const stored = yield* findAssetByIdentity({
-            targetId: caller.targetId,
+            targetId: worker.targetId,
             kind: identity.kind,
             identity: identity.identity,
           }).pipe(Effect.mapError(lift("assets", identity.identity)));
@@ -2065,8 +2678,8 @@ const makeStore = Effect.fnUntraced(function* () {
               asset_id, operation_id, caller_scope, intent_id, attempt_id,
               discovered_as, note, discovered_at
             ) VALUES (
-              ${asset.id}, ${input.operationId}, ${caller.callerScope},
-              ${caller.intentId}, ${caller.attemptId}, ${input.url},
+              ${asset.id}, ${input.operationId}, ${worker.callerScope},
+              ${worker.intentId}, ${worker.attemptId}, ${input.url},
               ${input.note}, ${recordedAt}
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
 
@@ -2086,16 +2699,16 @@ const makeStore = Effect.fnUntraced(function* () {
               key, caller_scope, operation, operation_id, request_hash, result,
               created_at
             ) VALUES (
-              ${key}, ${caller.callerScope}, 'record_asset', ${input.operationId},
+              ${key}, ${worker.callerScope}, 'record_asset', ${input.operationId},
               ${requestHash}, ${JSON.stringify(result)}, ${recordedAt}
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
 
           const event = yield* appendEvent({
             kind: "asset.recorded",
-            targetId: caller.targetId,
-            callerScope: caller.callerScope,
-            intentId: caller.intentId,
-            attemptId: caller.attemptId,
+            targetId: worker.targetId,
+            callerScope: worker.callerScope,
+            intentId: worker.intentId,
+            attemptId: worker.attemptId,
             operation: "record_asset",
             operationId: input.operationId,
             subjectId: asset.id,
@@ -2110,7 +2723,7 @@ const makeStore = Effect.fnUntraced(function* () {
           });
           yield* enqueueRequest({
             requestType: "asset.enrich",
-            targetId: caller.targetId,
+            targetId: worker.targetId,
             payload: {
               assetId: asset.id,
               kind: identity.kind,
@@ -3881,22 +4494,24 @@ const makeStore = Effect.fnUntraced(function* () {
   const selectPlannerLineage = SqlSchema.findOneOption({
     Request: Schema.String,
     Result: Schema.Struct({ harness_session_id: Schema.String }),
-    execute: (targetId) =>
+    execute: (goalId) =>
       sql`SELECT harness_session_id FROM planner_lineages
-          WHERE target_id = ${targetId}`,
+          WHERE goal_id = ${goalId}`,
   });
 
   /**
-   * The harness session later planner rounds on this target should be opened under.
+   * The harness session later planner rounds on this **goal** should be opened under.
    *
-   * A hint, not a fact: the id names a row in OpenCode's storage, which can be cleared
-   * without ours changing. A caller confirms it and records a replacement when it
-   * cannot — nothing in the investigation depends on the answer either way.
+   * Keyed by goal since migration `0019`: one planner works one goal, so one lineage per
+   * goal is what the table means. A hint, not a fact — the id names a row in OpenCode's
+   * storage, which can be cleared without ours changing. A caller confirms it and records
+   * a replacement when it cannot; nothing in the investigation depends on the answer
+   * either way.
    */
   const plannerLineage = Effect.fn("ObservationStore.plannerLineage")(
-    function* (targetId: string) {
-      const row = yield* selectPlannerLineage(targetId).pipe(
-        Effect.mapError(lift("planner_lineages", targetId)),
+    function* (goalId: string) {
+      const row = yield* selectPlannerLineage(goalId).pipe(
+        Effect.mapError(lift("planner_lineages", goalId)),
       );
       return Option.match(row, {
         onNone: () => undefined,
@@ -3906,22 +4521,271 @@ const makeStore = Effect.fnUntraced(function* () {
   );
 
   /**
-   * Records the lineage for a target, replacing any earlier one.
+   * Records the lineage for a goal, replacing any earlier one.
    *
    * An upsert rather than an insert: a lineage the harness has forgotten is replaced by
-   * the next round, and there is exactly one current answer per target.
+   * the next round, and there is exactly one current answer per goal.
    */
   const recordPlannerLineage = Effect.fn(
     "ObservationStore.recordPlannerLineage",
-  )(function* (targetId: string, harnessSessionId: string) {
+  )(function* (goalId: string, harnessSessionId: string) {
     const now = yield* Clock.currentTimeMillis;
-    yield* sql`INSERT INTO planner_lineages (target_id, harness_session_id, created_at)
-      VALUES (${targetId}, ${harnessSessionId}, ${now})
-      ON CONFLICT(target_id) DO UPDATE SET
+    yield* sql`INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
+      VALUES (${goalId}, ${harnessSessionId}, ${now})
+      ON CONFLICT(goal_id) DO UPDATE SET
         harness_session_id = excluded.harness_session_id,
         created_at = excluded.created_at`.pipe(
       Effect.mapError(asDatabaseError("query")),
     );
+  });
+
+  /**
+   * Opens a planner round and returns the write authority a credential for it must carry.
+   *
+   * The round-shaped counterpart of {@link seedAttempt}, with three differences that are
+   * each a decision rather than an omission:
+   *
+   * - **It is not idempotent.** `seedAttempt` re-seeds harmlessly because a demo re-runs;
+   *   a round id that already exists is refused as a `conflict` here, because handing back
+   *   authority over somebody else's live round is the one mistake this slice exists to
+   *   prevent. Ids come from `identifier.newRoundId`, so a collision is a bug, not a retry.
+   * - **It refuses a second running round on the same goal, naming the holder.** One round
+   *   per goal at a time (the spec's decision 7). This is the *durable* half of that claim
+   *   and it holds across processes; the in-process half — claiming the goal synchronously
+   *   before the fiber forks — is the `FiberMap` slice 5 adds, and it is what stops two
+   *   starts in the same process racing before either row exists. Neither half replaces
+   *   the other, and the index on `(goal_id, status)` is what makes this one cheap.
+   * - **It writes no event.** `plan.round.started` and `plan.round.settled` are slice 5's,
+   *   together with the supervisor that will write them and the live-item kinds that
+   *   render them. A round row is visible to nothing yet, and minting the event kinds in
+   *   one slice while the thing that emits them lands in another would put two halves of
+   *   one record in different places.
+   *
+   * An ended goal is refused: ending a goal blocks new dispatch and planner wake-ups
+   * (decision 8), and opening a round is a planner wake-up.
+   *
+   * `startedAtSequence` is read inside the transaction and is **provenance** — see
+   * {@link RoundAuthority.startedAtSequence}. Nothing treats it as a snapshot.
+   */
+  const openRound = Effect.fn("ObservationStore.openRound")(function* (
+    host: HostContext,
+    input: OpenRoundInput,
+  ) {
+    const now = yield* Clock.currentTimeMillis;
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const goal = yield* goalAuthorityRow(input.goalId).pipe(
+            Effect.mapError(lift("goals", input.goalId)),
+          );
+          if (Option.isNone(goal) || goal.value.target_id !== host.targetId) {
+            return yield* new MutationError({
+              reason: "unauthorized",
+              detail: `goal ${input.goalId} does not belong to target ${host.targetId}, so no planner round can be opened under it`,
+            });
+          }
+          if (goal.value.status !== "active") {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `goal ${input.goalId} is ${goal.value.status}; ending a goal blocks new planner rounds under it, so none was opened`,
+            });
+          }
+          const clash = yield* roundOrFail(input.roundId);
+          if (clash !== undefined) {
+            return yield* new MutationError({
+              reason: "conflict",
+              detail: `round ${input.roundId} already exists under goal ${clash.goal_id}; a round id is minted per round and is never reused`,
+            });
+          }
+          const live = yield* selectRunningRoundOfGoal(input.goalId).pipe(
+            Effect.mapError(lift("planner_rounds", input.goalId)),
+          );
+          if (Option.isSome(live)) {
+            return yield* new MutationError({
+              reason: "conflict",
+              detail: `goal ${input.goalId} already has round ${live.value.id} running; one planner round works a goal at a time, so this one was not opened`,
+            });
+          }
+          const startedAtSequence = yield* sequenceNamed(SEQUENCE_NAME);
+          yield* sql`INSERT INTO planner_rounds (id, goal_id, target_id, status,
+              write_fence, harness_session_id, harness_instance_id, provider_id,
+              model_id, started_at_sequence, budget, disposition, started_at, ended_at)
+            VALUES (${input.roundId}, ${input.goalId}, ${host.targetId}, 'running',
+                    0, ${input.harnessSessionId}, ${input.harnessInstanceId},
+                    ${input.providerId}, ${input.modelId}, ${startedAtSequence},
+                    ${input.budget}, NULL, ${now}, NULL)`.pipe(
+            Effect.mapError(asDatabaseError("transaction")),
+          );
+          return {
+            roundId: input.roundId,
+            writeFence: 0,
+            startedAtSequence,
+          } satisfies RoundAuthority;
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
+  const selectRunningRoundOfGoal = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({ id: Schema.String }),
+    execute: (goalId) =>
+      sql`SELECT id FROM planner_rounds
+          WHERE goal_id = ${goalId} AND status = 'running'
+          ORDER BY started_at LIMIT 1`,
+  });
+
+  /** One round by id, or `undefined`. Read-only. */
+  const loadRound = Effect.fn("ObservationStore.loadRound")(function* (
+    roundId: string,
+  ) {
+    const row = yield* roundOrFail(roundId);
+    return row === undefined ? undefined : toStoredRound(row);
+  });
+
+  /**
+   * Records the round's terminal status.
+   *
+   * Guarded to `status = 'running'`, exactly as {@link settleAttempt} is and for the same
+   * reason: a round settling itself must not overwrite what a recovery sweep already
+   * decided about it. `changed: false` says this call wrote nothing, and `effective` says
+   * what the row holds instead.
+   *
+   * The disposition is **not** touched here. A round that recorded one keeps it, and a
+   * round that recorded none settles with `disposition` still null — which is the honest
+   * record of a round that was interrupted or could not say what it concluded. Writing a
+   * disposition at settlement would be the host inventing the planner's answer.
+   */
+  const settleRound = Effect.fn("ObservationStore.settleRound")(function* (
+    roundId: string,
+    status: RoundTerminalStatus,
+  ) {
+    const endedAt = yield* Clock.currentTimeMillis;
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const before = yield* roundOrFail(roundId);
+          if (before === undefined) {
+            return {
+              requested: status,
+              effective: undefined,
+              changed: false,
+            } satisfies RoundSettlement;
+          }
+          if (before.status !== "running") {
+            return {
+              requested: status,
+              effective: before.status,
+              changed: false,
+            } satisfies RoundSettlement;
+          }
+          yield* sql`UPDATE planner_rounds
+              SET status = ${status}, ended_at = ${endedAt}
+            WHERE id = ${roundId} AND status = 'running'`.pipe(
+            Effect.mapError(asDatabaseError("transaction")),
+          );
+          return {
+            requested: status,
+            effective: status,
+            changed: true,
+          } satisfies RoundSettlement;
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
+  /**
+   * Supersedes a round's write authority, returning the fence it now carries.
+   *
+   * The durable half of revoking a round credential, and the reason the column exists
+   * (ruling 5 of the slice brief): `McpCredentials.revokeRound` forgets the grants *this*
+   * process is holding, and this makes a credential minted before a restart unusable
+   * after one. Both are needed because they cover different windows, which is the
+   * argument `revokeAttempt` already makes for attempts.
+   *
+   * `undefined` for a round that does not exist: there is no authority to supersede, and
+   * inventing a fence for a missing row would be reporting work that did not happen.
+   * Separate from {@link settleRound} on purpose — a sweep that cannot tell how a round
+   * ended still has to stop its credential, and settling it would be claiming to know.
+   */
+  const supersedeRound = Effect.fn("ObservationStore.supersedeRound")(
+    function* (roundId: string) {
+      const bumped = yield* sql<{
+        write_fence: number;
+      }>`UPDATE planner_rounds SET write_fence = write_fence + 1
+          WHERE id = ${roundId}
+          RETURNING write_fence`.pipe(
+        Effect.mapError(asDatabaseError("query")),
+      );
+      return bumped[0]?.write_fence;
+    },
+  );
+
+  /**
+   * Records what one planner round concluded, under the round's own authority.
+   *
+   * The store half of slice 7's `record_round_disposition` tool. **Nothing calls it yet**
+   * — there is no planner loop and no tool — and it is here because it is the write that
+   * makes the round authority path real rather than a type: a round credential can write
+   * this, and an attempt or goal credential cannot.
+   *
+   * Two refusals beyond the authority path's own:
+   *
+   * - A round that already recorded a disposition is refused as a `conflict` naming it. A
+   *   round concludes once; letting a second call overwrite the first would make the
+   *   column the planner's latest opinion rather than the round's answer.
+   * - The authority path refuses a settled round (`stale`) and a round of another goal
+   *   (`unauthorized`), so a late call from a round that has already been swept records
+   *   nothing.
+   *
+   * No receipt key, unlike `addIntent` and `record_observation`. A disposition is
+   * idempotent by its own rule — the second call is a conflict whether it is a retry or a
+   * change of mind — so a receipt would add a second answer to a question the row already
+   * answers. Slice 7 should confirm that still holds when the tool is written.
+   */
+  const recordRoundDisposition = Effect.fn(
+    "ObservationStore.recordRoundDisposition",
+  )(function* (caller: CallerContext, disposition: RoundDisposition) {
+    const planner = yield* roundCallerOrFail(
+      caller,
+      "record a round disposition",
+    );
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const round = yield* checkRoundAuthority(planner);
+          if (round.disposition !== null) {
+            return yield* new MutationError({
+              reason: "conflict",
+              detail: `round ${planner.roundId} already recorded the disposition '${round.disposition}'; a round concludes once, so '${disposition}' was NOT recorded`,
+            });
+          }
+          yield* sql`UPDATE planner_rounds SET disposition = ${disposition}
+            WHERE id = ${planner.roundId} AND status = 'running'`.pipe(
+            Effect.mapError(asDatabaseError("transaction")),
+          );
+          return { roundId: planner.roundId, disposition };
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
   });
 
   const EventRow = Schema.Struct({
@@ -4262,6 +5126,12 @@ const makeStore = Effect.fnUntraced(function* () {
     recoveriesForAttempt,
     plannerLineage,
     recordPlannerLineage,
+    callerAuthority,
+    openRound,
+    loadRound,
+    settleRound,
+    supersedeRound,
+    recordRoundDisposition,
   });
 });
 
@@ -4519,13 +5389,65 @@ export class ObservationStore extends Context.Service<
       readonly (typeof RecentRecoveryRow.Type)[],
       DatabaseError | StoredRowError
     >;
+    /** The harness session this **goal**'s rounds should be opened under. A hint. */
     readonly plannerLineage: (
-      targetId: string,
+      goalId: string,
     ) => Effect.Effect<string | undefined, DatabaseError | StoredRowError>;
     readonly recordPlannerLineage: (
-      targetId: string,
+      goalId: string,
       harnessSessionId: string,
     ) => Effect.Effect<void, DatabaseError>;
+    /**
+     * What kind of authority this caller holds, checked against stored state.
+     *
+     * The public face of the three authority paths. A caller of one kind cannot be read
+     * as another: the answer is tagged like the question.
+     */
+    readonly callerAuthority: (
+      caller: CallerContext,
+    ) => Effect.Effect<
+      CallerAuthority,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * Opens a planner round and returns the authority a credential must carry. Refuses a
+     * reused id, a second running round on the goal, and an ended goal. See the
+     * implementation.
+     */
+    readonly openRound: (
+      host: HostContext,
+      input: OpenRoundInput,
+    ) => Effect.Effect<
+      RoundAuthority,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /** One round by id, or `undefined`. Read-only. */
+    readonly loadRound: (
+      roundId: string,
+    ) => Effect.Effect<StoredRound | undefined, DatabaseError | StoredRowError>;
+    /** Records a round's terminal status. Guarded to `running`, like `settleAttempt`. */
+    readonly settleRound: (
+      roundId: string,
+      status: RoundTerminalStatus,
+    ) => Effect.Effect<RoundSettlement, DatabaseError | StoredRowError>;
+    /**
+     * Supersedes a round's write authority and returns its new fence. `undefined` when
+     * there is no such round.
+     */
+    readonly supersedeRound: (
+      roundId: string,
+    ) => Effect.Effect<number | undefined, DatabaseError>;
+    /**
+     * Records what a round concluded, under the round's own authority. Refuses a caller
+     * of any other kind, and a round that already concluded.
+     */
+    readonly recordRoundDisposition: (
+      caller: CallerContext,
+      disposition: RoundDisposition,
+    ) => Effect.Effect<
+      { readonly roundId: string; readonly disposition: RoundDisposition },
+      MutationError | DatabaseError | StoredRowError
+    >;
   }
 >()("bit/persistence/ObservationStore") {
   /** Opens and migrates the database before exposing the store for this scope. */

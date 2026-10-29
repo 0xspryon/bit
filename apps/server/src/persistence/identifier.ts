@@ -143,6 +143,15 @@ export const prefixed = (prefix: string): string => `${prefix}_${ascending()}`;
 export const newIntentId = (): string => prefixed("int");
 export const newGoalId = (): string => prefixed("goal");
 export const newAttemptId = (): string => prefixed("att");
+/**
+ * One planner round.
+ *
+ * `rnd` rather than `round`, so that no minted id can ever spell the reserved segment a
+ * namespaced caller scope uses (`<targetId>/round/<roundId>`). See `store.ts`'s
+ * {@link callerScopeOf}: the four scope shapes are distinct because every id in them is
+ * minted here, with a prefix, and none of the prefixes is a reserved word.
+ */
+export const newRoundId = (): string => prefixed("rnd");
 export const newDimensionId = (): string => prefixed("dim");
 export const newAssetId = (): string => prefixed("asset");
 

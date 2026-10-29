@@ -51,7 +51,7 @@ import { AWKWARD_TEXT, multiCaseInput } from "../persistence/fixtures";
 import { TargetStores } from "../persistence/targetStores";
 import {
   ObservationStore,
-  type CallerContext,
+  type AttemptCaller,
   type StoredCounts,
 } from "../persistence/store";
 
@@ -77,7 +77,8 @@ const newDatabasePath = () => {
 
 const TARGET = "target-1";
 
-const CALLER: CallerContext = {
+const CALLER: AttemptCaller = {
+  _tag: "attempt",
   callerScope: `${TARGET}/attempt-1`,
   targetId: TARGET,
   intentId: "intent-1",

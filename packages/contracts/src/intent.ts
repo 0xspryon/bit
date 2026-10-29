@@ -9,12 +9,17 @@
  * speculation about speculation.
  *
  * **Who may call this, and why that is not a worker.** Intents are planner-generated, and
- * a planner round has no execution attempt: `CallerContext` requires `attemptId` and
- * `attemptFence`, and the store's authority check validates against a live unsettled
- * attempt. There is nothing for a planner to present. So this sprint enforces anchoring
- * **in the store**, with the host creating intents as it does today, and the
- * planner-facing tool waits for Sprint 07 when there is a planner loop to authenticate.
- * The contract below is therefore host-facing: it has no wire encoding and is not
+ * a worker attempt cannot present planner authority: the store's attempt path validates
+ * against a live unsettled attempt, which a planner does not have.
+ *
+ * A planner round now *does* have an authority of its own — `CallerContext` is a tagged
+ * union of attempt, round and goal callers, and a round is a row with its own write fence
+ * (`persistence/store.ts`, migration `0018`). What has not happened yet is the wiring:
+ * `addIntent` still takes the host's `HostContext`, there is no planner loop to
+ * authenticate, and `add_intent` becomes a round-scoped MCP tool in slice 7 of
+ * `docs/design/goal-and-planner-flow.md`, where the budget and duplicate rules move
+ * inside it. Until then anchoring is enforced **in the store** with the host creating
+ * intents, and the contract below is host-facing: it has no wire encoding and is not
  * advertised as an MCP tool.
  *
  * Browser-safe: Effect Schema only.

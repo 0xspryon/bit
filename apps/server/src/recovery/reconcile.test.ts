@@ -48,7 +48,7 @@ import {
   ObservationStore,
   decideRecovery,
   type AttemptExecutionStatus,
-  type CallerContext,
+  type AttemptCaller,
 } from "../persistence/store";
 import {
   HarnessSessionStatus,
@@ -100,7 +100,8 @@ const seed = (
     harnessSessionId,
   });
 
-const caller = (attemptId: string, attemptFence: number): CallerContext => ({
+const caller = (attemptId: string, attemptFence: number): AttemptCaller => ({
+  _tag: "attempt",
   callerScope: `${TARGET}/${attemptId}`,
   targetId: TARGET,
   intentId: INTENT,
@@ -833,6 +834,7 @@ describe("write authority after recovery", () => {
           const credentials = yield* McpCredentials;
           const authority = yield* seed(store, "attempt-1");
           const issued = yield* credentials.issue({
+            _tag: "attempt",
             targetId: TARGET,
             intentId: INTENT,
             attemptId: "attempt-1",
@@ -841,6 +843,7 @@ describe("write authority after recovery", () => {
             attemptFence: authority.writeFence,
           });
           const other = yield* credentials.issue({
+            _tag: "attempt",
             targetId: TARGET,
             intentId: INTENT,
             attemptId: "attempt-other",
@@ -857,7 +860,12 @@ describe("write authority after recovery", () => {
               Redacted.value(issued.token),
             ),
             size: yield* credentials.size,
-            otherAttempt: other.grant.attemptId,
+            // The grant is a tagged union now, so reading an attempt's id means saying
+            // that is what this is. The assertion below is unchanged.
+            otherAttempt:
+              other.grant._tag === "attempt"
+                ? other.grant.attemptId
+                : undefined,
           };
         }).pipe(
           Effect.provide(

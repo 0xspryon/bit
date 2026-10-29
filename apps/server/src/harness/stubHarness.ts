@@ -9,8 +9,8 @@
  * harness cannot answer" states a test could not produce on demand.
  *
  * It lives in `src/` rather than in one of those files for a reason that only appeared with
- * the second harness: {@link AgentHarness} has twelve members, and three hand-written
- * copies of a twelve-member object is three places to forget the thirteenth. `persistence/
+ * the second harness: {@link AgentHarness} has thirteen members, and three hand-written
+ * copies of a thirteen-member object is three places to forget the fourteenth. `persistence/
  * fixtures.ts` is here on the same grounds.
  *
  * **Every member is overridable and the defaults are the dullest possible answers**: a
@@ -105,6 +105,9 @@ export const stubHarness = (
     createSession: (input) =>
       Effect.succeed({ id: input.sessionId ?? "ses_chosen_by_harness" }),
     registerMcpServer: () => Effect.void,
+    // Succeeds without recording anything, like the registration above: a test that cares
+    // which registrations were taken away says so by overriding it.
+    unregisterMcpServer: () => Effect.void,
     prompt: () => Effect.void,
     waitForIdle: () => Effect.void,
     sessionStatus: () => Effect.succeed({} satisfies SessionStatus),

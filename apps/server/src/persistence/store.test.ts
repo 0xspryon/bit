@@ -39,11 +39,15 @@ import {
   multiCaseInput,
   writeFirstSliceDatabase,
 } from "./fixtures";
+import * as identifier from "./identifier";
 import {
   ClaimRefused,
   MutationError,
   ObservationStore,
   StoredRowError,
+  callerScopeOf,
+  operatorScope,
+  type AttemptCaller,
   type CallerContext,
 } from "./store";
 import { DatabaseError, sqliteLayer } from "./sql";
@@ -84,7 +88,8 @@ const withStore = <A, E>(
     ),
   );
 
-const CALLER: CallerContext = {
+const CALLER: AttemptCaller = {
+  _tag: "attempt",
   callerScope: "target-1/attempt-1",
   targetId: "target-1",
   intentId: "intent-1",
@@ -95,7 +100,7 @@ const CALLER: CallerContext = {
   attemptFence: 0,
 };
 
-const OTHER_CALLER: CallerContext = {
+const OTHER_CALLER: AttemptCaller = {
   ...CALLER,
   callerScope: "target-1/attempt-2",
   attemptId: "attempt-2",
@@ -708,6 +713,7 @@ describe("summary-format observations", () => {
           {
             // The adopted database's *running* attempt. `attempt-summary` is settled,
             // and a settled attempt is exactly what the authority check must refuse.
+            _tag: "attempt",
             callerScope: `fixture-local/${RUNNING_ATTEMPT_ID}`,
             targetId: "fixture-local",
             intentId: "intent-per-client-limiter",
@@ -738,6 +744,7 @@ describe("summary-format observations", () => {
         const conflict = yield* Effect.result(
           store.recordObservation(
             {
+              _tag: "attempt",
               callerScope: "fixture-local/attempt-summary",
               targetId: "fixture-local",
               intentId: "intent-per-client-limiter",
@@ -1538,31 +1545,53 @@ describe("settling an attempt", () => {
 });
 
 describe("the planner session lineage", () => {
-  test("a target with no recorded lineage is undefined, not an error", async () => {
-    // The first planner round on a target has nothing to join, and that is an ordinary
+  /**
+   * The lineage is keyed by **goal** since migration `0019`, and `goal_id` is a real
+   * foreign key, so these tests open the goals they record against.
+   *
+   * The re-key is the spec's decision 7 — one planner works one goal — and it is why the
+   * assertions below name goals where they used to name targets. What is being checked is
+   * unchanged: the row survives a reopen, one key has exactly one current answer, and
+   * losing the table costs nothing but a cache prefix.
+   */
+  const HOST = { callerScope: "target-1/operator", targetId: "target-1" };
+
+  const openGoals = (store: Store, ...goalIds: readonly string[]) =>
+    Effect.forEach(goalIds, (goalId) =>
+      store.openGoal(HOST, {
+        operationId: `open-${goalId}`,
+        goalId,
+        name: "",
+        description: `Establish something about ${goalId}.`,
+      }),
+    );
+
+  test("a goal with no recorded lineage is undefined, not an error", async () => {
+    // The first planner round on a goal has nothing to join, and that is an ordinary
     // answer rather than a missing row to report.
     const lineage = await withStore(newDatabasePath(), (store) =>
-      store.plannerLineage("target-1"),
+      store.plannerLineage("goal-1"),
     );
     expect(lineage).toBeUndefined();
   });
 
-  test("a recorded lineage survives a reopen, and is per target", async () => {
+  test("a recorded lineage survives a reopen, and is per goal", async () => {
     // Surviving the process is the entire point: within one run a caller could hold the
     // session id in memory, and a hunt is not one run.
     const path = newDatabasePath();
     await withStore(path, (store) =>
       Effect.gen(function* () {
-        yield* store.recordPlannerLineage("target-1", "ses_one");
-        yield* store.recordPlannerLineage("target-2", "ses_two");
+        yield* openGoals(store, "goal-1", "goal-2");
+        yield* store.recordPlannerLineage("goal-1", "ses_one");
+        yield* store.recordPlannerLineage("goal-2", "ses_two");
       }),
     );
 
     const reopened = await withStore(path, (store) =>
       Effect.all({
-        first: store.plannerLineage("target-1"),
-        second: store.plannerLineage("target-2"),
-        absent: store.plannerLineage("target-3"),
+        first: store.plannerLineage("goal-1"),
+        second: store.plannerLineage("goal-2"),
+        absent: store.plannerLineage("goal-3"),
       }),
     );
 
@@ -1573,16 +1602,26 @@ describe("the planner session lineage", () => {
     });
   });
 
+  test("a lineage cannot be recorded for a goal that does not exist", async () => {
+    // The foreign key `0019` adds. A lineage names the goal whose rounds join it, and a
+    // row pointing at no goal would be a cache key nothing could ever ask for.
+    const failure = await withStore(newDatabasePath(), (store) =>
+      Effect.result(store.recordPlannerLineage("goal-absent", "ses_orphan")),
+    );
+    expect(failure._tag).toBe("Failure");
+  });
+
   test("recording again replaces the lineage instead of adding a second one", async () => {
     // What happens when the harness has forgotten the session we recorded: the next
     // round opens a new one and this is the write that retires the old id. Two current
-    // lineages for one target would make "which session do rounds join" unanswerable.
+    // lineages for one goal would make "which session do rounds join" unanswerable.
     const path = newDatabasePath();
     const after = await withStore(path, (store) =>
       Effect.gen(function* () {
-        yield* store.recordPlannerLineage("target-1", "ses_gone");
-        yield* store.recordPlannerLineage("target-1", "ses_fresh");
-        return yield* store.plannerLineage("target-1");
+        yield* openGoals(store, "goal-1");
+        yield* store.recordPlannerLineage("goal-1", "ses_gone");
+        yield* store.recordPlannerLineage("goal-1", "ses_fresh");
+        return yield* store.plannerLineage("goal-1");
       }),
     );
     expect(after).toBe("ses_fresh");
@@ -1590,12 +1629,12 @@ describe("the planner session lineage", () => {
     const sqlite = new (await import("bun:sqlite")).Database(path);
     const rows = sqlite
       .query(
-        `SELECT target_id, harness_session_id FROM planner_lineages ORDER BY target_id`,
+        `SELECT goal_id, harness_session_id FROM planner_lineages ORDER BY goal_id`,
       )
       .all();
     sqlite.close();
     expect(rows).toEqual([
-      { target_id: "target-1", harness_session_id: "ses_fresh" },
+      { goal_id: "goal-1", harness_session_id: "ses_fresh" },
     ]);
   });
 
@@ -1608,7 +1647,7 @@ describe("the planner session lineage", () => {
       Effect.gen(function* () {
         yield* seed(store);
         yield* store.recordObservation(CALLER, multiCaseInput());
-        yield* store.recordPlannerLineage("target-1", "ses_one");
+        yield* store.recordPlannerLineage("goal-1", "ses_one");
         return yield* store.observationsForIntent("intent-1");
       }),
     );
@@ -1620,7 +1659,7 @@ describe("the planner session lineage", () => {
     const after = await withStore(path, (store) =>
       Effect.all({
         observations: store.observationsForIntent("intent-1"),
-        lineage: store.plannerLineage("target-1"),
+        lineage: store.plannerLineage("goal-1"),
       }),
     );
 
@@ -2219,7 +2258,7 @@ describe("answering another intent's dimension", () => {
     declare: boolean,
     use: (
       store: Store,
-      context: { raiserId: string; sibling: CallerContext },
+      context: { raiserId: string; sibling: AttemptCaller },
     ) => Effect.Effect<A, E>,
   ) => {
     const path = newDatabasePath();
@@ -2260,7 +2299,7 @@ describe("answering another intent's dimension", () => {
           modelOptions: null,
           harnessSessionId: "ses_sibling",
         });
-        const sibling: CallerContext = {
+        const sibling: AttemptCaller = {
           ...CALLER,
           callerScope: "target-1/attempt-sibling",
           intentId: "intent-sibling",
@@ -3615,7 +3654,8 @@ describe("the intent lifecycle", () => {
       harnessSessionId: null,
     });
 
-  const callerFor = (attemptId: string): CallerContext => ({
+  const callerFor = (attemptId: string): AttemptCaller => ({
+    _tag: "attempt",
     callerScope: `target-1/${attemptId}`,
     targetId: "target-1",
     intentId: "int-L",
@@ -4238,5 +4278,683 @@ describe("the intent lifecycle", () => {
     expect(outcome.before?.status).toBe("open");
     // Never claimed, so there was no claim to turn into an answer.
     expect(outcome.after?.status).toBe("open");
+  });
+});
+
+/* ── Round identity and the three authority paths ────────────────────────────── */
+
+/**
+ * Slice 4's whole subject: a planner round is a row, and the store can tell three kinds
+ * of caller apart.
+ *
+ * Nothing here creates a session or calls a tool. What is checked is the part a later
+ * slice would otherwise find out the hard way: that a credential of one kind cannot write
+ * as another, that a round's authority ends when the round does, and that a goal's ends
+ * when the goal does.
+ */
+describe("a planner round", () => {
+  const HOST = { callerScope: operatorScope("target-1"), targetId: "target-1" };
+  const OTHER_HOST = {
+    callerScope: operatorScope("target-2"),
+    targetId: "target-2",
+  };
+
+  const openRoundInput = (
+    overrides: Partial<{
+      goalId: string;
+      roundId: string;
+      budget: number;
+    }> = {},
+  ) => ({
+    goalId: "goal-1",
+    roundId: "rnd-1",
+    budget: 3,
+    harnessInstanceId: null,
+    providerId: null,
+    modelId: null,
+    harnessSessionId: null,
+    ...overrides,
+  });
+
+  /** A seeded target, goal and attempt, so every id these tests name exists. */
+  const withSeeded = <A, E>(use: (store: Store) => Effect.Effect<A, E>) =>
+    withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* seed(store);
+        return yield* use(store);
+      }),
+    );
+
+  const roundCallerFor = (
+    roundId: string,
+    roundFence = 0,
+    goalId = "goal-1",
+    targetId = "target-1",
+  ): CallerContext => ({
+    _tag: "round",
+    callerScope: callerScopeOf({ _tag: "round", targetId, roundId }),
+    targetId,
+    goalId,
+    roundId,
+    roundFence,
+  });
+
+  test("opens as a row with its own identity, fence and budget", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        const authority = yield* store.openRound(HOST, openRoundInput());
+        return { authority, round: yield* store.loadRound("rnd-1") };
+      }),
+    );
+
+    expect(outcome.authority).toEqual({
+      roundId: "rnd-1",
+      writeFence: 0,
+      startedAtSequence: 0,
+    });
+    expect(outcome.round).toMatchObject({
+      roundId: "rnd-1",
+      goalId: "goal-1",
+      targetId: "target-1",
+      status: "running",
+      writeFence: 0,
+      budget: 3,
+      // Null until the planner says, which is a different fact from any of the four
+      // dispositions — including `no_useful_next_action`, which is a considered answer.
+      disposition: null,
+      endedAt: null,
+      harnessSessionId: null,
+    });
+  });
+
+  test("records where the graph stood as provenance, not as a snapshot", async () => {
+    // `started_at_sequence` is the sequence when the round opened. The planner reads the
+    // graph live and sees writes that land after it — including its own — so this test
+    // asserts both halves: the recorded number does not move, and a read taken after a
+    // later write returns the later write.
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.recordObservation(CALLER, multiCaseInput());
+        const authority = yield* store.openRound(HOST, openRoundInput());
+        const atOpen = yield* store.currentSequence;
+        yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "after-the-round-opened" }),
+        );
+        return {
+          authority,
+          atOpen,
+          later: yield* store.currentSequence,
+          round: yield* store.loadRound("rnd-1"),
+          live: yield* store.observationsForIntent("intent-1"),
+        };
+      }),
+    );
+
+    expect(outcome.authority.startedAtSequence).toBe(1);
+    expect(outcome.atOpen).toBe(1);
+    expect(outcome.later).toBe(2);
+    // Unmoved by the write that followed it.
+    expect(outcome.round?.startedAtSequence).toBe(1);
+    // And the graph a round reads is the current one, which is the point of saying this
+    // column is provenance rather than a consistency boundary.
+    expect(outcome.live).toHaveLength(2);
+  });
+
+  test("a second running round on one goal is refused, naming the holder", async () => {
+    const failure = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.openRound(HOST, openRoundInput());
+        return yield* Effect.result(
+          store.openRound(HOST, openRoundInput({ roundId: "rnd-2" })),
+        );
+      }),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    if (failure._tag === "Failure") {
+      const error = failure.failure as MutationError;
+      expect(error.reason).toBe("conflict");
+      expect(error.detail).toContain("rnd-1");
+      expect(error.detail).toContain(
+        "one planner round works a goal at a time",
+      );
+    }
+  });
+
+  test("a settled round's goal can take another round", async () => {
+    // The exclusivity is about *running* rounds. A goal is worked over many rounds.
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.openRound(HOST, openRoundInput());
+        yield* store.settleRound("rnd-1", "settled");
+        const second = yield* store.openRound(
+          HOST,
+          openRoundInput({ roundId: "rnd-2" }),
+        );
+        return { second, round: yield* store.loadRound("rnd-2") };
+      }),
+    );
+    expect(outcome.second.roundId).toBe("rnd-2");
+    expect(outcome.round?.status).toBe("running");
+  });
+
+  test("a round id is never reused", async () => {
+    const failure = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.openRound(HOST, openRoundInput());
+        yield* store.settleRound("rnd-1", "settled");
+        return yield* Effect.result(store.openRound(HOST, openRoundInput()));
+      }),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    if (failure._tag === "Failure") {
+      const error = failure.failure as MutationError;
+      expect(error.reason).toBe("conflict");
+      expect(error.detail).toContain("already exists");
+    }
+  });
+
+  test("an ended goal takes no new round, and the refusal names its status", async () => {
+    // Decision 8: ending a goal blocks new dispatch and planner wake-ups. Opening a
+    // round is a planner wake-up.
+    const failure = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.endGoal(HOST, {
+          operationId: "end-1",
+          goalId: "goal-1",
+          status: "met",
+          endedBy: "operator",
+          reason: "the objective was established",
+        });
+        return yield* Effect.result(store.openRound(HOST, openRoundInput()));
+      }),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    if (failure._tag === "Failure") {
+      const error = failure.failure as MutationError;
+      expect(error.reason).toBe("invalid");
+      expect(error.detail).toContain("is met");
+    }
+  });
+
+  test("a host cannot open a round on another target's goal", async () => {
+    const failure = await withSeeded((store) =>
+      Effect.result(store.openRound(OTHER_HOST, openRoundInput())),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    if (failure._tag === "Failure") {
+      const error = failure.failure as MutationError;
+      expect(error.reason).toBe("unauthorized");
+      expect(error.detail).toContain("does not belong to target target-2");
+    }
+  });
+
+  test("records a disposition once, and refuses a second", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.openRound(HOST, openRoundInput());
+        const first = yield* store.recordRoundDisposition(
+          roundCallerFor("rnd-1"),
+          "actionable",
+        );
+        const second = yield* Effect.result(
+          store.recordRoundDisposition(roundCallerFor("rnd-1"), "waiting"),
+        );
+        return { first, second, round: yield* store.loadRound("rnd-1") };
+      }),
+    );
+
+    expect(outcome.first).toEqual({
+      roundId: "rnd-1",
+      disposition: "actionable",
+    });
+    expect(outcome.round?.disposition).toBe("actionable");
+    expect(outcome.second._tag).toBe("Failure");
+    if (outcome.second._tag === "Failure") {
+      const error = outcome.second.failure as MutationError;
+      expect(error.reason).toBe("conflict");
+      expect(error.detail).toContain("already recorded the disposition");
+      expect(error.detail).toContain("NOT recorded");
+    }
+  });
+
+  test("settling leaves a recorded disposition alone and does not invent one", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.openRound(HOST, openRoundInput());
+        yield* store.recordRoundDisposition(
+          roundCallerFor("rnd-1"),
+          "objective_met",
+        );
+        const settled = yield* store.settleRound("rnd-1", "settled");
+        yield* store.openRound(HOST, openRoundInput({ roundId: "rnd-2" }));
+        const interrupted = yield* store.settleRound("rnd-2", "interrupted");
+        return {
+          settled,
+          interrupted,
+          first: yield* store.loadRound("rnd-1"),
+          second: yield* store.loadRound("rnd-2"),
+        };
+      }),
+    );
+
+    expect(outcome.settled).toEqual({
+      requested: "settled",
+      effective: "settled",
+      changed: true,
+    });
+    expect(outcome.first?.disposition).toBe("objective_met");
+    // A round that never concluded settles with none, which is the honest record.
+    expect(outcome.second?.status).toBe("interrupted");
+    expect(outcome.second?.disposition).toBeNull();
+  });
+
+  test("settling twice changes nothing and says so", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.openRound(HOST, openRoundInput());
+        yield* store.settleRound("rnd-1", "uncertain");
+        return {
+          again: yield* store.settleRound("rnd-1", "settled"),
+          missing: yield* store.settleRound("rnd-absent", "settled"),
+          round: yield* store.loadRound("rnd-1"),
+        };
+      }),
+    );
+
+    expect(outcome.again).toEqual({
+      requested: "settled",
+      effective: "uncertain",
+      changed: false,
+    });
+    expect(outcome.missing).toEqual({
+      requested: "settled",
+      effective: undefined,
+      changed: false,
+    });
+    expect(outcome.round?.status).toBe("uncertain");
+  });
+
+  test("superseding bumps the fence and answers nothing for a round that does not exist", async () => {
+    const outcome = await withSeeded((store) =>
+      Effect.gen(function* () {
+        yield* store.openRound(HOST, openRoundInput());
+        return {
+          first: yield* store.supersedeRound("rnd-1"),
+          second: yield* store.supersedeRound("rnd-1"),
+          absent: yield* store.supersedeRound("rnd-absent"),
+          round: yield* store.loadRound("rnd-1"),
+        };
+      }),
+    );
+
+    expect(outcome.first).toBe(1);
+    expect(outcome.second).toBe(2);
+    expect(outcome.absent).toBeUndefined();
+    expect(outcome.round?.writeFence).toBe(2);
+    // Superseding is not settling: a sweep that cannot tell how a round ended still has
+    // to stop its credential, and claiming it settled would be claiming to know.
+    expect(outcome.round?.status).toBe("running");
+  });
+});
+
+describe("telling three kinds of caller apart", () => {
+  const HOST = { callerScope: operatorScope("target-1"), targetId: "target-1" };
+
+  const roundCaller = (roundFence = 0, roundId = "rnd-1"): CallerContext => ({
+    _tag: "round",
+    callerScope: callerScopeOf({
+      _tag: "round",
+      targetId: "target-1",
+      roundId,
+    }),
+    targetId: "target-1",
+    goalId: "goal-1",
+    roundId,
+    roundFence,
+  });
+
+  const goalCaller = (goalId = "goal-1"): CallerContext => ({
+    _tag: "goal",
+    callerScope: callerScopeOf({ _tag: "goal", targetId: "target-1", goalId }),
+    targetId: "target-1",
+    goalId,
+  });
+
+  const withRound = <A, E>(use: (store: Store) => Effect.Effect<A, E>) =>
+    withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* seed(store);
+        yield* store.openRound(HOST, {
+          goalId: "goal-1",
+          roundId: "rnd-1",
+          budget: 3,
+          harnessInstanceId: null,
+          providerId: null,
+          modelId: null,
+          harnessSessionId: null,
+        });
+        return yield* use(store);
+      }),
+    );
+
+  const refusal = (result: {
+    _tag: string;
+    failure?: unknown;
+  }): MutationError => result.failure as MutationError;
+
+  test("an attempt credential is refused for a round write", async () => {
+    const failure = await withRound((store) =>
+      Effect.result(store.recordRoundDisposition(CALLER, "actionable")),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    const error = refusal(failure);
+    expect(error.reason).toBe("unauthorized");
+    expect(error.detail).toContain("attempt attempt-1 (a worker)");
+    expect(error.detail).toContain("may not record a round disposition");
+    expect(error.detail).toContain("nothing was recorded");
+  });
+
+  test("a round credential is refused for an observation", async () => {
+    const failure = await withRound((store) =>
+      Effect.result(store.recordObservation(roundCaller(), multiCaseInput())),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    const error = refusal(failure);
+    expect(error.reason).toBe("unauthorized");
+    expect(error.detail).toContain(
+      "round rnd-1 (a planner round on goal goal-1)",
+    );
+    expect(error.detail).toContain("may not record an observation");
+  });
+
+  test("a round credential is refused for an asset", async () => {
+    const failure = await withRound((store) =>
+      Effect.result(
+        store.recordAsset(roundCaller(), {
+          operationId: "asset-round",
+          kind: "endpoint",
+          url: "http://127.0.0.1:41317/login",
+          method: "post",
+          note: "a planner has no business recording this",
+        }),
+      ),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    expect(refusal(failure).reason).toBe("unauthorized");
+    expect(refusal(failure).detail).toContain("may not record an asset");
+  });
+
+  test("a goal credential is refused everything a goal may not write", async () => {
+    const outcome = await withRound((store) =>
+      Effect.all({
+        observation: Effect.result(
+          store.recordObservation(goalCaller(), multiCaseInput()),
+        ),
+        disposition: Effect.result(
+          store.recordRoundDisposition(goalCaller(), "actionable"),
+        ),
+        asset: Effect.result(
+          store.recordAsset(goalCaller(), {
+            operationId: "asset-goal",
+            kind: "host",
+            url: "http://127.0.0.1:41317/",
+            method: null,
+            note: "nor this",
+          }),
+        ),
+      }),
+    );
+
+    for (const result of [
+      outcome.observation,
+      outcome.disposition,
+      outcome.asset,
+    ]) {
+      expect(result._tag).toBe("Failure");
+      const error = refusal(result);
+      expect(error.reason).toBe("unauthorized");
+      expect(error.detail).toContain("the goal agent for goal goal-1");
+    }
+  });
+
+  test("nothing a refused caller sent reaches the graph", async () => {
+    // The refusals above are only worth having if they are also writes that did not
+    // happen: no observation, no disposition, and no sequence consumed.
+    const outcome = await withRound((store) =>
+      Effect.gen(function* () {
+        yield* Effect.result(
+          store.recordObservation(roundCaller(), multiCaseInput()),
+        );
+        yield* Effect.result(
+          store.recordRoundDisposition(goalCaller(), "actionable"),
+        );
+        return {
+          observations: yield* store.observationsForIntent("intent-1"),
+          sequence: yield* store.currentSequence,
+          round: yield* store.loadRound("rnd-1"),
+        };
+      }),
+    );
+
+    expect(outcome.observations).toEqual([]);
+    expect(outcome.sequence).toBe(0);
+    expect(outcome.round?.disposition).toBeNull();
+  });
+
+  test("each kind's authority is answered in the kind it was asked", async () => {
+    const outcome = await withRound((store) =>
+      Effect.all({
+        attempt: store.callerAuthority(CALLER),
+        round: store.callerAuthority(roundCaller()),
+        goal: store.callerAuthority(goalCaller()),
+      }),
+    );
+
+    expect(outcome.attempt).toEqual({
+      _tag: "attempt",
+      attemptId: "attempt-1",
+      intentId: "intent-1",
+      targetId: "target-1",
+      fence: 0,
+    });
+    expect(outcome.round).toEqual({
+      _tag: "round",
+      roundId: "rnd-1",
+      goalId: "goal-1",
+      targetId: "target-1",
+      fence: 0,
+    });
+    expect(outcome.goal).toEqual({
+      _tag: "goal",
+      goalId: "goal-1",
+      targetId: "target-1",
+    });
+  });
+
+  test("a settled round's credential is refused as stale, naming the status", async () => {
+    const failure = await withRound((store) =>
+      Effect.gen(function* () {
+        yield* store.settleRound("rnd-1", "settled");
+        return yield* Effect.result(
+          store.recordRoundDisposition(roundCaller(), "actionable"),
+        );
+      }),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    const error = refusal(failure);
+    expect(error.reason).toBe("stale");
+    expect(error.detail).toContain("round rnd-1 is settled");
+    expect(error.detail).toContain(
+      "its write authority ended when it stopped running",
+    );
+  });
+
+  test("a superseded round's credential is refused as stale, naming both fences", async () => {
+    const failure = await withRound((store) =>
+      Effect.gen(function* () {
+        yield* store.supersedeRound("rnd-1");
+        // The credential still carries fence 0, which is what a grant minted before the
+        // sweep would hold. The round is at 1.
+        return yield* Effect.result(
+          store.recordRoundDisposition(roundCaller(0), "actionable"),
+        );
+      }),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    const error = refusal(failure);
+    expect(error.reason).toBe("stale");
+    expect(error.detail).toContain(
+      "write authority for round rnd-1 was revoked",
+    );
+    expect(error.detail).toContain("carries fence 0");
+    expect(error.detail).toContain("the round is at 1");
+  });
+
+  test("a credential reissued against the current fence works again", async () => {
+    // The fence is an epoch, not a kill switch: a replacement round credential minted
+    // against the bumped fence is live authority.
+    const outcome = await withRound((store) =>
+      Effect.gen(function* () {
+        const fence = yield* store.supersedeRound("rnd-1");
+        return yield* store.recordRoundDisposition(
+          roundCaller(fence ?? 0),
+          "waiting",
+        );
+      }),
+    );
+    expect(outcome.disposition).toBe("waiting");
+  });
+
+  test("a round credential naming another goal is refused as unauthorized", async () => {
+    const failure = await withRound((store) =>
+      Effect.result(
+        store.recordRoundDisposition(
+          {
+            _tag: "round",
+            callerScope: "target-1/round/rnd-1",
+            targetId: "target-1",
+            goalId: "goal-elsewhere",
+            roundId: "rnd-1",
+            roundFence: 0,
+          },
+          "actionable",
+        ),
+      ),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    const error = refusal(failure);
+    expect(error.reason).toBe("unauthorized");
+    expect(error.detail).toContain(
+      "round rnd-1 is not registered for target target-1 and goal goal-elsewhere",
+    );
+  });
+
+  test("an ended goal's credential is refused, naming the status", async () => {
+    const failure = await withRound((store) =>
+      Effect.gen(function* () {
+        yield* store.endGoal(HOST, {
+          operationId: "end-1",
+          goalId: "goal-1",
+          status: "abandoned",
+          endedBy: "operator",
+          reason: "out of scope",
+        });
+        return yield* Effect.result(store.callerAuthority(goalCaller()));
+      }),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    const error = refusal(failure);
+    expect(error.reason).toBe("stale");
+    expect(error.detail).toContain("goal goal-1 is abandoned");
+    expect(error.detail).toContain("its authority ended when the goal ended");
+  });
+
+  test("a goal credential for another target's goal is refused", async () => {
+    const failure = await withRound((store) =>
+      Effect.result(
+        store.callerAuthority({
+          _tag: "goal",
+          callerScope: "target-2/goal/goal-1",
+          targetId: "target-2",
+          goalId: "goal-1",
+        }),
+      ),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    const error = refusal(failure);
+    expect(error.reason).toBe("unauthorized");
+    expect(error.detail).toContain(
+      "goal goal-1 is not registered for target target-2",
+    );
+  });
+
+  test("no two kinds of caller can produce the same scope string", async () => {
+    // Asserted on constructed scopes rather than by reading the builder: the claim is
+    // about the strings, and every id in one is minted by `identifier.ts`.
+    const targets = ["target-1", "target-2"];
+    const scopes = targets.flatMap((targetId) => [
+      callerScopeOf({
+        _tag: "attempt",
+        targetId,
+        attemptId: identifier.newAttemptId(),
+      }),
+      callerScopeOf({
+        _tag: "round",
+        targetId,
+        roundId: identifier.newRoundId(),
+      }),
+      callerScopeOf({
+        _tag: "goal",
+        targetId,
+        goalId: identifier.newGoalId(),
+      }),
+      operatorScope(targetId),
+    ]);
+
+    expect(new Set(scopes).size).toBe(scopes.length);
+    // And the shapes are what the table in `callerScopeOf` says, so a receipt key read
+    // out of the database can be attributed to a kind of caller by eye.
+    expect(scopes[0]).toMatch(/^target-1\/att_[0-9a-zA-Z]+$/);
+    expect(scopes[1]).toMatch(/^target-1\/round\/rnd_[0-9a-zA-Z]+$/);
+    expect(scopes[2]).toMatch(/^target-1\/goal\/goal_[0-9a-zA-Z]+$/);
+    expect(scopes[3]).toBe("target-1/operator");
+    // The two reserved segments cannot be mistaken for an attempt id: a minted attempt
+    // id is `att_…` and contains no `/`, so an attempt scope is always two segments.
+    expect(identifier.newAttemptId()).not.toContain("/");
+    expect(identifier.newRoundId().startsWith("rnd_")).toBe(true);
+  });
+
+  test("a worker's own writes are unaffected by any of this", async () => {
+    // The regression this slice must not have, asserted here as well as in the suites
+    // above: an attempt credential still records an observation under its own identity.
+    const outcome = await withRound((store) =>
+      Effect.gen(function* () {
+        const recorded = yield* store.recordObservation(
+          CALLER,
+          multiCaseInput(),
+        );
+        return {
+          recorded,
+          stored: yield* store.observationsForIntent("intent-1"),
+        };
+      }),
+    );
+
+    expect(outcome.recorded.replayed).toBe(false);
+    expect(outcome.stored).toHaveLength(1);
+    expect(outcome.stored[0]?.provenance.attemptId).toBe("attempt-1");
   });
 });

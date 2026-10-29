@@ -218,12 +218,13 @@ const SECTION_MARKERS = [
 ] as const;
 
 /**
- * The session this target's planner rounds are opened under, opening one if needed.
+ * The session this **goal**'s planner rounds are opened under, opening one if needed.
  *
- * Every round is still a fresh session with no transcript — this only decides whose
- * lineage it joins, and a lineage is what OpenCode turns into a provider cache key. The
- * anchor session is created and never prompted, so there is nothing in it for a round to
- * inherit even in principle.
+ * Keyed by goal since migration `0019`: one planner works one goal, which is what the
+ * lineage table now records. Every round is still a fresh session with no transcript —
+ * this only decides whose lineage it joins, and a lineage is what OpenCode turns into a
+ * provider cache key. The anchor session is created and never prompted, so there is
+ * nothing in it for a round to inherit even in principle.
  *
  * A recorded lineage is confirmed before it is used, because it names a session in
  * OpenCode's storage rather than a row in ours: a cleared harness leaves our row
@@ -231,12 +232,12 @@ const SECTION_MARKERS = [
  * `session.create`. An unconfirmable lineage is replaced, which costs one uncached round
  * and is invisible to the investigation either way.
  */
-const plannerLineage = Effect.fnUntraced(function* (targetId: string) {
+const plannerLineage = Effect.fnUntraced(function* (goalId: string) {
   const store = yield* ObservationStore;
   const client = yield* AgentHarness;
   const paths = yield* SpikePaths;
 
-  const recorded = yield* store.plannerLineage(targetId);
+  const recorded = yield* store.plannerLineage(goalId);
   if (recorded !== undefined) {
     const confirmed = yield* Effect.result(client.sessionStatus(recorded));
     if (confirmed._tag === "Success") {
@@ -245,11 +246,11 @@ const plannerLineage = Effect.fnUntraced(function* (targetId: string) {
   }
 
   const anchor = yield* client.createSession({
-    title: `bit planner lineage: ${targetId}`,
+    title: `bit planner lineage: ${goalId}`,
     model: WORKER_MODEL,
     directory: paths.workspace,
   });
-  yield* store.recordPlannerLineage(targetId, anchor.id);
+  yield* store.recordPlannerLineage(goalId, anchor.id);
   return { sessionId: anchor.id, reused: false };
 });
 
@@ -273,7 +274,18 @@ export const runPlannerPhase = Effect.fn("runPlannerPhase")(function* (
   const rendered = renderBriefing(briefing);
   const stored = yield* store.observationsForIntent(intentId);
 
-  const lineage = yield* plannerLineage(briefing.targetId);
+  // The goal is read from the intent rather than taken from the briefing, which carries a
+  // target and not a goal: migration `0019` keys a lineage by goal, and passing a target
+  // id here would record one goal's session under another's key.
+  const intent = yield* store.intent(intentId);
+  if (intent === undefined) {
+    return yield* Effect.die(
+      new Error(
+        `intent ${intentId} has no row, so it has no goal to plan under`,
+      ),
+    );
+  }
+  const lineage = yield* plannerLineage(intent.goalId);
   const session = yield* client.createSession({
     title: "bit planner: fresh session",
     model: WORKER_MODEL,

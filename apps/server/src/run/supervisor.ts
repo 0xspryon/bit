@@ -1118,6 +1118,10 @@ const make = Effect.fnUntraced(function* (options?: {
     }
 
     const credential = yield* credentials.issue({
+      // A worker attempt, said rather than implied: the credential registry takes a
+      // tagged binding, so this call site has to name which kind of authority it is
+      // minting and cannot produce a round's or a goal's by leaving a field out.
+      _tag: "attempt",
       targetId: input.targetId,
       intentId: ids.intentId,
       attemptId: ids.attemptId,
@@ -1128,19 +1132,45 @@ const make = Effect.fnUntraced(function* (options?: {
       attemptFence: authority.writeFence,
     });
 
-    yield* harness.registerMcpServer(session.id, `bit-${ids.attemptId}`, {
-      url: urls.mcp,
-      // Unwrapped and immediately re-wrapped: this is the one place the raw token is
-      // touched, to put it in the header of the one request that delivers it. It never
-      // reaches the harness's argv or the environment the agent's shells inherit
-      // (DECISIONS.md §6, "credentials off argv").
-      headers: {
-        authorization: Redacted.make(
-          `Bearer ${Redacted.value(credential.token)}`,
+    const serverName = `bit-${ids.attemptId}`;
+    // An `acquireRelease`, so the registration is taken away when this scope closes —
+    // the same scope that revokes the credential, and for the same reason: a revoked
+    // credential that leaves a registration behind is an entry that still reads as
+    // connected (DECISIONS.md §24.2, caveat 3). Release order is reverse-acquire, so the
+    // entry goes first and the token a moment later; both are gone before the scope is,
+    // and in between the endpoint is the only thing the dead entry can reach.
+    //
+    // The release cannot fail the run. Tidy-up that reports an outcome would make a
+    // settled attempt look unsettled, so a harness that will not take the removal is
+    // logged and nothing more.
+    yield* Effect.acquireRelease(
+      harness.registerMcpServer(session.id, serverName, {
+        url: urls.mcp,
+        // Unwrapped and immediately re-wrapped: this is the one place the raw token is
+        // touched, to put it in the header of the one request that delivers it. It never
+        // reaches the harness's argv or the environment the agent's shells inherit
+        // (DECISIONS.md §6, "credentials off argv").
+        headers: {
+          authorization: Redacted.make(
+            `Bearer ${Redacted.value(credential.token)}`,
+          ),
+        },
+        directory: input.workspace,
+      }),
+      () =>
+        harness.unregisterMcpServer(session.id, serverName).pipe(
+          Effect.catch((failure) =>
+            Effect.logWarning(
+              "a harness would not take back an MCP registration; the credential behind it is revoked either way",
+              {
+                attemptId: ids.attemptId,
+                server: serverName,
+                detail: failure.message,
+              },
+            ),
+          ),
         ),
-      },
-      directory: input.workspace,
-    });
+    );
 
     return { store, harnessSessionId: session.id, provenance };
   });

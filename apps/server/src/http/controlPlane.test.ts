@@ -43,6 +43,7 @@ class TestCredential extends Context.Service<
     TestCredential,
     Effect.flatMap(McpCredentials, (credentials) =>
       credentials.issue({
+        _tag: "attempt",
         targetId: "t",
         intentId: "i",
         attemptId: "a",

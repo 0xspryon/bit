@@ -41,6 +41,7 @@ const directory = mkdtempSync(join(tmpdir(), "bit-mcp-"));
 const databaseFile = join(directory, "hunt.sqlite");
 
 const BINDING = {
+  _tag: "attempt",
   targetId: "target-1",
   intentId: "intent-1",
   attemptId: "attempt-1",
@@ -113,10 +114,57 @@ class StaleCredential extends Context.Service<
   );
 }
 
+/**
+ * A planner round's credential, and a goal agent's.
+ *
+ * Both are genuinely valid — the registry resolves them and the request reaches the
+ * toolkit — which is the point: what refuses them is the *authority path*, not the auth
+ * middleware. The round row deliberately does not exist, because the kind check happens
+ * before any read and a test that seeded one could not show that.
+ *
+ * The goal credential is issued with **no expiry** (`issueWithoutExpiry`), so the
+ * no-expiry path is exercised over real HTTP rather than only against the registry.
+ */
+class RoundCredential extends Context.Service<
+  RoundCredential,
+  IssuedCredential
+>()("test/RoundCredential") {
+  static readonly layer = Layer.effect(
+    RoundCredential,
+    Effect.flatMap(McpCredentials, (credentials) =>
+      credentials.issue({
+        _tag: "round",
+        targetId: "target-1",
+        goalId: "goal-1",
+        roundId: "rnd-1",
+        roundFence: 0,
+      }),
+    ),
+  );
+}
+
+class GoalCredential extends Context.Service<
+  GoalCredential,
+  IssuedCredential
+>()("test/GoalCredential") {
+  static readonly layer = Layer.effect(
+    GoalCredential,
+    Effect.flatMap(McpCredentials, (credentials) =>
+      credentials.issueWithoutExpiry({
+        _tag: "goal",
+        targetId: "target-1",
+        goalId: "goal-1",
+      }),
+    ),
+  );
+}
+
 const testLayer = Layer.mergeAll(
   ControlPlaneEndpoint.layer({ policy: DEFAULT_POLICY }),
   TestCredential.layer,
   StaleCredential.layer,
+  RoundCredential.layer,
+  GoalCredential.layer,
   McpCredentials.layer,
   McpCallCounter.layer,
   PolicyDecisions.layer,
@@ -141,6 +189,8 @@ const runtime = ManagedRuntime.make(testLayer);
 let url = "";
 let token = "";
 let staleToken = "";
+let roundToken = "";
+let goalToken = "";
 
 beforeAll(async () => {
   await runtime.runPromise(
@@ -161,6 +211,8 @@ beforeAll(async () => {
       url = endpoint.mcpUrl;
       token = Redacted.value(credential.token);
       staleToken = Redacted.value((yield* StaleCredential).token);
+      roundToken = Redacted.value((yield* RoundCredential).token);
+      goalToken = Redacted.value((yield* GoalCredential).token);
     }),
   );
 });
@@ -433,6 +485,60 @@ describe("MCP authorization", () => {
     // before the request reaches protocol dispatch at all.
     const response = await rpc("initialize", {}, null);
     expect(response.status).toBe(401);
+  });
+
+  test("a round credential is authenticated and then refused the write", async () => {
+    // The two halves of the boundary, told apart. The credential is valid, so this is
+    // not a 401: the request reaches the tool, and the *authority path* is what refuses
+    // it, naming the kind of caller it is and the write it attempted.
+    const response = await callTool(
+      args({ operation_id: "op-round-credential" }),
+      roundToken,
+    );
+    expect(response.status).toBe(200);
+    const { isError, data } = payloadOf(response.body);
+    expect(isError).toBe(true);
+    expect(data["reason"]).toBe("unauthorized");
+    expect(String(data["detail"])).toContain(
+      "round rnd-1 (a planner round on goal goal-1)",
+    );
+    expect(String(data["detail"])).toContain("may not record an observation");
+  });
+
+  test("a goal credential with no expiry is authenticated and then refused the write", async () => {
+    const response = await callTool(
+      args({ operation_id: "op-goal-credential" }),
+      goalToken,
+    );
+    expect(response.status).toBe(200);
+    const { isError, data } = payloadOf(response.body);
+    expect(isError).toBe(true);
+    expect(data["reason"]).toBe("unauthorized");
+    expect(String(data["detail"])).toContain("the goal agent for goal goal-1");
+  });
+
+  test("neither credential of the wrong kind wrote anything", async () => {
+    // The refusals above are only worth having if they are also writes that did not
+    // happen. The attempt's own observations are the ones the tests below record; what
+    // is asserted here is that no observation exists under the round's or the goal's
+    // scope, which is checked by the receipt keys they would have written.
+    const sqlite = new (await import("bun:sqlite")).Database(databaseFile, {
+      readonly: true,
+    });
+    const receipts = sqlite
+      .query(
+        `SELECT key FROM command_receipts
+         WHERE caller_scope LIKE 'target-1/round/%' OR caller_scope LIKE 'target-1/goal/%'`,
+      )
+      .all();
+    const observations = sqlite
+      .query(
+        `SELECT id FROM observations WHERE attempt_id NOT IN ('attempt-1')`,
+      )
+      .all();
+    sqlite.close();
+    expect(receipts).toEqual([]);
+    expect(observations).toEqual([]);
   });
 });
 

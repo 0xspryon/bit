@@ -689,15 +689,29 @@ export const openCodeHarness = (
         };
       };
 
+      /**
+       * Which directory each `(sessionId, name)` was registered into.
+       *
+       * Kept so {@link unregisterMcpServer} needs no directory parameter — see the seam
+       * on why that is the caller's business to not know. Layer-scoped, like the server
+       * child process it talks to: a registration cannot outlive the OpenCode server, so
+       * neither does this map, and a key that is missing means there is nothing of ours
+       * in any registry to remove.
+       */
+      const registeredIn = new Map<string, string>();
+      const registrationKey = (sessionId: string, name: string): string =>
+        `${sessionId}\u0000${name}`;
+
       const registerMcpServer: AgentHarness["Service"]["registerMcpServer"] =
         Effect.fn("openCodeHarness.registerMcpServer")(
-          // `_sessionId` is unused, and that is the whole point of the parameter: OpenCode
-          // registers an MCP server into a directory and has no per-session channel, so
-          // the session the credential is for is implicit here. The interface takes it
-          // anyway because Claude Code cannot register without it; see
-          // `AgentHarness.registerMcpServer` for what this implementation is therefore
-          // wider than.
-          function* (_sessionId, name, config) {
+          // The session id reaches no OpenCode call here, and that is the whole point of
+          // the parameter: OpenCode registers an MCP server into a *directory* and has no
+          // per-session channel, so the session the credential is for is implicit in the
+          // registry. The interface takes it anyway because Claude Code cannot register
+          // without it; see `AgentHarness.registerMcpServer` for what this implementation
+          // is therefore wider than. It is used below only as half of the key that
+          // remembers where to remove the entry from.
+          function* (sessionId, name, config) {
             yield* bounded(
               "mcp.add",
               timeouts.control,
@@ -727,6 +741,47 @@ export const openCodeHarness = (
                     execution: 60_000,
                   }),
                 }),
+              }),
+            );
+            registeredIn.set(
+              registrationKey(sessionId, name),
+              config.directory,
+            );
+          },
+        );
+
+      /**
+       * Removes the registration from the directory it was added to.
+       *
+       * `mcp.remove` is real here and does what the name says: OpenCode sets an in-memory
+       * override for the server and reloads, so the entry leaves the directory's registry
+       * for the life of its own process (`packages/core/src/mcp/index.ts`, `MCP.remove`).
+       * It does **not** edit the operator's `opencode.json`; the override is held in
+       * memory, which is what makes this safe to call against a directory whose config we
+       * did not write.
+       *
+       * Two honest limits:
+       *
+       * - A name this process never registered is a no-op with no request made. The
+       *   directory is not ours to guess, and OpenCode answers `404` for a server it does
+       *   not hold, so asking would turn tidy-up into a failure for no gain.
+       * - The entry was *directory*-scoped while it existed, so removing it removes it for
+       *   every session in that directory — which is the same width `registerMcpServer`
+       *   already has, and is recorded there and in DECISIONS.md §24.2.
+       */
+      const unregisterMcpServer: AgentHarness["Service"]["unregisterMcpServer"] =
+        Effect.fn("openCodeHarness.unregisterMcpServer")(
+          function* (sessionId, name) {
+            const key = registrationKey(sessionId, name);
+            const directory = registeredIn.get(key);
+            if (directory === undefined) return;
+            registeredIn.delete(key);
+            yield* bounded(
+              "mcp.remove",
+              timeouts.control,
+              api.mcp.remove({
+                server: name,
+                location: { directory: directoryOf(directory) },
               }),
             );
           },
@@ -902,6 +957,7 @@ export const openCodeHarness = (
         modelProvenance: openCodeModelProvenance,
         installGate: installOpenCodeGate,
         registerMcpServer,
+        unregisterMcpServer,
         createSession,
         prompt,
         waitForIdle,

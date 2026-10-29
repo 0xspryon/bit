@@ -48,7 +48,7 @@ import {
   targetStoreLayer,
   type FleetMigrationOutcome,
 } from "../persistence/fleet";
-import { ObservationStore, type CallerContext } from "../persistence/store";
+import { ObservationStore, type AttemptCaller } from "../persistence/store";
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
 import {
   reconcileUnsettledAttempts,
@@ -90,7 +90,8 @@ const exact = (name: string, passed: boolean, evidence: string) => {
   checks.push({ name, passed, evidence });
 };
 
-const caller = (targetId: string, attemptId = ATTEMPT_ID): CallerContext => ({
+const caller = (targetId: string, attemptId = ATTEMPT_ID): AttemptCaller => ({
+  _tag: "attempt",
   callerScope: `${targetId}/${attemptId}`,
   targetId,
   intentId: INTENT_ID,

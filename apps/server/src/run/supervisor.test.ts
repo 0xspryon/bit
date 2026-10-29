@@ -139,6 +139,8 @@ interface Script {
 interface Recorder {
   readonly prompts: string[];
   readonly registrations: { name: string; url: string; bearer: string }[];
+  /** Registrations taken back, so "the entry went with the credential" is checkable. */
+  readonly unregistrations: { sessionId: string; name: string }[];
   readonly interrupts: string[];
   readonly created: string[];
   /** What each `createSession` was handed of the model, after the supervisor resolved it. */
@@ -220,6 +222,10 @@ const fakeClient = (
             ),
           });
         }),
+      unregisterMcpServer: (sessionId, name) =>
+        Effect.sync(() => {
+          recorder.unregistrations.push({ sessionId, name });
+        }),
       createSession: (input) =>
         Effect.sync(() => {
           // Honours the id it is handed, like both real harnesses were verified to do. A
@@ -275,6 +281,7 @@ const fakeClient = (
 const emptyRecorder = (): Recorder => ({
   prompts: [],
   registrations: [],
+  unregistrations: [],
   interrupts: [],
   created: [],
   sessionOptions: [],
@@ -714,6 +721,139 @@ describe("starting a run", () => {
       priorStatus: "running",
       settledBy: "supervisor",
     });
+    await runtime.dispose();
+  });
+
+  test("takes the registration back when the credential is revoked", async () => {
+    // DECISIONS.md §24.2, caveat 3: nothing used to call OpenCode's `mcp.remove`, so a
+    // revoked credential left an entry still reported `connected`. The registration is
+    // now scope-owned beside the credential, so settling a run takes both away.
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const credentials = yield* McpCredentials;
+        const started = yield* supervisor.start(
+          yield* draft(root, "alpha", "probe it"),
+        );
+        // While the run is live the registration stands: it is what the worker reaches
+        // our endpoint through.
+        const during = [...recorder.unregistrations];
+        yield* release(started.harnessSessionId);
+        yield* settled(supervisor, started.attemptId);
+        return {
+          started,
+          during,
+          after: [...recorder.unregistrations],
+          liveCredentials: yield* credentials.size,
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.during).toEqual([]);
+    expect(observed.after).toEqual([
+      {
+        sessionId: observed.started.harnessSessionId,
+        name: `bit-${observed.started.attemptId}`,
+      },
+    ]);
+    // The credential went too, which is the pairing that matters: an entry without a
+    // credential is misleading, and a credential without an entry is unreachable.
+    expect(observed.liveCredentials).toBe(0);
+    await runtime.dispose();
+  });
+
+  test("a harness that will not take the registration back does not fail the run", async () => {
+    // Tidy-up must not become an outcome. A refused removal is logged and the attempt
+    // still settles, because a settled attempt that reported a failure would look to the
+    // operator like work that did not finish.
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const root = newRoot();
+    const fleet = FleetStore.layer(root);
+    const stores = TargetStores.layer.pipe(Layer.provide(fleet));
+    const credentials = McpCredentials.layer;
+    const stubborn = Layer.succeed(
+      AgentHarness,
+      AgentHarness.of({
+        ...fakeHarnessShape(scriptFor, recorder),
+        unregisterMcpServer: () =>
+          Effect.fail(
+            transport("mcp.remove", "the harness is no longer listening"),
+          ),
+      }),
+    );
+    const runtime = ManagedRuntime.make(
+      Layer.mergeAll(
+        fleet,
+        stores,
+        credentials,
+        RunSupervisor.layer.pipe(
+          Layer.provide(HarnessResolver.single),
+          Layer.provide(stubborn),
+          Layer.provide(stores),
+          Layer.provide(credentials),
+          Layer.provide(RunNarrations.layer),
+          Layer.provide(
+            Layer.succeed(
+              WorkerEndpoints,
+              WorkerEndpoints.of({
+                urls: Effect.succeed({
+                  mcp: "http://127.0.0.1:9/api/v1/mcp",
+                  policy: "http://127.0.0.1:9/api/v1/policy/decide",
+                }),
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const registry = yield* FleetStore;
+        yield* registry.register({
+          targetId: "alpha",
+          name: "alpha",
+          scopeNote: "",
+        });
+        yield* registry.migrateFleet();
+      }).pipe(Effect.orDie),
+    );
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const resolver = yield* TargetStores;
+        const registry = yield* McpCredentials;
+        const started = yield* supervisor.start(
+          yield* draft(root, "alpha", "probe it"),
+        );
+        yield* release(started.harnessSessionId);
+        yield* settled(supervisor, started.attemptId);
+        const row = yield* withTargetStore(resolver, "alpha", (store) =>
+          store.loadAttempt(started.attemptId, "alpha"),
+        );
+        return {
+          status: row?.status,
+          liveCredentials: yield* registry.size,
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.status).toBe("succeeded");
+    expect(observed.liveCredentials).toBe(0);
     await runtime.dispose();
   });
 

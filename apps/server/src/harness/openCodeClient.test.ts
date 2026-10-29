@@ -46,6 +46,8 @@ const FAKE_SERVER = {
 interface Recorded {
   readonly signals: AbortSignal[];
   readonly urls: string[];
+  /** Methods as sent, so "it removed the entry" is not read off a URL alone. */
+  readonly methods: string[];
   /** Request bodies as sent, so a test can assert on what reached the wire. */
   readonly bodies: string[];
 }
@@ -58,7 +60,12 @@ const clientWith = (
     recorded: Recorded,
   ) => Promise<Response>,
 ) => {
-  const recorded: Recorded = { signals: [], urls: [], bodies: [] };
+  const recorded: Recorded = {
+    signals: [],
+    urls: [],
+    methods: [],
+    bodies: [],
+  };
   const fetchStub = Object.assign(
     (input: URL | RequestInfo, init?: RequestInit) => {
       const url = String(input instanceof Request ? input.url : input);
@@ -75,6 +82,11 @@ const clientWith = (
       const startup = url.includes("/api/model");
       if (!startup) {
         recorded.urls.push(url);
+        recorded.methods.push(
+          String(
+            (input instanceof Request ? input.method : init?.method) ?? "GET",
+          ).toUpperCase(),
+        );
         if (signal) recorded.signals.push(signal);
         const body = input instanceof Request ? undefined : init?.body;
         if (typeof body === "string") recorded.bodies.push(body);
@@ -403,6 +415,91 @@ describe("requests", () => {
     // Credentials must never be in a URL: those land in logs and process listings.
     expect(recorded.urls[0]).not.toContain("s3cret");
     expect(recorded.urls[0]).toContain("/api/experimental/mcp/bit-attempt-1");
+  });
+
+  /** `mcp.add` and `mcp.remove` answer `204 No Content`, which is what the client decodes. */
+  const noContent = () => Promise.resolve(new Response(null, { status: 204 }));
+
+  test("unregistering removes the entry from the directory it was added to", async () => {
+    // Spike B (DECISIONS.md §24.2, caveat 3) found nothing ever calls `mcp.remove`, so a
+    // revoked credential left an entry reported `connected` until the server died. This
+    // is the call that takes it away, and the directory comes from the registration
+    // rather than from the caller.
+    const { layer, recorded } = clientWith(noContent);
+    const outcome = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (client) =>
+              Effect.gen(function* () {
+                yield* client.registerMcpServer("ses_1", "bit-attempt-1", {
+                  url: "http://127.0.0.1:1234/mcp",
+                  headers: { authorization: Redacted.make("Bearer s3cret") },
+                  directory: "/tmp/ws",
+                });
+                yield* client.unregisterMcpServer("ses_1", "bit-attempt-1");
+              }),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    );
+
+    expect(outcome._tag).toBe("Success");
+    expect(recorded.urls).toHaveLength(2);
+    expect(recorded.urls[1]).toContain("/api/experimental/mcp/bit-attempt-1");
+    expect(recorded.methods).toEqual(["PUT", "DELETE"]);
+    // The directory it was registered into travels with the removal, taken from the
+    // registration rather than re-stated by the caller.
+    expect(recorded.urls[1]).toContain(encodeURIComponent("/tmp/ws"));
+  });
+
+  test("unregistering a name that was never registered makes no request", async () => {
+    // There is no directory to guess, and OpenCode answers 404 for a server it does not
+    // hold, so asking would turn tidy-up into a failure for no gain.
+    const { layer, recorded } = clientWith(noContent);
+    const outcome = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (client) =>
+              client.unregisterMcpServer("ses_1", "bit-never-registered"),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    );
+
+    expect(outcome._tag).toBe("Success");
+    expect(recorded.urls).toEqual([]);
+  });
+
+  test("unregistering twice makes exactly one request", async () => {
+    const { layer, recorded } = clientWith(noContent);
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (client) =>
+              Effect.gen(function* () {
+                yield* client.registerMcpServer("ses_1", "bit-attempt-1", {
+                  url: "http://127.0.0.1:1234/mcp",
+                  headers: { authorization: Redacted.make("Bearer s3cret") },
+                  directory: "/tmp/ws",
+                });
+                yield* client.unregisterMcpServer("ses_1", "bit-attempt-1");
+                yield* client.unregisterMcpServer("ses_1", "bit-attempt-1");
+              }),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    );
+
+    expect(recorded.methods).toEqual(["PUT", "DELETE"]);
   });
 
   test("a session id with URL-significant characters is encoded", async () => {

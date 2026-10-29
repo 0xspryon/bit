@@ -48,6 +48,7 @@ export const SURVIVING_OPERATION = "op-survives-the-crash";
 export const LOST_OPERATION = "op-never-committed";
 
 const caller: CallerContext = {
+  _tag: "attempt",
   callerScope: `${targetId}/${ATTEMPT_ID}`,
   targetId,
   intentId: INTENT_ID,

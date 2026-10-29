@@ -194,6 +194,7 @@ describe("a fresh database", () => {
       "observations",
       "outbox",
       "planner_lineages",
+      "planner_rounds",
       "sequence_cursor",
     ]);
     // The table `0003` left behind, not the one `0001` created or the one `0002` did.
@@ -474,6 +475,8 @@ describe("a database already at 0002", () => {
       "15_attempt_model_options",
       "16_goal_lifecycle",
       "17_intent_lifecycle",
+      "18_planner_rounds",
+      "19_planner_lineage_by_goal",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -746,6 +749,8 @@ describe("a database already at 0005", () => {
       "15_attempt_model_options",
       "16_goal_lifecycle",
       "17_intent_lifecycle",
+      "18_planner_rounds",
+      "19_planner_lineage_by_goal",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1462,6 +1467,8 @@ describe("a database already at 0015", () => {
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "16_goal_lifecycle",
       "17_intent_lifecycle",
+      "18_planner_rounds",
+      "19_planner_lineage_by_goal",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1600,6 +1607,8 @@ describe("a database already at 0016", () => {
 
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "17_intent_lifecycle",
+      "18_planner_rounds",
+      "19_planner_lineage_by_goal",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1675,6 +1684,162 @@ describe("a database already at 0016", () => {
     expect(fromScratch).toContain("suggested_instance_id");
     expect(fromScratch).toContain("suggested_model");
     expect(fromScratch).toContain("suggested_model_options");
+  });
+});
+
+describe("a database already at 0017", () => {
+  /**
+   * A file at `0017`, with a planner lineage keyed by target and two goals under it.
+   *
+   * This is the state `0019` has to re-key from, and the rows are what the migration's
+   * comment makes a claim about: a target-keyed lineage cannot be re-keyed to a goal
+   * without inventing which goal it belonged to, so it is dropped.
+   */
+  const seedLineageAtZeroSeventeen = (path: string) =>
+    withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* runMigrations({ loader: chainThrough(17) });
+        yield* sql`INSERT INTO goals (id, target_id, description, created_at, name, status)
+          VALUES ('goal_old', 'acme-corp', 'find auth bypasses', 100, '', 'active')`;
+        yield* sql`INSERT INTO planner_lineages (target_id, harness_session_id, created_at)
+          VALUES ('acme-corp', 'ses_old_lineage', 101)`;
+      }),
+    );
+
+  test("0018 adds the round table with its own index, and nothing else moves", async () => {
+    const path = newDatabasePath();
+    await seedLineageAtZeroSeventeen(path);
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        const applied = yield* runMigrations({ loader: chainThrough(18) });
+        return {
+          applied,
+          rounds: yield* columnsOf(sql, "planner_rounds"),
+          key: yield* primaryKeyOf(sql, "planner_rounds"),
+          indexes: yield* sql<{ name: string }>`SELECT name FROM sqlite_master
+            WHERE type = 'index' AND tbl_name = 'planner_rounds' ORDER BY name`,
+          // The lineage is still target-keyed at 0018: one migration, one change.
+          lineageColumns: yield* columnsOf(sql, "planner_lineages"),
+          goals: yield* sql<{ id: string }>`SELECT id FROM goals ORDER BY id`,
+        };
+      }),
+    );
+
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "18_planner_rounds",
+    ]);
+    expect(outcome.rounds).toEqual(
+      [
+        "id",
+        "goal_id",
+        "target_id",
+        "status",
+        "write_fence",
+        "harness_session_id",
+        "harness_instance_id",
+        "provider_id",
+        "model_id",
+        "started_at_sequence",
+        "budget",
+        "disposition",
+        "started_at",
+        "ended_at",
+      ].sort(),
+    );
+    expect(outcome.key).toEqual(["id"]);
+    expect(outcome.indexes.map((row) => row.name)).toContain(
+      "planner_rounds_goal_idx",
+    );
+    expect(outcome.lineageColumns).toContain("target_id");
+    expect(outcome.goals.map((row) => row.id)).toEqual(["goal_old"]);
+  });
+
+  test("0019 re-keys the lineage to the goal over an existing database, dropping the rows it cannot re-key", async () => {
+    const path = newDatabasePath();
+    await seedLineageAtZeroSeventeen(path);
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        const applied = yield* migrate;
+        return {
+          applied,
+          columns: yield* columnsOf(sql, "planner_lineages"),
+          key: yield* primaryKeyOf(sql, "planner_lineages"),
+          rows: yield* sql<{
+            goal_id: string;
+          }>`SELECT goal_id FROM planner_lineages`,
+          // Everything the lineage is *not* about is untouched by the rebuild.
+          goals: yield* sql<{ id: string }>`SELECT id FROM goals ORDER BY id`,
+        };
+      }),
+    );
+
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "18_planner_rounds",
+      "19_planner_lineage_by_goal",
+    ]);
+    expect(outcome.key).toEqual(["goal_id"]);
+    expect(outcome.columns).toEqual(
+      ["goal_id", "harness_session_id", "created_at"].sort(),
+    );
+    // The migration's own comment says these go, and why: a target-keyed row names no
+    // goal, and the table holds only a prompt-cache hint. Asserted rather than described.
+    expect(outcome.rows).toEqual([]);
+    expect(outcome.goals.map((row) => row.id)).toEqual(["goal_old"]);
+  });
+
+  test("the re-keyed lineage takes a goal that exists and refuses one that does not", async () => {
+    // The foreign key is new in `0019`: `target_id` was a bare column and `goal_id` is a
+    // reference, because a goal is ours and a target folder is not.
+    const path = newDatabasePath();
+    await seedLineageAtZeroSeventeen(path);
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* migrate;
+        const accepted = yield* Effect.result(
+          sql`INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
+            VALUES ('goal_old', 'ses_new_lineage', 200)`,
+        );
+        const refused = yield* Effect.result(
+          sql`INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
+            VALUES ('goal_absent', 'ses_orphan', 201)`,
+        );
+        return { accepted, refused };
+      }),
+    );
+
+    expect(outcome.accepted._tag).toBe("Success");
+    expect(outcome.refused._tag).toBe("Failure");
+  });
+
+  test("the upgraded lineage table matches a fresh replay exactly", async () => {
+    const upgraded = newDatabasePath();
+    await seedLineageAtZeroSeventeen(upgraded);
+    await withSql(upgraded, () => migrate);
+
+    const fresh = newDatabasePath();
+    await withSql(fresh, () => migrate);
+
+    const [fromUpgrade, fromScratch] = await Promise.all([
+      withSql(upgraded, (sql) =>
+        Effect.all({
+          lineage: columnsOf(sql, "planner_lineages"),
+          lineageKey: primaryKeyOf(sql, "planner_lineages"),
+          rounds: columnsOf(sql, "planner_rounds"),
+        }),
+      ),
+      withSql(fresh, (sql) =>
+        Effect.all({
+          lineage: columnsOf(sql, "planner_lineages"),
+          lineageKey: primaryKeyOf(sql, "planner_lineages"),
+          rounds: columnsOf(sql, "planner_rounds"),
+        }),
+      ),
+    ]);
+
+    expect(fromUpgrade).toEqual(fromScratch);
   });
 });
 

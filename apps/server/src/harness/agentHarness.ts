@@ -31,6 +31,8 @@
  * 8. {@link AgentHarness.waitForIdle} — block until the session is no longer running.
  * 9. {@link AgentHarness.sessionStatus}, {@link AgentHarness.interruptSession},
  *    {@link AgentHarness.messages} — settle, stop, read back.
+ * 10. {@link AgentHarness.unregisterMcpServer} — take the registration away again when
+ *    the credential it carried is revoked.
  *
  * Plus {@link AgentHarness.instance}: which configured harness this is, so an attempt can
  * be pinned to it.
@@ -368,6 +370,35 @@ export class AgentHarness extends Context.Service<
       sessionId: string,
       name: string,
       config: McpRegistration,
+    ) => Effect.Effect<void, HarnessFailure>;
+    /**
+     * Removes a registration this seam made, so a revoked credential leaves no entry
+     * behind.
+     *
+     * **Why this exists.** DECISIONS.md §24.2 (Spike B, caveat 3) measured that nothing
+     * ever calls OpenCode's `mcp.remove`: after a credential is revoked the entry stays
+     * in the directory's registry, reported `connected`, until the OpenCode server dies.
+     * That is **not an authority leak**: our endpoint refuses the dead token with a 401,
+     * which `mcp/server.test.ts` tests directly ("an unknown bearer token is rejected",
+     * and the auth middleware runs before any protocol handling). The spike is **not** the
+     * evidence for that and says the opposite about its own runs — it saw "no 401" —
+     * because it revoked each token before anything presented it. What the spike does say
+     * is that the entry stays: it is misleading to anybody reading the registry, and in a
+     * shared directory it accumulates one dead entry per attempt.
+     *
+     * No directory parameter, deliberately. The registration already established which
+     * directory the entry is in; making a caller re-state it would put an
+     * implementation's own fact in the caller's hands, and a caller that remembered the
+     * *wrong* directory would quietly remove nothing. An implementation that needs it
+     * remembers it.
+     *
+     * **Idempotent, and never the reason a run fails.** Removing a name that was never
+     * registered, or was already removed, succeeds. It is called from the release side of
+     * the registration's scope, where a failure would turn tidy-up into an outcome.
+     */
+    readonly unregisterMcpServer: (
+      sessionId: string,
+      name: string,
     ) => Effect.Effect<void, HarnessFailure>;
     readonly prompt: (
       sessionId: string,

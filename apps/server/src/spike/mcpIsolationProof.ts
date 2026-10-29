@@ -230,6 +230,7 @@ const makeKit = (driver: Driver) =>
           harnessSessionId: sessionId,
         });
         const credential = yield* credentials.issue({
+          _tag: "attempt",
           targetId: TARGET_ID,
           intentId: `intent-iso-${label}`,
           attemptId,

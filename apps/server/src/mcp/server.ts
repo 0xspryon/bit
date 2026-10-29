@@ -43,7 +43,7 @@ import { Context, Effect, Layer, type Types } from "effect";
 import { McpProtocol, McpServer } from "effect/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import { McpCredentials } from "./credentials";
+import { McpCredentials, callerOf } from "./credentials";
 import { McpInvocation } from "./invocation";
 import { DomainToolkit, DomainToolkitLayer } from "./tools";
 
@@ -81,11 +81,21 @@ const bearerOf = (header: string | undefined): string =>
     : "";
 
 /**
- * Resolves the presented credential, or refuses the request outright.
+ * Resolves the presented credential into the caller it authenticates, or refuses the
+ * request outright.
  *
  * Note what this does *not* do: there is no fallback identity, and no path where a
  * missing credential produces an empty tool list instead of a refusal. An agent that
  * silently loses the toolkit is far harder to diagnose than one that gets a 401.
+ *
+ * **A grant of any of the three kinds resolves here, and {@link callerOf} is what turns
+ * it into the right caller** — a worker attempt, a planner round or a goal agent, tagged,
+ * with the credential's own bookkeeping (`issuedAt`, `expiresAt`) dropped. Nothing
+ * downstream decides what kind of caller it has by looking at which fields are present:
+ * it reads the tag, and the store's authority paths refuse a caller of the wrong kind for
+ * the write it attempted. A round credential presented to `record_observation` therefore
+ * reaches the handler as a round and is refused as one, rather than arriving as an
+ * attempt with `attemptId: undefined`.
  */
 const authMiddleware = HttpRouter.middleware<{ provides: McpInvocation }>()(
   Effect.gen(function* () {
@@ -109,7 +119,11 @@ const authMiddleware = HttpRouter.middleware<{ provides: McpInvocation }>()(
         return HttpServerResponse.text("unauthorized", { status: 401 });
       }
       yield* counter.increment;
-      return yield* Effect.provideService(httpEffect, McpInvocation, grant);
+      return yield* Effect.provideService(
+        httpEffect,
+        McpInvocation,
+        callerOf(grant),
+      );
     });
   }),
 ).layer;

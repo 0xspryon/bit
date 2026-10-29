@@ -1078,6 +1078,105 @@ const addIntentLifecycle = statements(
 );
 
 /**
+ * `0018` — a planner round becomes a row with an identity and an authority epoch.
+ *
+ * Until now the planner was a phase a script ran (`spike/phases.ts`): a briefing, a
+ * session, an answer printed for a human to read. Nothing recorded that a round of
+ * planning had happened, which means nothing could authenticate one. This is the table
+ * the round-scoped credential points at — the spec's decisions 1 to 5
+ * (`docs/design/goal-and-planner-flow.md`) — and it is the reason `CallerContext` becomes
+ * a tagged union in the same change: a round is now something a write can be attributed
+ * to.
+ *
+ * - **`goal_id`** is a real foreign key, and the round's parent. One planner works one
+ *   goal; a round is a bounded unit of work on it. `target_id` is carried beside it
+ *   rather than reached through the goal, for the reason `intents.target_id` is: every
+ *   authority check compares the caller's target with the row's, and a check that had to
+ *   join to do that would be a check that reads two tables to answer "is this yours".
+ * - **`status`** is `running`, `settled`, `uncertain` or `interrupted` — the attempt
+ *   vocabulary minus `succeeded`/`failed`, because a round does not pass or fail. It
+ *   produces a disposition or it does not. No `CHECK`, for the reason `0016` gives: the
+ *   store owns the set, every read decodes through it, and a stored value outside it
+ *   surfaces as a `StoredRowError` naming the row rather than as an `INSERT` failing for
+ *   a reason the writer cannot see.
+ * - **`write_fence`** is the same mechanism `attempts` has, for the same reason: a round
+ *   outlives the individual tool calls made under it, and recovery may supersede one
+ *   while its credential is still out. The in-memory grant map forgets on restart; the
+ *   column does not.
+ * - **`started_at_sequence`** is **provenance, not a snapshot**. The planner reads the
+ *   graph live and will see its own writes within the round (decision 9), so this records
+ *   where the graph stood when the round opened and nothing more. It is not "the state
+ *   this round saw" and must never be read as a consistency boundary.
+ * - **`budget`** is how many intents this round may add. Enforced inside `add_intent` in
+ *   slice 7 (decision 10), stored here so the limit a round was opened under is a fact
+ *   about the round rather than a parameter of whoever happened to call the tool.
+ * - **`disposition`** is nullable and holds `actionable`, `waiting`,
+ *   `no_useful_next_action` or `objective_met` once the round records one. Null means it
+ *   has not, which is a different fact from any of the four — including from
+ *   `no_useful_next_action`, which is a planner's considered answer and not an absence.
+ * - **`harness_session_id`, `harness_instance_id`, `provider_id`, `model_id`** are all
+ *   nullable, unlike `attempts`', because a round row exists *before* a session does:
+ *   the row is what a credential is minted against, and the credential is minted before
+ *   the session is prompted. A round that never reached a harness therefore holds nulls,
+ *   which is the honest record of what happened.
+ *
+ * The index serves the one question the lifecycle asks: "this goal's rounds, by state",
+ * which is both the one-round-per-goal claim (decision 7) and the startup sweep's
+ * "what was left running".
+ */
+const addPlannerRounds = statements(
+  `CREATE TABLE planner_rounds (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT NOT NULL REFERENCES goals(id),
+    target_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    write_fence INTEGER NOT NULL DEFAULT 0,
+    harness_session_id TEXT,
+    harness_instance_id TEXT,
+    provider_id TEXT,
+    model_id TEXT,
+    started_at_sequence INTEGER NOT NULL,
+    budget INTEGER NOT NULL,
+    disposition TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER
+  )`,
+  `CREATE INDEX planner_rounds_goal_idx ON planner_rounds(goal_id, status)`,
+);
+
+/**
+ * `0019` — a planner lineage belongs to a goal, not to a target.
+ *
+ * `0007` keyed `planner_lineages` by `target_id`, when a planner was a phase of a script
+ * and a target had one of them. The spec settles that a planner works a **goal**
+ * (decision 7, one round per goal at a time), so one lineage per goal is what the table
+ * now means. `0007` is applied and is therefore frozen; this is the forward migration
+ * that corrects it, which is the only way this chain retracts anything.
+ *
+ * **What happens to existing rows: they are dropped, and that is the whole cost.** A
+ * target-keyed lineage cannot be re-keyed to a goal without inventing which of that
+ * target's goals it belonged to, and an invented parent is worse than an absent one —
+ * it would hand `session.create` a parent chosen by a migration. `0007`'s own comment
+ * says what is lost: this table "holds no knowledge", only the harness session later
+ * rounds should be opened under so a provider's prompt cache is reused. A dropped row
+ * costs one uncached prefix on the next round and nothing else; no briefing, observation
+ * or intent references it, and the id it holds names a row in OpenCode's storage rather
+ * than in ours.
+ *
+ * Rebuilt rather than altered: SQLite cannot change a primary key in place, in the manner
+ * of `0006` and `0008`. `goal_id` is a real foreign key where `target_id` was a bare
+ * column, because a goal is ours and a target folder is not.
+ */
+const keyPlannerLineageByGoal = statements(
+  `DROP TABLE planner_lineages`,
+  `CREATE TABLE planner_lineages (
+    goal_id TEXT PRIMARY KEY REFERENCES goals(id),
+    harness_session_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1112,6 +1211,8 @@ export const MIGRATIONS: Record<
   "0015_attempt_model_options": addAttemptModelOptions,
   "0016_goal_lifecycle": addGoalLifecycle,
   "0017_intent_lifecycle": addIntentLifecycle,
+  "0018_planner_rounds": addPlannerRounds,
+  "0019_planner_lineage_by_goal": keyPlannerLineageByGoal,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

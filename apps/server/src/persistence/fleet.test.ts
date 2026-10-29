@@ -37,7 +37,7 @@ import {
   isTargetId,
   targetStoreLayer,
 } from "./fleet";
-import { ObservationStore, type CallerContext } from "./store";
+import { ObservationStore, type AttemptCaller } from "./store";
 import { sqliteLayer } from "./sql";
 
 const directories: string[] = [];
@@ -92,7 +92,8 @@ const register = (fleet: Fleet, targetId: string) =>
     scopeNote: `Only the local fixture is in scope; ${AWKWARD_TEXT}`,
   });
 
-const callerFor = (targetId: string): CallerContext => ({
+const callerFor = (targetId: string): AttemptCaller => ({
+  _tag: "attempt",
   callerScope: `${targetId}/attempt-1`,
   targetId,
   intentId: `intent-${targetId}`,

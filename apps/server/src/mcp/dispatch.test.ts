@@ -53,7 +53,11 @@ import { FleetStore } from "../persistence/fleet";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
-import { McpCredentials, type IssuedCredential } from "./credentials";
+import {
+  McpCredentials,
+  type AttemptBinding,
+  type IssuedCredential,
+} from "./credentials";
 import { McpCallCounter } from "./server";
 
 const directory = mkdtempSync(join(tmpdir(), "bit-mcp-dispatch-"));
@@ -69,7 +73,8 @@ const workspaceFor = (targetId: string): string => {
 /** Two engagements, each with its own attempt, intent and goal in its own file. */
 const TARGETS = ["alpha", "beta"] as const;
 
-const bindingFor = (targetId: string) => ({
+const bindingFor = (targetId: string): AttemptBinding => ({
+  _tag: "attempt",
   targetId,
   intentId: `intent-${targetId}`,
   attemptId: `attempt-${targetId}`,
