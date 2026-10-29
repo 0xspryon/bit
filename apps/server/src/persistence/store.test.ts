@@ -1402,6 +1402,56 @@ describe("addressing an earlier untested dimension", () => {
 });
 
 describe("settling an attempt", () => {
+  test("recent recovery reads the latest persisted outcome after reopening", async () => {
+    const path = newDatabasePath();
+    await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-recovered");
+        yield* store.recordRecovery({
+          attemptId: "attempt-recovered",
+          observed: "missing",
+          proposedStatus: "uncertain",
+          detail: "session not found",
+        });
+      }),
+    );
+    const uncertain = await withStore(path, (store) =>
+      store.recentRecoveries(),
+    );
+    expect(uncertain).toHaveLength(1);
+    expect(uncertain[0]?.status).toBe("uncertain");
+    await withStore(path, (store) =>
+      store.recordRecovery({
+        attemptId: "attempt-recovered",
+        observed: "succeeded",
+        proposedStatus: "succeeded",
+        detail: "harness confirmed completion",
+      }),
+    );
+    const refined = await withStore(path, (store) => store.recentRecoveries());
+    expect(refined).toHaveLength(1);
+    expect(refined[0]?.status).toBe("succeeded");
+    expect(refined[0]?.disposition).toBe("refined");
+  });
+
+  test("a later ordinary settlement does not display a stale running recovery", async () => {
+    const path = newDatabasePath();
+    await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-later-settled");
+        yield* store.recordRecovery({
+          attemptId: "attempt-later-settled",
+          observed: "running",
+          proposedStatus: "running",
+          detail: "harness still running",
+        });
+        yield* store.settleAttempt("attempt-later-settled", "succeeded");
+      }),
+    );
+    const notices = await withStore(path, (store) => store.recentRecoveries());
+    expect(notices).toEqual([]);
+  });
+
   test("settlement moves a running attempt once and reports that it did", async () => {
     const path = newDatabasePath();
     const outcome = await withStore(path, (store) =>
@@ -2702,6 +2752,43 @@ describe("one transaction per mutation", () => {
       unknownString(after.all[1]?.payload, "nothing_declared_this"),
     ).toBeUndefined();
     expect(unknownNumber(after.all[2]?.payload, "sequence")).toBe(1);
+  });
+
+  test("the event log's own counter is separate from the observations', and survives a reopen", async () => {
+    const path = newDatabasePath();
+    const written = await withSeeded(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.recordAsset(CALLER, assetInput("a-1"));
+        yield* store.recordObservation(
+          CALLER,
+          multiCaseInput({ operationId: "o-1" }),
+        );
+        return {
+          events: yield* store.currentEventSequence,
+          observations: yield* store.currentSequence,
+        };
+      }),
+    );
+    // Three events — the seed's `attempt.started`, the asset and the observation — against
+    // one observation. The two counters advance at different rates, which is the whole
+    // reason they are two counters and the reason a consumer that read the wrong one would
+    // be told the event log ends wherever the observations happen to.
+    expect(written.events).toBe(3);
+    expect(written.observations).toBe(1);
+
+    const reopened = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        return {
+          events: yield* store.currentEventSequence,
+          last: yield* store.eventsAfter(),
+        };
+      }),
+    );
+    // And it is the end of the log rather than an in-memory count: a consumer opening a
+    // cursor read after a restart has to know where the end is to say whether it is
+    // showing all of it.
+    expect(reopened.events).toBe(3);
+    expect(reopened.last[reopened.last.length - 1]?.sequence).toBe(3);
   });
 
   test("a superseded attempt cannot write, across a restart, and writes no event", async () => {

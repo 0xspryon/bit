@@ -144,18 +144,99 @@ export interface MessageEntry {
 }
 
 /**
- * One narrated moment of a session, reduced to what this application reads.
+ * The most characters {@link NarrationDetail} carries in one text field.
  *
- * **Deliberately four fields and no content.** A transcript needs the text of a reply, the
- * arguments of a tool call and a shape to render them in; choosing that shape is a later
- * slice's work, and a field invented here would be the format that slice inherits without
- * having decided it.
+ * A tool input can be a whole file and a tool result can be a directory listing, and both
+ * travel over a browser connection that is holding the screen for a live run. This is the
+ * cap at the point the harness's payload is *read*, so an oversized argument is cut once,
+ * here, rather than growing a queue, a PubSub buffer and an SSE frame on the way out.
+ *
+ * {@link truncateNarration} marks what it cut, in the value itself, because a silently
+ * shortened tool argument is a tool argument a reader would misread.
+ */
+export const NARRATION_FIELD_MAX = 4_000;
+
+/** The marker appended to a field {@link NARRATION_FIELD_MAX} cut short. */
+export const NARRATION_TRUNCATED_MARK = "\n… (shortened)";
+
+/** Caps one narration field, saying so in the value when it cuts. */
+export const truncateNarration = (value: string): string =>
+  value.length <= NARRATION_FIELD_MAX
+    ? value
+    : `${value.slice(0, NARRATION_FIELD_MAX)}${NARRATION_TRUNCATED_MARK}`;
+
+/**
+ * What one narrated moment *is*, in this application's vocabulary.
+ *
+ * This field used to be absent, and the reason it was absent is worth keeping: a
+ * transcript needs the text of a reply, the arguments of a tool call and a shape to render
+ * them in, and until something had to render them, any shape invented here would have been
+ * the format a later slice inherited without having decided it. The live transcript is
+ * that slice, so this is the decision — four cases, chosen because they are the four both
+ * harnesses can actually produce.
+ *
+ * `opaque` is the honest default and most entries are it: a token delta, a step boundary, a
+ * usage update. A reader that can render nothing useful from an entry gets `opaque` rather
+ * than an empty `reply`, so "the harness said something we do not display" never reads as
+ * "the agent replied with nothing".
+ *
+ * **`toolResult.output` is the tool's own output, not a verdict about it.** `failed` is set
+ * when the harness says the call failed; it says nothing about whether the action was
+ * *allowed*, which is the policy gate's answer and arrives on a different channel.
+ */
+export type NarrationDetail =
+  | {
+      readonly _tag: "reply";
+      /** One complete block of assistant text, never a token delta. */
+      readonly text: string;
+    }
+  | {
+      readonly _tag: "toolCall";
+      /** The harness's own id for this call, so a result can be matched to it. */
+      readonly callId: string;
+      /**
+       * The tool being called, when the harness has named it by now.
+       *
+       * `undefined` is reachable for the same reason it is on `toolResult`: OpenCode names
+       * a tool on `session.tool.input.started` and the call's arguments arrive on a later
+       * event, so a stream joined between the two has an id and no name. Borrowing a name
+       * from somewhere would be the one mistake worth refusing here.
+       */
+      readonly tool: string | undefined;
+      /** The arguments, serialised as JSON, capped by {@link NARRATION_FIELD_MAX}. */
+      readonly input: string;
+    }
+  | {
+      readonly _tag: "toolResult";
+      readonly callId: string;
+      /**
+       * The tool this result is for, when the harness still remembers.
+       *
+       * `undefined` is reachable: OpenCode names a tool on `session.tool.input.started`
+       * and not on the success or failure event, so a result that arrives for a call whose
+       * name was never seen — a reconnected stream, a dropped entry — has no name to carry
+       * and must not borrow one.
+       */
+      readonly tool: string | undefined;
+      /** The output, capped by {@link NARRATION_FIELD_MAX}. */
+      readonly output: string;
+      /** The harness said this call failed. Not a policy decision; see above. */
+      readonly failed: boolean;
+    }
+  | { readonly _tag: "opaque" };
+
+/**
+ * One narrated moment of a session, reduced to what this application reads.
  *
  * `type` is a plain `string` and carries the harness's own event name verbatim — OpenCode's
  * `session.text.delta`, Claude Code's `assistant`. Which names exist is the harness's
  * business and the set grows with its releases; a union here would make an upgrade a
  * compile error in a module that only forwards the value, and would make the two harnesses
  * have to agree on a vocabulary neither of them owns.
+ *
+ * `detail` is this application's reading of the same moment, and the two are kept side by
+ * side on purpose: a screen renders `detail`, and `type` is what an operator compares
+ * against the harness's own log when the rendering looks wrong.
  *
  * `outcome` is the exception, and it is the whole reason this is not an opaque blob: a
  * harness stating a terminal outcome is a *definite answer* and must be told apart from
@@ -170,6 +251,8 @@ export interface HarnessNarration {
   readonly at: number;
   /** Set only by an entry that states a terminal outcome. Never inferred. */
   readonly outcome: TerminalOutcome | undefined;
+  /** What this moment is, as this application reads it. See {@link NarrationDetail}. */
+  readonly detail: NarrationDetail;
 }
 
 /** Where our MCP endpoint is, and what authority reaches it. */

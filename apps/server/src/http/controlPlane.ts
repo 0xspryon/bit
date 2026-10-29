@@ -51,7 +51,7 @@
  * method handling, `415` on the wrong content type, `406` on the wrong accept header and
  * origin checks, none of which the hand-written policy handler did.
  */
-import { apiPath, type Health } from "@bit/contracts";
+import { LIVE_HEARTBEAT_SECONDS, apiPath, type Health } from "@bit/contracts";
 import { Context, Effect, Layer } from "effect";
 import { HttpRouter, HttpServerResponse } from "effect/http";
 
@@ -102,14 +102,57 @@ const healthRoutes = Layer.effectDiscard(
  * this file has always served, which is what keeps the merge from changing what was
  * already here.
  *
- * The layer must already have everything resolved except the router. Whatever it
- * registers carries its own admission posture; nothing here wraps it, and it cannot wrap
- * the three routes below.
+ * The layer must already have everything resolved except the router and
+ * {@link PolicyDecisions}. Whatever it registers carries its own admission posture;
+ * nothing here wraps it, and it cannot wrap the three routes below.
+ *
+ * **Why {@link PolicyDecisions} is in this requirement and the other three are not.** This
+ * endpoint passes four services across the router's own memo-map boundary with
+ * `Layer.succeed` — see the body of {@link ControlPlaneEndpoint.layer} and `main.ts` on why
+ * that boundary exists at all — and any of them *could* be left unprovided by a caller. Only
+ * this one is declared, because only this one a caller has no other way to get: the
+ * policy route and the browser API are the two halves of the gate's decisions, the route
+ * publishes and the API subscribes, and they must be the same instance or one of them is
+ * talking to a bus nobody is listening to. The other three are things a caller holds for
+ * its own reasons anyway, and a caller that provides its own gets the one it meant.
+ *
+ * Anything else a route set needs — the narration bus, for one — is the caller's to hand in
+ * the same way, with `Layer.succeedContext` over an instance read out of its own graph.
+ * This endpoint does not know about those services and must not grow a list of them.
  */
+/**
+ * How long this listener lets a connection sit with no traffic before closing it, in
+ * seconds.
+ *
+ * **This is not a tuning knob, it is an invariant, and leaving it unset was a bug a
+ * browser found.** `Bun.serve`'s `idleTimeout` defaults to **10 seconds** and closes any
+ * connection with no bytes in either direction for that long. A Server-Sent Events stream
+ * watching a quiet target is exactly that: the live transcript sends a `LiveCursor` every
+ * {@link LIVE_HEARTBEAT_SECONDS} and nothing in between, so the default closed the
+ * connection at ten seconds — before the twenty-second heartbeat that was supposed to keep
+ * it alive could fire. In a browser the transcript went dead after ten seconds on a target
+ * with nothing running, and because the proxy in front of it kept the downstream response
+ * open, nothing said so.
+ *
+ * It is **derived** from the heartbeat rather than written beside it, so the two cannot
+ * drift: three times the heartbeat leaves room for a heartbeat to be late without the
+ * listener giving up, and `LIVE_HEARTBEAT_SECONDS` is the contract's constant that the
+ * stream itself also derives from. The floor of 30 keeps the ordinary request paths —
+ * MCP, policy, the browser API — from inheriting a short timeout if the heartbeat is ever
+ * shortened, and `Bun.serve` caps `idleTimeout` at 255 seconds, which is the other clamp.
+ *
+ * The invariant that matters, asserted in `browserApi.test.ts`:
+ * `CONTROL_PLANE_IDLE_TIMEOUT > LIVE_HEARTBEAT_SECONDS`.
+ */
+export const CONTROL_PLANE_IDLE_TIMEOUT = Math.min(
+  255,
+  Math.max(30, LIVE_HEARTBEAT_SECONDS * 3),
+);
+
 export type ControlPlaneRoutes = Layer.Layer<
   never,
   never,
-  HttpRouter.HttpRouter
+  HttpRouter.HttpRouter | PolicyDecisions
 >;
 
 export interface ControlPlaneHandle {
@@ -144,6 +187,14 @@ export class ControlPlaneEndpoint extends Context.Service<
     readonly port?: number;
     /** Merged onto the same router. See {@link ControlPlaneRoutes}. */
     readonly extraRoutes?: ControlPlaneRoutes | undefined;
+    /**
+     * Seconds a connection may be idle, overriding {@link CONTROL_PLANE_IDLE_TIMEOUT}.
+     *
+     * For tests, and only for tests: the claim worth checking is that a heartbeat keeps a
+     * connection alive *past* the listener's idle timeout, and checking it against the real
+     * sixty seconds would be a sixty-second test. Nothing in the server passes this.
+     */
+    readonly idleTimeout?: number | undefined;
   }) =>
     Layer.effect(
       ControlPlaneEndpoint,
@@ -185,6 +236,9 @@ export class ControlPlaneEndpoint extends Context.Service<
             Bun.serve({
               hostname: "127.0.0.1",
               port: options.port ?? 0,
+              // See `CONTROL_PLANE_IDLE_TIMEOUT`. Unset, Bun's ten-second default closes
+              // every idle live-transcript connection before its heartbeat can fire.
+              idleTimeout: options.idleTimeout ?? CONTROL_PLANE_IDLE_TIMEOUT,
               fetch: (request) => web.handler(request),
             }),
           ),

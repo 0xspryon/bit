@@ -11,18 +11,23 @@
     "packages/*"
   ],
   "scripts": {
+    "prepare": "effect-tsgo patch --no-typescript --oxlint",
     "dev": "turbo run dev",
     "build": "turbo run build",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "test:persistence": "turbo run test:persistence",
     "lint": "eslint .",
+    "lint:oxlint": "oxlint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },
   "devDependencies": {
+    "@effect/tsgo": "0.59.0",
     "@eslint/js": "10.0.1",
     "eslint": "10.13.0",
+    "oxlint": "1.89.0",
+    "oxlint-tsgolint": "7.0.2005",
     "prettier": "3.9.10",
     "prettier-plugin-svelte": "4.1.1",
     "turbo": "2.11.9",

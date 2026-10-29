@@ -10,7 +10,16 @@
  * path. Only a named, coded boundary produces a denial.
  */
 import { apiPath } from "@bit/contracts";
-import { Context, Effect, Layer, Schema } from "effect";
+import {
+  Channel,
+  Clock,
+  Context,
+  Effect,
+  Layer,
+  PubSub,
+  Schema,
+  Stream,
+} from "effect";
 import { HttpRouter, HttpServerResponse } from "effect/http";
 
 /**
@@ -28,6 +37,26 @@ export const PolicyRequest = Schema.Struct({
 export type PolicyRequest = typeof PolicyRequest.Type;
 
 const decodeRequest = Schema.decodeUnknownResult(PolicyRequest);
+
+/**
+ * Narrows one recorded entry back to just its decision.
+ *
+ * `record` is handed `PolicyRequest & PolicyDecision` — one flat object, which is the shape
+ * the audit list has always held — and the feed carries the two apart so a reader renders
+ * the gate's reason without picking it out of a merged record. Splitting them means
+ * reconstructing the union, and this does it by **discriminating on `effect`** rather than
+ * by stripping the request's keys and casting the remainder.
+ *
+ * The difference matters and the earlier version got it wrong in a way its own comment
+ * denied: `const { sessionId, tool, input, ...rest } = entry` followed by `rest as
+ * PolicyDecision` compiles whatever {@link PolicyDecision} gains, so a new member would have
+ * been silently mis-shaped rather than caught. Returning a literal per arm is what actually
+ * makes a new field a compile error here.
+ */
+const decisionOf = (entry: PolicyRequest & PolicyDecision): PolicyDecision =>
+  entry.effect === "allow"
+    ? { effect: "allow", basis: entry.basis }
+    : { effect: "deny", reason: entry.reason };
 
 /**
  * Why a call was allowed.
@@ -228,11 +257,63 @@ const hostOf = (authority: string): string => {
 export const POLICY_DECIDE_PATH = apiPath("policy/decide");
 
 /**
+ * How many decisions are held for a subscriber that is behind.
+ *
+ * The same shape of bound, and for the same reason, as `run/narration.ts`'s
+ * `NARRATION_BUFFER`: enough that a browser repainting keeps up through a burst of tool
+ * calls, small enough to be bounded memory per subscriber. A power of two because
+ * `PubSub`'s atomic backing is a ring buffer.
+ */
+export const DECISION_BUFFER = 256;
+
+/**
+ * One answered decision, with the identity this service gives it.
+ *
+ * `id` is this process's answer order, and it exists for the reason `RunNarration.id`
+ * does: a live consumer has to be able to say "I have already shown this", and nothing in
+ * a decision's own fields can answer it — the same tool called twice with the same
+ * arguments in the same millisecond is two decisions that are equal in every field.
+ *
+ * **It is an in-process counter and it is not a cursor.** A restart begins at zero and a
+ * decision answered while nobody was listening is gone. {@link PolicyDecisions} is an
+ * in-memory record, not the durable audit trail — the audit *file* the hook writes beside
+ * the engagement is that (`policy/install.ts`) — and reading it back as a persisted log is
+ * a later day's work.
+ *
+ * `sessionId` is the harness session the hook was called about, which is what lets a
+ * reader attribute a decision to an attempt: the supervisor knows which session belongs to
+ * which attempt. It is **not** trusted as authority for anything; it is a join key.
+ */
+export interface AnsweredDecision {
+  /**
+   * This process's answer order, counting from 1. See above for what it is not.
+   *
+   * It counts decisions this service *recorded*, which is the same set {@link
+   * PolicyDecisions.all} holds — so `id` is the position in that list and the two cannot
+   * drift. A request the route refused as undecodable is never recorded and so never
+   * consumes a number: the ids on this feed are contiguous, and a gap in them would mean a
+   * dropped publish rather than a refused request.
+   */
+  readonly id: number;
+  /** When this process answered, in epoch milliseconds. */
+  readonly at: number;
+  readonly request: PolicyRequest;
+  readonly decision: PolicyDecision;
+}
+
+/**
  * The decisions this process has answered, in order.
  *
  * A service rather than a closure because the route handler and the demo that reads the
  * audit now live on opposite sides of the shared listener. It is an in-memory record for
  * the spike's own assertions, not the durable audit trail.
+ *
+ * **It now also publishes**, so a live transcript can show a refused action as it is
+ * refused rather than after the run. The publish is a `PubSub.sliding`, which never blocks
+ * and drops the oldest buffered entry for a subscriber that is behind — because this
+ * service is on the gate's own response path and a browser tab must not be able to slow
+ * down the answer a worker is waiting for. A dropped decision is an accepted loss on this
+ * channel and `all` still holds every one of them.
  */
 export class PolicyDecisions extends Context.Service<
   PolicyDecisions,
@@ -241,18 +322,85 @@ export class PolicyDecisions extends Context.Service<
       entry: PolicyRequest & PolicyDecision,
     ) => Effect.Effect<void>;
     readonly all: Effect.Effect<readonly (PolicyRequest & PolicyDecision)[]>;
+    /**
+     * Decisions answered from now on. No replay: see {@link AnsweredDecision} on why
+     * there is nothing to replay from.
+     */
+    readonly answered: Stream.Stream<AnsweredDecision>;
+    /**
+     * How many subscriptions are open.
+     *
+     * Diagnostics, exactly as `run/narration.ts`'s counterpart is, and here for the same
+     * reason: {@link answered} replays nothing, so the only way a test can state the claim
+     * this makes — that a decision reaches a live reader — is to wait until a reader is
+     * actually attached before answering one. Without it the test would be a sleep.
+     */
+    readonly subscriberCount: Effect.Effect<number>;
   }
 >()("bit/policy/PolicyDecisions") {
-  static readonly layer = Layer.sync(PolicyDecisions, () => {
-    const entries: (PolicyRequest & PolicyDecision)[] = [];
-    return PolicyDecisions.of({
-      record: (entry) =>
-        Effect.sync(() => {
-          entries.push(entry);
-        }),
-      all: Effect.sync(() => [...entries]),
-    });
-  });
+  static readonly layer = Layer.effect(
+    PolicyDecisions,
+    Effect.gen(function* () {
+      const entries: (PolicyRequest & PolicyDecision)[] = [];
+      const pubsub = yield* PubSub.sliding<AnsweredDecision>(DECISION_BUFFER);
+      let answeredCount = 0;
+      let subscribers = 0;
+      return PolicyDecisions.of({
+        record: (entry) =>
+          Effect.flatMap(Clock.currentTimeMillis, (at) => {
+            entries.push(entry);
+            answeredCount += 1;
+            return Effect.asVoid(
+              PubSub.publish(pubsub, {
+                id: answeredCount,
+                at,
+                request: {
+                  sessionId: entry.sessionId,
+                  tool: entry.tool,
+                  input: entry.input,
+                },
+                decision: decisionOf(entry),
+              }),
+            );
+          }),
+        all: Effect.sync(() => [...entries]),
+        /**
+         * Subscribes, counts, then streams — in that order.
+         *
+         * `PubSub.subscribe` is the real subscription, so it is taken first and the counter
+         * moves only once it has returned. That ordering is what makes
+         * {@link PolicyDecisions.subscriberCount} usable as a readiness signal, which it has
+         * to be: this bus replays nothing, so a test that answered a decision before a
+         * subscription existed would be testing its own luck. Incrementing beside
+         * `Stream.fromPubSub` and returning the stream reads as the same thing and is not —
+         * the subscription is taken when the stream is first pulled, so the count could
+         * lead it. `run/narration.ts` carries the same fix for the same reason.
+         *
+         * `Channel.fromSubscriptionArray` is the pair `Stream.fromPubSub` uses internally
+         * (`effect/src/Channel.ts`'s `fromPubSubArray`), so the stream behaves identically.
+         */
+        answered: Stream.fromChannel(
+          Channel.unwrap(
+            Effect.map(
+              Effect.acquireRelease(
+                Effect.tap(PubSub.subscribe(pubsub), () =>
+                  Effect.sync(() => {
+                    subscribers += 1;
+                  }),
+                ),
+                () =>
+                  Effect.sync(() => {
+                    subscribers -= 1;
+                  }),
+              ),
+              Channel.fromSubscriptionArray,
+            ),
+          ),
+        ),
+        subscriberCount: Effect.sync(() => subscribers),
+      });
+    }),
+  );
 }
 
 /**

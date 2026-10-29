@@ -49,7 +49,7 @@
  * (`effect/src/PubSub.ts`, `subscriberCount === 0`). So the no-subscriber case this slice
  * runs in costs one function call per entry.
  */
-import { Context, Effect, Layer, PubSub, Stream } from "effect";
+import { Channel, Context, Effect, Layer, PubSub, Stream } from "effect";
 
 import type { HarnessNarration } from "../harness/agentHarness";
 
@@ -64,7 +64,8 @@ import type { HarnessNarration } from "../harness/agentHarness";
 export const NARRATION_BUFFER = 256;
 
 /**
- * One entry of narration, with the three things that say whose it is.
+ * One entry of narration as the supervisor hands it over, with the three things that say
+ * whose it is.
  *
  * `targetId` and `attemptId` are the keys a subscriber filters on. Both come from the
  * attempt the supervisor is running — never from the harness's own payload — so a
@@ -74,11 +75,32 @@ export const NARRATION_BUFFER = 256;
  * `harnessSessionId` is carried because it is the join to the harness's own storage, and
  * a reader comparing our narration against `opencode`'s log needs it.
  */
-export interface RunNarration {
+export interface RunNarrationInput {
   readonly targetId: string;
   readonly attemptId: string;
   readonly harnessSessionId: string;
   readonly entry: HarnessNarration;
+}
+
+/**
+ * One published entry, with the identity this bus gives it.
+ *
+ * `id` exists because a consumer has to be able to say "I have already shown this", and
+ * nothing on {@link HarnessNarration} can answer that: `sequence` is the *harness's*
+ * cursor and Claude Code has none at all, `at` collides freely — several entries derived
+ * from one SDK message share a receipt time by construction — and two token deltas can be
+ * identical in every field. So the bus assigns one, in publish order, and
+ * {@link RunNarrations.publish} is the only thing that may.
+ *
+ * **It is an in-process counter and it means nothing outside this process.** It is not a
+ * cursor and cannot be resumed from: a restart begins at zero, and an entry published
+ * while nobody was listening is gone — see this module's header. What it is good for is
+ * exactly one thing, which is the thing a live transcript needs: within one connection,
+ * two frames carrying the same `id` are the same entry.
+ */
+export interface RunNarration extends RunNarrationInput {
+  /** This process's publish order. See above for what it is not. */
+  readonly id: number;
 }
 
 /** Which narration a subscriber wants. Absent means every target, or every attempt. */
@@ -109,7 +131,7 @@ export class RunNarrations extends Context.Service<
      * would turn a dropped line into a written one at a worse volume), and certainly must
      * not slow down to accommodate a reader.
      */
-    readonly publish: (item: RunNarration) => Effect.Effect<void>;
+    readonly publish: (item: RunNarrationInput) => Effect.Effect<void>;
     /**
      * A stream of the narration matching `filter`, from now on.
      *
@@ -122,11 +144,19 @@ export class RunNarrations extends Context.Service<
       filter: NarrationFilter,
     ) => Stream.Stream<RunNarration>;
     /**
-     * How many subscriptions are open.
+     * How many subscriptions are **established**.
      *
      * Diagnostics, and the only way a test can state the claim this slice actually makes:
      * that the supervisor publishes correctly with **no** subscribers, and that a
      * subscriber attached to one attempt is not handed another's entries.
+     *
+     * **Counted after the `PubSub` subscription exists, not before**, which is what makes
+     * it usable as a readiness signal — and it is used as one: this bus replays nothing, so
+     * a test that published before a subscription was established would be testing its own
+     * luck. An earlier version incremented a counter beside `Stream.fromPubSub` and
+     * returned the stream, which reads as the same thing and is not: the subscription is
+     * taken when the stream is first *pulled*, so the count could lead it. It happened to
+     * hold in practice and that is exactly the kind of thing that stops holding.
      */
     readonly subscriberCount: Effect.Effect<number>;
   }
@@ -135,26 +165,55 @@ export class RunNarrations extends Context.Service<
     RunNarrations,
     Effect.gen(function* () {
       const pubsub = yield* PubSub.sliding<RunNarration>(NARRATION_BUFFER);
+      // Assigned here, in publish order, and nowhere else. See `RunNarration.id`.
+      let published = 0;
       // Counted here rather than read off the PubSub, whose subscriber count is an
       // internal field of its backing ring buffer. A cast into someone else's internals
-      // to satisfy a diagnostic is a cast that breaks on a patch release.
+      // to satisfy a diagnostic is a cast that breaks on a patch release. See `subscribe`
+      // for *when* this moves, which is the part that makes it meaningful.
       let subscribers = 0;
       return RunNarrations.of({
-        publish: (item) => Effect.asVoid(PubSub.publish(pubsub, item)),
+        publish: (item) =>
+          Effect.suspend(() => {
+            published += 1;
+            return Effect.asVoid(
+              PubSub.publish(pubsub, { ...item, id: published }),
+            );
+          }),
+        /**
+         * Subscribes, counts, then streams — in that order, which is the point.
+         *
+         * `PubSub.subscribe` is the real subscription and it is scoped, so it is taken here
+         * and the counter moves *after* it returns. `Channel.fromSubscriptionArray` is then
+         * what `Stream.fromPubSub` would have used internally anyway
+         * (`effect/src/Channel.ts`'s `fromPubSubArray` is that exact pair), so nothing about
+         * the stream's behaviour changes — only when the count becomes true.
+         *
+         * The release decrements. It is attached with `acquireRelease` around the already
+         * scoped subscribe, so both land in the same scope and a stream that is interrupted
+         * mid-pull still gives the count back.
+         */
         subscribe: (filter) =>
-          Stream.unwrap(
-            Effect.acquireRelease(
-              Effect.sync(() => {
-                subscribers += 1;
-                return Stream.filter(Stream.fromPubSub(pubsub), (item) =>
-                  matches(filter, item),
-                );
-              }),
-              () =>
-                Effect.sync(() => {
-                  subscribers -= 1;
-                }),
+          Stream.filter(
+            Stream.fromChannel(
+              Channel.unwrap(
+                Effect.map(
+                  Effect.acquireRelease(
+                    Effect.tap(PubSub.subscribe(pubsub), () =>
+                      Effect.sync(() => {
+                        subscribers += 1;
+                      }),
+                    ),
+                    () =>
+                      Effect.sync(() => {
+                        subscribers -= 1;
+                      }),
+                  ),
+                  Channel.fromSubscriptionArray,
+                ),
+              ),
             ),
+            (item) => matches(filter, item),
           ),
         subscriberCount: Effect.sync(() => subscribers),
       });

@@ -1,5 +1,14 @@
 # Working in bit
 
+- The operator is experienced with single-tenant software but new to building agent
+  harnesses. In plans, reviews, and explanations, focus on the harness-specific
+  mechanics and tradeoffs: session and attempt identity, tool/MCP authority,
+  credential isolation, policy hooks, stream durability, interruption, recovery,
+  and uncertain outcomes. Keep ordinary single-tenant application plumbing brief
+  unless it is needed to explain a harness boundary.
+- The app is intended for tablet-sized screens and larger, not mobile phones.
+  Verify responsive UI from tablet widths upward; do not spend roadmap or
+  implementation effort fixing phone-width layout solely for mobile support.
 - Use Bun 1.4.3 and the committed `bun.lock`. Install with
   `bun install --frozen-lockfile`; do not add another package manager's lockfile.
 - Commands from this root: `bun run dev`, `bun run build`, `bun run typecheck`,
@@ -7,6 +16,21 @@
   `bun run format`. `test:persistence` is the real-SQLite subset; `test` includes it.
 - Keep TypeScript strict and ESM. Verify Effect v4 APIs against installed types;
   v3 examples are not reliable. Use Effect Schema, not a direct Zod dependency.
+- The Effect devtools are advisory and sit beside the gates, not inside them.
+  `bun run lint` stays ESLint: it owns the browser-safety import boundary and
+  unused-vars, and the Effect Oxlint preset carries neither. `bun run lint:oxlint`
+  is the Effect-rule pass, and it currently reports pre-existing findings, so do not
+  treat a non-zero exit as a regression without diffing against the baseline.
+  `bun run typecheck` stays stock `tsc` at the pinned TypeScript; the Effect
+  diagnostics come from `effect-tsgo tsc -p <project>`, which brings its own
+  TypeScript 7 and never changes what CI compiles with.
+- TypeScript stays pinned at 6.0.3. `typescript-eslint` requires `<6.1.0` and
+  `svelte-check` requires `^5 || ^6`, so a TypeScript 7 upgrade breaks `lint` and
+  `typecheck`. `@effect/tsgo` does not need it: its compiler is bundled. The root
+  `prepare` script is therefore `effect-tsgo patch --no-typescript --oxlint`, which
+  patches only the Oxlint binaries. Do not alias `@typescript/native` to a
+  TypeScript 7 release to satisfy the patcher — that package's `tsc` bin hijacks
+  `node_modules/.bin/tsc` and silently moves `typecheck` and `build` onto TS 7.
 - Contracts must remain browser-safe: no server, Bun, Node, or persistence imports.
   Web code consumes contracts, never server implementation.
 - Persistence is `effect/sql` with the `@effect/sql-sqlite-bun` driver. No ORM.

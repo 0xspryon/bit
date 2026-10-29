@@ -18,6 +18,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  LIVE_SILENCE_LIMIT_SECONDS,
   PathRefused,
   RunRefused,
   SessionRefused,
@@ -28,11 +29,16 @@ import {
 } from "@bit/contracts";
 
 import { App, fromSummary } from "../src/lib/app.svelte";
+import { FakeCountdown } from "./fakeCountdown";
 import {
   AT,
   FakeServer,
   attemptTranscript,
   harnessInstance,
+  liveActivity,
+  liveCursor,
+  liveItem,
+  liveOpened,
   ok,
   refused,
   runStarted,
@@ -55,10 +61,17 @@ import {
 const settle = (): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, 0));
 
-/** An app and the double it talks to, wired together and nothing else done to them. */
-const open = (): { app: App; fake: FakeServer } => {
+/**
+ * An app, the double it talks to, and the schedule it arms timers on.
+ *
+ * The third is new and only one thing uses it — the live transcript's silence watchdog —
+ * but it is handed to every instance so that a test which does not care about timers still
+ * cannot accidentally arm a real forty-second one.
+ */
+const open = (): { app: App; fake: FakeServer; clock: FakeCountdown } => {
   const fake = new FakeServer();
-  return { app: new App(fake), fake };
+  const clock = new FakeCountdown();
+  return { app: new App(fake, clock), fake, clock };
 };
 
 /**
@@ -845,5 +858,770 @@ describe("a session that goes while the app is up", () => {
     expect(app.reconnecting).toBe(true);
     expect(app.bannerDismissed).toBe(false);
     expect(app.targets.map((target) => target.id)).toEqual(["acme-corp"]);
+  });
+});
+
+/* ── The live transcript ─────────────────────────────────────────────────────── */
+
+/**
+ * Watching a run, as the state machine sees it.
+ *
+ * The double delivers nothing on its own — see {@link FakeServer.watchLive} — so every
+ * frame below is one a test chose to send. That is the only way to state the day's two
+ * claims as tests rather than as hopes: items appear in the order they arrive and are not
+ * re-sorted, and an item already shown is never shown again.
+ *
+ * Nothing here renders a component. `LiveTranscript.svelte` reads exactly the fields
+ * asserted below, and the division is the one this file's header records.
+ */
+describe("the live transcript", () => {
+  /** Signed in with one target, opened, with a live connection waiting to be driven. */
+  const watching = async (): Promise<{ app: App; fake: FakeServer }> => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    return { app, fake };
+  };
+
+  test("opening a target opens one connection, for that target", async () => {
+    const { app, fake } = await watching();
+    expect(fake.watches).toHaveLength(1);
+    expect(fake.watch.targetId).toBe("acme-corp");
+    expect(app.liveTargetId).toBe("acme-corp");
+    expect(app.liveWatching).toBe(true);
+    // An empty view reconstructs the committed record from the beginning.
+    expect(fake.watch.cursor).toBe(0);
+  });
+
+  test("the record arrives in the order it was sent, and is not re-sorted", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveOpened({ from: 0, latest: 3 }));
+    // Deliberately descending timestamps against ascending sequences. Sorting by `at` is
+    // the obvious wrong thing to do here — two items can share a millisecond and a run's
+    // timestamps come from three different clocks — so the store's order has to be the
+    // arrival order and nothing else.
+    fake.watch.send(
+      liveItem({
+        id: "record:e1",
+        sequence: 1,
+        at: AT + 300,
+        kind: "run.started",
+      }),
+    );
+    fake.watch.send(
+      liveItem({
+        id: "record:e2",
+        sequence: 2,
+        at: AT + 200,
+        kind: "tool.result",
+      }),
+    );
+    fake.watch.send(
+      liveItem({
+        id: "record:e3",
+        sequence: 3,
+        at: AT + 100,
+        kind: "observation.recorded",
+      }),
+    );
+    expect(app.liveItems.map((item) => item.sequence)).toEqual([1, 2, 3]);
+    expect(app.liveItems.map((item) => item.kind)).toEqual([
+      "run.started",
+      "tool.result",
+      "observation.recorded",
+    ]);
+  });
+
+  test("every render kind the day asks for survives to the screen's fields", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveOpened());
+    fake.watch.send(liveItem({ id: "r1", sequence: 1, kind: "run.started" }));
+    fake.watch.send(
+      liveActivity({
+        id: "a1",
+        kind: "tool.call",
+        tool: "bash",
+        input: '{"command":"curl -s http://127.0.0.1:41317/login"}',
+      }),
+    );
+    fake.watch.send(
+      liveActivity({
+        id: "a2",
+        kind: "tool.result",
+        tool: "bash",
+        input: null,
+        output: "HTTP/1.1 429 Too Many Requests",
+        outcome: "ok",
+      }),
+    );
+    fake.watch.send(
+      liveActivity({
+        id: "a3",
+        kind: "action.denied",
+        headline: "Denied",
+        body: "host 'out-of-scope.test' is not in scope",
+        tool: "bash",
+        outcome: "denied",
+      }),
+    );
+    fake.watch.send(
+      liveItem({
+        id: "r2",
+        sequence: 2,
+        kind: "observation.recorded",
+        outcome: "negative",
+      }),
+    );
+
+    const byKind = new Map(app.liveItems.map((item) => [item.kind, item]));
+    // A tool call shows its arguments; its result shows its output. Both are the harness's
+    // own and neither is invented here.
+    expect(byKind.get("tool.call")?.input).toContain("curl");
+    expect(byKind.get("tool.result")?.output).toContain("429");
+    // A denied action reads as denied, with the gate's reason.
+    expect(byKind.get("action.denied")?.outcome).toBe("denied");
+    expect(byKind.get("action.denied")?.body).toContain("out-of-scope.test");
+    // A recorded observation reads as recorded, and a negative result is still a result.
+    expect(byKind.get("observation.recorded")?.outcome).toBe("negative");
+    // And the two channels stay told apart: only the record carries a position.
+    expect(byKind.get("run.started")?.sequence).toBe(1);
+    expect(byKind.get("tool.call")?.sequence).toBeNull();
+  });
+
+  test("an item delivered twice is shown once", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    fake.watch.send(liveActivity({ id: "activity:9" }));
+    fake.watch.send(liveActivity({ id: "activity:9" }));
+    expect(app.liveItems.map((item) => item.id)).toEqual([
+      "record:e1",
+      "activity:9",
+    ]);
+  });
+
+  test("the cursor follows the record forward, and never back", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e4", sequence: 4 }));
+    expect(app.liveCursor).toBe(4);
+    // An activity item carries no position, so it cannot move the cursor.
+    fake.watch.send(liveActivity({ id: "activity:1" }));
+    expect(app.liveCursor).toBe(4);
+    // Nor can a frame about somewhere this tab has already been. A cursor that went
+    // backwards would mean "somewhere I have been" rather than "everything up to here".
+    fake.watch.send(liveCursor({ sequence: 2, caughtUp: true }));
+    expect(app.liveCursor).toBe(4);
+    fake.watch.send(liveCursor({ sequence: 6, caughtUp: true }));
+    expect(app.liveCursor).toBe(6);
+  });
+
+  test("the cursor frame is what says whether the history has finished arriving", async () => {
+    const { app, fake } = await watching();
+    expect(app.liveCaughtUp).toBe(false);
+    fake.watch.send(liveCursor({ sequence: 2, caughtUp: false }));
+    expect(app.liveCaughtUp).toBe(false);
+    fake.watch.send(liveCursor({ sequence: 3, caughtUp: true }));
+    expect(app.liveCaughtUp).toBe(true);
+  });
+
+  test("a bounded start is reported rather than swallowed", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveOpened({ from: 900, latest: 1000, skipped: 900 }));
+    // The transcript starts part way through this target's record, and a screen that
+    // looked complete and was not would be the wrong kind of quiet.
+    expect(app.liveSkipped).toBe(900);
+    expect(app.liveCursor).toBe(900);
+  });
+
+  test("a dropped connection reconnects without discarding committed items", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    fake.watch.close({ _tag: "failed", detail: "Failed to fetch" });
+    expect(app.liveWatching).toBe(false);
+    expect(app.liveReconnecting).toBe(true);
+    expect(app.liveDetail).toContain("cannot be replayed");
+    expect(app.liveItems).toHaveLength(1);
+  });
+
+  test("a clean end also resumes the durable stream", async () => {
+    const { app, fake } = await watching();
+    fake.watch.close({ _tag: "ended" });
+    expect(app.liveWatching).toBe(false);
+    expect(app.liveReconnecting).toBe(true);
+  });
+
+  test("reconnect resumes after the committed cursor and deduplicates overlap", async () => {
+    const { app, fake, clock } = open();
+    fake.onTargets = () => ok([targetSummary()]);
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    fake.watch.send(liveItem({ id: "record:one", sequence: 1 }));
+    fake.watch.close({ _tag: "failed", detail: "network" });
+    expect(app.liveReconnecting).toBe(true);
+    expect(clock.latest.ms).toBe(1_000);
+    clock.fire();
+    expect(fake.watches).toHaveLength(2);
+    expect(fake.watch.cursor).toBe(1);
+    fake.watch.send(liveOpened({ from: 1, latest: 2 }));
+    fake.watch.send(liveItem({ id: "record:one", sequence: 1 }));
+    fake.watch.send(liveItem({ id: "record:two", sequence: 2 }));
+    fake.watch.send(liveCursor({ sequence: 2, caughtUp: true }));
+    expect(app.liveItems.map((item) => item.id)).toEqual([
+      "record:one",
+      "record:two",
+    ]);
+    expect(app.liveCursor).toBe(2);
+    expect(app.liveReconnecting).toBe(false);
+    expect(app.liveCaughtUp).toBe(true);
+  });
+
+  test("a reloaded view reconstructs committed history rather than skipping to a saved cursor", async () => {
+    const first = await watching();
+    first.fake.watch.send(liveItem({ id: "record:one", sequence: 1 }));
+    first.app.stopLive();
+    const second = await watching();
+    expect(second.fake.watch.cursor).toBe(0);
+    second.fake.watch.send(liveItem({ id: "record:one", sequence: 1 }));
+    second.fake.watch.send(liveItem({ id: "record:two", sequence: 2 }));
+    second.fake.watch.send(liveCursor({ sequence: 2, caughtUp: true }));
+    expect(second.app.liveItems.map((item) => item.id)).toEqual([
+      "record:one",
+      "record:two",
+    ]);
+  });
+
+  test("target recovery notices retain uncertain as distinct from a definite outcome", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary()]);
+    fake.onTarget = () => ok(targetView(targetSummary(), {}));
+    await signIn(app);
+    fake.onTarget = () =>
+      ok({
+        ...targetView(targetSummary()),
+        recoveries: [
+          {
+            attemptId: "attempt-unknown",
+            status: "uncertain",
+            disposition: "uncertain",
+            observedStatus: "missing",
+            detail: "session unavailable",
+            reconciledAt: AT,
+          },
+          {
+            attemptId: "attempt-confirmed",
+            status: "succeeded",
+            disposition: "settled",
+            observedStatus: "succeeded",
+            detail: "harness confirmed",
+            reconciledAt: AT,
+          },
+        ],
+      });
+    app.openTarget("acme-corp");
+    await settle();
+    expect(app.liveRecoveries.map((recovery) => recovery.status)).toEqual([
+      "uncertain",
+      "succeeded",
+    ]);
+    expect(
+      fake.calls.filter((call) => call.method === "startRun"),
+    ).toHaveLength(0);
+  });
+
+  test("switching target cancels a pending reconnect", async () => {
+    const { app, fake, clock } = open();
+    fake.onTargets = () => ok([targetSummary()]);
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    fake.watch.close({ _tag: "failed", detail: "network" });
+    const pending = clock.latest;
+    app.openTarget("other-corp");
+    await settle();
+    expect(pending.cancelled).toBe(true);
+    pending.fire();
+    expect(fake.watches).toHaveLength(2);
+    expect(app.liveTargetId).toBe("other-corp");
+  });
+
+  /**
+   * An expired session on the live connection signs the tab out.
+   *
+   * The failure that says so is the contract's own typed `Unauthenticated`, and the client
+   * keeps it typed all the way here rather than stringifying it — see `LiveClosed`. This is
+   * the test for what happened when it did not: the tab reported "the connection dropped",
+   * went on showing a target list it could no longer refresh, and held a dead token while
+   * looking signed in.
+   */
+  test("an expired session on the live connection signs out as expired", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    fake.watch.close({ _tag: "unauthenticated" });
+
+    expect(app.screen).toBe("connect");
+    expect(app.connectError).toBe("expired");
+    expect(fake.token).toBeUndefined();
+    // Not left as a connection-trouble message: the operator is being asked to sign in
+    // again, which is a different thing from being told the socket went.
+    expect(app.liveDetail).toBe("");
+    expect(app.liveWatching).toBe(false);
+    expect(app.liveItems).toEqual([]);
+    expect(app.liveTargetId).toBe("");
+  });
+
+  /**
+   * A connection this tab stopped reports nothing, and navigating is not news.
+   *
+   * The client sets its own stopped flag before interrupting the fiber, so `onClosed` is
+   * never called for a connection the caller closed — which is what keeps "the operator
+   * opened another target" from putting up a connection-lost alert or, worse, a sign-out.
+   *
+   * It also bounds the guard-order fix above: an expired session can only be reported by the
+   * connection that is *current*, because a replaced one is already stopped. The
+   * unauthenticated case is still handled before the target check, because the ordering is
+   * free and the alternative — a tab that keeps a dead token because the news arrived a beat
+   * after a navigation — is the failure that is expensive to find.
+   */
+  test("a connection this tab stopped reports nothing at all", async () => {
+    const { app, fake } = await watching();
+    const leaving = fake.watch;
+    app.openTarget("other-corp");
+    await settle();
+    expect(leaving.stopped()).toBe(true);
+
+    leaving.close({ _tag: "unauthenticated" });
+    leaving.close({ _tag: "failed", detail: "Failed to fetch" });
+    expect(app.screen).toBe("target");
+    expect(app.connectError).toBe("none");
+    expect(app.liveDetail).toBe("");
+    // The new connection is the one that would report it, and it is still up.
+    expect(app.liveWatching).toBe(true);
+    expect(app.liveTargetId).toBe("other-corp");
+  });
+
+  test("the connection opened after a switch is the one that reports an expired session", async () => {
+    const { app, fake } = await watching();
+    app.openTarget("other-corp");
+    await settle();
+    fake.watch.close({ _tag: "unauthenticated" });
+    expect(app.screen).toBe("connect");
+    expect(app.connectError).toBe("expired");
+    expect(fake.watches.every((watch) => watch.stopped())).toBe(true);
+  });
+
+  /**
+   * Two tools running at once, with their results coming back the other way round.
+   *
+   * Both harnesses run tools concurrently, so this is the ordinary case rather than a
+   * contrived one, and it is the case where pairing by tool *name* silently attributes one
+   * command's output to the other command. `callId` is the only thing that can pair them —
+   * and for Claude Code it is the only thing available at all, because a `tool_result`
+   * block carries no tool name.
+   */
+  test("concurrent tool calls keep their own call ids when results arrive reversed", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(
+      liveActivity({
+        id: "activity:1",
+        kind: "tool.call",
+        tool: "bash",
+        callId: "c1",
+        input: '{"command":"curl -s http://a/"}',
+      }),
+    );
+    fake.watch.send(
+      liveActivity({
+        id: "activity:2",
+        kind: "tool.call",
+        tool: "bash",
+        callId: "c2",
+        input: '{"command":"curl -s http://b/"}',
+      }),
+    );
+    // The second call answers first.
+    fake.watch.send(
+      liveActivity({
+        id: "activity:3",
+        kind: "tool.result",
+        tool: "bash",
+        callId: "c2",
+        input: null,
+        output: "from b",
+        outcome: "ok",
+      }),
+    );
+    fake.watch.send(
+      liveActivity({
+        id: "activity:4",
+        kind: "tool.result",
+        tool: "bash",
+        callId: "c1",
+        input: null,
+        output: "from a",
+        outcome: "failed",
+      }),
+    );
+
+    // Arrival order is kept — nothing regroups or reorders the list — so the pairing has to
+    // be carried on the items themselves.
+    expect(app.liveItems.map((item) => [item.kind, item.callId])).toEqual([
+      ["tool.call", "c1"],
+      ["tool.call", "c2"],
+      ["tool.result", "c2"],
+      ["tool.result", "c1"],
+    ]);
+    // And pairing on the id gives the right answer where pairing on the tool name would
+    // give whichever call to `bash` came first.
+    const paired = (callId: string) =>
+      app.liveItems
+        .filter((item) => item.callId === callId)
+        .map((item) => item.output ?? item.input);
+    expect(paired("c1")).toEqual(['{"command":"curl -s http://a/"}', "from a"]);
+    expect(paired("c2")).toEqual(['{"command":"curl -s http://b/"}', "from b"]);
+  });
+
+  test("a result the harness never named a call for carries no pairing at all", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(
+      liveActivity({
+        id: "activity:9",
+        kind: "tool.result",
+        tool: null,
+        callId: null,
+        input: null,
+        output: "orphan",
+        outcome: "ok",
+      }),
+    );
+    // Null rather than the tool name: an unpairable result must read as unpairable, because
+    // the alternative is attributing it to a call it may have nothing to do with.
+    expect(app.liveItems[0]?.callId).toBeNull();
+  });
+
+  test("the record items this tab is shown do not carry a call id", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    expect(app.liveItems[0]?.callId).toBeNull();
+  });
+
+  test("switching target clears what the other one said, and opens one connection", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    expect(app.liveItems).toHaveLength(1);
+
+    app.openTarget("other-corp");
+    await settle();
+    // A stale item here is actively misleading: it looks like the target in front of you
+    // doing something it did not do.
+    expect(app.liveTargetId).toBe("other-corp");
+    expect(app.liveItems).toEqual([]);
+    expect(app.liveCursor).toBe(0);
+    expect(fake.watches).toHaveLength(2);
+    expect(fake.watches[0]?.stopped()).toBe(true);
+    expect(fake.watch.targetId).toBe("other-corp");
+  });
+
+  test("a frame from the connection this tab has left is dropped", async () => {
+    const { app, fake } = await watching();
+    const leaving = fake.watch;
+    app.openTarget("other-corp");
+    await settle();
+    // A connection being torn down can deliver one more frame after the operator moved on.
+    leaving.send(liveItem({ id: "record:stale", sequence: 99 }));
+    expect(app.liveItems).toEqual([]);
+    expect(app.liveCursor).toBe(0);
+  });
+
+  test("reopening the same target does not open a second connection", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    app.openTarget("acme-corp");
+    await settle();
+    // Two sockets delivering the same frames would be deduped by their ids, but a second
+    // socket is still a second socket.
+    expect(fake.watches).toHaveLength(1);
+    expect(app.liveItems).toHaveLength(1);
+  });
+
+  test("signing out closes the connection and clears what it showed", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    app.signOut();
+    // The connection carries a bearer that has just been dropped, so it goes with it.
+    expect(fake.watches[0]?.stopped()).toBe(true);
+    expect(app.liveWatching).toBe(false);
+    expect(app.liveItems).toEqual([]);
+    expect(app.liveTargetId).toBe("");
+    // Stopping is not news: nothing went wrong.
+    expect(app.liveDetail).toBe("");
+  });
+
+  test("a target the registry no longer holds stops the connection", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onTarget = () =>
+      refused(
+        new TargetNotFound({
+          reason: "unknown_target",
+          targetId: "gone",
+          detail: "no target 'gone' is registered on this server",
+        }),
+      );
+    await signIn(app);
+    app.openTarget("gone");
+    await settle();
+    expect(app.screen).toBe("welcome");
+    expect(fake.watches[0]?.stopped()).toBe(true);
+    expect(app.liveWatching).toBe(false);
+    expect(app.liveTargetId).toBe("");
+  });
+
+  /**
+   * Resetting to a scenario takes the live transcript with it, socket included.
+   *
+   * The picker replaces the rail with mock rows no server has heard of, so a stream left
+   * running would go on writing items attributed to a target that is no longer on screen —
+   * and would hold a connection open against a server the picker has just walked away from.
+   */
+  test("reset closes the connection and forgets what it showed", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    expect(app.liveItems).toHaveLength(1);
+
+    app.reset();
+    expect(fake.watches[0]?.stopped()).toBe(true);
+    expect(app.liveWatching).toBe(false);
+    expect(app.liveItems).toEqual([]);
+    expect(app.liveTargetId).toBe("");
+    expect(app.liveCursor).toBe(0);
+    expect(app.liveCaughtUp).toBe(false);
+    expect(app.liveSkipped).toBe(0);
+    expect(app.liveDetail).toBe("");
+    // And nothing is reopened: the rows `reset` installs are the prototype's.
+    expect(fake.watches).toHaveLength(1);
+  });
+
+  /**
+   * The memory of what has been shown is bounded, and the bound is out of reach in practice.
+   *
+   * Unbounded it grew one string per narrated moment for as long as a tab stayed open, which
+   * for an agent working overnight was the one structure here with no ceiling. What the
+   * bound costs is that an id evicted after `LIVE_IDS_KEPT` newer items could be shown
+   * twice — reachable only from a server that re-sent it, which within a connection it never
+   * does.
+   */
+  test("the id memory is bounded, and still dedupes everything on screen", async () => {
+    const { app, fake } = await watching();
+    for (let n = 1; n <= App.LIVE_IDS_KEPT + 10; n += 1) {
+      fake.watch.send(liveItem({ id: `record:e${n}`, sequence: n }));
+    }
+    // Re-delivering the newest is still a no-op, which is the case that actually happens.
+    const before = app.liveItems.length;
+    fake.watch.send(
+      liveItem({
+        id: `record:e${App.LIVE_IDS_KEPT + 10}`,
+        sequence: App.LIVE_IDS_KEPT + 10,
+      }),
+    );
+    expect(app.liveItems).toHaveLength(before);
+    // And every id still on screen is remembered: the eviction window is four times the
+    // number of items kept, so nothing visible can have been forgotten.
+    for (const item of app.liveItems) {
+      const length = app.liveItems.length;
+      fake.watch.send(item);
+      expect(app.liveItems).toHaveLength(length);
+    }
+  });
+
+  test("a very long run keeps the newest items and not the oldest", async () => {
+    const { app, fake } = await watching();
+    for (let n = 1; n <= App.LIVE_KEPT + 5; n += 1) {
+      fake.watch.send(liveItem({ id: `record:e${n}`, sequence: n }));
+    }
+    expect(app.liveItems).toHaveLength(App.LIVE_KEPT);
+    // Dropping the oldest is sound here in a way it would not be on the server: everything
+    // on the record channel is still in the target's event log, and the cursor still says
+    // where this tab had got to.
+    expect(app.liveItems[0]?.sequence).toBe(6);
+    expect(app.liveItems[App.LIVE_KEPT - 1]?.sequence).toBe(App.LIVE_KEPT + 5);
+    expect(app.liveCursor).toBe(App.LIVE_KEPT + 5);
+  });
+});
+
+/* ── Noticing a connection that stopped speaking ─────────────────────────────── */
+
+/**
+ * The silence watchdog, driven by hand.
+ *
+ * **What it is for.** Observed in a browser: through the dev server's `/api` proxy the
+ * downstream response stayed open after the upstream closed, so the stream never ended,
+ * nothing failed, and the transcript sat showing `Live` with a cursor that would never move
+ * again. Any buffering reverse proxy can do the same. The stream ending is therefore not a
+ * signal that can be relied on, and silence is the only evidence of a drop that does not
+ * depend on someone telling us.
+ *
+ * Every test here fires the timer on purpose rather than waiting for it — see
+ * `test/fakeCountdown.ts`. That is what makes "a frame re-armed it" a statement about which
+ * timers are outstanding instead of a statement about how fast this machine is.
+ */
+describe("the live transcript's silence watchdog", () => {
+  const watching = async (): Promise<{
+    app: App;
+    fake: FakeServer;
+    clock: FakeCountdown;
+  }> => {
+    const opened = open();
+    opened.fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    await signIn(opened.app);
+    opened.app.openTarget("acme-corp");
+    await settle();
+    return opened;
+  };
+
+  test("opening a connection arms it, at twice the server's heartbeat", async () => {
+    const { clock } = await watching();
+    expect(clock.live).toHaveLength(1);
+    // The limit comes from the contract, where the server's heartbeat is also defined, so
+    // the two cannot drift into a client that gives up on a healthy connection.
+    expect(clock.latest.ms).toBe(LIVE_SILENCE_LIMIT_SECONDS * 1_000);
+  });
+
+  test("every frame re-arms it, and only one is ever outstanding", async () => {
+    const { fake, clock } = await watching();
+    const first = clock.latest;
+
+    fake.watch.send(liveOpened({ from: 0, latest: 1 }));
+    expect(first.cancelled).toBe(true);
+    expect(clock.live).toHaveLength(1);
+
+    const second = clock.latest;
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    expect(second.cancelled).toBe(true);
+    expect(clock.live).toHaveLength(1);
+  });
+
+  /**
+   * A heartbeat alone keeps it alive, which is the whole reason this cannot false-positive.
+   *
+   * The server sends a `LiveCursor` every heartbeat whether or not anything is happening, so
+   * a quiet target and a long slow catch-up both keep producing frames. Keying liveness off
+   * *items* would have made a run that is thinking for a minute look dead.
+   */
+  test("cursor frames alone keep it alive, so a quiet target is not read as dropped", async () => {
+    const { app, fake, clock } = await watching();
+    for (let beat = 1; beat <= 5; beat += 1) {
+      const armed = clock.latest;
+      fake.watch.send(liveCursor({ sequence: 0, caughtUp: true }));
+      expect(armed.cancelled).toBe(true);
+    }
+    expect(app.liveWatching).toBe(true);
+    expect(app.liveDetail).toBe("");
+    expect(clock.live).toHaveLength(1);
+  });
+
+  test("a duplicate frame still counts as evidence of life", async () => {
+    const { app, fake, clock } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    const armed = clock.latest;
+    // Already shown, so it changes nothing on screen — but it arrived, so the socket works.
+    // A reconnect that re-read a range would otherwise look like silence.
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    expect(armed.cancelled).toBe(true);
+    expect(app.liveItems).toHaveLength(1);
+  });
+
+  test("when it fires, the tab stops claiming to be live and says why", async () => {
+    const { app, fake, clock } = await watching();
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    clock.fire();
+
+    expect(app.liveWatching).toBe(false);
+    // The connection is actually closed, not merely relabelled: a socket left open would
+    // keep a credential in use and go on buffering frames nobody reads.
+    expect(fake.watch.stopped()).toBe(true);
+    // Said as silence rather than as a diagnosis — we do not know it is dead, we know
+    // nothing has arrived for long enough that it cannot be called live.
+    expect(app.liveDetail).toContain("Reconnecting");
+    expect(app.liveDetail).toContain(String(LIVE_SILENCE_LIMIT_SECONDS));
+    // What arrived is kept, and so is the cursor: both are still true.
+    expect(app.liveItems).toHaveLength(1);
+    expect(app.liveCursor).toBe(1);
+  });
+
+  test("it waits before reconnecting after a silent connection", async () => {
+    const { app, fake, clock } = await watching();
+    const before = fake.watches.length;
+    clock.fire();
+    // Backoff avoids a hot loop against a stopped server.
+    expect(fake.watches).toHaveLength(before);
+    expect(app.liveReconnecting).toBe(true);
+    expect(clock.latest.ms).toBe(1_000);
+    clock.fire();
+    expect(fake.watches).toHaveLength(before + 1);
+    expect(fake.watch.cursor).toBe(app.liveCursor);
+  });
+
+  test("switching target cancels the old watchdog and arms one for the new connection", async () => {
+    const { app, fake, clock } = await watching();
+    const forOldTarget = clock.latest;
+
+    app.openTarget("other-corp");
+    await settle();
+    expect(forOldTarget.cancelled).toBe(true);
+    expect(clock.live).toHaveLength(1);
+
+    // And the cancelled one cannot come back to life and blank the new target's transcript.
+    fake.watches[1]?.send(liveItem({ id: "record:n1", sequence: 1 }));
+    forOldTarget.fire();
+    expect(app.liveWatching).toBe(true);
+    expect(app.liveTargetId).toBe("other-corp");
+    expect(app.liveDetail).toBe("");
+    expect(app.liveItems).toHaveLength(1);
+  });
+
+  test("signing out cancels it", async () => {
+    const { app, clock } = await watching();
+    const armed = clock.latest;
+    app.signOut();
+    expect(armed.cancelled).toBe(true);
+    expect(clock.live).toHaveLength(0);
+  });
+
+  test("resetting cancels it", async () => {
+    const { app, clock } = await watching();
+    const armed = clock.latest;
+    app.reset();
+    expect(armed.cancelled).toBe(true);
+    expect(clock.live).toHaveLength(0);
+  });
+
+  test("stopping the connection cancels it", async () => {
+    const { app, clock } = await watching();
+    const armed = clock.latest;
+    app.stopLive();
+    expect(armed.cancelled).toBe(true);
+    expect(clock.live).toHaveLength(0);
+  });
+
+  test("a connection that ends on its own cancels it, and keeps its own words", async () => {
+    const { app, fake, clock } = await watching();
+    const armed = clock.latest;
+    fake.watch.close({ _tag: "failed", detail: "Failed to fetch" });
+    expect(armed.cancelled).toBe(true);
+    // The close said what happened; a watchdog firing afterwards would overwrite that with
+    // a vaguer sentence about silence.
+    expect(app.liveDetail).toContain("Reconnecting");
+  });
+
+  test("an expired session cancels it rather than leaving it to fire after sign-out", async () => {
+    const { app, fake, clock } = await watching();
+    const armed = clock.latest;
+    fake.watch.close({ _tag: "unauthenticated" });
+    expect(armed.cancelled).toBe(true);
+    expect(app.screen).toBe("connect");
+    expect(app.connectError).toBe("expired");
   });
 });

@@ -2,9 +2,10 @@
   /**
    * What a settled attempt left behind, and how durable it is.
    *
-   * **The minimum that makes the read path real**, and no more. It is not a transcript
-   * *design*: the live stream, the tool-call rendering and the place a transcript belongs
-   * in the shell are all later work, and inventing them here would make them look decided.
+   * **The minimum that makes the read path real**, and no more. It is not the live view:
+   * the live stream and the tool-call rendering are `LiveTranscript.svelte`, which sits
+   * above this one and is about a run that is still happening. This is the read-back of
+   * what a *settled* attempt left behind, and its two sources are not equal-status data.
    * What this does is prove the thing Part 3 is about — that an attempt's transcript can be
    * read back after the harness session is gone, and that the two sources are not presented
    * as the same kind of thing.

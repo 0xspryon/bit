@@ -37,7 +37,12 @@ import type {
 import { Effect, Fiber, Redacted, Stream } from "effect";
 
 import { CLAUDE_CODE_MINIMUM, compareVersions } from "../policy/claudeCodeGate";
-import { AgentHarness, SESSION_NOT_FOUND_TAG } from "./agentHarness";
+import {
+  AgentHarness,
+  NARRATION_FIELD_MAX,
+  NARRATION_TRUNCATED_MARK,
+  SESSION_NOT_FOUND_TAG,
+} from "./agentHarness";
 import {
   claudeCodeHarness,
   newClaudeCodeSessionId,
@@ -544,6 +549,152 @@ describe("outcomes", () => {
     // No cursor to carry: the SDK's stream is not resumable from a position, which is why
     // the interface makes `sequence` optional.
     expect(entries.every((entry) => entry.sequence === undefined)).toBe(true);
+  });
+
+  /**
+   * One SDK message is several narrated moments, and the mapping is what a transcript reads.
+   *
+   * Verified against `@anthropic-ai/claude-agent-sdk@0.3.310`'s declared shapes: an
+   * `assistant` message carries a `BetaMessage` whose `content` is a list of blocks, so a
+   * turn that says something and then calls a tool is **one** message holding a `text`
+   * block and a `tool_use` block. A reduction to one entry would have had to choose which
+   * of the two to show.
+   */
+  test("one assistant message carrying text and a tool call narrates both", async () => {
+    const sessionId = "ignored";
+    const outcome = await run([
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Probing the limiter." },
+            {
+              type: "tool_use",
+              id: "toolu_1",
+              name: "Bash",
+              input: { command: "curl -s http://127.0.0.1:41317/login" },
+            },
+          ],
+        },
+        parent_tool_use_id: null,
+        session_id: sessionId,
+        uuid: "00000000-0000-4000-8000-00000000fff0",
+      } as unknown as SDKMessage,
+      result(sessionId, "success"),
+    ]);
+    const entries = [...outcome.narrated];
+    // Two entries from one message, and both carry that message's own `type`: the harness's
+    // vocabulary is unchanged by our reading of it.
+    expect(entries.map((entry) => entry.type)).toEqual([
+      "assistant",
+      "assistant",
+      "result",
+    ]);
+    expect(entries[0]?.detail).toEqual({
+      _tag: "reply",
+      text: "Probing the limiter.",
+    });
+    expect(entries[1]?.detail).toEqual({
+      _tag: "toolCall",
+      callId: "toolu_1",
+      tool: "Bash",
+      input: '{"command":"curl -s http://127.0.0.1:41317/login"}',
+    });
+  });
+
+  test("a tool result comes back on a user message, and is read as one", async () => {
+    const sessionId = "ignored";
+    const outcome = await run([
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_1",
+              content: [
+                { type: "text", text: "HTTP/1.1 429 Too Many Requests" },
+              ],
+              is_error: false,
+            },
+          ],
+        },
+        parent_tool_use_id: null,
+        session_id: sessionId,
+        uuid: "00000000-0000-4000-8000-00000000fff1",
+      } as unknown as SDKMessage,
+      result(sessionId, "success"),
+    ]);
+    const entries = [...outcome.narrated];
+    // A tool's output arrives as a *user* message, because that is how the Messages API
+    // carries it. It reads oddly and it is the SDK's shape rather than ours.
+    expect(entries[0]?.detail).toEqual({
+      _tag: "toolResult",
+      callId: "toolu_1",
+      // Named by its call id and not by its tool: a `tool_result` block says which call it
+      // answers, never which tool, and borrowing a name would be the one mistake worth
+      // refusing. The id pairs it with the `toolCall` entry that does carry the name.
+      tool: undefined,
+      output: "HTTP/1.1 429 Too Many Requests",
+      failed: false,
+    });
+  });
+
+  test("a message with nothing to render still narrates, as opaque", async () => {
+    const sessionId = "ignored";
+    const outcome = await run([
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "...", signature: "x" }],
+        },
+        parent_tool_use_id: null,
+        session_id: sessionId,
+        uuid: "00000000-0000-4000-8000-00000000fff2",
+      } as unknown as SDKMessage,
+      result(sessionId, "success"),
+    ]);
+    const entries = [...outcome.narrated];
+    // One entry per message either way, so nothing downstream has to cope with a message
+    // that narrated nothing — and `opaque` is not an empty reply: "the harness said
+    // something we do not display" must not read as "the agent replied with nothing".
+    expect(entries).toHaveLength(2);
+    expect(entries[0]?.detail).toEqual({ _tag: "opaque" });
+  });
+
+  test("an oversized tool argument is cut once, here, and says so", async () => {
+    const sessionId = "ignored";
+    const outcome = await run([
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_big",
+              name: "Write",
+              input: { content: "x".repeat(NARRATION_FIELD_MAX * 2) },
+            },
+          ],
+        },
+        parent_tool_use_id: null,
+        session_id: sessionId,
+        uuid: "00000000-0000-4000-8000-00000000fff3",
+      } as unknown as SDKMessage,
+      result(sessionId, "success"),
+    ]);
+    const detail = [...outcome.narrated][0]?.detail;
+    expect(detail?._tag).toBe("toolCall");
+    if (detail?._tag !== "toolCall") throw new Error("not a tool call");
+    // Cut at the point the payload is read, so an oversized argument does not go on to
+    // grow a queue, a PubSub buffer and an SSE frame — and it says it was cut, because a
+    // silently shortened argument is an argument a reader would misread.
+    expect(detail.input.length).toBeLessThan(NARRATION_FIELD_MAX + 64);
+    expect(detail.input.endsWith(NARRATION_TRUNCATED_MARK)).toBe(true);
   });
 
   test("an error result settles failed", async () => {

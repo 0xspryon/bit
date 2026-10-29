@@ -89,8 +89,10 @@ import { installOpenCodeGate } from "../policy/install";
 import {
   AgentHarness,
   TerminalOutcome,
+  truncateNarration,
   type HarnessNarration,
   type MessageEntry,
+  type NarrationDetail,
 } from "./agentHarness";
 import { HarnessDecodeError, HarnessTransportError } from "./errors";
 import {
@@ -259,25 +261,166 @@ const sessionOf = (event: unknown): string | undefined => {
 };
 
 /**
- * Reduces one log entry to {@link HarnessNarration}.
+ * One `{ type: "text", text }` / `{ type: "file", uri }` list, as one string.
+ *
+ * `session.tool.success` carries its output as that union
+ * (`@opencode/protocol@2.1.0`'s `event.d.ts`), and a file part has no text to show — so it
+ * is named by its uri rather than dropped, because "the tool answered with a file" and
+ * "the tool answered with nothing" are different results.
+ */
+const partsText = (value: unknown): string => {
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((part) => {
+      const record = (part ?? {}) as {
+        type?: unknown;
+        text?: unknown;
+        uri?: unknown;
+      };
+      if (record.type === "text" && typeof record.text === "string") {
+        return record.text;
+      }
+      if (record.type === "file" && typeof record.uri === "string") {
+        return `[file ${record.uri}]`;
+      }
+      return "";
+    })
+    .filter((text) => text !== "")
+    .join("\n");
+};
+
+/** `JSON.stringify` that answers with something for a value it cannot serialise. */
+const asJson = (value: unknown): string => {
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    // A cyclic or non-serialisable argument object. The call still happened and still has
+    // to appear, so it appears with its arguments unavailable rather than not at all.
+    return "";
+  }
+};
+
+/**
+ * What this application reads one OpenCode event as.
+ *
+ * ## The tool name arrives on a different event from the arguments
+ *
+ * Verified against `@opencode/protocol@2.1.0`'s generated event union: a call is five
+ * events, keyed by `data.id`, and only the first of them carries the tool's name.
+ *
+ * | event                        | `data` carries                        |
+ * | ---------------------------- | ------------------------------------- |
+ * | `session.tool.input.started` | `id`, **`name`**                      |
+ * | `session.tool.input.delta`   | `id`, `delta`                         |
+ * | `session.tool.input.ended`   | `id`, `text`                          |
+ * | `session.tool.called`        | `id`, **`input`**, `executed`         |
+ * | `session.tool.success`       | `id`, **`content`**, `metadata`       |
+ * | `session.tool.failed`        | `id`, **`error`**, `content`          |
+ *
+ * So `names` is a join table for the length of one session's stream: the name is remembered
+ * when it is seen and read when the arguments or the result arrive. It is **per stream**,
+ * created by the caller, which is what keeps one run's tool names out of another's — and
+ * entries are deleted when the call resolves, so the map is bounded by the calls in flight
+ * rather than by the length of the run.
+ *
+ * A name that was never seen stays `undefined` and is carried as such. Guessing one from
+ * the arguments, or reusing the last name seen, would put the wrong tool next to a real
+ * set of arguments, which is worse than an unnamed call.
+ *
+ * ## Text comes from `ended`, never from `delta`
+ *
+ * `session.text.delta` is one event per token-ish chunk and is read as `opaque`:
+ * `session.text.ended` carries the whole block once (`data.text`), so taking the reply from
+ * there means one entry per block instead of hundreds per reply, with no reassembly to get
+ * wrong. The deltas are still published — they are what the supervisor's outcome watch
+ * reads the stream for — they just carry nothing to render.
  *
  * Reads defensively off an already-decoded value, for the same reason {@link flatten}
  * does: the entry union is wide and version-specific, and re-asserting a shape the
  * generated client has already validated would only add a second place for it to be wrong.
+ *
+ * **Exported for the tests, and that is the honest reason.** Driving this through
+ * `sessionEvents` would mean stubbing an SSE transport to assert a mapping that has nothing
+ * to do with transport — and the five-event tool sequence above is the part most likely to
+ * be wrong on an `opencode` upgrade, so it is the part that wants a direct test.
  */
-const narrate = (entry: unknown): HarnessNarration => {
+export const openCodeNarration = (
+  entry: unknown,
+  names: Map<string, string>,
+): HarnessNarration => {
   const record = (entry ?? {}) as {
     type?: unknown;
     created?: unknown;
     durable?: { seq?: unknown } | undefined;
+    data?: Record<string, unknown> | undefined;
   };
   const type = typeof record.type === "string" ? record.type : "unknown";
   const sequence = record.durable?.seq;
+  const data = record.data ?? {};
+  const callId = typeof data["id"] === "string" ? data["id"] : undefined;
+
+  const detail = ((): NarrationDetail => {
+    switch (type) {
+      case "session.text.ended":
+        return typeof data["text"] === "string"
+          ? { _tag: "reply", text: truncateNarration(data["text"]) }
+          : { _tag: "opaque" };
+      case "session.tool.input.started": {
+        if (callId !== undefined && typeof data["name"] === "string") {
+          names.set(callId, data["name"]);
+        }
+        return { _tag: "opaque" };
+      }
+      case "session.tool.called":
+        return callId === undefined
+          ? { _tag: "opaque" }
+          : {
+              _tag: "toolCall",
+              callId,
+              tool: names.get(callId),
+              input: truncateNarration(asJson(data["input"])),
+            };
+      case "session.tool.success": {
+        if (callId === undefined) return { _tag: "opaque" };
+        const tool = names.get(callId);
+        names.delete(callId);
+        return {
+          _tag: "toolResult",
+          callId,
+          tool,
+          output: truncateNarration(partsText(data["content"])),
+          failed: false,
+        };
+      }
+      case "session.tool.failed": {
+        if (callId === undefined) return { _tag: "opaque" };
+        const tool = names.get(callId);
+        names.delete(callId);
+        const error = (data["error"] ?? {}) as { message?: unknown };
+        const content = partsText(data["content"]);
+        const message =
+          typeof error.message === "string" ? error.message : "the tool failed";
+        return {
+          _tag: "toolResult",
+          callId,
+          tool,
+          output: truncateNarration(
+            content === "" ? message : `${message}\n${content}`,
+          ),
+          failed: true,
+        };
+      }
+      default:
+        return { _tag: "opaque" };
+    }
+  })();
+
   return {
     type,
     sequence: typeof sequence === "number" ? sequence : undefined,
     at: typeof record.created === "number" ? record.created : 0,
     outcome: EXECUTION_OUTCOMES[type],
+    detail,
   };
 };
 
@@ -730,19 +873,28 @@ export const openCodeHarness = (
        */
       const sessionEvents: AgentHarness["Service"]["sessionEvents"] = (
         sessionId,
-      ) =>
-        api.event
+      ) => {
+        /**
+         * The tool-name join table for this stream, and nothing wider.
+         *
+         * Created per call, so N concurrent runs have N maps and one run's tool names can
+         * never be read for another's call id. {@link openCodeNarration} deletes an entry when the
+         * call succeeds or fails, which bounds this by the calls in flight.
+         */
+        const names = new Map<string, string>();
+        return api.event
           .subscribe()
           .pipe(
             Stream.mapError(fail("event.subscribe")),
             Stream.filterMap(
               Filter.make((event: unknown) =>
                 sessionOf(event) === sessionId
-                  ? Result.succeed(narrate(event))
+                  ? Result.succeed(openCodeNarration(event, names))
                   : Result.fail(event),
               ),
             ),
           );
+      };
 
       return AgentHarness.of({
         instance,

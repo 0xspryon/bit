@@ -53,6 +53,7 @@ import {
 import {
   AgentHarness,
   type HarnessNarration,
+  type NarrationDetail,
   type TerminalOutcome,
 } from "../harness/agentHarness";
 import { newClaudeCodeSessionId } from "../harness/claudeCodeClient";
@@ -154,11 +155,22 @@ const narration = (
   type: string,
   sequence: number,
   outcome?: TerminalOutcome,
+  /**
+   * What the entry is, as this application reads it.
+   *
+   * `opaque` by default, because nothing in this suite is about rendering: the supervisor
+   * forwards whatever the harness says to the narration bus without reading `detail`, and
+   * a test that had to name a detail per entry would be stating a dependency the
+   * supervisor does not have. The suite that *is* about rendering is
+   * `run/liveTranscript.test.ts`.
+   */
+  detail: NarrationDetail = { _tag: "opaque" },
 ): HarnessNarration => ({
   type,
   sequence,
   at: 1_700_000_000_000 + sequence,
   outcome,
+  detail,
 });
 
 /**

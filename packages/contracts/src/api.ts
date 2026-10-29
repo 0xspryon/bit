@@ -34,10 +34,12 @@ import {
   HttpApiEndpoint,
   HttpApiGroup,
   HttpApiMiddleware,
+  HttpApiSchema,
   HttpApiSecurity,
 } from "effect/http-api";
 
 import { API_PREFIX, apiPath } from "./http";
+import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
@@ -288,6 +290,21 @@ export type TargetCounts = typeof TargetCounts.Type;
 export const TargetView = Schema.Struct({
   target: TargetSummary,
   counts: TargetCounts,
+  /**
+   * Up to 20 latest persisted reconciliation outcomes whose status is still current.
+   * A normal settlement after a `still_running` sweep removes that stale notice. This
+   * is not the full recovery audit history, which remains in the target database.
+   */
+  recoveries: Schema.Array(
+    Schema.Struct({
+      attemptId: Schema.String,
+      status: Schema.String,
+      disposition: Schema.String,
+      observedStatus: Schema.String,
+      detail: Schema.String,
+      reconciledAt: EpochMillis,
+    }),
+  ),
 });
 export type TargetView = typeof TargetView.Type;
 
@@ -979,6 +996,40 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         error: [AttemptNotFound, TargetNotFound, TargetUnavailable],
       },
     ),
+    /**
+     * One target's live transcript, as Server-Sent Events.
+     *
+     * **This is not the `transcript` endpoint above with a stream bolted on, and the two
+     * are not interchangeable.** That one answers with the artefact a *settled* attempt
+     * left behind — our content-hashed file, or the harness's own copy while it lasts —
+     * and it answers once, after the fact. This one is the target's event log being read
+     * in store-assigned order behind a cursor, with what the harness and the policy gate
+     * are saying right now merged alongside it. One is a document; this is a position in a
+     * log plus a live feed. `@bit/contracts`'s `live.ts` is where the two channels and
+     * what each promises are written down.
+     *
+     * **Per target, not per attempt.** The cursor belongs to a target's event log — §8:
+     * "cursors belong to a particular target event log, not a global sequence across
+     * independent target files" — and an attempt's own events are a subset of that log, so
+     * a per-attempt stream would be a filter over this one with a cursor that could not be
+     * resumed. A client that wants one attempt filters on {@link LiveItem.attemptId}.
+     *
+     * `cursor` is optional and its absence is **not** "from now": absent means the server
+     * picks a start far enough back to fill a screen and says in the opening frame how
+     * much it skipped. A client that has a cursor passes it and is answered from exactly
+     * there. A negative or fractional value is clamped rather than refused — it can only
+     * ask for *more* history than exists, which reads from the beginning.
+     *
+     * The refusals are the same three the rest of this target's routes give, from the same
+     * check, because watching a target is reading it: a stream that opened against a
+     * target the rail says is unavailable would be the one place those two disagree.
+     */
+    HttpApiEndpoint.get("live", "/targets/:targetId/live", {
+      params: { targetId: Schema.String },
+      query: { cursor: Schema.optional(Schema.FiniteFromString) },
+      success: HttpApiSchema.StreamSse({ data: LiveFrame }),
+      error: [TargetNotFound, TargetUnavailable],
+    }),
   )
   .middleware(SessionGuard) {}
 

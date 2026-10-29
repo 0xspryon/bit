@@ -19,8 +19,12 @@ import { describe, expect, test } from "bun:test";
 import { Effect, Fiber, Layer, Redacted } from "effect";
 import { FetchHttpClient } from "effect/http";
 
-import { AgentHarness } from "./agentHarness";
-import { openCodeHarness } from "./openCodeClient";
+import {
+  AgentHarness,
+  NARRATION_FIELD_MAX,
+  NARRATION_TRUNCATED_MARK,
+} from "./agentHarness";
+import { openCodeHarness, openCodeNarration } from "./openCodeClient";
 import { OpenCodeServer } from "./openCodeServer";
 
 const FAKE_SERVER = {
@@ -416,5 +420,282 @@ describe("requests", () => {
       ),
     );
     expect(recorded.urls[0]).toContain("ses%2F..%2Fadmin");
+  });
+});
+
+/* ── Reading an event ────────────────────────────────────────────────────────── */
+
+/**
+ * The mapping from `opencode`'s events to what a transcript renders.
+ *
+ * Checked directly rather than through `sessionEvents`, because nothing here is about
+ * transport: the shapes below are copied from `@opencode/protocol@2.1.0`'s generated event
+ * union, and the thing most likely to break on an upgrade is the fact that a tool call is
+ * **five events keyed by `data.id`, only the first of which carries the tool's name**.
+ *
+ * | event                        | `data` carries                |
+ * | ---------------------------- | ----------------------------- |
+ * | `session.tool.input.started` | `id`, `name`                  |
+ * | `session.tool.input.delta`   | `id`, `delta`                 |
+ * | `session.tool.input.ended`   | `id`, `text`                  |
+ * | `session.tool.called`        | `id`, `input`, `executed`     |
+ * | `session.tool.success`       | `id`, `content`, `metadata`   |
+ * | `session.tool.failed`        | `id`, `error`, `content`      |
+ */
+describe("reading an opencode event", () => {
+  const event = (
+    type: string,
+    data: Record<string, unknown>,
+    created = 10,
+  ) => ({
+    type,
+    created,
+    durable: { aggregateID: "ses_1", seq: 4, version: 1 },
+    data: { sessionID: "ses_1", assistantMessageID: "msg_1", ...data },
+  });
+
+  test("a tool call's name is joined to its arguments across two events", async () => {
+    const names = new Map<string, string>();
+    const started = openCodeNarration(
+      event("session.tool.input.started", { id: "t1", name: "bash" }),
+      names,
+    );
+    // The naming event itself has nothing to render — it is the join, not the moment.
+    expect(started.detail).toEqual({ _tag: "opaque" });
+
+    const called = openCodeNarration(
+      event("session.tool.called", {
+        id: "t1",
+        input: { command: "curl -s http://127.0.0.1:41317/login" },
+        executed: true,
+      }),
+      names,
+    );
+    expect(called.detail).toEqual({
+      _tag: "toolCall",
+      callId: "t1",
+      tool: "bash",
+      input: '{"command":"curl -s http://127.0.0.1:41317/login"}',
+    });
+    // The harness's own event name, unmapped, and its own cursor and clock.
+    expect(called.type).toBe("session.tool.called");
+    expect(called.sequence).toBe(4);
+    expect(called.at).toBe(10);
+  });
+
+  test("a successful result carries the tool's name and its output, then releases the join", async () => {
+    const names = new Map<string, string>();
+    openCodeNarration(
+      event("session.tool.input.started", { id: "t1", name: "read" }),
+      names,
+    );
+    const success = openCodeNarration(
+      event("session.tool.success", {
+        id: "t1",
+        content: [
+          { type: "text", text: "line one" },
+          { type: "file", uri: "file:///tmp/a.txt", mime: "text/plain" },
+        ],
+        executed: true,
+      }),
+      names,
+    );
+    // A file part is named rather than dropped: "the tool answered with a file" and "the
+    // tool answered with nothing" are different results.
+    expect(success.detail).toEqual({
+      _tag: "toolResult",
+      callId: "t1",
+      tool: "read",
+      output: "line one\n[file file:///tmp/a.txt]",
+      failed: false,
+    });
+    // Released when the call resolves, so the map is bounded by the calls in flight rather
+    // than by the length of the run.
+    expect(names.size).toBe(0);
+  });
+
+  /**
+   * Two calls in flight at once, answered in the other order.
+   *
+   * The join table is keyed by `data.id` precisely so this works, and this is the case that
+   * would be silently wrong without it: both calls are to the same tool, so a mapping that
+   * remembered "the last name seen" would attribute both results to whichever call named
+   * itself most recently, and a mapping keyed on the tool name could not tell them apart at
+   * all. `opencode` interleaves tool events freely, so this is the ordinary case.
+   */
+  test("two concurrent calls keep their own names and ids when answered out of order", async () => {
+    const names = new Map<string, string>();
+    openCodeNarration(
+      event("session.tool.input.started", { id: "t1", name: "bash" }),
+      names,
+    );
+    openCodeNarration(
+      event("session.tool.input.started", { id: "t2", name: "read" }),
+      names,
+    );
+    const first = openCodeNarration(
+      event("session.tool.called", {
+        id: "t1",
+        input: { command: "curl -s http://a/" },
+        executed: true,
+      }),
+      names,
+    );
+    const second = openCodeNarration(
+      event("session.tool.called", {
+        id: "t2",
+        input: { filePath: "/tmp/b.txt" },
+        executed: true,
+      }),
+      names,
+    );
+    // `t2` answers first.
+    const secondResult = openCodeNarration(
+      event("session.tool.success", {
+        id: "t2",
+        content: [{ type: "text", text: "b's contents" }],
+        executed: true,
+      }),
+      names,
+    );
+    const firstResult = openCodeNarration(
+      event("session.tool.success", {
+        id: "t1",
+        content: [{ type: "text", text: "HTTP/1.1 429" }],
+        executed: true,
+      }),
+      names,
+    );
+
+    expect(first.detail).toEqual({
+      _tag: "toolCall",
+      callId: "t1",
+      tool: "bash",
+      input: '{"command":"curl -s http://a/"}',
+    });
+    expect(second.detail).toEqual({
+      _tag: "toolCall",
+      callId: "t2",
+      tool: "read",
+      input: '{"filePath":"/tmp/b.txt"}',
+    });
+    // Each result carries its own call's id and its own call's tool, in the order they came
+    // back rather than the order they were asked for.
+    expect(secondResult.detail).toEqual({
+      _tag: "toolResult",
+      callId: "t2",
+      tool: "read",
+      output: "b's contents",
+      failed: false,
+    });
+    expect(firstResult.detail).toEqual({
+      _tag: "toolResult",
+      callId: "t1",
+      tool: "bash",
+      output: "HTTP/1.1 429",
+      failed: false,
+    });
+    // Both joins released, so the map is bounded by what is in flight.
+    expect(names.size).toBe(0);
+  });
+
+  test("a failed result carries the harness's own error text", async () => {
+    const names = new Map<string, string>([["t1", "bash"]]);
+    const failed = openCodeNarration(
+      event("session.tool.failed", {
+        id: "t1",
+        error: { type: "ToolError", message: "command not found: curl" },
+        executed: false,
+      }),
+      names,
+    );
+    expect(failed.detail).toEqual({
+      _tag: "toolResult",
+      callId: "t1",
+      tool: "bash",
+      output: "command not found: curl",
+      // The harness's word about its own call. It says nothing about whether the action
+      // was *allowed*, which is the gate's answer and arrives on its own item.
+      failed: true,
+    });
+  });
+
+  test("a result for a call whose name was never seen says so rather than borrowing one", async () => {
+    // Reachable: a stream joined between `input.started` and the result has an id and no
+    // name. Reusing the last name seen would put the wrong tool beside a real result.
+    const orphan = openCodeNarration(
+      event("session.tool.success", {
+        id: "t9",
+        content: [{ type: "text", text: "done" }],
+        executed: true,
+      }),
+      new Map([["t1", "bash"]]),
+    );
+    expect(orphan.detail).toEqual({
+      _tag: "toolResult",
+      callId: "t9",
+      tool: undefined,
+      output: "done",
+      failed: false,
+    });
+  });
+
+  test("text comes from `ended` and never from a delta", async () => {
+    const names = new Map<string, string>();
+    // One event per token-ish chunk. Published — the supervisor's outcome watch reads this
+    // stream — but carrying nothing to render, so one frame per reply block reaches a
+    // browser instead of hundreds per turn.
+    expect(
+      openCodeNarration(
+        event("session.text.delta", { ordinal: 1, delta: "Prob" }),
+        names,
+      ).detail,
+    ).toEqual({ _tag: "opaque" });
+    expect(
+      openCodeNarration(
+        event("session.text.ended", {
+          ordinal: 1,
+          text: "Probing the limiter.",
+        }),
+        names,
+      ).detail,
+    ).toEqual({ _tag: "reply", text: "Probing the limiter." });
+  });
+
+  test("an execution outcome is still stated, and nothing else infers one", async () => {
+    const names = new Map<string, string>();
+    expect(
+      openCodeNarration(event("session.execution.succeeded", {}), names)
+        .outcome,
+    ).toBe("succeeded");
+    expect(
+      openCodeNarration(event("session.step.finished", {}), names).outcome,
+    ).toBeUndefined();
+  });
+
+  test("an oversized tool argument is cut once, here, and says so", async () => {
+    const names = new Map<string, string>([["t1", "write"]]);
+    const detail = openCodeNarration(
+      event("session.tool.called", {
+        id: "t1",
+        input: { content: "x".repeat(NARRATION_FIELD_MAX * 2) },
+        executed: true,
+      }),
+      names,
+    ).detail;
+    expect(detail._tag).toBe("toolCall");
+    if (detail._tag !== "toolCall") throw new Error("not a tool call");
+    expect(detail.input.length).toBeLessThan(NARRATION_FIELD_MAX + 64);
+    expect(detail.input.endsWith(NARRATION_TRUNCATED_MARK)).toBe(true);
+  });
+
+  test("an event with nothing we read is opaque, not an empty reply", async () => {
+    // "The harness said something we do not display" must not read as "the agent replied
+    // with nothing".
+    expect(
+      openCodeNarration({ type: "server.connected", created: 1 }, new Map())
+        .detail,
+    ).toEqual({ _tag: "opaque" });
+    expect(openCodeNarration(undefined, new Map()).type).toBe("unknown");
   });
 });

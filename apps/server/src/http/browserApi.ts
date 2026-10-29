@@ -46,7 +46,14 @@ import {
   type TargetCounts,
   type TargetSummary,
 } from "@bit/contracts";
-import { Context, Effect, Layer, Redacted } from "effect";
+import {
+  Context,
+  Effect,
+  Layer,
+  Redacted,
+  Stream,
+  type Duration,
+} from "effect";
 import { HttpServer } from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
 
@@ -67,8 +74,11 @@ import {
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
+import { liveTranscript } from "../run/liveTranscript";
+import { RunNarrations } from "../run/narration";
 import { RunSupervisor } from "../run/supervisor";
 import { readTranscript } from "../run/transcript";
+import { PolicyDecisions } from "../policy/service";
 
 /** What the browser API needs to know about this installation. */
 export interface BrowserApiConfig {
@@ -79,6 +89,21 @@ export interface BrowserApiConfig {
    * filesystem but never widen it.
    */
   readonly workspaceRoot: string;
+  /**
+   * How long a live connection may go without sending a frame. Defaults to
+   * `LIVE_HEARTBEAT`.
+   *
+   * **For tests, and the reason is worth stating so nobody mistakes it for a knob.** The
+   * claim that needs checking is that an *idle* connection stays open past the listener's
+   * own idle timeout because the heartbeat keeps it warm — the thing that was broken, and
+   * broken in a way only a real socket shows. Against the real twenty-second heartbeat and
+   * the real sixty-second timeout that is a minute-long test, so both are shortened
+   * together and the mechanism is exercised at the same ratio. Nothing in the server passes
+   * this.
+   */
+  readonly liveHeartbeat?: Duration.Input | undefined;
+  /** How long a caught-up reader waits before reading again. Defaults to `LIVE_SWEEP`. */
+  readonly liveSweep?: Duration.Input | undefined;
 }
 
 /**
@@ -357,6 +382,14 @@ const fleetHandlers = HttpApiBuilder.group(
     // And the resolver holds the built harnesses — for OpenCode, a child process. One per
     // process, resolved here, for exactly the reason the two above are.
     const harnesses = yield* HarnessResolver;
+    // The two in-process buses the live transcript's activity channel reads. Same place,
+    // same reason — and for these two it is load-bearing beyond tidiness: each is a single
+    // `PubSub` that the supervisor and the policy route publish into, so a second instance
+    // would be a bus with a publisher and no subscriber on one side and a subscriber and no
+    // publisher on the other. `main.ts` records how instances are handed across the
+    // router's own memo map, and this is the second pair that depends on it.
+    const narrations = yield* RunNarrations;
+    const decisions = yield* PolicyDecisions;
 
     const summaries = Effect.fnUntraced(function* () {
       const rows = yield* fleet.targets();
@@ -464,6 +497,10 @@ const fleetHandlers = HttpApiBuilder.group(
           Effect.catchTag("StoredRowError", Effect.die),
         );
 
+        const recoveries = yield* withTargetStore(stores, targetId, (store) =>
+          store.recentRecoveries(),
+        ).pipe(Effect.orDie);
+
         return {
           target,
           // Field by field rather than by spreading the store's own shape. The contract
@@ -479,6 +516,14 @@ const fleetHandlers = HttpApiBuilder.group(
             assets: counts.assets,
             events: counts.events,
           } satisfies TargetCounts,
+          recoveries: recoveries.map((recovery) => ({
+            attemptId: recovery.attempt_id,
+            status: recovery.status,
+            disposition: recovery.disposition,
+            observedStatus: recovery.observed_status,
+            detail: recovery.detail,
+            reconciledAt: recovery.last_reconciled_at,
+          })),
         };
       }),
 
@@ -753,6 +798,83 @@ const fleetHandlers = HttpApiBuilder.group(
             ? {}
             : { writtenAt: read.writtenAt }),
         } satisfies AttemptTranscript;
+      }),
+
+      /**
+       * One target's live transcript, as Server-Sent Events.
+       *
+       * The handler is three steps and the order is the same one every other route on this
+       * target uses, for the same reason:
+       *
+       * 1. {@link openableTarget} — the id, the registry, then availability, with the
+       *    rail's own words. Watching a target is reading it, so it is refused for exactly
+       *    the reasons opening it is refused.
+       * 2. The store is borrowed **for the length of the connection**, not of the request.
+       *    `Stream.unwrap` is what does that: it takes the scope the borrow needs and ties
+       *    it to the stream's own lifetime, so the handle is returned when the browser
+       *    disconnects and not a moment before. A per-request `Effect.scoped` here would
+       *    have released the reference while the stream was still reading through it.
+       * 3. `run/liveTranscript.ts` does the rest. It is handed one read method rather than
+       *    the store, which is why its ordering claim can be tested without a listener.
+       *
+       * **The second open is `orDie` and that is a narrowing, not a shrug.** Step 1 has
+       * already asked the registry and the filesystem; what is left is the registry
+       * changing between step 1 and step 2, which `GET /targets/:id` reports as
+       * `schema_unavailable` because it can still answer with a body. This endpoint cannot:
+       * by the time a frame could say so the response is a 200 with an open stream, and a
+       * transcript that reported a resolver race as though it were the run's own news would
+       * be worse than a connection that fails.
+       *
+       * **Attribution for the policy gate's decisions is done here**, because this is where
+       * the target is known. The gate's request carries a harness session id and nothing
+       * else — the hook is a plugin inside the harness process — so a decision is matched
+       * against the runs this supervisor is holding *for this target*, and one whose
+       * session does not appear there is dropped rather than attributed to a guess. That
+       * also means a decision answered after its attempt settled does not appear; the
+       * audit file beside the engagement still has it.
+       */
+      live: Effect.fn(function* ({ params, query }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return Stream.unwrap(
+          Effect.map(
+            // See the handler's note: the typed refusals are step 1's, and a failure here
+            // is the resolver racing itself.
+            Effect.orDie(stores.open(row.targetId)),
+            (store) =>
+              liveTranscript({
+                targetId: row.targetId,
+                // `orDie` on the read for the reason `run/liveTranscript.ts` records on its
+                // error channel: the file is open and migrated by now, so a failing
+                // `SELECT … FROM events` is this server being broken rather than anything a
+                // transcript can usefully say.
+                events: (after, limit) =>
+                  Effect.orDie(store.eventsAfter(after, limit)),
+                // The *event log's* counter. `currentSequence` is the observations' own and
+                // would report the record as ending wherever the observations do.
+                latestSequence: Effect.orDie(store.currentEventSequence),
+                narrations,
+                decisions,
+                attemptForSession: (harnessSessionId) =>
+                  Effect.map(
+                    supervisor.running,
+                    (running) =>
+                      running.find(
+                        (held) =>
+                          held.targetId === row.targetId &&
+                          held.harnessSessionId === harnessSessionId,
+                      )?.attemptId,
+                  ),
+                ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
+                // Both default inside `liveTranscript`; an installation passes neither.
+                ...(config.liveHeartbeat === undefined
+                  ? {}
+                  : { heartbeat: config.liveHeartbeat }),
+                ...(config.liveSweep === undefined
+                  ? {}
+                  : { sweep: config.liveSweep }),
+              }),
+          ),
+        );
       }),
     });
   }),

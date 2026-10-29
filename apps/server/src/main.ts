@@ -440,6 +440,11 @@ const withoutHarness = Layer.mergeAll(
   // on whether a harness was configured: the browser's picker asks the same service either
   // way and gets an empty list, which is the true answer.
   HarnessResolver.empty,
+  // Same reasoning one service along: the live transcript subscribes to this bus whether or
+  // not anything can publish to it, and a graph whose *shape* changed with `HARNESS` would
+  // make a watcher on a harness-less server a compile-time special case rather than a
+  // stream that is simply quiet.
+  RunNarrations.layer,
 );
 
 /**
@@ -495,7 +500,10 @@ const agent =
         Layer.provideMerge(harnessResolverLayer(configured)),
         Layer.provide(targetStores),
         Layer.provide(credentials),
-        Layer.provide(RunNarrations.layer),
+        // `provideMerge`, so the bus the supervisor publishes to is also in this graph's
+        // context and can be handed to the browser API below. With `provide` it was the
+        // supervisor's private dependency, which was right while nothing subscribed.
+        Layer.provideMerge(RunNarrations.layer),
         Layer.provide(workerEndpoints.layer),
       );
 
@@ -542,7 +550,15 @@ const agent =
 const endpoint = Layer.unwrap(
   Effect.map(
     Effect.context<
-      FleetStore | TargetStores | RunSupervisor | HarnessResolver
+      | FleetStore
+      | TargetStores
+      | RunSupervisor
+      | HarnessResolver
+      // The narration bus, for the same reason as the four above and with the same
+      // consequence if it were rebuilt instead: the supervisor would publish into one
+      // `PubSub` and the live transcript would subscribe to another, so a run would narrate
+      // to nobody and the transcript would show the record and never the activity.
+      | RunNarrations
     >(),
     (shared) =>
       ControlPlaneEndpoint.layer({

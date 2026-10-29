@@ -19,15 +19,18 @@
    *
    * What is new is {@link ComposeBox} beneath the frame: a run can be started
    * and stopped against the open target, on a harness and model the operator
-   * picks. The *live* transcript is still deliberately absent — the run narrates
-   * to an in-process bus with no subscriber yet, and Day 6 owns the stream — but
-   * {@link TranscriptPanel} reads back what a settled attempt left behind, which
-   * is a different thing: the server's own artefact when it has one, and the
-   * harness's own copy, labelled as the thing that may be gone, when it does not.
+   * picks. The *live* transcript is now here: {@link LiveTranscript} shows the
+   * target's own event log, read in store-assigned order behind a cursor, next to
+   * the harness's narration and the policy gate's denials as live activity — and
+   * says which is which. {@link TranscriptPanel} remains the different thing
+   * beside it: what a *settled* attempt left behind, the server's own artefact
+   * when it has one, and the harness's own copy, labelled as the thing that may
+   * be gone, when it does not.
    */
   import Badge from "../components/Badge.svelte";
   import Button from "../components/Button.svelte";
   import ComposeBox from "../components/ComposeBox.svelte";
+  import LiveTranscript from "../components/LiveTranscript.svelte";
   import PageFrame from "../components/PageFrame.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import TargetHeader from "../components/TargetHeader.svelte";
@@ -141,11 +144,15 @@
     -->
     {#if app.navItem === "hunts"}
       <!--
-        The transcript sits above the composer and below the frame, for the same reason the
-        composer does: it is about the target rather than about whichever page is showing.
-        It renders nothing at all until this tab has started a run here, which is the only
-        handle a browser has on a settled attempt until Flow B lists them.
+        The transcripts sit above the composer and below the frame, for the same reason the
+        composer does: they are about the target rather than about whichever page is showing.
+        The live one goes first because it is about the run happening now, while the panel
+        under it is about a run that has already ended; reading top to bottom therefore reads
+        from the present backwards. Each renders nothing until it has something to say — the
+        settled one not until this tab has started a run here, which is the only handle a
+        browser has on a settled attempt until Flow B lists them.
       -->
+      <LiveTranscript {app} />
       <TranscriptPanel {app} />
       <ComposeBox {app} />
     {/if}

@@ -121,10 +121,12 @@ import {
 import {
   AgentHarness,
   SESSION_NOT_FOUND_TAG,
+  truncateNarration,
   type HarnessFailure,
   type HarnessNarration,
   type McpRegistration,
   type MessageEntry,
+  type NarrationDetail,
   type TerminalOutcome,
 } from "./agentHarness";
 import { HarnessProcessError, HarnessTransportError } from "./errors";
@@ -414,13 +416,70 @@ const transport = (
     cause: detail,
   });
 
+/** `JSON.stringify` that answers with something for a value it cannot serialise. */
+const asJson = (value: unknown): string => {
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    // A tool input the SDK handed us that will not serialise. The call still happened and
+    // still has to appear, so it appears with its arguments unavailable rather than not.
+    return "";
+  }
+};
+
 /**
- * Reduces one SDK message to {@link HarnessNarration}.
+ * One `tool_result` block's content, as one string.
+ *
+ * The Messages API allows the block's `content` to be a bare string or a list of blocks,
+ * so both are read. A block kind with no text — an image result — is named rather than
+ * dropped, because "the tool answered with an image" is not "the tool answered nothing".
+ */
+const resultText = (value: unknown): string => {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((part) => {
+      const record = (part ?? {}) as { type?: unknown; text?: unknown };
+      if (typeof record.text === "string") return record.text;
+      return typeof record.type === "string" ? `[${record.type}]` : "";
+    })
+    .filter((text) => text !== "")
+    .join("\n");
+};
+
+/**
+ * What this application reads one SDK message as — zero, one or several entries.
+ *
+ * **Several, because one SDK message is several moments.** An `assistant` message's
+ * `message.content` is a list of blocks, and a turn that says something and then calls two
+ * tools arrives as one message holding a `text` block and two `tool_use` blocks
+ * (`@anthropic-ai/claude-agent-sdk@0.3.310`'s `SDKAssistantMessage.message: BetaMessage`).
+ * Reducing that to one entry would mean choosing which of the three to show, so this
+ * returns a list and the caller offers each.
+ *
+ * The block kinds read, and where each comes from:
+ *
+ * - `assistant` → `text` blocks become `reply`, `tool_use` blocks (`{ id, name, input }`)
+ *   become `toolCall`. Both are complete when they arrive; the SDK streams partial content
+ *   as `stream_event` messages, which this build does not ask for.
+ * - `user` → `tool_result` blocks (`{ tool_use_id, content, is_error }`) become
+ *   `toolResult`. A tool's output comes back as a *user* message because that is how the
+ *   Messages API carries it, which reads oddly and is the SDK's shape rather than ours.
+ * - everything else → one `opaque` entry, so the stream's shape and the supervisor's
+ *   outcome watch are unchanged by this mapping.
+ *
+ * **`toolResult.tool` is `undefined` here, and it is not an oversight.** A `tool_result`
+ * block names the call it answers (`tool_use_id`) and not the tool, and the id is enough
+ * for a reader to pair it with the `toolCall` entry that *does* carry the name. Keeping a
+ * map from id to name across the stream, as the OpenCode client must, would buy nothing:
+ * there the arguments and the name arrive on different events, and here they arrive
+ * together.
  *
  * `type` is the SDK's own message type, verbatim and unmapped, for the reason the
  * interface gives: the vocabulary belongs to the harness. It is coarser than OpenCode's —
  * `assistant`, `user`, `result`, `system` against twenty-odd `session.*` names — and that
- * is a real difference the seam absorbs by not promising a vocabulary at all.
+ * is a real difference the seam absorbs by not promising a vocabulary at all. Every entry
+ * derived from one message carries that one `type`.
  *
  * `sequence` is `undefined` because there is no cursor to carry: the SDK's stream is not
  * resumable from a position, which is exactly why that field is optional on the interface.
@@ -428,16 +487,82 @@ const transport = (
  * `at` is receipt time. The SDK messages carry no timestamp of their own, so this is when
  * *we* saw it — stated rather than implied, because a consumer comparing it against
  * OpenCode's `created` is comparing two different clocks.
+ *
+ * The `outcome` is carried on the **last** entry of the list, and only `result` messages
+ * have one, so the question of which of several entries states it does not arise.
  */
 const narrate = (
   message: SDKMessage,
   outcome: TerminalOutcome | undefined,
-): HarnessNarration => ({
-  type: message.type,
-  sequence: undefined,
-  at: Date.now(),
-  outcome,
-});
+): readonly HarnessNarration[] => {
+  const at = Date.now();
+  const frame = (detail: NarrationDetail): HarnessNarration => ({
+    type: message.type,
+    sequence: undefined,
+    at,
+    outcome,
+    detail,
+  });
+
+  // Read off an `unknown` view of the message rather than narrowing the SDK's own union:
+  // `BetaMessage`'s content blocks are a wide, version-specific union, and asserting a
+  // shape the SDK has already built would add a second place for it to be wrong.
+  const content = (
+    (message as { message?: { content?: unknown } }).message ?? {}
+  ).content;
+  const blocks = Array.isArray(content) ? content : [];
+  const details: NarrationDetail[] = [];
+
+  if (message.type === "assistant") {
+    for (const block of blocks) {
+      const record = (block ?? {}) as {
+        type?: unknown;
+        text?: unknown;
+        id?: unknown;
+        name?: unknown;
+        input?: unknown;
+      };
+      if (record.type === "text" && typeof record.text === "string") {
+        details.push({ _tag: "reply", text: truncateNarration(record.text) });
+      } else if (record.type === "tool_use" && typeof record.id === "string") {
+        details.push({
+          _tag: "toolCall",
+          callId: record.id,
+          tool: typeof record.name === "string" ? record.name : undefined,
+          input: truncateNarration(asJson(record.input)),
+        });
+      }
+    }
+  } else if (message.type === "user") {
+    for (const block of blocks) {
+      const record = (block ?? {}) as {
+        type?: unknown;
+        tool_use_id?: unknown;
+        content?: unknown;
+        is_error?: unknown;
+      };
+      if (
+        record.type === "tool_result" &&
+        typeof record.tool_use_id === "string"
+      ) {
+        details.push({
+          _tag: "toolResult",
+          callId: record.tool_use_id,
+          tool: undefined,
+          output: truncateNarration(resultText(record.content)),
+          failed: record.is_error === true,
+        });
+      }
+    }
+  }
+
+  // An `assistant` message carrying only a thinking block, or a `user` message that is a
+  // plain prompt echo, lands here: one `opaque` entry, so the stream still has an entry
+  // per message and nothing downstream has to cope with a message that narrated nothing.
+  return details.length === 0
+    ? [frame({ _tag: "opaque" })]
+    : details.map(frame);
+};
 
 /**
  * The outcome a `result` message states, or `undefined` for every other message.
@@ -642,10 +767,9 @@ export const claudeCodeHarness = (
                       unknown
                     >;
                   }
-                  Queue.offerUnsafe(
-                    record.narration,
-                    narrate(message, outcome),
-                  );
+                  for (const entry of narrate(message, outcome)) {
+                    Queue.offerUnsafe(record.narration, entry);
+                  }
                   // One prompt, one turn: the first result is the end of the run. Reading
                   // on would mean waiting for input that will never be sent.
                   if (message.type === "result") break;

@@ -32,19 +32,39 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Context, Effect, Layer, ManagedRuntime, Redacted } from "effect";
+import {
+  LIVE_HEARTBEAT_SECONDS,
+  LIVE_SILENCE_LIMIT_SECONDS,
+  RunRefused,
+  type LiveFrame,
+  type LiveItem,
+  type RunningAttempt,
+} from "@bit/contracts";
+import {
+  Context,
+  Duration,
+  Effect,
+  Layer,
+  ManagedRuntime,
+  Redacted,
+} from "effect";
 
 import { browserApiRoutes } from "./browserApi";
+import { CONTROL_PLANE_IDLE_TIMEOUT } from "./controlPlane";
 import { BrowserSessions, ensureServerPassword } from "./browserSessions";
 import { ControlPlaneEndpoint } from "./controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { FleetStore, HUNT_FILE } from "../persistence/fleet";
+import { multiCaseInput } from "../persistence/fixtures";
 import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { InstanceId } from "../harness/identity";
 import { HarnessResolver } from "../harness/resolver";
 import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
+import type { NarrationDetail } from "../harness/agentHarness";
+import { LIVE_HEARTBEAT } from "../run/liveTranscript";
+import { RunNarrations } from "../run/narration";
 import { RunSupervisor } from "../run/supervisor";
 import { PolicyDecisions, type PolicyConfig } from "../policy/service";
 
@@ -82,55 +102,122 @@ class TestCredential extends Context.Service<
 
 const fleet = FleetStore.layer(fleetRoot);
 
-const browserApi = browserApiRoutes({ workspaceRoot }).pipe(
-  Layer.provide(BrowserSessions.layer),
-  // The same resolver the server builds, over the same registry: the route under test is
-  // the one that opens a target's own file, so a stub here would test the stub.
-  Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
-  Layer.provide(fleet),
-  // No harness in this suite, so the supervisor is the one a server without `opencode`
-  // runs: it refuses every start by name. That is the behaviour under test here — the
-  // route, its guard and its typed refusal — and standing up an agent to check a 409
-  // would make this suite depend on a provider login.
-  Layer.provide(RunSupervisor.unavailable),
-  /**
-   * Two configured instances, one of which would not start.
-   *
-   * No harness is *driven* here — `RunSupervisor.unavailable` refuses every start — and
-   * that is the point of splitting the two: the harness **listing** is configuration plus
-   * what a server observed, and it has to answer correctly on a server that cannot run
-   * anything. The broken entry is what proves the route keeps an unusable instance visible
-   * with its reason rather than filtering it out.
-   */
-  Layer.provide(
-    Layer.succeed(
-      HarnessResolver,
-      HarnessResolver.fromEntries([
-        { instance: STUB_INSTANCE, harness: stubHarness() },
-        {
-          instance: {
-            ...STUB_INSTANCE,
-            instanceId: InstanceId.make("absent-harness"),
-            displayName: "Absent harness",
-            installed: false,
-          },
-          harness: undefined,
-          reason: "no such binary on this server's PATH",
-          setup: "install it and log in",
-        },
-      ]),
-    ),
+/**
+ * The one run this suite's supervisor claims to be holding.
+ *
+ * Its session id is what the policy gate's request has to name for a refusal to be
+ * attributable, and its target is the one the live-transcript block registers. Nothing
+ * actually runs: `start` is refused exactly as it is on a harness-less server.
+ */
+const SUPERVISED: RunningAttempt = {
+  attemptId: "at_live",
+  targetId: "livefeed",
+  intentId: "intent-live",
+  harnessSessionId: "ses_live",
+  startedAt: 1_700_000_000_000,
+};
+
+/**
+ * A supervisor that refuses every start and reports {@link SUPERVISED} as running.
+ *
+ * `RunSupervisor.unavailable` with one answer changed. The refusals are copied in their
+ * shape rather than imported, because what this suite needs is a *reporting* supervisor on
+ * a server that still cannot run anything — which is a combination no production layer
+ * produces and which is exactly the right fixture here: it lets the attribution path be
+ * driven over HTTP without a harness, a model or a provider login.
+ */
+const supervisorHolding: Layer.Layer<RunSupervisor> = Layer.succeed(
+  RunSupervisor,
+  RunSupervisor.of({
+    start: () =>
+      Effect.fail(
+        new RunRefused({
+          reason: "no_harness",
+          detail: "this suite configures no harness, so nothing can be started",
+        }),
+      ),
+    stop: (attemptId) =>
+      Effect.fail(
+        new RunRefused({
+          reason: "unknown_attempt",
+          detail: `nothing is running under ${attemptId} in this suite`,
+        }),
+      ),
+    running: Effect.succeed([SUPERVISED]),
+  }),
+);
+
+/**
+ * The browser API's routes, with the narration bus handed in rather than rebuilt.
+ *
+ * `Layer.unwrap` over `Effect.context` is the same move `main.ts` makes and it is here for
+ * the same reason: `ControlPlaneEndpoint` builds the router's application layer through
+ * `HttpRouter.toWebHandler`, which uses **its own memo map**, so a layer merely *provided*
+ * to `extraRoutes` is built a second time. For a `PubSub` that means the supervisor
+ * publishing into one bus and the live transcript subscribing to another — a run that
+ * narrates to nobody — so the instance is read out of this graph and passed as a context.
+ * Which also means a test can get the same reference out of the runtime and publish into it.
+ */
+const endpoint = Layer.unwrap(
+  Effect.map(Effect.context<RunNarrations>(), (shared) =>
+    ControlPlaneEndpoint.layer({
+      policy: POLICY,
+      extraRoutes: browserApiRoutes({ workspaceRoot }).pipe(
+        Layer.provide(BrowserSessions.layer),
+        // The same resolver the server builds, over the same registry: the route under test is
+        // the one that opens a target's own file, so a stub here would test the stub.
+        Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
+        Layer.provide(fleet),
+        // No harness in this suite, so starts are refused exactly as they are on a server
+        // without one — standing up an agent to check a 409 would make this suite depend on
+        // a provider login. What this adds over `RunSupervisor.unavailable` is a non-empty
+        // `running`, because that is the only way a policy decision can be attributed: the
+        // gate's request carries a harness session id and the live route resolves it against
+        // the runs the supervisor is holding. See {@link SUPERVISED}.
+        Layer.provide(supervisorHolding),
+        /**
+         * Two configured instances, one of which would not start.
+         *
+         * No harness is *driven* here — `RunSupervisor.unavailable` refuses every start — and
+         * that is the point of splitting the two: the harness **listing** is configuration plus
+         * what a server observed, and it has to answer correctly on a server that cannot run
+         * anything. The broken entry is what proves the route keeps an unusable instance visible
+         * with its reason rather than filtering it out.
+         */
+        Layer.provide(
+          Layer.succeed(
+            HarnessResolver,
+            HarnessResolver.fromEntries([
+              { instance: STUB_INSTANCE, harness: stubHarness() },
+              {
+                instance: {
+                  ...STUB_INSTANCE,
+                  instanceId: InstanceId.make("absent-harness"),
+                  displayName: "Absent harness",
+                  installed: false,
+                },
+                harness: undefined,
+                reason: "no such binary on this server's PATH",
+                setup: "install it and log in",
+              },
+            ]),
+          ),
+        ),
+        Layer.provide(Layer.succeedContext(shared)),
+        Layer.orDie,
+      ),
+    }),
   ),
-  Layer.orDie,
 );
 
 const testLayer = Layer.mergeAll(
   TestCredential.layer,
-  ControlPlaneEndpoint.layer({ policy: POLICY, extraRoutes: browserApi }),
+  endpoint,
   McpCredentials.layer,
   McpCallCounter.layer,
   PolicyDecisions.layer,
 ).pipe(
+  Layer.provideMerge(RunNarrations.layer),
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
   Layer.provideMerge(PolicyDecisions.layer),
@@ -695,6 +782,7 @@ describe("opening a target", () => {
       assets: 0,
       events: 0,
     });
+    expect((response.body as { recoveries: unknown[] }).recoveries).toEqual([]);
   });
 
   test("the neighbour's counts are the neighbour's", async () => {
@@ -976,5 +1064,923 @@ describe("reading an attempt's transcript", () => {
       "no harness session recorded",
     );
     expect(answered.body["entries"]).toEqual([]);
+  });
+});
+
+/* ── The live transcript, on the wire ────────────────────────────────────────── */
+
+/**
+ * Reads Server-Sent Events off the real socket until `done`, then aborts.
+ *
+ * Over `fetch` and parsed by hand, deliberately. Everything that could be wrong about this
+ * endpoint is on the wire: whether the response is a 200 with `text/event-stream` rather
+ * than a buffered body, whether a frame survives the SSE framing the contract's
+ * `HttpApiSchema.StreamSse` chose, and whether the connection stays open while the server
+ * is reading pages. Calling the handler in process would check none of it.
+ *
+ * `AbortController` is what closes it. The stream never ends on its own — a caught-up
+ * reader sleeps and reads again — so every test has to say what it is waiting for, and the
+ * deadline turns "the frame never came" into a failed assertion rather than a hung suite.
+ */
+const liveFrames = async (
+  path: string,
+  done: (frames: readonly LiveFrame[]) => boolean,
+  /**
+   * Work to do while the connection is open — publishing narration, answering a decision.
+   *
+   * Started as soon as the response's headers are in and **not** awaited before the read
+   * loop, because the two have to overlap: the activity channel replays nothing, so a
+   * publish has to land while this connection is subscribed, and a publish that blocked the
+   * reader would deadlock against a server waiting for the socket to drain. It is awaited at
+   * the end, so a failure inside it fails the test rather than vanishing.
+   */
+  during?: () => Promise<void>,
+): Promise<{
+  readonly status: number;
+  readonly contentType: string | null;
+  readonly frames: readonly LiveFrame[];
+}> => {
+  const controller = new AbortController();
+  const response = await fetch(`${api}${path}`, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "text/event-stream",
+    },
+    signal: controller.signal,
+  });
+  const contentType = response.headers.get("content-type");
+  const body = response.body;
+  if (response.status !== 200 || body === null) {
+    controller.abort();
+    return { status: response.status, contentType, frames: [] };
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const frames: LiveFrame[] = [];
+  let buffer = "";
+  const deadline = Date.now() + 10_000;
+  const working = during?.();
+  try {
+    while (!done(frames) && Date.now() < deadline) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let split = buffer.indexOf("\n\n");
+      while (split >= 0) {
+        for (const line of buffer.slice(0, split).split("\n")) {
+          if (line.startsWith("data:")) {
+            frames.push(JSON.parse(line.slice(5).trim()) as LiveFrame);
+          }
+        }
+        buffer = buffer.slice(split + 2);
+        split = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    controller.abort();
+  }
+  await working;
+  return { status: response.status, contentType, frames };
+};
+
+/**
+ * Waits for a bus's subscriber count to reach `want`.
+ *
+ * Both activity buses replay nothing — `run/narration.ts` and `policy/service.ts` both say
+ * so — so publishing before the connection under test is subscribed is publishing into the
+ * void. The counts are usable as readiness signals precisely because each is incremented
+ * *after* its `PubSub.subscribe` returns, which `policy/service.test.ts` pins down; a fixed
+ * sleep here would be a test that passes on a fast machine and flakes on a loaded one.
+ */
+const untilSubscribers = (
+  count: Effect.Effect<number, never, RunNarrations | PolicyDecisions>,
+  want: number,
+): Promise<void> =>
+  runtime.runPromise(
+    Effect.timeout(
+      Effect.gen(function* () {
+        while ((yield* count) !== want) yield* Effect.sleep("5 millis");
+      }),
+      "10 seconds",
+    ).pipe(Effect.orDie),
+  );
+
+const narrationSubscribers = Effect.flatMap(
+  RunNarrations,
+  (narrations) => narrations.subscriberCount,
+);
+const decisionSubscribers = Effect.flatMap(
+  PolicyDecisions,
+  (decisions) => decisions.subscriberCount,
+);
+
+/**
+ * Waits until no live connection is subscribed to either activity bus.
+ *
+ * **This is what makes the readiness wait below mean anything**, and finding out why cost a
+ * debugging round worth recording. Aborting a `fetch` tears the socket down from the client
+ * side; the server's own stream, and therefore its subscription, unwinds a moment later. So
+ * a connection from the previous test can still be holding a subscriber while the next one
+ * opens — and a readiness wait phrased as "the count went above what it was when I started"
+ * is then satisfied by *that* subscriber, letting the publish land before the connection
+ * under test has subscribed to anything. The symptom was a handful of tests timing out
+ * while the one that happened to run first passed.
+ *
+ * Draining to zero first and then waiting for exactly one is unambiguous: the only
+ * subscriber there can be is this connection's.
+ */
+const quietBuses = async (): Promise<void> => {
+  await untilSubscribers(narrationSubscribers, 0);
+  await untilSubscribers(decisionSubscribers, 0);
+};
+
+/** Waits until the connection under test — the only one — has subscribed. */
+const connectionSubscribed = (
+  count: Effect.Effect<number, never, RunNarrations | PolicyDecisions>,
+): Promise<void> => untilSubscribers(count, 1);
+
+const liveItems = (frames: readonly LiveFrame[]): readonly LiveItem[] =>
+  frames.filter((frame): frame is LiveItem => frame._tag === "item");
+
+const liveCaughtUp = (frames: readonly LiveFrame[]): boolean =>
+  frames.some((frame) => frame._tag === "cursor" && frame.caughtUp);
+
+/**
+ * The live endpoint against a target with a real event log.
+ *
+ * The events are written through the real store rather than inserted by hand, so the
+ * sequences under test are the ones the store assigned inside its own transactions — the
+ * same reason `run/liveTranscript.test.ts` uses a real file. What this block adds on top of
+ * that suite is the HTTP half: the guard, the typed refusals, the framing, and that the
+ * connection is a stream rather than a response that waits for the run to finish.
+ *
+ * `RunSupervisor.unavailable` is still what this suite has, so nothing is *running*: the
+ * activity channel has no publisher a request could reach and the policy gate's decisions
+ * cannot be attributed to an attempt. Those two paths are proven in
+ * `run/liveTranscript.test.ts`, with the real narration bus, and claiming them here would
+ * mean standing up an agent and a provider login to assert a status code.
+ */
+describe("watching a target's live transcript", () => {
+  const targetId = "livefeed";
+
+  beforeAll(async () => {
+    mkdirSync(join(workspaceRoot, targetId), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: {
+          workspacePath: join(workspaceRoot, targetId),
+          name: targetId,
+          scopeNote: "",
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+
+    // Three committed events: the attempt, an asset and an observation. Written with the
+    // store's own writer, in its own scope, which is closed before the suite reads over
+    // HTTP — so the connection the endpoint opens is a second one on a settled file.
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const store = yield* ObservationStore;
+          yield* store.seedAttempt({
+            targetId,
+            goalId: "goal-live",
+            goal: "Watch a run happen.",
+            intentId: "intent-live",
+            question: "Does the transcript arrive in order?",
+            attemptId: "at_live",
+            workerId: "wk_live",
+            harnessInstanceId: "stub",
+            providerId: "stub",
+            modelId: "scripted/model",
+            modelOptions: null,
+            harnessSessionId: "ses_live",
+          });
+          const caller = {
+            callerScope: `${targetId}/at_live`,
+            targetId,
+            intentId: "intent-live",
+            attemptId: "at_live",
+            harnessSessionId: "ses_live",
+            workerId: "wk_live",
+            attemptFence: 0,
+          };
+          yield* store.recordAsset(caller, {
+            operationId: "op-asset",
+            kind: "endpoint",
+            url: "http://127.0.0.1:41317/login",
+            method: "POST",
+            note: "the fixture's login endpoint",
+          });
+          yield* store.recordObservation(
+            caller,
+            multiCaseInput({ operationId: "op-obs" }),
+          );
+        }).pipe(
+          Effect.provide(
+            ObservationStore.layer(
+              join(fleetRoot, "targets", targetId, HUNT_FILE),
+            ),
+          ),
+          Effect.orDie,
+        ),
+      ),
+    );
+  });
+
+  test("it needs a session, like everything else about a target", async () => {
+    const response = await fetch(`${api}/targets/${targetId}/live`, {
+      headers: { accept: "text/event-stream" },
+    });
+    expect(response.status).toBe(401);
+    await response.body?.cancel();
+  });
+
+  test("a well-formed id nothing is registered under is a typed 404", async () => {
+    const refused = await read(await signedIn("/targets/nosuchtarget/live"));
+    expect(refused.status).toBe(404);
+    expect(refused.body["_tag"]).toBe("TargetNotFound");
+  });
+
+  test("a string that cannot name a target is refused before any path is built", async () => {
+    const refused = await read(await signedIn("/targets/..%2Fetc/live"));
+    expect(refused.status).toBe(404);
+    expect(refused.body["_tag"]).toBe("TargetNotFound");
+    expect(refused.body["reason"]).toBe("invalid_target_id");
+  });
+
+  test("it answers as an event stream, opening with where it is reading from", async () => {
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=0`,
+      liveCaughtUp,
+    );
+    expect(live.status).toBe(200);
+    // A stream, not a buffered body. A 200 with `application/json` here would mean the
+    // response was waiting for the run to end, which is the one thing this endpoint exists
+    // not to do.
+    expect(live.contentType).toContain("text/event-stream");
+    const opened = live.frames[0];
+    expect(opened?._tag).toBe("opened");
+    if (opened?._tag !== "opened") throw new Error("no opening frame");
+    expect(opened.targetId).toBe(targetId);
+    expect(opened.from).toBe(0);
+    expect(opened.latest).toBe(3);
+    expect(opened.skipped).toBe(0);
+  });
+
+  test("the record arrives in store-assigned order, once each", async () => {
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=0`,
+      liveCaughtUp,
+    );
+    const items = liveItems(live.frames);
+    expect(items.map((item) => item.sequence)).toEqual([1, 2, 3]);
+    expect(items.map((item) => item.kind)).toEqual([
+      "run.started",
+      "asset.recorded",
+      "observation.recorded",
+    ]);
+    // Every item on this channel says it is the record and carries a position, which is
+    // what a client's resume cursor is taken from.
+    expect(items.every((item) => item.origin === "record")).toBe(true);
+    expect(new Set(items.map((item) => item.id)).size).toBe(3);
+    // And a recorded observation reads as recorded, through the framing, with its outcome.
+    const observation = items[2];
+    expect(observation?.headline).toBe("Observation recorded");
+    expect(observation?.outcome).toBe("positive");
+  });
+
+  test("a cursor in the query string is honoured on the wire", async () => {
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=2`,
+      liveCaughtUp,
+    );
+    // The protocol Day 7's reconnect is built on: a client that passes the highest sequence
+    // it saw is answered strictly after it, so the gap is filled and nothing repeats.
+    expect(liveItems(live.frames).map((item) => item.sequence)).toEqual([3]);
+    const opened = live.frames[0];
+    if (opened?._tag !== "opened") throw new Error("no opening frame");
+    expect(opened.from).toBe(2);
+    expect(opened.skipped).toBe(0);
+  });
+
+  test("a cursor at the end of the log opens, says so, and sends no items", async () => {
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=3`,
+      liveCaughtUp,
+    );
+    expect(liveItems(live.frames)).toEqual([]);
+    // Caught up at once rather than after a heartbeat: a watcher on a quiet target is told
+    // the history has finished arriving instead of being left to guess.
+    const cursor = live.frames.find((frame) => frame._tag === "cursor");
+    expect(cursor?._tag).toBe("cursor");
+    if (cursor?._tag !== "cursor") throw new Error("no cursor frame");
+    expect(cursor.sequence).toBe(3);
+    expect(cursor.caughtUp).toBe(true);
+  });
+
+  test("a target whose database is gone is refused for the reason the rail gives", async () => {
+    // `acme-corp`'s data directory is removed by the availability block above, which is the
+    // same condition the rail dims its row with. Watching a target is reading it, so the
+    // refusal has to be the same one — and with the same words.
+    const refused = await read(await signedIn("/targets/acme-corp/live"));
+    expect(refused.status).toBe(409);
+    expect(refused.body["_tag"]).toBe("TargetUnavailable");
+    expect(String(refused.body["detail"]).length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * The activity channel, over the socket.
+ *
+ * The block above proves the record channel on the wire. This one proves the other half,
+ * which nothing had tested over HTTP: that a harness's narration and the policy gate's
+ * refusals reach a browser through this endpoint, with their arguments intact and
+ * attributed to the right attempt.
+ *
+ * **It is a different claim from the one `run/liveTranscript.test.ts` makes**, and the
+ * difference is the whole reason it is here. That suite drives the merge in process, so it
+ * cannot see any of the things that only exist on this path: whether the `PubSub` the
+ * supervisor publishes into is the same instance the route subscribes to — which it only is
+ * because `main.ts` and this file hand it across the router's own memo map by value — and
+ * whether an item survives SSE framing and the contract's own encoding with its JSON
+ * arguments unmangled. Both were taken on trust until this block existed.
+ *
+ * Attribution needs a supervisor that is holding something, which is what {@link SUPERVISED}
+ * is for: the gate's request carries a harness session id and nothing else, so a decision is
+ * matched against the runs this process reports.
+ */
+describe("the live transcript's activity channel, on the wire", () => {
+  const targetId = "livefeed";
+
+  /** One narration entry, published as the supervisor publishes them. */
+  const publish = (entry: {
+    readonly type: string;
+    readonly detail: NarrationDetail;
+  }) =>
+    runtime.runPromise(
+      Effect.flatMap(RunNarrations, (narrations) =>
+        narrations.publish({
+          targetId,
+          attemptId: SUPERVISED.attemptId,
+          harnessSessionId: SUPERVISED.harnessSessionId,
+          entry: {
+            type: entry.type,
+            sequence: undefined,
+            at: 1_700_000_000_000,
+            outcome: undefined,
+            detail: entry.detail,
+          },
+        }),
+      ),
+    );
+
+  const activityOf = (frames: readonly LiveFrame[]): readonly LiveItem[] =>
+    liveItems(frames).filter((item) => item.origin === "activity");
+
+  test("a tool call reaches the browser with its arguments and its call id", async () => {
+    await quietBuses();
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=99`,
+      (frames) => activityOf(frames).length >= 1,
+      async () => {
+        await connectionSubscribed(narrationSubscribers);
+        await publish({
+          type: "session.tool.called",
+          detail: {
+            _tag: "toolCall",
+            callId: "t1",
+            tool: "bash",
+            input: '{"command":"curl -s http://127.0.0.1:41317/login"}',
+          },
+        });
+      },
+    );
+
+    const [call] = activityOf(live.frames);
+    expect(call?.kind).toBe("tool.call");
+    expect(call?.headline).toBe("bash");
+    expect(call?.tool).toBe("bash");
+    expect(call?.callId).toBe("t1");
+    // The arguments as JSON text, through SSE framing and the contract's encoding, with the
+    // quotes and the colon intact. A `data:` line that had been mangled would still parse
+    // as a frame and would be wrong here.
+    expect(call?.input).toBe(
+      '{"command":"curl -s http://127.0.0.1:41317/login"}',
+    );
+    // An activity item claims no position, on the wire as everywhere else.
+    expect(call?.sequence).toBeNull();
+    expect(call?.attemptId).toBe(SUPERVISED.attemptId);
+  });
+
+  test("a result arrives with the same call id as its call, answered out of order", async () => {
+    await quietBuses();
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=99`,
+      (frames) => activityOf(frames).length >= 4,
+      async () => {
+        await connectionSubscribed(narrationSubscribers);
+        await publish({
+          type: "session.tool.called",
+          detail: { _tag: "toolCall", callId: "a", tool: "bash", input: "{}" },
+        });
+        await publish({
+          type: "session.tool.called",
+          detail: { _tag: "toolCall", callId: "b", tool: "bash", input: "{}" },
+        });
+        // `b` answers first, which is the ordinary case with two tools in flight.
+        await publish({
+          type: "session.tool.success",
+          detail: {
+            _tag: "toolResult",
+            callId: "b",
+            tool: "bash",
+            output: "from b",
+            failed: false,
+          },
+        });
+        await publish({
+          type: "session.tool.failed",
+          detail: {
+            _tag: "toolResult",
+            callId: "a",
+            tool: "bash",
+            output: "from a",
+            failed: true,
+          },
+        });
+      },
+    );
+
+    // Published order is kept through the bus, the merge and the framing, so the pairing has
+    // to be carried on the items — which is what `callId` is for.
+    expect(
+      activityOf(live.frames).map((item) => [item.kind, item.callId]),
+    ).toEqual([
+      ["tool.call", "a"],
+      ["tool.call", "b"],
+      ["tool.result", "b"],
+      ["tool.result", "a"],
+    ]);
+    const failed = activityOf(live.frames).find(
+      (item) => item.kind === "tool.result" && item.callId === "a",
+    );
+    expect(failed?.outcome).toBe("failed");
+    expect(failed?.output).toBe("from a");
+  });
+
+  test("an opaque entry is not pushed down the socket at all", async () => {
+    await quietBuses();
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=99`,
+      (frames) => activityOf(frames).some((item) => item.kind === "turn.reply"),
+      async () => {
+        await connectionSubscribed(narrationSubscribers);
+        // A token delta, which is most of what a harness narrates. Dropped at the
+        // projection so one frame reaches the wire per reply block instead of hundreds per
+        // turn; the reply behind it is what proves the drop happened rather than the
+        // publish failing.
+        await publish({
+          type: "session.text.delta",
+          detail: { _tag: "opaque" },
+        });
+        await publish({
+          type: "session.text.ended",
+          detail: { _tag: "reply", text: "Probing the limiter." },
+        });
+      },
+    );
+    expect(activityOf(live.frames).map((item) => item.kind)).toEqual([
+      "turn.reply",
+    ]);
+    expect(activityOf(live.frames)[0]?.body).toBe("Probing the limiter.");
+  });
+
+  test("a refused action reaches the browser, attributed to the run holding its session", async () => {
+    await quietBuses();
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=99`,
+      (frames) => activityOf(frames).some((i) => i.kind === "action.denied"),
+      async () => {
+        await connectionSubscribed(decisionSubscribers);
+        // Through the real decision bus, from the same instance the policy route records
+        // into — see this block's header on why that sameness is the thing under test.
+        await runtime.runPromise(
+          Effect.flatMap(PolicyDecisions, (decisions) =>
+            decisions.record({
+              sessionId: SUPERVISED.harnessSessionId,
+              tool: "shell",
+              input: { command: "curl -s https://out-of-scope.test/" },
+              effect: "deny",
+              reason: "host 'out-of-scope.test' is not in scope",
+            }),
+          ),
+        );
+      },
+    );
+
+    const denied = activityOf(live.frames).find(
+      (item) => item.kind === "action.denied",
+    );
+    expect(denied?.headline).toBe("Denied");
+    expect(denied?.outcome).toBe("denied");
+    expect(denied?.tool).toBe("shell");
+    // The gate's own sentence, unsoftened and unmangled.
+    expect(denied?.body).toBe("host 'out-of-scope.test' is not in scope");
+    expect(denied?.input).toContain("out-of-scope.test");
+    // Attributed from the supervisor's own map, not from anything in the request.
+    expect(denied?.attemptId).toBe(SUPERVISED.attemptId);
+    // A refusal carries no call id: the hook does not know which of the harness's own calls
+    // it is being asked about.
+    expect(denied?.callId).toBeNull();
+  });
+
+  test("a decision for a session this target does not hold never reaches the browser", async () => {
+    await quietBuses();
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=99`,
+      (frames) => activityOf(frames).some((i) => i.kind === "action.denied"),
+      async () => {
+        await connectionSubscribed(decisionSubscribers);
+        await runtime.runPromise(
+          Effect.flatMap(PolicyDecisions, (decisions) =>
+            Effect.andThen(
+              // Another engagement's session — or this one's, after its attempt settled and
+              // left the supervisor's map.
+              decisions.record({
+                sessionId: "ses_somewhere_else",
+                tool: "shell",
+                input: { command: "whoami" },
+                effect: "deny",
+                reason: "not this target's business",
+              }),
+              // One that *is* placeable behind it, so reaching the second proves the first
+              // was reached and dropped rather than still in flight.
+              decisions.record({
+                sessionId: SUPERVISED.harnessSessionId,
+                tool: "shell",
+                input: { command: "id" },
+                effect: "deny",
+                reason: "placeable",
+              }),
+            ),
+          ),
+        );
+      },
+    );
+
+    const denials = activityOf(live.frames).filter(
+      (item) => item.kind === "action.denied",
+    );
+    // Showing one target's refused action under another target would be worse than not
+    // showing it, so it does not appear.
+    expect(denials).toHaveLength(1);
+    expect(denials[0]?.body).toBe("placeable");
+  });
+
+  test("an allowed decision is not pushed down the socket", async () => {
+    await quietBuses();
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=99`,
+      (frames) => activityOf(frames).some((i) => i.kind === "action.denied"),
+      async () => {
+        await connectionSubscribed(decisionSubscribers);
+        await runtime.runPromise(
+          Effect.flatMap(PolicyDecisions, (decisions) =>
+            Effect.andThen(
+              decisions.record({
+                sessionId: SUPERVISED.harnessSessionId,
+                tool: "read",
+                input: { filePath: "in-scope.txt" },
+                effect: "allow",
+                basis: "no_host_named",
+              }),
+              decisions.record({
+                sessionId: SUPERVISED.harnessSessionId,
+                tool: "shell",
+                input: { command: "id" },
+                effect: "deny",
+                reason: "the one that should arrive",
+              }),
+            ),
+          ),
+        );
+      },
+    );
+    // The permitted call is already on this stream as `tool.call` from the harness's own
+    // narration; the gate's agreement beside it would show one call as two items.
+    expect(activityOf(live.frames).map((item) => item.body)).toEqual([
+      "the one that should arrive",
+    ]);
+  });
+
+  test("the record and the activity channel arrive on one connection, told apart", async () => {
+    await quietBuses();
+    const live = await liveFrames(
+      `/targets/${targetId}/live?cursor=0`,
+      (frames) => liveCaughtUp(frames) && activityOf(frames).length >= 1,
+      async () => {
+        await connectionSubscribed(narrationSubscribers);
+        await publish({
+          type: "session.text.ended",
+          detail: { _tag: "reply", text: "both channels" },
+        });
+      },
+    );
+
+    const record = liveItems(live.frames).filter(
+      (item) => item.origin === "record",
+    );
+    // The record still arrives in store-assigned order beside the activity, and only it
+    // carries a position — which is the distinction the whole contract exists to keep.
+    expect(record.map((item) => item.sequence)).toEqual([1, 2, 3]);
+    expect(
+      activityOf(live.frames).every((item) => item.sequence === null),
+    ).toBe(true);
+  });
+});
+
+/* ── Surviving an idle connection ────────────────────────────────────────────── */
+
+/**
+ * A live connection with nothing to say stays open, because the heartbeat keeps it warm.
+ *
+ * **This is the one claim about this endpoint that only a real socket, held past a real
+ * timeout, can make — and it was false.** `Bun.serve`'s `idleTimeout` defaults to ten
+ * seconds and closes any connection with no bytes in either direction for that long; the
+ * live transcript sends a `LiveCursor` every twenty. So in a browser the transcript on a
+ * quiet target went dead after ten seconds, and because the dev-server proxy kept the
+ * downstream response open, nothing said so. Every test above this point reads a frame and
+ * aborts within a second or two, which is exactly why none of them saw it.
+ *
+ * The suite's own listener cannot answer this: it is built once with the real timings, and
+ * asserting against those is a sixty-second test. So this block stands up listeners of its
+ * own with the heartbeat and the idle timeout scaled down **together**, which keeps it a
+ * test of the relationship between them rather than of two numbers.
+ *
+ * **Two of them, because the second is the control.** A test that only watched a healthy
+ * connection survive could pass for reasons that have nothing to do with the heartbeat — a
+ * Bun that ignored `idleTimeout`, a reader that kept the socket busy by itself. The second
+ * listener reproduces the shipped bug's *shape*, a heartbeat longer than the timeout, and
+ * asserts that the server does close it. Together they say: the timeout is real, and the
+ * heartbeat is what defeats it.
+ */
+describe("a live connection that has nothing to say", () => {
+  /** Scaled down together, at a ratio wider than the shipped 60:20. */
+  const IDLE_TIMEOUT_SECONDS = 2;
+  const FITTING_HEARTBEAT = Duration.millis(400);
+  /** Longer than the timeout: the shape the server shipped with. */
+  const OVERLONG_HEARTBEAT = Duration.seconds(30);
+  /** Comfortably past the timeout, so surviving it is the thing being observed. */
+  const WATCH_FOR_MS = 3_000;
+
+  /** One listener of this block's own, with its own fleet, password and target. */
+  interface Endpoint {
+    readonly api: string;
+    readonly token: string;
+    readonly dispose: () => Promise<void>;
+  }
+
+  const standUp = async (options: {
+    readonly name: string;
+    readonly heartbeat: Duration.Duration;
+  }): Promise<Endpoint> => {
+    const password = `${options.name}-pass`;
+    const ownFleet = FleetStore.layer(join(base, `${options.name}-fleet`));
+    const layer = Layer.unwrap(
+      Effect.map(Effect.context<RunNarrations>(), (shared) =>
+        ControlPlaneEndpoint.layer({
+          policy: POLICY,
+          idleTimeout: IDLE_TIMEOUT_SECONDS,
+          extraRoutes: browserApiRoutes({
+            workspaceRoot,
+            liveHeartbeat: options.heartbeat,
+            // The sweep is left at its default on purpose. Shortening it would make the
+            // record channel chatty, and chatter would keep the connection alive whether or
+            // not the heartbeat ever fired — which is the one thing being measured.
+          }).pipe(
+            Layer.provide(BrowserSessions.layerWithPassword(password)),
+            Layer.provide(TargetStores.layer.pipe(Layer.provide(ownFleet))),
+            Layer.provide(ownFleet),
+            Layer.provide(supervisorHolding),
+            Layer.provide(HarnessResolver.empty),
+            Layer.provide(Layer.succeedContext(shared)),
+            Layer.orDie,
+          ),
+        }),
+      ),
+    ).pipe(
+      Layer.provideMerge(RunNarrations.layer),
+      Layer.provideMerge(McpCredentials.layer),
+      Layer.provideMerge(McpCallCounter.layer),
+      Layer.provideMerge(PolicyDecisions.layer),
+      Layer.provide(
+        TargetStores.ofStore("t").pipe(
+          Layer.provide(
+            ObservationStore.layer(join(base, `${options.name}-served.sqlite`)),
+          ),
+        ),
+      ),
+    );
+
+    const own = ManagedRuntime.make(layer);
+    const endpoint = await own.runPromise(ControlPlaneEndpoint);
+    const api = `${endpoint.origin}/api/v1`;
+
+    const opened = await fetch(`${api}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    const token = String(
+      ((await opened.json()) as Record<string, unknown>)["token"],
+    );
+
+    mkdirSync(join(workspaceRoot, options.name), { recursive: true });
+    const created = await fetch(`${api}/targets`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        workspacePath: join(workspaceRoot, options.name),
+        name: options.name,
+        scopeNote: "",
+      }),
+    });
+    expect(created.status).toBe(200);
+
+    return { api, token, dispose: () => own.dispose() };
+  };
+
+  let beating: Endpoint;
+  let silent: Endpoint;
+
+  beforeAll(async () => {
+    beating = await standUp({ name: "beating", heartbeat: FITTING_HEARTBEAT });
+    silent = await standUp({ name: "silent", heartbeat: OVERLONG_HEARTBEAT });
+  });
+
+  afterAll(async () => {
+    await beating?.dispose();
+    await silent?.dispose();
+  });
+
+  /**
+   * Holds one connection open for a fixed wall-clock window and reports what arrived.
+   *
+   * Deliberately *not* `done`-driven like {@link liveFrames}: the question here is what
+   * happens over time rather than whether a particular frame shows up, and "the server was
+   * still holding the connection when we stopped looking" is half the answer. A reader that
+   * stopped at the first frame it liked could not tell a surviving connection from one the
+   * server had already hung up on.
+   *
+   * `Promise.race` against the deadline rather than a bare `read()`, because a healthy idle
+   * connection sends nothing for a whole heartbeat and an unraced read would sit there past
+   * the window.
+   */
+  const watchFor = async (
+    endpoint: Endpoint,
+    path: string,
+    ms: number,
+  ): Promise<{
+    readonly frames: readonly LiveFrame[];
+    /** True when the *server* ended the stream before the window closed. */
+    readonly closedByServer: boolean;
+    readonly heldForMs: number;
+  }> => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const response = await fetch(`${endpoint.api}${path}`, {
+      headers: {
+        authorization: `Bearer ${endpoint.token}`,
+        accept: "text/event-stream",
+      },
+      signal: controller.signal,
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    if (reader === undefined) throw new Error("the response carried no body");
+    const decoder = new TextDecoder();
+    const frames: LiveFrame[] = [];
+    let buffer = "";
+    let closedByServer = false;
+    const deadline = started + ms;
+    try {
+      while (Date.now() < deadline) {
+        const chunk = await Promise.race([
+          reader.read(),
+          new Promise<"deadline">((resolve) =>
+            setTimeout(
+              () => resolve("deadline"),
+              Math.max(0, deadline - Date.now()),
+            ),
+          ),
+        ]).catch(() => {
+          // An idle-timeout close arrives as an abrupt `ECONNRESET`, not as a clean
+          // end-of-stream, so the read *throws*. Caught here and reported as what it is: a
+          // server-side close. Letting it propagate failed the test with a transport error
+          // instead of an assertion, which told a reader nothing about the behaviour — and
+          // it is the same reason a browser cannot notice a drop by waiting for the stream
+          // to end.
+          closedByServer = true;
+          return "closed" as const;
+        });
+        if (chunk === "deadline" || chunk === "closed") break;
+        if (chunk.done) {
+          closedByServer = true;
+          break;
+        }
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let split = buffer.indexOf("\n\n");
+        while (split >= 0) {
+          for (const line of buffer.slice(0, split).split("\n")) {
+            if (line.startsWith("data:")) {
+              frames.push(JSON.parse(line.slice(5).trim()) as LiveFrame);
+            }
+          }
+          buffer = buffer.slice(split + 2);
+          split = buffer.indexOf("\n\n");
+        }
+      }
+    } finally {
+      controller.abort();
+    }
+    return { frames, closedByServer, heldForMs: Date.now() - started };
+  };
+
+  const cursorFrames = (frames: readonly LiveFrame[]) =>
+    frames.filter((frame) => frame._tag === "cursor");
+
+  test("it stays open past the listener's idle timeout, sending a cursor each heartbeat", async () => {
+    const watched = await watchFor(
+      beating,
+      "/targets/beating/live?cursor=0",
+      WATCH_FOR_MS,
+    );
+
+    // The window was comfortably longer than the listener's own timeout, so surviving it
+    // is a fact about the heartbeat rather than about the test being quick.
+    expect(watched.heldForMs).toBeGreaterThan(IDLE_TIMEOUT_SECONDS * 1_000);
+    // The point of the test: the server did not hang up.
+    expect(watched.closedByServer).toBe(false);
+    // More than one cursor frame on the *same* connection, which is what proves the
+    // heartbeat is firing rather than the opening pair simply having arrived.
+    const beats = cursorFrames(watched.frames);
+    expect(beats.length).toBeGreaterThan(1);
+    // And every one of them says the same true thing about a target with no events.
+    expect(beats.every((frame) => frame.caughtUp)).toBe(true);
+    expect(beats.every((frame) => frame.sequence === 0)).toBe(true);
+  }, 15_000);
+
+  /**
+   * The control, and what it deliberately does **not** assert.
+   *
+   * Its job is to show that the test above passes *because of the heartbeat* rather than
+   * because nothing was ever going to close the connection. So the same endpoint shape is
+   * given a heartbeat longer than its own idle timeout — the shipped bug exactly — and the
+   * assertion is that no heartbeat arrives in the same window.
+   *
+   * It is **not** an assertion about when `Bun.serve` hangs up, because that turned out not
+   * to be a stable number: a standalone probe closed an idle streaming response after
+   * ~4000ms with `idleTimeout` set to both 2 *and* 4, and inside this suite the close landed
+   * sooner still. Bun's idle timer is evidently coarser than the value it is handed, and
+   * possibly not reckoned per connection. A test that pinned a time would be asserting
+   * Bun's scheduling; a test that asserts "nothing kept this one warm" is asserting ours.
+   *
+   * What a close *does* look like when it comes is recorded on {@link watchFor}: an abrupt
+   * `ECONNRESET` rather than a clean end-of-stream — which is itself part of why a browser
+   * cannot rely on the stream ending to notice, and why the client needs a silence watchdog
+   * of its own (`LIVE_SILENCE_LIMIT_SECONDS`).
+   */
+  test("with a heartbeat longer than the timeout, nothing keeps the connection warm", async () => {
+    const watched = await watchFor(
+      silent,
+      "/targets/silent/live?cursor=0",
+      WATCH_FOR_MS,
+    );
+
+    // The opening pair arrived, so the connection and the route worked: what is missing is
+    // only the thing that would have kept it alive.
+    expect(watched.frames[0]?._tag).toBe("opened");
+    // Exactly one cursor frame — the caught-up announcement — and no heartbeat behind it,
+    // across a window the other endpoint fitted several heartbeats into.
+    expect(cursorFrames(watched.frames)).toHaveLength(1);
+  }, 15_000);
+
+  test("the shipped constants satisfy the invariant a browser depends on", () => {
+    // The structural half of the fix: the listener's timeout is *derived* from the
+    // heartbeat, so the two cannot drift apart again. Were this to fail, every live
+    // connection on a quiet target would be closed by the server before it could speak.
+    expect(CONTROL_PLANE_IDLE_TIMEOUT).toBeGreaterThan(LIVE_HEARTBEAT_SECONDS);
+    expect(Duration.toSeconds(LIVE_HEARTBEAT)).toBe(LIVE_HEARTBEAT_SECONDS);
+    // `Bun.serve` refuses an `idleTimeout` above 255 seconds.
+    expect(CONTROL_PLANE_IDLE_TIMEOUT).toBeLessThanOrEqual(255);
+    // And the client's patience is longer than the heartbeat, or a healthy quiet connection
+    // would be read as dead. See `LIVE_SILENCE_LIMIT_SECONDS`.
+    expect(LIVE_SILENCE_LIMIT_SECONDS).toBeGreaterThan(LIVE_HEARTBEAT_SECONDS);
   });
 });

@@ -25,15 +25,43 @@ import {
   explicitModelOptionSelections,
   modelOptionDescriptors,
   type AttemptTranscript,
+  LIVE_SILENCE_LIMIT_SECONDS,
   type HarnessInstanceView,
+  type LiveFrame,
+  type LiveItem,
   type ModelOptionSelection,
   type RunningAttempt,
+  type TargetView,
   type TargetCounts,
   type TargetSummary,
 } from "@bit/contracts";
 
 import { initialTargets, previewCounts, type Target } from "./mock";
 import { server, type ServerClient } from "./client";
+
+/**
+ * A cancellable one-shot timer.
+ *
+ * A seam rather than a direct `setTimeout`, for the reason {@link App}'s client is one: the
+   * live transcript's silence watchdog and reconnect backoff depend on elapsed time;
+   * a test of the watchdog that actually waited would be a forty-second test.
+ * There is one real implementation and it is three lines; see `test/fakeCountdown.ts` for
+ * the other.
+ */
+export interface Countdown {
+  /** Schedules `fire` for `ms` from now. The returned function cancels it. */
+  readonly after: (ms: number, fire: () => void) => () => void;
+}
+
+/** `setTimeout`, as a {@link Countdown}. What the app runs with. */
+export const realCountdown: Countdown = {
+  after: (ms, fire) => {
+    const handle = setTimeout(fire, ms);
+    return () => {
+      clearTimeout(handle);
+    };
+  },
+};
 
 export type Screen = "connect" | "welcome" | "target";
 /**
@@ -111,12 +139,26 @@ export class App {
   readonly client: ServerClient;
 
   /**
-   * Defaults to the live client, so `new App()` is unchanged for the route that mounts
-   * it. The parameter exists for the tests, which hand in a hand-written double; it is
-   * not a configuration point and there is no second real implementation.
+   * How this instance schedules the one thing it does on a timer.
+   *
+   * Not reactive and never reassigned, for the same reason {@link client} is not: it is
+   * handed in once, and a `$state` field would make "which timer did that watchdog use" a
+   * question about when an effect ran.
    */
-  constructor(client: ServerClient = server) {
+  readonly countdown: Countdown;
+
+  /**
+   * Defaults to the live client and real timers, so `new App()` is unchanged for the route
+   * that mounts it. Both parameters exist for the tests, which hand in hand-written
+   * doubles; neither is a configuration point and there is no second real implementation
+   * of either.
+   */
+  constructor(
+    client: ServerClient = server,
+    countdown: Countdown = realCountdown,
+  ) {
     this.client = client;
+    this.countdown = countdown;
   }
 
   screen = $state<Screen>("connect");
@@ -352,6 +394,93 @@ export class App {
   /** Unreachable-server text for the transcript panel. Refusals arrive in the value. */
   transcriptDetail = $state("");
 
+  /* ── The live transcript ──────────────────────────────────────────────────── */
+  /**
+   * What the open target's live transcript has shown, in arrival order.
+   *
+   * **Arrival order, and deliberately not re-sorted.** The record items arrive in the
+   * order the store assigned them — the server reads `WHERE sequence > ? ORDER BY
+   * sequence` and nothing between here and there reorders a stream — so appending is what
+   * preserves that order. Sorting by {@link LiveItem.at} would actively break it: two
+   * items can share a millisecond, and a run's timestamps come from the store, the harness
+   * and this server's own clock, which are three clocks. Sorting by `sequence` would have
+   * to invent one for every activity item, which is the claim the contract refuses to make.
+   */
+  liveItems = $state<LiveItem[]>([]);
+  /**
+   * The highest store-assigned sequence this tab has been shown.
+   *
+   * The resume cursor within this tab. A reload has no rendered items, so it reconstructs
+   * from zero rather than trusting a persisted cursor whose preceding items are absent.
+   */
+  liveCursor = $state(0);
+  /** Whether the record channel has delivered everything committed up to its cursor. */
+  liveCaughtUp = $state(false);
+  /**
+   * How many committed events the connection would not send, from its opening frame.
+   *
+   * Non-zero means what is on screen starts part way through this target's record. Shown,
+   * not swallowed: a transcript that looked complete and was not is the wrong kind of quiet.
+   */
+  liveSkipped = $state(0);
+  /** True between asking for a connection and whatever ends it. */
+  liveWatching = $state(false);
+  liveReconnecting = $state(false);
+  /** Last persisted recovery outcomes for the target on screen. */
+  liveRecoveries = $state<TargetView["recoveries"]>([]);
+  /** What ended the connection, in the client's words. Empty while it is up or stopped. */
+  liveDetail = $state("");
+  /** Which target {@link liveItems} belong to, so one target's never shows under another. */
+  liveTargetId = $state("");
+
+  /**
+   * Ids already shown, so an item delivered twice is shown once.
+   *
+   * A reconnect re-reads a range of the record on purpose — the client's cursor is the last
+   * item it *received*, and asking to be answered after it is what guarantees nothing
+   * committed in the gap is skipped — so the same event arriving again is the normal case
+   * rather than a fault, and this is what makes it invisible. A record item's id is the
+   * store's own event id, which is why that works across connections and across a server
+   * restart.
+   *
+   * **Bounded at {@link App.LIVE_IDS_KEPT}, oldest evicted first.** Unbounded, this grew
+   * one string per narrated moment for as long as a tab stayed open on a run, which for an
+   * agent working overnight is the one structure here with no ceiling at all.
+   *
+   * What the bound costs, stated rather than hoped over: an id evicted after
+   * `LIVE_IDS_KEPT` newer items would be shown a second time if the server sent it again.
+   * Within one connection the server never does — the record reader's cursor only moves
+   * forward — so the only path is a reconnect, which resumes *after* the cursor and
+   * therefore re-sends only what is newer than the last item this tab saw. The eviction
+   * window is four times the number of items kept on screen, so the ids that can be
+   * re-delivered are, by a wide margin, ones already dropped from the view.
+   *
+   * Not `$state`: nothing renders it, and a reactive `Set` would make every arrival
+   * invalidate every reader of the list.
+   */
+  #shown = new Set<string>();
+  /**
+   * The same ids in arrival order, so the oldest can be evicted.
+   *
+   * A second structure rather than relying on `Set` iteration order: insertion order is
+   * specified for `Set`, but evicting from the front of it means `values().next()` per
+   * eviction, and an array index is the same answer without the iterator.
+   */
+  #shownOrder: string[] = [];
+  /** The live connection's stop function, while one is open. */
+  #stopLive: (() => void) | undefined;
+  /**
+   * Cancels the silence watchdog, while one is armed.
+   *
+   * See {@link App.prototype.watchLive}. Held apart from {@link stopLive} because the two
+   * are cancelled on different occasions: every frame re-arms the watchdog without touching
+   * the connection.
+   */
+  #cancelSilence: (() => void) | undefined;
+  #cancelReconnect: (() => void) | undefined;
+  #liveGeneration = 0;
+  #reconnectFailures = 0;
+
   /* New target */
   dialogOpen = $state(false);
   /** Server-fed: the folder currently being listed. */
@@ -484,6 +613,11 @@ export class App {
     this.runs = [];
     this.instruction = "";
     this.runDetail = "";
+    // The connection carries a bearer that has just been dropped, so it has to go with it:
+    // a stream left open on a signed-out session is a credential still in use. What it
+    // showed goes too — this is one of the exits where it belongs to a session that no
+    // longer exists.
+    this.#forgetLive();
   }
 
   /* ── Targets ─────────────────────────────────────────────────────────────── */
@@ -552,6 +686,11 @@ export class App {
     // Asked on every open, because a run started in another tab — or by this one before a
     // reload — is a fact about the server that this screen has no other way to learn.
     void this.loadRuns();
+    // And the live transcript, which is the other half of that: `loadRuns` says *that*
+    // something is running and this says what it is doing. Opened before the counts come
+    // back, so a run already in progress starts appearing while the header is still
+    // loading rather than after it.
+    this.watchLive(id);
   }
 
   /**
@@ -623,6 +762,9 @@ export class App {
       if (error._tag === "TargetNotFound") {
         this.viewState = "empty";
         this.screen = "welcome";
+        // There is no target to watch any more. Forgotten rather than left running against
+        // a deep link to something the registry does not hold.
+        this.#forgetLive();
         await this.loadTargets();
         return;
       }
@@ -637,6 +779,7 @@ export class App {
       ? this.targets.map((target) => (target.id === row.id ? row : target))
       : [...this.targets, row];
     this.counts = call.value.counts;
+    this.liveRecoveries = call.value.recoveries;
     this.viewState = "ready";
   }
 
@@ -1062,6 +1205,292 @@ export class App {
     if (!this.pickerOpen) this.modelQuery = "";
   }
 
+  /* ── The live transcript ──────────────────────────────────────────────────── */
+
+  /**
+   * How many live items this tab keeps.
+   *
+   * A long run narrates thousands of moments and a browser that kept all of them would
+   * grow a DOM nobody scrolls back through. The oldest are dropped, which is sound here in
+   * a way it would not be on the server: everything on the record channel is still in the
+   * target's event log, and {@link liveCursor} still says where this tab had got to.
+   */
+  static readonly LIVE_KEPT = 500;
+
+  /**
+   * How many item ids this tab remembers for the purpose of not showing one twice.
+   *
+   * Four times {@link App.LIVE_KEPT}, so an id can only fall out of memory long after the
+   * item itself has fallen off the screen. The `#shown` field records what the bound costs
+   * and why that multiple puts the cost out of reach in practice.
+   */
+  static readonly LIVE_IDS_KEPT = 2_000;
+
+  /**
+   * Opens the live transcript for one target, closing any other.
+   *
+   * **Asking for the same target twice is a no-op**, not a second connection. The hunt view
+   * reaches here from opening a target and from a reload, and two sockets delivering the
+   * same frames would be the one duplication the day's claim is about — the ids would
+   * dedupe them, but a second socket is still a second socket.
+   *
+   * Switching target clears everything first; reconnecting the same target retains the
+   * already shown items and resumes after their committed cursor.
+   */
+  watchLive(targetId: string) {
+    if (this.liveWatching && this.liveTargetId === targetId) return;
+    const sameTarget = this.liveTargetId === targetId;
+    this.stopLive();
+    this.liveTargetId = targetId;
+    if (!sameTarget) {
+      this.liveItems = [];
+      this.liveCursor = 0;
+      this.liveRecoveries = [];
+      this.#shown = new Set();
+      this.#shownOrder = [];
+    }
+    this.liveCaughtUp = false;
+    if (!sameTarget) this.liveSkipped = 0;
+    this.liveDetail = "";
+    this.#reconnectFailures = 0;
+    // An empty view must reconstruct from the start; an already populated view can
+    // resume after its last delivered durable sequence. Activity has no replay cursor.
+    this.#connectLive(
+      targetId,
+      this.liveItems.length === 0 ? 0 : this.liveCursor,
+    );
+  }
+
+  #connectLive(targetId: string, cursor: number) {
+    const generation = ++this.#liveGeneration;
+    this.liveWatching = true;
+    this.#armSilence(targetId);
+    this.#stopLive = this.client.watchLive(this.serverUrl, targetId, {
+      cursor,
+      onFrame: (frame) => {
+        if (generation !== this.#liveGeneration) return;
+        if (frame._tag === "cursor" && frame.caughtUp) {
+          const wasCatchingUp = !this.liveCaughtUp;
+          this.#reconnectFailures = 0;
+          this.liveReconnecting = false;
+          this.liveDetail = "";
+          if (wasCatchingUp) void this.refreshTarget(targetId);
+        }
+        this.applyLiveFrame(targetId, frame);
+      },
+      onClosed: (closed) => {
+        /**
+         * **The session going is handled before the target guard, and that order matters.**
+         *
+         * An expired token is a fact about this tab, not about the target it happened to be
+         * watching, so it has to be acted on even if the operator has since navigated —
+         * otherwise a tab that switched target at the wrong moment keeps a dead token and
+         * goes on looking signed in. `signOut` clears the live state itself.
+         */
+        if (closed._tag === "unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        if (generation !== this.#liveGeneration) return;
+        // Everything else *is* about this connection, so news about one this tab has left
+        // is dropped, exactly as `applyLiveFrame` drops a late frame from it.
+        if (this.liveTargetId !== targetId) return;
+        // The connection has already ended, so the watchdog has nothing left to watch for
+        // and must not fire later and overwrite this sentence with its own.
+        this.#cancelSilence?.();
+        this.#cancelSilence = undefined;
+        this.liveWatching = false;
+        this.#stopLive = undefined;
+        this.#scheduleReconnect(
+          targetId,
+          closed._tag === "ended"
+            ? "The live connection ended."
+            : "The live connection dropped.",
+        );
+      },
+    });
+  }
+
+  #scheduleReconnect(targetId: string, reason = "The live connection ended.") {
+    if (this.liveTargetId !== targetId) return;
+    this.liveReconnecting = true;
+    this.liveCaughtUp = false;
+    this.liveDetail = `${reason} Reconnecting to the committed record. Live activity during the gap cannot be replayed.`;
+    this.#cancelReconnect?.();
+    const delay = Math.min(
+      10_000,
+      1_000 * 2 ** Math.min(this.#reconnectFailures++, 4),
+    );
+    this.#cancelReconnect = this.countdown.after(delay, () => {
+      this.#cancelReconnect = undefined;
+      if (this.liveTargetId !== targetId || !this.liveReconnecting) return;
+      // A cursor is advanced only from committed items or cursor frames. Resume after it;
+      // overlap is harmless because stable event ids are deduplicated below.
+      this.#connectLive(targetId, this.liveCursor);
+    });
+  }
+
+  /**
+   * Forgets everything about the live transcript, connection included.
+   *
+   * One method because three exits need it and each of them needs *all* of it: signing out,
+   * resetting to a scenario, and a deep link to a target the registry does not hold. Each
+   * used to clear the fields it remembered to, which is how `#shown` kept one session's ids
+   * across a sign-out and how `reset()` left a socket open against a server the scenario
+   * picker had just pretended to leave.
+   *
+   * It is deliberately *not* what {@link stopLive} does. Stopping leaves what arrived on
+   * screen, because an operator may still be reading it; this is for the exits where what is
+   * on screen belongs to a session or a target that no longer exists.
+   */
+  #forgetLive() {
+    // `stopLive` cancels the silence watchdog as well as the connection.
+    this.stopLive();
+    this.liveTargetId = "";
+    this.liveItems = [];
+    this.liveCursor = 0;
+    this.liveCaughtUp = false;
+    this.liveSkipped = 0;
+    this.liveDetail = "";
+    this.liveRecoveries = [];
+    this.#shown = new Set();
+    this.#shownOrder = [];
+  }
+
+  /**
+   * Closes the live connection, if one is open.
+   *
+   * Leaves the items on screen. Navigating away from a target clears them — see
+   * {@link watchLive} — but signing out or losing the view is not a reason to blank a
+   * transcript the operator may still be reading, and the stop itself is not news:
+   * {@link liveDetail} stays empty because nothing went wrong.
+   */
+  stopLive() {
+    ++this.#liveGeneration;
+    this.#stopLive?.();
+    this.#stopLive = undefined;
+    this.#cancelSilence?.();
+    this.#cancelSilence = undefined;
+    this.#cancelReconnect?.();
+    this.#cancelReconnect = undefined;
+    this.liveWatching = false;
+    this.liveReconnecting = false;
+  }
+
+  /**
+   * Arms the silence watchdog, replacing any armed before it.
+   *
+   * ## Why silence is the signal, and not the stream ending
+   *
+   * The obvious way to notice a dead connection is for the stream to end, and it is not a
+   * reliable one. Observed in a browser: through the dev server's `/api` proxy the
+   * downstream response **stayed open after the upstream closed**, so nothing ended, nothing
+   * failed, and the transcript sat there showing `Live` and a cursor that would never move
+   * again. Any buffering reverse proxy can do the same in a deployment. And when a close
+   * *is* visible it arrives as an abrupt reset rather than an end-of-stream — which is how
+   * `Bun.serve` hangs up on an idle connection — so even the visible case is not a tidy
+   * signal.
+   *
+   * What is always true is that a healthy connection speaks. The server sends a
+   * {@link LiveCursor} after every catch-up batch and then every
+   * `LIVE_HEARTBEAT_SECONDS` whether or not anything is happening, so **silence longer than
+   * `LIVE_SILENCE_LIMIT_SECONDS` is the only evidence of a drop that does not depend on
+   * anyone telling us.** The limit is twice the heartbeat, so one late or lost heartbeat is
+   * not read as a death and two in a row is.
+   *
+   * ## Why this cannot fire on a healthy slow run
+   *
+   * Because the heartbeat is not conditional on there being anything to report. A target
+   * with nothing running still sends a cursor frame every heartbeat; a long catch-up sends
+   * one after every page. Both re-arm this. The only way to go a whole
+   * `LIVE_SILENCE_LIMIT_SECONDS` without a frame is for the frames to have stopped
+   * arriving, which is the condition being detected.
+   *
+   * ## What it does not do
+   *
+   * Day 7 reconnects after this watchdog fires, from the last delivered record cursor.
+   * Until catch-up finishes the panel says reconnecting, not live. Activity in the gap
+   * remains unrecoverable.
+   *
+   * `targetId` is captured and re-checked when it fires, so a watchdog armed for a target
+   * the operator has since left cannot overwrite the state of the one that replaced it.
+   */
+  #armSilence(targetId: string) {
+    this.#cancelSilence?.();
+    this.#cancelSilence = this.countdown.after(
+      LIVE_SILENCE_LIMIT_SECONDS * 1_000,
+      () => {
+        this.#cancelSilence = undefined;
+        if (this.liveTargetId !== targetId || !this.liveWatching) return;
+        this.stopLive();
+        this.#scheduleReconnect(
+          targetId,
+          `Nothing has arrived for ${LIVE_SILENCE_LIMIT_SECONDS} seconds.`,
+        );
+      },
+    );
+  }
+
+  /**
+   * Applies one frame.
+   *
+   * Separate from {@link watchLive} and taking the target it is for, which is what makes
+   * the day's two claims testable without a connection:
+   *
+   * - **In store-assigned order.** Items are appended as they arrive and never re-sorted;
+   *   {@link liveItems} records why that *is* the store's order for the record channel.
+   * - **Without duplicates.** An id already shown is dropped, so a reconnect that re-reads
+   *   a range of the record shows nothing twice.
+   *
+   * A frame naming a target this tab has left is dropped rather than applied. The guard is
+   * the same one {@link refreshTarget} uses and is there for the same reason: a connection
+   * that is being torn down can deliver one more frame after the operator has moved on.
+   *
+   * {@link liveCursor} only ever moves **forward**, and only from a record item or a cursor
+   * frame. A cursor that could go backwards would make a reconnect re-read a range it had
+   * already been shown — harmless, because of the deduplication above, but it would make
+   * the cursor mean "somewhere I have been" rather than "everything up to here".
+   */
+  applyLiveFrame(targetId: string, frame: LiveFrame) {
+    if (this.liveTargetId !== targetId) return;
+    /**
+     * Any frame at all is evidence the connection is alive, so the watchdog restarts here
+     * and not in one of the branches below.
+     *
+     * Before the deduplication check on purpose: a frame this tab has already shown still
+     * arrived, so it still proves the socket works. Keying liveness off *new* items would
+     * have made a reconnect that re-read a range look like silence.
+     */
+    this.#armSilence(targetId);
+    if (frame._tag === "opened") {
+      this.liveSkipped = Math.max(this.liveSkipped, frame.skipped);
+      // The cursor the server is reading after. Taken as the floor rather than ignored, so
+      // a client that asked for nothing knows where the record it is being shown starts.
+      this.liveCursor = Math.max(this.liveCursor, frame.from);
+      return;
+    }
+    if (frame._tag === "cursor") {
+      this.liveCursor = Math.max(this.liveCursor, frame.sequence);
+      this.liveCaughtUp = frame.caughtUp;
+      return;
+    }
+    if (this.#shown.has(frame.id)) return;
+    this.#shown.add(frame.id);
+    this.#shownOrder.push(frame.id);
+    if (this.#shownOrder.length > App.LIVE_IDS_KEPT) {
+      const oldest = this.#shownOrder.shift();
+      if (oldest !== undefined) this.#shown.delete(oldest);
+    }
+    if (frame.sequence !== null) {
+      this.liveCursor = Math.max(this.liveCursor, frame.sequence);
+    }
+    const next = [...this.liveItems, frame];
+    this.liveItems =
+      next.length > App.LIVE_KEPT
+        ? next.slice(next.length - App.LIVE_KEPT)
+        : next;
+  }
+
   /**
    * Reads one attempt's transcript: ours if the server kept one, the harness's if not.
    *
@@ -1189,6 +1618,18 @@ export class App {
     this.starting = false;
     this.stopping = false;
     this.runDetail = "";
+    /**
+     * The live transcript goes, connection and all.
+     *
+     * The scenario picker's whole job is to reach a UI state without reproducing the
+     * conditions that cause it, and `reset()` is the way back to the beginning of that —
+     * which has to include the one piece of state here that owns an open socket. Leaving it
+     * meant a reset that walked the screen back to Connect while a stream went on arriving
+     * behind it, writing items for a target the picker had just replaced with a mock row.
+     * The mock rows this method installs are not targets any server has heard of, so there
+     * is nothing to re-watch and nothing is reopened.
+     */
+    this.#forgetLive();
     // The harness list is *not* cleared: it is this server's configuration, not a screen
     // state, and a scenario that emptied it would make the composer claim a server has no
     // harness when it has two. The *selection* is cleared, because that is a screen state.

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { API_PREFIX } from "@bit/contracts";
-import { Effect, Layer } from "effect";
+import { Effect, Fiber, Layer, Option, Stream } from "effect";
 
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
@@ -314,5 +314,186 @@ describe("the policy HTTP boundary", () => {
     const response = await post("<html>not json</html>");
     expect(response.status).toBe(400);
     expect(response.body.effect).toBe("deny");
+  });
+});
+
+/**
+ * The gate's answers as a live feed, which is what a transcript showing a refusal reads.
+ *
+ * The in-memory list was always here; publishing is new, and the two claims worth checking
+ * are that a decision reaches a subscriber at all and that `record` does not *depend* on
+ * one. The second is the load-bearing one: this runs on the gate's own response path, with a
+ * worker waiting, so a subscriber must not be able to make it slower — hence a sliding
+ * `PubSub`, which never blocks and drops the oldest rather than waiting for a reader.
+ */
+describe("the decision feed", () => {
+  const entry = {
+    sessionId: "ses_test",
+    tool: "shell",
+    input: { command: "curl https://out-of-scope.test/" },
+    effect: "deny" as const,
+    reason: "host 'out-of-scope.test' is not in scope",
+  };
+
+  test("a recorded decision reaches a subscriber, with its request and its reason apart", async () => {
+    const answered = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const decisions = yield* PolicyDecisions;
+          const reader = yield* Effect.forkScoped(
+            Stream.runHead(decisions.answered),
+          );
+          // Waited for, not slept through. The bus replays nothing, so a decision answered
+          // before the subscription exists is gone — and a fixed delay here would be a test
+          // that passes on a fast machine and flakes on a loaded one.
+          yield* Effect.timeout(
+            Effect.gen(function* () {
+              while ((yield* decisions.subscriberCount) === 0) {
+                yield* Effect.sleep("2 millis");
+              }
+            }),
+            "10 seconds",
+          ).pipe(Effect.orDie);
+          yield* decisions.record(entry);
+          // `Stream.runHead` answers with an `Option`, and an empty one would mean the feed
+          // ended without saying anything — which is a failure, not an absence.
+          return Option.getOrUndefined(yield* Fiber.join(reader));
+        }).pipe(Effect.provide(PolicyDecisions.layer)),
+      ),
+    );
+
+    expect(answered?.request.tool).toBe("shell");
+    expect(answered?.request.sessionId).toBe("ses_test");
+    // The decision is carried apart from the request, so a reader renders the gate's reason
+    // rather than having to pick it out of a flattened record.
+    expect(answered?.decision).toEqual({
+      effect: "deny",
+      reason: "host 'out-of-scope.test' is not in scope",
+    });
+    // In-process answer order: enough for a live reader to say "already shown", and
+    // deliberately not a cursor. See `AnsweredDecision`.
+    expect(answered?.id).toBe(1);
+  });
+
+  /**
+   * The count is a readiness signal, so it must not lead the subscription.
+   *
+   * The test above waits on `subscriberCount` and then answers one decision *once*. That is
+   * only sound if the count becoming 1 means the `PubSub` subscription genuinely exists —
+   * which is why `answered` takes `PubSub.subscribe` first and counts after. An earlier
+   * version incremented beside `Stream.fromPubSub` and returned the stream, which reads as
+   * the same thing: the subscription is actually taken when the stream is first *pulled*,
+   * so the count could lead it, and the test above would have been relying on a race it
+   * happened to win.
+   *
+   * This asserts the ordering from the other side: nothing is counted until a reader is
+   * attached, and the count goes back when the reader's scope closes.
+   */
+  test("nothing is counted until a reader is attached, and the count is given back", async () => {
+    const counts = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const decisions = yield* PolicyDecisions;
+          const before = yield* decisions.subscriberCount;
+
+          const during = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const reader = yield* Effect.forkScoped(
+                Stream.runHead(decisions.answered),
+              );
+              yield* Effect.timeout(
+                Effect.gen(function* () {
+                  while ((yield* decisions.subscriberCount) === 0) {
+                    yield* Effect.sleep("2 millis");
+                  }
+                }),
+                "10 seconds",
+              ).pipe(Effect.orDie);
+              // Read while the reader is still attached. After `Fiber.join` it is already
+              // back to zero — `Stream.runHead` closes the stream's scope when it answers,
+              // which is the release working rather than a surprise.
+              const counted = yield* decisions.subscriberCount;
+              // A decision published now reaches it, which is the proof that the count
+              // means what the readiness wait takes it to mean.
+              yield* decisions.record(entry);
+              const seen = Option.getOrUndefined(yield* Fiber.join(reader));
+              return { counted, tool: seen?.request.tool };
+            }),
+          );
+
+          return { before, during, after: yield* decisions.subscriberCount };
+        }).pipe(Effect.provide(PolicyDecisions.layer)),
+      ),
+    );
+
+    expect(counts.before).toBe(0);
+    expect(counts.during.counted).toBe(1);
+    expect(counts.during.tool).toBe("shell");
+    // Released with the reader's scope, so a dropped connection does not leave the count
+    // claiming a subscriber that is gone.
+    expect(counts.after).toBe(0);
+  });
+
+  test("recording does not wait for a subscriber, and still keeps every decision", async () => {
+    const all = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const decisions = yield* PolicyDecisions;
+          // Nobody is listening. A bus that back-pressured here would mean a browser tab
+          // that closed could stall the answer a worker is blocked on.
+          yield* decisions.record(entry);
+          yield* decisions.record({ ...entry, tool: "read" });
+          return yield* decisions.all;
+        }).pipe(Effect.provide(PolicyDecisions.layer)),
+      ),
+    );
+    expect(all.map((one) => one.tool)).toEqual(["shell", "read"]);
+  });
+
+  /**
+   * The split into `request` and `decision` is a split, not a cast.
+   *
+   * The earlier version destructured the request's keys off and cast the remainder, under a
+   * comment claiming that made a new `PolicyDecision` member a compile error. It did not —
+   * a cast compiles whatever the union gains. Reconstructing the arm by discriminating on
+   * `effect` is what actually does, and this checks that both arms survive the trip with
+   * the field each one carries.
+   */
+  test("both arms of a decision survive the split with their own field", async () => {
+    const answered = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const decisions = yield* PolicyDecisions;
+          const reader = yield* Effect.forkScoped(
+            Stream.runCollect(Stream.take(decisions.answered, 2)),
+          );
+          yield* Effect.timeout(
+            Effect.gen(function* () {
+              while ((yield* decisions.subscriberCount) === 0) {
+                yield* Effect.sleep("2 millis");
+              }
+            }),
+            "10 seconds",
+          ).pipe(Effect.orDie);
+          yield* decisions.record({
+            sessionId: "ses_test",
+            tool: "read",
+            input: { filePath: "in-scope.txt" },
+            effect: "allow",
+            basis: "no_host_named",
+          });
+          yield* decisions.record(entry);
+          return yield* Fiber.join(reader);
+        }).pipe(Effect.provide(PolicyDecisions.layer)),
+      ),
+    );
+
+    expect([...answered].map((one) => one.decision)).toEqual([
+      { effect: "allow", basis: "no_host_named" },
+      { effect: "deny", reason: "host 'out-of-scope.test' is not in scope" },
+    ]);
+    // Answer order, counting from 1 and contiguous: a request the route refused as
+    // undecodable is never recorded and so never consumes a number.
+    expect([...answered].map((one) => one.id)).toEqual([1, 2]);
   });
 });

@@ -27,6 +27,10 @@ import type {
   AttemptTranscript,
   FolderListing,
   HarnessInstanceView,
+  LiveCursor,
+  LiveFrame,
+  LiveItem,
+  LiveOpened,
   RunStarted,
   RunStopped,
   RunningAttempt,
@@ -36,7 +40,7 @@ import type {
   TargetSummary,
   TargetView,
 } from "@bit/contracts";
-import type { Call, ServerClient } from "../src/lib/client";
+import type { Call, LiveClosed, ServerClient } from "../src/lib/client";
 
 /** What one of {@link ServerClient}'s calls answers with, exactly as declared. */
 type Answer<K extends keyof ServerClient> = ServerClient[K] extends (
@@ -114,7 +118,7 @@ export const targetCounts = (
 export const targetView = (
   target: TargetSummary,
   counts: Partial<TargetCounts> = {},
-): TargetView => ({ target, counts: targetCounts(counts) });
+): TargetView => ({ target, counts: targetCounts(counts), recoveries: [] });
 
 export const sessionOpened = (
   over: Partial<SessionOpened> = {},
@@ -235,6 +239,97 @@ export const attemptTranscript = (
   ...over,
 });
 
+/* ── Live transcript frames ──────────────────────────────────────────────────── */
+
+/**
+ * One record item, defaulted to a recorded observation.
+ *
+ * `origin: "record"` and a real `sequence` by default, because that is the channel the
+ * day's claims are about: ordered, deduplicable, resumable. A test that wants the other
+ * channel asks for it, which keeps "this item has no position" a thing a test states
+ * rather than a thing it gets by forgetting a field.
+ */
+export const liveItem = (over: Partial<LiveItem> = {}): LiveItem => ({
+  _tag: "item",
+  id: "record:evt-1",
+  origin: "record",
+  sequence: 1,
+  kind: "observation.recorded",
+  at: AT,
+  attemptId: "attempt-1",
+  headline: "Observation recorded",
+  body: "the endpoint did not rate limit",
+  tool: null,
+  input: null,
+  output: null,
+  callId: null,
+  outcome: "negative",
+  ...over,
+});
+
+/** One activity item: no sequence, an id in the activity space. */
+export const liveActivity = (over: Partial<LiveItem> = {}): LiveItem =>
+  liveItem({
+    id: "activity:1",
+    origin: "activity",
+    sequence: null,
+    kind: "tool.call",
+    headline: "bash",
+    body: "",
+    tool: "bash",
+    input: '{"command":"curl -s http://127.0.0.1:4000/"}',
+    // A real call id by default, because the thing most worth getting wrong about a tool
+    // call is which result answers it: a default of `null` would let a test assert pairing
+    // without ever saying which call it meant.
+    callId: "call-1",
+    outcome: null,
+    ...over,
+  });
+
+export const liveOpened = (over: Partial<LiveOpened> = {}): LiveOpened => ({
+  _tag: "opened",
+  targetId: "acme-corp",
+  from: 0,
+  latest: 0,
+  skipped: 0,
+  at: AT,
+  ...over,
+});
+
+export const liveCursor = (over: Partial<LiveCursor> = {}): LiveCursor => ({
+  _tag: "cursor",
+  sequence: 0,
+  caughtUp: true,
+  at: AT,
+  ...over,
+});
+
+/**
+ * One live connection the double has been asked for.
+ *
+ * A test drives frames through {@link FakeWatch.send} and ends it with
+ * {@link FakeWatch.close}, which is what lets the assertions about ordering, deduplication
+ * and reconnect run with no server, no SSE and no timing.
+ */
+export interface FakeWatch {
+  readonly targetId: string;
+  /** What the app asked to resume after, or `undefined` for "the server picks". */
+  readonly cursor: number | undefined;
+  /** Delivers one frame, unless the app has stopped this watch. */
+  readonly send: (frame: LiveFrame) => void;
+  /**
+   * Ends it, the way the client would.
+   *
+   * Takes the typed {@link LiveClosed} rather than a sentence, so a test can say "the
+   * session expired" as the client actually says it. That distinction is the one the app
+   * must act on — see `LiveClosed` — and a double that only offered a string could not
+   * express it.
+   */
+  readonly close: (closed: LiveClosed) => void;
+  /** Whether the app called the returned stop function. */
+  readonly stopped: () => boolean;
+}
+
 /* ── The double ──────────────────────────────────────────────────────────────── */
 
 /** One call that was made, for the tests that care that it was made at all. */
@@ -344,6 +439,9 @@ export class FakeServer implements ServerClient {
 
   onRuns: (baseUrl: string) => Answer<"runs"> = () => ok([]);
 
+  /** Every live connection asked for, oldest first. See {@link FakeWatch}. */
+  readonly watches: FakeWatch[] = [];
+
   /* The {@link ServerClient} surface. Each one logs, then defers to its slot. */
 
   storedToken = (): string | undefined => {
@@ -398,6 +496,48 @@ export class FakeServer implements ServerClient {
 
   runs = (baseUrl: string) =>
     this.record("runs", [baseUrl], () => this.onRuns(baseUrl));
+
+  /**
+   * Records the connection and hands back its stop function, delivering nothing by itself.
+   *
+   * Nothing arrives until a test sends it, which is the opposite of the other slots here
+   * and is deliberate: a stream that pushed a plausible opening frame on its own would
+   * decide what "the beginning of a transcript" looks like, and that is the thing the
+   * tests are checking.
+   */
+  watchLive: ServerClient["watchLive"] = (baseUrl, targetId, options) => {
+    this.calls.push({
+      method: "watchLive",
+      args: [baseUrl, targetId, options.cursor],
+    });
+    let stopped = false;
+    let closed = false;
+    this.watches.push({
+      targetId,
+      cursor: options.cursor,
+      send: (frame) => {
+        if (!stopped && !closed) options.onFrame(frame);
+      },
+      close: (ended) => {
+        if (stopped || closed) return;
+        closed = true;
+        options.onClosed(ended);
+      },
+      stopped: () => stopped,
+    });
+    return () => {
+      stopped = true;
+    };
+  };
+
+  /** The most recent live connection, for a test that opened exactly one. */
+  get watch(): FakeWatch {
+    const latest = this.watches[this.watches.length - 1];
+    if (latest === undefined) {
+      throw new Error("no live transcript connection has been opened");
+    }
+    return latest;
+  }
 
   /** How many times one method was called. */
   countOf(method: keyof ServerClient): number {

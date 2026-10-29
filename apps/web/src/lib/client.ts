@@ -37,10 +37,11 @@
 import {
   BitApi,
   SessionGuard,
+  type LiveFrame,
   type ModelOptionSelection,
   type TargetDraft,
 } from "@bit/contracts";
-import { Effect, Layer, Result } from "effect";
+import { Effect, Fiber, Layer, Result, Stream } from "effect";
 import { FetchHttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient, HttpApiMiddleware } from "effect/http-api";
 
@@ -103,6 +104,53 @@ const clientLayer = Layer.mergeAll(guardClient, FetchHttpClient.layer);
 
 const client = (baseUrl: string) =>
   HttpApiClient.make(BitApi, { baseUrl }).pipe(Effect.provide(clientLayer));
+
+/**
+ * How a live connection ended.
+ *
+ * Three cases rather than a string, because the screens have to do three different things
+ * and the distinction is not recoverable from prose:
+ *
+ * - `ended` — the stream finished without an error. On this endpoint that means the server
+ *   went away cleanly. Not news, and not a reason to put up an alert.
+ * - `unauthenticated` — the session is gone. **This is the one that must not be flattened.**
+ *   The server answered the typed `Unauthenticated` the contract declares, and the only
+ *   correct response is to sign out as expired: a tab that reported it as "the connection
+ *   dropped" would sit on a target list it can no longer refresh, holding a dead token, and
+ *   still looking signed in. An earlier version stringified the failure and the app did
+ *   exactly that.
+ * - `failed` — anything else, with whatever can be said about it. A refused connection, a
+ *   dev-proxy 502, a target that stopped being openable, a frame that would not decode.
+ *   From the operator's seat those are one situation: what is on screen is what arrived.
+ *
+ * It is the same judgement {@link Call} makes about a round trip — an answer from the server
+ * is not the same thing as no answer — applied to a connection instead of a request.
+ */
+export type LiveClosed =
+  | { readonly _tag: "ended" }
+  | { readonly _tag: "unauthenticated" }
+  | { readonly _tag: "failed"; readonly detail: string };
+
+/**
+ * Classifies whatever ended a live connection.
+ *
+ * `Unauthenticated` is matched by its tag, which is the contract's own and survives
+ * `HttpApiClient`'s decoding intact — the same test {@link isRefusal} applies to a round
+ * trip, for the same reason: it is the one failure on this endpoint that is an *answer*
+ * with a consequence. Everything else keeps its own text and nothing further is inferred.
+ */
+const closedBy = (failure: unknown): LiveClosed => {
+  const tagged =
+    typeof failure === "object" && failure !== null
+      ? (failure as { _tag?: unknown; message?: unknown })
+      : undefined;
+  if (tagged?._tag === "Unauthenticated") return { _tag: "unauthenticated" };
+  return {
+    _tag: "failed",
+    detail:
+      typeof tagged?.message === "string" ? tagged.message : String(failure),
+  };
+};
 
 /**
  * What a call to the server came back as.
@@ -331,6 +379,74 @@ export const server = {
    */
   runs: (baseUrl: string) =>
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.runs())),
+
+  /**
+   * Watches one target's live transcript, and hands back the way to stop.
+   *
+   * **The one call on this seam that is not a round trip**, which is why it is shaped
+   * differently from every other method here. The rest return a {@link Call} and are
+   * `await`ed once; this one opens a connection that stays open, delivers frames until
+   * something ends it, and has to be cancellable from a Svelte lifecycle that knows nothing
+   * about Effect. So it takes callbacks and returns a function: a fiber is forked for the
+   * stream and interrupting it is what closes the socket.
+   *
+   * `cursor` is where to resume the record channel. Omitted means "the server picks", and
+   * the opening frame says what it picked and what it skipped; a client that has watched
+   * before passes the highest sequence it saw. An empty view passes zero to reconstruct
+   * committed history; a view with items resumes from its last delivered position.
+   *
+   * **`onClosed` is called exactly once, whatever ends the stream**, and it is handed a
+   * typed {@link LiveClosed} rather than a sentence — see that type for why the
+   * `Unauthenticated` case in particular may not be flattened into one. It is not called
+   * for a caller that stopped it itself: interrupting is not an error and a screen that
+   * put up "connection lost" because the operator navigated would be lying about its own
+   * doing.
+   */
+  watchLive: (
+    baseUrl: string,
+    targetId: string,
+    options: {
+      readonly cursor?: number | undefined;
+      readonly onFrame: (frame: LiveFrame) => void;
+      readonly onClosed: (closed: LiveClosed) => void;
+    },
+  ): (() => void) => {
+    let stopped = false;
+    const fiber = Effect.runFork(
+      Effect.flatMap(client(baseUrl), (api) =>
+        Effect.flatMap(
+          api.fleet.live({
+            params: { targetId },
+            query:
+              options.cursor === undefined ? {} : { cursor: options.cursor },
+          }),
+          (stream) =>
+            Stream.runForEach(stream, (frame) =>
+              Effect.sync(() => {
+                options.onFrame(frame);
+              }),
+            ),
+        ),
+      ).pipe(
+        Effect.result,
+        Effect.flatMap((outcome) =>
+          Effect.sync(() => {
+            // The caller's own stop interrupts this fiber, and an interruption is not news.
+            if (stopped) return;
+            options.onClosed(
+              Result.isSuccess(outcome)
+                ? { _tag: "ended" }
+                : closedBy(outcome.failure),
+            );
+          }),
+        ),
+      ),
+    );
+    return () => {
+      stopped = true;
+      Effect.runFork(Fiber.interrupt(fiber));
+    };
+  },
 };
 
 /**

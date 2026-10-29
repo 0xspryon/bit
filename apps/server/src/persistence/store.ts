@@ -598,6 +598,15 @@ export type AttemptRecoveryRow = typeof AttemptRecoveryRow.Type;
 
 const recoveryColumns = Object.keys(AttemptRecoveryRow.fields).join(", ");
 
+const RecentRecoveryRow = Schema.Struct({
+  attempt_id: Schema.String,
+  status: Schema.String,
+  disposition: Schema.String,
+  observed_status: Schema.String,
+  detail: Schema.String,
+  last_reconciled_at: Schema.Finite,
+});
+
 /**
  * One recorded untested dimension, as a row with its own identity (migration `0008`).
  *
@@ -2521,19 +2530,41 @@ const makeStore = Effect.fnUntraced(function* () {
       sql`SELECT value FROM sequence_cursor WHERE name = ${name}`,
   });
 
-  const currentSequence = selectSequence(SEQUENCE_NAME).pipe(
-    Effect.map(Option.getOrElse(() => ({ value: 0 }))),
-    Effect.map((row) => row.value),
-    Effect.mapError((error) =>
-      error._tag === "SqlError"
-        ? asDatabaseError("query")(error)
-        : new DatabaseError({
-            operation: "query",
-            reason: "sequence_cursor did not decode",
-            cause: error,
-          }),
-    ),
-  );
+  const sequenceNamed = (name: string) =>
+    selectSequence(name).pipe(
+      Effect.map(Option.getOrElse(() => ({ value: 0 }))),
+      Effect.map((row) => row.value),
+      Effect.mapError((error) =>
+        error._tag === "SqlError"
+          ? asDatabaseError("query")(error)
+          : new DatabaseError({
+              operation: "query",
+              reason: "sequence_cursor did not decode",
+              cause: error,
+            }),
+      ),
+    );
+
+  const currentSequence = sequenceNamed(SEQUENCE_NAME);
+
+  /**
+   * The last sequence the event log assigned, or `0` for a file nothing has written to.
+   *
+   * **A separate counter from {@link currentSequence}, which is the observations'**, and the
+   * two must not be confused: they advance at different rates — one mutation writes one
+   * event and not necessarily an observation — so reading one for the other would be
+   * reporting a position in a log that nobody is reading.
+   *
+   * Taken from `sequence_cursor` rather than `SELECT MAX(sequence) FROM events`, because
+   * the counter is bumped *inside* the writing transaction and a rolled-back mutation
+   * therefore leaves it untouched (`store.test.ts`: "a refused mutation leaves no event
+   * sequence gap"). The two answers agree, and this one is a single-row lookup on a primary
+   * key rather than a scan.
+   *
+   * What it is for: a consumer opening a cursor read needs to know where the end is, so it
+   * can say whether it is showing the whole log or a bounded tail of it.
+   */
+  const currentEventSequence = sequenceNamed(EVENT_SEQUENCE_NAME);
 
   const selectIntent = SqlSchema.findOneOption({
     Request: Schema.String,
@@ -2651,6 +2682,28 @@ const makeStore = Effect.fnUntraced(function* () {
       Effect.mapError(lift("attempt_recoveries", attemptId)),
     );
   });
+
+  const selectRecentRecoveries = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: RecentRecoveryRow,
+    // The latest reconciliation per attempt, only while its resulting status is still
+    // current. A run that later settled normally must not keep a "still running" notice.
+    execute: () => sql`SELECT r.attempt_id, a.status, r.disposition,
+        r.observed_status, r.detail, r.last_reconciled_at
+      FROM attempt_recoveries AS r JOIN attempts AS a ON a.id = r.attempt_id
+      WHERE r.rowid = (SELECT r2.rowid FROM attempt_recoveries AS r2
+        WHERE r2.attempt_id = r.attempt_id
+        ORDER BY r2.last_reconciled_at DESC, r2.rowid DESC LIMIT 1)
+        AND a.status = r.resulting_status
+      ORDER BY r.last_reconciled_at DESC, r.rowid DESC LIMIT 20`,
+  });
+  const recentRecoveries = Effect.fn("ObservationStore.recentRecoveries")(
+    function* () {
+      return yield* selectRecentRecoveries().pipe(
+        Effect.mapError(lift("attempt_recoveries", "recent")),
+      );
+    },
+  );
 
   const selectPlannerLineage = SqlSchema.findOneOption({
     Request: Schema.String,
@@ -3000,6 +3053,7 @@ const makeStore = Effect.fnUntraced(function* () {
 
   return ObservationStore.of({
     counts,
+    recentRecoveries,
     seedAttempt,
     recordAsset,
     addIntent,
@@ -3018,6 +3072,7 @@ const makeStore = Effect.fnUntraced(function* () {
     dimensionsForIntent,
     dimensionSchedulesForIntent,
     currentSequence,
+    currentEventSequence,
     loadIntent,
     loadAttempt,
     unsettledAttempts,
@@ -3177,6 +3232,8 @@ export class ObservationStore extends Context.Service<
       DatabaseError | StoredRowError
     >;
     readonly currentSequence: Effect.Effect<number, DatabaseError>;
+    /** The event log's own last-assigned sequence. Not {@link currentSequence}. */
+    readonly currentEventSequence: Effect.Effect<number, DatabaseError>;
     readonly loadIntent: (
       intentId: string,
     ) => Effect.Effect<IntentRow | undefined, DatabaseError>;
@@ -3192,6 +3249,10 @@ export class ObservationStore extends Context.Service<
       attemptId: string,
     ) => Effect.Effect<
       readonly AttemptRecoveryRow[],
+      DatabaseError | StoredRowError
+    >;
+    readonly recentRecoveries: () => Effect.Effect<
+      readonly (typeof RecentRecoveryRow.Type)[],
       DatabaseError | StoredRowError
     >;
     readonly plannerLineage: (
