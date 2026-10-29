@@ -4448,3 +4448,310 @@ it is no longer the file `main.ts` opens at all.
 - **Nothing closes a question, still.** Dispositions are not implemented, so a brief only
   grows. `scheduled` narrows what a planner should act on but retires nothing, and the
   rendered briefing continues to say in as many words that nothing here settles anything.
+
+## 24. Goal and planner flow — spike findings
+
+Two investigations run on 2026-10-29 before the goal/planner slices, because the design
+in `docs/design/goal-and-planner-flow.md` rested on two claims nobody had run. Both are
+reproducible: `apps/server/src/spike/steeringProbe.ts` and
+`apps/server/src/spike/mcpIsolationProof.ts`, with run logs under `apps/server/.runtime/`.
+
+### 24.1 Mid-run prompt injection (Spike A)
+
+### `SPIKE` resolved — a running session can be prompted again on both drivers, but only OpenCode keeps it inside one execution (2026-10-29)
+
+Spike A of `docs/design/goal-and-planner-flow.md`. Decision 12 says steering "injects into a
+live planner session". That is now measured on both drivers and **injection works on both**,
+so the approved fallback — settle the round, open another one carrying the directive — is
+**not needed** and is not designed here. What the measurement does change is the round
+contract's _settlement_ clause on Claude Code, and it adds a knob decision 12 does not
+mention: each driver offers two injection timings, one of which throws the round's work in
+flight away and one of which does not.
+
+**What was run.** `apps/server/src/spike/steeringProbe.ts`, against both drivers on this
+machine — `opencode` 2.2.1 (model `openai/gpt-5.6-sol`) and Claude Code 2.1.310 through
+`@anthropic-ai/claude-agent-sdk@0.3.310` (model `claude-sonnet-5`). Nothing was simulated
+and nothing is UNTESTED for want of a driver. Each round prompts a session with slow work,
+waits for the model to be demonstrably producing output, prompts again with a directive —
+"reply with exactly the single word STEERED" — and reads the verdict off the driver's own
+event stream rather than off the second call returning without an error. The probe measures
+**executions and turns, not prompts**: an accepted prompt that the model never sees is the
+failure decision 12 would not survive, so the marker has to appear in the transcript and
+the driver has to say which execution produced it.
+
+**OpenCode — INTERLEAVED.** The second prompt lands inside the **same**
+`session.execution`, and one `api.session.wait` covers both.
+
+- `POST /api/session/:id/prompt` carries a `delivery: "steer" | "queue"` field that
+  `AgentHarness.prompt` does not pass today. Omitting it, the server resolved it to
+  `steer` — reported back on the inbox record the call answers with, so this is the
+  server's own word and not a default read out of its source.
+- Both deliveries produced exactly **one** `session.execution.started` /
+  `.succeeded` pair, with the directive arriving as a second
+  `session.inbox.enqueued` and later `session.inbox.delivered` **inside** it.
+- The two deliveries differ in _when_, and a one-step first turn cannot show it: a single
+  long text answer is one step, and OpenCode promotes an inbox item only at a **step**
+  boundary, so steer and queue both landed at the same instant. With a first prompt made
+  of eight sequential `read` calls the difference is stark:
+  - `delivery: "steer"` — directive delivered **after step 1 of 2**, 4 tool events. The
+    tool call in flight completed, then the directive cut the rest of the work off. The
+    session read one file of eight.
+  - `delivery: "queue"` — directive delivered **after step 9 of 10**, 32 tool events. All
+    eight reads finished, then the directive ran, still inside the one execution.
+- No permission event appeared in any round, and `session.wait` answered after the
+  directive's own output in every round.
+- A prompt to an **idle** session starts a new execution rather than being refused; that is
+  what every round's first prompt did. OpenCode never refuses a prompt for being busy
+  (`packages/core/src/session/run-coordinator.ts` is a coalescing doorbell, not a queue of
+  callers, and `SessionBusyError` is wired only to the three `session.revert.*` handlers).
+  **So a steer that loses the race against settlement does not fail — it silently starts
+  fresh work.** That is a race the goal agent has to lose safely; see the consequences.
+
+**Claude Code — QUEUED.** The directive runs in the same session, the same process and the
+same open `query()`, but as its **own turn** with its own `result`.
+
+- Our own seam refuses it first, verbatim: `HarnessTransportError: session
+<id> has already been prompted; carrying work on means a new attempt identity`
+  (`claudeCodeClient.ts`'s `prompt`). That is bit's rule, not the driver's.
+- Below it there is no second call to make. The SDK takes an
+  `AsyncIterable<SDKUserMessage>` and `launch` already holds that iterable open for the
+  session's whole life; a second prompt is a second `yield`. The probe drives `query()`
+  itself, with `SDKUserMessage.priority`:
+  - `priority: "now"` — the running turn was **cut off**: result 1 at 3.9s, 53 characters,
+    the count reached 1 of 60, `subtype: "success"`. Result 2 at 8.0s carried `STEERED`.
+  - `priority: "later"` — the running turn ran **to completion**: result 1 at 19.9s, 4757
+    characters, the count reached 60 of 60. Result 2 at 21.8s carried `STEERED`.
+- In **both** cases there were two `result` messages, each with `num_turns: 1` and
+  `user_message_uuids` of length 1, and the directive's uuid appeared only on the second.
+  Nothing folded. The SDK's own `user_message_uuids` doc describes folding only "for a turn
+  started by a synthetic (meta) prompt", which a host-sent prompt is not — so the
+  measurement and the documentation agree.
+- The stream says so plainly: a `command_lifecycle` frame marks the directive's acceptance,
+  then `result`, then a fresh `command_lifecycle command_lifecycle system system` — a
+  second `system/init` — before the directive's turn.
+- **This breaks bit's pump as written.** `claudeCodeClient.ts`'s `pump` has
+  `if (message.type === "result") break;` — "one prompt, one turn" — and then
+  `closeSession`. Under a steer that first `result` is the _steered-away_ turn: the pump
+  would end narration, complete `idle`, close the query, and the directive's turn would be
+  killed before it ran. `waitForIdle` would answer early and the supervisor would settle a
+  round that is about to produce its real answer.
+
+**T3 Code does exactly this, and names it.** Read at
+`/run/media/hbt/work/01-better-agents-codebases/resources/t3code`:
+
+- Five dispatch modes on one command, as a tagged union, not a flag:
+  `defer_start | steer_active | restart_active | queue_after_active | start_immediately`
+  (`packages/contracts/src/orchestrationV2.ts:2812`); newer clients send
+  `deliveryIntent: "auto" | "steer" | "restart"` and the server picks under the thread lock
+  (`:2804`).
+- The pick is a capability ladder, not a preference:
+  `apps/server/src/orchestration-v2/CommandPolicy.ts:147-199`. No active run →
+  `start_immediately`; active run with no _running provider turn_ → `queue_after_active`,
+  "so steering cannot reject the message"; otherwise `supportsActiveSteering` → steer,
+  else `supportsQueuedMessages` → queue, else `supportsSteeringByInterruptRestart` →
+  restart.
+- The two drivers bit has are declared differently.
+  `Adapters/ClaudeAdapterV2.ts:351-361`: `supportsActiveSteering: true`,
+  **`activeSteeringInterruptsTools: true`**, `supportsSteeringByInterruptRestart: false`.
+  `packages/provider-opencode/src/server/v2/adapter.ts:109-118`: steering, queueing and
+  interrupt-restart all true, and `activeSteeringInterruptsTools` absent. Both of those
+  match what the probe measured.
+- Mechanism per driver: Claude is `existing.query.offer(userMessage)` with
+  `priority: "now"` (`ClaudeAdapterV2.ts:9810-9860`), after first moving foreground
+  subagents to the background because the priority cancels the root turn's running tool
+  calls. OpenCode is `client.session.prompt({ ..., id: inboxID, delivery: "steer" })`
+  (`provider-opencode/src/server/v2/adapter.ts:3735-3790`), where `inboxID` is **derived**
+  from the session and message id so a retry cannot double-deliver.
+- A steer is a **durable outbox effect**, not a call:
+  `effect:${commandId}:provider-turn.steer:${providerTurnId}`
+  (`Orchestrator.ts:4373-4387`, executed in `EffectWorker.ts:219`). The "steer arrived too
+  late" race is handled at three layers — dispatch (`Orchestrator.ts:5021-5050`), effect
+  (`ProviderTurnControlService.ts:130-139`, `turnCompleted: true`) and recovery
+  (`EffectWorker.ts:248-300`, which re-dispatches the _same_ `messageId` as a new turn
+  under the deterministic command id `command:steer-follow-up:${effect.id}`).
+- Queued follow-ups are real runs with `status: "queued"` and a `queuePosition`, which is
+  what makes them listable, editable, reorderable and promotable
+  (`QueuedRunOrder.ts`; `queued-message.promote-to-steer` at `Orchestrator.ts:7918`, whose
+  resulting turn is tagged `inputIntent: "promoted_queued_to_steer"` rather than `"steer"`).
+- Default client behaviour is `followUpBehavior: "queue"`, not steer
+  (`packages/contracts/src/settings.ts:440`).
+
+**Consequences for the plan**
+
+1. **Decision 12 stands.** Steering injects into a live session on both drivers, with the
+   session's lineage, its MCP registration and its credential all intact. No fallback.
+2. **Decision 12 needs a second sentence: which timing.** Each driver has a destructive and
+   a non-destructive injection, and the probe shows the difference is not academic —
+   OpenCode's `steer` cost seven of eight reads, Claude's `"now"` cost 59 of 60 lines.
+   A planner round that is part-way through writing intents should finish them, so the
+   default should be the non-destructive one (`delivery: "queue"` / `priority: "later"`),
+   with the destructive one reserved for an explicit "redirect now" the operator or the
+   goal agent asks for. T3's own default agrees (`followUpBehavior: "queue"`).
+3. **`AgentHarness.prompt` has to grow.** It needs an urgency, and it needs an
+   application-chosen message id for idempotency — OpenCode takes one (`id`) and Claude
+   takes one (`uuid`), and T3 derives both deterministically so a retried steer cannot
+   double-deliver. A steer must also be distinguishable from the round's opening prompt at
+   the seam, because the two have different recovery rules: the opening prompt is never
+   resubmitted, and a steer whose delivery is uncertain must not be either.
+4. **Round settlement is now per-driver, and slice 6's settlement table has to say so.**
+   On OpenCode a steered round settles once. On Claude Code it produces a second `result`,
+   so "the first `result` ends the run" is wrong for a steered round: the pump must not
+   break at the first one, `waitForIdle` must mean "idle after the last accepted message",
+   and `closeSession` must not fire while a steer is outstanding. This is the only place
+   the spike demands a change to shipped code, and it is in `claudeCodeClient.ts`.
+5. **A steer can lose the race, and on OpenCode losing is not an error.** Prompting an idle
+   session starts a new execution. So the goal agent's `steer` tool cannot simply call
+   `prompt`: it has to claim the round as live first — the `FiberMap` keyed by round id
+   from decision 6 is the natural claim — and fall back to decision 12's second clause
+   ("open a round whose prompt already carries the directive") when the claim fails.
+   Otherwise a late steer starts unsupervised work on a settled round, with no round record
+   and no disposition.
+6. **Decision 17 is load-bearing, not cosmetic.** Neither driver's narration, as bit
+   reduces it, distinguishes a steer from the round's own prompt: OpenCode's steer is a
+   `session.inbox.*` pair that maps to `opaque`, and Claude Code's is a
+   `command_lifecycle` frame plus a second `system/init`, also `opaque`. Without the
+   `plan.round.steered` record the spec already asks for, a steered round's transcript
+   cannot explain its own disposition.
+
+**Not tested.** Interrupting a tool call mid-execution with a steer (OpenCode's steer waited
+for the tool to finish, which is what its capability flags claim; Claude's `"now"` was
+measured against text generation, not against a tool call). More than one steer into one
+round. A steer racing settlement (the behaviour is read from OpenCode's source and from
+bit's own pump, not measured). Withdrawing a steer (`cancel_async_message` on Claude Code,
+`session.inbox.cancel` on OpenCode). Any driver other than these two.
+
+**Verification actually run.** `bun run typecheck` and `bun run lint` pass.
+`bun run format:check` reports only `sprint-roadmap.html`, which is the documented baseline.
+No production code changed. Logs are in `apps/server/.runtime/steering-probe-*.log`
+(gitignored); `steering-probe-full.log` is the single run that produced every verdict above.
+
+### 24.2 The directory as an authority boundary (Spike B)
+
+### `SPIKE` resolved — the directory is an authority boundary under OpenCode, and a session is one under Claude Code (2026-10-29)
+
+Spike B of `docs/design/goal-and-planner-flow.md`. Decision 5 builds the three-directory
+layout, and a goal credential with no clock expiry, on the claim that an OpenCode MCP
+registration belongs to a directory. Until now that claim was inferred from the comment on
+`AgentHarness.registerMcpServer` (`apps/server/src/harness/agentHarness.ts`). It is now
+measured, on both drivers, and **the design stands as written**. No fallback (reissued
+short-lived credentials) is needed, so none is designed here.
+
+**What was run.** `apps/server/src/spike/mcpIsolationProof.ts`, once per driver: real
+`McpCredentials.issue`, real `seedAttempt`, the real control-plane MCP endpoint, real
+`registerMcpServer` on the real driver (`opencode` 2.2.1, Claude Code 2.1.310 through the
+Agent SDK), and the policy gate installed in every directory. Nothing was simulated and
+both drivers started, so nothing is UNTESTED for want of a driver.
+
+**What counts as evidence.** Never the model's account of itself. Each registration is
+pointed at a recording proxy in front of the MCP endpoint, which notes which bearer each
+request carried and what the endpoint answered. The store then says whose credential a
+write came in under, because provenance is derived from the credential. For OpenCode the
+harness's own registry (`api.mcp.list`, per directory) is read as well.
+
+**Question 1 — POSITIVE.** Two OpenCode sessions in one directory: the second sees the
+first's `bit-<id>` server and calls it successfully with the first's credential.
+
+- With no model involved, `mcp.list` for the shared directory showed `bit-iso-a` the
+  moment it was registered for session A, and the same call for a second directory
+  showed nothing of it.
+- Session B, which was never registered for anything named `bit-iso-a`, called its
+  `record_observation`. The proxy saw `tools/call` carrying **A's** token, answered 200;
+  the store holds the observation under **A's attempt and A's harness session id**. B's
+  model made the call and A's identity signed it. That is the exact failure the layout
+  exists to prevent, demonstrated rather than inferred. It succeeded in runs 3 to 6; in
+  runs 1 and 2 the tool was not yet exposed to B's first prompt (caveat 1 below).
+- Control: a session in a **different** directory, whose own server was reachable, asked
+  for `bit-iso-a` and got the harness's own refusal: `Unknown tool
+'bit-iso-a.record_observation'. Did you mean tools["bit-iso-c"].record_observation?`
+  Zero requests reached the endpoint. The two directories were siblings under one parent
+  and inside one git worktree, which is the shape of `targets/<id>/{workspace,planning,goal}`.
+- Source agrees (OpenCode `packages/core/src/tool/mcp.ts`): MCP tools are registered into
+  a registry built with `makeLocationNode`, so they belong to the location, and the
+  session id is passed to `callTool` only as context. There is no per-session filter to
+  find.
+
+So under OpenCode the directory is the only boundary there is. The layout is
+**load-bearing, not merely tidy**, and `mcp/credentials.ts` should say so when slice 4
+documents the no-expiry case (the spec already asks for this).
+
+**Question 2 — OpenCode replaces cleanly; Claude Code replaces before the prompt and
+silently ignores after it.**
+
+- _OpenCode._ Re-adding `bit-iso-a` with a new token (a different attempt, `a2`) left one
+  registry entry, not two. The harness reconnected immediately under the new token
+  (`server/discover`, `subscriptions/listen`, `tools/list`, all `a2`). Every later call,
+  from a brand-new session and from a session that was already open, carried `a2`; the old
+  token was revoked first and no request ever carried it, so no 401 appeared. The writes
+  are attributed to `a2`.
+- _Claude Code, before the prompt._ Registering one name twice on a session replaces the
+  first: only the second token ever connected and the first presented nothing.
+- _Claude Code, after the prompt was accepted._ `registerMcpServer` **returns success and
+  does nothing**: zero requests reached the endpoint under the late name. The registration
+  is pushed to the CLI once, at launch (`claudeCodeClient.ts` `launch`), and a later write
+  to the session record is never sent. A token cannot be rotated on a live Claude Code
+  session through this seam, and nothing says so.
+
+**Question 3 — CONFIRMED.** Two Claude Code sessions live at once in one directory, each
+registered with its own server. A (positive control) called its own server; the proxy saw
+that call under A's token. B searched for `bit-iso-a` three ways and the harness answered
+"No matching deferred tools found" each time; B reached only its own server, and no
+request under A's token came from B. Registration is per session, as `agentHarness.ts`
+documents.
+
+**Neither driver wrote the bearer to disk.** Files modified during each run under the
+harness's data and config directories, the Claude Code home, and the spike's own
+directory were searched for the raw tokens: none found, on either driver.
+
+**Caveats that change how this is built**
+
+1. **A server can be registered, connected and not yet callable.** `mcp.add` returns once
+   the server is connected, but OpenCode's tool registry reloads on its own schedule, behind
+   a lock and a debounce (`tool/mcp.ts`, the `ToolsChanged` subscription). In 3 of 8
+   first prompts after a registration, the model reported the tool was not exposed and the
+   endpoint saw no call; the same prompt succeeded on the next turn or the next run. Not
+   root-caused. It cuts both ways: a negative result in this spike is weak evidence on its
+   own, which is why the control above is a harness error beside a working sibling rather
+   than a model's "not found". And it means **a worker prompted straight after
+   registration can silently lack `record_observation` today.** There is no API to read
+   the tool registry, so a readiness check would need a different mechanism. Worth its own
+   follow-up; not fixed here.
+2. **Workers are not isolated from each other.** Concurrent attempts on one target share
+   `targets/<id>/workspace/`, so each sees every `bit-<attemptId>` registered there and can
+   write under another attempt's credential. The layout protects the planner and goal tool
+   sets from workers, which is what it claims; it does not protect worker from worker. The
+   comment on `registerMcpServer` already says this; the demonstration is above.
+3. **Registrations are never removed.** Nothing calls `mcp.remove`, and the interface has
+   no way to. After a credential is revoked the entry stays, `connected`, until the OpenCode
+   server dies. A per-round `planning/<roundId>/` directory keeps that from accumulating
+   across rounds; the shared `workspace/` accumulates a dead entry per attempt.
+4. **The operator's global OpenCode config is in every directory.** Every registry listing
+   above carried four servers the spike did not register, from the operator's
+   `~/.config/opencode` (one of them a remote server with a key in its headers). A planner
+   or goal session in its own directory sees them exactly as a worker does. Directory
+   splitting does not reach this; the harness child's `XDG_CONFIG_HOME` would.
+5. **Claude Code's stored transcript did not carry the final reply** in this run, so the
+   spike took narration from `sessionEvents` instead. That is a retention detail
+   (`AgentHarness.messages`) and matters to decision 14's replay, not to this finding.
+
+**Consequences for the plan**
+
+- Slice 3 stays as specified: three sibling directories, never nested, gate in each. The
+  review should check the paths are siblings, since only siblings were tested.
+- Slice 9: under OpenCode a goal credential's token can be swapped in place by
+  re-registering the same name, and an already-open session picks it up. Under Claude Code
+  it cannot be swapped at all on a live session; a replacement means a new session. The
+  no-expiry design never needs a swap, but any future rotation work must know this.
+- Slice 7's "a worker cannot reach `add_intent`" is now backed by the cross-directory
+  control, not assumed.
+
+**Not tested.** A tool call in flight across a re-registration. Nested directories (a
+role directory inside another). Whether a registration survives an OpenCode server
+restart (the server is a child of this process, so it should not outlive it). Any
+driver other than these two. Claude Code across directories, which is moot while
+registration is per session.
+
+**Verification actually run.** Six OpenCode runs and two Claude Code runs; logs are in
+`apps/server/.runtime/mcp-isolation-*.log` (gitignored). `bun run typecheck`, `bun run
+lint` pass; `bun run format:check` reports only files outside this spike
+(`sprint-roadmap.html` and others edited elsewhere in the tree). No production code
+changed.
