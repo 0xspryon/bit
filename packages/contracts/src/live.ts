@@ -85,8 +85,10 @@ export const LIVE_HEARTBEAT_SECONDS = 20;
  * closed the connection. Silence is the only signal available in that case, and this is how
  * long silence has to last before it means something.
  *
- * A client acting on this must *not* reconnect — reading the record from a cursor after a
- * drop is its own day's work. What it must do is stop claiming to be live.
+ * On silence the client stops claiming to be live, closes the stalled stream and reconnects
+ * from its last delivered record cursor. It says `Reconnecting` until the committed record
+ * has caught up; in-process activity missed during the gap has no cursor and cannot be
+ * replayed.
  */
 export const LIVE_SILENCE_LIMIT_SECONDS = LIVE_HEARTBEAT_SECONDS * 2;
 

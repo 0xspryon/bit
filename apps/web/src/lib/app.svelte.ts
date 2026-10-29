@@ -43,8 +43,8 @@ import { server, type ServerClient } from "./client";
  * A cancellable one-shot timer.
  *
  * A seam rather than a direct `setTimeout`, for the reason {@link App}'s client is one: the
-   * live transcript's silence watchdog and reconnect backoff depend on elapsed time;
-   * a test of the watchdog that actually waited would be a forty-second test.
+ * live transcript's silence watchdog and reconnect backoff depend on elapsed time;
+ * a test of the watchdog that actually waited would be a forty-second test.
  * There is one real implementation and it is three lines; see `test/fakeCountdown.ts` for
  * the other.
  */

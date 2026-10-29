@@ -80,7 +80,7 @@
 import { join } from "node:path";
 
 import { API_PREFIX } from "@bit/contracts";
-import { Effect, Layer } from "effect";
+import { Effect, Latch, Layer } from "effect";
 
 import { browserApiRoutes } from "./http/browserApi";
 import {
@@ -132,6 +132,44 @@ import {
   reconcileUnsettledAttempts,
   renderReconciliation,
 } from "./recovery/reconcile";
+
+/**
+ * Opened when this process is asked to stop. Armed **at module scope**, before any of the
+ * slow work starts.
+ *
+ * The registration used to sit at the end of {@link program}, after the migrations, the
+ * harness resolution and the startup reconciliation — so for that whole window there was
+ * no handler of ours and a signal was answered by the platform's default, which
+ * terminates the process without running a single finalizer in this file. Measured, that
+ * is survivable today: a `SIGINT` during boot leaves no `opencode serve` behind, because
+ * the child dies with the process that spawned it. What it is not is *this file's*
+ * shutdown path. Arming here means one mechanism answers a stop at every moment of the
+ * process's life — the scope unwinds, the listener closes, the harness child is killed by
+ * the finalizer that owns it — rather than two, one of which bypasses all of that and
+ * happens to get away with it.
+ *
+ * **A latch rather than a callback, because a latch remembers.** A signal that arrives
+ * while the layer graph is still building opens it, and the `await` at the end of
+ * {@link program} then returns at once instead of waiting for a second signal the
+ * operator has no reason to think is needed. A one-shot `process.once` handler had
+ * nowhere to hold that fact.
+ *
+ * `makeUnsafe` and `openUnsafe` are the synchronous pair, which is what lets this live
+ * outside an effect: a signal handler runs on the platform's stack rather than in a
+ * fiber, so opening the latch has to be something a plain function can do.
+ *
+ * **Listeners do not pile up across a watch restart**, which is worth stating because
+ * `bun --watch` reuses the pid — `reapOrphanedHarnesses` below exists because of that, so
+ * the assumption is not free here. Measured: a restarted context reads
+ * `process.listenerCount("SIGINT") === 0` before it registers, so Bun drops them with the
+ * old context and every boot starts from none.
+ */
+const shutdownRequested = Latch.makeUnsafe(false);
+const requestShutdown = () => {
+  shutdownRequested.openUnsafe();
+};
+process.on("SIGINT", requestShutdown);
+process.on("SIGTERM", requestShutdown);
 
 /**
  * Where the fleet lives.
@@ -697,15 +735,9 @@ const program = Effect.gen(function* () {
   console.log(
     `  runs supervised right now: ${String(alreadyRunning.length)} (a fresh process supervises none; rows left by an old one are the sweep's)`,
   );
-  yield* Effect.callback<void>((resume) => {
-    const stop = () => resume(Effect.void);
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
-    return Effect.sync(() => {
-      process.off("SIGINT", stop);
-      process.off("SIGTERM", stop);
-    });
-  });
+  // Already open if the signal landed while we were still booting, in which case this
+  // returns straight away. See `shutdownRequested`.
+  yield* shutdownRequested.await;
 });
 
 // Three steps, in an order that is load-bearing at both joints.
@@ -720,27 +752,65 @@ const program = Effect.gen(function* () {
 // make that ordering a matter of luck.
 await Effect.runPromise(
   Effect.scoped(
-    Effect.andThen(
+    // `raceFirst`, so a signal arriving mid-boot interrupts the boot instead of being
+    // acted on once it finishes: the loser is interrupted either way, and the scope this
+    // sits inside still releases in reverse, so the listener closes and the harness child
+    // is killed exactly as they are on a settled exit. `raceFirst` rather than `race`
+    // because a boot that *fails* has to surface now — `race` would wait for the other
+    // side, and the other side is a latch that nothing is going to open.
+    Effect.raceFirst(
       Effect.andThen(
-        reapOrphanedHarnesses,
-        prepareFleet.pipe(Effect.provide(fleet)),
-      ),
-      program.pipe(
-        Effect.provide(
-          // The endpoint *requires* the three shared services now, because it hands them
-          // to the browser API's routes as values rather than letting the router's own
-          // build make its own copies. `provideMerge` satisfies that requirement and keeps
-          // them reachable by `program`, which reconciles the fleet through the same
-          // instances the browser and the MCP route use.
-          Layer.provideMerge(
-            endpoint,
-            Layer.mergeAll(agent, targetStores, fleet),
+        Effect.andThen(
+          reapOrphanedHarnesses,
+          prepareFleet.pipe(Effect.provide(fleet)),
+        ),
+        program.pipe(
+          Effect.provide(
+            // The endpoint *requires* the three shared services now, because it hands them
+            // to the browser API's routes as values rather than letting the router's own
+            // build make its own copies. `provideMerge` satisfies that requirement and keeps
+            // them reachable by `program`, which reconciles the fleet through the same
+            // instances the browser and the MCP route use.
+            Layer.provideMerge(
+              endpoint,
+              Layer.mergeAll(agent, targetStores, fleet),
+            ),
           ),
         ),
       ),
+      shutdownRequested.await,
     ),
   ),
 );
+
+/**
+ * Ends the process, because finishing the work is not the same thing as finishing. **This
+ * line is the one that fixes the reported hang**; the latch above is what makes the path
+ * into it the same at every moment of a boot.
+ *
+ * **The scope is already released by the time this runs** — the listener is closed, the
+ * harness child is killed, the databases are shut. Measured after a `SIGINT` under
+ * `bun --watch`: the health route refuses the connection and the `opencode serve` child is
+ * gone, while the process itself is still there, indefinitely. So this is not a way of
+ * skipping cleanup; cleanup has already happened and nobody has left.
+ *
+ * What keeps it there is `bun --watch`, which holds the process open after the module
+ * settles so it can re-run it on the next edit — measured on its own: a script that merely
+ * logs and returns exits under `bun` and lingers under `bun --watch`. That is exactly what
+ * a watcher is for, and it is wrong once we have been asked to stop. `turbo` is waiting on
+ * this task to end, so a server that had shut down but never exited is a `dev` task that
+ * never finishes: what the operator sees is `turbo` re-printing `1 task shutting down`
+ * until a second `Ctrl+C` makes it force-kill us. The hang was a completed shutdown that
+ * nobody had exited.
+ *
+ * Unconditional rather than `if (watching)`, because there is nothing to detect and nothing
+ * to lose: under plain `bun` the process was going to exit here anyway, and this only says
+ * so. `0` because arriving here *is* the successful path — the only way out of the race
+ * above is a signal we asked for or a boot that failed, and a failed boot rejects the
+ * promise rather than reaching this line.
+ */
+console.log("bit control plane: stopped");
+process.exit(0);
 
 /** Re-exported so the entrypoint's own dependencies are visible to a reader. */
 export type { ObservationStore };
