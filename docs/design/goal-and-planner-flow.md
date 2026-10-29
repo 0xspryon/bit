@@ -11,13 +11,13 @@ document plus that slice's plan, and nothing else is assumed to travel with them
 
 ## 1. The model
 
-| Term       | Means                                                                       |
-| ---------- | --------------------------------------------------------------------------- |
-| **Target** | A system under test. Owns a folder and its own `hunt.sqlite`. Already built. |
-| **Hunt**   | The investigation of one target over time. Not a row — it _is_ the target.  |
-| **Goal**   | An objective within the hunt. A durable record with a lifecycle.            |
-| **Intent** | A specific direction to investigate, under one goal. Planner-created.       |
-| **Attempt**| One execution of one intent by one worker. Already built.                   |
+| Term        | Means                                                                        |
+| ----------- | ---------------------------------------------------------------------------- |
+| **Target**  | A system under test. Owns a folder and its own `hunt.sqlite`. Already built. |
+| **Hunt**    | The investigation of one target over time. Not a row — it _is_ the target.   |
+| **Goal**    | An objective within the hunt. A durable record with a lifecycle.             |
+| **Intent**  | A specific direction to investigate, under one goal. Planner-created.        |
+| **Attempt** | One execution of one intent by one worker. Already built.                    |
 
 The graph belongs to the **target**, not to a goal: `goals.target_id`,
 `intents.goal_id`, `attempts.intent_id` already express this and nothing is re-parented.
@@ -96,7 +96,7 @@ one conflicts with something in the code, the code is what changes.
 
 **Harness and model**
 
-13. Harness and model stay per-attempt and free-floating. The planner may *suggest* an
+13. Harness and model stay per-attempt and free-floating. The planner may _suggest_ an
     instance and model per intent (advisory columns, never a pin). Resolution order:
     operator's explicit pick → intent's suggestion → server default. A suggestion naming a
     dead instance **falls back and says so**; only an operator's explicit pick is refused
