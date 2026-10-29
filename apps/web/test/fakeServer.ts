@@ -27,6 +27,7 @@ import type {
   AttemptTranscript,
   FolderListing,
   GoalView,
+  IntentView,
   HarnessInstanceView,
   LiveCursor,
   LiveFrame,
@@ -135,6 +136,20 @@ export const goalView = (over: Partial<GoalView> = {}): GoalView => ({
   ...over,
 });
 
+export const intentView = (over: Partial<IntentView> = {}): IntentView => ({
+  intentId: "intent-1",
+  goalId: "goal_1",
+  question: "Does the limiter reset on a new window?",
+  status: "open",
+  anchoredTo: [],
+  addressesDimension: null,
+  createdAt: AT,
+  claimedByAttemptId: null,
+  suggestion: { instanceId: null, model: null, modelOptions: null },
+  attempts: 0,
+  ...over,
+});
+
 export const sessionOpened = (
   over: Partial<SessionOpened> = {},
 ): SessionOpened => ({
@@ -210,6 +225,7 @@ export const runStarted = (over: Partial<RunStarted> = {}): RunStarted => ({
   providerId: "anthropic",
   modelId: "claude-sonnet-5",
   startedAt: AT,
+  instanceFallback: null,
   ...over,
 });
 
@@ -464,6 +480,28 @@ export class FakeServer implements ServerClient {
   ) => Answer<"goal"> = (_baseUrl, targetId, goalId) =>
     ok(goalView({ targetId, goalId }));
 
+  onIntents: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+  ) => Answer<"intents"> = () => ok({ intents: [] });
+
+  onGoalObservations: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+  ) => Answer<"goalObservations"> = () => ok({ observations: [] });
+
+  onCreateIntent: (
+    ...args: Parameters<ServerClient["createIntent"]>
+  ) => Answer<"createIntent"> = (_baseUrl, _targetId, goalId, draft) =>
+    ok(intentView({ goalId, question: draft.question }));
+
+  onAbandonIntent: (
+    ...args: Parameters<ServerClient["abandonIntent"]>
+  ) => Answer<"abandonIntent"> = (_baseUrl, _targetId, intentId) =>
+    ok(intentView({ intentId, status: "abandoned" }));
+
   onEndGoal: (
     ...args: Parameters<ServerClient["endGoal"]>
   ) => Answer<"endGoal"> = (_baseUrl, targetId, goalId, draft) =>
@@ -551,6 +589,22 @@ export class FakeServer implements ServerClient {
 
   endGoal = (...args: Parameters<ServerClient["endGoal"]>) =>
     this.record("endGoal", args, () => this.onEndGoal(...args));
+
+  intents = (baseUrl: string, targetId: string, goalId: string) =>
+    this.record("intents", [baseUrl, targetId, goalId], () =>
+      this.onIntents(baseUrl, targetId, goalId),
+    );
+
+  goalObservations = (baseUrl: string, targetId: string, goalId: string) =>
+    this.record("goalObservations", [baseUrl, targetId, goalId], () =>
+      this.onGoalObservations(baseUrl, targetId, goalId),
+    );
+
+  createIntent = (...args: Parameters<ServerClient["createIntent"]>) =>
+    this.record("createIntent", args, () => this.onCreateIntent(...args));
+
+  abandonIntent = (...args: Parameters<ServerClient["abandonIntent"]>) =>
+    this.record("abandonIntent", args, () => this.onAbandonIntent(...args));
 
   harnesses = (baseUrl: string) =>
     this.record("harnesses", [baseUrl], () => this.onHarnesses(baseUrl));

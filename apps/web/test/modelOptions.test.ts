@@ -196,7 +196,7 @@ describe("what a run is dispatched with", () => {
   const readyToRun = async (): Promise<{ app: App; fake: FakeServer }> => {
     const { app, fake } = await signedIn();
     await app.openTarget("acme-corp");
-    app.instruction = "probe it";
+    app.runIntentId = "intent-1";
     return { app, fake };
   };
 

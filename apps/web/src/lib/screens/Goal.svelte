@@ -12,9 +12,15 @@
    * over, which is what stops new work being started under it; it does not stop a run that
    * is already going, and an operator who ends a goal expecting the run to halt would be
    * surprised by the run, not by the page.
+   *
+   * The goal's intents are listed between the objective and the end control, because they
+   * are what the goal is *made of* and the end control is what is done to the whole. A run
+   * is started from a row of that list; the run box sits under the page (see
+   * {@link ComposeBox}).
    */
   import Button from "../components/Button.svelte";
   import GoalStatusChip from "../components/GoalStatusChip.svelte";
+  import IntentList from "../components/IntentList.svelte";
   import PageFrame from "../components/PageFrame.svelte";
   import { countsLine, goalTitle, whenText } from "../goalFormat";
   import type { App } from "../app.svelte";
@@ -59,6 +65,8 @@
             <p>{goal.name}</p>
           </section>
         {/if}
+
+        <IntentList {app} />
 
         {#if goal.status === "active"}
           <section aria-labelledby="goal-end-heading">

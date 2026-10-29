@@ -473,6 +473,7 @@ describe("a database already at 0002", () => {
       "14_attempt_harness_instance",
       "15_attempt_model_options",
       "16_goal_lifecycle",
+      "17_intent_lifecycle",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -744,6 +745,7 @@ describe("a database already at 0005", () => {
       "14_attempt_harness_instance",
       "15_attempt_model_options",
       "16_goal_lifecycle",
+      "17_intent_lifecycle",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1456,9 +1458,10 @@ describe("a database already at 0015", () => {
       }),
     );
 
-    // Only the new entry is outstanding.
+    // Everything above 0015 is outstanding.
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "16_goal_lifecycle",
+      "17_intent_lifecycle",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1539,6 +1542,139 @@ describe("a database already at 0015", () => {
         "end_reason",
       ].sort(),
     );
+  });
+});
+
+describe("a database already at 0016", () => {
+  /**
+   * Intents as the old minting path wrote them, in a file at `0016`.
+   *
+   * Plain `INSERT`s naming only the columns that existed then, so the defaults are what
+   * has to supply the rest. One intent has an attempt, so "the attempt link survives" is
+   * not satisfied by an intent nothing hangs off.
+   */
+  const seedIntentsAtZeroSixteen = (path: string) =>
+    withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* runMigrations({ loader: chainThrough(16) });
+        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
+          VALUES ('goal_old', 'acme-corp', 'find auth bypasses', 100)`;
+        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
+          VALUES ('intent_old_a', 'goal_old', 'acme-corp', 'does login rate-limit?', 101)`;
+        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
+          VALUES ('intent_old_b', 'goal_old', 'acme-corp', 'is the token rotated?', 102)`;
+        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
+            provider_id, model_id, status, started_at, write_fence)
+          VALUES ('att_old', 'intent_old_a', 'acme-corp', 'wk_old', 'p', 'm',
+                  'succeeded', 103, 0)`;
+      }),
+    );
+
+  test("existing intents become open, unclaimed and unsuggested", async () => {
+    const path = newDatabasePath();
+    await seedIntentsAtZeroSixteen(path);
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        return {
+          applied: yield* migrate,
+          intents: yield* sql<{
+            id: string;
+            goal_id: string;
+            question: string;
+            created_at: number;
+            status: string;
+            claimed_by_attempt_id: string | null;
+            suggested_instance_id: string | null;
+            suggested_model: string | null;
+            suggested_model_options: string | null;
+          }>`SELECT id, goal_id, question, created_at, status, claimed_by_attempt_id,
+                    suggested_instance_id, suggested_model, suggested_model_options
+             FROM intents ORDER BY id`,
+          attempts: yield* sql<{
+            intent_id: string;
+          }>`SELECT intent_id FROM attempts`,
+        };
+      }),
+    );
+
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "17_intent_lifecycle",
+    ]);
+    const unchanged = {
+      claimed_by_attempt_id: null,
+      suggested_instance_id: null,
+    };
+    expect(outcome.intents).toEqual([
+      {
+        id: "intent_old_a",
+        goal_id: "goal_old",
+        question: "does login rate-limit?",
+        created_at: 101,
+        status: "open",
+        ...unchanged,
+        suggested_model: null,
+        suggested_model_options: null,
+      },
+      {
+        id: "intent_old_b",
+        goal_id: "goal_old",
+        question: "is the token rotated?",
+        created_at: 102,
+        status: "open",
+        ...unchanged,
+        suggested_model: null,
+        suggested_model_options: null,
+      },
+    ]);
+    // Not back-filled to `answered`, even though its attempt succeeded: the settlement
+    // rule judges at the moment of settling and is not applied to rows it never saw.
+    expect(outcome.attempts).toEqual([{ intent_id: "intent_old_a" }]);
+  });
+
+  test("adds the index a goal's intent list reads through", async () => {
+    const path = newDatabasePath();
+    await withSql(path, () => migrate);
+
+    const index = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        const rows = yield* sql.unsafe<{ name: string }>(
+          `PRAGMA index_list(intents)`,
+        );
+        const columns = yield* sql.unsafe<{ seqno: number; name: string }>(
+          `PRAGMA index_info(intents_goal_status_idx)`,
+        );
+        return {
+          present: rows.map((row) => row.name),
+          columns: [...columns]
+            .sort((a, b) => a.seqno - b.seqno)
+            .map((column) => column.name),
+        };
+      }),
+    );
+
+    expect(index.present).toContain("intents_goal_status_idx");
+    expect(index.columns).toEqual(["goal_id", "status"]);
+  });
+
+  test("a fresh database has the same intent columns as an upgraded one", async () => {
+    const upgraded = newDatabasePath();
+    await seedIntentsAtZeroSixteen(upgraded);
+    await withSql(upgraded, () => migrate);
+    const fresh = newDatabasePath();
+    await withSql(fresh, () => migrate);
+
+    const [fromUpgrade, fromScratch] = await Promise.all([
+      withSql(upgraded, (sql) => columnsOf(sql, "intents")),
+      withSql(fresh, (sql) => columnsOf(sql, "intents")),
+    ]);
+
+    expect(fromScratch).toEqual(fromUpgrade);
+    expect(fromScratch).toContain("status");
+    expect(fromScratch).toContain("claimed_by_attempt_id");
+    expect(fromScratch).toContain("suggested_instance_id");
+    expect(fromScratch).toContain("suggested_model");
+    expect(fromScratch).toContain("suggested_model_options");
   });
 });
 

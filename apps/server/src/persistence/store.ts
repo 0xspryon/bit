@@ -41,18 +41,21 @@ import {
   RecordAssetResult,
   RecordObservationResult,
   SummaryObservationConditions,
+  AbandonIntentResult,
   AddIntentResult,
   EndGoalResult,
   GoalEndedBy,
   GoalStatus,
+  IntentStatus,
+  ModelOptionSelection,
   OpenGoalResult,
   assetIdentityOf,
   dimensionAddress,
   isAssetIdentityRefusal,
   parseDimensionAddress,
+  type AbandonIntentInput,
   type AddIntentInput,
   type EndGoalInput,
-  type ModelOptionSelection,
   type OpenGoalInput,
   type ObservationProvenance,
   type ObservationRecordFormat,
@@ -112,6 +115,41 @@ export class StoredRowError extends Schema.TaggedError<StoredRowError>()(
 }
 
 /**
+ * An intent that could not be claimed, and exactly why.
+ *
+ * Its own error rather than a {@link MutationError}, because a claim has four different
+ * refusals that a caller must tell apart and a bare `invalid` or `conflict` would make it
+ * parse a sentence to do so. Each reason is one the store established from the row, not
+ * one it inferred:
+ *
+ * - `no_such_intent` — nothing is stored under that id.
+ * - `other_target` — the intent belongs to a different target than the caller's.
+ * - `not_open` — it is `claimed`, `answered`, `abandoned` or `proposed`. `heldBy` names the
+ *   attempt holding it when the status is `claimed`, and is null otherwise.
+ * - `goal_not_active` — the intent is open but its goal has ended. Ending a goal blocks
+ *   new dispatch under it (the spec's decision 8).
+ */
+export class ClaimRefused extends Schema.TaggedError<ClaimRefused>()(
+  "ClaimRefused",
+  {
+    reason: Schema.Literals([
+      "no_such_intent",
+      "other_target",
+      "not_open",
+      "goal_not_active",
+    ]),
+    intentId: Schema.String,
+    /** The attempt holding the claim, when that is why. Null for every other reason. */
+    heldBy: Schema.NullOr(Schema.String),
+    detail: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `${this.reason} (${this.intentId}): ${this.detail}`;
+  }
+}
+
+/**
  * The authenticated caller. Every field is derived from the bearer credential the
  * host issued when it created the session, never from anything the model said. A
  * worker cannot name a different intent, attempt or target by asking.
@@ -144,6 +182,20 @@ export interface HostContext {
   readonly callerScope: string;
   readonly targetId: string;
 }
+
+/**
+ * Who a mutation the operator makes through the browser is recorded as.
+ *
+ * `<targetId>/operator` follows the scope namespacing the spec settles — `targetId/<attemptId>`
+ * for a worker, and later `targetId/round/…` and `targetId/goal/…` for the planner and the
+ * goal agent — so the operator is one more author in the same space and cannot collide with
+ * an attempt: attempt ids are `att_…`. It is the host's own authority, supplied by the
+ * process that owns the session guard, never read from a payload. One definition, because
+ * the browser API and the run supervisor both act as the operator and a second spelling of
+ * the string is a receipt key that stops matching.
+ */
+export const operatorScope = (targetId: string): string =>
+  `${targetId}/operator`;
 
 export interface SeedInput {
   readonly targetId: string;
@@ -304,6 +356,71 @@ export interface StoredGoal {
   readonly intentCount: number;
   readonly attemptCount: number;
   readonly observationCount: number;
+}
+
+/**
+ * An intent's advisory suggestion for how to run it, as stored.
+ *
+ * Null is no opinion, field by field. Never provenance: `attempts` records what ran.
+ */
+export interface StoredIntentSuggestion {
+  readonly instanceId: string | null;
+  readonly model: string | null;
+  /** Null, never `[]`: an empty list would claim an opinion. See `AddIntentInput`. */
+  readonly modelOptions: readonly ModelOptionSelection[] | null;
+}
+
+/**
+ * One intent as the store reads it, with its anchors and how many attempts it has had.
+ *
+ * Like {@link StoredGoal}, deliberately not the contract's `IntentView`: the browser API
+ * maps one to the other field by field. `addressesDimension` is the wire alias a briefing
+ * prints, derived from the dimension row at read time rather than stored a second time.
+ */
+export interface StoredIntent {
+  readonly intentId: string;
+  readonly goalId: string;
+  readonly targetId: string;
+  readonly question: string;
+  readonly status: IntentStatus;
+  readonly anchoredTo: readonly string[];
+  readonly addressesDimension: string | null;
+  readonly createdAt: number;
+  readonly claimedByAttemptId: string | null;
+  readonly suggestion: StoredIntentSuggestion;
+  readonly attemptCount: number;
+}
+
+/**
+ * What a successful claim hands the run: the intent as it was taken, and its goal's words.
+ *
+ * Everything a run needs to start comes from here and none of it from the request — the
+ * prompt is `question` — so a run is exactly the intent that was claimed.
+ */
+export interface ClaimResult {
+  readonly intentId: string;
+  readonly goalId: string;
+  /** The goal's objective, for the attempt's provenance text. */
+  readonly goal: string;
+  readonly question: string;
+  readonly suggestion: StoredIntentSuggestion;
+  /** The attempt now holding the claim: the one the caller named. */
+  readonly claimedByAttemptId: string;
+}
+
+/**
+ * One claim the startup sweep gave back, and what it found when it looked.
+ *
+ * `attemptStatus` is null when the attempt the claim names has no row at all — the process
+ * died between taking the claim and writing the attempt — and otherwise the status that
+ * row holds, which is never `running`.
+ */
+export interface ReleasedClaim {
+  readonly intentId: string;
+  readonly goalId: string;
+  readonly targetId: string;
+  readonly claimedByAttemptId: string;
+  readonly attemptStatus: string | null;
 }
 
 /** An attempt's identity plus the write-authority epoch a credential must carry. */
@@ -596,6 +713,84 @@ const toStoredGoal = (row: typeof GoalRow.Type): StoredGoal => ({
   intentCount: row.intent_count,
   attemptCount: row.attempt_count,
   observationCount: row.observation_count,
+});
+
+const jsonModelOptions = Schema.fromJsonString(
+  Schema.Array(ModelOptionSelection),
+);
+
+/**
+ * An intent row with its attempt count and, when it addresses a dimension, the raising
+ * observation and position the wire alias is built from.
+ *
+ * `status` is decoded through the contract's literals, like {@link GoalRow}'s: a value
+ * outside the five is corruption, and corruption belongs in a typed error naming the row.
+ * `suggested_model_options` is decoded from its JSON here, so a stored list that no longer
+ * matches the contract fails naming the row rather than reaching a browser.
+ */
+const IntentRowSchema = Schema.Struct({
+  id: Schema.String,
+  goal_id: Schema.String,
+  target_id: Schema.String,
+  question: Schema.String,
+  status: IntentStatus,
+  created_at: Schema.Finite,
+  claimed_by_attempt_id: Schema.NullOr(Schema.String),
+  suggested_instance_id: Schema.NullOr(Schema.String),
+  suggested_model: Schema.NullOr(Schema.String),
+  suggested_model_options: Schema.NullOr(jsonModelOptions),
+  dimension_observation_id: Schema.NullOr(Schema.String),
+  dimension_position: Schema.NullOr(Schema.Int),
+  attempt_count: Schema.Int,
+});
+
+/** One anchor link, selected beside the intents it belongs to. */
+const IntentAnchorRow = Schema.Struct({
+  intent_id: Schema.String,
+  observation_id: Schema.String,
+});
+
+/**
+ * The columns {@link IntentRowSchema} names. The attempt count is a correlated subquery for
+ * the reason {@link goalSelect}'s counts are: one table counted once, no row multiplication.
+ * The dimension join is `LEFT`, because most intents address none.
+ */
+const intentSelect = `SELECT intents.id AS id, intents.goal_id AS goal_id,
+    intents.target_id AS target_id, intents.question AS question,
+    intents.status AS status, intents.created_at AS created_at,
+    intents.claimed_by_attempt_id AS claimed_by_attempt_id,
+    intents.suggested_instance_id AS suggested_instance_id,
+    intents.suggested_model AS suggested_model,
+    intents.suggested_model_options AS suggested_model_options,
+    dimensions.observation_id AS dimension_observation_id,
+    dimensions.position AS dimension_position,
+    (SELECT COUNT(*) FROM attempts WHERE attempts.intent_id = intents.id) AS attempt_count
+  FROM intents
+  LEFT JOIN observation_dimensions AS dimensions
+    ON dimensions.id = intents.addresses_dimension`;
+
+const toStoredIntent = (
+  row: typeof IntentRowSchema.Type,
+  anchors: readonly string[],
+): StoredIntent => ({
+  intentId: row.id,
+  goalId: row.goal_id,
+  targetId: row.target_id,
+  question: row.question,
+  status: row.status,
+  anchoredTo: anchors,
+  addressesDimension:
+    row.dimension_observation_id === null || row.dimension_position === null
+      ? null
+      : dimensionAddress(row.dimension_observation_id, row.dimension_position),
+  createdAt: row.created_at,
+  claimedByAttemptId: row.claimed_by_attempt_id,
+  suggestion: {
+    instanceId: row.suggested_instance_id,
+    model: row.suggested_model,
+    modelOptions: row.suggested_model_options,
+  },
+  attemptCount: row.attempt_count,
 });
 
 /**
@@ -946,6 +1141,45 @@ const makeStore = Effect.fnUntraced(function* () {
   });
 
   /**
+   * Gives a claimed intent back, and says what it became. **One statement.**
+   *
+   * The destination is the settlement rule (`contracts/intent.ts`, {@link IntentStatus}):
+   * `answered` only when the attempt `succeeded` **and** at least one observation exists
+   * under the intent, otherwise `open`. A `failed`, `interrupted` or `uncertain` attempt
+   * never reaches `answered`, because a run that did not finish saying what it found is an
+   * absence of evidence and `answered` is the one status that asserts evidence. The
+   * observation test is a subquery in the same `UPDATE`, so the answer cannot be decided
+   * on a count that is stale by the time it is written.
+   *
+   * The `WHERE` is the safety: it matches only an intent that is `claimed` **and** (when
+   * `heldBy` is given) claimed by that attempt. So a settlement that fires for an attempt
+   * that never held the claim — a replacement attempt opened beside an intent that is
+   * `open`, a refinement of an `uncertain` attempt whose claim was released long ago, a
+   * refused run's cleanup arriving after another run took the intent — changes nothing,
+   * rather than freeing a claim somebody else holds.
+   *
+   * Transaction-local by use: {@link settleAttempt} and {@link recordRecovery} call it
+   * inside their own transaction so a settled attempt and a released intent commit
+   * together or not at all. Returns whether a row changed.
+   */
+  const releaseClaim = Effect.fnUntraced(function* (
+    intentId: string,
+    settledStatus: string,
+    heldBy: string | null,
+  ) {
+    const released = yield* sql<{ id: string }>`UPDATE intents
+      SET status = CASE
+            WHEN ${settledStatus} = 'succeeded'
+              AND EXISTS (SELECT 1 FROM observations WHERE observations.intent_id = intents.id)
+            THEN 'answered' ELSE 'open' END,
+          claimed_by_attempt_id = NULL
+      WHERE id = ${intentId} AND status = 'claimed'
+        AND (${heldBy} IS NULL OR claimed_by_attempt_id = ${heldBy})
+      RETURNING id`.pipe(Effect.mapError(asDatabaseError("transaction")));
+    return released.length > 0;
+  });
+
+  /**
    * Creates the goal, intent and attempt a worker will be bound to, and returns the
    * write authority a credential for it must carry.
    *
@@ -1070,6 +1304,10 @@ const makeStore = Effect.fnUntraced(function* () {
             WHERE id = ${attemptId} AND status = 'running'`.pipe(
             Effect.mapError(asDatabaseError("transaction")),
           );
+          // The claim goes back in the same transaction the attempt settles in, so there
+          // is no instant at which an attempt has settled and its intent still says it is
+          // being worked, or the reverse.
+          yield* releaseClaim(before.intent_id, status, attemptId);
           yield* appendAttemptEvent({
             kind: "attempt.settled",
             targetId: before.target_id,
@@ -2077,11 +2315,22 @@ const makeStore = Effect.fnUntraced(function* () {
             addressesDimensionId = dimension.value.dimension_id;
           }
 
+          // Advisory, and stored as given: nothing reads these as what ran. An empty
+          // option list becomes null for the reason `canonicalModelOptions` says — it
+          // would claim an opinion — and the rest is sorted so the same suggestion is the
+          // same bytes.
+          const suggestedOptions = canonicalModelOptions(
+            input.suggestedModelOptions ?? null,
+          );
           yield* sql`INSERT INTO intents (
-              id, goal_id, target_id, question, created_at, addresses_dimension
+              id, goal_id, target_id, question, created_at, addresses_dimension,
+              status, suggested_instance_id, suggested_model, suggested_model_options
             ) VALUES (
               ${input.intentId}, ${input.goalId}, ${host.targetId},
-              ${input.question}, ${createdAt}, ${addressesDimensionId}
+              ${input.question}, ${createdAt}, ${addressesDimensionId},
+              'open', ${input.suggestedInstanceId ?? null},
+              ${input.suggestedModel ?? null},
+              ${suggestedOptions === null ? null : JSON.stringify(suggestedOptions)}
             )`.pipe(Effect.mapError(asDatabaseError("transaction")));
 
           for (const [
@@ -2135,6 +2384,11 @@ const makeStore = Effect.fnUntraced(function* () {
               anchoredTo: input.anchorObservationIds,
               addressesDimensionId,
               topLevel: result.topLevel,
+              // What the intent hoped to run on, for the record of what was asked. Not
+              // what ran: that is `attempt.started`.
+              suggestedInstanceId: input.suggestedInstanceId ?? null,
+              suggestedModel: input.suggestedModel ?? null,
+              suggestedModelOptions: suggestedOptions,
             },
             recordedAt: createdAt,
           });
@@ -2463,6 +2717,507 @@ const makeStore = Effect.fnUntraced(function* () {
     });
   });
 
+  const selectIntentById = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: IntentRowSchema,
+    execute: (intentId) =>
+      sql.unsafe(`${intentSelect} WHERE intents.id = ?`, [intentId]),
+  });
+
+  const selectIntentsOfGoal = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: IntentRowSchema,
+    execute: (goalId) =>
+      sql.unsafe(
+        `${intentSelect} WHERE intents.goal_id = ? ORDER BY intents.created_at, intents.id`,
+        [goalId],
+      ),
+  });
+
+  const selectAnchorsOfGoal = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: IntentAnchorRow,
+    execute: (goalId) =>
+      sql`SELECT intent_anchors.intent_id AS intent_id,
+            intent_anchors.observation_id AS observation_id
+          FROM intent_anchors
+          INNER JOIN intents ON intents.id = intent_anchors.intent_id
+          WHERE intents.goal_id = ${goalId}
+          ORDER BY intent_anchors.intent_id, intent_anchors.position`,
+  });
+
+  /**
+   * Every intent under one goal, oldest first, each with its anchors and attempt count.
+   *
+   * Oldest first because an intent list reads as a queue of directions in the order they
+   * were raised, where a goal list reads as a feed. Two statements (intents, then their
+   * anchors) rather than a join, because a join across anchors multiplies each intent by
+   * its anchor count and the grouping back is the thing that goes wrong. Read-only and
+   * transaction-free, like {@link goals}.
+   */
+  const intentsForGoal = Effect.fn("ObservationStore.intentsForGoal")(
+    function* (goalId: string) {
+      const rows = yield* selectIntentsOfGoal(goalId).pipe(
+        Effect.mapError(lift("intents", `goal:${goalId}`)),
+      );
+      const anchorRows = yield* selectAnchorsOfGoal(goalId).pipe(
+        Effect.mapError(lift("intent_anchors", `goal:${goalId}`)),
+      );
+      const anchors = new Map<string, string[]>();
+      for (const anchor of anchorRows) {
+        const held = anchors.get(anchor.intent_id);
+        if (held === undefined)
+          anchors.set(anchor.intent_id, [anchor.observation_id]);
+        else held.push(anchor.observation_id);
+      }
+      return rows.map((row) => toStoredIntent(row, anchors.get(row.id) ?? []));
+    },
+  );
+
+  /** One intent by id, or `undefined`. Which target and goal it belongs to are on it. */
+  const intent = Effect.fn("ObservationStore.intent")(function* (
+    intentId: string,
+  ) {
+    const row = yield* selectIntentById(intentId).pipe(
+      Effect.mapError(lift("intents", intentId)),
+    );
+    if (Option.isNone(row)) return undefined;
+    const anchors = yield* anchorsForIntent(intentId);
+    return toStoredIntent(row.value, anchors);
+  });
+
+  const selectClaimState = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      target_id: Schema.String,
+      goal_id: Schema.String,
+      status: Schema.String,
+      claimed_by_attempt_id: Schema.NullOr(Schema.String),
+      goal_status: Schema.String,
+    }),
+    execute: (intentId) =>
+      sql`SELECT intents.target_id AS target_id, intents.goal_id AS goal_id,
+            intents.status AS status,
+            intents.claimed_by_attempt_id AS claimed_by_attempt_id,
+            goals.status AS goal_status
+          FROM intents INNER JOIN goals ON goals.id = intents.goal_id
+          WHERE intents.id = ${intentId}`,
+  });
+
+  const selectClaimed = SqlSchema.findOne({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      goal_description: Schema.String,
+    }),
+    execute: (goalId) =>
+      sql`SELECT description AS goal_description FROM goals WHERE id = ${goalId}`,
+  });
+
+  /**
+   * Takes an intent for one attempt, or refuses by name. **The take is one statement.**
+   *
+   * `UPDATE intents SET status = 'claimed', claimed_by_attempt_id = ? WHERE id = ? AND
+   * status = 'open' …` is the whole claim, and a zero-row result is the refusal. There is
+   * no read-then-write: two requests that both saw the intent `open` would both write, and
+   * the second would silently take what the first holds. Under the single write lock the
+   * statements serialise, the first matches, the second finds `status = 'claimed'` and
+   * matches nothing — which is what the concurrency test asserts with two claims racing.
+   *
+   * The same statement carries the other two things that make an intent claimable: it
+   * belongs to the caller's target (`host.targetId`, never a payload's), and its goal is
+   * still `active`. Ending a goal blocks new dispatch (the spec's decision 8), and putting
+   * that in the claim rather than in a check before it means a goal ended a millisecond ago
+   * cannot be dispatched under by a request that read it as active.
+   *
+   * **The diagnosis is read after the refusal and only names it.** Once the statement has
+   * matched nothing the store reads why — missing, another target's, not open (naming the
+   * holder), or a goal that has ended — and that read decides no write. If it finds the
+   * intent claimable after all, the state moved between the two statements, and the answer
+   * is a `not_open` that says so rather than a retry here.
+   *
+   * No receipt and no event: a claim is not an operator command to be replayed, it is a
+   * lock taken for a run that has not started, and it is followed by the `attempt.started`
+   * event for the run it was taken for. A claim whose run never starts is released and
+   * leaves no trace in the log, which is correct: nothing happened.
+   *
+   * The attempt id is the caller's and is not required to exist yet. The claim is taken
+   * *before* the attempt row is written, so that a run refused for any later reason leaves
+   * no attempt behind to settle; for that reason `claimed_by_attempt_id` is not a foreign
+   * key.
+   */
+  const claimIntent = Effect.fn("ObservationStore.claimIntent")(function* (
+    host: HostContext,
+    intentId: string,
+    attemptId: string,
+  ) {
+    const taken = yield* sql<{ goal_id: string }>`UPDATE intents
+      SET status = 'claimed', claimed_by_attempt_id = ${attemptId}
+      WHERE id = ${intentId} AND status = 'open' AND target_id = ${host.targetId}
+        AND goal_id IN (SELECT id FROM goals WHERE status = 'active')
+      RETURNING goal_id`.pipe(Effect.mapError(asDatabaseError("query")));
+
+    if (taken.length === 0) {
+      const state = yield* selectClaimState(intentId).pipe(
+        Effect.mapError(lift("intents", intentId)),
+      );
+      if (Option.isNone(state)) {
+        return yield* new ClaimRefused({
+          reason: "no_such_intent",
+          intentId,
+          heldBy: null,
+          detail: `no intent ${intentId} exists`,
+        });
+      }
+      const found = state.value;
+      if (found.target_id !== host.targetId) {
+        return yield* new ClaimRefused({
+          reason: "other_target",
+          intentId,
+          heldBy: null,
+          detail: `intent ${intentId} belongs to target ${found.target_id}, not ${host.targetId}`,
+        });
+      }
+      if (found.status !== "open") {
+        const heldBy =
+          found.status === "claimed" ? found.claimed_by_attempt_id : null;
+        const why =
+          found.status === "claimed"
+            ? `it is claimed by attempt ${found.claimed_by_attempt_id ?? "(unrecorded)"}; wait for that attempt to settle, or stop it, and then run this intent`
+            : found.status === "answered"
+              ? "it is already answered, and an answered intent is not run again; a follow-up is a new intent"
+              : found.status === "abandoned"
+                ? "it was abandoned, and an abandoned intent is not run"
+                : found.status === "proposed"
+                  ? "it is only proposed, and a proposal is not run until it is accepted"
+                  : `its status is ${found.status}`;
+        return yield* new ClaimRefused({
+          reason: "not_open",
+          intentId,
+          heldBy,
+          detail: `intent ${intentId} cannot be claimed: ${why}`,
+        });
+      }
+      if (found.goal_status !== "active") {
+        return yield* new ClaimRefused({
+          reason: "goal_not_active",
+          intentId,
+          heldBy: null,
+          detail: `intent ${intentId} is open but its goal ${found.goal_id} is ${found.goal_status}; ending a goal blocks new dispatch under it, and a different conclusion is a new goal`,
+        });
+      }
+      // Open, ours and under an active goal, yet the statement matched nothing: the row
+      // changed between the two. Said as it is rather than guessed at.
+      return yield* new ClaimRefused({
+        reason: "not_open",
+        intentId,
+        heldBy: null,
+        detail: `intent ${intentId} changed while it was being claimed; nothing was claimed, and it can be tried again`,
+      });
+    }
+
+    const goalId = taken[0]!.goal_id;
+    const claimed = yield* selectIntentById(intentId).pipe(
+      Effect.mapError(lift("intents", intentId)),
+    );
+    const goal = yield* selectClaimed(goalId).pipe(
+      Effect.mapError(lift("goals", goalId)),
+    );
+    if (Option.isNone(claimed)) {
+      // Unreachable: the row was just updated. Reported as corruption, not swallowed.
+      return yield* new StoredRowError({
+        table: "intents",
+        rowId: intentId,
+        detail: "the intent was claimed and could not be read back",
+        cause: undefined,
+      });
+    }
+    const stored = toStoredIntent(claimed.value, []);
+    return {
+      intentId,
+      goalId,
+      goal: goal.goal_description,
+      question: stored.question,
+      suggestion: stored.suggestion,
+      claimedByAttemptId: attemptId,
+    } satisfies ClaimResult;
+  });
+
+  /**
+   * Gives an intent back without an attempt having settled: the path a refused run takes.
+   *
+   * `settledStatus` is the same vocabulary {@link settleAttempt} uses and runs through the
+   * same rule, so a release with anything but `succeeded` returns the intent to `open`. A
+   * run that never started passes a non-`succeeded` word and the claim goes back; this is
+   * not a way to mark an intent answered, because answering needs an attempt that
+   * succeeded *and* an observation, and a refused run has neither.
+   *
+   * `heldBy`, when given, restricts the release to a claim that attempt still holds. The
+   * supervisor always passes it: a cleanup that fires after another run took the intent
+   * must not free that run's claim. Releasing an intent nobody claims changes nothing and
+   * is not an error.
+   */
+  const releaseIntent = Effect.fn("ObservationStore.releaseIntent")(function* (
+    intentId: string,
+    settledStatus: string,
+    heldBy?: string,
+  ) {
+    yield* releaseClaim(intentId, settledStatus, heldBy ?? null);
+  });
+
+  const selectOrphanedClaims = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({
+      id: Schema.String,
+      goal_id: Schema.String,
+      target_id: Schema.String,
+      claimed_by_attempt_id: Schema.String,
+      attempt_status: Schema.NullOr(Schema.String),
+    }),
+    execute: () =>
+      sql`SELECT intents.id AS id, intents.goal_id AS goal_id,
+            intents.target_id AS target_id,
+            intents.claimed_by_attempt_id AS claimed_by_attempt_id,
+            attempts.status AS attempt_status
+          FROM intents
+          LEFT JOIN attempts ON attempts.id = intents.claimed_by_attempt_id
+          WHERE intents.status = 'claimed'
+            AND intents.claimed_by_attempt_id IS NOT NULL
+            AND (attempts.id IS NULL OR attempts.status <> 'running')
+          ORDER BY intents.id`,
+  });
+
+  /**
+   * Gives back every claim whose attempt is not running and will not be: the startup
+   * sweep's half of the intent lifecycle.
+   *
+   * A claim is released by the settlement of the attempt that holds it, in the same
+   * transaction. That covers every ending but one: a process that dies **between taking the
+   * claim and writing the attempt row** leaves an intent `claimed` by an attempt that does
+   * not exist. Nothing else would ever see it — the attempt sweep enumerates `attempts` —
+   * and it could be neither run (`claimIntent` refuses `not_open`) nor abandoned (the
+   * refusal advises stopping an attempt that is not there). This finds it by the claim
+   * instead.
+   *
+   * It also gives back a claim whose attempt exists and has already left `running`
+   * (including `uncertain`, whose authority is revoked). Settlement releases in its own
+   * transaction so this should not occur; if it does, nothing is working the intent either.
+   * A `running` attempt is never touched here: that is the attempt sweep's, which asks the
+   * harness before it concludes anything.
+   *
+   * **The outcome is `open`, never `answered`.** Nothing ran under a claim with no attempt,
+   * so nothing is known, and for a settled one the settlement already made its decision.
+   * This reconciles a lock; it does not invent a result, and it never reads observations.
+   *
+   * Each release is its own `intent.released` event, written in the same transaction as the
+   * `UPDATE`, because it is a state change with no `attempt.settled` behind it to say so. The
+   * event names the attempt the claim pointed at and what that attempt was, so an operator
+   * reading the log can tell a crash from a stale row.
+   *
+   * **When it may run, and what that depends on.** Only at startup, before this process
+   * runs anything. A claim a live `start` has taken and not yet written an attempt for is
+   * `claimed` with no attempt row, which is exactly the shape of an orphan, and this query
+   * cannot tell the two apart. What keeps them apart is ordering in the caller:
+   * `RunSupervisor.start` waits for the worker endpoints *before* it claims, and `main.ts`
+   * runs this and only then publishes them, so no start in this process can have a claim
+   * while this runs. That is a guarantee of that ordering and of there being one process
+   * writing the file; calling this anywhere else, or publishing the endpoints before it,
+   * can return a live run's claim to `open` from under it.
+   */
+  const releaseOrphanedClaims = Effect.fn(
+    "ObservationStore.releaseOrphanedClaims",
+  )(function* () {
+    const at = yield* Clock.currentTimeMillis;
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const found = yield* selectOrphanedClaims().pipe(
+            Effect.mapError(lift("intents", "orphaned claims")),
+          );
+          const released: ReleasedClaim[] = [];
+          for (const row of found) {
+            const updated = yield* sql<{ id: string }>`UPDATE intents
+              SET status = 'open', claimed_by_attempt_id = NULL
+              WHERE id = ${row.id} AND status = 'claimed'
+                AND claimed_by_attempt_id = ${row.claimed_by_attempt_id}
+              RETURNING id`.pipe(
+              Effect.mapError(asDatabaseError("transaction")),
+            );
+            if (updated.length === 0) continue;
+            yield* appendEvent({
+              kind: "intent.released",
+              targetId: row.target_id,
+              callerScope: null,
+              intentId: null,
+              attemptId: null,
+              operation: "release_orphaned_claim",
+              operationId: null,
+              subjectId: row.id,
+              payload: {
+                intentId: row.id,
+                goalId: row.goal_id,
+                claimedByAttemptId: row.claimed_by_attempt_id,
+                attemptStatus: row.attempt_status,
+                releasedBy: "recovery",
+              },
+              recordedAt: at,
+            });
+            released.push({
+              intentId: row.id,
+              goalId: row.goal_id,
+              targetId: row.target_id,
+              claimedByAttemptId: row.claimed_by_attempt_id,
+              attemptStatus: row.attempt_status,
+            });
+          }
+          return released as readonly ReleasedClaim[];
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
+  /**
+   * Drops an intent, once, as the operator, recording why.
+   *
+   * Receipt discipline is {@link endGoal}'s, in the same order: the receipt first, so an
+   * exact retry answers from what was committed; a reused operation id with different
+   * input is a `conflict`. Then the refusals, none of which writes anything:
+   *
+   * - **No such intent**, and **another target's** — `invalid`.
+   * - **Not abandonable** — `conflict`, naming the status. Only `open` (and `proposed`)
+   *   can be dropped. A `claimed` intent has a run in flight, and abandoning it from under
+   *   that run would leave the attempt writing evidence under a direction the record says
+   *   was dropped; stop the attempt, and when it settles the intent is open again. An
+   *   `answered` intent holds evidence and is not retracted, and an `abandoned` one is
+   *   already over.
+   *
+   * The `UPDATE` repeats the status guard and is checked through `RETURNING`, for the
+   * reason {@link endGoal}'s is: a second writer would refuse by name instead of
+   * overwriting.
+   *
+   * Abandonment is set only here, by an explicit act. A failed run is not a reason to give
+   * up a direction; it is a reason the direction is open again.
+   */
+  const abandonIntent = Effect.fn("ObservationStore.abandonIntent")(function* (
+    host: HostContext,
+    input: AbandonIntentInput,
+  ) {
+    const at = yield* Clock.currentTimeMillis;
+    const key = `${host.callerScope}:abandon_intent:${input.operationId}`;
+    const requestHash = hashRequest(
+      { callerScope: host.callerScope, targetId: host.targetId },
+      input,
+    );
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const existing = yield* findReceipt(key).pipe(
+            Effect.mapError(lift("command_receipts", key)),
+          );
+          if (Option.isSome(existing)) {
+            const receipt = existing.value;
+            if (receipt.request_hash !== requestHash) {
+              return yield* new MutationError({
+                reason: "conflict",
+                detail: `operation ${input.operationId} was already used with different input`,
+              });
+            }
+            const original = yield* replayResult(
+              key,
+              AbandonIntentResult,
+              receipt.result,
+            );
+            return { ...original, replayed: true };
+          }
+
+          const found = yield* selectIntentById(input.intentId).pipe(
+            Effect.mapError(lift("intents", input.intentId)),
+          );
+          if (Option.isNone(found)) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `no intent ${input.intentId} exists in this target`,
+            });
+          }
+          const row = found.value;
+          if (row.target_id !== host.targetId) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `intent ${input.intentId} belongs to target ${row.target_id}, not ${host.targetId}`,
+            });
+          }
+          if (row.status !== "open" && row.status !== "proposed") {
+            const why =
+              row.status === "claimed"
+                ? `attempt ${row.claimed_by_attempt_id ?? "(unrecorded)"} is running it; stop that attempt, and once it settles the intent can be abandoned`
+                : row.status === "answered"
+                  ? "it is answered and holds evidence, which is not retracted"
+                  : "it is already abandoned";
+            return yield* new MutationError({
+              reason: "conflict",
+              detail: `intent ${input.intentId} is ${row.status} and cannot be abandoned: ${why}`,
+            });
+          }
+
+          const updated = yield* sql<{ id: string }>`UPDATE intents
+            SET status = 'abandoned'
+            WHERE id = ${input.intentId} AND status IN ('open', 'proposed')
+            RETURNING id`.pipe(Effect.mapError(asDatabaseError("transaction")));
+          if (updated.length === 0) {
+            return yield* new MutationError({
+              reason: "conflict",
+              detail: `intent ${input.intentId} was changed by another call before it could be abandoned`,
+            });
+          }
+
+          const result: AbandonIntentResult = {
+            intentId: input.intentId,
+            replayed: false,
+          };
+          yield* sql`INSERT INTO command_receipts (
+              key, caller_scope, operation, operation_id, request_hash, result,
+              created_at
+            ) VALUES (
+              ${key}, ${host.callerScope}, 'abandon_intent', ${input.operationId},
+              ${requestHash}, ${JSON.stringify(result)}, ${at}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          yield* appendEvent({
+            kind: "intent.abandoned",
+            targetId: host.targetId,
+            callerScope: host.callerScope,
+            intentId: null,
+            attemptId: null,
+            operation: "abandon_intent",
+            operationId: input.operationId,
+            subjectId: input.intentId,
+            payload: {
+              intentId: input.intentId,
+              goalId: row.goal_id,
+              // So the log names which direction was dropped, not only its id.
+              question: row.question,
+              reason: input.reason,
+            },
+            recordedAt: at,
+          });
+
+          return result;
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
   /**
    * Records what the harness said about one running attempt, and settles it accordingly.
    *
@@ -2551,6 +3306,19 @@ const makeStore = Effect.fnUntraced(function* () {
                 },
                 recordedAt: now,
               });
+            }
+
+            // The sweep is the other writer of a settlement, so it is the other releaser of
+            // a claim: an attempt whose supervisor died would otherwise hold its intent for
+            // the life of the file. Only when the status really left `running`; a repeat
+            // pass, or a refinement of an `uncertain` attempt whose claim was released when
+            // it first settled, matches no claimed row and changes nothing.
+            if (decided.status !== current && decided.status !== "running") {
+              yield* releaseClaim(
+                attempt.intent_id,
+                decided.status,
+                write.attemptId,
+              );
             }
 
             if (decided.status !== current) {
@@ -3466,6 +4234,12 @@ const makeStore = Effect.fnUntraced(function* () {
     endGoal,
     goals,
     loadGoal,
+    claimIntent,
+    releaseIntent,
+    intentsForGoal,
+    intent,
+    abandonIntent,
+    releaseOrphanedClaims,
     eventsAfter,
     pendingRequests,
     anchorsForIntent,
@@ -3600,6 +4374,58 @@ export class ObservationStore extends Context.Service<
     readonly loadGoal: (
       goalId: string,
     ) => Effect.Effect<StoredGoal | undefined, DatabaseError | StoredRowError>;
+    /**
+     * Takes an open intent for one attempt in a single statement, or refuses naming why.
+     * The refusal names the attempt already holding it. See the implementation.
+     */
+    readonly claimIntent: (
+      host: HostContext,
+      intentId: string,
+      attemptId: string,
+    ) => Effect.Effect<
+      ClaimResult,
+      ClaimRefused | DatabaseError | StoredRowError
+    >;
+    /**
+     * Gives a claimed intent back for a run that never settled an attempt. `heldBy`
+     * restricts it to a claim that attempt still holds.
+     */
+    readonly releaseIntent: (
+      intentId: string,
+      settledStatus: string,
+      heldBy?: string,
+    ) => Effect.Effect<void, DatabaseError | StoredRowError>;
+    /** Every intent under a goal, oldest first, with anchors and attempt counts. Read-only. */
+    readonly intentsForGoal: (
+      goalId: string,
+    ) => Effect.Effect<readonly StoredIntent[], DatabaseError | StoredRowError>;
+    /** One intent by id, or `undefined`. */
+    readonly intent: (
+      intentId: string,
+    ) => Effect.Effect<
+      StoredIntent | undefined,
+      DatabaseError | StoredRowError
+    >;
+    /**
+     * Drops an open intent once, as the operator, recording why. Refuses a claimed or
+     * answered one.
+     */
+    readonly abandonIntent: (
+      host: HostContext,
+      input: AbandonIntentInput,
+    ) => Effect.Effect<
+      AbandonIntentResult,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * Startup only: gives back claims held by an attempt that does not exist or is not
+     * running, as `open`, with an `intent.released` event each. See the implementation for
+     * why it may not run while starts are in flight.
+     */
+    readonly releaseOrphanedClaims: () => Effect.Effect<
+      readonly ReleasedClaim[],
+      DatabaseError | StoredRowError
+    >;
     readonly eventsAfter: (
       after?: number,
       limit?: number,

@@ -50,7 +50,12 @@ import {
   Redacted,
 } from "effect";
 
-import { browserApiRoutes, goalRefusal } from "./browserApi";
+import {
+  abandonRefusal,
+  addIntentRefusal,
+  browserApiRoutes,
+  goalRefusal,
+} from "./browserApi";
 import { CONTROL_PLANE_IDLE_TIMEOUT } from "./controlPlane";
 import { BrowserSessions, ensureServerPassword } from "./browserSessions";
 import { ControlPlaneEndpoint } from "./controlPlane";
@@ -62,6 +67,7 @@ import {
   MutationError,
   ObservationStore,
   type StoredGoal,
+  type StoredIntent,
 } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { InstanceId } from "../harness/identity";
@@ -70,7 +76,7 @@ import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
 import type { NarrationDetail } from "../harness/agentHarness";
 import { LIVE_HEARTBEAT } from "../run/liveTranscript";
 import { RunNarrations } from "../run/narration";
-import { RunSupervisor } from "../run/supervisor";
+import { RunSupervisor, type RunInput } from "../run/supervisor";
 import { PolicyDecisions, type PolicyConfig } from "../policy/service";
 
 const scratch = mkdtempSync(join(tmpdir(), "bit-browser-api-"));
@@ -122,6 +128,9 @@ const SUPERVISED: RunningAttempt = {
   startedAt: 1_700_000_000_000,
 };
 
+/** Every input the route has handed `start` in this suite, in order. */
+const startedWith: RunInput[] = [];
+
 /**
  * A supervisor that refuses every start and reports {@link SUPERVISED} as running.
  *
@@ -134,12 +143,20 @@ const SUPERVISED: RunningAttempt = {
 const supervisorHolding: Layer.Layer<RunSupervisor> = Layer.succeed(
   RunSupervisor,
   RunSupervisor.of({
-    start: () =>
-      Effect.fail(
-        new RunRefused({
-          reason: "no_harness",
-          detail: "this suite configures no harness, so nothing can be started",
+    start: (input) =>
+      Effect.andThen(
+        // Recorded, so a test can read what the route handed the supervisor. The refusal
+        // is unchanged; this only makes "startRun passes the intent through" observable.
+        Effect.sync(() => {
+          startedWith.push(input);
         }),
+        Effect.fail(
+          new RunRefused({
+            reason: "no_harness",
+            detail:
+              "this suite configures no harness, so nothing can be started",
+          }),
+        ),
       ),
     stop: (attemptId) =>
       Effect.fail(
@@ -2088,6 +2105,572 @@ describe("what a goal refusal is allowed to claim", () => {
     expect(Exit.isFailure(exit)).toBe(true);
     expect(JSON.stringify(exit)).toContain("GoalNotFound");
     expect(JSON.stringify(exit)).toContain("no goal goal_x exists");
+  });
+});
+
+describe("a goal's intents", () => {
+  let counter = 0;
+
+  /**
+   * A target of its own for every test, and so a database of its own: nothing here reads
+   * what an earlier test left. The goals block above shares its targets across tests and
+   * is order-dependent for it; this one is not.
+   */
+  const freshTarget = async () => {
+    counter += 1;
+    const name = `intents-${String(counter)}`;
+    mkdirSync(join(workspaceRoot, name), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: { workspacePath: join(workspaceRoot, name), name, scopeNote: "" },
+      }),
+    );
+    expect(created.status).toBe(200);
+    return name;
+  };
+
+  const newGoal = async (targetId: string) => {
+    const created = await read(
+      await signedIn(`/targets/${targetId}/goals`, {
+        method: "POST",
+        body: { description: "Can the login limiter be bypassed?" },
+      }),
+    );
+    return String(created.body["goalId"]);
+  };
+
+  const addIntent = (targetId: string, goalId: string, body: unknown) =>
+    signedIn(`/targets/${targetId}/goals/${goalId}/intents`, {
+      method: "POST",
+      body,
+    });
+
+  const draft = (overrides: Record<string, unknown> = {}) => ({
+    question: "Does the limiter reset on a new window?",
+    anchorObservationIds: [],
+    addressesDimension: null,
+    ...overrides,
+  });
+
+  /** The target's file through a store of our own, for what no route writes yet. */
+  const withHunt = <A, E>(
+    targetId: string,
+    use: (store: ObservationStore["Service"]) => Effect.Effect<A, E>,
+  ) =>
+    Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(ObservationStore, use).pipe(
+          Effect.provide(
+            ObservationStore.layer(
+              join(fleetRoot, "targets", targetId, HUNT_FILE),
+            ),
+          ),
+        ),
+      ),
+    );
+
+  test("adding an intent mints its identity, trims the question, and lists it with the goal's count", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+
+    const empty = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/intents`),
+    );
+    expect(empty.status).toBe(200);
+    expect(empty.body).toEqual({ intents: [] });
+
+    const created = await read(
+      await addIntent(
+        targetId,
+        goalId,
+        draft({ question: "  Does the limiter reset on a new window?  " }),
+      ),
+    );
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({
+      goalId,
+      question: "Does the limiter reset on a new window?",
+      status: "open",
+      anchoredTo: [],
+      addressesDimension: null,
+      claimedByAttemptId: null,
+      attempts: 0,
+      suggestion: { instanceId: null, model: null, modelOptions: null },
+    });
+    // The server minted it; the browser sent no id.
+    expect(String(created.body["intentId"])).toStartWith("int_");
+
+    const listed = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/intents`),
+    );
+    expect(
+      (listed.body["intents"] as ReadonlyArray<{ intentId: string }>).map(
+        (intent) => intent.intentId,
+      ),
+    ).toEqual([String(created.body["intentId"])]);
+
+    const goal = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}`),
+    );
+    expect(goal.body["counts"]).toMatchObject({ intents: 1 });
+  });
+
+  test("a suggestion is carried as a suggestion, and absent stays absent", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const created = await read(
+      await addIntent(
+        targetId,
+        goalId,
+        draft({
+          suggestedInstanceId: "claude-code",
+          suggestedModel: "claude-sonnet-5",
+          suggestedModelOptions: [{ id: "effort", value: "high" }],
+        }),
+      ),
+    );
+    expect(created.status).toBe(201);
+    expect(created.body["suggestion"]).toEqual({
+      instanceId: "claude-code",
+      model: "claude-sonnet-5",
+      modelOptions: [{ id: "effort", value: "high" }],
+    });
+    // Nothing about what ran is on an intent: only the attempt says that.
+    expect(Object.keys(created.body)).not.toContain("instanceId");
+  });
+
+  test("a blank question, or an empty suggestion, is refused before anything is written", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    for (const bad of [
+      draft({ question: "   " }),
+      draft({ suggestedInstanceId: "" }),
+    ]) {
+      expect((await addIntent(targetId, goalId, bad)).status).toBe(400);
+    }
+    const listed = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/intents`),
+    );
+    expect(listed.body).toEqual({ intents: [] });
+  });
+
+  test("an anchoring refusal comes back as the store's own sentence, and writes nothing", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const first = await read(await addIntent(targetId, goalId, draft()));
+
+    // Anchoring an intent to an intent: the one mistake the rule exists to teach.
+    const refused = await read(
+      await addIntent(
+        targetId,
+        goalId,
+        draft({
+          question: "Follow-up?",
+          anchorObservationIds: [first.body["intentId"]],
+        }),
+      ),
+    );
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({
+      _tag: "IntentRefused",
+      reason: "invalid",
+    });
+    // Says what the id is, why that cannot anchor, and what to do instead.
+    expect(String(refused.body["detail"])).toContain("is an intent");
+    expect(String(refused.body["detail"])).toContain("new top-level direction");
+
+    const listed = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/intents`),
+    );
+    expect(listed.body["intents"]).toHaveLength(1);
+  });
+
+  test("an intent anchors to a recorded observation under its goal, and can address its dimension", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    // Evidence has to come from somewhere, and no route records it: a worker does, through
+    // the MCP route. A store over the same file stands in for the worker.
+    const observationId = await withHunt(targetId, (store) =>
+      Effect.gen(function* () {
+        yield* store.seedAttempt({
+          targetId,
+          goalId,
+          goal: "g",
+          intentId: "int_seed",
+          question: "q",
+          attemptId: "att_seed",
+          workerId: "wk_seed",
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt",
+          modelOptions: null,
+          harnessSessionId: null,
+        });
+        const recorded = yield* store.recordObservation(
+          {
+            callerScope: `${targetId}/att_seed`,
+            targetId,
+            intentId: "int_seed",
+            attemptId: "att_seed",
+            harnessSessionId: "ses_seed",
+            workerId: "wk_seed",
+            attemptFence: 0,
+          },
+          multiCaseInput({
+            operationId: "obs-1",
+            untestedDimensions: ["no window rollover was measured"],
+          }),
+        );
+        return recorded.observationId;
+      }),
+    );
+
+    // The digest the form picks from: the claim, how it came out, and what it left open.
+    const digest = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/observations`),
+    );
+    expect(digest.status).toBe(200);
+    expect(digest.body["observations"]).toMatchObject([
+      {
+        observationId,
+        intentId: "int_seed",
+        outcome: "positive",
+        untestedDimensions: [
+          {
+            address: `${observationId}#u0`,
+            text: "no window rollover was measured",
+          },
+        ],
+      },
+    ]);
+
+    const created = await read(
+      await addIntent(
+        targetId,
+        goalId,
+        draft({
+          anchorObservationIds: [observationId],
+          addressesDimension: `${observationId}#u0`,
+        }),
+      ),
+    );
+    expect(created.status).toBe(201);
+    expect(created.body["anchoredTo"]).toEqual([observationId]);
+    // Read back as the alias that was submitted, derived from the dimension row.
+    expect(created.body["addressesDimension"]).toBe(`${observationId}#u0`);
+  });
+
+  test("a dimension address that names nothing is refused with the store's sentence", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const refused = await read(
+      await addIntent(
+        targetId,
+        goalId,
+        draft({ addressesDimension: "obs_000009_nothing#u0" }),
+      ),
+    );
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({
+      _tag: "IntentRefused",
+      reason: "invalid",
+    });
+    expect(String(refused.body["detail"])).toContain("obs_000009_nothing#u0");
+  });
+
+  test("the observation digest of a goal nobody created is a 404, and of an empty goal is empty", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const empty = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/observations`),
+    );
+    expect(empty.body).toEqual({ observations: [] });
+    const missing = await read(
+      await signedIn(`/targets/${targetId}/goals/goal_nonesuch/observations`),
+    );
+    expect(missing.status).toBe(404);
+    expect(missing.body).toMatchObject({ _tag: "GoalNotFound" });
+  });
+
+  test("a goal nobody created, and another target's goal, are a 404 that names it", async () => {
+    const targetId = await freshTarget();
+    const other = await freshTarget();
+    const othersGoal = await newGoal(other);
+    for (const goalId of ["goal_nonesuch", othersGoal]) {
+      const listed = await read(
+        await signedIn(`/targets/${targetId}/goals/${goalId}/intents`),
+      );
+      expect(listed.status).toBe(404);
+      expect(listed.body).toMatchObject({ _tag: "GoalNotFound", goalId });
+      const added = await read(await addIntent(targetId, goalId, draft()));
+      expect(added.status).toBe(404);
+      expect(added.body).toMatchObject({ _tag: "GoalNotFound", goalId });
+    }
+    // And nothing landed in the target that the goal does belong to.
+    const untouched = await read(
+      await signedIn(`/targets/${other}/goals/${othersGoal}/intents`),
+    );
+    expect(untouched.body).toEqual({ intents: [] });
+  });
+
+  test("abandoning drops an open intent once, as the operator, and says why on the second try", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const created = await read(await addIntent(targetId, goalId, draft()));
+    const intentId = String(created.body["intentId"]);
+
+    const abandoned = await read(
+      await signedIn(`/targets/${targetId}/intents/${intentId}/abandon`, {
+        method: "POST",
+        body: { reason: "Out of scope." },
+      }),
+    );
+    expect(abandoned.status).toBe(200);
+    expect(abandoned.body).toMatchObject({ intentId, status: "abandoned" });
+
+    const again = await read(
+      await signedIn(`/targets/${targetId}/intents/${intentId}/abandon`, {
+        method: "POST",
+        body: { reason: "" },
+      }),
+    );
+    expect(again.status).toBe(409);
+    expect(again.body).toMatchObject({
+      _tag: "IntentRefused",
+      reason: "not_abandonable",
+    });
+    expect(String(again.body["detail"])).toContain("already abandoned");
+
+    // And the abandonment is in the target's record, attributed to the operator.
+    const database = new Database(
+      join(fleetRoot, "targets", targetId, HUNT_FILE),
+      { readonly: true },
+    );
+    try {
+      const events = database
+        .query<{ kind: string; caller_scope: string }, []>(
+          "SELECT kind, caller_scope FROM events WHERE kind = 'intent.abandoned'",
+        )
+        .all();
+      expect(events).toEqual([
+        { kind: "intent.abandoned", caller_scope: `${targetId}/operator` },
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("an intent a run holds cannot be abandoned from under it, and the refusal names the attempt", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const created = await read(await addIntent(targetId, goalId, draft()));
+    const intentId = String(created.body["intentId"]);
+    await withHunt(targetId, (store) =>
+      store.claimIntent(
+        { callerScope: `${targetId}/operator`, targetId },
+        intentId,
+        "att_running",
+      ),
+    );
+
+    const refused = await read(
+      await signedIn(`/targets/${targetId}/intents/${intentId}/abandon`, {
+        method: "POST",
+        body: { reason: "" },
+      }),
+    );
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({
+      _tag: "IntentRefused",
+      reason: "not_abandonable",
+    });
+    expect(String(refused.body["detail"])).toContain("att_running");
+    // The view of it says who holds it.
+    const listed = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/intents`),
+    );
+    expect(listed.body["intents"]).toMatchObject([
+      { status: "claimed", claimedByAttemptId: "att_running" },
+    ]);
+  });
+
+  test("an intent nobody created, or another target's, is a 404 that names it", async () => {
+    const targetId = await freshTarget();
+    const other = await freshTarget();
+    const othersGoal = await newGoal(other);
+    const othersIntent = String(
+      (await read(await addIntent(other, othersGoal, draft()))).body[
+        "intentId"
+      ],
+    );
+    for (const intentId of ["int_nonesuch", othersIntent]) {
+      const refused = await read(
+        await signedIn(`/targets/${targetId}/intents/${intentId}/abandon`, {
+          method: "POST",
+          body: { reason: "" },
+        }),
+      );
+      expect(refused.status).toBe(404);
+      expect(refused.body).toMatchObject({ _tag: "IntentNotFound", intentId });
+    }
+    // Not abandoned by the attempt.
+    const listed = await read(
+      await signedIn(`/targets/${other}/goals/${othersGoal}/intents`),
+    );
+    expect(listed.body["intents"]).toMatchObject([{ status: "open" }]);
+  });
+
+  test("starting a run hands the supervisor the intent, and nothing the old route minted from", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const created = await read(await addIntent(targetId, goalId, draft()));
+    const intentId = String(created.body["intentId"]);
+    startedWith.length = 0;
+
+    const refused = await read(
+      await signedIn(`/targets/${targetId}/runs`, {
+        method: "POST",
+        body: { intentId, instanceId: "opencode", model: "gpt" },
+      }),
+    );
+    // This suite's supervisor refuses every start; what matters is what it was given.
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({ _tag: "RunRefused" });
+    expect(startedWith).toHaveLength(1);
+    expect(startedWith[0]).toMatchObject({
+      targetId,
+      intentId,
+      instanceId: "opencode",
+      model: "gpt",
+    });
+    // No free text reaches the supervisor: the prompt is the intent's, claimed there.
+    expect(Object.keys(startedWith[0] ?? {})).not.toContain("task");
+    expect(Object.keys(startedWith[0] ?? {})).not.toContain("question");
+    expect(Object.keys(startedWith[0] ?? {})).not.toContain("goal");
+  });
+
+  test("the old one-instruction run is no longer accepted", async () => {
+    const targetId = await freshTarget();
+    startedWith.length = 0;
+    const response = await signedIn(`/targets/${targetId}/runs`, {
+      method: "POST",
+      body: { instruction: "probe the limiter" },
+    });
+    expect(response.status).toBe(400);
+    expect(startedWith).toHaveLength(0);
+  });
+
+  test("the routes need a session like everything else", async () => {
+    const targetId = await freshTarget();
+    for (const [method, path, body] of [
+      ["GET", `/targets/${targetId}/goals/g/intents`, undefined],
+      ["POST", `/targets/${targetId}/goals/g/intents`, draft()],
+      ["POST", `/targets/${targetId}/intents/i/abandon`, { reason: "" }],
+    ] as const) {
+      const response = await call(path, {
+        method,
+        ...(body === undefined ? {} : { body }),
+      });
+      expect(response.status).toBe(401);
+    }
+  });
+
+  test("an unopenable target refuses the three routes the way every other route does", async () => {
+    for (const [method, path, body] of [
+      ["GET", "/targets/no-such-target/goals/g/intents", undefined],
+      ["POST", "/targets/no-such-target/goals/g/intents", draft()],
+      ["POST", "/targets/no-such-target/intents/i/abandon", { reason: "" }],
+    ] as const) {
+      const response = await read(
+        await signedIn(path, {
+          method,
+          ...(body === undefined ? {} : { body }),
+        }),
+      );
+      expect(response.status).toBe(404);
+      expect(response.body).toMatchObject({ _tag: "TargetNotFound" });
+    }
+  });
+});
+
+describe("what an intent refusal is allowed to claim", () => {
+  const stored = (status: StoredIntent["status"]): StoredIntent => ({
+    intentId: "int_x",
+    goalId: "goal_x",
+    targetId: "t",
+    question: "q",
+    status,
+    anchoredTo: [],
+    addressesDimension: null,
+    createdAt: 1,
+    claimedByAttemptId: status === "claimed" ? "att_1" : null,
+    suggestion: { instanceId: null, model: null, modelOptions: null },
+    attemptCount: 0,
+  });
+  const storeHolding = (intent: StoredIntent | undefined) => ({
+    intent: () => Effect.succeed(intent),
+  });
+  const conflict = new MutationError({
+    reason: "conflict",
+    detail: "operation op_1 was already used with different input",
+  });
+
+  test("an add refused as invalid is an IntentRefused carrying the store's sentence", async () => {
+    const exit = await Effect.runPromiseExit(
+      addIntentRefusal(
+        new MutationError({
+          reason: "invalid",
+          detail: "anchor 'x' is nothing",
+        }),
+      ),
+    );
+    expect(JSON.stringify(exit)).toContain("IntentRefused");
+    expect(JSON.stringify(exit)).toContain("anchor 'x' is nothing");
+  });
+
+  test("an add refused for any other reason is a defect, not an invented refusal", async () => {
+    for (const reason of ["conflict", "unauthorized", "stale"] as const) {
+      const exit = await Effect.runPromiseExit(
+        addIntentRefusal(new MutationError({ reason, detail: "d" })),
+      );
+      expect(Exit.hasDies(exit)).toBe(true);
+    }
+  });
+
+  test("a conflict about an intent that is no longer open is not_abandonable", async () => {
+    for (const status of ["claimed", "answered", "abandoned"] as const) {
+      const exit = await Effect.runPromiseExit(
+        abandonRefusal(storeHolding(stored(status)), "t", "int_x", conflict),
+      );
+      expect(JSON.stringify(exit)).toContain("not_abandonable");
+    }
+  });
+
+  test("a conflict about an intent that is still open is not claimed to be a status", async () => {
+    // A reused operation id: the store says `conflict` and the intent is open. Calling
+    // that `not_abandonable` would tell an operator an open intent cannot be dropped.
+    const exit = await Effect.runPromiseExit(
+      abandonRefusal(storeHolding(stored("open")), "t", "int_x", conflict),
+    );
+    expect(Exit.hasDies(exit)).toBe(true);
+    expect(JSON.stringify(exit)).not.toContain("not_abandonable");
+  });
+
+  test("an invalid refusal is an IntentNotFound carrying the store's sentence", async () => {
+    const exit = await Effect.runPromiseExit(
+      abandonRefusal(
+        storeHolding(undefined),
+        "t",
+        "int_x",
+        new MutationError({
+          reason: "invalid",
+          detail: "no intent int_x exists",
+        }),
+      ),
+    );
+    expect(JSON.stringify(exit)).toContain("IntentNotFound");
+    expect(JSON.stringify(exit)).toContain("no intent int_x exists");
   });
 });
 

@@ -26,6 +26,7 @@
  *   identity, and that a failure while writing one leaves nothing behind.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,7 +54,11 @@ import {
   HarnessSessionStatus,
   type HarnessObservedStatus,
 } from "./harnessStatus";
-import { mapObserved, reconcileUnsettledAttempts } from "./reconcile";
+import {
+  mapObserved,
+  reconcileUnsettledAttempts,
+  releaseOrphanedClaims,
+} from "./reconcile";
 
 const directories: string[] = [];
 
@@ -1380,5 +1385,180 @@ describe("the live harness adapter's own mapping", () => {
     );
     expect(report.observed).toBe("unreachable");
     expect(report.detail).toContain("could not ask the harness");
+  });
+});
+
+describe("an intent claim a dead process left behind", () => {
+  const HOST = { callerScope: `${TARGET}/operator`, targetId: TARGET };
+
+  /** A goal and one open intent under it, written and then left behind by "the old process". */
+  const operatorMadeIntent = (store: ObservationStore["Service"]) =>
+    Effect.gen(function* () {
+      yield* store.openGoal(HOST, {
+        operationId: "open-goal",
+        goalId: "goal-1",
+        name: "",
+        description:
+          "Determine whether authentication rate limits can be bypassed.",
+      });
+      yield* store.addIntent(HOST, {
+        operationId: "add-intent",
+        goalId: "goal-1",
+        intentId: INTENT,
+        question: "Probe the per-client limiter on POST /login.",
+        anchorObservationIds: [],
+        addressesDimension: null,
+      });
+    });
+
+  const intentState = (store: ObservationStore["Service"]) =>
+    Effect.map(store.intent(INTENT), (intent) => ({
+      status: intent?.status,
+      claimedBy: intent?.claimedByAttemptId,
+    }));
+
+  test("a claim with no attempt row is neither runnable nor abandonable, until the sweep gives it back", async () => {
+    const path = newDatabasePath();
+    // The old process: claims the intent, then dies before writing the attempt.
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* operatorMadeIntent(store);
+        yield* store.claimIntent(HOST, INTENT, "att-never-written");
+      }),
+    );
+
+    // The new process.
+    const outcome = await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        const stuckRun = yield* Effect.result(
+          store.claimIntent(HOST, INTENT, "att-retry"),
+        );
+        const stuckAbandon = yield* Effect.result(
+          store.abandonIntent(HOST, {
+            operationId: "abandon-stuck",
+            intentId: INTENT,
+            reason: "",
+          }),
+        );
+        // The attempt sweep cannot see it: there is no row for it to enumerate.
+        const attemptSweep = yield* reconcileUnsettledAttempts();
+
+        const released = yield* releaseOrphanedClaims();
+        const afterRelease = yield* intentState(store);
+        const events = yield* store.eventsAfter();
+        // Repeating it finds nothing: the claim it gave back is gone.
+        const again = yield* releaseOrphanedClaims();
+        // Runnable again, which is the whole point.
+        const rerun = yield* store.claimIntent(HOST, INTENT, "att-retry");
+        return {
+          stuckRun,
+          stuckAbandon,
+          attemptSweep,
+          released,
+          afterRelease,
+          events: events.filter((event) => event.kind === "intent.released"),
+          rerun,
+          again,
+          afterRerun: yield* intentState(store),
+        };
+      }),
+    );
+
+    // The two ways out that did not work.
+    expect(outcome.stuckRun._tag).toBe("Failure");
+    expect(outcome.stuckAbandon._tag).toBe("Failure");
+    expect(outcome.attemptSweep).toEqual([]);
+
+    expect(outcome.released).toEqual([
+      {
+        intentId: INTENT,
+        goalId: "goal-1",
+        targetId: TARGET,
+        claimedByAttemptId: "att-never-written",
+        attemptStatus: null,
+      },
+    ]);
+    // `open`, never `answered`: nothing ran, so nothing is known.
+    expect(outcome.afterRelease).toEqual({ status: "open", claimedBy: null });
+    expect(outcome.rerun.claimedByAttemptId).toBe("att-retry");
+    expect(outcome.afterRerun).toEqual({
+      status: "claimed",
+      claimedBy: "att-retry",
+    });
+    // Recorded as the sweep records its other work: an event naming what it found.
+    expect(outcome.events).toHaveLength(1);
+    expect(outcome.events[0]).toMatchObject({
+      subjectId: INTENT,
+      callerScope: null,
+      payload: {
+        claimedByAttemptId: "att-never-written",
+        attemptStatus: null,
+        releasedBy: "recovery",
+      },
+    });
+    expect(outcome.again).toEqual([]);
+  });
+
+  test("a claim held by a running attempt is not an orphan; the attempt sweep gives it back when it settles the attempt", async () => {
+    const path = newDatabasePath();
+    const outcome = await withRecovery(
+      path,
+      { [SESSION]: "missing" },
+      (store) =>
+        Effect.gen(function* () {
+          yield* operatorMadeIntent(store);
+          yield* store.claimIntent(HOST, INTENT, "attempt-1");
+          yield* seed(store, "attempt-1");
+          const released = yield* releaseOrphanedClaims();
+          const whileRunning = yield* intentState(store);
+          yield* reconcileUnsettledAttempts();
+          return { released, whileRunning, after: yield* intentState(store) };
+        }),
+    );
+    // Left to the sweep that asks the harness.
+    expect(outcome.released).toEqual([]);
+    expect(outcome.whileRunning).toEqual({
+      status: "claimed",
+      claimedBy: "attempt-1",
+    });
+    // The harness could not find the session: `uncertain`, so the intent is open, not answered.
+    expect(outcome.after).toEqual({ status: "open", claimedBy: null });
+  });
+
+  test("a claim whose attempt has already settled is given back as open, even with an observation under it", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* operatorMadeIntent(store);
+        yield* store.claimIntent(HOST, INTENT, "attempt-1");
+        yield* seed(store, "attempt-1");
+        yield* store.recordObservation(
+          caller("attempt-1", 0),
+          multiCaseInput(),
+        );
+      }),
+    );
+    // A stale lock the settlement should have released and did not, written directly: the
+    // transactional path cannot produce it, which is why this is a repair and not a rule.
+    const database = new Database(path);
+    try {
+      database.run(
+        "UPDATE attempts SET status = 'succeeded', ended_at = 1 WHERE id = 'attempt-1'",
+      );
+    } finally {
+      database.close();
+    }
+
+    const outcome = await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        const released = yield* releaseOrphanedClaims();
+        return { released, after: yield* intentState(store) };
+      }),
+    );
+    expect(outcome.released.map((claim) => claim.attemptStatus)).toEqual([
+      "succeeded",
+    ]);
+    // It does not read observations: reconciling a lock is not judging the work.
+    expect(outcome.after).toEqual({ status: "open", claimedBy: null });
   });
 });

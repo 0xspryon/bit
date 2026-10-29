@@ -32,8 +32,10 @@ import {
   type AttemptTranscript,
   LIVE_SILENCE_LIMIT_SECONDS,
   type GoalEndStatus,
+  type GoalObservationView,
   type GoalView,
   type HarnessInstanceView,
+  type IntentView,
   type LiveFrame,
   type LiveItem,
   type ModelOptionSelection,
@@ -249,14 +251,28 @@ export class App {
 
   /* ── Runs ─────────────────────────────────────────────────────────────────── */
   /**
-   * What the operator has typed into the compose box.
+   * The intent the run box is aimed at, or `""` for none.
    *
-   * One field, because one field is all the server takes: the instruction becomes the
-   * goal, the intent's question and the prompt. Which existing intent a run belongs to is
-   * the work of the flow that shows intents, and a picker here would be choosing on its
-   * behalf.
+   * A run claims an intent that already exists, so there is nothing to type: the operator
+   * picks "Run this intent" on a row and the box shows that intent's question as the
+   * prompt. Held as an id and looked up in {@link intents} rather than as a copy of the
+   * row, so the box always shows the intent's *current* status — an intent another tab
+   * has since started reads as claimed here too, instead of offering a run the server
+   * will refuse.
    */
-  instruction = $state("");
+  runIntentId = $state("");
+  /**
+   * What became of the last accepted run's harness suggestion, when it could not be honoured.
+   *
+   * Non-null only when the intent *suggested* an instance and the server ran the default
+   * instead; the sentence says so, because a substitution nobody mentions is the quiet
+   * kind of lie this product refuses. Cleared by the next start and by leaving the target.
+   */
+  runFallback = $state<{
+    requested: string;
+    reason: string;
+    ranOn: string;
+  } | null>(null);
   /** True from submitting until the server has answered, which is not the run's length. */
   starting = $state(false);
   /** True from asking to stop until the server confirms it settled. */
@@ -316,6 +332,61 @@ export class App {
   /** The goal being looked at, from the list. Absent if it has left the list. */
   openGoalView = $derived(
     this.goals.find((goal) => goal.goalId === this.openGoalId),
+  );
+
+  /* ── Intents ──────────────────────────────────────────────────────────────── */
+  /**
+   * The open goal's intents, oldest first, as the server last told us.
+   *
+   * Server-fed and one goal's at a time: {@link intentsGoalId} says whose, and nothing
+   * reads {@link intents} without agreeing with {@link openGoalId}, for the reason
+   * {@link goalsTargetId} exists.
+   */
+  intents = $state<IntentView[]>([]);
+  intentsGoalId = $state("");
+  intentsState = $state<GoalsState>("idle");
+  /** The server's own words when the intents could not be read. */
+  intentsDetail = $state("");
+
+  /* The Add intent form */
+  intentFormOpen = $state(false);
+  intentQuestion = $state("");
+  /** Observation ids chosen as anchors, in the order they were ticked. */
+  intentAnchors = $state<string[]>([]);
+  /** The wire alias of the dimension the intent addresses, or `""` for none. */
+  intentDimension = $state("");
+  intentCreating = $state(false);
+  /**
+   * The server's sentence when an intent was refused, shown as written.
+   *
+   * The store's anchoring refusals name what the offending id actually is and what to do
+   * instead, so they are the instruction the operator needs and are not paraphrased.
+   */
+  intentCreateDetail = $state("");
+  /** What the form can anchor to: the open goal's observations, read when it opens. */
+  goalObservations = $state<GoalObservationView[]>([]);
+  goalObservationsState = $state<GoalsState>("idle");
+
+  /**
+   * The intent whose abandon confirmation is open, or `""`.
+   *
+   * Abandoning is one-way (an abandoned intent is not reopened; a different conclusion is a
+   * new intent), so the control opens a confirmation with a place to say why first, the way
+   * ending a goal does, and nothing is sent until it is confirmed. One at a time: opening a
+   * second closes the first.
+   */
+  intentAbandonOpenId = $state("");
+  /** Why, in the operator's words, for the open confirmation. Empty means none given. */
+  intentAbandonReason = $state("");
+  /** The intent being abandoned right now, so only its own button spins. */
+  intentAbandoningId = $state("");
+  /** Why an abandon was refused, against the intent it was about. */
+  intentAbandonDetail = $state("");
+  intentAbandonDetailId = $state("");
+
+  /** The intent the run box is aimed at, with its current status. */
+  runIntent = $derived(
+    this.intents.find((intent) => intent.intentId === this.runIntentId),
   );
 
   /**
@@ -687,7 +758,8 @@ export class App {
     this.viewState = "empty";
     this.viewDetail = "";
     this.runs = [];
-    this.instruction = "";
+    this.runIntentId = "";
+    this.runFallback = null;
     this.runDetail = "";
     this.#clearGoals();
     // The connection carries a bearer that has just been dropped, so it has to go with it:
@@ -756,7 +828,8 @@ export class App {
     this.screen = "target";
     this.navItem = "goals";
     this.detailOpen = false;
-    this.instruction = "";
+    this.runIntentId = "";
+    this.runFallback = null;
     this.runDetail = "";
     this.viewTargetId = id;
     // Cleared before the read, like the counts: between two targets the only honest
@@ -940,6 +1013,30 @@ export class App {
     this.goalEndReason = "";
     this.goalEnding = false;
     this.goalEndDetail = "";
+    this.#clearIntents();
+  }
+
+  /** Puts every intent field back where a fresh goal leaves it. */
+  #clearIntents() {
+    this.intents = [];
+    this.intentsGoalId = "";
+    this.intentsState = "idle";
+    this.intentsDetail = "";
+    this.intentFormOpen = false;
+    this.intentQuestion = "";
+    this.intentAnchors = [];
+    this.intentDimension = "";
+    this.intentCreating = false;
+    this.intentCreateDetail = "";
+    this.goalObservations = [];
+    this.goalObservationsState = "idle";
+    this.intentAbandoningId = "";
+    this.intentAbandonOpenId = "";
+    this.intentAbandonReason = "";
+    this.intentAbandonDetail = "";
+    this.intentAbandonDetailId = "";
+    // The run box was aimed at one of these intents; with them gone it points at nothing.
+    this.runIntentId = "";
   }
 
   /**
@@ -1009,13 +1106,17 @@ export class App {
     this.goalEndStatus = "met";
     this.goalEndReason = "";
     this.goalEndDetail = "";
+    // The previous goal's intents must not be on screen under this one's heading.
+    this.#clearIntents();
     void this.refreshGoal(goalId);
+    void this.loadIntents(goalId);
   }
 
   closeGoal() {
     this.openGoalId = "";
     this.goalEndOpen = false;
     this.goalEndDetail = "";
+    this.#clearIntents();
   }
 
   /** Replaces one goal in the list with the server's current answer about it. */
@@ -1173,6 +1274,249 @@ export class App {
     }
   }
 
+  /* ── Intents ─────────────────────────────────────────────────────────────── */
+
+  /**
+   * Reads the open goal's intents into {@link intents}.
+   *
+   * **It reads. It does not navigate**: it asks about the goal the view already names, and
+   * an answer for a goal or target the operator has since left is dropped. The list is kept
+   * while it reloads *if it is this goal's*, so a refresh after a run settles does not blank
+   * the rows the operator is looking at.
+   */
+  async loadIntents(goalId: string) {
+    const targetId = this.viewTargetId;
+    if (targetId === "" || this.openGoalId !== goalId) return;
+    if (this.intentsGoalId !== goalId) {
+      this.intents = [];
+      this.intentsGoalId = goalId;
+    }
+    this.intentsState = "loading";
+    this.intentsDetail = "";
+
+    const call = await this.client.intents(this.serverUrl, targetId, goalId);
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+
+    if (call._tag === "Unreachable") {
+      this.intentsState = "failed";
+      this.intentsDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.intentsState = "failed";
+      this.intentsDetail = this.#refusalText(
+        call.error,
+        "This goal's intents could not be read.",
+      );
+      return;
+    }
+    this.intents = call.value.intents.map((intent) => ({ ...intent }));
+    this.intentsState = "ready";
+  }
+
+  /** Reads what the add-intent form can anchor to: the open goal's observations. */
+  async loadGoalObservations(goalId: string) {
+    const targetId = this.viewTargetId;
+    if (targetId === "" || this.openGoalId !== goalId) return;
+    this.goalObservationsState = "loading";
+    const call = await this.client.goalObservations(
+      this.serverUrl,
+      targetId,
+      goalId,
+    );
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+    if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+      this.signOut("expired");
+      return;
+    }
+    if (call._tag !== "Ok") {
+      // Anchors are optional, so a failed read costs the picker and not the form: an
+      // intent can still be added as a new top-level direction.
+      this.goalObservations = [];
+      this.goalObservationsState = "failed";
+      return;
+    }
+    this.goalObservations = call.value.observations.map((entry) => ({
+      ...entry,
+    }));
+    this.goalObservationsState = "ready";
+  }
+
+  openIntentForm() {
+    this.intentFormOpen = true;
+    this.intentQuestion = "";
+    this.intentAnchors = [];
+    this.intentDimension = "";
+    this.intentCreateDetail = "";
+    if (this.openGoalId !== "") void this.loadGoalObservations(this.openGoalId);
+  }
+
+  cancelIntentForm() {
+    if (this.intentCreating) return;
+    this.intentFormOpen = false;
+    this.intentCreateDetail = "";
+  }
+
+  /** Ticks or unticks one observation as an anchor. */
+  toggleAnchor(observationId: string) {
+    this.intentAnchors = this.intentAnchors.includes(observationId)
+      ? this.intentAnchors.filter((id) => id !== observationId)
+      : [...this.intentAnchors, observationId];
+    // A dimension belongs to the observation that raised it; it does not have to be one of
+    // the anchors, so nothing is cleared here.
+  }
+
+  /**
+   * Adds an intent under the open goal.
+   *
+   * The question is trimmed and must not be blank, checked here so an empty submit asks
+   * the server nothing. A refusal keeps everything typed and shows the server's sentence
+   * as written — for an anchoring refusal that sentence *is* the instruction, naming what
+   * the id was and what to do instead — so it is not summarised into "invalid".
+   */
+  async createIntent() {
+    const targetId = this.viewTargetId;
+    const goalId = this.openGoalId;
+    const question = this.intentQuestion.trim();
+    if (targetId === "" || goalId === "" || this.intentCreating) return;
+    if (question.length === 0) {
+      this.intentCreateDetail =
+        "An intent needs a question: say what a bounded test could find out.";
+      return;
+    }
+    this.intentCreating = true;
+    this.intentCreateDetail = "";
+    try {
+      const call = await this.client.createIntent(
+        this.serverUrl,
+        targetId,
+        goalId,
+        {
+          question,
+          anchorObservationIds: [...this.intentAnchors],
+          addressesDimension:
+            this.intentDimension === "" ? null : this.intentDimension,
+        },
+      );
+      if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+      if (call._tag === "Unreachable") {
+        this.intentCreateDetail = "No server answered at this address.";
+        return;
+      }
+      if (call._tag === "Refused") {
+        if (call.error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        this.intentCreateDetail = this.#refusalText(
+          call.error,
+          "That intent was refused.",
+        );
+        return;
+      }
+      this.intents = [...this.intents, { ...call.value }];
+      this.intentsGoalId = goalId;
+      this.intentsState = "ready";
+      this.intentFormOpen = false;
+      this.intentQuestion = "";
+      this.intentAnchors = [];
+      this.intentDimension = "";
+      // The goal's intent count moved, and creating wrote an event the header counts.
+      void this.refreshGoal(goalId);
+      void this.refreshTarget(targetId);
+    } finally {
+      this.intentCreating = false;
+    }
+  }
+
+  /** Opens the confirmation for one intent, with the reason empty. */
+  openIntentAbandon(intentId: string) {
+    if (this.intentAbandoningId !== "") return;
+    this.intentAbandonOpenId = intentId;
+    this.intentAbandonReason = "";
+    this.intentAbandonDetail = "";
+    this.intentAbandonDetailId = "";
+  }
+
+  cancelIntentAbandon() {
+    if (this.intentAbandoningId !== "") return;
+    this.intentAbandonOpenId = "";
+    this.intentAbandonReason = "";
+  }
+
+  /**
+   * Abandons one open intent, with the reason typed into its confirmation.
+   *
+   * The refusal for a claimed intent names the attempt running it, and is shown against
+   * that intent's row. The list is re-read after a refusal either way: the likeliest cause
+   * is another tab having started it, and the row should then say so.
+   */
+  async abandonIntent(intentId: string) {
+    const targetId = this.viewTargetId;
+    const goalId = this.openGoalId;
+    if (targetId === "" || goalId === "" || this.intentAbandoningId !== "")
+      return;
+    this.intentAbandoningId = intentId;
+    this.intentAbandonDetail = "";
+    this.intentAbandonDetailId = "";
+    try {
+      const call = await this.client.abandonIntent(
+        this.serverUrl,
+        targetId,
+        intentId,
+        { reason: this.intentAbandonReason.trim() },
+      );
+      if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+      if (call._tag === "Unreachable") {
+        this.intentAbandonDetail = "No server answered at this address.";
+        this.intentAbandonDetailId = intentId;
+        return;
+      }
+      if (call._tag === "Refused") {
+        if (call.error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        this.intentAbandonDetail = this.#refusalText(
+          call.error,
+          "That intent could not be abandoned.",
+        );
+        this.intentAbandonDetailId = intentId;
+        // Closed: the row is re-read below and may no longer be abandonable at all.
+        this.intentAbandonOpenId = "";
+        await this.loadIntents(goalId);
+        return;
+      }
+      this.intents = this.intents.map((intent) =>
+        intent.intentId === intentId ? { ...call.value } : intent,
+      );
+      if (this.runIntentId === intentId) this.runIntentId = "";
+      this.intentAbandonOpenId = "";
+      this.intentAbandonReason = "";
+      void this.refreshTarget(targetId);
+    } finally {
+      this.intentAbandoningId = "";
+    }
+  }
+
+  /** Aims the run box at one intent. */
+  chooseRun(intentId: string) {
+    this.runIntentId = intentId;
+    this.runDetail = "";
+    this.runFallback = null;
+  }
+
+  /** Takes the run box off its intent without running anything. */
+  clearRunChoice() {
+    if (this.starting) return;
+    this.runIntentId = "";
+    this.runDetail = "";
+  }
+
   /* ── New target ──────────────────────────────────────────────────────────── */
 
   openDialog() {
@@ -1327,15 +1671,17 @@ export class App {
    */
   async startRun() {
     const targetId = this.viewTargetId;
-    if (targetId === "" || this.instruction.trim().length === 0) return;
+    const intentId = this.runIntentId;
+    if (targetId === "" || intentId === "") return;
     if (this.starting) return;
     this.starting = true;
     this.runDetail = "";
+    this.runFallback = null;
     try {
       const call = await this.client.startRun(
         this.serverUrl,
         targetId,
-        this.instruction.trim(),
+        intentId,
         // Omitted when the operator has not picked, which means "whatever this server
         // would choose" rather than any particular instance. The response says which it
         // used, so provenance comes back either way.
@@ -1370,9 +1716,17 @@ export class App {
           "detail" in error && typeof error.detail === "string"
             ? error.detail
             : "That run was refused.";
+        // Re-read, because the likeliest refusal is the intent having been taken or the
+        // goal ended since this list was loaded, and the row should then say so instead of
+        // offering the same run again.
+        if (this.openGoalId !== "") void this.loadIntents(this.openGoalId);
         return;
       }
-      this.instruction = "";
+      this.runIntentId = "";
+      this.runFallback =
+        call.value.instanceFallback === null
+          ? null
+          : { ...call.value.instanceFallback, ranOn: call.value.instanceId };
       // Remembered so its transcript is readable once it settles: a run leaves `runs` at
       // settlement, and nothing else a browser holds survives that.
       this.lastAttempts = {
@@ -1393,14 +1747,15 @@ export class App {
           startedAt: call.value.startedAt,
         },
       ];
-      // The counts moved: a run writes a goal, an intent and an attempt before it is
-      // answered, so the header would otherwise be stale until the next open. A refresh
-      // and not a navigation — if the operator opened something else while the start was
-      // in flight, the right number of targets to move them back to is none.
+      // The counts moved: a run writes an attempt and an event before it is answered, so
+      // the header would otherwise be stale until the next open. A refresh and not a
+      // navigation — if the operator opened something else while the start was in flight,
+      // the right number of targets to move them back to is none.
       await this.refreshTarget(targetId);
-      // And the goals: a run mints the goal it runs under until intents arrive, so the
-      // list the operator is looking at is now missing a row.
+      // The goals' counts, and the intent: it is claimed now, so its row must stop
+      // offering a run.
       void this.loadGoals(targetId);
+      if (this.openGoalId !== "") void this.loadIntents(this.openGoalId);
     } finally {
       this.starting = false;
     }
@@ -1834,6 +2189,33 @@ export class App {
       next.length > App.LIVE_KEPT
         ? next.slice(next.length - App.LIVE_KEPT)
         : next;
+    this.#refreshIntentsFor(targetId, frame);
+  }
+
+  /**
+   * Re-reads the open goal's intents when the record says one of them moved.
+   *
+   * A run settling gives its intent back (to `open`, or `answered`), another tab may have
+   * started or abandoned one, and none of that reaches this tab any other way — the
+   * intents are read, not pushed. **Only once the history has finished arriving**: opening
+   * a target replays its whole recent record, and a refresh per historical `run.settled`
+   * would be a request storm that says nothing a single read does not.
+   */
+  #refreshIntentsFor(targetId: string, frame: LiveItem) {
+    if (!this.liveCaughtUp || this.viewTargetId !== targetId) return;
+    if (
+      frame.kind !== "run.started" &&
+      frame.kind !== "run.settled" &&
+      frame.kind !== "intent.added" &&
+      frame.kind !== "intent.abandoned"
+    ) {
+      return;
+    }
+    if (frame.kind === "run.settled") void this.loadRuns();
+    if (this.openGoalId !== "") {
+      void this.loadIntents(this.openGoalId);
+      void this.refreshGoal(this.openGoalId);
+    }
   }
 
   /**
@@ -1960,7 +2342,8 @@ export class App {
     this.viewDetail = "";
     this.requestedTargetId = "";
     this.runs = [];
-    this.instruction = "";
+    this.runIntentId = "";
+    this.runFallback = null;
     this.starting = false;
     this.stopping = false;
     this.runDetail = "";

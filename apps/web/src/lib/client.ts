@@ -39,6 +39,8 @@ import {
   SessionGuard,
   type GoalDraft,
   type GoalEndDraft,
+  type IntentAbandonDraft,
+  type IntentDraft,
   type LiveFrame,
   type ModelOptionSelection,
   type TargetDraft,
@@ -306,7 +308,11 @@ export const server = {
   startRun: (
     baseUrl: string,
     targetId: string,
-    instruction: string,
+    /**
+     * The intent to run. A run claims an intent that exists; it does not create one, and
+     * there is no free text here for the server to turn into one.
+     */
+    intentId: string,
     /**
      * Which harness and model, when the operator has picked.
      *
@@ -333,7 +339,7 @@ export const server = {
         api.fleet.startRun({
           params: { targetId },
           payload: {
-            instruction,
+            intentId,
             ...(pick?.instanceId === undefined
               ? {}
               : { instanceId: pick.instanceId }),
@@ -393,6 +399,60 @@ export const server = {
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.endGoal({ params: { targetId, goalId }, payload: draft }),
+      ),
+    ),
+
+  /** The intents under one goal, oldest first. Refused if the target lacks the goal. */
+  intents: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.intents({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * The observations under one goal, as a digest to pick an anchor and a dimension from.
+   * Not the record: see `GoalObservationView`.
+   */
+  goalObservations: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.goalObservations({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * Adds an intent under a goal. The draft carries a question, anchors, a dimension and an
+   * optional suggestion and **no id**: the server mints the intent id and the operation id.
+   */
+  createIntent: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+    draft: IntentDraft,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.createIntent({
+          params: { targetId, goalId },
+          payload: draft,
+        }),
+      ),
+    ),
+
+  /** Abandons an open intent as the operator. Refused if a run holds it. */
+  abandonIntent: (
+    baseUrl: string,
+    targetId: string,
+    intentId: string,
+    draft: IntentAbandonDraft,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.abandonIntent({
+          params: { targetId, intentId },
+          payload: draft,
+        }),
       ),
     ),
 

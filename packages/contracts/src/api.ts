@@ -39,6 +39,12 @@ import {
 } from "effect/http-api";
 
 import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
+import {
+  GoalObservationView,
+  IntentAbandonDraft,
+  IntentDraft,
+  IntentView,
+} from "./intent";
 import { API_PREFIX, apiPath } from "./http";
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
@@ -408,33 +414,42 @@ export class TargetRefused extends Schema.TaggedError<TargetRefused>()(
 export const RUNS_PATH = apiPath("runs");
 
 /**
- * What the compose box submits.
+ * What the run control submits: which existing intent to run, and optionally how.
  *
- * One field, and the shortfall is deliberate. A run needs a goal, an intent's question
- * and a prompt; today all three come from the one thing the operator typed, and the server
- * mints the goal, intent and attempt ids for it. Letting the browser choose which existing
- * intent a run belongs to is Flow B's work — it is the screen that shows intents in the
- * first place — and a `intentId` field here would be a contract the UI could not yet fill
- * honestly.
+ * **A run claims an intent that already exists; it does not mint one.** Until the goal
+ * lifecycle, one typed instruction became a goal, an intent and an attempt all at once, and
+ * that 1:1:1 minting is exactly what this contract no longer does. The prompt the worker
+ * receives is the intent's own `question`, so there is no free text here to disagree with
+ * it. An intent is added under a goal first ({@link IntentDraft}); starting a run is
+ * choosing one.
  *
- * What is *not* a shortfall any more is which agent runs it. Both fields below are
- * optional and both mean the same thing when absent: "whatever this server would pick".
- * The server's pick is the first ready instance in its own configuration order and that
- * instance's default model, and the response says which it actually used — so a client that
- * sends neither still gets provenance back rather than having to assume it.
+ * The server refuses, naming the reason ({@link RunRefused}), an intent that does not
+ * exist, belongs to another target, is not `open` (naming the attempt holding it, when
+ * that is why), or whose goal has ended.
+ *
+ * Which agent runs it is still the operator's to say, and both fields below are optional
+ * and mean the same thing when absent: "whatever this server would pick" — except that an
+ * intent may now carry a *suggestion*. The order is the operator's explicit pick, then the
+ * intent's suggestion, then the server's default. The server's default is the first ready
+ * instance in its own configuration order and that instance's default model, and the
+ * response says which it actually used, so a client that sends neither still gets
+ * provenance back.
  */
 export const RunDraft = Schema.Struct({
-  /** What the operator wants done. Becomes the prompt verbatim. */
-  instruction: Schema.NonEmptyString,
+  /** The intent to run. It must be `open`, in this target, under an active goal. */
+  intentId: Schema.NonEmptyString,
   /**
-   * Which configured harness to run on. Absent means the server's default.
+   * Which configured harness to run on. Absent means the intent's suggestion, then the
+   * server's default.
    *
    * The id from {@link HarnessInstanceView}, never a driver slug: a driver names an
    * implementation and an instance names a configuration of one, and only the second is
    * something a run can be pinned to. An id this server does not configure, or one whose
    * harness did not come up, is refused `harness_not_ready` — never silently swapped for a
    * working one, because an attempt records which instance ran it and a quiet substitution
-   * would make that record a lie.
+   * would make that record a lie. **This applies to an explicit pick only**: a dead
+   * *suggestion* on the intent falls back to the default and the response says so
+   * ({@link RunStarted.instanceFallback}).
    */
   instanceId: Schema.optional(Schema.String),
   /**
@@ -504,6 +519,24 @@ export const RunStarted = Schema.Struct({
   providerId: Schema.String,
   modelId: Schema.String,
   startedAt: EpochMillis,
+  /**
+   * Non-null only when the intent *suggested* an instance this server could not give it.
+   *
+   * The run went ahead on the server's default and this says what was wanted and why it was
+   * not honoured, so the substitution is visible rather than silent. Null in every other
+   * case, including an intent with no suggestion: it is an account of a suggestion that
+   * failed, never a restatement of a choice that worked. An operator's explicit
+   * `instanceId` never produces it — that is refused `harness_not_ready` instead, because
+   * running somewhere the operator did not pick is not something to report after the fact.
+   */
+  instanceFallback: Schema.NullOr(
+    Schema.Struct({
+      /** The instance id the intent suggested. */
+      requested: Schema.String,
+      /** Why it could not be used, in the resolver's own sentence. */
+      reason: Schema.String,
+    }),
+  ),
 });
 export type RunStarted = typeof RunStarted.Type;
 
@@ -568,6 +601,10 @@ export type RunStopped = typeof RunStopped.Type;
  *   Nothing was prompted; if an attempt row was written it is left for the startup sweep.
  * - `store_unavailable` — the target's database could not be written to.
  * - `unknown_attempt` — nothing is running under that id *in this process*.
+ * - `intent_not_found`, `intent_wrong_target`, `intent_not_open`, `goal_not_active` — the
+ *   intent a run named cannot be claimed, each for the reason it says. The store established
+ *   each from the row; none is inferred. Nothing was written and the intent is left as it
+ *   was.
  *
  * `409` for all of them. Each has a defensible status of its own — `503` for `no_harness`,
  * `404` for `unknown_attempt` — and a tagged error carries one, so the choice is between
@@ -615,6 +652,21 @@ export class RunRefused extends Schema.TaggedError<RunRefused>()(
       "harness_unreachable",
       "store_unavailable",
       "unknown_attempt",
+      /** Nothing is stored under that intent id. Nothing was claimed or written. */
+      "intent_not_found",
+      /** The intent exists in a different target. A run cannot cross targets. */
+      "intent_wrong_target",
+      /**
+       * The intent is not `open`: it is claimed (the detail names the attempt holding it),
+       * answered, abandoned or only proposed. This is also what a second tab gets when it
+       * runs an intent the first already started.
+       */
+      "intent_not_open",
+      /**
+       * The intent's goal has ended. Ending a goal blocks new dispatch under it, though it
+       * does not interrupt a run already going; the detail names the goal's status.
+       */
+      "goal_not_active",
     ]),
     detail: Schema.String,
   },
@@ -669,6 +721,49 @@ export class GoalRefused extends Schema.TaggedError<GoalRefused>()(
 ) {
   override get message(): string {
     return `${this.reason} (${this.goalId}): ${this.detail}`;
+  }
+}
+
+/* ── Intents ─────────────────────────────────────────────────────────────────── */
+
+/**
+ * No intent under that id in this target. One refusal for a missing id and another
+ * target's, for the reason {@link GoalNotFound} gives. `404`.
+ */
+export class IntentNotFound extends Schema.TaggedError<IntentNotFound>()(
+  "IntentNotFound",
+  { targetId: Schema.String, intentId: Schema.String, detail: Schema.String },
+  { httpApiStatus: 404 },
+) {
+  override get message(): string {
+    return `no intent '${this.intentId}' in target '${this.targetId}': ${this.detail}`;
+  }
+}
+
+/**
+ * An intent change the server will not make.
+ *
+ * - `invalid` — the submission does not resolve against stored state: an anchor that is an
+ *   intent, a goal or nothing recorded, an anchor from another goal, a dimension address
+ *   that names nothing. `detail` is the store's own sentence and **is written to teach**
+ *   (what the id actually is, why that cannot anchor an intent, how to express a new
+ *   direction); a client shows it as written. This is the only thing `invalid` is claimed
+ *   to mean — the store gives no finer reason.
+ * - `not_abandonable` — the intent is not `open`: a run holds it, or it is answered or
+ *   already abandoned. `detail` says which and what to do about it.
+ *
+ * `409`, like {@link GoalRefused}.
+ */
+export class IntentRefused extends Schema.TaggedError<IntentRefused>()(
+  "IntentRefused",
+  {
+    reason: Schema.Literals(["invalid", "not_abandonable"]),
+    detail: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {
+  override get message(): string {
+    return `${this.reason}: ${this.detail}`;
   }
 }
 
@@ -1096,6 +1191,78 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       success: GoalView,
       error: [GoalNotFound, GoalRefused, TargetNotFound, TargetUnavailable],
     }),
+    /**
+     * The intents under one goal, oldest first, each with its anchors, status and attempt
+     * count.
+     *
+     * Wrapped in an object for the reason `goals` is. A goal another target holds is not
+     * found here ({@link GoalNotFound}).
+     */
+    HttpApiEndpoint.get("intents", "/targets/:targetId/goals/:goalId/intents", {
+      params: { targetId: Schema.String, goalId: Schema.String },
+      success: Schema.Struct({ intents: Schema.Array(IntentView) }),
+      error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+    }),
+    /**
+     * The observations recorded under one goal, as a digest an anchor can be chosen from.
+     *
+     * In store order, oldest first. Read-only, and **not the record**: see
+     * {@link GoalObservationView}. It exists so the add-intent form can offer real evidence
+     * to anchor to and real untested dimensions to address, rather than asking an operator
+     * to type an id nobody can be expected to remember.
+     */
+    HttpApiEndpoint.get(
+      "goalObservations",
+      "/targets/:targetId/goals/:goalId/observations",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        success: Schema.Struct({
+          observations: Schema.Array(GoalObservationView),
+        }),
+        error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * Adds an intent under a goal, by hand.
+     *
+     * `201`. The body is {@link IntentDraft}; **the server mints the intent id and the
+     * operation id**, and the write is the store's existing `addIntent`, so its anchoring
+     * rule is enforced there and not restated here. A refusal of that rule comes back as
+     * {@link IntentRefused} with the store's sentence, which is meant to be read.
+     */
+    HttpApiEndpoint.post(
+      "createIntent",
+      "/targets/:targetId/goals/:goalId/intents",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        payload: IntentDraft,
+        success: IntentView.pipe(HttpApiSchema.status(201)),
+        error: [GoalNotFound, IntentRefused, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * Abandons an open intent, as the operator.
+     *
+     * A `POST` to a sub-resource for the reason `endGoal` is. Refused as
+     * {@link IntentRefused} when the intent is claimed, answered or already abandoned, and
+     * as {@link IntentNotFound} when this target has no such intent. It stops nothing: a
+     * claimed intent is refused, because stopping its attempt is the stop control's job.
+     */
+    HttpApiEndpoint.post(
+      "abandonIntent",
+      "/targets/:targetId/intents/:intentId/abandon",
+      {
+        params: { targetId: Schema.String, intentId: Schema.String },
+        payload: IntentAbandonDraft,
+        success: IntentView,
+        error: [
+          IntentNotFound,
+          IntentRefused,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
     /**
      * One target's live transcript, as Server-Sent Events.
      *

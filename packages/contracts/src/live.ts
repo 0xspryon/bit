@@ -168,6 +168,8 @@ export const LIVE_ITEM_KINDS = [
   "intent.added",
   "goal.added",
   "goal.ended",
+  "intent.abandoned",
+  "intent.released",
   "record.other",
   /* Live activity. */
   "turn.reply",

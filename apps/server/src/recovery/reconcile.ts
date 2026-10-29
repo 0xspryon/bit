@@ -48,6 +48,7 @@ import {
   type AttemptExecutionStatus,
   type AttemptRow,
   type RecoveryOutcome,
+  type ReleasedClaim,
 } from "../persistence/store";
 import {
   HarnessSessionStatus,
@@ -168,6 +169,55 @@ export const reconcileUnsettledAttempts = Effect.fn(
   );
   return yield* Effect.forEach(unsettled, reconcileAttempt);
 });
+
+/**
+ * Gives back the intent claims a dead process left behind that no attempt can settle.
+ *
+ * {@link reconcileUnsettledAttempts} enumerates `attempts`, so it can only see a claim that
+ * has an attempt row. A process that died after claiming an intent and before writing the
+ * attempt leaves a claim with none, and that intent could then be neither run nor abandoned.
+ * This finds it by the claim and returns it to `open`: nothing ran, so nothing is known, and
+ * like the attempt sweep it **reconciles rather than guesses** — it asks no one, concludes
+ * nothing about the work, and never marks an intent `answered`. A claim whose attempt exists
+ * and has already left `running` is given back the same way; a `running` attempt is left to
+ * the attempt sweep, which asks the harness first.
+ *
+ * Each release is written to the event log (`intent.released`) by the store, in the same
+ * transaction as the change, and returned here so the caller can print it like the attempt
+ * sweep prints its own.
+ *
+ * **It is a separate step, and the order around it is what makes it safe.** A claim a live
+ * `start` took a moment ago has no attempt row yet either and looks exactly like an orphan,
+ * so this can only run while no start in this process can hold a claim. That is arranged by
+ * ordering and not by anything here: `RunSupervisor.start` waits for the worker endpoints
+ * before it claims, and `main.ts` runs this and only then publishes them. It is not folded
+ * into the attempt sweep, which runs after publication and can spend a long time asking a
+ * harness. A root that published first, or ran this later, would lose the guarantee; nothing
+ * in this function can detect that.
+ */
+export const releaseOrphanedClaims = Effect.fn("releaseOrphanedClaims")(
+  function* () {
+    const store = yield* ObservationStore;
+    const released = yield* store.releaseOrphanedClaims();
+    if (released.length > 0) {
+      yield* Effect.logInfo(
+        `released ${String(released.length)} intent claim(s) no running attempt holds: ` +
+          released.map((claim) => claim.intentId).join(", "),
+      );
+    }
+    return released;
+  },
+);
+
+/** One line per released claim, in the register of {@link renderReconciliation}. */
+export const renderReleasedClaim = (claim: ReleasedClaim): string =>
+  [
+    claim.intentId,
+    `goal=${claim.goalId}`,
+    `claimedBy=${claim.claimedByAttemptId}`,
+    `attempt=${claim.attemptStatus ?? "never recorded"}`,
+    "intent=claimed->open",
+  ].join("  ");
 
 /** One line per reconciled attempt, for an operator reading a console or a log file. */
 export const renderReconciliation = (entry: Reconciliation): string =>

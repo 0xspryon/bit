@@ -130,6 +130,8 @@ import { RunSupervisor, WorkerEndpoints } from "./run/supervisor";
 import { HarnessSessionStatus } from "./recovery/harnessStatus";
 import {
   reconcileUnsettledAttempts,
+  releaseOrphanedClaims,
+  renderReleasedClaim,
   renderReconciliation,
 } from "./recovery/reconcile";
 
@@ -691,8 +693,56 @@ const reconcile = Effect.gen(function* () {
   );
 });
 
+/**
+ * Gives back intent claims a dead process left with no attempt to settle them.
+ *
+ * Fleet-wide and with the attempt sweep's partial-failure policy: a target that will not open
+ * is logged by name and the rest are still done. **It runs before the worker endpoints are
+ * published, and that ordering is the whole safety argument.** A live claim and an orphan
+ * look alike to it (a claim with no attempt row), and `RunSupervisor.start` waits for these
+ * endpoints *before* it claims an intent, so until they are published no start in this
+ * process holds a claim for it to take. Publish them earlier, or run this later, and a
+ * start's claim can be returned to `open` from under it. Requests that arrive in the
+ * meantime are held, not refused.
+ */
+const releaseOrphans = Effect.gen(function* () {
+  if (process.env["RECONCILE_ON_START"] === "0") return;
+  const registry = yield* FleetStore;
+  const stores = yield* TargetStores;
+  const rows = yield* registry.targets();
+  let total = 0;
+  for (const row of rows) {
+    if (row.archivedAt !== undefined) continue;
+    const outcome = yield* Effect.result(
+      Effect.scoped(
+        Effect.flatMap(stores.open(row.targetId), (store) =>
+          releaseOrphanedClaims().pipe(
+            Effect.provideService(ObservationStore, store),
+          ),
+        ),
+      ),
+    );
+    if (outcome._tag === "Failure") {
+      console.error(
+        `startup reconciliation: ${row.targetId} intent claims could not be reconciled — ${outcome.failure.message}`,
+      );
+      continue;
+    }
+    total += outcome.success.length;
+    for (const claim of outcome.success)
+      console.log(`  ${row.targetId}: ${renderReleasedClaim(claim)}`);
+  }
+  if (total > 0) {
+    console.log(
+      `startup reconciliation: ${String(total)} intent claim(s) released`,
+    );
+  }
+});
+
 const program = Effect.gen(function* () {
   const control = yield* ControlPlaneEndpoint;
+  // First, and before the URL below is published; see `releaseOrphans`.
+  yield* releaseOrphans;
   // Before reconciliation, deliberately. The listener is already accepting by the time
   // this runs, so the sooner the URL is answerable the smaller the window in which a start
   // would have to wait for it. Reconciliation can take as long as the harness takes to

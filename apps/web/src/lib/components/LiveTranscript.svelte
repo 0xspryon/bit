@@ -52,6 +52,8 @@
     "intent.added": "Intent",
     "goal.added": "Goal",
     "goal.ended": "Goal ended",
+    "intent.abandoned": "Intent abandoned",
+    "intent.released": "Intent released",
     "record.other": "Event",
     "turn.reply": "Reply",
     "tool.call": "Tool call",

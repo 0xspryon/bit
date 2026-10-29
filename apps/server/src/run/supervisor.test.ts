@@ -70,6 +70,8 @@ import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { FleetStore } from "../persistence/fleet";
+import type { ObservationStore } from "../persistence/store";
+import * as identifier from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import {
   CLAUDE_SETTINGS_PATH,
@@ -82,6 +84,7 @@ import {
   WorkerEndpoints,
   RunSupervisor,
   settlementFor,
+  chooseHarness,
   type RunInput,
   type SupervisionEnd,
 } from "./supervisor";
@@ -288,7 +291,11 @@ const world = (
   targets: readonly string[],
   scriptFor: (sessionId: string) => Script,
   recorder: Recorder,
-  options?: { readonly askTimeout?: Duration.Input | undefined },
+  options?: {
+    readonly askTimeout?: Duration.Input | undefined;
+    /** Endpoints that are not published yet, to hold a start where `main.ts` holds one. */
+    readonly endpoints?: Layer.Layer<WorkerEndpoints> | undefined;
+  },
 ) => {
   const root = newRoot();
   const fleet = FleetStore.layer(root);
@@ -312,15 +319,16 @@ const world = (
       Layer.provide(McpCredentials.layer),
       Layer.provide(RunNarrations.layer),
       Layer.provide(
-        Layer.succeed(
-          WorkerEndpoints,
-          WorkerEndpoints.of({
-            urls: Effect.succeed({
-              mcp: "http://127.0.0.1:9/api/v1/mcp",
-              policy: "http://127.0.0.1:9/api/v1/policy/decide",
+        options?.endpoints ??
+          Layer.succeed(
+            WorkerEndpoints,
+            WorkerEndpoints.of({
+              urls: Effect.succeed({
+                mcp: "http://127.0.0.1:9/api/v1/mcp",
+                policy: "http://127.0.0.1:9/api/v1/policy/decide",
+              }),
             }),
-          }),
-        ),
+          ),
       ),
     ),
   );
@@ -349,6 +357,22 @@ const world = (
   return { root, runtime, ready, registry };
 };
 
+/**
+ * How many events making a run's goal and intent writes: `goal.added`, then `intent.added`.
+ *
+ * Named so that an assertion about an attempt's position in the log reads as "after the
+ * fixture" rather than as a bare number that happens to be 3.
+ */
+const FIXTURE_EVENTS = 2;
+
+/** A target's `attempt.*` events: the run's own, without the fixture's. */
+const attemptEventsOf = (
+  store: Pick<ObservationStore["Service"], "eventsAfter">,
+) =>
+  Effect.map(store.eventsAfter(), (events) =>
+    events.filter((event) => event.kind.startsWith("attempt.")),
+  );
+
 /** One target's rows, read straight off the file after the runtime is gone. */
 const readAfterShutdown = (root: string, targetId: string) => {
   const database = new Database(
@@ -372,9 +396,12 @@ const readAfterShutdown = (root: string, targetId: string) => {
           "SELECT id, status, ended_at, model_options FROM attempts ORDER BY started_at",
         )
         .all(),
+      // The attempt's own lifecycle events. Making the goal and the intent a run claims
+      // writes `goal.added` and `intent.added` ahead of them, and those are the fixture's,
+      // not the run's: what these tests mean by "a run's events" is `attempt.*`.
       events: database
         .query<{ kind: string; subject_id: string }, []>(
-          "SELECT kind, subject_id FROM events ORDER BY sequence",
+          "SELECT kind, subject_id FROM events WHERE kind LIKE 'attempt.%' ORDER BY sequence",
         )
         .all(),
     };
@@ -396,22 +423,54 @@ const readAfterShutdown = (root: string, targetId: string) => {
  * arrangement the server uses for a real run and the same reason: a worker that can read
  * its own audit trail can read the shape of the boundary it is inside.
  */
-const draft = (root: string, targetId: string, task: string): RunInput => {
-  const base = join(root, "..", "work", targetId);
-  mkdirSync(base, { recursive: true });
-  return {
-    targetId,
-    workspace: base,
-    auditPath: join(root, "..", "work", `${targetId}-policy-audit.log`),
-    // The target's own `evidence/` directory, where a settled attempt's transcript lands.
-    // Beside the workspace for the same reason the audit path is: outside it.
-    evidenceDirectory: join(root, "targets", targetId, "evidence"),
-    goal: `Work out what ${targetId} does under load.`,
-    question: `Probe ${targetId}'s limiter.`,
-    task,
-    title: `bit: ${targetId}`,
-  };
-};
+const draft = (
+  root: string,
+  targetId: string,
+  task: string,
+  suggestion: {
+    readonly suggestedInstanceId?: string;
+    readonly suggestedModel?: string;
+  } = {},
+) =>
+  Effect.gen(function* () {
+    const base = join(root, "..", "work", targetId);
+    mkdirSync(base, { recursive: true });
+    const stores = yield* TargetStores;
+    // A run claims an intent that already exists, so the test makes one first, the way an
+    // operator does: a goal, then an intent under it. The question is the prompt.
+    const goalId = `goal_${identifier.prefixed("t")}`;
+    const intentId = `int_${identifier.prefixed("t")}`;
+    yield* withTargetStore(stores, targetId, (store) =>
+      Effect.gen(function* () {
+        const host = { callerScope: `${targetId}/operator`, targetId };
+        yield* store.openGoal(host, {
+          operationId: `op_${goalId}`,
+          goalId,
+          name: "",
+          description: `Work out what ${targetId} does under load.`,
+        });
+        yield* store.addIntent(host, {
+          operationId: `op_${intentId}`,
+          goalId,
+          intentId,
+          question: task,
+          anchorObservationIds: [],
+          addressesDimension: null,
+          ...suggestion,
+        });
+      }),
+    ).pipe(Effect.orDie);
+    return {
+      targetId,
+      intentId,
+      workspace: base,
+      auditPath: join(root, "..", "work", `${targetId}-policy-audit.log`),
+      // The target's own `evidence/` directory, where a settled attempt's transcript lands.
+      // Beside the workspace for the same reason the audit path is: outside it.
+      evidenceDirectory: join(root, "targets", targetId, "evidence"),
+      title: `bit: ${targetId}`,
+    } satisfies RunInput;
+  });
 
 /** The scripts a test wires in, with a settle gate per session created on demand. */
 const scripts = (defaults: Omit<Script, "settle">) => {
@@ -533,7 +592,7 @@ describe("starting a run", () => {
         const credentials = yield* McpCredentials;
 
         const started = yield* supervisor.start(
-          draft(root, "alpha", "probe it"),
+          yield* draft(root, "alpha", "probe it"),
         );
 
         // The assertion that matters, and it is a state rather than a duration: nothing
@@ -600,7 +659,7 @@ describe("starting a run", () => {
         const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
         const started = yield* supervisor.start(
-          draft(root, "alpha", "probe it"),
+          yield* draft(root, "alpha", "probe it"),
         );
 
         // Let the long poll return, then wait for the supervisor to be gone from the
@@ -612,7 +671,7 @@ describe("starting a run", () => {
           store.loadAttempt(started.attemptId, "alpha"),
         );
         const events = yield* withTargetStore(stores, "alpha", (store) =>
-          store.eventsAfter(),
+          attemptEventsOf(store),
         );
         return {
           started,
@@ -634,7 +693,10 @@ describe("starting a run", () => {
       "attempt.started",
       "attempt.settled",
     ]);
-    expect(observed.events.map((event) => event.sequence)).toEqual([1, 2]);
+    expect(observed.events.map((event) => event.sequence)).toEqual([
+      FIXTURE_EVENTS + 1,
+      FIXTURE_EVENTS + 2,
+    ]);
     expect(observed.events.map((event) => event.subjectId)).toEqual([
       observed.started.attemptId,
       observed.started.attemptId,
@@ -717,7 +779,7 @@ describe("starting a run", () => {
         const supervisor = yield* RunSupervisor;
         const resolver = yield* TargetStores;
         const started = yield* supervisor.start(
-          draft(root, "alpha", "probe it"),
+          yield* draft(root, "alpha", "probe it"),
         );
         yield* release(started.harnessSessionId);
         yield* settled(supervisor, started.attemptId);
@@ -760,8 +822,8 @@ describe("two runs at once, against two targets", () => {
 
         const [alpha, beta] = yield* Effect.all(
           [
-            supervisor.start(draft(root, "alpha", "probe alpha")),
-            supervisor.start(draft(root, "beta", "probe beta")),
+            supervisor.start(yield* draft(root, "alpha", "probe alpha")),
+            supervisor.start(yield* draft(root, "beta", "probe beta")),
           ],
           { concurrency: 2 },
         );
@@ -772,7 +834,7 @@ describe("two runs at once, against two targets", () => {
               return {
                 counts: yield* store.counts(),
                 unsettled: yield* store.unsettledAttempts(),
-                events: yield* store.eventsAfter(),
+                events: yield* attemptEventsOf(store),
               };
             }),
           );
@@ -813,8 +875,12 @@ describe("two runs at once, against two targets", () => {
 
     // Separate sequence counters, because they are separate files. Each log holds one
     // `attempt.started` for its own attempt and nothing of the other's.
-    expect(observed.inAlpha.events.map((event) => event.sequence)).toEqual([1]);
-    expect(observed.inBeta.events.map((event) => event.sequence)).toEqual([1]);
+    expect(observed.inAlpha.events.map((event) => event.sequence)).toEqual([
+      FIXTURE_EVENTS + 1,
+    ]);
+    expect(observed.inBeta.events.map((event) => event.sequence)).toEqual([
+      FIXTURE_EVENTS + 1,
+    ]);
     expect(observed.inAlpha.events[0]?.subjectId).toBe(
       observed.alpha.attemptId,
     );
@@ -843,9 +909,11 @@ describe("two runs at once, against two targets", () => {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
         const alpha = yield* supervisor.start(
-          draft(root, "alpha", "probe alpha"),
+          yield* draft(root, "alpha", "probe alpha"),
         );
-        const beta = yield* supervisor.start(draft(root, "beta", "probe beta"));
+        const beta = yield* supervisor.start(
+          yield* draft(root, "beta", "probe beta"),
+        );
         const stopped = yield* supervisor.stop(alpha.attemptId);
         return {
           alpha,
@@ -892,7 +960,7 @@ describe("stopping a run", () => {
         const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
         const started = yield* supervisor.start(
-          draft(root, "alpha", "probe it"),
+          yield* draft(root, "alpha", "probe it"),
         );
         const before = yield* credentials.size;
 
@@ -907,7 +975,7 @@ describe("stopping a run", () => {
             store.loadAttempt(started.attemptId, "alpha"),
           ),
           events: yield* withTargetStore(stores, "alpha", (store) =>
-            store.eventsAfter(),
+            attemptEventsOf(store),
           ),
           supervising: yield* supervisor.running,
         };
@@ -957,7 +1025,7 @@ describe("stopping a run", () => {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
         const started = yield* supervisor.start(
-          draft(root, "alpha", "probe it"),
+          yield* draft(root, "alpha", "probe it"),
         );
         yield* supervisor.stop(started.attemptId);
         return yield* withTargetStore(stores, "alpha", (store) =>
@@ -1019,7 +1087,7 @@ describe("when the harness stops being readable", () => {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
         const started = yield* supervisor.start(
-          draft(root, "alpha", "probe it"),
+          yield* draft(root, "alpha", "probe it"),
         );
         // The stream has already failed by now. Nothing has settled.
         const during = yield* withTargetStore(stores, "alpha", (store) =>
@@ -1057,7 +1125,7 @@ describe("when the harness stops being readable", () => {
         const supervisor = yield* RunSupervisor;
         const stores = yield* TargetStores;
         const started = yield* supervisor.start(
-          draft(root, "alpha", "probe it"),
+          yield* draft(root, "alpha", "probe it"),
         );
         // Break the long poll. Our request losing its answer says nothing about the
         // harness, so the supervisor has to go and ask.
@@ -1095,7 +1163,7 @@ describe("when the harness stops being readable", () => {
         const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
         const started = yield* supervisor.start(
-          draft(root, "alpha", "probe it"),
+          yield* draft(root, "alpha", "probe it"),
         );
         yield* release(
           started.harnessSessionId,
@@ -1195,7 +1263,7 @@ describe("when the harness stops being readable", () => {
         const resolver = yield* TargetStores;
         const registry = yield* McpCredentials;
         const refusal = yield* Effect.result(
-          supervisor.start(draft(root, "alpha", "probe it")),
+          supervisor.start(yield* draft(root, "alpha", "probe it")),
         );
         // The finalizer settles on its own fiber, so wait for the supervisor to let go
         // before reading the row. Not a sleep: the condition is the thing being waited
@@ -1276,9 +1344,11 @@ describe("shutting the process down", () => {
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         const alpha = yield* supervisor.start(
-          draft(root, "alpha", "probe alpha"),
+          yield* draft(root, "alpha", "probe alpha"),
         );
-        const beta = yield* supervisor.start(draft(root, "beta", "probe beta"));
+        const beta = yield* supervisor.start(
+          yield* draft(root, "beta", "probe beta"),
+        );
         return {
           alpha,
           beta,
@@ -1371,7 +1441,9 @@ describe("shutting the process down", () => {
 
     const started = await runtime.runPromise(
       Effect.flatMap(RunSupervisor, (supervisor) =>
-        supervisor.start(draft(root, "alpha", "probe it")),
+        Effect.flatMap(draft(root, "alpha", "probe it"), (input) =>
+          supervisor.start(input),
+        ),
       ).pipe(Effect.orDie),
     );
 
@@ -1429,7 +1501,7 @@ describe("the narration bus", () => {
         // No subscribers yet, deliberately: this run's narration is published into a bus
         // nobody is listening to, and it must not fail, block or settle differently.
         const alpha = yield* supervisor.start(
-          draft(root, "alpha", "probe alpha"),
+          yield* draft(root, "alpha", "probe alpha"),
         );
         const unwatched = yield* narrations.subscriberCount;
 
@@ -1443,7 +1515,9 @@ describe("the narration bus", () => {
         // into the gap. Not a sleep: a check on the state that matters.
         yield* waitFor(narrations.subscriberCount, (n) => n === 1);
 
-        const beta = yield* supervisor.start(draft(root, "beta", "probe beta"));
+        const beta = yield* supervisor.start(
+          yield* draft(root, "beta", "probe beta"),
+        );
         const received: readonly RunNarration[] = yield* Fiber.join(collected);
         return { alpha, beta, unwatched, received };
       }).pipe(Effect.orDie),
@@ -1750,7 +1824,9 @@ describe("one supervisor, two harnesses", () => {
       );
       await ready;
       try {
-        const input = draft(root, targetId, "probe the limiter");
+        const input = await runtime.runPromise(
+          draft(root, targetId, "probe the limiter").pipe(Effect.orDie),
+        );
         const started = await runtime.runPromise(
           Effect.flatMap(RunSupervisor, (supervisor) =>
             supervisor.start(input),
@@ -1833,17 +1909,24 @@ describe("one supervisor, two harnesses", () => {
     });
     await ready;
     try {
-      const input = draft(root, targetId, "probe the limiter");
+      const input = await runtime.runPromise(
+        draft(root, targetId, "probe the limiter").pipe(Effect.orDie),
+      );
       const first = await runtime.runPromise(
         Effect.flatMap(RunSupervisor, (supervisor) =>
           supervisor.start(input),
         ).pipe(Effect.orDie),
       );
 
+      // A different intent in the same folder: the first intent is claimed, and a second
+      // run of *it* would be refused for that reason, which is not what this test is about.
+      const other = await runtime.runPromise(
+        draft(root, targetId, "probe something else").pipe(Effect.orDie),
+      );
       const second = await runtime.runPromise(
         Effect.result(
           Effect.flatMap(RunSupervisor, (supervisor) =>
-            supervisor.start(input),
+            supervisor.start(other),
           ),
         ),
       );
@@ -1859,8 +1942,21 @@ describe("one supervisor, two harnesses", () => {
       // part that matters — no second gate installed over the first run's.
       expect(recorder.created).toHaveLength(1);
       expect(recorder.prompts).toHaveLength(1);
+      // And the refused run gave its intent back: a start that refuses after the claim was
+      // taken must not leave the intent `claimed` by an attempt that never existed.
+      const refusedIntent = await runtime.runPromise(
+        Effect.flatMap(TargetStores, (stores) =>
+          withTargetStore(stores, targetId, (store) =>
+            store.intent(other.intentId),
+          ),
+        ).pipe(Effect.orDie),
+      );
+      expect(refusedIntent?.status).toBe("open");
+      expect(refusedIntent?.claimedByAttemptId).toBeNull();
 
-      // Keyed on what is *running*, so settling the first frees the folder.
+      // Keyed on what is *running*, so settling the first frees the folder. It settles
+      // `succeeded` having recorded nothing, which returns its intent to `open` rather than
+      // answering it, so the third run can take the same intent again.
       await runtime.runPromise(release(first.harnessSessionId));
       await runtime.runPromise(
         Effect.flatMap(RunSupervisor, (supervisor) =>
@@ -1922,7 +2018,9 @@ describe("one supervisor, two harnesses", () => {
           Effect.result(
             Effect.flatMap(RunSupervisor, (supervisor) =>
               // `draft` gives each target its own folder, which is the point.
-              supervisor.start(draft(root, targetId, "probe")),
+              Effect.flatMap(draft(root, targetId, "probe"), (input) =>
+                supervisor.start(input),
+              ),
             ),
           ),
         );
@@ -1958,7 +2056,9 @@ describe("one supervisor, two harnesses", () => {
     });
     await ready;
     try {
-      const input = draft(root, targetId, "probe the limiter");
+      const input = await runtime.runPromise(
+        draft(root, targetId, "probe the limiter").pipe(Effect.orDie),
+      );
       mkdirSync(join(input.workspace, ".claude"), { recursive: true });
       const theirs = "{ not json, and possibly precious\n";
       await Bun.write(join(input.workspace, CLAUDE_SETTINGS_PATH), theirs);
@@ -2149,12 +2249,12 @@ describe("two configured instances", () => {
         const stores = yield* TargetStores;
 
         const onAlpha = yield* supervisor.start({
-          ...draft(root, "alpha-target", "probe alpha"),
+          ...(yield* draft(root, "alpha-target", "probe alpha")),
           instanceId: "alpha",
         });
         yield* release(onAlpha.harnessSessionId);
         const onBeta = yield* supervisor.start({
-          ...draft(root, "beta-target", "probe beta"),
+          ...(yield* draft(root, "beta-target", "probe beta")),
           instanceId: "beta",
           model: "beta/other",
         });
@@ -2214,7 +2314,7 @@ describe("two configured instances", () => {
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         const run = yield* supervisor.start(
-          draft(root, "alpha-target", "probe it"),
+          yield* draft(root, "alpha-target", "probe it"),
         );
         yield* release(run.harnessSessionId);
         return run;
@@ -2251,7 +2351,7 @@ describe("two configured instances", () => {
     const observed = await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
-        const input = draft(root, "alpha-target", "probe it");
+        const input = yield* draft(root, "alpha-target", "probe it");
         const refused = yield* Effect.result(
           supervisor.start({ ...input, instanceId: "beta" }),
         );
@@ -2295,10 +2395,9 @@ describe("two configured instances", () => {
     const refused = await runtime.runPromise(
       Effect.result(
         Effect.flatMap(RunSupervisor, (supervisor) =>
-          supervisor.start({
-            ...draft(root, "alpha-target", "probe it"),
-            instanceId: "nonesuch",
-          }),
+          Effect.flatMap(draft(root, "alpha-target", "probe it"), (input) =>
+            supervisor.start({ ...input, instanceId: "nonesuch" }),
+          ),
         ),
       ).pipe(Effect.orDie),
     );
@@ -2310,6 +2409,161 @@ describe("two configured instances", () => {
     }
     expect(recorder.created).toEqual([]);
     await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  /**
+   * A suggestion is advice. These four are the whole of decision 13: an explicit pick
+   * wins and is refused if it is dead, a suggestion is used if it is alive, and a dead
+   * suggestion falls back **and says so**.
+   */
+  const suggested = (
+    suggestion: { instanceId: string; model?: string },
+    betaBroken?: string,
+  ) => {
+    const recorder = emptyRecorder();
+    const routed: Routed = { prompted: [] };
+    const { scriptFor, release } = scripts({
+      narration: [],
+      stream: "open",
+      status: "succeeded",
+    });
+    const built = twoInstanceWorld(
+      scriptFor,
+      recorder,
+      routed,
+      betaBroken === undefined ? undefined : { betaBroken },
+    );
+    const input = (task: string) =>
+      draft(built.root, "alpha-target", task, {
+        suggestedInstanceId: suggestion.instanceId,
+        ...(suggestion.model === undefined
+          ? {}
+          : { suggestedModel: suggestion.model }),
+      });
+    return { ...built, routed, recorder, release, input };
+  };
+
+  const intentOf = (intentId: string) =>
+    Effect.flatMap(TargetStores, (stores) =>
+      withTargetStore(stores, "alpha-target", (store) =>
+        store.intent(intentId),
+      ),
+    );
+
+  test("a suggestion that can be honoured is, and nothing is reported as a fallback", async () => {
+    const { runtime, ready, routed, input, release } = suggested({
+      instanceId: "beta",
+      model: "beta/other",
+    });
+    await ready;
+
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const run = yield* supervisor.start(yield* input("probe it"));
+        yield* release(run.harnessSessionId);
+        return run;
+      }).pipe(Effect.orDie),
+    );
+
+    expect(started.instanceId).toBe("beta");
+    expect(started.instanceFallback).toBeNull();
+    // The suggested model reached the harness: the suggestion is used, not only stored.
+    expect(routed.prompted).toEqual([
+      { instanceId: "beta", model: "beta/other" },
+    ]);
+    await runtime.dispose();
+  });
+
+  test("a suggestion naming a dead instance falls back to the default and says so", async () => {
+    const { runtime, ready, routed, input, release } = suggested(
+      { instanceId: "beta", model: "beta/other" },
+      "beta would not start: no such binary",
+    );
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const draftInput = yield* input("probe it");
+        const run = yield* supervisor.start(draftInput);
+        yield* release(run.harnessSessionId);
+        return { run, intent: yield* intentOf(draftInput.intentId) };
+      }).pipe(Effect.orDie),
+    );
+
+    // It ran, on the default, and the response carries what was wanted and why not.
+    expect(observed.run.instanceId).toBe("alpha");
+    expect(observed.run.instanceFallback).toMatchObject({ requested: "beta" });
+    expect(observed.run.instanceFallback?.reason).toContain("no such binary");
+    // The suggested *model* belonged to the instance that fell away, so it is not carried
+    // across: `beta/other` is not a name alpha knows.
+    expect(routed.prompted).toEqual([
+      { instanceId: "alpha", model: "alpha/default" },
+    ]);
+    // And the suggestion is still on the intent, untouched: advice that failed once is not
+    // erased, and nothing was pinned to it.
+    expect(observed.intent?.suggestion.instanceId).toBe("beta");
+    await runtime.dispose();
+  });
+
+  test("an operator's explicit pick wins over a suggestion, and never falls back", async () => {
+    const { runtime, ready, routed, input, release } = suggested({
+      instanceId: "beta",
+      model: "beta/other",
+    });
+    await ready;
+
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const run = yield* supervisor.start({
+          ...(yield* input("probe it")),
+          instanceId: "alpha",
+        });
+        yield* release(run.harnessSessionId);
+        return run;
+      }).pipe(Effect.orDie),
+    );
+
+    expect(started.instanceId).toBe("alpha");
+    expect(started.instanceFallback).toBeNull();
+    // The suggestion's model is for beta and is not applied to an instance it was not
+    // suggested for.
+    expect(routed.prompted).toEqual([
+      { instanceId: "alpha", model: "alpha/default" },
+    ]);
+    await runtime.dispose();
+  });
+
+  test("an explicit pick that is dead is refused harness_not_ready, even beside a live suggestion, and the intent stays open", async () => {
+    const { runtime, ready, recorder, input } = suggested(
+      { instanceId: "alpha" },
+      "beta would not start: no such binary",
+    );
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const draftInput = yield* input("probe it");
+        const refused = yield* Effect.result(
+          supervisor.start({ ...draftInput, instanceId: "beta" }),
+        );
+        return { refused, intent: yield* intentOf(draftInput.intentId) };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.refused._tag).toBe("Failure");
+    if (observed.refused._tag === "Failure") {
+      expect(observed.refused.failure.reason).toBe("harness_not_ready");
+    }
+    // Not substituted: nothing ran anywhere, and the intent can be run again.
+    expect(recorder.created).toEqual([]);
+    expect(observed.intent?.status).toBe("open");
+    expect(observed.intent?.claimedByAttemptId).toBeNull();
+    expect(observed.intent?.attemptCount).toBe(0);
     await runtime.dispose();
   });
 });
@@ -2422,7 +2676,9 @@ describe("the transcript at settlement", () => {
     const started = await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
-        const run = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const run = yield* supervisor.start(
+          yield* draft(root, "alpha", "probe it"),
+        );
         yield* release(run.harnessSessionId);
         // Settled: `stop` awaits the finalizer, which settles and then writes.
         yield* Effect.result(supervisor.stop(run.attemptId));
@@ -2471,7 +2727,9 @@ describe("the transcript at settlement", () => {
     const started = await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
-        const run = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const run = yield* supervisor.start(
+          yield* draft(root, "alpha", "probe it"),
+        );
         yield* release(run.harnessSessionId);
         yield* Effect.result(supervisor.stop(run.attemptId));
         return run;
@@ -2516,7 +2774,9 @@ describe("the transcript at settlement", () => {
     await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
-        const run = yield* supervisor.start(draft(root, "alpha", "probe it"));
+        const run = yield* supervisor.start(
+          yield* draft(root, "alpha", "probe it"),
+        );
         yield* release(run.harnessSessionId);
         yield* Effect.result(supervisor.stop(run.attemptId));
       }).pipe(Effect.orDie),
@@ -2561,7 +2821,7 @@ describe("the model options a run is dispatched with", () => {
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         yield* supervisor.start({
-          ...draft(root, "alpha", "probe it"),
+          ...(yield* draft(root, "alpha", "probe it")),
           ...(model === undefined ? {} : { model }),
           modelOptions,
         });
@@ -2626,7 +2886,7 @@ describe("the model options a run is dispatched with", () => {
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
         yield* supervisor.start({
-          ...draft(root, "alpha", "probe it"),
+          ...(yield* draft(root, "alpha", "probe it")),
           modelOptions: [
             { id: "effort", value: "high" },
             // Dropped on the way, and so absent from the row too: what is recorded is
@@ -2659,7 +2919,7 @@ describe("the model options a run is dispatched with", () => {
     await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
-        yield* supervisor.start(draft(root, "alpha", "probe it"));
+        yield* supervisor.start(yield* draft(root, "alpha", "probe it"));
       }).pipe(Effect.orDie),
     );
     await runtime.dispose();
@@ -2676,5 +2936,416 @@ describe("the model options a run is dispatched with", () => {
     expect(
       await dispatched([{ id: "effort", value: "low" }], "scripted/unlisted"),
     ).toBeUndefined();
+  });
+});
+
+/* ── Choosing the harness, on its own ────────────────────────────────────────── */
+
+describe("which harness, model and options a run gets", () => {
+  const instanceOf = (id: string): HarnessInstance => ({
+    ...STUB_INSTANCE,
+    instanceId: defaultInstanceIdForDriver(DriverKind.make(id)),
+    driver: DriverKind.make(id),
+    displayName: id,
+    defaultModel: `${id}/default`,
+    models: [{ id: `${id}/default` }],
+  });
+  const harnessOf = (id: string) => {
+    const { scriptFor } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    return AgentHarness.of({
+      ...fakeHarnessShape(scriptFor, emptyRecorder()),
+      instance: instanceOf(id),
+    });
+  };
+  const resolver = (deadBeta = false) =>
+    HarnessResolver.fromEntries([
+      { instance: instanceOf("alpha"), harness: harnessOf("alpha") },
+      deadBeta
+        ? {
+            instance: instanceOf("beta"),
+            harness: undefined,
+            reason: "beta is down",
+          }
+        : { instance: instanceOf("beta"), harness: harnessOf("beta") },
+    ]);
+  const idOf = (chosen: { resolved: { instance: { instanceId: string } } }) =>
+    String(chosen.resolved.instance.instanceId);
+  const none = { instanceId: null, model: null, modelOptions: null };
+  const run = (
+    explicit: Parameters<typeof chooseHarness>[1],
+    suggestion: Parameters<typeof chooseHarness>[2],
+    deadBeta = false,
+  ) =>
+    Effect.runPromise(chooseHarness(resolver(deadBeta), explicit, suggestion));
+
+  test("explicit, then suggestion, then default", async () => {
+    expect(idOf(await run({}, none))).toBe("alpha");
+    expect(idOf(await run({}, { ...none, instanceId: "beta" }))).toBe("beta");
+    expect(
+      idOf(await run({ instanceId: "alpha" }, { ...none, instanceId: "beta" })),
+    ).toBe("alpha");
+  });
+
+  test("a dead suggestion falls back with a reason; a dead explicit pick fails", async () => {
+    const chosen = await run({}, { ...none, instanceId: "beta" }, true);
+    expect(idOf(chosen)).toBe("alpha");
+    expect(chosen.fallback?.requested).toBe("beta");
+    expect(chosen.fallback?.reason).toContain("beta is down");
+
+    const refused = await Effect.runPromise(
+      Effect.result(
+        chooseHarness(resolver(true), { instanceId: "beta" }, none),
+      ),
+    );
+    expect(refused._tag).toBe("Failure");
+  });
+
+  test("a suggestion's model and options apply only where they were suggested", async () => {
+    const suggestion = {
+      instanceId: "beta",
+      model: "beta/default",
+      modelOptions: [{ id: "effort", value: "high" }],
+    };
+    // On the instance it was suggested for: used.
+    const used = await run({}, suggestion);
+    expect(used.model).toBe("beta/default");
+    expect(used.modelOptions).toEqual([{ id: "effort", value: "high" }]);
+    // The instance fell away: neither carries over.
+    const fellBack = await run({}, suggestion, true);
+    expect(fellBack.model).toBeUndefined();
+    expect(fellBack.modelOptions).toBeUndefined();
+    // The operator chose another instance: neither applies.
+    const elsewhere = await run({ instanceId: "alpha" }, suggestion);
+    expect(elsewhere.model).toBeUndefined();
+    expect(elsewhere.modelOptions).toBeUndefined();
+    // The operator chose another model on the right instance: the options were for the
+    // model that was suggested, so they are dropped with it.
+    const otherModel = await run(
+      { instanceId: "beta", model: "beta/other" },
+      suggestion,
+    );
+    expect(otherModel.model).toBe("beta/other");
+    expect(otherModel.modelOptions).toBeUndefined();
+    // And the operator's explicit options beat the suggestion's.
+    const explicit = await run(
+      { modelOptions: [{ id: "effort", value: "low" }] },
+      suggestion,
+    );
+    expect(explicit.modelOptions).toEqual([{ id: "effort", value: "low" }]);
+  });
+});
+
+/* ── Running an intent that already exists ───────────────────────────────────── */
+
+describe("running an existing intent", () => {
+  const quiet = () =>
+    scripts({ narration: [], stream: "open", status: "succeeded" });
+
+  /** Counts straight off the target's file: goals, intents, attempts. */
+  const countsOf = (targetId: string) =>
+    Effect.flatMap(TargetStores, (stores) =>
+      withTargetStore(stores, targetId, (store) => store.counts()),
+    );
+  const intentIn = (targetId: string, intentId: string) =>
+    Effect.flatMap(TargetStores, (stores) =>
+      withTargetStore(stores, targetId, (store) => store.intent(intentId)),
+    );
+
+  test("mints nothing: the attempt is the only new row, and the intent is claimed by it", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = quiet();
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const input = yield* draft(root, "alpha", "does login rate-limit?");
+        const before = yield* countsOf("alpha");
+        const run = yield* supervisor.start(input);
+        return {
+          input,
+          before,
+          after: yield* countsOf("alpha"),
+          run,
+          intent: yield* intentIn("alpha", input.intentId),
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    // Exactly one new row, and it is the attempt. A run that minted a goal or an intent
+    // would move one of the other two.
+    expect(observed.after.goals).toBe(observed.before.goals);
+    expect(observed.after.intents).toBe(observed.before.intents);
+    expect(observed.after.attempts).toBe(observed.before.attempts + 1);
+    // The run is against the intent it was given, and its prompt is that intent's question.
+    expect(observed.run.intentId).toBe(observed.input.intentId);
+    expect([...recorder.prompts]).toEqual([
+      `${observed.run.harnessSessionId}:does login rate-limit?`,
+    ]);
+    // Held by the attempt that is running it, and counted.
+    expect(observed.intent?.status).toBe("claimed");
+    expect(observed.intent?.claimedByAttemptId).toBe(observed.run.attemptId);
+    expect(observed.intent?.attemptCount).toBe(1);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("a second run of a claimed intent is refused, naming the attempt holding it", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held, release } = quiet();
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const input = yield* draft(root, "alpha", "probe it");
+        const first = yield* supervisor.start(input);
+        const second = yield* Effect.result(supervisor.start(input));
+        yield* release(first.harnessSessionId);
+        yield* settled(supervisor, first.attemptId);
+        return {
+          first,
+          second,
+          settledIntent: yield* intentIn("alpha", input.intentId),
+          counts: yield* countsOf("alpha"),
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.second._tag).toBe("Failure");
+    if (observed.second._tag === "Failure") {
+      expect(observed.second.failure.reason).toBe("intent_not_open");
+      expect(observed.second.failure.detail).toContain(
+        observed.first.attemptId,
+      );
+    }
+    // The refused one wrote no attempt, and the first run's settlement gave the intent
+    // back: it succeeded having recorded nothing, which is an absence of evidence and so
+    // returns the intent to `open` rather than answering it.
+    expect(observed.counts.attempts).toBe(1);
+    expect(observed.settledIntent?.status).toBe("open");
+    expect(observed.settledIntent?.claimedByAttemptId).toBeNull();
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("two starts of one intent racing: exactly one wins, and the loser names it", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = quiet();
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const results = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const input = yield* draft(root, "alpha", "probe it");
+        return yield* Effect.all(
+          [
+            Effect.result(supervisor.start(input)),
+            Effect.result(supervisor.start(input)),
+          ],
+          { concurrency: "unbounded" },
+        );
+      }).pipe(Effect.orDie),
+    );
+
+    const wins = results.filter((result) => result._tag === "Success");
+    const losses = results.filter((result) => result._tag === "Failure");
+    expect(wins).toHaveLength(1);
+    expect(losses).toHaveLength(1);
+    const winner = wins[0];
+    const loser = losses[0];
+    if (winner?._tag === "Success" && loser?._tag === "Failure") {
+      expect(loser.failure.reason).toBe("intent_not_open");
+      expect(loser.failure.detail).toContain(winner.success.attemptId);
+    }
+    // One session, one prompt: the loser never reached a harness.
+    expect(recorder.created).toHaveLength(1);
+    expect(recorder.prompts).toHaveLength(1);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("a stopped run gives its intent back, `open`", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = quiet();
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const intent = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const input = yield* draft(root, "alpha", "probe it");
+        const run = yield* supervisor.start(input);
+        yield* supervisor.stop(run.attemptId);
+        return yield* intentIn("alpha", input.intentId);
+      }).pipe(Effect.orDie),
+    );
+
+    // `interrupted` never produces `answered`.
+    expect(intent?.status).toBe("open");
+    expect(intent?.claimedByAttemptId).toBeNull();
+    expect(intent?.attemptCount).toBe(1);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("an intent whose goal has ended is refused by name, and stays open", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = quiet();
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const input = yield* draft(root, "alpha", "probe it");
+        const before = yield* intentIn("alpha", input.intentId);
+        yield* withTargetStore(stores, "alpha", (store) =>
+          store.endGoal(
+            { callerScope: "alpha/operator", targetId: "alpha" },
+            {
+              operationId: "op-end",
+              goalId: before?.goalId ?? "",
+              status: "abandoned",
+              endedBy: "operator",
+              reason: "out of scope",
+            },
+          ),
+        );
+        const refused = yield* Effect.result(supervisor.start(input));
+        return {
+          refused,
+          intent: yield* intentIn("alpha", input.intentId),
+          counts: yield* countsOf("alpha"),
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.refused._tag).toBe("Failure");
+    if (observed.refused._tag === "Failure") {
+      expect(observed.refused.failure.reason).toBe("goal_not_active");
+      // Names the status, so the operator reads why.
+      expect(observed.refused.failure.detail).toContain("abandoned");
+    }
+    expect(observed.intent?.status).toBe("open");
+    expect(observed.counts.attempts).toBe(0);
+    expect(recorder.created).toEqual([]);
+  });
+
+  test("an intent that does not exist, or is another target's, is refused by name", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = quiet();
+    const { root, runtime, ready } = world(
+      ["alpha", "beta"],
+      scriptFor,
+      recorder,
+    );
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const alphas = yield* draft(root, "alpha", "probe it");
+        const betas = yield* draft(root, "beta", "probe it");
+        return {
+          missing: yield* Effect.result(
+            supervisor.start({ ...alphas, intentId: "int_nonesuch" }),
+          ),
+          // Alpha's intent id, presented against beta's target: beta's file does not hold
+          // it, so it is not found there. A target's file is the boundary.
+          crossed: yield* Effect.result(
+            supervisor.start({ ...betas, intentId: alphas.intentId }),
+          ),
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.missing._tag).toBe("Failure");
+    if (observed.missing._tag === "Failure") {
+      expect(observed.missing.failure.reason).toBe("intent_not_found");
+    }
+    expect(observed.crossed._tag).toBe("Failure");
+    if (observed.crossed._tag === "Failure") {
+      expect(observed.crossed.failure.reason).toBe("intent_not_found");
+    }
+    expect(recorder.created).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a start held for the worker endpoints holds no claim, so the startup sweep has nothing of its live work to take", async () => {
+    // `main.ts` runs the orphan sweep and only then publishes the endpoints. The sweep cannot
+    // tell a live start's claim from an orphan, so the guarantee is that a start waiting for
+    // the endpoints has not claimed anything yet. Parked here exactly where it parks at boot.
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = quiet();
+    const pending = WorkerEndpoints.pending();
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder, {
+      endpoints: pending.layer,
+    });
+    await ready;
+
+    const input = await runtime.runPromise(
+      draft(root, "alpha", "probe it").pipe(Effect.orDie),
+    );
+    // The request arrives while the sweep is still walking the fleet.
+    const starting = runtime.runPromise(
+      Effect.flatMap(RunSupervisor, (supervisor) => supervisor.start(input)),
+    );
+    // Long enough for a start that was going to claim to have claimed.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const during = await runtime.runPromise(
+      Effect.gen(function* () {
+        const before = yield* intentIn("alpha", input.intentId);
+        // The sweep, exactly as `main.ts` runs it.
+        const swept = yield* Effect.flatMap(TargetStores, (stores) =>
+          withTargetStore(stores, "alpha", (store) =>
+            store.releaseOrphanedClaims(),
+          ),
+        );
+        return {
+          before,
+          swept,
+          after: yield* intentIn("alpha", input.intentId),
+          counts: yield* countsOf("alpha"),
+        };
+      }).pipe(Effect.orDie),
+    );
+    // The start is parked, and it has taken nothing: no claim, no attempt.
+    expect(during.before?.status).toBe("open");
+    expect(during.before?.claimedByAttemptId).toBeNull();
+    expect(during.counts.attempts).toBe(0);
+    // So the sweep found nothing, and the intent is untouched.
+    expect(during.swept).toEqual([]);
+    expect(during.after).toEqual(during.before);
+
+    // Published after the sweep, as `main.ts` does: the start proceeds and owns its claim.
+    await Effect.runPromise(
+      pending.publish({
+        mcp: "http://127.0.0.1:9/api/v1/mcp",
+        policy: "http://127.0.0.1:9/api/v1/policy/decide",
+      }),
+    );
+    const started = await starting;
+    const afterStart = await runtime.runPromise(
+      intentIn("alpha", input.intentId).pipe(Effect.orDie),
+    );
+    expect(afterStart?.status).toBe("claimed");
+    expect(afterStart?.claimedByAttemptId).toBe(started.attemptId);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
   });
 });

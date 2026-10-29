@@ -1031,6 +1031,53 @@ const addGoalLifecycle = statements(
 );
 
 /**
+ * `0017` — an intent becomes something with a lifecycle, and something a run can claim.
+ *
+ * Until now an intent was a row `seedAttempt` minted beside a goal and an attempt, one of
+ * each per run, and nothing could say whether it was being worked, had been answered, or
+ * had been dropped. This adds the state that lets an intent exist *before* a run does and
+ * be taken by one.
+ *
+ * - **`status`** is `proposed`, `open`, `claimed`, `answered` or `abandoned`.
+ *   `NOT NULL DEFAULT 'open'`: every intent that exists when this runs is a direction
+ *   somebody could still run, and "available" is the only claim about it that is true.
+ *   `proposed` is in the vocabulary (`contracts/intent.ts`) and nothing writes it yet; it
+ *   is reserved for a planner, which does not exist. No `CHECK`, for the reason `0016`
+ *   gives: the contract owns the set, every read decodes through it, and a stored value
+ *   outside it surfaces as a `StoredRowError` naming the row.
+ * - **`claimed_by_attempt_id`** names the attempt holding the claim while `status` is
+ *   `claimed`, and is null otherwise. It is deliberately **not** a foreign key: the claim
+ *   is taken before the attempt row is written (so a refused run leaves no attempt to
+ *   point at), and a reference that had to exist first would force the order the other
+ *   way round. It exists so a second claim can be refused *by name*.
+ * - **`suggested_instance_id`, `suggested_model`, `suggested_model_options`** are
+ *   **advisory**: a suggestion for how to run this intent, nothing more. Nothing is ever
+ *   pinned to them. `attempts` remains the only provenance record — it stores the
+ *   instance, model and options a run actually carried, and a suggestion that was
+ *   ignored, overridden or unresolvable leaves no trace there, which is correct. A reader
+ *   asking "what ran this?" must read the attempt and never these columns. All three are
+ *   nullable, and null means *no suggestion*, which is different from a suggestion of an
+ *   empty option list (`suggested_model_options` is the JSON of the selections, or null).
+ *
+ * **What an existing row looks like afterwards:** `status = 'open'`, no claim, no
+ * suggestion. That includes a legacy intent whose attempt already settled, which is
+ * deliberately *not* back-filled to `answered`: whether a past run answered its question
+ * is a judgement the settlement rule makes at the moment of settling, and applying it
+ * retroactively to rows it never saw would be inventing a conclusion.
+ *
+ * The index serves the two questions asked of it: "this goal's intents, by state", and,
+ * for a dispatcher, "what is open under it".
+ */
+const addIntentLifecycle = statements(
+  `ALTER TABLE intents ADD COLUMN status TEXT NOT NULL DEFAULT 'open'`,
+  `ALTER TABLE intents ADD COLUMN claimed_by_attempt_id TEXT`,
+  `ALTER TABLE intents ADD COLUMN suggested_instance_id TEXT`,
+  `ALTER TABLE intents ADD COLUMN suggested_model TEXT`,
+  `ALTER TABLE intents ADD COLUMN suggested_model_options TEXT`,
+  `CREATE INDEX IF NOT EXISTS intents_goal_status_idx ON intents(goal_id, status)`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1064,6 +1111,7 @@ export const MIGRATIONS: Record<
   "0014_attempt_harness_instance": addAttemptHarnessInstance,
   "0015_attempt_model_options": addAttemptModelOptions,
   "0016_goal_lifecycle": addGoalLifecycle,
+  "0017_intent_lifecycle": addIntentLifecycle,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

@@ -68,6 +68,21 @@ import { Schema } from "effect";
  * `intentId` and `attemptId` are null and `callerScope` is the host's own, as for
  * `intent.added`, and neither carries an outbox request — creating or ending a goal
  * obliges nothing outside this database.
+ *
+ * **`intent.abandoned` is the operator dropping a direction, and it is the only intent
+ * lifecycle change that is an event of its own.** A claim is followed by the
+ * `attempt.started` it was taken for, and a release is the other face of the
+ * `attempt.settled` that caused it, so a second event for either would say the same thing
+ * twice. An abandonment has no attempt behind it and nothing else in the log would record
+ * that a person decided it. Host-originated, like `goal.ended`: `intentId` and `attemptId`
+ * are null and the subject is the intent.
+ *
+ * **`intent.released` is the startup sweep giving back a claim nothing was working.** A
+ * claim is normally released by the settlement of the attempt holding it, which writes
+ * `attempt.settled`. When the process died before the attempt row was written there is no
+ * attempt to settle, so the release is its own event: `recovery` is the releaser, the payload
+ * names the attempt the claim pointed at and the status that row held (null when it had
+ * none), and the intent returns to `open`, never `answered`.
  */
 export const EventKind = Schema.Literals([
   "asset.recorded",
@@ -77,6 +92,8 @@ export const EventKind = Schema.Literals([
   "attempt.settled",
   "goal.added",
   "goal.ended",
+  "intent.abandoned",
+  "intent.released",
 ]);
 export type EventKind = typeof EventKind.Type;
 

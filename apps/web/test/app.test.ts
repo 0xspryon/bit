@@ -18,7 +18,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  GoalNotFound,
   GoalRefused,
+  IntentRefused,
   LIVE_SILENCE_LIMIT_SECONDS,
   PathRefused,
   RunRefused,
@@ -37,6 +39,7 @@ import {
   attemptTranscript,
   goalView,
   harnessInstance,
+  intentView,
   liveActivity,
   liveCursor,
   liveItem,
@@ -487,24 +490,25 @@ describe("runs", () => {
     fake.onStartRun = () =>
       ok(runStarted({ attemptId: "attempt-7", targetId: "acme-corp" }));
 
-    app.instruction = "  enumerate the subdomains  ";
+    app.runIntentId = "intent-1";
     await app.startRun();
 
     expect(app.activeRun?.attemptId).toBe("attempt-7");
     // Readable later, which is the only handle this tab keeps on a settled attempt.
     expect(app.readableAttemptId).toBe("attempt-7");
-    // Cleared only once the server accepted it, and trimmed on the way out.
-    expect(app.instruction).toBe("");
+    // Cleared only once the server accepted it.
+    expect(app.runIntentId).toBe("");
     expect(app.runDetail).toBe("");
     const started = fake.calls.find((call) => call.method === "startRun");
-    expect(started?.args[2]).toBe("enumerate the subdomains");
+    // The intent, by id: there is no free text in a run any more.
+    expect(started?.args[2]).toBe("intent-1");
     expect(app.starting).toBe(false);
   });
 
   /**
-   * Two of the refusals the compose box exists to show. Both are normal answers rather
-   * than faults, and in both cases what the operator typed has to survive — a box that
-   * emptied optimistically would lose the instruction every time.
+   * Two of the refusals the run box exists to show. Both are normal answers rather than
+   * faults, and in both cases the intent the box is aimed at has to stay aimed at — a box
+   * that emptied optimistically would make the operator find their intent again every time.
    */
   test.each([
     ["workspace_busy", "another run is already working in /work/acme-corp"],
@@ -513,11 +517,11 @@ describe("runs", () => {
     const [app, fake] = await onTarget();
     fake.onStartRun = () => refused(new RunRefused({ reason, detail }));
 
-    app.instruction = "enumerate the subdomains";
+    app.runIntentId = "intent-1";
     await app.startRun();
 
     expect(app.runDetail).toBe(detail);
-    expect(app.instruction).toBe("enumerate the subdomains");
+    expect(app.runIntentId).toBe("intent-1");
     expect(app.activeRun).toBeUndefined();
     expect(app.readableAttemptId).toBe("");
   });
@@ -540,7 +544,7 @@ describe("runs", () => {
       });
     };
 
-    app.instruction = "enumerate the subdomains";
+    app.runIntentId = "intent-1";
     await app.startRun();
     expect(app.activeRun?.attemptId).toBe("attempt-7");
 
@@ -572,12 +576,362 @@ describe("runs", () => {
       );
     };
 
-    app.instruction = "enumerate the subdomains";
+    app.runIntentId = "intent-1";
     await app.startRun();
     await app.stopRun();
 
     expect(app.runDetail).toBe("that attempt is not running");
     expect(app.activeRun).toBeUndefined();
+  });
+});
+
+/* ── Intents ─────────────────────────────────────────────────────────────────── */
+
+describe("intents", () => {
+  /** Signs in, opens a target holding one goal, and opens that goal. */
+  const onGoal = async (
+    held: Parameters<typeof intentView>[0][] = [],
+    goal: Parameters<typeof goalView>[0] = {},
+  ): Promise<[App, FakeServer]> => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onHarnesses = () => ok([harnessInstance()]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1", ...goal })] });
+    fake.onIntents = (_baseUrl, _targetId, goalId) =>
+      ok({ intents: held.map((over) => intentView({ goalId, ...over })) });
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+    return [app, fake];
+  };
+
+  test("opening a goal reads its intents, and only that goal's", async () => {
+    const [app, fake] = await onGoal([
+      { intentId: "intent-a" },
+      { intentId: "intent-b", status: "claimed", claimedByAttemptId: "att-1" },
+    ]);
+    expect(app.intentsState).toBe("ready");
+    expect(app.intents.map((intent) => intent.intentId)).toEqual([
+      "intent-a",
+      "intent-b",
+    ]);
+    expect(app.intentsGoalId).toBe("goal_1");
+    expect(fake.calls.find((call) => call.method === "intents")?.args).toEqual([
+      expect.any(String),
+      "acme-corp",
+      "goal_1",
+    ]);
+
+    // Leaving the goal leaves its intents behind, so another goal's heading is never over
+    // them.
+    app.closeGoal();
+    expect(app.intents).toEqual([]);
+    expect(app.intentsGoalId).toBe("");
+  });
+
+  test("an answer for a goal the operator has left is dropped", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({
+        goals: [
+          goalView({ targetId, goalId: "goal_1" }),
+          goalView({ targetId, goalId: "goal_2" }),
+        ],
+      });
+    fake.onIntents = (_baseUrl, _targetId, goalId) =>
+      ok({
+        intents: [intentView({ goalId, intentId: `intent_of_${goalId}` })],
+      });
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    const release = fake.hold("intents");
+    app.openGoal("goal_1");
+    app.openGoal("goal_2");
+    release();
+    await settle();
+    expect(app.intents.map((intent) => intent.intentId)).toEqual([
+      "intent_of_goal_2",
+    ]);
+  });
+
+  test("a failed read says so, in the server's words", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = () => ok({ goals: [goalView()] });
+    fake.onIntents = () =>
+      refused(
+        new GoalNotFound({
+          targetId: "acme-corp",
+          goalId: "goal_1",
+          detail: "no goal 'goal_1' is recorded in this target",
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+    expect(app.intentsState).toBe("failed");
+    expect(app.intentsDetail).toContain("no goal 'goal_1'");
+  });
+
+  test("adding an intent sends the question trimmed with its anchors and dimension, and no id", async () => {
+    const [app, fake] = await onGoal();
+    app.openIntentForm();
+    app.intentQuestion = "  Is rollover measured?  ";
+    app.toggleAnchor("obs_1");
+    app.toggleAnchor("obs_2");
+    app.toggleAnchor("obs_1");
+    app.intentDimension = "obs_2#u0";
+    await app.createIntent();
+
+    const sent = fake.calls.find((call) => call.method === "createIntent");
+    expect(sent?.args[3]).toEqual({
+      question: "Is rollover measured?",
+      anchorObservationIds: ["obs_2"],
+      addressesDimension: "obs_2#u0",
+    });
+    // The row is on screen at once and the form is closed and empty.
+    expect(app.intents.map((intent) => intent.question)).toEqual([
+      "Is rollover measured?",
+    ]);
+    expect(app.intentFormOpen).toBe(false);
+    expect(app.intentQuestion).toBe("");
+    expect(app.intentAnchors).toEqual([]);
+  });
+
+  test("no dimension is sent as null, not as an empty string", async () => {
+    const [app, fake] = await onGoal();
+    app.openIntentForm();
+    app.intentQuestion = "q";
+    await app.createIntent();
+    expect(
+      (
+        fake.calls.find((call) => call.method === "createIntent")?.args[3] as {
+          addressesDimension: unknown;
+        }
+      ).addressesDimension,
+    ).toBeNull();
+  });
+
+  test("a blank question asks the server nothing and keeps the form open", async () => {
+    const [app, fake] = await onGoal();
+    app.openIntentForm();
+    app.intentQuestion = "   ";
+    await app.createIntent();
+    expect(fake.countOf("createIntent")).toBe(0);
+    expect(app.intentFormOpen).toBe(true);
+    expect(app.intentCreateDetail).toContain("needs a question");
+  });
+
+  test("an anchoring refusal is shown as the server wrote it, and nothing typed is lost", async () => {
+    const [app, fake] = await onGoal();
+    const sentence =
+      "anchor 'intent-1' is an intent and cannot anchor an intent. Leave anchorObservationIds empty for a new top-level direction.";
+    fake.onCreateIntent = () =>
+      refused(new IntentRefused({ reason: "invalid", detail: sentence }));
+    app.openIntentForm();
+    app.intentQuestion = "Follow up?";
+    app.toggleAnchor("intent-1");
+    await app.createIntent();
+
+    // Verbatim: the sentence is the instruction.
+    expect(app.intentCreateDetail).toBe(sentence);
+    expect(app.intentFormOpen).toBe(true);
+    expect(app.intentQuestion).toBe("Follow up?");
+    expect(app.intentAnchors).toEqual(["intent-1"]);
+    expect(app.intents).toEqual([]);
+    expect(app.intentCreating).toBe(false);
+  });
+
+  test("the form offers the goal's observations as anchors when it opens", async () => {
+    const [app, fake] = await onGoal();
+    fake.onGoalObservations = () =>
+      ok({
+        observations: [
+          {
+            observationId: "obs_1",
+            intentId: "intent-1",
+            testedClaim: "The limiter resets per window.",
+            outcome: "positive",
+            untestedDimensions: [{ address: "obs_1#u0", text: "rollover" }],
+          },
+        ],
+      });
+    app.openIntentForm();
+    await settle();
+    expect(app.goalObservationsState).toBe("ready");
+    expect(app.goalObservations.map((entry) => entry.observationId)).toEqual([
+      "obs_1",
+    ]);
+  });
+
+  test("abandoning asks first: nothing is sent until it is confirmed, and the reason goes with it", async () => {
+    const [app, fake] = await onGoal([{ intentId: "intent-a" }]);
+    app.openIntentAbandon("intent-a");
+    expect(app.intentAbandonOpenId).toBe("intent-a");
+    // Opening the confirmation is not the act.
+    expect(fake.countOf("abandonIntent")).toBe(0);
+
+    app.intentAbandonReason = "  Out of scope.  ";
+    await app.abandonIntent("intent-a");
+
+    const sent = fake.calls.find((call) => call.method === "abandonIntent");
+    expect(sent?.args[2]).toBe("intent-a");
+    expect(sent?.args[3]).toEqual({ reason: "Out of scope." });
+    expect(app.intents.map((intent) => intent.status)).toEqual(["abandoned"]);
+    // Closed and cleared, so the next one does not inherit this one's reason.
+    expect(app.intentAbandonOpenId).toBe("");
+    expect(app.intentAbandonReason).toBe("");
+  });
+
+  test("cancelling the confirmation sends nothing and forgets the reason", async () => {
+    const [app, fake] = await onGoal([{ intentId: "intent-a" }]);
+    app.openIntentAbandon("intent-a");
+    app.intentAbandonReason = "changed my mind";
+    app.cancelIntentAbandon();
+    expect(app.intentAbandonOpenId).toBe("");
+    expect(app.intentAbandonReason).toBe("");
+    expect(fake.countOf("abandonIntent")).toBe(0);
+    // And opening another starts with an empty reason.
+    app.openIntentAbandon("intent-a");
+    expect(app.intentAbandonReason).toBe("");
+  });
+
+  test("an abandon with no reason typed sends an empty one, which is none given", async () => {
+    const [app, fake] = await onGoal([{ intentId: "intent-a" }]);
+    app.openIntentAbandon("intent-a");
+    await app.abandonIntent("intent-a");
+    expect(
+      fake.calls.find((call) => call.method === "abandonIntent")?.args[3],
+    ).toEqual({ reason: "" });
+  });
+
+  test("a refused abandon is shown against that intent, closes the confirmation, and re-reads the list", async () => {
+    const [app, fake] = await onGoal([{ intentId: "intent-a" }]);
+    fake.onAbandonIntent = () =>
+      refused(
+        new IntentRefused({
+          reason: "not_abandonable",
+          detail: "intent intent-a is claimed: attempt att-9 is running it",
+        }),
+      );
+    app.openIntentAbandon("intent-a");
+    const before = fake.countOf("intents");
+    await app.abandonIntent("intent-a");
+    expect(app.intentAbandonDetailId).toBe("intent-a");
+    expect(app.intentAbandonDetail).toContain("att-9");
+    expect(app.intentAbandonOpenId).toBe("");
+    // The likeliest cause is another tab having started it, so the row is re-read.
+    expect(fake.countOf("intents")).toBe(before + 1);
+  });
+
+  test("a run starts from the intent aimed at, which is then cleared and re-read as claimed", async () => {
+    const [app, fake] = await onGoal([{ intentId: "intent-a" }]);
+    app.chooseRun("intent-a");
+    expect(app.runIntent?.intentId).toBe("intent-a");
+    fake.onStartRun = () =>
+      ok(runStarted({ attemptId: "attempt-7", intentId: "intent-a" }));
+    const before = fake.countOf("intents");
+
+    await app.startRun();
+
+    expect(fake.calls.find((call) => call.method === "startRun")?.args[2]).toBe(
+      "intent-a",
+    );
+    expect(app.runIntentId).toBe("");
+    expect(app.activeRun?.attemptId).toBe("attempt-7");
+    // The row has to stop offering a run: it is claimed now, and only the server knows.
+    expect(fake.countOf("intents")).toBe(before + 1);
+  });
+
+  test("a start with nothing aimed at asks the server nothing", async () => {
+    const [app, fake] = await onGoal([{ intentId: "intent-a" }]);
+    await app.startRun();
+    expect(fake.countOf("startRun")).toBe(0);
+  });
+
+  test("a refused run keeps the intent aimed at, shows the reason, and re-reads the list", async () => {
+    const [app, fake] = await onGoal([{ intentId: "intent-a" }]);
+    fake.onStartRun = () =>
+      refused(
+        new RunRefused({
+          reason: "intent_not_open",
+          detail:
+            "intent intent-a cannot be claimed: it is claimed by attempt att-3",
+        }),
+      );
+    app.chooseRun("intent-a");
+    const before = fake.countOf("intents");
+    await app.startRun();
+    expect(app.runDetail).toContain("att-3");
+    expect(app.runIntentId).toBe("intent-a");
+    expect(fake.countOf("intents")).toBe(before + 1);
+  });
+
+  test("a suggestion that could not be honoured is reported with where the run went", async () => {
+    const [app, fake] = await onGoal([{ intentId: "intent-a" }]);
+    fake.onStartRun = () =>
+      ok(
+        runStarted({
+          attemptId: "attempt-7",
+          instanceId: "opencode",
+          instanceFallback: {
+            requested: "claude-code",
+            reason: "claude-code is configured but would not start",
+          },
+        }),
+      );
+    app.chooseRun("intent-a");
+    await app.startRun();
+    expect(app.runFallback).toEqual({
+      requested: "claude-code",
+      reason: "claude-code is configured but would not start",
+      ranOn: "opencode",
+    });
+    // And a run that needed no fallback says nothing.
+    app.chooseRun("intent-a");
+    fake.onStartRun = () => ok(runStarted({ attemptId: "attempt-8" }));
+    await app.startRun();
+    expect(app.runFallback).toBeNull();
+  });
+
+  test("the run box is aimed at an intent of the goal on screen and no other", async () => {
+    const [app] = await onGoal([{ intentId: "intent-a" }]);
+    app.chooseRun("intent-a");
+    app.closeGoal();
+    expect(app.runIntentId).toBe("");
+    expect(app.runIntent).toBeUndefined();
+  });
+
+  test("the record saying a run settled re-reads the intents, but only once history has arrived", async () => {
+    const [, fake] = await onGoal([{ intentId: "intent-a" }]);
+    // History replays on opening: none of it may cause a request per item.
+    fake.watch.send(liveOpened({ from: 0, latest: 2 }));
+    fake.watch.send(
+      liveItem({ id: "record:e1", sequence: 1, kind: "run.settled" }),
+    );
+    expect(fake.countOf("intents")).toBe(1);
+
+    fake.watch.send(liveCursor({ sequence: 1, caughtUp: true }));
+    const before = fake.countOf("intents");
+    fake.watch.send(
+      liveItem({ id: "record:e2", sequence: 2, kind: "run.settled" }),
+    );
+    await settle();
+    expect(fake.countOf("intents")).toBe(before + 1);
+
+    // An unrelated record does not.
+    fake.watch.send(
+      liveItem({ id: "record:e3", sequence: 3, kind: "observation.recorded" }),
+    );
+    await settle();
+    expect(fake.countOf("intents")).toBe(before + 1);
   });
 });
 
@@ -925,7 +1279,7 @@ describe("a round trip that outlives the view it started in", () => {
     const { app, fake } = await onAlpha();
 
     const release = fake.hold("startRun");
-    app.instruction = "enumerate the subdomains";
+    app.runIntentId = "intent-1";
     const starting = app.startRun();
     // The round trip is open; the operator clicks beta in the rail.
     app.openTarget("beta");
@@ -942,7 +1296,7 @@ describe("a round trip that outlives the view it started in", () => {
 
   test("a stop that lands late leaves the view where the operator put it", async () => {
     const { app, fake } = await onAlpha();
-    app.instruction = "enumerate the subdomains";
+    app.runIntentId = "intent-1";
     await app.startRun();
     expect(app.activeRun?.attemptId).toBe("alpha-run");
 

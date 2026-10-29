@@ -40,6 +40,7 @@ import {
   writeFirstSliceDatabase,
 } from "./fixtures";
 import {
+  ClaimRefused,
   MutationError,
   ObservationStore,
   StoredRowError,
@@ -3562,5 +3563,680 @@ describe("goals", () => {
       expect(failed.failure).toBeInstanceOf(StoredRowError);
       expect((failed.failure as StoredRowError).rowId).toBe("goal-new");
     }
+  });
+});
+
+describe("the intent lifecycle", () => {
+  const HOST = { callerScope: "target-1/operator", targetId: "target-1" };
+
+  /**
+   * A goal and one open intent under it, made the way an operator makes them. A fresh
+   * file per test, so nothing here depends on what another test left behind.
+   */
+  const withIntent = <A, E>(
+    use: (store: Store) => Effect.Effect<A, E>,
+    options: { readonly suggestion?: Record<string, unknown> } = {},
+  ) =>
+    withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* store.openGoal(HOST, {
+          operationId: "open-goal",
+          goalId: "goal-L",
+          name: "",
+          description: "Work out how the limiter behaves.",
+        });
+        yield* store.addIntent(HOST, {
+          operationId: "add-intent",
+          goalId: "goal-L",
+          intentId: "int-L",
+          question: "Does the limiter reset on a new window?",
+          anchorObservationIds: [],
+          addressesDimension: null,
+          ...options.suggestion,
+        });
+        return yield* use(store);
+      }),
+    );
+
+  /** The row a run writes once it holds the claim: the attempt, under the claimed intent. */
+  const startAttempt = (store: Store, attemptId: string) =>
+    store.seedAttempt({
+      targetId: "target-1",
+      goalId: "goal-L",
+      goal: "Work out how the limiter behaves.",
+      intentId: "int-L",
+      question: "Does the limiter reset on a new window?",
+      attemptId,
+      workerId: "worker-1",
+      harnessInstanceId: "opencode",
+      providerId: "openai",
+      modelId: "gpt-5.6-sol",
+      modelOptions: null,
+      harnessSessionId: null,
+    });
+
+  const callerFor = (attemptId: string): CallerContext => ({
+    callerScope: `target-1/${attemptId}`,
+    targetId: "target-1",
+    intentId: "int-L",
+    attemptId,
+    harnessSessionId: "ses_abc",
+    workerId: "worker-1",
+    attemptFence: 0,
+  });
+
+  const statusOf = (store: Store) =>
+    Effect.map(store.intent("int-L"), (intent) => ({
+      status: intent?.status,
+      claimedBy: intent?.claimedByAttemptId,
+    }));
+
+  /** The `ClaimRefused` a failed claim carries, or fails the test. */
+  const claimRefusal = (result: {
+    readonly _tag: string;
+    readonly failure?: unknown;
+  }): ClaimRefused => {
+    expect(result._tag).toBe("Failure");
+    expect(result.failure).toBeInstanceOf(ClaimRefused);
+    return result.failure as ClaimRefused;
+  };
+
+  /** The `MutationError` a failed abandonment carries, or fails the test. */
+  const mutationRefusal = (result: {
+    readonly _tag: string;
+    readonly failure?: unknown;
+  }): MutationError => {
+    expect(result._tag).toBe("Failure");
+    expect(result.failure).toBeInstanceOf(MutationError);
+    return result.failure as MutationError;
+  };
+
+  test("an intent added by hand is open, unclaimed and carries no suggestion", async () => {
+    const intent = await withIntent((store) => store.intent("int-L"));
+    expect(intent).toMatchObject({
+      intentId: "int-L",
+      goalId: "goal-L",
+      targetId: "target-1",
+      status: "open",
+      claimedByAttemptId: null,
+      attemptCount: 0,
+      anchoredTo: [],
+      addressesDimension: null,
+      suggestion: { instanceId: null, model: null, modelOptions: null },
+    });
+  });
+
+  test("a suggestion is stored as advice, an empty option list as none, and absent stays absent", async () => {
+    const suggested = await withIntent((store) => store.intent("int-L"), {
+      suggestion: {
+        suggestedInstanceId: "claude-code",
+        suggestedModel: "claude-sonnet-5",
+        suggestedModelOptions: [
+          { id: "effort", value: "high" },
+          { id: "a-first", value: "x" },
+        ],
+      },
+    });
+    expect(suggested?.suggestion).toEqual({
+      instanceId: "claude-code",
+      model: "claude-sonnet-5",
+      // One canonical order, so the same advice is the same bytes.
+      modelOptions: [
+        { id: "a-first", value: "x" },
+        { id: "effort", value: "high" },
+      ],
+    });
+    const empty = await withIntent((store) => store.intent("int-L"), {
+      suggestion: { suggestedModelOptions: [] },
+    });
+    // An empty list would claim an opinion; it is stored as no opinion.
+    expect(empty?.suggestion.modelOptions).toBeNull();
+  });
+
+  describe("claiming", () => {
+    test("takes an open intent for one attempt and hands back what the run needs", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          const claim = yield* store.claimIntent(HOST, "int-L", "att-1");
+          return { claim, after: yield* statusOf(store) };
+        }),
+      );
+      expect(outcome.claim).toEqual({
+        intentId: "int-L",
+        goalId: "goal-L",
+        goal: "Work out how the limiter behaves.",
+        question: "Does the limiter reset on a new window?",
+        suggestion: { instanceId: null, model: null, modelOptions: null },
+        claimedByAttemptId: "att-1",
+      });
+      expect(outcome.after).toEqual({ status: "claimed", claimedBy: "att-1" });
+    });
+
+    test("two claims racing: exactly one wins, and the loser's refusal names the holder", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          const results = yield* Effect.all(
+            [
+              Effect.result(store.claimIntent(HOST, "int-L", "att-a")),
+              Effect.result(store.claimIntent(HOST, "int-L", "att-b")),
+            ],
+            { concurrency: "unbounded" },
+          );
+          return { results, after: yield* statusOf(store) };
+        }),
+      );
+      const wins = outcome.results.filter((r) => r._tag === "Success");
+      const losses = outcome.results.filter((r) => r._tag === "Failure");
+      expect(wins).toHaveLength(1);
+      expect(losses).toHaveLength(1);
+      const winner = wins[0];
+      const loser = losses[0];
+      if (winner?._tag !== "Success" || loser?._tag !== "Failure") {
+        throw new Error("expected one success and one failure");
+      }
+      const refusal = claimRefusal(loser);
+      expect(refusal).toMatchObject({
+        reason: "not_open",
+        heldBy: winner.success.claimedByAttemptId,
+      });
+      expect(refusal.detail).toContain(winner.success.claimedByAttemptId);
+      // And the row names the winner, not whoever wrote last.
+      expect(outcome.after.claimedBy).toBe(winner.success.claimedByAttemptId);
+    });
+
+    test("a second claim of a claimed intent is refused naming the first attempt", async () => {
+      const refusal = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          return yield* Effect.result(
+            store.claimIntent(HOST, "int-L", "att-2"),
+          );
+        }),
+      );
+      expect(claimRefusal(refusal)).toMatchObject({
+        reason: "not_open",
+        heldBy: "att-1",
+      });
+    });
+
+    test("an intent that is not there, and another target's, are refused each for what it is", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          return {
+            missing: yield* Effect.result(
+              store.claimIntent(HOST, "int-nonesuch", "att-1"),
+            ),
+            crossed: yield* Effect.result(
+              store.claimIntent(
+                { callerScope: "target-2/operator", targetId: "target-2" },
+                "int-L",
+                "att-1",
+              ),
+            ),
+            after: yield* statusOf(store),
+          };
+        }),
+      );
+      expect(claimRefusal(outcome.missing)).toMatchObject({
+        reason: "no_such_intent",
+      });
+      expect(claimRefusal(outcome.crossed)).toMatchObject({
+        reason: "other_target",
+      });
+      expect(claimRefusal(outcome.crossed).detail).toContain("target-1");
+      // Neither refusal touched the row.
+      expect(outcome.after).toEqual({ status: "open", claimedBy: null });
+    });
+
+    test("an intent under an ended goal is refused, naming the goal's status, and stays open", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.endGoal(HOST, {
+            operationId: "end-goal",
+            goalId: "goal-L",
+            status: "abandoned",
+            endedBy: "operator",
+            reason: "superseded",
+          });
+          return {
+            refusal: yield* Effect.result(
+              store.claimIntent(HOST, "int-L", "att-1"),
+            ),
+            after: yield* statusOf(store),
+          };
+        }),
+      );
+      expect(claimRefusal(outcome.refusal)).toMatchObject({
+        reason: "goal_not_active",
+      });
+      expect(claimRefusal(outcome.refusal).detail).toContain("abandoned");
+      expect(outcome.after).toEqual({ status: "open", claimedBy: null });
+    });
+
+    test("an answered or abandoned intent is not claimable", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.abandonIntent(HOST, {
+            operationId: "abandon",
+            intentId: "int-L",
+            reason: "",
+          });
+          return yield* Effect.result(
+            store.claimIntent(HOST, "int-L", "att-1"),
+          );
+        }),
+      );
+      expect(claimRefusal(outcome)).toMatchObject({
+        reason: "not_open",
+        heldBy: null,
+      });
+      expect(claimRefusal(outcome).detail).toContain("abandoned");
+    });
+  });
+
+  describe("settlement releases the claim in the same transaction", () => {
+    /** Claim, start the attempt, optionally record an observation, then settle it. */
+    const settleWith = (
+      status: "succeeded" | "failed" | "interrupted" | "uncertain",
+      observation: boolean,
+    ) =>
+      withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* startAttempt(store, "att-1");
+          if (observation) {
+            yield* store.recordObservation(
+              callerFor("att-1"),
+              multiCaseInput({ operationId: "obs-1" }),
+            );
+          }
+          const held = yield* statusOf(store);
+          const settlement = yield* store.settleAttempt("att-1", status);
+          return { held, settlement, after: yield* statusOf(store) };
+        }),
+      );
+
+    test("succeeded with an observation under it: answered", async () => {
+      const outcome = await settleWith("succeeded", true);
+      expect(outcome.held.status).toBe("claimed");
+      expect(outcome.settlement.changed).toBe(true);
+      expect(outcome.after).toEqual({ status: "answered", claimedBy: null });
+    });
+
+    test("succeeded with nothing recorded: open, because no evidence is not an answer", async () => {
+      const outcome = await settleWith("succeeded", false);
+      expect(outcome.after).toEqual({ status: "open", claimedBy: null });
+    });
+
+    for (const status of ["failed", "interrupted", "uncertain"] as const) {
+      test(`${status}: open, even with an observation recorded`, async () => {
+        const outcome = await settleWith(status, true);
+        // An attempt that did not finish saying what it found never answers the intent,
+        // whatever it managed to write on the way.
+        expect(outcome.after).toEqual({ status: "open", claimedBy: null });
+      });
+    }
+
+    test("the intent and the attempt change together or not at all", async () => {
+      const path = newDatabasePath();
+      // A settlement whose event write raises must leave the claim held, not freed.
+      await withStore(path, (store) =>
+        Effect.gen(function* () {
+          yield* store.openGoal(HOST, {
+            operationId: "open-goal",
+            goalId: "goal-L",
+            name: "",
+            description: "g",
+          });
+          yield* store.addIntent(HOST, {
+            operationId: "add-intent",
+            goalId: "goal-L",
+            intentId: "int-L",
+            question: "q",
+            anchorObservationIds: [],
+            addressesDimension: null,
+          });
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* startAttempt(store, "att-1");
+        }),
+      );
+      const database = new Database(path);
+      try {
+        // The log's insert is made to fail, which is the last statement of a settlement.
+        database.run(
+          "CREATE TRIGGER refuse_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'no events'); END",
+        );
+      } finally {
+        database.close();
+      }
+      const outcome = await withStore(path, (store) =>
+        Effect.gen(function* () {
+          const failed = yield* Effect.result(
+            store.settleAttempt("att-1", "succeeded"),
+          );
+          return {
+            failed,
+            attempt: yield* store.loadAttempt("att-1", "target-1"),
+            intent: yield* statusOf(store),
+          };
+        }),
+      );
+      expect(outcome.failed._tag).toBe("Failure");
+      expect(outcome.attempt?.status).toBe("running");
+      expect(outcome.intent).toEqual({ status: "claimed", claimedBy: "att-1" });
+    });
+
+    test("the recovery sweep releases a claim too, and a definite answer answers it", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* startAttempt(store, "att-1");
+          yield* store.recordObservation(
+            callerFor("att-1"),
+            multiCaseInput({ operationId: "obs-1" }),
+          );
+          yield* store.recordRecovery({
+            attemptId: "att-1",
+            observed: "succeeded",
+            proposedStatus: "succeeded",
+            detail: "the harness says it finished",
+          });
+          return yield* statusOf(store);
+        }),
+      );
+      expect(outcome).toEqual({ status: "answered", claimedBy: null });
+    });
+
+    test("the sweep reconciling to uncertain returns the intent to open", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* startAttempt(store, "att-1");
+          yield* store.recordObservation(
+            callerFor("att-1"),
+            multiCaseInput({ operationId: "obs-1" }),
+          );
+          yield* store.recordRecovery({
+            attemptId: "att-1",
+            observed: "missing",
+            proposedStatus: "uncertain",
+            detail: "session not found",
+          });
+          return yield* statusOf(store);
+        }),
+      );
+      expect(outcome).toEqual({ status: "open", claimedBy: null });
+    });
+
+    test("an attempt that never held the claim frees nothing", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          // att-1 holds the claim; att-2 is another attempt on the same intent that does
+          // not — the shape a replacement attempt has — and settling it must not release
+          // att-1's.
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* startAttempt(store, "att-1");
+          yield* startAttempt(store, "att-2");
+          yield* store.settleAttempt("att-2", "failed");
+          return yield* statusOf(store);
+        }),
+      );
+      expect(outcome).toEqual({ status: "claimed", claimedBy: "att-1" });
+    });
+  });
+
+  describe("releasing without a settlement", () => {
+    test("gives a claimed intent back, and only to the attempt that held it", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* store.releaseIntent("int-L", "refused", "att-someone-else");
+          const wrongHolder = yield* statusOf(store);
+          yield* store.releaseIntent("int-L", "refused", "att-1");
+          const rightHolder = yield* statusOf(store);
+          // Nothing claimed any more: a further release is not an error and not a change.
+          yield* store.releaseIntent("int-L", "refused", "att-1");
+          return { wrongHolder, rightHolder, again: yield* statusOf(store) };
+        }),
+      );
+      expect(outcome.wrongHolder).toEqual({
+        status: "claimed",
+        claimedBy: "att-1",
+      });
+      expect(outcome.rightHolder).toEqual({ status: "open", claimedBy: null });
+      expect(outcome.again).toEqual({ status: "open", claimedBy: null });
+    });
+
+    test("is not a way to answer an intent", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* store.releaseIntent("int-L", "refused", "att-1");
+          return yield* statusOf(store);
+        }),
+      );
+      expect(outcome.status).toBe("open");
+    });
+  });
+
+  describe("abandoning", () => {
+    const abandon = (overrides = {}) => ({
+      operationId: "abandon-1",
+      intentId: "int-L",
+      reason: "No longer relevant.",
+      ...overrides,
+    });
+
+    test("drops an open intent, once, and records it in the log", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          const result = yield* store.abandonIntent(HOST, abandon());
+          const replay = yield* store.abandonIntent(HOST, abandon());
+          const events = yield* store.eventsAfter();
+          return {
+            result,
+            replay,
+            after: yield* statusOf(store),
+            events: events.filter((e) => e.kind === "intent.abandoned"),
+          };
+        }),
+      );
+      expect(outcome.result).toEqual({ intentId: "int-L", replayed: false });
+      expect(outcome.replay).toEqual({ intentId: "int-L", replayed: true });
+      expect(outcome.after.status).toBe("abandoned");
+      // One event, not two: the replay wrote nothing.
+      expect(outcome.events).toHaveLength(1);
+      expect(outcome.events[0]).toMatchObject({
+        subjectId: "int-L",
+        callerScope: "target-1/operator",
+        attemptId: null,
+        payload: {
+          intentId: "int-L",
+          goalId: "goal-L",
+          reason: "No longer relevant.",
+        },
+      });
+    });
+
+    test("a claimed intent is refused, naming the attempt running it", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          return {
+            refusal: yield* Effect.result(store.abandonIntent(HOST, abandon())),
+            after: yield* statusOf(store),
+          };
+        }),
+      );
+      const error = mutationRefusal(outcome.refusal);
+      expect(error).toBeInstanceOf(MutationError);
+      expect(error.reason).toBe("conflict");
+      expect(error.detail).toContain("att-1");
+      expect(outcome.after.status).toBe("claimed");
+    });
+
+    test("an answered intent is refused, and so is a second abandonment", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* startAttempt(store, "att-1");
+          yield* store.recordObservation(
+            callerFor("att-1"),
+            multiCaseInput({ operationId: "obs-1" }),
+          );
+          yield* store.settleAttempt("att-1", "succeeded");
+          const answered = yield* Effect.result(
+            store.abandonIntent(HOST, abandon()),
+          );
+          return answered;
+        }),
+      );
+      expect(mutationRefusal(outcome).detail).toContain("answered");
+
+      const twice = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.abandonIntent(HOST, abandon());
+          return yield* Effect.result(
+            store.abandonIntent(HOST, abandon({ operationId: "abandon-2" })),
+          );
+        }),
+      );
+      expect(mutationRefusal(twice).detail).toContain("already abandoned");
+    });
+
+    test("a missing intent and another target's are `invalid`, and a reused operation id is a conflict", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          yield* store.abandonIntent(HOST, abandon());
+          return {
+            missing: yield* Effect.result(
+              store.abandonIntent(
+                HOST,
+                abandon({ operationId: "abandon-3", intentId: "int-nonesuch" }),
+              ),
+            ),
+            crossed: yield* Effect.result(
+              store.abandonIntent(
+                { callerScope: "target-2/operator", targetId: "target-2" },
+                abandon({ operationId: "abandon-4" }),
+              ),
+            ),
+            reused: yield* Effect.result(
+              store.abandonIntent(HOST, abandon({ reason: "different" })),
+            ),
+          };
+        }),
+      );
+      expect(mutationRefusal(outcome.missing).reason).toBe("invalid");
+      expect(mutationRefusal(outcome.crossed).reason).toBe("invalid");
+      expect(mutationRefusal(outcome.crossed).detail).toContain("target-1");
+      expect(mutationRefusal(outcome.reused).reason).toBe("conflict");
+    });
+  });
+
+  describe("reading a goal's intents", () => {
+    test("oldest first, each with anchors, suggestion, dimension alias and attempt count", async () => {
+      const outcome = await withIntent((store) =>
+        Effect.gen(function* () {
+          // Evidence under int-L to anchor to and to raise a dimension from.
+          yield* store.claimIntent(HOST, "int-L", "att-1");
+          yield* startAttempt(store, "att-1");
+          const raised = yield* store.recordObservation(
+            callerFor("att-1"),
+            multiCaseInput({
+              operationId: "obs-1",
+              untestedDimensions: ["no window rollover was measured"],
+            }),
+          );
+          yield* store.settleAttempt("att-1", "succeeded");
+          yield* store.addIntent(HOST, {
+            operationId: "add-2",
+            goalId: "goal-L",
+            intentId: "int-M",
+            question: "Is rollover measured?",
+            anchorObservationIds: [raised.observationId],
+            addressesDimension: dimensionAddress(raised.observationId, 0),
+            suggestedInstanceId: "opencode",
+          });
+          return {
+            raised: raised.observationId,
+            intents: yield* store.intentsForGoal("goal-L"),
+            none: yield* store.intentsForGoal("goal-nonesuch"),
+          };
+        }),
+      );
+      expect(outcome.intents.map((i) => i.intentId)).toEqual([
+        "int-L",
+        "int-M",
+      ]);
+      expect(outcome.intents[0]).toMatchObject({
+        status: "answered",
+        attemptCount: 1,
+        anchoredTo: [],
+      });
+      expect(outcome.intents[1]).toMatchObject({
+        status: "open",
+        attemptCount: 0,
+        anchoredTo: [outcome.raised],
+        addressesDimension: dimensionAddress(outcome.raised, 0),
+        suggestion: { instanceId: "opencode", model: null },
+      });
+      expect(outcome.none).toEqual([]);
+    });
+
+    test("a stored status outside the vocabulary is a typed error naming the row", async () => {
+      const path = newDatabasePath();
+      await withStore(path, (store) =>
+        Effect.gen(function* () {
+          yield* store.openGoal(HOST, {
+            operationId: "open-goal",
+            goalId: "goal-L",
+            name: "",
+            description: "g",
+          });
+          yield* store.addIntent(HOST, {
+            operationId: "add-intent",
+            goalId: "goal-L",
+            intentId: "int-L",
+            question: "q",
+            anchorObservationIds: [],
+            addressesDimension: null,
+          });
+        }),
+      );
+      const database = new Database(path);
+      try {
+        database.run(
+          "UPDATE intents SET status = 'finished' WHERE id = 'int-L'",
+        );
+      } finally {
+        database.close();
+      }
+      const failed = await withStore(path, (store) =>
+        Effect.result(store.intent("int-L")),
+      );
+      expect(failed._tag).toBe("Failure");
+      if (failed._tag === "Failure") {
+        expect(failed.failure).toBeInstanceOf(StoredRowError);
+        expect((failed.failure as StoredRowError).rowId).toContain("int-L");
+      }
+    });
+  });
+
+  test("an intent a legacy run minted is open and its settlement frees nothing it never held", async () => {
+    const outcome = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        // `seedAttempt` still mints a goal and an intent when given ids that do not
+        // exist, which is what the pre-lifecycle path did. Such an intent is `open`.
+        yield* seed(store);
+        const before = yield* store.intent("intent-1");
+        yield* store.recordObservation(CALLER, multiCaseInput());
+        yield* store.settleAttempt("attempt-1", "succeeded");
+        return { before, after: yield* store.intent("intent-1") };
+      }),
+    );
+    expect(outcome.before?.status).toBe("open");
+    // Never claimed, so there was no claim to turn into an answer.
+    expect(outcome.after?.status).toBe("open");
   });
 });

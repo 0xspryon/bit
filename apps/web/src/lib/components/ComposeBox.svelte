@@ -1,12 +1,20 @@
 <script lang="ts">
   /**
-   * Start a run against the open target, and stop the one that is running.
+   * Run the intent the operator has aimed it at, and stop the run that is going.
    *
    * **It is not a chat box, and the difference is the whole design.** Submitting does not
    * add a message to a conversation; it starts an *attempt* — a durable row with its own
    * identity, its own credential and its own place in the target's event log. So there is
    * one of them at a time per target, the control flips to Stop while it runs, and nothing
    * here pretends to show what the agent is doing.
+   *
+   * **There is nothing to type, and that is the change.** A run claims an intent that
+   * already exists, and the prompt the worker receives is that intent's question. So the
+   * box shows the question it is about to send — read-only, as a quotation — instead of a
+   * field, and the only inputs left are the ones that are really the operator's to give:
+   * which harness, which model, and whether to go. "Run this intent" on a row of the goal's
+   * list is what puts an intent here ({@link IntentList}); with nothing aimed at and no run
+   * going, the box renders nothing at all rather than a control with no subject.
    *
    * **There is deliberately no *live* transcript.** The run narrates — the server publishes
    * every step of it onto an in-process bus — and nothing subscribes yet; the stream is
@@ -45,8 +53,8 @@
    * ## One control with nothing behind it
    *
    * `+` is rendered, positioned, and unavailable. There is no attachment anywhere in
-   * this product: a run carries `instruction`, and optionally which harness and which
-   * model (`RunDraft` in `@bit/contracts`). Rendering it as a live control would be a
+   * this product: a run carries an intent, and optionally which harness and which model
+   * (`RunDraft` in `@bit/contracts`). Rendering it as a live control would be a
    * promise nothing keeps, and leaving it out would make the composer's shape a lie about
    * what is coming — so it is here, dimmed, with the reason readable by pointer and by
    * screen reader.
@@ -66,6 +74,7 @@
   import Button from "./Button.svelte";
   import HarnessPicker from "./HarnessPicker.svelte";
   import { IconArrowUp, IconPlus } from "../icons";
+  import { notRunnableBecause, suggestionText } from "../goalFormat";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
@@ -77,7 +86,7 @@
    * thing that is missing: an operator who reads it knows there is nothing to look for.
    */
   const attachUnavailable =
-    "Attachments are not supported yet: a run carries the instruction you type and nothing else.";
+    "Attachments are not supported yet: a run carries the intent's question and nothing else.";
 
   /**
    * A ticking clock, so the elapsed time is live rather than frozen at render.
@@ -119,12 +128,30 @@
    * so the disabled button is never unexplained.
    */
   let harnessReady = $derived(app.pickedInstance?.ready === true);
+  /** The intent being aimed at, with the status the server last gave it. */
+  let intent = $derived(app.runIntent);
+  /**
+   * Why this intent cannot be run right now, or `null`.
+   *
+   * The list row's own function, so the row and the box cannot disagree about whether an
+   * intent is runnable: an intent another tab has since started, or whose goal has just
+   * ended, reads that way here instead of offering a run the server will refuse.
+   */
+  let blocked = $derived(
+    intent === undefined
+      ? null
+      : notRunnableBecause(intent, app.openGoalView?.status),
+  );
+  let suggested = $derived(
+    intent === undefined ? null : suggestionText(intent.suggestion),
+  );
   let canSubmit = $derived(
     ready &&
       harnessReady &&
       running === undefined &&
       !app.starting &&
-      app.instruction.trim().length > 0,
+      intent !== undefined &&
+      blocked === null,
   );
   /**
    * Why the box will not submit, when the reason is the harness rather than the text.
@@ -149,145 +176,137 @@
     if (minutes < 60) return `${String(minutes)}m ${String(seconds % 60)}s`;
     return `${String(Math.floor(minutes / 60))}h ${String(minutes % 60)}m`;
   }
-
-  /**
-   * The field grows with the instruction, up to the cap, and then scrolls.
-   *
-   * OpenCode's editor is a `contenteditable` inside a scroll view bounded at 60–180px,
-   * which grows as you type; a textarea does not do that on its own, so the height is
-   * written from the content's own `scrollHeight`. The floor is CSS (`min-height`), which
-   * wins over an inline height smaller than it, so this only ever has to handle growth.
-   * Resetting to `auto` first is what lets it shrink again when a line is deleted.
-   */
-  let field = $state<HTMLTextAreaElement | null>(null);
-  const fieldMaxHeight = 180;
-  $effect(() => {
-    // Touched so this reruns on every edit, including a programmatic clear.
-    void app.instruction;
-    const element = field;
-    if (element === null) return;
-    element.style.height = "auto";
-    element.style.height = `${String(Math.min(element.scrollHeight, fieldMaxHeight))}px`;
-  });
-
-  /**
-   * Enter submits, Shift+Enter breaks the line.
-   *
-   * The convention an operator will expect from the shape of the control, and the reason
-   * the textarea is a textarea: an instruction describing what to probe is often more than
-   * one line, and a single-line input would quietly truncate the way people write.
-   */
-  function onkeydown(event: KeyboardEvent) {
-    if (event.key !== "Enter" || event.shiftKey) return;
-    event.preventDefault();
-    if (canSubmit) void app.startRun();
-  }
 </script>
 
-<section class="compose" aria-label="Start a run">
-  {#if running !== undefined}
-    <div class="status" role="status">
-      <span class="pulse" aria-hidden="true"></span>
-      <span class="status-text">
-        Running for <strong>{elapsed}</strong>
-      </span>
-      <span class="attempt mono" title="Attempt {running.attemptId}">
-        {running.attemptId}
-      </span>
-      <Button
-        size="sm"
-        variant="danger"
-        loading={app.stopping}
-        onclick={() => void app.stopRun()}
-      >
-        Stop
-      </Button>
-    </div>
-    <p class="note">
-      This run is going on the server, not in this tab — closing it will not
-      stop the agent. Stopping settles the attempt and withdraws its write
-      authority.
-    </p>
-  {:else}
-    <!--
-      One container. The textarea has no border of its own and the strip has no
-      background of its own: the border below belongs to the box, and everything inside
-      it reads as one control. `overflow` is deliberately not clipped here — the harness
-      picker's popover rises out of the strip, and clipping the box would cut it off.
-    -->
-    <div class="box">
-      <textarea
-        class="input"
-        rows="1"
-        placeholder={ready
-          ? "What should this run find out?"
-          : "This target cannot be opened, so nothing can run against it."}
-        disabled={!ready || app.starting}
-        bind:this={field}
-        bind:value={app.instruction}
-        {onkeydown}></textarea>
-
-      <div class="strip">
-        <div class="strip-controls">
-          <!--
-            Rendered, positioned, and honest about being unavailable: the sentence is the
-            `title` for a pointer and the accessible description for a screen reader, and
-            the control keeps its place in the tab order so both routes reach it.
-          -->
-          <button
-            class="square ghost unavailable"
-            type="button"
-            aria-disabled="true"
-            aria-label="Attach a file"
-            aria-describedby="compose-attach-why"
-            title={attachUnavailable}
-          >
-            <IconPlus width="13" height="13" />
-          </button>
-          <span id="compose-attach-why" class="visually-hidden"
-            >{attachUnavailable}</span
-          >
-
-          <!--
-            Reasoning depth is not a control here. It is the picker's third column: it is
-            a setting *of the model*, so it belongs where the model is chosen and has to
-            change when the model does. A separate strip control would have had to be
-            cleared, restored and relabelled in step with this one anyway.
-          -->
-          <HarnessPicker {app} />
+{#if running !== undefined || intent !== undefined || app.runFallback !== null || app.runDetail !== ""}
+  <section class="compose" aria-label="Run an intent">
+    {#if running !== undefined}
+      <div class="status" role="status">
+        <span class="pulse" aria-hidden="true"></span>
+        <span class="status-text">
+          Running for <strong>{elapsed}</strong>
+        </span>
+        <span class="attempt mono" title="Attempt {running.attemptId}">
+          {running.attemptId}
+        </span>
+        <Button
+          size="sm"
+          variant="danger"
+          loading={app.stopping}
+          onclick={() => void app.stopRun()}
+        >
+          Stop
+        </Button>
+      </div>
+      <p class="note">
+        This run is going on the server, not in this tab — closing it will not
+        stop the agent. Stopping settles the attempt and withdraws its write
+        authority.
+      </p>
+      {#if app.runFallback !== null}
+        <!--
+          A suggestion that could not be honoured, said once the run exists. The run went
+          ahead on the default and this is why; nothing about it is hidden in a log.
+        -->
+        <p class="note" role="status">
+          The intent suggested <strong>{app.runFallback.requested}</strong>,
+          which could not be used ({app.runFallback.reason}). This run is on
+          <strong>{app.runFallback.ranOn}</strong> instead.
+        </p>
+      {/if}
+    {:else if intent !== undefined}
+      <!--
+        One container. The prompt is a quotation and not a field, and the strip has no
+        background of its own: the border below belongs to the box, and everything inside
+        it reads as one control. `overflow` is deliberately not clipped here — the harness
+        picker's popover rises out of the strip, and clipping the box would cut it off.
+      -->
+      <div class="box">
+        <div class="prompt">
+          <span class="prompt-label">Run this intent</span>
+          <blockquote class="question">{intent.question}</blockquote>
+          {#if suggested !== null}
+            <p class="note">
+              This intent suggests <strong>{suggested}</strong>. Unless you pick
+              a harness below, the run goes there; if that cannot be used, the
+              server's default runs instead and the run says so.
+            </p>
+          {/if}
         </div>
 
-        <button
-          class="square submit"
-          type="button"
-          disabled={!canSubmit}
-          aria-label="Start run"
-          title="Start run"
-          onclick={() => void app.startRun()}
-        >
-          {#if app.starting}
-            <span class="spinner" aria-hidden="true"></span>
-          {:else}
-            <IconArrowUp width="14" height="14" />
-          {/if}
-        </button>
+        <div class="strip">
+          <div class="strip-controls">
+            <!--
+              Rendered, positioned, and honest about being unavailable: the sentence is the
+              `title` for a pointer and the accessible description for a screen reader, and
+              the control keeps its place in the tab order so both routes reach it.
+            -->
+            <button
+              class="square ghost unavailable"
+              type="button"
+              aria-disabled="true"
+              aria-label="Attach a file"
+              aria-describedby="compose-attach-why"
+              title={attachUnavailable}
+            >
+              <IconPlus width="13" height="13" />
+            </button>
+            <span id="compose-attach-why" class="visually-hidden"
+              >{attachUnavailable}</span
+            >
+
+            <!--
+              Reasoning depth is not a control here. It is the picker's third column: it is
+              a setting *of the model*, so it belongs where the model is chosen and has to
+              change when the model does. A separate strip control would have had to be
+              cleared, restored and relabelled in step with this one anyway.
+            -->
+            <HarnessPicker {app} />
+          </div>
+
+          <Button
+            size="sm"
+            variant="quiet"
+            disabled={app.starting}
+            onclick={() => app.clearRunChoice()}
+          >
+            Cancel
+          </Button>
+          <button
+            class="square submit"
+            type="button"
+            disabled={!canSubmit}
+            aria-label="Start run"
+            title="Start run"
+            onclick={() => void app.startRun()}
+          >
+            {#if app.starting}
+              <span class="spinner" aria-hidden="true"></span>
+            {:else}
+              <IconArrowUp width="14" height="14" />
+            {/if}
+          </button>
+        </div>
       </div>
-    </div>
-  {/if}
+      {#if blocked !== null}
+        <p class="note" role="status">{blocked}</p>
+      {/if}
+    {/if}
 
-  {#if harnessNote !== "" && running === undefined}
-    <!--
-      Not `role="alert"`: this is a standing condition of the server rather than a response
-      to something the operator just did, and announcing it on every repaint would be
-      noise. The refusal below *is* an alert, because it is an answer.
-    -->
-    <p class="note">{harnessNote}</p>
-  {/if}
+    {#if harnessNote !== "" && running === undefined && intent !== undefined}
+      <!--
+        Not `role="alert"`: this is a standing condition of the server rather than a response
+        to something the operator just did, and announcing it on every repaint would be
+        noise. The refusal below *is* an alert, because it is an answer.
+      -->
+      <p class="note">{harnessNote}</p>
+    {/if}
 
-  {#if app.runDetail !== ""}
-    <p class="refusal" role="alert">{app.runDetail}</p>
-  {/if}
-</section>
+    {#if app.runDetail !== ""}
+      <p class="refusal" role="alert">{app.runDetail}</p>
+    {/if}
+  </section>
+{/if}
 
 <style>
   .compose {
@@ -327,31 +346,32 @@
   }
 
   /**
-   * The text area fills the box. OpenCode: 60px floor, 180px cap, `px-4 pt-4 pb-2`
-   * (16px sides, 16px above, 8px below — the strip's own padding carries the rest), and
-   * 13px/20px type, which is this app's body size already.
+   * The prompt the run will send, as a quotation. OpenCode's composer gives its text field
+   * `px-4 pt-4 pb-2` (16px sides, 16px above, 8px below), so the same padding keeps the box
+   * the shape it was; the 180px cap and the scroll are for a long question, which is
+   * ordinary.
    */
-  .input {
+  .prompt {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
     min-height: 60px;
-    max-height: 180px;
     padding: 16px 16px 8px;
-    border: 0;
-    background: transparent;
-    color: var(--text-base);
-    font: 400 13px/var(--lh-base) var(--font-sans);
-    /* The height is written from the content; a drag handle would fight it. */
-    resize: none;
-    overflow-y: auto;
   }
-  .input:focus-visible {
-    outline: none;
-  }
-  .input::placeholder {
+  .prompt-label {
+    font: 600 11px/var(--lh-compact) var(--font-sans);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
     color: var(--text-faint);
   }
-  .input:disabled {
-    cursor: not-allowed;
-    opacity: 0.6;
+  .question {
+    margin: 0;
+    max-height: 180px;
+    overflow-y: auto;
+    color: var(--text-base);
+    font: 400 13px/var(--lh-base) var(--font-sans);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
   /**

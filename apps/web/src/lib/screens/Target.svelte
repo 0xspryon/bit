@@ -16,8 +16,9 @@
    * What is real in the frame itself: {@link TargetHeader} shows the open target's name,
    * its scope note and the counts read from that target's own database.
    *
-   * {@link ComposeBox} sits beneath the Goals list: a run can be started and stopped
-   * against the open target, on a harness and model the operator picks. The *live*
+   * {@link ComposeBox} sits beneath the Goals section: a run of an intent the operator has
+   * aimed it at can be started, and a running one stopped, against the open target, on a
+   * harness and model the operator picks. The *live*
    * transcript is here too: {@link LiveTranscript} shows the target's own event log, read
    * in store-assigned order behind a cursor, next to the harness's narration and the
    * policy gate's denials as live activity — and says which is which.
@@ -138,17 +139,17 @@
     {/if}
 
     <!--
-      The compose box sits under the frame rather than inside it, on the Goals list only.
-      Starting a run is an action on the *target*, so it belongs to the pane and not to
-      whichever page is showing; and it is only on the Goals list because that is where a
-      run's goal appears. Putting it under every section would make it look like a control
-      for Findings and Traffic too, and under one goal's page would make it look like a run
-      *of that goal*, which it is not yet: a run still mints the goal it runs under.
+      The run box sits under the frame rather than inside it, on the Goals section only: the
+      list and an open goal alike, because a run is started from an intent and intents are
+      listed on a goal's page, but a run is an action on the *target* and its strip has to be
+      visible from the list too. It renders nothing until there is something to say — an
+      intent aimed at, or a run going — so on the list it is usually absent. Putting it
+      under every section would make it look like a control for Findings and Traffic too.
     -->
-    {#if app.navItem === "goals" && app.openGoalId === ""}
+    {#if app.navItem === "goals"}
       <!--
-        The transcripts sit above the composer and below the frame, for the same reason the
-        composer does: they are about the target rather than about whichever page is showing.
+        The transcripts sit above the run box and below the frame, for the same reason the
+        box does: they are about the target rather than about whichever page is showing.
         The live one goes first because it is about the run happening now, while the panel
         under it is about a run that has already ended; reading top to bottom therefore reads
         from the present backwards. Each renders nothing until it has something to say — the

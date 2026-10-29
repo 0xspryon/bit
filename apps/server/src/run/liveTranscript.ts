@@ -203,6 +203,19 @@ const ATTEMPT_SUBJECT_KINDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * How an intent event names its intent: the question when the event carries it, and always
+ * the id, because a question can repeat and an id cannot. `subject_id` is the intent for
+ * these kinds, so it is the fallback when a payload lacks `intentId`.
+ */
+const intentPhrase = (event: RecordedEvent): string => {
+  const id = text(event.payload, "intentId") || event.subjectId;
+  const question = text(event.payload, "question");
+  return question === ""
+    ? `The intent ${id}`
+    : `The intent \u201c${question}\u201d (${id})`;
+};
+
+/**
  * One committed event as one transcript item.
  *
  * Pure, exported, and tested on its own: this is where "a recorded observation reads as
@@ -344,6 +357,37 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
         headline: "Goal ended",
         body: reason === "" ? sentence : `${sentence} ${reason}`,
         outcome: status === "" ? null : status,
+      };
+    }
+    case "intent.abandoned": {
+      const reason = text(event.payload, "reason");
+      // As `goal.ended` does: the act, then the operator's reason when there is one. It
+      // has no attempt, and `subject_id` is the intent, so the item borrows none.
+      const sentence = `${intentPhrase(event)} was abandoned.`;
+      return {
+        ...base,
+        kind: "intent.abandoned",
+        headline: "Intent abandoned",
+        body: reason === "" ? sentence : `${sentence} ${reason}`,
+        outcome: null,
+      };
+    }
+    case "intent.released": {
+      const held = text(event.payload, "attemptStatus");
+      const attempt = text(event.payload, "claimedByAttemptId");
+      // What the sweep found, in the words the record uses: a claim by an attempt that was
+      // never written is a crash between the claim and the row, and a claim by one that
+      // had already left `running` is a stale lock. Either way nothing is known to have
+      // run under it, which is why the outcome is `open` and never `answered`.
+      return {
+        ...base,
+        kind: "intent.released",
+        headline: "Intent released",
+        body:
+          held === ""
+            ? `${intentPhrase(event)} was released: it was claimed by attempt ${attempt}, which was never recorded, so nothing is known to have run. It is open again.`
+            : `${intentPhrase(event)} was released: it was still claimed by attempt ${attempt}, which had already ${held === "uncertain" ? "become uncertain" : `settled as ${held}`}. It is open again.`,
+        outcome: null,
       };
     }
     default:

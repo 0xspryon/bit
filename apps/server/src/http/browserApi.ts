@@ -34,8 +34,11 @@
 import {
   AttemptNotFound,
   BitApi,
+  dimensionsOf,
   GoalNotFound,
   GoalRefused,
+  IntentNotFound,
+  IntentRefused,
   RunRefused,
   SessionActor,
   SessionGuard,
@@ -44,8 +47,10 @@ import {
   TargetUnavailable,
   Unauthenticated,
   type AttemptTranscript,
+  type GoalObservationView,
   type GoalView,
   type HarnessInstanceView,
+  type IntentView,
   type TargetCounts,
   type TargetSummary,
 } from "@bit/contracts";
@@ -75,10 +80,12 @@ import {
   type TargetRow,
 } from "../persistence/fleet";
 import * as identifier from "../persistence/identifier";
-import type {
-  MutationError,
-  ObservationStore,
-  StoredGoal,
+import {
+  operatorScope,
+  type MutationError,
+  type ObservationStore,
+  type StoredGoal,
+  type StoredIntent,
 } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { POLICY_AUDIT_FILE } from "../policy/install";
@@ -326,16 +333,8 @@ const openableTarget = Effect.fnUntraced(function* (
 
 /* ── Goals ───────────────────────────────────────────────────────────────────── */
 
-/**
- * Who a goal mutation made through the browser is recorded as.
- *
- * `<targetId>/operator` follows the scope namespacing the spec settles — `targetId/<attemptId>`
- * for a worker, and later `targetId/round/…` and `targetId/goal/…` for the planner and the
- * goal agent — so the operator is one more author in the same space and cannot collide with
- * an attempt: attempt ids are `att_…`. It is the host's own authority and is supplied here,
- * by the process that owns the session guard, never read from a payload.
- */
-const operatorScope = (targetId: string): string => `${targetId}/operator`;
+// `operatorScope` — who a mutation made through the browser is recorded as — is defined
+// beside `HostContext` in the store, because the run supervisor acts as the operator too.
 
 /**
  * One stored goal as the contract's view of it, field by field.
@@ -404,6 +403,94 @@ export const goalRefusal = (
         return yield* new GoalRefused({
           reason: "already_ended",
           goalId,
+          detail: error.detail,
+        });
+      }
+    }
+    return yield* Effect.die(error);
+  });
+
+/**
+ * One stored intent as the contract's view of it, field by field.
+ *
+ * Not a spread, for the reason {@link goalView} is not. The suggestion is carried as a
+ * suggestion — its own sub-object, every field nullable — so a client has no way to
+ * mistake it for what ran; that is the attempt's.
+ */
+const intentView = (intent: StoredIntent): IntentView => ({
+  intentId: intent.intentId,
+  goalId: intent.goalId,
+  question: intent.question,
+  status: intent.status,
+  anchoredTo: intent.anchoredTo,
+  addressesDimension: intent.addressesDimension,
+  createdAt: intent.createdAt,
+  claimedByAttemptId: intent.claimedByAttemptId,
+  suggestion: {
+    instanceId: intent.suggestion.instanceId,
+    model: intent.suggestion.model,
+    modelOptions: intent.suggestion.modelOptions,
+  },
+  attempts: intent.attemptCount,
+});
+
+/**
+ * What a refused `addIntent` becomes at the HTTP surface.
+ *
+ * The handler has already established that the goal exists in this target, so the refusals
+ * left are the store's anchoring rule's, and they arrive as `invalid`: "the submission does
+ * not resolve against stored state". That is all `IntentRefused.reason` claims, and the
+ * store's sentence — which names what the offending id actually is and how to correct it —
+ * is passed through unchanged for the operator to read.
+ *
+ * `conflict` (an operation id reused), `unauthorized` (a goal from another target) and
+ * `stale` (a worker's revoked credential) cannot be reached from this route: the handler
+ * mints a fresh operation id, checks the goal against the target first, and a browser holds
+ * no credential. They are defects if they ever appear, because a refusal an operator could
+ * act on would be an invented one. Exported for its test; the unreachable branch cannot be
+ * driven over HTTP.
+ */
+export const addIntentRefusal = (error: MutationError) =>
+  error.reason === "invalid"
+    ? Effect.fail(
+        new IntentRefused({ reason: "invalid", detail: error.detail }),
+      )
+    : Effect.die(error);
+
+/**
+ * What a refused `abandonIntent` becomes, for the abandon route.
+ *
+ * `invalid` is "no such intent here" — a missing id or another target's, the only two
+ * things the store gives it for on this operation.
+ *
+ * `conflict` is **not** taken to mean "not abandonable", for the reason {@link goalRefusal}
+ * gives: the store raises it for an operation id reused with different input as well. So
+ * the claim is checked against the row — `not_abandonable` is said only if the intent is
+ * really no longer `open` or `proposed` when re-read. Anything else is a defect.
+ */
+export const abandonRefusal = (
+  store: Pick<ObservationStore["Service"], "intent">,
+  targetId: string,
+  intentId: string,
+  error: MutationError,
+) =>
+  Effect.gen(function* () {
+    if (error.reason === "invalid") {
+      return yield* new IntentNotFound({
+        targetId,
+        intentId,
+        detail: error.detail,
+      });
+    }
+    if (error.reason === "conflict") {
+      const intent = yield* store.intent(intentId);
+      if (
+        intent !== undefined &&
+        intent.status !== "open" &&
+        intent.status !== "proposed"
+      ) {
+        return yield* new IntentRefused({
+          reason: "not_abandonable",
           detail: error.detail,
         });
       }
@@ -760,6 +847,9 @@ const fleetHandlers = HttpApiBuilder.group(
         const started = yield* supervisor.start({
           targetId: row.targetId,
           workspace: row.workspacePath ?? config.workspaceRoot,
+          // The intent to claim. Everything the run is *about* — the prompt, the goal, the
+          // question — comes from that intent, which is why none of them is below.
+          intentId: payload.intentId,
           ...(payload.instanceId === undefined
             ? {}
             : { instanceId: payload.instanceId }),
@@ -779,12 +869,6 @@ const fleetHandlers = HttpApiBuilder.group(
           // the workspace the worker runs in, so the worker cannot read the record of
           // what it was allowed to do.
           auditPath: `${fleet.paths.evidenceDirectory(row.targetId)}/${POLICY_AUDIT_FILE}`,
-          // One instruction becomes all three, because that is all the operator has given
-          // us. The shortfall is recorded on the contract's `RunDraft`: choosing which
-          // intent a run belongs to is the work of the flow that shows intents.
-          goal: payload.instruction,
-          question: payload.instruction,
-          task: payload.instruction,
           title: `bit: ${row.name}`,
         });
         return started;
@@ -1027,6 +1111,198 @@ const fleetHandlers = HttpApiBuilder.group(
           );
         }
         return goalView(ended);
+      }),
+
+      /** The intents under one goal. A goal another target holds is not found here. */
+      intents: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const found = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            const goal = yield* store.loadGoal(params.goalId);
+            if (goal === undefined || goal.targetId !== row.targetId) {
+              return undefined;
+            }
+            return yield* store.intentsForGoal(params.goalId);
+          }),
+        ).pipe(Effect.orDie);
+        if (found === undefined) {
+          return yield* new GoalNotFound({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            detail: `no goal '${params.goalId}' is recorded in this target`,
+          });
+        }
+        return { intents: found.map(intentView) };
+      }),
+
+      /**
+       * The digest of every observation under one goal, for choosing an anchor from.
+       *
+       * Read per intent and merged, because the store reads observations by intent and an
+       * anchor may be any of the goal's. The merge is by the store's own sequence, so the
+       * order is the order they were recorded in whichever intent they sit under. Only the
+       * fields a choice needs are mapped (see `GoalObservationView`): this is not a second
+       * way to read an observation.
+       */
+      goalObservations: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const found = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            const goal = yield* store.loadGoal(params.goalId);
+            if (goal === undefined || goal.targetId !== row.targetId) {
+              return undefined;
+            }
+            const intents = yield* store.intentsForGoal(params.goalId);
+            const lists = yield* Effect.forEach(intents, (intent) =>
+              store.observationsForIntent(intent.intentId),
+            );
+            return lists.flat().sort((a, b) => a.sequence - b.sequence);
+          }),
+        ).pipe(Effect.orDie);
+        if (found === undefined) {
+          return yield* new GoalNotFound({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            detail: `no goal '${params.goalId}' is recorded in this target`,
+          });
+        }
+        return {
+          observations: found.map((observation): GoalObservationView => ({
+            observationId: observation.observationId,
+            intentId: observation.provenance.intentId,
+            testedClaim: observation.testedClaim,
+            outcome: observation.outcome,
+            untestedDimensions: dimensionsOf(observation).map((entry) => ({
+              address: entry.address,
+              text: entry.dimension,
+            })),
+          })),
+        };
+      }),
+
+      /**
+       * Adds an intent under a goal, minting both identities the store needs.
+       *
+       * The write is the store's existing `addIntent`: its goal and target ownership check,
+       * its anchoring rule, its receipt and its event. Nothing of that is restated here.
+       * The goal is looked up first only so that "no such goal" is a `GoalNotFound` before
+       * the store is asked, which leaves its `invalid` meaning the anchoring family and
+       * nothing else (see {@link addIntentRefusal}).
+       *
+       * The intent id and the operation id are minted here for the reason `createGoal`'s
+       * are. The suggestion fields are forwarded only when present, so an absent one stays
+       * absent in the store rather than becoming an empty opinion.
+       */
+      createIntent: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const intentId = identifier.newIntentId();
+        const created = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            const goal = yield* store.loadGoal(params.goalId);
+            if (goal === undefined || goal.targetId !== row.targetId) {
+              return undefined;
+            }
+            yield* store
+              .addIntent(
+                {
+                  callerScope: operatorScope(row.targetId),
+                  targetId: row.targetId,
+                },
+                {
+                  operationId: identifier.prefixed("op"),
+                  goalId: params.goalId,
+                  intentId,
+                  question: payload.question,
+                  anchorObservationIds: payload.anchorObservationIds,
+                  addressesDimension: payload.addressesDimension,
+                  ...(payload.suggestedInstanceId === undefined
+                    ? {}
+                    : { suggestedInstanceId: payload.suggestedInstanceId }),
+                  ...(payload.suggestedModel === undefined
+                    ? {}
+                    : { suggestedModel: payload.suggestedModel }),
+                  ...(payload.suggestedModelOptions === undefined
+                    ? {}
+                    : {
+                        suggestedModelOptions: payload.suggestedModelOptions,
+                      }),
+                },
+              )
+              .pipe(Effect.catchTag("MutationError", addIntentRefusal));
+            return yield* store.intent(intentId);
+          }),
+        ).pipe(
+          Effect.catchTag("FleetError", Effect.die),
+          Effect.catchTag("DatabaseError", Effect.die),
+          Effect.catchTag("StoredRowError", Effect.die),
+        );
+        if (created === undefined) {
+          // Reached for the missing-goal case (the `undefined` above) and, in principle,
+          // for an intent that was written and could not be read back; the goal is read
+          // again to tell which, so the 404 is only ever said of a goal that is not there.
+          const goal = yield* withTargetStore(stores, row.targetId, (store) =>
+            store.loadGoal(params.goalId),
+          ).pipe(Effect.orDie);
+          if (goal === undefined || goal.targetId !== row.targetId) {
+            return yield* new GoalNotFound({
+              targetId: row.targetId,
+              goalId: params.goalId,
+              detail: `no goal '${params.goalId}' is recorded in this target`,
+            });
+          }
+          return yield* Effect.die(
+            new Error(
+              `intent ${intentId} was written and could not be read back`,
+            ),
+          );
+        }
+        return intentView(created);
+      }),
+
+      /**
+       * Abandons an open intent as the operator. The store does the refusing — missing,
+       * another target's, claimed, answered, already abandoned — and this handler only
+       * translates, through {@link abandonRefusal}, so the two cannot drift.
+       */
+      abandonIntent: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const abandoned = yield* withTargetStore(
+          stores,
+          row.targetId,
+          (store) =>
+            Effect.gen(function* () {
+              yield* store
+                .abandonIntent(
+                  {
+                    callerScope: operatorScope(row.targetId),
+                    targetId: row.targetId,
+                  },
+                  {
+                    operationId: identifier.prefixed("op"),
+                    intentId: params.intentId,
+                    reason: payload.reason,
+                  },
+                )
+                .pipe(
+                  Effect.catchTag("MutationError", (error) =>
+                    abandonRefusal(store, row.targetId, params.intentId, error),
+                  ),
+                );
+              return yield* store.intent(params.intentId);
+            }),
+        ).pipe(
+          Effect.catchTag("FleetError", Effect.die),
+          Effect.catchTag("DatabaseError", Effect.die),
+          Effect.catchTag("StoredRowError", Effect.die),
+        );
+        if (abandoned === undefined) {
+          return yield* Effect.die(
+            new Error(
+              `intent ${params.intentId} was abandoned and could not be read back`,
+            ),
+          );
+        }
+        return intentView(abandoned);
       }),
 
       /**

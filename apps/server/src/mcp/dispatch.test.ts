@@ -469,16 +469,35 @@ describe("one endpoint, two targets", () => {
     const observed = await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
+        // A run claims an intent that already exists, so one is made first.
+        const opened = yield* TargetStores;
+        yield* withTargetStore(opened, "alpha", (store) =>
+          Effect.gen(function* () {
+            const host = { callerScope: "alpha/operator", targetId: "alpha" };
+            yield* store.openGoal(host, {
+              operationId: "op-goal-supervised",
+              goalId: "goal-supervised",
+              name: "",
+              description: "Work out what alpha does under load.",
+            });
+            yield* store.addIntent(host, {
+              operationId: "op-intent-supervised",
+              goalId: "goal-supervised",
+              intentId: "intent-supervised",
+              question: "probe it",
+              anchorObservationIds: [],
+              addressesDimension: null,
+            });
+          }),
+        );
         const started = yield* supervisor.start({
           targetId: "alpha",
+          intentId: "intent-supervised",
           // A scratch workspace of its own, because starting a run installs the
           // pre-execution policy gate into it before creating the session.
           workspace: workspaceFor("alpha"),
           auditPath: join(directory, "alpha-policy-audit.log"),
           evidenceDirectory: join(directory, "alpha-evidence"),
-          goal: "Work out what alpha does under load.",
-          question: "Probe alpha's limiter.",
-          task: "probe it",
           title: "bit: alpha",
         });
         return { started, supervisor };

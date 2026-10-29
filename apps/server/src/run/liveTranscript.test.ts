@@ -495,6 +495,83 @@ describe("projecting the record", () => {
     expect(bare.body).toBe("The goal ended as abandoned, ended by operator.");
   });
 
+  test("an intent being abandoned says so, with the reason and no attempt borrowed from its subject", () => {
+    const withReason = projectEvent(
+      event({
+        kind: "intent.abandoned",
+        callerScope: "host",
+        attemptId: null,
+        intentId: null,
+        subjectId: "int-9",
+        payload: {
+          intentId: "int-9",
+          goalId: "goal-7",
+          reason: "Out of scope.",
+        },
+      }),
+    );
+    expect(withReason.kind).toBe("intent.abandoned");
+    // Names the intent it is about, by id (this payload carries no question).
+    expect(withReason.body).toBe(
+      "The intent int-9 was abandoned. Out of scope.",
+    );
+    expect(withReason.attemptId).toBeNull();
+    const bare = projectEvent(
+      event({ kind: "intent.abandoned", payload: { reason: "" } }),
+    );
+    // Falls back to the subject, which is the intent for this kind.
+    expect(bare.body).toBe("The intent obs-1 was abandoned.");
+    const named = projectEvent(
+      event({
+        kind: "intent.abandoned",
+        subjectId: "int-9",
+        payload: {
+          intentId: "int-9",
+          question: "Does the limiter reset?",
+          reason: "",
+        },
+      }),
+    );
+    // The question and the id both: a question can repeat and an id cannot.
+    expect(named.body).toBe(
+      "The intent \u201cDoes the limiter reset?\u201d (int-9) was abandoned.",
+    );
+  });
+
+  test("a released claim says what the sweep found, and does not borrow an attempt", () => {
+    const never = projectEvent(
+      event({
+        kind: "intent.released",
+        callerScope: null,
+        intentId: null,
+        attemptId: null,
+        subjectId: "int-9",
+        payload: {
+          intentId: "int-9",
+          claimedByAttemptId: "att-3",
+          attemptStatus: null,
+        },
+      }),
+    );
+    expect(never.kind).toBe("intent.released");
+    expect(never.body).toContain("int-9");
+    expect(never.body).toContain("att-3, which was never recorded");
+    expect(never.body).toContain("It is open again.");
+    expect(never.attemptId).toBeNull();
+    const settled = projectEvent(
+      event({
+        kind: "intent.released",
+        subjectId: "int-9",
+        payload: {
+          intentId: "int-9",
+          claimedByAttemptId: "att-3",
+          attemptStatus: "failed",
+        },
+      }),
+    );
+    expect(settled.body).toContain("settled as failed");
+  });
+
   test("an event kind this build has never seen still appears, by name and in place", () => {
     const item = projectEvent(
       event({

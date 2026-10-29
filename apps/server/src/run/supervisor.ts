@@ -103,13 +103,20 @@ import {
 } from "effect";
 
 import { AgentHarness, type TerminalOutcome } from "../harness/agentHarness";
-import { HarnessResolver, type ResolvedHarness } from "../harness/resolver";
+import {
+  HarnessResolver,
+  type HarnessNotReady,
+  type ResolvedHarness,
+} from "../harness/resolver";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import * as identifier from "../persistence/identifier";
-import type {
-  AttemptTerminalStatus,
-  ObservationStore,
+import {
+  operatorScope,
+  type AttemptTerminalStatus,
+  type ClaimResult,
+  type ObservationStore,
+  type StoredIntentSuggestion,
 } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { RunNarrations } from "./narration";
@@ -199,10 +206,21 @@ export class WorkerEndpoints extends Context.Service<
   };
 }
 
-/** What starting one run needs. Every id below is minted here, not supplied. */
+/**
+ * What starting one run needs. The attempt and worker ids are minted here; the goal and
+ * the intent are not minted at all, because a run claims an intent that already exists.
+ */
 export interface RunInput {
   /** Whose evidence this run writes to. Dispatch is by this id, everywhere. */
   readonly targetId: string;
+  /**
+   * The intent to run. It is **claimed**, not created: the run refuses (`RunRefused`,
+   * naming why) unless the intent exists in this target, is `open`, and sits under an
+   * `active` goal. The prompt is the intent's `question` and the goal is the intent's own,
+   * which is why neither is a field here — a second source for either would be two
+   * answers to "what is this run about".
+   */
+  readonly intentId: string;
   /**
    * The directory the harness session runs in.
    *
@@ -212,7 +230,8 @@ export interface RunInput {
    */
   readonly workspace: string;
   /**
-   * Which configured harness to run on, or the server's default.
+   * Which configured harness to run on: the operator's explicit pick, else the intent's
+   * *suggestion*, else the server's default.
    *
    * Slice B said this would arrive "as a resolver in front of {@link AgentHarness}, not as
    * a field here", and both halves of that happened: the field is an *id*, and what turns
@@ -223,7 +242,9 @@ export interface RunInput {
    * (migration `0014`) and nothing updates it: moving work to another harness is a
    * replacement attempt, not a retarget (DECISIONS.md §15). An id this server does not
    * configure, or one whose harness did not come up, is refused `harness_not_ready` before
-   * a row is written.
+   * a row is written. **That refusal is for an explicit pick only.** A suggestion the
+   * intent carries that cannot be honoured falls back to the default and the result says
+   * so (`RunStarted.instanceFallback`); see {@link chooseHarness}.
    */
   readonly instanceId?: string | undefined;
   /**
@@ -249,12 +270,6 @@ export interface RunInput {
    * exactly the kind of quiet loss this product keeps refusing to ship.
    */
   readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
-  /** What the engagement is after. Advisory prose; never enforcement (§4). */
-  readonly goal: string;
-  /** The narrower question this run is against. */
-  readonly question: string;
-  /** The prompt text. Built by the caller; never contains a credential. */
-  readonly task: string;
   /**
    * Where the harness-side policy gate appends its decisions.
    *
@@ -277,6 +292,126 @@ export interface RunInput {
   readonly evidenceDirectory: string;
   /** Shown as the session's title in the harness's own UI. */
   readonly title: string;
+}
+
+/**
+ * The harness, model and options a run gets, and what became of a suggestion.
+ *
+ * `fallback` is non-null only when the intent *suggested* an instance this server could
+ * not give it. It is the visible half of the spec's decision 13: a dead suggestion falls
+ * back **and says so**.
+ */
+export interface HarnessChoice {
+  readonly resolved: ResolvedHarness;
+  readonly model: string | undefined;
+  readonly modelOptions: readonly ModelOptionSelection[] | undefined;
+  readonly fallback: {
+    readonly requested: string;
+    readonly reason: string;
+  } | null;
+}
+
+/**
+ * Decides which harness, model and options a run gets. Written once, here, and tested on
+ * its own.
+ *
+ * ## The order
+ *
+ * **Instance:** the operator's explicit `instanceId`, then the intent's suggestion, then
+ * the server's default.
+ *
+ * - An **explicit** id that does not resolve is **refused** (`HarnessNotReady`, which the
+ *   supervisor reports as `harness_not_ready`). The operator asked for that harness by
+ *   name; running somewhere else would make the attempt's recorded instance something they
+ *   did not pick.
+ * - A **suggestion** that does not resolve **falls back to the default and says so**
+ *   ({@link HarnessChoice.fallback}). A suggestion is the planner's or an earlier operator's
+ *   guess about what would suit the intent; it is not a promise anybody made to this
+ *   operator, and refusing a run over a harness that has since gone away would turn
+ *   advice into a veto. If the *default* cannot resolve either, that refusal stands, since
+ *   there is nowhere to run.
+ *
+ * **Model:** the operator's explicit `model`, then the suggestion's, then the instance's
+ * default (which is `undefined` here; the instance fills it in). The suggestion's model and
+ * options are used **only on the instance they were suggested for**. A model name is
+ * harness-scoped, so a suggestion made for one harness applied to another would be a name
+ * that means nothing there, or worse, something different. So they are ignored when the
+ * suggested instance fell back or the operator chose another one. A suggestion that named
+ * a model but no instance applies to the default instance, which is where it lands.
+ *
+ * **Options:** the operator's explicit list, else the suggestion's when it applies **and**
+ * the model is the one it was suggested with (options are per model), else none.
+ *
+ * Nothing here is written down as provenance. The attempt row records what actually ran.
+ */
+export const chooseHarness = (
+  resolver: HarnessResolver["Service"],
+  explicit: {
+    readonly instanceId?: string | undefined;
+    readonly model?: string | undefined;
+    readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
+  },
+  suggestion: StoredIntentSuggestion,
+): Effect.Effect<HarnessChoice, HarnessNotReady> =>
+  Effect.gen(function* () {
+    const pick =
+      explicit.instanceId === undefined || explicit.instanceId === ""
+        ? undefined
+        : explicit.instanceId;
+
+    let resolved: ResolvedHarness;
+    let fallback: HarnessChoice["fallback"] = null;
+    if (pick !== undefined) {
+      resolved = yield* resolver.resolve(pick);
+    } else if (suggestion.instanceId !== null) {
+      const tried = yield* Effect.result(
+        resolver.resolve(suggestion.instanceId),
+      );
+      if (tried._tag === "Success") {
+        resolved = tried.success;
+      } else {
+        fallback = {
+          requested: suggestion.instanceId,
+          reason: tried.failure.message,
+        };
+        resolved = yield* resolver.resolve(undefined);
+      }
+    } else {
+      resolved = yield* resolver.resolve(undefined);
+    }
+
+    const suggestionApplies =
+      fallback === null &&
+      (suggestion.instanceId === null
+        ? pick === undefined
+        : resolved.instance.instanceId === suggestion.instanceId);
+    const model =
+      explicit.model ??
+      (suggestionApplies ? (suggestion.model ?? undefined) : undefined);
+    const modelOptions =
+      explicit.modelOptions ??
+      (suggestionApplies &&
+      (explicit.model === undefined || explicit.model === suggestion.model)
+        ? (suggestion.modelOptions ?? undefined)
+        : undefined);
+    return { resolved, model, modelOptions, fallback };
+  });
+
+/**
+ * A run after its intent was claimed and its harness chosen: the {@link RunInput} with
+ * what only the claim could supply, and the choice made.
+ *
+ * Internal, and the only place the prompt exists. It is the intent's `question`, taken from
+ * the claim and not from the caller, so a run is exactly the intent that was claimed.
+ */
+interface Dispatch extends RunInput {
+  /** The goal's objective. Advisory prose; never enforcement (§4). */
+  readonly goal: string;
+  /** The intent's question. */
+  readonly question: string;
+  /** The prompt text. The question verbatim; never contains a credential. */
+  readonly task: string;
+  readonly fallback: HarnessChoice["fallback"];
 }
 
 /**
@@ -539,8 +674,28 @@ export class RunSupervisor extends Context.Service<
 const refuse = (error: {
   readonly _tag: string;
   readonly message?: string;
+  readonly reason?: string;
+  readonly detail?: string;
 }): RunRefused => {
   switch (error._tag) {
+    // One reason each, taken from the one the store gave. A `ClaimRefused` is never mapped
+    // by its sentence and never defaulted into a reason it did not state.
+    case "ClaimRefused": {
+      const detail =
+        error.detail ?? error.message ?? "that intent cannot be run";
+      switch (error.reason) {
+        case "no_such_intent":
+          return new RunRefused({ reason: "intent_not_found", detail });
+        case "other_target":
+          return new RunRefused({ reason: "intent_wrong_target", detail });
+        case "not_open":
+          return new RunRefused({ reason: "intent_not_open", detail });
+        case "goal_not_active":
+          return new RunRefused({ reason: "goal_not_active", detail });
+        default:
+          return new RunRefused({ reason: "store_unavailable", detail });
+      }
+    }
     case "FleetError":
       return new RunRefused({
         reason: "target_unavailable",
@@ -744,6 +899,73 @@ const make = Effect.fnUntraced(function* (options?: {
   };
 
   /**
+   * Gives an intent back that a run claimed and never used. Idempotent, and it cannot free
+   * a claim that is not ours: the store only releases an intent still claimed by *this*
+   * attempt.
+   *
+   * A failure is logged and swallowed. This runs on refusal paths and in finalizers, where
+   * raising a second error would hide the first, and the worst case of failing to release
+   * is an intent that reads `claimed` by an attempt that is not running — visible, and
+   * cleared by the next restart's sweep only if an attempt row exists, so it is logged at
+   * error level rather than quietly dropped.
+   */
+  const giveBack = (
+    targetId: string,
+    intentId: string,
+    attemptId: string,
+  ): Effect.Effect<void> =>
+    Effect.scoped(
+      Effect.flatMap(stores.open(targetId), (store) =>
+        // Any word but `succeeded`: a run that did not finish can only return the intent
+        // to `open`, never answer it.
+        store.releaseIntent(intentId, "refused", attemptId),
+      ),
+    ).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logError("could not release a claimed intent", {
+          targetId,
+          intentId,
+          attemptId,
+          cause,
+        }),
+      ),
+    );
+
+  /**
+   * Gives the claim back unless an attempt row exists to carry it.
+   *
+   * Once the attempt row is written, its settlement — the supervisor's, or the startup
+   * sweep's if the process dies — releases the intent in the same transaction, and
+   * releasing it here as well would free it while an attempt the record says is `running`
+   * still exists. So this acts only for a start that never wrote the row.
+   */
+  const releaseUnstarted = (
+    targetId: string,
+    ids: { readonly intentId: string; readonly attemptId: string },
+  ): Effect.Effect<void> =>
+    Effect.scoped(
+      Effect.flatMap(stores.open(targetId), (store) =>
+        store.loadAttempt(ids.attemptId, targetId),
+      ),
+    ).pipe(
+      Effect.flatMap((row) =>
+        row === undefined
+          ? giveBack(targetId, ids.intentId, ids.attemptId)
+          : Effect.void,
+      ),
+      Effect.catchCause((cause) =>
+        Effect.logError(
+          "could not check whether a started run left an attempt",
+          {
+            targetId,
+            attemptId: ids.attemptId,
+            cause,
+          },
+        ),
+      ),
+    );
+
+  /**
    * The start half: everything up to, but not including, the prompt.
    *
    * The prompt is one step further out, in {@link supervise}, because the narration
@@ -776,7 +998,7 @@ const make = Effect.fnUntraced(function* (options?: {
    * written.
    */
   const startHalf = Effect.fnUntraced(function* (
-    input: RunInput,
+    input: Dispatch,
     ids: {
       readonly goalId: string;
       readonly intentId: string;
@@ -852,6 +1074,11 @@ const make = Effect.fnUntraced(function* (options?: {
       requestedOptions,
     );
 
+    // The goal and the intent already exist — the claim in `start` proved it — so every
+    // insert in `seedAttempt` but the attempt's own is an `ON CONFLICT(id) DO NOTHING` that
+    // matches and writes nothing. The text passed for them is therefore never stored; it is
+    // the claimed intent's own, so it is correct even in the case where it would matter.
+    // `supervisor.test.ts` asserts the goal and intent counts do not move.
     const authority = yield* store.seedAttempt({
       targetId: input.targetId,
       goalId: ids.goalId,
@@ -1086,7 +1313,7 @@ const make = Effect.fnUntraced(function* (options?: {
    * `AgentHarness`" means in code: the requirement did not widen, the provider moved.
    */
   const supervise = (
-    input: RunInput,
+    input: Dispatch,
     ids: {
       readonly goalId: string;
       readonly intentId: string;
@@ -1103,6 +1330,7 @@ const make = Effect.fnUntraced(function* (options?: {
           yield* Deferred.fail(gate, refuse(opened.failure));
           return;
         }
+
         const { store, harnessSessionId, provenance } = opened.success;
         const startedAt = Date.now();
 
@@ -1223,6 +1451,7 @@ const make = Effect.fnUntraced(function* (options?: {
           providerId: provenance.providerId,
           modelId: provenance.modelId,
           startedAt,
+          instanceFallback: input.fallback,
         };
         supervised.set(ids.attemptId, {
           attemptId: ids.attemptId,
@@ -1309,6 +1538,12 @@ const make = Effect.fnUntraced(function* (options?: {
           }),
         ),
       ),
+      // The claim, if no attempt ever came to hold it. When a row was written its
+      // settlement (or the sweep's) releases the intent in the same transaction, so this
+      // acts only for a start that failed before the row existed — the gate refusing to
+      // install, say — and leaves the intent `open` rather than `claimed` by an attempt
+      // that does not exist.
+      Effect.ensuring(releaseUnstarted(input.targetId, ids)),
       // The one harness this run was resolved to, handed to everything above. Provided
       // here rather than passed down, so no step of a run has a second harness-shaped
       // value in reach — see this function's header.
@@ -1318,84 +1553,201 @@ const make = Effect.fnUntraced(function* (options?: {
   const start: RunSupervisor["Service"]["start"] = Effect.fn(
     "RunSupervisor.start",
   )(function* (input) {
-    const ids = {
-      goalId: identifier.newGoalId(),
-      intentId: identifier.newIntentId(),
-      attemptId: identifier.newAttemptId(),
-      workerId: identifier.prefixed("wk"),
-    };
-    /**
-     * Which harness this run gets, decided before anything is claimed or written.
-     *
-     * **First, ahead of the workspace claim**, so a run that names an instance this server
-     * cannot give it leaves nothing behind: no folder held, no attempt row, nothing for a
-     * sweep to find. That is the same disposition the gate installation already has in
-     * `startHalf` and for the same reason.
-     *
-     * A refusal names the instance. It is never a fallback onto a different harness:
-     * running on one the operator did not pick would write provenance nobody could trust,
-     * which is the whole reason migration `0014` records the instance at all.
-     */
-    const resolved = yield* Effect.result(resolver.resolve(input.instanceId));
-    if (resolved._tag === "Failure") return yield* refuse(resolved.failure);
+    // Only the attempt and the worker are minted. The goal and the intent are the claimed
+    // intent's own, taken from the claim below: a run no longer creates what it runs.
+    const attemptId = identifier.newAttemptId();
+    const workerId = identifier.prefixed("wk");
 
     /**
-     * The folder, claimed before anything else happens.
+     * Wait for the worker endpoints **before** claiming anything.
      *
-     * Synchronously: the reasoning is on {@link claimedWorkspaces}. Refusing
-     * here means a second concurrent run in one engagement's folder writes *nothing at
-     * all* — no gate installed over the first run's, no attempt row, nothing for a sweep
-     * to find.
+     * This line is an ordering guarantee and not a convenience. The startup sweep that gives
+     * back orphaned intent claims (`releaseOrphanedClaims`) cannot tell a claim whose attempt
+     * the dead process never wrote from a claim a live `start` has taken and not yet written
+     * an attempt for: both are `claimed` with no attempt row. What separates them is time.
+     * `main.ts` runs that sweep and only then publishes the endpoints, so a `start` that
+     * cannot claim until they are published cannot have a claim for the sweep to take. Wait
+     * after the claim instead — as `startHalf` does — and a request that arrives while the
+     * sweep is walking the fleet claims, parks, and has its claim returned to `open` from
+     * under it; a second start then claims the same intent, and the first run's success
+     * leaves it `open`, not `answered`.
+     *
+     * The wait costs nothing that was not already paid: `startHalf` awaits the same value
+     * (a `Deferred`, so every later read is immediate) and a start could not proceed without
+     * it. What changes is only that a request arriving during boot is held *before* it
+     * touches the intent, so a start that is merely waiting holds no claim.
+     *
+     * **What this does not cover, stated plainly.** It protects the sweep only where the
+     * endpoints are published after the sweep, which is `main.ts`'s order. A composition
+     * root that published them first, or ran the sweep later, would reopen the window, and
+     * nothing here would stop it. It also assumes this process is the only writer of the
+     * file, which is the deployment's premise for the single-writer database anyway.
      */
-    const busy = yield* workspaceClaim(input.workspace, {
-      attemptId: ids.attemptId,
-      targetId: input.targetId,
-    });
-    if (busy !== undefined) return yield* busy;
+    yield* endpoints.urls;
 
-    const gate = yield* Deferred.make<RunStarted, RunRefused>();
-    // Forked, not run: this is the line that detaches the run from the request. The
-    // fiber is a daemon of the layer's scope rather than a child of this fiber, so
-    // writing the response below cannot interrupt it.
-    const fiber = fork(
-      ids.attemptId,
-      supervise(input, ids, gate, resolved.success),
+    /**
+     * The intent, claimed before anything else is claimed or written.
+     *
+     * **First, ahead of the harness choice and the workspace claim**, because the claim is
+     * the thing that decides whether this run exists at all — a second request for the same
+     * intent, from a second tab or a retry, is refused here, naming the attempt already
+     * holding it, with nothing written. It is also where the intent's suggestion comes
+     * from, which the harness choice needs.
+     *
+     * Taken in the target's own store, opened for the length of this one statement and not
+     * held across anything else: the claim is a single `UPDATE`, so there is nothing to
+     * keep the store open for, and the run's own body borrows it again when it needs it.
+     *
+     * **Everything after this line must give the claim back if it refuses.** That is what
+     * `handedOver` is for: it is false until the supervisor fiber exists, and until then
+     * the `ensuring` at the bottom releases the claim on every exit — a refusal, a defect,
+     * an interruption of the request. After the fork the fiber owns it, and its own
+     * `ensuring` and settlement release it. A refused run therefore leaves the intent
+     * `open`, which is what the test for it asserts.
+     */
+    const claimed = yield* Effect.result(
+      Effect.scoped(
+        Effect.flatMap(stores.open(input.targetId), (store) =>
+          store.claimIntent(
+            {
+              callerScope: operatorScope(input.targetId),
+              targetId: input.targetId,
+            },
+            input.intentId,
+            attemptId,
+          ),
+        ),
+      ),
     );
-    /**
-     * Wait for the gate, but never longer than the fiber lives.
-     *
-     * `supervise`'s own `ensuring` completes the gate on every path its body reaches, so
-     * in normal operation the first branch wins immediately. The second exists for the
-     * one path the body never reaches: a {@link FiberMap} whose scope has closed hands
-     * back an already-interrupted fiber without running anything
-     * (`effect/src/FiberMap.ts`, `constInterruptedFiber`), and a request waiting on that
-     * gate would wait for the life of the process. Which is a shutting-down server
-     * answering nothing instead of answering honestly.
-     *
-     * `Deferred.isDone` rather than letting the race decide, because the two branches can
-     * become ready in the same tick when a run settles very fast: checking the gate means
-     * a completed start is always reported as one, however the race lands.
-     */
-    return yield* Effect.raceFirst(
-      Deferred.await(gate),
-      Effect.andThen(
-        Fiber.await(fiber),
-        Effect.flatMap(Deferred.isDone(gate), (done) =>
-          done
-            ? Deferred.await(gate)
-            : // The one path `supervise`'s body never reached, so its finalizer never ran
-              // and the claim above is still held. Given back here, or a shutting-down
-              // server would leave the folder claimed by a run that never started.
-              Effect.andThen(
-                releaseWorkspace(input.workspace, ids.attemptId),
-                Effect.fail(
-                  new RunRefused({
-                    reason: "store_unavailable",
-                    detail:
-                      "this server is shutting down and is no longer starting runs; nothing was prompted",
-                  }),
+    if (claimed._tag === "Failure") return yield* refuse(claimed.failure);
+    const claim: ClaimResult = claimed.success;
+    let handedOver = false;
+
+    return yield* Effect.gen(function* () {
+      /**
+       * Which harness this run gets, decided before the folder is claimed or anything is
+       * written.
+       *
+       * The order and the reasons are on {@link chooseHarness}: the operator's explicit
+       * pick, then the intent's suggestion, then the default. An explicit pick that cannot
+       * be had is refused `harness_not_ready`, naming the instance, and never falls back —
+       * running on one the operator did not pick would write provenance nobody could trust,
+       * which is the whole reason migration `0014` records the instance at all. A
+       * *suggestion* that cannot be had falls back and the result says so.
+       *
+       * Still ahead of the workspace claim, so a refusal leaves no folder held, no attempt
+       * row, and — now — an intent that is `open` again.
+       */
+      const chosen = yield* Effect.result(
+        chooseHarness(
+          resolver,
+          {
+            instanceId: input.instanceId,
+            model: input.model,
+            modelOptions: input.modelOptions,
+          },
+          claim.suggestion,
+        ),
+      );
+      if (chosen._tag === "Failure") return yield* refuse(chosen.failure);
+      const choice = chosen.success;
+      if (choice.fallback !== null) {
+        yield* Effect.logWarning(
+          "an intent suggested a harness this server could not give it; the default was used",
+          {
+            intentId: claim.intentId,
+            requested: choice.fallback.requested,
+            reason: choice.fallback.reason,
+          },
+        );
+      }
+      const dispatch: Dispatch = {
+        ...input,
+        model: choice.model,
+        modelOptions: choice.modelOptions,
+        goal: claim.goal,
+        question: claim.question,
+        task: claim.question,
+        fallback: choice.fallback,
+      };
+      const ids = {
+        goalId: claim.goalId,
+        intentId: claim.intentId,
+        attemptId,
+        workerId,
+      };
+
+      /**
+       * The folder, claimed before anything else happens.
+       *
+       * Synchronously: the reasoning is on {@link claimedWorkspaces}. Refusing
+       * here means a second concurrent run in one engagement's folder writes *nothing at
+       * all* — no gate installed over the first run's, no attempt row, nothing for a sweep
+       * to find.
+       */
+      const busy = yield* workspaceClaim(input.workspace, {
+        attemptId,
+        targetId: input.targetId,
+      });
+      if (busy !== undefined) return yield* busy;
+
+      const gate = yield* Deferred.make<RunStarted, RunRefused>();
+      // Forked, not run: this is the line that detaches the run from the request. The
+      // fiber is a daemon of the layer's scope rather than a child of this fiber, so
+      // writing the response below cannot interrupt it.
+      const fiber = fork(
+        attemptId,
+        supervise(dispatch, ids, gate, choice.resolved),
+      );
+      handedOver = true;
+      /**
+       * Wait for the gate, but never longer than the fiber lives.
+       *
+       * `supervise`'s own `ensuring` completes the gate on every path its body reaches, so
+       * in normal operation the first branch wins immediately. The second exists for the
+       * one path the body never reaches: a {@link FiberMap} whose scope has closed hands
+       * back an already-interrupted fiber without running anything
+       * (`effect/src/FiberMap.ts`, `constInterruptedFiber`), and a request waiting on that
+       * gate would wait for the life of the process. Which is a shutting-down server
+       * answering nothing instead of answering honestly.
+       *
+       * `Deferred.isDone` rather than letting the race decide, because the two branches can
+       * become ready in the same tick when a run settles very fast: checking the gate means
+       * a completed start is always reported as one, however the race lands.
+       */
+      return yield* Effect.raceFirst(
+        Deferred.await(gate),
+        Effect.andThen(
+          Fiber.await(fiber),
+          Effect.flatMap(Deferred.isDone(gate), (done) =>
+            done
+              ? Deferred.await(gate)
+              : // The one path `supervise`'s body never reached, so its finalizer never ran
+                // and the claims above are still held. Given back here, or a shutting-down
+                // server would leave the folder claimed by a run that never started, and
+                // the intent claimed by an attempt that does not exist.
+                Effect.andThen(
+                  Effect.andThen(
+                    releaseWorkspace(input.workspace, attemptId),
+                    giveBack(input.targetId, claim.intentId, attemptId),
+                  ),
+                  Effect.fail(
+                    new RunRefused({
+                      reason: "store_unavailable",
+                      detail:
+                        "this server is shutting down and is no longer starting runs; nothing was prompted",
+                    }),
+                  ),
                 ),
-              ),
+          ),
+        ),
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.suspend(() =>
+          handedOver
+            ? Effect.void
+            : giveBack(input.targetId, claim.intentId, attemptId),
         ),
       ),
     );
