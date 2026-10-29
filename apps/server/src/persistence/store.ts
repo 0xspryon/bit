@@ -4376,6 +4376,207 @@ const makeStore = Effect.fnUntraced(function* () {
     }));
   });
 
+  /* ── The same four reads, scoped to a goal ─────────────────────────────────── */
+
+  // A goal briefing needs every intent of the goal at once (the spec's decision 11), and
+  // each of the four below is its `*ForIntent` sibling with the raising side's intent
+  // joined to its goal.
+  //
+  // **What this does not do is find rows the per-intent reads would have missed.** All
+  // four select by the *raising* side, and so do their siblings: `selectSchedulesForIntent`
+  // is `WHERE raising.intent_id = ?` over *any* declaring intent, which is the design the
+  // `0009` relaxation needs and which `briefing.ts` documents. Because a dimension belongs
+  // to one observation and an observation to one intent, running the `*ForIntent` reads
+  // over every intent of a goal and concatenating yields the same sets — including a
+  // dimension raised under one intent and declared by a sibling, which is `scheduled`
+  // either way.
+  //
+  // What the goal-scoped shape buys is the assembly, and that is worth the four statements:
+  //
+  // - **One statement instead of N + 1.** The caller does not have to read the intent list
+  //   first and then fan out per intent, and a goal with thirty intents is four queries
+  //   rather than a hundred and twenty.
+  // - **One ascending order across the goal.** The observations arrive as the single
+  //   sequence they were written in, not as N groups a caller would have to merge — and
+  //   that ascending order is what makes a later briefing an extension of an earlier one.
+  // - **One pass over a complete set.** `openQuestionsOf` is called once, over every
+  //   dimension, link and declaration the goal holds, so the tail is grouped by dimension
+  //   id in one place. Concatenating N partial answers would put the merge, and the
+  //   question of whether it de-duplicated correctly, in the caller.
+
+  const selectObservationsForGoal = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: StoredObservationRow,
+    execute: (goalId) =>
+      sql.unsafe(
+        // A subquery rather than a join: `observationColumns` is bare column names, and
+        // joining `intents` would make `id`, `target_id` and `created_at` ambiguous.
+        `SELECT ${observationColumns} FROM observations
+          WHERE intent_id IN (SELECT id FROM intents WHERE goal_id = ?)
+          ORDER BY sequence`,
+        [goalId],
+      ),
+  });
+
+  /**
+   * Every observation under any intent of one goal, ascending by sequence.
+   *
+   * Ascending across the whole goal, not grouped by intent: the sequence is the target's
+   * own write order, so this is the order the evidence was actually recorded in. Which
+   * intent each belongs to is on the observation's provenance.
+   */
+  const observationsForGoal = Effect.fn("ObservationStore.observationsForGoal")(
+    function* (goalId: string) {
+      const rows = yield* selectObservationsForGoal(goalId).pipe(
+        Effect.mapError(lift("observations", `goal:${goalId}`)),
+      );
+      return yield* Effect.forEach(rows, toObservation);
+    },
+  );
+
+  const selectLinksForGoal = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: DimensionLinkRow,
+    execute: (goalId) =>
+      sql`SELECT links.observation_id, links.dimension_id, links.address,
+            links.created_at,
+            addressing.sequence AS addressing_sequence,
+            addressing.outcome AS addressing_outcome
+          FROM observation_dimension_links AS links
+          INNER JOIN observation_dimensions AS dimensions
+            ON dimensions.id = links.dimension_id
+          INNER JOIN observations AS raising
+            ON raising.id = dimensions.observation_id
+          INNER JOIN intents AS raisingIntent
+            ON raisingIntent.id = raising.intent_id
+          INNER JOIN observations AS addressing
+            ON addressing.id = links.observation_id
+          WHERE raisingIntent.goal_id = ${goalId}
+          ORDER BY raising.sequence, dimensions.position, addressing.sequence`,
+  });
+
+  /**
+   * Every link that addresses a dimension raised under any intent of one goal.
+   *
+   * Selected by the *raising* side, like {@link dimensionLinksForIntent} and for the same
+   * reason: the addressing observation may sit under a sibling intent, or under another
+   * goal entirely, and selecting by it would hide the link the same-intent relaxation
+   * (migration `0009`) exists to allow.
+   */
+  const dimensionLinksForGoal = Effect.fn(
+    "ObservationStore.dimensionLinksForGoal",
+  )(function* (goalId: string) {
+    const rows = yield* selectLinksForGoal(goalId).pipe(
+      Effect.mapError(lift("observation_dimension_links", `goal:${goalId}`)),
+    );
+    return rows.map((row): DimensionLink => ({
+      observationId: row.observation_id,
+      dimensionId: row.dimension_id,
+      address: row.address,
+      addressingSequence: row.addressing_sequence,
+      addressingOutcome: row.addressing_outcome,
+    }));
+  });
+
+  const selectDimensionsForGoal = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: StoredDimensionRow,
+    execute: (goalId) =>
+      sql`SELECT dimensions.id, dimensions.observation_id, dimensions.position,
+            dimensions.text, dimensions.created_at
+          FROM observation_dimensions AS dimensions
+          INNER JOIN observations AS raising
+            ON raising.id = dimensions.observation_id
+          INNER JOIN intents AS raisingIntent
+            ON raisingIntent.id = raising.intent_id
+          WHERE raisingIntent.goal_id = ${goalId}
+          ORDER BY raising.sequence, dimensions.position`,
+  });
+
+  /**
+   * Every dimension raised under any intent of one goal, in graph order.
+   *
+   * **One row per dimension, by construction.** A dimension belongs to exactly one
+   * observation and an observation to exactly one intent, so neither join can multiply a
+   * row and no de-duplication step is needed or performed here. Two observations that
+   * recorded the same sentence recorded two dimensions and stay two rows — see
+   * `openQuestionsOf`, which is where that rule is written down.
+   */
+  const dimensionsForGoal = Effect.fn("ObservationStore.dimensionsForGoal")(
+    function* (goalId: string) {
+      const rows = yield* selectDimensionsForGoal(goalId).pipe(
+        Effect.mapError(lift("observation_dimensions", `goal:${goalId}`)),
+      );
+      return rows.map((row): StoredDimension => ({
+        dimensionId: row.id,
+        observationId: row.observation_id,
+        position: row.position,
+        text: row.text,
+        address: dimensionAddress(row.observation_id, row.position),
+      }));
+    },
+  );
+
+  const selectSchedulesForGoal = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      dimension_id: Schema.String,
+      intent_id: Schema.String,
+      question: Schema.String,
+      attempts_total: Schema.Int,
+      attempts_open: Schema.Int,
+    }),
+    execute: (goalId) =>
+      sql`SELECT declaring.addresses_dimension AS dimension_id,
+            declaring.id AS intent_id,
+            declaring.question AS question,
+            COUNT(attempts.id) AS attempts_total,
+            COALESCE(SUM(
+              CASE WHEN attempts.status IN ('running', 'uncertain') THEN 1 ELSE 0 END
+            ), 0) AS attempts_open
+          FROM intents AS declaring
+          INNER JOIN observation_dimensions AS dimensions
+            ON dimensions.id = declaring.addresses_dimension
+          INNER JOIN observations AS raising
+            ON raising.id = dimensions.observation_id
+          INNER JOIN intents AS raisingIntent
+            ON raisingIntent.id = raising.intent_id
+          LEFT JOIN attempts ON attempts.intent_id = declaring.id
+          WHERE raisingIntent.goal_id = ${goalId}
+          GROUP BY declaring.id, declaring.addresses_dimension, declaring.question
+          ORDER BY declaring.created_at, declaring.id`,
+  });
+
+  /**
+   * Every intent that declared it addresses a dimension raised under this goal, with how
+   * much of its work is still outstanding.
+   *
+   * Selected by the raising side's goal, like the three above, so a dimension raised under
+   * one intent and taken on by a *sibling* intent of the same goal comes back here. So does
+   * it from {@link dimensionSchedulesForIntent}, which selects by the raising side too —
+   * this read is not what makes that dimension `scheduled`. What it is, is every such
+   * declaration for every dimension of the goal in one answer, keyed by dimension id, which
+   * is what lets the briefing's tail be grouped in a single pass.
+   *
+   * The declaring intent is not restricted to this goal: what the row reports is that
+   * somebody declared this dimension, and `intentId` says who, so a reader can see a
+   * cross-goal declaration rather than have it dropped.
+   */
+  const dimensionSchedulesForGoal = Effect.fn(
+    "ObservationStore.dimensionSchedulesForGoal",
+  )(function* (goalId: string) {
+    const rows = yield* selectSchedulesForGoal(goalId).pipe(
+      Effect.mapError(lift("intents", `goal:${goalId}`)),
+    );
+    return rows.map((row): DimensionScheduleRow => ({
+      dimensionId: row.dimension_id,
+      intentId: row.intent_id,
+      question: row.question,
+      attemptsTotal: row.attempts_total,
+      attemptsOpen: row.attempts_open,
+    }));
+  });
+
   const selectSequence = SqlSchema.findOneOption({
     Request: Schema.String,
     Result: SequenceRow,
@@ -5304,6 +5505,10 @@ const makeStore = Effect.fnUntraced(function* () {
     dimensionLinksForIntent,
     dimensionsForIntent,
     dimensionSchedulesForIntent,
+    observationsForGoal,
+    dimensionLinksForGoal,
+    dimensionsForGoal,
+    dimensionSchedulesForGoal,
     currentSequence,
     currentEventSequence,
     loadIntent,
@@ -5549,6 +5754,35 @@ export class ObservationStore extends Context.Service<
     >;
     readonly dimensionSchedulesForIntent: (
       intentId: string,
+    ) => Effect.Effect<
+      readonly DimensionScheduleRow[],
+      DatabaseError | StoredRowError
+    >;
+    /**
+     * The same four reads over every intent of one goal, for the goal briefing.
+     *
+     * Not the `*ForIntent` reads in a loop: `dimensionSchedulesForGoal` is what makes a
+     * dimension's state derivable across the goal rather than per intent, and
+     * `observationsForGoal` returns one ascending sequence rather than N groups. See the
+     * block comment above the statements.
+     */
+    readonly observationsForGoal: (
+      goalId: string,
+    ) => Effect.Effect<readonly Observation[], DatabaseError | StoredRowError>;
+    readonly dimensionLinksForGoal: (
+      goalId: string,
+    ) => Effect.Effect<
+      readonly DimensionLink[],
+      DatabaseError | StoredRowError
+    >;
+    readonly dimensionsForGoal: (
+      goalId: string,
+    ) => Effect.Effect<
+      readonly StoredDimension[],
+      DatabaseError | StoredRowError
+    >;
+    readonly dimensionSchedulesForGoal: (
+      goalId: string,
     ) => Effect.Effect<
       readonly DimensionScheduleRow[],
       DatabaseError | StoredRowError

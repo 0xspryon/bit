@@ -90,6 +90,7 @@ import { join } from "node:path";
 import { API_PREFIX } from "@bit/contracts";
 import { Effect, Latch, Layer } from "effect";
 
+import { DEFAULT_GOAL_BRIEFING_MAX_CHARS } from "./briefing/goalBriefing";
 import { browserApiRoutes } from "./http/browserApi";
 import {
   BrowserSessions,
@@ -221,6 +222,36 @@ const PLANNER_ROUND_BUDGET = ((raw: string | undefined): number => {
   }
   return parsed;
 })(process.env["PLANNER_ROUND_BUDGET"]);
+
+/**
+ * The ceiling on a rendered goal briefing, in characters, from `GOAL_BRIEFING_MAX_CHARS`.
+ *
+ * **320 000 by default**, which is `briefing/goalBriefing.ts`'s
+ * `DEFAULT_GOAL_BRIEFING_MAX_CHARS`. It is a bound on the planner's whole input: a goal
+ * briefing omits nothing, so the only thing standing between a long investigation and a
+ * prompt no provider will take is this number. Above it the briefing is **refused naming
+ * both figures** rather than shortened, because a planner given a silently shorter brief
+ * would reason from a gap it cannot see.
+ *
+ * Characters rather than tokens, and that is an approximation stated as one: no tokenizer
+ * exists on this seam, since the brief is tokenised inside whichever provider the round's
+ * harness is pointed at. The reasoning is written out on the default constant.
+ *
+ * An unparseable or non-positive value falls back to the default and says so, like
+ * {@link PLANNER_ROUND_BUDGET}. A ceiling of `NaN` would refuse every briefing, including
+ * the ones that are nowhere near it.
+ */
+const GOAL_BRIEFING_MAX_CHARS = ((raw: string | undefined): number => {
+  if (raw === undefined) return DEFAULT_GOAL_BRIEFING_MAX_CHARS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.error(
+      `GOAL_BRIEFING_MAX_CHARS='${raw}' is not a positive whole number; using the default of ${String(DEFAULT_GOAL_BRIEFING_MAX_CHARS)}`,
+    );
+    return DEFAULT_GOAL_BRIEFING_MAX_CHARS;
+  }
+  return parsed;
+})(process.env["GOAL_BRIEFING_MAX_CHARS"]);
 
 /**
  * The configured server password, read and **removed from this process's environment**
@@ -655,6 +686,7 @@ const endpoint = Layer.unwrap(
         port: PORT,
         extraRoutes: browserApiRoutes({
           workspaceRoot: WORKSPACE_ROOT,
+          goalBriefingMaxChars: GOAL_BRIEFING_MAX_CHARS,
         }).pipe(
           Layer.provide(
             CONFIGURED_PASSWORD === undefined
@@ -861,6 +893,9 @@ const program = Effect.gen(function* () {
   const planning = yield* planner.running;
   console.log(
     `  planner rounds supervised right now: ${String(planning.length)} (budget per round: ${String(PLANNER_ROUND_BUDGET)} intent(s), from PLANNER_ROUND_BUDGET)`,
+  );
+  console.log(
+    `  goal briefing ceiling: ${String(GOAL_BRIEFING_MAX_CHARS)} characters, from GOAL_BRIEFING_MAX_CHARS (a goal over it is refused, never shortened)`,
   );
   // Already open if the signal landed while we were still booting, in which case this
   // returns straight away. See `shutdownRequested`.

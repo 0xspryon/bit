@@ -35,6 +35,7 @@ import {
   AttemptNotFound,
   BitApi,
   dimensionsOf,
+  GoalBriefingRefused,
   GoalNotFound,
   GoalRefused,
   IntentNotFound,
@@ -47,6 +48,7 @@ import {
   TargetUnavailable,
   Unauthenticated,
   type AttemptTranscript,
+  type GoalBriefingView,
   type GoalObservationView,
   type GoalView,
   type HarnessInstanceView,
@@ -74,6 +76,10 @@ import {
 } from "./folders";
 import { BrowserSessions } from "./browserSessions";
 import {
+  DEFAULT_GOAL_BRIEFING_MAX_CHARS,
+  buildGoalBriefing,
+} from "../briefing/goalBriefing";
+import {
   FleetStore,
   HUNT_FILE,
   isTargetId,
@@ -81,9 +87,9 @@ import {
 } from "../persistence/fleet";
 import * as identifier from "../persistence/identifier";
 import {
+  ObservationStore,
   operatorScope,
   type MutationError,
-  type ObservationStore,
   type StoredGoal,
   type StoredIntent,
 } from "../persistence/store";
@@ -120,6 +126,16 @@ export interface BrowserApiConfig {
   readonly liveHeartbeat?: Duration.Input | undefined;
   /** How long a caught-up reader waits before reading again. Defaults to `LIVE_SWEEP`. */
   readonly liveSweep?: Duration.Input | undefined;
+  /**
+   * The ceiling on a rendered goal briefing, in characters. Defaults to
+   * {@link DEFAULT_GOAL_BRIEFING_MAX_CHARS}.
+   *
+   * Real configuration, unlike the two above: `main.ts` reads
+   * `GOAL_BRIEFING_MAX_CHARS` and passes it, and the number is reported back on every
+   * briefing so an operator can see what is in force. A goal whose briefing exceeds it is
+   * refused naming both figures, never shortened.
+   */
+  readonly goalBriefingMaxChars?: number | undefined;
 }
 
 /**
@@ -1178,6 +1194,79 @@ const fleetHandlers = HttpApiBuilder.group(
             })),
           })),
         };
+      }),
+
+      /**
+       * The briefing a planner round would be given for this goal.
+       *
+       * Three answers, and each is the one the caller can act on. A goal this target does
+       * not hold is {@link GoalNotFound}, decided here before the briefing is built so the
+       * builder's own `unknown_goal` is unreachable from this route. A briefing over the
+       * ceiling is {@link GoalBriefingRefused} with both numbers and **no briefing**.
+       * Otherwise it is the rendered text with its size and the ceiling beside it.
+       *
+       * `ObservationStore` is provided from the borrowed handle rather than read from this
+       * file's context, which is the arrangement the module header describes: the only way
+       * to reach a target's store here is to pass a target id to the resolver, so which
+       * target a handler reads is answered by the type.
+       */
+      goalBriefing: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const maxChars =
+          config.goalBriefingMaxChars ?? DEFAULT_GOAL_BRIEFING_MAX_CHARS;
+        const built = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            const goal = yield* store.loadGoal(params.goalId);
+            if (goal === undefined || goal.targetId !== row.targetId) {
+              return undefined;
+            }
+            return yield* buildGoalBriefing(params.goalId, maxChars).pipe(
+              Effect.map((prepared) => ({ _tag: "built", prepared }) as const),
+              // Kept as a value so this route can turn it into the contract's refusal.
+              // Everything else stays on the error channel for the `orDie` below, which
+              // is what the sibling goal routes do with the store's own failures.
+              Effect.catchTag("GoalBriefingTooLarge", (refusal) =>
+                Effect.succeed({ _tag: "tooLarge", refusal } as const),
+              ),
+              Effect.provideService(ObservationStore, store),
+            );
+          }),
+        ).pipe(Effect.orDie);
+        if (built === undefined) {
+          return yield* new GoalNotFound({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            detail: `no goal '${params.goalId}' is recorded in this target`,
+          });
+        }
+        if (built._tag === "tooLarge") {
+          const { sizeChars } = built.refusal;
+          return yield* new GoalBriefingRefused({
+            reason: "too_large",
+            goalId: params.goalId,
+            sizeChars,
+            maxChars,
+            detail:
+              `This goal's briefing renders to ${String(sizeChars)} characters, over the ` +
+              `${String(maxChars)}-character ceiling, so none was built. A planner is never ` +
+              `given a shortened briefing: it would reason from a gap it could not see. ` +
+              `Either raise GOAL_BRIEFING_MAX_CHARS on the server, or split this goal into ` +
+              `narrower ones.`,
+          });
+        }
+        const { briefing, rendered } = built.prepared;
+        return {
+          targetId: briefing.targetId,
+          goalId: briefing.goalId,
+          rendered,
+          sizeChars: briefing.sizeChars,
+          maxChars,
+          preparedAtSequence: briefing.preparedAtSequence,
+          intentCount: briefing.intents.length,
+          observationCount: briefing.observations.length,
+          omittedObservationIds: briefing.omittedObservationIds,
+          truncated: briefing.truncated,
+        } satisfies GoalBriefingView;
       }),
 
       /**

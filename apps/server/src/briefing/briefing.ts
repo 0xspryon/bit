@@ -402,6 +402,32 @@ const renderSummary = (observation: SummaryObservation): readonly string[] => [
 ];
 
 /**
+ * One observation's block, minus its heading line.
+ *
+ * Exported because the goal briefing renders the same observation the same way
+ * (`briefing/goalBriefing.ts`), and an observation shown two ways would mean two things to
+ * audit. Only the heading differs between the two callers — the goal briefing names the
+ * intent in it — so the heading is each caller's and everything under it is here.
+ *
+ * `limitations` is the last line deliberately. It qualifies what this observation
+ * established, so it is part of the evidence and immutable with it. The dimensions it left
+ * untested are *forward* work, their visibility changes as they are addressed or disposed
+ * of, and they are therefore rendered once in the volatile tail — see
+ * {@link renderOpenQuestions} and the note above {@link PREPARATION_HEADING}.
+ */
+export const observationBody = (
+  observation: Observation,
+): readonly string[] => [
+  `- outcome: ${observation.outcome} — relative to the tested claim only`,
+  `- tested claim: ${observation.testedClaim}`,
+  ...(observation._tag === "caseBased"
+    ? renderCaseBased(observation)
+    : renderSummary(observation)),
+  `- worker interpretation (not established fact): ${observation.interpretation}`,
+  `- limitations: ${list(observation.limitations)}`,
+];
+
+/**
  * Renders a briefing as the text a fresh session receives.
  *
  * Each observation keeps its tested claim, outcome, cases, bounds and limitations side
@@ -434,19 +460,7 @@ export const renderBriefing = (briefing: Briefing): string => {
     lines.push(
       ``,
       `### ${observation.observationId} (sequence ${observation.sequence})`,
-      `- outcome: ${observation.outcome} — relative to the tested claim only`,
-      `- tested claim: ${observation.testedClaim}`,
-      ...(observation._tag === "caseBased"
-        ? renderCaseBased(observation)
-        : renderSummary(observation)),
-      `- worker interpretation (not established fact): ${observation.interpretation}`,
-      // `limitations` is the last line of a block deliberately. It qualifies what this
-      // observation established, so it is part of the evidence and immutable with it.
-      // The dimensions it left untested are *forward* work, their visibility changes as
-      // they are addressed or disposed of, and they are therefore rendered once in the
-      // volatile tail — see `renderOpenQuestions` and the note above
-      // `PREPARATION_HEADING`.
-      `- limitations: ${list(observation.limitations)}`,
+      ...observationBody(observation),
     );
   }
 
@@ -504,12 +518,16 @@ const STATUS_HEADINGS: ReadonlyArray<
 /**
  * Renders the addressable open questions, grouped by how far each has been taken.
  *
+ * Exported for the goal briefing, which groups the goal's whole tail by the same four
+ * statuses with the same wording. What is *not* shared with it is the selection: these
+ * lines describe questions somebody else chose.
+ *
  * Every question prints its address, because that address is what a worker has to send
  * back in `addresses_dimensions` to claim it. Guessing is not an option by design: an
  * address that does not resolve is refused at the write boundary, so the briefing is
  * the only place a worker can get one.
  */
-const renderOpenQuestions = (
+export const renderOpenQuestions = (
   questions: readonly OpenQuestion[],
 ): readonly string[] => {
   if (questions.length === 0) {

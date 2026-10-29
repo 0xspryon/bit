@@ -18,6 +18,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  GoalBriefingRefused,
   GoalNotFound,
   GoalRefused,
   IntentRefused,
@@ -37,6 +38,7 @@ import {
   AT,
   FakeServer,
   attemptTranscript,
+  goalBriefingView,
   goalView,
   harnessInstance,
   intentView,
@@ -1231,6 +1233,147 @@ describe("goals", () => {
     expect(app.openGoalId).toBe("goal_a");
     app.closeGoal();
     expect(app.openGoalId).toBe("");
+  });
+});
+
+/* ── The goal briefing panel ─────────────────────────────────────────────────── */
+
+/**
+ * The planner's input for the open goal, as the panel's state rather than as text.
+ *
+ * What is pinned here is the app's half: that opening a goal reads the briefing and
+ * leaving it clears the panel, that an over-the-ceiling refusal keeps both numbers and
+ * no briefing, that a refusal carrying no figures has none invented for it, and that an
+ * answer for a goal the operator has left is dropped.
+ *
+ * **These drive `FakeServer`, which implements `ServerClient` directly, so none of them
+ * exercises `client.ts`.** Whether a `409 GoalBriefingRefused` is classified as a
+ * refusal at all is that module's judgement and is covered in `clientRefusals.test.ts`
+ * against a stubbed `fetch`. The two halves are separate on purpose: it was the gap
+ * between them that let the panel report a connectivity failure for a typed 409 while
+ * the block below passed.
+ */
+describe("the goal briefing", () => {
+  /** Signs in, opens a target holding one goal, and opens that goal. */
+  const onGoal = async (): Promise<[App, FakeServer]> => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onHarnesses = () => ok([harnessInstance()]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1" })] });
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+    return [app, fake];
+  };
+
+  test("opening a goal reads its briefing, and leaving it puts the panel back", async () => {
+    const [app, fake] = await onGoal();
+
+    expect(app.goalBriefingState).toBe("ready");
+    expect(app.goalBriefingGoalId).toBe("goal_1");
+    expect(app.goalBriefing?.rendered).toContain("# Planner briefing");
+    expect(app.goalBriefing?.sizeChars).toBe(app.goalBriefing?.rendered.length);
+    expect(app.goalBriefing?.maxChars).toBe(320_000);
+    expect(app.goalBriefing?.omittedObservationIds).toEqual([]);
+    expect(app.goalBriefing?.truncated).toBe(false);
+    expect(
+      fake.calls.find((call) => call.method === "goalBriefing")?.args,
+    ).toEqual([expect.any(String), "acme-corp", "goal_1"]);
+
+    app.closeGoal();
+    expect(app.goalBriefing).toBeUndefined();
+    expect(app.goalBriefingGoalId).toBe("");
+    expect(app.goalBriefingState).toBe("idle");
+  });
+
+  test("over the ceiling keeps both numbers and no briefing at all", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1" })] });
+    fake.onGoalBriefing = () =>
+      refused(
+        new GoalBriefingRefused({
+          reason: "too_large",
+          goalId: "goal_1",
+          sizeChars: 400_000,
+          maxChars: 320_000,
+          detail: "This goal's briefing renders to 400000 characters.",
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+
+    expect(app.goalBriefingState).toBe("failed");
+    // The two figures are kept as numbers so the panel names them without parsing prose.
+    expect(app.goalBriefingSize).toBe(400_000);
+    expect(app.goalBriefingCeiling).toBe(320_000);
+    expect(app.goalBriefingDetail).toContain("400000");
+    // Nothing is shown in place of the briefing: there is no shorter version of it.
+    expect(app.goalBriefing).toBeUndefined();
+  });
+
+  test("a failed read says so without numbers it was not given", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1" })] });
+    fake.onGoalBriefing = () =>
+      refused(
+        new GoalNotFound({
+          targetId: "acme-corp",
+          goalId: "goal_1",
+          detail: "no goal 'goal_1' is recorded in this target",
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+
+    expect(app.goalBriefingState).toBe("failed");
+    expect(app.goalBriefingDetail).toContain("no goal 'goal_1'");
+    // Not every refusal carries figures, and the panel must not invent them.
+    expect(app.goalBriefingSize).toBeUndefined();
+    expect(app.goalBriefingCeiling).toBeUndefined();
+  });
+
+  test("an answer for a goal the operator has left is dropped", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({
+        goals: [
+          goalView({ targetId, goalId: "goal_1" }),
+          goalView({ targetId, goalId: "goal_2" }),
+        ],
+      });
+    fake.onGoalBriefing = (_baseUrl, targetId, goalId) =>
+      ok(
+        goalBriefingView({
+          targetId,
+          goalId,
+          rendered: `# Planner briefing for ${goalId}`,
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    const release = fake.hold("goalBriefing");
+    app.openGoal("goal_1");
+    app.openGoal("goal_2");
+    release();
+    await settle();
+
+    expect(app.goalBriefing?.goalId).toBe("goal_2");
+    expect(app.goalBriefing?.rendered).toContain("goal_2");
   });
 });
 

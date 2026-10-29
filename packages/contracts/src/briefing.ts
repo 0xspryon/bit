@@ -9,6 +9,7 @@
  */
 import { Schema } from "effect";
 
+import { IntentStatus } from "./intent";
 import { Observation, ObservationOutcome } from "./observation";
 
 /**
@@ -158,3 +159,113 @@ export const Briefing = Schema.Struct({
   openQuestions: Schema.Array(OpenQuestion),
 });
 export type Briefing = typeof Briefing.Type;
+
+/* ── The goal briefing ───────────────────────────────────────────────────────── */
+
+/**
+ * One intent of the goal, as the briefing carries it.
+ *
+ * Deliberately not `IntentView`: that one is a screen's row and carries counts, a
+ * suggestion and a claim holder. This is what a planner needs to know about a direction
+ * that already exists — what it asks, how far it has got, what evidence it hangs off, and
+ * which open question it was created to answer — so a round does not propose a direction
+ * the goal is already carrying.
+ *
+ * `addressesDimension` is the wire alias, the same string {@link OpenQuestion.address}
+ * prints, so the two can be matched by identity rather than by wording.
+ */
+export const GoalBriefingIntent = Schema.Struct({
+  intentId: Schema.String,
+  /** The actionable direction, verbatim. */
+  question: Schema.String,
+  status: IntentStatus,
+  /** Observation ids this intent was anchored to, in the order they were given. */
+  anchoredTo: Schema.Array(Schema.String),
+  /** The dimension alias this intent declared it addresses, or null for none. */
+  addressesDimension: Schema.NullOr(Schema.String),
+});
+export type GoalBriefingIntent = typeof GoalBriefingIntent.Type;
+
+/**
+ * Everything one goal holds, as a planner round's input (the spec's decision 11).
+ *
+ * **This is not {@link Briefing} with a different key, and the difference is the
+ * selection.** An intent briefing is bounded: it selects newest-first up to a limit,
+ * lists what it dropped in `omittedObservationIds`, and sets `truncated`. A goal briefing
+ * selects nothing. Every intent of the goal and every observation under all of them is
+ * here in full, because a planner choosing the goal's next direction is reasoning about
+ * the shape of the whole record and a gap it cannot see would be the one thing it could
+ * not account for. Above the configured ceiling the server refuses to build one at all
+ * rather than shortening it.
+ *
+ * `omittedObservationIds` and `truncated` are therefore constant — `[]` and `false`. They
+ * are kept rather than dropped because a constant is a claim that can be checked: an
+ * empty list says "nothing was dropped" in a form a test and a reader can both verify,
+ * where an absent field would make completeness unfalsifiable. Nothing in this codebase
+ * sets either to anything else.
+ */
+export const GoalBriefing = Schema.Struct({
+  targetId: Schema.String,
+  goalId: Schema.String,
+  /** The goal's short label, or `""` when the operator gave none. */
+  name: Schema.String,
+  /** The objective, in the operator's words. Not settled by any observation below. */
+  description: Schema.String,
+  /** The graph sequence this briefing was prepared at. Provenance, not a snapshot. */
+  preparedAtSequence: Schema.Number,
+  /** Every intent under the goal, oldest first, including settled and abandoned ones. */
+  intents: Schema.Array(GoalBriefingIntent),
+  /**
+   * Every observation under every intent of the goal, **ascending by sequence**.
+   *
+   * One ascending list across the goal rather than per-intent groups: the sequence is the
+   * target's own write order, so this is the order the evidence was recorded in, and a
+   * briefing built after one more observation lands is this list with one entry appended.
+   * Which intent each belongs to is on its own provenance.
+   */
+  observations: Schema.Array(Observation),
+  /**
+   * Always empty, and kept for that reason.
+   *
+   * A goal briefing omits nothing below the ceiling, so there is never an id to put here.
+   * The field stays because an empty list is a *checkable* claim that nothing was
+   * dropped: a reader and a test can both assert it, where an absent field would make
+   * "complete" unfalsifiable. Above the ceiling nothing is returned at all, so this is
+   * never a partial disclosure of a shortened brief.
+   */
+  omittedObservationIds: Schema.Array(Schema.String),
+  /** Always false, kept for the same reason {@link omittedObservationIds} is. */
+  truncated: Schema.Boolean,
+  /**
+   * Every untested dimension raised anywhere under the goal, with its state derived from
+   * the whole goal.
+   *
+   * One row per dimension *identity*, across every intent of the goal. A dimension raised
+   * under one intent and declared by a sibling intent of the same goal is `scheduled` here
+   * — as it also is in that intent's own {@link Briefing}, which derives the same answer
+   * from the same stored declaration. What is different is the scope of the list: this one
+   * holds every dimension the goal has raised, grouped in one pass, where N intent
+   * briefings hold N partial lists.
+   *
+   * Nothing is collapsed by wording: two observations that recorded the same sentence
+   * recorded two dimensions and stay two rows, exactly as in
+   * {@link Briefing.openQuestions}. The de-duplication is on dimension id and nothing
+   * else, which is what `addresses_dimension` exists to make possible.
+   */
+  openQuestions: Schema.Array(OpenQuestion),
+  /**
+   * How many characters the rendered briefing is.
+   *
+   * Carried so the operator watches the brief grow towards the ceiling instead of
+   * discovering the wall when a round is refused. It is the length of the rendered text
+   * and **not** printed inside it: a number that described the text it sits in would both
+   * be its own fixed point and move every byte after it on each write, which is what
+   * prefix stability costs to lose.
+   *
+   * Characters, not tokens, because no tokenizer exists on this seam. A character count is
+   * an approximation of what a model will be charged for, and it is the honest kind: it is
+   * visibly not a token count rather than a token count that is quietly wrong.
+   */
+  sizeChars: Schema.Int,
+});
+export type GoalBriefing = typeof GoalBriefing.Type;

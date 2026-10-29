@@ -32,6 +32,7 @@ import {
   type AttemptTranscript,
   LIVE_SILENCE_LIMIT_SECONDS,
   type GoalEndStatus,
+  type GoalBriefingView,
   type GoalObservationView,
   type GoalView,
   type HarnessInstanceView,
@@ -333,6 +334,33 @@ export class App {
   openGoalView = $derived(
     this.goals.find((goal) => goal.goalId === this.openGoalId),
   );
+
+  /* ── The goal briefing ────────────────────────────────────────────────────── */
+  /**
+   * What a planner round would be given for the open goal, as the server last rendered it.
+   *
+   * One goal's at a time, like {@link intents}: {@link goalBriefingGoalId} says whose, and
+   * nothing reads this without agreeing with {@link openGoalId}. It is the server's
+   * rendering and is never assembled here — the panel's whole claim is that it is showing
+   * the text the planner gets, and a browser that built any part of it could not make that
+   * claim.
+   */
+  goalBriefing = $state<GoalBriefingView | undefined>(undefined);
+  goalBriefingGoalId = $state("");
+  goalBriefingState = $state<GoalsState>("idle");
+  /**
+   * Why there is no briefing, in the server's words.
+   *
+   * Carries the over-the-ceiling refusal as well as a failed read, because to the panel
+   * they are the same shape of answer: a sentence instead of a briefing. The two numbers
+   * are in {@link goalBriefingSize} and {@link goalBriefingCeiling} so the panel can name
+   * them without parsing the sentence.
+   */
+  goalBriefingDetail = $state("");
+  /** The rendered size the refusal named, or `undefined` when the failure had no size. */
+  goalBriefingSize = $state<number | undefined>(undefined);
+  /** The ceiling the refusal named. Also `undefined` for a failure that had none. */
+  goalBriefingCeiling = $state<number | undefined>(undefined);
 
   /* ── Intents ──────────────────────────────────────────────────────────────── */
   /**
@@ -1014,6 +1042,17 @@ export class App {
     this.goalEnding = false;
     this.goalEndDetail = "";
     this.#clearIntents();
+    this.#clearGoalBriefing();
+  }
+
+  /** Puts every goal-briefing field back where a fresh goal leaves it. */
+  #clearGoalBriefing() {
+    this.goalBriefing = undefined;
+    this.goalBriefingGoalId = "";
+    this.goalBriefingState = "idle";
+    this.goalBriefingDetail = "";
+    this.goalBriefingSize = undefined;
+    this.goalBriefingCeiling = undefined;
   }
 
   /** Puts every intent field back where a fresh goal leaves it. */
@@ -1106,10 +1145,13 @@ export class App {
     this.goalEndStatus = "met";
     this.goalEndReason = "";
     this.goalEndDetail = "";
-    // The previous goal's intents must not be on screen under this one's heading.
+    // The previous goal's intents must not be on screen under this one's heading, and the
+    // same goes for its briefing — which names its own goal in its first lines.
     this.#clearIntents();
+    this.#clearGoalBriefing();
     void this.refreshGoal(goalId);
     void this.loadIntents(goalId);
+    void this.loadGoalBriefing(goalId);
   }
 
   closeGoal() {
@@ -1117,6 +1159,7 @@ export class App {
     this.goalEndOpen = false;
     this.goalEndDetail = "";
     this.#clearIntents();
+    this.#clearGoalBriefing();
   }
 
   /** Replaces one goal in the list with the server's current answer about it. */
@@ -1316,6 +1359,67 @@ export class App {
     }
     this.intents = call.value.intents.map((intent) => ({ ...intent }));
     this.intentsState = "ready";
+  }
+
+  /**
+   * Reads the open goal's briefing into {@link goalBriefing}.
+   *
+   * **It reads. It does not navigate**, like {@link loadIntents}: it asks about the goal
+   * the view already names and drops an answer for a goal or target the operator has since
+   * left. The previous briefing is kept while it reloads *if it is this goal's*, so a
+   * refresh after an observation lands does not blank the panel being read.
+   *
+   * The over-the-ceiling refusal is handled as an answer rather than as a broken read,
+   * because that is what it is: the server built the briefing, measured it, and declined
+   * to hand it over. Both numbers are kept so the panel names them.
+   */
+  async loadGoalBriefing(goalId: string) {
+    const targetId = this.viewTargetId;
+    if (targetId === "" || this.openGoalId !== goalId) return;
+    if (this.goalBriefingGoalId !== goalId) {
+      this.goalBriefing = undefined;
+      this.goalBriefingGoalId = goalId;
+    }
+    this.goalBriefingState = "loading";
+    this.goalBriefingDetail = "";
+    this.goalBriefingSize = undefined;
+    this.goalBriefingCeiling = undefined;
+
+    const call = await this.client.goalBriefing(
+      this.serverUrl,
+      targetId,
+      goalId,
+    );
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+
+    if (call._tag === "Unreachable") {
+      this.goalBriefing = undefined;
+      this.goalBriefingState = "failed";
+      this.goalBriefingDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      if (call.error._tag === "GoalBriefingRefused") {
+        this.goalBriefingSize = call.error.sizeChars;
+        this.goalBriefingCeiling = call.error.maxChars;
+      }
+      // Cleared, not kept: a briefing that is over the ceiling has no shorter version, and
+      // leaving the last readable one on screen would show a planner input that no longer
+      // exists.
+      this.goalBriefing = undefined;
+      this.goalBriefingState = "failed";
+      this.goalBriefingDetail = this.#refusalText(
+        call.error,
+        "This goal's briefing could not be read.",
+      );
+      return;
+    }
+    this.goalBriefing = { ...call.value };
+    this.goalBriefingState = "ready";
   }
 
   /** Reads what the add-intent form can anchor to: the open goal's observations. */
@@ -2190,6 +2294,7 @@ export class App {
         ? next.slice(next.length - App.LIVE_KEPT)
         : next;
     this.#refreshIntentsFor(targetId, frame);
+    this.#refreshGoalBriefingFor(targetId, frame);
   }
 
   /**
@@ -2216,6 +2321,36 @@ export class App {
       void this.loadIntents(this.openGoalId);
       void this.refreshGoal(this.openGoalId);
     }
+  }
+
+  /**
+   * Re-reads the open goal's briefing when something that is *in* it has changed.
+   *
+   * A narrower trigger than {@link #refreshIntentsFor}'s, and separate from it, because a
+   * briefing is the one read here whose response is allowed to be hundreds of kilobytes:
+   * it is re-read when an observation lands (the body grows) or when an intent appears,
+   * goes or changes hands (the tail moves), and not for the rest. `goal.ended` is not
+   * among them — a briefing carries no goal status, so ending one does not change its
+   * text.
+   *
+   * Guarded on `liveCaughtUp` for the reason the intents refresh is: opening a target
+   * replays its whole recent record, and a briefing read per historical observation would
+   * be a request storm that says nothing one read at the end does not.
+   */
+  #refreshGoalBriefingFor(targetId: string, frame: LiveItem) {
+    if (!this.liveCaughtUp || this.viewTargetId !== targetId) return;
+    if (this.openGoalId === "") return;
+    if (
+      frame.kind !== "observation.recorded" &&
+      frame.kind !== "run.started" &&
+      frame.kind !== "run.settled" &&
+      frame.kind !== "intent.added" &&
+      frame.kind !== "intent.abandoned" &&
+      frame.kind !== "intent.released"
+    ) {
+      return;
+    }
+    void this.loadGoalBriefing(this.openGoalId);
   }
 
   /**

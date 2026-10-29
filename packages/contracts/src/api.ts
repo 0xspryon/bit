@@ -724,6 +724,75 @@ export class GoalRefused extends Schema.TaggedError<GoalRefused>()(
   }
 }
 
+/**
+ * The briefing a planner round would be given for one goal, and how big it is.
+ *
+ * **The rendered text, not the structured briefing.** A planner round is prompted with
+ * `rendered` and nothing else, so that string is what "exactly what the planner will be
+ * given" means and what the panel shows. The structured `GoalBriefing` is not on the wire
+ * beside it: it would roughly double a payload that is allowed to reach `maxChars`, to
+ * carry the same facts a second time for a reader that renders text. The few structured
+ * fields a reader has to be able to *check* rather than read are here as fields.
+ *
+ * `sizeChars` is `rendered.length` and `maxChars` is this installation's ceiling, so a
+ * panel can show how close a goal is to it without a second request.
+ */
+export const GoalBriefingView = Schema.Struct({
+  targetId: Schema.String,
+  goalId: Schema.String,
+  /** The exact text a planner round receives. */
+  rendered: Schema.String,
+  /** Its length in characters. An approximation of cost: see the server's module note. */
+  sizeChars: Schema.Int,
+  /** The ceiling in force, from `GOAL_BRIEFING_MAX_CHARS`. Over it, this is a refusal. */
+  maxChars: Schema.Int,
+  /** The graph sequence it was prepared at. Provenance, not a snapshot. */
+  preparedAtSequence: Schema.Number,
+  /** How many intents the text carries. */
+  intentCount: Schema.Int,
+  /** How many observations it carries, which is every one the goal holds. */
+  observationCount: Schema.Int,
+  /**
+   * Always empty, and on the wire for that reason: an empty list is the checkable form of
+   * "nothing was dropped", where an absent field would make completeness unfalsifiable.
+   */
+  omittedObservationIds: Schema.Array(Schema.String),
+  /** Always false, kept for the same reason. */
+  truncated: Schema.Boolean,
+});
+export type GoalBriefingView = typeof GoalBriefingView.Type;
+
+/**
+ * The goal's briefing is too big to hand a planner, so none was built.
+ *
+ * **A refusal rather than a shorter briefing, which is the whole point.** A planner given
+ * a silently-shortened brief would reason from a gap it cannot see, so the server returns
+ * nothing and names both numbers: what the briefing rendered to, and the ceiling it went
+ * over. An operator can then raise `GOAL_BRIEFING_MAX_CHARS`, or split the goal, with the
+ * actual figures in hand rather than a guess.
+ *
+ * `409`, like {@link GoalRefused}: the request is well formed and the state of the world
+ * is what stops it. Not a `413`, which is about a request body, and not a `500`, which
+ * would claim the server is broken when it is working exactly as configured.
+ */
+export class GoalBriefingRefused extends Schema.TaggedError<GoalBriefingRefused>()(
+  "GoalBriefingRefused",
+  {
+    reason: Schema.Literals(["too_large"]),
+    goalId: Schema.String,
+    /** What the briefing rendered to, in characters. */
+    sizeChars: Schema.Int,
+    /** The ceiling it exceeded. */
+    maxChars: Schema.Int,
+    detail: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {
+  override get message(): string {
+    return `${this.reason} (${this.goalId}): ${this.detail}`;
+  }
+}
+
 /* ── Intents ─────────────────────────────────────────────────────────────────── */
 
 /**
@@ -1220,6 +1289,32 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
           observations: Schema.Array(GoalObservationView),
         }),
         error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * The briefing a planner round would be given for one goal.
+     *
+     * Read-only, and the planner's input object built before anything consumes it: an
+     * operator can see exactly what a round will be prompted with, and how close it is to
+     * the ceiling, rather than finding out when a round refuses.
+     *
+     * **It omits nothing** (the spec's decision 11). Every intent of the goal and every
+     * observation under all of them, in full. Over `GOAL_BRIEFING_MAX_CHARS` it is
+     * {@link GoalBriefingRefused} naming both numbers and carrying no briefing at all,
+     * because a shortened brief is the failure this route exists to make impossible.
+     */
+    HttpApiEndpoint.get(
+      "goalBriefing",
+      "/targets/:targetId/goals/:goalId/briefing",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        success: GoalBriefingView,
+        error: [
+          GoalBriefingRefused,
+          GoalNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
       },
     ),
     /**

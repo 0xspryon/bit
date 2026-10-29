@@ -168,8 +168,21 @@ export type Call<A, E> =
   | { readonly _tag: "Refused"; readonly error: E }
   | { readonly _tag: "Unreachable"; readonly detail: string };
 
-/** Tags the server defines. Anything else in the error channel is transport trouble. */
-const REFUSAL_TAGS = new Set([
+/**
+ * Tags the server defines. Anything else in the error channel is transport trouble.
+ *
+ * **This is an allow-list, and that is its one hazard.** A typed error the contract
+ * declares and this set omits is not a compile error: it is a well-formed answer from the
+ * server reported to the operator as "No server answered at this address", with the
+ * server's own carefully written sentence thrown away. Three tags were missing when that
+ * was first noticed — `GoalBriefingRefused`, `IntentRefused` and `IntentNotFound` — and
+ * each produced exactly that.
+ *
+ * So the set is no longer maintained by hand alone. `clientRefusals.test.ts` reads every
+ * tagged error the contract exports and asserts that this set and {@link NOT_REFUSALS}
+ * together account for all of them, with nothing stale in either. Exported for that test.
+ */
+export const REFUSAL_TAGS = new Set([
   "SessionRefused",
   "Unauthenticated",
   "PathRefused",
@@ -190,7 +203,32 @@ const REFUSAL_TAGS = new Set([
   // answers the goals screen puts in a sentence next to the control that caused them.
   "GoalNotFound",
   "GoalRefused",
+  // A goal briefing over the configured ceiling. **It has to be here or the panel lies.**
+  // The server built the briefing, measured it, and declined to hand it over — that is an
+  // answer carrying two numbers the panel prints, and classifying it as transport trouble
+  // would tell an operator no server answered when one answered precisely.
+  "GoalBriefingRefused",
+  // Intents: an intent this target does not hold, and one that cannot be changed because a
+  // run holds it or it is already answered or abandoned. `IntentRefused`'s `detail` is the
+  // store's own sentence and **is written to teach** — it says what an offending anchor id
+  // actually is and what to do instead — so classifying it as transport trouble replaced
+  // the one instruction an operator needed with a connectivity complaint.
+  "IntentNotFound",
+  "IntentRefused",
 ]);
+
+/**
+ * Error tags the contract declares that this client deliberately does **not** treat as
+ * refusals, each against the reason why.
+ *
+ * **Empty, and that is a claim rather than a placeholder.** Every error any endpoint
+ * declares is an answer one of the screens puts in a sentence, so there is nothing to put
+ * here, and `clientRefusals.test.ts` asserts that this is still true. The map exists so a
+ * genuine exception has to be written down by name with its reason — rather than left out
+ * of {@link REFUSAL_TAGS}, which is indistinguishable from forgetting, and which is how all
+ * three of the missing tags came to be missing.
+ */
+export const NOT_REFUSALS: Readonly<Record<string, string>> = {};
 
 const isRefusal = (error: unknown): boolean =>
   typeof error === "object" &&
@@ -418,6 +456,20 @@ export const server = {
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.goalObservations({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * The briefing a planner round would be given for one goal: the rendered text, its size
+   * and the ceiling.
+   *
+   * Refused as `GoalBriefingRefused` when the briefing would exceed the ceiling, and that
+   * refusal carries no briefing — the server never shortens one.
+   */
+  goalBriefing: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.goalBriefing({ params: { targetId, goalId } }),
       ),
     ),
 

@@ -87,6 +87,17 @@ const fleetRoot = join(base, "fleet");
 const workspaceRoot = join(base, "workspace");
 const outside = join(base, "outside");
 
+/**
+ * The goal-briefing ceiling this suite configures, far below the shipped 320 000.
+ *
+ * Deliberately small, because the refusal above the ceiling is the behaviour worth
+ * driving over the wire and crossing the real default would take about a hundred recorded
+ * observations per test. A handful of writes crosses this one. It is also the only way to
+ * prove the number is *threaded*: the route reports the ceiling in force, so a response
+ * saying 320 000 here would mean `browserApiRoutes` was ignoring its own configuration.
+ */
+const SUITE_BRIEFING_CEILING = 12_000;
+
 const POLICY: PolicyConfig = {
   forbiddenPathFragments: ["out-of-scope/"],
   hostScope: { _tag: "hosts", allowed: ["127.0.0.1"] },
@@ -186,7 +197,10 @@ const endpoint = Layer.unwrap(
   Effect.map(Effect.context<RunNarrations>(), (shared) =>
     ControlPlaneEndpoint.layer({
       policy: POLICY,
-      extraRoutes: browserApiRoutes({ workspaceRoot }).pipe(
+      extraRoutes: browserApiRoutes({
+        workspaceRoot,
+        goalBriefingMaxChars: SUITE_BRIEFING_CEILING,
+      }).pipe(
         Layer.provide(BrowserSessions.layer),
         // The same resolver the server builds, over the same registry: the route under test is
         // the one that opens a target's own file, so a stub here would test the stub.
@@ -2569,6 +2583,7 @@ describe("a goal's intents", () => {
     const targetId = await freshTarget();
     for (const [method, path, body] of [
       ["GET", `/targets/${targetId}/goals/g/intents`, undefined],
+      ["GET", `/targets/${targetId}/goals/g/briefing`, undefined],
       ["POST", `/targets/${targetId}/goals/g/intents`, draft()],
       ["POST", `/targets/${targetId}/intents/i/abandon`, { reason: "" }],
     ] as const) {
@@ -2580,9 +2595,10 @@ describe("a goal's intents", () => {
     }
   });
 
-  test("an unopenable target refuses the three routes the way every other route does", async () => {
+  test("an unopenable target refuses these routes the way every other route does", async () => {
     for (const [method, path, body] of [
       ["GET", "/targets/no-such-target/goals/g/intents", undefined],
+      ["GET", "/targets/no-such-target/goals/g/briefing", undefined],
       ["POST", "/targets/no-such-target/goals/g/intents", draft()],
       ["POST", "/targets/no-such-target/intents/i/abandon", { reason: "" }],
     ] as const) {
@@ -2675,6 +2691,206 @@ describe("what an intent refusal is allowed to claim", () => {
     );
     expect(JSON.stringify(exit)).toContain("IntentNotFound");
     expect(JSON.stringify(exit)).toContain("no intent int_x exists");
+  });
+});
+
+describe("a goal's planner briefing", () => {
+  let counter = 0;
+
+  /** A target, and so a database, of its own per test. See the intents block's note. */
+  const freshTarget = async () => {
+    counter += 1;
+    const name = `briefing-${String(counter)}`;
+    mkdirSync(join(workspaceRoot, name), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: { workspacePath: join(workspaceRoot, name), name, scopeNote: "" },
+      }),
+    );
+    expect(created.status).toBe(200);
+    return name;
+  };
+
+  const newGoal = async (targetId: string) => {
+    const created = await read(
+      await signedIn(`/targets/${targetId}/goals`, {
+        method: "POST",
+        body: {
+          name: "Login limiter",
+          description: "Can the login limiter be bypassed?",
+        },
+      }),
+    );
+    expect(created.status).toBe(201);
+    return String(created.body["goalId"]);
+  };
+
+  /** The target's own file through a store of our own, for what no route writes. */
+  const withHunt = <A, E>(
+    targetId: string,
+    use: (store: ObservationStore["Service"]) => Effect.Effect<A, E>,
+  ) =>
+    Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(ObservationStore, use).pipe(
+          Effect.provide(
+            ObservationStore.layer(
+              join(fleetRoot, "targets", targetId, HUNT_FILE),
+            ),
+          ),
+        ),
+      ),
+    );
+
+  /** `count` observations under one intent of the goal, seeded directly. */
+  const seedObservations = (
+    targetId: string,
+    goalId: string,
+    intentId: string,
+    count: number,
+  ) =>
+    withHunt(targetId, (store) =>
+      Effect.gen(function* () {
+        yield* store.seedAttempt({
+          targetId,
+          goalId,
+          goal: "Can the login limiter be bypassed?",
+          intentId,
+          question: `Probe the limiter, from ${intentId}.`,
+          attemptId: `att_${intentId}`,
+          workerId: `wk_${intentId}`,
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt",
+          modelOptions: null,
+          harnessSessionId: null,
+        });
+        const caller: AttemptCaller = {
+          _tag: "attempt",
+          callerScope: `${targetId}/att_${intentId}`,
+          targetId,
+          intentId,
+          attemptId: `att_${intentId}`,
+          harnessSessionId: `ses_${intentId}`,
+          workerId: `wk_${intentId}`,
+          attemptFence: 0,
+        };
+        for (let index = 0; index < count; index += 1) {
+          yield* store.recordObservation(
+            caller,
+            multiCaseInput({ operationId: `${intentId}-${String(index)}` }),
+          );
+        }
+      }),
+    );
+
+  test("an empty goal is a briefing that says so, with its size and the ceiling", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+
+    const response = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/briefing`),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      targetId,
+      goalId,
+      maxChars: SUITE_BRIEFING_CEILING,
+      intentCount: 0,
+      observationCount: 0,
+      omittedObservationIds: [],
+      truncated: false,
+    });
+    const rendered = String(response.body["rendered"]);
+    // Not an error and not blank: the text says the graph has nothing yet.
+    expect(rendered).toContain("Nothing has been recorded under this goal yet");
+    expect(rendered).toContain("Can the login limiter be bypassed?");
+    expect(response.body["sizeChars"]).toBe(rendered.length);
+  });
+
+  test("the text carries every observation of every intent, and says nothing was omitted", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    await seedObservations(targetId, goalId, "int_a", 1);
+    await seedObservations(targetId, goalId, "int_b", 1);
+
+    const response = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/briefing`),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      intentCount: 2,
+      observationCount: 2,
+      omittedObservationIds: [],
+      truncated: false,
+    });
+    const rendered = String(response.body["rendered"]);
+    expect(rendered).toContain("under intent int_a");
+    expect(rendered).toContain("under intent int_b");
+    expect(rendered).toContain("Observations above: 2. Omitted: 0.");
+    // The whole record of each, not a digest of it: a case's interior is on the page.
+    expect(rendered).toContain("case case-saturate:");
+    expect(response.body["sizeChars"]).toBe(rendered.length);
+  });
+
+  test("over the ceiling is a 409 naming both numbers, and carries no briefing", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    await seedObservations(targetId, goalId, "int_a", 1);
+
+    const under = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/briefing`),
+    );
+    expect(under.status).toBe(200);
+    expect(Number(under.body["sizeChars"])).toBeLessThanOrEqual(
+      SUITE_BRIEFING_CEILING,
+    );
+
+    // Enough more that the total is well past the ceiling rather than just over it.
+    await seedObservations(targetId, goalId, "int_b", 5);
+
+    const over = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/briefing`),
+    );
+    expect(over.status).toBe(409);
+    expect(over.body).toMatchObject({
+      _tag: "GoalBriefingRefused",
+      reason: "too_large",
+      goalId,
+      maxChars: SUITE_BRIEFING_CEILING,
+    });
+    expect(Number(over.body["sizeChars"])).toBeGreaterThan(
+      SUITE_BRIEFING_CEILING,
+    );
+    // The sentence an operator reads carries both figures and what to do about it.
+    const detail = String(over.body["detail"]);
+    expect(detail).toContain(String(over.body["sizeChars"]));
+    expect(detail).toContain(String(SUITE_BRIEFING_CEILING));
+    expect(detail).toContain("GOAL_BRIEFING_MAX_CHARS");
+    // Nothing partial rode along: no text, no counts, nothing a client could render as a
+    // briefing.
+    for (const field of ["rendered", "observationCount", "intentCount"]) {
+      expect(over.body).not.toHaveProperty(field);
+    }
+  });
+
+  test("a goal nobody created, and another target's goal, are a 404 that names it", async () => {
+    const targetId = await freshTarget();
+    const other = await freshTarget();
+    const othersGoal = await newGoal(other);
+    for (const goalId of ["goal_nonesuch", othersGoal]) {
+      const response = await read(
+        await signedIn(`/targets/${targetId}/goals/${goalId}/briefing`),
+      );
+      expect(response.status).toBe(404);
+      expect(response.body).toMatchObject({ _tag: "GoalNotFound", goalId });
+    }
+    // The goal is still readable in the target that does hold it.
+    const mine = await read(
+      await signedIn(`/targets/${other}/goals/${othersGoal}/briefing`),
+    );
+    expect(mine.status).toBe(200);
   });
 });
 

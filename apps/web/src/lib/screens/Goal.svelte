@@ -17,8 +17,15 @@
    * are what the goal is *made of* and the end control is what is done to the whole. A run
    * is started from a row of that list; the run box sits under the page (see
    * {@link ComposeBox}).
+   *
+   * The planner briefing sits below the intents and above the end control, because it is
+   * built *from* them: a reader who has just seen the directions and the counts is in a
+   * position to recognise the text as the record of them. It is read-only — nothing on this
+   * page opens a planner round yet — and it is the one section whose content is the
+   * server's string verbatim (see {@link GoalBriefingPanel}).
    */
   import Button from "../components/Button.svelte";
+  import GoalBriefingPanel from "../components/GoalBriefingPanel.svelte";
   import GoalStatusChip from "../components/GoalStatusChip.svelte";
   import IntentList from "../components/IntentList.svelte";
   import PageFrame from "../components/PageFrame.svelte";
@@ -67,6 +74,8 @@
         {/if}
 
         <IntentList {app} />
+
+        <GoalBriefingPanel {app} />
 
         {#if goal.status === "active"}
           <section aria-labelledby="goal-end-heading">

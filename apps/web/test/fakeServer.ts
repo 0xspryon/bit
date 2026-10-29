@@ -26,6 +26,7 @@
 import type {
   AttemptTranscript,
   FolderListing,
+  GoalBriefingView,
   GoalView,
   IntentView,
   HarnessInstanceView,
@@ -135,6 +136,31 @@ export const goalView = (over: Partial<GoalView> = {}): GoalView => ({
   counts: { intents: 0, attempts: 0, observations: 0 },
   ...over,
 });
+
+/**
+ * A goal briefing as the panel sees it: the rendered text, its size and the ceiling.
+ *
+ * `sizeChars` defaults to the length of `rendered` so the fake does not ship a view whose
+ * own two numbers disagree, which is a state the server cannot produce.
+ */
+export const goalBriefingView = (
+  over: Partial<GoalBriefingView> = {},
+): GoalBriefingView => {
+  const rendered = over.rendered ?? "# Planner briefing\n\nTarget: acme-corp\n";
+  return {
+    targetId: "acme-corp",
+    goalId: "goal_1",
+    rendered,
+    sizeChars: rendered.length,
+    maxChars: 320_000,
+    preparedAtSequence: 0,
+    intentCount: 0,
+    observationCount: 0,
+    omittedObservationIds: [],
+    truncated: false,
+    ...over,
+  };
+};
 
 export const intentView = (over: Partial<IntentView> = {}): IntentView => ({
   intentId: "intent-1",
@@ -492,6 +518,13 @@ export class FakeServer implements ServerClient {
     goalId: string,
   ) => Answer<"goalObservations"> = () => ok({ observations: [] });
 
+  onGoalBriefing: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+  ) => Answer<"goalBriefing"> = (_baseUrl, targetId, goalId) =>
+    ok(goalBriefingView({ targetId, goalId }));
+
   onCreateIntent: (
     ...args: Parameters<ServerClient["createIntent"]>
   ) => Answer<"createIntent"> = (_baseUrl, _targetId, goalId, draft) =>
@@ -598,6 +631,11 @@ export class FakeServer implements ServerClient {
   goalObservations = (baseUrl: string, targetId: string, goalId: string) =>
     this.record("goalObservations", [baseUrl, targetId, goalId], () =>
       this.onGoalObservations(baseUrl, targetId, goalId),
+    );
+
+  goalBriefing = (baseUrl: string, targetId: string, goalId: string) =>
+    this.record("goalBriefing", [baseUrl, targetId, goalId], () =>
+      this.onGoalBriefing(baseUrl, targetId, goalId),
     );
 
   createIntent = (...args: Parameters<ServerClient["createIntent"]>) =>

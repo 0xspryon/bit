@@ -4966,3 +4966,239 @@ describe("telling three kinds of caller apart", () => {
     expect(outcome.stored[0]?.provenance.attemptId).toBe("attempt-1");
   });
 });
+
+describe("the four goal-scoped reads", () => {
+  const HOST = { callerScope: operatorScope("target-1"), targetId: "target-1" };
+
+  /**
+   * One goal with two intents, each with its own attempt, and a second goal beside it.
+   *
+   * The second goal exists so every assertion below is also a statement that the reads
+   * are scoped: a statement that forgot its `goal_id` would pass against one goal.
+   */
+  const withTwoGoals = <A, E>(
+    use: (
+      store: Store,
+      callers: {
+        first: AttemptCaller;
+        second: AttemptCaller;
+        other: AttemptCaller;
+      },
+    ) => Effect.Effect<A, E>,
+  ) =>
+    withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* migrated(store);
+        yield* store.seedAttempt({
+          targetId: "target-1",
+          goalId: "goal-1",
+          goal: "Determine whether authentication rate limits can be bypassed.",
+          intentId: "intent-2",
+          question: "Probe the per-account limiter on POST /login.",
+          attemptId: "attempt-2",
+          workerId: "worker-1",
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          modelOptions: null,
+          harnessSessionId: null,
+        });
+        yield* store.seedAttempt({
+          targetId: "target-1",
+          goalId: "goal-2",
+          goal: "An unrelated objective in the same target.",
+          intentId: "intent-9",
+          question: "Something else entirely.",
+          attemptId: "attempt-9",
+          workerId: "worker-1",
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          modelOptions: null,
+          harnessSessionId: null,
+        });
+        return yield* use(store, {
+          first: CALLER,
+          second: {
+            ...CALLER,
+            callerScope: "target-1/attempt-2",
+            intentId: "intent-2",
+            attemptId: "attempt-2",
+          },
+          other: {
+            ...CALLER,
+            callerScope: "target-1/attempt-9",
+            intentId: "intent-9",
+            attemptId: "attempt-9",
+          },
+        });
+      }),
+    );
+
+  test("observationsForGoal spans every intent of the goal, ascending, and no other goal's", async () => {
+    const outcome = await withTwoGoals((store, callers) =>
+      Effect.gen(function* () {
+        // Interleaved across the two intents, so "ascending by sequence" is a different
+        // answer from "grouped by intent".
+        const written: string[] = [];
+        for (const [caller, tag] of [
+          [callers.first, "a"],
+          [callers.second, "b"],
+          [callers.first, "c"],
+        ] as const) {
+          const recorded = yield* store.recordObservation(
+            caller,
+            multiCaseInput({ operationId: `op-${tag}` }),
+          );
+          written.push(recorded.observationId);
+        }
+        yield* store.recordObservation(
+          callers.other,
+          multiCaseInput({ operationId: "op-other" }),
+        );
+        return {
+          written,
+          forGoal: yield* store.observationsForGoal("goal-1"),
+          forOther: yield* store.observationsForGoal("goal-2"),
+          forMissing: yield* store.observationsForGoal("goal-nonesuch"),
+        };
+      }),
+    );
+
+    expect(outcome.forGoal.map((item) => item.observationId)).toEqual(
+      outcome.written,
+    );
+    expect(outcome.forGoal.map((item) => item.provenance.intentId)).toEqual([
+      "intent-1",
+      "intent-2",
+      "intent-1",
+    ]);
+    const sequences = outcome.forGoal.map((item) => item.sequence);
+    expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+    expect(outcome.forOther).toHaveLength(1);
+    expect(outcome.forMissing).toEqual([]);
+  });
+
+  test("dimensionsForGoal is one row per dimension across the goal, and links follow the raising side", async () => {
+    const outcome = await withTwoGoals((store, callers) =>
+      Effect.gen(function* () {
+        const raiser = yield* store.recordObservation(
+          callers.first,
+          multiCaseInput({
+            operationId: "raise",
+            untestedDimensions: ["left untested one", "left untested two"],
+          }),
+        );
+        const address = `${raiser.observationId}#u0`;
+        // Addressed from a *sibling* intent of the same goal, which is the case a read
+        // selected by the addressing side would have dropped. The sibling has to have been
+        // created declaring the address — the write boundary refuses it otherwise — so it
+        // is added through `addIntent` and then given an attempt of its own.
+        yield* store.addIntent(HOST, {
+          operationId: "declare-addresser",
+          goalId: "goal-1",
+          intentId: "intent-3",
+          question: "Take on the dimension the first intent left open.",
+          anchorObservationIds: [],
+          addressesDimension: address,
+        });
+        yield* store.seedAttempt({
+          targetId: "target-1",
+          goalId: "goal-1",
+          goal: "Determine whether authentication rate limits can be bypassed.",
+          intentId: "intent-3",
+          question: "Take on the dimension the first intent left open.",
+          attemptId: "attempt-3",
+          workerId: "worker-1",
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          modelOptions: null,
+          harnessSessionId: null,
+        });
+        const addresser = yield* store.recordObservation(
+          {
+            ...callers.first,
+            callerScope: "target-1/attempt-3",
+            intentId: "intent-3",
+            attemptId: "attempt-3",
+          },
+          multiCaseInput({
+            operationId: "address",
+            outcome: "negative",
+            // Raises nothing of its own, so the count below is only the first
+            // observation's two.
+            untestedDimensions: [],
+            addressesDimensions: [address],
+          }),
+        );
+        return {
+          raiserId: raiser.observationId,
+          addresserId: addresser.observationId,
+          address,
+          dimensions: yield* store.dimensionsForGoal("goal-1"),
+          links: yield* store.dimensionLinksForGoal("goal-1"),
+          otherDimensions: yield* store.dimensionsForGoal("goal-2"),
+        };
+      }),
+    );
+
+    // Two dimensions, each exactly once: a dimension belongs to one observation and an
+    // observation to one intent, so neither join can multiply a row.
+    expect(outcome.dimensions).toHaveLength(2);
+    expect(outcome.dimensions.map((item) => item.address)).toEqual([
+      `${outcome.raiserId}#u0`,
+      `${outcome.raiserId}#u1`,
+    ]);
+    expect(
+      new Set(outcome.dimensions.map((item) => item.dimensionId)).size,
+    ).toBe(2);
+    expect(outcome.links).toHaveLength(1);
+    expect(outcome.links[0]).toMatchObject({
+      observationId: outcome.addresserId,
+      address: outcome.address,
+      addressingOutcome: "negative",
+    });
+    expect(outcome.otherDimensions).toEqual([]);
+  });
+
+  test("dimensionSchedulesForGoal finds a declaration from any intent of the goal", async () => {
+    const outcome = await withTwoGoals((store, callers) =>
+      Effect.gen(function* () {
+        const raiser = yield* store.recordObservation(
+          callers.first,
+          multiCaseInput({
+            operationId: "raise",
+            untestedDimensions: ["left untested one"],
+          }),
+        );
+        const address = `${raiser.observationId}#u0`;
+        yield* store.addIntent(HOST, {
+          operationId: "declare",
+          goalId: "goal-1",
+          intentId: "intent-3",
+          question: "Take on the dimension the first intent left open.",
+          anchorObservationIds: [],
+          addressesDimension: address,
+        });
+        return {
+          schedules: yield* store.dimensionSchedulesForGoal("goal-1"),
+          perIntent: yield* store.dimensionSchedulesForIntent("intent-1"),
+          otherGoal: yield* store.dimensionSchedulesForGoal("goal-2"),
+        };
+      }),
+    );
+
+    expect(outcome.schedules).toHaveLength(1);
+    expect(outcome.schedules[0]).toMatchObject({
+      intentId: "intent-3",
+      attemptsTotal: 0,
+      attemptsOpen: 0,
+    });
+    // The goal-scoped read is a superset of the per-intent one by construction: this
+    // dimension was raised under `intent-1`, so both see it. What the goal read adds is
+    // every *other* intent's dimensions in the same answer.
+    expect(outcome.perIntent).toHaveLength(1);
+    expect(outcome.otherGoal).toEqual([]);
+  });
+});
