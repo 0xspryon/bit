@@ -61,11 +61,19 @@ import type {
  * what happened" has always meant here. It carries the rendered cause for the log only;
  * nothing branches on the text.
  *
- * **Produced by `plan/planSupervisor.ts` today and not by `run/supervisor.ts`.** The
- * attempt supervisor has the same latent inversion on a narrow path — a defect after its
- * finalizer is registered would settle `interrupted` the same way — and it is deliberately
- * not changed here, because the slice that extracted this module is bound to change no
- * attempt behaviour. It is written down rather than left to be rediscovered.
+ * **Produced by both supervisors now.** It reached `plan/planSupervisor.ts` first, and the
+ * note here recorded that `run/supervisor.ts` had the same latent inversion on a narrow
+ * path — a defect after its finalizer is registered settling `interrupted` the same way —
+ * left alone because the slice that extracted this module was bound to change no attempt
+ * behaviour. That constraint has expired and the attempt path now carries the same
+ * `catchCause` guard, in the same shape and for the same reason: one guard around the body,
+ * `Cause.hasInterruptsOnly` re-raising a stop untouched, and the cause re-raised either
+ * way. Writing the inversion down is what made it a five-minute fix rather than a second
+ * discovery.
+ *
+ * The only asymmetry left is the vocabulary: an attempt's `crashed` settles `uncertain`
+ * through {@link settlementFor} and a round's through {@link roundSettlementFor}, which is
+ * the same answer by two tables because the two statuses are different unions.
  */
 export type SupervisionEnd =
   | { readonly _tag: "waited" }

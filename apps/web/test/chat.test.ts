@@ -739,6 +739,15 @@ describe("the goal conversation", () => {
      */
     replayedThrough?: number;
     awaiting?: boolean;
+    /**
+     * Whether anything more can arrive, which is the goal's own status.
+     *
+     * Defaults to `true` — an active goal — because that is the state nearly every case
+     * here is about. The one block that varies it is the write states: `pending` and
+     * `unresolved` are the same row under the two answers, and the hardcoded `true` this
+     * replaced made the second unreachable.
+     */
+    conversationLive?: boolean;
   }) =>
     buildGoalConversation({
       goalId: GOAL,
@@ -748,6 +757,7 @@ describe("the goal conversation", () => {
       sent: input.sent ?? [],
       replayedThrough: input.replayedThrough ?? (input.sent ?? []).length,
       awaiting: input.awaiting ?? false,
+      conversationLive: input.conversationLive ?? true,
     });
 
   test("a goal nobody has talked to has no group at all, not an empty one", () => {
@@ -945,6 +955,184 @@ describe("the goal conversation", () => {
   test("a conversation the replay has not answered for yet reads as loading", () => {
     const view = built({ sent: [sent()], conversation: undefined });
     expect(view.groups[0]?.prose._tag).toBe("loading");
+  });
+
+  /**
+   * The goal agent's own writes, and the merge rule over them.
+   *
+   * **This block exists because nothing in the web suite named a goal-agent tool.** The
+   * merge rule was fixed for the planner's two tools and left broken for the goal agent's,
+   * so a steer and a goal ending rendered twice on this surface for two slices — and a
+   * whole-branch review had to measure it by driving this function with fixtures, because no
+   * test could fail. The lesson slice 8 learned for the planner applies here identically:
+   * the wire name is built by `@bit/contracts` from the goal's own MCP server name, never
+   * typed out, so a fixture cannot assert against a tool-name space the system does not
+   * produce.
+   */
+  describe("the goal agent's write tools", () => {
+    /** The MCP server the goal agent's tools really arrive under: `bit-<goalId>`. */
+    const GOAL_SERVER = bitMcpServerName(GOAL);
+
+    /** One call to a goal-agent tool, named the way a driver names it. */
+    const goalCall = (
+      bare: string,
+      callId: string,
+      driver: "claude-code" | "opencode" = "claude-code",
+      input: string | null = null,
+    ): LiveItem => {
+      const wire =
+        driver === "opencode"
+          ? openCodeToolName(GOAL_SERVER, bare)
+          : claudeCodeToolName(GOAL_SERVER, bare);
+      return activity({
+        kind: "tool.call",
+        // The goal agent's narration is published under the goal subject, so a goal id and
+        // no round id is what reaches this surface.
+        goalId: GOAL,
+        roundId: null,
+        tool: wire,
+        toolName: bareToolName(wire, GOAL_SERVER) ?? null,
+        callId,
+        headline: wire,
+        body: "",
+        input,
+      });
+    };
+
+    /** One record the agent's own write produced, carried by its caller scope's goal. */
+    const goalRecord = (kind: string, body: string): LiveItem =>
+      record({ kind, goalId: GOAL, roundId: null, body });
+
+    test("a steer renders once, as the record, with the call folded into it", () => {
+      /*
+       * Measured as **2** rows before the fix, which is slice 8's I1 surviving on the
+       * surface it was never applied to. `live.ts` declares the pairing on
+       * `plan.round.steered` in so many words — "it is the record half of the
+       * `steer_planner` tool call the agent made" — and the table in `chat.ts` did not
+       * implement it.
+       */
+      const view = built({
+        items: [
+          goalCall("steer_planner", "toolu_steer"),
+          goalRecord("plan.round.steered", "a steer landed on round rnd_1"),
+        ],
+        conversation: conversation(),
+      });
+
+      const rows = view.groups[0]?.rows ?? [];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.item.kind).toBe("plan.round.steered");
+      expect(rows[0]?.item.origin).toBe("record");
+      // The call is kept rather than discarded: it is the only place the directive the
+      // agent passed is, since the record deliberately carries no directive text.
+      expect(rows[0]?.proposedBy?.toolName).toBe("steer_planner");
+      expect(rows[0]?.write).toBe("recorded");
+    });
+
+    test("a goal ending renders once, under the same rule", () => {
+      const view = built({
+        items: [
+          goalCall("end_goal", "toolu_end"),
+          goalRecord("goal.ended", "this goal was ended: met"),
+        ],
+        conversation: conversation(),
+      });
+
+      const rows = view.groups[0]?.rows ?? [];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.item.kind).toBe("goal.ended");
+      expect(rows[0]?.write).toBe("recorded");
+    });
+
+    test("both wire forms reduce, so neither driver renders twice", () => {
+      // The OpenCode form as well as Claude Code's, because the reduction is what the merge
+      // rule is keyed on and a table keyed on the raw name matched neither.
+      const view = built({
+        items: [
+          goalCall("end_goal", "toolu_end", "opencode"),
+          goalRecord("goal.ended", "this goal was ended: met"),
+        ],
+        conversation: conversation(),
+      });
+      expect(view.groups[0]?.rows).toHaveLength(1);
+      expect(view.groups[0]?.rows[0]?.write).toBe("recorded");
+    });
+
+    test("a wake is not a write here, because its record never reaches this chat", () => {
+      /*
+       * The decision, asserted rather than left to fall out of an absent table entry.
+       *
+       * `wake_planner` writes `plan.round.started`, and that event is appended with
+       * `callerScope: null` — so it carries no goal id and does not pass this surface's
+       * filter. Listing it would make every wake read `pending` forever, which is a chat
+       * claiming a write may have been lost when it is simply recorded under the round.
+       */
+      const view = built({
+        items: [goalCall("wake_planner", "toolu_wake")],
+        conversation: conversation(),
+      });
+
+      const rows = view.groups[0]?.rows ?? [];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.item.toolName).toBe("wake_planner");
+      // `null`, which is "not a write on this surface" — not `unresolved`, which would be a
+      // claim that a record went missing.
+      expect(rows[0]?.write).toBeNull();
+    });
+
+    test("a steer the record has not answered is pending, and unresolved once the goal ends", () => {
+      /*
+       * The two states the hardcoded `true` collapsed into one.
+       *
+       * Decision 12's second branch opens a round carrying the directive and writes no
+       * steer event at all, so an unpaired `steer_planner` is the ordinary case rather than
+       * an anomaly. While the goal is active a record may still arrive, so `pending` is
+       * right; once the goal is ended nothing more can, and a row that still said `pending`
+       * would be waiting on a write that will never resolve.
+       */
+      const items = [goalCall("steer_planner", "toolu_steer")];
+      expect(
+        built({ items, conversation: conversation() }).groups[0]?.rows[0]
+          ?.write,
+      ).toBe("pending");
+      expect(
+        built({ items, conversation: conversation(), conversationLive: false })
+          .groups[0]?.rows[0]?.write,
+      ).toBe("unresolved");
+    });
+
+    test("a refused write is refused, not left open", () => {
+      // The harness said the call failed, so the write did not happen and that is a
+      // resolved answer rather than an open question.
+      const view = built({
+        items: [
+          goalCall("end_goal", "toolu_end"),
+          activity({
+            kind: "tool.result",
+            goalId: GOAL,
+            roundId: null,
+            callId: "toolu_end",
+            output: "goal_ended: this goal has already ended",
+            outcome: "failed",
+          }),
+        ],
+        conversation: conversation(),
+      });
+
+      const rows = view.groups[0]?.rows ?? [];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.write).toBe("refused");
+    });
+
+    test("a read the agent made is not a write at all", () => {
+      // The control for the block: eight tools reach this surface and three of them are
+      // writes. A read collapses nothing and carries no write state.
+      const view = built({
+        items: [goalCall("get_goal_briefing", "toolu_read")],
+        conversation: conversation(),
+      });
+      expect(view.groups[0]?.rows[0]?.write).toBeNull();
+    });
   });
 });
 

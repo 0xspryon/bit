@@ -140,7 +140,8 @@ import { WorkerEndpoints } from "../run/supervisor";
  *
  * Five, and the number is a starting point rather than a finding: it is written on the
  * round row so the limit a round was opened under is a fact about that round, and
- * `add_intent` is what enforces it in slice 7 (the spec's decision 10). `main.ts` reads
+ * `add_intent` is what enforces it, inside the write transaction (the spec's decision
+ * 10). `main.ts` reads
  * `PLANNER_ROUND_BUDGET` over it.
  */
 export const DEFAULT_ROUND_BUDGET = 5;
@@ -286,16 +287,71 @@ export interface PlanRoundStopped {
   readonly credentialsRevoked: number;
   /**
    * Authenticated MCP requests this round's credential made, from
-   * {@link McpCallCounter.countFor}.
+   * {@link McpCallCounter.countFor}, or `null` when this process has no settlement for the
+   * round and therefore does not know.
    *
    * **Zero means the round never reached its own tool surface**, which is a different fact
    * from a round that had its tools and chose to say nothing — see {@link settle}, where
    * the figure is read and where the distinction is made for every settlement path rather
    * than only for a stop.
+   *
+   * **`null` is the whole reason this is nullable, and it was reported as `0`.** That
+   * single figure is the entire mitigation for DECISIONS.md §24.2 caveat 1 — the measured
+   * case where an OpenCode registration is connected and not yet callable — so it exists
+   * only to separate "this round never had its tools" from "it had them and said nothing".
+   * A stop whose settlement was not recorded knows neither, and answering `0` there made
+   * "we do not know" indistinguishable from "it never called", which is a false negative on
+   * the one diagnostic that condition has. The companion fields take the same care in their
+   * own way: `status` answers `uncertain` rather than claiming one.
    */
-  readonly toolCallsSeen: number;
+  readonly toolCallsSeen: number | null;
   readonly stoppedAt: number;
 }
+
+/**
+ * What this process recorded about one round's settlement, or nothing.
+ *
+ * Nothing is reachable in one window: the stretch between a round's row being committed
+ * and its first finalizer being registered. An interruption delivered in there settles
+ * nothing and remembers nothing — the startup sweep is what reconciles that row — so a
+ * `stop` that lands on it has a fiber to interrupt and no settlement to report.
+ */
+export interface RememberedSettlement {
+  readonly status: RoundTerminalStatus;
+  readonly grants: number;
+  readonly toolCallsSeen: number;
+}
+
+/**
+ * What a stop answers, from the round's entry and the settlement this process recorded.
+ *
+ * A pure function, exported for the reason `run/settlement.ts`'s table is: the interesting
+ * part is what it says when a source is **absent**, and that is three decisions rather than
+ * three defaults. `status` claims `uncertain` rather than a status it did not observe,
+ * `toolCallsSeen` claims nothing at all, and `targetId` / `harnessSessionId` fall back to
+ * empty strings because a stop with no entry is answering about a round it never held.
+ */
+export const roundStopReport = (input: {
+  readonly roundId: string;
+  readonly held:
+    Pick<RunningRound, "targetId" | "harnessSessionId"> | undefined;
+  readonly settled: RememberedSettlement | undefined;
+  readonly stoppedAt: number;
+}): PlanRoundStopped => ({
+  roundId: input.roundId,
+  targetId: input.held?.targetId ?? "",
+  harnessSessionId: input.held?.harnessSessionId ?? "",
+  // Absent only if the finalizer could not settle, which it reports in the log. The
+  // response says `uncertain` there rather than claiming a status, which is the same answer
+  // the row would carry.
+  status: input.settled?.status ?? "uncertain",
+  credentialsRevoked: input.settled?.grants ?? 0,
+  // From the same `settle` call that wrote the log line, so a stop reports the figure the
+  // log carries rather than re-reading a counter that has moved on — and `null` where there
+  // is no such call, because the alternative is reporting a zero nobody measured.
+  toolCallsSeen: input.settled?.toolCallsSeen ?? null,
+  stoppedAt: input.stoppedAt,
+});
 
 /**
  * What steering a goal's live round came to.
@@ -711,18 +767,8 @@ const make = Effect.fnUntraced(function* (options?: {
    * there. Bounded by {@link SETTLEMENT_MEMORY}, because this is a courtesy for a response
    * body and not a record.
    */
-  const settlements = new Map<
-    string,
-    { status: RoundTerminalStatus; grants: number; toolCallsSeen: number }
-  >();
-  const remember = (
-    roundId: string,
-    outcome: {
-      status: RoundTerminalStatus;
-      grants: number;
-      toolCallsSeen: number;
-    },
-  ): void => {
+  const settlements = new Map<string, RememberedSettlement>();
+  const remember = (roundId: string, outcome: RememberedSettlement): void => {
     settlements.set(roundId, outcome);
     while (settlements.size > SETTLEMENT_MEMORY) {
       const oldest = settlements.keys().next().value;
@@ -788,8 +834,9 @@ const make = Effect.fnUntraced(function* (options?: {
 
     const authority = yield* store.openRound(
       // The host's own authority. A round is opened by whoever asked for it — the operator
-      // today, the goal agent's `wake_planner` in slice 9 — and never by a round
-      // credential: minting one needs the row this call creates.
+      // through `POST /goals/:goalId/plan`, or a goal agent through `wake_planner` and
+      // `steer_planner`'s opened branch — and never by a round credential: minting one needs
+      // the row this call creates.
       { callerScope: operatorScope(input.targetId), targetId: input.targetId },
       {
         goalId: input.goalId,
@@ -1150,22 +1197,59 @@ const make = Effect.fnUntraced(function* (options?: {
      * a warning about a round whose row could not be read would be a claim nobody checked.
      */
     const row = yield* Effect.result(store.loadRound(input.roundId));
+    if (row._tag === "Failure") {
+      /*
+       * The read failed, so this settlement cannot say what the round concluded.
+       *
+       * Logged rather than discarded, which is what it was: a settlement that could not
+       * read its own round said nothing at all about it, on the one path every recovery
+       * story depends on. It is deliberately not an error and not a refusal — the row has
+       * already been settled above and the authority is already revoked, so nothing is left
+       * undone; what is lost is the warning below, and this line is what says so rather
+       * than leaving a silent absence.
+       */
+      yield* Effect.logWarning(
+        "a planner round's own row could not be read back at settlement; the round is settled either way, but this process cannot say whether it concluded anything",
+        {
+          roundId: input.roundId,
+          harnessSessionId: input.harnessSessionId,
+          status,
+          detail: row.failure.message,
+        },
+      );
+    }
     const disposition =
       row._tag === "Success" && row.success !== undefined
         ? row.success.disposition
         : undefined;
     if (toolCallsSeen === 0 && disposition === null) {
+      /*
+       * Zero calls and no conclusion — but *why* that is worth saying depends on how the
+       * round ended, and one sentence for all of them was wrong.
+       *
+       * `waited` is the Spike B case: the session ran to its own finish and never reached
+       * its tools, which is the measured condition §24.2 caveat 1 describes and the only
+       * one that reads as a harness fault. An operator-requested stop and a start that
+       * failed are ordinary: a round stopped ten seconds in has made no call because nobody
+       * gave it time, and a round whose start broke never had a session. Naming the
+       * tool-exposure lag for those was a warning that blamed the wrong thing.
+       */
+      const unreached = input.end._tag === "waited";
       yield* Effect.logWarning(
-        "a planner round settled having concluded nothing and having made no authenticated tool call: its tool surface was never reached, so this is not a planner with nothing to say",
+        unreached
+          ? "a planner round settled having concluded nothing and having made no authenticated tool call: its tool surface was never reached, so this is not a planner with nothing to say"
+          : "a planner round settled having concluded nothing and having made no authenticated tool call, which is expected for how it ended",
         {
           roundId: input.roundId,
           callerScope: roundScope,
           harnessSessionId: input.harnessSessionId,
           status,
+          end: renderEnd(input.end),
           // Named so an operator reading this line once has the reference without
           // grepping for it.
-          cause:
-            "DECISIONS.md §24.2 caveat 1: an OpenCode registration can be connected and not yet callable. Open another round on this goal.",
+          cause: unreached
+            ? "DECISIONS.md §24.2 caveat 1: an OpenCode registration can be connected and not yet callable. Open another round on this goal."
+            : "the round did not run to its own finish, so nothing here says its tools were unreachable",
         },
       );
     }
@@ -1808,21 +1892,14 @@ const make = Effect.fnUntraced(function* (options?: {
     // revokes its authority. So by the time this returns, the things a stop promises have
     // happened — rather than having been scheduled.
     yield* Fiber.interrupt(fiber.value);
-    const settled = settlements.get(roundId);
-    return {
+    // Assembled by the exported rule rather than here, so what a missing settlement answers
+    // is one decision with a test over it. See {@link roundStopReport}.
+    return roundStopReport({
       roundId,
-      targetId: held?.targetId ?? "",
-      harnessSessionId: held?.harnessSessionId ?? "",
-      // Absent only if the finalizer could not settle, which it reports in the log. The
-      // response says `uncertain` there rather than claiming a status, which is the same
-      // answer the row would carry.
-      status: settled?.status ?? "uncertain",
-      credentialsRevoked: settled?.grants ?? 0,
-      // From the same `settle` call that wrote the log line, so a stop reports the figure
-      // the log carries rather than re-reading a counter that has moved on.
-      toolCallsSeen: settled?.toolCallsSeen ?? 0,
+      held,
+      settled: settlements.get(roundId),
       stoppedAt: Date.now(),
-    } satisfies PlanRoundStopped;
+    });
   });
 
   const steer: PlanSupervisor["Service"]["steer"] = Effect.fn(

@@ -96,6 +96,7 @@ import {
   type RunStopped,
 } from "@bit/contracts";
 import {
+  Cause,
   Context,
   Deferred,
   Effect,
@@ -1288,8 +1289,24 @@ const make = Effect.fnUntraced(function* (options?: {
     },
     gate: Deferred.Deferred<RunStarted, RunRefused>,
     resolved: ResolvedHarness,
-  ) =>
-    Effect.scoped(
+  ) => {
+    /**
+     * What the finalizer will settle from, if the wait never gets to say.
+     *
+     * `stopped` is the right default for the *watching* part of the body below: the only
+     * expected way out of it without the wait returning is an interruption, and the only
+     * thing that interrupts this fiber is a stop or the process's scope closing — both of
+     * which are us stopping the run. The paths that leave before the run is being watched
+     * set `startFailed` explicitly, which is what keeps them out of the `interrupted`
+     * bucket: nobody interrupted anything.
+     *
+     * **Declared out here, one per call, so the defect guard below can reach it.** It was a
+     * `let` inside the generator, which is why that guard could not exist — see it for what
+     * it is for, and `run/settlement.ts`'s `crashed` case for the long form. The move is
+     * the whole of the change: nothing reads it earlier and nothing writes it later.
+     */
+    let ending: SupervisionEnd = { _tag: "stopped" };
+    return Effect.scoped(
       Effect.gen(function* () {
         const opened = yield* Effect.result(startHalf(input, ids));
         if (opened._tag === "Failure") {
@@ -1300,15 +1317,6 @@ const make = Effect.fnUntraced(function* (options?: {
         const { store, harnessSessionId, provenance } = opened.success;
         const startedAt = Date.now();
 
-        /**
-         * What the finalizer will settle from, if the wait never gets to say.
-         *
-         * `stopped` is the right default because the only way out of the body below
-         * without the wait returning is an interruption, and the only thing that
-         * interrupts this fiber is a stop or the process's scope closing — both of which
-         * are us stopping the run.
-         */
-        let ending: SupervisionEnd = { _tag: "stopped" };
         /**
          * Where the narration fiber leaves a terminal outcome it saw.
          *
@@ -1481,7 +1489,48 @@ const make = Effect.fnUntraced(function* (options?: {
         // before the settlement round trips, and `report.narrated` is final by the time
         // the finalizer reads it.
         yield* Fiber.interrupt(narrator);
-      }),
+      }).pipe(
+        /**
+         * A defect anywhere in the body above must not be recorded as an interruption.
+         *
+         * **This is one guard for the whole body rather than one per statement, and that is
+         * the point.** The body wraps the failures it expects in `Effect.result`, which
+         * absorbs *typed* failures and not defects — so a thrown `TypeError` in a seam, or
+         * an `Effect.die`, propagates straight out, the scope closes, and the finalizer
+         * settles from whatever `ending` holds. That default is `stopped`, so a crash was
+         * written down as `interrupted`: a durable row claiming the operator stopped an
+         * attempt that in fact crashed, and `interrupted` is the one status
+         * `settlementFor` says is first-hand — the operator asked, we asked the harness,
+         * we revoked the authority. A crash has none of that, and `uncertain` is what "we
+         * cannot say what happened" has always meant here.
+         *
+         * `plan/planSupervisor.ts` carries the identical arrangement and carried it first.
+         * This is the same inversion on the attempt path, which `run/settlement.ts` wrote
+         * down rather than fixed, because the slice that extracted that module was bound to
+         * change no attempt behaviour. That constraint has expired; the note it left has
+         * been brought up to date with this.
+         *
+         * **Interrupts are re-raised untouched**, which is why the predicate is
+         * `hasInterruptsOnly` rather than "is there a defect". A stop and a shutdown both
+         * arrive as interruptions and `stopped` is correct for them; a cause carrying a
+         * defect *and* an interrupt is a crash we then interrupted, and `uncertain` is the
+         * honest answer for it.
+         *
+         * The cause is **re-raised either way.** Swallowing it would hide a bug: the fiber
+         * should die, `tapCause` below should log it, and the `ensuring` that completes the
+         * gate should answer the caller. All this does is correct the record on the way out.
+         */
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.failCause(cause)
+            : Effect.andThen(
+                Effect.sync(() => {
+                  ending = { _tag: "crashed", detail: Cause.pretty(cause) };
+                }),
+                Effect.failCause(cause),
+              ),
+        ),
+      ),
     ).pipe(
       Effect.tapCause((cause) =>
         Effect.logError("a run supervisor ended abnormally", {
@@ -1515,6 +1564,7 @@ const make = Effect.fnUntraced(function* (options?: {
       // value in reach — see this function's header.
       Effect.provideService(AgentHarness, resolved.harness),
     );
+  };
 
   const start: RunSupervisor["Service"]["start"] = Effect.fn(
     "RunSupervisor.start",

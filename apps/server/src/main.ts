@@ -46,11 +46,21 @@
  *
  * **And it can open planner rounds.** `plan/planSupervisor.ts` is the second supervisor in
  * this process and is built beside the first, from the same resolver and the same
- * credential registry. Nothing calls it yet: there is no route and the round's prompt is a
- * stub, because a planner with no tools has nothing to plan with until slice 7 gives it
- * some. What *is* live is the lifecycle — a round in flight is settled when this process
- * stops, and a round a dead process left `running` is reconciled at the next boot, which is
- * what keeps a goal from being blocked by a crash.
+ * credential registry. Three things reach it: `POST /goals/:goalId/plan` from the browser,
+ * and `wake_planner` and `steer_planner` from a goal agent's own session, which cross the
+ * MCP boundary as the two functions `GoalPlanning` carries. A round is prompted with its
+ * goal's objective plus the rendered briefing and is given six tools of its own, on its own
+ * endpoint, in its own directory. The lifecycle is the half that was live first and is
+ * unchanged: a round in flight is settled when this process stops, and a round a dead
+ * process left `running` is reconciled at the next boot, which is what keeps a goal from
+ * being blocked by a crash.
+ *
+ * **And it holds goal conversations.** `plan/goalConversation.ts` is the third thing in
+ * this process that owns harness sessions — one per goal, with a credential that has no
+ * clock expiry and a directory of its own — and the operator talks to it through the
+ * browser. It is not a supervisor: there is no fiber watching a conversation, so what owns
+ * a conversation's lifetime is a `Scope`, and this entrypoint's shutdown closes every one
+ * it was holding.
  *
  * What this entrypoint owns, in one scope, released in reverse on every exit including
  * `SIGINT`:
@@ -132,7 +142,7 @@ import {
   type HarnessCandidate,
 } from "./harness/resolver";
 import { McpCredentials } from "./mcp/credentials";
-import { GoalPlanning } from "./mcp/goalTools";
+import { GoalBriefingCeiling, GoalPlanning } from "./mcp/goalTools";
 import { PlannerHarnesses, plannerHarnessesOf } from "./mcp/plannerTools";
 import { GoalConversations } from "./plan/goalConversation";
 import { DEFAULT_ROUND_BUDGET, PlanSupervisor } from "./plan/planSupervisor";
@@ -212,8 +222,12 @@ const PORT = Number(process.env["PORT"] ?? 3000);
  * starting point rather than a finding. It is read here, with the rest of this process's
  * configuration, and written onto each round's row — so the limit a round was opened under
  * is a fact about that round and not about whatever this variable happens to say later.
- * `add_intent` is what enforces it, in slice 7 (the spec's decision 10); nothing enforces
- * it today, because a round has no tools yet.
+ * **`add_intent` is what enforces it**, inside the write transaction (the spec's decision
+ * 10): `addRoundIntent` re-reads the round's budget and its count in the same transaction
+ * as the insert, and refuses `budget_spent` naming what to do instead. That is the whole
+ * reason the budget is a column rather than a constant — the limit a round was opened under
+ * is a fact about that round. This comment used to say nothing enforced it, which was true
+ * for one slice.
  *
  * An unparseable or non-positive value falls back to the default and says so, rather than
  * opening rounds with a budget of `NaN`. A budget is a ceiling on writes, and a ceiling
@@ -819,6 +833,17 @@ const endpoint = Layer.unwrap(
             openRound: Context.get(shared, RoundOpener).open,
           }),
         ),
+        /**
+         * The ceiling the goal agent's own `get_goal_briefing` reads under.
+         *
+         * **The same number the three other briefing call sites get**, which is the whole
+         * of this line: the panel below and `RoundOpener` already receive
+         * `GOAL_BRIEFING_MAX_CHARS`, and the goal toolkit used to receive nothing and read
+         * the default. An operator who raised the variable then had rounds open fine while
+         * the agent's own read refused, naming a figure that appears nowhere in their
+         * environment. Decision 11 says the *configured* ceiling refuses.
+         */
+        briefingCeiling: GoalBriefingCeiling.at(GOAL_BRIEFING_MAX_CHARS),
         extraRoutes: browserApiRoutes({
           workspaceRoot: WORKSPACE_ROOT,
           goalBriefingMaxChars: GOAL_BRIEFING_MAX_CHARS,

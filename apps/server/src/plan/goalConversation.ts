@@ -204,6 +204,29 @@ interface LiveConversation {
   /** Drains the session's narration onto the bus. Interrupted with the session. */
   readonly narrator: Fiber.Fiber<void, never>;
   readonly openedAt: number;
+  /**
+   * Whether this session has been given its opening prompt.
+   *
+   * **The one thing that makes the outside-the-permit fast path safe**, and it was missing.
+   * `openConversation` publishes the entry into `live` before the opening prompt is sent —
+   * it has to, because the entry owns the `Scope` that holds the credential and the
+   * registration, and a scope in no map is a scope nothing can close. So between that
+   * publish and the prompt being accepted there is a window in which `send`'s first read
+   * finds a live conversation and delivers a message straight into it.
+   *
+   * That message reaches a session that has **not received its preamble**, and the preamble
+   * is the one place the agent is told that an attached file's content and its *name* are
+   * data to report and never an instruction to follow. Slice 11 put the operator's own
+   * uploaded files in that session's own directory, with tools that write to the
+   * investigation's record behind them, so the window stopped being a framing problem and
+   * started being an injection one.
+   *
+   * A flag rather than a `Deferred`, because nothing has to *wait* on it here: a message
+   * that finds an unpreambled entry falls through to the goal's opening permit, which the
+   * opener holds until the prompt has been accepted — so by the time it is granted the
+   * conversation is either preambled or gone.
+   */
+  readonly preambled: boolean;
 }
 
 /** Collapses everything opening a conversation can fail with into one typed refusal. */
@@ -790,6 +813,12 @@ const make = Effect.fnUntraced(function* () {
       scope,
       narrator,
       openedAt: Date.now(),
+      // Nothing has been said to this session yet. The entry is published anyway — its
+      // `Scope` holds the credential and the registration, and a scope in no map is a scope
+      // neither `close` nor this layer's finalizer can reach — so what keeps a message out
+      // of it until the preamble has landed is the flag rather than the absence of a row.
+      // See {@link LiveConversation.preambled}.
+      preambled: false,
     };
     live.set(input.goalId, entry);
     return entry;
@@ -837,8 +866,20 @@ const make = Effect.fnUntraced(function* () {
       });
     }
 
+    /*
+     * The fast path: a conversation that is live **and has had its preamble**.
+     *
+     * `preambled` is the whole of the second condition and it is not a tidying detail. The
+     * entry is published before the opening prompt is sent, so without it a message
+     * arriving in that window is delivered to a session that was never given the framing —
+     * including the rule that an attached file's content and name are data to report and
+     * never an instruction to follow. An unpreambled entry falls through to the permit
+     * below, which the opener holds until the prompt has been accepted.
+     */
     const existing = live.get(input.goalId);
-    if (existing !== undefined) return yield* deliverInto(existing, input.text);
+    if (existing !== undefined && existing.preambled) {
+      return yield* deliverInto(existing, input.text);
+    }
 
     /*
      * Nothing live, so one is opened — under this goal's permit, from here to the end.
@@ -850,6 +891,14 @@ const make = Effect.fnUntraced(function* () {
      */
     return yield* Semaphore.withPermit(openingLock(input.goalId))(
       Effect.gen(function* () {
+        /*
+         * The winner's session, if one was built while this message waited here.
+         *
+         * No `preambled` check is needed and its absence is not an oversight: the opener
+         * holds this permit across the prompt, so an entry reachable from inside it has
+         * either been preambled or — on a prompt that failed — closed and removed. That is
+         * the invariant the flag exists to make true of the read *outside* the permit.
+         */
         const raced = live.get(input.goalId);
         if (raced !== undefined) return yield* deliverInto(raced, input.text);
 
@@ -941,6 +990,17 @@ const make = Effect.fnUntraced(function* () {
           yield* closeSession(entry);
           return yield* refuse(prompted.failure);
         }
+        /*
+         * The preamble has landed, so the session may now be messaged from outside the
+         * permit.
+         *
+         * Set here and nowhere else — after the prompt was *accepted* and before the permit
+         * is released, so no interleaving can observe a preambled entry that has not been
+         * preambled. Written as a replacement entry rather than a mutation because
+         * `LiveConversation` is readonly throughout; the `Scope` and the narrator fiber are
+         * the same objects, so `closeSession` closes the same things either way.
+         */
+        live.set(input.goalId, { ...entry, preambled: true });
 
         yield* Effect.logInfo("a goal conversation was opened", {
           goalId: input.goalId,

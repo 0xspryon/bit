@@ -138,6 +138,55 @@ export class GoalPlanning extends Context.Service<
   );
 }
 
+/**
+ * The ceiling on a rendered goal briefing, as this toolkit sees it.
+ *
+ * **A service rather than a constant, because the number is configuration and this file is
+ * not the composition root.** `get_goal_briefing` built its briefing with
+ * {@link DEFAULT_GOAL_BRIEFING_MAX_CHARS} while the other three call sites threaded what
+ * `GOAL_BRIEFING_MAX_CHARS` says — the panel, `wake_planner`'s opener and
+ * `POST /goals/:goalId/plan` — and a review found both directions of the consequence:
+ *
+ * - **Raised.** Rounds open, the panel renders, and the agent's own read still refuses
+ *   `briefing_too_large` naming 320,000 — a figure the operator never configured and cannot
+ *   find in their environment. The panel's refusal text tells them to raise exactly the
+ *   variable that had no effect here.
+ * - **Lowered.** The read succeeds and hands the agent a full briefing that `wake_planner`
+ *   then refuses, so the agent has read a briefing no round can be opened on.
+ *
+ * Decision 11 says the *configured* ceiling refuses. The tool's own description claims the
+ * two are coupled ("no planner round can be opened on the goal either"), and threading this
+ * is what makes that sentence true.
+ *
+ * It crosses the `mcpApplicationLayer` boundary as an already-built **value**, for
+ * {@link GoalPlanning}'s reason: that layer is built inside `HttpRouter.toWebHandler`'s own
+ * memo map, so anything *provided to* it is built a second time. A number is not expensive
+ * to build twice — the reason it goes the same way is that `main.ts` is the one place
+ * `GOAL_BRIEFING_MAX_CHARS` is read, and a second reader is a second number waiting to
+ * differ (`plan/roundOpener.ts` makes the same argument).
+ */
+export class GoalBriefingCeiling extends Context.Service<
+  GoalBriefingCeiling,
+  { readonly maxChars: number }
+>()("bit/mcp/GoalBriefingCeiling") {
+  /**
+   * The default, for a caller that configures nothing.
+   *
+   * Honest rather than convenient: a server whose operator has not set
+   * `GOAL_BRIEFING_MAX_CHARS` really does bound briefings at
+   * {@link DEFAULT_GOAL_BRIEFING_MAX_CHARS}, and that is the same number every other call
+   * site falls back to.
+   */
+  static readonly default: Layer.Layer<GoalBriefingCeiling> = Layer.succeed(
+    GoalBriefingCeiling,
+    GoalBriefingCeiling.of({ maxChars: DEFAULT_GOAL_BRIEFING_MAX_CHARS }),
+  );
+
+  /** The configured ceiling. `main.ts` is the only production caller. */
+  static readonly at = (maxChars: number): Layer.Layer<GoalBriefingCeiling> =>
+    Layer.succeed(GoalBriefingCeiling, GoalBriefingCeiling.of({ maxChars }));
+}
+
 /* ── The refusal ─────────────────────────────────────────────────────────────── */
 
 /**
@@ -416,9 +465,9 @@ export const GetGoalBriefing = Tool.make("get_goal_briefing", {
     "Read it once and work from it rather than calling this between every message.",
     "",
     "If it is over this server's ceiling the call is refused naming both numbers, and no",
-    "planner round can be opened on the goal either — the operator has to split it. Say",
-    "so plainly if that happens; it is a configuration fact, not something you can work",
-    "around.",
+    "planner round can be opened on the goal either — the same configured ceiling bounds",
+    "both, so the operator has to raise it or split the goal. Say so plainly if that",
+    "happens; it is a configuration fact, not something you can work around.",
   ].join("\n"),
   parameters: Tool.EmptyParams,
   success: GoalBriefingOutcome,
@@ -763,6 +812,9 @@ export const GoalToolkitLayer = GoalToolkit.toLayer(
   Effect.gen(function* () {
     const stores = yield* TargetStores;
     const planning = yield* GoalPlanning;
+    // The configured ceiling, read once here rather than per call: it is a constant for the
+    // life of the process and the figure `get_goal_briefing` refuses by.
+    const briefingCeiling = yield* GoalBriefingCeiling;
 
     /**
      * One permit per `(caller scope, operation id)`, held for the length of one steer.
@@ -1075,10 +1127,11 @@ export const GoalToolkitLayer = GoalToolkit.toLayer(
           stores,
           caller.targetId,
           (store) =>
-            buildGoalBriefing(
-              caller.goalId,
-              DEFAULT_GOAL_BRIEFING_MAX_CHARS,
-            ).pipe(Effect.provideService(ObservationStore, store)),
+            // The **configured** ceiling, not the default: see {@link GoalBriefingCeiling}
+            // for the two ways reading the wrong one was visible to an operator.
+            buildGoalBriefing(caller.goalId, briefingCeiling.maxChars).pipe(
+              Effect.provideService(ObservationStore, store),
+            ),
         );
         return {
           goal_id: prepared.briefing.goalId,

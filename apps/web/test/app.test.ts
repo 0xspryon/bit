@@ -3186,6 +3186,105 @@ describe("the goal conversation", () => {
     expect(app.goalConversationThrough).toBe(0);
   });
 
+  test("leaving a goal and coming back cannot let the old answer swallow a re-sent turn", async () => {
+    /*
+     * The A → B → A navigation, and the reason `replayedThrough` alone could not hold it.
+     *
+     * That bound is a **count** — how many of this tab's turns had been sent when a replay
+     * was asked for — and `#clearGoalConversation` renumbers turns from 1 on every
+     * navigation. So an answer to the first visit's read, landing after the operator has
+     * been to another goal and back, passes the `openGoalId === goalId` guard (it is the
+     * same goal), installs the first visit's count of 1, and makes the second visit's
+     * freshly re-sent turn 1 a cancellation candidate again. If the stale replay happens to
+     * contain that sentence — "ok", "yes", "continue" — the message is delivered and
+     * appears nowhere, which is the exact harm slice 9 called worse than showing it twice.
+     *
+     * A per-visit token is the fix: an answer from a visit nobody is on is dropped whole.
+     *
+     * `holdOne` rather than `hold`, and that is what makes this reproducible at all: the
+     * stale answer has to land **after** the two reads the navigation itself issues, or the
+     * last writer wins and the defect hides.
+     */
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({
+        goals: [
+          goalView({ targetId, goalId: "goal_1" }),
+          goalView({ targetId, goalId: "goal_2" }),
+        ],
+      });
+    fake.onGoalConversation = (_baseUrl, targetId, goalId) =>
+      ok(
+        goalConversationView({
+          targetId,
+          goalId,
+          harnessSessionId: "ses_goal_1",
+          live: true,
+          source: "harness",
+          ephemeral: true,
+          // An "ok" from earlier in the history, which is what a text-only cancellation
+          // fires on.
+          messages: [{ index: 0, type: "user", text: "ok" }],
+          note: "From OpenCode, which may delete it.",
+        }),
+      );
+    fake.onSendGoalMessage = (_baseUrl, targetId, goalId) =>
+      ok(
+        goalTurnAccepted({
+          targetId,
+          goalId,
+          // `continued`, so a send never re-reads the replay: the reads in this test are
+          // exactly the three the navigation makes.
+          conversation: "continued",
+          note: "",
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+
+    // Visit one, with a turn of its own, so the read below is asked for with a count of 1.
+    app.openGoal("goal_1");
+    await settle();
+    app.goalMessage = "ok";
+    await app.sendGoalMessage();
+    expect(app.goalTurns).toHaveLength(1);
+
+    // The stale read: asked for during visit one, parked, and released at the end.
+    const releaseStale = fake.holdOne("goalConversation");
+    void app.loadGoalConversation("goal_1");
+
+    // Away and back. Both visits' own reads answer immediately, because the gate above was
+    // one-shot.
+    app.openGoal("goal_2");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+    // Visit three's turns are numbered from 1 again, which is the whole mechanism.
+    expect(app.goalTurns).toEqual([]);
+
+    app.goalMessage = "ok";
+    await app.sendGoalMessage();
+    expect(app.goalTurns.map((turn) => turn.index)).toEqual([1]);
+
+    // And now the first visit's answer arrives.
+    releaseStale();
+    await settle();
+
+    /*
+     * The operator's own words, still on screen. **This assertion first**, because it is
+     * the harm: without the token this reads `[]` — the message reached the agent and the
+     * chat shows nothing, so the operator cannot tell whether it was sent.
+     */
+    expect(
+      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+    ).toEqual(["ok"]);
+    // The bookkeeping underneath it: the stale answer installed nothing, so the bound is
+    // still visit three's own zero rather than visit one's one.
+    expect(app.goalConversationThrough).toBe(0);
+  });
+
   test("a refused message keeps the text and says why, with no turn invented", async () => {
     const [app] = await onGoal((fake) => {
       fake.onSendGoalMessage = () =>

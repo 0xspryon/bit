@@ -158,9 +158,25 @@ export const CHAT_ROUNDS_SHOWN = 8;
  * `unresolved` was unreachable. The reduction is the server's, done where the registration's
  * own name is known (`mcpToolName.ts`), so this table can name the tool as the toolkit
  * declares it.
+ *
+ * ## It covers **both** agents, and leaving one out shipped the same bug twice
+ *
+ * The planner's two tools were here and the goal agent's were not, so a steer and a goal
+ * ending rendered **twice** in the goal conversation — once as the `tool.call` and once as
+ * the record — while the planner's controls collapsed correctly. A whole-branch review
+ * measured it: 2 rows where `add_intent` gives 1. `live.ts` already declared the pairing
+ * this table did not implement, on `plan.round.steered`: "it is the record half of the
+ * `steer_planner` tool call the agent made". Nothing caught it because no web test named a
+ * goal-agent tool at all — which is why `chat.test.ts` and `chatComponent.test.ts` now
+ * build those names through `mcpToolName.ts` rather than typing them.
+ *
+ * Both halves reach the goal conversation: `plan.round.steered` and `goal.ended` are
+ * written under the goal agent's own caller scope, so `goalIdFromScope` sets
+ * `LiveItem.goalId` and they pass `buildGoalConversation`'s filter; the calls arrive because
+ * `plan/goalConversation.ts` publishes the harness's session events under the goal subject.
  */
 const WRITE_TOOLS: Record<string, string | undefined> = {
-  /** One proposed intent, one `intent.added`. */
+  /** One proposed intent, one `intent.added`. The planner's. */
   add_intent: "intent.added",
   /**
    * The round's conclusion, which reaches the record as part of `plan.round.settled`.
@@ -171,6 +187,36 @@ const WRITE_TOOLS: Record<string, string | undefined> = {
    * then the only evidence it took is the tool's own result.
    */
   record_round_disposition: "plan.round.settled",
+  /**
+   * The goal agent steering a live round, and the record that says a steer landed.
+   *
+   * `plan.round.steered` carries no directive text (`event.ts`), so the collapsed row is
+   * the record's sentence with the agent's own arguments one disclosure away — which is the
+   * only place the directive is visible at all, since a steer is `opaque` on both drivers'
+   * narration (DECISIONS.md §24.1).
+   *
+   * **Only the `steered` branch writes it.** Decision 12's other branch opens a round
+   * carrying the directive and writes no steer event by design, so that call pairs with
+   * nothing and resolves through {@link unrecorded} like any other unpaired write — which
+   * is why {@link GoalChatInput.conversationLive} has to be the real liveness and not
+   * `true`.
+   */
+  steer_planner: "plan.round.steered",
+  /** The agent ending its own goal, one `goal.ended`. One-way, so exactly one of each. */
+  end_goal: "goal.ended",
+  /*
+   * `wake_planner` is **deliberately absent**, which is a decision rather than the
+   * oversight that left the two above out.
+   *
+   * It writes `plan.round.started`, and that event is appended with `callerScope: null` —
+   * it is a fact about a round rather than about the agent that asked for one — so
+   * `goalIdFromScope` yields nothing and the record never reaches this surface. Listing it
+   * here would pair the call against a record that cannot arrive: every wake would read
+   * `pending` while the conversation was live and `unresolved` once it was not, which is a
+   * chat claiming a write may have been lost when it is simply recorded elsewhere. Left out,
+   * the call renders as what it is — a tool call with its own result — and the round it
+   * opened appears in the planner chat beside this one, under its own separator.
+   */
 };
 
 /**
@@ -793,6 +839,22 @@ export interface GoalChatInput {
    */
   readonly replayedThrough: number;
   readonly awaiting: boolean;
+  /**
+   * Whether anything more can still arrive in this conversation.
+   *
+   * **What `roundRunning` is to a planner round, and it used to be a hardcoded `true`.**
+   * {@link WriteState} is the reason it has to be real: a write with no record is `pending`
+   * while something may still arrive and `unresolved` once nothing can, and an ended goal's
+   * conversation is in the second state. Hardcoded `true`, a steer whose record this tab
+   * dropped read as `pending` for as long as the page stayed open — a chat waiting forever
+   * on a write that will never resolve, which is the one thing `unresolved` exists to say.
+   *
+   * The caller owns it because the fact is the **goal's status**, which is a row this module
+   * is not given: `app.svelte.ts` passes `openGoalView?.status === "active"`, and `true`
+   * while the goal row has not loaded — a brief `pending` is honest about an unknown, where
+   * `unresolved` would claim a finality nobody has established.
+   */
+  readonly conversationLive: boolean;
 }
 
 /**
@@ -905,12 +967,17 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
         },
         prose,
         replayed: prose._tag === "replayed" ? replayed : [],
-        // A conversation has no status to make a write "pending until recorded" against,
-        // and the only writes on this surface — a steer, a wake, an ending — all produce
-        // records of their own. `true` is the honest argument: this conversation is live as
-        // far as a row is concerned, so a call with no record yet is pending rather than
-        // unresolved.
-        rows: rowsFor(ordered, true),
+        /*
+         * The writes on this surface are a steer and an ending, and they pair with the
+         * records {@link WRITE_TOOLS} names — `plan.round.steered` and `goal.ended`, both
+         * written under the agent's own caller scope and so both on this feed. A wake does
+         * not pair, deliberately; the table says why.
+         *
+         * `conversationLive` rather than the `true` this argument used to be: a conversation
+         * is not a round, but it does end, and after it has nothing a chat is waiting for
+         * can arrive. See {@link GoalChatInput.conversationLive}.
+         */
+        rows: rowsFor(ordered, input.conversationLive),
       },
     ],
   };

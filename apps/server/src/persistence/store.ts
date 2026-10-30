@@ -310,15 +310,17 @@ export type CallerIdentity =
 /**
  * The host's own authority, for a mutation no agent makes.
  *
- * A goal and an intent are created by the host today: there is no planner loop to
- * authenticate yet, so `addIntent`, `openGoal`, `endGoal` and `abandonIntent` take this —
- * the smaller thing that is still true, which target and whose receipts — supplied by the
- * process that owns the registry and never by a payload.
+ * `openGoal`, `endGoal`, `abandonIntent`, `openRound` and the operator's own `addIntent`
+ * take this — the smaller thing that is still true, which target and whose receipts —
+ * supplied by the process that owns the registry and never by a payload.
  *
- * **This is no longer a gap in the authority model, only in its wiring.** A planner round
- * now has a {@link RoundCaller} it could present (slice 4), and slice 7 is where
- * `add_intent` becomes a round-scoped tool and takes one. Until then the host is what
- * calls it, and `contracts/intent.ts` says the same.
+ * **It is not the planner's path and never was a placeholder for it.** A planner round
+ * presents a {@link RoundCaller} to {@link addRoundIntent}, which is where decision 10's
+ * budget and duplicate rules live; a goal agent presents a {@link GoalCaller} to
+ * `recordRoundSteer` and `endGoalAsAgent`. What remains host-authorised is the work the
+ * *operator* does — creating a goal, abandoning an intent, opening a round from the browser
+ * — and that is a different claim rather than an unfinished one. An earlier version of this
+ * comment said `add_intent` would take a round caller "in slice 7"; it does.
  */
 export interface HostContext {
   readonly callerScope: string;
@@ -336,8 +338,8 @@ export interface HostContext {
  * | Scope                        | Caller          | May write                                        |
  * | ---------------------------- | --------------- | ------------------------------------------------ |
  * | `<targetId>/<attemptId>`     | a worker attempt | `record_observation`, `record_asset`             |
- * | `<targetId>/round/<roundId>` | a planner round  | a round disposition; `add_intent` from slice 7   |
- * | `<targetId>/goal/<goalId>`   | a goal agent     | nothing yet; steer, wake and `end_goal` in slice 9 |
+ * | `<targetId>/round/<roundId>` | a planner round  | `add_intent`, and a round disposition            |
+ * | `<targetId>/goal/<goalId>`   | a goal agent     | a round steer, and the goal's own ending         |
  * | `<targetId>/operator`        | the host, acting for the operator | goals, intents, claims, abandonments |
  *
  * The right-hand column is what the **store** enforces through the authority paths, not a
@@ -345,6 +347,18 @@ export interface HostContext {
  * `recordObservation` and by `recordRoundDisposition` whatever tools its session happens
  * to have been registered with. The tool lists are the second half of the same boundary
  * and are per-directory (the spec's decision 5, demonstrated in DECISIONS.md §24.2).
+ *
+ * **The column is the present tense and is kept that way deliberately.** It read "nothing
+ * yet; steer, wake and `end_goal` in slice 9" for two slices after slice 9 shipped, so the
+ * canonical reference for what each kind of caller may write said a goal agent may write
+ * nothing while `recordRoundSteer` and `endGoalAsAgent` were taking goal callers. A
+ * forward reference in this table is a statement about current capability to anybody
+ * reading it, and on an authority boundary that is the one comment that most needs to be
+ * right — so what a later slice *will* add belongs in the spec, not here.
+ *
+ * A **wake** is not in the goal row, and the absence is the honest one: `wake_planner`
+ * opens a round through `openRound`, which takes the host's context, so nothing is written
+ * under the agent's own scope by it. What the goal agent writes is the two above.
  *
  * **Why the four cannot collide.** The last three are namespaced by a reserved segment,
  * and an attempt scope is two segments. A collision would need an attempt id spelled
@@ -762,7 +776,8 @@ export interface OpenRoundInput {
   readonly roundId: string;
   /**
    * How many intents this round may add. Stored so the limit a round was opened under is
-   * a fact about the round; `add_intent` enforces it in slice 7 (the spec's decision 10).
+   * a fact about the round; `addRoundIntent` enforces it inside its own write
+   * transaction (the spec's decision 10).
    */
   readonly budget: number;
   /** See {@link SeedInput.harnessInstanceId}: null until a session exists. */
@@ -2392,12 +2407,17 @@ const makeStore = Effect.fnUntraced(function* () {
    * `endGoal` is what makes both true. So an ended goal takes no new rounds and no new
    * attempts; the one round that was already running finishes and settles.
    *
-   * The gap that leaves is narrow and real: that running round may still add intents under
-   * a goal nobody wants worked. **Slice 7 closes it inside `add_intent`**, which is where
-   * the budget and duplicate rules already live and the only place a round actually writes
-   * to the graph. Until then nothing calls `add_intent` with a round caller at all, so the
-   * gap is reachable only through `recordRoundDisposition`, which records what the round
-   * concluded about a goal that has ended — a true statement, and harmless.
+   * The gap that would leave is narrow and real: a running round adding intents under a
+   * goal nobody wants worked. **It is closed inside {@link addRoundIntent}**, which is
+   * where the budget and duplicate rules already live and the only place a round writes to
+   * the graph — a round caller whose goal is not `active` is refused there with
+   * `RoundIntentRefused.goal_ended`. So what reaches this check under an ended goal is
+   * `recordRoundDisposition`, which records what the round concluded about a goal that has
+   * ended: a true statement, and the one this check is deliberately permissive for.
+   *
+   * An earlier version of this comment said slice 7 *would* close it and that nothing
+   * called `add_intent` with a round caller yet. Both were true when written and a reader
+   * would now conclude the gap is open.
    */
   const checkRoundAuthority = Effect.fnUntraced(function* (
     caller: RoundCaller,

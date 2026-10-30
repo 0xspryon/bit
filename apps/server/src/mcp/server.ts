@@ -88,7 +88,12 @@ import { McpProtocol, McpServer } from "effect/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { McpCredentials, callerOf } from "./credentials";
-import { GoalPlanning, GoalToolkit, GoalToolkitLayer } from "./goalTools";
+import {
+  GoalBriefingCeiling,
+  GoalPlanning,
+  GoalToolkit,
+  GoalToolkitLayer,
+} from "./goalTools";
 import { McpInvocation } from "./invocation";
 import {
   PlannerHarnesses,
@@ -380,6 +385,17 @@ export const mcpApplicationLayer = (options?: {
    * no harness.
    */
   readonly planning?: Layer.Layer<GoalPlanning> | undefined;
+  /**
+   * The ceiling `get_goal_briefing` bounds its read by, from `GOAL_BRIEFING_MAX_CHARS`.
+   *
+   * A third value across this boundary, and the reason it is here rather than read inside
+   * the toolkit is the reason the other two are: `main.ts` is the one place this process's
+   * configuration is read. Omitted, the toolkit uses
+   * {@link GoalBriefingCeiling.default} — which is what every other call site falls back to
+   * for an operator who has configured nothing, and is therefore a true answer rather than
+   * a convenient one.
+   */
+  readonly briefingCeiling?: Layer.Layer<GoalBriefingCeiling> | undefined;
 }) =>
   Layer.mergeAll(
     roleEndpoint({
@@ -416,6 +432,7 @@ export const mcpApplicationLayer = (options?: {
       registration: goalRegistered.pipe(
         Layer.provide(GoalToolkitLayer),
         Layer.provide(options?.planning ?? GoalPlanning.unavailable),
+        Layer.provide(options?.briefingCeiling ?? GoalBriefingCeiling.default),
       ),
     }),
   );

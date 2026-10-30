@@ -38,6 +38,8 @@ import {
   goalNarrationView,
   goalUploadsAccepted,
   goalView,
+  liveGoalAgentCall,
+  liveItem,
   liveOpened,
   ok,
   planRoundView,
@@ -930,6 +932,121 @@ describe("the goal agent's own half of the chat", () => {
     expect(withMeter).toContain("2 held by the harness");
     expect(withMeter).toContain("ses_live");
     expect(withMeter).toContain("not stated by this harness");
+  });
+
+  /**
+   * The goal agent's own writes, on the screen rather than in the reducer.
+   *
+   * `chat.test.ts` asserts the merge rule over these three tools; this asserts that the
+   * rule reaches the markup an operator reads, which is where the defect was *seen*: a
+   * review found a steer rendered as two rows, one saying a tool was called and one saying
+   * the same steer landed. Every tool name here is built by `@bit/contracts` from the goal's
+   * own MCP server name — `bit-<goalId>` — because a fixture that typed `"steer_planner"`
+   * would assert against a name no harness sends, which is exactly how this survived.
+   */
+  describe("the goal agent's writes on screen", () => {
+    /** The app with the live stream opened, so items can be pushed onto it. */
+    const withLive = async (
+      items: readonly LiveItem[],
+    ): Promise<{ html: string; app: App }> => {
+      const { app, fake } = await goalBody((server) => {
+        server.onGoalConversation = (_baseUrl, targetId, goalId) =>
+          ok(
+            goalConversationView({
+              targetId,
+              goalId,
+              harnessSessionId: "ses_goal_1",
+              source: "harness",
+              ephemeral: true,
+              messages: [{ index: 0, type: "user", text: "steer the planner" }],
+            }),
+          );
+      });
+      fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+      for (const item of items) fake.watch.send(item);
+      await settle();
+      return { html: render(GoalAgentChat, { props: { app } }).body, app };
+    };
+
+    /**
+     * Rows in the rendered conversation. One `<li class="item …">` each.
+     *
+     * Matched on the class with its scoping suffix left open, because Svelte appends a
+     * per-component hash — and anchored on the word boundary so the surrounding
+     * `class="items …"` list is not counted as a row.
+     */
+    const rowCount = (html: string): number =>
+      [...html.matchAll(/class="item\s/g)].length;
+
+    test("a steer is one row, carrying the record and the call it came from", async () => {
+      const { html } = await withLive([
+        liveGoalAgentCall("steer_planner", {
+          goalId: "goal_1",
+          over: { callId: "toolu_steer" },
+        }),
+        liveItem({
+          id: "record:evt-steer",
+          sequence: 9,
+          kind: "plan.round.steered",
+          attemptId: null,
+          roundId: "rnd_1",
+          goalId: "goal_1",
+          headline: "Round steered",
+          body: "a directive was delivered to round rnd_1 at queued urgency",
+          outcome: null,
+        }),
+      ]);
+
+      // One row, where this shipped as two.
+      expect(rowCount(html)).toBe(1);
+      expect(html).toContain("recorded");
+      // The record's sentence, and the record's own durable id beside the harness's local
+      // call id — which is the pair the collapsed row exists to show.
+      expect(html).toContain("a directive was delivered");
+      expect(html).toContain("record:evt-steer");
+      expect(html).toContain("call toolu_steer");
+    });
+
+    test("a goal ending is one row too", async () => {
+      const { html } = await withLive([
+        liveGoalAgentCall("end_goal", {
+          goalId: "goal_1",
+          over: { callId: "toolu_end" },
+        }),
+        liveItem({
+          id: "record:evt-ended",
+          sequence: 10,
+          kind: "goal.ended",
+          attemptId: null,
+          roundId: null,
+          goalId: "goal_1",
+          headline: "Goal ended",
+          body: "this goal was ended: met",
+          outcome: null,
+        }),
+      ]);
+
+      expect(rowCount(html)).toBe(1);
+      expect(html).toContain("this goal was ended: met");
+      expect(html).toContain("recorded");
+    });
+
+    test("a wake is one row with no write chip, because its record is the round's", async () => {
+      // The decision, on screen: `plan.round.started` is written with no caller scope, so
+      // it never reaches this conversation and the call is shown as a call. A `pending`
+      // chip here would be the chat waiting on something that cannot arrive.
+      const { html } = await withLive([
+        liveGoalAgentCall("wake_planner", {
+          goalId: "goal_1",
+          over: { callId: "toolu_wake" },
+        }),
+      ]);
+
+      expect(rowCount(html)).toBe(1);
+      expect(html).toContain("wake_planner");
+      expect(html).not.toContain(">pending<");
+      expect(html).not.toContain(">unresolved<");
+    });
   });
 
   test("the operator's own turn and the agent's are distinguishable without colour", async () => {

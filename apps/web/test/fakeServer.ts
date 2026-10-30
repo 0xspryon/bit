@@ -585,6 +585,49 @@ export const livePlannerCall = (
   });
 };
 
+/**
+ * One call to a **goal agent's** tool, named the way a driver names it.
+ *
+ * {@link livePlannerCall}'s sibling, and it exists because its absence hid the same bug a
+ * second time: the merge rule was keyed on the planner's two tools and the goal agent's
+ * were left out, so a steer and a goal ending rendered twice on the newest surface in the
+ * app for two slices. No web test named `steer_planner`, `wake_planner` or `end_goal` at
+ * all, which is why nothing could fail.
+ *
+ * The server name is `bit-<goalId>` — `plan/goalConversation.ts` registers the goal
+ * endpoint under the **goal's** id, not a round's — and the ids on the item are the ones
+ * this surface really carries: a goal id from the agent's own caller scope, and no round
+ * id, because the goal agent's narration is published under the goal subject.
+ */
+export const liveGoalAgentCall = (
+  bare: string,
+  options: {
+    readonly goalId: string;
+    readonly driver?: "claude-code" | "opencode";
+    readonly over?: Partial<LiveItem>;
+  },
+): LiveItem => {
+  const server = bitMcpServerName(options.goalId);
+  const wire =
+    (options.driver ?? "claude-code") === "opencode"
+      ? openCodeToolName(server, bare)
+      : claudeCodeToolName(server, bare);
+  return liveActivity({
+    kind: "tool.call",
+    attemptId: null,
+    roundId: null,
+    goalId: options.goalId,
+    headline: wire,
+    body: "",
+    tool: wire,
+    toolName: bareToolName(wire, server) ?? null,
+    input: null,
+    output: null,
+    outcome: null,
+    ...options.over,
+  });
+};
+
 export const liveOpened = (over: Partial<LiveOpened> = {}): LiveOpened => ({
   _tag: "opened",
   targetId: "acme-corp",
@@ -684,6 +727,29 @@ export class FakeServer implements ServerClient {
     return () => {
       open();
     };
+  }
+
+  /** Methods whose gate applies to the next call only. See {@link holdOne}. */
+  private readonly holdOnce = new Set<keyof ServerClient>();
+
+  /**
+   * Holds the **next** call to one method open, and lets every later one through.
+   *
+   * {@link hold} freezes a method until it is released, which is the right shape for "one
+   * request is in flight while the operator does something else". What it cannot express is
+   * a request that is still in flight while *later calls to the same method complete* —
+   * which is the A → B → A navigation: three reads of one goal's conversation, where the
+   * answer under test is the **first** one and the harm only appears if it lands after the
+   * others. Held with {@link hold}, all three park on one gate and resolve in order, so the
+   * stale answer can never be last and the case cannot be reproduced.
+   *
+   * So the gate is taken out of the map as soon as one call has taken it. The call that did
+   * keeps its promise and stays parked until the returned function is called.
+   */
+  holdOne(method: keyof ServerClient): () => void {
+    const release = this.hold(method);
+    this.holdOnce.add(method);
+    return release;
   }
 
   /* Each slot is pre-set to a bland success; a test replaces the ones it is about. */
@@ -1069,6 +1135,12 @@ export class FakeServer implements ServerClient {
     answer: () => A,
   ): Promise<A> {
     this.calls.push({ method, args });
-    return (this.held.get(method) ?? Promise.resolve()).then(answer);
+    const gate = this.held.get(method);
+    // A one-shot gate stops applying the moment a call has taken it — the call keeps the
+    // promise it is parked on. See {@link holdOne}.
+    if (gate !== undefined && this.holdOnce.delete(method)) {
+      this.held.delete(method);
+    }
+    return (gate ?? Promise.resolve()).then(answer);
   }
 }

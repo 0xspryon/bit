@@ -44,6 +44,7 @@ import {
   Effect,
   Fiber,
   Layer,
+  Logger,
   ManagedRuntime,
   Redacted,
   Stream,
@@ -72,6 +73,7 @@ import {
 } from "../briefing/goalBriefing";
 import {
   PlanSupervisor,
+  roundStopReport,
   type PlanInput,
   type PlanRefused,
 } from "./planSupervisor";
@@ -454,7 +456,27 @@ const world = (
    * subscriber.
    */
   const narrations = RunNarrations.layer;
+  /**
+   * Every log line this world wrote, so a test can assert on one.
+   *
+   * The only way to check a claim whose whole content *is* a log line — the settlement's
+   * report that it could not read its own round, which was previously discarded in silence.
+   * `mergeWithExisting` is deliberately off: the suite's output is noisy enough without
+   * every line twice, and nothing here asserts on the console.
+   */
+  const logged: { level: string; message: string }[] = [];
+  const logging = Logger.layer([
+    Logger.make<unknown, void>((entry) => {
+      logged.push({
+        level: String(entry.logLevel),
+        message: Array.isArray(entry.message)
+          ? entry.message.map((part) => String(part)).join(" ")
+          : String(entry.message),
+      });
+    }),
+  ]);
   const layer = Layer.mergeAll(
+    logging,
     fleet,
     stores,
     credentials,
@@ -466,6 +488,7 @@ const world = (
         : { askTimeout: options.askTimeout }),
       ...(options?.budget === undefined ? {} : { budget: options.budget }),
     }).pipe(
+      Layer.provide(logging),
       Layer.provide(options?.resolver ?? HarnessResolver.single),
       Layer.provide(fakeClient(scriptFor, recorder, options?.faults ?? {})),
       Layer.provide(stores),
@@ -509,7 +532,7 @@ const world = (
    * it was supposed to.
    */
   const registry = runtime.runPromise(Effect.map(McpCredentials, (it) => it));
-  return { root, workspace, runtime, ready, registry };
+  return { root, workspace, runtime, ready, registry, logged };
 };
 
 /** A goal, made the way an operator makes one, and the round input that names it. */
@@ -1499,12 +1522,174 @@ describe("whether a round ever reached its tool surface", () => {
       }).pipe(Effect.orDie),
     );
 
+    // Zero, and it is a **measured** zero: this process settled the round and read the
+    // counter. The case that must not read the same is below.
     expect(outcome.stopped.toolCallsSeen).toBe(0);
     // Zero **and** no disposition is the conjunction the settlement warns about. The row
     // half of it is asserted here; the warning itself is a log line, which is the honest
     // extent of where this figure goes — it is not on the round row and not on
     // `plan.round.settled`, and `settle`'s own comment says so.
     expect(outcome.round?.disposition).toBeNull();
+  });
+
+  test("the zero-call warning blames the tool-exposure lag only when it fits", async () => {
+    /*
+     * The warning's **wording**, which used to be one sentence for four endings.
+     *
+     * Zero calls plus no disposition is worth saying, but why depends on how the round
+     * ended. A round that ran to its own finish and never reached its tools is
+     * DECISIONS.md §24.2 caveat 1 — the measured case where an OpenCode registration is
+     * connected and not yet callable — and that is a harness fault an operator should act
+     * on by opening another round. A round an operator **stopped** ten seconds in has made
+     * no call because nobody gave it time, and a start that failed never had a session at
+     * all. Naming the exposure lag for those is a line that blames the wrong thing, which
+     * is worse than no line: this figure is the whole mitigation for that condition and a
+     * diagnostic that cries wolf is one nobody reads.
+     */
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready, logged } = world(
+      scriptFor,
+      recorder,
+      { askTimeout: "10 millis" },
+    );
+    await ready;
+
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_one");
+        const planner = yield* PlanSupervisor;
+        const started = yield* planner.start(input);
+        return yield* planner.stop(started.roundId);
+      }).pipe(Effect.orDie),
+    );
+
+    const warned = logged.filter(
+      (line) =>
+        line.level === "Warn" &&
+        line.message.includes("made no authenticated tool call"),
+    );
+    // It still fires: zero and null is still the conjunction worth reporting.
+    expect(warned).toHaveLength(1);
+    // And it says what is true of a stop rather than reaching for the spike's finding.
+    expect(warned[0]?.message).toContain("expected for how it ended");
+    expect(warned[0]?.message).not.toContain("tool surface was never reached");
+
+    await runtime.dispose();
+  });
+
+  test("a settlement that cannot read its own round says so", async () => {
+    /*
+     * The swallowed read, which is what this asserts the absence of.
+     *
+     * `settle` reads the round back for its disposition, so that "zero calls" can be
+     * reported as the thing it actually is. That read was wrapped in `Effect.result` and the
+     * failure case discarded with no log line at all — a settlement that could not read its
+     * own round said **nothing** about it, on the one path every recovery story depends on.
+     *
+     * The fault is injected the only way it is reachable: the round's own table is taken out
+     * from under the connection after the row exists. Both reads in the settlement path go
+     * through it, so this also exercises the settlement-failure line beside it, and the two
+     * together are the honest picture — the row is left for the startup sweep, and this
+     * process says which parts of its own accounting it could not do.
+     */
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready, logged } = world(
+      scriptFor,
+      recorder,
+      { askTimeout: "10 millis" },
+    );
+    await ready;
+
+    const stopped = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_one");
+        const planner = yield* PlanSupervisor;
+        const started = yield* planner.start(input);
+        // The row is written and the round is running; now the table goes.
+        yield* Effect.sync(() => {
+          const database = new Database(
+            join(root, "targets", TARGET, "hunt.sqlite"),
+          );
+          try {
+            database.run(
+              "ALTER TABLE planner_rounds RENAME TO planner_rounds_gone",
+            );
+          } finally {
+            database.close();
+          }
+        });
+        return yield* planner.stop(started.roundId);
+      }).pipe(Effect.orDie),
+    );
+
+    // The read failed, and the settlement says which part of its own accounting it lost.
+    const unread = logged.filter((line) =>
+      line.message.includes("could not be read back at settlement"),
+    );
+    expect(unread).toHaveLength(1);
+    expect(unread[0]?.level).toBe("Warn");
+    // Beside it, the write that failed first — so the pair reads as one known handover to
+    // the sweep rather than as a silent gap.
+    expect(
+      logged.some((line) => line.message.includes("could not be settled")),
+    ).toBe(true);
+    /*
+     * The stop still answers, and what it answers is worth being precise about: `status` is
+     * the status this settlement **decided**, which is `interrupted` because the operator
+     * stopped the round — first-hand knowledge, unaffected by the row read failing. What
+     * could not be written is the row, and that is the line beside it rather than a
+     * different status here.
+     */
+    expect(stopped.status).toBe("interrupted");
+    // A settlement *was* recorded, so the count is a measured `0` rather than a `null`.
+    expect(stopped.toolCallsSeen).toBe(0);
+
+    await runtime.dispose();
+  });
+
+  test("a stop with no settlement to report says it does not know, not zero", () => {
+    /*
+     * The other half of the figure, and the reason it is nullable.
+     *
+     * `toolCallsSeen` exists for one purpose: to separate "this round never reached its
+     * tools" (DECISIONS.md §24.2 caveat 1, measured in 3 of 8 first prompts) from "it had
+     * its tools and chose to say nothing". A stop that has no settlement recorded knows
+     * neither — and answering `0` made it indistinguishable from the first, which is a
+     * false negative on the only diagnostic that condition has.
+     *
+     * Asserted over the rule rather than over a run, because the window it covers is one
+     * this process cannot be driven into from outside: the stretch between a round's row
+     * committing and its first finalizer being registered, where a `stop` finds a fiber and
+     * no settlement. The rule is what `stop` returns, so this is the same answer either
+     * way, and the window is documented on `supervise` rather than asserted through it.
+     */
+    const unknown = roundStopReport({
+      roundId: "rnd_unsettled",
+      held: undefined,
+      settled: undefined,
+      stoppedAt: 1_700_000_000_000,
+    });
+
+    // `null`, not `0`: nothing was measured.
+    expect(unknown.toolCallsSeen).toBeNull();
+    // And the companions take the same care: a status this process did not observe is
+    // `uncertain` rather than a claim.
+    expect(unknown.status).toBe("uncertain");
+    expect(unknown.credentialsRevoked).toBe(0);
+
+    const known = roundStopReport({
+      roundId: "rnd_settled",
+      held: { targetId: TARGET, harnessSessionId: "ses_1" },
+      settled: { status: "interrupted", grants: 1, toolCallsSeen: 0 },
+      stoppedAt: 1_700_000_000_000,
+    });
+
+    // The contrast that makes the `null` mean something: a measured zero is still zero.
+    expect(known.toolCallsSeen).toBe(0);
+    expect(known.status).toBe("interrupted");
+    expect(known.harnessSessionId).toBe("ses_1");
   });
 });
 

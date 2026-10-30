@@ -63,7 +63,7 @@ import {
   McpCallCounter,
   mcpApplicationLayer,
 } from "../mcp/server";
-import type { GoalPlanning } from "../mcp/goalTools";
+import type { GoalBriefingCeiling, GoalPlanning } from "../mcp/goalTools";
 import type { PlannerHarnesses } from "../mcp/plannerTools";
 import { TargetStores } from "../persistence/targetStores";
 import {
@@ -235,6 +235,16 @@ export class ControlPlaneEndpoint extends Context.Service<
      */
     readonly planning?: Layer.Layer<GoalPlanning> | undefined;
     /**
+     * The ceiling the goal agent's `get_goal_briefing` reads under.
+     *
+     * Passed as a layer carrying the configured number for {@link planning}'s reason, and
+     * omitted everywhere but `main.ts`: a test or a spike that configures nothing gets the
+     * same default every other briefing call site falls back to. Threading it is what makes
+     * the agent's own read and `wake_planner` agree about one goal — a review found them
+     * disagreeing in both directions.
+     */
+    readonly briefingCeiling?: Layer.Layer<GoalBriefingCeiling> | undefined;
+    /**
      * Seconds a connection may be idle, overriding {@link CONTROL_PLANE_IDLE_TIMEOUT}.
      *
      * For tests, and only for tests: the claim worth checking is that a heartbeat keeps a
@@ -267,6 +277,9 @@ export class ControlPlaneEndpoint extends Context.Service<
             ...(options.planning === undefined
               ? {}
               : { planning: options.planning }),
+            ...(options.briefingCeiling === undefined
+              ? {}
+              : { briefingCeiling: options.briefingCeiling }),
           }),
           policyRoutes(options.policy),
           healthRoutes,

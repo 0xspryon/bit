@@ -137,6 +137,16 @@ interface Script {
    * returns, a silence does not, and only the second can hang a shutdown.
    */
   readonly statusHangs?: boolean;
+  /**
+   * When true, `prompt` **dies** rather than failing.
+   *
+   * A defect, not a typed failure, and the distinction is the whole point of the test that
+   * uses it: `Effect.result` absorbs the second and not the first, so a defect propagates
+   * out of the supervised body with `ending` still holding its `stopped` default. The
+   * prompt is where it is injected because it is the first seam *after* the attempt's
+   * finalizer is registered — which is the only region where the inversion is reachable.
+   */
+  readonly promptDefect?: boolean;
 }
 
 interface Recorder {
@@ -239,9 +249,15 @@ const fakeClient = (
           return { id };
         }),
       prompt: (sessionId, text) =>
-        Effect.sync(() => {
+        Effect.suspend(() => {
+          if (scriptFor(sessionId).promptDefect === true) {
+            // `die`, not `fail`: the shape of a bug in a seam — a thrown `TypeError`, a
+            // broken invariant — rather than an outcome the supervisor declared it could
+            // receive.
+            return Effect.die(new Error("scripted: the prompt seam has a bug"));
+          }
           recorder.prompts.push(`${sessionId}:${text}`);
-          return { delivered: true };
+          return Effect.succeed({ delivered: true });
         }),
       waitForIdle: (sessionId) => Deferred.await(scriptFor(sessionId).settle),
       sessionStatus: (sessionId) => {
@@ -1700,6 +1716,75 @@ describe("shutting the process down", () => {
     // not to be flaky on a loaded machine, tight enough that losing the bound fails it.
     expect(took).toBeLessThan(5_000);
   });
+});
+
+test("a defect while running settles `uncertain`, never `interrupted`", async () => {
+  /*
+   * The inversion `run/settlement.ts` wrote down and did not fix.
+   *
+   * The supervised body wraps the failures it expects in `Effect.result`, which absorbs
+   * *typed* failures and not defects. So a thrown `TypeError` in a seam, or an
+   * `Effect.die`, propagated straight out of the body, the scope closed, and the finalizer
+   * settled from whatever `ending` held — which on every path after the watching begins is
+   * its `stopped` default. The attempt was therefore written down **`interrupted`**: a
+   * durable row asserting that the operator stopped work that in fact crashed.
+   *
+   * `interrupted` is the one status this code claims first-hand knowledge of, and the claim
+   * is specific: the operator asked us to stop, we asked the harness to interrupt the
+   * session, and we revoked the attempt's authority. A crash has none of those. `uncertain`
+   * is what "we cannot say what happened" has always meant here, and `failed` is still not
+   * reachable from silence (DECISIONS.md §15).
+   *
+   * Slice 5 found this and deliberately left it, because the slice that extracted
+   * `run/settlement.ts` was bound to change no attempt behaviour — and recorded it on
+   * `SupervisionEnd`'s `crashed` case rather than leaving it to be rediscovered.
+   * `plan/planSupervisor.ts` already carried the guard; this is the same guard, and
+   * `planSupervisor.test.ts` carries the round's half of this assertion.
+   */
+  const recorder = emptyRecorder();
+  const { scriptFor } = scripts({
+    narration: [],
+    status: undefined,
+    stream: "open",
+    promptDefect: true,
+  });
+  const { root, runtime, ready, registry } = world(
+    ["alpha"],
+    scriptFor,
+    recorder,
+    {
+      askTimeout: "10 millis",
+    },
+  );
+  await ready;
+  const credentials = await registry;
+
+  const refused = await runtime.runPromise(
+    Effect.flatMap(RunSupervisor, (supervisor) =>
+      Effect.flatMap(draft(root, "alpha", "probe it"), (input) =>
+        Effect.result(supervisor.start(input)),
+      ),
+    ).pipe(Effect.orDie),
+  );
+
+  // The caller still gets an answer rather than hanging on a deferred the dead fiber will
+  // never complete: that is the `ensuring` at the bottom of `supervise`.
+  expect(refused._tag).toBe("Failure");
+
+  await runtime.dispose();
+  const stored = readAfterShutdown(root, "alpha");
+  /**
+   * `uncertain`, and the status this asserts *against* is the finding.
+   */
+  expect(stored.attempts[0]?.status).toBe("uncertain");
+  expect(stored.attempts[0]?.status).not.toBe("interrupted");
+  expect(stored.attempts[0]?.ended_at).not.toBeNull();
+  // Nothing asked the harness to interrupt a session, because nobody interrupted: the
+  // finalizer's `interruptSession` is guarded on `ending._tag === "stopped"`, which is the
+  // same inversion seen from the other side.
+  expect(recorder.interrupts).toEqual([]);
+  // And the crash did not cost the attempt its settlement: the authority is revoked.
+  expect(await Effect.runPromise(credentials.size)).toBe(0);
 });
 
 describe("the narration bus", () => {

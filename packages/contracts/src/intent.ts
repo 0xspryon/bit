@@ -12,15 +12,17 @@
  * a worker attempt cannot present planner authority: the store's attempt path validates
  * against a live unsettled attempt, which a planner does not have.
  *
- * A planner round now *does* have an authority of its own — `CallerContext` is a tagged
- * union of attempt, round and goal callers, and a round is a row with its own write fence
- * (`persistence/store.ts`, migration `0018`). What has not happened yet is the wiring:
- * `addIntent` still takes the host's `HostContext`, there is no planner loop to
- * authenticate, and `add_intent` becomes a round-scoped MCP tool in slice 7 of
- * `docs/design/goal-and-planner-flow.md`, where the budget and duplicate rules move
- * inside it. Until then anchoring is enforced **in the store** with the host creating
- * intents, and the contract below is host-facing: it has no wire encoding and is not
- * advertised as an MCP tool.
+ * A planner round has an authority of its own — `CallerContext` is a tagged union of
+ * attempt, round and goal callers, and a round is a row with its own write fence
+ * (`persistence/store.ts`, migration `0018`) — and `add_intent` **is** a round-scoped MCP
+ * tool, with the budget and duplicate rules inside the write transaction (decision 10 of
+ * `docs/design/goal-and-planner-flow.md`). That path is `addRoundIntent`, and its refusals
+ * are its own: `budget_spent`, `duplicate`, `goal_ended`.
+ *
+ * **The contract below is the other path, and it is host-facing**: the operator creating an
+ * intent from the browser, authorised by `HostContext` rather than by a credential. It has
+ * no wire encoding and is not advertised as an MCP tool. Anchoring is enforced **in the
+ * store** either way, which is the point of enforcing it there — one rule, two callers.
  *
  * Browser-safe: Effect Schema only.
  */

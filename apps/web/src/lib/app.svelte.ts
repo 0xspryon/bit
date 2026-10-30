@@ -506,6 +506,30 @@ export class App {
    */
   goalConversationThrough = $state(0);
 
+  /**
+   * Which **visit** to a goal conversation this tab is on. Counted, never reset.
+   *
+   * ## What it is for, and why the count beside it was not enough
+   *
+   * {@link goalConversationThrough} bounds the cancellation by *how many* turns had been
+   * sent, and {@link #clearGoalConversation} renumbers turns from 1 on every navigation. So
+   * goal A → B → A, inside one replay round trip, defeats it: the answer to visit one's read
+   * arrives while `openGoalId` is A again, passes the `openGoalId === goalId` guard, and
+   * installs visit one's `through` — under which visit two's freshly re-sent turn 1 is a
+   * cancellation candidate again, and is swallowed if the stale replay happens to contain
+   * its text. Slice 9's own finding applies to it exactly: a chat that silently swallows
+   * what was just typed is worse than one that shows it twice.
+   *
+   * A token rather than a larger count, because the thing being identified is the *visit* —
+   * a monotonic number taken before a request leaves and compared when it lands. A reply
+   * that does not match belongs to a conversation nobody is looking at any more, and it is
+   * dropped whole rather than having its parts guarded one at a time.
+   *
+   * Not a `$state` field anybody renders, and it is deliberately **not** cleared: a reset
+   * counter is a counter that can collide with the request it is supposed to tell apart.
+   */
+  #goalConversationVisit = 0;
+
   /** What the operator is typing. Cleared the moment the server accepts it. */
   goalMessage = $state("");
   /** True while a message is in flight, so the composer spins exactly once. */
@@ -906,6 +930,12 @@ export class App {
       sent: this.goalTurns,
       replayedThrough: this.goalConversationThrough,
       awaiting: this.goalAwaiting,
+      /*
+       * Whether a write with no record yet is still worth waiting for, which is the goal's
+       * own status and not anything the conversation knows. `true` while the row has not
+       * loaded: see `chat.ts` on why an unknown reads as `pending` rather than `unresolved`.
+       */
+      conversationLive: (this.openGoalView?.status ?? "active") === "active",
     }),
   );
 
@@ -1407,8 +1437,13 @@ export class App {
    * {@link goalTurns} is cleared with the rest, which is what it means for the operator's
    * own messages to be this tab's and not the record's: navigating away loses them, and the
    * harness's copy is what a later visit replays.
+   *
+   * It also **ends the visit**: {@link #goalConversationVisit} moves on, so every reply
+   * still in flight for the conversation being cleared is discarded when it lands instead of
+   * being installed over the next one's. See that field for the navigation that needs it.
    */
   #clearGoalConversation() {
+    this.#goalConversationVisit += 1;
     this.goalConversation = undefined;
     this.goalConversationGoalId = "";
     this.goalConversationState = "idle";
@@ -1980,6 +2015,9 @@ export class App {
     // answer can possibly contain is decided at the moment it is asked for, and a turn sent
     // during the round trip is one no answer to this request holds.
     const through = this.goalTurns.length;
+    // And which visit asked, which is what `through` alone cannot express: see
+    // {@link #goalConversationVisit}. Taken here, compared below.
+    const visit = this.#goalConversationVisit;
 
     const call = await this.client.goalConversation(
       this.serverUrl,
@@ -1987,6 +2025,17 @@ export class App {
       goalId,
     );
     if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+    /*
+     * The same goal, and not the same visit: A → B → A inside one round trip.
+     *
+     * The guard above cannot see it — `openGoalId` is this goal again — and the cost of
+     * missing it is not a stale block of prose but a **swallowed message**: visit one's
+     * `through` would be installed over visit two's turns, which are numbered from 1 again,
+     * and a re-sent sentence the stale replay happens to contain would be cancelled against
+     * it. Dropped whole rather than partly honoured, because none of the three fields below
+     * is about the conversation on screen.
+     */
+    if (visit !== this.#goalConversationVisit) return;
 
     if (call._tag === "Unreachable") {
       this.goalConversationState = "failed";
@@ -2039,6 +2088,10 @@ export class App {
     // Taken before the message goes, so the turn sorts before whatever the agent says in
     // answer to it. See `SentTurn.after`.
     const after = this.#activityHighWater() ?? 0;
+    // And which visit sent it, for the reason `loadGoalConversation` takes one: an accepted
+    // turn from a visit nobody is on would be appended to this visit's list, as a sentence
+    // the operator did not type here.
+    const visit = this.#goalConversationVisit;
 
     const call = await this.client.sendGoalMessage(
       this.serverUrl,
@@ -2047,6 +2100,7 @@ export class App {
       text,
     );
     if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+    if (visit !== this.#goalConversationVisit) return;
     this.goalSending = false;
 
     if (call._tag === "Unreachable") {

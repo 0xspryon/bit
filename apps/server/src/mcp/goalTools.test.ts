@@ -40,7 +40,7 @@ import {
 } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { McpCredentials } from "./credentials";
-import { GoalPlanning } from "./goalTools";
+import { GoalBriefingCeiling, GoalPlanning } from "./goalTools";
 import { McpCallCounter } from "./server";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
@@ -56,6 +56,29 @@ const GOAL_TO_END = "goal-to-end";
 const ROUND = "rnd-1";
 /** The round the `openRound` stub answers with, which the store also holds a row for. */
 const OPENED_ROUND = "rnd-opened";
+/** A third goal, whose objective alone renders a briefing over this suite's ceiling. */
+const GOAL_TOO_BIG = "goal-too-big";
+
+/**
+ * The briefing ceiling this suite configures, which is deliberately **not** the default.
+ *
+ * 6 000, against `DEFAULT_GOAL_BRIEFING_MAX_CHARS`'s 320 000, and both numbers matter: it
+ * is above {@link GOAL}'s own briefing (4 872 characters, so every other read here still
+ * succeeds) and far below {@link GOAL_TOO_BIG}'s. `get_goal_briefing` built its briefing
+ * with the default regardless of configuration until a review found it, so a suite that
+ * configured nothing could not tell the two apart — the agent's own read and
+ * `wake_planner` disagreed about the same goal in both directions.
+ */
+const SUITE_BRIEFING_CEILING = 6_000;
+
+/**
+ * An objective long enough to carry a briefing past the ceiling on its own.
+ *
+ * The description is rendered into the briefing verbatim, so this needs no intents and no
+ * observations behind it: the point under test is which *number* the ceiling check uses,
+ * not what a large goal is made of.
+ */
+const OVERSIZED_OBJECTIVE = `Determine whether the limiter can be bypassed. ${"Background on the engagement. ".repeat(300)}`;
 
 const HOST = { callerScope: operatorScope(TARGET), targetId: TARGET } as const;
 
@@ -199,6 +222,7 @@ class Seeded extends Context.Service<
   {
     readonly goalToken: string;
     readonly endableGoalToken: string;
+    readonly oversizedGoalToken: string;
     readonly roundToken: string;
     readonly observationId: string;
   }
@@ -232,6 +256,12 @@ class Seeded extends Context.Service<
         goalId: GOAL_TO_END,
         name: "Endable",
         description: "A goal the agent will end.",
+      });
+      yield* store.openGoal(HOST, {
+        operationId: "op-open-oversized",
+        goalId: GOAL_TOO_BIG,
+        name: "Oversized",
+        description: OVERSIZED_OBJECTIVE,
       });
       /*
        * The round the `opened` branch's stub answers with, as a real row.
@@ -277,6 +307,11 @@ class Seeded extends Context.Service<
         targetId: TARGET,
         goalId: GOAL_TO_END,
       });
+      const oversized = yield* credentials.issueWithoutExpiry({
+        _tag: "goal",
+        targetId: TARGET,
+        goalId: GOAL_TOO_BIG,
+      });
       const round = yield* credentials.issue({
         _tag: "round",
         targetId: TARGET,
@@ -288,6 +323,7 @@ class Seeded extends Context.Service<
       return Seeded.of({
         goalToken: Redacted.value(goal.token),
         endableGoalToken: Redacted.value(endable.token),
+        oversizedGoalToken: Redacted.value(oversized.token),
         roundToken: Redacted.value(round.token),
         observationId: recorded.observationId,
       });
@@ -296,7 +332,13 @@ class Seeded extends Context.Service<
 }
 
 const testLayer = Layer.mergeAll(
-  ControlPlaneEndpoint.layer({ policy: DEFAULT_POLICY, planning }),
+  ControlPlaneEndpoint.layer({
+    policy: DEFAULT_POLICY,
+    planning,
+    // The configured ceiling, which is what `main.ts` passes and what this suite exists to
+    // check reaches the toolkit at all. See {@link SUITE_BRIEFING_CEILING}.
+    briefingCeiling: GoalBriefingCeiling.at(SUITE_BRIEFING_CEILING),
+  }),
   Seeded.layer,
   McpCredentials.layer,
   McpCallCounter.layer,
@@ -320,6 +362,7 @@ let goalUrl = "";
 let plannerUrl = "";
 let goalToken = "";
 let endableGoalToken = "";
+let oversizedGoalToken = "";
 let roundToken = "";
 
 beforeAll(async () => {
@@ -331,6 +374,7 @@ beforeAll(async () => {
       plannerUrl = endpoint.plannerMcpUrl;
       goalToken = seeded.goalToken;
       endableGoalToken = seeded.endableGoalToken;
+      oversizedGoalToken = seeded.oversizedGoalToken;
       roundToken = seeded.roundToken;
     }),
   );
@@ -992,6 +1036,29 @@ describe("what the agent can read", () => {
     expect(questions.length).toBeGreaterThan(0);
     expect(questions[0]?.["address"]).toBeTruthy();
     expect(questions[0]?.["status"]).toBe("uninvestigated");
+  });
+
+  test("get_goal_briefing refuses by the ceiling the server was configured with", async () => {
+    /*
+     * Important finding 2: three of the four briefing call sites threaded
+     * `GOAL_BRIEFING_MAX_CHARS` and this one was hardcoded to the default, with no path for
+     * the number to reach it at all.
+     *
+     * So the assertion is about **which figure** refuses. This suite configures 6 000; the
+     * goal below renders well over that and nowhere near the default 320 000, so before the
+     * fix this call succeeded and handed the agent a briefing no round could have been
+     * opened on — which is decision 11's second failure direction exactly.
+     */
+    const outcome = await callGoal("get_goal_briefing", {}, oversizedGoalToken);
+
+    expect(outcome.isError).toBe(true);
+    expect(outcome.data["reason"]).toBe("briefing_too_large");
+    const detail = String(outcome.data["detail"]);
+    // Both numbers, and the ceiling is the configured one rather than the default — a
+    // figure the operator never set and could not find in their environment.
+    expect(detail).toContain(String(SUITE_BRIEFING_CEILING));
+    expect(detail).not.toContain("320000");
+    expect(detail).toContain(GOAL_TOO_BIG);
   });
 
   test("get_goal_briefing answers the same text a round is prompted with", async () => {
