@@ -4816,3 +4816,203 @@ one is ever wanted, is the one caveat 4 already names: set the harness child's
 **Not tested.** Whether `AGENTS.md` inheritance behaves as the source says (the model run
 hit a provider usage limit). Claude Code's own configuration discovery. Whether a
 `.gitignore`d ancestor config is treated differently. Any driver other than OpenCode 2.2.2.
+
+### 24.4 Token usage and context limits (Spike C)
+
+### 24.4 Usage and context limits (Spike C)
+
+### `SPIKE` resolved — both drivers report tokens per model call, only OpenCode reports a limit before a run starts, and the figure that arrives most readily is the wrong one for a meter (2026-10-30)
+
+Spike C of `docs/design/goal-and-planner-flow.md`, for slice 10's context meter. A meter is
+tokens-used over a limit; `agentHarness.ts` classifies "a usage update" as `opaque` and
+`HarnessModelView` carries no limit. This measures what each driver actually emits, so the
+slice draws only what is true. Reproducible: `apps/server/src/spike/usageProbe.ts`, raw
+frames under `apps/server/.runtime/usage-probe/` (JSONL, unreduced; gitignored).
+
+**What was run.** `opencode` 2.2.2 on model `opencode/glm-5.3-flash-free` (catalogue name
+"GLM-5.3-Flash Free"; the operator's `GLM-5.3-Flash` is that id, not a different one), and
+Claude Code 2.1.310 through `@anthropic-ai/claude-agent-sdk@0.3.310` on `claude-sonnet-5`.
+Nothing is UNTESTED. Claude Code was run three times (partials on, then again, then
+partials off); the figures below are from the surviving partials-on file, and the stale
+`output_tokens` and per-turn `result` behaviour were seen in every run. Each driver was prompted twice in one session: a three-file read task
+(one `read` per file; four model calls on each driver) and then "reply
+DONE" (one call). The second prompt is what separates per-call from cumulative figures.
+OpenCode's stream was read **raw** (`fetch` on `/api/event`), not through the generated
+client, because a schema decode drops fields it does not name.
+
+#### OpenCode: three carriers, and only one of them is a context measure
+
+| Event                            | Durable                      | Scope                      | Fields                                                                                                    |
+| -------------------------------- | ---------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `session.step.ended`             | yes (`durable.seq`)          | **one model call**         | `data.tokens {input, output, reasoning, cache{read, write}}`, `data.cost`, `assistantMessageID`, `finish` |
+| `session.usage.updated`          | no (ephemeral, no `durable`) | **session lifetime total** | `data.tokens` (same shape), `data.cost`                                                                   |
+| `message.list` assistant message | n/a (REST)                   | one model call             | `tokens`, `cost`, `finish`                                                                                |
+
+`session.usage.updated` fires in the same millisecond as each `session.step.ended` (five
+of each over two prompts). `GET /api/session/:id` carries the same cumulative `tokens` and
+`cost`; that is what `sessionStatus` already returns as `tokens` for OpenCode.
+
+Observed, per call (`step.ended`), then the running `usage.updated` total after it:
+
+| call           | input | output | reasoning | cache.read | cache.write | context (in+cr+cw+out+rsn) | session total, in / cache.read |
+| -------------- | ----- | ------ | --------- | ---------- | ----------- | -------------------------- | ------------------------------ |
+| 1              | 10979 | 14     | 57        | 0          | 0           | 11050                      | 10979 / 0                      |
+| 2              | 2692  | 25     | 28        | 10880      | 0           | 13625                      | 13671 / 10880                  |
+| 3              | 590   | 26     | 0         | 13056      | 0           | 13672                      | 14261 / 23936                  |
+| 4              | 93    | 45     | 0         | 13600      | 0           | 13738                      | 14354 / 37536                  |
+| 5 (2nd prompt) | 150   | 3      | 0         | 13600      | 0           | 13753                      | 14504 / 51136                  |
+
+- **`usage.updated` and `session.tokens` are cumulative and exactly the sum of the
+  `step.ended` figures** (14504 input, 113 output, 85 reasoning, 51136 cache read: checked).
+  The second prompt did not reset them. They are **not** a context measure: the last total
+  sums to 65 838 tokens against a real context of 13 753, 4.8 times too many, because
+  `cache.read` re-counts the whole cached prefix on every call.
+- `input` is the **uncached** remainder, `cache.read` the cached prefix; they are disjoint,
+  so the prompt size of a call is `input + cache.read + cache.write`. `reasoning` is **not**
+  inside `output` on this provider. Call 1 shows `output 14, reasoning 57`.
+- `cache.write` was 0 on every call: this provider never reports a write. Do not read
+  zero as "nothing was written".
+- `cost` was 0 throughout (free model).
+- OpenCode's own meter (`packages/tui/src/util/session.ts`, `contextUsage`) takes the
+  **last assistant message's** `input + output + reasoning + cache.read + cache.write`
+  over `model.limit.context`. That is the last row above: 13 753 / 200 000, 7%.
+
+#### OpenCode: the limit is reachable, through the call bit already makes
+
+`GET /api/model`, which `openCodeClient.ts` already calls as `api.model.list()` for the
+picker, carries `limit` on **all 27** catalogue entries:
+
+```
+opencode/glm-5.3-flash-free   limit: { context: 200000, output: 32000 }
+openai/gpt-5.6-sol (default)  limit: { context: 400000, input: 272000, output: 128000 }
+```
+
+- It **survives the generated client's decode**: `api.model.list()` returns the entry with
+  `limit.context` intact (the installed `@opencode/schema` 2.1.0 types it as `{ context: Int,
+input?: Int, output: Int }`, against a 2.2.2 server). No new request, no raw HTTP.
+- `limit.input` is optional and present on the default model. OpenCode's compaction uses
+  `limit.input || limit.context` as its window; its meter uses `limit.context`. These
+  differ for bit's own default (272 000 against 400 000), so the choice of denominator is a
+  decision, not a given.
+- The limit is **per model**, not per variant, and it is known at catalogue time, before
+  any session exists. It fits `HarnessModelView` directly.
+
+#### Claude Code: per-call figures in the stream, and a limit that is not in the catalogue
+
+Carriers, per frame type (production does **not** set `includePartialMessages`, so the
+first row is the only live carrier it sees; the second needs the option turned on):
+
+| Frame                         | Scope        | What it carries                                                                                        |
+| ----------------------------- | ------------ | ------------------------------------------------------------------------------------------------------ |
+| `assistant` (`message.usage`) | one API call | `input_tokens, cache_creation_input_tokens, cache_read_input_tokens, cache_creation{…}, output_tokens` |
+| `stream_event/message_start`  | one API call | the same snapshot                                                                                      |
+| `stream_event/message_delta`  | one API call | `usage` with the **final** `output_tokens`, `output_tokens_details.thinking_tokens`, `iterations[]`    |
+| `result`                      | see below    | `usage`, `total_cost_usd`, `modelUsage`, `model_usage_since_last_result`                               |
+
+- **An `assistant` frame's `usage` is the `message_start` snapshot, not the final figure.**
+  The input side is exact; `output_tokens` is stale. The call that really produced 16
+  output tokens reported `output_tokens: 1` on its `assistant` frame, and the one that
+  produced 153 reported 2. This holds with partials off as well (the production
+  configuration). Only `message_delta` (partials on) and the `result` carry the true
+  output count.
+- **One API call arrives as several `assistant` frames**, one per content block (a thinking
+  block, then a tool_use block), each repeating the same `message.id` and the same `usage`.
+  Counting per frame double-counts; the unit is `message.id`.
+- No reasoning bucket in `assistant.usage`. `output_tokens_details.thinking_tokens` exists
+  on `message_delta` and `result.usage`, and is **inside** `output_tokens` (the opposite of
+  OpenCode here).
+- Prompt side per call, turn 1: 21 388, 22 851, 23 007, 23 163 (grows). The last call's
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` is the context
+  size at that call; with its 16 output tokens, 23 179.
+- **`result.usage` is per turn and summed over that turn's calls**: `input_tokens 8` (2 per
+  call, four calls), `cache_read 88 626` = 21 386 + 21 386 + 22 849 + 23 005, and
+  `cache_creation 1 775`. All four fields sum to 90 784 against a real context of 23 179,
+  3.9 times too many, the same trap as OpenCode's total. Turn 2's `result.usage` was
+  `2 / 74 / 23 161 / 5` (input / cache creation / cache read / output): it restarted, it
+  did not accumulate.
+- **`result.usage.iterations[0]` is the last call alone** (here input 2, output 16, cache read 23 005, cache creation 156),
+  exact, with the true output count. It is the only exact last-call figure that needs
+  neither partials nor a second request, and it arrives at turn end only.
+- **`total_cost_usd` and `modelUsage` are cumulative across the query; `usage` and
+  `model_usage_since_last_result` are per turn.** Cost went 0.02872 to 0.03371 (the
+  difference, 0.00498, is turn 2's own figure); `modelUsage["claude-sonnet-5"].cacheReadInputTokens`
+  went 88 626 to 111 787, a difference of 23 161, which is turn 2's own cache read. The same `result` mixes both scopes.
+- `modelUsage` also lists **`claude-haiku-5-5`** (1 237 input, 17 output): a side call the
+  SDK made that is billed to the session and is not part of the main model's context. A
+  reader summing `modelUsage` over its keys overstates the context.
+
+Limit, three candidates:
+
+| Source                                               | Value                                     | Available when                                                                                                 |
+| ---------------------------------------------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `result.modelUsage[model].contextWindow`             | 1 000 000 (also `maxOutputTokens` 64 000) | the end of the first turn, and keyed by model with a side model beside it                                      |
+| `query.getContextUsage().maxTokens` / `rawMaxTokens` | 1 000 000                                 | **from `system/init`**, before any API response (`apiUsage: null` then); a control request, not a stream frame |
+| `query.supportedModels()` (`ModelInfo`)              | **absent**                                | no `contextWindow` field on any of the entries                                                                 |
+
+- `claudeCodeClient.ts`'s `CLAUDE_CODE_MODELS` is a static list; there is no catalogue to
+  read a limit from, so a Claude Code limit cannot live on `HarnessModelView` honestly.
+  It is a **session-time** fact. The 1 000 000 is this account's, for the model as
+  resolved here; it should not be written down as a constant.
+- `getContextUsage().totalTokens` is **not** a usage figure to trust: it was 24 053 after
+  both turns (and 27 847 / 24 098 at the two `system/init`s), a category estimate that did
+  not move between turn 1 (context 23 179) and turn 2 (23 242). Use it, if at all, for
+  `maxTokens`. Its `apiUsage` field is the last call's exact usage.
+
+#### Where this sits against `NarrationDetail`
+
+- **OpenCode.** `openCodeNarration`'s `default:` arm turns `session.step.ended` and
+  `session.usage.updated` into `{ _tag: "opaque" }`. What it discards is, on `step.ended`,
+  the per-call token breakdown, `cost`, `assistantMessageID` and `finish`; on
+  `usage.updated`, a cumulative total. **The right event is `session.step.ended`**:
+  durable (it has a `sequence`, so a reconnect can resume past it), per call, and carrying
+  the message id that dedupes it. `usage.updated` is ephemeral, a stream that reconnects
+  loses it silently, and it is the wrong scope.
+- **Claude Code.** `narrate` returns `[opaque]` for any `assistant` frame without a `text`
+  or `tool_use` block and for every `result`. For `assistant` frames with blocks the usage
+  rides on the same frame and is dropped; for `result`, `pump` keeps only
+  `record.tokens = message.usage` and `record.cost`, then narrates it as `opaque`.
+- **`sessionStatus.tokens` already means two different things.** On OpenCode it is the
+  lifetime session total; on Claude Code it is the **last turn's** `result.usage`,
+  overwritten each turn. Same field, same `Record<string, unknown>`, different scope, and
+  neither is a context measure. Slice 10 must not reuse it as a numerator.
+
+#### Consequence for the `usage` tag
+
+The seam's rule is that a case exists only if both harnesses can produce it. What both can
+produce, per model call, in the stream, exactly, is the **prompt side**: OpenCode
+`input + cache.read + cache.write`; Claude Code `input_tokens + cache_read_input_tokens +
+cache_creation_input_tokens`. That is the size of the context sent on that call, and it
+is the bulk of the meter. Output is exact on OpenCode and exact on Claude Code only at turn
+end (or with partials on), and reasoning is separate on one and inside output on the other.
+
+```ts
+| {
+    readonly _tag: "usage";
+    /** One model call: OpenCode assistantMessageID, Claude Code message.id. The dedupe key. */
+    readonly callId: string;
+    /** Tokens sent to the model on this call: uncached input + cache read + cache write. */
+    readonly promptTokens: number;
+    /** Tokens generated on this call, thinking included; undefined where the stream has not yet stated it. */
+    readonly outputTokens: number | undefined;
+    /** The model's context window, when this driver states it by now. */
+    readonly contextLimit: number | undefined;
+  }
+```
+
+- `promptTokens` is the numerator the meter needs and both drivers state it exactly.
+- `outputTokens` is `undefined` on Claude Code's `assistant` frames, which would otherwise
+  carry a stale 1. If a later frame (the `result`'s `iterations[0]`) states it, that is a
+  second `usage` entry with the same `callId`; the reader keeps the latest per `callId`.
+  For OpenCode it is `output + reasoning`, so the field means "all generated" on both.
+- Cache read and write, and reasoning, are deliberately **not** cases. They cannot be
+  filled on both drivers with the same meaning (`cache.write` is a constant 0 on one,
+  `reasoning` is inside `output` on the other), and slice 10 does not draw them.
+- `contextLimit` is optional on the tag **and** should be added to `HarnessModelView` as
+  `contextLimit?: number`, filled by OpenCode from `limit.context` and left absent on
+  Claude Code. Claude Code's value comes from `getContextUsage()` at `system/init` or the
+  first `result`, so it can only ride the tag or the session, never the static model list.
+- A meter shows a percentage only when `contextLimit` is known and shows the token figure
+  alone otherwise. Both are reachable here; neither is guaranteed by the seam.
+- Do **not** put cumulative figures on the tag. `usage.updated`, `session.tokens`,
+  `result.usage`, `modelUsage` and `total_cost_usd` all measure spend, not context, and
+  two of them mix scopes in one object.
