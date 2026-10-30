@@ -46,6 +46,7 @@ import {
   ObservationStore,
   StoredRowError,
   callerScopeOf,
+  roundIdFromScope,
   operatorScope,
   type AttemptCaller,
   type CallerContext,
@@ -4981,6 +4982,39 @@ describe("telling three kinds of caller apart", () => {
     // id is `att_…` and contains no `/`, so an attempt scope is always two segments.
     expect(identifier.newAttemptId()).not.toContain("/");
     expect(identifier.newRoundId().startsWith("rnd_")).toBe(true);
+  });
+
+  test("a round can be read back out of its scope, and only a round's", async () => {
+    // `roundIdFromScope` is what attributes a record to the planner round that wrote it —
+    // `events.caller_scope` is the only column that says so, since an `intent.added`
+    // carries the intent as its subject. The inverse lives beside the builder so the format
+    // has one home, and this asserts the pair actually round-trips.
+    const roundId = identifier.newRoundId();
+    expect(
+      roundIdFromScope(
+        callerScopeOf({ _tag: "round", targetId: "target-1", roundId }),
+      ),
+    ).toBe(roundId);
+
+    // And nothing else is read as a round. An attempt scope, a goal scope, the operator's
+    // and a null caller all answer `undefined`, which is what keeps a hand-written intent
+    // out of whichever round happened to be open.
+    for (const scope of [
+      callerScopeOf({
+        _tag: "attempt",
+        targetId: "target-1",
+        attemptId: identifier.newAttemptId(),
+      }),
+      callerScopeOf({
+        _tag: "goal",
+        targetId: "target-1",
+        goalId: identifier.newGoalId(),
+      }),
+      operatorScope("target-1"),
+      null,
+    ]) {
+      expect(roundIdFromScope(scope)).toBeUndefined();
+    }
   });
 
   test("a worker's own writes are unaffected by any of this", async () => {

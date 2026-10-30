@@ -23,6 +23,12 @@
  * Those are the server's rules, the server has its own tests for them, and a second
  * implementation of them here would be a thing to keep in sync that nobody runs.
  */
+import {
+  bareToolName,
+  bitMcpServerName,
+  claudeCodeToolName,
+  openCodeToolName,
+} from "@bit/contracts";
 import type {
   AttemptTranscript,
   FolderListing,
@@ -34,8 +40,10 @@ import type {
   LiveFrame,
   LiveItem,
   LiveOpened,
+  GoalNarrationView,
   PlanRoundStarted,
   PlanRoundView,
+  RoundNarration,
   RunStarted,
   RunStopped,
   RunningAttempt,
@@ -178,6 +186,47 @@ export const runningRound = (
   goalId: "goal_1",
   harnessSessionId: "ses_1",
   startedAt: AT,
+  ...over,
+});
+
+/**
+ * One round's narration, as the harness still has it.
+ *
+ * `harness` with two messages is the ordinary interesting case: a round whose prose came
+ * back. The three empty sources are what tests of the degradation reach for, and each needs
+ * its own `note` — a `forgotten` round with a `harness` sentence would be a shape the
+ * server cannot produce.
+ */
+export const roundNarration = (
+  over: Partial<RoundNarration> = {},
+): RoundNarration => ({
+  roundId: "rnd_1",
+  harnessSessionId: "ses_1",
+  source: "harness",
+  ephemeral: true,
+  note: "From OpenCode, which may delete it: this build does not store a round's narration.",
+  messages: [
+    { index: 0, type: "assistant", text: "Two dimensions have no work out." },
+    { index: 1, type: "tool", text: "add_intent" },
+  ],
+  truncated: false,
+  // Nothing left out by default. The two figures are not optional on the shape, because an
+  // omission a reader cannot count is indistinguishable from a round that said less than it
+  // did — so a fixture has to state them, and a test about either says which.
+  omittedBlank: 0,
+  promptOmitted: false,
+  ...over,
+});
+
+/** One goal's replayed narration. No rounds by default, like `onGoalRounds`. */
+export const goalNarrationView = (
+  over: Partial<GoalNarrationView> = {},
+): GoalNarrationView => ({
+  goalId: "goal_1",
+  targetId: "acme-corp",
+  rounds: [],
+  skipped: 0,
+  at: AT,
   ...over,
 });
 
@@ -378,9 +427,11 @@ export const liveItem = (over: Partial<LiveItem> = {}): LiveItem => ({
   kind: "observation.recorded",
   at: AT,
   attemptId: "attempt-1",
+  roundId: null,
   headline: "Observation recorded",
   body: "the endpoint did not rate limit",
   tool: null,
+  toolName: null,
   input: null,
   output: null,
   callId: null,
@@ -398,6 +449,10 @@ export const liveActivity = (over: Partial<LiveItem> = {}): LiveItem =>
     headline: "bash",
     body: "",
     tool: "bash",
+    // A harness's own tool is not namespaced, so the reduced name equals the raw one. A
+    // tool of *ours* is namespaced and must be built with {@link livePlannerCall}, never
+    // typed out.
+    toolName: "bash",
     input: '{"command":"curl -s http://127.0.0.1:4000/"}',
     // A real call id by default, because the thing most worth getting wrong about a tool
     // call is which result answers it: a default of `null` would let a test assert pairing
@@ -406,6 +461,54 @@ export const liveActivity = (over: Partial<LiveItem> = {}): LiveItem =>
     outcome: null,
     ...over,
   });
+
+/**
+ * One call to a tool **this application registered**, named the way a driver names it.
+ *
+ * **The reason this helper exists is a shipped bug.** The planner chat's merge rule is keyed
+ * on `add_intent`, and against a real round it matched nothing: a planner's tools arrive over
+ * MCP, so the name on the wire is `mcp__bit-<roundId>__add_intent` under Claude Code and
+ * `bit-<roundId>.add_intent` under OpenCode. Two test suites fabricated the bare name in both
+ * fields and therefore asserted the implementation against a tool-name space the server never
+ * produces — so neither could have caught it.
+ *
+ * So nothing here is typed by hand. The wire name is built by `@bit/contracts`'
+ * {@link claudeCodeToolName} / {@link openCodeToolName}, and the reduced name by
+ * {@link bareToolName} — the very function `run/liveTranscript.ts` calls. A fixture built
+ * from the same module as the reducer cannot drift from it, and a change to either naming
+ * breaks the reducer and the fixture together instead of silently only the reducer.
+ *
+ * `driver` defaults to Claude Code because that is the form the reviewer read out of a live
+ * round's DOM; `"opencode"` emits the form DECISIONS.md §24.2 Q1 recorded from OpenCode's own
+ * refusal message.
+ */
+export const livePlannerCall = (
+  bare: string,
+  options: {
+    readonly roundId: string;
+    readonly driver?: "claude-code" | "opencode";
+    readonly over?: Partial<LiveItem>;
+  },
+): LiveItem => {
+  const server = bitMcpServerName(options.roundId);
+  const wire =
+    (options.driver ?? "claude-code") === "opencode"
+      ? openCodeToolName(server, bare)
+      : claudeCodeToolName(server, bare);
+  return liveActivity({
+    kind: "tool.call",
+    attemptId: null,
+    roundId: options.roundId,
+    headline: wire,
+    body: "",
+    tool: wire,
+    toolName: bareToolName(wire, server) ?? null,
+    input: null,
+    output: null,
+    outcome: null,
+    ...options.over,
+  });
+};
 
 export const liveOpened = (over: Partial<LiveOpened> = {}): LiveOpened => ({
   _tag: "opened",
@@ -611,6 +714,35 @@ export class FakeServer implements ServerClient {
   /** Nothing in flight by default, for the reason `onRuns` answers with nothing. */
   onRounds: (baseUrl: string) => Answer<"rounds"> = () => ok([]);
 
+  /**
+   * No replayed narration by default, matching `onGoalRounds`'s empty goal.
+   *
+   * A goal with no rounds has no narration, so the pair is consistent without a test
+   * having to override both to get the ordinary empty state.
+   */
+  onGoalNarration: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+  ) => Answer<"goalNarration"> = (_baseUrl, targetId, goalId) =>
+    ok(goalNarrationView({ targetId, goalId }));
+
+  /** A stop that worked, answering with the round as `interrupted`. */
+  onStopRound: (
+    ...args: Parameters<ServerClient["stopRound"]>
+  ) => Answer<"stopRound"> = (_baseUrl, targetId, goalId, roundId) =>
+    ok(
+      planRoundView({
+        targetId,
+        goalId,
+        roundId,
+        status: "interrupted",
+        disposition: null,
+        dispositionRationale: null,
+        endedAt: AT + 2_000,
+      }),
+    );
+
   onCreateIntent: (
     ...args: Parameters<ServerClient["createIntent"]>
   ) => Answer<"createIntent"> = (_baseUrl, _targetId, goalId, draft) =>
@@ -734,6 +866,14 @@ export class FakeServer implements ServerClient {
 
   rounds = (baseUrl: string) =>
     this.record("rounds", [baseUrl], () => this.onRounds(baseUrl));
+
+  goalNarration = (baseUrl: string, targetId: string, goalId: string) =>
+    this.record("goalNarration", [baseUrl, targetId, goalId], () =>
+      this.onGoalNarration(baseUrl, targetId, goalId),
+    );
+
+  stopRound = (...args: Parameters<ServerClient["stopRound"]>) =>
+    this.record("stopRound", args, () => this.onStopRound(...args));
 
   createIntent = (...args: Parameters<ServerClient["createIntent"]>) =>
     this.record("createIntent", args, () => this.onCreateIntent(...args));

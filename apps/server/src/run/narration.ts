@@ -64,20 +64,40 @@ import type { HarnessNarration } from "../harness/agentHarness";
 export const NARRATION_BUFFER = 256;
 
 /**
- * One entry of narration as the supervisor hands it over, with the three things that say
- * whose it is.
+ * Whose session is narrating: a worker's attempt, or a planner round.
  *
- * `targetId` and `attemptId` are the keys a subscriber filters on. Both come from the
- * attempt the supervisor is running — never from the harness's own payload — so a
- * misattributed entry is not reachable: the supervisor publishes under the attempt whose
- * session it opened.
+ * **Tagged rather than two nullable id fields, for the reason `CallerContext` is tagged.**
+ * Exactly one of the two is ever set, and a pair of nullable fields makes "neither" and
+ * "both" shapes the type permits and every consumer has to re-rule-out. A publisher that
+ * cannot name which kind it is cannot publish at all, which is the property wanted: the
+ * supervisor publishes under the identity whose session it opened, so a misattributed
+ * entry is not reachable.
+ *
+ * It grew a second case when the planner view arrived. Before it, a round's narration was
+ * drained for its terminal outcome and thrown away, because this bus's filter was keyed by
+ * attempt id and a round has no attempt — `plan/planSupervisor.ts` said so and attached the
+ * widening to the slice that would have a screen to design it against. This is that
+ * widening.
+ */
+export type NarrationSubject =
+  | { readonly _tag: "attempt"; readonly attemptId: string }
+  | { readonly _tag: "round"; readonly roundId: string };
+
+/**
+ * One entry of narration as a supervisor hands it over, with the things that say whose it
+ * is.
+ *
+ * `targetId` and {@link NarrationSubject} are the keys a subscriber filters on. Both come
+ * from the attempt or round the supervisor is running — never from the harness's own
+ * payload.
  *
  * `harnessSessionId` is carried because it is the join to the harness's own storage, and
- * a reader comparing our narration against `opencode`'s log needs it.
+ * a reader comparing our narration against `opencode`'s log needs it. It is also what the
+ * planner view's replay reads from, which is why a round's narration carries it too.
  */
 export interface RunNarrationInput {
   readonly targetId: string;
-  readonly attemptId: string;
+  readonly subject: NarrationSubject;
   readonly harnessSessionId: string;
   readonly entry: HarnessNarration;
 }
@@ -103,15 +123,32 @@ export interface RunNarration extends RunNarrationInput {
   readonly id: number;
 }
 
-/** Which narration a subscriber wants. Absent means every target, or every attempt. */
+/**
+ * Which narration a subscriber wants. Absent means every target, or every subject.
+ *
+ * `attemptId` and `roundId` are both here and both optional, and that is **not** the shape
+ * {@link NarrationSubject} refused. A filter is a question and may legitimately name
+ * neither — the live transcript asks for a whole target — or name one of them. What it
+ * cannot do is name both, which is a question with no answers and reads as one.
+ */
 export interface NarrationFilter {
   readonly targetId?: string | undefined;
   readonly attemptId?: string | undefined;
+  readonly roundId?: string | undefined;
 }
+
+const subjectMatches = (
+  filter: NarrationFilter,
+  subject: NarrationSubject,
+): boolean =>
+  (filter.attemptId === undefined ||
+    (subject._tag === "attempt" && subject.attemptId === filter.attemptId)) &&
+  (filter.roundId === undefined ||
+    (subject._tag === "round" && subject.roundId === filter.roundId));
 
 const matches = (filter: NarrationFilter, item: RunNarration): boolean =>
   (filter.targetId === undefined || filter.targetId === item.targetId) &&
-  (filter.attemptId === undefined || filter.attemptId === item.attemptId);
+  subjectMatches(filter, item.subject);
 
 /**
  * The one in-process narration bus.

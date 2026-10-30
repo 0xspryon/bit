@@ -42,6 +42,7 @@ import { join } from "node:path";
 import {
   Deferred,
   Effect,
+  Fiber,
   Layer,
   ManagedRuntime,
   Redacted,
@@ -63,6 +64,7 @@ import { FleetStore } from "../persistence/fleet";
 import { ObservationStore, operatorScope } from "../persistence/store";
 import { PolicyHookNotInstalled } from "../policy/install";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
+import { RunNarrations, type RunNarration } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 import {
   GoalBriefingTooLarge,
@@ -392,11 +394,22 @@ const world = (
    * way the middleware does — by calling `increment` for the round's own caller scope.
    */
   const calls = McpCallCounter.layer;
+  /**
+   * The real narration bus, merged in rather than hidden under the supervisor.
+   *
+   * A round publishes its narration onto this (slice 8's planner chat is the subscriber),
+   * and a test that wanted to assert the publishing had to be able to subscribe to the same
+   * instance. `Layer.provide` would have made it the supervisor's private dependency, which
+   * is the shape that let the attempt supervisor's bus be a publisher with no reachable
+   * subscriber.
+   */
+  const narrations = RunNarrations.layer;
   const layer = Layer.mergeAll(
     fleet,
     stores,
     credentials,
     calls,
+    narrations,
     PlanSupervisor.layerWith({
       ...(options?.askTimeout === undefined
         ? {}
@@ -409,6 +422,7 @@ const world = (
       Layer.provide(fleet),
       Layer.provide(credentials),
       Layer.provide(calls),
+      Layer.provide(narrations),
       Layer.provide(
         Layer.succeed(
           WorkerEndpoints,
@@ -865,6 +879,82 @@ describe("opening a planner round", () => {
     expect(rows.lineages).toEqual([
       { goal_id: "goal_one", harness_session_id: started.harnessSessionId },
     ]);
+  });
+
+  test("a round's narration reaches the bus under the round, with no attempt on it", async () => {
+    /*
+     * The widening slice 8 needed, and the one thing a planner chat cannot do without.
+     *
+     * Before this, a round's harness stream was drained only so a terminal
+     * `session.execution.*` could be read off it, and the entries were thrown away: the bus
+     * was keyed by attempt id and a round has no attempt. Now the subject is tagged, so an
+     * entry published under a round is reachable by a subscriber filtering on it — which is
+     * exactly what the live transcript does on its way to the browser.
+     *
+     * Publishing is still not persisting. An entry published with nobody listening is gone;
+     * this test subscribes first, which is why the subscription is established before the
+     * round is started and not after.
+     */
+    const recorder = emptyRecorder();
+    const { scriptFor, releaseAll } = scripts({
+      narration: [
+        {
+          type: "session.text.ended",
+          sequence: 1,
+          at: 1_700_000_000_000,
+          outcome: undefined,
+          detail: { _tag: "reply", text: "two dimensions are untested" },
+        },
+      ],
+      status: undefined,
+    });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const narrations = yield* RunNarrations;
+        const collected = yield* Effect.forkChild(
+          Stream.runCollect(
+            Stream.take(narrations.subscribe({ targetId: TARGET }), 1),
+          ),
+        );
+        // The bus replays nothing, so the subscription has to exist before the round is
+        // prompted. `subscriberCount` moves after `PubSub.subscribe` returns, which is what
+        // makes it usable as a readiness signal rather than a guess.
+        yield* Effect.timeout(
+          Effect.gen(function* () {
+            while ((yield* narrations.subscriberCount) === 0) {
+              yield* Effect.sleep("5 millis");
+            }
+          }),
+          "10 seconds",
+        );
+        const input = yield* goal(root, workspace, "goal_one");
+        const planner = yield* PlanSupervisor;
+        const started = yield* planner.start(input);
+        const received: readonly RunNarration[] = yield* Fiber.join(collected);
+        return { started, received };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.received).toHaveLength(1);
+    const entry = observed.received[0];
+    expect(entry?.targetId).toBe(TARGET);
+    // Under the round, not under an attempt — and not under the goal: a goal's narration is
+    // several rounds' worth, and the chat groups by the thing the records can corroborate.
+    expect(entry?.subject).toEqual({
+      _tag: "round",
+      roundId: observed.started.roundId,
+    });
+    expect(entry?.harnessSessionId).toBe(observed.started.harnessSessionId);
+    expect(entry?.entry.detail).toEqual({
+      _tag: "reply",
+      text: "two dimensions are untested",
+    });
+
+    await runtime.runPromise(releaseAll());
+    await runtime.dispose();
   });
 
   test("two starts on one goal: one wins, the other is refused naming the holder", async () => {

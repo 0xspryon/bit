@@ -1,0 +1,401 @@
+<script lang="ts">
+  /**
+   * One row of a transcript: a reply, a tool call, a record, a refused action.
+   *
+   * **Extracted from {@link LiveTranscript} rather than rewritten beside it**, which is the
+   * answer to the slice brief's "refactor it or extract a component both use". That panel
+   * had already settled four things worth keeping exactly as they were, and a second
+   * implementation of them in the chat would have been two renderings of the same contract
+   * drifting apart: the origin as a readable **word** rather than a tint (`live.ts` §9), the
+   * `callId` shown on both a call and its result because nothing else can pair them, the
+   * payloads in collapsed `<details>` so a screen reader is not narrated a directory
+   * listing on every arrival, and the outcome as text rather than as a colour.
+   *
+   * So this is that row, and both the target's live panel and the planner chat render it.
+   * What differs between them is **arrangement**, which is their business: the panel is a
+   * flat list in arrival order, and the chat groups by round and folds a result into the
+   * call it answers.
+   *
+   * ## What the three optional props add, and why the chat needs them
+   *
+   * They are the whole of the spec's pending-until-recorded merge rule as it reaches the
+   * screen. `chat.ts` decides them; this renders them.
+   *
+   * - `proposedBy` — the `tool.call` a committed record was collapsed into. The record is
+   *   `item`, because the record wins and carries the real id; the call is kept because it
+   *   is the only place the *arguments* are.
+   * - `result` — the `tool.result` paired to this call by `callId`, folded in rather than
+   *   left as a row of its own.
+   * - `write` — what became of an attempted write, in words. `unresolved` is the one that
+   *   must never be quiet: a call that produced neither a record nor a stated failure is
+   *   either a record this tab dropped or a write that did not happen, and the row says so
+   *   rather than picking one.
+   * - `summary` — the brief's one-line domain summary: `add_intent` → the question it
+   *   proposed, `record_round_disposition` → the disposition. Shown **only when the
+   *   rendered item has no body of its own**, so a committed record's own sentence is never
+   *   doubled by a paraphrase of the request that produced it. Without it a planner's row
+   *   is the raw MCP tool name over two empty disclosure labels, and the proposed question
+   *   reaches the screen only once the record arrives — which is exactly what a *pending*
+   *   call cannot rely on.
+   */
+  import type { LiveItem } from "@bit/contracts";
+
+  import { kindLabel, outcomeTint, type WriteState } from "../chat";
+
+  let {
+    item,
+    proposedBy = null,
+    result = null,
+    write = null,
+    summary = null,
+  }: {
+    item: LiveItem;
+    proposedBy?: LiveItem | null;
+    result?: LiveItem | null;
+    write?: WriteState | null;
+    summary?: string | null;
+  } = $props();
+
+  /**
+   * What each write state says, as a sentence an operator can act on.
+   *
+   * Written out rather than left as the tag, because the tag is a state machine's word and
+   * these are four genuinely different situations. `refused` says the tool's own output is
+   * where the reason is, which for `add_intent` is the store's instructive refusal.
+   */
+  const WRITE_NOTES: Record<WriteState, string> = {
+    recorded:
+      "Committed: this is the record the call produced. The store's own event id is above, beside the harness's id for the call it came from; the first is durable and the second is not.",
+    refused:
+      "The harness reported this call failed, so nothing was written. Its result below is where the reason is.",
+    pending:
+      "Asked for and not yet confirmed. No record of it has arrived, and the round is still running.",
+    unresolved:
+      "Unresolved: the round has finished and this call produced neither a record nor a stated failure. It may have been refused, or its record may have been dropped from this tab's feed — which of the two is not knowable from here.",
+  };
+
+  const WRITE_LABELS: Record<WriteState, string> = {
+    recorded: "recorded",
+    refused: "refused",
+    pending: "pending",
+    unresolved: "unresolved",
+  };
+
+  let writeTint = $derived(
+    write === "recorded"
+      ? "success"
+      : write === "refused"
+        ? "danger"
+        : write === "unresolved"
+          ? "warning"
+          : "plain",
+  );
+</script>
+
+<li class="item">
+  <div class="row">
+    <span class="chip kind">{kindLabel(item.kind)}</span>
+    <!-- The origin as a word: `record` is durable and ordered, `activity` is neither. -->
+    {#if item.origin === "record"}
+      <span
+        class="origin mono"
+        data-origin="record"
+        title="A committed event, in the order the store assigned it."
+      >
+        record
+      </span>
+    {:else}
+      <span
+        class="origin mono"
+        data-origin="activity"
+        title="Live, in-process activity. Not part of the record; can be dropped under load."
+      >
+        activity
+      </span>
+    {/if}
+    <!--
+      The call id, on the items that have one.
+
+      **It is the only thing that can pair a `tool.result` with its `tool.call`.** Both
+      harnesses run tools concurrently, so results do not arrive in the order the calls
+      were made and two calls to the same tool are indistinguishable by name. When
+      `callId` is `null` on a result — reachable, when the harness never named the call —
+      the row carries no tag: falling back to the tool name would attribute one command's
+      output to a different command.
+    -->
+    {#if item.callId !== null}
+      <span
+        class="call mono"
+        title="The harness's own id for this tool call. A result and the call it answers carry the same id; this is the only thing that pairs them."
+      >
+        call {item.callId}
+      </span>
+    {:else if proposedBy !== null && proposedBy.callId !== null}
+      <!--
+        A collapsed pair, which renders **two** ids because they are two different kinds of
+        thing and the row's own sentence distinguishes them.
+
+        The record's id comes first: it is the store's own event id, stable across
+        connections and across a restart, and it is the thing the merge rule means when it
+        says the record wins and carries the real identity. `WRITE_NOTES.recorded` used to
+        say "the id above is the real one" while the only id rendered was the second one
+        below — the harness's local, non-durable call id — which told an operator the
+        opposite of the distinction the sentence exists to draw.
+      -->
+      <span
+        class="call mono"
+        data-kind="record"
+        title="The store's own event id for this committed record. Stable across connections and across a restart; this is the durable identity."
+      >
+        {item.id}
+      </span>
+      <span
+        class="call mono"
+        title="The harness's own id for the tool call this record came from. Local to that harness session and not durable."
+      >
+        call {proposedBy.callId}
+      </span>
+    {/if}
+    <span class="headline">{item.headline}</span>
+    {#if write !== null}
+      <span
+        class="chip outcome"
+        data-tint={writeTint}
+        title={WRITE_NOTES[write]}
+      >
+        {WRITE_LABELS[write]}
+      </span>
+    {/if}
+    {#if item.outcome !== null}
+      <span class="chip outcome" data-tint={outcomeTint(item.outcome)}>
+        {item.outcome}
+      </span>
+    {/if}
+  </div>
+
+  {#if item.body !== ""}
+    <p class="body">{item.body}</p>
+  {:else if summary !== null}
+    <!--
+      The one-line domain summary, in place of the body a tool call does not have. The
+      `{:else if}` is the rule rather than a convenience: a committed record *has* a body —
+      the server's own sentence about what was written — and showing a paraphrase of the
+      request beneath it would be the same fact twice.
+    -->
+    <p class="body">{summary}</p>
+  {/if}
+
+  <!--
+    The write's state in words as well as in the chip, because the chip is one word and
+    three of the four states need a sentence to be actionable. `role="status"` only on
+    `unresolved`: it is the one an operator must not miss, and announcing every pending
+    tool call would make the region useless.
+  -->
+  {#if write !== null}
+    <p
+      class={["note", write === "unresolved" && "loud"]}
+      role={write === "unresolved" ? "status" : undefined}
+    >
+      {WRITE_NOTES[write]}
+    </p>
+  {/if}
+
+  <!--
+    Collapsed by default, and the `<summary>` says what is inside while it is shut, so the
+    row stays readable and the payload stays out of both the accessibility tree and the box
+    until a reader asks for it.
+  -->
+  {#if item.input !== null}
+    <details class="io">
+      <summary class="io-label">Arguments</summary>
+      <pre class="io-text mono">{item.input}</pre>
+    </details>
+  {:else if proposedBy !== null && proposedBy.input !== null}
+    <details class="io">
+      <summary class="io-label">Arguments the round asked with</summary>
+      <pre class="io-text mono">{proposedBy.input}</pre>
+    </details>
+  {/if}
+
+  {#if item.output !== null}
+    <details class="io">
+      <summary class="io-label">Result</summary>
+      <pre class="io-text mono">{item.output}</pre>
+    </details>
+  {/if}
+
+  {#if result !== null && result.output !== null}
+    <details class="io">
+      <summary class="io-label">
+        Result{result.outcome === "failed"
+          ? " (the harness reported a failure)"
+          : ""}
+      </summary>
+      <pre class="io-text mono">{result.output}</pre>
+    </details>
+  {/if}
+</li>
+
+<style>
+  .item {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-muted);
+  }
+  .item:last-child {
+    padding-bottom: 0;
+    border-bottom: 0;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  /*
+   * `--text-muted` is the floor for text in these rows; `--text-faint` is not usable here.
+   *
+   * Every label below is 10-11px, and `--text-faint` measures 3.4-4.0:1 against both
+   * backgrounds these rows sit on in both themes, which is under WCAG AA's 4.5:1 for
+   * normal-size text. `--text-muted` is 6.1-7.0:1 across those same pairings.
+   */
+  .chip {
+    display: inline-block;
+    padding: 1px 6px;
+    border: 1px solid var(--border-base);
+    border-radius: var(--radius-sm);
+    background: var(--bg-layer-02);
+    color: var(--text-base);
+    font: 600 10px/var(--lh-tight) var(--font-sans);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+  .chip[data-tint="success"] {
+    border-color: var(--state-border-success);
+    background: var(--state-bg-success);
+    color: var(--state-fg-success);
+  }
+  .chip[data-tint="warning"] {
+    border-color: var(--state-border-warning);
+    background: var(--state-bg-warning);
+    color: var(--state-fg-warning);
+  }
+  .chip[data-tint="danger"] {
+    border-color: var(--state-border-danger);
+    background: var(--state-bg-danger);
+    color: var(--state-fg-danger);
+  }
+  .outcome {
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  /* The origin reads as metadata rather than as a state: it is a fact about the channel. */
+  .origin {
+    padding: 1px 5px;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-xs);
+    color: var(--text-muted);
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .origin[data-origin="record"] {
+    border-color: var(--border-strong);
+  }
+  .origin[data-origin="activity"] {
+    border-style: dashed;
+  }
+  /*
+   * Metadata like `.origin`, but a harness's call id can be long, so this truncates instead
+   * of wrapping the row: the leading characters are what an operator matches on by eye, and
+   * the `title` has the whole of it.
+   */
+  /*
+   * The record's id is given more room than the call id, because it is the one an operator
+   * matches against the event log and the prefix (`record:`) eats four characters of it.
+   */
+  .call[data-kind="record"] {
+    max-width: 24ch;
+    border-style: solid;
+    border-color: var(--border-strong);
+  }
+  .call {
+    max-width: 16ch;
+    padding: 1px 5px;
+    overflow: hidden;
+    border: 1px dotted var(--border-muted);
+    border-radius: var(--radius-xs);
+    color: var(--text-muted);
+    font-size: 10px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .headline {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-base);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .body {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: var(--lh-compact);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .note {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: var(--lh-compact);
+  }
+  .note.loud {
+    color: var(--state-fg-warning);
+  }
+  /* Block, not flex: a `<details>` laid out as a flex container does not reliably collapse. */
+  .io {
+    display: block;
+  }
+  /*
+   * The old `.io-label` look — small, uppercase, faint — on what is now the control that
+   * opens the block, so it also has to read as clickable: a pointer, a hover shift, and a
+   * focus ring, since this is reachable by keyboard and a summary with no visible focus is
+   * a control nobody can find.
+   */
+  .io-label {
+    width: fit-content;
+    padding: 1px 2px;
+    border-radius: var(--radius-xs);
+    color: var(--text-muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+  }
+  .io-label:hover {
+    color: var(--text-base);
+  }
+  .io-label:focus-visible {
+    outline: 1px solid var(--border-focus);
+    outline-offset: 1px;
+  }
+  /* Still capped and still scrollable: open, a long payload must not take over the box. */
+  .io-text {
+    max-height: 140px;
+    margin: 2px 0 0;
+    padding: 6px 8px;
+    overflow-y: auto;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-sm);
+    background: var(--bg-deep);
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: var(--lh-compact);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+</style>

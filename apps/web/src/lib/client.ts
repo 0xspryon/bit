@@ -224,6 +224,14 @@ export const REFUSAL_TAGS = new Set([
   // ceiling comes back as `GoalBriefingRefused`, already listed above, because it is the
   // same fact the panel reports and the round started nothing.
   "PlanRefused",
+  // Stopping a planner round: a round id this goal does not hold. Kept apart from
+  // `PlanRefused`'s `unknown_round` on purpose — one says the row is not here, the other
+  // says this process is not driving it, which is the ordinary state of every settled
+  // round — and both are sentences the round's own controls print rather than transport
+  // trouble. A goal's narration replay declares no error at all: a round the harness has
+  // forgotten is a `200` that says so, because for an older round that is the expected
+  // answer and not a fault.
+  "RoundNotFound",
 ]);
 
 /**
@@ -559,6 +567,44 @@ export const server = {
    */
   rounds: (baseUrl: string) =>
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.rounds())),
+
+  /**
+   * One goal's planner narration, replayed from the harness.
+   *
+   * The companion of {@link goalRounds} and the half that cannot be promised: a round's
+   * prose is never stored, so this is the harness's own copy and each round says whether it
+   * still had one. Every answer is a success, including a goal whose rounds the harness has
+   * deleted — `source` is what distinguishes "nothing yet" from "forgotten" from "this
+   * round said nothing", and a client that treated an empty list as an error would report
+   * three different facts as one fault.
+   */
+  goalNarration: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.goalNarration({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * Stops one planner round, answering with the round's own row once it has settled.
+   *
+   * The round is named under its goal because that is where it is recorded. Both refusals
+   * are sentences the planner view prints beside the control: `RoundNotFound` for a round
+   * this goal does not hold, and `PlanRefused`'s `unknown_round` for one this process is
+   * not driving — which is what an operator gets for pressing stop on a round that settled
+   * while the page was open.
+   */
+  stopRound: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+    roundId: string,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.stopRound({ params: { targetId, goalId, roundId } }),
+      ),
+    ),
 
   /**
    * Which agent harnesses the server configures, ready or not.

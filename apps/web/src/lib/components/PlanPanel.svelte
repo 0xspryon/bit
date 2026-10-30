@@ -1,13 +1,16 @@
 <script lang="ts">
   /**
-   * "Plan next" on a goal: the control that opens a planner round, and what the last one
+   * "Plan next" on a goal: the control that opens a planner round, and what every round
    * concluded.
    *
-   * **It is not the round's live view.** Watching a round think, its tool calls and its
-   * controls are slice 8, and this panel deliberately stops at the record: a round is in
-   * flight or it is not, and a settled one has a disposition or it has not. The one thing
-   * it says about a round in flight is that there is one, because that is what explains a
-   * disabled button.
+   * **It is not the round's live view, and that boundary still holds now that the live view
+   * exists.** {@link PlannerChat} sits directly under this panel and shows what a round
+   * said; this one stops at the record — a round is in flight or it is not, and a settled
+   * one has a disposition or it has not. The split is not tidiness: this panel's content is
+   * rows and survives anything, where the chat's content is narration this build never
+   * stores, so a month-old round has a disposition here and no words there. The one thing
+   * this says about a round in flight is that there is one, because that is what explains a
+   * disabled button; the stop control for it is on the chat, beside the round it stops.
    *
    * ## Two sources, and the difference is why there are two
    *

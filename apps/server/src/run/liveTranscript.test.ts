@@ -25,7 +25,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { LiveFrame, LiveItem, RecordedEvent } from "@bit/contracts";
+import {
+  bitMcpServerName,
+  claudeCodeToolName,
+  openCodeToolName,
+  type LiveFrame,
+  type LiveItem,
+  type RecordedEvent,
+} from "@bit/contracts";
 import {
   Duration,
   Effect,
@@ -152,7 +159,11 @@ const narrationsFrom = (items: readonly RunNarration[]) =>
             (filter.targetId === undefined ||
               filter.targetId === item.targetId) &&
             (filter.attemptId === undefined ||
-              filter.attemptId === item.attemptId),
+              (item.subject._tag === "attempt" &&
+                filter.attemptId === item.subject.attemptId)) &&
+            (filter.roundId === undefined ||
+              (item.subject._tag === "round" &&
+                filter.roundId === item.subject.roundId)),
         ),
       ),
     subscriberCount: Effect.succeed(0),
@@ -177,7 +188,7 @@ const narration = (
 ): RunNarration => ({
   id: 1,
   targetId: TARGET,
-  attemptId: "attempt-1",
+  subject: { _tag: "attempt", attemptId: "attempt-1" },
   harnessSessionId: "ses_abc",
   ...over,
   entry: {
@@ -486,6 +497,51 @@ describe("projecting the record", () => {
       }),
     );
     expect(concluded.body).toContain("actionable");
+    // And both carry the round itself, which is the planner chat's grouping key. It is the
+    // subject on these two because they are host-originated with no caller at all.
+    expect(started.roundId).toBe("rnd_live");
+    expect(settled.roundId).toBe("rnd_live");
+  });
+
+  test("a record a round wrote is attributed to that round from its caller scope", () => {
+    // The half that matters and the one nothing else could answer: an `intent.added` the
+    // planner committed carries the *intent* as its subject and says nothing about the
+    // round in its payload. `events.caller_scope` is the only column that does, and slice 4
+    // namespaced a round's scope so this read is unambiguous rather than a guess.
+    const planned = projectEvent(
+      event({
+        kind: "intent.added",
+        callerScope: `${TARGET}/round/rnd_live`,
+        attemptId: null,
+        intentId: "int_planned",
+        subjectId: "int_planned",
+        payload: { question: "can the limiter be bypassed?" },
+      }),
+    );
+    expect(planned.kind).toBe("intent.added");
+    expect(planned.roundId).toBe("rnd_live");
+    // Still no attempt: a round is not one, and the field is not borrowed.
+    expect(planned.attemptId).toBeNull();
+  });
+
+  test("an operator's own intent belongs to no round, and is not filed under one", () => {
+    // The whole reason this is read from the caller rather than inferred from the goal: a
+    // hand-written intent and a planner's differ in exactly this column, and guessing would
+    // put an operator's intent inside whichever round happened to be open.
+    const byHand = projectEvent(
+      event({
+        kind: "intent.added",
+        callerScope: `${TARGET}/operator`,
+        attemptId: null,
+        intentId: "int_hand",
+        subjectId: "int_hand",
+        payload: { question: "what does the login page set?" },
+      }),
+    );
+    expect(byHand.roundId).toBeNull();
+
+    // And a worker's observation, which has a two-segment attempt scope.
+    expect(projectEvent(event({})).roundId).toBeNull();
   });
 
   test("an asset says whether it was new or already known", () => {
@@ -663,6 +719,93 @@ describe("projecting the record", () => {
 });
 
 describe("projecting live activity", () => {
+  test("a tool of ours is reduced to its bare name, on both drivers' forms", () => {
+    /*
+     * The bug this is the regression test for: the planner chat's merge rule is keyed on
+     * `add_intent`, and against a real round it matched nothing — a planner's tools arrive
+     * over MCP, so the harness reports the name the server registered plus its own
+     * separator. Every write rendered twice, no write state was computed and `unresolved`
+     * was unreachable.
+     *
+     * The reduction is done here, where the registration's own name is derivable from the
+     * narration's subject, rather than guessed at in a browser from a separator. Both wire
+     * forms below are recorded: Claude Code's was read out of a live round's DOM, and
+     * OpenCode's `<server>.<tool>` from the harness's own refusal message in DECISIONS.md
+     * §24.2 Q1.
+     */
+    const roundId = "rnd_live";
+    const server = bitMcpServerName(roundId);
+    for (const wire of [
+      claudeCodeToolName(server, "add_intent"),
+      openCodeToolName(server, "add_intent"),
+    ]) {
+      const item = projectNarration(
+        narration(
+          {
+            _tag: "toolCall",
+            callId: "toolu_01",
+            tool: wire,
+            input: '{"question":"can the limiter be bypassed?"}',
+          },
+          { subject: { _tag: "round", roundId } },
+        ),
+      );
+      // Raw for a reader matching it against the harness's own log…
+      expect(item?.tool).toBe(wire);
+      // …and reduced for anything matching it in code.
+      expect(item?.toolName).toBe("add_intent");
+    }
+  });
+
+  test("a harness's own tool is left alone, and another round's prefix is not stripped", () => {
+    // Only the prefix *this* application chose is removed. Taking "the segment after the
+    // last separator" would have worked for both forms above and would also have renamed a
+    // harness's own dotted tool, which is a misattribution a reader cannot see.
+    const own = projectNarration(
+      narration(
+        { _tag: "toolCall", callId: "c1", tool: "bash", input: "{}" },
+        { subject: { _tag: "round", roundId: "rnd_live" } },
+      ),
+    );
+    expect(own?.toolName).toBe("bash");
+
+    const foreign = projectNarration(
+      narration(
+        {
+          _tag: "toolCall",
+          callId: "c2",
+          tool: claudeCodeToolName(bitMcpServerName("rnd_other"), "add_intent"),
+          input: "{}",
+        },
+        { subject: { _tag: "round", roundId: "rnd_live" } },
+      ),
+    );
+    // Not reachable today — a session is registered with its own round's server only — but
+    // the reduction is anchored on this round's name rather than on "any bit- prefix", so a
+    // name that is not this round's survives intact rather than being claimed.
+    expect(foreign?.toolName).toBe(foreign?.tool);
+  });
+
+  test("a round's narration carries the round and no attempt, and an attempt's the reverse", () => {
+    // Exactly one of the two is ever set, which is what the bus's tagged subject buys: a
+    // publisher that cannot name which kind it is cannot publish, so neither field is a
+    // slot left unfilled. The planner chat groups on the first of them.
+    const fromRound = projectNarration(
+      narration(
+        { _tag: "reply", text: "two dimensions are untested" },
+        { subject: { _tag: "round", roundId: "rnd_live" } },
+      ),
+    );
+    expect(fromRound?.roundId).toBe("rnd_live");
+    expect(fromRound?.attemptId).toBeNull();
+
+    const fromAttempt = projectNarration(
+      narration({ _tag: "reply", text: "running the probe" }),
+    );
+    expect(fromAttempt?.attemptId).toBe("attempt-1");
+    expect(fromAttempt?.roundId).toBeNull();
+  });
+
   test("a reply reads as a turn, with no sequence", () => {
     const item = projectNarration(
       narration({ _tag: "reply", text: "I will probe the limiter." }),
@@ -1312,7 +1455,7 @@ describe("the record and live activity, together", () => {
 
           yield* narrations.publish({
             targetId: TARGET,
-            attemptId: "attempt-1",
+            subject: { _tag: "attempt", attemptId: "attempt-1" },
             harnessSessionId: "ses_abc",
             entry: {
               type: "session.text.ended",

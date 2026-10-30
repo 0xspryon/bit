@@ -182,9 +182,9 @@ export const LIVE_ITEM_KINDS = [
    * nothing between them, and that is the honest degradation rather than an empty screen.
    *
    * `attemptId` is null on both, and not because it was unavailable: a round is not an
-   * attempt and has no attempt behind it. The round's own id is in the item's `body`
-   * rather than in a field of its own, because adding one would be designing the planner
-   * screen's filter before the screen exists.
+   * attempt and has no attempt behind it. The round's own id is in
+   * {@link LiveItem.roundId}, which the planner chat groups by — and in the item's `body`
+   * as well, because the sentence has to read on a screen that does no grouping.
    */
   "plan.round.started",
   "plan.round.settled",
@@ -261,12 +261,61 @@ export const LiveItem = Schema.Struct({
    * `null` for an item about something with no run behind it at all.
    */
   attemptId: Schema.NullOr(Schema.String),
+  /**
+   * The planner round this item belongs to, when there is one.
+   *
+   * **The planner chat's grouping key, and the reason it can exist at all.** A planner
+   * round's own content is narration, which this build does not persist (the goal and
+   * planner flow's decision 14), so a screen that wants to show one round's turns under
+   * one heading has to be told which round each item is. Nothing else on this struct can
+   * answer that: `attemptId` is null on everything a round produces, because a round is
+   * not an attempt.
+   *
+   * It is set three ways and each is the server's, never the browser's:
+   *
+   * - **`plan.round.started` and `plan.round.settled`** — the round is the event's own
+   *   subject, so this is that subject.
+   * - **A record a round wrote** — `intent.added` from `add_intent`, `goal.ended` from a
+   *   planner's `objective_met`. The round is read from the event's caller scope, which
+   *   slice 4 namespaced as `<targetId>/round/<roundId>` precisely so attribution of this
+   *   kind does not have to be guessed from the payload.
+   * - **A round's narration** — the supervisor publishes under the round whose session it
+   *   opened, exactly as an attempt's narration is published under its attempt.
+   *
+   * `null` for everything else, including every item a worker produced. An earlier build
+   * put a round's id in {@link body} and said a field would be "designing the planner
+   * screen's filter before the screen exists"; the screen exists now, and a sentence is
+   * not a filter.
+   */
+  roundId: Schema.NullOr(Schema.String),
   /** A short label: the tool's name, `Denied`, `Observation recorded`. */
   headline: Schema.String,
   /** A sentence for the operator. The gate's reason, the store's claim, the reply's text. */
   body: Schema.String,
-  /** The tool a `tool.*` or `action.*` item is about, when the harness named one. */
+  /**
+   * The tool a `tool.*` or `action.*` item is about, **as the harness named it**.
+   *
+   * Verbatim, which means namespaced: a tool from an MCP server this application registered
+   * arrives as `mcp__bit-<id>__add_intent` under Claude Code and `bit-<id>.add_intent` under
+   * OpenCode. That is the string to show a reader who is matching it against a harness's own
+   * log, and it is the wrong string to match on in code — see {@link LiveItem.toolName}.
+   */
   tool: Schema.NullOr(Schema.String),
+  /**
+   * The same tool with this application's MCP namespacing removed, for matching on.
+   *
+   * **Both fields exist because a screen needs one and the code needs the other, and
+   * conflating them shipped a broken merge rule.** The planner chat recognises `add_intent`
+   * in order to collapse a tool call into the record it produced; keyed on {@link tool} it
+   * recognised nothing, because the wire form embeds the round id and differs per driver. So
+   * the reduction is done **here, on the server**, where the registration's own name is
+   * known — `mcpToolName.ts` has the two observed forms and the evidence for each — rather
+   * than guessed at in a browser from a separator.
+   *
+   * Equal to {@link tool} for anything that is not one of ours: a harness's own `bash` is
+   * `bash` in both fields. `null` wherever {@link tool} is null.
+   */
+  toolName: Schema.NullOr(Schema.String),
   /**
    * The harness's own id for the tool call this item belongs to.
    *

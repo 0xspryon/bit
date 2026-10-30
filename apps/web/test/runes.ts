@@ -23,7 +23,7 @@
  * a test gets told about a misuse instead of quietly getting a stale number.
  */
 import { plugin } from "bun";
-import { compileModule } from "svelte/compiler";
+import { compile, compileModule } from "svelte/compiler";
 
 const typescript = new Bun.Transpiler({ loader: "ts" });
 
@@ -35,6 +35,40 @@ plugin({
       const compiled = compileModule(typescript.transformSync(source), {
         filename: args.path,
         generate: "client",
+        dev: true,
+      });
+      return { contents: compiled.js.code, loader: "js" };
+    });
+  },
+});
+
+/**
+ * Lets `bun test` load a `.svelte` component, compiled for the server.
+ *
+ * Added for the chat: one of its claims — that the composer is present when the prop says
+ * so and absent in read-only mode — is a claim about *markup*, and the only honest way to
+ * test markup is to render it. `svelte/server`'s `render` does that without a DOM, a
+ * second test runner or a new dependency, which is the same bargain the module above
+ * struck for runes.
+ *
+ * **It is server output, so an `$effect` never runs.** That is a real limit and it is why
+ * the chat's scroll-following lives in `scroll.ts` and its grouping and merge rules live
+ * in `chat.ts`, both plain modules with their own tests: what is asserted here is what the
+ * markup says, not what the component does once it is alive in a browser.
+ *
+ * `css: "external"` keeps the `<style>` block out of the emitted module. The styles are
+ * Vite's business in the real build, and a test that imported them would need a CSS loader
+ * to no purpose.
+ */
+plugin({
+  name: "svelte-components",
+  setup(build) {
+    build.onLoad({ filter: /\.svelte$/ }, async (args) => {
+      const source = await Bun.file(args.path).text();
+      const compiled = compile(source, {
+        filename: args.path,
+        generate: "server",
+        css: "external",
         dev: true,
       });
       return { contents: compiled.js.code, loader: "js" };

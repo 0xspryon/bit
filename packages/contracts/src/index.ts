@@ -14,4 +14,5 @@ export * from "./goal";
 export * from "./plan";
 export * from "./event";
 export * from "./live";
+export * from "./mcpToolName";
 export * from "./unknownField";

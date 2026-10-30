@@ -86,6 +86,7 @@
  */
 import {
   RunRefused,
+  bitMcpServerName,
   droppedModelOptionIds,
   explicitModelOptionSelections,
   modelOptionDescriptors,
@@ -1055,7 +1056,9 @@ const make = Effect.fnUntraced(function* (options?: {
       attemptFence: authority.writeFence,
     });
 
-    const serverName = `bit-${ids.attemptId}`;
+    // One builder, in `@bit/contracts`, because the live transcript's tool-name reduction
+    // is written against it — see `mcpToolName.ts`.
+    const serverName = bitMcpServerName(ids.attemptId);
     // An `acquireRelease`, so the registration is taken away when this scope closes —
     // the same scope that revokes the credential, and for the same reason: a revoked
     // credential that leaves a registration behind is an entry that still reads as
@@ -1139,7 +1142,7 @@ const make = Effect.fnUntraced(function* (options?: {
         Effect.andThen(
           narrations.publish({
             targetId,
-            attemptId,
+            subject: { _tag: "attempt", attemptId },
             harnessSessionId,
             entry,
           }),

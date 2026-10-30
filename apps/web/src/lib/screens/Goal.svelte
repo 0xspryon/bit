@@ -24,9 +24,17 @@
    * as the evidence behind the control above it rather than as a document in its own right.
    * The end control stays last, because it is what is done to the whole goal.
    *
-   * The planner panel is the record and not the round's live view: whether a round is in
-   * flight, what the last one concluded, and the refusals of the control itself. Watching a
-   * round think is its own surface and is not on this page.
+   * The planner reads as two sections because it is two different kinds of claim.
+   * {@link PlanPanel} is the **record**: every round the goal has had, its status, its
+   * disposition and its budget, all from rows that survive anything. {@link PlannerChat}
+   * under it is the **conversation**: what the round actually said, which this build never
+   * stores and which therefore lasts exactly as long as the harness keeps it. Keeping them
+   * apart is the same separation the live transcript makes between a record and activity,
+   * and it is why a month-old round still shows what it concluded above a chat that says
+   * the harness has forgotten its words.
+   *
+   * The chat is read-only. An operator may stop a round and may not prompt one — see
+   * {@link PlannerChat}.
    *
    * The briefing is read-only and is the one section whose content is the server's string
    * verbatim (see {@link GoalBriefingPanel}).
@@ -37,6 +45,7 @@
   import IntentList from "../components/IntentList.svelte";
   import PageFrame from "../components/PageFrame.svelte";
   import PlanPanel from "../components/PlanPanel.svelte";
+  import PlannerChat from "../components/PlannerChat.svelte";
   import { countsLine, goalTitle, whenText } from "../goalFormat";
   import type { App } from "../app.svelte";
 
@@ -84,6 +93,8 @@
         <IntentList {app} />
 
         <PlanPanel {app} />
+
+        <PlannerChat {app} />
 
         <GoalBriefingPanel {app} />
 

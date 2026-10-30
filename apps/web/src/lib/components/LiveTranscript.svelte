@@ -31,74 +31,11 @@
    * store's order on the record channel; re-sorting it in the view would either break it or
    * invent a sequence for activity items that the contract refuses to claim.
    */
+  import ChatItem from "./ChatItem.svelte";
   import type { App } from "../app.svelte";
   import { atBottom } from "../scroll";
 
   let { app }: { app: App } = $props();
-
-  /**
-   * Readable text for the kinds this build knows, from `LIVE_ITEM_KINDS`.
-   *
-   * A lookup rather than a union-exhaustive switch, because `LiveItem.kind` is a string on
-   * the wire on purpose: the set only grows, and a tab one deploy behind the server must
-   * render a kind it has never seen rather than hiding the item. Hence the verbatim
-   * fallback in {@link kindLabel} — an unknown kind shows as itself.
-   */
-  const KIND_LABELS: Record<string, string | undefined> = {
-    "run.started": "Run started",
-    "run.settled": "Run settled",
-    "observation.recorded": "Observation",
-    "asset.recorded": "Asset",
-    "intent.added": "Intent",
-    "goal.added": "Goal",
-    "goal.ended": "Goal ended",
-    "intent.abandoned": "Intent abandoned",
-    "intent.released": "Intent released",
-    // A planner round's two records. They appear in a target's own log now, so this
-    // existing transcript would otherwise show them as their raw kind — correct, by the
-    // fallback below, and not words. The planner's own screen is slice 8's.
-    "plan.round.started": "Planner round",
-    "plan.round.settled": "Planner round settled",
-    "record.other": "Event",
-    "turn.reply": "Reply",
-    "tool.call": "Tool call",
-    "tool.result": "Tool result",
-    "action.denied": "Denied",
-  };
-
-  /** The kind as words, or the kind itself when this build has never heard of it. */
-  function kindLabel(kind: string): string {
-    return KIND_LABELS[kind] ?? kind;
-  }
-
-  /**
-   * Which tint an outcome gets.
-   *
-   * The vocabularies are deliberately not normalised in the contract — an observation's
-   * `negative` and a tool's `failed` are not the same claim — so this maps the words it
-   * knows and leaves anything else plain rather than guessing at a severity.
-   */
-  function outcomeTint(
-    outcome: string,
-  ): "danger" | "success" | "warning" | "plain" {
-    switch (outcome) {
-      case "denied":
-      case "failed":
-        return "danger";
-      case "succeeded":
-      case "ok":
-      case "positive":
-      case "met":
-        return "success";
-      case "negative":
-      case "inconclusive":
-      case "uncertain":
-      case "interrupted":
-        return "warning";
-      default:
-        return "plain";
-    }
-  }
 
   /** Whether this panel is about the target on screen, and has anything to say about it. */
   let showing = $derived(
@@ -263,85 +200,13 @@
       aria-label="Live run items, oldest first"
     >
       {#each app.liveItems as item (item.id)}
-        <li class="item">
-          <div class="row">
-            <span class="chip kind">{kindLabel(item.kind)}</span>
-            <!--
-              The origin as a word: `record` is durable and ordered, `activity` is neither.
-            -->
-            {#if item.origin === "record"}
-              <span
-                class="origin mono"
-                data-origin="record"
-                title="A committed event, in the order the store assigned it."
-              >
-                record
-              </span>
-            {:else}
-              <span
-                class="origin mono"
-                data-origin="activity"
-                title="Live, in-process activity. Not part of the record; can be dropped under load."
-              >
-                activity
-              </span>
-            {/if}
-            <!--
-              The call id, on the items that have one.
-
-              **It is the only thing that can pair a `tool.result` with its `tool.call`.**
-              Both harnesses run tools concurrently, so results do not arrive in the order
-              the calls were made and two calls to the same tool are indistinguishable by
-              name. Showing the id on both rows is the whole requirement: nothing here
-              reorders, groups or nests items, because `app.liveItems` is in arrival order
-              and on the record channel that *is* the store's order (see this component's
-              header).
-
-              When `callId` is `null` on a `tool.result` — reachable, when the harness never
-              named the call — the row simply carries no tag. Falling back to `item.tool`
-              would pair the result with whichever call to `bash` happened to be nearest on
-              screen, which attributes one command's output to a different command; no tag
-              is the honest rendering of "we cannot tell which call this answers".
-            -->
-            {#if item.callId !== null}
-              <span
-                class="call mono"
-                title="The harness's own id for this tool call. A result and the call it answers carry the same id; this is the only thing that pairs them."
-              >
-                call {item.callId}
-              </span>
-            {/if}
-            <span class="headline">{item.headline}</span>
-            {#if item.outcome !== null}
-              <span class="chip outcome" data-tint={outcomeTint(item.outcome)}>
-                {item.outcome}
-              </span>
-            {/if}
-          </div>
-
-          {#if item.body !== ""}
-            <p class="body">{item.body}</p>
-          {/if}
-
-          <!--
-            Collapsed by default, and the `<summary>` says what is inside while it is shut,
-            so the row stays readable and the payload stays out of both the accessibility
-            tree and the box until a reader asks for it.
-          -->
-          {#if item.input !== null}
-            <details class="io">
-              <summary class="io-label">Arguments</summary>
-              <pre class="io-text mono">{item.input}</pre>
-            </details>
-          {/if}
-
-          {#if item.output !== null}
-            <details class="io">
-              <summary class="io-label">Result</summary>
-              <pre class="io-text mono">{item.output}</pre>
-            </details>
-          {/if}
-        </li>
+        <!--
+          The row itself is {@link ChatItem}, shared with the planner chat. Nothing is
+          grouped, paired or folded here: `app.liveItems` is in arrival order, and on the
+          record channel that *is* the store's order (see this component's header), so this
+          panel passes each item through on its own. The chat's merge rule is the chat's.
+        -->
+        <ChatItem {item} />
       {/each}
     </ol>
 
@@ -430,10 +295,6 @@
     background: var(--state-bg-danger);
     color: var(--state-fg-danger);
   }
-  .outcome {
-    text-transform: none;
-    letter-spacing: 0;
-  }
   .note,
   .detail,
   .empty,
@@ -484,110 +345,5 @@
   .items.hollow {
     padding: 0;
     border: 0;
-  }
-  .item {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border-muted);
-  }
-  .item:last-child {
-    padding-bottom: 0;
-    border-bottom: 0;
-  }
-  .row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-  }
-  /* The origin reads as metadata rather than as a state: it is a fact about the channel. */
-  .origin {
-    padding: 1px 5px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-xs);
-    color: var(--text-muted);
-    font-size: 10px;
-    white-space: nowrap;
-  }
-  .origin[data-origin="record"] {
-    border-color: var(--border-strong);
-  }
-  .origin[data-origin="activity"] {
-    border-style: dashed;
-  }
-  /*
-   * Metadata like `.origin`, but a harness's call id can be long, so this truncates instead
-   * of wrapping the row: the leading characters are what an operator matches on by eye, and
-   * the `title` has the whole of it.
-   */
-  .call {
-    max-width: 16ch;
-    padding: 1px 5px;
-    overflow: hidden;
-    border: 1px dotted var(--border-muted);
-    border-radius: var(--radius-xs);
-    color: var(--text-muted);
-    font-size: 10px;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-  .headline {
-    flex: 1;
-    min-width: 0;
-    color: var(--text-base);
-    font-size: 12px;
-    overflow-wrap: anywhere;
-  }
-  .body {
-    margin: 0;
-    color: var(--text-muted);
-    font-size: 12px;
-    line-height: var(--lh-compact);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-  }
-  /* Block, not flex: a `<details>` laid out as a flex container does not reliably collapse. */
-  .io {
-    display: block;
-  }
-  /*
-   * The old `.io-label` look — small, uppercase, faint — on what is now the control that
-   * opens the block, so it also has to read as clickable: a pointer, a hover shift, and a
-   * focus ring, since this is reachable by keyboard and a summary with no visible focus is
-   * a control nobody can find.
-   */
-  .io-label {
-    width: fit-content;
-    padding: 1px 2px;
-    border-radius: var(--radius-xs);
-    color: var(--text-muted);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    cursor: pointer;
-  }
-  .io-label:hover {
-    color: var(--text-base);
-  }
-  .io-label:focus-visible {
-    outline: 1px solid var(--border-focus);
-    outline-offset: 1px;
-  }
-  /* Still capped and still scrollable: open, a long payload must not take over the box. */
-  .io-text {
-    max-height: 140px;
-    margin: 2px 0 0;
-    padding: 6px 8px;
-    overflow-y: auto;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-deep);
-    color: var(--text-muted);
-    font-size: 11px;
-    line-height: var(--lh-compact);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
   }
 </style>

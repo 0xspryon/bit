@@ -100,6 +100,8 @@
  */
 import {
   LIVE_HEARTBEAT_SECONDS,
+  bareToolName,
+  bitMcpServerName,
   type LiveCursor,
   type LiveFrame,
   type LiveItem,
@@ -116,6 +118,7 @@ import {
   Stream,
 } from "effect";
 
+import { roundIdFromScope } from "../persistence/store";
 import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
 import type { RunNarration, RunNarrations } from "./narration";
 
@@ -203,6 +206,20 @@ const ATTEMPT_SUBJECT_KINDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The event kinds whose subject *is* the planner round they are about.
+ *
+ * {@link ATTEMPT_SUBJECT_KINDS}'s counterpart, and narrow for the same reason: these two
+ * are the only host-originated round events, both written by `plan/planSupervisor.ts` with
+ * no caller authority at all, so the round is the `subject_id`. Every other item that
+ * belongs to a round gets it from the **caller scope** instead — `intent.added` from a
+ * round's `add_intent` is a round's write, and its subject is the intent.
+ */
+const ROUND_SUBJECT_KINDS: ReadonlySet<string> = new Set([
+  "plan.round.started",
+  "plan.round.settled",
+]);
+
+/**
  * How an intent event names its intent: the question when the event carries it, and always
  * the id, because a question can repeat and an id cannot. `subject_id` is the intent for
  * these kinds, so it is the fallback when a payload lacks `intentId`.
@@ -261,7 +278,26 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
     attemptId: ATTEMPT_SUBJECT_KINDS.has(event.kind)
       ? event.subjectId
       : event.attemptId,
+    /**
+     * Which planner round this item belongs to, read the two ways a round can own an event.
+     *
+     * The subject for the round's own two records, and the **caller scope** for everything
+     * a round wrote — which is the half that matters, because an `intent.added` the planner
+     * committed carries the intent as its subject and says nothing about the round in its
+     * payload. `roundIdFromScope` is `callerScopeOf`'s inverse and lives beside it, so the
+     * `<targetId>/round/<roundId>` format has one home.
+     *
+     * Deliberately **not** inferred from anything else. An operator-added intent and a
+     * planner-added one differ in exactly this column, and guessing from, say, the goal
+     * would file a hand-written intent under whichever round happened to be open.
+     */
+    roundId:
+      roundIdFromScope(event.callerScope) ??
+      (ROUND_SUBJECT_KINDS.has(event.kind) ? event.subjectId : null),
     tool: null,
+    // Null together with `tool`, always: a committed event is not a tool call, and the
+    // record channel never names one.
+    toolName: null,
     input: null,
     output: null,
     callId: null,
@@ -459,8 +495,31 @@ export const projectNarration = (item: RunNarration): LiveItem | undefined => {
     origin: "activity" as const,
     sequence: null,
     at: item.entry.at,
-    attemptId: item.attemptId,
+    /**
+     * Whose session narrated this, projected from the bus's tagged subject.
+     *
+     * Exactly one of the two is set, which is what the tag buys: an attempt's narration
+     * has no round and a round's has no attempt, and neither is a field left unfilled.
+     * The supervisor publishes under the identity whose session it opened, so this is not
+     * a guess at attribution.
+     */
+    attemptId: item.subject._tag === "attempt" ? item.subject.attemptId : null,
+    roundId: item.subject._tag === "round" ? item.subject.roundId : null,
   };
+  /**
+   * The registration whose prefix this subject's tool names carry.
+   *
+   * Derived from the subject rather than searched for, which is what makes the reduction
+   * below exact: the server was registered as `bit-<attemptId>` or `bit-<roundId>` by the
+   * supervisor that opened this session, so the only prefix stripped is the one this
+   * application chose. A harness's own `bash` is untouched. `mcpToolName.ts` carries the
+   * two observed wire forms and the evidence for each.
+   */
+  const serverName = bitMcpServerName(
+    item.subject._tag === "attempt"
+      ? item.subject.attemptId
+      : item.subject.roundId,
+  );
   const detail = item.entry.detail;
   switch (detail._tag) {
     case "reply":
@@ -475,6 +534,7 @@ export const projectNarration = (item: RunNarration): LiveItem | undefined => {
             headline: "Reply",
             body: detail.text,
             tool: null,
+            toolName: null,
             input: null,
             output: null,
             callId: null,
@@ -492,6 +552,10 @@ export const projectNarration = (item: RunNarration): LiveItem | undefined => {
             ? "A tool call the harness had not yet named."
             : "",
         tool: detail.tool ?? null,
+        // The same name with our MCP prefix off, so a consumer can recognise `add_intent`
+        // without knowing which driver reported it or which round registered it. The
+        // planner chat's merge rule matches on this and shipped broken matching on `tool`.
+        toolName: bareToolName(detail.tool, serverName) ?? null,
         input: detail.input === "" ? null : detail.input,
         output: null,
         // Carried through so a result can be paired with *this* call rather than with
@@ -507,6 +571,7 @@ export const projectNarration = (item: RunNarration): LiveItem | undefined => {
         headline: detail.tool ?? "Tool result",
         body: "",
         tool: detail.tool ?? null,
+        toolName: bareToolName(detail.tool, serverName) ?? null,
         input: null,
         output: detail.output === "" ? null : detail.output,
         // The only thing that says which call this answers. Claude Code's `tool_result`
@@ -550,11 +615,29 @@ export const projectDecision = (
     kind: "action.denied",
     at: decision.at,
     attemptId,
+    /**
+     * Null, and that is a gap worth naming rather than papering over.
+     *
+     * A denial is placed by **harness session id** against the attempt supervisor's map
+     * (see {@link projectDecision}'s caller), and a planner round's session is not in that
+     * map — so a tool call the gate refuses inside a planning directory does not reach this
+     * feed at all, and nothing reaches it with a round on it. The gate still writes it to
+     * the engagement's audit file, which the contract already names as the only complete
+     * record of refusals. Reading that file back is its own day's work; what must not happen
+     * meanwhile is a round's denial arriving filed under no round and looking like a
+     * worker's.
+     */
+    roundId: null,
     headline: "Denied",
     // The gate's own sentence, unsoftened. It is the only description of this refusal that
     // exists, and a handler that rephrased it would be describing a rule it cannot read.
     body: decision.decision.reason,
     tool: decision.request.tool,
+    // Reduced against the attempt's own registration, which is the only one a decision this
+    // feed can place could have come through. A gate denial of a *round's* tool never
+    // reaches here at all — see `roundId` above.
+    toolName:
+      bareToolName(decision.request.tool, bitMcpServerName(attemptId)) ?? null,
     input,
     output: null,
     // The gate's request carries a session id, a tool name and the arguments, and no call

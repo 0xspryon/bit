@@ -33,6 +33,7 @@ import {
   LIVE_SILENCE_LIMIT_SECONDS,
   type GoalEndStatus,
   type GoalBriefingView,
+  type GoalNarrationView,
   type GoalObservationView,
   type GoalView,
   type HarnessInstanceView,
@@ -55,6 +56,7 @@ import {
   previewGoals,
   type Target,
 } from "./mock";
+import { activityOrder, buildChat } from "./chat";
 import { server, type ServerClient } from "./client";
 
 /**
@@ -420,6 +422,52 @@ export class App {
     this.planRoundsGoalId === this.openGoalId ? this.planRounds[0] : undefined,
   );
 
+  /* ── A round's narration ──────────────────────────────────────────────────── */
+  /**
+   * The open goal's planner narration, as the harness last had it.
+   *
+   * **The one read in this application whose answer is somebody else's retention policy.**
+   * A round's prose is never stored (the spec's decision 14), so after a reload this is the
+   * only place it can come from — and the harness may have deleted it, which arrives as a
+   * success saying so rather than as a failure. Each round in it carries its own `source`,
+   * and `chat.ts` turns that into the sentence the chat prints.
+   *
+   * `undefined` means the read has not answered yet, which the chat shows as `loading`
+   * rather than as an absence: "we have not asked" and "there is nothing" are different.
+   */
+  goalNarration = $state<GoalNarrationView | undefined>(undefined);
+  goalNarrationGoalId = $state("");
+  goalNarrationState = $state<GoalsState>("idle");
+  /** The server's own words when the narration could not be read at all. */
+  goalNarrationDetail = $state("");
+
+  /**
+   * The activity publish order at the moment the narration answered.
+   *
+   * **This is the dedupe between the replay and the live tail, and it is the honest version
+   * of the one the spec asks for.** The spec's join is "by the harness's own message
+   * index", and neither side has one to join on: `AgentHarness.messages` is the reduced
+   * `{ type, text, error }` shape, and a `LiveItem` carries the server's publish counter
+   * rather than the harness's cursor — Claude Code has no cursor at all. So what is used
+   * instead is *our* arrival order: narration published at or below this number is already
+   * inside the replayed block, and narration above it is this tab's own tail.
+   *
+   * It is an in-process counter, which is exactly the right scope for the question: both
+   * the replay and the live feed came from this server process, and a restart invalidates
+   * the replay and the floor together.
+   *
+   * The remaining overlap is small and real: an entry the harness had already recorded when
+   * it answered, but which this process published between then and the answer landing, is
+   * in both. The replayed block says it is a replay rather than claiming completeness,
+   * which is why that is tolerable and a silent dedupe by tool name would not be.
+   */
+  goalNarrationFloor = $state<number | undefined>(undefined);
+
+  /** True while a round's stop is in flight, so the control spins exactly once. */
+  roundStopping = $state("");
+  /** Why a stop was refused, in the server's words, beside the control. */
+  roundStopDetail = $state("");
+
   /* ── Intents ──────────────────────────────────────────────────────────────── */
   /**
    * The open goal's intents, oldest first, as the server last told us.
@@ -665,6 +713,32 @@ export class App {
   liveDetail = $state("");
   /** Which target {@link liveItems} belong to, so one target's never shows under another. */
   liveTargetId = $state("");
+
+  /**
+   * The open goal's chat: its rounds, their replayed prose and their live rows.
+   *
+   * Declared here, among the live transcript's state, rather than up with the planner
+   * rounds it is mostly about: a `$derived` is initialised in field order, so one that read
+   * {@link liveItems} before that field existed would be reading an uninitialised class
+   * field. It is the live feed that decides where it goes.
+   *
+   * Derived rather than stored, so one arriving item moves the chat without anything having
+   * to remember to rebuild it. The rules it applies — grouping by round, folding a tool
+   * result into its call, and collapsing a write into the record it produced — are all in
+   * `chat.ts`, which is a plain module so they can be tested without a browser.
+   */
+  goalChat = $derived(
+    buildChat({
+      rounds: this.planRoundsGoalId === this.openGoalId ? this.planRounds : [],
+      items: this.liveTargetId === this.viewTargetId ? this.liveItems : [],
+      narration:
+        this.goalNarrationGoalId === this.openGoalId
+          ? this.goalNarration
+          : undefined,
+      narrationFloor: this.goalNarrationFloor,
+      inFlight: new Set(this.runningRounds.map((round) => round.roundId)),
+    }),
+  );
 
   /**
    * Ids already shown, so an item delivered twice is shown once.
@@ -1121,6 +1195,13 @@ export class App {
     this.planDetail = "";
     this.planRefusalSize = undefined;
     this.planRefusalCeiling = undefined;
+    this.goalNarration = undefined;
+    this.goalNarrationGoalId = "";
+    this.goalNarrationState = "idle";
+    this.goalNarrationDetail = "";
+    this.goalNarrationFloor = undefined;
+    this.roundStopping = "";
+    this.roundStopDetail = "";
   }
 
   /** Puts every goal-briefing field back where a fresh goal leaves it. */
@@ -1232,6 +1313,10 @@ export class App {
     void this.loadIntents(goalId);
     void this.loadGoalBriefing(goalId);
     void this.loadPlanRounds(goalId);
+    // The prose, from the harness's own retention. Read on opening a goal because that is
+    // the moment a reloaded tab has no narration of its own: everything on the activity
+    // channel before this page connected is unrecoverable from the stream.
+    void this.loadGoalNarration(goalId);
     // What the *process* is driving, which the rows cannot answer. Read on opening a goal
     // so a reloaded tab knows at once whether a round is in flight rather than finding out
     // when the button is refused.
@@ -1523,6 +1608,11 @@ export class App {
       this.#placePlanRound(call.value);
       void this.loadRunningRounds();
       void this.loadPlanRounds(goalId);
+      // And the narration, so the new round has something to say about itself at once.
+      // The live stream's own `plan.round.started` triggers this too, which is belt and
+      // braces on purpose: a tab whose stream is still catching up — or reconnecting —
+      // would otherwise leave the round it just opened reading as "still being read".
+      void this.loadGoalNarration(goalId);
     } finally {
       this.planStarting = false;
     }
@@ -1580,6 +1670,143 @@ export class App {
         (round) => round.roundId !== started.roundId,
       ),
     ];
+  }
+
+  /**
+   * Reads the open goal's planner narration into {@link goalNarration}.
+   *
+   * **A read whose empty answers are the interesting ones.** A round the harness has
+   * deleted, a round that has only just been prompted and a round that genuinely said
+   * nothing all come back as successes with no messages and different `source` values, and
+   * {@link goalNarrationDetail} is reserved for the one case where no server answered at
+   * all. Treating a forgotten round as an error is the mistake this route's shape exists to
+   * make impossible.
+   *
+   * {@link goalNarrationFloor} is taken **before** the request goes out, not after it
+   * returns. The floor's job is to say which narration the replay already contains, and the
+   * answer describes the harness's log as of when the harness read it — which is at or
+   * before the moment the request left here. Reading the counter afterwards would exclude
+   * entries that arrived during the round trip and are *not* in the replay, which is the
+   * one direction this dedupe must not err in: a dropped live entry is invisible, where a
+   * duplicated one is merely untidy and the replayed block is labelled as a replay anyway.
+   */
+  async loadGoalNarration(goalId: string) {
+    const targetId = this.viewTargetId;
+    if (targetId === "" || this.openGoalId !== goalId) return;
+    if (this.goalNarrationGoalId !== goalId) {
+      this.goalNarration = undefined;
+      this.goalNarrationGoalId = goalId;
+    }
+    this.goalNarrationState = "loading";
+    this.goalNarrationDetail = "";
+    const floor = this.#activityHighWater();
+
+    const call = await this.client.goalNarration(
+      this.serverUrl,
+      targetId,
+      goalId,
+    );
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+
+    if (call._tag === "Unreachable") {
+      this.goalNarrationState = "failed";
+      this.goalNarrationDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.goalNarrationState = "failed";
+      this.goalNarrationDetail = this.#refusalText(
+        call.error,
+        "This goal's planner narration could not be read.",
+      );
+      return;
+    }
+    this.goalNarration = call.value;
+    this.goalNarrationFloor = floor;
+    this.goalNarrationState = "ready";
+  }
+
+  /**
+   * The highest activity publish order this tab has seen, or `undefined` for none.
+   *
+   * Read across every live item rather than only this round's, because the counter is one
+   * per process: an entry numbered below the high-water mark cannot be one that arrives
+   * later, whichever round or attempt it belongs to. See {@link goalNarrationFloor}.
+   */
+  #activityHighWater(): number | undefined {
+    let highest: number | undefined;
+    for (const item of this.liveItems) {
+      const order = activityOrder(item);
+      if (order === undefined) continue;
+      if (highest === undefined || order > highest) highest = order;
+    }
+    return highest;
+  }
+
+  /**
+   * Stops one planner round on the open goal.
+   *
+   * **It settles the round; it does not pause it and there is no resume.** By the time the
+   * server answers, the harness has been asked to interrupt, the row is `interrupted`, the
+   * round's credential is revoked and its write fence is superseded — so anything the
+   * planner tries to write afterwards is refused by the store, not merely ignored. Work
+   * carried on after an interruption is a new round, which is why there is no second
+   * control here.
+   *
+   * The answer is the settled row, placed straight into {@link planRounds} so the
+   * separator's status changes on the same tick the control disappears, and
+   * {@link loadRunningRounds} follows because the round leaving the fiber map is what the
+   * stop control is keyed on.
+   */
+  async stopRound(roundId: string) {
+    const targetId = this.viewTargetId;
+    const goalId = this.openGoalId;
+    if (targetId === "" || goalId === "" || this.roundStopping !== "") return;
+    this.roundStopping = roundId;
+    this.roundStopDetail = "";
+    try {
+      const call = await this.client.stopRound(
+        this.serverUrl,
+        targetId,
+        goalId,
+        roundId,
+      );
+      if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+      if (call._tag === "Unreachable") {
+        this.roundStopDetail = "No server answered at this address.";
+        return;
+      }
+      if (call._tag === "Refused") {
+        if (call.error._tag === "Unauthenticated") {
+          this.signOut("expired");
+          return;
+        }
+        this.roundStopDetail = this.#refusalText(
+          call.error,
+          "That round was not stopped.",
+        );
+        // A refusal usually means the round settled on its own while the page was open, so
+        // what this tab believes about the fiber map is stale. Re-read both halves.
+        void this.loadRunningRounds();
+        void this.loadPlanRounds(goalId);
+        return;
+      }
+      const settled = call.value;
+      this.planRounds = this.planRounds.map((round) =>
+        round.roundId === settled.roundId ? { ...settled } : round,
+      );
+      this.runningRounds = this.runningRounds.filter(
+        (round) => round.roundId !== settled.roundId,
+      );
+      void this.loadRunningRounds();
+      void this.loadPlanRounds(goalId);
+    } finally {
+      this.roundStopping = "";
+    }
   }
 
   /* ── Intents ─────────────────────────────────────────────────────────────── */
@@ -2632,6 +2859,16 @@ export class App {
     }
     void this.loadPlanRounds(this.openGoalId);
     void this.loadRunningRounds();
+    /*
+     * And the prose, which is a different read with a different source.
+     *
+     * On a **start** because a round newer than the last replay has no entry in it, and
+     * the chat would have nothing to say about it until the first narration arrived. On a
+     * **settle** because a round this tab did not watch — opened in another tab, or
+     * started before this page connected — has no live narration of its own, and the
+     * harness's copy is the only thing that will ever show what it said.
+     */
+    void this.loadGoalNarration(this.openGoalId);
   }
 
   #refreshGoalBriefingFor(targetId: string, frame: LiveItem) {

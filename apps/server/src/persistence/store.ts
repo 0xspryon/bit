@@ -368,6 +368,34 @@ export const callerScopeOf = (binding: CallerIdentity): string => {
   }
 };
 
+/** The reserved segment a round's caller scope is namespaced by. */
+const ROUND_SCOPE_SEGMENT = "/round/";
+
+/**
+ * Reads the round out of a caller scope, or `undefined` when it is not a round's.
+ *
+ * {@link callerScopeOf}'s inverse, and it lives beside it so the format has one home. The
+ * caller behind an event is the only thing that says a record was written *by a planner
+ * round* — `events.caller_scope` is the column, and the payload of an `intent.added` says
+ * nothing about who added it — so a planner chat that wants to show a round's own writes
+ * under that round's heading has to read it from here. `run/liveTranscript.ts` is the
+ * caller.
+ *
+ * It takes the whole scope rather than a target and a scope, and does not check the target
+ * prefix. The reserved segment plus `identifier.ts`'s id alphabet is what makes the match
+ * unambiguous — no minted id contains a `/` — and a reader that already has the event
+ * knows its target from the row.
+ */
+export const roundIdFromScope = (
+  callerScope: string | null,
+): string | undefined => {
+  if (callerScope === null) return undefined;
+  const at = callerScope.indexOf(ROUND_SCOPE_SEGMENT);
+  if (at < 0) return undefined;
+  const roundId = callerScope.slice(at + ROUND_SCOPE_SEGMENT.length);
+  return roundId === "" ? undefined : roundId;
+};
+
 /**
  * How a caller is named in a refusal it reads.
  *

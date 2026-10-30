@@ -1468,7 +1468,7 @@ describe("the live transcript's activity channel, on the wire", () => {
       Effect.flatMap(RunNarrations, (narrations) =>
         narrations.publish({
           targetId,
-          attemptId: SUPERVISED.attemptId,
+          subject: { _tag: "attempt", attemptId: SUPERVISED.attemptId },
           harnessSessionId: SUPERVISED.harnessSessionId,
           entry: {
             type: entry.type,
@@ -3023,12 +3023,61 @@ describe("opening a planner round over HTTP", () => {
     expect(await response.json()).toEqual([]);
   });
 
+  test("a goal with no rounds has no narration either, and that is a 200", async () => {
+    // **Not a 404 and not an error.** A round the harness has forgotten is the expected
+    // state of anything old enough, so this route's shape has to make the common case a
+    // success — the same reason `transcript` answers 200 with `source: "absent"`.
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const response = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/narration`),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ goalId, targetId, rounds: [] });
+    // Nothing was left out, and the figure is present rather than implied by an absence.
+    expect(response.body["skipped"]).toBe(0);
+  });
+
+  test("the narration of a goal this target does not hold is a 404", async () => {
+    const targetId = await freshTarget();
+    const response = await read(
+      await signedIn(`/targets/${targetId}/goals/goal_nonesuch/narration`),
+    );
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({ _tag: "GoalNotFound" });
+  });
+
+  test("stopping a round this goal does not hold is a 404, not a 409", async () => {
+    // The two refusals answer two different questions and must not be swapped.
+    // `RoundNotFound` is the row: a request built from the wrong pieces. `unknown_round` is
+    // the fiber map, which is the ordinary state of every round that has already settled —
+    // so answering the first with the second would tell an operator to wait for something
+    // that was never there.
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const response = await read(
+      await signedIn(
+        `/targets/${targetId}/goals/${goalId}/rounds/rnd_nonesuch/stop`,
+        { method: "POST" },
+      ),
+    );
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({
+      _tag: "RoundNotFound",
+      goalId,
+      roundId: "rnd_nonesuch",
+    });
+    expect(String(response.body["detail"])).toContain("rnd_nonesuch");
+  });
+
   test("the planner routes are behind the session guard, like every other fleet route", async () => {
     const targetId = await freshTarget();
     const goalId = await newGoal(targetId);
     for (const [path, method] of [
       [`/targets/${targetId}/goals/${goalId}/plan`, "POST"],
       [`/targets/${targetId}/goals/${goalId}/rounds`, "GET"],
+      [`/targets/${targetId}/goals/${goalId}/narration`, "GET"],
+      [`/targets/${targetId}/goals/${goalId}/rounds/rnd_1/stop`, "POST"],
       ["/rounds", "GET"],
     ] as const) {
       const response = await read(await call(path, { method }));

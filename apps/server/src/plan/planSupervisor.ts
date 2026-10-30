@@ -37,17 +37,20 @@
  *
  * ## What is not here yet, said plainly
  *
- * **No narration published.** The round's harness stream is drained so a terminal
- * `session.execution.*` can be read off it (see {@link narrateRound}), and it is **not**
- * forwarded to `run/narration.ts`: that bus's filter is keyed by attempt id, and widening
- * it would be designing slice 8's planner chat before slice 8 has a screen to design it
- * against. What survives a reload in the meantime is the pair of records,
- * `plan.round.started` and `plan.round.settled`, which is exactly what the spec's decision
- * 16 asks for.
+ * **Narration is published and never stored.** The round's harness stream is drained so a
+ * terminal `session.execution.*` can be read off it, and every entry is forwarded to
+ * `run/narration.ts` under this round (see {@link narrateRound}) so the planner chat can
+ * watch it. That bus is in-process and sliding: an entry published with no browser attached
+ * is gone, and nothing reconciles against it. What survives a reload is the pair of
+ * records, `plan.round.started` and `plan.round.settled` — the spec's decision 16 — plus
+ * whatever the harness still holds, which `plan/roundNarration.ts` replays and which the
+ * harness may have deleted.
  *
- * **No transcript.** `run/transcript.ts` captures a settled *attempt*'s transcript into
- * the target's evidence directory. A round's own transcript belongs with the planner view
- * that reads it.
+ * **No transcript artefact.** `run/transcript.ts` captures a settled *attempt*'s transcript
+ * into the target's evidence directory; nothing writes a round's. The planner view reads
+ * the harness's own copy instead and says that it is the harness's — which is the whole of
+ * decision 14's accepted cost, and the reason a month-old round shows its disposition and
+ * not its prose.
  *
  * ## The three ways a round ends
  *
@@ -76,6 +79,7 @@
  */
 import {
   PlanRefused,
+  bitMcpServerName,
   type PlanRoundStarted,
   type RunningRound,
 } from "@bit/contracts";
@@ -119,6 +123,7 @@ import {
   roundSettlementFor,
   type SupervisionEnd,
 } from "../run/settlement";
+import { RunNarrations } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 
 /**
@@ -384,6 +389,7 @@ export class PlanSupervisor extends Context.Service<
     | McpCredentials
     | McpCallCounter
     | WorkerEndpoints
+    | RunNarrations
   > = Layer.effect(
     PlanSupervisor,
     // `Effect.suspend` for `RunSupervisor.layer`'s reason: `make` closes over this class
@@ -410,6 +416,7 @@ export class PlanSupervisor extends Context.Service<
     | McpCredentials
     | McpCallCounter
     | WorkerEndpoints
+    | RunNarrations
   > =>
     Layer.effect(
       PlanSupervisor,
@@ -464,6 +471,16 @@ const make = Effect.fnUntraced(function* (options?: {
   const stores = yield* TargetStores;
   const fleet = yield* FleetStore;
   const credentials = yield* McpCredentials;
+  /**
+   * The in-process narration bus, which a round now publishes onto.
+   *
+   * **It is the planner view's live channel, and it is not durable.** Nothing here writes
+   * narration anywhere (the spec's decision 14): what a round says reaches a browser only
+   * while a browser is attached, and the pair of records this file does write —
+   * `plan.round.started` and `plan.round.settled` — is what survives a reload. The bus is
+   * sliding, so a slow tab drops entries rather than slowing the round down.
+   */
+  const narrations = yield* RunNarrations;
   /**
    * The MCP endpoint's own request tally, read at settlement.
    *
@@ -786,7 +803,8 @@ const make = Effect.fnUntraced(function* (options?: {
       roundFence: opened.authority.writeFence,
     });
 
-    const serverName = `bit-${ids.roundId}`;
+    // One builder; see `run/supervisor.ts`'s call and `mcpToolName.ts`.
+    const serverName = bitMcpServerName(ids.roundId);
     // An `acquireRelease`, so the registration is taken away when this scope closes — the
     // same scope that revokes the credential, and for the same reason: a revoked credential
     // that leaves a registration behind is an entry that still reads as connected
@@ -852,25 +870,40 @@ const make = Effect.fnUntraced(function* (options?: {
    * and because the stream does not end when a session settles, taking settlement from
    * here would hang rather than answer wrongly.
    *
-   * **It publishes nothing.** `run/narration.ts`'s bus filters by attempt id, and a round
-   * has no attempt; widening it is slice 8's, which has a planner chat to design it
-   * against. So this fiber exists for the backstop alone, and the durable record of a
-   * round is its two events.
+   * **It publishes onto `run/narration.ts`'s bus, under the round.** It used to publish
+   * nothing, because that bus's subject was an attempt id and a round has no attempt; the
+   * planner view is the screen that made widening it worth doing, and the subject is now
+   * tagged. The entries are keyed by this round, not by the goal: a goal's narration is
+   * several rounds' worth and the chat groups them by round, which is the only grouping
+   * the records can corroborate after a reload.
+   *
+   * **Publishing is not persisting.** An entry published with nobody listening is gone,
+   * and a reload replays from the harness instead (`plan/roundNarration.ts`). The durable
+   * record of a round is still its two events.
    *
    * A failure here is logged and nothing more. The stream breaking is not an outcome, and
    * the supervisor that outlives it still settles from the wait and from `session.get`.
    */
   const narrateRound = Effect.fnUntraced(function* (
     roundId: string,
+    targetId: string,
     harnessSessionId: string,
     report: { narrated: TerminalOutcome | undefined },
   ) {
     const harness = yield* AgentHarness;
     const outcome = yield* Effect.result(
       Stream.runForEach(harness.sessionEvents(harnessSessionId), (entry) =>
-        Effect.sync(() => {
-          if (entry.outcome !== undefined) report.narrated = entry.outcome;
-        }),
+        Effect.andThen(
+          narrations.publish({
+            targetId,
+            subject: { _tag: "round", roundId },
+            harnessSessionId,
+            entry,
+          }),
+          Effect.sync(() => {
+            if (entry.outcome !== undefined) report.narrated = entry.outcome;
+          }),
+        ),
       ),
     );
     if (outcome._tag === "Failure") {
@@ -1296,7 +1329,7 @@ const make = Effect.fnUntraced(function* (options?: {
         // fiber rather than one in the map: it belongs to this round and is interrupted
         // with it.
         const narrator = yield* Effect.forkChild(
-          narrateRound(ids.roundId, harnessSessionId, report),
+          narrateRound(ids.roundId, input.targetId, harnessSessionId, report),
         );
 
         const harness = yield* AgentHarness;

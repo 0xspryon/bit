@@ -1754,10 +1754,11 @@ describe("the narration bus", () => {
       "beta",
       "beta",
     ]);
-    expect(observed.received.map((item) => item.attemptId)).toEqual([
-      observed.beta.attemptId,
-      observed.beta.attemptId,
-    ]);
+    expect(
+      observed.received.map((item) =>
+        item.subject._tag === "attempt" ? item.subject.attemptId : "(a round)",
+      ),
+    ).toEqual([observed.beta.attemptId, observed.beta.attemptId]);
     expect(observed.received.map((item) => item.entry.type)).toEqual([
       "session.execution.started",
       "session.text.ended",

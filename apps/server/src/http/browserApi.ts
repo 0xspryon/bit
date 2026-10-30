@@ -40,6 +40,7 @@ import {
   GoalRefused,
   IntentNotFound,
   IntentRefused,
+  RoundNotFound,
   RunRefused,
   SessionActor,
   SessionGuard,
@@ -58,6 +59,7 @@ import {
   type TargetSummary,
 } from "@bit/contracts";
 import {
+  Clock,
   Context,
   Effect,
   Layer,
@@ -99,6 +101,10 @@ import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
 import { PlanSupervisor } from "../plan/planSupervisor";
+import {
+  GOAL_NARRATION_ROUND_LIMIT,
+  roundNarration,
+} from "../plan/roundNarration";
 import { liveTranscript } from "../run/liveTranscript";
 import { RunNarrations } from "../run/narration";
 import { RunSupervisor } from "../run/supervisor";
@@ -1531,6 +1537,110 @@ const fleetHandlers = HttpApiBuilder.group(
           });
         }
         return { rounds: found.map(planRoundView) };
+      }),
+
+      /**
+       * One goal's planner narration, replayed from the harness.
+       *
+       * The other half of `goalRounds`, and the half this build cannot promise: narration
+       * is never stored (the spec's decision 14), so the prose comes from the harness's own
+       * retention and each round says which of the four answers it got
+       * (`plan/roundNarration.ts`). Nothing here is an error — a goal whose rounds the
+       * harness has entirely deleted is a `200` with four `forgotten` rounds and four
+       * sentences saying so.
+       *
+       * **Newest rounds first into the budget, oldest first out of it.** The rows arrive
+       * newest first, the newest `GOAL_NARRATION_ROUND_LIMIT` of them are the ones worth a
+       * harness call, and the answer is reversed so it reads in the order the chat renders
+       * them. `skipped` is the rest, which still have their separators and dispositions
+       * from `goalRounds`.
+       *
+       * The reads run concurrently and each is bounded by its own fetch timeout, so eight
+       * rounds cost one slow harness rather than eight. `Effect.forEach` with
+       * `concurrency: "unbounded"` is safe at this width because the width *is* the limit
+       * above.
+       */
+      goalNarration: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const found = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            const goal = yield* store.loadGoal(params.goalId);
+            if (goal === undefined || goal.targetId !== row.targetId) {
+              return undefined;
+            }
+            return yield* store.roundsForGoal(params.goalId);
+          }),
+        ).pipe(Effect.orDie);
+        if (found === undefined) {
+          return yield* new GoalNotFound({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            detail: `no goal '${params.goalId}' is recorded in this target`,
+          });
+        }
+        const asked = found.slice(0, GOAL_NARRATION_ROUND_LIMIT);
+        const replayed = yield* Effect.forEach(
+          asked,
+          (round) => roundNarration({ resolver: harnesses, round }),
+          { concurrency: "unbounded" },
+        );
+        return {
+          goalId: params.goalId,
+          targetId: row.targetId,
+          rounds: [...replayed].reverse(),
+          skipped: found.length - asked.length,
+          at: yield* Clock.currentTimeMillis,
+        };
+      }),
+
+      /**
+       * Stops one planner round.
+       *
+       * Two checks before the supervisor is asked, and they answer two different questions.
+       * The **row** says whether this goal has such a round at all — a `RoundNotFound` if
+       * not, which is a request built from the wrong pieces. The **fiber map** says whether
+       * this process is driving it, and that is the supervisor's own `unknown_round`: the
+       * ordinary answer for a round that already settled, and for a row a dead process left
+       * for the startup sweep. Deciding the first here keeps the 404 and the 409 from both
+       * being plausible answers to one mistake, exactly as `plan` does for the goal.
+       *
+       * The row is re-read **after** the stop rather than before, because the stop is what
+       * makes it true: by the time the supervisor returns, the harness has been asked to
+       * interrupt, the status is `interrupted`, the credential is revoked and the write
+       * fence is superseded. A row read before would be the running one.
+       */
+      stopRound: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const before = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.loadRound(params.roundId),
+        ).pipe(Effect.orDie);
+        if (
+          before === undefined ||
+          before.targetId !== row.targetId ||
+          before.goalId !== params.goalId
+        ) {
+          return yield* new RoundNotFound({
+            targetId: row.targetId,
+            goalId: params.goalId,
+            roundId: params.roundId,
+            detail: `no planner round '${params.roundId}' is recorded under goal '${params.goalId}' in this target`,
+          });
+        }
+        yield* planner.stop(params.roundId);
+        const settled = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.roundsForGoal(params.goalId),
+        ).pipe(Effect.orDie);
+        const found = settled.find((round) => round.roundId === params.roundId);
+        if (found === undefined) {
+          // The row was there a moment ago and the stop succeeded, so its disappearance is
+          // not something an operator can act on. Nothing deletes a round row.
+          return yield* Effect.die(
+            new Error(
+              `planner round ${params.roundId} was stopped and could not be read back`,
+            ),
+          );
+        }
+        return planRoundView(found);
       }),
 
       /**

@@ -47,9 +47,11 @@ import {
 } from "./intent";
 import { API_PREFIX, apiPath } from "./http";
 import {
+  GoalNarrationView,
   PlanRefused,
   PlanRoundStarted,
   PlanRoundView,
+  RoundNotFound,
   RunningRound,
 } from "./plan";
 import { LiveFrame } from "./live";
@@ -1414,6 +1416,82 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         params: { targetId: Schema.String, goalId: Schema.String },
         success: Schema.Struct({ rounds: Schema.Array(PlanRoundView) }),
         error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * One goal's planner narration, replayed from the harness.
+     *
+     * **The other half of {@link goalRounds}, and the halves are not interchangeable.**
+     * That one answers from our rows: a round's status and what it concluded, which
+     * survive anything. This one answers from the harness's own retention: the prose, which
+     * this build never persisted (the goal and planner flow's decision 14) and therefore
+     * cannot promise. A planner chat shows both, with each round's row as its heading and
+     * this as what is under it.
+     *
+     * `200` in every case, including a goal whose rounds the harness has entirely
+     * forgotten, for the reason the `transcript` route is a 200 with `source: "absent"`:
+     * "gone" is the ordinary end state of anything old enough, and an error status would
+     * make a browser treat the common case as a fault. Each round says for itself which of
+     * {@link RoundNarrationSource}'s four answers it got.
+     *
+     * Read-only and makes no claim to be live: a round in flight narrates onto the
+     * `live` stream, where the items carry {@link LiveItem.roundId}. This is what a
+     * **refresh** gets, and joining the two is the client's job.
+     *
+     * **That join is by the client's own arrival order, not by any index on this shape.**
+     * There is no index the two channels share: `AgentHarness.messages` carries none at
+     * all, so {@link RoundNarrationMessage.index} is a position in *this answer* and a
+     * render key — see that field, which says what it is not. The browser instead records
+     * the in-process narration publish counter before this request leaves and treats live
+     * narration at or below it as already replayed. The residual overlap is accepted and
+     * disclosed: the replayed block is labelled a replay rather than claiming completeness.
+     *
+     * Each round also says what it left out — {@link RoundNarration.omittedBlank} and
+     * {@link RoundNarration.promptOmitted} — because an omission a reader cannot count is
+     * indistinguishable from a round that said less than it did.
+     */
+    HttpApiEndpoint.get(
+      "goalNarration",
+      "/targets/:targetId/goals/:goalId/narration",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        success: GoalNarrationView,
+        error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * Stops one planner round, settling it and withdrawing its authority.
+     *
+     * The round is in the path under its goal, which is what makes the two refusals
+     * different questions. {@link RoundNotFound} is the row: no such round in this goal.
+     * {@link PlanRefused} with `unknown_round` is the fiber map: the row is here and *this
+     * process is not driving it* — a round that already settled, or one a dead process left
+     * behind for the startup sweep. Neither is actionable in the same way, so neither is
+     * answered with the other.
+     *
+     * Answers with the round's own row, re-read after the stop, rather than with a shape of
+     * its own — see `plan.ts`'s header. By the time it returns the harness has been asked to
+     * interrupt, the row is `interrupted`, the round's credential is revoked and its write
+     * fence is superseded. **The prompt is never resubmitted** and there is no resume: work
+     * carried on after an interruption is a new round.
+     */
+    HttpApiEndpoint.post(
+      "stopRound",
+      "/targets/:targetId/goals/:goalId/rounds/:roundId/stop",
+      {
+        params: {
+          targetId: Schema.String,
+          goalId: Schema.String,
+          roundId: Schema.String,
+        },
+        success: PlanRoundView,
+        error: [
+          PlanRefused,
+          RoundNotFound,
+          GoalNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
       },
     ),
     /**

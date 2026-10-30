@@ -40,6 +40,7 @@ import {
   FakeServer,
   attemptTranscript,
   goalBriefingView,
+  goalNarrationView,
   goalView,
   harnessInstance,
   intentView,
@@ -47,10 +48,12 @@ import {
   liveCursor,
   liveItem,
   liveOpened,
+  livePlannerCall,
   ok,
   planRoundStarted,
   planRoundView,
   refused,
+  roundNarration,
   runStarted,
   runningAttempt,
   runningRound,
@@ -1610,6 +1613,357 @@ describe("planning a goal", () => {
     // out of the supervisor's map — a panel that refreshed only the rows would keep saying
     // a round was in flight after it had finished.
     expect(fake.countOf("rounds")).toBe(before + 1);
+    // And the prose, which is a third read with a third source: a round this tab did not
+    // watch has no live narration, so the harness's copy is the only thing that will ever
+    // show what it said.
+    expect(fake.calls.map((call) => call.method)).toContain("goalNarration");
+  });
+
+  /* ── The planner chat ─────────────────────────────────────────────────────── */
+
+  test("opening a goal replays its narration from the harness", async () => {
+    const [app] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({ rounds: [planRoundView({ targetId, goalId })] });
+      fake.onGoalNarration = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalNarrationView({
+            targetId,
+            goalId,
+            rounds: [roundNarration({ roundId: "rnd_1" })],
+          }),
+        );
+    });
+
+    expect(app.goalNarrationState).toBe("ready");
+    expect(app.goalNarrationGoalId).toBe("goal_1");
+    const shown = app.goalChat.groups[0];
+    expect(shown?.key).toBe("rnd_1");
+    expect(shown?.prose._tag).toBe("replayed");
+    expect(shown?.replayed.length).toBe(2);
+
+    app.closeGoal();
+    expect(app.goalNarration).toBeUndefined();
+    expect(app.goalNarrationGoalId).toBe("");
+    expect(app.goalNarrationState).toBe("idle");
+  });
+
+  test("a refresh mid-round keeps the round and its disposition, and degrades the prose", async () => {
+    // What a reload *is* from the app's side: the rows come back from the server and the
+    // activity channel has nothing to replay, so the chat is the separator plus whatever
+    // the harness still holds. Here it holds nothing, and the structure is untouched.
+    const [app] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({
+          rounds: [
+            planRoundView({
+              targetId,
+              goalId,
+              roundId: "rnd_1",
+              status: "settled",
+              disposition: "waiting",
+              dispositionRationale: "Two runs are still out.",
+            }),
+          ],
+        });
+      fake.onGoalNarration = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalNarrationView({
+            targetId,
+            goalId,
+            rounds: [
+              roundNarration({
+                roundId: "rnd_1",
+                source: "forgotten",
+                ephemeral: false,
+                note: "OpenCode no longer holds session ses_1.",
+                messages: [],
+              }),
+            ],
+          }),
+        );
+    });
+
+    const shown = app.goalChat.groups[0];
+    // The structure is rows and survives: status and disposition are both still here.
+    expect(shown?.subject.round.status).toBe("settled");
+    expect(shown?.subject.round.disposition).toBe("waiting");
+    // The prose is the harness's and did not: it says so, and it is not an error.
+    expect(shown?.prose._tag).toBe("forgotten");
+    expect(app.goalNarrationDetail).toBe("");
+  });
+
+  test("a round the harness has forgotten is not reported as a failed read", async () => {
+    const [app] = await onGoal((fake) => {
+      fake.onGoalNarration = () => unreachable("Unable to connect");
+    });
+
+    // The one case that *is* a failed read, kept apart from every empty answer above.
+    expect(app.goalNarrationState).toBe("failed");
+    expect(app.goalNarrationDetail).toBe("No server answered at this address.");
+  });
+
+  test("an added intent appears once in the chat, under the record's own id", async () => {
+    const [app, fake] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({
+          rounds: [
+            planRoundView({
+              targetId,
+              goalId,
+              roundId: "rnd_1",
+              status: "running",
+              disposition: null,
+              dispositionRationale: null,
+              endedAt: null,
+            }),
+          ],
+        });
+    });
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(liveCursor({ sequence: 0, caughtUp: true }));
+    /*
+     * The call, as the harness narrates it: immediate and unconfirmed — and **named the way
+     * a driver names it**.
+     *
+     * {@link livePlannerCall} builds both the namespaced wire form and the reduced name from
+     * `@bit/contracts`, the same module `run/liveTranscript.ts` reduces with. This test
+     * previously set `tool: "add_intent"` by hand, which is a tool-name space the server
+     * never produces: the merge rule was keyed on it, matched nothing against a real round,
+     * and this suite could not have noticed.
+     */
+    fake.watch.send(
+      livePlannerCall("add_intent", {
+        roundId: "rnd_1",
+        over: {
+          id: "activity:7",
+          callId: "call-1",
+          input: '{"question":"can the limiter be bypassed?"}',
+        },
+      }),
+    );
+    // And the record it produced, with the store's own id on it.
+    fake.watch.send(
+      liveItem({
+        id: "record:evt-real",
+        sequence: 1,
+        kind: "intent.added",
+        attemptId: null,
+        roundId: "rnd_1",
+        headline: "Intent",
+        body: "intent int_real was added",
+        outcome: null,
+      }),
+    );
+    await settle();
+
+    const rows = app.goalChat.groups[0]?.rows ?? [];
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.write).toBe("recorded");
+    expect(rows[0]?.item.id).toBe("record:evt-real");
+    expect(rows[0]?.proposedBy?.callId).toBe("call-1");
+    // The wire name really was namespaced, so this test is evidence about the shape the
+    // server sends rather than about a shape it was handed.
+    expect(rows[0]?.proposedBy?.tool).toBe("mcp__bit-rnd_1__add_intent");
+    // And the brief's one-line domain summary is on the row, from the call's arguments.
+    expect(rows[0]?.summary).toBe("can the limiter be bypassed?");
+  });
+
+  test("a write the round never recorded stays visibly unresolved once it settles", async () => {
+    // The clause of ruling 4 that was unreachable in the running app: with the rule keyed
+    // on the namespaced name, a refused `add_intent` rendered as an ordinary tool call with
+    // nothing said about it — a chat reporting writes that may have been refused.
+    const [app, fake] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({
+          rounds: [
+            planRoundView({
+              targetId,
+              goalId,
+              roundId: "rnd_1",
+              status: "settled",
+              disposition: "waiting",
+              dispositionRationale: "Nothing to add.",
+            }),
+          ],
+        });
+    });
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(liveCursor({ sequence: 0, caughtUp: true }));
+    fake.watch.send(
+      livePlannerCall("add_intent", {
+        roundId: "rnd_1",
+        driver: "opencode",
+        over: {
+          id: "activity:9",
+          callId: "call-9",
+          input: '{"question":"is the lockout bypassable?"}',
+        },
+      }),
+    );
+    await settle();
+
+    const row = app.goalChat.groups[0]?.rows[0];
+    expect(row?.write).toBe("unresolved");
+    expect(row?.summary).toBe("is the lockout bypassable?");
+  });
+
+  test("stopping a round settles its row and takes it out of what this process drives", async () => {
+    const [app, fake] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({
+          rounds: [
+            planRoundView({
+              targetId,
+              goalId,
+              roundId: "rnd_1",
+              status: "running",
+              disposition: null,
+              dispositionRationale: null,
+              endedAt: null,
+            }),
+          ],
+        });
+      fake.onRounds = () => ok([runningRound({ roundId: "rnd_1" })]);
+    });
+    expect(app.openGoalRunningRound?.roundId).toBe("rnd_1");
+
+    await app.stopRound("rnd_1");
+
+    // The settled row is placed at once, so the separator changes on the same tick the
+    // control disappears rather than after the re-read.
+    expect(app.planRounds[0]?.status).toBe("interrupted");
+    expect(
+      app.runningRounds.filter((round) => round.roundId === "rnd_1"),
+    ).toEqual([]);
+    expect(app.roundStopDetail).toBe("");
+    expect(fake.calls.map((call) => call.method)).toContain("stopRound");
+  });
+
+  test("stopping a round nothing is driving says so, and re-reads both halves", async () => {
+    const [app, fake] = await onGoal();
+    fake.onStopRound = () =>
+      refused(
+        new PlanRefused({
+          reason: "unknown_round",
+          detail: "no round 'rnd_1' is running in this process",
+        }),
+      );
+    const rows = fake.countOf("goalRounds");
+    const driving = fake.countOf("rounds");
+
+    await app.stopRound("rnd_1");
+    await settle();
+
+    // The server's sentence, not "No server answered": a round that settled on its own
+    // while the page was open is an answer an operator can act on.
+    expect(app.roundStopDetail).toContain("running in this process");
+    expect(fake.countOf("goalRounds")).toBe(rows + 1);
+    expect(fake.countOf("rounds")).toBe(driving + 1);
+  });
+
+  test("a refresh mid-round keeps the replayed prose beside the live tail", async () => {
+    const [app, fake] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({
+          rounds: [
+            planRoundView({
+              targetId,
+              goalId,
+              roundId: "rnd_1",
+              status: "running",
+              disposition: null,
+              dispositionRationale: null,
+              endedAt: null,
+            }),
+          ],
+        });
+      fake.onGoalNarration = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalNarrationView({
+            targetId,
+            goalId,
+            rounds: [roundNarration({ roundId: "rnd_1" })],
+          }),
+        );
+    });
+    expect(app.goalChat.groups[0]?.prose._tag).toBe("replayed");
+
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(
+      liveItem({
+        id: "activity:11",
+        origin: "activity",
+        sequence: null,
+        kind: "turn.reply",
+        attemptId: null,
+        roundId: "rnd_1",
+        headline: "Reply",
+        body: "two dimensions have no work out",
+        outcome: null,
+      }),
+    );
+    await settle();
+
+    // Both halves: what the harness already had, and what has arrived since. Hiding the
+    // first the moment the second landed would make a refresh mid-round lose the round's
+    // own history, which is the opposite of degrading honestly.
+    const shown = app.goalChat.groups[0];
+    expect(shown?.prose._tag).toBe("replayed");
+    expect(shown?.replayed.length).toBe(2);
+    expect(shown?.rows.map((row) => row.item.body)).toEqual([
+      "two dimensions have no work out",
+    ]);
+  });
+
+  test("narration already inside the replay is not shown twice beside the live tail", async () => {
+    const [app, fake] = await onGoal((fake) => {
+      fake.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({
+          rounds: [
+            planRoundView({
+              targetId,
+              goalId,
+              roundId: "rnd_1",
+              status: "running",
+              disposition: null,
+              dispositionRationale: null,
+              endedAt: null,
+            }),
+          ],
+        });
+      fake.onGoalNarration = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalNarrationView({
+            targetId,
+            goalId,
+            rounds: [roundNarration({ roundId: "rnd_1" })],
+          }),
+        );
+    });
+
+    // An entry this tab already holds, numbered below the floor the replay was read at.
+    // It is inside the replayed block, so it must not also be a live row.
+    const early = liveItem({
+      id: "activity:3",
+      origin: "activity",
+      sequence: null,
+      kind: "turn.reply",
+      attemptId: null,
+      roundId: "rnd_1",
+      headline: "Reply",
+      body: "already in the replay",
+      outcome: null,
+    });
+    fake.watch.send(early);
+    await settle();
+    // Re-reading the narration takes a fresh floor, which is now above that entry.
+    await app.loadGoalNarration("goal_1");
+
+    expect(app.goalNarrationFloor).toBe(3);
+    const shown = app.goalChat.groups[0];
+    expect(shown?.prose._tag).toBe("replayed");
+    expect(shown?.rows).toEqual([]);
   });
 });
 
