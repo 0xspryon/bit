@@ -23,8 +23,10 @@ import { afterAll, describe, expect, test } from "bun:test";
 
 import * as contracts from "@bit/contracts";
 import {
+  GOAL_UPLOAD_FIELD,
   GoalBriefingRefused,
   GoalNotFound,
+  GoalUploadRefused,
   IntentNotFound,
   IntentRefused,
 } from "@bit/contracts";
@@ -50,9 +52,22 @@ let handler: (url: string) => Promise<Response> = () =>
 /** Every URL the stub was asked for, so a test can say the request was really made. */
 let asked: string[] = [];
 
-globalThis.fetch = ((input: RequestInfo | URL) => {
+/**
+ * Every request the stub was handed, as a `Request`, so a test can read the body it sent.
+ *
+ * Recorded **here** rather than by a second wrapper around `globalThis.fetch`: the note on
+ * {@link handler} is the reason — `FetchHttpClient`'s `Fetch` is a `Context.Reference`
+ * resolved on first use and then held, so a later reassignment is never seen. The upload
+ * call is the only one whose body is not JSON, and its body is the thing worth asserting.
+ */
+let sent: Request[] = [];
+
+globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
   asked.push(url);
+  sent.push(
+    input instanceof Request ? input : new Request(url, init ?? undefined),
+  );
   return handler(url);
 }) as typeof globalThis.fetch;
 
@@ -63,6 +78,7 @@ afterAll(() => {
 /** Answers every request with one status and one JSON body. */
 const answering = (status: number, body: unknown): void => {
   asked = [];
+  sent = [];
   handler = () =>
     Promise.resolve(
       new Response(JSON.stringify(body), {
@@ -75,6 +91,7 @@ const answering = (status: number, body: unknown): void => {
 /** Answers every request by failing the way an unreachable server does. */
 const unreachable = (): void => {
   asked = [];
+  sent = [];
   handler = () => Promise.reject(new TypeError("Unable to connect"));
 };
 
@@ -208,6 +225,58 @@ describe("the intent refusals, which were missing for the same reason", () => {
   });
 });
 
+describe("attaching files, which is the one multipart call on this client", () => {
+  test("a refused upload keeps the server's figures instead of becoming Unreachable", async () => {
+    const detail =
+      "'huge.bin' is more than 10485760 bytes (10.0 MiB), which is this server's per-file cap, so reading it was abandoned and nothing in that request was attached.";
+    answering(409, { _tag: "GoalUploadRefused", reason: "too_large", detail });
+
+    const call = await server.uploadGoalFiles(BASE, "acme-corp", "goal_1", [
+      new File(["x"], "huge.bin"),
+    ]);
+
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toContain("/targets/acme-corp/goals/goal_1/uploads");
+    expect(call._tag).toBe("Refused");
+    if (call._tag !== "Refused") return;
+    expect(call.error).toBeInstanceOf(GoalUploadRefused);
+    // The sentence, as written: both figures and what to do about them.
+    expect(call.error).toMatchObject({ _tag: "GoalUploadRefused", detail });
+  });
+
+  test("the request really goes out as multipart with the contract's field name", async () => {
+    /*
+     * The one thing no other test here can say. This call is the only place in the browser
+     * half that builds a body by hand, and what it has to produce is a `multipart/form-data`
+     * request with each file under the contract's own field — which is the key the server
+     * reads the parts under. The stub captures the request so the body is asserted rather
+     * than assumed.
+     */
+    answering(201, {
+      targetId: "acme-corp",
+      goalId: "goal_1",
+      stored: [],
+      attachedCount: 0,
+      note: "",
+      acceptedAt: 0,
+    });
+
+    await server.uploadGoalFiles(BASE, "acme-corp", "goal_1", [
+      new File(["a scope letter"], "scope.pdf", { type: "application/pdf" }),
+    ]);
+
+    const seen = sent[0];
+    expect(seen?.headers.get("content-type")).toContain("multipart/form-data");
+    // A boundary the runtime chose, which is the part a hand-set content-type would lose
+    // and the part the server's parser needs.
+    expect(seen?.headers.get("content-type")).toContain("boundary=");
+    const body = await seen?.text();
+    expect(body).toContain(`name="${GOAL_UPLOAD_FIELD}"`);
+    expect(body).toContain('filename="scope.pdf"');
+    expect(body).toContain("a scope letter");
+  });
+});
+
 /**
  * Every tagged error the contract declares is accounted for, by name.
  *
@@ -261,7 +330,7 @@ describe("every declared error tag is accounted for", () => {
     const declared = declaredErrorTags();
     // A guard on the guard: if `Schema.TaggedError`'s runtime shape ever changes, this
     // enumeration could quietly return nothing and every assertion below would pass.
-    expect(declared.length).toBeGreaterThanOrEqual(14);
+    expect(declared.length).toBeGreaterThanOrEqual(15);
     expect(declared).toContain("GoalBriefingRefused");
     expect(declared).toContain("IntentRefused");
     expect(declared).toContain("Unauthenticated");

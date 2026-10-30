@@ -46,6 +46,11 @@ import {
   GoalTurnAccepted,
 } from "./goalAgent";
 import {
+  GoalUploadDraft,
+  GoalUploadRefused,
+  GoalUploadsAccepted,
+} from "./goalUpload";
+import {
   GoalObservationView,
   IntentAbandonDraft,
   IntentDraft,
@@ -1519,6 +1524,46 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         success: GoalTurnAccepted.pipe(HttpApiSchema.status(202)),
         error: [
           GoalConversationRefused,
+          GoalNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
+     * Attaches files to one goal's conversation, where its agent can read them.
+     *
+     * **The only endpoint on this API that is not JSON.** The body is
+     * `multipart/form-data` and the payload declaration is what makes both halves of it:
+     * the server is handed the parser's stream of parts and consumes it itself, and
+     * `HttpApiClient` takes a `FormData` — see {@link GoalUploadDraft} on why the streaming
+     * shape and not the buffered one, which cannot work at this version, and why no parser
+     * limits are set on it.
+     *
+     * `201`: the files exist on disk under the goal's own directory by the time this
+     * answers, and nothing has been said to the agent. The attachment list reaches it on
+     * the **next** message, as a block above the delimiter — never spliced into the
+     * operator's own words. {@link GoalUploadsAccepted.note} is the sentence that says so.
+     *
+     * **Nothing in the request chooses where the bytes go.** There is no path in
+     * {@link GoalUploadDraft} and no path in the answer: the server writes under
+     * `targets/<id>/goal/<goalId>/uploads/`, obtained through the same gating a goal
+     * session's directory is, and never under the engagement folder a worker runs in.
+     *
+     * Both caps — `UPLOAD_MAX_BYTES` per file and `UPLOAD_MAX_FILES` per goal — are
+     * enforced on the server, answered as {@link GoalUploadRefused} naming the figure, and
+     * are **not sent to the browser at all**: a client that knew them would be a second
+     * copy to keep in step, and a client that did not would be refused by the same check.
+     */
+    HttpApiEndpoint.post(
+      "uploadGoalFiles",
+      "/targets/:targetId/goals/:goalId/uploads",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        payload: GoalUploadDraft,
+        success: GoalUploadsAccepted.pipe(HttpApiSchema.status(201)),
+        error: [
+          GoalUploadRefused,
           GoalNotFound,
           TargetNotFound,
           TargetUnavailable,

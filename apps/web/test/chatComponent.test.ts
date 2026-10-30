@@ -23,6 +23,7 @@ import {
   type LiveItem,
   type LiveUsage,
   type PlanRoundView,
+  GoalUploadRefused,
 } from "@bit/contracts";
 
 import Chat from "../src/lib/components/Chat.svelte";
@@ -35,10 +36,12 @@ import {
   FakeServer,
   goalConversationView,
   goalNarrationView,
+  goalUploadsAccepted,
   goalView,
   liveOpened,
   ok,
   planRoundView,
+  refused,
   roundNarration,
   runningRound,
   targetSummary,
@@ -941,5 +944,110 @@ describe("the goal agent's own half of the chat", () => {
     expect(html).toContain("look at the lockout path");
     expect(html).toContain("activity");
     expect(html).toContain("Waiting for the agent");
+  });
+
+  test("the composer offers a file control, with a real input behind the paperclip", async () => {
+    const { html } = await goalBody();
+    // A real `<input type="file">`, not only a button: a browser cannot produce bytes
+    // without one, and it stays in the accessibility tree with its own label so the
+    // paperclip is a convenience over a working control rather than a replacement for it.
+    expect(html).toContain('type="file"');
+    expect(html).toContain("Attach files to this goal");
+    expect(html).toContain("Attach files the goal agent can read");
+  });
+
+  test("an attached file is listed by the name the server chose, with what happens next", async () => {
+    const { app, fake } = await goalBody();
+    fake.onUploadGoalFiles = (_baseUrl, targetId, goalId) =>
+      ok(
+        goalUploadsAccepted({
+          targetId,
+          goalId,
+          // Deliberately not the name passed in below: this is what says the list is built
+          // from the **server's** answer rather than from the browser's own `File`.
+          files: [{ name: "scope-letter.pdf", bytes: 2_048 }],
+          note: "It has not been told yet: the list goes to it with your next message.",
+        }),
+      );
+
+    await app.attachGoalFiles([
+      new File(["a scope letter"], "SCOPE LETTER.pdf", {
+        type: "application/pdf",
+      }),
+    ]);
+    const html = render(GoalAgentChat, { props: { app } }).body;
+
+    expect(html).toContain("scope-letter.pdf");
+    expect(html).not.toContain("SCOPE LETTER.pdf");
+    expect(html).toContain("2048 bytes");
+    // The part an operator could otherwise get wrong: the files are there and the agent
+    // does not know yet. The server composes that sentence; this only places it.
+    expect(html).toContain("your next message");
+  });
+
+  test("a refused upload says why, in the server's words, beside the composer", async () => {
+    const { app, fake } = await goalBody();
+    const detail =
+      "'huge.bin' is more than 10485760 bytes (10.0 MiB), which is this server's per-file cap, so reading it was abandoned and nothing in that request was attached.";
+    fake.onUploadGoalFiles = () =>
+      refused(new GoalUploadRefused({ reason: "too_large", detail }));
+
+    await app.attachGoalFiles([new File(["x"], "huge.bin")]);
+    const html = render(GoalAgentChat, { props: { app } }).body;
+
+    // As written, including both figures: a rejected upload that said only "failed" would
+    // be the first refusal in this app that does not teach.
+    expect(html).toContain("10485760 bytes");
+    expect(html).toContain("per-file cap");
+    expect(html).toContain('role="alert"');
+    // And nothing is listed as attached, because nothing was.
+    expect(app.goalAttachments).toEqual([]);
+  });
+
+  test("a replaced file stays one row and says it replaced one", async () => {
+    const { app, fake } = await goalBody();
+    fake.onUploadGoalFiles = (_baseUrl, targetId, goalId, files) =>
+      ok(
+        goalUploadsAccepted({
+          targetId,
+          goalId,
+          files: files.map((file) => ({ name: file.name, bytes: file.size })),
+          replaced: app.goalAttachments.length === 0 ? [] : ["notes.txt"],
+        }),
+      );
+
+    await app.attachGoalFiles([new File(["one"], "notes.txt")]);
+    await app.attachGoalFiles([new File(["corrected"], "notes.txt")]);
+    const html = render(GoalAgentChat, { props: { app } }).body;
+
+    // One row, because the agent will see one file: a list that grew a second row for a
+    // replacement would show two documents where there is one.
+    expect(app.goalAttachments).toHaveLength(1);
+    expect(app.goalAttachments[0]?.bytes).toBe(9);
+    expect(html).toContain("replaced an earlier one");
+  });
+
+  test("an ended goal has no composer, so there is nothing to attach to", async () => {
+    const ended = (targetId: string) =>
+      goalView({
+        targetId,
+        goalId: "goal_1",
+        status: "met",
+        endedAt: AT,
+        endedBy: "operator",
+        endReason: "established",
+      });
+    const { html } = await goalBody((fake) => {
+      fake.onGoals = (_baseUrl, targetId) => ok({ goals: [ended(targetId)] });
+      // `openGoal` re-reads the one goal and that answer replaces the row in the list, so
+      // both have to say it ended or the list's version is overwritten by the default.
+      fake.onGoal = (_baseUrl, targetId) => ok(ended(targetId));
+    });
+
+    // The composer goes away whole, the attach control with it: an ended goal's agent has
+    // no authority left, and a file control that submitted into a refusal would be worse
+    // than a sentence that explains itself.
+    expect(html).not.toContain('type="file"');
+    expect(html).toContain("This goal has ended");
   });
 });

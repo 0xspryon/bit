@@ -93,6 +93,10 @@ import { Context, Effect, Latch, Layer } from "effect";
 import { DEFAULT_GOAL_BRIEFING_MAX_CHARS } from "./briefing/goalBriefing";
 import { browserApiRoutes } from "./http/browserApi";
 import {
+  DEFAULT_UPLOAD_MAX_BYTES,
+  DEFAULT_UPLOAD_MAX_FILES,
+} from "./plan/goalUploads";
+import {
   BrowserSessions,
   PASSWORD_ENV_VAR,
   ensureServerPassword,
@@ -256,6 +260,59 @@ const GOAL_BRIEFING_MAX_CHARS = ((raw: string | undefined): number => {
   }
   return parsed;
 })(process.env["GOAL_BRIEFING_MAX_CHARS"]);
+
+/**
+ * A positive whole number from the environment, or the default with a sentence.
+ *
+ * The third and fourth copy of {@link PLANNER_ROUND_BUDGET}'s little parser, so it stops
+ * being copied: a cap of `NaN` refuses everything, including the uploads that are nowhere
+ * near the limit, and falling back silently would leave an operator who mistyped a figure
+ * wondering why raising it changed nothing.
+ */
+const wholeNumberFromEnv = (
+  name: string,
+  raw: string | undefined,
+  fallback: number,
+): number => {
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.error(
+      `${name}='${raw}' is not a positive whole number; using the default of ${String(fallback)}`,
+    );
+    return fallback;
+  }
+  return parsed;
+};
+
+/**
+ * The per-file ceiling on a file attached to a goal conversation, from `UPLOAD_MAX_BYTES`.
+ *
+ * **10 MiB by default** (`plan/goalUploads.ts`'s `DEFAULT_UPLOAD_MAX_BYTES`). Enforced on
+ * the server and **nowhere else**: the browser is not told this figure, so there is no
+ * second copy of it to drift, and a composer that pre-checked would be the one place the
+ * cap could be out of date. A file over it is refused with its own size and this figure in
+ * the sentence, so an operator can tell whether to split the file or raise the number.
+ */
+const UPLOAD_MAX_BYTES = wholeNumberFromEnv(
+  "UPLOAD_MAX_BYTES",
+  process.env["UPLOAD_MAX_BYTES"],
+  DEFAULT_UPLOAD_MAX_BYTES,
+);
+
+/**
+ * How many files one goal may hold, from `UPLOAD_MAX_FILES`.
+ *
+ * **Ten by default**, and counted against the goal rather than against one request — the
+ * only reading of a count cap that cannot be walked past ten files at a time. It is a bound
+ * on the prompt as much as on the disk: every attached file is named in every message this
+ * goal's agent is sent.
+ */
+const UPLOAD_MAX_FILES = wholeNumberFromEnv(
+  "UPLOAD_MAX_FILES",
+  process.env["UPLOAD_MAX_FILES"],
+  DEFAULT_UPLOAD_MAX_FILES,
+);
 
 /**
  * The configured server password, read and **removed from this process's environment**
@@ -765,6 +822,8 @@ const endpoint = Layer.unwrap(
         extraRoutes: browserApiRoutes({
           workspaceRoot: WORKSPACE_ROOT,
           goalBriefingMaxChars: GOAL_BRIEFING_MAX_CHARS,
+          uploadMaxBytes: UPLOAD_MAX_BYTES,
+          uploadMaxFiles: UPLOAD_MAX_FILES,
         }).pipe(
           Layer.provide(
             CONFIGURED_PASSWORD === undefined

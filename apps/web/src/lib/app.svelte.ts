@@ -36,6 +36,7 @@ import {
   type GoalConversationView,
   type GoalNarrationView,
   type GoalObservationView,
+  type GoalUploadView,
   type GoalView,
   type HarnessInstanceView,
   type IntentView,
@@ -547,6 +548,28 @@ export class App {
    * Cleared when the goal changes and on a reload, where the harness's own copy takes over.
    */
   goalTurns = $state<SentTurn[]>([]);
+
+  /**
+   * The files this tab has attached to the open goal, as the server described them.
+   *
+   * **What the server stored, not what the operator picked.** Each entry is the name the
+   * file is kept under, its size on disk and whether it replaced one of the same name — all
+   * three from the answer, because the browser's own `File` says nothing about what happened
+   * to it. A `replaced: true` entry is why this is a list of the server's words rather than
+   * a running count.
+   *
+   * Local to the tab, like {@link goalTurns}: nothing reads the uploads directory back for
+   * the browser, and an attachment the operator made in another tab is one the agent will
+   * be told about and this list will not show. That is the honest state, and the composer
+   * says the agent is told on the next message rather than claiming to know the directory.
+   */
+  goalAttachments = $state<GoalUploadView[]>([]);
+  /** True while an upload is in flight, so the attach control spins exactly once. */
+  goalAttaching = $state(false);
+  /** Why an upload was refused, in the server's words, beside the composer. */
+  goalAttachDetail = $state("");
+  /** What the server said about the files it stored. Its sentence, not this tab's. */
+  goalAttachNote = $state("");
 
   /** True while a round's stop is in flight, so the control spins exactly once. */
   roundStopping = $state("");
@@ -1398,6 +1421,10 @@ export class App {
     this.goalSessionNote = "";
     this.goalAgentRuntime = undefined;
     this.goalTurns = [];
+    this.goalAttachments = [];
+    this.goalAttaching = false;
+    this.goalAttachDetail = "";
+    this.goalAttachNote = "";
   }
 
   /** Puts every goal-briefing field back where a fresh goal leaves it. */
@@ -2069,6 +2096,76 @@ export class App {
     if (call.value.conversation === "opened") {
       void this.loadGoalConversation(goalId);
     }
+  }
+
+  /**
+   * Attaches files to the open goal, so its agent can read them.
+   *
+   * **It does not send a message and does not wait for the agent.** The route answers once
+   * the bytes are on disk in the goal's own directory; the agent is told about them on the
+   * operator's *next* message. {@link goalAttachNote} is the server's sentence saying so,
+   * and it is kept on screen rather than toasted because "the agent does not know yet" is
+   * the one thing an operator could otherwise get wrong about this control.
+   *
+   * **The caps are the server's and are not checked here.** This tab is never told
+   * `UPLOAD_MAX_BYTES` or `UPLOAD_MAX_FILES`, which is deliberate: a figure in the browser
+   * is a second copy to keep in step, and the refusal that comes back already carries the
+   * file's size, the cap and what to do about it. The cost is that an oversized file is
+   * uploaded before it is refused, which is a wasted transfer on a same-machine server and
+   * the honest price of having one place the limit lives.
+   *
+   * A refusal leaves the picked files unattached and prints the server's sentence. There is
+   * nothing to retry automatically: every reason is either a file to change or a limit to
+   * raise.
+   */
+  async attachGoalFiles(files: readonly File[]) {
+    const targetId = this.viewTargetId;
+    const goalId = this.openGoalId;
+    if (targetId === "" || goalId === "" || files.length === 0) return;
+    if (this.goalAttaching) return;
+    this.goalAttaching = true;
+    this.goalAttachDetail = "";
+
+    const call = await this.client.uploadGoalFiles(
+      this.serverUrl,
+      targetId,
+      goalId,
+      files,
+    );
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+    this.goalAttaching = false;
+
+    if (call._tag === "Unreachable") {
+      this.goalAttachDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.goalAttachDetail = this.#refusalText(
+        call.error,
+        "Those files were not attached.",
+      );
+      return;
+    }
+
+    /*
+     * The stored list, merged by the name the **server** chose rather than appended to.
+     *
+     * A re-attached file replaces the one of the same name on disk (`replaced: true` says
+     * so), and a list that grew a second row for it would show the operator two documents
+     * where the agent will see one.
+     */
+    const byName = new Map(
+      this.goalAttachments.map((file) => [file.name, file]),
+    );
+    for (const file of call.value.stored) byName.set(file.name, file);
+    this.goalAttachments = [...byName.values()].sort((left, right) =>
+      left.name < right.name ? -1 : 1,
+    );
+    this.goalAttachNote = call.value.note;
   }
 
   /**

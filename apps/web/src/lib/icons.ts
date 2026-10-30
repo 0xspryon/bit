@@ -44,6 +44,7 @@ export { default as IconCompass } from "line-awesome/svg/compass-solid.svg?compo
 export { default as IconExchange } from "line-awesome/svg/exchange-alt-solid.svg?component";
 export { default as IconArchive } from "line-awesome/svg/archive-solid.svg?component";
 export { default as IconFile } from "line-awesome/svg/file-alt-solid.svg?component";
+export { default as IconPaperclip } from "line-awesome/svg/paperclip-solid.svg?component";
 export { default as IconRobot } from "line-awesome/svg/robot-solid.svg?component";
 export { default as IconBlocked } from "line-awesome/svg/exclamation-circle-solid.svg?component";
 export { default as IconShield } from "line-awesome/svg/shield-alt-solid.svg?component";

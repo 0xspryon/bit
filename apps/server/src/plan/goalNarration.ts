@@ -48,8 +48,15 @@
  * operator's text after it unaltered — so {@link operatorTextOf} is an exact split. It is
  * the same technique `isRoundPromptText` uses one file over, and for the same reason.
  *
- * An entry with no delimiter in it is left exactly as it is: a later operator message
- * travels verbatim and has no framing to remove.
+ * **It is not only the first entry any more.** Slice 11 put an attachment list above the
+ * same delimiter on *every* message of a goal that has files attached
+ * (`plan/goalPrompt.ts`'s header has the two reasons), so a conversation can have framing
+ * on several of its `user` entries and a long one can have it on all of them. Nothing here
+ * needed changing — the trim is per entry and the delimiter is the same string — but the
+ * count is now *n* rather than one, which is why {@link FRAMING_NOTE} does not promise that
+ * only the first message was trimmed. An entry with no delimiter in it is still left
+ * exactly as it is: a later message on a goal with no attachments travels verbatim and has
+ * nothing to remove.
  */
 import { Effect, type Duration } from "effect";
 
@@ -99,15 +106,21 @@ const empty = (input: {
 });
 
 /**
- * What is said when the framing was trimmed off the operator's first message.
+ * What is said when framing was trimmed off one or more of the operator's own messages.
  *
- * Said rather than silent, for the reason every other omission on this shape is counted:
- * the operator's first message looks shorter here than the thing the agent was actually
- * given, and a reader comparing this screen against the harness's own log would otherwise
- * find a message that does not match.
+ * Said rather than silent, for the reason every other omission on this shape is counted: a
+ * trimmed message looks shorter here than the thing the agent was actually given, and a
+ * reader comparing this screen against the harness's own log would otherwise find a message
+ * that does not match.
+ *
+ * **"Your messages", not "your first message".** It was the first one only while the
+ * preamble was the one thing this server put above a message. Since slice 11 a goal with
+ * files attached carries the attachment list above the same delimiter on every turn, so the
+ * trim can touch several entries — and a sentence naming only the first would be the
+ * understatement this note exists to prevent.
  */
 const FRAMING_NOTE =
-  "Your first message is shown as you wrote it; the briefing this server puts above it for the agent is not replayed.";
+  "Your messages are shown as you wrote them; what this server puts above them for the agent — the opening briefing, and the list of any files you have attached — is not replayed.";
 
 /**
  * The sentence appended to every answer about a session this process does not hold.
@@ -255,12 +268,13 @@ export const goalConversationNarration = Effect.fnUntraced(function* (input: {
    * Unlike a round's replay, no `user` entry is dropped. See this module's header.
    */
   /**
-   * The framing above the operator's first message, taken off before anything else.
+   * The framing above each of the operator's messages, taken off before anything else.
    *
    * Before the blanks and before the limit, for `roundNarration.ts`'s reason in the same
    * position: an entry whose text is about to change size should change size before a
-   * budget is spent on it. An entry with no delimiter is untouched, which is every entry
-   * but one.
+   * budget is spent on it. An entry with no delimiter is untouched — which is every entry
+   * on a goal with no files attached but the first, and may be no entry at all on one that
+   * has had files attached from the start. See this module's header.
    */
   const trimmed = fetched.success.map((entry) => {
     const operator = operatorTextOf(entry.text);

@@ -16,7 +16,9 @@
         "HARNESS",
         "RECONCILE_ON_START",
         "PLANNER_ROUND_BUDGET",
-        "GOAL_BRIEFING_MAX_CHARS"
+        "GOAL_BRIEFING_MAX_CHARS",
+        "UPLOAD_MAX_BYTES",
+        "UPLOAD_MAX_FILES"
       ]
     },
     "build": {

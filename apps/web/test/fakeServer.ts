@@ -43,6 +43,7 @@ import type {
   GoalConversationView,
   GoalNarrationView,
   GoalTurnAccepted,
+  GoalUploadsAccepted,
   PlanRoundStarted,
   PlanRoundView,
   RoundNarration,
@@ -270,6 +271,37 @@ export const goalTurnAccepted = (
   note: "This is the first message on this goal, so a conversation was opened for it.",
   acceptedAt: AT,
   ...over,
+});
+
+/**
+ * One accepted upload, answering as though every picked file was stored.
+ *
+ * `stored` is derived from what the caller asked for rather than fixed, because the thing
+ * most worth asserting about the composer is that it shows the **server's** names: a
+ * fixture that always answered with one made-up filename could not tell a list built from
+ * the answer from a list built from the browser's own `File` objects.
+ */
+export const goalUploadsAccepted = (input: {
+  readonly targetId?: string;
+  readonly goalId?: string;
+  readonly files: readonly { readonly name: string; readonly bytes: number }[];
+  readonly replaced?: readonly string[];
+  readonly note?: string;
+}): GoalUploadsAccepted => ({
+  targetId: input.targetId ?? "acme-corp",
+  goalId: input.goalId ?? "goal_1",
+  stored: input.files.map((file) => ({
+    name: file.name,
+    bytes: file.bytes,
+    contentType: "application/octet-stream",
+    replaced: (input.replaced ?? []).includes(file.name),
+    uploadedAt: AT,
+  })),
+  attachedCount: input.files.length,
+  note:
+    input.note ??
+    "They are in this goal agent's own directory. It has not been told yet: the list goes to it with your next message.",
+  acceptedAt: AT,
 });
 
 /** What a started round answers with. */
@@ -782,6 +814,25 @@ export class FakeServer implements ServerClient {
   ) => Answer<"sendGoalMessage"> = (_baseUrl, targetId, goalId) =>
     ok(goalTurnAccepted({ targetId, goalId }));
 
+  /**
+   * An upload that worked, answering about the files it was handed.
+   *
+   * The sizes come from the `File` objects the composer passed, so a test does not have to
+   * restate them — and a composer that showed its own numbers rather than the server's
+   * would still pass only because the two agree here, which is why the *names* are what
+   * the component test asserts on.
+   */
+  onUploadGoalFiles: (
+    ...args: Parameters<ServerClient["uploadGoalFiles"]>
+  ) => Answer<"uploadGoalFiles"> = (_baseUrl, targetId, goalId, files) =>
+    ok(
+      goalUploadsAccepted({
+        targetId,
+        goalId,
+        files: files.map((file) => ({ name: file.name, bytes: file.size })),
+      }),
+    );
+
   /** A stop that worked, answering with the round as `interrupted`. */
   onStopRound: (
     ...args: Parameters<ServerClient["stopRound"]>
@@ -934,6 +985,9 @@ export class FakeServer implements ServerClient {
 
   sendGoalMessage = (...args: Parameters<ServerClient["sendGoalMessage"]>) =>
     this.record("sendGoalMessage", args, () => this.onSendGoalMessage(...args));
+
+  uploadGoalFiles = (...args: Parameters<ServerClient["uploadGoalFiles"]>) =>
+    this.record("uploadGoalFiles", args, () => this.onUploadGoalFiles(...args));
 
   stopRound = (...args: Parameters<ServerClient["stopRound"]>) =>
     this.record("stopRound", args, () => this.onStopRound(...args));

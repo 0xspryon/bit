@@ -36,6 +36,7 @@
  */
 import {
   BitApi,
+  GOAL_UPLOAD_FIELD,
   SessionGuard,
   type GoalDraft,
   type GoalEndDraft,
@@ -240,6 +241,12 @@ export const REFUSAL_TAGS = new Set([
   // unactionable. Reading the conversation declares no error at all: a conversation nobody
   // has started, and one the harness has deleted, are both a `200` that says which.
   "GoalConversationRefused",
+  // Attaching files to a goal. **Every reason names the figure it is about** — this file is
+  // this many bytes against this cap, this goal already holds this many of that many, this
+  // name cannot be stored and here is what one looks like. Those sentences are the whole
+  // difference between a rejected upload an operator can act on and one that says "failed",
+  // and classifying them as transport trouble would throw all of them away.
+  "GoalUploadRefused",
 ]);
 
 /**
@@ -631,6 +638,45 @@ export const server = {
         }),
       ),
     ),
+
+  /**
+   * Attaches files to one goal, where its agent can read them.
+   *
+   * **The one call on this client that does not send JSON**, and the only place in the
+   * browser half that builds a request body by hand. `FormData` is what the generated
+   * client takes for a multipart endpoint — the payload type of
+   * {@link BitApi.fleet.uploadGoalFiles} *is* `FormData`, because the contract brands the
+   * schema as multipart — so this is still derived from the declaration rather than a
+   * hand-rolled `fetch`: a renamed field or a moved path is a compile error here exactly as
+   * it is everywhere else.
+   *
+   * The field name comes from the contract ({@link GOAL_UPLOAD_FIELD}) rather than being
+   * typed in, since the server reads the parts under that key and a string written twice is
+   * a string that drifts.
+   *
+   * **Nothing here names a path.** A `File` from an `<input type="file">` carries only a
+   * name and its bytes; where they land is the server's decision and is not expressible in
+   * this call. The caps are the server's too, and this deliberately does not pre-check
+   * them: the browser is never told the figures, so there is no copy here to fall out of
+   * step, and the refusal that comes back carries both numbers for the composer to print.
+   */
+  uploadGoalFiles: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+    files: readonly File[],
+  ) => {
+    const form = new FormData();
+    for (const file of files) form.append(GOAL_UPLOAD_FIELD, file);
+    return run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.uploadGoalFiles({
+          params: { targetId, goalId },
+          payload: form,
+        }),
+      ),
+    );
+  },
 
   /**
    * Stops one planner round, answering with the round's own row once it has settled.
