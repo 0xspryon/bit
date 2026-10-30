@@ -47,7 +47,9 @@
    */
   import Button from "./Button.svelte";
   import Chat from "./Chat.svelte";
+  import ContextMeter from "./ContextMeter.svelte";
   import { roundConclusion, roundStatusLabel, whenText } from "../goalFormat";
+  import type { MeterFact } from "../chat";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
@@ -92,6 +94,81 @@
       : app.roundStopDetail,
   );
 
+  /**
+   * Which round the meter is about, and the facts only this screen can name.
+   *
+   * The same subject the strip below reports on — the round in flight if there is one, else
+   * the newest — so the figure and the sentence beside it are about one round rather than
+   * two. `app.plannerContextMeter` picks the same way, from the same two fields; this is
+   * the identity half of it, which the meter cannot know because a round's harness session
+   * and model live on the round's **row**.
+   */
+  let meterRoundId = $derived(inFlight?.roundId ?? latest?.roundId);
+  /**
+   * The round's **row**, which is the only place its harness and model are.
+   *
+   * Looked up rather than taken from `inFlight`: a running round arrives as a
+   * `RunningRound`, which carries the ids this process needs to drive it and nothing about
+   * what it is running on. The row has that, and it is also what survives a reload.
+   */
+  let meterRow = $derived(
+    meterRoundId === undefined
+      ? undefined
+      : app.planRounds.find((round) => round.roundId === meterRoundId),
+  );
+  /**
+   * How many messages the replay brought back for the round the meter is about.
+   *
+   * `"not read"` rather than `0`, and it covers **two** situations rather than one: a round
+   * past the replay budget, which will never be read, and a round that started after the
+   * replay answered — the ordinary case for the round an operator has just opened, whose
+   * read is still on its way. Both are "we have not been told", which is a different fact
+   * from "the harness holds none", and a bare zero would collapse all three.
+   */
+  let messagesHeld = $derived.by(() => {
+    const replay = app.goalNarration?.rounds.find(
+      (round) => round.roundId === meterRoundId,
+    );
+    if (replay === undefined) return "not read";
+    const held = replay.messages.length;
+    return `${String(held)} held by the harness${replay.truncated ? ", shortened" : ""}`;
+  });
+
+  let meterFacts = $derived<readonly MeterFact[]>(
+    meterRow === undefined
+      ? []
+      : [
+          { term: "Round", value: meterRow.roundId },
+          // Each one says "not recorded" rather than being left out, because a round whose
+          // row has no model is a round that never reached a harness — which is a fact
+          // worth seeing beside a figure, not a row to hide.
+          {
+            term: "Session",
+            value: meterRow.harnessSessionId ?? "not recorded",
+          },
+          { term: "Harness", value: meterRow.instanceId ?? "not recorded" },
+          {
+            term: "Model",
+            value:
+              meterRow.modelId === null
+                ? "not recorded"
+                : `${meterRow.providerId ?? "?"}/${meterRow.modelId}`,
+          },
+          /*
+           * The brief's "message counts", and the value says what it counts.
+           *
+           * It is the harness's **replayed** copy for this round, which is the only
+           * message count this application has: narration is not persisted (decision 14),
+           * so nothing here knows how many messages a round really had — only how many the
+           * harness still holds and answered with. A bare number labelled "Messages" would
+           * read as the second thing, and on a round the replay has not covered — one past
+           * the budget, or one still in flight — it would read as zero messages rather than
+           * as no answer. See {@link messagesHeld}.
+           */
+          { term: "Messages", value: messagesHeld },
+        ],
+  );
+
   function formatElapsed(ms: number): string {
     const seconds = Math.floor(ms / 1000);
     if (seconds < 60) return `${String(seconds)}s`;
@@ -133,6 +210,14 @@
     {#if group.subject.round.status !== "running"}
       <span class="sep-note">{roundConclusion(group.subject.round)}</span>
     {/if}
+  {/snippet}
+
+  {#snippet meter()}
+    <ContextMeter
+      meter={app.plannerContextMeter}
+      label="Planner round context"
+      facts={meterFacts}
+    />
   {/snippet}
 
   {#snippet footnote()}

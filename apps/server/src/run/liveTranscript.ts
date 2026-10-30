@@ -517,15 +517,20 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
 /* ── Projecting live activity ────────────────────────────────────────────────── */
 
 /**
- * One narration entry as one transcript item, or nothing.
+ * One narration entry as one live frame, or nothing.
  *
  * `undefined` is the common answer and is the point: most of what a harness narrates is a
- * token delta, a step boundary or a usage update, and `NarrationDetail` reads those as
- * `opaque`. Dropping them here is sound in a way it would not be on the record channel —
- * this channel never claims to be complete — and it is what keeps one item on the wire per
- * reply block and per tool call instead of hundreds per turn.
+ * token delta, a step boundary or a *cumulative* usage total, and `NarrationDetail` reads
+ * those as `opaque`. Dropping them here is sound in a way it would not be on the record
+ * channel — this channel never claims to be complete — and it is what keeps one item on the
+ * wire per reply block and per tool call instead of hundreds per turn.
+ *
+ * **Not every entry becomes an item.** A `usage` entry becomes a {@link LiveUsage} frame,
+ * which is a measurement about the session rather than a turn in it: `live.ts` has the full
+ * reasoning, and the short form is that a transcript with one row per model call would bury
+ * the work under its own instrumentation, and that these are numbers rather than sentences.
  */
-export const projectNarration = (item: RunNarration): LiveItem | undefined => {
+export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
   const base = {
     _tag: "item" as const,
     // This process's publish order, prefixed so it cannot collide with a record id. See
@@ -622,6 +627,56 @@ export const projectNarration = (item: RunNarration): LiveItem | undefined => {
         // impossible.
         callId: detail.callId,
         outcome: detail.failed ? "failed" : "ok",
+      };
+    case "thinking":
+      /*
+       * What was considered, collapsed into one row.
+       *
+       * An empty block produces nothing, for the reason an empty `reply` does: both drivers
+       * close a block they put nothing in — Claude Code emitted `{ type: "thinking",
+       * thinking: "" }` in the probe's own run — and a row saying the agent thought nothing
+       * is a claim about the model, not a fact about the stream.
+       *
+       * The `headline` says what the row is and the `body` is the text. Nothing here marks
+       * it as a record of anything: it is `activity`, like every other narration item, and
+       * the chat is where it is labelled as what was *considered* rather than what happened.
+       */
+      return detail.text.trim() === ""
+        ? undefined
+        : {
+            ...base,
+            kind: "turn.thinking",
+            headline: "Thinking",
+            body: detail.text,
+            tool: null,
+            toolName: null,
+            input: null,
+            output: null,
+            callId: null,
+            outcome: null,
+          };
+    case "usage":
+      /*
+       * One model call's measurement, as its own frame.
+       *
+       * The attribution is the item base's, so a page with two agents on it can tell the
+       * round's meter from the goal's. `undefined` is not reachable from here: a `usage`
+       * entry that could not be attributed to a call was never produced — both clients drop
+       * it rather than inventing an id.
+       */
+      return {
+        _tag: "usage",
+        callId: detail.callId,
+        promptTokens: detail.promptTokens,
+        // `null` on the wire where the harness has not stated it, which is what keeps
+        // "unknown" from arriving as a zero somebody adds up. See `live.ts`.
+        outputTokens: detail.outputTokens ?? null,
+        contextLimit: detail.contextLimit ?? null,
+        compactionAt: detail.compactionAt ?? null,
+        attemptId: base.attemptId,
+        roundId: base.roundId,
+        goalId: base.goalId,
+        at: base.at,
       };
     case "opaque":
       return undefined;

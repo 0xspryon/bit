@@ -19,6 +19,7 @@ import {
   openCodeToolName,
   type GoalNarrationView,
   type LiveItem,
+  type LiveUsage,
   type PlanRoundView,
 } from "@bit/contracts";
 
@@ -28,9 +29,17 @@ import {
   activityOrder,
   buildChat,
   buildGoalConversation,
+  contextMeter,
+  contextMeterLabel,
+  pastCompaction,
   domainSummary,
+  goalUsageScope,
+  groupDigits,
   kindLabel,
   outcomeTint,
+  roundUsageScope,
+  usageScope,
+  type ContextMeter,
   type SentTurn,
 } from "../src/lib/chat";
 import type { GoalConversationView } from "@bit/contracts";
@@ -936,5 +945,196 @@ describe("the goal conversation", () => {
   test("a conversation the replay has not answered for yet reads as loading", () => {
     const view = built({ sent: [sent()], conversation: undefined });
     expect(view.groups[0]?.prose._tag).toBe("loading");
+  });
+});
+
+/* ── The context meter ───────────────────────────────────────────────────────── */
+
+/**
+ * What the figure at the top of a pane is allowed to say.
+ *
+ * Three claims, and every one of them was a way to be wrong:
+ *
+ * 1. **The numerator is one model call.** Both drivers publish running totals that re-count
+ *    the cached prefix per call, so a meter built from those reads four to five times high
+ *    (DECISIONS.md §24.4: 65 838 against 13 753 on OpenCode, 90 784 against 23 179 on
+ *    Claude Code). The fixture below carries both figures so a regression to the easy one
+ *    fails here.
+ * 2. **No limit, no percentage.** Ruling 3. An honest "14,870 tokens" beats a fabricated
+ *    "7%".
+ * 3. **One call per session, latest wins.** A repeat of a call's id replaces it; nothing
+ *    anywhere adds two of these together.
+ */
+describe("the context meter", () => {
+  const usage = (over: Partial<LiveUsage> = {}): LiveUsage => ({
+    _tag: "usage",
+    callId: "msg_1",
+    promptTokens: 13_750,
+    outputTokens: 3,
+    contextLimit: 200_000,
+    compactionAt: 170_000,
+    attemptId: null,
+    roundId: ROUND,
+    goalId: null,
+    at: AT,
+    ...over,
+  });
+
+  /** The meter for a frame, with the "no call yet" case ruled out loudly. */
+  const meterOf = (frame: LiveUsage): ContextMeter => {
+    const meter = contextMeter(frame);
+    if (meter === undefined) throw new Error("expected a meter for this frame");
+    return meter;
+  };
+
+  /** The one-line figure for a frame. */
+  const labelOf = (frame: LiveUsage): string =>
+    contextMeterLabel(meterOf(frame));
+
+  test("the figure is the last call's own context, not the session's spend", () => {
+    /*
+     * The probe's fifth and last call: 150 uncached, 13 600 read from the cache, 3 output.
+     * Its context is 13 753. The **session total** at that same moment was 14 504 input,
+     * 113 output, 85 reasoning and 51 136 cache read — 65 838 together, 4.8 times as much
+     * — and that total is what `session.usage.updated` and `session.tokens` carry.
+     *
+     * Both numbers are in this test on purpose. A meter that regressed to the cumulative
+     * field would still produce a plausible-looking percentage, so the assertion names the
+     * wrong answer as well as the right one.
+     */
+    const meter = contextMeter(usage());
+    expect(meter?.tokens).toBe(13_753);
+    expect(meter?.tokens).not.toBe(65_838);
+    expect(meter?.percent).toBe(7);
+    expect(meter?.limit).toBe(200_000);
+    expect(meter?.outputStated).toBe(true);
+    expect(labelOf(usage())).toBe("13,753 / 200,000 · 7%");
+  });
+
+  test("no limit means no percentage, and the tokens still read", () => {
+    const unlimited = usage({
+      promptTokens: 14_870,
+      outputTokens: null,
+      contextLimit: null,
+    });
+    const meter = contextMeter(unlimited);
+    expect(meter?.limit).toBeNull();
+    expect(meter?.percent).toBeNull();
+    expect(labelOf(unlimited)).toBe("14,870 tokens");
+  });
+
+  test("an unstated output count is not a zero, and the meter says which", () => {
+    // Claude Code's `assistant` frames carry a stale output count, so the server omits it.
+    // The figure is then the prompt side alone and runs short — stated rather than rounded
+    // away.
+    const meter = contextMeter(
+      usage({
+        promptTokens: 21_388,
+        outputTokens: null,
+        contextLimit: 1_000_000,
+      }),
+    );
+    expect(meter?.tokens).toBe(21_388);
+    expect(meter?.outputStated).toBe(false);
+    expect(meter?.outputTokens).toBeNull();
+  });
+
+  test("a real fraction that rounds to nothing says so rather than reading as zero", () => {
+    const sliver = usage({
+      promptTokens: 1_500,
+      outputTokens: 0,
+      contextLimit: 1_000_000,
+    });
+    expect(contextMeter(sliver)?.percent).toBe(0);
+    expect(labelOf(sliver)).toBe("1,500 / 1,000,000 · <1%");
+  });
+
+  test("the harness's own compaction point is carried, as a fraction of the window", () => {
+    /*
+     * The number the meter would otherwise imply does not exist.
+     *
+     * bit's default model: OpenCode rewrites the session at 231 200 tokens, which is 58 %
+     * of the 400 000 the bar is drawn against. So a bar with no mark on it tells an
+     * operator that nothing happens until it reads full, and the thing they would actually
+     * act on arrives a little past halfway.
+     */
+    const meter = meterOf(
+      usage({
+        promptTokens: 120_000,
+        outputTokens: 500,
+        contextLimit: 400_000,
+        compactionAt: 231_200,
+      }),
+    );
+    expect(meter.compactionAt).toBe(231_200);
+    expect(meter.compactionPercent).toBe(58);
+    // Below it, so nothing has been rewritten yet.
+    expect(pastCompaction(meter)).toBe(false);
+  });
+
+  test("past the compaction point is its own state, because the next figure gets smaller", () => {
+    const meter = meterOf(
+      usage({
+        promptTokens: 235_000,
+        outputTokens: 0,
+        contextLimit: 400_000,
+        compactionAt: 231_200,
+      }),
+    );
+    // Not "nearly full" — 59 % of the window — but past the point where the harness is
+    // about to replace the conversation with a summary, or has just done so. The figure
+    // itself still measures a call that really was sent at this size.
+    expect(meter.percent).toBe(59);
+    expect(pastCompaction(meter)).toBe(true);
+  });
+
+  test("no window means no fraction to mark, even when a threshold is known", () => {
+    const meter = contextMeter(
+      usage({ contextLimit: null, compactionAt: 170_000 }),
+    );
+    expect(meter?.compactionAt).toBe(170_000);
+    // A mark is a mark *on* something. The panel still states the number in words.
+    expect(meter?.compactionPercent).toBeNull();
+  });
+
+  test("a harness that states no threshold gets no mark and no sentence", () => {
+    const meter = meterOf(usage({ compactionAt: null }));
+    expect(meter.compactionAt).toBeNull();
+    expect(meter.compactionPercent).toBeNull();
+    // And "we have not been told" is never read as "it will never compact": `pastCompaction`
+    // is false, which is what stops a warning being drawn for an unmeasured policy.
+    expect(pastCompaction(meter)).toBe(false);
+  });
+
+  test("a session that has not called a model yet has no meter", () => {
+    expect(contextMeter(undefined)).toBeUndefined();
+  });
+
+  test("a nonsense window costs the percentage rather than producing an Infinity", () => {
+    const meter = contextMeter(usage({ contextLimit: 0 }));
+    expect(meter?.limit).toBeNull();
+    expect(meter?.percent).toBeNull();
+  });
+
+  test("a frame is scoped to the one agent it measures, and an unattributed one is dropped", () => {
+    // A page shows a planner round above a goal conversation: two agents, two sessions,
+    // two windows. A figure shown against the wrong one is worse than no figure.
+    expect(usageScope(usage())).toBe(roundUsageScope(ROUND));
+    expect(usageScope(usage({ roundId: null, goalId: GOAL }))).toBe(
+      goalUsageScope(GOAL),
+    );
+    expect(usageScope(usage({ roundId: null, attemptId: "att_1" }))).toBe(
+      "attempt:att_1",
+    );
+    expect(usageScope(usage({ roundId: null }))).toBeUndefined();
+  });
+
+  test("the figure is grouped the same way in a test as on a screen", () => {
+    // `toLocaleString` would answer differently under the runner's locale than in a
+    // browser, which is a test passing for the wrong reason.
+    expect(groupDigits(13_753)).toBe("13,753");
+    expect(groupDigits(0)).toBe("0");
+    expect(groupDigits(999)).toBe("999");
+    expect(groupDigits(1_000_000)).toBe("1,000,000");
   });
 });

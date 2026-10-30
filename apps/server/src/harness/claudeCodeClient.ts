@@ -228,6 +228,14 @@ const claudeCodeEffortOf = (
  * resolves inside the harness, so an attempt row that recorded one would say which family
  * ran and not which build — and `model_id` is provenance. An operator who wants an alias
  * can still name one: the list is what the picker offers, never what the harness accepts.
+ *
+ * **No `contextLimit` on any entry, and that is the same refusal.** `ModelInfo` carries no
+ * context-window field at all, so there is nothing here to read one from; the only figure
+ * this driver states is `getContextUsage().maxTokens`, which belongs to a *session* and to
+ * the account that opened it (DECISIONS.md §24.4 saw 1 000 000 for `claude-sonnet-5` on
+ * this account). Writing that into this list would turn one observation into a constant
+ * every future deployment would inherit, so the limit rides the session instead and the
+ * picker says nothing about a window it cannot know.
  */
 export const CLAUDE_CODE_MODELS: readonly HarnessModelView[] = [
   { id: CLAUDE_CODE_DEFAULT_MODEL, optionDescriptors: [CLAUDE_CODE_EFFORT] },
@@ -281,6 +289,22 @@ export interface HarnessQuery extends AsyncIterable<SDKMessage> {
     servers: Record<string, McpServerConfig>,
   ): Promise<{ readonly errors?: unknown }>;
   interrupt(): Promise<unknown>;
+  /**
+   * What this session's model takes, as a control request.
+   *
+   * **The only honest source of a Claude Code context limit, and it is session-time.**
+   * `supportedModels()` carries no window at all and `CLAUDE_CODE_MODELS` is a written-down
+   * list, so there is nothing to read a limit from before a session exists; this answers
+   * from `system/init` onward, before any model response (DECISIONS.md §24.4). The figure
+   * is this account's, for the model as this session resolved it — which is exactly why it
+   * must not be copied into a constant.
+   *
+   * Narrowed to the one field read, like `setMcpServers`' return: the SDK's own response is
+   * a dozen fields of category breakdown, and `totalTokens` among them is a *category
+   * estimate* that did not move between two turns whose real contexts differed. The meter's
+   * numerator comes from the stream; only the denominator comes from here.
+   */
+  getContextUsage(): Promise<{ readonly maxTokens?: number }>;
   close(): void;
 }
 
@@ -401,6 +425,28 @@ interface SessionRecord {
   /** Estimated cost in USD, from the last `result`. Reported, never acted on. */
   cost: number | undefined;
   tokens: Record<string, unknown> | undefined;
+  /**
+   * What this session's model takes, once the control request has answered.
+   *
+   * On the session and not on the model view, because that is where the fact lives: see
+   * {@link HarnessQuery.getContextUsage}. `undefined` until it answers, and `undefined`
+   * forever if it does not — the meter then shows tokens with no percentage, which is the
+   * accurate rendering of "we do not know the window".
+   */
+  contextLimit: number | undefined;
+  /**
+   * The id of the last model call seen on this stream.
+   *
+   * **The join between a call and its own output count.** An `assistant` frame's
+   * `output_tokens` is the `message_start` snapshot and is stale; the true figure arrives
+   * at turn end in `result.usage.iterations[0]`, which carries **no message id at all**
+   * (checked against the probe's raw frames). So the only thing that can attribute that
+   * figure to a call is the stream's own order, which is what this remembers.
+   *
+   * Nothing is guessed when it is absent: a `result` on a stream that produced no
+   * `assistant` frame states no usage rather than inventing a call to hang it on.
+   */
+  lastCallId: string | undefined;
   /** Set by {@link interruptSession}, so the outcome is `interrupted` and not `failed`. */
   interrupted: boolean;
   /** The query has been closed; nothing more will arrive. */
@@ -514,8 +560,15 @@ const resultText = (value: unknown): string => {
  * The block kinds read, and where each comes from:
  *
  * - `assistant` → `text` blocks become `reply`, `tool_use` blocks (`{ id, name, input }`)
- *   become `toolCall`. Both are complete when they arrive; the SDK streams partial content
- *   as `stream_event` messages, which this build does not ask for.
+ *   become `toolCall`, `thinking` blocks become `thinking`. All three are complete when
+ *   they arrive; the SDK streams partial content as `stream_event` messages, which this
+ *   build does not ask for.
+ * - `assistant` → one `usage` entry as well, from `message.usage`. See
+ *   {@link usageOfAssistant} for why its output count is omitted rather than reported, and
+ *   why several frames of one call carrying the same figures is correct here.
+ * - `result` → one `usage` entry from `usage.iterations[0]`, which is the last call alone
+ *   and is the only exact output count that needs neither partial messages nor a second
+ *   request. The `result`'s own `usage` is a **per-turn sum** and is never read for this.
  * - `user` → `tool_result` blocks (`{ tool_use_id, content, is_error }`) become
  *   `toolResult`. A tool's output comes back as a *user* message because that is how the
  *   Messages API carries it, which reads oddly and is the SDK's shape rather than ours.
@@ -545,9 +598,150 @@ const resultText = (value: unknown): string => {
  * The `outcome` is carried on the **last** entry of the list, and only `result` messages
  * have one, so the question of which of several entries states it does not arise.
  */
+/** A finite number, or zero for anything else. The usage fields read defensively. */
+const count = (value: unknown): number =>
+  typeof value === "number" && Number.isFinite(value) ? value : 0;
+
+/**
+ * The prompt side of one call, from either an `assistant` frame's usage or an iteration.
+ *
+ * The three fields are disjoint parts of what was sent, so this is their sum: the uncached
+ * remainder, the cached prefix that was read, and whatever was written to the cache. The
+ * input side of an `assistant` frame is **exact** — it is only the output side that is a
+ * snapshot — which is what makes a meter possible without partial messages.
+ */
+const promptTokensOf = (usage: unknown): number => {
+  const record = (usage ?? {}) as Record<string, unknown>;
+  return (
+    count(record["input_tokens"]) +
+    count(record["cache_read_input_tokens"]) +
+    count(record["cache_creation_input_tokens"])
+  );
+};
+
+/**
+ * Whether this frame came from a **subagent** rather than from the session's own loop.
+ *
+ * `parent_tool_use_id` is the `Task` call a forwarded subagent frame is nested under; it is
+ * `null` on every frame of the main loop (`null` on all eight of DECISIONS.md §24.4's
+ * captures, which ran no subagent).
+ *
+ * **Read from the SDK's documentation, not from a measurement, and that is the whole of the
+ * evidence.** `sdk.d.ts:3686` states it in as many words — "`parent_tool_use_id` is non-null
+ * when the message was produced inside a subagent started by that tool_use" — and no run in
+ * this repository has ever produced one: §24.4's probe started no subagent, so **nothing
+ * here has observed a forwarded frame at all**, and whether such a frame even carries
+ * `message.usage` is unknown. The guard is written so that it does not need to know: it
+ * excludes the frame *before* any usage is read, so the unmeasured case costs a measurement
+ * this build would rather not have than produce a wrong one. What would change if the
+ * documented meaning turned out to be narrower is that a subagent's context could reach a
+ * pane's meter again, which is the defect this exists to prevent.
+ *
+ * **It matters because this build pins `forwardSubagentText: true`** — without it a
+ * subagent's text and thinking never reach the stream — and the policy gate's default
+ * answer is `allow`, so a `Task` call is reachable on any run. A subagent has its own
+ * context: its prompt size is not this session's, and a meter that took its newest frame
+ * would change subject without saying so, which is the one defect this meter is not allowed
+ * to have.
+ */
+const fromSubagent = (message: SDKMessage): boolean =>
+  (message as { parent_tool_use_id?: unknown }).parent_tool_use_id != null;
+
+/**
+ * One `assistant` frame's usage entry, or nothing if it is not a measurement of this
+ * session.
+ *
+ * **`outputTokens` is deliberately `undefined` here.** The usage on an `assistant` frame is
+ * the `message_start` snapshot: DECISIONS.md §24.4 measured a call that produced 16 output
+ * tokens reporting `output_tokens: 1`, and one that produced 153 reporting 2, with partial
+ * messages both on and off. Publishing that would be a precise-looking number that is wrong
+ * by two orders of magnitude, so the field is left unstated until the `result` states it.
+ *
+ * Several frames of one call each produce one of these, with the same id and the same
+ * figures, because one API call arrives as one frame per content block. That is not
+ * de-duplicated here — this function is called from a stateless mapping and a reader keys
+ * the latest per `callId` — and it is harmless precisely because nothing sums them.
+ *
+ * **A subagent's frame produces no entry at all** ({@link fromSubagent}), and the harness's
+ * own accounting agrees that this is the right unit: the SDK documents `result.usage` as
+ * "MAIN AGENT LOOP ONLY — excludes Task subagent, sidechain, and auxiliary model calls", so
+ * the `iterations` this driver's output count comes from describe main-loop calls. Letting a
+ * subagent's frame set {@link SessionRecord.lastCallId} would hang that output count on a
+ * call it is not about. The subagent's *text and thinking still narrate* — they are what the
+ * forwarding option exists for, and they are transcript content rather than a measurement.
+ */
+const usageOfAssistant = (
+  message: SDKMessage,
+  contextLimit: number | undefined,
+): NarrationDetail | undefined => {
+  if (fromSubagent(message)) return undefined;
+  const envelope = (message as { message?: { id?: unknown; usage?: unknown } })
+    .message;
+  const callId = envelope?.id;
+  if (typeof callId !== "string") return undefined;
+  return {
+    _tag: "usage",
+    callId,
+    promptTokens: promptTokensOf(envelope?.usage),
+    outputTokens: undefined,
+    contextLimit,
+    // Claude Code states no compaction threshold this build has measured. Its context
+    // breakdown carries `autocompact_buffer` and `compact_buffer` categories, so one
+    // exists; deriving a number from a policy nobody measured is what
+    // `HarnessModelView.compactionAt` forbids.
+    compactionAt: undefined,
+  };
+};
+
+/**
+ * The last call's exact figures from a `result`, or nothing when they cannot be attributed.
+ *
+ * `usage.iterations[0]` is that call alone — input, output, cache read and cache write —
+ * and its output count is the true one. The `result`'s own `usage` beside it is the turn's
+ * **sum** over its calls: all four of its fields together came to 90 784 against a real
+ * context of 23 179, 3.9 times too many, because the cached prefix is re-counted per call.
+ * It is not read here, and {@link SessionRecord.tokens} keeps it only as the diagnostic
+ * `sessionStatus` already reported.
+ *
+ * The id comes from {@link SessionRecord.lastCallId} because the iteration carries none.
+ * With no last call there is nothing to attribute this to and nothing is emitted.
+ */
+const usageOfResult = (
+  message: SDKMessage,
+  lastCallId: string | undefined,
+  contextLimit: number | undefined,
+): NarrationDetail | undefined => {
+  if (lastCallId === undefined) return undefined;
+  const usage = (message as { usage?: unknown }).usage;
+  const iterations = (usage as { iterations?: unknown } | undefined)
+    ?.iterations;
+  const last = Array.isArray(iterations) ? iterations[0] : undefined;
+  if (last === undefined || typeof last !== "object") return undefined;
+  const record = last as Record<string, unknown>;
+  return {
+    _tag: "usage",
+    callId: lastCallId,
+    promptTokens: promptTokensOf(record),
+    // Thinking is already inside this figure — `output_tokens_details.thinking_tokens` is
+    // a breakdown of it, not an addition to it, which is the opposite of OpenCode's shape.
+    outputTokens: count(record["output_tokens"]),
+    contextLimit,
+    // See `usageOfAssistant`: this driver states no threshold this build has measured.
+    compactionAt: undefined,
+  };
+};
+
 const narrate = (
   message: SDKMessage,
   outcome: TerminalOutcome | undefined,
+  /**
+   * The session's own usage state: its window, and the last call seen on this stream.
+   *
+   * Passed in and mutated here for the reason `openCodeNarration` takes a name map: the
+   * two facts a usage entry needs are not on the frame that needs them. It is one object
+   * per session, so one session's call ids can never be read for another's.
+   */
+  session: Pick<SessionRecord, "contextLimit" | "lastCallId">,
 ): readonly HarnessNarration[] => {
   const at = Date.now();
   const frame = (detail: NarrationDetail): HarnessNarration => ({
@@ -572,12 +766,25 @@ const narrate = (
       const record = (block ?? {}) as {
         type?: unknown;
         text?: unknown;
+        thinking?: unknown;
         id?: unknown;
         name?: unknown;
         input?: unknown;
       };
       if (record.type === "text" && typeof record.text === "string") {
         details.push({ _tag: "reply", text: truncateNarration(record.text) });
+      } else if (
+        record.type === "thinking" &&
+        typeof record.thinking === "string"
+      ) {
+        // The field is `thinking`, not `text`. An empty one is reachable and is carried as
+        // it is: the probe's own run produced `{ type: "thinking", thinking: "" }`, and
+        // whether a block with nothing in it is worth a row is the transcript's decision,
+        // not this mapping's.
+        details.push({
+          _tag: "thinking",
+          text: truncateNarration(record.thinking),
+        });
       } else if (record.type === "tool_use" && typeof record.id === "string") {
         details.push({
           _tag: "toolCall",
@@ -610,9 +817,34 @@ const narrate = (
     }
   }
 
-  // An `assistant` message carrying only a thinking block, or a `user` message that is a
-  // plain prompt echo, lands here: one `opaque` entry, so the stream still has an entry
-  // per message and nothing downstream has to cope with a message that narrated nothing.
+  /*
+   * The usage entry, last, so the blocks of a message are narrated before the measurement
+   * of the call that produced them.
+   *
+   * On an `assistant` frame the call's id is also remembered here, which is what lets the
+   * turn's `result` attribute its exact output count to it — see
+   * {@link SessionRecord.lastCallId}. It is set from the frame's own `message.id` rather
+   * than from the entry, so a frame this build narrates nothing else from still advances
+   * the join.
+   */
+  if (message.type === "assistant") {
+    const usage = usageOfAssistant(message, session.contextLimit);
+    if (usage !== undefined) {
+      session.lastCallId = usage._tag === "usage" ? usage.callId : undefined;
+      details.push(usage);
+    }
+  } else if (message.type === "result") {
+    const usage = usageOfResult(
+      message,
+      session.lastCallId,
+      session.contextLimit,
+    );
+    if (usage !== undefined) details.push(usage);
+  }
+
+  // A `user` message that is a plain prompt echo, or a `system` frame, lands here: one
+  // `opaque` entry, so the stream still has an entry per message and nothing downstream has
+  // to cope with a message that narrated nothing.
   return details.length === 0
     ? [frame({ _tag: "opaque" })]
     : details.map(frame);
@@ -861,7 +1093,7 @@ export const claudeCodeHarness = (
                     >;
                     record.completed += 1;
                   }
-                  for (const entry of narrate(message, outcome)) {
+                  for (const entry of narrate(message, outcome, record)) {
                     Queue.offerUnsafe(record.narration, entry);
                   }
                   if (message.type !== "result") continue;
@@ -1029,6 +1261,51 @@ export const claudeCodeHarness = (
           // so there is no fiber to leak either way.
           yield* Effect.forkIn(pump(record), harnessScope);
 
+          /*
+           * The session's context window, read once, beside the run rather than in it.
+           *
+           * Forked for two reasons. It is a control round trip to a subprocess that has
+           * just started, so awaiting it here would delay the moment the prompt is accepted
+           * — and the caller of this is the supervisor, which has a run to get going. And a
+           * window is a *denominator*: a read that does not answer costs a percentage on a
+           * meter, which must never be allowed to cost a run. So it is bounded, its failure
+           * is logged at debug and discarded, and `contextLimit` simply stays unset.
+           *
+           * Into the layer's scope, like the pump above, so it is not interrupted by the
+           * caller returning and is interrupted on shutdown.
+           */
+          yield* Effect.forkIn(
+            Effect.ignore(
+              Effect.timeout(
+                Effect.tap(
+                  Effect.tryPromise({
+                    try: () => started.getContextUsage(),
+                    catch: (cause) =>
+                      transport(
+                        "context_usage",
+                        `the session would not report its context window: ${String(cause)}`,
+                      ),
+                  }),
+                  (usage) =>
+                    Effect.sync(() => {
+                      const max = usage.maxTokens;
+                      record.contextLimit =
+                        max !== undefined && Number.isFinite(max)
+                          ? max
+                          : undefined;
+                    }),
+                ),
+                controlTimeout,
+              ),
+              {
+                log: "Debug",
+                message:
+                  "could not read this Claude Code session's context window; its meter will show tokens and no percentage",
+              },
+            ),
+            harnessScope,
+          );
+
           if (Object.keys(record.mcpServers).length > 0) {
             const registered = yield* Effect.result(
               Effect.timeout(
@@ -1091,6 +1368,8 @@ export const claudeCodeHarness = (
           outcome: undefined,
           cost: undefined,
           tokens: undefined,
+          contextLimit: undefined,
+          lastCallId: undefined,
           interrupted: false,
           closed: false,
         });

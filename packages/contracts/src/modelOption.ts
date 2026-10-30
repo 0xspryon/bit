@@ -142,6 +142,81 @@ export const HarnessModelView = Schema.Struct({
    * as we know*, which is the same answer for the picker's purposes.
    */
   optionDescriptors: Schema.optional(Schema.Array(ModelOptionDescriptor)),
+  /**
+   * How many tokens of context this model takes, when the harness says so **before a
+   * session exists**.
+   *
+   * The denominator of the context meter, and the whole reason it is on the model view
+   * rather than on a session: OpenCode's `GET /api/model` carries `limit` on every
+   * catalogue entry, and this application already reads that catalogue for the picker
+   * (DECISIONS.md §24.4 measured all 27 entries), so the limit is known before anything
+   * runs.
+   *
+   * **Absent on Claude Code, and that is a fact about Claude Code rather than a gap here.**
+   * Its model list (`ModelInfo`) has no context-window field at all; the only figure is
+   * `query.getContextUsage().maxTokens`, which exists once a *session* does and is this
+   * account's answer for the model as that session resolved it. Writing it down here would
+   * be a constant pretending to be an observation, so it rides the session instead — see
+   * `NarrationDetail`'s `usage` case.
+   *
+   * **It is `limit.context`, deliberately, not `limit.input`.** OpenCode publishes both and
+   * they differ (400 000 against 272 000 on bit's own default model): `limit.context` is
+   * the window the provider accepts, which is what a *fullness* meter is a fraction of and
+   * what OpenCode's own TUI meter divides by. `limit.input` is the smaller figure, and it is
+   * the one OpenCode's **own compaction** measures itself against — so a meter over it would
+   * be reporting how close the harness is to rewriting the session rather than how full the
+   * context is, which are two different questions an operator asks at two different moments.
+   *
+   * **That harness does rewrite the session, and this field is not where that is said** —
+   * {@link compactionAt} is. An earlier version of this comment said "this application does
+   * not compact, so it has no use for the trigger", which was false in the way that matters:
+   * bit never *calls* compaction and OpenCode compacts anyway, by default, well before this
+   * window fills. A denominator chosen on the strength of that sentence would have been a
+   * meter that implies nothing happens until it reads 100 %.
+   *
+   * Absent when the catalogue could not be read, for `optionDescriptors`' reason: a model
+   * whose entry is unavailable states no limit *as far as we know*, and the meter then
+   * shows tokens with no percentage rather than a fraction of a guess.
+   */
+  contextLimit: Schema.optional(Schema.Int),
+  /**
+   * The context size at which the **harness itself** will summarise the session, when its
+   * own policy states one.
+   *
+   * ## Why a meter needs this to be honest
+   *
+   * {@link contextLimit} is how much the provider accepts; this is the point at which
+   * something happens to the conversation without anybody asking. On bit's own default
+   * model the two are 400 000 and ~231 200 — so a bar drawn against the window alone passes
+   * **58 %** and the session is silently rewritten underneath it. A meter that showed only
+   * the window would be accurate about the window and misleading about the thing an
+   * operator would actually act on, which is the failure this whole slice was most at risk
+   * of.
+   *
+   * ## It is derived from the harness's source, not reported by the harness
+   *
+   * Nothing on the wire states it. It is OpenCode 2.2.2's own default policy, read out of
+   * `packages/core/src/session/compaction.ts` and reproduced in `openCodeClient.ts`:
+   * automatic compaction starts `auto: true` (line 200) and fires when the estimated
+   * context reaches `(limit.input || limit.context) − max(15 % of it, 16 000)` (line 849,
+   * `RESERVE_SHARE`/`RESERVE_MIN`). bit writes no `compaction` key into any OpenCode config
+   * — the gate install writes only its plugin registration — so the default is what applies.
+   *
+   * **So it is an estimate of somebody else's threshold, and three things can move it
+   * without moving this number:** an `opencode.json` at or above the session's directory
+   * setting `compaction.auto: false` or its own `buffer` (DECISIONS.md §24.3 measured that
+   * configuration is inherited from *every* ancestor directory, not just the project), and
+   * an `opencode` upgrade changing either constant. A consumer must present it as "where
+   * the harness says it will act", never as a measurement, and must not compute anything
+   * from the difference between it and a token count.
+   *
+   * **Absent for Claude Code**, like {@link contextLimit} and for a sibling reason: its
+   * `getContextUsage()` breakdown does carry `autocompact_buffer` and `compact_buffer`
+   * categories, so a threshold exists there too — but this build reads only `maxTokens` off
+   * that response and has measured nothing about when the CLI acts on those buffers.
+   * Deriving a number from an unmeasured policy is the thing the paragraph above forbids.
+   */
+  compactionAt: Schema.optional(Schema.Int),
 });
 export type HarnessModelView = typeof HarnessModelView.Type;
 

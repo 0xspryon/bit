@@ -40,7 +40,12 @@
    */
   import type { LiveItem } from "@bit/contracts";
 
-  import { kindLabel, outcomeTint, type WriteState } from "../chat";
+  import {
+    THINKING_KIND,
+    kindLabel,
+    outcomeTint,
+    type WriteState,
+  } from "../chat";
 
   let {
     item,
@@ -80,6 +85,21 @@
     pending: "pending",
     unresolved: "unresolved",
   };
+
+  /**
+   * Whether this row is what the agent **considered**, rather than what it did.
+   *
+   * It changes two things and nothing else: the text goes in a collapsed `<details>`
+   * instead of straight into the row, and a sentence says what the block is. Both follow
+   * from ruling 2 of the brief — collapsed by default, and never presented as a record of
+   * what happened.
+   *
+   * The thing that happened is the reply or the tool call beside this row. Thinking is a
+   * draft: it is streamed and never stored, it is not read back on a reload, and an
+   * operator who acted on it would be acting on something the agent may have talked itself
+   * out of two rows later.
+   */
+  let thinking = $derived(item.kind === THINKING_KIND);
 
   let writeTint = $derived(
     write === "recorded"
@@ -173,7 +193,24 @@
     {/if}
   </div>
 
-  {#if item.body !== ""}
+  {#if thinking && item.body !== ""}
+    <!--
+      Collapsed, like a tool's arguments and for one more reason than they are: the text
+      runs to paragraphs, it arrives a block at a time while the operator is reading
+      something else, and it is the one thing on this surface that is not a claim about
+      what happened. Shut, it is out of the accessibility tree, so a reader is not narrated
+      a model's deliberation on every arrival.
+    -->
+    <details class="io">
+      <summary class="io-label">What it considered</summary>
+      <p class="thought">{item.body}</p>
+      <p class="note">
+        What the agent was considering, not what it did — and not stored: this
+        is gone on a reload. What it actually did is the reply or the tool call
+        beside this.
+      </p>
+    </details>
+  {:else if item.body !== ""}
     <p class="body">{item.body}</p>
   {:else if summary !== null}
     <!--
@@ -337,6 +374,20 @@
     min-width: 0;
     color: var(--text-base);
     font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  /*
+   * Reads as the quotation it is: indented behind a rule, in the body size rather than the
+   * monospace a payload gets, because it is prose and not a tool's output.
+   */
+  .thought {
+    margin: 2px 0 0;
+    padding-left: 8px;
+    border-left: 2px solid var(--border-muted);
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: var(--lh-compact);
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
   .body {

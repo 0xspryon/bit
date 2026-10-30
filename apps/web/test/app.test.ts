@@ -32,6 +32,7 @@ import {
   TargetRefused,
   TargetUnavailable,
   Unauthenticated,
+  type LiveUsage,
 } from "@bit/contracts";
 
 import { App, fromSummary } from "../src/lib/app.svelte";
@@ -3311,5 +3312,143 @@ describe("the goal conversation", () => {
     expect(
       app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
     ).toEqual(["what is happening?", "One round has run so far."]);
+  });
+});
+
+/* ── The context meter ───────────────────────────────────────────────────────── */
+
+/**
+ * What this tab does with the usage frames, which is: keep the newest per session.
+ *
+ * `chat.ts` decides what a figure *says*; this is about which frame a pane is looking at,
+ * and the two things that must not happen. A meter that summed these would read four to
+ * five times high, because both drivers' cumulative figures re-count the cached prefix per
+ * call (DECISIONS.md §24.4). A meter that showed the newest frame on the *target* would
+ * show the planner round's context above the goal conversation and never say so.
+ */
+describe("the context meter", () => {
+  const onGoal = async (
+    arrange: (fake: FakeServer) => void = () => {},
+  ): Promise<[App, FakeServer]> => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1" })] });
+    fake.onGoalRounds = () =>
+      ok({ rounds: [planRoundView({ roundId: "rnd_1" })] });
+    arrange(fake);
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+    return [app, fake];
+  };
+
+  const usage = (over: Partial<LiveUsage> = {}): LiveUsage => ({
+    _tag: "usage",
+    callId: "msg_1",
+    promptTokens: 11_050,
+    outputTokens: 0,
+    contextLimit: 200_000,
+    compactionAt: 170_000,
+    attemptId: null,
+    roundId: "rnd_1",
+    goalId: null,
+    at: AT,
+    ...over,
+  });
+
+  test("each session's own call, and the newest of them, is what its pane shows", async () => {
+    const [app, fake] = await onGoal();
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+
+    // The probe's first four calls on one round. The context grows and the figure follows
+    // the last one — it is not the sum of them, which would be 52 085.
+    for (const [callId, promptTokens] of [
+      ["msg_1", 11_050],
+      ["msg_2", 13_572],
+      ["msg_3", 13_646],
+      ["msg_4", 13_693],
+    ] as const) {
+      fake.watch.send(usage({ callId, promptTokens, outputTokens: 45 }));
+    }
+    await settle();
+    expect(app.plannerContextMeter?.callId).toBe("msg_4");
+    expect(app.plannerContextMeter?.tokens).toBe(13_738);
+    expect(app.plannerContextMeter?.percent).toBe(7);
+
+    // The goal's own agent is a different session, a different model and a different
+    // window, and its pane says so rather than borrowing the round's figure.
+    expect(app.goalContextMeter).toBeUndefined();
+    fake.watch.send(
+      usage({
+        callId: "msg_g1",
+        roundId: null,
+        goalId: "goal_1",
+        promptTokens: 21_388,
+        outputTokens: null,
+        contextLimit: 1_000_000,
+      }),
+    );
+    await settle();
+    expect(app.goalContextMeter?.tokens).toBe(21_388);
+    expect(app.goalContextMeter?.outputStated).toBe(false);
+    // And the planner's is untouched by it.
+    expect(app.plannerContextMeter?.tokens).toBe(13_738);
+  });
+
+  test("a repeat of one call's id replaces it rather than counting twice", async () => {
+    const [app, fake] = await onGoal();
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+
+    /*
+     * Claude Code's shape: one API call arrives as several frames repeating one
+     * `message.id` with a stale output count, and the turn's `result` then states the real
+     * one under that same id. Three frames, one call: 21 388 sent, 16 generated.
+     */
+    fake.watch.send(
+      usage({ callId: "msg_a", promptTokens: 21_388, outputTokens: null }),
+    );
+    fake.watch.send(
+      usage({ callId: "msg_a", promptTokens: 21_388, outputTokens: null }),
+    );
+    fake.watch.send(
+      usage({ callId: "msg_a", promptTokens: 21_388, outputTokens: 16 }),
+    );
+    await settle();
+
+    expect(app.plannerContextMeter?.tokens).toBe(21_404);
+    expect(app.plannerContextMeter?.outputStated).toBe(true);
+    // Not three calls' worth, which is what a counter would have made of it.
+    expect(app.plannerContextMeter?.tokens).not.toBe(21_388 * 3);
+  });
+
+  test("a usage frame is not a transcript row, and does not dedupe like one", async () => {
+    const [app, fake] = await onGoal();
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(usage());
+    fake.watch.send(usage({ promptTokens: 13_572 }));
+    await settle();
+
+    // Nothing of it reaches the items, so no chat renders a row per model call.
+    expect(app.liveItems).toEqual([]);
+    // And the second frame was applied rather than dropped as a duplicate: these carry no
+    // item id, and "already shown" is not a question about a measurement.
+    expect(app.plannerContextMeter?.promptTokens).toBe(13_572);
+  });
+
+  test("leaving the target leaves its figures behind", async () => {
+    const [app, fake] = await onGoal();
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(usage());
+    await settle();
+    expect(app.plannerContextMeter).toBeDefined();
+
+    // Another target's screen must not carry this one's context figure, for the reason its
+    // items do not.
+    app.openTarget("other-target");
+    await settle();
+    expect(app.liveUsage).toEqual({});
   });
 });

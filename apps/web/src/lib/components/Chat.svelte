@@ -54,6 +54,7 @@
     footnote,
     controls,
     composer,
+    meter,
     detail = "",
     empty,
   }: {
@@ -93,6 +94,20 @@
     controls?: Snippet;
     /** The composer. Rendered only when {@link readonly} is false. */
     composer?: Snippet;
+    /**
+     * The context indicator, at the top of the pane beside the heading.
+     *
+     * A snippet for the reason {@link separator} is one: a meter is about **one agent's
+     * session**, and which session that is, on what model, with what window, is the
+     * caller's own fact — a goal conversation and a planner round keep it in different
+     * places. This component places it and knows nothing about what is in it, which is also
+     * what keeps the planner's vocabulary out of this file.
+     *
+     * Optional, and absent is the honest state of a pane whose session has not called a
+     * model yet: `ContextMeter` renders nothing without a measurement, so there is no
+     * placeholder here to render either.
+     */
+    meter?: Snippet;
     /** A sentence about the whole chat, when something is wrong with reading it. */
     detail?: string;
     /** What to say when there is no conversation at all. */
@@ -153,6 +168,13 @@
     <span class="title">{label}</span>
     {#if count !== ""}
       <span class="count">{count}</span>
+    {/if}
+    <!--
+      The context indicator, at the top of the pane. Last in the strip and pushed to the
+      end, so the heading and the count stay where a reader's eye starts.
+    -->
+    {#if meter !== undefined}
+      <div class="meter">{@render meter()}</div>
     {/if}
   </div>
 
@@ -287,6 +309,17 @@
     font-size: 12px;
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
+  }
+  /*
+   * Pushed to the end of the strip, and allowed to take the full width when its panel is
+   * open: the detail is a two-column grid of pairs and a column of it squeezed beside a
+   * heading would wrap every row.
+   */
+  .meter {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    justify-content: flex-end;
   }
   /*
    * `--text-muted` is the floor for text in here; `--text-faint` is not usable at these

@@ -52,6 +52,16 @@ import {
 
 /* ── A scripted SDK ──────────────────────────────────────────────────────────── */
 
+/**
+ * The context window the scripted session reports.
+ *
+ * The figure DECISIONS.md §24.4 measured for `claude-sonnet-5` on the operator's account.
+ * It is a *session's* answer and is scripted as one: nothing in `src/` writes it down, and
+ * a test asserting a number from the model list would be asserting the thing this harness
+ * refuses to claim.
+ */
+const CONTEXT_WINDOW = 1_000_000;
+
 /** What one `query()` call did, as the test watches it. */
 interface Launched {
   readonly options: Options;
@@ -151,6 +161,10 @@ const scriptedSdk = (script: Script = {}) => {
           seen.interrupts += 1;
           return undefined;
         },
+        // The window this account gets for this model, which is the only place a Claude
+        // Code limit can come from: it is session-time, not catalogue-time. See
+        // `HarnessQuery.getContextUsage`.
+        getContextUsage: async () => ({ maxTokens: CONTEXT_WINDOW }),
         close: () => {
           seen.closes += 1;
         },
@@ -231,6 +245,25 @@ describe("identity", () => {
     // this reporting a version nobody is running.
     expect(instance.version).not.toBe("unknown");
     expect(instance.defaultModel.length).toBeGreaterThan(0);
+  });
+
+  test("no model in the picker claims a context window", async () => {
+    /*
+     * The other half of `HarnessModelView.contextLimit`: OpenCode fills it from its
+     * catalogue, and this driver has no catalogue to fill it from. `ModelInfo` carries no
+     * context-window field, so the only figure available is a *session's*
+     * `getContextUsage().maxTokens` — this account's answer for the model as that session
+     * resolved it. Writing it into the model list would turn one observation into a
+     * constant every deployment inherits, and the meter would then draw a percentage
+     * against a denominator nobody measured.
+     */
+    const instance = await withHarness({}, (harness) =>
+      Effect.succeed<AgentHarness["Service"]["instance"]>(harness.instance),
+    );
+    expect(instance.models.length).toBeGreaterThan(0);
+    expect(
+      instance.models.every((model) => model.contextLimit === undefined),
+    ).toBe(true);
   });
 
   test("a minted session id is a UUID, because the SDK requires one", () => {
@@ -718,18 +751,81 @@ describe("outcomes", () => {
     });
   });
 
-  test("a message with nothing to render still narrates, as opaque", async () => {
+  /**
+   * A thinking block is read, and it used to be the example of something that was not.
+   *
+   * This test asserted `opaque` for exactly this message, with the comment that one entry
+   * per message is what keeps anything downstream from having to cope with a message that
+   * narrated nothing. That part still holds — see the `system` case below, which is now
+   * what carries it — but the premise does not: a thinking block has a whole block of text
+   * in `block.thinking`, and reading it as "nothing to render" was this build's limitation
+   * rather than the driver's.
+   */
+  test("a thinking block is narrated as thinking, with its own text", async () => {
     const sessionId = "ignored";
     const outcome = await run([
       {
         type: "assistant",
         message: {
           role: "assistant",
-          content: [{ type: "thinking", thinking: "...", signature: "x" }],
+          content: [
+            {
+              type: "thinking",
+              thinking: "The limiter is probably per-IP.",
+              signature: "x",
+            },
+          ],
         },
         parent_tool_use_id: null,
         session_id: sessionId,
         uuid: "00000000-0000-4000-8000-00000000fff2",
+      } as unknown as SDKMessage,
+      result(sessionId, "success"),
+    ]);
+    const entries = [...outcome.narrated];
+    expect(entries[0]?.detail).toEqual({
+      _tag: "thinking",
+      text: "The limiter is probably per-IP.",
+    });
+    // The field is `thinking` and not `text`, so a mapping that read the wrong one would
+    // produce an empty block rather than failing — which is why the text is asserted.
+    expect(entries[0]?.type).toBe("assistant");
+  });
+
+  test("an empty thinking block is carried as empty, and not as a reply", async () => {
+    const sessionId = "ignored";
+    // Observed in DECISIONS.md §24.4's own run: the provider returned no readable
+    // reasoning and the SDK still delivered the block, `thinking: ""`. Whether a block with
+    // nothing in it is worth a row is the transcript's decision — `liveTranscript.ts` drops
+    // it — and this mapping's job is not to turn it into something it is not.
+    const outcome = await run([
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "", signature: "x" }],
+        },
+        parent_tool_use_id: null,
+        session_id: sessionId,
+        uuid: "00000000-0000-4000-8000-00000000fff7",
+      } as unknown as SDKMessage,
+      result(sessionId, "success"),
+    ]);
+    expect([...outcome.narrated][0]?.detail).toEqual({
+      _tag: "thinking",
+      text: "",
+    });
+  });
+
+  test("a message with nothing to render still narrates, as opaque", async () => {
+    const sessionId = "ignored";
+    const outcome = await run([
+      // A `system` frame: no content blocks, nothing measurable, and nothing to show.
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        session_id: sessionId,
+        uuid: "00000000-0000-4000-8000-00000000fff8",
       } as unknown as SDKMessage,
       result(sessionId, "success"),
     ]);
@@ -739,6 +835,261 @@ describe("outcomes", () => {
     // something we do not display" must not read as "the agent replied with nothing".
     expect(entries).toHaveLength(2);
     expect(entries[0]?.detail).toEqual({ _tag: "opaque" });
+  });
+
+  /* ── Usage: per call, never per turn ───────────────────────────────────────── */
+
+  /**
+   * The figures below are DECISIONS.md §24.4's own, from
+   * `apps/server/.runtime/usage-probe/claude-messages.jsonl`.
+   *
+   * Three properties of this driver make a naive reading wrong, and each has a test:
+   * one API call arrives as several `assistant` frames repeating one `message.id`; those
+   * frames' `output_tokens` is a stale snapshot; and the `result`'s own `usage` is a
+   * per-turn **sum** that re-counts the cached prefix per call.
+   */
+  const usageOf = (entries: readonly { readonly detail: unknown }[]) =>
+    entries
+      .map((entry) => entry.detail)
+      .filter(
+        (
+          detail,
+        ): detail is {
+          _tag: "usage";
+          callId: string;
+          promptTokens: number;
+          outputTokens: number | undefined;
+          contextLimit: number | undefined;
+        } => (detail as { _tag?: string })._tag === "usage",
+      );
+
+  /** One API call, as two frames: a thinking block and then a tool call. */
+  const assistantCall = (
+    callId: string,
+    usage: Record<string, unknown>,
+    block: Record<string, unknown>,
+    /**
+     * The `Task` call this frame is nested under, for a forwarded subagent frame.
+     *
+     * `null` on the main loop, which is what all eight of the probe's captures carry.
+     */
+    parentToolUseId: string | null = null,
+  ): SDKMessage =>
+    ({
+      type: "assistant",
+      message: { role: "assistant", id: callId, usage, content: [block] },
+      parent_tool_use_id: parentToolUseId,
+      session_id: "ignored",
+      uuid: `00000000-0000-4000-8000-0000000${callId.slice(-5)}`,
+    }) as unknown as SDKMessage;
+
+  test("one API call delivered as several frames is one call, counted once", async () => {
+    const usage = {
+      input_tokens: 2,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 21_386,
+      output_tokens: 2,
+    };
+    const outcome = await run([
+      assistantCall("msg_011CgY4r9e5W12kRrNxTPEy4", usage, {
+        type: "thinking",
+        thinking: "Reading the first file.",
+        signature: "x",
+      }),
+      assistantCall("msg_011CgY4r9e5W12kRrNxTPEy4", usage, {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "Read",
+        input: { file_path: "/tmp/a" },
+      }),
+      result("ignored", "success"),
+    ]);
+    const measured = usageOf([...outcome.narrated]);
+    // Two frames, two entries — `narrate` is stateless and does not try to remember what
+    // it has already said — and **one call**, because both carry the same id. A reader
+    // keying the latest per id draws 21 388; one summing the entries would draw 42 776.
+    expect(measured).toHaveLength(2);
+    expect(new Set(measured.map((entry) => entry.callId)).size).toBe(1);
+    for (const entry of measured) {
+      // 2 uncached + 21 386 read from the cache + 0 written. The input side of an
+      // `assistant` frame is exact; it is only the output side that is a snapshot.
+      expect(entry.promptTokens).toBe(21_388);
+      // The frame says `output_tokens: 2` and the call really produced 16. The stale
+      // figure is omitted rather than published, so nothing downstream can draw it.
+      expect(entry.outputTokens).toBeUndefined();
+    }
+  });
+
+  test("the turn's result states the last call's real output, under the same id", async () => {
+    const callId = "msg_011CgY4rvbJ27RSLnHS5LvE1";
+    const turnResult = {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      num_turns: 1,
+      result: "done",
+      total_cost_usd: 0.028_72,
+      modelUsage: {},
+      permission_denials: [],
+      session_id: "ignored",
+      uuid: "00000000-0000-4000-8000-00000000fffa",
+      usage: {
+        /*
+         * The per-turn sum, which is the trap. These four fields add to 90 784 against a
+         * real context of 23 179 — 3.9 times too many — because `cache_read` re-counts the
+         * cached prefix on each of the turn's four calls. Put here deliberately so that a
+         * mapping which read the easy field would fail this test rather than pass it.
+         */
+        input_tokens: 8,
+        cache_creation_input_tokens: 1_775,
+        cache_read_input_tokens: 88_626,
+        output_tokens: 375,
+        output_tokens_details: { thinking_tokens: 63 },
+        // The last call alone, exact, with the true output count.
+        iterations: [
+          {
+            input_tokens: 2,
+            output_tokens: 16,
+            cache_read_input_tokens: 23_005,
+            cache_creation_input_tokens: 156,
+            type: "message",
+          },
+        ],
+      },
+    } as unknown as SDKMessage;
+
+    const outcome = await run([
+      assistantCall(
+        callId,
+        {
+          input_tokens: 2,
+          cache_creation_input_tokens: 156,
+          cache_read_input_tokens: 23_005,
+          output_tokens: 1,
+        },
+        { type: "text", text: "Done." },
+      ),
+      turnResult,
+    ]);
+    const measured = usageOf([...outcome.narrated]);
+    expect(measured).toHaveLength(2);
+    // The same call, topped up: the id comes from the stream's own order because
+    // `iterations[0]` carries no message id at all.
+    expect(measured[1]?.callId).toBe(callId);
+    expect(measured[1]?.promptTokens).toBe(23_163);
+    expect(measured[1]?.outputTokens).toBe(16);
+    // 23 163 + 16 is the context at that call. Not 90 784, and not 91 159.
+    expect(measured[1]?.promptTokens).not.toBe(90_784 - 375);
+    /*
+     * The session's window, asserted on this entry rather than on the one before it.
+     *
+     * It is read beside the run — a forked, bounded control request, so a failed read
+     * costs a percentage and never a run — which means a call that happens before it
+     * answers carries no limit. That is the honest behaviour and pinning down *which*
+     * calls have it would be asserting a race. By the turn's `result` the read has
+     * certainly answered.
+     */
+    expect(measured[1]?.contextLimit).toBe(CONTEXT_WINDOW);
+  });
+
+  test("a subagent's call narrates its words and does not feed the meter", async () => {
+    /*
+     * `forwardSubagentText: true` is pinned so that a subagent's text and thinking reach
+     * the stream, and the policy gate's default answer is `allow`, so a `Task` call is
+     * reachable on any run. A subagent has **its own context**: its prompt size is not this
+     * session's, and a meter that took its newest frame would change subject without saying
+     * so — which is the exact defect that keeps this meter off the target-wide transcript.
+     *
+     * The driver's own accounting agrees on the unit: the SDK documents `result.usage` as
+     * "MAIN AGENT LOOP ONLY — excludes Task subagent, sidechain, and auxiliary model
+     * calls", so the `iterations` the output count comes from describe main-loop calls.
+     * Letting a subagent set `lastCallId` would hang that count on a call it is not about.
+     */
+    const main = "msg_main";
+    const outcome = await run([
+      assistantCall(
+        main,
+        {
+          input_tokens: 2,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 21_386,
+          output_tokens: 1,
+        },
+        { type: "tool_use", id: "toolu_task", name: "Task", input: {} },
+      ),
+      // The subagent's own call, forwarded. A big context of its own, and not ours.
+      assistantCall(
+        "msg_sub",
+        {
+          input_tokens: 2,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 99_000,
+          output_tokens: 1,
+        },
+        { type: "text", text: "Subagent reporting." },
+        "toolu_task",
+      ),
+      {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        duration_ms: 1,
+        duration_api_ms: 1,
+        num_turns: 1,
+        result: "done",
+        total_cost_usd: 0.01,
+        modelUsage: {},
+        permission_denials: [],
+        session_id: "ignored",
+        uuid: "00000000-0000-4000-8000-00000000fffb",
+        usage: {
+          input_tokens: 4,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 120_386,
+          output_tokens: 20,
+          iterations: [
+            {
+              input_tokens: 2,
+              output_tokens: 9,
+              cache_read_input_tokens: 21_386,
+              cache_creation_input_tokens: 0,
+              type: "message",
+            },
+          ],
+        },
+      } as unknown as SDKMessage,
+    ]);
+    const entries = [...outcome.narrated];
+
+    // The subagent's words still narrate — that is what the forwarding option is for, and
+    // they are transcript content rather than a measurement.
+    expect(
+      entries.some(
+        (entry) =>
+          entry.detail._tag === "reply" &&
+          entry.detail.text === "Subagent reporting.",
+      ),
+    ).toBe(true);
+
+    const measured = usageOf(entries);
+    // Two measurements: the main call, and the turn's top-up of that same call. The
+    // subagent's 99 002 is not among them.
+    expect(measured.map((entry) => entry.callId)).toEqual([main, main]);
+    expect(measured.map((entry) => entry.promptTokens)).toEqual([
+      21_388, 21_388,
+    ]);
+    // And the turn's exact output count landed on the main call rather than on the
+    // subagent's id, which is what excluding it from `lastCallId` buys.
+    expect(measured[1]?.outputTokens).toBe(9);
+  });
+
+  test("a result on a stream that made no call states no usage", async () => {
+    // `iterations[0]` has no id, so with no call to attribute it to there is nothing
+    // honest to publish. Nothing is invented to hang the numbers on.
+    const outcome = await run([result("ignored", "success")]);
+    expect(usageOf([...outcome.narrated])).toEqual([]);
   });
 
   test("an oversized tool argument is cut once, here, and says so", async () => {
@@ -918,6 +1269,10 @@ const turnDrivenSdk = () => {
           seen.interrupts += 1;
           return undefined;
         },
+        // The window this account gets for this model, which is the only place a Claude
+        // Code limit can come from: it is session-time, not catalogue-time. See
+        // `HarnessQuery.getContextUsage`.
+        getContextUsage: async () => ({ maxTokens: CONTEXT_WINDOW }),
         close: () => {
           seen.closes += 1;
         },

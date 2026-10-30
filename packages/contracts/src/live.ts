@@ -27,6 +27,16 @@
  * showing the two channels identically would be promising a durability only one of them
  * has, which is why {@link LiveOrigin} is on every item and not inferred.
  *
+ * ## One thing on this stream is neither channel
+ *
+ * {@link LiveUsage} is a *measurement*, not an item: how big the context was on one model
+ * call, for the meter at the top of a chat. It has no id, no sequence and nothing to show
+ * twice, because a reader keeps the latest per model call rather than accumulating them —
+ * and accumulating them is the one mistake it exists to prevent, since the token figures
+ * both drivers publish most readily are spend totals that read four to five times higher
+ * than the context (DECISIONS.md §24.4). Its own documentation has the measured numbers and
+ * the list of fields a numerator must never come from.
+ *
  * ## What "without duplicates" means, exactly
  *
  * Every item carries an {@link LiveItem.id} that is stable for that item, and a client
@@ -206,6 +216,29 @@ export const LIVE_ITEM_KINDS = [
   "record.other",
   /* Live activity. */
   "turn.reply",
+  /**
+   * What the agent considered before it said or did anything.
+   *
+   * **Streamed and never stored**, which is a stronger statement than the rest of this
+   * channel's. Every other activity kind is lossy *by accident* — the buses are sliding
+   * buffers — whereas this one is lossy by decision: there is no durable field for it, no
+   * evidence, no transcript artefact, and it is not read back on a reload even from the
+   * harness's own copy. It lives as long as the harness's retention and no longer.
+   *
+   * It is **a record of what was considered, not of what happened**, and nothing on this
+   * stream contradicts that: the thing that happened is the `turn.reply` or the `tool.call`
+   * beside it, and those are the rows an operator acts on. A reader that presented thinking
+   * as the account of a run would be quoting a draft as a result, which is why it is
+   * rendered collapsed and labelled as what it is.
+   *
+   * Both drivers can fill it: Claude Code's `thinking` content blocks and OpenCode's
+   * `session.reasoning.ended` (which carries the whole block's text, exactly as
+   * `session.text.ended` does for a reply). The text is in {@link LiveItem.body}. An empty
+   * block — Claude Code emits `{ type: "thinking", thinking: "" }` when the provider
+   * returns no readable reasoning, observed in DECISIONS.md §24.4's probe — produces no
+   * item at all rather than an empty one.
+   */
+  "turn.thinking",
   "tool.call",
   "tool.result",
   "action.denied",
@@ -450,10 +483,147 @@ export const LiveCursor = Schema.Struct({
 export type LiveCursor = typeof LiveCursor.Type;
 
 /**
+ * How big the context was on **one model call**, for the meter at the top of a pane.
+ *
+ * ## Why this is a frame of its own and not a {@link LiveItem}
+ *
+ * It is not a turn. Nothing about it belongs in a transcript: it has no sentence, it is not
+ * something the agent did, and a list that rendered one row per model call would bury the
+ * work under its own instrumentation. It is a *measurement about the session*, so it
+ * travels beside the items. The numbers are also numbers, and carrying them in
+ * {@link LiveItem}'s string fields would mean a browser parsing a figure out of prose.
+ *
+ * **What that costs, stated rather than discovered later: a tab from a previous deploy
+ * cannot decode this frame.** {@link LiveItem.kind} is a plain `String` precisely so a tab
+ * one deploy behind renders an unknown *kind* rather than failing on the frame it arrived
+ * in; a new `_tag` in {@link LiveFrame} has no such tolerance, and it could not be given one
+ * retroactively — the old tab has the old union compiled into it. So such a tab's stream
+ * fails on the first model call of any run and reconnects in a loop until the page is
+ * reloaded, which cures it.
+ *
+ * The alternative was a sixteenth {@link LiveItem} field set and a kind the item channel
+ * would tolerate, and it was **not** better: that tab would then fill its transcript with a
+ * row per model call that it has no rendering for, during exactly the run the operator is
+ * watching. Neither shape leaves a stale tab usable, both are cured by a reload, and only
+ * one of them puts token counts on the contract every reader of a transcript branches on.
+ *
+ * ## The one thing that is easy to get wrong here, stated once and loudly
+ *
+ * **Every figure either driver publishes most readily is a *spend total*, and a meter fed
+ * from one reads four to five times too high.** DECISIONS.md §24.4 measured it on both:
+ * OpenCode's `session.usage.updated` summed to 65 838 against a real context of 13 753,
+ * and Claude Code's `result.usage` to 90 784 against 23 179. The cause is the same on each
+ * — the cached prefix is re-counted on every call, which is the right way to bill and the
+ * wrong way to measure fullness.
+ *
+ * So the numerator here is **per model call**, and these are the fields it is never taken
+ * from: OpenCode's `session.usage.updated`, `session.tokens` and `GET /api/session/:id`;
+ * Claude Code's `result.usage`, `modelUsage` and `total_cost_usd`; and
+ * `SessionStatus.tokens`, which is the *session* total on one driver and the *last turn's*
+ * on the other and therefore is not even one wrong thing consistently.
+ *
+ * ## What a reader does with several of these
+ *
+ * **Keeps the latest per {@link callId} and draws the newest call — it never sums them.**
+ * Two frames share a `callId` for two different reasons, and both are ordinary:
+ *
+ * - Claude Code delivers one API call as several `assistant` frames, one per content block,
+ *   each repeating the same `message.id` and the same usage. Counting per frame would
+ *   multiply one call by two or three.
+ * - That call's output count is **stale** on those frames (a call that produced 16 tokens
+ *   reported 1), so {@link outputTokens} is `null` on them and is stated later, once, from
+ *   the turn's `result`. That later frame is the same call, topping itself up.
+ */
+export const LiveUsage = Schema.Struct({
+  _tag: Schema.Literal("usage"),
+  /**
+   * The harness's own id for the model call this measures.
+   *
+   * OpenCode's `assistantMessageID` from `session.step.ended`; Claude Code's `message.id`.
+   * The de-duplication key — see this struct's header — and not an identity for the frame,
+   * which has none and needs none: a frame that arrived twice would replace itself with
+   * itself.
+   */
+  callId: Schema.String,
+  /**
+   * Tokens sent to the model on this call: uncached input, cache reads and cache writes.
+   *
+   * Exact on both drivers and the bulk of the meter. The three parts are disjoint — on
+   * OpenCode `input` is the *uncached* remainder and `cache.read` the cached prefix — so
+   * this is a sum and not a maximum.
+   *
+   * Cache read and cache write are deliberately not separate fields: `cache.write` was a
+   * constant 0 on the OpenCode provider measured, so a reader could not tell "nothing was
+   * written" from "this provider does not report writes", and the seam's rule is that a
+   * field exists only where both drivers can fill it with the same meaning.
+   */
+  promptTokens: Schema.Int,
+  /**
+   * Tokens generated on this call, thinking included, or `null` while unstated.
+   *
+   * `null` is **not** zero and must not be drawn as a precise figure: Claude Code's
+   * `assistant` frames carry a stale count, so this build omits it there rather than
+   * publishing the 1 or 2 they say, and states it from the turn's `result` instead. Until
+   * then the meter runs short by tens to hundreds of tokens against a window of hundreds of
+   * thousands, which is worth saying rather than rounding away.
+   *
+   * "Thinking included" is what makes it mean the same thing on both drivers, and it takes
+   * opposite work on each: OpenCode reports `reasoning` *beside* `output`, so they are
+   * added, while Claude Code's `output_tokens_details.thinking_tokens` is already inside
+   * `output_tokens`.
+   */
+  outputTokens: Schema.NullOr(Schema.Int),
+  /**
+   * The model's context window, when this driver has stated it by now, else `null`.
+   *
+   * Optional because it genuinely is: OpenCode has it in the catalogue before anything runs
+   * (`HarnessModelView.contextLimit`), and Claude Code has it only once a session exists.
+   * **A percentage is drawn only when this is set.** Where it is `null` the meter shows the
+   * token figure alone — an honest "14,870 tokens" rather than a fabricated "7%".
+   */
+  contextLimit: Schema.NullOr(Schema.Int),
+  /**
+   * Where the **harness itself** will summarise this session, or `null`.
+   *
+   * Not a smaller limit: {@link contextLimit} is what the provider accepts, and this is the
+   * point at which the harness rewrites the conversation on its own. They are far apart —
+   * OpenCode compacts bit's default model at about **58 %** of its window — so a meter that
+   * drew only the denominator would be telling an operator that nothing happens until it
+   * reads full, which is the opposite of true.
+   *
+   * **Derived from the driver's own source, not reported by it.**
+   * `HarnessModelView.compactionAt` carries the formula, the file and line, and the three
+   * things that can move it without moving this number. A consumer draws it as *where the
+   * harness says it will act* and never as a measurement.
+   *
+   * `null` on Claude Code, whose threshold this build has not measured.
+   */
+  compactionAt: Schema.NullOr(Schema.Int),
+  /**
+   * Whose session this call belongs to, exactly as {@link LiveItem} carries it.
+   *
+   * One of the three is set. A page showing a planner round and a goal conversation side by
+   * side has two meters on it, and nothing but this says which figure is which — the two
+   * agents have their own sessions, their own models and their own windows.
+   */
+  attemptId: Schema.NullOr(Schema.String),
+  roundId: Schema.NullOr(Schema.String),
+  goalId: Schema.NullOr(Schema.String),
+  /** When the harness said it, in epoch milliseconds. Not an ordering key. */
+  at: EpochMillis,
+});
+export type LiveUsage = typeof LiveUsage.Type;
+
+/**
  * One frame of the live transcript.
  *
  * Tagged, because a client has to branch on it, and discriminated by `_tag` rather than by
  * the presence of a field so a frame kind added later cannot be mistaken for one of these.
  */
-export const LiveFrame = Schema.Union([LiveOpened, LiveItem, LiveCursor]);
+export const LiveFrame = Schema.Union([
+  LiveOpened,
+  LiveItem,
+  LiveCursor,
+  LiveUsage,
+]);
 export type LiveFrame = typeof LiveFrame.Type;

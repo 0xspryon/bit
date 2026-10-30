@@ -95,6 +95,7 @@ import {
   type HarnessNarration,
   type MessageEntry,
   type NarrationDetail,
+  type SessionWindow,
 } from "./agentHarness";
 import { openCodeMessageId } from "./messageId";
 import { HarnessDecodeError, HarnessTransportError } from "./errors";
@@ -175,17 +176,106 @@ const OPENCODE_VARIANT_LABELS: Readonly<Record<string, string>> = {
 };
 
 /**
+ * What a model's `limit` is, as much of it as this file reads.
+ *
+ * Declared rather than inlined because two different numbers are taken out of it and they
+ * are taken from **different fields on purpose** — see {@link openCodeModelView} and
+ * {@link openCodeCompactionAt}.
+ */
+export interface OpenCodeModelLimit {
+  readonly context: number;
+  readonly input?: number | undefined;
+}
+
+/**
+ * Share of the window OpenCode keeps free before it compacts, and the floor under it.
+ *
+ * `RESERVE_SHARE` and `RESERVE_MIN` from `opencode` 2.2.2's
+ * `packages/core/src/session/compaction.ts` (lines 95 and 101). Copied rather than guessed,
+ * and copied **with** the file and line so the next reader can check whether they still
+ * hold — these are the two numbers an upgrade can move under us.
+ */
+const OPENCODE_RESERVE_SHARE = 0.15;
+const OPENCODE_RESERVE_MIN = 16_000;
+
+/**
+ * Where OpenCode will summarise a session of this model on its own, by its own default.
+ *
+ * **This is the number the meter needs so that it does not imply nothing happens before the
+ * window fills.** bit never calls compaction; OpenCode compacts anyway. Its
+ * `SessionCompaction` state starts `{ auto: true }` (`compaction.ts:200`) and the only thing
+ * that turns it off is a `compaction.auto` config key, which bit never writes — the gate
+ * install writes a plugin registration into `.opencode/opencode.json` and nothing else. So
+ * on bit's own default model, `openai/gpt-5.6-sol` (400 000 context, 272 000 input), the
+ * harness rewrites the session at about 231 200 tokens: **58 % of the figure the meter
+ * divides by.**
+ *
+ * The expression is `calculateCeiling`'s (`compaction.ts:849`), reproduced:
+ * `(limit.input || limit.context) − max(15 % of it, 16 000)`. Three details are the
+ * harness's rather than our preference, and each is kept:
+ *
+ * - **`||`, not `??`.** OpenCode reports an unknown limit as `0`, and `||` is what makes a
+ *   zero `input` fall back to the context window. `??` would divide by the zero.
+ * - **`RESERVE_MIN` only applies to a window at least twice its size**, so a small window
+ *   gives up the share instead of being floored to nothing.
+ * - **A window of zero never triggers compaction at all** — OpenCode returns an infinite
+ *   ceiling there — which is `undefined` here, because "it will never act" and "it will act
+ *   at a number we can show" are different answers and only one of them is a number.
+ *
+ * `buffer` is deliberately not a parameter. A config may set `compaction.buffer` and replace
+ * the whole reserve calculation, and `HarnessModelView.compactionAt` says so: this is an
+ * estimate of the harness's default threshold, and a configuration at or above the session's
+ * directory can move it without moving this.
+ *
+ * Exported for its test, which is the honest reason: the two constants above and the
+ * `input`-before-`context` precedence are exactly what an `opencode` upgrade breaks
+ * silently, and a direct test is what notices.
+ */
+export const openCodeCompactionAt = (
+  limit: OpenCodeModelLimit,
+): number | undefined => {
+  // OpenCode's own `||`: an unknown limit is reported as 0 and must fall through to the
+  // context window rather than being taken as a window of nothing.
+  const window =
+    limit.input === undefined ? limit.context : limit.input || limit.context;
+  if (window <= 0) return undefined;
+  const reserve = Math.max(
+    Math.floor(window * OPENCODE_RESERVE_SHARE),
+    window >= 2 * OPENCODE_RESERVE_MIN ? OPENCODE_RESERVE_MIN : 0,
+  );
+  return window - reserve;
+};
+
+/**
  * One model's catalogue entry, as the picker reads it.
  *
  * A model with no variants gets no descriptor at all rather than a descriptor with one
  * choice: "this model offers nothing to choose" and "this model offers only its default"
  * are the same fact, and the second spelling would put an inert control on the screen.
+ *
+ * **Two numbers come out of one `limit`, from two different fields, and that is the point.**
+ * The window the meter is a fraction of is `limit.context` — what the provider accepts, and
+ * what OpenCode's own TUI meter divides by. The point at which the harness rewrites the
+ * session is derived from `limit.input` where there is one ({@link openCodeCompactionAt}).
+ * Taking either from the other field would be a different claim: `limit.input` as the
+ * denominator reads high, and `limit.context` as the compaction base puts the threshold
+ * where OpenCode will not act.
  */
 const openCodeModelView = (
   id: string,
   variants: readonly { readonly id: string }[],
+  limitOf: OpenCodeModelLimit | undefined,
 ): HarnessModelView => {
-  if (variants.length === 0) return { id };
+  const compactionAt =
+    limitOf === undefined ? undefined : openCodeCompactionAt(limitOf);
+  const limit =
+    limitOf === undefined
+      ? {}
+      : {
+          contextLimit: limitOf.context,
+          ...(compactionAt === undefined ? {} : { compactionAt }),
+        };
+  if (variants.length === 0) return { id, ...limit };
   const descriptor: ModelOptionDescriptor = {
     id: OPENCODE_VARIANT_OPTION,
     label: "Reasoning",
@@ -200,7 +290,7 @@ const openCodeModelView = (
       })),
     ],
   };
-  return { id, optionDescriptors: [descriptor] };
+  return { id, optionDescriptors: [descriptor], ...limit };
 };
 
 /**
@@ -342,6 +432,18 @@ const asJson = (value: unknown): string => {
  * does: the entry union is wide and version-specific, and re-asserting a shape the
  * generated client has already validated would only add a second place for it to be wrong.
  *
+ * ## Reasoning, and usage, come from the `ended` events too
+ *
+ * `session.reasoning.ended` carries the whole block as `data.text`, exactly as
+ * `session.text.ended` does for a reply, so thinking is one entry per block and the deltas
+ * are `opaque` for the same reason text deltas are.
+ *
+ * `session.step.ended` is the per-call usage, and **`session.usage.updated` is not**: the
+ * two fire in the same millisecond with the same field shape, and the second is a session
+ * lifetime total that re-counts the cached prefix on every call — 65 838 against a real
+ * context of 13 753, measured (DECISIONS.md §24.4). It is also ephemeral, so a stream that
+ * reconnects loses it silently, where `step.ended` has a `durable.seq`. It stays `opaque`.
+ *
  * **Exported for the tests, and that is the honest reason.** Driving this through
  * `sessionEvents` would mean stubbing an SSE transport to assert a mapping that has nothing
  * to do with transport — and the five-event tool sequence above is the part most likely to
@@ -350,6 +452,15 @@ const asJson = (value: unknown): string => {
 export const openCodeNarration = (
   entry: unknown,
   names: Map<string, string>,
+  /**
+   * What the model this session was created on takes, when this process knows it.
+   *
+   * Passed in rather than read off the event, because no event carries either number: both
+   * are properties of the *model* and arrive in the catalogue, before any session exists.
+   * `undefined` for a session this process did not create — a recovery sweep's read of
+   * somebody else's session — and a consumer then draws no percentage and no threshold.
+   */
+  window?: SessionWindow | undefined,
 ): HarnessNarration => {
   const record = (entry ?? {}) as {
     type?: unknown;
@@ -368,6 +479,46 @@ export const openCodeNarration = (
         return typeof data["text"] === "string"
           ? { _tag: "reply", text: truncateNarration(data["text"]) }
           : { _tag: "opaque" };
+      case "session.reasoning.ended":
+        return typeof data["text"] === "string"
+          ? { _tag: "thinking", text: truncateNarration(data["text"]) }
+          : { _tag: "opaque" };
+      case "session.step.ended": {
+        /*
+         * One model call's figures, and the only per-call carrier on this driver.
+         *
+         * `assistantMessageID` is the call: it is what de-duplicates this entry and what a
+         * reader keys the latest figure by. Without it there is nothing to attribute the
+         * numbers to, so the entry is dropped rather than carried under an invented id.
+         *
+         * `input` is the **uncached** remainder and `cache.read` the cached prefix — they
+         * are disjoint — so the prompt side is the sum of the three. `reasoning` is *not*
+         * inside `output` on the provider measured (a call reported `output 14, reasoning
+         * 57`), so they are added to mean "everything generated", which is what the field
+         * means on the other driver too.
+         */
+        const callId = data["assistantMessageID"];
+        if (typeof callId !== "string") return { _tag: "opaque" };
+        const tokens = (data["tokens"] ?? {}) as {
+          input?: unknown;
+          output?: unknown;
+          reasoning?: unknown;
+          cache?: { read?: unknown; write?: unknown } | undefined;
+        };
+        const count = (value: unknown): number =>
+          typeof value === "number" && Number.isFinite(value) ? value : 0;
+        return {
+          _tag: "usage",
+          callId,
+          promptTokens:
+            count(tokens.input) +
+            count(tokens.cache?.read) +
+            count(tokens.cache?.write),
+          outputTokens: count(tokens.output) + count(tokens.reasoning),
+          contextLimit: window?.contextLimit,
+          compactionAt: window?.compactionAt,
+        };
+      }
       case "session.tool.input.started": {
         if (callId !== undefined && typeof data["name"] === "string") {
           names.set(callId, data["name"]);
@@ -634,6 +785,14 @@ export const openCodeHarness = (
               openCodeModelView(
                 `${model.providerID}/${model.id}`,
                 model.variants,
+                // Survives the generated client's decode: `@opencode/schema` 2.1.0 types
+                // `limit` as `{ context: Int, input?: Int, output: Int }` and it arrived
+                // intact on all 27 entries of a 2.2.2 server (DECISIONS.md §24.4). No new
+                // request, and nothing here falls back to a written-down number.
+                //
+                // The whole `limit` and not one field of it: the meter's denominator and
+                // the harness's own compaction point come out of different fields of it.
+                model.limit,
               ),
             )
           : [];
@@ -790,6 +949,23 @@ export const openCodeHarness = (
           },
         );
 
+      /**
+       * The context window of each session's model, for the sessions this process opened.
+       *
+       * The catalogue states a limit per *model* and the narration states usage per
+       * *session*, so something has to join them, and this is the smallest thing that can:
+       * the model is known exactly once, at `createSession`, and is not on any event
+       * afterwards. Reading it back off `GET /api/session/:id` per usage event would be a
+       * request per model call to learn a constant.
+       *
+       * Per session and unbounded for the life of the process, like {@link delivered} and
+       * for the same reason: one number per session this process has opened, bounded by the
+       * work actually done. A session this process did not open is simply absent, and its
+       * narration carries no limit — which is the honest answer rather than the default
+       * model's window applied to somebody else's session.
+       */
+      const contextLimits = new Map<string, SessionWindow>();
+
       const createSession: AgentHarness["Service"]["createSession"] = Effect.fn(
         "openCodeHarness.createSession",
       )(function* (input) {
@@ -825,6 +1001,15 @@ export const openCodeHarness = (
               : { id: input.sessionId as Session.ID }),
           }),
         );
+        // Noted here because this is the one moment the session's model is known; see
+        // `contextLimits`. A model the catalogue could not be read for states no limit.
+        const view = models.find((model) => model.id === input.model);
+        if (view?.contextLimit !== undefined) {
+          contextLimits.set(session.id, {
+            contextLimit: view.contextLimit,
+            compactionAt: view.compactionAt,
+          });
+        }
         return { id: session.id };
       });
 
@@ -1003,6 +1188,10 @@ export const openCodeHarness = (
          * call succeeds or fails, which bounds this by the calls in flight.
          */
         const names = new Map<string, string>();
+        // Read once per stream rather than per event: it is the model's window and the
+        // model of a live session does not change under this build — nothing calls
+        // `session.switchModel`.
+        const window = contextLimits.get(sessionId);
         return api.event
           .subscribe()
           .pipe(
@@ -1010,7 +1199,7 @@ export const openCodeHarness = (
             Stream.filterMap(
               Filter.make((event: unknown) =>
                 sessionOf(event) === sessionId
-                  ? Result.succeed(openCodeNarration(event, names))
+                  ? Result.succeed(openCodeNarration(event, names, window))
                   : Result.fail(event),
               ),
             ),

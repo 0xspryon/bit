@@ -24,7 +24,11 @@ import {
   NARRATION_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
 } from "./agentHarness";
-import { openCodeHarness, openCodeNarration } from "./openCodeClient";
+import {
+  openCodeCompactionAt,
+  openCodeHarness,
+  openCodeNarration,
+} from "./openCodeClient";
 import { OpenCodeServer } from "./openCodeServer";
 
 const FAKE_SERVER = {
@@ -946,5 +950,371 @@ describe("steering a live session", () => {
     );
 
     expect(recorded.bodies).toHaveLength(2);
+  });
+});
+
+/* ── Usage, and the limit the catalogue carries ──────────────────────────────── */
+
+/**
+ * The per-call figures, the cumulative ones, and the difference between them.
+ *
+ * DECISIONS.md §24.4 measured both carriers on a live `opencode` 2.2.2 and they fire in
+ * the same millisecond with the same field shape, which is exactly why this has tests: the
+ * wrong one is as easy to read as the right one and is wrong by a factor of five. The
+ * numbers below are the probe's own, from `apps/server/.runtime/usage-probe/
+ * opencode-events.jsonl`, so a regression is measured against a real session rather than
+ * against a shape somebody invented here.
+ */
+describe("reading opencode's token usage", () => {
+  /**
+   * What the probe's model takes: 200 000 context, and the point OpenCode compacts it.
+   *
+   * 170 000 is `calculateCeiling`'s own answer for a window with no `input` —
+   * `200 000 − max(15 %, 16 000)` — and it is 85 % of the figure the meter divides by. It is
+   * in the fixture rather than computed here so that a change to either number has to be
+   * written down twice.
+   */
+  const WINDOW = { contextLimit: 200_000, compactionAt: 170_000 };
+
+  const stepEnded = (
+    tokens: Record<string, unknown>,
+    callId = "msg_1",
+  ): unknown => ({
+    type: "session.step.ended",
+    created: 1_793_347_011_894,
+    durable: { aggregateID: "ses_1", seq: 13, version: 1 },
+    data: {
+      sessionID: "ses_1",
+      assistantMessageID: callId,
+      finish: "tool-calls",
+      tokens,
+      cost: 0,
+    },
+  });
+
+  test("a step's end is one model call, and the prompt side is the sum of three fields", () => {
+    // The probe's second call: 2 692 uncached, 10 880 read from the cache, nothing written.
+    // `input` and `cache.read` are disjoint — the first is the remainder, the second the
+    // cached prefix — so the prompt side is 13 572 and not 2 692.
+    const entry = openCodeNarration(
+      stepEnded({
+        input: 2692,
+        output: 25,
+        reasoning: 28,
+        cache: { read: 10880, write: 0 },
+      }),
+      new Map(),
+      WINDOW,
+    );
+    expect(entry.detail).toEqual({
+      _tag: "usage",
+      callId: "msg_1",
+      promptTokens: 13_572,
+      // Reasoning is *beside* output on this provider, not inside it, so "everything
+      // generated" is their sum. A reader that took `output` alone would under-report a
+      // reasoning model by most of what it produced.
+      outputTokens: 53,
+      contextLimit: 200_000,
+      // Beside the window, not instead of it: where the harness will rewrite the session
+      // on its own. See `openCodeCompactionAt`.
+      compactionAt: 170_000,
+    });
+    // Durable, so a reconnect can resume past it — which is half of why this event and not
+    // the ephemeral total that fires beside it.
+    expect(entry.sequence).toBe(13);
+  });
+
+  test("the cumulative total that fires beside it is still opaque", () => {
+    /*
+     * The regression this exists for, and the easiest mistake in the slice.
+     *
+     * `session.usage.updated` carries the same `tokens` shape in the same millisecond, and
+     * it is the **session's lifetime total**: the probe's last one summed to 65 838 against
+     * a real context of 13 753, because `cache.read` re-counts the whole cached prefix on
+     * every call. A meter fed from it reads 4.8 times high.
+     *
+     * So the figures here are deliberately the cumulative ones, and the assertion is that
+     * nothing reads them. A mapping that "supported both events" would pass a test written
+     * against `step.ended` alone and still ship the five-times-high meter.
+     */
+    const cumulative = {
+      input: 14_504,
+      output: 113,
+      reasoning: 85,
+      cache: { read: 51_136, write: 0 },
+    };
+    const updated = openCodeNarration(
+      {
+        type: "session.usage.updated",
+        created: 1_793_347_011_894,
+        data: { sessionID: "ses_1", tokens: cumulative, cost: 0 },
+      },
+      new Map(),
+      WINDOW,
+    );
+    expect(updated.detail).toEqual({ _tag: "opaque" });
+  });
+
+  test("a step that names no message is dropped rather than carried under an invented id", () => {
+    const entry = openCodeNarration(
+      {
+        type: "session.step.ended",
+        created: 1,
+        data: {
+          sessionID: "ses_1",
+          tokens: { input: 1, output: 1, reasoning: 0, cache: {} },
+        },
+      },
+      new Map(),
+      WINDOW,
+    );
+    // Without the call id there is nothing to de-duplicate it by and nothing to attribute
+    // the numbers to, which is worse than having no figure.
+    expect(entry.detail).toEqual({ _tag: "opaque" });
+  });
+
+  test("no limit from the catalogue means no limit on the entry, not a default", () => {
+    const entry = openCodeNarration(
+      stepEnded({
+        input: 150,
+        output: 3,
+        reasoning: 0,
+        cache: { read: 13_600 },
+      }),
+      new Map(),
+      undefined,
+    );
+    expect(entry.detail).toEqual({
+      _tag: "usage",
+      callId: "msg_1",
+      promptTokens: 13_750,
+      outputTokens: 3,
+      // A consumer draws no percentage from this, which is ruling 3: an honest token count
+      // beats a fraction of a window nobody stated. And no threshold either: both numbers
+      // come from the same catalogue entry, so a session with no entry has neither.
+      contextLimit: undefined,
+      compactionAt: undefined,
+    });
+  });
+
+  test("reasoning is narrated from its end event, where the whole block is", () => {
+    // `session.reasoning.ended` carries `data.text`, exactly as `session.text.ended` does
+    // for a reply, so thinking is one entry per block. The deltas are opaque for the same
+    // reason text deltas are: there would be hundreds of them and nothing to render.
+    const names = new Map<string, string>();
+    const delta = openCodeNarration(
+      {
+        type: "session.reasoning.delta",
+        created: 1,
+        data: { sessionID: "ses_1", delta: "The" },
+      },
+      names,
+    );
+    expect(delta.detail).toEqual({ _tag: "opaque" });
+
+    const ended = openCodeNarration(
+      {
+        type: "session.reasoning.ended",
+        created: 2,
+        data: {
+          sessionID: "ses_1",
+          assistantMessageID: "msg_1",
+          text: "The user wants three files read one at a time.",
+        },
+      },
+      names,
+    );
+    expect(ended.detail).toEqual({
+      _tag: "thinking",
+      text: "The user wants three files read one at a time.",
+    });
+  });
+});
+
+/**
+ * One catalogue entry, as `GET /api/model` sent it.
+ *
+ * Copied from the probe's own capture rather than hand-written, because the point of the
+ * test below is that `limit.context` **survives the generated client's decode** — and a
+ * fixture that omitted a required field would be testing the degradation path instead and
+ * passing for the wrong reason.
+ */
+const catalogueEntry = {
+  id: "glm-5.3-flash-free",
+  modelID: "glm-5.3-flash-free",
+  providerID: "opencode",
+  family: "glm-flash",
+  name: "GLM-5.3-Flash Free",
+  compatibility: { reasoningField: "reasoning_content" },
+  package: "@opencode/ai/providers/openai-compatible",
+  capabilities: {
+    tools: true,
+    input: ["text", "image"],
+    output: ["text"],
+    temperature: true,
+  },
+  variants: [{ id: "low" }, { id: "high" }],
+  time: { released: 1_787_702_400_000 },
+  cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+  status: "active",
+  enabled: true,
+  limit: { context: 200_000, output: 32_000 },
+};
+
+/**
+ * bit's own default model, which is the entry that makes the two numbers tell apart.
+ *
+ * `openai/gpt-5.6-sol` publishes **both** `context` and `input` and they differ — 400 000
+ * against 272 000 — so a fixture carrying only `context` cannot distinguish `limit.context`
+ * from `limit.input ?? limit.context`, and the second of those is OpenCode's own compaction
+ * formula. Values from DECISIONS.md §24.4's capture of `GET /api/model`.
+ */
+const defaultCatalogueEntry = {
+  ...catalogueEntry,
+  id: "gpt-5.6-sol",
+  modelID: "gpt-5.6-sol",
+  providerID: "openai",
+  family: "gpt-sol",
+  name: "GPT-5.6 Sol",
+  variants: [],
+  limit: { context: 400_000, input: 272_000, output: 128_000 },
+};
+
+/**
+ * The formula, directly, because its three edges are where an `opencode` upgrade shows.
+ *
+ * `openCodeCompactionAt` reproduces `calculateCeiling` from that project's
+ * `packages/core/src/session/compaction.ts`, and the two constants and the field
+ * precedence are what a release can move under this build without a word.
+ */
+describe("where OpenCode will compact a session", () => {
+  test("it is the input limit minus the larger of 15% and 16,000", () => {
+    // bit's own default model, and the number that makes the meter honest: 58% of 400 000.
+    expect(openCodeCompactionAt({ context: 400_000, input: 272_000 })).toBe(
+      231_200,
+    );
+    // The probe's model has no `input`, so the context window is the base: 85% of it.
+    expect(openCodeCompactionAt({ context: 200_000 })).toBe(170_000);
+  });
+
+  test("a window too small to give up 16,000 gives up the share instead", () => {
+    // OpenCode floors the reserve at `RESERVE_MIN` only for a window at least twice it,
+    // so a small window is not reduced to nothing.
+    expect(openCodeCompactionAt({ context: 20_000 })).toBe(17_000);
+    // Exactly at twice the floor, the floor applies and the share is smaller.
+    expect(openCodeCompactionAt({ context: 32_000 })).toBe(16_000);
+  });
+
+  test("an unknown limit states no threshold rather than a nonsense one", () => {
+    // OpenCode reports an unknown limit as 0 and returns an infinite ceiling — it never
+    // compacts. "It will not act" is not a number, so there is nothing to mark.
+    expect(openCodeCompactionAt({ context: 0 })).toBeUndefined();
+    // A zero `input` falls back to the context window, which is OpenCode's own `||` and
+    // not a `??`: with `??` this would divide the session's threshold by nothing.
+    expect(openCodeCompactionAt({ context: 200_000, input: 0 })).toBe(170_000);
+  });
+});
+
+describe("the context limit the picker reads", () => {
+  const instanceWith = (entries: readonly unknown[]) => {
+    const { layer } = clientWith((url) =>
+      url.includes("/api/model")
+        ? // The envelope the server actually sends: `location` beside `data`. Taken from
+          // the probe's captured response, because a stub that answered `{ data }` alone
+          // fails the decode and would quietly exercise the degradation path instead.
+          json({ location: { directory: "/tmp" }, data: entries })
+        : json(sessionInfo()),
+    );
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.map(AgentHarness, (client) => client.instance),
+          layer,
+        ),
+      ),
+    );
+  };
+
+  test("a model's window comes from the catalogue, before any session exists", async () => {
+    const instance = await instanceWith([catalogueEntry]);
+    const model = instance.models.find(
+      (entry) => entry.id === "opencode/glm-5.3-flash-free",
+    );
+    // `limit.context`, deliberately, and not `limit.input`: the window the provider accepts
+    // is what a fullness meter is a fraction of. `limit.input` is what OpenCode's own
+    // compaction measures itself against — and it *does* compact bit's sessions, by
+    // default, which is why `compactionAt` exists and is asserted below rather than being
+    // waved away. The discriminating fixture is two tests down.
+    expect(model?.contextLimit).toBe(200_000);
+    // Beside the variants rather than instead of them: both are facts about the model and
+    // a side table keyed by name would be a second place to keep in step.
+    expect(model?.optionDescriptors?.[0]?.id).toBe("variant");
+  });
+
+  test("the window is `limit.context` even where `limit.input` is smaller", async () => {
+    /*
+     * The decision this file's comments claim, finally made checkable.
+     *
+     * Until this fixture existed, every entry in the repository carried `context` and no
+     * `input`, so `expect(contextLimit).toBe(200_000)` passed identically under
+     * `model.limit.context` and under `model.limit.input ?? model.limit.context` — and the
+     * second is exactly the expression OpenCode's compaction uses, i.e. the regression the
+     * comment above the line warns about. A review mutated the source to it and the whole
+     * file still passed.
+     *
+     * With `input: 272_000` in the entry, 400 000 and 272 000 are different answers and the
+     * assertion names which one the meter divides by.
+     */
+    const instance = await instanceWith([defaultCatalogueEntry]);
+    const model = instance.models.find(
+      (entry) => entry.id === "openai/gpt-5.6-sol",
+    );
+    expect(model?.contextLimit).toBe(400_000);
+    expect(model?.contextLimit).not.toBe(272_000);
+  });
+
+  test("the compaction point comes from `limit.input`, which is why the two differ", async () => {
+    /*
+     * The other half, and the reason the slice has both numbers: the window the meter is a
+     * fraction of is what the provider accepts, and the point the **harness** acts at is
+     * computed from the smaller field — OpenCode's own `(limit.input || limit.context) −
+     * max(15 %, 16 000)`.
+     *
+     * 272 000 − 40 800 = 231 200, which is **58 %** of the 400 000 the bar is drawn
+     * against. An operator who was shown only the window would watch it pass 58 % with the
+     * session being rewritten underneath, which is what makes this a drawn figure rather
+     * than a comment.
+     */
+    const instance = await instanceWith([defaultCatalogueEntry]);
+    const model = instance.models.find(
+      (entry) => entry.id === "openai/gpt-5.6-sol",
+    );
+    expect(model?.compactionAt).toBe(231_200);
+    // Not the window, and not the input limit either: it is below both.
+    expect(model?.compactionAt).not.toBe(400_000);
+    expect(model?.compactionAt).not.toBe(272_000);
+  });
+
+  test("a model with no `limit.input` compacts against its context window", async () => {
+    // The probe's own model: 200 000 context, no `input`, so the ceiling is
+    // `200 000 − max(30 000, 16 000)` — 85 % of the window rather than 58 %.
+    const instance = await instanceWith([catalogueEntry]);
+    const model = instance.models.find(
+      (entry) => entry.id === "opencode/glm-5.3-flash-free",
+    );
+    expect(model?.contextLimit).toBe(200_000);
+    expect(model?.compactionAt).toBe(170_000);
+  });
+
+  test("a catalogue that cannot be read offers no window rather than a guessed one", async () => {
+    // The degradation the catalogue read already had: the instance keeps its default model
+    // and does not refuse the harness. What it must not do is fill in a limit — a
+    // percentage drawn against a made-up denominator is the one output worse than none.
+    const instance = await instanceWith([{ nonsense: true }]);
+    expect(instance.models).toHaveLength(1);
+    expect(instance.models[0]?.contextLimit).toBeUndefined();
+    // And no threshold either, for the same reason: both come out of the entry that could
+    // not be read, and a mark drawn at a made-up number is worse than no mark.
+    expect(instance.models[0]?.compactionAt).toBeUndefined();
   });
 });

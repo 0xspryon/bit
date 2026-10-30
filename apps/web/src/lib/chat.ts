@@ -40,6 +40,7 @@ import type {
   GoalConversationView,
   GoalNarrationView,
   LiveItem,
+  LiveUsage,
   PlanRoundView,
 } from "@bit/contracts";
 import { dispositionLabel } from "./goalFormat";
@@ -67,6 +68,14 @@ const KIND_LABELS: Record<string, string | undefined> = {
   "plan.round.steered": "Steered",
   "record.other": "Event",
   "turn.reply": "Reply",
+  /**
+   * What was considered, which is **not** a record of what happened.
+   *
+   * The label is a noun rather than a verb for that reason: "Thinking" is the kind of thing
+   * the row holds, where "Thought" or "Decided" would read as a conclusion. `ChatItem`
+   * renders it collapsed and says the rest in words.
+   */
+  "turn.thinking": "Thinking",
   "tool.call": "Tool call",
   /**
    * The operator's own message, which **no server ever sends**.
@@ -80,6 +89,16 @@ const KIND_LABELS: Record<string, string | undefined> = {
   "tool.result": "Tool result",
   "action.denied": "Denied",
 };
+
+/**
+ * The kind a thinking row carries, named once so the component and the label agree.
+ *
+ * It is the server's string (`live.ts`'s `turn.thinking`) rather than a browser invention —
+ * unlike {@link OPERATOR_TURN_KIND}, which no server sends — and it is a constant here
+ * because {@link ChatItem} branches on it and a typo would silently render a model's
+ * deliberation as an ordinary claim about what happened.
+ */
+export const THINKING_KIND = "turn.thinking";
 
 /** The kind as words, or the kind itself when this build has never heard of it. */
 export const kindLabel = (kind: string): string => KIND_LABELS[kind] ?? kind;
@@ -896,3 +915,194 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
     ],
   };
 };
+
+/* ── The context meter ───────────────────────────────────────────────────────── */
+
+/**
+ * Which session a {@link LiveUsage} frame measures, as one map key.
+ *
+ * The frame carries the same three nullable ids a {@link LiveItem} does and exactly one of
+ * them is set, so this is the join between "a measurement arrived" and "which pane it
+ * belongs to". A page showing a planner round above a goal conversation has **two** meters
+ * on it: two agents, two sessions, two models, two windows, and nothing but this key says
+ * which figure is which.
+ *
+ * `undefined` for a frame naming none, which the server does not send. It is dropped rather
+ * than shown against whichever pane is open, because a context figure attributed to the
+ * wrong agent is worse than no figure at all — the whole point of the thing is to be
+ * trusted at a glance.
+ */
+export const usageScope = (
+  usage: Pick<LiveUsage, "attemptId" | "roundId" | "goalId">,
+): string | undefined => {
+  if (usage.roundId !== null) return `round:${usage.roundId}`;
+  if (usage.goalId !== null) return `goal:${usage.goalId}`;
+  if (usage.attemptId !== null) return `attempt:${usage.attemptId}`;
+  return undefined;
+};
+
+/** The key a pane asks the usage map for. See {@link usageScope}. */
+export const roundUsageScope = (roundId: string): string => `round:${roundId}`;
+/** The key a pane asks the usage map for. See {@link usageScope}. */
+export const goalUsageScope = (goalId: string): string => `goal:${goalId}`;
+
+/**
+ * A figure with thousands separators, so 13753 reads as 13,753.
+ *
+ * Grouped here rather than through `toLocaleString`, so the same input produces the same
+ * string in a test as on a screen: the runner's default locale is not the browser's, and a
+ * meter asserted against "13,753" that renders "13.753" somewhere else would be a test
+ * passing for the wrong reason.
+ */
+export const groupDigits = (value: number): string =>
+  String(Math.trunc(value)).replace(/\B(?=(\d{3})+(?!\d))/gu, ",");
+
+/**
+ * One row of the meter's detail panel that only the caller can fill.
+ *
+ * The component owns the figures — tokens, window, percentage, the call's id — and the
+ * caller owns the identity, because what identifies a planner round and what identifies a
+ * goal conversation are different facts held in different places. A row the component
+ * invented would be a claim about a session it cannot see.
+ */
+export interface MeterFact {
+  readonly term: string;
+  readonly value: string;
+}
+
+/** What the meter draws, decided here so it can be tested without a browser. */
+export interface ContextMeter {
+  /** The model call this measures. Shown, because it is what the harness's log calls it. */
+  readonly callId: string;
+  /**
+   * The context this call carried: what was sent, plus what it generated.
+   *
+   * The same sum OpenCode's own meter uses for the last assistant message
+   * (`input + output + reasoning + cache.read + cache.write`). **Never a session or turn
+   * total** — see `live.ts` on the figures this is not built from.
+   */
+  readonly tokens: number;
+  readonly promptTokens: number;
+  /** `null` where the driver has not stated it. See {@link outputStated}. */
+  readonly outputTokens: number | null;
+  /**
+   * Whether this call's output count is known.
+   *
+   * False on Claude Code until the turn ends: its `assistant` frames carry a stale count,
+   * so the server omits it rather than publishing a 1. {@link tokens} is then the prompt
+   * side alone and runs short by tens to hundreds of tokens, which the meter says in words
+   * instead of implying a precision it does not have.
+   */
+  readonly outputStated: boolean;
+  readonly limit: number | null;
+  /**
+   * How full the window is, 0–100, or `null` when no limit is known.
+   *
+   * Ruling 3: **a percentage is drawn only when a limit is known.** An honest "14,870
+   * tokens" beats a fabricated "7%", so where this is `null` the meter shows the figure and
+   * nothing else — and that is the ordinary state on Claude Code for the first moments of a
+   * session, and the permanent state when a catalogue could not be read.
+   */
+  readonly percent: number | null;
+  /**
+   * Where the harness will summarise this session on its own, or `null`.
+   *
+   * **Not a second limit, and the meter must not read as if it were.** It is the point at
+   * which the conversation is rewritten without anybody asking, and it sits far below the
+   * window: OpenCode compacts bit's default model at about 58 % of the figure the bar is
+   * drawn against. A meter that showed only the window would be telling an operator that
+   * nothing happens until it reads full.
+   *
+   * `null` where the driver states no threshold this build has measured, which is every
+   * Claude Code session.
+   */
+  readonly compactionAt: number | null;
+  /**
+   * {@link compactionAt} as a fraction of the window, 0–100, or `null`.
+   *
+   * `null` whenever either number is missing — there is no fraction to draw without both —
+   * and clamped to the bar, because a harness whose threshold sits above the window it is
+   * measured against is a configuration this build cannot predict rather than a mark to
+   * draw off the end of a track.
+   */
+  readonly compactionPercent: number | null;
+  /** When the call was measured, in epoch milliseconds. */
+  readonly at: number;
+}
+
+/**
+ * The meter for one pane, from the latest measurement its session produced.
+ *
+ * **One call, not a sum**, which is the whole correctness of this: both drivers publish
+ * running totals that re-count the cached prefix on every call, and a meter built by adding
+ * these frames up would read four to five times high (`live.ts` has the measured figures).
+ * So the caller keeps the latest frame per session — `app.svelte.ts` does, keyed by
+ * {@link usageScope} — and this turns that one frame into what is drawn.
+ *
+ * `undefined` for a session that has not made a model call yet, which is every session for
+ * its first second or two.
+ */
+export const contextMeter = (
+  usage: LiveUsage | undefined,
+): ContextMeter | undefined => {
+  if (usage === undefined) return undefined;
+  const tokens = usage.promptTokens + (usage.outputTokens ?? 0);
+  // A limit of zero or less is not a denominator. Neither driver has produced one; the
+  // guard is here so a nonsense catalogue entry costs a percentage rather than an Infinity.
+  const limit =
+    usage.contextLimit !== null && usage.contextLimit > 0
+      ? usage.contextLimit
+      : null;
+  // A threshold is only a threshold of something: without a window there is no fraction to
+  // place it at, and the panel shows the token figure instead.
+  const compactionAt =
+    usage.compactionAt !== null && usage.compactionAt > 0
+      ? usage.compactionAt
+      : null;
+  return {
+    callId: usage.callId,
+    tokens,
+    promptTokens: usage.promptTokens,
+    outputTokens: usage.outputTokens,
+    outputStated: usage.outputTokens !== null,
+    limit,
+    percent: limit === null ? null : Math.round((tokens / limit) * 100),
+    compactionAt,
+    compactionPercent:
+      limit === null || compactionAt === null
+        ? null
+        : Math.max(0, Math.min(100, Math.round((compactionAt / limit) * 100))),
+    at: usage.at,
+  };
+};
+
+/**
+ * The meter's own one-line figure.
+ *
+ * Three shapes, and each says exactly what is known: tokens over a limit with a percentage;
+ * tokens alone where no limit is; and `<1%` where a real fraction of a large window rounds
+ * to nothing, because "0%" of 1,500 tokens reads as "nothing has been used".
+ */
+export const contextMeterLabel = (meter: ContextMeter): string => {
+  const used = groupDigits(meter.tokens);
+  if (meter.limit === null) return `${used} tokens`;
+  const percent =
+    meter.percent === 0 && meter.tokens > 0
+      ? "<1%"
+      : `${String(meter.percent)}%`;
+  return `${used} / ${groupDigits(meter.limit)} · ${percent}`;
+};
+
+/**
+ * Whether this call has passed the point at which the harness rewrites the session.
+ *
+ * Worth its own answer rather than a comparison at the call site, because what it means is
+ * not "the meter is nearly full". It is a statement about the **next** call, and the tense
+ * matters: this call was *sent* at this size, before anything was summarised, so the figure
+ * is a true measurement and nothing here is retracting it. What is true past this point is
+ * that the harness is about to rewrite the conversation, or has just done so — after which
+ * the next call's context is smaller and the figure appears to go backwards. A pane that
+ * did not say so would look like it had lost count.
+ */
+export const pastCompaction = (meter: ContextMeter): boolean =>
+  meter.compactionAt !== null && meter.tokens >= meter.compactionAt;

@@ -174,13 +174,20 @@ export const truncateNarration = (value: string): string =>
  * transcript needs the text of a reply, the arguments of a tool call and a shape to render
  * them in, and until something had to render them, any shape invented here would have been
  * the format a later slice inherited without having decided it. The live transcript is
- * that slice, so this is the decision — four cases, chosen because they are the four both
+ * that slice, so this is the decision — six cases, chosen because they are the six both
  * harnesses can actually produce.
  *
  * `opaque` is the honest default and most entries are it: a token delta, a step boundary, a
- * usage update. A reader that can render nothing useful from an entry gets `opaque` rather
- * than an empty `reply`, so "the harness said something we do not display" never reads as
- * "the agent replied with nothing".
+ * *cumulative* usage total. A reader that can render nothing useful from an entry gets
+ * `opaque` rather than an empty `reply`, so "the harness said something we do not display"
+ * never reads as "the agent replied with nothing".
+ *
+ * Two of the six arrived later than the others, and the comment they replace is worth
+ * keeping: this list used to name "a usage update" among the things that are honestly
+ * `opaque`, and that was true of the update both drivers publish most readily. It is not
+ * true of the per-call figure underneath it. DECISIONS.md §24.4 measured which event
+ * carries which, and `usage` is the one that survived; the cumulative ones are still
+ * `opaque` and `openCodeNarration` says so at the line.
  *
  * **`toolResult.output` is the tool's own output, not a verdict about it.** `failed` is set
  * when the harness says the call failed; it says nothing about whether the action was
@@ -225,7 +232,113 @@ export type NarrationDetail =
       /** The harness said this call failed. Not a policy decision; see above. */
       readonly failed: boolean;
     }
+  | {
+      /**
+       * What the agent considered, as one complete block.
+       *
+       * Claude Code's `thinking` content blocks and OpenCode's `session.reasoning.ended`,
+       * which carries the whole block's text exactly as `session.text.ended` does for a
+       * reply — so this is one entry per block on both drivers, never a delta.
+       *
+       * **It is a record of what was considered, not of what happened**, and it is
+       * streamed and never stored: no durable field, no evidence, no transcript artefact.
+       * It lasts as long as the harness's own retention, like the rest of the narration.
+       */
+      readonly _tag: "thinking";
+      /** The block's text, capped by {@link NARRATION_FIELD_MAX}. May be empty. */
+      readonly text: string;
+    }
+  | {
+      /**
+       * How big the context was on one model call.
+       *
+       * **The numerator is per call and never a running total**, which is the whole of
+       * DECISIONS.md §24.4: the figures both drivers publish most readily —
+       * `session.usage.updated` and `session.tokens` on OpenCode, `result.usage`,
+       * `modelUsage` and `total_cost_usd` on Claude Code, and {@link SessionStatus.tokens}
+       * on either — are **spend totals**, because the cached prefix is re-counted on every
+       * call. Measured: 65 838 against a real context of 13 753 on OpenCode, 90 784
+       * against 23 179 on Claude Code. A meter fed from one of them reads four to five
+       * times high, which is worse than no meter.
+       *
+       * The two events that are per call, and are what this is built from, are OpenCode's
+       * `session.step.ended` — durable, sequenced, carrying `assistantMessageID` — and
+       * Claude Code's `assistant` frames, topped up for the output count from the turn's
+       * `result.usage.iterations[0]`.
+       *
+       * Cache read, cache write and reasoning are deliberately **not** fields. They cannot
+       * be filled on both drivers with the same meaning (`cache.write` is a constant 0 on
+       * the OpenCode provider measured, and `reasoning` sits beside `output` on one driver
+       * and inside it on the other), and the seam's rule is that a case exists only where
+       * both can fill it honestly.
+       */
+      readonly _tag: "usage";
+      /**
+       * One model call: OpenCode's `assistantMessageID`, Claude Code's `message.id`.
+       *
+       * The de-duplication key, and it is needed: Claude Code delivers one API call as
+       * several `assistant` frames, one per content block, each repeating this id and the
+       * same usage. `narrate` is stateless, so it emits one entry per frame and **a reader
+       * keeps the latest per id rather than summing** — naive counting multiplies one call
+       * by two or three.
+       */
+      readonly callId: string;
+      /** Tokens sent on this call: uncached input + cache read + cache write. */
+      readonly promptTokens: number;
+      /**
+       * Tokens generated on this call, thinking included, or `undefined` while unstated.
+       *
+       * `undefined` rather than a number on Claude Code's `assistant` frames, whose
+       * `output_tokens` is the `message_start` snapshot and is stale — the call that
+       * produced 16 tokens reported 1. A later entry with the same {@link callId} states
+       * it from the turn's `result`. On OpenCode it is `output + reasoning`, so the field
+       * means "everything generated" on both.
+       */
+      readonly outputTokens: number | undefined;
+      /**
+       * The model's context window, when this driver has stated it by now.
+       *
+       * Set from the catalogue on OpenCode (`HarnessModelView.contextLimit`) and from
+       * `getContextUsage().maxTokens` on Claude Code, which only exists once a session
+       * does. `undefined` is reachable on both — an unreadable catalogue, a control request
+       * that has not answered yet — and a consumer draws no percentage without it.
+       */
+      readonly contextLimit: number | undefined;
+      /**
+       * Where the **harness itself** will summarise this session, when it states a policy.
+       *
+       * Not a second limit and not a smaller one: {@link contextLimit} is what the provider
+       * accepts, and this is the point at which the harness rewrites the conversation
+       * without being asked. OpenCode compacts bit's sessions by default at about 58 % of
+       * the window on bit's own default model, so a consumer that drew only the window
+       * would be implying nothing happens until it reads full.
+       *
+       * It is **derived from the driver's own source, not reported by it** —
+       * `HarnessModelView.compactionAt` has the formula, the file and line it came from, and
+       * the three things that can move it without moving this number. A consumer presents it
+       * as where the harness says it will act, never as a measurement.
+       *
+       * `undefined` on Claude Code, which this build has measured no threshold for.
+       */
+      readonly compactionAt: number | undefined;
+    }
   | { readonly _tag: "opaque" };
+
+/**
+ * What one session's model takes, as the two numbers a context meter needs.
+ *
+ * One struct rather than two parameters threaded side by side, because they come from the
+ * same catalogue entry at the same moment and a call site that had one and not the other
+ * would be a meter drawn against a window with no idea what the harness will do to it.
+ * Both are the *model's*, so neither can be read off a narration event — see
+ * `openCodeClient.ts`'s per-session map for the join.
+ */
+export interface SessionWindow {
+  /** What the provider accepts. `HarnessModelView.contextLimit`. */
+  readonly contextLimit: number;
+  /** Where the harness acts on its own. `HarnessModelView.compactionAt`. */
+  readonly compactionAt: number | undefined;
+}
 
 /**
  * One narrated moment of a session, reduced to what this application reads.

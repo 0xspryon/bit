@@ -718,6 +718,24 @@ describe("projecting the record", () => {
   });
 });
 
+/**
+ * {@link projectNarration}, narrowed to the transcript item it produced.
+ *
+ * Narration no longer projects to one frame type: a `usage` entry becomes a `LiveUsage`
+ * frame rather than an item, because it is a measurement about the session and not a turn
+ * in it (`live.ts`). Every assertion in the block below is about an item, so the narrowing
+ * is stated once here instead of at each field read — and a mapping that started answering
+ * with something else would fail loudly rather than silently reading `undefined` fields.
+ */
+const projectedItem = (entry: RunNarration): LiveItem | undefined => {
+  const frame = projectNarration(entry);
+  if (frame === undefined) return undefined;
+  if (frame._tag !== "item") {
+    throw new Error(`expected a transcript item, got a '${frame._tag}' frame`);
+  }
+  return frame;
+};
+
 describe("projecting live activity", () => {
   test("a tool of ours is reduced to its bare name, on both drivers' forms", () => {
     /*
@@ -739,7 +757,7 @@ describe("projecting live activity", () => {
       claudeCodeToolName(server, "add_intent"),
       openCodeToolName(server, "add_intent"),
     ]) {
-      const item = projectNarration(
+      const item = projectedItem(
         narration(
           {
             _tag: "toolCall",
@@ -761,7 +779,7 @@ describe("projecting live activity", () => {
     // Only the prefix *this* application chose is removed. Taking "the segment after the
     // last separator" would have worked for both forms above and would also have renamed a
     // harness's own dotted tool, which is a misattribution a reader cannot see.
-    const own = projectNarration(
+    const own = projectedItem(
       narration(
         { _tag: "toolCall", callId: "c1", tool: "bash", input: "{}" },
         { subject: { _tag: "round", roundId: "rnd_live" } },
@@ -769,7 +787,7 @@ describe("projecting live activity", () => {
     );
     expect(own?.toolName).toBe("bash");
 
-    const foreign = projectNarration(
+    const foreign = projectedItem(
       narration(
         {
           _tag: "toolCall",
@@ -790,7 +808,7 @@ describe("projecting live activity", () => {
     // Exactly one of the two is ever set, which is what the bus's tagged subject buys: a
     // publisher that cannot name which kind it is cannot publish, so neither field is a
     // slot left unfilled. The planner chat groups on the first of them.
-    const fromRound = projectNarration(
+    const fromRound = projectedItem(
       narration(
         { _tag: "reply", text: "two dimensions are untested" },
         { subject: { _tag: "round", roundId: "rnd_live" } },
@@ -799,7 +817,7 @@ describe("projecting live activity", () => {
     expect(fromRound?.roundId).toBe("rnd_live");
     expect(fromRound?.attemptId).toBeNull();
 
-    const fromAttempt = projectNarration(
+    const fromAttempt = projectedItem(
       narration({ _tag: "reply", text: "running the probe" }),
     );
     expect(fromAttempt?.attemptId).toBe("attempt-1");
@@ -807,7 +825,7 @@ describe("projecting live activity", () => {
   });
 
   test("a reply reads as a turn, with no sequence", () => {
-    const item = projectNarration(
+    const item = projectedItem(
       narration({ _tag: "reply", text: "I will probe the limiter." }),
     );
     expect(item?.kind).toBe("turn.reply");
@@ -819,7 +837,7 @@ describe("projecting live activity", () => {
   });
 
   test("a tool call shows its name and its arguments", () => {
-    const item = projectNarration(
+    const item = projectedItem(
       narration({
         _tag: "toolCall",
         callId: "call-1",
@@ -837,7 +855,7 @@ describe("projecting live activity", () => {
   });
 
   test("a tool result shows its output, and says when the harness called it a failure", () => {
-    const ok = projectNarration(
+    const ok = projectedItem(
       narration({
         _tag: "toolResult",
         callId: "call-1",
@@ -850,7 +868,7 @@ describe("projecting live activity", () => {
     expect(ok?.output).toBe("HTTP/1.1 429 Too Many Requests");
     expect(ok?.outcome).toBe("ok");
 
-    const failed = projectNarration(
+    const failed = projectedItem(
       narration({
         _tag: "toolResult",
         callId: "call-1",
@@ -900,7 +918,7 @@ describe("projecting live activity", () => {
         },
         { id: 4 },
       ),
-    ].map((item) => projectNarration(item));
+    ].map((item) => projectedItem(item));
 
     expect(projected.map((item) => [item?.kind, item?.callId])).toEqual([
       ["tool.call", "c1"],
@@ -923,7 +941,7 @@ describe("projecting live activity", () => {
 
   test("nothing but a tool call or its result carries a call id", () => {
     expect(
-      projectNarration(narration({ _tag: "reply", text: "hello" }))?.callId,
+      projectedItem(narration({ _tag: "reply", text: "hello" }))?.callId,
     ).toBeNull();
     // A refusal cannot carry one: the gate's request has a session id, a tool name and the
     // arguments, and no call id — the hook is a plugin inside the harness and the harness
@@ -933,7 +951,7 @@ describe("projecting live activity", () => {
   });
 
   test("a call the harness had not named says so rather than borrowing one", () => {
-    const item = projectNarration(
+    const item = projectedItem(
       narration({
         _tag: "toolCall",
         callId: "call-1",
@@ -950,7 +968,7 @@ describe("projecting live activity", () => {
   });
 
   test("a result whose call was never named keeps the id that pairs it", () => {
-    const item = projectNarration(
+    const item = projectedItem(
       narration({
         _tag: "toolResult",
         callId: "orphan",
@@ -969,10 +987,97 @@ describe("projecting live activity", () => {
     // Most of what a harness narrates is a token delta or a step boundary. Dropping those
     // is sound on a channel that never claims to be complete, and is what keeps one frame
     // per reply block on the wire instead of hundreds per turn.
-    expect(projectNarration(narration({ _tag: "opaque" }))).toBeUndefined();
+    expect(projectedItem(narration({ _tag: "opaque" }))).toBeUndefined();
     expect(
-      projectNarration(narration({ _tag: "reply", text: "   " })),
+      projectedItem(narration({ _tag: "reply", text: "   " })),
     ).toBeUndefined();
+  });
+
+  test("thinking is its own kind, carrying the text and claiming nothing", () => {
+    const item = projectedItem(
+      narration({ _tag: "thinking", text: "The limiter is probably per-IP." }),
+    );
+    expect(item?.kind).toBe("turn.thinking");
+    expect(item?.headline).toBe("Thinking");
+    expect(item?.body).toBe("The limiter is probably per-IP.");
+    // `activity`, like every other narration item: thinking is streamed and never stored,
+    // so it has no position and nothing to resume from.
+    expect(item?.origin).toBe("activity");
+    expect(item?.sequence).toBeNull();
+    // It is not a tool call and not a result; nothing about it is a thing that happened.
+    expect(item?.callId).toBeNull();
+    expect(item?.tool).toBeNull();
+    expect(item?.outcome).toBeNull();
+  });
+
+  test("an empty thinking block produces nothing at all", () => {
+    // Both drivers close a block they put nothing in — the probe's own run produced
+    // `{ type: "thinking", thinking: "" }` — and a row saying the agent thought nothing
+    // would be a claim about the model rather than a fact about the stream.
+    expect(
+      projectedItem(narration({ _tag: "thinking", text: "" })),
+    ).toBeUndefined();
+    expect(
+      projectedItem(narration({ _tag: "thinking", text: " \n  " })),
+    ).toBeUndefined();
+  });
+
+  test("a usage entry is a frame of its own, not a row in the transcript", () => {
+    /*
+     * A measurement about the session rather than a turn in it. If this were an item it
+     * would be a row per model call in every chat on the page, and the numbers would have
+     * to travel in `LiveItem`'s string fields for a browser to parse back out.
+     */
+    const frame = projectNarration(
+      narration(
+        {
+          _tag: "usage",
+          callId: "msg_1",
+          promptTokens: 13_572,
+          outputTokens: 53,
+          contextLimit: 200_000,
+          compactionAt: 170_000,
+        },
+        { subject: { _tag: "round", roundId: "rnd_7" } },
+      ),
+    );
+    expect(frame).toEqual({
+      _tag: "usage",
+      callId: "msg_1",
+      promptTokens: 13_572,
+      outputTokens: 53,
+      contextLimit: 200_000,
+      compactionAt: 170_000,
+      // The attribution a page with two agents on it needs to tell one meter from the
+      // other. Taken from the bus's own tagged subject, never from the harness's payload.
+      attemptId: null,
+      roundId: "rnd_7",
+      goalId: null,
+      at: 1_700_000_000_000,
+    });
+  });
+
+  test("an unstated output count and an unknown window arrive as null, not as zero", () => {
+    // `undefined` on the seam becomes `null` on the wire, which is what keeps "we have not
+    // been told" from arriving as a number somebody adds to a total.
+    const frame = projectNarration(
+      narration({
+        _tag: "usage",
+        callId: "msg_2",
+        promptTokens: 21_388,
+        outputTokens: undefined,
+        contextLimit: undefined,
+        compactionAt: undefined,
+      }),
+    );
+    expect(frame?._tag).toBe("usage");
+    if (frame?._tag !== "usage") throw new Error("expected a usage frame");
+    expect(frame.outputTokens).toBeNull();
+    expect(frame.contextLimit).toBeNull();
+    // The same for the harness's own threshold: "we have not been told" must not arrive as
+    // a number a bar could be marked at.
+    expect(frame.compactionAt).toBeNull();
+    expect(frame.promptTokens).toBe(21_388);
   });
 
   test("a denied action reads as denied, with the gate's own reason", () => {

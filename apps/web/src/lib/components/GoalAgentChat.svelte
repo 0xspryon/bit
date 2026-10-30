@@ -32,8 +32,10 @@
    */
   import Button from "./Button.svelte";
   import Chat from "./Chat.svelte";
+  import ContextMeter from "./ContextMeter.svelte";
   import { IconArrowUp } from "../icons";
   import { whenText } from "../goalFormat";
+  import type { MeterFact } from "../chat";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
@@ -62,6 +64,55 @@
    * reaches here.
    */
   let detail = $derived(app.goalConversationDetail);
+
+  /**
+   * What the context panel can say about this conversation, and only what it can.
+   *
+   * The session comes from the replay — which is also the thing that says whether this
+   * process still holds it — and the harness and model come from the last turn this tab
+   * sent, because that is the only answer that names them (`app.goalAgentRuntime`). A
+   * conversation this tab has only *read* therefore shows its session and not its model,
+   * which is the honest state: the model behind somebody else's session is not knowable
+   * from here, and the harness's default is not an answer to it.
+   */
+  let meterFacts = $derived<readonly MeterFact[]>([
+    ...(app.goalConversation?.harnessSessionId == null
+      ? []
+      : [
+          {
+            term: "Session",
+            value: app.goalConversation.harnessSessionId,
+          },
+        ]),
+    ...(app.goalAgentRuntime === undefined
+      ? []
+      : [
+          { term: "Harness", value: app.goalAgentRuntime.instanceId },
+          {
+            term: "Model",
+            value: `${app.goalAgentRuntime.providerId}/${app.goalAgentRuntime.modelId}`,
+          },
+        ]),
+    /*
+     * The brief's "message counts", with the value saying what it counts.
+     *
+     * The harness's **replayed** copy, which is the only count this application has: not a
+     * word of the conversation is stored (rulings 4 and decision 14), so nothing knows how
+     * many turns it really had — only how many the harness still holds. The operator's own
+     * unreplayed turns are deliberately not added in: they are this tab's, they are gone on
+     * a reload, and a single number covering both would be a count of two different things.
+     */
+    ...(app.goalConversation === undefined
+      ? []
+      : [
+          {
+            term: "Messages",
+            value: `${String(app.goalConversation.messages.length)} held by the harness${
+              app.goalConversation.truncated ? ", shortened" : ""
+            }`,
+          },
+        ]),
+  ]);
 
   function submit(event: Event): void {
     event.preventDefault();
@@ -120,6 +171,14 @@
     {#if group.subject.awaiting}
       <span class="chip" data-tint="warning">waiting</span>
     {/if}
+  {/snippet}
+
+  {#snippet meter()}
+    <ContextMeter
+      meter={app.goalContextMeter}
+      label="Goal agent context"
+      facts={meterFacts}
+    />
   {/snippet}
 
   {#snippet footnote()}

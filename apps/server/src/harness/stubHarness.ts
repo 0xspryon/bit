@@ -51,9 +51,22 @@ export const STUB_INSTANCE: HarnessInstance = {
   // Model *views*: a name plus what that model offers. The first one carries a reasoning
   // descriptor so a test can drive the option path without inventing a shape the real
   // harnesses would not report; the second offers nothing, which is the common case.
+  //
+  // The first also states a context window and a compaction point, and the second states
+  // neither, which is the split the two real drivers have: OpenCode's catalogue carries
+  // `limit.context` on every entry and its own compaction fires below that, while Claude
+  // Code's model list has no window field at all (DECISIONS.md §24.4). A stub whose every
+  // model claimed a window would make the no-percentage path — the honest rendering when
+  // nothing stated one — unreachable through this harness.
+  //
+  // 170 000 is what OpenCode's formula answers for a 200 000 window with no `input` limit;
+  // see `openCodeCompactionAt`. Written out rather than computed, because a stub reporting
+  // a figure derived by the code under test would agree with it by construction.
   models: [
     {
       id: "scripted/model",
+      contextLimit: 200_000,
+      compactionAt: 170_000,
       optionDescriptors: [
         {
           id: "effort",

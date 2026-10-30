@@ -41,6 +41,7 @@ import {
   type IntentView,
   type LiveFrame,
   type LiveItem,
+  type LiveUsage,
   type ModelOptionSelection,
   type PlanRoundStarted,
   type PlanRoundView,
@@ -61,6 +62,11 @@ import {
   activityOrder,
   buildChat,
   buildGoalConversation,
+  contextMeter,
+  goalUsageScope,
+  roundUsageScope,
+  usageScope,
+  type ContextMeter,
   type SentTurn,
 } from "./chat";
 import { server, type ServerClient } from "./client";
@@ -515,6 +521,25 @@ export class App {
    */
   goalSessionNote = $state("");
   /**
+   * Which harness and model the goal's agent is running on, from the last turn this tab
+   * sent.
+   *
+   * **From a turn, which is why it is `undefined` until this tab has sent one.** The
+   * conversation replay says which session the words came from and nothing about what is
+   * behind it; `GoalTurnAccepted` is the one answer that names the instance, the provider
+   * and the model. So the context panel shows the model once there has been a turn and says
+   * nothing before — rather than naming the harness's default, which is a guess about a
+   * session somebody else's process may have opened.
+   */
+  goalAgentRuntime = $state<
+    | {
+        readonly instanceId: string;
+        readonly providerId: string;
+        readonly modelId: string;
+      }
+    | undefined
+  >(undefined);
+  /**
    * The messages this tab has sent, oldest first.
    *
    * **Local because nothing stores them** (the spec's decision 15 and ruling 4): between
@@ -775,6 +800,24 @@ export class App {
   liveTargetId = $state("");
 
   /**
+   * The newest model call per session, keyed by {@link usageScope}.
+   *
+   * **The latest, never a running sum, and that is the whole correctness of the meter.**
+   * Both drivers publish cumulative figures that re-count the cached prefix on every call,
+   * and `live.ts` has the measured consequence: a meter built by adding these up reads four
+   * to five times high. So each frame *replaces* the one before it for its session —
+   * including a frame with the same `callId`, which is how Claude Code tops up a call's
+   * output count once its turn ends — and nothing here accumulates anything.
+   *
+   * A record rather than a `Map` because `$state` has to see the write: reassigning the
+   * object is what makes the deriveds below recompute.
+   *
+   * Cleared with {@link liveItems} when the target changes, for that field's reason: a
+   * figure from another target's run has no place on this one's screen.
+   */
+  liveUsage = $state<Record<string, LiveUsage>>({});
+
+  /**
    * The open goal's chat: its rounds, their replayed prose and their live rows.
    *
    * Declared here, among the live transcript's state, rather than up with the planner
@@ -841,6 +884,33 @@ export class App {
       replayedThrough: this.goalConversationThrough,
       awaiting: this.goalAwaiting,
     }),
+  );
+
+  /**
+   * The context meter for the planner pane: the round it is about, and that round only.
+   *
+   * **The round in flight if there is one, else the newest** — which is the same subject the
+   * strip under that chat already reports on, so the figure and the sentence beside it are
+   * about one round. A meter over "the newest call on this target" would jump between two
+   * concurrent rounds and between a round and a worker, and a number that changes subject
+   * without saying so is worse than no number.
+   *
+   * `undefined` before the round's first model call, and for a reloaded round whose session
+   * this process is not watching: narration is not replayed (decision 14), so there is
+   * nothing to measure a finished round with and the pane shows no meter rather than the
+   * last one it happened to see.
+   */
+  plannerContextMeter: ContextMeter | undefined = $derived.by(() => {
+    const round = this.openGoalRunningRound ?? this.latestPlanRound;
+    if (round === undefined) return undefined;
+    return contextMeter(this.liveUsage[roundUsageScope(round.roundId)]);
+  });
+
+  /** The context meter for the goal conversation: its own agent's session. */
+  goalContextMeter: ContextMeter | undefined = $derived.by(() =>
+    this.openGoalId === ""
+      ? undefined
+      : contextMeter(this.liveUsage[goalUsageScope(this.openGoalId)]),
   );
 
   /**
@@ -1326,6 +1396,7 @@ export class App {
     this.goalSending = false;
     this.goalSendDetail = "";
     this.goalSessionNote = "";
+    this.goalAgentRuntime = undefined;
     this.goalTurns = [];
   }
 
@@ -1979,6 +2050,13 @@ export class App {
     this.goalMessage = "";
     this.goalSessionNote =
       call.value.conversation === "opened" ? call.value.note : "";
+    // What the agent is actually running on, which only an accepted turn states. See
+    // {@link goalAgentRuntime}.
+    this.goalAgentRuntime = {
+      instanceId: call.value.instanceId,
+      providerId: call.value.providerId,
+      modelId: call.value.modelId,
+    };
     /*
      * The conversation is live now, which the replay read before it was.
      *
@@ -2804,6 +2882,7 @@ export class App {
     if (!sameTarget) {
       this.liveItems = [];
       this.liveCursor = 0;
+      this.liveUsage = {};
       this.liveRecoveries = [];
       this.#shown = new Set();
       this.#shownOrder = [];
@@ -2907,6 +2986,7 @@ export class App {
     this.stopLive();
     this.liveTargetId = "";
     this.liveItems = [];
+    this.liveUsage = {};
     this.liveCursor = 0;
     this.liveCaughtUp = false;
     this.liveSkipped = 0;
@@ -3031,6 +3111,24 @@ export class App {
     if (frame._tag === "cursor") {
       this.liveCursor = Math.max(this.liveCursor, frame.sequence);
       this.liveCaughtUp = frame.caughtUp;
+      return;
+    }
+    if (frame._tag === "usage") {
+      /*
+       * One model call's measurement, kept against its own session and nothing else.
+       *
+       * It does **not** go through the deduplication below, and it has no `id` to go
+       * through it with: a usage frame is not an item and there is nothing to show twice.
+       * Two frames sharing a `callId` are the ordinary case — Claude Code delivers one call
+       * as several frames and then states its output count once at turn end — and the rule
+       * for all of them is the same, which is that the newest replaces the last.
+       *
+       * A frame naming no session is dropped. {@link usageScope} says why: a context figure
+       * shown against the wrong agent is worse than none.
+       */
+      const scope = usageScope(frame);
+      if (scope === undefined) return;
+      this.liveUsage = { ...this.liveUsage, [scope]: frame };
       return;
     }
     if (this.#shown.has(frame.id)) return;

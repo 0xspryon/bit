@@ -21,10 +21,12 @@ import {
   bitMcpServerName,
   claudeCodeToolName,
   type LiveItem,
+  type LiveUsage,
   type PlanRoundView,
 } from "@bit/contracts";
 
 import Chat from "../src/lib/components/Chat.svelte";
+import ContextMeter from "../src/lib/components/ContextMeter.svelte";
 import GoalAgentChat from "../src/lib/components/GoalAgentChat.svelte";
 import PlannerChat from "../src/lib/components/PlannerChat.svelte";
 import { App } from "../src/lib/app.svelte";
@@ -32,14 +34,22 @@ import {
   AT,
   FakeServer,
   goalConversationView,
+  goalNarrationView,
   goalView,
+  liveOpened,
   ok,
   planRoundView,
+  roundNarration,
   runningRound,
   targetSummary,
 } from "./fakeServer";
 import { FakeCountdown } from "./fakeCountdown";
-import type { ChatRound } from "../src/lib/chat";
+import {
+  THINKING_KIND,
+  contextMeter,
+  type ChatRound,
+  type ContextMeter as ContextMeterView,
+} from "../src/lib/chat";
 
 /**
  * Lets everything already in flight finish. `app.test.ts`'s helper, for its reason:
@@ -201,6 +211,205 @@ describe("the composer, which slice 9 depends on", () => {
   test("read-only with no composer passed renders none, which is the planner's case", () => {
     const html = body({ groups: [], readonly: true });
     expect(html).not.toContain("<form");
+  });
+});
+
+/* ── Thinking ────────────────────────────────────────────────────────────────── */
+
+/**
+ * What the agent considered, and the two rulings that decide how it is drawn.
+ *
+ * Ruling 2: **collapsed by default, and never presented as a record of what happened.** So
+ * the text is inside a `<details>` — shut, it is out of the accessibility tree, which is
+ * the same argument a tool's arguments are behind one — and the row says in words that it
+ * is a record of what was *considered*.
+ */
+describe("a thinking row", () => {
+  const thought = (body: string): LiveItem => ({
+    ...committed(),
+    id: "activity:9",
+    origin: "activity",
+    sequence: null,
+    kind: THINKING_KIND,
+    headline: "Thinking",
+    body,
+  });
+
+  const withRow = (item: LiveItem): string =>
+    body({
+      groups: [
+        chatRound({
+          rows: [
+            {
+              key: item.id,
+              item,
+              proposedBy: null,
+              result: null,
+              write: null,
+              summary: null,
+            },
+          ],
+        }),
+      ],
+      readonly: true,
+    });
+
+  test("it is collapsed, and says what it is rather than what happened", () => {
+    const html = withRow(thought("The limiter is probably per-IP."));
+    // Inside the disclosure, not in the row's own body: an open `<details>` is a reader
+    // asking for it.
+    expect(html).toContain("What it considered");
+    expect(html).toContain("<details");
+    // Shut by default — a rendered `<details>` with no `open` attribute.
+    expect(html).not.toContain("<details open");
+    expect(html).toContain("The limiter is probably per-IP.");
+    // The sentence that stops it being read as the account of the run.
+    expect(html).toContain("not what it did");
+    expect(html).toContain("not stored");
+  });
+
+  test("a thinking row with nothing in it renders no disclosure at all", () => {
+    /*
+     * The server drops an empty block, so this should not be reachable — and the component
+     * still has to be right about it, because "the harness closed a block it put nothing
+     * in" must never render as "the agent considered nothing".
+     */
+    const html = withRow(thought(""));
+    expect(html).not.toContain("What it considered");
+    expect(html).not.toContain("not what it did");
+    // The row itself is still there with its label, which is the honest minimum.
+    expect(html).toContain("Thinking");
+  });
+});
+
+/* ── The context meter ───────────────────────────────────────────────────────── */
+
+/**
+ * The figure at the top of the pane, and the one thing it must never do.
+ *
+ * A percentage is drawn **only when a limit is known** (ruling 3). The rules are
+ * `chat.ts`'s and are tested there; what is asserted here is that the markup obeys them —
+ * including the sentence that says why there is no percentage, which is the part a reader
+ * actually needs.
+ */
+describe("the context meter", () => {
+  const meterBody = (
+    meter: ContextMeterView | undefined,
+    facts: readonly { readonly term: string; readonly value: string }[] = [],
+  ): string =>
+    render(ContextMeter, {
+      props: { meter, label: "Planner round context", facts },
+    }).body;
+
+  const usage = (over: Partial<LiveUsage> = {}): LiveUsage => ({
+    _tag: "usage",
+    callId: "msg_1",
+    promptTokens: 13_750,
+    outputTokens: 3,
+    contextLimit: 200_000,
+    compactionAt: 170_000,
+    attemptId: null,
+    roundId: "rnd_1",
+    goalId: null,
+    at: AT,
+    ...over,
+  });
+
+  test("a known window gets a figure, a percentage and the call it measured", () => {
+    const html = meterBody(contextMeter(usage()), [
+      { term: "Model", value: "openai/gpt-5.6-sol" },
+    ]);
+    expect(html).toContain("13,753 / 200,000");
+    expect(html).toContain("7%");
+    expect(html).toContain("msg_1");
+    expect(html).toContain("openai/gpt-5.6-sol");
+    // The sentence that keeps the figure from being read as a session's spend, which is
+    // the mistake the whole design is organised around.
+    expect(html).toContain("one model call");
+  });
+
+  test("no window means no percentage, and a sentence saying so", () => {
+    const html = meterBody(
+      contextMeter(usage({ contextLimit: null, outputTokens: null })),
+    );
+    expect(html).toContain("13,750 tokens");
+    expect(html).not.toContain("%");
+    expect(html).toContain("No context window was reported");
+    // And the output side says it is unstated rather than showing a zero.
+    expect(html).toContain("not stated yet");
+  });
+
+  test("the harness's own compaction point is on the meter and in the panel", () => {
+    /*
+     * The finding this exists for: "this application does not compact" was false. bit never
+     * calls compaction and OpenCode compacts anyway, at 231 200 tokens on bit's default
+     * model — **58 %** of the 400 000 this bar is drawn against. An operator shown only the
+     * window would watch it pass halfway with the session being rewritten underneath.
+     */
+    const html = meterBody(
+      contextMeter(
+        usage({
+          promptTokens: 120_000,
+          outputTokens: 500,
+          contextLimit: 400_000,
+          compactionAt: 231_200,
+        }),
+      ),
+    );
+    // The number, in the panel, in words.
+    expect(html).toContain("Summarised at");
+    expect(html).toContain("231,200 tokens");
+    expect(html).toContain("summarises a session on its own at");
+    // And marked on the track, at its own fraction of the window rather than at the fill.
+    expect(html).toContain("left: 58%");
+    // Said as what it is: read from the harness's policy, not reported by it.
+    expect(html).toContain("rather than reported");
+  });
+
+  test("past the compaction point the panel says the figure may go backwards", () => {
+    const html = meterBody(
+      contextMeter(
+        usage({
+          promptTokens: 235_000,
+          outputTokens: 0,
+          contextLimit: 400_000,
+          compactionAt: 231_200,
+        }),
+      ),
+    );
+    expect(html).toContain("Past the point where this harness summarises");
+    /*
+     * The tense is load-bearing, which is why it is asserted.
+     *
+     * This call was **sent** at this size — the rewrite had not happened when it went — so
+     * the figure is a true measurement and the sentence must not retract it. What is true
+     * past this point is about the *next* call. Asserted with whitespace collapsed, because
+     * prettier wraps the markup.
+     */
+    const flat = html.replace(/\s+/gu, " ");
+    expect(flat).toContain("is about to be, or has already been, rewritten");
+    expect(flat).not.toContain("has most likely already been rewritten");
+    // The one thing an operator cannot work out for themselves: the next figure is smaller,
+    // and that is not the meter losing count.
+    expect(html).toContain("smaller");
+    expect(html).toContain(`role="status"`);
+  });
+
+  test("a harness that states no threshold draws no mark and claims nothing", () => {
+    const html = meterBody(contextMeter(usage({ compactionAt: null })));
+    expect(html).toContain("not stated by this harness");
+    // No tick, and no sentence about a policy nobody measured.
+    expect(html).not.toContain("left:");
+    expect(html).not.toContain("summarises a session on its own");
+  });
+
+  test("a session that has not called a model renders nothing at all", () => {
+    // Not a zero and not a placeholder: there is no context to be a fraction of. The
+    // render is Svelte's own anchor comments and nothing else.
+    const html = meterBody(undefined);
+    expect(html).not.toContain("<details");
+    expect(html).not.toContain("tokens");
+    expect(html.replace(/<!--.*?-->/gu, "").trim()).toBe("");
   });
 });
 
@@ -383,9 +592,9 @@ describe("the planner's own half of the chat", () => {
    * separator carries — which moved out of `Chat.svelte` into `PlannerChat.svelte` when the
    * component was parameterised on its subject, and would otherwise be untested markup.
    */
-  const plannerBody = async (
+  const plannerApp = async (
     arrange: (fake: FakeServer) => void = () => {},
-  ): Promise<string> => {
+  ): Promise<{ app: App; fake: FakeServer }> => {
     const fake = new FakeServer();
     fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
     fake.onGoals = (_baseUrl, targetId) =>
@@ -398,8 +607,93 @@ describe("the planner's own half of the chat", () => {
     await settle();
     app.openGoal("goal_1");
     await settle();
+    return { app, fake };
+  };
+
+  const plannerBody = async (
+    arrange: (fake: FakeServer) => void = () => {},
+  ): Promise<string> => {
+    const { app } = await plannerApp(arrange);
     return render(PlannerChat, { props: { app } }).body;
   };
+
+  test("the context meter sits in the pane's head, naming the round's own model", async () => {
+    /*
+     * The whole of the slice's second half, end to end through the real component: a usage
+     * frame arrives on the target's feed, the app files it under the round it names, and
+     * this pane draws it beside its heading with the round's own harness and model — which
+     * come from the round's **row**, because a running round's in-flight record carries
+     * neither.
+     */
+    const { app, fake } = await plannerApp((server) => {
+      server.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({ rounds: [planRoundView({ targetId, goalId })] });
+    });
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send({
+      _tag: "usage",
+      callId: "msg_1",
+      promptTokens: 13_750,
+      outputTokens: 3,
+      contextLimit: 200_000,
+      compactionAt: 170_000,
+      attemptId: null,
+      roundId: "rnd_1",
+      goalId: null,
+      at: AT,
+    });
+    await settle();
+
+    const html = render(PlannerChat, { props: { app } }).body;
+    expect(html).toContain("13,753 / 200,000");
+    expect(html).toContain("Planner round context");
+    expect(html).toContain("openai/gpt-5.6-sol");
+    expect(html).toContain("ses_1");
+    /*
+     * The brief's "message counts", and the value says what it counts.
+     *
+     * It is the harness's **replayed** copy, which is the only count this application has:
+     * narration is not persisted, so nothing here knows how many messages a round really
+     * had. A bare number would read as the second thing — and on a round whose replay was
+     * never asked for it would read as zero messages rather than as no answer, which is
+     * what "not read" says instead.
+     */
+    expect(html).toContain("Messages");
+    expect(html).toContain("not read");
+  });
+
+  test("the panel counts the messages the harness actually answered with", async () => {
+    const { app, fake } = await plannerApp((server) => {
+      server.onGoalRounds = (_baseUrl, targetId, goalId) =>
+        ok({ rounds: [planRoundView({ targetId, goalId })] });
+      server.onGoalNarration = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalNarrationView({
+            targetId,
+            goalId,
+            rounds: [roundNarration({ roundId: "rnd_1" })],
+          }),
+        );
+    });
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send({
+      _tag: "usage",
+      callId: "msg_1",
+      promptTokens: 13_750,
+      outputTokens: 3,
+      contextLimit: 200_000,
+      compactionAt: 170_000,
+      attemptId: null,
+      roundId: "rnd_1",
+      goalId: null,
+      at: AT,
+    });
+    await settle();
+
+    const html = render(PlannerChat, { props: { app } }).body;
+    // `roundNarration`'s own two messages, and the value names whose count it is.
+    expect(html).toContain("2 held by the harness");
+  });
 
   test("a settled round's separator carries its status, its id and what it concluded", async () => {
     const html = await plannerBody((fake) => {
@@ -477,7 +771,7 @@ describe("the goal agent's own half of the chat", () => {
    */
   const goalBody = async (
     arrange: (fake: FakeServer) => void = () => {},
-  ): Promise<{ html: string; app: App }> => {
+  ): Promise<{ html: string; app: App; fake: FakeServer }> => {
     const fake = new FakeServer();
     fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
     fake.onGoals = (_baseUrl, targetId) =>
@@ -490,7 +784,7 @@ describe("the goal agent's own half of the chat", () => {
     await settle();
     app.openGoal("goal_1");
     await settle();
-    return { html: render(GoalAgentChat, { props: { app } }).body, app };
+    return { html: render(GoalAgentChat, { props: { app } }).body, app, fake };
   };
 
   test("an active goal gets a composer, which is the half the planner's chat has not", async () => {
@@ -585,6 +879,54 @@ describe("the goal agent's own half of the chat", () => {
     // cannot be pressed and does not say so is a question rather than an answer.
     expect(html).not.toContain("<textarea");
     expect(html).toContain("has ended, so its agent has no authority left");
+  });
+
+  test("the conversation's panel counts the messages the harness holds", async () => {
+    // The brief's "message counts" on this surface. The harness's replayed copy, labelled
+    // as such: not a word of this conversation is stored, so there is no other count — and
+    // this tab's own unreplayed turns are deliberately not added in, because a single
+    // number covering both would be counting two different things.
+    const { html, app, fake } = await goalBody((server) => {
+      server.onGoalConversation = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalConversationView({
+            targetId,
+            goalId,
+            harnessSessionId: "ses_live",
+            source: "harness",
+            ephemeral: true,
+            messages: [
+              { index: 0, type: "user", text: "look at the lockout path" },
+              { index: 1, type: "assistant", text: "steering the planner" },
+            ],
+            note: "From Claude Code, which may delete it.",
+          }),
+        );
+    });
+    expect(html).toContain("ses_live");
+
+    // The count rides the panel, so it needs a model call to open a panel at all.
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send({
+      _tag: "usage",
+      callId: "msg_g1",
+      promptTokens: 21_388,
+      outputTokens: null,
+      // Claude Code states neither, which is also what this asserts: the panel's
+      // threshold row says so rather than drawing a mark.
+      contextLimit: null,
+      compactionAt: null,
+      attemptId: null,
+      roundId: null,
+      goalId: "goal_1",
+      at: AT,
+    });
+    await settle();
+
+    const withMeter = render(GoalAgentChat, { props: { app } }).body;
+    expect(withMeter).toContain("2 held by the harness");
+    expect(withMeter).toContain("ses_live");
+    expect(withMeter).toContain("not stated by this harness");
   });
 
   test("the operator's own turn and the agent's are distinguishable without colour", async () => {
