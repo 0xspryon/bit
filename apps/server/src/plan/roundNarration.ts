@@ -50,6 +50,7 @@ import type { RoundNarration, RoundNarrationMessage } from "@bit/contracts";
 
 import { SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
 import type { HarnessResolver } from "../harness/resolver";
+import { isRoundPromptText } from "./roundPrompt";
 import type { StoredRound } from "../persistence/store";
 
 /**
@@ -212,15 +213,19 @@ export const roundNarration = Effect.fnUntraced(function* (input: {
    * thing on the screen and the one message that is never the planner speaking; the same
    * bytes are already on the page in the briefing panel.
    *
-   * **It is found by kind, not by position, because the order is the harness's and the two
-   * drivers disagree.** Claude Code replays it first; OpenCode's `message.list` answers in
-   * whatever order it answers in, and a round replayed from it read `idle`, `assistant`,
-   * `user(the prompt)` — the prompt **last**. A filter that looked at index 0 therefore
-   * worked on one driver and left the whole briefing in the chat on the other, which is the
-   * one this server defaults to. So the **first `user` entry wherever it sits** is dropped:
-   * for a round that is our prompt by construction, since the operator cannot prompt a
-   * round. Only one is dropped, so a steering directive injected later (slice 9, decision
-   * 12) still appears whichever side of the prompt the harness happens to return it.
+   * **It is found by its own first line, not by position and not by kind.** Claude Code
+   * replays it first; OpenCode's `message.list` answers in whatever order it answers in,
+   * and a round replayed from it read `idle`, `assistant`, `user(the prompt)` — the prompt
+   * **last**. So position is out, and the rule was "the first non-blank `user` entry
+   * wherever it sits", which was right for exactly as long as a round had one user message.
+   *
+   * It no longer does. A **steer** is a second non-blank `user` entry in the same session
+   * (DECISIONS.md §24.1), and on OpenCode's ordering it can sort *before* the prompt — in
+   * which case that rule dropped the directive and replayed the whole briefing into the
+   * chat, which is both halves of the failure at once. So the prompt is recognised by what
+   * it is: {@link isRoundPromptText}, the preamble's own first sentence plus this round's
+   * goal id. A steer carries `STEER_PROMPT_MARKER` instead and is kept, wherever it sits
+   * and however many there are.
    *
    * *The blanks.* The reduced shape has no text for a `tool_use` or `tool_result` block, so
    * each one became an entry with an empty `text` and no error — 15 of 21 rows on a real
@@ -229,12 +234,13 @@ export const roundNarration = Effect.fnUntraced(function* (input: {
    * text: a failure with no prose is still the round telling us something.
    */
   const promptAt = fetched.success.findIndex(
-    // A `user` entry with **text**. Claude Code's `tool_result` blocks are also `user`
-    // entries and the reduction leaves them empty, so matching on the type alone would
-    // claim the first tool result as the prompt — dropping one blank as "the prompt" and
-    // reporting the rest as blanks, which is two wrong figures from one wrong guess. Our
-    // prompt is never empty: it is an objective plus a whole briefing.
-    (entry) => entry.type === "user" && entry.text.trim() !== "",
+    // A `user` entry carrying **our prompt's own opening sentence**. The type is still
+    // checked, because an assistant turn quoting the preamble back is not the prompt; and
+    // Claude Code's `tool_result` blocks are `user` entries that the reduction leaves
+    // empty, which this cannot match either. Nothing here guesses: an entry that is not
+    // our prompt is kept, including every steer.
+    (entry) =>
+      entry.type === "user" && isRoundPromptText(entry.text, round.goalId),
   );
   const withoutPrompt =
     promptAt < 0

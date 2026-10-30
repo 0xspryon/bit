@@ -241,6 +241,7 @@ const fakeClient = (
       prompt: (sessionId, text) =>
         Effect.sync(() => {
           recorder.prompts.push(`${sessionId}:${text}`);
+          return { delivered: true };
         }),
       waitForIdle: (sessionId) => Deferred.await(scriptFor(sessionId).settle),
       sessionStatus: (sessionId) => {
@@ -336,6 +337,7 @@ const world = (
               urls: Effect.succeed({
                 mcp: "http://127.0.0.1:9/api/v1/mcp",
                 plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
+                goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                 policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
@@ -895,6 +897,7 @@ describe("starting a run", () => {
                 urls: Effect.succeed({
                   mcp: "http://127.0.0.1:9/api/v1/mcp",
                   plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
+                  goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                   policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
@@ -978,6 +981,7 @@ describe("starting a run", () => {
                 urls: Effect.succeed({
                   mcp: "http://127.0.0.1:9/api/v1/mcp",
                   plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
+                  goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                   policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
@@ -1462,6 +1466,7 @@ describe("when the harness stops being readable", () => {
                 urls: Effect.succeed({
                   mcp: "http://127.0.0.1:9/api/v1/mcp",
                   plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
+                  goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                   policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
@@ -2424,6 +2429,7 @@ describe("two configured instances", () => {
               urls: Effect.succeed({
                 mcp: "http://127.0.0.1:9/api/v1/mcp",
                 plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
+                goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                 policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
@@ -2853,6 +2859,7 @@ describe("the transcript at settlement", () => {
               urls: Effect.succeed({
                 mcp: "http://127.0.0.1:9/api/v1/mcp",
                 plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
+                goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                 policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
@@ -3564,6 +3571,7 @@ describe("running an existing intent", () => {
       pending.publish({
         mcp: "http://127.0.0.1:9/api/v1/mcp",
         plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
+        goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
         policy: "http://127.0.0.1:9/api/v1/policy/decide",
       }),
     );

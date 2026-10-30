@@ -796,3 +796,155 @@ describe("reading an opencode event", () => {
     expect(openCodeNarration(undefined, new Map()).type).toBe("unknown");
   });
 });
+
+/* ── Steering a live session ─────────────────────────────────────────────────── */
+
+describe("steering a live session", () => {
+  /**
+   * The inbox record a prompt answers with, shaped like the server's own.
+   *
+   * `SessionPromptOutput` is `SessionInbox.User`, so the generated client decodes the whole
+   * thing — an envelope of `{ data: { id } }` would be a `HarnessDecodeError` rather than a
+   * prompt. Copied from the schema's own `Enqueued` plus `UserItem` fields; §24.1 notes the
+   * server reports back on this record which delivery it resolved, which is how the spike
+   * knew an omitted `delivery` becomes `steer`.
+   */
+  const inbox =
+    (delivery: "steer" | "queue", id = "msg_1") =>
+    () =>
+      json({
+        data: {
+          id,
+          sessionID: "ses_1",
+          time: { created: 1_792_532_292_371 },
+          type: "user",
+          payload: { text: "a directive" },
+          delivery,
+        },
+      });
+
+  const prompting = <A>(
+    stub: Parameters<typeof clientWith>[0],
+    use: (harness: AgentHarness["Service"]) => Effect.Effect<A, unknown>,
+  ) => {
+    const { layer, recorded } = clientWith(stub);
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.map(
+          Effect.flatMap(AgentHarness, (harness) =>
+            use(harness).pipe(Effect.orDie),
+          ),
+          (value) => ({ value, recorded }),
+        ).pipe(Effect.provide(layer)),
+      ),
+    );
+  };
+
+  test("an opening prompt names no delivery and no id", async () => {
+    /*
+     * The field is left off rather than set to the server's default, for `parentID`'s
+     * reason: an absent optional *is* the server's own default, and §24.1 measured that it
+     * resolves an omitted `delivery` to `steer` — which is harmless for a first prompt
+     * because there is nothing in flight to cut off. Sending `queue` here would be pinning
+     * the opening prompt to today's answer for no gain.
+     */
+    const { recorded } = await prompting(inbox("steer"), (harness) =>
+      harness.prompt("ses_1", "the round's briefing"),
+    );
+
+    const body = recorded.bodies[0] ?? "";
+    expect(body).toContain("the round's briefing");
+    // **`null` on the wire, not an absent key**, which is the generated client's own
+    // encoding of an absent optional — the same thing `parentID` does and the same reason
+    // that call site spreads rather than passing `undefined`. What matters is that neither
+    // field carries a *value*: the server picks its own delivery and mints its own id.
+    expect(body).toContain('"delivery":null');
+    expect(body).toContain('"id":null');
+  });
+
+  test("a queued steer sends delivery queue and a msg_-prefixed id", async () => {
+    const { value, recorded } = await prompting(inbox("queue"), (harness) =>
+      harness.prompt("ses_1", "focus on the lockout path", {
+        _tag: "steer",
+        urgency: "queued",
+        messageId: "0123456789abcdef0123456789abcdef",
+      }),
+    );
+
+    expect(value.delivered).toBe(true);
+    const body = recorded.bodies[0] ?? "";
+    // `queue` lets the step in flight finish, which is the default everywhere in this
+    // application (ruling 5). §24.1 measured the difference: `steer` cost a round seven of
+    // eight file reads.
+    expect(body).toContain('"delivery":"queue"');
+    // The brand's only check is the prefix, so this is the whole of what the id must be.
+    expect(body).toContain('"id":"msg_0123456789abcdef0123456789abcdef"');
+  });
+
+  test("a preemptive steer sends delivery steer", async () => {
+    const { recorded } = await prompting(inbox("steer"), (harness) =>
+      harness.prompt("ses_1", "stop and look at this instead", {
+        _tag: "steer",
+        urgency: "preemptive",
+        messageId: "fedcba9876543210fedcba9876543210",
+      }),
+    );
+
+    expect(recorded.bodies[0] ?? "").toContain('"delivery":"steer"');
+  });
+
+  test("a retried steer makes no second request", async () => {
+    /*
+     * The dedupe is **ours**, not the server's, and this is where that is asserted.
+     *
+     * The id is passed — T3 Code derives one for this reason (§24.1) — but what OpenCode
+     * does with a repeat of it is not something this build has measured, and
+     * `AgentHarness.prompt` promises at-most-once delivery. So the promise is kept here,
+     * where it can be checked: the second call makes no request at all.
+     */
+    const { value, recorded } = await prompting(inbox("queue"), (harness) =>
+      Effect.gen(function* () {
+        const id = "11112222333344445555666677778888";
+        const first = yield* harness.prompt("ses_1", "a directive", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: id,
+        });
+        const retry = yield* harness.prompt("ses_1", "a directive", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: id,
+        });
+        return { first, retry };
+      }),
+    );
+
+    expect(value.first.delivered).toBe(true);
+    expect(value.retry.delivered).toBe(false);
+    expect(recorded.bodies).toHaveLength(1);
+  });
+
+  test("the same id into a different session is delivered, because the dedupe is per session", async () => {
+    // Two sessions could legitimately be steered under one derived id only if two callers
+    // shared an operation id and a caller scope, which `derivedMessageId` makes impossible
+    // — but keying the dedupe per session is what matches the promise the seam makes
+    // ("at most once per session") rather than a wider one it does not.
+    const { recorded } = await prompting(inbox("queue"), (harness) =>
+      Effect.gen(function* () {
+        const id = "aaaabbbbccccddddeeeeffff00001111";
+        yield* harness.prompt("ses_1", "a directive", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: id,
+        });
+        yield* harness.prompt("ses_2", "a directive", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: id,
+        });
+      }),
+    );
+
+    expect(recorded.bodies).toHaveLength(2);
+  });
+});

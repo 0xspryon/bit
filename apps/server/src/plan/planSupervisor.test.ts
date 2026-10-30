@@ -106,6 +106,17 @@ interface Script {
   readonly statusUnreachable?: boolean;
   /** When true, `prompt` fails, so the round is never watched. */
   readonly promptFails?: boolean;
+  /**
+   * When set, a **steer** into this session parks until it is resolved.
+   *
+   * The only way to drive the race DECISIONS.md §24.1 consequence 5 is about: a steer that
+   * is already inside the supervisor's permit while a settlement arrives. Without a way to
+   * hold the delivery open, the two can only be fired in sequence and the ordering claim is
+   * untestable.
+   */
+  readonly steerGate?: Deferred.Deferred<void> | undefined;
+  /** Resolved by the fake the moment a steer reaches it, before it parks on the gate. */
+  readonly steerEntered?: Deferred.Deferred<void> | undefined;
 }
 
 interface Recorder {
@@ -127,6 +138,19 @@ interface Recorder {
    * turn a test about *when* the prompt was sent into one about its wording.
    */
   readonly prompts: string[];
+  /**
+   * Every steer the supervisor delivered, with its urgency and derived message id.
+   *
+   * Separate from {@link prompts} because the two have different recovery rules at the
+   * seam — an opening prompt is never resubmitted and a steer may be retried under the
+   * same id — and a suite that could not tell them apart could not assert either.
+   */
+  readonly steers: {
+    sessionId: string;
+    text: string;
+    urgency: "queued" | "preemptive";
+    messageId: string;
+  }[];
   readonly unregistrations: { sessionId: string; name: string }[];
   readonly interrupts: string[];
   /** The `parentSessionId` each `createSession` was handed, so lineage is checkable. */
@@ -157,6 +181,7 @@ const emptyRecorder = (): Recorder => ({
   order: [],
   registrations: [],
   prompts: [],
+  steers: [],
   unregistrations: [],
   interrupts: [],
   parents: [],
@@ -273,17 +298,41 @@ const fakeClient = (
         Effect.sync(() => {
           recorder.unregistrations.push({ sessionId, name });
         }),
-      prompt: (sessionId, text) =>
+      prompt: (sessionId, text, delivery = { _tag: "open" as const }) =>
         scriptFor(sessionId).promptFails === true
           ? Effect.fail(transport("session.prompt", "the harness refused it"))
-          : Effect.sync(() => {
-              // The text is recorded separately from the order, because the prompt is now
-              // a rendered goal briefing wrapped in the round's framing — thousands of
-              // characters — and an order assertion carrying it would be unreadable and
-              // would be about the wording rather than the sequence.
-              recorder.order.push("prompt");
-              recorder.prompts.push(text);
-            }),
+          : delivery._tag === "steer"
+            ? Effect.gen(function* () {
+                const script = scriptFor(sessionId);
+                if (script.steerEntered !== undefined) {
+                  yield* Deferred.succeed(script.steerEntered, undefined);
+                }
+                // Parked inside the supervisor's permit, which is the whole point: a
+                // settlement arriving now has to wait behind this rather than race it.
+                if (script.steerGate !== undefined) {
+                  yield* Deferred.await(script.steerGate);
+                }
+                // In `order` as well as in `steers`, so a test can assert that the
+                // settlement's interrupt came *after* the delivery rather than merely that
+                // both happened.
+                recorder.order.push("steer");
+                recorder.steers.push({
+                  sessionId,
+                  text,
+                  urgency: delivery.urgency,
+                  messageId: delivery.messageId,
+                });
+                return { delivered: true };
+              })
+            : Effect.sync(() => {
+                // The text is recorded separately from the order, because the prompt is
+                // a rendered goal briefing wrapped in the round's framing — thousands of
+                // characters — and an order assertion carrying it would be unreadable and
+                // would be about the wording rather than the sequence.
+                recorder.order.push("prompt");
+                recorder.prompts.push(text);
+                return { delivered: true };
+              }),
       waitForIdle: (sessionId) => Deferred.await(scriptFor(sessionId).settle),
       sessionStatus: (sessionId) => {
         if (!created.has(sessionId)) {
@@ -304,6 +353,7 @@ const fakeClient = (
       interruptSession: (sessionId) =>
         Effect.andThen(
           Effect.sync(() => {
+            recorder.order.push("interrupt");
             recorder.interrupts.push(sessionId);
           }),
           Effect.succeed(true),
@@ -430,6 +480,7 @@ const world = (
             urls: Effect.succeed({
               mcp: "http://127.0.0.1:9/api/v1/mcp",
               plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
+              goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
               policy: "http://127.0.0.1:9/api/v1/policy/decide",
             }),
           }),
@@ -1678,5 +1729,232 @@ describe("stopping a round", () => {
 
     await runtime.dispose();
     expect(readAfterShutdown(root).rounds[0]?.status).toBe("uncertain");
+  });
+});
+
+/* ── Steering a live round ───────────────────────────────────────────────────── */
+
+describe("steering the round that is live on a goal", () => {
+  test("a steer reaches it, wrapped so the planner knows who is speaking", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, releaseAll } = scripts({
+      narration: [],
+      status: undefined,
+    });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    const outcome = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_steer");
+        const planner = yield* PlanSupervisor;
+        const round = yield* planner.start(input);
+        const steered = yield* planner.steer({
+          goalId: "goal_steer",
+          directive: "The operator says the admin console is out of scope.",
+          urgency: "queued",
+          messageId: "aaaa0000bbbb1111cccc2222dddd3333",
+        });
+        return { round, steered };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(outcome.steered._tag).toBe("steered");
+    if (outcome.steered._tag === "steered") {
+      expect(outcome.steered.roundId).toBe(outcome.round.roundId);
+      expect(outcome.steered.harnessSessionId).toBe(
+        outcome.round.harnessSessionId,
+      );
+      expect(outcome.steered.delivered).toBe(true);
+    }
+    expect(recorder.steers).toHaveLength(1);
+    // Queued by default and the urgency is carried through, not re-decided here.
+    expect(recorder.steers[0]?.urgency).toBe("queued");
+    // Wrapped, not bare: the planner has to be able to tell "the operator's agent is
+    // redirecting me" from "the operator is talking to me" — it is talking to neither.
+    expect(recorder.steers[0]?.text).toContain(
+      "A DIRECTIVE FROM THE GOAL AGENT",
+    );
+    expect(recorder.steers[0]?.text).toContain("admin console");
+    // And the session's rules are not restated: this is the same session, which is the
+    // whole reason steering beats opening a round.
+    expect(recorder.steers[0]?.text).not.toContain("THE RECORD FOLLOWS");
+
+    await runtime.runPromise(releaseAll());
+    await runtime.dispose();
+  });
+
+  test("a goal with nothing live answers noLiveRound and delivers nothing", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    const answer = await runtime.runPromise(
+      Effect.gen(function* () {
+        // A goal that exists and has never had a round: there is nothing to steer, and the
+        // caller takes decision 12's other branch.
+        yield* goal(root, workspace, "goal_quiet");
+        const planner = yield* PlanSupervisor;
+        return yield* planner.steer({
+          goalId: "goal_quiet",
+          directive: "Anything at all.",
+          urgency: "queued",
+          messageId: "11112222333344445555666677778888",
+        });
+      }).pipe(Effect.orDie),
+    );
+
+    expect(answer._tag).toBe("noLiveRound");
+    expect(recorder.steers).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a steer that lost the race against settlement starts no unsupervised work", async () => {
+    /*
+     * DECISIONS.md §24.1, consequence 5, and the reason this method exists at all.
+     *
+     * OpenCode never refuses a prompt — not for being busy and not for being finished — so
+     * prompting the session of a round that has just settled starts a **new execution**,
+     * with no supervisor watching it, no round record and no disposition. The supervisor
+     * therefore has to refuse to deliver rather than let the harness decide, and the
+     * assertion that matters is not the answer: it is that `prompt` was never called.
+     */
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [],
+      status: "succeeded",
+    });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    const answer = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_late");
+        const planner = yield* PlanSupervisor;
+        const round = yield* planner.start(input);
+        yield* release(round.harnessSessionId);
+        yield* awaitSettled(round.roundId);
+        return yield* planner.steer({
+          goalId: "goal_late",
+          directive: "Too late to matter.",
+          urgency: "queued",
+          messageId: "99998888777766665555444433332222",
+        });
+      }).pipe(Effect.orDie),
+    );
+
+    expect(answer._tag).toBe("noLiveRound");
+    expect(recorder.steers).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a settlement waits behind a steer that is already in flight", async () => {
+    /*
+     * The other half of the same race, and the half a sequence of calls cannot show.
+     *
+     * The window the claim is about is between the supervisor deciding the round is live
+     * and the prompt landing: if a settlement could run inside it, the directive would
+     * arrive at a session whose credential had just been revoked and whose round row had
+     * left `running` — which on OpenCode is new, unsupervised work. The one permit is what
+     * closes it, so a steer that is parked inside the harness holds the settlement off
+     * until it has been delivered.
+     *
+     * Read off `recorder.order`: `steer` before `interrupt` is the ordering, and the
+     * settlement's interrupt is the first thing `conclude` does after taking the permit.
+     */
+    const steerGate = Deferred.makeUnsafe<void>();
+    const steerEntered = Deferred.makeUnsafe<void>();
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({
+      narration: [],
+      status: undefined,
+      steerGate,
+      steerEntered,
+    });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_race");
+        const planner = yield* PlanSupervisor;
+        const round = yield* planner.start(input);
+
+        // In flight and parked inside the harness, holding the round's permit.
+        const steering = yield* Effect.forkChild(
+          planner.steer({
+            goalId: "goal_race",
+            directive: "Mid-settlement.",
+            urgency: "queued",
+            messageId: "0f0f0f0f1e1e1e1e2d2d2d2d3c3c3c3c",
+          }),
+        );
+        yield* Deferred.await(steerEntered);
+
+        // The stop arrives now. It must not interrupt the session until the steer is done.
+        const stopping = yield* Effect.forkChild(planner.stop(round.roundId));
+        yield* Effect.sleep("20 millis");
+        expect(recorder.interrupts).toEqual([]);
+
+        yield* Deferred.succeed(steerGate, undefined);
+        const steered = yield* Fiber.join(steering);
+        const stopped = yield* Fiber.join(stopping);
+        return { steered, stopped };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(recorder.steers).toHaveLength(1);
+    // The ordering, which is the claim: delivered, then the settlement's interrupt.
+    const steerAt = recorder.order.indexOf("steer");
+    const interruptAt = recorder.order.indexOf("interrupt");
+    expect(steerAt).toBeGreaterThanOrEqual(0);
+    expect(interruptAt).toBeGreaterThan(steerAt);
+
+    await runtime.dispose();
+  });
+
+  test("a directive with no round to steer is carried into the next round's prompt", async () => {
+    /*
+     * Decision 12's second clause, at this seam: the supervisor does not open the fallback
+     * round — the goal agent's tool does, through `RoundOpener` — but the directive has to
+     * reach the model, and the only place it can is the round's **opening prompt**. There is
+     * no directive storage anywhere (decision 12: the goal agent's own session is the
+     * memory), so if `PlanInput.directive` did not reach the prompt there would be nothing
+     * left of it at all.
+     */
+    const recorder = emptyRecorder();
+    const { scriptFor, releaseAll } = scripts({
+      narration: [],
+      status: undefined,
+    });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_carried");
+        const planner = yield* PlanSupervisor;
+        return yield* planner.start({
+          ...input,
+          directive: "Start with the lockout path; the operator asked for it.",
+        });
+      }).pipe(Effect.orDie),
+    );
+
+    const prompt = recorder.prompts[0] ?? "";
+    expect(prompt).toContain("A DIRECTIVE FROM THE GOAL AGENT");
+    expect(prompt).toContain("Start with the lockout path");
+    // Below the rules and above the briefing: a directive is not permission to ignore the
+    // budget, the anchoring rule or the disposition, all of which are stated before it.
+    expect(prompt.indexOf("THIS IS NOT OPTIONAL")).toBeLessThan(
+      prompt.indexOf("A DIRECTIVE FROM THE GOAL AGENT"),
+    );
+    expect(prompt.indexOf("A DIRECTIVE FROM THE GOAL AGENT")).toBeLessThan(
+      prompt.indexOf("THE RECORD FOLLOWS"),
+    );
+
+    await runtime.runPromise(releaseAll());
+    await runtime.dispose();
   });
 });

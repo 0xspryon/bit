@@ -68,6 +68,7 @@ import {
 import { ID as ProviderID } from "@opencode/schema/provider";
 import { AbsolutePath } from "@opencode/schema/schema";
 import { ID as SessionID, type Session } from "@opencode/schema/session";
+import type { SessionMessage } from "@opencode/schema/session-message";
 import {
   Effect,
   Layer,
@@ -88,12 +89,14 @@ import {
 import { installOpenCodeGate } from "../policy/install";
 import {
   AgentHarness,
+  OPEN_PROMPT,
   TerminalOutcome,
   truncateNarration,
   type HarnessNarration,
   type MessageEntry,
   type NarrationDetail,
 } from "./agentHarness";
+import { openCodeMessageId } from "./messageId";
 import { HarnessDecodeError, HarnessTransportError } from "./errors";
 import {
   defaultInstanceIdForDriver,
@@ -825,14 +828,77 @@ export const openCodeHarness = (
         return { id: session.id };
       });
 
+      /**
+       * The ids this process has already sent into each session, so a retry sends once.
+       *
+       * **The dedupe is ours and not OpenCode's**, which is the opposite of what the `id`
+       * on the wire suggests. The id is passed — T3 Code derives one for exactly this
+       * reason (DECISIONS.md §24.1) — and what the server does with a repeat of it is not
+       * something this build has measured. `AgentHarness.prompt` promises "the same message
+       * id is delivered at most once", so the promise is kept where it can be checked.
+       *
+       * Per session and unbounded for the life of the process, like the credential
+       * registry: a conversation's worth of derived ids, bounded by the work actually done.
+       */
+      const delivered = new Map<string, Set<string>>();
+
+      /**
+       * Gives a session its opening prompt, or a second message into a live one.
+       *
+       * ## What a steer does here, and the one thing this driver cannot tell us
+       *
+       * `delivery` is OpenCode's own field (`SessionPromptInput.delivery`, the literals
+       * `steer | queue`), and DECISIONS.md §24.1 measured both: the directive arrives as a
+       * second `session.inbox.enqueued` **inside the same `session.execution`**, promoted
+       * at a step boundary — after step 1 of 2 for `steer`, after step 9 of 10 for `queue`.
+       * One `session.wait` covers both turns, which is why `waitForIdle` needs no change on
+       * this driver.
+       *
+       * **What it cannot do is refuse a steer that arrived too late.** The same spike:
+       * OpenCode never refuses a prompt for being busy or for being finished — prompting an
+       * idle session starts a **new execution** — so a steer that lost the race against
+       * settlement would silently become unsupervised work. There is nothing to check here:
+       * this process holds no live-session state for an OpenCode session, and asking
+       * `session.get` first would be a read that is stale by the time the prompt lands. The
+       * claim that makes the window small is `plan/planSupervisor.ts`'s, taken before the
+       * prompt and released only by the round's own finalizer, and that is the only
+       * protection on this driver. It is stated here because this is where a reader would
+       * look for it.
+       */
       const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
         "openCodeHarness.prompt",
-      )(function* (sessionId, text) {
+      )(function* (sessionId, text, delivery = OPEN_PROMPT) {
+        if (delivery._tag === "steer") {
+          const sent = delivered.get(sessionId) ?? new Set<string>();
+          if (sent.has(delivery.messageId)) return { delivered: false };
+          sent.add(delivery.messageId);
+          delivered.set(sessionId, sent);
+        }
         yield* bounded(
           "session.prompt",
           timeouts.control,
-          api.session.prompt({ sessionID: sessionId as Session.ID, text }),
+          api.session.prompt({
+            sessionID: sessionId as Session.ID,
+            text,
+            // Spread rather than passed as `undefined` for `parentID`'s reason: an absent
+            // field is the server's own default, and the opening prompt deliberately takes
+            // it. §24.1 reports that the server resolved an omitted `delivery` to `steer`
+            // and said so on the inbox record it answered with — which is harmless for a
+            // first prompt, since there is nothing in flight to cut off.
+            ...(delivery._tag === "open"
+              ? {}
+              : {
+                  delivery:
+                    delivery.urgency === "preemptive" ? "steer" : "queue",
+                  // The derived id in OpenCode's own space: `msg_` plus the hex. The brand
+                  // checks only that prefix.
+                  id: openCodeMessageId(
+                    delivery.messageId,
+                  ) as SessionMessage.ID,
+                }),
+          }),
         );
+        return { delivered: true };
       });
 
       /**

@@ -100,6 +100,7 @@ import {
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
+import { GoalConversations } from "../plan/goalConversation";
 import { PlanSupervisor } from "../plan/planSupervisor";
 import {
   GOAL_NARRATION_ROUND_LIMIT,
@@ -325,6 +326,36 @@ export const describeTarget = Effect.fnUntraced(function* (
  * any path is built, the registry before the filesystem, and {@link describeTarget}'s own
  * answer before anything is opened.
  */
+/**
+ * The goal this target holds under that id, or {@link GoalNotFound}.
+ *
+ * Extracted for the two conversation routes, which both need exactly this check and nothing
+ * else from the store. Every other goal route reads something *with* the goal and does the
+ * ownership check inside that read; these two read nothing from the target's own database —
+ * the conversation lives in a harness and in this process's memory — so without this they
+ * would answer `200` for a goal id that belongs to another target.
+ *
+ * `orDie` for the store itself, like every other goal route here: a target the rail said
+ * was openable whose database then will not answer is not a condition a browser can act on.
+ */
+const ownedGoal = Effect.fnUntraced(function* (
+  stores: TargetStores["Service"],
+  targetId: string,
+  goalId: string,
+) {
+  const goal = yield* withTargetStore(stores, targetId, (store) =>
+    store.loadGoal(goalId),
+  ).pipe(Effect.orDie);
+  if (goal === undefined || goal.targetId !== targetId) {
+    return yield* new GoalNotFound({
+      targetId,
+      goalId,
+      detail: `no goal '${goalId}' is recorded in this target`,
+    });
+  }
+  return goal;
+});
+
 const openableTarget = Effect.fnUntraced(function* (
   fleet: FleetStore["Service"],
   targetId: string,
@@ -631,6 +662,11 @@ const fleetHandlers = HttpApiBuilder.group(
     // router's own memo map, and this is the second pair that depends on it.
     const narrations = yield* RunNarrations;
     const decisions = yield* PolicyDecisions;
+    // The goal conversations, for the reason `PlanSupervisor` is here: it holds every live
+    // goal session in this process, each with a credential that has no clock expiry, and a
+    // second instance built inside the router's memo map would be a second set of sessions
+    // whose grants the first one could not close.
+    const conversations = yield* GoalConversations;
 
     const summaries = Effect.fnUntraced(function* () {
       const rows = yield* fleet.targets();
@@ -1591,6 +1627,62 @@ const fleetHandlers = HttpApiBuilder.group(
           skipped: found.length - asked.length,
           at: yield* Clock.currentTimeMillis,
         };
+      }),
+
+      /**
+       * One goal's conversation, replayed from the harness.
+       *
+       * The goal is checked here so a stale deep link is a `404` rather than a `200` with
+       * an empty conversation, exactly as `goalNarration` does. After that this route
+       * **cannot fail**: every way of having no prose is one of
+       * {@link GoalConversationSource}'s five answers with a sentence, and for a
+       * conversation last opened weeks ago "the harness has deleted it" is the expected
+       * answer rather than a fault.
+       *
+       * Two things it says that no other route can. `live` is whether *this process* holds
+       * the session, which is false after a restart even when the words come back — so the
+       * view can say the conversation is readable and not continuable. And `source:
+       * "absent"` is a goal nobody has talked to, which is a different fact from a
+       * conversation whose words are gone.
+       */
+      goalConversation: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        yield* ownedGoal(stores, row.targetId, params.goalId);
+        return yield* conversations.replay({
+          targetId: row.targetId,
+          goalId: params.goalId,
+        });
+      }),
+
+      /**
+       * Says something to one goal's agent.
+       *
+       * `202` and no waiting: the turn is the model's to take, and what the agent says
+       * arrives on the `live` stream carrying {@link LiveItem.goalId}. The same shape as
+       * `plan` and `startRun` — this route makes something durable happen and answers
+       * before the work it started is done.
+       *
+       * **The first message is the one that does the work**, and all of it is
+       * {@link GoalConversations}: the goal's own directory under
+       * `targets/<id>/goal/<goalId>/`, the policy gate installed into it, a session on the
+       * default harness, a credential with **no clock expiry** (the spec's decision 4), the
+       * goal MCP endpoint registered under that credential, and the operator's words below
+       * a preamble. A later message is a second prompt into the same session, queued behind
+       * whatever it is doing rather than cutting it off.
+       *
+       * Nothing in the request chooses any of that. The payload is the operator's text —
+       * see {@link GoalMessageDraft} on why no model, harness, session or directory is
+       * nameable here — and a goal this target does not hold is a `404` before a session is
+       * opened for it.
+       */
+      sendGoalMessage: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        yield* ownedGoal(stores, row.targetId, params.goalId);
+        return yield* conversations.send({
+          targetId: row.targetId,
+          goalId: params.goalId,
+          text: payload.text,
+        });
       }),
 
       /**

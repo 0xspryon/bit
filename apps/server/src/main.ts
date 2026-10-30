@@ -128,8 +128,11 @@ import {
   type HarnessCandidate,
 } from "./harness/resolver";
 import { McpCredentials } from "./mcp/credentials";
+import { GoalPlanning } from "./mcp/goalTools";
 import { PlannerHarnesses, plannerHarnessesOf } from "./mcp/plannerTools";
+import { GoalConversations } from "./plan/goalConversation";
 import { DEFAULT_ROUND_BUDGET, PlanSupervisor } from "./plan/planSupervisor";
+import { RoundOpener } from "./plan/roundOpener";
 import { McpCallCounter } from "./mcp/server";
 import { FleetStore } from "./persistence/fleet";
 import { ObservationStore } from "./persistence/store";
@@ -560,6 +563,10 @@ const withoutHarness = Layer.mergeAll(
   // The same arrangement one supervisor along: a process with no harness still sweeps
   // rounds left behind by one that had, and refuses every new round by name.
   PlanSupervisor.unavailable,
+  // And one along again: a goal conversation needs a harness to be *had*, and a goal's
+  // previous conversation can still be reported as absent or as forgotten without one,
+  // which is why this variant reads the store rather than refusing both operations.
+  GoalConversations.unavailable.pipe(Layer.provide(targetStores)),
   HarnessSessionStatus.fromAnswers({}),
   // An empty resolver rather than no resolver, so the shape of this graph does not depend
   // on whether a harness was configured: the browser's picker asks the same service either
@@ -626,6 +633,16 @@ const agent =
         // requirement `RunSupervisor` does not have, because a round runs in a directory
         // this installation lays out rather than in the operator's own folder.
         PlanSupervisor.layerWith({ budget: PLANNER_ROUND_BUDGET }),
+        // The goal conversations, in this graph rather than inside the listener's, for the
+        // reason the plan supervisor is here: it holds every live goal session and each
+        // one's credential, and a second instance built in the router's own memo map would
+        // mint credentials into a registry the MCP middleware does not read — the `401`
+        // failure recorded on `endpoint` below, which was observed once already for
+        // workers.
+        GoalConversations.layer,
+        // Opens a round from a target and a goal, which is all the goal agent's tool has.
+        // `provideMerge` below puts it in this graph's context so it can be handed across
+        // the listener's memo-map boundary as a value.
         HarnessSessionStatus.layer,
       ).pipe(
         // One resolver for the process, provided to all three: a second would be a second
@@ -697,6 +714,13 @@ const endpoint = Layer.unwrap(
       // token and be answered `401` — the failure the comment above this block describes,
       // which was observed once already for workers.
       | PlanSupervisor
+      // The goal conversations, for `PlanSupervisor`'s reason exactly: the browser's
+      // composer has to talk to the *same* service whose goal credentials the MCP endpoint
+      // accepts, and whose sessions this process's shutdown closes.
+      | GoalConversations
+      // The round opener, so the goal agent's `wake_planner` and the browser's "Plan next"
+      // assemble one answer to where planning happens and where its gate writes.
+      | RoundOpener
       | HarnessResolver
       // The narration bus, for the same reason as the four above and with the same
       // consequence if it were rebuilt instead: the supervisor would publish into one
@@ -716,6 +740,27 @@ const endpoint = Layer.unwrap(
         // OpenCode means a second `opencode serve` child process.
         harnesses: PlannerHarnesses.listing(
           plannerHarnessesOf(Context.get(shared, HarnessResolver).instances),
+        ),
+        /**
+         * The two planning operations the goal agent's tools reach, as built functions.
+         *
+         * Read out of *this* graph's context and handed over as a value, for the reason
+         * `harnesses` is one and with a worse failure if it were not: `GoalPlanning`
+         * required inside the router's memo map would be satisfied by a **second**
+         * `PlanSupervisor`, with its own fiber map and its own goal claims — so a round the
+         * goal agent woke would be invisible to the browser's own round list and to the
+         * startup sweep's view of what this process is driving.
+         *
+         * `RoundOpener` is built here too and for the same reason: it closes over this
+         * graph's `FleetStore` and `PlanSupervisor`, so the directory layout the goal agent
+         * gets is the one the browser's "Plan next" uses.
+         */
+        planning: Layer.succeed(
+          GoalPlanning,
+          GoalPlanning.of({
+            steer: Context.get(shared, PlanSupervisor).steer,
+            openRound: Context.get(shared, RoundOpener).open,
+          }),
         ),
         extraRoutes: browserApiRoutes({
           workspaceRoot: WORKSPACE_ROOT,
@@ -883,6 +928,7 @@ const program = Effect.gen(function* () {
   yield* workerEndpoints.publish({
     mcp: control.mcpUrl,
     plannerMcp: control.plannerMcpUrl,
+    goalMcp: control.goalMcpUrl,
     policy: control.policyUrl,
   });
   yield* reconcile;
@@ -972,7 +1018,21 @@ await Effect.runPromise(
             // instances the browser and the MCP route use.
             Layer.provideMerge(
               endpoint,
-              Layer.mergeAll(agent, targetStores, fleet),
+              /**
+               * The round opener on top of the graph it needs, which is why it is the
+               * outer layer here rather than a sibling of the merge.
+               *
+               * It requires two of the services that merge produces — `PlanSupervisor` and
+               * `FleetStore` — and siblings of a `mergeAll` do not satisfy each other.
+               * `provideMerge` keeps both halves in the result, which is what `endpoint`
+               * needs: it reads the opener *and* the supervisor out of this context and
+               * hands both across the listener's own memo-map boundary as values.
+               */
+              RoundOpener.layer({
+                briefingMaxChars: GOAL_BRIEFING_MAX_CHARS,
+              }).pipe(
+                Layer.provideMerge(Layer.mergeAll(agent, targetStores, fleet)),
+              ),
             ),
           ),
         ),

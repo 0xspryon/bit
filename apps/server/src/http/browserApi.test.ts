@@ -77,6 +77,7 @@ import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
 import type { NarrationDetail } from "../harness/agentHarness";
 import { LIVE_HEARTBEAT } from "../run/liveTranscript";
 import { RunNarrations } from "../run/narration";
+import { GoalConversations } from "../plan/goalConversation";
 import { PlanSupervisor } from "../plan/planSupervisor";
 import { RunSupervisor, type RunInput } from "../run/supervisor";
 import { PolicyDecisions, type PolicyConfig } from "../policy/service";
@@ -218,6 +219,15 @@ const endpoint = Layer.unwrap(
         // what a server without one really answers, and what the goal screen's control
         // has to render. A real plan supervisor would need an agent to drive.
         Layer.provide(PlanSupervisor.unavailable),
+        // And no conversation either, for the same reason: `GoalConversations.unavailable`
+        // refuses every message `no_harness` — which is what a server without a harness
+        // really answers — and still replays, so a goal nobody has talked to reads as
+        // `absent` rather than as a conversation something forgot.
+        Layer.provide(
+          GoalConversations.unavailable.pipe(
+            Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
+          ),
+        ),
         /**
          * Two configured instances, one of which would not start.
          *
@@ -3130,6 +3140,11 @@ describe("a live connection that has nothing to say", () => {
             // what a server without one really answers, and what the goal screen's control
             // has to render. A real plan supervisor would need an agent to drive.
             Layer.provide(PlanSupervisor.unavailable),
+            Layer.provide(
+              GoalConversations.unavailable.pipe(
+                Layer.provide(TargetStores.layer.pipe(Layer.provide(ownFleet))),
+              ),
+            ),
             Layer.provide(HarnessResolver.empty),
             Layer.provide(Layer.succeedContext(shared)),
             Layer.orDie,

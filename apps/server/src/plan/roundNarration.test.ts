@@ -23,8 +23,31 @@ import type { MessageEntry } from "../harness/agentHarness";
 import type { StoredRound } from "../persistence/store";
 
 import { roundNarration } from "./roundNarration";
+import {
+  assembleRoundPrompt,
+  assembleSteerPrompt,
+  ROUND_PROMPT_MARKER,
+} from "./roundPrompt";
 
 const AT = 1_700_000_000_000;
+
+/**
+ * The text a real round's prompt has, built from the module the filter is written against.
+ *
+ * **Not a hand-typed excerpt, and that is the lesson `mcpToolName.ts` already records**: the
+ * replay recognises the prompt by its own opening sentence, so a fixture that typed an
+ * approximation of that sentence would be asserting the implementation against a string the
+ * system never produces. Built here, it cannot drift from `assembleRoundPrompt`, and if the
+ * preamble's first line ever changes these tests fail rather than silently testing nothing.
+ */
+const PROMPT = assembleRoundPrompt({
+  goalId: "goal_1",
+  budget: 5,
+  briefing: "THE WHOLE GOAL BRIEFING",
+}).prompt;
+
+/** A steer, in the form `PlanSupervisor.steer` really delivers one. */
+const STEER = assembleSteerPrompt("focus on the lockout path");
 
 const round = (over: Partial<StoredRound> = {}): StoredRound => ({
   roundId: "rnd_1",
@@ -156,11 +179,7 @@ describe("what is left out of a replay, and said", () => {
         // Our prompt: the goal's objective plus the whole briefing, and the one message
         // that is never the planner speaking. The briefing panel on the same page is the
         // same text.
-        {
-          type: "user",
-          text: "You are a planner round in bit…",
-          error: undefined,
-        },
+        { type: "user", text: PROMPT, error: undefined },
         {
           type: "assistant",
           text: "two dimensions are untested",
@@ -197,11 +216,7 @@ describe("what is left out of a replay, and said", () => {
           text: "The usage limit has been reached",
           error: undefined,
         },
-        {
-          type: "user",
-          text: "You are a planner round in bit, a security-testing tool…",
-          error: undefined,
-        },
+        { type: "user", text: PROMPT, error: undefined },
       ]),
     );
 
@@ -249,36 +264,79 @@ describe("what is left out of a replay, and said", () => {
     expect(answer.messages).toHaveLength(1);
   });
 
-  test("only one user entry is dropped, so a later steer would still appear", async () => {
-    // Steering injects into a live planner session (decision 12) and is slice 9's. A rule
-    // that dropped every user entry would silently hide a directive when that arrives, and
-    // the harness may return it on either side of the prompt — so the assertion is run
-    // both ways round rather than in the one order Claude Code happens to use.
+  test("the prompt is dropped and a steer is kept, in either order", async () => {
+    /*
+     * The regression that made the rule content-based rather than positional.
+     *
+     * Steering injects a second `user` entry into the same session (DECISIONS.md §24.1),
+     * and on OpenCode's ordering it can sort **before** the prompt. The old rule — "the
+     * first non-blank `user` entry, wherever it sits" — then dropped the *directive* and
+     * replayed the entire goal briefing as conversation: both halves wrong from one guess.
+     * So the assertion runs both ways round, and checks which of the two survived rather
+     * than only how many did.
+     */
     for (const order of [
-      ["prompt", "steer"],
-      ["steer", "prompt"],
+      [PROMPT, STEER],
+      [STEER, PROMPT],
     ] as const) {
       const answer = await read({}, () =>
         Effect.succeed([
           { type: "assistant", text: "thinking", error: undefined },
-          ...order.map((which) => ({
-            type: "user",
-            text:
-              which === "prompt"
-                ? "You are a planner round in bit…"
-                : "focus on the lockout path",
-            error: undefined,
-          })),
+          ...order.map((text) => ({ type: "user", text, error: undefined })),
         ]),
       );
 
       expect(answer.promptOmitted).toBe(true);
-      // One user entry survives either way: exactly one is dropped, never both.
       expect(answer.messages).toHaveLength(2);
-      expect(
-        answer.messages.filter((message) => message.type === "user"),
-      ).toHaveLength(1);
+      const user = answer.messages.filter((message) => message.type === "user");
+      expect(user).toHaveLength(1);
+      // The steer, by its own text. "One survived" was true of the broken rule too.
+      expect(user[0]?.text).toBe(STEER);
+      expect(user[0]?.text).not.toContain(ROUND_PROMPT_MARKER);
     }
+  });
+
+  test("two steers and no prompt drop nothing and say no prompt was omitted", async () => {
+    // More than one steer into one round is not tested against a driver (DECISIONS.md
+    // §24.1's "not tested" list) and is perfectly possible — the goal agent may send two.
+    // Neither is our prompt, so neither is dropped, and the note must not claim a prompt
+    // was left out of a replay that never held one.
+    const answer = await read({}, () =>
+      Effect.succeed([
+        { type: "user", text: STEER, error: undefined },
+        { type: "assistant", text: "adjusting", error: undefined },
+        {
+          type: "user",
+          text: assembleSteerPrompt("and ignore the admin console"),
+          error: undefined,
+        },
+      ]),
+    );
+
+    expect(answer.promptOmitted).toBe(false);
+    expect(answer.messages).toHaveLength(3);
+    expect(answer.note).not.toContain("not replayed here");
+  });
+
+  test("a user entry from another goal's prompt is not mistaken for this round's", async () => {
+    // The discriminator is the marker **and** this round's goal id, so a session lineage
+    // reused across goals cannot have one goal's prompt dropped out of another's replay.
+    const answer = await read({}, () =>
+      Effect.succeed([
+        {
+          type: "user",
+          text: assembleRoundPrompt({
+            goalId: "goal_other",
+            budget: 5,
+            briefing: "A DIFFERENT GOAL",
+          }).prompt,
+          error: undefined,
+        },
+      ]),
+    );
+
+    expect(answer.promptOmitted).toBe(false);
+    expect(answer.messages).toHaveLength(1);
   });
 
   test("a round that made calls and said nothing is still `harness`, not `none`", async () => {
@@ -287,11 +345,7 @@ describe("what is left out of a replay, and said", () => {
     // exist to keep apart.
     const answer = await read({}, () =>
       Effect.succeed([
-        {
-          type: "user",
-          text: "You are a planner round in bit…",
-          error: undefined,
-        },
+        { type: "user", text: PROMPT, error: undefined },
         { type: "assistant", text: "", error: undefined },
         { type: "user", text: "", error: undefined },
       ]),
@@ -312,7 +366,7 @@ describe("what is left out of a replay, and said", () => {
       {},
       () =>
         Effect.succeed([
-          { type: "user", text: "the prompt", error: undefined },
+          { type: "user", text: PROMPT, error: undefined },
           { type: "assistant", text: "", error: undefined },
           { type: "assistant", text: "one", error: undefined },
           { type: "assistant", text: "", error: undefined },

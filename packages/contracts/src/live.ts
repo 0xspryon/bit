@@ -188,6 +188,21 @@ export const LIVE_ITEM_KINDS = [
    */
   "plan.round.started",
   "plan.round.settled",
+  /**
+   * A live round having been steered by the goal agent.
+   *
+   * Here for the reason the two around it are here and one more: a steer is `opaque` on
+   * both drivers' narration (DECISIONS.md §24.1), so this record is the **only** place it
+   * is ever visible, live or replayed. It carries no directive text — see `event.ts` — so
+   * the item's `body` says that a steer landed and what urgency it was delivered at, and
+   * nothing about what was said.
+   *
+   * It appears in two chats, which is correct rather than a duplication: under the round
+   * in the planner view ({@link LiveItem.roundId}, the event's subject) and in the goal
+   * conversation ({@link LiveItem.goalId}, from the goal agent's own caller scope), where
+   * it is the record half of the `steer_planner` tool call the agent made.
+   */
+  "plan.round.steered",
   "record.other",
   /* Live activity. */
   "turn.reply",
@@ -288,6 +303,25 @@ export const LiveItem = Schema.Struct({
    * not a filter.
    */
   roundId: Schema.NullOr(Schema.String),
+  /**
+   * The goal this item belongs to, when it is part of a goal's **conversation**.
+   *
+   * {@link roundId}'s sibling and the goal conversation's grouping key. It is deliberately
+   * **not** "the goal this item is about": an `intent.added` written by a planner round is
+   * about a goal and is not part of the conversation, and putting it in both chats would
+   * show one write twice on one page.
+   *
+   * It is set exactly two ways, both the server's:
+   *
+   * - **The goal agent's own narration** — published under the goal whose session the
+   *   conversation service opened, exactly as an attempt's is published under its attempt.
+   * - **A record the goal agent wrote** — read from the event's caller scope, which slice
+   *   4 namespaced as `<targetId>/goal/<goalId>`. Today that is `goal.ended` from
+   *   `end_goal` and `plan.round.steered` from `steer_planner`.
+   *
+   * `null` for everything else, including every record a round or a worker wrote.
+   */
+  goalId: Schema.NullOr(Schema.String),
   /** A short label: the tool's name, `Denied`, `Observation recorded`. */
   headline: Schema.String,
   /** A sentence for the operator. The gate's reason, the store's claim, the reply's text. */

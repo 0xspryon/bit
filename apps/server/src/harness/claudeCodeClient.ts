@@ -120,6 +120,7 @@ import {
 } from "../policy/claudeCodeGate";
 import {
   AgentHarness,
+  OPEN_PROMPT,
   SESSION_NOT_FOUND_TAG,
   truncateNarration,
   type HarnessFailure,
@@ -127,9 +128,11 @@ import {
   type McpRegistration,
   type MessageEntry,
   type NarrationDetail,
+  type PromptDelivery,
   type TerminalOutcome,
 } from "./agentHarness";
 import { HarnessProcessError, HarnessTransportError } from "./errors";
+import { claudeCodeMessageId } from "./messageId";
 import {
   CLAUDE_CODE_DRIVER,
   defaultInstanceIdForDriver,
@@ -336,12 +339,63 @@ interface SessionRecord {
    * case and simply finishes earlier here.
    */
   readonly narration: Queue.Queue<HarnessNarration, Cause.Done>;
-  /** Completed by the pump when the session stops running, however it stopped. */
-  readonly idle: Deferred.Deferred<void, HarnessFailure>;
+  /**
+   * Whether this session survives going idle and may be prompted again.
+   *
+   * From `createSession`'s `multiTurn`. A worker attempt and a planner round are `false`:
+   * one prompt, one turn, and the pump closes the query when that turn's `result` arrives.
+   * A goal conversation is `true` and the query is held open across turns, because the
+   * operator may say something else at any time and a closed query cannot be prompted.
+   */
+  readonly multiTurn: boolean;
+  /**
+   * Completed by the pump when every accepted message has produced its `result`.
+   *
+   * **Replaced, not reused, when an idle session accepts another message.** A `Deferred`
+   * completes once, and a conversation's second turn needs a fresh one — otherwise
+   * `waitForIdle` on turn two would return instantly with turn one's answer. Mutable for
+   * that reason and no other; `waitForIdle` reads it at the moment it is called.
+   */
+  idle: Deferred.Deferred<void, HarnessFailure>;
+  /**
+   * How many messages this session has accepted, and how many have completed.
+   *
+   * The pair is what makes `waitForIdle` mean "idle after the last accepted message"
+   * (DECISIONS.md §24.1, consequence 4). The SDK emits one `result` per turn and a steered
+   * session has two turns, so a pump that stopped at the first `result` would end the
+   * session while the directive's own turn was still queued. Counted here rather than
+   * inferred from the stream, because the only thing that knows a second message was
+   * accepted is the call that accepted it.
+   */
+  accepted: number;
+  completed: number;
+  /**
+   * The pump has decided this session is over and is on its way out.
+   *
+   * Set **synchronously**, in the same microtask as the check that decided it, and read
+   * synchronously by `prompt` before it accepts a steer. That is what closes the one
+   * window the supervisor's own claim cannot: between the pump reading
+   * `completed >= accepted` and `closeSession` running there is an Effect boundary, and a
+   * steer that landed in it would be queued into a session that is about to close and
+   * reported as delivered.
+   *
+   * **Both sides have to be yield-free for that to be true**, which is a requirement on
+   * `prompt` rather than on this field: a review found a `yield* Deferred.isDone(...)`
+   * between the read and the `accepted += 1`, which is a fiber suspension point and left
+   * the window open. `prompt` now uses `Deferred.isDoneUnsafe` and carries the reasoning at
+   * the line. Nothing but those two places touches this.
+   */
+  settling: boolean;
+  /** The application message ids this session has accepted, so a retry delivers once. */
+  readonly deliveredIds: Set<string>;
   /** The live query, once {@link prompt} has launched one. */
   query: HarnessQuery | undefined;
   /** Releases the held-back prompt once the MCP registration is in place. */
   release: (() => void) | undefined;
+  /** Pushes one more message into the live input iterable. Set by `launch`. */
+  offer: ((message: SDKUserMessage) => void) | undefined;
+  /** Wakes the input iterable when it is parked on an empty queue. Set by `launch`. */
+  wake: (() => void) | undefined;
   /** The harness's own terminal answer, as the pump read it off a `result` message. */
   outcome: TerminalOutcome | undefined;
   /** Estimated cost in USD, from the last `result`. Reported, never acted on. */
@@ -610,6 +664,40 @@ const flatten = (entry: SessionMessage): MessageEntry => {
   };
 };
 
+/**
+ * One message for the SDK's input iterable, with the two fields a steer needs.
+ *
+ * `uuid` and `priority` are **cast on**, exactly as DECISIONS.md §24.1's probe does: the
+ * SDK's published `SDKUserMessage` type does not declare either, and both were measured
+ * working against `@anthropic-ai/claude-agent-sdk@0.3.310` — `priority: "now"` cut the
+ * running turn off at 1 of 60 lines, `priority: "later"` let it finish all 60, and the
+ * directive's own `uuid` appeared on the second `result`'s `user_message_uuids` and only
+ * there. A cast is the honest form of "the driver takes this and its types do not say so";
+ * inventing a declaration for somebody else's interface would read as though it did.
+ *
+ * `undefined` delivery is the session's opening prompt: no uuid and no priority, which is
+ * what every worker and round session has always sent.
+ */
+const userMessage = (
+  record: SessionRecord,
+  text: string,
+  delivery: Extract<PromptDelivery, { _tag: "steer" }> | undefined,
+): SDKUserMessage =>
+  ({
+    type: "user",
+    message: { role: "user", content: text },
+    parent_tool_use_id: null,
+    session_id: record.sessionId,
+    ...(delivery === undefined
+      ? {}
+      : {
+          uuid: claudeCodeMessageId(delivery.messageId),
+          // `later` lets the work in flight finish; `now` cuts it off. The mapping is in
+          // one place so a caller never names a driver's word.
+          priority: delivery.urgency === "preemptive" ? "now" : "later",
+        }),
+  }) as SDKUserMessage;
+
 export const claudeCodeHarness = (
   options: ClaudeCodeHarnessOptions = {},
 ): Layer.Layer<AgentHarness, HarnessProcessError> =>
@@ -707,6 +795,11 @@ export const claudeCodeHarness = (
           if (record.closed) return;
           record.closed = true;
           record.release?.();
+          // Wakes the input iterable, which may be parked on an empty queue: it checks
+          // `closed` when it wakes and returns, which ends the generator. Without this the
+          // generator stays parked on a promise nothing will resolve, which leaks nothing
+          // the process cares about and makes a shutdown wait for a timeout.
+          record.wake?.();
           try {
             record.query?.close();
           } catch {
@@ -766,13 +859,48 @@ export const claudeCodeHarness = (
                       string,
                       unknown
                     >;
+                    record.completed += 1;
                   }
                   for (const entry of narrate(message, outcome)) {
                     Queue.offerUnsafe(record.narration, entry);
                   }
-                  // One prompt, one turn: the first result is the end of the run. Reading
-                  // on would mean waiting for input that will never be sent.
-                  if (message.type === "result") break;
+                  if (message.type !== "result") continue;
+                  /*
+                   * One `result` per turn, and a steered session has two of them.
+                   *
+                   * DECISIONS.md §24.1 measured this directly: the SDK answers a second
+                   * accepted message with its own `result`, `num_turns: 1` and its own
+                   * `user_message_uuids` — nothing folds. This loop used to `break` here
+                   * unconditionally ("one prompt, one turn"), and under a steer that first
+                   * `result` belongs to the turn the steer took over from: breaking ended
+                   * narration, completed `idle` and closed the query while the directive's
+                   * own turn was still to run, so the supervisor would settle a round that
+                   * was about to produce its real answer.
+                   *
+                   * So the session is only finished when every message it has accepted has
+                   * been answered.
+                   */
+                  if (record.completed < record.accepted) continue;
+                  if (record.multiTurn) {
+                    /*
+                     * A conversation: the turn is over and the session is not.
+                     *
+                     * `doneUnsafe` rather than yielding `Deferred.succeed`, because this is
+                     * inside a plain `async` callback and there is nowhere to yield — and
+                     * because the alternative, breaking out to complete it in Effect and
+                     * re-entering the loop, would **close the query**: leaving a
+                     * `for await` calls the iterator's own `return()`, which finishes the
+                     * SDK's generator. That is right for a round and would make the
+                     * operator's second message unanswerable.
+                     */
+                    Deferred.doneUnsafe(record.idle, Effect.void);
+                    continue;
+                  }
+                  // One prompt, one turn: closing the generator here is the intent, and
+                  // `settling` is set in the same microtask so a steer cannot be accepted
+                  // into the gap before `closeSession` runs.
+                  record.settling = true;
+                  break;
                 }
               },
               catch: (cause) =>
@@ -782,6 +910,9 @@ export const claudeCodeHarness = (
                 ),
             }),
           );
+          // A stream that died takes the session with it, conversation or not: there is no
+          // query left to prompt, and `idle` must not be left uncompleted.
+          if (drained._tag === "Failure") record.settling = true;
           yield* drained._tag === "Failure"
             ? Deferred.fail(record.idle, drained.failure)
             : Deferred.succeed(record.idle, undefined);
@@ -809,23 +940,43 @@ export const claudeCodeHarness = (
           const released = Promise.withResolvers<void>();
           record.release = released.resolve;
 
+          /**
+           * Messages waiting to be handed to the SDK, oldest first.
+           *
+           * **A queue rather than one message and a parked promise**, which is what this
+           * was. The old shape could yield exactly once, so a second accepted message had
+           * nowhere to go; `AgentHarness.prompt`'s `steer` and a multi-turn conversation
+           * both need "yield again, whenever", and DECISIONS.md §24.1's probe drives the
+           * SDK with this same arrangement.
+           */
+          const pending: SDKUserMessage[] = [];
+          record.offer = (message) => {
+            pending.push(message);
+            const waiting = record.wake;
+            record.wake = undefined;
+            waiting?.();
+          };
+          // The opening prompt is message one. Counted here rather than in `prompt`, so
+          // that `accepted` is true from the moment anything can be read from it.
+          record.accepted = 1;
+          record.offer(userMessage(record, text, undefined));
+
           const input = async function* (): AsyncGenerator<SDKUserMessage> {
             await released.promise;
-            if (record.closed) return;
-            yield {
-              type: "user",
-              message: { role: "user", content: text },
-              parent_tool_use_id: null,
-              session_id: record.sessionId,
-            } as SDKUserMessage;
-            // Held open deliberately; see this function's header.
-            await new Promise<void>((resolve) => {
-              const previous = record.release;
-              record.release = () => {
-                previous?.();
-                resolve();
-              };
-            });
+            for (;;) {
+              if (record.closed) return;
+              const next = pending.shift();
+              if (next !== undefined) {
+                yield next;
+                continue;
+              }
+              // Held open deliberately; see this function's header. `record.wake` is what
+              // `offer` and `closeSession` use to get this loop moving again, so the
+              // generator parks here between turns rather than ending.
+              await new Promise<void>((resolve) => {
+                record.wake = resolve;
+              });
+            }
           };
 
           const started = yield* Effect.try({
@@ -927,9 +1078,16 @@ export const claudeCodeHarness = (
           directory: input.directory,
           mcpServers: {},
           narration,
+          multiTurn: input.multiTurn === true,
           idle,
+          accepted: 0,
+          completed: 0,
+          settling: false,
+          deliveredIds: new Set<string>(),
           query: undefined,
           release: undefined,
+          offer: undefined,
+          wake: undefined,
           outcome: undefined,
           cost: undefined,
           tokens: undefined,
@@ -1029,19 +1187,106 @@ export const claudeCodeHarness = (
           },
         );
 
+      /**
+       * The session's first prompt, or another message into one that is already running.
+       *
+       * ## The `open` half is unchanged, and its refusal is still bit's own rule
+       *
+       * A second `open` on a prompted session is refused with the sentence
+       * DECISIONS.md §24.1 quotes verbatim: carrying work on means a new attempt identity.
+       * That has nothing to do with the driver — there is no second call to make on the SDK
+       * — and a steer is exactly the case that is *not* carrying work on under a new
+       * identity, which is why it is a different tag rather than a flag on this one.
+       *
+       * ## The `steer` half, and the three ways it declines
+       *
+       * - **Nothing has been prompted yet.** There is no query, so there is no turn to
+       *   steer and nothing would receive the message.
+       * - **This id has already been accepted.** Answered successfully with
+       *   `delivered: false`, nothing sent. The id is the application's own and derived
+       *   (`harness/messageId.ts`), so this is what makes a retried `steer_planner` safe.
+       * - **The session is settling or closed.** Refused, and this is the backstop
+       *   DECISIONS.md §24.1 consequence 5 asks for: a steer that lost the race against
+       *   settlement must not start fresh work. On this driver it cannot — a closed query
+       *   takes nothing — and the refusal is what makes that a stated answer rather than a
+       *   message dropped into a generator nobody is reading.
+       *
+       * A steer into an **idle** multi-turn session is accepted and gets a fresh `idle`
+       * deferred first, so `waitForIdle` called afterwards waits for the new turn instead
+       * of returning the previous one's answer.
+       */
       const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
         "claudeCodeHarness.prompt",
-      )(function* (sessionId, text) {
+      )(function* (sessionId, text, delivery = OPEN_PROMPT) {
         const record = yield* recordFor("session.prompt", sessionId);
-        if (record.query !== undefined) {
+        if (delivery._tag === "open") {
+          if (record.query !== undefined) {
+            return yield* transport(
+              "session.prompt",
+              `session ${sessionId} has already been prompted; carrying work on means a new attempt identity`,
+            );
+          }
+          yield* launch(record, text);
+          return { delivered: true };
+        }
+        if (record.query === undefined) {
           return yield* transport(
             "session.prompt",
-            `session ${sessionId} has already been prompted; carrying work on means a new attempt identity`,
+            `session ${sessionId} has not been prompted yet, so there is no turn to steer; nothing was delivered`,
           );
         }
-        yield* launch(record, text);
+        if (record.deliveredIds.has(delivery.messageId)) {
+          return { delivered: false };
+        }
+        if (record.settling || record.closed) {
+          return yield* transport(
+            "session.prompt",
+            `session ${sessionId} has already finished the work it accepted, so a message sent now would be new work nothing is supervising; nothing was delivered`,
+          );
+        }
+        const offer = record.offer;
+        if (offer === undefined) {
+          return yield* transport(
+            "session.prompt",
+            `session ${sessionId} has a query but no input channel, which this process cannot explain; nothing was delivered`,
+          );
+        }
+        /*
+         * Accepted, and from the `settling` read above to the `offer` below there is **no
+         * yield**.
+         *
+         * That is what makes {@link SessionRecord.settling}'s claim true, and it was not
+         * before: this sequence used `yield* Deferred.isDone(...)`, which is a fiber
+         * suspension point — so the pump, which is where `settling = true` and
+         * `closeSession` live, could interleave between the check and the `accepted += 1`
+         * that stops the pump settling. The outcome would be a steer reported
+         * `delivered: true` into a query that is closing: on this driver the message is
+         * dropped rather than becoming unsupervised work, so the harm is a lying receipt
+         * rather than a rogue execution, but the comment stated the window was closed and
+         * it was open.
+         *
+         * `Deferred.isDoneUnsafe` is the synchronous read (`effect@4.0.5`'s
+         * `Deferred.d.ts`), and `makeUnsafe` was already synchronous — so the whole of
+         * "decide, claim, offer" is now one microtask. The `offer === undefined` guard moved
+         * **above** it for a second reason: `accepted` must not be incremented on a path
+         * that then refuses, or `waitForIdle` would wait for a turn nobody started.
+         */
+        if (Deferred.isDoneUnsafe(record.idle)) {
+          record.idle = Deferred.makeUnsafe<void, HarnessFailure>();
+        }
+        record.deliveredIds.add(delivery.messageId);
+        record.accepted += 1;
+        offer(userMessage(record, text, delivery));
+        return { delivered: true };
       });
 
+      /**
+       * Blocks until every message this session has accepted has been answered.
+       *
+       * The deferred is read when this is called rather than captured once, because a
+       * multi-turn session replaces it per turn — see {@link SessionRecord.idle}. For a
+       * worker or a round there is only ever one.
+       */
       const waitForIdle: AgentHarness["Service"]["waitForIdle"] = Effect.fn(
         "claudeCodeHarness.waitForIdle",
       )(function* (sessionId) {

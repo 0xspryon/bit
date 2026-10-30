@@ -181,6 +181,15 @@ export interface WorkerUrls {
    * every test for a word, while the comment that says what it holds costs nothing.
    */
   readonly plannerMcp: string;
+  /**
+   * Where a **goal agent**'s MCP client connects, carrying its goal credential.
+   *
+   * A third URL, for {@link plannerMcp}'s reason. `plan/goalConversation.ts` is what
+   * registers against it; nothing in this file uses it, and it is here because all three
+   * are answerable at the same instant by the same listener and a second gate to publish
+   * is a second chance to publish only one.
+   */
+  readonly goalMcp: string;
   /** Where the harness-side policy hook posts each decision request. */
   readonly policy: string;
 }
@@ -204,6 +213,7 @@ export class WorkerEndpoints extends Context.Service<
         urls: Effect.succeed({
           mcp: endpoint.mcpUrl,
           plannerMcp: endpoint.plannerMcpUrl,
+          goalMcp: endpoint.goalMcpUrl,
           policy: endpoint.policyUrl,
         }),
       }),

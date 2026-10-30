@@ -40,6 +40,12 @@ import {
 
 import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
 import {
+  GoalConversationRefused,
+  GoalConversationView,
+  GoalMessageDraft,
+  GoalTurnAccepted,
+} from "./goalAgent";
+import {
   GoalObservationView,
   IntentAbandonDraft,
   IntentDraft,
@@ -1457,6 +1463,66 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         params: { targetId: Schema.String, goalId: Schema.String },
         success: GoalNarrationView,
         error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * One goal's conversation, replayed from the harness.
+     *
+     * The goal agent's half of what {@link goalNarration} does for planner rounds, and it
+     * is the **only** way a reloaded tab sees a word of it: operator messages and agent
+     * turns are not stored (the goal and planner flow's decision 15). What is durable is
+     * the graph the conversation moved — the rounds it woke, the intents those added, the
+     * goal's own ending — and every one of those is on the same page from rows.
+     *
+     * `200` in every case. A goal nobody has talked to answers `source: "absent"`, and a
+     * conversation the harness has deleted answers `source: "forgotten"` with a sentence,
+     * because for a goal last opened weeks ago that is the expected answer and not a
+     * fault. {@link GoalConversationSource} is the five answers, and three of them are
+     * empty for different reasons the view must not flatten.
+     *
+     * The join with the live tail is {@link goalNarration}'s: the browser records the
+     * in-process narration publish counter before this request leaves and drops live
+     * narration at or below it. There is no index the two channels share.
+     */
+    HttpApiEndpoint.get(
+      "goalConversation",
+      "/targets/:targetId/goals/:goalId/conversation",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        success: GoalConversationView,
+        error: [GoalNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * Says something to one goal's agent, and answers without waiting for the turn.
+     *
+     * `202`: the message has been given to a live session and the turn is the model's to
+     * take. The agent's reply arrives on the {@link live} feed as activity, carrying
+     * {@link LiveItem.goalId}; what it *does* arrives there too, as records.
+     *
+     * **The first message creates the session**, in `targets/<id>/goal/<goalId>/` under a
+     * credential with no clock expiry, with the goal toolkit registered on it — and a
+     * later message is delivered into that same session, queued behind whatever it is
+     * doing rather than cutting it off. {@link GoalTurnAccepted.conversation} says which
+     * of the two happened, and `priorUnavailable` is how a first message *after a restart*
+     * is told from a first message ever.
+     *
+     * The payload is the operator's words and nothing else: see {@link GoalMessageDraft}
+     * on why no model, harness, session or directory is nameable here.
+     */
+    HttpApiEndpoint.post(
+      "sendGoalMessage",
+      "/targets/:targetId/goals/:goalId/conversation",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        payload: GoalMessageDraft,
+        success: GoalTurnAccepted.pipe(HttpApiSchema.status(202)),
+        error: [
+          GoalConversationRefused,
+          GoalNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
       },
     ),
     /**

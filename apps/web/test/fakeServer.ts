@@ -40,7 +40,9 @@ import type {
   LiveFrame,
   LiveItem,
   LiveOpened,
+  GoalConversationView,
   GoalNarrationView,
+  GoalTurnAccepted,
   PlanRoundStarted,
   PlanRoundView,
   RoundNarration,
@@ -227,6 +229,46 @@ export const goalNarrationView = (
   rounds: [],
   skipped: 0,
   at: AT,
+  ...over,
+});
+
+/**
+ * One goal's replayed conversation. `absent` by default: nobody has talked to it.
+ *
+ * The default is the state a fresh goal is really in, for `goalNarrationView`'s reason —
+ * a suite that wanted the ordinary empty case should not have to construct it.
+ */
+export const goalConversationView = (
+  over: Partial<GoalConversationView> = {},
+): GoalConversationView => ({
+  targetId: "acme-corp",
+  goalId: "goal_1",
+  harnessSessionId: null,
+  live: false,
+  source: "absent",
+  ephemeral: false,
+  note: "Nobody has talked to this goal's agent yet.",
+  messages: [],
+  truncated: false,
+  omittedBlank: 0,
+  at: AT,
+  ...over,
+});
+
+/** One accepted operator turn: the conversation's first message, by default. */
+export const goalTurnAccepted = (
+  over: Partial<GoalTurnAccepted> = {},
+): GoalTurnAccepted => ({
+  targetId: "acme-corp",
+  goalId: "goal_1",
+  harnessSessionId: "ses_goal_1",
+  instanceId: "opencode",
+  providerId: "openai",
+  modelId: "gpt-5.6-sol",
+  conversation: "opened",
+  priorUnavailable: false,
+  note: "This is the first message on this goal, so a conversation was opened for it.",
+  acceptedAt: AT,
   ...over,
 });
 
@@ -428,6 +470,7 @@ export const liveItem = (over: Partial<LiveItem> = {}): LiveItem => ({
   at: AT,
   attemptId: "attempt-1",
   roundId: null,
+  goalId: null,
   headline: "Observation recorded",
   body: "the endpoint did not rate limit",
   tool: null,
@@ -727,6 +770,18 @@ export class FakeServer implements ServerClient {
   ) => Answer<"goalNarration"> = (_baseUrl, targetId, goalId) =>
     ok(goalNarrationView({ targetId, goalId }));
 
+  onGoalConversation: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+  ) => Answer<"goalConversation"> = (_baseUrl, targetId, goalId) =>
+    ok(goalConversationView({ targetId, goalId }));
+
+  onSendGoalMessage: (
+    ...args: Parameters<ServerClient["sendGoalMessage"]>
+  ) => Answer<"sendGoalMessage"> = (_baseUrl, targetId, goalId) =>
+    ok(goalTurnAccepted({ targetId, goalId }));
+
   /** A stop that worked, answering with the round as `interrupted`. */
   onStopRound: (
     ...args: Parameters<ServerClient["stopRound"]>
@@ -871,6 +926,14 @@ export class FakeServer implements ServerClient {
     this.record("goalNarration", [baseUrl, targetId, goalId], () =>
       this.onGoalNarration(baseUrl, targetId, goalId),
     );
+
+  goalConversation = (baseUrl: string, targetId: string, goalId: string) =>
+    this.record("goalConversation", [baseUrl, targetId, goalId], () =>
+      this.onGoalConversation(baseUrl, targetId, goalId),
+    );
+
+  sendGoalMessage = (...args: Parameters<ServerClient["sendGoalMessage"]>) =>
+    this.record("sendGoalMessage", args, () => this.onSendGoalMessage(...args));
 
   stopRound = (...args: Parameters<ServerClient["stopRound"]>) =>
     this.record("stopRound", args, () => this.onStopRound(...args));

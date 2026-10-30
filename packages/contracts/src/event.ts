@@ -101,6 +101,27 @@ import { Schema } from "effect";
  * caller-authority columns are null and the round is the `subjectId`. Neither carries an
  * outbox request, for `attempt.*`'s reason.
  *
+ * **`plan.round.steered` is the odd one out: it is the only event here that records
+ * something an agent *said*, and it carries none of it.** A steer is the goal agent
+ * injecting a directive into a live round's session. Neither driver's narration, as bit
+ * reduces it, can show that it happened — OpenCode's steer is a `session.inbox.*` pair and
+ * Claude Code's is a `command_lifecycle` frame plus a second `system/init`, and both map
+ * to `opaque` (DECISIONS.md §24.1, consequence 6). So without this event a round whose
+ * framing changed mid-flight would read as having answered the question it opened with,
+ * and its disposition would be attributed to a prompt that had been superseded.
+ *
+ * The payload carries the round, the goal, the delivery urgency and the derived message
+ * id — and **never the directive text**. The text is the operator's and the agent's
+ * business, this build stores no conversation (decision 15), and a log that kept the one
+ * sentence that steered a round while storing none of the conversation around it would be
+ * the most misleading possible half of the record.
+ *
+ * It is **not** half of a pair. A round may be steered any number of times or not at all,
+ * and nothing answers a steer: what answers it is the round's own `plan.round.settled`.
+ * Unlike the three pairs above it carries a `callerScope` — the goal agent's,
+ * `<targetId>/goal/<goalId>` — because a steer is the one round-related mutation an
+ * authenticated agent causes rather than the host.
+ *
  * What is *not* here: the round's disposition. `plan.round.settled` carries the
  * disposition the round had recorded, if any, as a fact about the row — but a round
  * recording one is the planner's own write and gets no event of its own in this build.
@@ -117,6 +138,7 @@ export const EventKind = Schema.Literals([
   "intent.released",
   "plan.round.started",
   "plan.round.settled",
+  "plan.round.steered",
 ]);
 export type EventKind = typeof EventKind.Type;
 

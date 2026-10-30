@@ -19,6 +19,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   GoalBriefingRefused,
+  GoalConversationRefused,
   GoalNotFound,
   GoalRefused,
   IntentRefused,
@@ -40,7 +41,9 @@ import {
   FakeServer,
   attemptTranscript,
   goalBriefingView,
+  goalConversationView,
   goalNarrationView,
+  goalTurnAccepted,
   goalView,
   harnessInstance,
   intentView,
@@ -2993,5 +2996,320 @@ describe("the live transcript's silence watchdog", () => {
     expect(armed.cancelled).toBe(true);
     expect(app.screen).toBe("connect");
     expect(app.connectError).toBe("expired");
+  });
+});
+
+describe("the goal conversation", () => {
+  /** Signs in, opens a target holding one active goal, and opens that goal. */
+  const onGoal = async (
+    arrange: (fake: FakeServer) => void = () => {},
+  ): Promise<[App, FakeServer]> => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1" })] });
+    arrange(fake);
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+    return [app, fake];
+  };
+
+  test("opening a goal reads its conversation, and a fresh goal has none", async () => {
+    const [app, fake] = await onGoal();
+
+    expect(fake.calls.map((call) => call.method)).toContain("goalConversation");
+    expect(app.goalConversationState).toBe("ready");
+    expect(app.goalConversationGoalId).toBe("goal_1");
+    // `absent` is the default the fake answers with, and the chat renders it by showing no
+    // group at all: "there is no conversation" is not one of the three ways a conversation
+    // can have no prose.
+    expect(app.goalConversation?.source).toBe("absent");
+    expect(app.goalConversationChat.groups).toEqual([]);
+
+    app.closeGoal();
+    expect(app.goalConversation).toBeUndefined();
+    expect(app.goalConversationGoalId).toBe("");
+  });
+
+  test("a sent message clears the composer and appears as this tab's own turn", async () => {
+    const [app, fake] = await onGoal();
+    app.goalMessage = "  look at the lockout path  ";
+    await app.sendGoalMessage();
+
+    const sent = fake.calls.find((call) => call.method === "sendGoalMessage");
+    // Trimmed before it goes: the payload decoder refuses an empty message, and leading
+    // whitespace is not something an operator meant to send.
+    expect(sent?.args[3]).toBe("look at the lockout path");
+    expect(app.goalMessage).toBe("");
+    expect(app.goalSending).toBe(false);
+    expect(app.goalTurns.map((turn) => turn.text)).toEqual([
+      "look at the lockout path",
+    ]);
+    // The turn is in the chat, which now has a group even though the replay said `absent`:
+    // the operator's own message is enough of a conversation to render.
+    expect(app.goalConversationChat.groups).toHaveLength(1);
+    expect(
+      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+    ).toEqual(["look at the lockout path"]);
+    // And the agent owes an answer until something arrives for this goal.
+    expect(app.goalAwaiting).toBe(true);
+  });
+
+  test("re-sending a sentence the replay already holds still shows it", async () => {
+    /*
+     * The false positive, end to end through the app rather than through `chat.ts` alone:
+     * the replay is read when the goal opens, so by the time the operator types it is stale,
+     * and a repeated short sentence must not be cancelled against the old entry.
+     *
+     * `goalConversationThrough` is what carries the bound — the number of turns sent when
+     * the replay was *asked for*, which here is zero — and this test is what proves it is
+     * plumbed rather than merely present in `chat.ts`.
+     */
+    const [app] = await onGoal((fake) => {
+      fake.onGoalConversation = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalConversationView({
+            targetId,
+            goalId,
+            harnessSessionId: "ses_goal_1",
+            live: true,
+            source: "harness",
+            ephemeral: true,
+            messages: [
+              { index: 0, type: "user", text: "ok" },
+              { index: 1, type: "assistant", text: "done" },
+            ],
+            note: "From OpenCode, which may delete it.",
+          }),
+        );
+      fake.onSendGoalMessage = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalTurnAccepted({
+            targetId,
+            goalId,
+            conversation: "continued",
+            note: "",
+          }),
+        );
+    });
+    expect(app.goalConversationThrough).toBe(0);
+
+    app.goalMessage = "ok";
+    await app.sendGoalMessage();
+    await settle();
+
+    expect(app.goalTurns.map((turn) => turn.text)).toEqual(["ok"]);
+    // The row the operator just typed, on screen rather than swallowed.
+    expect(
+      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+    ).toEqual(["ok"]);
+  });
+
+  test("a turn sent while the replay is in flight survives the answer", async () => {
+    /*
+     * The regression the bound exists to prevent, and the one the bound alone does not pin:
+     * capturing `replayedThrough` **late** — when the replay returns rather than before the
+     * request leaves — passes every other test in this suite while reintroducing the
+     * swallowed message.
+     *
+     * The window is a real one: a replay round trip is long enough to type into, and the
+     * answer describes the harness's log as of when the *request* left. A turn sent during
+     * the trip cannot be in that answer, so it must never be cancelled against it — however
+     * much the answer happens to agree with its text.
+     */
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1" })] });
+    fake.onGoalConversation = (_baseUrl, targetId, goalId) =>
+      ok(
+        goalConversationView({
+          targetId,
+          goalId,
+          harnessSessionId: "ses_goal_1",
+          live: true,
+          source: "harness",
+          ephemeral: true,
+          // The answer agrees with what is about to be typed, which is what makes a
+          // text-only cancellation fire.
+          messages: [{ index: 0, type: "user", text: "ok" }],
+          note: "From OpenCode, which may delete it.",
+        }),
+      );
+    fake.onSendGoalMessage = (_baseUrl, targetId, goalId) =>
+      ok(
+        goalTurnAccepted({
+          targetId,
+          goalId,
+          // `continued`, so the send does not itself re-read the replay: the one read under
+          // test has to still be the one in flight.
+          conversation: "continued",
+          note: "",
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+
+    // The replay is held open from before the goal is opened, so it is in flight for the
+    // whole of the send below.
+    const answer = fake.hold("goalConversation");
+    app.openGoal("goal_1");
+    await settle();
+    expect(app.goalConversationState).toBe("loading");
+
+    app.goalMessage = "ok";
+    await app.sendGoalMessage();
+    expect(app.goalTurns.map((turn) => turn.text)).toEqual(["ok"]);
+
+    // Now the replay lands, carrying an "ok" of its own from earlier in the history.
+    answer();
+    await settle();
+
+    expect(app.goalConversationState).toBe("ready");
+    /*
+     * The operator's own words, still on the screen. **This assertion first**, because it
+     * is the defect: with the capture moved late this reads `[]` — the message was
+     * delivered and is nowhere to be seen — and a test that failed on the bookkeeping
+     * instead would report the cause rather than the harm.
+     */
+    expect(
+      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+    ).toEqual(["ok"]);
+    // And the bookkeeping that makes it true: captured before the request left, so a turn
+    // sent during the trip is out of this answer's reach. A late capture reads
+    // `goalTurns.length` here and makes it 1.
+    expect(app.goalConversationThrough).toBe(0);
+  });
+
+  test("a refused message keeps the text and says why, with no turn invented", async () => {
+    const [app] = await onGoal((fake) => {
+      fake.onSendGoalMessage = () =>
+        refused(
+          new GoalConversationRefused({
+            reason: "goal_not_active",
+            detail: "goal goal_1 is abandoned, so its authority has ended",
+          }),
+        );
+    });
+    app.goalMessage = "anything";
+    await app.sendGoalMessage();
+
+    // The agent did not hear it, so there is no row claiming it did — a chat that invented
+    // a turn for a refused message would be the one lie this surface cannot afford.
+    expect(app.goalTurns).toEqual([]);
+    expect(app.goalConversationChat.groups).toEqual([]);
+    // The text stays, so it can be sent again once whatever was wrong is fixed.
+    expect(app.goalMessage).toBe("anything");
+    expect(app.goalSendDetail).toContain("abandoned");
+  });
+
+  test("a turn that opened a conversation after a restart says so above the composer", async () => {
+    /*
+     * The spec's §5, as the operator meets it. The grant died with the process and the row
+     * did not, so this message opened a *new* conversation — and the words still on screen
+     * belong to the old one. A silent second conversation on the same goal looks from here
+     * exactly like the old one continuing, which is why the note is rendered rather than
+     * logged.
+     */
+    const [app] = await onGoal((fake) => {
+      fake.onGoalConversation = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalConversationView({
+            targetId,
+            goalId,
+            harnessSessionId: "ses_before",
+            live: false,
+            source: "harness",
+            ephemeral: true,
+            messages: [{ index: 0, type: "assistant", text: "earlier words" }],
+            note: "From Claude Code. This conversation was opened by a server process that is no longer running.",
+          }),
+        );
+      fake.onSendGoalMessage = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalTurnAccepted({
+            targetId,
+            goalId,
+            harnessSessionId: "ses_after",
+            conversation: "opened",
+            priorUnavailable: true,
+            note: "This goal had a conversation on session ses_before, which this server process no longer holds — a restart ends a conversation.",
+          }),
+        );
+    });
+
+    // Before the message: the words are here and the conversation is not continuable.
+    expect(app.goalConversation?.live).toBe(false);
+    expect(app.goalConversationChat.groups[0]?.prose._tag).toBe("replayed");
+
+    app.goalMessage = "are you still there?";
+    await app.sendGoalMessage();
+    await settle();
+
+    expect(app.goalSessionNote).toContain("restart ends a conversation");
+    expect(app.goalSessionNote).toContain("ses_before");
+  });
+
+  test("a continued turn says nothing new and does not re-read the replay", async () => {
+    const [app, fake] = await onGoal((fake) => {
+      fake.onSendGoalMessage = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalTurnAccepted({
+            targetId,
+            goalId,
+            conversation: "continued",
+            priorUnavailable: false,
+            note: "",
+          }),
+        );
+    });
+    const readsBefore = fake.calls.filter(
+      (call) => call.method === "goalConversation",
+    ).length;
+
+    app.goalMessage = "and the admin console?";
+    await app.sendGoalMessage();
+    await settle();
+
+    // Nothing to say: a continued turn changes nothing the replay said, and re-reading it
+    // would replace the block an operator is reading mid-sentence.
+    expect(app.goalSessionNote).toBe("");
+    expect(
+      fake.calls.filter((call) => call.method === "goalConversation").length,
+    ).toBe(readsBefore);
+  });
+
+  test("narration for this goal answers the turn and clears the waiting state", async () => {
+    const [app, fake] = await onGoal();
+    app.goalMessage = "what is happening?";
+    await app.sendGoalMessage();
+    expect(app.goalAwaiting).toBe(true);
+
+    // The agent's reply, over the target's own live connection, carrying the goal it
+    // belongs to — which is the field that puts it in this conversation rather than in the
+    // planner's.
+    fake.watch.send(liveOpened());
+    fake.watch.send(
+      liveActivity({
+        // `activity:<n>` is the server's own id for a narration entry, and the number is
+        // what the join reads: an id this tab could not parse would be treated as having
+        // no order at all, which is right for a record and wrong for narration.
+        id: "activity:7",
+        goalId: "goal_1",
+        roundId: null,
+        kind: "turn.reply",
+        body: "One round has run so far.",
+      }),
+    );
+    await settle();
+
+    expect(app.goalAwaiting).toBe(false);
+    expect(
+      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+    ).toEqual(["what is happening?", "One round has run so far."]);
   });
 });

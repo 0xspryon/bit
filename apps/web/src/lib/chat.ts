@@ -37,6 +37,7 @@
  * **visibly unresolved**. {@link WriteState} is those four answers.
  */
 import type {
+  GoalConversationView,
   GoalNarrationView,
   LiveItem,
   PlanRoundView,
@@ -63,9 +64,19 @@ const KIND_LABELS: Record<string, string | undefined> = {
   "intent.released": "Intent released",
   "plan.round.started": "Planner round",
   "plan.round.settled": "Planner round settled",
+  "plan.round.steered": "Steered",
   "record.other": "Event",
   "turn.reply": "Reply",
   "tool.call": "Tool call",
+  /**
+   * The operator's own message, which **no server ever sends**.
+   *
+   * See {@link operatorTurn}: these rows are minted in this tab so that what was just
+   * typed appears in the conversation. The label is here rather than in `LIVE_ITEM_KINDS`
+   * because that list is what the *server* writes, and claiming a kind the server cannot
+   * produce would make the contract describe a browser.
+   */
+  "turn.operator": "You",
   "tool.result": "Tool result",
   "action.denied": "Denied",
 };
@@ -608,4 +619,280 @@ export const buildChat = (input: {
     };
   });
   return { groups, older: input.rounds.length - shown.length };
+};
+
+/* ── The goal conversation ───────────────────────────────────────────────────── */
+
+/**
+ * One message this tab has sent to a goal's agent and has not been told to forget.
+ *
+ * **Local, and the reason it has to be local is ruling 4.** Operator messages are not
+ * stored anywhere: not in the graph, not on the narration bus, and the harness's own copy
+ * is only readable on a *later* page load. So between typing and reloading, the only place
+ * what you said exists is here — and a chat that showed the agent's half of a conversation
+ * and not yours would read as though the agent were talking to itself.
+ *
+ * `after` is the activity publish order at the moment the message was sent, which is the
+ * same join {@link buildChat}'s `narrationFloor` uses and not a second mechanism: it is
+ * what lets {@link buildGoalConversation} place a turn before the narration that answered
+ * it without comparing two clocks that are not the same clock.
+ */
+export interface SentTurn {
+  /** This tab's own order, from one. A render key and a tiebreak, nothing else. */
+  readonly index: number;
+  readonly text: string;
+  /** Epoch milliseconds, from this tab. Shown, never used for ordering. */
+  readonly at: number;
+  /** The activity high-water mark when it was sent. See above. */
+  readonly after: number;
+}
+
+/** The kind {@link operatorTurn} mints. Never written by a server. */
+export const OPERATOR_TURN_KIND = "turn.operator";
+
+/**
+ * One operator message as a chat row.
+ *
+ * **Minted in the browser, which is a thing this file does exactly once and says so.**
+ * `LiveItem.kind` is a plain string on the wire precisely so a reader tolerates a kind it
+ * has never seen, and this is the other side of that: a row the *server* has never seen.
+ * It is marked `activity` rather than `record` because that is the truth — it is not part
+ * of the record, it is not stored, and it is gone on a reload (it comes back from the
+ * harness's own copy, as a `user` entry in the replay).
+ *
+ * `id` is namespaced away from both id spaces the server uses (`record:` and `activity:`)
+ * so nothing can collide with it and {@link activityOrder} cannot read an order out of it.
+ */
+export const operatorTurn = (turn: SentTurn): LiveItem => ({
+  _tag: "item",
+  id: `operator:${String(turn.index)}`,
+  origin: "activity",
+  sequence: null,
+  kind: OPERATOR_TURN_KIND,
+  at: turn.at,
+  attemptId: null,
+  roundId: null,
+  goalId: null,
+  headline: "You",
+  body: turn.text,
+  tool: null,
+  toolName: null,
+  input: null,
+  output: null,
+  callId: null,
+  outcome: null,
+});
+
+/** What a goal conversation's separator needs, and the whole of what the chat is given. */
+export interface GoalSubject {
+  /**
+   * The replay the server answered with, or `undefined` while it has not answered.
+   *
+   * The separator reads the session id and `live` off it: after a restart the words can be
+   * here and the conversation still not be continuable, which is the one thing a reader
+   * has to be told rather than left to infer from an empty composer.
+   */
+  readonly conversation: GoalConversationView | undefined;
+  /** True between a message being sent and anything arriving in answer to it. */
+  readonly awaiting: boolean;
+}
+
+/** One goal conversation as a chat group. */
+export type GoalConversationGroup = ChatGroup<GoalSubject>;
+
+/** The goal conversation, as the chat renders it. */
+export interface GoalChatView {
+  /**
+   * One group, or none at all.
+   *
+   * **None is the "nobody has said anything" state**, and leaving the group out is how it
+   * is rendered: {@link Chat} shows its `empty` sentence when there are no groups, which is
+   * the right shape for "there is no conversation" — as against the three ways a
+   * conversation that exists can have no prose, which are {@link RoundProse}'s and are
+   * shown inside the group.
+   */
+  readonly groups: readonly GoalConversationGroup[];
+}
+
+/**
+ * What to say about a goal conversation's prose, from the server's five answers.
+ *
+ * `absent` has no case here and cannot reach this function: {@link buildGoalConversation}
+ * renders no group at all for it. Everything else maps onto the same five states a round's
+ * prose has, because they are the same five facts about the same kind of absence.
+ */
+const goalProseFor = (
+  conversation: GoalConversationView | undefined,
+  hasLive: boolean,
+): RoundProse => {
+  if (conversation === undefined) {
+    return hasLive ? { _tag: "live" } : { _tag: "loading" };
+  }
+  if (conversation.messages.length > 0) {
+    return {
+      _tag: "replayed",
+      note: conversation.note,
+      ephemeral: conversation.ephemeral,
+      truncated: conversation.truncated,
+    };
+  }
+  if (hasLive) return { _tag: "live" };
+  switch (conversation.source) {
+    case "harness":
+      // The harness answered and held only tool calls and results, which the reduced shape
+      // carries no text for. Its own note says so; this is not the absence of a session.
+      return { _tag: "none", note: conversation.note };
+    case "pending":
+      return { _tag: "pending", note: conversation.note };
+    case "forgotten":
+      return { _tag: "forgotten", note: conversation.note };
+    case "none":
+    case "absent":
+      return { _tag: "none", note: conversation.note };
+  }
+};
+
+/** What the goal conversation is assembled from. */
+export interface GoalChatInput {
+  readonly goalId: string;
+  /** The target's live feed, in arrival order. Filtered to this goal here. */
+  readonly items: readonly LiveItem[];
+  readonly conversation: GoalConversationView | undefined;
+  /** The activity publish order when the replay answered. See {@link buildChat}. */
+  readonly narrationFloor: number | undefined;
+  /** What this tab has sent, oldest first. */
+  readonly sent: readonly SentTurn[];
+  /**
+   * How many of {@link sent} had been sent when the replay was **asked for**. Zero when no
+   * replay has been asked for at all.
+   *
+   * The bound on which local turns the replay may cancel, and it is a count rather than a
+   * timestamp on purpose: the turn's `at` comes from this tab's clock and the replay's from
+   * the server's, and a cancellation that depended on which was ahead would lose a message
+   * for no visible reason. A turn numbered above this was sent after the request left, so no
+   * answer to that request can contain it.
+   */
+  readonly replayedThrough: number;
+  readonly awaiting: boolean;
+}
+
+/**
+ * Builds a goal's conversation from the live feed, the replay and what this tab has sent.
+ *
+ * ## One group, and why there is no second grouping to make
+ *
+ * A planner chat groups by round because a round is a durable record with a status and a
+ * disposition — the structure survives a reload even when the prose does not (decision 16).
+ * A conversation has **no such boundary**: a turn is not a row, nothing records where one
+ * ended, and inventing a separator per turn would be claiming a structure the records
+ * cannot corroborate. So the conversation is one stretch under one heading, which is also
+ * what it is.
+ *
+ * ## Where an operator's own message goes
+ *
+ * Each {@link SentTurn} is placed **before the first live narration that arrived after it**,
+ * using the activity publish order it was sent at. That is the same join the replay uses
+ * and deliberately not a timestamp comparison: the browser's clock and the server's are not
+ * the same clock, and a conversation whose order depended on which was ahead would reorder
+ * itself for no visible reason. Record items carry no activity order and keep their arrival
+ * position, which is the store's own order.
+ */
+export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
+  const mine = input.items.filter((item) => item.goalId === input.goalId);
+  const live = mine.filter((item) => {
+    const order = activityOrder(item);
+    if (order === undefined) return true;
+    return input.narrationFloor === undefined || order > input.narrationFloor;
+  });
+  const hasLive = live.some((item) => item.origin === "activity");
+  const replayed = input.conversation?.messages ?? [];
+
+  if (
+    live.length === 0 &&
+    replayed.length === 0 &&
+    input.sent.length === 0 &&
+    (input.conversation === undefined || input.conversation.source === "absent")
+  ) {
+    // Nothing at all: no conversation, nothing sent, nothing replayed. The chat says so in
+    // its own words rather than showing an empty group with a heading.
+    return { groups: [] };
+  }
+
+  /**
+   * What this tab has sent, minus anything the replay has already brought back.
+   *
+   * **Only turns the replay could possibly contain are candidates, and that bound is the
+   * whole correctness of this.** The operator's first message reaches the replay as a `user`
+   * entry — the harness stores it, and `goalNarration.ts` trims this server's framing off
+   * it — so without some cancellation the same sentence appears twice on one screen.
+   *
+   * Matching on the text alone was the first attempt and it was **wrong in the one
+   * direction that loses data**. The replay is read on open and re-read only after a send
+   * that *opens* a conversation, so it is usually stale; an operator who re-sent a sentence
+   * already in the history — "ok", "continue", "yes" — had the new turn cancelled against
+   * the old entry and saw it **nowhere at all** until a reload. A review measured it: a
+   * replay of `[user "ok", assistant "done"]` plus a newly sent "ok" rendered zero operator
+   * rows. A chat that silently swallows what was just typed is worse than one that shows it
+   * twice, because the operator cannot tell whether it was sent.
+   *
+   * {@link GoalChatInput.replayedThrough} is the fix and it is a count, not a clock: how
+   * many of this tab's turns had been sent at the moment the replay was **asked for**. A
+   * turn numbered above it cannot be in that answer, whatever it says, so it is never a
+   * candidate. Within the bound the match is still text, one-for-one and counted rather
+   * than filtered, so two "ok"s with one of them replayed still show one local row.
+   *
+   * Nothing is dropped on the strength of a replay that does not contain it: a turn the
+   * replay was asked for but had not caught up with stays on screen until a later read
+   * brings it back, and then it is cancelled.
+   */
+  const replayedUser = new Map<string, number>();
+  for (const message of replayed) {
+    if (message.type !== "user") continue;
+    replayedUser.set(message.text, (replayedUser.get(message.text) ?? 0) + 1);
+  }
+  const unreplayed = input.sent.filter((turn) => {
+    if (turn.index > input.replayedThrough) return true;
+    const left = replayedUser.get(turn.text) ?? 0;
+    if (left === 0) return true;
+    replayedUser.set(turn.text, left - 1);
+    return false;
+  });
+  const pending = [...unreplayed].sort(
+    (left, right) => left.after - right.after || left.index - right.index,
+  );
+  const ordered: LiveItem[] = [];
+  for (const item of live) {
+    const order = activityOrder(item);
+    if (order !== undefined) {
+      while (pending.length > 0 && (pending[0]?.after ?? 0) < order) {
+        const turn = pending.shift();
+        if (turn !== undefined) ordered.push(operatorTurn(turn));
+      }
+    }
+    ordered.push(item);
+  }
+  for (const turn of pending) ordered.push(operatorTurn(turn));
+
+  const prose = goalProseFor(input.conversation, hasLive);
+  return {
+    groups: [
+      {
+        // The session id would change under the operator on a restart and take the whole
+        // group's identity with it; the goal does not.
+        key: input.goalId,
+        subject: {
+          conversation: input.conversation,
+          awaiting: input.awaiting,
+        },
+        prose,
+        replayed: prose._tag === "replayed" ? replayed : [],
+        // A conversation has no status to make a write "pending until recorded" against,
+        // and the only writes on this surface — a steer, a wake, an ending — all produce
+        // records of their own. `true` is the honest argument: this conversation is live as
+        // far as a row is concerned, so a call with no record yet is pending rather than
+        // unresolved.
+        rows: rowsFor(ordered, true),
+      },
+    ],
+  };
 };

@@ -45,6 +45,7 @@
   import IntentList from "../components/IntentList.svelte";
   import PageFrame from "../components/PageFrame.svelte";
   import PlanPanel from "../components/PlanPanel.svelte";
+  import GoalAgentChat from "../components/GoalAgentChat.svelte";
   import PlannerChat from "../components/PlannerChat.svelte";
   import { countsLine, goalTitle, whenText } from "../goalFormat";
   import type { App } from "../app.svelte";
@@ -52,8 +53,21 @@
   let { app }: { app: App } = $props();
 
   let goal = $derived(app.openGoalView);
+  /**
+   * Who ended the goal, in words.
+   *
+   * Three values since this slice, and the third is not a flavour of the second: a planner
+   * round ends a goal by recording `objective_met` on its disposition, and the **goal
+   * agent** ends one because the operator asked it to in the conversation. Saying "the
+   * planner" for the latter would be a claim about an ending that no planner round reached,
+   * and `goals.ended_by` is the only place the difference is kept.
+   */
   let endedByText = $derived(
-    goal?.endedBy === "planner" ? "the planner" : "an operator",
+    goal?.endedBy === "planner"
+      ? "the planner"
+      : goal?.endedBy === "goal_agent"
+        ? "this goal's agent"
+        : "an operator",
   );
 </script>
 
@@ -89,6 +103,8 @@
             <p>{goal.name}</p>
           </section>
         {/if}
+
+        <GoalAgentChat {app} />
 
         <IntentList {app} />
 

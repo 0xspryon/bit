@@ -257,6 +257,73 @@ export interface HarnessNarration {
   readonly detail: NarrationDetail;
 }
 
+/**
+ * Which of the two injection timings a second message asks for.
+ *
+ * **Both drivers offer exactly two, and the difference is not academic** (DECISIONS.md
+ * §24.1, measured on both). `preemptive` is OpenCode's `delivery: "steer"` and Claude
+ * Code's `priority: "now"`: the directive is promoted at the next step boundary and the
+ * rest of the work in flight is thrown away. In the probe that cost seven of eight file
+ * reads on OpenCode and 59 of 60 lines on Claude Code. `queued` is OpenCode's
+ * `delivery: "queue"` and Claude Code's `priority: "later"`: the work in flight finishes,
+ * then the directive runs.
+ *
+ * `queued` is the default everywhere in this application, and the spec's ruling 5 says so:
+ * a planner round part-way through writing intents should finish them, and `preemptive` is
+ * reserved for an explicit redirect. T3 Code's own client default agrees
+ * (`followUpBehavior: "queue"`).
+ *
+ * Named for what the caller wants rather than for either driver's word, because the two
+ * drivers spell both of them differently and neither spelling is this application's.
+ */
+export type SteerUrgency = "queued" | "preemptive";
+
+/**
+ * What kind of prompt this is, which decides what a harness does with it.
+ *
+ * **A tagged union rather than three optional parameters, because the two cases have
+ * different recovery rules and the type is where that is checkable.** An `open` prompt is
+ * the session's first and **is never resubmitted** on any path (DECISIONS.md §15): a
+ * harness therefore refuses a second `open` on a session it has already prompted, which is
+ * what stops "carrying work on" from quietly becoming a second attempt under one identity.
+ * A `steer` is a message into a session that is already running, it may legitimately
+ * arrive many times, and a *retry* of one must not deliver twice — so it carries an
+ * application-chosen message id and the harness is required to drop a repeat of it.
+ *
+ * `messageId` is the application's own, derived deterministically by the caller from the
+ * operation it belongs to (`plan/steerId.ts`), and it is **not** in either driver's format:
+ * OpenCode wants `msg_…` and Claude Code wants a UUID, so each implementation maps this
+ * value into its own id space and the mapping has to be total and stable. The seam's
+ * promise is the one the caller needs — *the same message id is delivered at most once* —
+ * and it is kept by this layer rather than inherited from a driver.
+ */
+export type PromptDelivery =
+  | {
+      readonly _tag: "open";
+    }
+  | {
+      readonly _tag: "steer";
+      readonly urgency: SteerUrgency;
+      /** Deterministic, per steer. See above: never a driver's own format. */
+      readonly messageId: string;
+    };
+
+/** The default for every existing caller: one session, one prompt, never resubmitted. */
+export const OPEN_PROMPT: PromptDelivery = { _tag: "open" };
+
+/** What a harness says about a prompt it took. */
+export interface PromptAccepted {
+  /**
+   * Whether this call put a new message into the session.
+   *
+   * `false` only for a `steer` whose `messageId` this session has already accepted: the
+   * retry is answered successfully and **nothing is sent again**. A caller that treated
+   * this as a failure would retry forever; a caller that ignored it entirely would be
+   * correct about the session's state and would merely not know it had retried.
+   */
+  readonly delivered: boolean;
+}
+
 /** Where our MCP endpoint is, and what authority reaches it. */
 export interface McpRegistration {
   readonly url: string;
@@ -345,6 +412,22 @@ export class AgentHarness extends Context.Service<
        * and a harness told the default explicitly has been pinned to today's answer.
        */
       readonly options?: readonly ModelOptionSelection[] | undefined;
+      /**
+       * Whether this session stays open after a turn ends.
+       *
+       * `false` or absent — a worker attempt or a planner round: one prompt, one turn, and
+       * the harness may close the session when it idles. `true` — a goal conversation: the
+       * operator may say something else at any time, so the session must survive going
+       * idle and be promptable again.
+       *
+       * **It exists because of what it costs on one driver and nothing on the other.** An
+       * OpenCode session lives in the harness's own server and outlives every turn
+       * regardless, so this changes nothing there. A Claude Code session *is* an open
+       * `query()` held by this process, and the pump closes it when the last accepted
+       * message has produced its `result` — which is right for a round and would make a
+       * conversation unanswerable from its second message on.
+       */
+      readonly multiTurn?: boolean | undefined;
     }) => Effect.Effect<SessionRef, HarnessFailure>;
     /**
      * Makes our MCP endpoint reachable from one session, under one credential.
@@ -400,12 +483,43 @@ export class AgentHarness extends Context.Service<
       sessionId: string,
       name: string,
     ) => Effect.Effect<void, HarnessFailure>;
+    /**
+     * Gives a session something to do: its first prompt, or a message into a live turn.
+     *
+     * {@link PromptDelivery} is which, and it defaults to {@link OPEN_PROMPT} so that the
+     * two callers who only ever send a first prompt — the run supervisor and the plan
+     * supervisor — say nothing about steering at all.
+     *
+     * **A `steer` into a session that has already settled must fail rather than start
+     * fresh work**, and that is the one requirement of this operation that is not obvious
+     * from its shape. DECISIONS.md §24.1 measured that OpenCode never refuses a prompt for
+     * being busy *or* for being finished: prompting an idle session starts a **new
+     * execution**, with no supervisor, no round record and no disposition. So the race a
+     * steer can lose — the round settling between the decision to steer and the prompt
+     * landing — has to be lost *safely*, and an implementation that cannot tell a live
+     * session from a settled one has to refuse rather than guess. `plan/planSupervisor.ts`
+     * holds the claim that makes the window small; this is the backstop for the rest of it.
+     */
     readonly prompt: (
       sessionId: string,
       text: string,
-    ) => Effect.Effect<void, HarnessFailure>;
+      delivery?: PromptDelivery,
+    ) => Effect.Effect<PromptAccepted, HarnessFailure>;
     /**
      * Blocks until the session is no longer running.
+     *
+     * **"No longer running" means idle after the *last accepted message*, not after the
+     * first turn**, and the distinction is the whole of DECISIONS.md §24.1's consequence 4.
+     * Claude Code produces one `result` per turn, so a steered session produces two; a
+     * `waitForIdle` that answered at the first one would answer about the turn the steer
+     * took over from — the supervisor would settle the round, revoke its credential and
+     * close the session while the directive's own turn was still to run. An implementation
+     * therefore tracks how many messages it has accepted against how many have completed,
+     * and answers when they agree.
+     *
+     * It is **not** per turn and there is no way to wait for one: a caller holding this
+     * wants to know when the session has finished everything it has been given, which for
+     * a round is the one thing settlement is allowed to be read from.
      *
      * A failure here means the outcome is **uncertain**, not that execution stopped: our
      * request losing its answer says nothing about the harness (DECISIONS.md §15).

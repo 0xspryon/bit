@@ -81,7 +81,18 @@ export const NARRATION_BUFFER = 256;
  */
 export type NarrationSubject =
   | { readonly _tag: "attempt"; readonly attemptId: string }
-  | { readonly _tag: "round"; readonly roundId: string };
+  | { readonly _tag: "round"; readonly roundId: string }
+  /**
+   * A goal's own agent: the long-horizon conversation an operator is having.
+   *
+   * The third case, and unlike the first two its session is **not** one unit of work. An
+   * attempt and a round each narrate once and settle; a goal conversation narrates for as
+   * long as the operator keeps it open, across any number of turns, and the entries of two
+   * turns are one stream here. Nothing on this bus cares — it is keyed by subject, not by
+   * turn — and the chat groups by the conversation rather than by the turn for the same
+   * reason: there is no durable record of a turn boundary to corroborate one.
+   */
+  | { readonly _tag: "goal"; readonly goalId: string };
 
 /**
  * One entry of narration as a supervisor hands it over, with the things that say whose it
@@ -135,6 +146,7 @@ export interface NarrationFilter {
   readonly targetId?: string | undefined;
   readonly attemptId?: string | undefined;
   readonly roundId?: string | undefined;
+  readonly goalId?: string | undefined;
 }
 
 const subjectMatches = (
@@ -144,7 +156,9 @@ const subjectMatches = (
   (filter.attemptId === undefined ||
     (subject._tag === "attempt" && subject.attemptId === filter.attemptId)) &&
   (filter.roundId === undefined ||
-    (subject._tag === "round" && subject.roundId === filter.roundId));
+    (subject._tag === "round" && subject.roundId === filter.roundId)) &&
+  (filter.goalId === undefined ||
+    (subject._tag === "goal" && subject.goalId === filter.goalId));
 
 const matches = (filter: NarrationFilter, item: RunNarration): boolean =>
   (filter.targetId === undefined || filter.targetId === item.targetId) &&

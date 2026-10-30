@@ -770,7 +770,16 @@ const LIVE_INTENT_STATUSES: readonly IntentStatus[] = [
   "claimed",
 ];
 
-const questionWire = (
+/**
+ * One open question as a tool answers it.
+ *
+ * Exported because the **goal agent's** toolkit answers the same question with the same
+ * shape (`mcp/goalTools.ts`). Two mappings would be two digests of one graph that could
+ * come to disagree about whether a dimension is still open — and the whole reason
+ * `openQuestionsOf` is shared rather than reimplemented is that a second derivation is how
+ * a tool and a briefing come to disagree. The same argument applies one level up.
+ */
+export const questionWire = (
   question: OpenQuestion,
 ): typeof PlannerQuestionWire.Type => ({
   address: question.address,
@@ -788,7 +797,8 @@ const questionWire = (
   ),
 });
 
-const observationWire = (
+/** One observation digest as a tool answers it. Shared for {@link questionWire}'s reason. */
+export const observationWire = (
   observation: Observation,
 ): typeof PlannerObservationWire.Type => ({
   observation_id: observation.observationId,

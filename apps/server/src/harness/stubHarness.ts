@@ -108,7 +108,10 @@ export const stubHarness = (
     // Succeeds without recording anything, like the registration above: a test that cares
     // which registrations were taken away says so by overriding it.
     unregisterMcpServer: () => Effect.void,
-    prompt: () => Effect.void,
+    // Accepted, always, and reported as delivered: a suite that wants a refusal or a
+    // deduped retry overrides it. `PromptAccepted` rather than void since slice 9, because
+    // a steer has to be able to say "that id had already been sent".
+    prompt: () => Effect.succeed({ delivered: true }),
     waitForIdle: () => Effect.void,
     sessionStatus: () => Effect.succeed({} satisfies SessionStatus),
     messages: () => Effect.succeed([] as readonly MessageEntry[]),

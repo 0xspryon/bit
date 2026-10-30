@@ -24,12 +24,16 @@ import {
 
 import {
   CHAT_ROUNDS_SHOWN,
+  OPERATOR_TURN_KIND,
   activityOrder,
   buildChat,
+  buildGoalConversation,
   domainSummary,
   kindLabel,
   outcomeTint,
+  type SentTurn,
 } from "../src/lib/chat";
+import type { GoalConversationView } from "@bit/contracts";
 
 const AT = 1_700_000_000_000;
 const ROUND = "rnd_1";
@@ -65,6 +69,7 @@ const activity = (over: Partial<LiveItem> = {}): LiveItem => ({
   at: AT,
   attemptId: null,
   roundId: ROUND,
+  goalId: null,
   headline: "Reply",
   body: "thinking",
   tool: null,
@@ -89,6 +94,7 @@ const record = (over: Partial<LiveItem> = {}): LiveItem => {
     at: AT,
     attemptId: null,
     roundId: ROUND,
+    goalId: null,
     headline: "Intent",
     body: "intent int_real was added",
     tool: null,
@@ -189,9 +195,13 @@ const chat = (input: {
 describe("labels", () => {
   test("a kind this build knows reads as words, and one it does not reads as itself", () => {
     expect(kindLabel("plan.round.settled")).toBe("Planner round settled");
+    // `plan.round.steered` arrived with the goal conversation and is known now, which is
+    // why the unknown example below is one no build writes: the claim is about the
+    // fallback, and a kind that becomes known makes the test pass for the wrong reason.
+    expect(kindLabel("plan.round.steered")).toBe("Steered");
     // The whole reason `LiveItem.kind` is a string on the wire: a tab one deploy behind
     // must render an item it has never seen rather than hiding it.
-    expect(kindLabel("plan.round.steered")).toBe("plan.round.steered");
+    expect(kindLabel("plan.round.invented")).toBe("plan.round.invented");
   });
 
   test("an outcome vocabulary that is not ours is left plain rather than guessed at", () => {
@@ -674,5 +684,257 @@ describe("the replay and the live tail", () => {
     expect(rows.map((row) => row.item.id)).toEqual(["record:evt-kept"]);
     // A record on its own is not a live narration, so the replayed block still shows.
     expect(view.groups[0]?.prose._tag).toBe("replayed");
+  });
+});
+
+/* ── The goal conversation ───────────────────────────────────────────────────── */
+
+describe("the goal conversation", () => {
+  const conversation = (
+    over: Partial<GoalConversationView> = {},
+  ): GoalConversationView => ({
+    targetId: "acme-corp",
+    goalId: GOAL,
+    harnessSessionId: "ses_goal",
+    live: true,
+    source: "harness",
+    ephemeral: true,
+    note: "From OpenCode, which may delete it.",
+    messages: [],
+    truncated: false,
+    omittedBlank: 0,
+    at: AT,
+    ...over,
+  });
+
+  const sent = (over: Partial<SentTurn> = {}): SentTurn => ({
+    index: 1,
+    text: "look at the lockout path",
+    at: AT,
+    after: 0,
+    ...over,
+  });
+
+  const built = (input: {
+    items?: readonly LiveItem[];
+    conversation?: GoalConversationView | undefined;
+    sent?: readonly SentTurn[];
+    narrationFloor?: number | undefined;
+    /**
+     * How many turns had been sent when the replay was asked for.
+     *
+     * Defaults to **every** turn the case passes, which is the "the replay was asked for
+     * after everything on screen" arrangement most of these cases want. The one case that
+     * matters most passes `0` explicitly, because that is the real state of a replay read
+     * on open: it cannot contain a message sent afterwards.
+     */
+    replayedThrough?: number;
+    awaiting?: boolean;
+  }) =>
+    buildGoalConversation({
+      goalId: GOAL,
+      items: input.items ?? [],
+      conversation: input.conversation,
+      narrationFloor: input.narrationFloor,
+      sent: input.sent ?? [],
+      replayedThrough: input.replayedThrough ?? (input.sent ?? []).length,
+      awaiting: input.awaiting ?? false,
+    });
+
+  test("a goal nobody has talked to has no group at all, not an empty one", () => {
+    // The fifth source, and the shape it is rendered in: `Chat` prints its `empty`
+    // sentence when there are no groups, which is the right rendering of "there is no
+    // conversation" — as against the three ways a conversation that exists can have no
+    // prose, which are shown inside a group.
+    const view = built({ conversation: conversation({ source: "absent" }) });
+    expect(view.groups).toEqual([]);
+  });
+
+  test("a conversation this process no longer holds is shown and marked as such", () => {
+    const view = built({
+      conversation: conversation({
+        live: false,
+        messages: [
+          { index: 0, type: "assistant", text: "two rounds have run" },
+        ],
+        note: "From Claude Code. This conversation was opened by a server process that is no longer running.",
+      }),
+    });
+
+    const group = view.groups[0];
+    expect(group?.prose._tag).toBe("replayed");
+    expect(group?.replayed).toHaveLength(1);
+    // The separator reads this: the words are here and the conversation is not continuable,
+    // which are two facts and must not be collapsed into one.
+    expect(group?.subject.conversation?.live).toBe(false);
+  });
+
+  test("only this goal's items are in it", () => {
+    const view = built({
+      items: [
+        activity({ goalId: GOAL, roundId: null, body: "the agent" }),
+        activity({ goalId: "goal_other", roundId: null, body: "another goal" }),
+        activity({ goalId: null, roundId: ROUND, body: "a planner round" }),
+      ],
+      conversation: conversation(),
+    });
+
+    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual([
+      "the agent",
+    ]);
+  });
+
+  test("an operator's own message is a row, marked activity and never a record", () => {
+    const view = built({ sent: [sent()], conversation: conversation() });
+
+    const row = view.groups[0]?.rows[0];
+    expect(row?.item.kind).toBe(OPERATOR_TURN_KIND);
+    expect(row?.item.body).toBe("look at the lockout path");
+    // Not part of the record, not stored, gone on a reload — and the row says so rather
+    // than borrowing the authority of a committed event.
+    expect(row?.item.origin).toBe("activity");
+    expect(row?.item.sequence).toBeNull();
+    // And it cannot be read as a narration entry by the floor, which would drop it.
+    expect(activityOrder(row?.item as LiveItem)).toBeUndefined();
+  });
+
+  test("a sent message the replay has brought back is shown once", () => {
+    /*
+     * Important finding 6's second half, seen in the browser: the operator's first sentence
+     * appeared twice — once in the replayed block, because the harness stores it and the
+     * server now trims its framing off, and once as this tab's own "YOU" row.
+     *
+     * The match is on the operator's own verbatim words, which is a much stronger key than
+     * anything the narration join could use, and it cancels **one** local turn per replayed
+     * entry rather than filtering by text.
+     */
+    const view = built({
+      conversation: conversation({
+        messages: [
+          { index: 0, type: "user", text: "look at the lockout path" },
+          { index: 1, type: "assistant", text: "I will steer the planner." },
+        ],
+      }),
+      sent: [sent()],
+    });
+
+    expect(view.groups[0]?.replayed).toHaveLength(2);
+    // No "YOU" row for a sentence the replayed block above already shows.
+    expect(view.groups[0]?.rows).toEqual([]);
+  });
+
+  test("a sentence re-sent after a stale replay is still shown", () => {
+    /*
+     * The false positive the one-for-one drop had, and the reason the bound exists.
+     *
+     * The replay is read on open and re-read only after a send that *opens* a conversation,
+     * so by the time an operator types into a live conversation it is stale. Cancelling by
+     * text alone meant a re-sent short sentence — "ok", "continue", "yes" — was matched
+     * against the old entry and rendered **nowhere**: a review measured zero operator rows
+     * for exactly this input. The message was still delivered, which is what makes it the
+     * worse failure: the operator cannot tell.
+     *
+     * `replayedThrough: 0` is the honest state of that replay. The new turn is numbered 1,
+     * so no answer read before it was sent can contain it, and it is never a candidate.
+     */
+    const view = built({
+      conversation: conversation({
+        messages: [
+          { index: 0, type: "user", text: "ok" },
+          { index: 1, type: "assistant", text: "done" },
+        ],
+      }),
+      sent: [sent({ index: 1, text: "ok" })],
+      replayedThrough: 0,
+    });
+
+    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual(["ok"]);
+    // And the old entry is still in the replayed block above it, which is correct: those
+    // are two different messages that happen to say the same thing.
+    expect(view.groups[0]?.replayed).toHaveLength(2);
+  });
+
+  test("the same sentence sent twice with one in the replay still shows two", () => {
+    // Counted, not filtered: an operator who sends "ok" twice has sent two messages, and a
+    // replay that has caught up with one of them must not hide the other.
+    const view = built({
+      conversation: conversation({
+        messages: [{ index: 0, type: "user", text: "ok" }],
+      }),
+      sent: [
+        sent({ index: 1, text: "ok" }),
+        sent({ index: 2, text: "ok", after: 1 }),
+      ],
+    });
+
+    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual(["ok"]);
+  });
+
+  test("a sent message the replay does not have is kept", () => {
+    // The ordinary state of a second or later message: nothing is dropped on the strength
+    // of a replay that does not contain it.
+    const view = built({
+      conversation: conversation({
+        messages: [{ index: 0, type: "assistant", text: "One round has run." }],
+      }),
+      sent: [sent({ text: "and the admin console?" })],
+    });
+
+    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual([
+      "and the admin console?",
+    ]);
+  });
+
+  test("a sent message sorts before the narration that answered it", () => {
+    /*
+     * The join, and it is the same one the replay uses rather than a second mechanism: the
+     * turn carries the activity publish order it was sent at, so it lands before the first
+     * entry that arrived after it. Comparing timestamps instead would compare this tab's
+     * clock with the server's, and the order would wobble for no visible reason.
+     */
+    const before = activity({ goalId: GOAL, roundId: null, body: "earlier" });
+    const after = activity({ goalId: GOAL, roundId: null, body: "later" });
+    const order = activityOrder(before);
+    expect(order).toBeDefined();
+
+    const view = built({
+      items: [before, after],
+      sent: [sent({ after: order ?? 0 })],
+      conversation: conversation(),
+    });
+
+    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual([
+      "earlier",
+      "look at the lockout path",
+      "later",
+    ]);
+  });
+
+  test("the three empty states read as three different things", () => {
+    const states: {
+      source: GoalConversationView["source"];
+      expected: ReturnType<typeof built>["groups"][number]["prose"]["_tag"];
+    }[] = [
+      { source: "pending", expected: "pending" },
+      { source: "forgotten", expected: "forgotten" },
+      { source: "none", expected: "none" },
+    ];
+    for (const state of states) {
+      const view = built({
+        conversation: conversation({
+          source: state.source,
+          note: `the note for ${state.source}`,
+        }),
+        // A sent message so there is something to render a group for at all; the prose is
+        // the claim under test.
+        sent: [sent()],
+      });
+      expect(view.groups[0]?.prose._tag).toBe(state.expected);
+    }
+  });
+
+  test("a conversation the replay has not answered for yet reads as loading", () => {
+    const view = built({ sent: [sent()], conversation: undefined });
+    expect(view.groups[0]?.prose._tag).toBe("loading");
   });
 });

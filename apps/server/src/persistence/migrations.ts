@@ -1209,6 +1209,48 @@ const addRoundDispositionRationale = statements(
 );
 
 /**
+ * `0021` — a goal remembers which session its conversation was on.
+ *
+ * **One row per goal, holding the one thing that cannot be re-derived.** The goal agent's
+ * session is created on the operator's first message and lives in this process's memory
+ * along with its credential; nothing about the conversation is stored (the goal and planner
+ * flow's decision 15, and this slice's ruling 4), and that is not changed here. What is
+ * stored is the **session id**, and it is here for two things a process cannot do without
+ * it:
+ *
+ * 1. **Replay after a reload.** The conversation's prose only exists in the harness, and
+ *    asking for it needs the session id. Without a row, a reloaded tab could show a live
+ *    conversation only while the process that opened it was still running.
+ * 2. **Telling a restart from a fresh start.** The grant dies with the process and the row
+ *    does not, so a goal with a row and no live session is one whose conversation this
+ *    process cannot reach — which is exactly the state the next message must report as
+ *    `priorUnavailable` rather than silently opening a second conversation. With no row
+ *    there is nothing to say: nobody has talked to this goal.
+ *
+ * Shaped on `planner_lineages` deliberately, down to the upsert: there is exactly one
+ * current answer per goal and a session the harness has forgotten is replaced by the next
+ * message, so `goal_id` is the primary key rather than a row per session. The history of
+ * which sessions a goal has had is not kept, because nothing reads it and keeping it would
+ * be the beginning of storing the conversation.
+ *
+ * `harness_instance_id` is here and nullable for `attempts`' reason: a session recorded
+ * against an instance this server does not configure must not be *asked about* — the
+ * harness we do have would answer a confident "no such session" for a session that may be
+ * alive elsewhere — and that check needs the instance on the row.
+ *
+ * No index: one row per goal, read by its primary key.
+ */
+const addGoalSessions = statements(
+  `CREATE TABLE goal_sessions (
+    goal_id TEXT PRIMARY KEY REFERENCES goals(id),
+    target_id TEXT NOT NULL,
+    harness_session_id TEXT NOT NULL,
+    harness_instance_id TEXT,
+    opened_at INTEGER NOT NULL
+  )`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1246,6 +1288,7 @@ export const MIGRATIONS: Record<
   "0018_planner_rounds": addPlannerRounds,
   "0019_planner_lineage_by_goal": keyPlannerLineageByGoal,
   "0020_round_disposition_rationale": addRoundDispositionRationale,
+  "0021_goal_sessions": addGoalSessions,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

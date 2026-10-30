@@ -38,13 +38,15 @@
  * auth middleware is attached to the protocol layer rather than to the router, which is
  * what lets the two routes keep different postures on one port.
  *
- * ## Two endpoints, one per role, and why it is not one endpoint with a filter
+ * ## Three endpoints, one per role, and why it is not one endpoint with a filter
  *
  * A worker attempt is offered `record_observation`; a planner round is offered
- * `add_intent`, `record_round_disposition`, the graph reads and `list_harnesses`; neither
- * sees the other's. That is this slice's first ruling, and the shape it takes here is **a
- * second `McpServer` on a second path** ({@link PLANNER_MCP_PATH}), each with its own
- * `Toolkit` and its own auth middleware.
+ * `add_intent`, `record_round_disposition`, the graph reads and `list_harnesses`; a goal
+ * agent is offered `steer_planner`, `wake_planner`, `end_goal` and reads, and **no
+ * `add_intent`**. No role sees another's. That is the slice-7 ruling extended to the third
+ * role, and the shape it takes here is **one `McpServer` per path** — {@link MCP_PATH},
+ * {@link PLANNER_MCP_PATH}, {@link GOAL_MCP_PATH} — each with its own `Toolkit` and its own
+ * auth middleware.
  *
  * It is not a per-request filter over one toolkit because `effect/ai` does not offer one
  * that can see the caller. `McpServer.addTool` takes an `EnabledWhen` annotation whose
@@ -86,6 +88,7 @@ import { McpProtocol, McpServer } from "effect/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { McpCredentials, callerOf } from "./credentials";
+import { GoalPlanning, GoalToolkit, GoalToolkitLayer } from "./goalTools";
 import { McpInvocation } from "./invocation";
 import {
   PlannerHarnesses,
@@ -115,6 +118,15 @@ export const MCP_PATH = apiPath("mcp");
  * endpoint" rather than "a variant of the MCP endpoint", which is what it is.
  */
 export const PLANNER_MCP_PATH = apiPath("planner/mcp");
+/**
+ * Where a **goal agent**'s MCP client connects. `steer_planner` and `end_goal` live here.
+ *
+ * A third sibling path, for {@link PLANNER_MCP_PATH}'s reason. The three are peers rather
+ * than a hierarchy because the roles are peers: no credential is a weaker form of another,
+ * and a path that read as a sub-resource of the planner's would suggest the goal agent is a
+ * kind of planner. It is the opposite — it is the thing that cannot write intents.
+ */
+export const GOAL_MCP_PATH = apiPath("goal/mcp");
 
 /**
  * Authenticated MCP requests served, in total and per caller scope.
@@ -284,6 +296,13 @@ const plannerRegistered = plannerRegistration as Layer.Layer<
   Exclude<Layer.Services<typeof plannerRegistration>, McpInvocation>
 >;
 
+const goalRegistration = McpServer.toolkit(GoalToolkit);
+const goalRegistered = goalRegistration as Layer.Layer<
+  never,
+  never,
+  Exclude<Layer.Services<typeof goalRegistration>, McpInvocation>
+>;
+
 /**
  * One role's endpoint: its toolkit, on its path, behind its own auth.
  *
@@ -350,6 +369,17 @@ const roleEndpoint = <RIn>(options: {
  */
 export const mcpApplicationLayer = (options?: {
   readonly harnesses?: Layer.Layer<PlannerHarnesses> | undefined;
+  /**
+   * The two planning operations the goal agent's tools reach, as an already-built value.
+   *
+   * Passed in rather than required for {@link PlannerHarnesses}' reason, and the cost of
+   * getting it wrong is higher: this layer is built inside `HttpRouter.toWebHandler`'s own
+   * memo map, so a `PlanSupervisor` *required* here would be built a second time — a second
+   * fiber map, a second set of goal claims, and two processes' worth of supervision inside
+   * one process. {@link GoalPlanning.unavailable} is the honest default for a server with
+   * no harness.
+   */
+  readonly planning?: Layer.Layer<GoalPlanning> | undefined;
 }) =>
   Layer.mergeAll(
     roleEndpoint({
@@ -363,6 +393,29 @@ export const mcpApplicationLayer = (options?: {
       registration: plannerRegistered.pipe(
         Layer.provide(PlannerToolkitLayer),
         Layer.provide(options?.harnesses ?? PlannerHarnesses.none),
+      ),
+    }),
+    /**
+     * The goal agent's endpoint.
+     *
+     * The third `Layer.fresh` pair, and the trap this module's header records applies to it
+     * exactly as to the other two: without `fresh` around the registration-and-transport
+     * pair all three paths would serve one merged toolkit, and with `fresh` on the
+     * transport alone all three would serve an empty one.
+     *
+     * **What catches either is `plannerTools.test.ts` and `goalTools.test.ts`**, each of
+     * which reads `tools/list` off its own endpoint and asserts the whole list. Not
+     * `server.test.ts`: that file drives {@link MCP_PATH} only and never names the other
+     * two paths, so it would pass with all three toolkits merged. An earlier version of
+     * this comment named it, which is the kind of claim that makes a protection look
+     * tested when the test is somewhere else.
+     */
+    roleEndpoint({
+      path: GOAL_MCP_PATH,
+      serves: "goal",
+      registration: goalRegistered.pipe(
+        Layer.provide(GoalToolkitLayer),
+        Layer.provide(options?.planning ?? GoalPlanning.unavailable),
       ),
     }),
   );

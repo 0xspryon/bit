@@ -300,9 +300,30 @@ export class McpCredentials extends Context.Service<
      *
      * The explicit half of what bounds a no-expiry credential (point 2 in this module's
      * header). **Only goal grants**: a round running under the same goal keeps its own
-     * credential until its scope closes or {@link revokeRound} is called for it. That is
-     * deliberate — the two are different authorities with different write surfaces — and
-     * it means ending a goal has to revoke both if that is what is wanted.
+     * credential until its scope closes or {@link revokeRound} is called for it.
+     *
+     * ## It does not cascade, and slice 9 is where that was decided
+     *
+     * Slice 4 left the question open. The answer is **no cascade, and nothing calls this
+     * when a goal ends**, for two reasons that are about what the cascade would break
+     * rather than about tidiness:
+     *
+     * - **To the goal's rounds.** A round holds its own credential and the spec's decision
+     *   8 says ending a goal interrupts nothing that is running. A round whose credential
+     *   vanished could not call `record_round_disposition`, so the one write that explains
+     *   what it concluded would be refused — and `add_intent` is already refused under an
+     *   ended goal by `RoundIntentRefused`'s `goal_ended`, which is the dispatch-shaped gap
+     *   that actually mattered. Revoking would buy nothing and cost the record.
+     * - **To the goal agent itself.** `store.checkGoalAuthority` refuses every write under
+     *   an ended goal, which is durable and is a column rather than a map — so revocation
+     *   adds no containment. What it would take away is the agent's **reads**, and
+     *   "summarise what we established" is a reasonable thing to ask about a goal that has
+     *   just been closed.
+     *
+     * So what calls this is `plan/goalConversation.ts`, when it gives up on a session — and
+     * there it is a **check** rather than the mechanism: the session's own scope has just
+     * revoked the grant, and a non-zero count here means one existed that no scope owned,
+     * which is a bug and is logged as one.
      */
     readonly revokeGoal: (goalId: string) => Effect.Effect<number>;
     /** Live grants. Used by tests to prove nothing outlived its scope. */

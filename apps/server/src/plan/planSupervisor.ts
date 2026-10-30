@@ -93,17 +93,26 @@ import {
   Layer,
   Option,
   Redacted,
+  Semaphore,
   Stream,
   type Duration,
 } from "effect";
 
-import { AgentHarness, type TerminalOutcome } from "../harness/agentHarness";
+import {
+  AgentHarness,
+  type SteerUrgency,
+  type TerminalOutcome,
+} from "../harness/agentHarness";
 import {
   DEFAULT_GOAL_BRIEFING_MAX_CHARS,
   buildGoalBriefing,
   type GoalBriefingTooLarge,
 } from "../briefing/goalBriefing";
-import { assembleRoundPrompt, type AssembledRoundPrompt } from "./roundPrompt";
+import {
+  assembleRoundPrompt,
+  assembleSteerPrompt,
+  type AssembledRoundPrompt,
+} from "./roundPrompt";
 import { HarnessResolver, type ResolvedHarness } from "../harness/resolver";
 import { FleetStore } from "../persistence/fleet";
 import * as identifier from "../persistence/identifier";
@@ -238,6 +247,17 @@ export interface PlanInput {
    * reported on the started round rather than left to be inferred.
    */
   readonly briefingMaxChars?: number | undefined;
+  /**
+   * An instruction from the goal agent this round is being opened to carry out.
+   *
+   * Decision 12's second clause, and the fallback {@link PlanSupervisor.steer} takes when
+   * no round is live: the directive goes into the round's *opening prompt* rather than
+   * being stored anywhere, because there is nowhere to store it — the goal agent's own
+   * session is the memory (decision 12) and this build keeps no directive table.
+   *
+   * Absent for an operator's "Plan next", which carries no instruction at all.
+   */
+  readonly directive?: string | undefined;
 }
 
 /**
@@ -276,6 +296,38 @@ export interface PlanRoundStopped {
   readonly toolCallsSeen: number;
   readonly stoppedAt: number;
 }
+
+/**
+ * What steering a goal's live round came to.
+ *
+ * **A tagged result rather than a refusal, because "no round is live" is not an error —
+ * it is the other branch of decision 12.** The goal agent steers a live round *or* opens
+ * one whose prompt already carries the directive, and the caller has to be able to take
+ * the second branch without reading a reason string. Everything that genuinely went wrong
+ * — the harness, the store — is still a {@link PlanRefused} in the error channel.
+ *
+ * `noLiveRound` covers three states that are one state to a caller: this goal has never
+ * had a round, its last round settled, or **a round was live and settled while the steer
+ * was being decided**. That last one is DECISIONS.md §24.1's consequence 5, and it is the
+ * reason this answer exists at all: on OpenCode a late steer does not fail, it silently
+ * starts a new unsupervised execution, so the supervisor has to refuse to deliver rather
+ * than let the harness decide.
+ */
+export type SteerAttempt =
+  | {
+      readonly _tag: "steered";
+      readonly roundId: string;
+      readonly targetId: string;
+      readonly goalId: string;
+      readonly harnessSessionId: string;
+      readonly urgency: SteerUrgency;
+      /**
+       * False when the harness had already accepted this message id: nothing was sent
+       * again. A retried steer, in other words, and the round is not steered twice.
+       */
+      readonly delivered: boolean;
+    }
+  | { readonly _tag: "noLiveRound" };
 
 /**
  * Collapses everything the start half can fail with into one typed refusal.
@@ -367,6 +419,38 @@ export class PlanSupervisor extends Context.Service<
     readonly stop: (
       roundId: string,
     ) => Effect.Effect<PlanRoundStopped, PlanRefused>;
+    /**
+     * Delivers a directive into the round this process is driving on one goal.
+     *
+     * **It claims the round as live before it prompts, and that claim is the whole of this
+     * method's reason for existing.** DECISIONS.md §24.1 measured that OpenCode never
+     * refuses a prompt — not for being busy and not for being finished — so prompting a
+     * session whose round has just settled starts a **new execution** with no supervisor
+     * watching it, no round record and no disposition. A `steer_planner` tool that simply
+     * called `AgentHarness.prompt` would therefore turn a lost race into unsupervised work.
+     *
+     * So the round's own supervising fiber publishes a steerable entry when it is prompted
+     * and withdraws it in its settling finalizer, both under a one-permit semaphore that
+     * this method also takes. A steer that arrives while the round is settling **waits**
+     * for the settlement rather than racing it, and then finds the entry gone and answers
+     * `noLiveRound`; a steer that gets the permit first delivers, and the settlement that
+     * was waiting behind it then interrupts the session as it always does. Neither order
+     * produces work nothing is supervising.
+     *
+     * It does **not** record the steer. `plan.round.steered` is written by the goal agent's
+     * tool, after this answers, because the receipt that makes a retry replay is keyed on
+     * that agent's own operation id — see `mcp/goalTools.ts` for the ordering and why
+     * delivery comes first.
+     */
+    readonly steer: (input: {
+      readonly goalId: string;
+      /** The operator's or the agent's words, as they are. Wrapped, not rewritten. */
+      readonly directive: string;
+      /** Defaults to `queued` everywhere; see {@link SteerUrgency}. */
+      readonly urgency: SteerUrgency;
+      /** Derived by the caller, so a retry cannot double-deliver. */
+      readonly messageId: string;
+    }) => Effect.Effect<SteerAttempt, PlanRefused>;
     /** The rounds this process is supervising right now, from the fiber map itself. */
     readonly running: Effect.Effect<readonly RunningRound[]>;
   }
@@ -449,6 +533,11 @@ export class PlanSupervisor extends Context.Service<
             detail: `nothing is running under ${roundId}: this server has no agent harness, so it has opened no rounds`,
           }),
         ),
+      // `noLiveRound` rather than `no_harness`, and it is the true answer: a server with no
+      // harness is driving no round, which is exactly what a caller has to know to take
+      // decision 12's other branch. That branch then refuses with `no_harness` from
+      // `start`, which is where the fact belongs.
+      steer: () => Effect.succeed({ _tag: "noLiveRound" }),
       running: Effect.succeed([]),
     }),
   );
@@ -548,6 +637,38 @@ const make = Effect.fnUntraced(function* (options?: {
   const claimedGoals = new Map<
     string,
     { readonly roundId: string; readonly targetId: string }
+  >();
+
+  /**
+   * The rounds a steer may reach, keyed by goal, with the lock that makes reaching one safe.
+   *
+   * **Keyed by goal rather than by round, because the goal is what a caller has.** The goal
+   * agent holds a goal credential and no round id at all; "steer the planner" means "steer
+   * whatever round is working my goal", and one round works a goal at a time
+   * ({@link claimedGoals}), so the key is exact rather than a lookup over candidates.
+   *
+   * An entry exists for the stretch between the round's prompt being accepted and its
+   * settling finalizer running, and for no part of either end: before the prompt there is
+   * nothing to steer, and after the finalizer the credential is revoked and the row has
+   * moved out of `running`. The `settled` flag and the `lock` are what make that interval
+   * mean something to a concurrent steer — see {@link PlanSupervisor.steer}.
+   *
+   * It is not the same map as {@link supervised}, which answers "what is this process
+   * driving" for an HTTP route and holds no harness. This one holds the harness instance
+   * and the session id, which is authority-shaped and has no business on a wire.
+   */
+  const steerable = new Map<
+    string,
+    {
+      readonly roundId: string;
+      readonly targetId: string;
+      readonly harnessSessionId: string;
+      readonly harness: AgentHarness["Service"];
+      /** Set by the round's own finalizer, under {@link lock}, before it settles. */
+      settled: boolean;
+      /** One permit. A steer and a settlement cannot both hold it. */
+      readonly lock: Semaphore.Semaphore;
+    }
   >();
 
   /**
@@ -1219,53 +1340,71 @@ const make = Effect.fnUntraced(function* (options?: {
          * for why there are two registrations at all.
          */
         let concluded = false;
+        /**
+         * The one permit a steer and this round's settlement compete for.
+         *
+         * Made here, per round, and taken by {@link conclude} around **everything** it
+         * does — so a steer that has the permit finishes delivering before the round is
+         * interrupted and settled, and a steer that arrives while the settlement holds it
+         * waits and then finds `settled` true. See {@link PlanSupervisor.steer}.
+         */
+        const steerLock = Semaphore.makeUnsafe(1);
         const conclude = Effect.suspend(() => {
           if (concluded) return Effect.void;
           concluded = true;
-          return Effect.gen(function* () {
-            supervised.delete(ids.roundId);
-            // Given back here rather than in `start`, because the claim has to outlive the
-            // request: it is held for as long as a planner is working that goal, and this
-            // finalizer runs on every exit. The *durable* half of the claim is released by
-            // the settlement below moving the row out of `running`.
-            yield* releaseGoal(input.goalId, ids.roundId);
-            // Only when we are the reason it is over. A session that reported its own
-            // outcome has already stopped, and asking it to stop again would be a
-            // pointless round trip on every clean round.
-            if (ending._tag === "stopped") {
-              const harness = yield* AgentHarness;
-              const interrupted = yield* Effect.result(
-                // Bounded for the reason the `sessionStatus` ask in `settle` is: this also
-                // runs in a finalizer, and a dying harness answers neither.
-                Effect.timeout(
-                  harness.interruptSession(session.id),
-                  askTimeout,
-                ),
-              );
-              yield* Effect.logInfo(
-                "asked the harness to interrupt a planner session",
-                {
-                  roundId: ids.roundId,
-                  harnessSessionId: session.id,
-                  // A refusal here is reported, not acted on: the round's authority is
-                  // revoked below either way, so a session we could not reach cannot
-                  // record anything even if it carries on working.
-                  harnessInterrupted:
-                    interrupted._tag === "Success"
-                      ? interrupted.success
-                      : `could not ask: ${interrupted.failure.message}`,
-                },
-              );
-            }
-            const settled = yield* settle(store, {
-              roundId: ids.roundId,
-              targetId: input.targetId,
-              harnessSessionId: session.id,
-              end: ending,
-              narrated: report.narrated,
-            });
-            remember(ids.roundId, settled);
-          });
+          return Semaphore.withPermit(steerLock)(
+            Effect.gen(function* () {
+              // Withdrawn first, inside the permit: from here on a steer for this goal gets
+              // `noLiveRound` rather than a session that is about to be interrupted.
+              const live = steerable.get(input.goalId);
+              if (live !== undefined && live.roundId === ids.roundId) {
+                live.settled = true;
+                steerable.delete(input.goalId);
+              }
+              supervised.delete(ids.roundId);
+              // Given back here rather than in `start`, because the claim has to outlive the
+              // request: it is held for as long as a planner is working that goal, and this
+              // finalizer runs on every exit. The *durable* half of the claim is released by
+              // the settlement below moving the row out of `running`.
+              yield* releaseGoal(input.goalId, ids.roundId);
+              // Only when we are the reason it is over. A session that reported its own
+              // outcome has already stopped, and asking it to stop again would be a
+              // pointless round trip on every clean round.
+              if (ending._tag === "stopped") {
+                const harness = yield* AgentHarness;
+                const interrupted = yield* Effect.result(
+                  // Bounded for the reason the `sessionStatus` ask in `settle` is: this also
+                  // runs in a finalizer, and a dying harness answers neither.
+                  Effect.timeout(
+                    harness.interruptSession(session.id),
+                    askTimeout,
+                  ),
+                );
+                yield* Effect.logInfo(
+                  "asked the harness to interrupt a planner session",
+                  {
+                    roundId: ids.roundId,
+                    harnessSessionId: session.id,
+                    // A refusal here is reported, not acted on: the round's authority is
+                    // revoked below either way, so a session we could not reach cannot
+                    // record anything even if it carries on working.
+                    harnessInterrupted:
+                      interrupted._tag === "Success"
+                        ? interrupted.success
+                        : `could not ask: ${interrupted.failure.message}`,
+                  },
+                );
+              }
+              const settled = yield* settle(store, {
+                roundId: ids.roundId,
+                targetId: input.targetId,
+                harnessSessionId: session.id,
+                end: ending,
+                narrated: report.narrated,
+              });
+              remember(ids.roundId, settled);
+            }),
+          );
         });
 
         // The net. Registered first, so it runs *last*, and guarded so it does nothing on
@@ -1345,6 +1484,24 @@ const make = Effect.fnUntraced(function* (options?: {
           yield* Deferred.fail(gate, refuse(prompted.failure));
           return;
         }
+
+        /*
+         * Steerable from here, and not a moment earlier.
+         *
+         * After the prompt was accepted, because a round whose prompt the harness refused
+         * has no turn for a directive to land in; and before the gate is completed, so the
+         * `POST .../plan` that opened this round cannot answer the browser before the
+         * round is reachable — a goal agent that woke a round and steered it immediately
+         * would otherwise race its own wake-up.
+         */
+        steerable.set(input.goalId, {
+          roundId: ids.roundId,
+          targetId: input.targetId,
+          harnessSessionId,
+          harness: resolved.harness,
+          settled: false,
+          lock: steerLock,
+        });
 
         // The request is let go here, and not before: everything above had to succeed for
         // the round to be a real, authorised, prompted round.
@@ -1524,6 +1681,9 @@ const make = Effect.fnUntraced(function* (options?: {
       goalId: input.goalId,
       budget,
       briefing: prepared.success.rendered,
+      // Forwarded only when there is one, so a round an operator opened reads exactly as
+      // it did before this slice: no directive section at all.
+      ...(input.directive === undefined ? {} : { directive: input.directive }),
     });
 
     /**
@@ -1665,9 +1825,86 @@ const make = Effect.fnUntraced(function* (options?: {
     } satisfies PlanRoundStopped;
   });
 
+  const steer: PlanSupervisor["Service"]["steer"] = Effect.fn(
+    "PlanSupervisor.steer",
+  )(function* (input) {
+    /*
+     * Read once, outside the permit, and re-read nothing.
+     *
+     * The entry object is stable for the life of the round — the finalizer mutates
+     * `settled` and removes the key rather than replacing the object — so holding the
+     * reference across the permit is sound, and `settled` read *inside* the permit is the
+     * authoritative answer. Looking the key up again inside the permit would be a second
+     * question with the same answer.
+     */
+    const live = steerable.get(input.goalId);
+    if (live === undefined) return { _tag: "noLiveRound" };
+    return yield* Semaphore.withPermit(live.lock)(
+      Effect.gen(function* () {
+        // Settled while we waited for the permit: the finalizer ran, the credential is
+        // revoked and the row has left `running`. Nothing is delivered, and the caller
+        // opens a round carrying the directive instead.
+        if (live.settled) return { _tag: "noLiveRound" } as const;
+        const accepted = yield* Effect.result(
+          live.harness.prompt(
+            live.harnessSessionId,
+            // Wrapped so the planner knows who is speaking and that its rules still hold.
+            // `plan/roundPrompt.ts` carries the reasoning and the marker a replay matches.
+            assembleSteerPrompt(input.directive),
+            {
+              _tag: "steer",
+              urgency: input.urgency,
+              messageId: input.messageId,
+            },
+          ),
+        );
+        if (accepted._tag === "Failure") {
+          /*
+           * The harness would not take it, which includes the one case Claude Code can see
+           * and OpenCode cannot: a session that has already finished everything it
+           * accepted. Reported as a refusal rather than as `noLiveRound`, because the two
+           * call for different things — a refusal is about the harness and opening a fresh
+           * round would most likely hit the same wall — and the sentence the client prints
+           * is the harness's own.
+           */
+          yield* Effect.logWarning(
+            "a harness would not take a steer into a live planner round",
+            {
+              roundId: live.roundId,
+              goalId: input.goalId,
+              harnessSessionId: live.harnessSessionId,
+              detail: accepted.failure.message,
+            },
+          );
+          return yield* refuse(accepted.failure);
+        }
+        yield* Effect.logInfo("a planner round was steered", {
+          roundId: live.roundId,
+          goalId: input.goalId,
+          harnessSessionId: live.harnessSessionId,
+          urgency: input.urgency,
+          // The id, never the directive: this build stores no conversation and a log line
+          // is storage.
+          messageId: input.messageId,
+          delivered: accepted.success.delivered,
+        });
+        return {
+          _tag: "steered",
+          roundId: live.roundId,
+          targetId: live.targetId,
+          goalId: input.goalId,
+          harnessSessionId: live.harnessSessionId,
+          urgency: input.urgency,
+          delivered: accepted.success.delivered,
+        } as const;
+      }),
+    );
+  });
+
   return PlanSupervisor.of({
     start,
     stop,
+    steer,
     // Returned whole rather than projected: unlike `Supervised`, this holds nothing that is
     // only the server's business — a round's goal and target are the two things a caller
     // asking "what is planning right now" wants, and there is no filesystem layout in it.

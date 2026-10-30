@@ -48,6 +48,45 @@
  */
 
 /**
+ * The first line of every round prompt, which is also how a replay recognises one.
+ *
+ * **This is the prompt discriminator, and it is load-bearing.** A round's replay has to
+ * drop the prompt — it is the whole goal briefing, thousands of characters, already on the
+ * page verbatim in the briefing panel — and the rule for finding it used to be "the first
+ * non-blank `user` entry, wherever it sits". That worked while a round had exactly one user
+ * message. A steer is also a non-blank `user` entry, and on OpenCode's ordering a later
+ * steer can sort **before** the prompt (DECISIONS.md §24.1 and `roundNarration.ts`'s own
+ * note on the prompt arriving last), so the old rule would have dropped the steer and
+ * replayed the entire briefing into the chat.
+ *
+ * So the prompt is identified by **what it is**, not by where it sits: an entry that starts
+ * with this sentence. It cannot collide with a steer, because a steer is the goal agent's
+ * directive under {@link STEER_PROMPT_MARKER}, and it cannot collide with an operator
+ * message because an operator cannot prompt a round at all.
+ *
+ * The alternative the brief also allows — carrying the opening prompt's *message id* on the
+ * round row and matching on that — needs a column, a migration, and an id on
+ * `AgentHarness.messages`'s reduced entries, which that shape does not have. Matching the
+ * text needs none of those and is exact.
+ */
+export const ROUND_PROMPT_MARKER =
+  "You are a planner round in bit, a security-testing tool.";
+
+/** The first line of a steer, so a reader and a test can recognise one. */
+export const STEER_PROMPT_MARKER = "A DIRECTIVE FROM THE GOAL AGENT";
+
+/**
+ * Whether one replayed entry's text is a round's own opening prompt.
+ *
+ * Both halves are checked: the marker **and** the goal id the preamble names on its second
+ * line. A round replayed from a session its goal shares with no other round makes the goal
+ * id redundant; a session lineage that was reused across goals would not, and the id is
+ * free to check.
+ */
+export const isRoundPromptText = (text: string, goalId: string): boolean =>
+  text.startsWith(ROUND_PROMPT_MARKER) && text.includes(goalId);
+
+/**
  * The framing above the briefing.
  *
  * `budget` and `goalId` are the two facts about *this* round that a planner cannot read
@@ -58,6 +97,16 @@
 const preamble = (input: {
   readonly goalId: string;
   readonly budget: number;
+  /**
+   * An instruction from the goal agent this round was opened to carry out, if any.
+   *
+   * Decision 12's second clause: with no live round to steer, the goal agent opens one
+   * *whose prompt already carries the directive*. It goes **after** the rules and before
+   * the briefing, so a directive cannot be read as permission to ignore the budget, the
+   * anchoring rule or the disposition — all of which are above it — and so that the
+   * briefing stays the last thing the model reads.
+   */
+  readonly directive?: string | undefined;
 }): readonly string[] => [
   `You are a planner round in bit, a security-testing tool. You are planning one goal:`,
   `${input.goalId}. One round is one bounded unit of planning work, and this is yours.`,
@@ -110,6 +159,19 @@ const preamble = (input: {
   `a record, nobody will act on it, and a round that says so honestly is one an`,
   `operator can simply run again.`,
   ``,
+  ...(input.directive === undefined
+    ? []
+    : [
+        `${STEER_PROMPT_MARKER}`,
+        ``,
+        `This round was opened to carry out an instruction from the goal's own agent,`,
+        `which is the operator's conversation about this goal. It is not a replacement for`,
+        `the work above: do what it asks, within the rules above, and record a disposition`,
+        `as always. The instruction is:`,
+        ``,
+        input.directive,
+        ``,
+      ]),
   `THE RECORD FOLLOWS. Everything below this line is the briefing.`,
   ``,
   `----------------------------------------------------------------------`,
@@ -145,6 +207,8 @@ export const assembleRoundPrompt = (input: {
   readonly goalId: string;
   readonly budget: number;
   readonly briefing: string;
+  /** An instruction from the goal agent, when this round was opened to carry one out. */
+  readonly directive?: string | undefined;
 }): AssembledRoundPrompt => {
   const prompt = [...preamble(input), input.briefing].join("\n");
   return {
@@ -165,3 +229,42 @@ export const roundPromptOverhead = (input: {
   readonly goalId: string;
   readonly budget: number;
 }): number => assembleRoundPrompt({ ...input, briefing: "" }).promptChars;
+
+/**
+ * The text a steer delivers into a round that is already running.
+ *
+ * ## Why the directive is wrapped at all
+ *
+ * The directive arrives as a second `user` message in a session whose only other user
+ * message is the round's enormous opening prompt. Sent bare, a model has no way to tell
+ * "the operator's agent is redirecting me" from "the operator is talking to me" — it is
+ * talking to neither; the goal agent is — and no reason to believe the rules it was given
+ * at the start still apply. The framing says who is speaking and what is unchanged.
+ *
+ * ## What it deliberately does not do
+ *
+ * It does not restate the briefing, the budget or the tool contracts. The session already
+ * has all three from its opening prompt and this is the *same* session — that is the whole
+ * point of steering rather than opening a round (DECISIONS.md §24.1: the second prompt
+ * lands inside the same execution on OpenCode and as a second turn on the same session on
+ * Claude Code, with its lineage, its MCP registration and its credential intact). A steer
+ * that re-sent the briefing would cost the tokens the injection exists to save.
+ *
+ * It also does not say which urgency it was delivered at. The model cannot act on that and
+ * it is already recorded where it is useful: on `plan.round.steered`, for the operator.
+ */
+export const assembleSteerPrompt = (directive: string): string =>
+  [
+    STEER_PROMPT_MARKER,
+    "",
+    "This is the goal agent — the operator's conversation about the goal you are",
+    "planning — speaking into the round you are already working. Everything you were",
+    "told at the start of this round still holds: the same budget, the same anchoring",
+    "rule, and record_round_disposition exactly once as the last thing you do.",
+    "",
+    "Take the instruction below into account in the planning you have left to do. If you",
+    "have already added intents, they stand; do not try to withdraw them. If the",
+    "instruction makes the rest of your plan wrong, say so in your disposition rationale.",
+    "",
+    directive,
+  ].join("\n");

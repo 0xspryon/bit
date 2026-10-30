@@ -60,11 +60,27 @@ export type GoalEndStatus = typeof GoalEndStatus.Type;
  * Who ended a goal.
  *
  * - `operator` — a person, through the browser.
- * - `planner` — the planner recorded that the objective was met. Nothing writes this yet;
- *   the value exists so that when something does, the record already distinguishes a
- *   person's decision from a machine's.
+ * - `planner` — a planner round recorded `objective_met` on its disposition, which ends
+ *   the goal in the same transaction (`record_round_disposition`).
+ * - `goal_agent` — the goal conversation's own agent called `end_goal`.
+ *
+ * **`goal_agent` is a third value rather than a second use of `planner`, and the reason is
+ * that the two are different writers with different authority.** A planner round is
+ * bounded, unprompted and settles with a disposition; the goal agent is the long-horizon
+ * conversation the operator is talking to, and it has no `add_intent` at all. Reusing
+ * `planner` would have made the goal page say "ended by the planner" for an ending no
+ * planner round reached — the one claim about an ending that a later reader cannot check
+ * against anything else, since the two write through different credentials and the
+ * `goal.ended` event's `callerScope` is the only other place the difference appears.
+ *
+ * Adding a literal is additive for stored rows: no existing row holds it, and every reader
+ * that switches on this has a branch for it.
  */
-export const GoalEndedBy = Schema.Literals(["planner", "operator"]);
+export const GoalEndedBy = Schema.Literals([
+  "planner",
+  "operator",
+  "goal_agent",
+]);
 export type GoalEndedBy = typeof GoalEndedBy.Type;
 
 /**

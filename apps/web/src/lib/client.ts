@@ -232,6 +232,14 @@ export const REFUSAL_TAGS = new Set([
   // forgotten is a `200` that says so, because for an older round that is the expected
   // answer and not a fault.
   "RoundNotFound",
+  // Saying something to a goal's agent. **Every reason is a sentence the composer prints
+  // beside itself**: no harness configured, a harness that would not take a session, a goal
+  // that has ended, a directory the policy gate would not install into. Classifying any of
+  // them as transport trouble would replace "this goal has ended, so its agent's authority
+  // has ended with it" with "No server answered at this address", which is wrong and
+  // unactionable. Reading the conversation declares no error at all: a conversation nobody
+  // has started, and one the harness has deleted, are both a `200` that says which.
+  "GoalConversationRefused",
 ]);
 
 /**
@@ -582,6 +590,45 @@ export const server = {
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.goalNarration({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * One goal's conversation, replayed from the harness.
+   *
+   * {@link goalNarration}'s sibling for the other agent, and the same promise: every answer
+   * is a success. `source` is what distinguishes a goal nobody has talked to (`absent`)
+   * from one whose words the harness has deleted (`forgotten`) from a live conversation
+   * that has not said anything yet (`pending`), and a client that treated an empty list as
+   * a fault would report four different facts as one.
+   */
+  goalConversation: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.goalConversation({ params: { targetId, goalId } }),
+      ),
+    ),
+
+  /**
+   * Says something to one goal's agent, answering once the session has it.
+   *
+   * `202`: the turn is the model's to take, and what the agent says arrives on the live
+   * stream. The payload is the operator's words and nothing else — no model, no harness, no
+   * session — because the session is the server's and a browser that could name any of
+   * that would be choosing where an agent runs.
+   */
+  sendGoalMessage: (
+    baseUrl: string,
+    targetId: string,
+    goalId: string,
+    text: string,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.sendGoalMessage({
+          params: { targetId, goalId },
+          payload: { text },
+        }),
       ),
     ),
 

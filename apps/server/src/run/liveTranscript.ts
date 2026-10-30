@@ -118,7 +118,7 @@ import {
   Stream,
 } from "effect";
 
-import { roundIdFromScope } from "../persistence/store";
+import { goalIdFromScope, roundIdFromScope } from "../persistence/store";
 import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
 import type { RunNarration, RunNarrations } from "./narration";
 
@@ -217,6 +217,10 @@ const ATTEMPT_SUBJECT_KINDS: ReadonlySet<string> = new Set([
 const ROUND_SUBJECT_KINDS: ReadonlySet<string> = new Set([
   "plan.round.started",
   "plan.round.settled",
+  // A steer's subject is the round too, and this one has a caller scope as well — the goal
+  // agent's. So it is the one event that fills both `roundId` (from here) and `goalId`
+  // (from the scope), which is exactly what puts it in both chats.
+  "plan.round.steered",
 ]);
 
 /**
@@ -294,6 +298,17 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
     roundId:
       roundIdFromScope(event.callerScope) ??
       (ROUND_SUBJECT_KINDS.has(event.kind) ? event.subjectId : null),
+    /**
+     * Which goal's **conversation** this item belongs to, from the caller scope only.
+     *
+     * No subject fallback, deliberately, and the asymmetry with `roundId` above is the
+     * point: `goal.added` and `goal.ended` carry the goal as their subject, and an operator
+     * creating or ending a goal through the browser is not the goal agent talking. Reading
+     * the subject here would put every hand-made goal change into a conversation nobody
+     * had. What this field means is "the goal agent wrote this", and the scope is the only
+     * thing that says so.
+     */
+    goalId: goalIdFromScope(event.callerScope) ?? null,
     tool: null,
     // Null together with `tool`, always: a committed event is not a tool call, and the
     // record channel never names one.
@@ -446,6 +461,30 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
         outcome: status === "" ? null : status,
       };
     }
+    case "plan.round.steered": {
+      const urgency = text(event.payload, "urgency");
+      /*
+       * What a steer says on a screen, and what it deliberately cannot say.
+       *
+       * **No directive text, because the event carries none** (`event.ts`): the
+       * conversation that produced it is not stored, and a transcript holding the one
+       * sentence that redirected a round while holding none of the words around it would
+       * be worse than holding nothing. What the item gives a reader is the fact and the
+       * timing — `queued` let the round finish what it was doing, `preemptive` cut it off
+       * — because that is what explains the round's own output afterwards.
+       */
+      const timing =
+        urgency === "preemptive"
+          ? "It was delivered pre-emptively, so work in flight was cut short."
+          : "It was queued behind the work already in flight.";
+      return {
+        ...base,
+        kind: "plan.round.steered",
+        headline: "Planner round steered",
+        body: `The goal agent steered round ${event.subjectId}. ${timing} The directive itself is not recorded; what the round does next is below.`,
+        outcome: null,
+      };
+    }
     case "intent.released": {
       const held = text(event.payload, "attemptStatus");
       const attempt = text(event.payload, "claimedByAttemptId");
@@ -505,6 +544,7 @@ export const projectNarration = (item: RunNarration): LiveItem | undefined => {
      */
     attemptId: item.subject._tag === "attempt" ? item.subject.attemptId : null,
     roundId: item.subject._tag === "round" ? item.subject.roundId : null,
+    goalId: item.subject._tag === "goal" ? item.subject.goalId : null,
   };
   /**
    * The registration whose prefix this subject's tool names carry.
@@ -518,7 +558,9 @@ export const projectNarration = (item: RunNarration): LiveItem | undefined => {
   const serverName = bitMcpServerName(
     item.subject._tag === "attempt"
       ? item.subject.attemptId
-      : item.subject.roundId,
+      : item.subject._tag === "round"
+        ? item.subject.roundId
+        : item.subject.goalId,
   );
   const detail = item.entry.detail;
   switch (detail._tag) {
@@ -615,6 +657,9 @@ export const projectDecision = (
     kind: "action.denied",
     at: decision.at,
     attemptId,
+    // Null for the reason `roundId` below is null: the hook sends a harness session id and
+    // nothing else, so there is nothing here that names a goal conversation either.
+    goalId: null,
     /**
      * Null, and that is a gap worth naming rather than papering over.
      *

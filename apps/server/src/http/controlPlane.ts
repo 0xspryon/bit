@@ -57,11 +57,13 @@ import { HttpRouter, HttpServerResponse } from "effect/http";
 
 import { McpCredentials } from "../mcp/credentials";
 import {
+  GOAL_MCP_PATH,
   MCP_PATH,
   PLANNER_MCP_PATH,
   McpCallCounter,
   mcpApplicationLayer,
 } from "../mcp/server";
+import type { GoalPlanning } from "../mcp/goalTools";
 import type { PlannerHarnesses } from "../mcp/plannerTools";
 import { TargetStores } from "../persistence/targetStores";
 import {
@@ -175,6 +177,14 @@ export interface ControlPlaneHandle {
    * toolkit.
    */
   readonly plannerMcpUrl: string;
+  /**
+   * Where a **goal agent**'s MCP client connects.
+   *
+   * A third URL, for the second one's reason. `steer_planner`, `wake_planner`, `end_goal`
+   * and the goal reads are here, and `add_intent` is not — on any path this agent's
+   * credential is accepted at.
+   */
+  readonly goalMcpUrl: string;
   /** Where the harness-side policy hook posts. */
   readonly policyUrl: string;
   /** Liveness, on the same origin as the other two. */
@@ -214,6 +224,17 @@ export class ControlPlaneEndpoint extends Context.Service<
      */
     readonly harnesses?: Layer.Layer<PlannerHarnesses> | undefined;
     /**
+     * The two planning operations the goal agent's `steer_planner` and `wake_planner` reach.
+     *
+     * Passed as a layer carrying already-built functions for exactly the reason
+     * {@link harnesses} is, and with a sharper consequence: a `PlanSupervisor` *required*
+     * through this boundary would be built a second time inside the router's memo map, and
+     * two supervisors in one process would hold two fiber maps and two sets of goal claims
+     * that could not see each other. Omitted — which every test and every spike does — the
+     * goal agent is told this server has no harness, which for such a caller is true.
+     */
+    readonly planning?: Layer.Layer<GoalPlanning> | undefined;
+    /**
      * Seconds a connection may be idle, overriding {@link CONTROL_PLANE_IDLE_TIMEOUT}.
      *
      * For tests, and only for tests: the claim worth checking is that a heartbeat keeps a
@@ -239,11 +260,14 @@ export class ControlPlaneEndpoint extends Context.Service<
         // rebuilt: the store's connection and the credential registry are the ones the
         // rest of the program already holds.
         const application = Layer.mergeAll(
-          mcpApplicationLayer(
-            options.harnesses === undefined
+          mcpApplicationLayer({
+            ...(options.harnesses === undefined
               ? {}
-              : { harnesses: options.harnesses },
-          ),
+              : { harnesses: options.harnesses }),
+            ...(options.planning === undefined
+              ? {}
+              : { planning: options.planning }),
+          }),
           policyRoutes(options.policy),
           healthRoutes,
           options.extraRoutes ?? Layer.empty,
@@ -280,6 +304,7 @@ export class ControlPlaneEndpoint extends Context.Service<
           origin,
           mcpUrl: `${origin}${MCP_PATH}`,
           plannerMcpUrl: `${origin}${PLANNER_MCP_PATH}`,
+          goalMcpUrl: `${origin}${GOAL_MCP_PATH}`,
           policyUrl: `${origin}${POLICY_DECIDE_PATH}`,
           healthUrl: `${origin}${HEALTH_PATH}`,
           callCount: counter.count,

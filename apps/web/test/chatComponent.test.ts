@@ -25,11 +25,13 @@ import {
 } from "@bit/contracts";
 
 import Chat from "../src/lib/components/Chat.svelte";
+import GoalAgentChat from "../src/lib/components/GoalAgentChat.svelte";
 import PlannerChat from "../src/lib/components/PlannerChat.svelte";
 import { App } from "../src/lib/app.svelte";
 import {
   AT,
   FakeServer,
+  goalConversationView,
   goalView,
   ok,
   planRoundView,
@@ -100,6 +102,7 @@ const committed = (): LiveItem => ({
   at: AT,
   attemptId: null,
   roundId: "rnd_1",
+  goalId: null,
   headline: "Intent added",
   body: "intent int_real was added",
   tool: null,
@@ -460,5 +463,141 @@ describe("the planner's own half of the chat", () => {
     });
     expect(html).toContain("3 older rounds are not here");
     expect(html).toContain("still listed above");
+  });
+});
+
+describe("the goal agent's own half of the chat", () => {
+  /**
+   * The real component, with a real {@link App} the fake server has answered into.
+   *
+   * The same arrangement as the planner's body above, and the contrast between the two is
+   * the point: one renders `Chat` read-only with controls where a composer would be, the
+   * other renders it with a composer — and `Chat.svelte` is the same file in both cases,
+   * unmodified by this slice. That is ruling 1 holding.
+   */
+  const goalBody = async (
+    arrange: (fake: FakeServer) => void = () => {},
+  ): Promise<{ html: string; app: App }> => {
+    const fake = new FakeServer();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = (_baseUrl, targetId) =>
+      ok({ goals: [goalView({ targetId, goalId: "goal_1" })] });
+    arrange(fake);
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_1");
+    await settle();
+    return { html: render(GoalAgentChat, { props: { app } }).body, app };
+  };
+
+  test("an active goal gets a composer, which is the half the planner's chat has not", async () => {
+    const { html } = await goalBody();
+    expect(html).toContain("<form");
+    expect(html).toContain("<textarea");
+    expect(html).toContain("Send to the goal agent");
+    // The ruling, on the screen as well as in the toolkit: an operator reading this knows
+    // why asking for an intent produces a steer rather than a row.
+    expect(html).toContain("cannot create intents itself");
+  });
+
+  test("a goal nobody has talked to says so instead of showing an empty conversation", async () => {
+    const { html } = await goalBody();
+    expect(html).toContain("Nobody has talked to this goal's agent yet");
+    // No separator, because there is no conversation to put one over.
+    expect(html).not.toContain("Goal agent</span>");
+  });
+
+  test("a conversation the harness still has is labelled as the harness's copy", async () => {
+    const { html } = await goalBody((fake) => {
+      fake.onGoalConversation = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalConversationView({
+            targetId,
+            goalId,
+            harnessSessionId: "ses_goal_1",
+            live: true,
+            source: "harness",
+            ephemeral: true,
+            messages: [
+              { index: 0, type: "user", text: "what is happening?" },
+              { index: 1, type: "assistant", text: "One round has run." },
+            ],
+            note: "From OpenCode, which may delete it: this build stores no part of a conversation.",
+          }),
+        );
+    });
+
+    expect(html).toContain("Goal agent");
+    expect(html).toContain("ses_goal_1");
+    expect(html).toContain("One round has run.");
+    // The cost decision 14 accepted, said rather than hidden.
+    expect(html).toContain("may delete it");
+    // The operator's own half of it comes back from the harness as a `user` entry, which is
+    // the only reason a reload is not one-sided.
+    expect(html).toContain("what is happening?");
+  });
+
+  test("a conversation this process no longer holds is marked, not silently shown", async () => {
+    const { html } = await goalBody((fake) => {
+      fake.onGoalConversation = (_baseUrl, targetId, goalId) =>
+        ok(
+          goalConversationView({
+            targetId,
+            goalId,
+            harnessSessionId: "ses_before",
+            live: false,
+            source: "harness",
+            ephemeral: true,
+            messages: [{ index: 0, type: "assistant", text: "earlier words" }],
+            note: "This conversation was opened by a server process that is no longer running.",
+          }),
+        );
+    });
+
+    expect(html).toContain("earlier words");
+    // Readable and not continuable, which are two facts: a chip rather than a colour, so a
+    // monochrome display carries it too.
+    expect(html).toContain("not this process's");
+    expect(html).toContain("no longer running");
+  });
+
+  test("an ended goal has no composer and a sentence in its place", async () => {
+    const ended = (targetId: string) =>
+      goalView({
+        targetId,
+        goalId: "goal_1",
+        status: "abandoned",
+        endedAt: AT + 1,
+        endedBy: "goal_agent",
+        endReason: "The operator asked me to stop.",
+      });
+    const { html } = await goalBody((fake) => {
+      fake.onGoals = (_baseUrl, targetId) => ok({ goals: [ended(targetId)] });
+      // And the single-goal read, which `openGoal` makes straight after the list and which
+      // replaces the row: overriding only the list would leave an active goal on screen.
+      fake.onGoal = (_baseUrl, targetId) => ok(ended(targetId));
+    });
+
+    // Not a disabled box: an ended goal's agent has no authority left, and a control that
+    // cannot be pressed and does not say so is a question rather than an answer.
+    expect(html).not.toContain("<textarea");
+    expect(html).toContain("has ended, so its agent has no authority left");
+  });
+
+  test("the operator's own turn and the agent's are distinguishable without colour", async () => {
+    const { app } = await goalBody();
+    app.goalMessage = "look at the lockout path";
+    await app.sendGoalMessage();
+    const html = render(GoalAgentChat, { props: { app } }).body;
+
+    // The label, as a word: "You" on the minted turn, and the activity marker that says it
+    // is not part of the record.
+    expect(html).toContain("You");
+    expect(html).toContain("look at the lockout path");
+    expect(html).toContain("activity");
+    expect(html).toContain("Waiting for the agent");
   });
 });

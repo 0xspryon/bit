@@ -75,3 +75,35 @@ plugin({
     });
   },
 });
+
+/**
+ * Lets `bun test` load an icon, which the app imports as a Svelte component.
+ *
+ * `icons.ts` imports every icon as `line-awesome/svg/<name>.svg?component`, which **Vite**
+ * turns into a component at build time. `bun test` has no such plugin, so the import
+ * resolved to the file and the module's default export was the *path string* — and the
+ * first component that rendered an icon failed with `IconArrowUp is not a function`. The
+ * planner chat never hit it because it has no icons; the goal conversation's composer has a
+ * submit button, and a component test for a composer that cannot render its own submit is
+ * not a test of the composer.
+ *
+ * An SVG document is valid Svelte markup, so the fix is the same compiler the plugin above
+ * uses. It is **not** an attempt to reimplement the Vite plugin's options — no `?raw`, no
+ * `?url`, no svgo pass — because nothing in a test asserts on an icon's path data. What it
+ * buys is that a component holding an icon can be rendered at all.
+ */
+plugin({
+  name: "svelte-svg",
+  setup(build) {
+    build.onLoad({ filter: /\.svg(\?.*)?$/ }, async (args) => {
+      const file = args.path.replace(/\?.*$/, "");
+      const source = await Bun.file(file).text();
+      const compiled = compile(source, {
+        filename: file,
+        generate: "server",
+        css: "external",
+      });
+      return { contents: compiled.js.code, loader: "js" };
+    });
+  },
+});

@@ -45,6 +45,7 @@ import {
   AddIntentResult,
   EndGoalResult,
   GoalEndedBy,
+  GoalEndStatus,
   GoalStatus,
   IntentStatus,
   ModelOptionSelection,
@@ -394,6 +395,33 @@ export const roundIdFromScope = (
   if (at < 0) return undefined;
   const roundId = callerScope.slice(at + ROUND_SCOPE_SEGMENT.length);
   return roundId === "" ? undefined : roundId;
+};
+
+/** The reserved segment a goal agent's caller scope is namespaced by. */
+const GOAL_SCOPE_SEGMENT = "/goal/";
+
+/**
+ * Reads the goal out of a caller scope, or `undefined` when it is not a goal agent's.
+ *
+ * {@link roundIdFromScope}'s sibling, here for the same reason and with the same one
+ * caller: `run/liveTranscript.ts` needs to know which items belong to a goal's
+ * **conversation**, and the only thing that says a record was written by the goal agent is
+ * `events.caller_scope`. A `goal.ended` says nothing in its payload about whether an
+ * operator, a planner round or the goal agent wrote it beyond `endedBy`, and
+ * `plan.round.steered`'s subject is the round.
+ *
+ * It is **not** "which goal is this event about". An `intent.added` is about a goal and is
+ * not part of the conversation; a filter that read the goal out of a payload would put
+ * every write under the goal chat and show it twice on one page.
+ */
+export const goalIdFromScope = (
+  callerScope: string | null,
+): string | undefined => {
+  if (callerScope === null) return undefined;
+  const at = callerScope.indexOf(GOAL_SCOPE_SEGMENT);
+  if (at < 0) return undefined;
+  const goalId = callerScope.slice(at + GOAL_SCOPE_SEGMENT.length);
+  return goalId === "" ? undefined : goalId;
 };
 
 /**
@@ -1248,6 +1276,17 @@ export type AttemptRow = typeof AttemptRow.Type;
 
 /** Derived like {@link observationColumns}, and for the same reason. */
 const attemptColumns = Object.keys(AttemptRow.fields).join(", ");
+
+/**
+ * The same columns, qualified, for the one statement that joins `attempts` to `intents`.
+ *
+ * Derived from the same schema rather than written out, like {@link attemptColumns}: an
+ * unqualified `id` in a join against a table that also has one is ambiguous, and a hand
+ * written list is a list that stops matching the row schema.
+ */
+const attemptColumnsQualified = Object.keys(AttemptRow.fields)
+  .map((column) => `attempts.${column}`)
+  .join(", ");
 
 /**
  * How a planner round row is stored.
@@ -2451,6 +2490,27 @@ const makeStore = Effect.fnUntraced(function* () {
       return yield* new MutationError({
         reason: "unauthorized",
         detail: `${describeCaller(caller)} may not ${write}: that is a planner round's write, and nothing was recorded`,
+      });
+    }
+    return caller;
+  });
+
+  /**
+   * Narrows the caller to a goal agent. The goal's own authority is checked by the write.
+   *
+   * {@link roundCallerOrFail}'s sibling. The two writes a goal agent makes — recording a
+   * steer and ending the goal — both resolve the goal from `caller.goalId`, so this check
+   * is what makes "an agent writes only about its own goal" a property of the type rather
+   * than of care at each call site.
+   */
+  const goalCallerOrFail = Effect.fnUntraced(function* (
+    caller: CallerContext,
+    write: string,
+  ) {
+    if (caller._tag !== "goal") {
+      return yield* new MutationError({
+        reason: "unauthorized",
+        detail: `${describeCaller(caller)} may not ${write}: that is a goal agent's write, and nothing was recorded`,
       });
     }
     return caller;
@@ -5660,6 +5720,355 @@ const makeStore = Effect.fnUntraced(function* () {
     );
   });
 
+  /* ── The goal agent's session, and the two writes it makes ─────────────────── */
+
+  const selectGoalSession = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      harness_session_id: Schema.String,
+      harness_instance_id: Schema.NullOr(Schema.String),
+      opened_at: Schema.Finite,
+    }),
+    execute: (goalId) =>
+      sql`SELECT harness_session_id, harness_instance_id, opened_at
+          FROM goal_sessions WHERE goal_id = ${goalId}`,
+  });
+
+  /**
+   * The harness session this goal's conversation was last opened on, if any.
+   *
+   * **A hint about somebody else's storage, exactly as {@link plannerLineage} is**, and the
+   * same caution applies twice over: the id names a session in the harness's own store,
+   * which can be cleared without ours changing, and the *credential* that made that session
+   * able to do anything died with the process that minted it. So a row here says "a
+   * conversation was opened on this goal", never "a conversation is live".
+   *
+   * `undefined` means nobody has ever talked to this goal, which is a different answer from
+   * a row whose session the harness has forgotten — and
+   * `plan/goalConversation.ts` reports the two differently because an operator does
+   * different things about them.
+   */
+  const goalSession = Effect.fn("ObservationStore.goalSession")(function* (
+    goalId: string,
+  ) {
+    const row = yield* selectGoalSession(goalId).pipe(
+      Effect.mapError(lift("goal_sessions", goalId)),
+    );
+    return Option.match(row, {
+      onNone: () => undefined,
+      onSome: (value) => ({
+        harnessSessionId: value.harness_session_id,
+        harnessInstanceId: value.harness_instance_id,
+        openedAt: value.opened_at,
+      }),
+    });
+  });
+
+  /**
+   * Records which session a goal's conversation is on, replacing any earlier one.
+   *
+   * An upsert for {@link recordPlannerLineage}'s reason: there is exactly one current
+   * answer per goal, and a session this process can no longer reach is replaced by the one
+   * the next message opens. **The replaced id is not kept**, and that is deliberate rather
+   * than an omission — a history of sessions would be the first step towards storing the
+   * conversation, which this build does not do (the goal and planner flow's decision 15),
+   * and nothing reads it.
+   */
+  const recordGoalSession = Effect.fn("ObservationStore.recordGoalSession")(
+    function* (input: {
+      readonly goalId: string;
+      readonly targetId: string;
+      readonly harnessSessionId: string;
+      readonly harnessInstanceId: string | null;
+    }) {
+      const now = yield* Clock.currentTimeMillis;
+      yield* sql`INSERT INTO goal_sessions (
+            goal_id, target_id, harness_session_id, harness_instance_id, opened_at
+          ) VALUES (
+            ${input.goalId}, ${input.targetId}, ${input.harnessSessionId},
+            ${input.harnessInstanceId}, ${now}
+          )
+          ON CONFLICT(goal_id) DO UPDATE SET
+            harness_session_id = excluded.harness_session_id,
+            harness_instance_id = excluded.harness_instance_id,
+            opened_at = excluded.opened_at`.pipe(
+        Effect.mapError(asDatabaseError("query")),
+      );
+    },
+  );
+
+  /** What a recorded steer answers with, and what a retry of one replays. */
+  const SteerResult = Schema.Struct({
+    roundId: Schema.String,
+    goalId: Schema.String,
+    /**
+     * Which way the directive reached the planner.
+     *
+     * `steered` — injected into a round that was already live, which is the case that
+     * appends `plan.round.steered`. `opened` — carried in the opening prompt of a round
+     * opened for it, which appends nothing because the round was never redirected.
+     *
+     * **It is on the stored result because the retry answer depends on it**, which is the
+     * whole of Important finding 1: an operation that reached the planner through a new
+     * round must not reach it a second time as a steer, and a caller replaying the receipt
+     * has to be told which of the two happened the first time.
+     */
+    how: Schema.Literals(["steered", "opened"]),
+    urgency: Schema.Literals(["queued", "preemptive"]),
+    messageId: Schema.String,
+    steeredAt: Schema.Finite,
+  });
+
+  const selectSteerReceipt = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({ result: Schema.String }),
+    execute: (key) =>
+      sql`SELECT result FROM command_receipts WHERE key = ${key}`,
+  });
+
+  /**
+   * What one `steer_planner` operation already did, if anything.
+   *
+   * **A read, before either branch of the tool decides anything**, and it exists because of
+   * a measured double delivery: `steer_planner` has two ways of reaching the planner, only
+   * one of them used to write a receipt, and a retry that fell down the other branch
+   * delivered the same directive twice — once in a round's opening prompt and once as a
+   * steer into that same round, with a `plan.round.steered` event claiming a redirect that
+   * never happened.
+   *
+   * So the receipt is the operation's whole identity: **one `operation_id`, one delivery,
+   * whichever branch took it.** A retry replays this answer and sends nothing. An operation
+   * first used while a round was live, retried when none is, replays `steered` rather than
+   * opening a round for a directive the planner already has; and the other way round for
+   * `opened`.
+   *
+   * It does **not** compare request hashes, and that is deliberate rather than an omission.
+   * The directive text is not in the hashed input — the record carries no directive, by
+   * design — so a reused id with different words is indistinguishable from a retry to
+   * everything durable, and pretending otherwise is the mistake Important finding 3 names.
+   * The agent is told what the id already did; the tool's description is where the rule
+   * "a new directive needs a new operation id" lives.
+   */
+  const steerReceipt = Effect.fn("ObservationStore.steerReceipt")(function* (
+    caller: CallerContext,
+    operationId: string,
+  ) {
+    const agent = yield* goalCallerOrFail(caller, "steer a planner round");
+    const key = `${agent.callerScope}:steer_planner:${operationId}`;
+    const row = yield* selectSteerReceipt(key).pipe(
+      Effect.mapError(lift("command_receipts", key)),
+    );
+    if (Option.isNone(row)) return undefined;
+    return yield* replayResult(key, SteerResult, row.value.result);
+  });
+
+  /**
+   * Records that the goal agent steered one of its goal's rounds.
+   *
+   * **The record is the whole point and it carries no directive text.** A steer is `opaque`
+   * on both drivers' narration (DECISIONS.md §24.1, consequence 6), so without this event
+   * a round whose framing changed mid-flight would read as having answered the question it
+   * opened with. What the event holds is the round, the goal, the urgency and the derived
+   * message id; the directive itself is the conversation's, and this build stores no
+   * conversation.
+   *
+   * **It checks the round belongs to the caller's goal and nothing else about it.** Not its
+   * status: by the time this is called the directive has already been delivered — see
+   * `plan/planSupervisor.ts` on why delivery comes first — and refusing to record a steer
+   * that landed would leave the round's transcript claiming the round was never redirected.
+   * A round that settled between the delivery and this call is recorded as steered because
+   * it was.
+   *
+   * **`how: "opened"` writes the receipt and no event.** That branch is the directive
+   * travelling in a round's *opening prompt*: nothing was redirected, so an event would be
+   * a false claim — and the receipt is still written, because without it a retry of the
+   * same operation would deliver the directive a second time as a steer. The receipt is the
+   * operation's identity on both branches; see {@link steerReceipt}, which is what a caller
+   * reads before it decides which branch to take.
+   */
+  const recordRoundSteer = Effect.fn("ObservationStore.recordRoundSteer")(
+    function* (
+      caller: CallerContext,
+      input: {
+        readonly operationId: string;
+        readonly roundId: string;
+        readonly how: "steered" | "opened";
+        readonly urgency: "queued" | "preemptive";
+        readonly messageId: string;
+      },
+    ) {
+      const agent = yield* goalCallerOrFail(caller, "steer a planner round");
+      const key = `${agent.callerScope}:steer_planner:${input.operationId}`;
+      const requestHash = hashRequest(agent, input);
+      const steeredAt = yield* Clock.currentTimeMillis;
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const existing = yield* findReceipt(key).pipe(
+              Effect.mapError(lift("command_receipts", key)),
+            );
+            if (Option.isSome(existing)) {
+              const receipt = existing.value;
+              if (receipt.request_hash !== requestHash) {
+                return yield* new MutationError({
+                  reason: "conflict",
+                  detail: `operation ${input.operationId} was already used to steer with different arguments`,
+                });
+              }
+              return {
+                ...(yield* replayResult(key, SteerResult, receipt.result)),
+                replayed: true,
+              };
+            }
+            const round = yield* roundOrFail(input.roundId);
+            if (
+              round === undefined ||
+              round.goal_id !== agent.goalId ||
+              round.target_id !== agent.targetId
+            ) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `round ${input.roundId} is not a round of goal ${agent.goalId}, so no steer of it was recorded`,
+              });
+            }
+            const result: typeof SteerResult.Type = {
+              roundId: input.roundId,
+              goalId: agent.goalId,
+              how: input.how,
+              urgency: input.urgency,
+              messageId: input.messageId,
+              steeredAt,
+            };
+            yield* sql`INSERT INTO command_receipts (
+                  key, caller_scope, operation, operation_id, request_hash, result,
+                  created_at
+                ) VALUES (
+                  ${key}, ${agent.callerScope}, 'steer_planner', ${input.operationId},
+                  ${requestHash}, ${JSON.stringify(result)}, ${steeredAt}
+                )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+            // The event, on the `steered` branch only: an `opened` round was not
+            // redirected and an event saying it was would be the one claim a later reader
+            // cannot check against anything else.
+            if (input.how === "steered") {
+              yield* appendEvent({
+                kind: "plan.round.steered",
+                targetId: agent.targetId,
+                // The goal agent's own scope: a steer is the one round-related mutation an
+                // authenticated agent causes rather than the host, and this column is what
+                // puts the item in the goal's conversation as well as under the round.
+                callerScope: agent.callerScope,
+                intentId: null,
+                attemptId: null,
+                operation: "steer_planner",
+                operationId: input.operationId,
+                // The round, because that is what the event is *about*. The goal is in the
+                // payload and in the scope.
+                subjectId: input.roundId,
+                payload: {
+                  roundId: input.roundId,
+                  goalId: agent.goalId,
+                  urgency: input.urgency,
+                  messageId: input.messageId,
+                },
+                recordedAt: steeredAt,
+              });
+            }
+            return { ...result, replayed: false };
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "SqlError"
+              ? asDatabaseError("transaction")(error)
+              : error,
+          ),
+        );
+    },
+  );
+
+  /**
+   * Ends a goal as its own agent, through the goal agent's credential.
+   *
+   * The same write {@link endGoal} makes, reached by a different authority: the goal comes
+   * from the credential and is not an argument, so an agent cannot end a goal it is not
+   * the agent for, and `endedBy` is `goal_agent` by construction rather than by payload —
+   * exactly as the browser route's is `operator` by construction.
+   *
+   * **No `checkGoalAuthority` call, and the omission is deliberate.** That check would
+   * refuse an already-ended goal as `stale`, where {@link endGoalWithin}'s own check
+   * refuses it as a `conflict` naming what ended it — which is the better answer for an
+   * agent that is about to tell an operator what happened. The two refusals cover the same
+   * fact and this takes the more informative one; ownership of the goal by this target is
+   * checked inside the transaction either way.
+   */
+  const endGoalAsAgent = Effect.fn("ObservationStore.endGoalAsAgent")(
+    function* (
+      caller: CallerContext,
+      input: {
+        readonly operationId: string;
+        readonly status: GoalEndStatus;
+        readonly reason: string;
+      },
+    ) {
+      const agent = yield* goalCallerOrFail(caller, "end a goal");
+      const endedAt = yield* Clock.currentTimeMillis;
+      return yield* sql
+        .withTransaction(
+          endGoalWithin(
+            { callerScope: agent.callerScope, targetId: agent.targetId },
+            {
+              operationId: input.operationId,
+              goalId: agent.goalId,
+              status: input.status,
+              endedBy: "goal_agent",
+              reason: input.reason,
+            },
+            endedAt,
+          ),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "SqlError"
+              ? asDatabaseError("transaction")(error)
+              : error,
+          ),
+        );
+    },
+  );
+
+  const selectAttemptsForGoal = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: AttemptRow,
+    execute: (goalId) =>
+      sql.unsafe(
+        `SELECT ${attemptColumnsQualified} FROM attempts
+         INNER JOIN intents ON intents.id = attempts.intent_id
+         WHERE intents.goal_id = ?
+         ORDER BY attempts.started_at, attempts.id`,
+        [goalId],
+      ),
+  });
+
+  /**
+   * Every attempt made under one goal, oldest first, across all of its intents.
+   *
+   * **A join rather than `attemptsForIntent` in a loop**, for the reason
+   * `observationsForGoal` is one: the goal agent asks "what work has been done here" once,
+   * and N+1 statements for an answer SQLite can produce in one is the kind of read that is
+   * fine until a goal has forty intents.
+   *
+   * The rows as stored, including `status` as a plain string — `AttemptRow` says why — so a
+   * reader that meets an unrecognised status reports it against the row rather than failing
+   * the read of every attempt beside it.
+   */
+  const attemptsForGoal = Effect.fn("ObservationStore.attemptsForGoal")(
+    function* (goalId: string) {
+      return yield* selectAttemptsForGoal(goalId).pipe(
+        Effect.mapError(lift("attempts", goalId)),
+      );
+    },
+  );
+
   const EventRow = Schema.Struct({
     id: Schema.String,
     sequence: Schema.Int,
@@ -6012,6 +6421,12 @@ const makeStore = Effect.fnUntraced(function* () {
     settleRound,
     supersedeRound,
     recordRoundDisposition,
+    recordRoundSteer,
+    steerReceipt,
+    goalSession,
+    recordGoalSession,
+    endGoalAsAgent,
+    attemptsForGoal,
   });
 });
 
@@ -6404,6 +6819,113 @@ export class ObservationStore extends Context.Service<
       },
       MutationError | DatabaseError | StoredRowError
     >;
+    /**
+     * Records that the goal agent steered one of its goal's rounds, carrying no directive.
+     *
+     * Receipt-keyed, so a retried steer replays and appends one `plan.round.steered` event
+     * rather than two. Refuses `invalid` for a round that is not this goal's and
+     * `unauthorized` for a caller that is not a goal agent; it deliberately does **not**
+     * refuse a round that has since settled — see the implementation on why a steer that
+     * was delivered is recorded whatever the round did next.
+     */
+    readonly recordRoundSteer: (
+      caller: CallerContext,
+      input: {
+        readonly operationId: string;
+        readonly roundId: string;
+        /**
+         * Which way the directive reached the planner.
+         *
+         * `steered` appends `plan.round.steered`; `opened` appends nothing and writes only
+         * the receipt, because a round that started with the directive in its prompt was
+         * never redirected. Both are the operation's one delivery.
+         */
+        readonly how: "steered" | "opened";
+        readonly urgency: "queued" | "preemptive";
+        readonly messageId: string;
+      },
+    ) => Effect.Effect<
+      {
+        readonly roundId: string;
+        readonly goalId: string;
+        readonly how: "steered" | "opened";
+        readonly urgency: "queued" | "preemptive";
+        readonly messageId: string;
+        readonly steeredAt: number;
+      },
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * What one `steer_planner` operation already did, or `undefined` for a new one.
+     *
+     * Read **before** either of the tool's branches decides anything: one `operation_id` is
+     * one delivery, whichever way it reached the planner, and a retry replays this rather
+     * than delivering again. See the implementation on why it compares no request hash.
+     */
+    readonly steerReceipt: (
+      caller: CallerContext,
+      operationId: string,
+    ) => Effect.Effect<
+      | {
+          readonly roundId: string;
+          readonly goalId: string;
+          readonly how: "steered" | "opened";
+          readonly urgency: "queued" | "preemptive";
+          readonly messageId: string;
+          readonly steeredAt: number;
+        }
+      | undefined,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * The harness session this goal's conversation was last opened on.
+     *
+     * A hint about the harness's storage, never a claim that a conversation is live: the
+     * credential that made the session able to act died with the process that minted it.
+     */
+    readonly goalSession: (goalId: string) => Effect.Effect<
+      | {
+          readonly harnessSessionId: string;
+          readonly harnessInstanceId: string | null;
+          readonly openedAt: number;
+        }
+      | undefined,
+      DatabaseError | StoredRowError
+    >;
+    /** Records which session a goal's conversation is on, replacing any earlier one. */
+    readonly recordGoalSession: (input: {
+      readonly goalId: string;
+      readonly targetId: string;
+      readonly harnessSessionId: string;
+      readonly harnessInstanceId: string | null;
+    }) => Effect.Effect<void, DatabaseError>;
+    /**
+     * Ends the caller's own goal, recorded as `endedBy: "goal_agent"`.
+     *
+     * The goal comes from the credential and is not an argument, so this cannot reach
+     * another goal. Records state only: it interrupts nothing that is running.
+     */
+    readonly endGoalAsAgent: (
+      caller: CallerContext,
+      input: {
+        readonly operationId: string;
+        readonly status: GoalEndStatus;
+        readonly reason: string;
+      },
+    ) => Effect.Effect<
+      EndGoalResult & { readonly replayed: boolean },
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * Every attempt made under one goal, oldest first, as one join.
+     *
+     * The rows as stored. What reads it is the goal agent's `list_attempts`, which is the
+     * one thing on its tool surface that neither the briefing nor the intent list answers:
+     * what has actually been *run*.
+     */
+    readonly attemptsForGoal: (
+      goalId: string,
+    ) => Effect.Effect<readonly AttemptRow[], DatabaseError | StoredRowError>;
     /**
      * Every round of one goal, newest first, each with how many intents it added.
      *

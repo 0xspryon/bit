@@ -860,3 +860,382 @@ describe("a session this process does not hold", () => {
     ]);
   });
 });
+
+/* ── Steering, and what `waitForIdle` means once a session can take two messages ── */
+
+/**
+ * An SDK whose turns are driven by the test, one `result` at a time.
+ *
+ * The scripted SDK above delivers its whole message list as soon as the prompt is pulled,
+ * which is right for every claim it serves and useless for these: what is being asserted
+ * here is **when** a turn ends relative to a second message being accepted, so the test has
+ * to own that moment. `emitResult` is it.
+ *
+ * It models the one thing DECISIONS.md §24.1 measured about this driver: **one `result` per
+ * accepted message**, `num_turns: 1` on each, and the directive's own uuid on the second
+ * one only. Nothing folds. A fake that answered one `result` for two messages would make
+ * the fixed pump look broken and the broken one look fine.
+ */
+const turnDrivenSdk = () => {
+  const seen = {
+    /** Every message the SDK pulled off the input iterable, oldest first. */
+    prompts: [] as string[],
+    uuids: [] as (string | undefined)[],
+    priorities: [] as (string | undefined)[],
+    closes: 0,
+    interrupts: 0,
+  };
+  const pending: SDKMessage[] = [];
+  let wake: (() => void) | undefined;
+  let sessionId = "";
+  const push = (message: SDKMessage): void => {
+    pending.push(message);
+    const waiting = wake;
+    wake = undefined;
+    waiting?.();
+  };
+
+  const sdk: ClaudeCodeSdk = {
+    query: ({ prompt, options }) => {
+      sessionId = options.sessionId ?? "";
+      void (async () => {
+        for await (const message of prompt) {
+          const record = message as unknown as {
+            message?: { content?: unknown };
+            uuid?: string;
+            priority?: string;
+          };
+          seen.prompts.push(String(record.message?.content));
+          seen.uuids.push(record.uuid);
+          seen.priorities.push(record.priority);
+          // A reply arrives with the turn; the `result` that *ends* it is the test's.
+          push(assistant(sessionId));
+        }
+      })();
+      const query: HarnessQuery = {
+        setMcpServers: async () => ({}),
+        interrupt: async () => {
+          seen.interrupts += 1;
+          return undefined;
+        },
+        close: () => {
+          seen.closes += 1;
+        },
+        [Symbol.asyncIterator]: async function* () {
+          // Never ends on its own, like the real stream: it is closed, not completed.
+          for (;;) {
+            while (pending.length > 0) {
+              const next = pending.shift();
+              if (next !== undefined) yield next;
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        },
+      };
+      return query;
+    },
+    sessionMessages: () => Promise.resolve([]),
+    sessionInfo: () => Promise.resolve(undefined),
+  };
+
+  /** Ends one turn, as the driver does: one `result` per accepted message. */
+  const emitResult = (): void => {
+    push(result(sessionId, "success"));
+  };
+  /** Waits until the SDK has pulled `count` messages off the input iterable. */
+  const pulled = async (count: number): Promise<void> => {
+    for (let index = 0; index < 400; index += 1) {
+      if (seen.prompts.length >= count) return;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+  return { sdk, seen, emitResult, pulled };
+};
+
+const withTurnDriven = <A>(
+  use: (
+    harness: AgentHarness["Service"],
+    driver: ReturnType<typeof turnDrivenSdk>,
+  ) => Effect.Effect<A, unknown>,
+): Promise<A> => {
+  const driver = turnDrivenSdk();
+  return Effect.runPromise(
+    Effect.scoped(
+      Effect.flatMap(AgentHarness, (harness) => use(harness, driver)).pipe(
+        Effect.provide(
+          claudeCodeHarness({ sdk: driver.sdk, controlTimeout: "2 seconds" }),
+        ),
+        Effect.orDie,
+      ),
+    ),
+  );
+};
+
+const SESSION = "22222222-0000-4000-8000-000000000001";
+
+describe("a second accepted message, and what settlement means after one", () => {
+  test("waitForIdle waits for the steer's own turn, not the one it took over from", async () => {
+    /*
+     * DECISIONS.md §24.1, consequence 4 — the only place the spike demanded a change to
+     * shipped code, and it is this.
+     *
+     * The pump used to `break` at the first `result` ("one prompt, one turn") and then
+     * close the session. Under a steer that first `result` belongs to the turn the steer
+     * took over from, so the old pump ended narration, completed `idle` and closed the
+     * query while the directive's own turn was still queued: the supervisor would settle a
+     * round that was about to produce its real answer.
+     *
+     * So the assertion is in two halves and the first half is the one that used to fail:
+     * after one `result` with two messages accepted, `waitForIdle` is **still waiting**.
+     */
+    const answer = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "round",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+        });
+        yield* harness.prompt(SESSION, "the round's briefing");
+        yield* Effect.promise(() => driver.pulled(1));
+
+        const waiting = yield* Effect.forkChild(harness.waitForIdle(SESSION));
+
+        // The steer, accepted while the first turn is still running.
+        const steered = yield* harness.prompt(SESSION, "a directive", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: "aaaaaaaabbbbbbbbccccccccdddddddd",
+        });
+        yield* Effect.promise(() => driver.pulled(2));
+
+        // Turn one ends. Two messages are outstanding, so the session is not idle.
+        driver.emitResult();
+        yield* Effect.sleep("40 millis");
+        // `pollUnsafe` because that is the only "has it finished yet" there is in Effect
+        // 4: `Fiber` exposes it as an immediate runtime hook and has no effectful poll.
+        const earlyWait = waiting.pollUnsafe();
+
+        // Turn two ends. Now every accepted message has been answered.
+        driver.emitResult();
+        yield* Fiber.join(waiting);
+        return { steered, earlyWait };
+      }),
+    );
+
+    expect(answer.steered.delivered).toBe(true);
+    // The half that used to fail: no answer at the first `result`.
+    expect(answer.earlyWait).toBeUndefined();
+  });
+
+  test("the steer carries the driver's own id and its own timing", async () => {
+    const seen = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "round",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+        });
+        yield* harness.prompt(SESSION, "the round's briefing");
+        yield* Effect.promise(() => driver.pulled(1));
+        yield* harness.prompt(SESSION, "finish first", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: "0123456789abcdef0123456789abcdef",
+        });
+        yield* harness.prompt(SESSION, "stop now", {
+          _tag: "steer",
+          urgency: "preemptive",
+          messageId: "fedcba9876543210fedcba9876543210",
+        });
+        yield* Effect.promise(() => driver.pulled(3));
+        return driver.seen;
+      }),
+    );
+
+    // The opening prompt carries neither, exactly as every worker and round session always
+    // has: there is nothing to be idempotent about and no timing to choose.
+    expect(seen.uuids[0]).toBeUndefined();
+    expect(seen.priorities[0]).toBeUndefined();
+    /*
+     * A **UUID**, because the SDK's `uuid` is one, derived from the application's own hex
+     * id so a retry presents the same value. `later` lets the work in flight finish and
+     * `now` cuts it off — measured at 60 of 60 lines against 1 of 60 (§24.1).
+     */
+    expect(seen.uuids[1]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(seen.priorities[1]).toBe("later");
+    expect(seen.priorities[2]).toBe("now");
+    // Two different application ids, two different driver ids.
+    expect(seen.uuids[1]).not.toBe(seen.uuids[2]);
+  });
+
+  test("a retried steer under the same message id delivers nothing twice", async () => {
+    const answer = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "round",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+        });
+        yield* harness.prompt(SESSION, "the round's briefing");
+        yield* Effect.promise(() => driver.pulled(1));
+
+        const id = "11112222333344445555666677778888";
+        const first = yield* harness.prompt(SESSION, "a directive", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: id,
+        });
+        yield* Effect.promise(() => driver.pulled(2));
+        // The retry: the same derived id, because the id is a function of the operation it
+        // belongs to and not of the attempt to send it.
+        const retry = yield* harness.prompt(SESSION, "a directive", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: id,
+        });
+        yield* Effect.sleep("20 millis");
+        const other = yield* harness.prompt(SESSION, "something else", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: "99998888777766665555444433332222",
+        });
+        yield* Effect.promise(() => driver.pulled(3));
+        return { first, retry, other, prompts: [...driver.seen.prompts] };
+      }),
+    );
+
+    expect(answer.first.delivered).toBe(true);
+    // Answered successfully with `delivered: false`: a caller that read this as a failure
+    // would retry forever, and one that read it as a delivery would believe the round had
+    // been told twice.
+    expect(answer.retry.delivered).toBe(false);
+    expect(answer.other.delivered).toBe(true);
+    // Three messages pulled, not four. The directive is in the session once.
+    expect(answer.prompts).toHaveLength(3);
+    expect(
+      answer.prompts.filter((text) => text.includes("a directive")),
+    ).toHaveLength(1);
+  });
+
+  test("a steer into a session that has finished what it accepted is refused", async () => {
+    /*
+     * The backstop for the race the supervisor's claim narrows. On this driver the session
+     * is a query this process holds, so "already finished" is knowable — and refusing is
+     * the only safe answer: a message pushed into a closing generator would be reported as
+     * delivered and read by nobody.
+     *
+     * On OpenCode the same call cannot be refused at all (§24.1: prompting an idle session
+     * starts a new execution), which is why `PlanSupervisor.steer` holds a claim rather
+     * than relying on this.
+     */
+    const failure = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "round",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+        });
+        yield* harness.prompt(SESSION, "the round's briefing");
+        yield* Effect.promise(() => driver.pulled(1));
+        driver.emitResult();
+        yield* harness.waitForIdle(SESSION);
+        return yield* Effect.result(
+          harness.prompt(SESSION, "too late", {
+            _tag: "steer",
+            urgency: "queued",
+            messageId: "abababababababababababababababab",
+          }),
+        );
+      }),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    if (failure._tag === "Failure") {
+      expect((failure.failure as { message: string }).message).toContain(
+        "already finished the work it accepted",
+      );
+    }
+  });
+
+  test("a steer before the session has been prompted at all is refused", async () => {
+    const failure = await withTurnDriven((harness) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "round",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+        });
+        return yield* Effect.result(
+          harness.prompt(SESSION, "a directive", {
+            _tag: "steer",
+            urgency: "queued",
+            messageId: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          }),
+        );
+      }),
+    );
+
+    expect(failure._tag).toBe("Failure");
+    if (failure._tag === "Failure") {
+      expect((failure.failure as { message: string }).message).toContain(
+        "no turn to steer",
+      );
+    }
+  });
+
+  test("a multi-turn session survives going idle and takes another message", async () => {
+    /*
+     * The goal conversation's whole requirement, and the one thing that genuinely differs
+     * between the two drivers: an OpenCode session lives in the harness's own server and
+     * outlives every turn, while a Claude Code session **is** an open `query()` this
+     * process holds. Closed when it idles — which is right for a round — the operator's
+     * second message would have nothing to arrive at.
+     */
+    const answer = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "conversation",
+          model: "claude-sonnet-5",
+          directory: "/tmp/goal",
+          sessionId: SESSION,
+          multiTurn: true,
+        });
+        yield* harness.prompt(SESSION, "what is happening?");
+        yield* Effect.promise(() => driver.pulled(1));
+        driver.emitResult();
+        yield* harness.waitForIdle(SESSION);
+        const closedAfterTurnOne = driver.seen.closes;
+
+        const second = yield* harness.prompt(SESSION, "look at the lockout", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: "1a1a1a1a2b2b2b2b3c3c3c3c4d4d4d4d",
+        });
+        yield* Effect.promise(() => driver.pulled(2));
+        driver.emitResult();
+        // A fresh wait for the new turn, which is only possible because the deferred was
+        // replaced when the message was accepted.
+        yield* harness.waitForIdle(SESSION);
+        return {
+          second,
+          closedAfterTurnOne,
+          prompts: [...driver.seen.prompts],
+        };
+      }),
+    );
+
+    // Not closed when it went idle, which is the difference from a round.
+    expect(answer.closedAfterTurnOne).toBe(0);
+    expect(answer.second.delivered).toBe(true);
+    expect(answer.prompts).toHaveLength(2);
+  });
+});

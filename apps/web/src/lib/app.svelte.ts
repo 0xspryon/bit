@@ -33,6 +33,7 @@ import {
   LIVE_SILENCE_LIMIT_SECONDS,
   type GoalEndStatus,
   type GoalBriefingView,
+  type GoalConversationView,
   type GoalNarrationView,
   type GoalObservationView,
   type GoalView,
@@ -56,7 +57,12 @@ import {
   previewGoals,
   type Target,
 } from "./mock";
-import { activityOrder, buildChat } from "./chat";
+import {
+  activityOrder,
+  buildChat,
+  buildGoalConversation,
+  type SentTurn,
+} from "./chat";
 import { server, type ServerClient } from "./client";
 
 /**
@@ -463,6 +469,60 @@ export class App {
    */
   goalNarrationFloor = $state<number | undefined>(undefined);
 
+  /* ── The goal conversation ────────────────────────────────────────────────── */
+  /**
+   * The open goal's conversation, as the harness last had it.
+   *
+   * {@link goalNarration}'s sibling for the other agent, with one state a round cannot be
+   * in: `absent`, for a goal nobody has said anything to. `undefined` means the read has
+   * not answered, which the chat shows as `loading` — "we have not asked" and "there is
+   * nothing" are different things to tell an operator.
+   */
+  goalConversation = $state<GoalConversationView | undefined>(undefined);
+  goalConversationGoalId = $state("");
+  goalConversationState = $state<GoalsState>("idle");
+  /** The server's own words when the conversation could not be read at all. */
+  goalConversationDetail = $state("");
+  /** The replay's join floor, for {@link goalNarrationFloor}'s reason exactly. */
+  goalConversationFloor = $state<number | undefined>(undefined);
+  /**
+   * How many of {@link goalTurns} had been sent when the replay was asked for.
+   *
+   * **The bound on which of this tab's own messages the replay may cancel.** The replay
+   * brings the operator's words back as `user` entries, so a local turn it contains has to
+   * be dropped or the sentence appears twice — but it is read on open and re-read only
+   * after a send that opens a conversation, so it is usually stale. Cancelling by text
+   * alone therefore swallowed a *re-sent* sentence ("ok", "continue") against the old entry
+   * and showed it nowhere until a reload. This is a count rather than a clock, for the
+   * reason the floor beside it is: a turn numbered above it was sent after the request
+   * left, so no answer to that request can contain it. `chat.ts` is where it is applied.
+   */
+  goalConversationThrough = $state(0);
+
+  /** What the operator is typing. Cleared the moment the server accepts it. */
+  goalMessage = $state("");
+  /** True while a message is in flight, so the composer spins exactly once. */
+  goalSending = $state(false);
+  /** Why a message was refused, in the server's words, beside the composer. */
+  goalSendDetail = $state("");
+  /**
+   * What the server said about the session this tab's last message landed in.
+   *
+   * Only ever non-empty for a turn that **opened** a conversation, which includes the first
+   * message after a restart — and that is the one an operator has to be told about, because
+   * a new conversation on a goal that already had one looks from here exactly like the old
+   * one continuing.
+   */
+  goalSessionNote = $state("");
+  /**
+   * The messages this tab has sent, oldest first.
+   *
+   * **Local because nothing stores them** (the spec's decision 15 and ruling 4): between
+   * typing and a reload, this is the only copy of the operator's half of the conversation.
+   * Cleared when the goal changes and on a reload, where the harness's own copy takes over.
+   */
+  goalTurns = $state<SentTurn[]>([]);
+
   /** True while a round's stop is in flight, so the control spins exactly once. */
   roundStopping = $state("");
   /** Why a stop was refused, in the server's words, beside the control. */
@@ -737,6 +797,49 @@ export class App {
           : undefined,
       narrationFloor: this.goalNarrationFloor,
       inFlight: new Set(this.runningRounds.map((round) => round.roundId)),
+    }),
+  );
+
+  /**
+   * The open goal's **conversation**: the agent's narration, the record of what it did, and
+   * what this tab has said to it.
+   *
+   * Beside {@link goalChat} rather than part of it, because they are two conversations with
+   * two different agents on one page: the planner's is grouped by round and read-only, and
+   * this one is one stretch with a composer. The rules for both are in `chat.ts`.
+   */
+  /**
+   * Whether the agent still owes an answer to the last thing this tab said.
+   *
+   * True while a message is in flight, and after it is accepted until **any** narration for
+   * this goal arrives above the publish order the message was sent at. That is the same
+   * join everything else on this surface uses, and it is deliberately not a timeout: an
+   * agent reading a briefing can be quiet for a while, and a strip that gave up on it
+   * would be inventing a deadline for work this build does not bound.
+   */
+  goalAwaiting = $derived.by(() => {
+    if (this.goalSending) return true;
+    const last = this.goalTurns.at(-1);
+    if (last === undefined) return false;
+    return !this.liveItems.some(
+      (item) =>
+        item.goalId === this.openGoalId &&
+        (activityOrder(item) ?? -1) > last.after,
+    );
+  });
+
+  goalConversationChat = $derived(
+    buildGoalConversation({
+      goalId: this.openGoalId,
+      items: this.liveTargetId === this.viewTargetId ? this.liveItems : [],
+      conversation:
+        this.goalConversationGoalId === this.openGoalId
+          ? this.goalConversation
+          : undefined,
+      narrationFloor: this.goalConversationFloor,
+      sent: this.goalTurns,
+      replayedThrough: this.goalConversationThrough,
+      awaiting: this.goalAwaiting,
     }),
   );
 
@@ -1176,6 +1279,7 @@ export class App {
     this.#clearIntents();
     this.#clearGoalBriefing();
     this.#clearPlanRounds();
+    this.#clearGoalConversation();
   }
 
   /**
@@ -1202,6 +1306,27 @@ export class App {
     this.goalNarrationFloor = undefined;
     this.roundStopping = "";
     this.roundStopDetail = "";
+  }
+
+  /**
+   * Puts every goal-conversation field back where a fresh goal leaves it.
+   *
+   * {@link goalTurns} is cleared with the rest, which is what it means for the operator's
+   * own messages to be this tab's and not the record's: navigating away loses them, and the
+   * harness's copy is what a later visit replays.
+   */
+  #clearGoalConversation() {
+    this.goalConversation = undefined;
+    this.goalConversationGoalId = "";
+    this.goalConversationState = "idle";
+    this.goalConversationDetail = "";
+    this.goalConversationFloor = undefined;
+    this.goalConversationThrough = 0;
+    this.goalMessage = "";
+    this.goalSending = false;
+    this.goalSendDetail = "";
+    this.goalSessionNote = "";
+    this.goalTurns = [];
   }
 
   /** Puts every goal-briefing field back where a fresh goal leaves it. */
@@ -1309,6 +1434,7 @@ export class App {
     this.#clearIntents();
     this.#clearGoalBriefing();
     this.#clearPlanRounds();
+    this.#clearGoalConversation();
     void this.refreshGoal(goalId);
     void this.loadIntents(goalId);
     void this.loadGoalBriefing(goalId);
@@ -1317,6 +1443,9 @@ export class App {
     // the moment a reloaded tab has no narration of its own: everything on the activity
     // channel before this page connected is unrecoverable from the stream.
     void this.loadGoalNarration(goalId);
+    // And the other agent's half of the page, for the same reason: a reloaded tab has no
+    // conversation of its own, and the harness is the only other place it exists.
+    void this.loadGoalConversation(goalId);
     // What the *process* is driving, which the rows cannot answer. Read on opening a goal
     // so a reloaded tab knows at once whether a round is in flight rather than finding out
     // when the button is refused.
@@ -1330,6 +1459,7 @@ export class App {
     this.#clearIntents();
     this.#clearGoalBriefing();
     this.#clearPlanRounds();
+    this.#clearGoalConversation();
   }
 
   /** Replaces one goal in the list with the server's current answer about it. */
@@ -1728,6 +1858,139 @@ export class App {
     this.goalNarration = call.value;
     this.goalNarrationFloor = floor;
     this.goalNarrationState = "ready";
+  }
+
+  /**
+   * Reads the open goal's conversation into {@link goalConversation}.
+   *
+   * {@link loadGoalNarration}'s shape and its reasoning, including the floor being taken
+   * **before** the request leaves. The difference is what the empty answers mean: a goal
+   * nobody has talked to answers `absent`, which is not an absence of prose but an absence
+   * of a conversation, and the chat renders it by showing no group rather than an empty one.
+   */
+  async loadGoalConversation(goalId: string) {
+    const targetId = this.viewTargetId;
+    if (targetId === "" || this.openGoalId !== goalId) return;
+    if (this.goalConversationGoalId !== goalId) {
+      this.goalConversation = undefined;
+      this.goalConversationGoalId = goalId;
+    }
+    this.goalConversationState = "loading";
+    this.goalConversationDetail = "";
+    const floor = this.#activityHighWater();
+    // Taken before the request leaves, like the floor and for the same reason: what the
+    // answer can possibly contain is decided at the moment it is asked for, and a turn sent
+    // during the round trip is one no answer to this request holds.
+    const through = this.goalTurns.length;
+
+    const call = await this.client.goalConversation(
+      this.serverUrl,
+      targetId,
+      goalId,
+    );
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+
+    if (call._tag === "Unreachable") {
+      this.goalConversationState = "failed";
+      this.goalConversationDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.goalConversationState = "failed";
+      this.goalConversationDetail = this.#refusalText(
+        call.error,
+        "This goal's conversation could not be read.",
+      );
+      return;
+    }
+    this.goalConversation = call.value;
+    this.goalConversationFloor = floor;
+    this.goalConversationThrough = through;
+    this.goalConversationState = "ready";
+  }
+
+  /**
+   * Says what the operator typed to the open goal's agent.
+   *
+   * **The turn is recorded locally the moment the server accepts it, and not before.** A
+   * message that was refused never appears in the conversation: the agent did not hear it,
+   * and a row claiming otherwise would be the chat inventing a turn. The composer keeps the
+   * text on a refusal so it can be sent again once whatever was wrong is fixed.
+   *
+   * It does **not** wait for the agent. The route answers `202` once the session has the
+   * message, and what the agent says arrives on the live stream like everything else — so
+   * {@link goalAwaiting} is what the strip reads, not this promise.
+   *
+   * `priorUnavailable` is put on screen through {@link goalSessionNote} rather than
+   * swallowed. It is true exactly once per restart, and it is the only way an operator
+   * learns that the conversation they can see above is not the one they are now talking to.
+   */
+  async sendGoalMessage() {
+    const targetId = this.viewTargetId;
+    const goalId = this.openGoalId;
+    const text = this.goalMessage.trim();
+    if (targetId === "" || goalId === "" || text === "" || this.goalSending) {
+      return;
+    }
+    this.goalSending = true;
+    this.goalSendDetail = "";
+    // Taken before the message goes, so the turn sorts before whatever the agent says in
+    // answer to it. See `SentTurn.after`.
+    const after = this.#activityHighWater() ?? 0;
+
+    const call = await this.client.sendGoalMessage(
+      this.serverUrl,
+      targetId,
+      goalId,
+      text,
+    );
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+    this.goalSending = false;
+
+    if (call._tag === "Unreachable") {
+      this.goalSendDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.goalSendDetail = this.#refusalText(
+        call.error,
+        "That message was not delivered.",
+      );
+      return;
+    }
+
+    this.goalTurns = [
+      ...this.goalTurns,
+      {
+        index: this.goalTurns.length + 1,
+        text,
+        at: Date.now(),
+        after,
+      },
+    ];
+    this.goalMessage = "";
+    this.goalSessionNote =
+      call.value.conversation === "opened" ? call.value.note : "";
+    /*
+     * The conversation is live now, which the replay read before it was.
+     *
+     * Only on the turn that **opened** one: a `continued` turn changes nothing the replay
+     * said, and re-reading it would replace the block an operator is reading mid-sentence.
+     * On an opened one the replay is about a session this process no longer holds — or
+     * about no session at all — and leaving it on screen would attribute the last
+     * conversation's words to this one.
+     */
+    if (call.value.conversation === "opened") {
+      void this.loadGoalConversation(goalId);
+    }
   }
 
   /**

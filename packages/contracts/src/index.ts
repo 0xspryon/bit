@@ -12,6 +12,7 @@ export * from "./asset";
 export * from "./intent";
 export * from "./goal";
 export * from "./plan";
+export * from "./goalAgent";
 export * from "./event";
 export * from "./live";
 export * from "./mcpToolName";
