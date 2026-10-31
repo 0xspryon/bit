@@ -74,6 +74,13 @@ These are not oversights. Each is a thing a reader will expect and not find.
   force-directed coverage graph are a separate feature built on top of this one. The
   **data** that feature needs is included here, in D12, because it cannot be
   reconstructed after the fact; the feature itself is not.
+
+  A graph view **has** been designed — a banded containment layout, scope entry to host
+  to endpoint, not a force-directed one, so it needs no graph library — and the operator
+  deferred it on 2026-11-01. Slice 8 is the two-tab list (Estate and Scope) from that
+  same design and nothing more. The graph's own open questions, listed under **Deferred**
+  below, are not answered here and should not be guessed at by an implementer.
+
 - **No per-goal narrowing.** Scope is the client's, held once per target.
 - **No ports on entries.** `203.0.113.44` in scope means every port on it.
 
@@ -608,6 +615,30 @@ Settled without the operator, each recoverable if wrong:
 - Contradictory entry pairs are refused at the write boundary (D2).
 - D1's stated rationale was wrong and is corrected; its conclusion stands (D1).
 - `PERMISSIVE_POLICY.because` is reworded without touching the policy (Non-goals).
+
+## Deferred
+
+Raised by the mockups on 2026-11-01, deliberately not settled here.
+
+- **The graph view.** Deferred by the operator. See the Non-goals note above.
+- **A `service` asset kind.** The designed Estate view shows a row typed `service`
+  (`203.0.113.44:8443`) nested under a host with a different name
+  (`api.acme-cdn.net`). `AssetKind` is `Literals(["host", "endpoint"])` and `0010`'s
+  CHECK enforces exactly those two, and all grouping is by the `host` column, so an
+  IP-keyed row cannot nest under a name-keyed one. Adding a third kind needs its own
+  identity rule under §17 and a host-to-service edge. **Open: unanswered.** Slice 8
+  builds the two kinds that exist.
+- **Per-entry aggregates and pagination, together.** The designed view shows counts per
+  scope entry ("22 hosts · 198 endpoints", "145 in · 8 excluded · 31 not covered"),
+  each of which means running `scopeStateOf` across every host and grouping by the
+  deciding entry. That is a server-side aggregate the browser route returns, not
+  something a page of rows can yield — and the same view carries a filter box, a sort
+  toggle and a truncated tail. Decide the aggregate and the pagination in one go; the
+  "whether `list_assets` paginates" item below is the same question from the agent's
+  side.
+- **"Frontier" as a navigation section.** Removed from the rail on 2026-11-01 as empty
+  text. Its count matched "covered by nothing" exactly; if a promotion queue wants its
+  own section later, it should be named for what it holds.
 
 ## Left to the builder
 
