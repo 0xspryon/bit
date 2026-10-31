@@ -13,20 +13,22 @@
    * there is the prototype's, and swapping in a number this screen cannot source would
    * make an undesigned page look decided.
    *
-   * What is real in the frame itself: {@link TargetHeader} shows the open target's name,
-   * its scope note and the counts read from that target's own database.
+   * **There is no target header.** Which target this is is the first crumb's job, and the
+   * counts it used to show are the rail's: two places counting the same things had already
+   * begun to disagree. What the header said that nothing else does — that the target could
+   * not be read — is a one-line notice here, shown only when it is true.
    *
    * {@link ComposeBox} sits beneath the Goals section: a run of an intent the operator has
    * aimed it at can be started, and a running one stopped, against the open target, on a
    * harness and model the operator picks. The *live*
-   * transcript is here too: {@link LiveTranscript} shows the target's own event log, read
-   * in store-assigned order behind a cursor, next to the harness's narration and the
-   * policy gate's denials as live activity — and says which is which.
+   * transcript is the dock at the foot of every section: {@link LiveTranscript} shows the
+   * target's own event log, read in store-assigned order behind a cursor, next to the
+   * harness's narration and the policy gate's denials as live activity — and says which is
+   * which. It is about the target rather than any one page, so it is under all of them.
    * {@link TranscriptPanel} remains the different thing beside it: what a *settled*
    * attempt left behind, the server's own artefact when it has one, and the harness's own
    * copy, labelled as the thing that may be gone, when it does not.
    */
-  import Badge from "../components/Badge.svelte";
   import Button from "../components/Button.svelte";
   import ComposeBox from "../components/ComposeBox.svelte";
   import Goal from "./Goal.svelte";
@@ -34,17 +36,15 @@
   import LiveTranscript from "../components/LiveTranscript.svelte";
   import PageFrame from "../components/PageFrame.svelte";
   import Sidebar from "../components/Sidebar.svelte";
-  import TargetHeader from "../components/TargetHeader.svelte";
   import TranscriptPanel from "../components/TranscriptPanel.svelte";
   import { IconSearch } from "../icons";
-  import { navGroups } from "../mock";
+  import { navItems } from "../mock";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
 
-  let item = $derived(
-    navGroups.flatMap((g) => g.items).find((i) => i.id === app.navItem),
-  );
+  let item = $derived(navItems.find((i) => i.id === app.navItem));
+  let label = $derived(item?.label ?? "Settings");
   /**
    * How many placeholder rows this section shows.
    *
@@ -62,10 +62,14 @@
 </script>
 
 <div class="level2">
-  <Sidebar {app} />
+  {#if !app.drawerHidden}<Sidebar {app} />{/if}
 
   <div class="pane">
-    <TargetHeader {app} />
+    {#if app.viewState === "unavailable" || app.viewState === "unreachable"}
+      <!-- The server's own sentence, unedited: the target picker marks the row with the
+           same failure, so the two cannot describe it differently. -->
+      <p class="notice" role="status">{app.viewDetail}</p>
+    {/if}
 
     {#if app.navItem === "goals"}
       {#if app.openGoalId === ""}
@@ -75,9 +79,10 @@
       {/if}
     {:else}
       <PageFrame
-        title={item?.label ?? ""}
+        title={label}
         description="Placeholder content. This page is designed in a later flow — what Flow A settles is the frame around it."
-        detailTitle="{item?.label ?? ''} detail"
+        centered={app.drawerHidden}
+        detailTitle="{label} detail"
         detailOpen={app.detailOpen}
         onclosedetail={() => (app.detailOpen = false)}
       >
@@ -89,7 +94,7 @@
         {#snippet filters()}
           <span class="search-wrap">
             <IconSearch class="search-icon" width="13" height="13" />
-            <input class="search" placeholder="Filter {item?.label ?? ''}" />
+            <input class="search" placeholder="Filter {label}" />
           </span>
           <Button size="sm" variant="quiet">All statuses</Button>
           <Button size="sm" variant="quiet">Any time</Button>
@@ -109,9 +114,8 @@
                       app.detailOpen = true;
                     }}
                   >
-                    <Badge name={app.selected?.name ?? "?"} size={16} />
                     <span class="row-title">
-                      {item?.label ?? ""} row {row.index + 1}
+                      {label} row {row.index + 1}
                     </span>
                     <span class="row-meta mono">placeholder</span>
                   </button>
@@ -132,7 +136,7 @@
             <dt>Target</dt>
             <dd class="mono">{app.selected?.name ?? ""}</dd>
             <dt>Section</dt>
-            <dd>{item?.label ?? ""}</dd>
+            <dd>{label}</dd>
           </dl>
         {/snippet}
       </PageFrame>
@@ -144,22 +148,19 @@
       listed on a goal's page, but a run is an action on the *target* and its strip has to be
       visible from the list too. It renders nothing until there is something to say — an
       intent aimed at, or a run going — so on the list it is usually absent. Putting it
-      under every section would make it look like a control for Findings and Traffic too.
+      under every section would make it look like a control for Findings and Assets too.
+
+      The settled transcript sits above it for the same reason, and renders nothing until
+      this tab has started a run here — the only handle a browser has on a settled attempt
+      until Flow B lists them.
     -->
     {#if app.navItem === "goals"}
-      <!--
-        The transcripts sit above the run box and below the frame, for the same reason the
-        box does: they are about the target rather than about whichever page is showing.
-        The live one goes first because it is about the run happening now, while the panel
-        under it is about a run that has already ended; reading top to bottom therefore reads
-        from the present backwards. Each renders nothing until it has something to say — the
-        settled one not until this tab has started a run here, which is the only handle a
-        browser has on a settled attempt until Flow B lists them.
-      -->
-      <LiveTranscript {app} />
       <TranscriptPanel {app} />
       <ComposeBox {app} />
     {/if}
+
+    <!-- Last, so it is the foot of the window: one line until it is opened. -->
+    <LiveTranscript {app} />
   </div>
 </div>
 
@@ -176,6 +177,16 @@
     flex-direction: column;
     min-width: 0;
     min-height: 0;
+  }
+  .notice {
+    flex: none;
+    margin: 0;
+    padding: 10px 32px;
+    border-bottom: 1px solid var(--state-border-warning);
+    background: var(--state-bg-warning);
+    color: var(--state-fg-warning);
+    font-size: 13px;
+    line-height: 18px;
   }
   .search-wrap {
     position: relative;
@@ -214,7 +225,7 @@
     cursor: pointer;
   }
   .row:hover {
-    background: var(--bg-layer-01);
+    background: var(--overlay-hover);
   }
   .row-title {
     flex: 1;

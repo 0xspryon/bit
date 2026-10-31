@@ -1,35 +1,70 @@
 <script lang="ts">
+  /**
+   * All targets: the page above target scope, behind the first crumb.
+   *
+   * Every target this server knows, as a table. Create is in the page header, reading is
+   * the row, and everything else done *to* a target lives in the row's overflow menu, with
+   * delete below a rule and the only thing on this page in danger red. An unavailable
+   * target says so next to its name rather than in a column, so a target with nothing wrong
+   * carries no decoration at all.
+   *
+   * There is no rail here — you are above target scope — and the crumb bar is one chip
+   * that does not switch.
+   *
+   * **The row menu is the design's, not yet the server's.** The registry has no endpoint to
+   * edit, duplicate, export, archive or delete a target, so those entries are shown
+   * disabled and say why, rather than looking like controls that silently do nothing.
+   */
   import Badge from "../components/Badge.svelte";
   import Banner from "../components/Banner.svelte";
   import Button from "../components/Button.svelte";
   import {
-    IconCog,
+    IconArchive,
+    IconCopy,
     IconCrosshairs,
-    IconFolderOpen,
-    IconHelp,
+    IconEllipsis,
+    IconExport,
     IconPencil,
     IconPlus,
     IconSearch,
-    IconStream,
     IconTrash,
     IconWarning,
   } from "../icons";
-  import { hunts, huntGroups } from "../mock";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
 
   let visible = $derived(
-    hunts.filter(
-      (h) =>
-        h.targetId === app.selectedId &&
-        h.title.toLowerCase().includes(app.search.toLowerCase()),
+    app.targets.filter((target) =>
+      target.name.toLowerCase().includes(app.search.trim().toLowerCase()),
     ),
   );
-  let targetHunts = $derived(
-    hunts.filter((h) => h.targetId === app.selectedId),
-  );
+
+  /** The target whose row menu is open, or "" for none. */
+  let menuFor = $state("");
+  let menu = $state<HTMLDivElement | undefined>(undefined);
+
+  const when = (lastActivity: string) =>
+    lastActivity === "now" ? "just now" : `${lastActivity} ago`;
+
+  const NOT_YET = "Not available yet: the server has no endpoint for this.";
 </script>
+
+<svelte:window
+  onpointerdown={(event) => {
+    if (menuFor === "" || menu === undefined) return;
+    if (
+      event.target instanceof Element &&
+      event.target.closest(".more") !== null
+    )
+      return;
+    if (event.target instanceof Node && menu.contains(event.target)) return;
+    menuFor = "";
+  }}
+  onkeydown={(event) => {
+    if (menuFor !== "" && event.key === "Escape") menuFor = "";
+  }}
+/>
 
 {#if app.reconnecting && !app.bannerDismissed}
   <Banner tone="danger" ondismiss={() => (app.bannerDismissed = true)}>
@@ -38,481 +73,417 @@
   </Banner>
 {/if}
 
-<div class="welcome">
-  <!-- ── Target rail ── -->
-  <nav class="rail" aria-label="Targets">
-    <div class="rail-head">
-      <span class="label">Targets</span>
-      <button
-        class="icon"
-        aria-label="New target"
-        onclick={() => app.openDialog()}
-      >
-        <IconPlus width="12" height="12" />
-      </button>
-    </div>
-
-    <ul class="targets">
-      {#each app.targets as target (target.id)}
-        <li
-          class={[
-            "row",
-            target.id === app.selectedId && "selected",
-            target.status === "missing" && "missing",
-          ]}
+<div class="page">
+  {#if app.targets.length === 0}
+    <div class="centre">
+      <div class="empty">
+        <span class="empty-icon"><IconCrosshairs width="17" height="17" /></span
         >
-          <button class="row-main" onclick={() => app.select(target.id)}>
-            <Badge name={target.name} />
-            <span class="row-label">
-              <span class="row-name">
-                {#if target.status === "missing"}
-                  <IconWarning class="warn-icon" width="11" height="11" />
-                {/if}
-                {target.name}
-              </span>
-              <span class="row-path mono">{target.path}</span>
-            </span>
-          </button>
-          {#if target.status === "missing"}
-            <span class="chip">Missing</span>
-          {:else}
-            <span class="when">{target.lastActivity}</span>
-            <span class="actions">
-              <button class="icon sm" aria-label="Reveal folder">
-                <IconFolderOpen width="12" height="12" />
-              </button>
-              <button class="icon sm" aria-label="Rename">
-                <IconPencil width="12" height="12" />
-              </button>
-              <button class="icon sm" aria-label="Remove">
-                <IconTrash width="12" height="12" />
-              </button>
-            </span>
-          {/if}
-        </li>
-      {/each}
-    </ul>
-
-    {#if app.targets.length === 0}
-      <p class="rail-empty">None yet.</p>
-    {/if}
-
-    <div class="rail-foot">
-      <button class="foot">
-        <IconCog width="13" height="13" /> Settings
-      </button>
-      <button class="foot">
-        <IconHelp width="13" height="13" /> Help
-      </button>
+        <h2>Add your first target</h2>
+        <p>
+          A target is one system you are testing. It gets a folder on your
+          machine, and everything the agent learns about it is recorded there.
+        </p>
+        <Button variant="primary" size="page" onclick={() => app.openDialog()}>
+          <IconPlus width="14" height="14" />
+          New target
+        </Button>
+      </div>
     </div>
-  </nav>
+  {:else}
+    <header class="head">
+      <div class="titles">
+        <h1>Targets</h1>
+        <p>
+          Every system you have permission to investigate. Open one to see its
+          goals.
+        </p>
+      </div>
+      <Button variant="primary" size="page" onclick={() => app.openDialog()}>
+        <IconPlus width="14" height="14" />
+        New target
+      </Button>
+    </header>
 
-  <!-- ── Hunts ── -->
-  <section class="hunts" aria-label="Hunts">
-    {#if app.targets.length === 0}
-      <div class="centre">
-        <div class="empty">
-          <span class="empty-icon"
-            ><IconCrosshairs width="17" height="17" /></span
-          >
-          <h2>Add your first target</h2>
-          <p>
-            A target is one system you are testing. It gets a folder on your
-            machine, and everything the agent learns about it is recorded there.
-          </p>
-          <Button variant="primary" onclick={() => app.openDialog()}>
-            New target
-          </Button>
-          <p class="kbd">Or press <kbd>N</kbd></p>
-        </div>
-      </div>
-    {:else if app.selected?.status === "missing"}
-      <div class="search-bar">
-        <span class="search-wrap">
-          <IconSearch class="search-icon" width="13" height="13" />
-          <input
-            class="search"
-            placeholder="Search hunts in {app.selected.name}"
-            disabled
-          />
-        </span>
-      </div>
-      <div class="centre">
-        <div class="empty">
-          <span class="empty-icon warn"
-            ><IconWarning width="17" height="17" /></span
-          >
-          <h2>This target cannot be opened</h2>
-          <p class="mono path">{app.selected.path}</p>
-          <!--
-            The server's own words for why. One `missing` state covers every reason a
-            target is unavailable — a deleted folder, a missing database, a migration
-            that failed — and the sentence is where the distinction lives, because it is
-            the only part the operator acts on differently.
-          -->
-          <p>
-            {app.selected.detail ??
-              "Nothing has been deleted. What this target recorded is still in the registry and becomes readable again as soon as its folder is back."}
-          </p>
-          <div class="pair">
-            <Button onclick={() => {}}>Locate folder…</Button>
-            <Button variant="quiet" onclick={() => {}}>Remove target</Button>
-          </div>
-        </div>
+    <label class="filter">
+      <IconSearch width="14" height="14" />
+      <input placeholder="Filter targets…" bind:value={app.search} />
+    </label>
+
+    {#if visible.length === 0}
+      <div class="no-match">
+        <p>Nothing matches “{app.search}”.</p>
+        <Button variant="quiet" size="sm" onclick={() => (app.search = "")}>
+          Clear filter
+        </Button>
       </div>
     {:else}
-      <div class="search-bar">
-        <span class="search-wrap">
-          <IconSearch class="search-icon" width="13" height="13" />
-          <input
-            class="search"
-            placeholder="Search hunts in {app.selected?.name ?? ''}"
-            bind:value={app.search}
-          />
-        </span>
-      </div>
+      <div class="table" role="table" aria-label="Targets">
+        <div class="cols" role="row">
+          <span class="col-name" role="columnheader">Target</span>
+          <span class="col-scope" role="columnheader">Scope</span>
+          <span class="col-when" role="columnheader">Last activity</span>
+          <span class="col-more" aria-hidden="true"></span>
+        </div>
 
-      {#if targetHunts.length === 0}
-        <div class="centre">
-          <div class="empty">
-            <span class="empty-icon"><IconStream width="17" height="17" /></span
-            >
-            <h2>No hunts yet</h2>
-            <p>
-              This target is ready. Start an investigation and it will appear
-              here.
-            </p>
-            <Button
-              variant="primary"
-              onclick={() => app.openTarget(app.selectedId)}>New hunt</Button
-            >
-          </div>
-        </div>
-      {:else if visible.length === 0}
-        <div class="centre">
-          <div class="empty">
-            <span class="empty-icon"><IconSearch width="17" height="17" /></span
-            >
-            <h2>Nothing matches “{app.search}”</h2>
-            <p>
-              {targetHunts.length} hunts on this target, none with that in the title.
-            </p>
-            <Button variant="quiet" onclick={() => (app.search = "")}>
-              Clear search
-            </Button>
-          </div>
-        </div>
-      {:else}
-        <div class="list">
-          {#each huntGroups as group (group)}
-            {@const rows = visible.filter((h) => h.group === group)}
-            {#if rows.length > 0}
-              <div class="group-head">
-                <span class="label">{group}</span>
-                {#if group === "Today"}
-                  <Button
-                    size="sm"
-                    onclick={() => app.openTarget(app.selectedId)}
+        <ul class="rows">
+          {#each visible as target (target.id)}
+            {@const missing = target.status === "missing"}
+            <li class={["row", menuFor === target.id && "menu-open"]}>
+              <button
+                class="row-main"
+                onclick={() => app.openTarget(target.id)}
+              >
+                <span class="col-name">
+                  <Badge
+                    name={target.name}
+                    size={26}
+                    letters={2}
+                    tone={target.id === app.selectedId
+                      ? "current"
+                      : missing
+                        ? "quiet"
+                        : "plain"}
+                  />
+                  <span class={["name", missing && "dim"]}>{target.name}</span>
+                  {#if missing}
+                    <!-- The server's words for why, on hover; the target page says it in full. -->
+                    <span class="warn" title={target.detail}>
+                      <IconWarning width="13" height="13" />
+                      Cannot be opened
+                    </span>
+                  {/if}
+                </span>
+                <span class="col-scope mono">{target.scope}</span>
+                <span class="col-when mono">{when(target.lastActivity)}</span>
+              </button>
+
+              <div class="col-more">
+                <button
+                  class="more"
+                  aria-label="Actions for {target.name}"
+                  aria-haspopup="menu"
+                  aria-expanded={menuFor === target.id}
+                  onclick={() =>
+                    (menuFor = menuFor === target.id ? "" : target.id)}
+                >
+                  <IconEllipsis width="15" height="15" />
+                </button>
+
+                {#if menuFor === target.id}
+                  <div
+                    class="menu"
+                    role="menu"
+                    aria-label="Actions for {target.name}"
+                    bind:this={menu}
                   >
-                    + New hunt
-                  </Button>
+                    <button
+                      class="menu-item"
+                      role="menuitem"
+                      disabled
+                      title={NOT_YET}
+                    >
+                      <IconPencil width="14" height="14" /> Edit target
+                    </button>
+                    <button
+                      class="menu-item"
+                      role="menuitem"
+                      disabled
+                      title={NOT_YET}
+                    >
+                      <IconCopy width="14" height="14" /> Duplicate
+                    </button>
+                    <button
+                      class="menu-item"
+                      role="menuitem"
+                      disabled
+                      title={NOT_YET}
+                    >
+                      <IconExport width="14" height="14" /> Export report
+                    </button>
+                    <span class="menu-rule" role="separator"></span>
+                    <button
+                      class="menu-item"
+                      role="menuitem"
+                      disabled
+                      title={NOT_YET}
+                    >
+                      <IconArchive width="14" height="14" /> Archive
+                    </button>
+                    <button
+                      class="menu-item danger"
+                      role="menuitem"
+                      disabled
+                      title={NOT_YET}
+                    >
+                      <IconTrash width="14" height="14" /> Delete target
+                    </button>
+                    <p class="menu-note">Not wired to the server yet.</p>
+                  </div>
                 {/if}
               </div>
-              {#each rows as hunt (hunt.id)}
-                <button
-                  class="hunt"
-                  onclick={() => app.openTarget(app.selectedId)}
-                >
-                  <Badge name={app.selected?.name ?? "?"} size={16} />
-                  <span class="hunt-title">{hunt.title}</span>
-                  <span class="hunt-when">{hunt.when}</span>
-                </button>
-              {/each}
-            {/if}
+            </li>
           {/each}
-        </div>
-      {/if}
+        </ul>
+      </div>
     {/if}
-  </section>
+  {/if}
 </div>
 
 <style>
-  .welcome {
-    display: grid;
-    grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  .page {
+    display: flex;
     flex: 1;
+    flex-direction: column;
+    gap: 28px;
     min-height: 0;
+    padding: 40px 56px;
+    overflow: auto;
+    background: var(--bg-base);
   }
 
-  /* ── Rail ── */
-  .rail {
+  .head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 32px;
+  }
+  .titles {
     display: flex;
     flex-direction: column;
-    border-right: 1px solid var(--border-base);
-    background: var(--bg-base);
-    min-height: 0;
+    gap: 6px;
+    max-width: 620px;
   }
-  .rail-head {
+  h1 {
+    margin: 0;
+    font: 530 26px/32px var(--font-sans);
+    letter-spacing: -0.01em;
+  }
+  .titles p {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 19px;
+    text-wrap: pretty;
+  }
+
+  .filter {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 14px 12px 8px 16px;
+    gap: 10px;
+    max-width: 360px;
+    height: 34px;
+    padding: 0 10px;
+    border: 1px solid var(--border-base);
+    border-radius: var(--radius-md);
+    background: var(--bg-deep);
+    color: var(--icon-muted);
   }
-  .label {
-    font: 600 11px/var(--lh-compact) var(--font-sans);
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+  .filter:focus-within {
+    border-color: var(--border-strong);
+  }
+  .filter input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-base);
+    font: 400 13px/18px var(--font-sans);
+    outline: none;
+  }
+  .filter input::placeholder {
     color: var(--text-faint);
   }
-  .targets {
-    list-style: none;
-    margin: 0;
-    padding: 0 8px;
-    flex: 1;
-    overflow: auto;
-  }
-  .row {
-    position: relative;
+
+  .no-match {
     display: flex;
     align-items: center;
+    gap: 12px;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .no-match p {
+    margin: 0;
+  }
+
+  /* ── Table ── */
+  .table {
+    display: flex;
+    flex-direction: column;
+  }
+  .cols {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    padding: 0 12px 10px;
+    border-bottom: 1px solid var(--border-muted);
+    color: var(--text-faint);
+    font: 600 10px/14px var(--font-sans);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .col-name {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    gap: 11px;
+    min-width: 0;
+  }
+  .col-scope {
+    flex: none;
+    width: 200px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .col-when {
+    flex: none;
+    width: 130px;
+  }
+  .col-more {
+    position: relative;
+    flex: none;
+    width: 28px;
+  }
+
+  .rows {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding: 6px 0 0;
+    list-style: none;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    padding-right: 12px;
     border-radius: var(--radius-md);
-    background: var(--bg-base);
-    transition: background var(--dur-hover) ease-out;
   }
   .row:hover,
-  .row:focus-within {
-    background: var(--bg-layer-01);
-  }
-  .row.selected {
-    background: var(--bg-layer-02);
-  }
-  .row.missing {
-    opacity: 0.75;
+  .row.menu-open {
+    background: var(--overlay-hover);
   }
   .row-main {
     display: flex;
-    align-items: center;
-    gap: 10px;
     flex: 1;
+    align-items: center;
+    gap: 24px;
     min-width: 0;
-    padding: 8px 10px;
+    padding: 12px 0 12px 12px;
     border: 0;
     background: transparent;
     color: inherit;
     text-align: left;
     cursor: pointer;
   }
-  .row-label {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-    gap: 1px;
-  }
-  /* The label fades where the action strip slides over it, instead of
-     being pushed — no layout shift on hover. */
-  .row:hover .row-label,
-  .row:focus-within .row-label {
-    mask-image: linear-gradient(
-      to right,
-      black 0,
-      black calc(100% - 44px),
-      transparent calc(100% - 36px)
-    );
-  }
-  .row-name {
-    font-size: 13px;
-    color: var(--text-base);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .row-path {
-    font-size: 11px;
-    color: var(--text-faint);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  /* The class lands on the icon component's own <svg>, so it needs :global. */
-  :global(.warn-icon) {
-    display: inline-block;
-    vertical-align: -1px;
-    color: var(--state-fg-warning);
-  }
-  .when {
-    padding-right: 10px;
-    font-size: 11px;
-    color: var(--text-faint);
-  }
-  .actions {
-    position: absolute;
-    right: 0;
-    display: none;
-    align-items: center;
-    gap: 2px;
-    padding: 0 8px 0 10px;
-    height: 100%;
-    background: linear-gradient(to right, transparent, var(--bg-layer-01) 8px);
-  }
-  .row:hover .actions,
-  .row:focus-within .actions {
-    display: flex;
-  }
-  .row.selected:hover .actions {
-    background: linear-gradient(to right, transparent, var(--bg-layer-02) 8px);
-  }
-  .row:hover .when {
-    opacity: 0;
-  }
-  .chip {
-    margin-right: 10px;
-    padding: 2px 7px;
-    border: 1px solid var(--state-border-warning);
-    border-radius: var(--radius-sm);
-    background: var(--state-bg-warning);
-    color: var(--state-fg-warning);
-    font-size: 10px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    white-space: nowrap;
-  }
-  .rail-empty {
-    margin: 0;
-    padding: 4px 16px;
-    font-size: 12px;
-    color: var(--text-faint);
-  }
-  .rail-foot {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding: 8px;
-    border-top: 1px solid var(--border-muted);
-  }
-  .foot {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    padding: 7px 8px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
+  .row-main .col-scope,
+  .row-main .col-when {
     color: var(--text-muted);
-    font: 400 12px/var(--lh-compact) var(--font-sans);
-    text-align: left;
-    cursor: pointer;
+    font-size: 12px;
+    line-height: 18px;
   }
-  .foot:hover {
-    background: var(--overlay-hover);
+  .name {
+    min-width: 0;
+    overflow: hidden;
     color: var(--text-base);
+    font: 600 14px/20px var(--font-sans);
+    white-space: nowrap;
+    text-overflow: ellipsis;
   }
-  .icon {
-    display: inline-flex;
+  .name.dim {
+    color: var(--text-muted);
+  }
+  .warn {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 5px;
+    color: var(--state-fg-warning);
+    font-size: 12px;
+    line-height: 16px;
+  }
+
+  .more {
+    display: flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
+    width: 28px;
+    height: 28px;
     border: 0;
-    border-radius: var(--radius-sm);
+    border-radius: 5px;
     background: transparent;
     color: var(--icon-muted);
-    font-size: 14px;
     cursor: pointer;
   }
-  .icon.sm {
-    width: 22px;
-    height: 22px;
-    font-size: 12px;
-  }
-  .icon:hover {
+  .more:hover,
+  .more[aria-expanded="true"] {
     background: var(--overlay-pressed);
-    color: var(--text-base);
+    color: var(--icon-base);
   }
 
-  /* ── Hunts ── */
-  .hunts {
+  .menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
     display: flex;
     flex-direction: column;
-    min-width: 0;
-    min-height: 0;
-    background: var(--bg-base);
-  }
-  .search-bar {
-    padding: 12px 16px;
-    flex: none;
-  }
-  .search-wrap {
-    position: relative;
-    display: block;
-  }
-  :global(.search-icon) {
-    position: absolute;
-    left: 11px;
-    top: 50%;
-    transform: translateY(-50%);
-    color: var(--text-faint);
-    pointer-events: none;
-  }
-  .search {
-    width: 100%;
-    height: 34px;
-    padding: 0 12px 0 32px;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-md);
+    width: 216px;
+    padding: 6px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
     background: var(--bg-layer-01);
-    color: var(--text-base);
-    font: 400 13px/var(--lh-base) var(--font-sans);
+    box-shadow: 0 18px 48px #00000070;
   }
-  .search::placeholder {
-    color: var(--text-faint);
-  }
-  .search:disabled {
-    opacity: 0.5;
-  }
-  .list {
-    padding: 4px 8px 16px;
-    overflow: auto;
-  }
-  .group-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px 8px 6px;
-  }
-  .hunt {
+  .menu-item {
     display: flex;
     align-items: center;
     gap: 10px;
-    width: 100%;
-    padding: 9px 10px;
+    padding: 8px;
     border: 0;
-    border-radius: var(--radius-md);
+    border-radius: 5px;
     background: transparent;
-    color: inherit;
+    color: var(--text-base);
+    font: 400 13px/18px var(--font-sans);
     text-align: left;
     cursor: pointer;
   }
-  .hunt:hover {
-    background: var(--bg-layer-01);
+  .menu-item :global(svg) {
+    flex: none;
+    color: var(--icon-muted);
   }
-  .hunt-title {
-    flex: 1;
-    min-width: 0;
-    font-size: 13px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .menu-item:hover:not(:disabled) {
+    background: var(--overlay-hover);
   }
-  .hunt-when {
+  .menu-item.danger,
+  .menu-item.danger :global(svg) {
+    color: var(--state-fg-danger);
+  }
+  .menu-item.danger:hover:not(:disabled) {
+    background: var(--state-bg-danger);
+  }
+  .menu-item:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+  .menu-rule {
+    height: 1px;
+    margin: 5px 2px;
+    background: var(--border-muted);
+  }
+  .menu-note {
+    margin: 4px 8px 2px;
+    color: var(--text-muted);
     font-size: 11px;
-    color: var(--text-faint);
-    white-space: nowrap;
+    line-height: 15px;
   }
 
-  /* ── Empty states ── */
+  /* ── First run ── */
   .centre {
-    flex: 1;
     display: grid;
+    flex: 1;
     place-items: center;
     padding: 24px;
   }
@@ -533,48 +504,24 @@
     border: 1px solid var(--border-base);
     border-radius: var(--radius-lg);
     color: var(--icon-faint);
-    font-size: 15px;
-  }
-  .empty-icon.warn {
-    border-color: var(--state-border-warning);
-    background: var(--state-bg-warning);
-    color: var(--state-fg-warning);
   }
   .empty h2 {
     margin: 0;
     font: 530 15px/20px var(--font-sans);
   }
   .empty p {
-    margin: 0;
+    margin: 0 0 6px;
+    color: var(--text-muted);
     font-size: 13px;
     line-height: var(--lh-base);
-    color: var(--text-muted);
-  }
-  .empty .path {
-    font-size: 12px;
-    color: var(--text-faint);
-  }
-  .pair {
-    display: flex;
-    gap: 8px;
-    margin-top: 4px;
-  }
-  .kbd {
-    font-size: 11px !important;
-    color: var(--text-faint) !important;
-  }
-  kbd {
-    padding: 1px 5px;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-xs);
-    background: var(--bg-layer-01);
-    font-family: var(--font-mono);
-    font-size: 10px;
   }
 
   @media (max-width: 1024px) {
-    .welcome {
-      grid-template-columns: 220px minmax(0, 1fr);
+    .page {
+      padding: 32px;
+    }
+    .col-scope {
+      display: none;
     }
   }
 </style>

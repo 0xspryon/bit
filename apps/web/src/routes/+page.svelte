@@ -99,11 +99,11 @@
     <!-- Level 0: no chrome. There is nothing to navigate to yet. -->
     <Connect {app} />
   {:else if app.screen === "welcome"}
-    <!-- Level 1: title bar only. The target rail is the navigation. -->
+    <!-- Level 1: above target scope. One crumb, and the table of targets is the navigation. -->
     <TitleBar {app} />
     <Welcome {app} />
   {:else}
-    <!-- Level 2: title bar plus the target's own navigation. -->
+    <!-- Level 2: the crumb bar plus the target's own rail. -->
     <TitleBar {app} />
     <Target {app} />
   {/if}
@@ -113,7 +113,8 @@
   {/if}
 </div>
 
-<ScenarioBar {app} />
+<!-- Inside a target the Live dock carries this toggle; see `ScenarioBar`. -->
+{#if app.screen !== "target"}<ScenarioBar {app} />{/if}
 
 <style>
   .app {

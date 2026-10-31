@@ -37,13 +37,22 @@ export const statusLabel = (status: GoalStatus): string =>
 const plural = (count: number, one: string, many: string) =>
   `${String(count)} ${count === 1 ? one : many}`;
 
-/** "2 intents · 1 attempt · 5 observations", always all three, zero included. */
+/**
+ * "2 intents · 5 observations": the facets that have something in them, and only those.
+ *
+ * A zero is dropped rather than shown, because "0 attempts · 0 observations" teaches the
+ * operator nothing the timestamp beside it does not. An empty string when every facet is
+ * zero, so a caller can leave the line out entirely.
+ */
 export const countsLine = (counts: GoalView["counts"]): string =>
   [
-    plural(counts.intents, "intent", "intents"),
-    plural(counts.attempts, "attempt", "attempts"),
-    plural(counts.observations, "observation", "observations"),
-  ].join(" · ");
+    [counts.intents, "intent", "intents"] as const,
+    [counts.attempts, "attempt", "attempts"] as const,
+    [counts.observations, "observation", "observations"] as const,
+  ]
+    .filter(([count]) => count > 0)
+    .map(([count, one, many]) => plural(count, one, many))
+    .join(" · ");
 
 /** A date and time in the reader's own locale, from epoch milliseconds. */
 export const whenText = (at: number): string =>

@@ -59,9 +59,7 @@
 <section aria-labelledby="intents-heading" class="intents">
   <div class="head">
     <h2 id="intents-heading">Intents</h2>
-    {#if goalActive && !app.intentFormOpen}
-      <Button size="sm" onclick={() => app.openIntentForm()}>Add intent</Button>
-    {/if}
+    <!-- No add button here: the page header's New intent opens this list's form. -->
   </div>
 
   {#if app.intentFormOpen}

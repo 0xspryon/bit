@@ -11,8 +11,9 @@
     type = "button",
     children,
   }: {
-    variant?: "primary" | "neutral" | "quiet" | "danger";
-    size?: "sm" | "md";
+    variant?: "primary" | "neutral" | "quiet" | "outline" | "danger";
+    /** `page` is a page header's action: shorter than `md`, beside a 32px title. */
+    size?: "sm" | "md" | "page";
     loading?: boolean;
     disabled?: boolean;
     full?: boolean;
@@ -50,6 +51,11 @@
     min-height: 44px;
     padding: 0 16px;
   }
+  .page {
+    min-height: 34px;
+    padding: 0 14px;
+    font-weight: 500;
+  }
   .sm {
     min-height: 28px;
     padding: 0 10px;
@@ -81,6 +87,17 @@
     background: var(--bg-layer-02);
   }
 
+  .outline {
+    background: transparent;
+    border-color: var(--border-strong);
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  .outline:hover:not(:disabled) {
+    background: var(--overlay-hover);
+    color: var(--text-base);
+  }
+
   .quiet {
     background: transparent;
     color: var(--text-muted);
@@ -96,6 +113,11 @@
     color: var(--state-fg-danger);
   }
 
+  .label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
   .loading .label {
     opacity: 0.7;
   }

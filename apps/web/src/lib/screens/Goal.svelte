@@ -39,6 +39,8 @@
    * The briefing is read-only and is the one section whose content is the server's string
    * verbatim (see {@link GoalBriefingPanel}).
    */
+  import { tick } from "svelte";
+
   import Button from "../components/Button.svelte";
   import GoalBriefingPanel from "../components/GoalBriefingPanel.svelte";
   import GoalStatusChip from "../components/GoalStatusChip.svelte";
@@ -47,7 +49,8 @@
   import PlanPanel from "../components/PlanPanel.svelte";
   import GoalAgentChat from "../components/GoalAgentChat.svelte";
   import PlannerChat from "../components/PlannerChat.svelte";
-  import { countsLine, goalTitle, whenText } from "../goalFormat";
+  import { IconPlus } from "../icons";
+  import { goalTitle, whenText } from "../goalFormat";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
@@ -69,14 +72,57 @@
         ? "this goal's agent"
         : "an operator",
   );
+
+  /**
+   * Opens a form further down the page and brings it into view.
+   *
+   * The header's two actions open forms that live with what they act on — the intent form
+   * in the intents list, the end form at the foot of the page — so the button has to take
+   * the operator there, or the click would appear to do nothing.
+   */
+  async function reveal(open: () => void, id: string) {
+    open();
+    await tick();
+    document
+      .getElementById(id)
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
 </script>
 
 <PageFrame
   title={goal === undefined ? "Goal" : goalTitle(goal)}
-  description={goal === undefined ? "" : `Created ${whenText(goal.createdAt)}`}
+  centered={app.drawerHidden}
 >
+  {#snippet heading()}
+    <div class="title-line">
+      <h1>{goal === undefined ? "Goal" : goalTitle(goal)}</h1>
+      {#if goal !== undefined}<GoalStatusChip status={goal.status} />{/if}
+    </div>
+    {#if goal !== undefined && goal.name !== ""}
+      <!-- The objective, when the title is a name. Unnamed, the title already is it. -->
+      <p class="objective">{goal.description}</p>
+    {/if}
+  {/snippet}
+
   {#snippet actions()}
-    <Button variant="quiet" onclick={() => app.closeGoal()}>All goals</Button>
+    {#if goal?.status === "active"}
+      <Button
+        variant="outline"
+        size="page"
+        onclick={() => void reveal(() => app.openGoalEnd(), "goal-end-heading")}
+      >
+        End goal
+      </Button>
+      <Button
+        variant="primary"
+        size="page"
+        onclick={() =>
+          void reveal(() => app.openIntentForm(), "intents-heading")}
+      >
+        <IconPlus width="14" height="14" />
+        New intent
+      </Button>
+    {/if}
   {/snippet}
 
   {#snippet body()}
@@ -87,23 +133,6 @@
       </p>
     {:else}
       <article class="goal">
-        <div class="status-row">
-          <GoalStatusChip status={goal.status} />
-          <span class="counts">{countsLine(goal.counts)}</span>
-        </div>
-
-        <section aria-labelledby="goal-objective-heading">
-          <h2 id="goal-objective-heading">Objective</h2>
-          <p class="objective">{goal.description}</p>
-        </section>
-
-        {#if goal.name !== ""}
-          <section aria-labelledby="goal-name-heading">
-            <h2 id="goal-name-heading">Name</h2>
-            <p>{goal.name}</p>
-          </section>
-        {/if}
-
         <GoalAgentChat {app} />
 
         <IntentList {app} />
@@ -115,17 +144,10 @@
         <GoalBriefingPanel {app} />
 
         {#if goal.status === "active"}
-          <section aria-labelledby="goal-end-heading">
-            <h2 id="goal-end-heading">End this goal</h2>
-            {#if !app.goalEndOpen}
-              <p class="hint">
-                Ending a goal records that it is over. Nothing new is started
-                under it afterwards; a run already going is not stopped.
-              </p>
-              <div class="actions">
-                <Button onclick={() => app.openGoalEnd()}>End goal</Button>
-              </div>
-            {:else}
+          <!-- Opened from the header's End goal; until then the page ends at the briefing. -->
+          {#if app.goalEndOpen}
+            <section aria-labelledby="goal-end-heading">
+              <h2 id="goal-end-heading">End this goal</h2>
               <form
                 class="end"
                 onsubmit={(event) => {
@@ -200,8 +222,8 @@
                   </Button>
                 </div>
               </form>
-            {/if}
-          </section>
+            </section>
+          {/if}
         {:else}
           <section aria-labelledby="goal-ended-heading">
             <h2 id="goal-ended-heading">How it ended</h2>
@@ -244,15 +266,15 @@
     max-width: 720px;
     padding: 0 8px;
   }
-  .status-row {
+  .title-line {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 12px;
+    gap: 10px;
+    min-width: 0;
   }
-  .counts {
-    font-size: 12px;
-    color: var(--text-muted);
+  .title-line h1 {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
   h2 {
     margin: 0 0 6px;
@@ -267,6 +289,8 @@
     line-height: var(--lh-base);
   }
   .objective {
+    color: var(--text-muted);
+    font: 400 14px/21px var(--font-mono);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }

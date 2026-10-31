@@ -1,13 +1,38 @@
 <script lang="ts">
   /**
-   * Target badge. Neutral by design: with the monochrome direction the letter
-   * and the mono path carry identity instead of a colour.
+   * Target badge. Neutral by design: with the monochrome direction the letters
+   * carry identity instead of a colour.
+   *
+   * The tone says how the target stands relative to the screen, not what it is:
+   * `current` is the target you are in (the one filled badge on any screen),
+   * `plain` is any other, and `quiet` is one with nothing in it or nothing to
+   * open. Two letters where there is room for them, one in the crumb.
    */
-  let { name, size = 24 }: { name: string; size?: number } = $props();
-  let letter = $derived((name[0] ?? "?").toUpperCase());
+  let {
+    name,
+    size = 24,
+    letters = 1,
+    tone = "plain",
+  }: {
+    name: string;
+    size?: number;
+    letters?: 1 | 2;
+    tone?: "current" | "plain" | "quiet";
+  } = $props();
+
+  let initials = $derived(
+    (
+      name.replace(/[^\p{L}\p{N}]/gu, "").slice(0, letters) || "?"
+    ).toUpperCase(),
+  );
 </script>
 
-<span class="badge" style:--size="{size}px" aria-hidden="true">{letter}</span>
+<span
+  class={["badge", tone]}
+  style:--size="{size}px"
+  style:--ratio={letters === 2 ? 0.42 : 0.56}
+  aria-hidden="true">{initials}</span
+>
 
 <style>
   .badge {
@@ -17,13 +42,20 @@
     justify-content: center;
     width: var(--size);
     height: var(--size);
-    border: 1px solid var(--badge-border);
     border-radius: var(--radius-sm);
-    background: var(--badge-bg);
-    color: var(--badge-fg);
-    font-family: var(--font-mono);
-    font-size: calc(var(--size) * 0.46);
-    line-height: 1;
+    font: 600 calc(var(--size) * var(--ratio)) / 1 var(--font-sans);
     user-select: none;
+  }
+  .current {
+    background: var(--bg-inverse);
+    color: var(--bg-deep);
+  }
+  .plain {
+    background: var(--bg-layer-03);
+    color: var(--text-base);
+  }
+  .quiet {
+    background: var(--bg-layer-02);
+    color: var(--text-muted);
   }
 </style>

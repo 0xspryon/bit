@@ -5,6 +5,12 @@
    * detail panel that reflows the body rather than covering it.
    *
    * Designed once here so Flows B through G inherit it.
+   *
+   * The header starts at the page title: which target this is is the first crumb's job,
+   * and a header that said it again would be the third statement of one fact. `heading`
+   * replaces the default title block for a page whose title carries more than words — a
+   * goal and its status chip. `centered` holds the content to a reading width, for when the
+   * rail is hidden and the page would otherwise run the whole width of the window.
    */
   import type { Snippet } from "svelte";
   import { IconClose } from "../icons";
@@ -12,9 +18,11 @@
   let {
     title,
     description = "",
+    centered = false,
     detailTitle = "",
     detailOpen = false,
     onclosedetail,
+    heading,
     actions,
     filters,
     body,
@@ -22,9 +30,11 @@
   }: {
     title: string;
     description?: string;
+    centered?: boolean;
     detailTitle?: string;
     detailOpen?: boolean;
     onclosedetail?: () => void;
+    heading?: Snippet;
     actions?: Snippet;
     filters?: Snippet;
     body: Snippet;
@@ -32,13 +42,17 @@
   } = $props();
 </script>
 
-<div class="frame">
+<div class={["frame", centered && "centered"]}>
   <div class="main">
     <header class="page-head">
-      <div class="titles">
-        <h1>{title}</h1>
-        {#if description !== ""}<p>{description}</p>{/if}
-      </div>
+      {#if heading}
+        <div class="titles">{@render heading()}</div>
+      {:else}
+        <div class="titles">
+          <h1>{title}</h1>
+          {#if description !== ""}<p>{description}</p>{/if}
+        </div>
+      {/if}
       {#if actions}<div class="actions">{@render actions()}</div>{/if}
     </header>
 
@@ -80,22 +94,34 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 16px;
-    padding: 16px 20px 14px;
+    gap: 32px;
+    padding: 28px 32px 24px;
     flex: none;
   }
-  .titles h1 {
+  .titles {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+    max-width: 640px;
+  }
+  .titles h1,
+  .titles :global(h1) {
     margin: 0;
-    font: 530 17px/22px var(--font-sans);
+    font: 530 26px/32px var(--font-sans);
+    letter-spacing: -0.01em;
+    color: var(--text-base);
   }
   .titles p {
-    margin: 3px 0 0;
-    font-size: 12px;
-    line-height: var(--lh-compact);
+    margin: 0;
+    font-size: 13px;
+    line-height: 19px;
     color: var(--text-muted);
+    text-wrap: pretty;
   }
   .actions {
     display: flex;
+    align-items: center;
     gap: 8px;
     flex: none;
   }
@@ -103,14 +129,27 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 0 20px 12px;
+    padding: 0 32px 16px;
     flex: none;
   }
   .body {
     flex: 1;
     min-height: 0;
     overflow: auto;
-    padding: 0 12px 20px;
+    padding: 0 20px 28px;
+  }
+  /*
+   * The rail is hidden: hold the header and the list to a reading width, centred, rather
+   * than letting a row run 1400px from its title to its timestamp.
+   */
+  .centered .page-head,
+  .centered .filters {
+    width: 100%;
+    max-width: 1104px;
+    margin: 0 auto;
+  }
+  .centered .body {
+    padding-inline: max(20px, calc((100% - 1088px) / 2));
   }
 
   /* Reflows the list instead of covering it: you keep your place. */

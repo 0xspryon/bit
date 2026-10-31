@@ -19,6 +19,7 @@
   import GoalStatusChip from "../components/GoalStatusChip.svelte";
   import Modal from "../components/Modal.svelte";
   import PageFrame from "../components/PageFrame.svelte";
+  import { IconPlus } from "../icons";
   import { countsLine, goalTitle, whenText } from "../goalFormat";
   import type { App } from "../app.svelte";
 
@@ -26,14 +27,22 @@
 
   /** Only this target's rows, whatever else the store holds from an earlier visit. */
   let goals = $derived(app.goalsTargetId === app.viewTargetId ? app.goals : []);
+
+  /** The right-hand facts: what is under the goal, if anything, then when it began. */
+  const facts = (goal: (typeof goals)[number]) =>
+    [countsLine(goal.counts), `created ${whenText(goal.createdAt)}`]
+      .filter((part) => part !== "")
+      .join(" · ");
 </script>
 
 <PageFrame
   title="Goals"
   description="What this target's investigation is trying to establish. A goal stays open until you end it."
+  centered={app.drawerHidden}
 >
   {#snippet actions()}
-    <Button variant="primary" onclick={() => app.openGoalDialog()}>
+    <Button variant="primary" size="page" onclick={() => app.openGoalDialog()}>
+      <IconPlus width="14" height="14" />
       New goal
     </Button>
   {/snippet}
@@ -65,17 +74,20 @@
       <ul class="rows" aria-label="Goals">
         {#each goals as goal (goal.goalId)}
           <li>
-            <button class="row" onclick={() => app.openGoal(goal.goalId)}>
+            <button
+              class={["row", goal.status !== "active" && "ended"]}
+              onclick={() => app.openGoal(goal.goalId)}
+            >
               <span class="main">
-                <span class="title">{goalTitle(goal)}</span>
+                <span class="title-line">
+                  <span class="title">{goalTitle(goal)}</span>
+                  <GoalStatusChip status={goal.status} />
+                </span>
                 {#if goal.name !== ""}
                   <span class="objective">{goal.description}</span>
                 {/if}
-                <span class="meta">
-                  {countsLine(goal.counts)} · created {whenText(goal.createdAt)}
-                </span>
               </span>
-              <GoalStatusChip status={goal.status} />
+              <span class="meta">{facts(goal)}</span>
             </button>
           </li>
         {/each}
@@ -173,19 +185,21 @@
     line-height: var(--lh-base);
     color: var(--text-muted);
   }
+  /* A list, not a table: no rules between rows. Spacing and hover separate them. */
   .rows {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
     list-style: none;
     margin: 0;
     padding: 0;
   }
   .row {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
+    align-items: center;
+    gap: 20px;
     width: 100%;
-    min-height: 44px;
-    padding: 10px 10px;
+    padding: 14px 12px;
     border: 0;
     border-radius: var(--radius-md);
     background: transparent;
@@ -194,34 +208,44 @@
     cursor: pointer;
   }
   .row:hover {
-    background: var(--bg-layer-01);
+    background: var(--overlay-hover);
   }
   .main {
     display: flex;
+    flex: 1;
     flex-direction: column;
-    gap: 3px;
+    gap: 4px;
+    min-width: 0;
+  }
+  .title-line {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     min-width: 0;
   }
   .title {
-    font: 530 13px/var(--lh-base) var(--font-sans);
+    min-width: 0;
     overflow: hidden;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
+    color: var(--text-base);
+    font: 600 14px/20px var(--font-sans);
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .ended .title {
+    color: var(--text-muted);
   }
   .objective {
-    font-size: 12px;
-    line-height: var(--lh-compact);
-    color: var(--text-muted);
-    white-space: nowrap;
     overflow: hidden;
+    color: var(--text-muted);
+    font: 400 13px/19px var(--font-mono);
+    white-space: nowrap;
     text-overflow: ellipsis;
   }
   .meta {
-    font-size: 12px;
-    line-height: var(--lh-compact);
-    color: var(--text-faint);
+    flex: none;
+    color: var(--text-muted);
+    font: 400 12px/18px var(--font-mono);
+    text-align: right;
   }
   form {
     display: flex;

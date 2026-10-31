@@ -1,8 +1,7 @@
 /**
  * Static data for the Flow A prototype.
  *
- * What is left here is what has no server behind it yet: the prototype hunt list, the
- * Level 2 navigation, and the rows the state picker loads — including the two goals its
+ * What is left here is what has no server behind it yet: the Level 2 navigation, and the rows the state picker loads — including the two goals its
  * open target shows, since a scenario has no server to read real ones from.
  *
  * The target rail is **not** fed from here any more: `app.svelte.ts` fills it from
@@ -79,8 +78,6 @@ export interface Target {
   readonly scope: string;
   readonly lastActivity: string;
   status: TargetStatus;
-  readonly hunts: number;
-  readonly findings: number;
   /**
    * The server's own words for the state this row is in.
    *
@@ -91,14 +88,6 @@ export interface Target {
   readonly detail?: string;
 }
 
-export interface Hunt {
-  readonly id: string;
-  readonly targetId: string;
-  readonly title: string;
-  readonly when: string;
-  readonly group: "Today" | "Yesterday" | "Earlier";
-}
-
 export const initialTargets: Target[] = [
   {
     id: "acme-corp",
@@ -107,8 +96,6 @@ export const initialTargets: Target[] = [
     scope: "*.acme-corp.test",
     lastActivity: "2m",
     status: "ready",
-    hunts: 6,
-    findings: 2,
   },
   {
     id: "internal-api",
@@ -117,8 +104,6 @@ export const initialTargets: Target[] = [
     scope: "api.internal.test",
     lastActivity: "7m",
     status: "ready",
-    hunts: 14,
-    findings: 3,
   },
   {
     id: "scratch",
@@ -127,71 +112,8 @@ export const initialTargets: Target[] = [
     scope: "localhost:8080",
     lastActivity: "6d",
     status: "ready",
-    hunts: 1,
-    findings: 0,
   },
 ];
-
-export const hunts: Hunt[] = [
-  {
-    id: "h1",
-    targetId: "acme-corp",
-    title: "Rate limit probe on /v1/login",
-    when: "2m ago",
-    group: "Today",
-  },
-  {
-    id: "h2",
-    targetId: "acme-corp",
-    title: "Auth surface sweep",
-    when: "1h ago",
-    group: "Today",
-  },
-  {
-    id: "h3",
-    targetId: "acme-corp",
-    title: "IDOR check across tenant ids",
-    when: "4h ago",
-    group: "Today",
-  },
-  {
-    id: "h4",
-    targetId: "acme-corp",
-    title: "GraphQL introspection",
-    when: "Yesterday",
-    group: "Yesterday",
-  },
-  {
-    id: "h5",
-    targetId: "acme-corp",
-    title: "Session fixation follow-up",
-    when: "Yesterday",
-    group: "Yesterday",
-  },
-  {
-    id: "h6",
-    targetId: "acme-corp",
-    title: "Initial recon",
-    when: "12 Oct",
-    group: "Earlier",
-  },
-  {
-    id: "h7",
-    targetId: "internal-api",
-    title: "Tenant boundary probe",
-    when: "7m ago",
-    group: "Today",
-  },
-  {
-    id: "h8",
-    targetId: "internal-api",
-    title: "JWT claim tampering",
-    when: "Yesterday",
-    group: "Yesterday",
-  },
-];
-
-export const huntGroups = ["Today", "Yesterday", "Earlier"] as const;
 
 export const START_COMMAND = "bun run dev --filter @bit/server";
 
@@ -207,6 +129,13 @@ export interface NavItem {
   readonly attention?: boolean;
 }
 
+/**
+ * The rail, trimmed to the things being investigated.
+ *
+ * Eleven items rather than fifteen: Policy, Quota and Notifications are configuration and
+ * live under Settings, and Traffic and Reports wait for the flows that design them. Settings
+ * and Help are the rail's footer, not entries here.
+ */
 export const navGroups: ReadonlyArray<{
   readonly label: string;
   readonly items: readonly NavItem[];
@@ -214,40 +143,38 @@ export const navGroups: ReadonlyArray<{
   {
     label: "Investigation",
     items: [
-      // The one Level 2 item driven by real rows. It has no `count` here on purpose: the
-      // number comes from the open target's goals (`App.goalCount`), and a prototype figure
-      // in this record would be the thing shown whenever that one was unavailable.
-      { id: "goals", label: "Goals", icon: "stream" },
+      // Goals, Observations and Assets are driven by real rows, so they carry no `count`
+      // here on purpose: the number comes from the open target (`App.navCount`), and a
+      // prototype figure in this record would be the thing shown whenever that one was
+      // unavailable.
+      { id: "goals", label: "Goals", icon: "goals" },
       {
         id: "findings",
         label: "Findings",
-        icon: "bug",
+        icon: "findings",
         count: 2,
         attention: true,
       },
-      { id: "observations", label: "Observations", icon: "eye", count: 148 },
-      { id: "assets", label: "Assets", icon: "sitemap", count: 37 },
-      { id: "frontier", label: "Frontier", icon: "compass", count: 12 },
-      { id: "traffic", label: "Traffic", icon: "exchange" },
-      { id: "evidence", label: "Evidence", icon: "archive", count: 9 },
-      { id: "reports", label: "Reports", icon: "file", count: 1 },
+      { id: "observations", label: "Observations", icon: "observations" },
+      { id: "assets", label: "Assets", icon: "assets" },
+      { id: "evidence", label: "Evidence", icon: "evidence", count: 9 },
     ],
   },
   {
     label: "Operations",
     items: [
-      { id: "workers", label: "Workers", icon: "robot", count: 2 },
+      { id: "workers", label: "Workers", icon: "workers", count: 2 },
       {
         id: "blockers",
         label: "Blockers",
-        icon: "blocked",
+        icon: "blockers",
         count: 1,
         attention: true,
       },
-      { id: "policy", label: "Policy", icon: "shield" },
-      { id: "quota", label: "Quota", icon: "hourglass" },
-      { id: "notifications", label: "Notifications", icon: "bell" },
-      { id: "events", label: "Event log", icon: "scroll" },
+      { id: "events", label: "Event log", icon: "events" },
     ],
   },
 ];
+
+/** Every rail item, flat, for the places that look one up by id. */
+export const navItems: readonly NavItem[] = navGroups.flatMap((g) => g.items);

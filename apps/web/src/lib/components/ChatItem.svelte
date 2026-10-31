@@ -101,6 +101,14 @@
    */
   let thinking = $derived(item.kind === THINKING_KIND);
 
+  /** When it happened, as a wall-clock time. Display only: never an ordering key. */
+  let time = $derived(
+    new Date(item.at).toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+    }),
+  );
+
   let writeTint = $derived(
     write === "recorded"
       ? "success"
@@ -112,27 +120,22 @@
   );
 </script>
 
-<li class="item">
+<!--
+  The origin is the row's left edge: a solid rule for a committed record, a dashed rule and
+  italics for in-process activity. The word is still here for a screen reader and in the
+  row's title, because an edge nobody can read cannot say "this one is not part of the
+  record" (`live.ts` §9) — it just no longer costs a second badge on every row.
+-->
+<li
+  class="item"
+  data-origin={item.origin}
+  title={item.origin === "record"
+    ? "Record: a committed event, in the order the store assigned it."
+    : "Activity: live and in-process. Not part of the record; can be dropped under load."}
+>
   <div class="row">
-    <span class="chip kind">{kindLabel(item.kind)}</span>
-    <!-- The origin as a word: `record` is durable and ordered, `activity` is neither. -->
-    {#if item.origin === "record"}
-      <span
-        class="origin mono"
-        data-origin="record"
-        title="A committed event, in the order the store assigned it."
-      >
-        record
-      </span>
-    {:else}
-      <span
-        class="origin mono"
-        data-origin="activity"
-        title="Live, in-process activity. Not part of the record; can be dropped under load."
-      >
-        activity
-      </span>
-    {/if}
+    <span class="kind mono">{kindLabel(item.kind)}</span>
+    <span class="visually-hidden">{item.origin}</span>
     <!--
       The call id, on the items that have one.
 
@@ -191,6 +194,7 @@
         {item.outcome}
       </span>
     {/if}
+    <span class="time mono">{time}</span>
   </div>
 
   {#if thinking && item.body !== ""}
@@ -278,18 +282,47 @@
     display: flex;
     flex-direction: column;
     gap: 3px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border-muted);
+    padding: 9px 0 9px 14px;
+    border-left: 2px solid var(--border-strong);
   }
-  .item:last-child {
-    padding-bottom: 0;
-    border-bottom: 0;
+  .item[data-origin="activity"] {
+    border-left-style: dashed;
+    border-left-color: var(--border-muted);
+  }
+  .item[data-origin="activity"] .headline {
+    color: var(--text-muted);
+    font-style: italic;
   }
   .row {
     display: flex;
     flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
+    align-items: baseline;
+    gap: 6px 14px;
+  }
+  /* What sits under the row lines up with the headline, past the kind column. */
+  .item > :not(.row) {
+    margin-left: 100px;
+  }
+  /* The one badge a row carries: what kind of thing it is. */
+  .kind {
+    flex: none;
+    width: 86px;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 500;
+    line-height: 18px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .time {
+    flex: none;
+    margin-left: auto;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 18px;
   }
   /*
    * `--text-muted` is the floor for text in these rows; `--text-faint` is not usable here.
@@ -329,21 +362,6 @@
     text-transform: none;
     letter-spacing: 0;
   }
-  /* The origin reads as metadata rather than as a state: it is a fact about the channel. */
-  .origin {
-    padding: 1px 5px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-xs);
-    color: var(--text-muted);
-    font-size: 10px;
-    white-space: nowrap;
-  }
-  .origin[data-origin="record"] {
-    border-color: var(--border-strong);
-  }
-  .origin[data-origin="activity"] {
-    border-style: dashed;
-  }
   /*
    * Metadata like `.origin`, but a harness's call id can be long, so this truncates instead
    * of wrapping the row: the leading characters are what an operator matches on by eye, and
@@ -373,7 +391,8 @@
     flex: 1;
     min-width: 0;
     color: var(--text-base);
-    font-size: 12px;
+    font-size: 13px;
+    line-height: 18px;
     overflow-wrap: anywhere;
   }
   /*

@@ -36,8 +36,26 @@ export { default as IconStream } from "line-awesome/svg/stream-solid.svg?compone
 export { default as IconEye } from "line-awesome/svg/eye-solid.svg?component";
 export { default as IconEyeSlash } from "line-awesome/svg/eye-slash-solid.svg?component";
 export { default as IconLock } from "line-awesome/svg/lock-solid.svg?component";
+export { default as IconCheck } from "line-awesome/svg/check-solid.svg?component";
+export { default as IconAngleUp } from "line-awesome/svg/angle-up-solid.svg?component";
+export { default as IconInfo } from "line-awesome/svg/info-solid.svg?component";
+
+/* ── Crumb bar ── */
+export { default as IconPanel } from "line-awesome/svg/columns-solid.svg?component";
+export { default as IconTheme } from "line-awesome/svg/adjust-solid.svg?component";
+
+/* ── Row menu ── */
+export { default as IconEllipsis } from "line-awesome/svg/ellipsis-v-solid.svg?component";
+export { default as IconCopy } from "line-awesome/svg/copy-solid.svg?component";
+export { default as IconExport } from "line-awesome/svg/file-export-solid.svg?component";
 
 /* ── Level 2 navigation ── */
+export { default as IconGoal } from "line-awesome/svg/bullseye-solid.svg?component";
+export { default as IconCube } from "line-awesome/svg/cube-solid.svg?component";
+export { default as IconWave } from "line-awesome/svg/wave-square-solid.svg?component";
+export { default as IconClipboard } from "line-awesome/svg/clipboard-list-solid.svg?component";
+export { default as IconUser } from "line-awesome/svg/user-solid.svg?component";
+export { default as IconList } from "line-awesome/svg/list-solid.svg?component";
 export { default as IconBug } from "line-awesome/svg/bug-solid.svg?component";
 export { default as IconSitemap } from "line-awesome/svg/sitemap-solid.svg?component";
 export { default as IconCompass } from "line-awesome/svg/compass-solid.svg?component";

@@ -55,6 +55,7 @@ import {
 
 import {
   initialTargets,
+  navItems,
   previewCounts,
   previewGoals,
   type Target,
@@ -151,9 +152,6 @@ const relative = (at: number, now: number): string => {
  * cannot open this. *Which* reason it was is kept in `detail`, in the server's own words,
  * and shown where there is room for a sentence. A per-reason badge would be five states
  * for a distinction the operator acts on identically.
- *
- * `hunts` and `findings` are zero and visibly so: there is no count to read without
- * opening the target's own database.
  */
 export const fromSummary = (summary: TargetSummary, now: number): Target => ({
   id: summary.id,
@@ -162,8 +160,6 @@ export const fromSummary = (summary: TargetSummary, now: number): Target => ({
   scope: summary.scopeNote === "" ? "—" : summary.scopeNote,
   lastActivity: relative(summary.lastActivityAt, now),
   status: summary.available ? "ready" : "missing",
-  hunts: 0,
-  findings: 0,
   detail: summary.detail,
 });
 
@@ -229,7 +225,6 @@ export class App {
   /* Welcome */
   /** Server-fed. Empty until a session is open; `reset()` loads the mock rows. */
   targets = $state<Target[]>([]);
-  openTargetIds = $state<string[]>([]);
   selectedId = $state("");
   search = $state("");
   reconnecting = $state(false);
@@ -264,7 +259,23 @@ export class App {
    * re-asking on every refresh of it.
    */
   requestedTargetId = $state("");
-  sidebarCollapsed = $state(false);
+  /**
+   * Whether the target's rail is put away.
+   *
+   * Hidden, not collapsed to icons: the crumb bar takes over the one job the rail did that
+   * nothing else does — moving between sections — by growing a section crumb while the
+   * rail is gone. So there is never a state with two ways to switch section on screen.
+   */
+  drawerHidden = $state(false);
+  /**
+   * Whether the Live dock is open past its one-line summary.
+   *
+   * Closed by default so the page above it gets the viewport. Kept across targets: it is
+   * how this operator likes the screen, not a fact about any one target.
+   */
+  liveExpanded = $state(false);
+  /** Whether the prototype's state picker is open. See `ScenarioBar`. */
+  statesOpen = $state(false);
   detailOpen = $state(false);
   detailRow = $state(0);
 
@@ -671,6 +682,33 @@ export class App {
         : undefined,
   );
 
+  /**
+   * The open target's counts, only if they are this target's.
+   *
+   * The same guard {@link goalCount} applies, for the rail's other real numbers: a count
+   * read for the target the operator just left must not sit beside the new one's name.
+   */
+  viewCounts = $derived(
+    this.counts !== undefined && this.viewTargetId === this.selectedId
+      ? this.counts
+      : undefined,
+  );
+
+  /**
+   * The number a rail item shows, from wherever it really comes from.
+   *
+   * Goals, Observations and Assets are read from the open target; every other item keeps
+   * the prototype's figure. `undefined` hides the count, which is what a real item does
+   * until it has a number for *this* target — the rail used to show the prototype's 148
+   * observations beside a header that had read the real figure, and the two disagreed.
+   */
+  navCount(id: string): number | undefined {
+    if (id === "goals") return this.goalCount;
+    if (id === "observations") return this.viewCounts?.observations;
+    if (id === "assets") return this.viewCounts?.assets;
+    return navItems.find((item) => item.id === id)?.count;
+  }
+
   /* ── The harness and model picker ─────────────────────────────────────────── */
   /**
    * Every harness instance the server configures, ready or not.
@@ -1040,12 +1078,6 @@ export class App {
     this.targets.find((t) => t.id === this.selectedId) ?? this.targets[0],
   );
 
-  openTargets = $derived(
-    this.openTargetIds
-      .map((id) => this.targets.find((t) => t.id === id))
-      .filter((t): t is Target => t !== undefined),
-  );
-
   /* ── Session ─────────────────────────────────────────────────────────────── */
 
   /**
@@ -1137,7 +1169,6 @@ export class App {
     this.password = "";
     this.connectError = reason;
     this.targets = [];
-    this.openTargetIds = [];
     this.selectedId = "";
     this.viewTargetId = "";
     this.counts = undefined;
@@ -1183,17 +1214,17 @@ export class App {
     if (this.targets.find((t) => t.id === this.selectedId) === undefined) {
       this.selectedId = this.targets[0]?.id ?? "";
     }
-    this.openTargetIds = this.openTargetIds.filter((id) =>
-      this.targets.some((t) => t.id === id),
-    );
   }
 
+  /**
+   * Makes a target the selected one, without opening it.
+   *
+   * One target is mounted at a time — there is no tab row, so no per-tab state to keep —
+   * and switching is the target crumb's picker rather than a list of open ones.
+   */
   select(id: string) {
     this.selectedId = id;
     this.search = "";
-    if (!this.openTargetIds.includes(id)) {
-      this.openTargetIds = [...this.openTargetIds, id];
-    }
   }
 
   /**
@@ -1376,8 +1407,21 @@ export class App {
     this.navItem = "settings";
   }
 
-  closeTab(id: string) {
-    this.openTargetIds = this.openTargetIds.filter((t) => t !== id);
+  /**
+   * Moves to a section of the open target.
+   *
+   * Choosing Goals from inside one goal means the list, not the same page, so it closes
+   * the goal as well.
+   */
+  toSection(id: string) {
+    this.navItem = id;
+    if (id === "goals") this.closeGoal();
+  }
+
+  /** Back above target scope, to every target. */
+  toAllTargets() {
+    this.search = "";
+    this.screen = "welcome";
   }
 
   /* ── Goals ───────────────────────────────────────────────────────────────── */
@@ -3502,7 +3546,6 @@ export class App {
     this.connecting = false;
     this.simulateDown = false;
     this.targets = initialTargets.map((t) => ({ ...t }));
-    this.openTargetIds = ["acme-corp", "internal-api"];
     this.selectedId = "acme-corp";
     this.search = "";
     this.reconnecting = false;
@@ -3514,7 +3557,8 @@ export class App {
     this.dialogPathError = "";
     this.navItem = "goals";
     this.#clearGoals();
-    this.sidebarCollapsed = false;
+    this.drawerHidden = false;
+    this.liveExpanded = false;
     this.detailOpen = false;
     this.passwordVisible = false;
     this.viewTargetId = "";
@@ -3619,20 +3663,6 @@ export const scenarios: Scenario[] = [
       a.reset();
       a.screen = "welcome";
       a.targets = [];
-      a.openTargetIds = [];
-    },
-  },
-  {
-    id: "welcome-no-hunts",
-    group: "A2 Welcome",
-    label: "Target with no hunts",
-    apply: (a) => {
-      a.reset();
-      a.screen = "welcome";
-      a.select("scratch");
-      a.targets = a.targets.map((t) =>
-        t.id === "scratch" ? { ...t, hunts: 0 } : t,
-      );
     },
   },
   {
@@ -3692,12 +3722,11 @@ export const scenarios: Scenario[] = [
   {
     id: "target-collapsed",
     group: "Level 2 shell",
-    label: "Collapsed icon rail",
+    label: "Rail hidden",
     apply: (a) => {
       a.reset();
       a.previewTarget("acme-corp");
-      a.navItem = "blockers";
-      a.sidebarCollapsed = true;
+      a.drawerHidden = true;
     },
   },
   {
@@ -3707,7 +3736,7 @@ export const scenarios: Scenario[] = [
     apply: (a) => {
       a.reset();
       a.previewTarget("acme-corp");
-      a.navItem = "traffic";
+      a.navItem = "events";
     },
   },
   {
