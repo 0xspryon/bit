@@ -621,13 +621,12 @@ Settled without the operator, each recoverable if wrong:
 Raised by the mockups on 2026-11-01, deliberately not settled here.
 
 - **The graph view.** Deferred by the operator. See the Non-goals note above.
-- **A `service` asset kind.** The designed Estate view shows a row typed `service`
-  (`203.0.113.44:8443`) nested under a host with a different name
-  (`api.acme-cdn.net`). `AssetKind` is `Literals(["host", "endpoint"])` and `0010`'s
-  CHECK enforces exactly those two, and all grouping is by the `host` column, so an
-  IP-keyed row cannot nest under a name-keyed one. Adding a third kind needs its own
-  identity rule under §17 and a host-to-service edge. **Open: unanswered.** Slice 8
-  builds the two kinds that exist.
+- **A `service` asset kind — raised, then withdrawn.** An early mockup of the Estate
+  view carried a row typed `service` (`203.0.113.44:8443`) nested under a host with a
+  different name. It was not a decision, and the operator removed it from the final
+  design on 2026-11-01. Recorded only so a reader who meets an old mockup does not
+  reopen it: `AssetKind` stays `Literals(["host", "endpoint"])`, and slice 8 builds
+  those two.
 - **Per-entry aggregates and pagination, together.** The designed view shows counts per
   scope entry ("22 hosts · 198 endpoints", "145 in · 8 excluded · 31 not covered"),
   each of which means running `scopeStateOf` across every host and grouping by the
