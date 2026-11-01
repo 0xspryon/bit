@@ -39,6 +39,7 @@
  * this is comfortably above it.
  */
 import {
+  scopeImportLinkIndex,
   scopeImportLinks,
   type ScopeImportCall,
   type ScopeImportStatus,
@@ -157,6 +158,31 @@ export class ScopeImportProgress extends Context.Service<
       readonly status: Exclude<ScopeImportStatus, "running">;
       readonly detail: string | null;
     }) => Effect.Effect<void>;
+    /**
+     * Which of this import's own links a call's `source_url` names, in the operator's
+     * spelling, or `undefined`.
+     *
+     * **This is what makes an entry's attribution a handler's fact rather than the
+     * model's.** `source_url` is a tool argument, so left unchecked it is the model's
+     * choice of which page to blame an entry on — and a program page is untrusted input
+     * whose payoff is exactly that: an entry attributed to a page the operator trusts.
+     * The importer's toolkit resolves the argument through here and refuses anything this
+     * import was not pointed at, then stores **this** string rather than the one it was
+     * sent.
+     *
+     * Matched by `scopeImportLinkIndex`, which normalises both sides: the importer retypes
+     * the URL, and a trailing slash or a redirect's scheme is not an attack. `undefined`
+     * means either an import this process does not know or a page it was never given, and
+     * the caller refuses both — the distinction is not one a refusal needs to make.
+     */
+    readonly pageOf: (
+      importId: string,
+      sourceUrl: string,
+    ) => Effect.Effect<string | undefined>;
+    /** The links an import was given, or `undefined` for one this process forgot. */
+    readonly linksOf: (
+      importId: string,
+    ) => Effect.Effect<readonly string[] | undefined>;
     /** One import as the panel reads it, or `undefined` if this process forgot it. */
     readonly view: (
       importId: string,
@@ -236,6 +262,20 @@ export class ScopeImportProgress extends Context.Service<
           evict();
         }),
 
+      pageOf: (importId, sourceUrl) =>
+        Effect.sync(() => {
+          const entry = entries.get(importId);
+          if (entry === undefined) return undefined;
+          const at = scopeImportLinkIndex(entry.urls, sourceUrl);
+          return at === -1 ? undefined : entry.urls[at];
+        }),
+
+      linksOf: (importId) =>
+        Effect.sync(() => {
+          const entry = entries.get(importId);
+          return entry === undefined ? undefined : entry.urls;
+        }),
+
       view: (importId) =>
         Effect.sync(() => {
           const entry = entries.get(importId);
@@ -272,6 +312,10 @@ export class ScopeImportProgress extends Context.Service<
         open: () => Effect.void,
         record: () => Effect.void,
         settle: () => Effect.void,
+        // No import exists, so no page belongs to one. The toolkit refuses on this, which
+        // is correct on a server where no import can have been started.
+        pageOf: () => Effect.succeed(undefined),
+        linksOf: () => Effect.succeed(undefined),
         view: () => Effect.succeed(undefined),
         stop: () => Effect.succeed(undefined),
         stopped: () => Effect.succeed(false),

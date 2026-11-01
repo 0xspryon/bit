@@ -14,7 +14,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  scopeImportLinkIndex,
   scopeImportLinks,
+  scopeImportUrlKey,
   type ScopeImportCall,
   type ScopeImportTool,
 } from "@bit/contracts";
@@ -156,5 +158,100 @@ describe("scopeImportLinks", () => {
     expect(scopeImportLinks({ urls: [], calls: [], running: false })).toEqual(
       [],
     );
+  });
+});
+
+/**
+ * The near misses, which are the common case rather than the exotic one.
+ *
+ * `source_url` is a tool argument: the importer **retypes** the URL it was given, and a
+ * model that normalised it, a reader that followed a redirect, or an operator who pasted a
+ * trailing slash all produce a string that names the right page and is not the same bytes.
+ * Matched exactly, every one of those calls is attributed to no link — and because the
+ * totals are tallied over every call while the rows are tallied only over attributed ones,
+ * the receipt reads "2 in-scope · 1 out-of-scope" above a list where every link says
+ * "nothing read". The screen contradicting itself is the failure these vectors exist to
+ * stop.
+ */
+describe("a link is matched on what identifies the page, not on the bytes", () => {
+  const near = (sourceUrl: string) =>
+    scopeImportLinks({
+      urls: [A],
+      calls: [entryIn(sourceUrl), entryOut(sourceUrl), asset(sourceUrl)],
+      running: false,
+    })[0];
+
+  test("a trailing slash is the same page", () => {
+    expect(near(`${A}/`)).toMatchObject({
+      url: A,
+      state: "read",
+      entriesIn: 1,
+      entriesOut: 1,
+      assets: 1,
+    });
+  });
+
+  test("a different case in the host and scheme is the same page", () => {
+    expect(near("HTTPS://HackerOne.com/acme/policy")).toMatchObject({
+      state: "read",
+      entriesIn: 1,
+    });
+  });
+
+  test("the scheme a redirect landed on is the same page", () => {
+    // The operator pastes `http`, the program serves `https` after one redirect, and the
+    // harness's reader reports where it ended up. The page the importer read is the page
+    // the operator named.
+    expect(
+      scopeImportLinks({
+        urls: ["http://hackerone.com/acme/policy"],
+        calls: [entryIn("https://hackerone.com/acme/policy")],
+        running: false,
+      })[0],
+    ).toMatchObject({ state: "read", entriesIn: 1 });
+  });
+
+  test("the default port and a fragment change nothing", () => {
+    expect(near("https://hackerone.com:443/acme/policy#scope")).toMatchObject({
+      state: "read",
+      entriesIn: 1,
+    });
+  });
+
+  test("a dropped query still finds the one page it can be", () => {
+    // A model that reported `…/policy` for a page pasted as `…/policy?tab=scope` is naming
+    // the page it read. One link can match, so there is nothing to guess at.
+    expect(
+      scopeImportLinks({
+        urls: [`${A}?tab=scope`],
+        calls: [entryIn(A)],
+        running: false,
+      })[0],
+    ).toMatchObject({ state: "read", entriesIn: 1 });
+  });
+
+  test("but not when two links differ only by their query", () => {
+    // Two pages, and attributing the call to either would be a guess. Left unattributed:
+    // the call is still in `calls` and still counted in the totals, so nothing is lost
+    // except a row's claim to have produced it.
+    const links = scopeImportLinks({
+      urls: [`${A}?tab=scope`, `${A}?tab=rewards`],
+      calls: [entryIn(A)],
+      running: false,
+    });
+    expect(links.map((link) => link.state)).toEqual(["waiting", "waiting"]);
+  });
+
+  test("a wholly foreign page is still attributed nowhere", () => {
+    expect(scopeImportLinkIndex([A, B], "https://example.test/elsewhere")).toBe(
+      -1,
+    );
+  });
+
+  test("a string no URL parser accepts is compared as it stands", () => {
+    // It is still what the importer was handed, and inventing a shape for it would be
+    // worse than comparing it as it is.
+    expect(scopeImportUrlKey("  Not A Url  ")).toBe("not a url");
+    expect(scopeImportLinkIndex(["not a url"], "NOT A URL")).toBe(0);
   });
 });

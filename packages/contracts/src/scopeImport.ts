@@ -75,9 +75,15 @@ export const ScopeImportCall = Schema.Struct({
   /**
    * The program page the call named, or null for a read.
    *
-   * This is the whole of what per-link progress is derived from (D13). It is the
-   * importer's own argument, so it is the page the importer says it read this off — not an
-   * observation of a fetch, which nothing we own makes.
+   * This is the whole of what per-link progress is derived from (D13), and it is **one of
+   * the links the operator pasted**, in the operator's own spelling: the importer's
+   * endpoint resolves the `source_url` argument against this import's own link list and
+   * refuses a page it was not given, so the model chooses which of those pages a write is
+   * attributed to and nothing more.
+   *
+   * What it is still not is an observation of a fetch. Nothing we own watches the page
+   * load (D13), so this says *the importer attributed this write to that page* — which,
+   * the list being closed, is the strongest claim available without a reader of our own.
    */
   sourceUrl: Schema.NullOr(Schema.String),
   at: Schema.Int,
@@ -201,6 +207,103 @@ export const ImporterModelView = Schema.Struct({
 export type ImporterModelView = typeof ImporterModelView.Type;
 
 /**
+ * One program page, reduced to a key two spellings of it can be compared by.
+ *
+ * **The importer retypes the URL it was given, so an exact string match is the wrong
+ * comparison.** `source_url` is a tool argument: a model that normalised the address, a
+ * harness whose reader followed a redirect, and an operator who pasted a trailing slash
+ * all produce a string that names the page the operator pasted and is not byte-identical
+ * to it. Matched exactly, those calls are attributed to no link — and because the totals
+ * are tallied over *every* call while the link rows are tallied only over attributed ones,
+ * the panel would read "11 in-scope · 0 out-of-scope" above a list where every link says
+ * "nothing read". That is the screen contradicting itself on the one surface the operator
+ * is there to trust.
+ *
+ * So both sides are reduced to this key before matching. What it folds away:
+ *
+ * - **Case in the scheme and the host**, which are case-insensitive by RFC 3986 and which
+ *   `URL` lowercases for us.
+ * - **The default port**, likewise `URL`'s own doing: `https://acme.com:443` has host
+ *   `acme.com`.
+ * - **A trailing slash on the path**, because `…/policy` and `…/policy/` are the same page
+ *   on every program host in the wild.
+ * - **The fragment**, which is never sent to a server and cannot change which page was
+ *   read.
+ * - **`http` against `https`**, because a program page pasted as `http` is served as
+ *   `https` after one redirect, and the page the importer read is the page the operator
+ *   named.
+ *
+ * What it deliberately keeps is the **query**, which can be the whole of which page this
+ * is. {@link scopeImportLinkIndex} is where a model that dropped one is given a second
+ * chance, under a condition that keeps two links differing only by query apart.
+ *
+ * A string `URL` cannot parse is lowercased and trimmed and otherwise left alone: it is
+ * still what the importer was handed, and inventing a shape for it would be worse than
+ * comparing it as it stands.
+ */
+export const scopeImportUrlKey = (url: string): string => {
+  const trimmed = url.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return trimmed.toLowerCase();
+  }
+  const scheme =
+    parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? "web:"
+      : parsed.protocol;
+  const path = parsed.pathname.endsWith("/")
+    ? parsed.pathname.slice(0, -1)
+    : parsed.pathname;
+  return `${scheme}//${parsed.host}${path}${parsed.search}`;
+};
+
+/**
+ * Which of this import's links a call's `source_url` names, or `-1`.
+ *
+ * Two passes, and the second one's condition is the interesting part:
+ *
+ * 1. **The normalised key**, which is {@link scopeImportUrlKey} and covers every
+ *    difference that function folds away.
+ * 2. **The same key with the query dropped**, used *only when exactly one link matches
+ *    that way*. A model that reported `…/policy` for a page pasted as `…/policy?tab=scope`
+ *    is naming the page it read; but two links that differ only by their query are two
+ *    pages, and attributing a call to either of them would be a guess. Guessing is worse
+ *    than leaving the call unattributed, because an unattributed call is still counted in
+ *    the totals and still listed in the receipt.
+ *
+ * `-1` for a URL that is none of this import's links. The caller decides what that means:
+ * the panel counts such a call nowhere (it is still a write that landed), and the
+ * importer's own toolkit **refuses** it, because an entry's note is where the operator
+ * reads which page to trust it against.
+ */
+export const scopeImportLinkIndex = (
+  urls: readonly string[],
+  sourceUrl: string,
+): number => {
+  const wanted = scopeImportUrlKey(sourceUrl);
+  const keys = urls.map(scopeImportUrlKey);
+  const exact = keys.indexOf(wanted);
+  if (exact !== -1) return exact;
+
+  const withoutQuery = (key: string): string => {
+    const at = key.indexOf("?");
+    return at === -1 ? key : key.slice(0, at);
+  };
+  const loose = withoutQuery(wanted);
+  let found = -1;
+  for (const [at, key] of keys.entries()) {
+    if (withoutQuery(key) !== loose) continue;
+    // A second match makes the page ambiguous, and an ambiguous attribution is not an
+    // attribution. Left unattributed rather than assigned to the first.
+    if (found !== -1) return -1;
+    found = at;
+  }
+  return found;
+};
+
+/**
  * Derives each link's state and tallies from the calls made against it.
  *
  * One function, because the panel renders this and the tests assert it, and two readings
@@ -217,9 +320,13 @@ export type ImporterModelView = typeof ImporterModelView.Type;
  * - Every **earlier** link with calls is `read`: the session goes through them in order,
  *   so a call against a later page is what says an earlier one is done.
  *
- * A call whose `sourceUrl` matches no link is counted nowhere. It still appears in
- * {@link ScopeImportView.calls} and still counts toward the totals, because it is a write
- * that really landed — it just cannot be attributed to a link the operator pasted.
+ * A call whose `sourceUrl` matches no link — by {@link scopeImportLinkIndex}, which
+ * normalises both sides rather than comparing the strings — is counted nowhere. It still
+ * appears in {@link ScopeImportView.calls} and still counts toward the totals, because it
+ * is a write that really landed; it just cannot be attributed to a link the operator
+ * pasted. The importer's own endpoint refuses such a call outright, so on a correctly
+ * wired server this is the shape of a call recorded before that refusal existed rather
+ * than something the panel meets today.
  */
 export const scopeImportLinks = (input: {
   readonly urls: readonly string[];
@@ -234,8 +341,8 @@ export const scopeImportLinks = (input: {
   }));
   for (const call of input.calls) {
     if (call.sourceUrl === null) continue;
-    const at = input.urls.indexOf(call.sourceUrl);
-    const tally = tallies[at];
+    const at = scopeImportLinkIndex(input.urls, call.sourceUrl);
+    const tally = at === -1 ? undefined : tallies[at];
     if (tally === undefined) continue;
     tally.calls += 1;
     if (call.tool === "record_imported_asset") tally.assets += 1;

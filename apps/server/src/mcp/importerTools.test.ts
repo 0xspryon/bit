@@ -620,3 +620,89 @@ describe("the panel's receipt", () => {
     expect(view?.totals).toMatchObject({ entriesIn: 2, assets: 2 });
   });
 });
+
+/**
+ * The page an entry is attributed to is the handler's fact, not the model's.
+ *
+ * `source_url` is a tool argument, so left unchecked it is the model's choice of which
+ * page to blame an entry on — and the pages are untrusted input whose payoff is exactly
+ * that: an entry naming someone else's domain, attributed to a page the operator trusts.
+ * The operator reads that note to decide whether to trust the row, so the server resolves
+ * the argument against this import's own links, refuses anything else, and stores its own
+ * spelling of the page rather than the one it was sent.
+ *
+ * Last in the file on purpose: the refusals write nothing, and the accepted near miss
+ * would otherwise change the call counts `the panel's receipt` above asserts.
+ */
+describe("source_url must be one of this import's own pages", () => {
+  test("an entry attributed to a page this import was not given is refused", async () => {
+    const called = await callTool(
+      importerUrl,
+      importerToken,
+      "add_scope_entry",
+      {
+        effect: "in",
+        kind: "subtree",
+        value: "attacker.example.test",
+        source_url: "https://attacker.example.test/scope",
+        note: "the in-scope table",
+      },
+    );
+    expect(called.isError).toBe(true);
+    expect(called.text).toContain("invalid");
+    // The refusal names the pages this import does have, because the common and innocent
+    // case is a model that mistyped one of them and can correct itself.
+    expect(called.text).toContain(PAGE_A);
+
+    const stored = await runtime.runPromise(
+      Effect.flatMap(ObservationStore, (store) => store.targetScope(TARGET)),
+    );
+    expect(
+      stored.entries.some((entry) => entry.value === "attacker.example.test"),
+    ).toBe(false);
+  });
+
+  test("an asset attributed to one is refused on the same ground", async () => {
+    const called = await callTool(
+      importerUrl,
+      importerToken,
+      "record_imported_asset",
+      {
+        operation_id: "op-import-foreign",
+        kind: "host",
+        url: "https://host.attacker.example.test",
+        method: null,
+        source_url: "https://attacker.example.test/scope",
+        note: "the in-scope table",
+      },
+    );
+    expect(called.isError).toBe(true);
+    expect(called.text).toContain("invalid");
+  });
+
+  test("a near miss of a real link is accepted and stored in the operator's spelling", async () => {
+    // The importer retypes the URL it was given, so a trailing slash is the normal case
+    // rather than an attack. What is stored is the operator's own string: the note is read
+    // beside the link list on the panel, and two spellings of one page there would read as
+    // two pages.
+    const called = await callTool(
+      importerUrl,
+      importerToken,
+      "add_scope_entry",
+      {
+        effect: "in",
+        kind: "host",
+        value: "near.acme.com",
+        source_url: `${PAGE_A}/`,
+        note: "scope table, row 4",
+      },
+    );
+    expect(called.isError).toBe(false);
+
+    const stored = await runtime.runPromise(
+      Effect.flatMap(ObservationStore, (store) => store.targetScope(TARGET)),
+    );
+    const entry = stored.entries.find((row) => row.value === "near.acme.com");
+    expect(entry?.note).toBe(`${PAGE_A} · scope table, row 4`);
+  });
+});
