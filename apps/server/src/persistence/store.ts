@@ -108,6 +108,22 @@ export class MutationError extends Schema.TaggedError<MutationError>()(
   {
     reason: Schema.Literals(["conflict", "unauthorized", "invalid", "stale"]),
     detail: Schema.String,
+    /**
+     * Set when the refusal is "the row you named is not here", so a transport can say so
+     * without reading the sentence.
+     *
+     * `reason` cannot carry this on its own: a missing row and an unparseable value are
+     * both `invalid` to every caller that only has to decide between refusing and
+     * failing, and splitting the literal would make every exhaustive match on it handle a
+     * case it does not care about. The alternative in place before this field was
+     * `browserApi.ts` matching on substrings of `detail` — "nothing was removed", "is not
+     * an asset of" — which made the HTTP status a property of a sentence's wording, so
+     * rewording a message for an operator silently moved a 404 to a 400.
+     *
+     * Optional rather than defaulted to `false`, so the dozens of refusals that are not
+     * about absence say nothing about it.
+     */
+    absent: Schema.optional(Schema.Boolean),
   },
 ) {
   override get message(): string {
@@ -6903,6 +6919,7 @@ const makeStore = Effect.fnUntraced(function* () {
               return yield* new MutationError({
                 reason: "invalid",
                 detail: `no scope entry '${entryId}' on target ${caller.targetId}; nothing was removed`,
+                absent: true,
               });
             }
             const entry = scopeEntryOf(row.value);
@@ -7043,6 +7060,7 @@ const makeStore = Effect.fnUntraced(function* () {
               return yield* new MutationError({
                 reason: "invalid",
                 detail: `no hand label on '${host}' for target ${caller.targetId}; nothing was cleared`,
+                absent: true,
               });
             }
             yield* sql`DELETE FROM host_scope_labels
@@ -7105,6 +7123,7 @@ const makeStore = Effect.fnUntraced(function* () {
               return yield* new MutationError({
                 reason: "invalid",
                 detail: `asset '${input.assetId}' is not an asset of target ${caller.targetId}, so no label was set`,
+                absent: true,
               });
             }
             yield* sql`INSERT INTO asset_scope_labels (
@@ -7174,6 +7193,7 @@ const makeStore = Effect.fnUntraced(function* () {
             return yield* new MutationError({
               reason: "invalid",
               detail: `asset '${assetId}' is not an asset of target ${caller.targetId}; nothing was cleared`,
+              absent: true,
             });
           }
           const labels = yield* selectAssetLabels(caller.targetId).pipe(
@@ -7183,6 +7203,7 @@ const makeStore = Effect.fnUntraced(function* () {
             return yield* new MutationError({
               reason: "invalid",
               detail: `no hand label on asset '${assetId}'; nothing was cleared`,
+              absent: true,
             });
           }
           yield* sql`DELETE FROM asset_scope_labels

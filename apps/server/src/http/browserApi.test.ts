@@ -3974,6 +3974,38 @@ describe("a target's assets", () => {
       );
     });
 
+    test("the contradiction is refused the other way round too", async () => {
+      // The same route with the effects swapped. Every other contradiction case in this
+      // repo authors `out` first, so a lookup hardcoded to `out` would have passed them
+      // all while accepting `out` on top of an existing `in` — the pair the Scope tab
+      // cannot show. This also renders the refusal's `an in-scope` branch.
+      const first = await read(
+        await signedIn(`/targets/${withRows}/scope/entries`, {
+          method: "POST",
+          body: { effect: "in", kind: "host", value: "portal.acme.test" },
+        }),
+      );
+      expect(first.status).toBe(200);
+      const existing = (
+        first.body["entries"] as ReadonlyArray<Record<string, unknown>>
+      ).find((entry) => entry["value"] === "portal.acme.test");
+
+      const clash = await read(
+        await signedIn(`/targets/${withRows}/scope/entries`, {
+          method: "POST",
+          body: { effect: "out", kind: "host", value: "portal.acme.test" },
+        }),
+      );
+      expect(clash.status).toBe(409);
+      expect(clash.body["reason"]).toBe("contradiction");
+      expect(String(clash.body["detail"])).toContain(
+        "is already an in-scope host entry",
+      );
+      expect(String(clash.body["detail"])).toContain(
+        String(existing?.["entryId"]),
+      );
+    });
+
     test("a host label covers every asset on it, and says which entry it beat", async () => {
       // In scope by an entry first...
       await signedIn(`/targets/${withRows}/scope/entries`, {
@@ -4061,7 +4093,80 @@ describe("a target's assets", () => {
       expect(cleared.body["hostLabels"]).toEqual([]);
     });
 
-    test("a label on another target's asset is refused", async () => {
+    test("an asset label outranks its host's, and is reported with the asset's identity", async () => {
+      /*
+       * The narrower of the two directions, over the route, which nothing covered: every
+       * other test here sends a `host` subject and `assetLabels` appeared only as `[]`,
+       * so the asset branch of the mutation and of the view had no success path at all.
+       *
+       * `app.acme.test` is excluded by a hand label by now (the test above), and this
+       * keeps one endpoint on it in scope — which is D5's reason for two tables rather
+       * than one.
+       */
+      const labelled = await read(
+        await signedIn(`/targets/${withRows}/scope/labels`, {
+          method: "POST",
+          body: {
+            subject: { _tag: "asset", assetId: "asset_endpoint" },
+            state: "in",
+            reason: "the client asked for this one endpoint back",
+          },
+        }),
+      );
+      expect(labelled.status).toBe(200);
+      expect(labelled.body["assetLabels"]).toEqual([
+        {
+          assetId: "asset_endpoint",
+          // The identity, not just the id: a label the operator cannot read is a label
+          // they cannot check.
+          identity: "GET https://app.acme.test:443/v1/orders",
+          state: "in",
+          reason: "the client asked for this one endpoint back",
+          setBy: `${withRows}/operator`,
+          setAt: expect.any(Number),
+        },
+      ]);
+      // The agent is told about it by its identity, under the effect the label gave it.
+      expect(labelled.body["promptBlock"]).toContain(
+        "GET https://app.acme.test:443/v1/orders (that one asset, set by hand)",
+      );
+
+      // The row follows its own label; its sibling on the same host still follows the
+      // host's.
+      const assets = (
+        (await read(await signedIn(`/targets/${withRows}/assets`))).body[
+          "assets"
+        ] as ReadonlyArray<Record<string, unknown>>
+      ).filter((asset) => asset["host"] === "app.acme.test");
+      const byId = (id: string) =>
+        assets.find((asset) => asset["assetId"] === id)?.["scope"] as Record<
+          string,
+          unknown
+        >;
+      expect(byId("asset_endpoint")["state"]).toBe("in");
+      expect(
+        (byId("asset_endpoint")["by"] as Record<string, unknown>)["_tag"],
+      ).toBe("assetLabel");
+      expect(byId("asset_host")["state"]).toBe("out");
+      expect(
+        (byId("asset_host")["by"] as Record<string, unknown>)["_tag"],
+      ).toBe("hostLabel");
+
+      // Cleared, and the host's label decides it again.
+      const cleared = await read(
+        await signedIn(`/targets/${withRows}/scope/labels`, {
+          method: "POST",
+          body: {
+            subject: { _tag: "asset", assetId: "asset_endpoint" },
+            state: "cleared",
+          },
+        }),
+      );
+      expect(cleared.status).toBe(200);
+      expect(cleared.body["assetLabels"]).toEqual([]);
+    });
+
+    test("a label on an asset this target does not hold is refused", async () => {
       const refused = await read(
         await signedIn(`/targets/${empty}/scope/labels`, {
           method: "POST",
@@ -4071,8 +4176,17 @@ describe("a target's assets", () => {
           },
         }),
       );
-      // `asset_endpoint` exists, in the *other* target's file. The foreign key cannot
-      // catch that, and labelling it would record a decision against the wrong client.
+      /*
+       * `asset_endpoint` is an id from the *other* target's fixture, and this target's
+       * file has no such row — which is the absent-row branch, not the cross-target one.
+       * An earlier version of this test claimed the asset "exists in the other target's
+       * file", which it does not: the seeding runs for that target only, so deleting the
+       * `target_id !== caller.targetId` guard left it green. The guard's own test lives
+       * in `scopeStore.test.ts`, where one file can hold two targets' rows.
+       *
+       * What is asserted here is the translation: an absent row is a `not_found`, and it
+       * comes off the refusal's typed `absent` field rather than off its wording.
+       */
       expect(refused.status).toBe(409);
       expect(refused.body["reason"]).toBe("not_found");
       expect(String(refused.body["detail"])).toContain("is not an asset of");
@@ -4090,28 +4204,58 @@ describe("a target's assets", () => {
     });
 
     test("an entry can be removed, and the block goes with the last one", async () => {
+      /*
+       * D6's nothing-in-scope-means-no-block, as the *transition* an operator actually
+       * makes rather than as a property of a target nobody ever authored.
+       *
+       * This used to add one entry, remove it, and never read `promptBlock` — which could
+       * not have been null anyway, because another `in` entry was authored on this target
+       * earlier in the file. So the rule was covered only for an untouched target, and a
+       * renderer that emitted "In scope: (nothing)" once a list was emptied would have
+       * passed.
+       */
       const added = await read(
         await signedIn(`/targets/${empty}/scope/entries`, {
           method: "POST",
           body: { effect: "in", kind: "cidr", value: "203.0.113.0/24" },
         }),
       );
-      const entryId = String(
-        (added.body["entries"] as ReadonlyArray<Record<string, unknown>>).find(
-          (entry) => entry["kind"] === "cidr",
-        )?.["entryId"],
+      expect(added.status).toBe(200);
+      expect(added.body["promptBlock"]).toContain(
+        "203.0.113.0/24 (every address in the block)",
       );
-      const removed = await read(
-        await signedIn(`/targets/${empty}/scope/entries/${entryId}/remove`, {
-          method: "POST",
-        }),
-      );
-      expect(removed.status).toBe(200);
-      expect(
-        (
-          removed.body["entries"] as ReadonlyArray<Record<string, unknown>>
-        ).some((entry) => entry["entryId"] === entryId),
-      ).toBe(false);
+
+      const ids = (
+        added.body["entries"] as ReadonlyArray<Record<string, unknown>>
+      ).map((entry) => String(entry["entryId"]));
+      // More than one, which is what makes the last removal the interesting one.
+      expect(ids.length).toBeGreaterThan(1);
+
+      let body: Record<string, unknown> = added.body;
+      for (const [index, entryId] of ids.entries()) {
+        const removed = await read(
+          await signedIn(`/targets/${empty}/scope/entries/${entryId}/remove`, {
+            method: "POST",
+          }),
+        );
+        expect(removed.status).toBe(200);
+        body = removed.body;
+        const left = body["entries"] as ReadonlyArray<Record<string, unknown>>;
+        expect(left.some((entry) => entry["entryId"] === entryId)).toBe(false);
+        expect(left).toHaveLength(ids.length - index - 1);
+        if (index < ids.length - 1) {
+          // Still something in scope, so the agent still gets a block.
+          expect(body["promptBlock"]).toContain(
+            "[Authorized testing scope — highest priority]",
+          );
+        }
+      }
+
+      // The last one out, and the block is gone rather than empty: an agent told
+      // "In scope: (nothing)" has been told it may touch nothing.
+      expect(body["entries"]).toEqual([]);
+      expect(body["hostLabels"]).toEqual([]);
+      expect(body["promptBlock"]).toBeNull();
     });
 
     test("the scope routes need a session too", async () => {

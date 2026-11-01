@@ -543,6 +543,13 @@ const scopeView = (scope: {
  * danger-red banner in the screen. An `invalid` that names a missing row becomes
  * `not_found`, because "you typed something unparseable" and "that entry is gone" are
  * different problems with different next actions.
+ *
+ * **Which of the two it is comes off `MutationError.absent`, not out of the sentence.**
+ * This function used to sniff `detail` for "nothing was removed" and "is not an asset
+ * of", which made the HTTP status a property of the store's prose: rewording a refusal
+ * for an operator would silently have moved a 404 to a 400, with nothing failing
+ * anywhere. The store sets a typed field on the refusals that are about a row that is not
+ * there, and this reads that.
  */
 const scopeRefusal = (error: MutationError): ScopeRefused => {
   if (error.reason === "conflict") {
@@ -551,12 +558,8 @@ const scopeRefusal = (error: MutationError): ScopeRefused => {
       detail: error.detail,
     });
   }
-  const missing =
-    error.detail.includes("nothing was removed") ||
-    error.detail.includes("nothing was cleared") ||
-    error.detail.includes("is not an asset of");
   return new ScopeRefused({
-    reason: missing ? "not_found" : "invalid",
+    reason: error.absent === true ? "not_found" : "invalid",
     detail: error.detail,
   });
 };
