@@ -257,6 +257,18 @@ export const REFUSAL_TAGS = new Set([
   // difference between a rejected upload an operator can act on and one that says "failed",
   // and classifying them as transport trouble would throw all of them away.
   "GoalUploadRefused",
+  // The scope import panel. An import this process has forgotten is a real answer and the
+  // panel acts on it by sending the operator to Assets, where what the import *wrote* is —
+  // the entries and the assets are durable rows, and only the receipt was ever in memory.
+  // Classifying it as transport trouble would say "No server answered at this address"
+  // about a server that answered precisely, and would strand the operator on a panel
+  // watching an import that is over.
+  "ScopeImportNotFound",
+  // Which model an import would run on. `no_harness` is the server saying there is no
+  // catalogue to resolve D15's rule against, which is what disables the autoload checkbox
+  // on the create-target screen and says why. A connectivity complaint here would leave the
+  // checkbox enabled and the operator pasting links nothing will ever read.
+  "ImporterModelUnavailable",
 ]);
 
 /**
@@ -780,6 +792,34 @@ export const server = {
    */
   harnesses: (baseUrl: string) =>
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.harnesses())),
+
+  /**
+   * Which model a scope import would run on right now (D15).
+   *
+   * **A request rather than a constant in this bundle, and that is the whole point of the
+   * endpoint.** `modelOption.ts` is explicit that a descriptor is observed when the server
+   * built the harness and replaced wholesale when it is rebuilt. A preferred model id
+   * written down here would outlive the catalogue entry it names, and the create-target
+   * screen would keep offering a choice the server could not honour.
+   */
+  importerModel: (baseUrl: string) =>
+    run(Effect.flatMap(client(baseUrl), (api) => api.fleet.importerModel())),
+
+  /** One import's links, tool calls and totals, for the "Loading the scope" panel. */
+  scopeImport: (baseUrl: string, targetId: string, importId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.scopeImport({ params: { targetId, importId } }),
+      ),
+    ),
+
+  /** Stops one import, keeping everything it has already written. */
+  stopScopeImport: (baseUrl: string, targetId: string, importId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.stopScopeImport({ params: { targetId, importId } }),
+      ),
+    ),
 
   /**
    * One past attempt's transcript — the server's own copy, or the harness's.

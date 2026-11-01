@@ -29,6 +29,7 @@ import {
   droppedModelOptionIds,
   explicitModelOptionSelections,
   modelOptionDescriptors,
+  SCOPE_IMPORT_MAX_LINKS,
   type AssetView,
   type AttemptTranscript,
   LIVE_SILENCE_LIMIT_SECONDS,
@@ -40,6 +41,7 @@ import {
   type GoalUploadView,
   type GoalView,
   type HarnessInstanceView,
+  type ImporterModelView,
   type IntentView,
   type LiveFrame,
   type LiveItem,
@@ -49,6 +51,7 @@ import {
   type PlanRoundView,
   type RunningAttempt,
   type RunningRound,
+  type ScopeImportView,
   type ScopeKind,
   type ScopeLabelDraft,
   type ScopeState,
@@ -87,6 +90,17 @@ import { server, type ServerClient } from "./client";
  * There is one real implementation and it is three lines; see `test/fakeCountdown.ts` for
  * the other.
  */
+/**
+ * How often the "Loading the scope" panel asks the server what the import has done.
+ *
+ * An import writes a dozen rows over a minute or so, and the panel is a receipt rather
+ * than a live channel — so this is slow enough to cost nothing and quick enough that a
+ * line appears while the operator is still looking at the one before it. The poll
+ * reschedules itself after each answer, so this is the gap between answers rather than a
+ * rate at which requests are fired.
+ */
+export const IMPORT_POLL_MS = 900;
+
 export interface Countdown {
   /** Schedules `fire` for `ms` from now. The returned function cancels it. */
   readonly after: (ms: number, fire: () => void) => () => void;
@@ -102,7 +116,26 @@ export const realCountdown: Countdown = {
   },
 };
 
-export type Screen = "connect" | "welcome" | "target";
+/**
+ * Which top-level screen is showing.
+ *
+ * `new-target` is new, and it is a screen rather than a flag because A3 turns the New
+ * target **dialog** into a **page**: the folder browser becomes the only remaining modal,
+ * the program links are a repeatable list, and the "Loading the scope" panel takes the
+ * same page over once the target exists. None of that fits in a 560px `Modal`, and more to
+ * the point a dialog is the wrong promise — the import runs for a minute or more and the
+ * operator is allowed to leave it.
+ */
+export type Screen = "connect" | "welcome" | "target" | "new-target";
+/**
+ * What the create-target page is doing.
+ *
+ * `form` and `importing` are two views of one page, which is A3's C1 and C2. They are a
+ * state on the page rather than two screens because the breadcrumb, the chrome and the
+ * page frame do not change between them — only the body does, and the target already
+ * exists by the time the second one shows.
+ */
+export type NewTargetPhase = "form" | "importing";
 /**
  * What the hunt view knows about the target it is showing.
  *
@@ -1278,6 +1311,148 @@ export class App {
   createDetail = $state("");
   /** For the duplicate state: the target already holding that folder. */
   duplicateOf = $state("");
+
+  /**
+   * Which half of the create-target page is showing.
+   *
+   * `form` until a target with links has been created, then `importing`. It never goes
+   * back: the target exists by then, and a form that could be returned to would be a form
+   * offering to create it again.
+   */
+  newTargetPhase = $state<NewTargetPhase>("form");
+
+  /**
+   * Whether the folder browser is open.
+   *
+   * **The only modal A3 leaves standing.** It does one thing and hands back one value, so
+   * it can be modal without trapping anything: open it, choose, land back on the form with
+   * the path filled and every other field as you left it.
+   */
+  folderPickerOpen = $state(false);
+
+  /* ── The program links (A3, D13) ──────────────────────────────────────────── */
+
+  /**
+   * The program pages the importer will read, as the operator is typing them.
+   *
+   * **A list of drafts with ids rather than a list of strings**, because Svelte's `{#each}`
+   * needs a stable key for a repeatable input list: keyed on the string, two identical
+   * half-typed URLs collapse into one row and the operator's cursor jumps. The id is
+   * local and never sent.
+   *
+   * It starts with one empty row, which is what A3 shows: the field is there to be typed
+   * into, and an empty list with only an "Add another link" button would make pasting one
+   * URL a two-click operation.
+   */
+  programLinks = $state<{ id: number; url: string }[]>([{ id: 1, url: "" }]);
+  #nextLinkId = 2;
+
+  /**
+   * Whether the importer should run at all (A3's checkbox).
+   *
+   * On by default, because an operator who pasted a program link pasted it so that it
+   * would be read. Turning it off keeps the links — they are still a record of where the
+   * scope came from — and simply does not start an agent.
+   */
+  autoloadScope = $state(true);
+
+  /** The links that would actually be sent: non-empty, trimmed, in order, deduplicated. */
+  usableLinks = $derived.by(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const link of this.programLinks) {
+      const url = link.url.trim();
+      if (url === "" || seen.has(url)) continue;
+      seen.add(url);
+      out.push(url);
+    }
+    return out.slice(0, SCOPE_IMPORT_MAX_LINKS);
+  });
+
+  /** True when the model picker should be on screen: a checkbox plus something to read. */
+  showImportModel = $derived(this.autoloadScope && this.usableLinks.length > 0);
+
+  /* ── The importer's model (D15) ───────────────────────────────────────────── */
+
+  /**
+   * What the server says an import would run on, resolved against the live catalogue.
+   *
+   * **Read from the server, never written down here.** `modelOption.ts`'s doctrine is the
+   * reason and it is worth restating at the one place a constant would have been
+   * convenient: a descriptor is observed when the server built its harnesses and replaced
+   * wholesale when they are rebuilt, so a model id in this bundle would outlive the
+   * catalogue entry it names and this screen would offer a choice the server could not
+   * honour. `undefined` means "not asked yet"; `importModelDetail` carries the refusal when
+   * there is no harness to resolve against.
+   */
+  importerModel = $state<ImporterModelView | undefined>(undefined);
+  /** Why there is no resolved model, in the server's words. Empty when there is one. */
+  importModelDetail = $state("");
+  /** The operator's override, or "" for "whatever the server resolved". */
+  pickedImportInstanceId = $state("");
+  pickedImportModel = $state("");
+  importPickerOpen = $state(false);
+  importModelQuery = $state("");
+
+  /** The instance the import would use: the operator's pick, else the resolved default. */
+  importInstance = $derived.by(() => {
+    const wanted =
+      this.pickedImportInstanceId !== ""
+        ? this.pickedImportInstanceId
+        : this.importerModel?.instanceId;
+    return this.harnesses.find((entry) => entry.instanceId === wanted);
+  });
+
+  /** The model id the import would use, as a string the screen can print. */
+  effectiveImportModel = $derived(
+    this.pickedImportModel !== ""
+      ? this.pickedImportModel
+      : this.pickedImportInstanceId !== "" &&
+          this.pickedImportInstanceId !== this.importerModel?.instanceId
+        ? // Another instance was picked with no model, so the resolved model — which
+          // belongs to a different harness's catalogue — says nothing here. The server
+          // applies the same rule; this is only what the screen shows meanwhile.
+          (this.importInstance?.defaultModel ?? "")
+        : (this.importerModel?.model ?? ""),
+  );
+
+  /** Models the picked instance offers, filtered by what the operator has typed. */
+  importModelOptions = $derived.by(() => {
+    const all = this.importInstance?.models ?? [];
+    const query = this.importModelQuery.trim().toLowerCase();
+    return query === ""
+      ? all
+      : all.filter((model) => model.id.toLowerCase().includes(query));
+  });
+
+  /* ── The import in progress (D16) ─────────────────────────────────────────── */
+
+  /**
+   * The import the panel is watching, or `undefined`.
+   *
+   * **It carries tool calls and nothing else**, because that is all the contract has: the
+   * panel is a receipt for what landed on the target, and there is no field on
+   * `ScopeImportView` for narration. A reasoning line cannot reach this screen, because
+   * nothing on the server ever captured one.
+   */
+  scopeImport = $state<ScopeImportView | undefined>(undefined);
+  /** Which import is being watched, so a stale poll cannot write over a newer one. */
+  scopeImportId = $state("");
+  /** The target the import is writing to. Where the three exits lead. */
+  scopeImportTargetId = $state("");
+  /** A refusal from the import read or the stop, in the server's words. */
+  scopeImportDetail = $state("");
+  /**
+   * The error toast for an import that produced nothing, or could not start.
+   *
+   * Per D15 this is **not** an error state: the operator is moved on to the target's
+   * Assets screen and told in a toast, because the target was created and is entirely
+   * usable with no scope — the same state as a target created with no links at all.
+   * Keeping someone on a dead progress panel to contemplate a failure they cannot fix from
+   * there would be worse.
+   */
+  toast = $state("");
+  #stopPolling: (() => void) | undefined;
 
   selected = $derived(
     this.targets.find((t) => t.id === this.selectedId) ?? this.targets[0],
@@ -3097,8 +3272,21 @@ export class App {
 
   /* ── New target ──────────────────────────────────────────────────────────── */
 
-  openDialog() {
-    this.dialogOpen = true;
+  /**
+   * Opens the create-target **page** (A3).
+   *
+   * `dialogOpen` is gone from this path: A3 turns the dialog into a page and leaves the
+   * folder browser as the only modal. The fields keep their names — `dialogChosen`,
+   * `dialogName`, `dialogScope` — because renaming them would touch every test and every
+   * binding for a word, and the comment that says what they are costs nothing.
+   *
+   * It asks the server which model an import would run on while the operator is typing, so
+   * the picker has an answer by the time the checkbox reveals it. Asked here rather than
+   * held, for `importerModel`'s reason.
+   */
+  openNewTarget() {
+    this.screen = "new-target";
+    this.newTargetPhase = "form";
     this.dialogChosen = "";
     this.dialogName = "";
     this.dialogScope = "";
@@ -3106,7 +3294,147 @@ export class App {
     this.createState = "idle";
     this.createDetail = "";
     this.duplicateOf = "";
+    this.programLinks = [{ id: 1, url: "" }];
+    this.#nextLinkId = 2;
+    this.autoloadScope = true;
+    this.pickedImportInstanceId = "";
+    this.pickedImportModel = "";
+    this.importPickerOpen = false;
+    this.importModelQuery = "";
+    this.scopeImport = undefined;
+    this.scopeImportId = "";
+    this.scopeImportTargetId = "";
+    this.scopeImportDetail = "";
+    this.folderPickerOpen = false;
     void this.browseTo(this.dialogRoot === "" ? undefined : this.dialogRoot);
+    void this.loadHarnesses();
+    void this.loadImporterModel();
+  }
+
+  /**
+   * Leaves the create-target page without creating anything.
+   *
+   * Back to wherever the operator came from, which is the target list when there are
+   * targets and the welcome screen when there are not — the same decision `toAllTargets`
+   * makes, so Cancel and the breadcrumb agree.
+   */
+  cancelNewTarget() {
+    this.stopWatchingImport();
+    this.screen = "welcome";
+    this.folderPickerOpen = false;
+    this.createState = "idle";
+    this.createDetail = "";
+  }
+
+  /** Opens the folder browser, which is the only modal A3 keeps. */
+  openFolderPicker() {
+    this.folderPickerOpen = true;
+    void this.browseTo(
+      this.dialogChosen !== ""
+        ? this.dialogChosen
+        : this.dialogRoot === ""
+          ? undefined
+          : this.dialogRoot,
+    );
+  }
+
+  /**
+   * Takes the folder the picker is showing and closes it.
+   *
+   * The picker "does one thing and hands back one value", which is what lets it be modal
+   * without trapping anything: the operator lands back on the form with the path filled and
+   * every other field as they left it.
+   */
+  useChosenFolder() {
+    if (this.dialogChosen === "") this.chooseFolder(this.dialogPath);
+    this.folderPickerOpen = false;
+  }
+
+  /* ── Program links ────────────────────────────────────────────────────────── */
+
+  addProgramLink() {
+    if (this.programLinks.length >= SCOPE_IMPORT_MAX_LINKS) return;
+    this.programLinks = [
+      ...this.programLinks,
+      { id: this.#nextLinkId++, url: "" },
+    ];
+  }
+
+  /**
+   * Removes one link row.
+   *
+   * The last row is emptied rather than removed, so the field the operator types into is
+   * always on screen. A3 shows a field, not an empty space with a button under it.
+   */
+  removeProgramLink(id: number) {
+    const left = this.programLinks.filter((link) => link.id !== id);
+    this.programLinks =
+      left.length === 0 ? [{ id: this.#nextLinkId++, url: "" }] : left;
+  }
+
+  setProgramLink(id: number, url: string) {
+    this.programLinks = this.programLinks.map((link) =>
+      link.id === id ? { ...link, url } : link,
+    );
+  }
+
+  /* ── The importer's model ─────────────────────────────────────────────────── */
+
+  /**
+   * Asks the server which model an import would run on (D15).
+   *
+   * One request, one rule, on the server, over the catalogue it observed. A refusal means
+   * no harness is ready, which disables the checkbox and says why — rather than leaving it
+   * enabled and letting the operator paste links nothing will ever read.
+   */
+  async loadImporterModel() {
+    const call = await this.client.importerModel(this.serverUrl);
+    if (call._tag === "Ok") {
+      this.importerModel = call.value;
+      this.importModelDetail = "";
+      return;
+    }
+    this.importerModel = undefined;
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      // `ImporterModelUnavailable` carries one; `Unauthenticated` does not, which is why
+      // this reads the field rather than assuming the union has it.
+      this.importModelDetail =
+        "detail" in call.error && typeof call.error.detail === "string"
+          ? call.error.detail
+          : "No agent harness is ready, so program pages cannot be read.";
+      return;
+    }
+    this.importModelDetail = "No server answered at this address.";
+  }
+
+  toggleAutoload() {
+    this.autoloadScope = !this.autoloadScope;
+    // The picker hides with the checkbox, because a model choice with no agent to run is a
+    // control for nothing. Closing it rather than leaving it open-but-hidden means it
+    // reopens where the operator expects.
+    if (!this.autoloadScope) this.importPickerOpen = false;
+  }
+
+  toggleImportPicker() {
+    this.importPickerOpen = !this.importPickerOpen;
+  }
+
+  pickImportInstance(instanceId: string) {
+    this.pickedImportInstanceId = instanceId;
+    // A model belongs to one instance's catalogue, so a model picked on the old instance
+    // means nothing on the new one. Cleared rather than carried, which is what stops the
+    // screen showing a model the chosen harness has never heard of.
+    this.pickedImportModel = "";
+    this.importModelQuery = "";
+  }
+
+  pickImportModel(model: string) {
+    this.pickedImportModel = model;
+    this.importPickerOpen = false;
   }
 
   /**
@@ -3185,10 +3513,33 @@ export class App {
     if (this.dialogChosen === "" || this.dialogName === "") return;
     this.createState = "creating";
     this.createDetail = "";
+    // The links, only when the checkbox is on. Off, they are kept on screen as the
+    // operator's record of where the scope came from and simply not sent — no links means
+    // no importer, which is the same thing as not asking for one.
+    const links = this.autoloadScope ? this.usableLinks : [];
     const call = await this.client.createTarget(this.serverUrl, {
       workspacePath: this.dialogChosen,
       name: this.dialogName,
       scopeNote: this.dialogScope,
+      programLinks: links,
+      // Absent unless the operator actually overrode something, which is what lets the
+      // server apply D15's rule to the catalogue it observed. Sending the model this
+      // screen is *showing* would make the browser the authority on a descriptor it only
+      // read, and would pin an import to a model id that may have been retired since the
+      // page loaded.
+      ...(links.length > 0 &&
+      (this.pickedImportInstanceId !== "" || this.pickedImportModel !== "")
+        ? {
+            importModel: {
+              ...(this.pickedImportInstanceId === ""
+                ? {}
+                : { instanceId: this.pickedImportInstanceId }),
+              ...(this.pickedImportModel === ""
+                ? {}
+                : { model: this.pickedImportModel }),
+            },
+          }
+        : {}),
     });
 
     if (call._tag === "Unreachable") {
@@ -3222,18 +3573,218 @@ export class App {
       return;
     }
 
-    const created = call.value;
+    const answer = call.value;
+    const created = answer.target;
     await this.loadTargets();
     if (!created.available) {
-      // The target exists and is listed; it just cannot be opened yet. The dialog stays
-      // up so the operator reads why, with the server's own failure text.
+      // The target exists and is listed; it just cannot be opened yet. The form stays up
+      // so the operator reads why, with the server's own failure text.
       this.createState = "failed";
       this.createDetail = created.detail;
       return;
     }
-    this.dialogOpen = false;
     this.createState = "idle";
     this.select(created.id);
+
+    /*
+     * No import: straight to the target, exactly as before.
+     *
+     * `importDetail` is set when links were given and this server could not read them —
+     * no harness, or a picked instance that is not ready. Per D15 that is a **toast and a
+     * move on**, not an error state: the target was created and is entirely usable with no
+     * scope, which is the same state as a target created with no links at all.
+     */
+    if (answer.scopeImport === null) {
+      if (answer.importDetail !== null) this.toast = answer.importDetail;
+      this.screen = "target";
+      this.openTarget(created.id);
+      if (answer.importDetail !== null) this.toSection("assets");
+      return;
+    }
+
+    // An import is running. The page becomes the panel; the target already exists.
+    this.newTargetPhase = "importing";
+    this.scopeImportId = answer.scopeImport.importId;
+    this.scopeImportTargetId = created.id;
+    this.scopeImport = undefined;
+    this.scopeImportDetail = "";
+    this.watchImport(created.id, answer.scopeImport.importId);
+  }
+
+  /* ── The "Loading the scope" panel (D16) ──────────────────────────────────── */
+
+  /**
+   * Polls one import until it settles.
+   *
+   * **Polled rather than streamed, and the reason is what the panel is.** It is a receipt
+   * for writes that have already landed, read from an in-process registry — not a live
+   * channel. The live transcript's socket exists because a run narrates for hours and an
+   * operator watches it; an import writes a dozen rows over a minute, and a poll every
+   * `IMPORT_POLL_MS` is both simpler and enough. It also means "Continue in background" is
+   * a navigation rather than a mode: the import keeps running whether or not anybody is
+   * polling it.
+   */
+  watchImport(targetId: string, importId: string) {
+    this.stopWatchingImport();
+    let stopped = false;
+    const tick = async (): Promise<void> => {
+      if (stopped) return;
+      const call = await this.client.scopeImport(
+        this.serverUrl,
+        targetId,
+        importId,
+      );
+      // A poll that came back after the operator moved on, or for an import that is no
+      // longer the one being watched, is dropped. Without this a slow response can
+      // overwrite a newer import's panel with an older one's receipt.
+      if (stopped || this.scopeImportId !== importId) return;
+      if (call._tag === "Ok") {
+        this.scopeImport = call.value;
+        this.scopeImportDetail = "";
+        if (call.value.status === "running") return;
+        this.stopWatchingImport();
+        this.settleImport(call.value);
+        return;
+      }
+      if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+        this.stopWatchingImport();
+        this.signOut("expired");
+        return;
+      }
+      // Anything else — an import this process has forgotten, a server that stopped
+      // answering — sends the operator to where the writes are. There is nothing to do on
+      // a panel whose subject is gone.
+      this.stopWatchingImport();
+      this.scopeImportDetail =
+        call._tag === "Refused"
+          ? ((call.error as { detail?: string }).detail ??
+            "That import could not be read.")
+          : "No server answered at this address.";
+      this.toast = this.scopeImportDetail;
+      this.openAssetsFor(targetId);
+    };
+    /*
+     * Rescheduled after each answer rather than fired on an interval.
+     *
+     * `Countdown` offers `after` and nothing else, which is the shape that actually suits
+     * this: an interval would start a second request while the first was still out, and on
+     * a slow link that is how a poll turns into a queue. Rescheduling means exactly one
+     * request is in flight at a time, and the gap is measured from the answer rather than
+     * from the request.
+     */
+    let cancelNext: (() => void) | undefined;
+    const loop = async (): Promise<void> => {
+      await tick();
+      if (stopped) return;
+      cancelNext = this.countdown.after(IMPORT_POLL_MS, () => void loop());
+    };
+    this.#stopPolling = () => {
+      stopped = true;
+      cancelNext?.();
+      cancelNext = undefined;
+    };
+    void loop();
+  }
+
+  stopWatchingImport() {
+    this.#stopPolling?.();
+    this.#stopPolling = undefined;
+  }
+
+  /**
+   * What happens when an import finishes on screen.
+   *
+   * **Nothing, when it wrote something.** The panel stays, showing the receipt and the
+   * three exits, because the operator is on it to read what landed. A screen that jumped
+   * away the instant the import finished would take the receipt with it.
+   *
+   * **A toast and a move to Assets, when it wrote nothing** (D15). Every link failing is
+   * not an error state: the target is created and usable with no scope, which is the same
+   * state as a target created with no links at all, and the Assets screen already says
+   * what that means ("No scope authored for this target"). Keeping someone on a dead
+   * progress panel to contemplate a failure they cannot fix from there would be worse.
+   */
+  settleImport(view: ScopeImportView) {
+    const wrote =
+      view.totals.entriesIn + view.totals.entriesOut + view.totals.assets;
+    if (wrote > 0) return;
+    this.toast =
+      view.status === "failed"
+        ? `The scope could not be read: ${view.detail ?? "the importer did not start"}. The target is created — author its scope here.`
+        : "Nothing could be read from those pages. The target is created and has no scope yet — author it here.";
+    this.openAssetsFor(view.targetId);
+  }
+
+  /** Opens a target on its Assets screen. Where all three of the panel's exits lead. */
+  openAssetsFor(targetId: string) {
+    this.stopWatchingImport();
+    this.folderPickerOpen = false;
+    this.openTarget(targetId);
+    this.toSection("assets");
+  }
+
+  /** The panel's first exit: go and read what was imported. */
+  openImportedAssets() {
+    this.openAssetsFor(
+      this.scopeImportTargetId === ""
+        ? this.selectedId
+        : this.scopeImportTargetId,
+    );
+  }
+
+  /**
+   * The panel's second exit: leave it reading.
+   *
+   * Identical to the first in what it does to the import — which is nothing. The import is
+   * a server-side fiber and was never driven from here. The difference is only where the
+   * operator lands, and they land on the target either way; this one does not jump them to
+   * Assets, because they said they were going to do something else.
+   */
+  continueImportInBackground() {
+    const targetId =
+      this.scopeImportTargetId === ""
+        ? this.selectedId
+        : this.scopeImportTargetId;
+    this.stopWatchingImport();
+    this.folderPickerOpen = false;
+    this.openTarget(targetId);
+  }
+
+  /**
+   * The panel's third exit: stop, keeping everything already written.
+   *
+   * **Stopping early is not a failure.** The entries written so far stay, and the rest is
+   * the operator's to add — which is true because the importer writes as it reads rather
+   * than batching to the end (D15). The answer carries the import as it stood at the stop,
+   * so the panel's last render is the receipt for exactly what landed.
+   */
+  async stopImport() {
+    const targetId = this.scopeImportTargetId;
+    const importId = this.scopeImportId;
+    if (targetId === "" || importId === "") return;
+    this.stopWatchingImport();
+    const call = await this.client.stopScopeImport(
+      this.serverUrl,
+      targetId,
+      importId,
+    );
+    if (call._tag === "Ok") {
+      this.scopeImport = call.value;
+      return;
+    }
+    if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+      this.signOut("expired");
+      return;
+    }
+    this.scopeImportDetail =
+      call._tag === "Refused"
+        ? ((call.error as { detail?: string }).detail ??
+          "That import could not be stopped.")
+        : "No server answered at this address.";
+  }
+
+  dismissToast() {
+    this.toast = "";
   }
 
   /**
@@ -4001,6 +4552,26 @@ export class App {
     this.createDetail = "";
     this.duplicateOf = "";
     this.dialogPathError = "";
+    // The create-target page and the import panel. A scenario that left a half-filled
+    // link list or a settled import behind would show the next scenario somebody else's
+    // receipt, which is the one thing the state picker must not do.
+    this.newTargetPhase = "form";
+    this.folderPickerOpen = false;
+    this.programLinks = [{ id: 1, url: "" }];
+    this.#nextLinkId = 2;
+    this.autoloadScope = true;
+    this.importerModel = undefined;
+    this.importModelDetail = "";
+    this.pickedImportInstanceId = "";
+    this.pickedImportModel = "";
+    this.importPickerOpen = false;
+    this.importModelQuery = "";
+    this.stopWatchingImport();
+    this.scopeImport = undefined;
+    this.scopeImportId = "";
+    this.scopeImportTargetId = "";
+    this.scopeImportDetail = "";
+    this.toast = "";
     this.navItem = "goals";
     this.#clearGoals();
     this.drawerHidden = false;
@@ -4191,8 +4762,7 @@ export const scenarios: Scenario[] = [
     label: "Idle",
     apply: (a) => {
       a.reset();
-      a.screen = "welcome";
-      a.openDialog();
+      a.openNewTarget();
     },
   },
   {
@@ -4201,8 +4771,7 @@ export const scenarios: Scenario[] = [
     label: "Folder selected",
     apply: (a) => {
       a.reset();
-      a.screen = "welcome";
-      a.openDialog();
+      a.openNewTarget();
       // A note for people, like the field: a pattern here would show the prototype
       // promising something the field has never parsed.
       a.dialogScope = "The local bit fixture, and nothing else.";
@@ -4214,8 +4783,7 @@ export const scenarios: Scenario[] = [
     label: "Creating",
     apply: (a) => {
       a.reset();
-      a.screen = "welcome";
-      a.openDialog();
+      a.openNewTarget();
       a.dialogChosen = `${a.dialogRoot}/example`;
       a.dialogName = "example";
       a.createState = "creating";
@@ -4227,8 +4795,7 @@ export const scenarios: Scenario[] = [
     label: "Migration failed",
     apply: (a) => {
       a.reset();
-      a.screen = "welcome";
-      a.openDialog();
+      a.openNewTarget();
       a.dialogChosen = `${a.dialogRoot}/example`;
       a.dialogName = "example";
       a.createState = "failed";
@@ -4242,8 +4809,7 @@ export const scenarios: Scenario[] = [
     label: "Permission denied",
     apply: (a) => {
       a.reset();
-      a.screen = "welcome";
-      a.openDialog();
+      a.openNewTarget();
       a.dialogChosen = `${a.dialogRoot}/locked`;
       a.dialogName = "locked";
       a.createState = "denied";
@@ -4256,8 +4822,7 @@ export const scenarios: Scenario[] = [
     label: "Already a target",
     apply: (a) => {
       a.reset();
-      a.screen = "welcome";
-      a.openDialog();
+      a.openNewTarget();
       a.dialogChosen = `${a.dialogRoot}/acme-corp`;
       a.dialogName = "acme-corp";
       a.createState = "duplicate";

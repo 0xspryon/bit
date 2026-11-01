@@ -62,6 +62,7 @@ import {
   runningAttempt,
   runningRound,
   sessionProbe,
+  targetCreated,
   targetSummary,
   targetView,
   unreachable,
@@ -364,13 +365,13 @@ describe("targets", () => {
   });
 });
 
-/* ── The New target dialog ───────────────────────────────────────────────────── */
+/* ── The New target screen ───────────────────────────────────────────────────── */
 
 describe("new target", () => {
-  /** Walks the dialog to the point where `createTarget()` will do something. */
+  /** Walks the page to the point where `createTarget()` will do something. */
   const choose = async (app: App, path: string): Promise<void> => {
     await signIn(app);
-    app.openDialog();
+    app.openNewTarget();
     await settle();
     app.chooseFolder(path);
   };
@@ -394,8 +395,9 @@ describe("new target", () => {
     expect(app.createDetail).toBe(
       "/work/acme-corp is already registered as 'acme-corp'",
     );
-    // The dialog stays up: there is an offer on it to accept.
-    expect(app.dialogOpen).toBe(true);
+    // The page stays up: there is an offer on it to accept.
+    expect(app.screen).toBe("new-target");
+    expect(app.newTargetPhase).toBe("form");
   });
 
   test("a folder the server may not read is denied, in its words", async () => {
@@ -451,7 +453,7 @@ describe("new target", () => {
       unavailableReason: "never_migrated",
       detail: 'migrate failed: Migration "1_delegation_memory_slice" failed',
     });
-    fake.onCreateTarget = () => ok(broken);
+    fake.onCreateTarget = () => ok(targetCreated({ target: broken }));
     fake.onTargets = () => ok([broken]);
 
     await choose(app, "/work/example");
@@ -462,7 +464,8 @@ describe("new target", () => {
       'migrate failed: Migration "1_delegation_memory_slice" failed',
     );
     // Up, so the operator reads why — and listed, because it does exist.
-    expect(app.dialogOpen).toBe(true);
+    expect(app.screen).toBe("new-target");
+    expect(app.newTargetPhase).toBe("form");
     expect(app.targets.map((target) => target.id)).toEqual(["example"]);
     expect(app.targets[0]?.status).toBe("missing");
   });
@@ -470,14 +473,15 @@ describe("new target", () => {
   test("a target that is created appears on the rail and is selected", async () => {
     const { app, fake } = open();
     const created = targetSummary({ id: "example", name: "example" });
-    fake.onCreateTarget = () => ok(created);
+    fake.onCreateTarget = () => ok(targetCreated({ target: created }));
     // The rail is re-read rather than appended to locally, so this is what it becomes.
     fake.onTargets = () => ok([created]);
 
     await choose(app, "/work/example");
     await app.createTarget();
 
-    expect(app.dialogOpen).toBe(false);
+    // No links, so no import: the page is left behind and the target is open.
+    expect(app.screen).toBe("target");
     expect(app.createState).toBe("idle");
     expect(app.targets.map((target) => target.id)).toEqual(["example"]);
     expect(app.selectedId).toBe("example");

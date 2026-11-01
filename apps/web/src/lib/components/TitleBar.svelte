@@ -151,7 +151,7 @@
           class="foot-item"
           onclick={() => {
             targetOpen = false;
-            app.openDialog();
+            app.openNewTarget();
           }}
         >
           <IconPlus width="14" height="14" />
@@ -281,6 +281,19 @@
         {/snippet}
       </CrumbPicker>
     {/if}
+  {:else if app.screen === "new-target"}
+    <!--
+      Above target scope, and two crumbs rather than one — the only place that happens up
+      here. The first is a way back out, which matters on this screen because it is the one
+      page above target scope that the operator can be *in* rather than at: A3 shows
+      exactly this, and without the first crumb Cancel is the only exit.
+    -->
+    <button class="chip-back" onclick={() => app.cancelNewTarget()}>
+      <IconGrid width="13" height="13" />
+      All targets
+    </button>
+    <IconAngleRight class="sep" width="12" height="12" />
+    <span class="crumb-leaf">New target</span>
   {:else}
     <!-- Above target scope: one chip, and nothing to switch it to. -->
     <span class="chip-all">
@@ -373,6 +386,33 @@
     padding: 0 8px;
     color: var(--text-base);
     font: 500 12px/16px var(--font-sans);
+  }
+  /* The same chip, but it goes somewhere. */
+  .chip-back {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 7px;
+    height: 26px;
+    margin-left: 10px;
+    padding: 0 8px;
+    box-sizing: border-box;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-base);
+    font: 500 12px/16px var(--font-sans);
+    cursor: pointer;
+  }
+  .chip-back:hover {
+    background: var(--overlay-hover);
+    border-color: var(--border-base);
+  }
+  .crumb-leaf {
+    flex: none;
+    padding: 0 2px;
+    color: var(--text-base);
+    font: 400 12px/16px var(--font-sans);
   }
 
   .section-count {

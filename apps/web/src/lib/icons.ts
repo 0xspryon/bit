@@ -15,6 +15,9 @@ export { default as IconPlus } from "line-awesome/svg/plus-solid.svg?component";
 export { default as IconClose } from "line-awesome/svg/times-solid.svg?component";
 export { default as IconSearch } from "line-awesome/svg/search-solid.svg?component";
 
+/** A program link on the create-target screen. */
+export { default as IconLink } from "line-awesome/svg/link-solid.svg?component";
+
 export { default as IconFolder } from "line-awesome/svg/folder-solid.svg?component";
 export { default as IconFolderOpen } from "line-awesome/svg/folder-open-solid.svg?component";
 export { default as IconFolderPlus } from "line-awesome/svg/folder-plus-solid.svg?component";

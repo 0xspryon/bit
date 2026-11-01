@@ -102,14 +102,38 @@
     <!-- Level 1: above target scope. One crumb, and the table of targets is the navigation. -->
     <TitleBar {app} />
     <Welcome {app} />
+  {:else if app.screen === "new-target"}
+    <!--
+      Level 1 as well: a page above target scope, because the target it is about does not
+      exist yet. A3 turns what was a dialog into this, and keeps only the folder browser
+      modal — which `NewTarget` mounts itself, since it is the one thing on that page
+      whose state nothing else reads.
+    -->
+    <TitleBar {app} />
+    <NewTarget {app} />
   {:else}
     <!-- Level 2: the crumb bar plus the target's own rail. -->
     <TitleBar {app} />
     <Target {app} />
   {/if}
 
-  {#if app.dialogOpen}
-    <NewTarget {app} />
+  <!--
+    The import's error toast (D15).
+
+    Every link failing is not an error state: the operator has already been moved on to the
+    target's Assets screen by the time this shows, and this says why. It is the one toast in
+    the application, and it is here rather than in a screen because the screen it belongs to
+    is not the screen that raised it.
+  -->
+  {#if app.toast !== ""}
+    <div class="toast" role="status">
+      <p>{app.toast}</p>
+      <button
+        class="toast-close"
+        aria-label="Dismiss"
+        onclick={() => app.dismissToast()}>×</button
+      >
+    </div>
   {/if}
 </div>
 
@@ -123,5 +147,42 @@
     height: 100vh;
     background: var(--bg-base);
     color: var(--text-base);
+  }
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%);
+    z-index: 60;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    max-width: 560px;
+    padding: 12px 14px;
+    box-sizing: border-box;
+    border: 1px solid var(--state-border-warning);
+    border-radius: var(--radius-md);
+    background: var(--state-bg-warning);
+    color: var(--state-fg-warning);
+    box-shadow: var(--elevation-overlay);
+  }
+  .toast p {
+    margin: 0;
+    font-size: 12px;
+    line-height: var(--lh-base);
+    text-wrap: pretty;
+  }
+  .toast-close {
+    flex: none;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.8;
+  }
+  .toast-close:hover {
+    opacity: 1;
   }
 </style>

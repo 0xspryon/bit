@@ -84,7 +84,11 @@
           A target is one system you are testing. It gets a folder on your
           machine, and everything the agent learns about it is recorded there.
         </p>
-        <Button variant="primary" size="page" onclick={() => app.openDialog()}>
+        <Button
+          variant="primary"
+          size="page"
+          onclick={() => app.openNewTarget()}
+        >
           <IconPlus width="14" height="14" />
           New target
         </Button>
@@ -99,7 +103,7 @@
           goals.
         </p>
       </div>
-      <Button variant="primary" size="page" onclick={() => app.openDialog()}>
+      <Button variant="primary" size="page" onclick={() => app.openNewTarget()}>
         <IconPlus width="14" height="14" />
         New target
       </Button>

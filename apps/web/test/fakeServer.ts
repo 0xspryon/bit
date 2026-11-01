@@ -37,6 +37,7 @@ import type {
   GoalView,
   IntentView,
   HarnessInstanceView,
+  ImporterModelView,
   LiveCursor,
   LiveFrame,
   LiveItem,
@@ -52,10 +53,12 @@ import type {
   RunStopped,
   RunningAttempt,
   RunningRound,
+  ScopeImportView,
   ScopeView,
   SessionOpened,
   SessionProbe,
   TargetCounts,
+  TargetCreated,
   TargetSummary,
   TargetView,
 } from "@bit/contracts";
@@ -140,6 +143,57 @@ export const assetView = (over: Partial<AssetView> = {}): AssetView => ({
   firstIntentId: "intent_1",
   lastDiscoveredAt: AT,
   scope: { state: "out", by: { _tag: "default" }, overrode: null },
+  ...over,
+});
+
+/**
+ * A created target, as the route now answers.
+ *
+ * `TargetCreated` wraps the summary because an import handle exists only at the moment of
+ * creation; `scopeImport: null` with `importDetail: null` is what "no program links" looks
+ * like, which is what every test that does not care about the importer wants.
+ */
+export const targetCreated = (
+  over: Partial<TargetCreated> = {},
+): TargetCreated => ({
+  target: targetSummary(),
+  scopeImport: null,
+  importDetail: null,
+  ...over,
+});
+
+/**
+ * One import's progress, with nothing having happened yet.
+ *
+ * Note what cannot be overridden into existence here: there is no narration field on
+ * `ScopeImportView` (D16), so a test cannot set up a panel that renders reasoning even if
+ * it wanted to. `calls` is the whole of what the panel reads.
+ */
+export const scopeImportView = (
+  over: Partial<ScopeImportView> = {},
+): ScopeImportView => ({
+  importId: "imp_1",
+  targetId: "acme-corp",
+  status: "running",
+  detail: null,
+  harnessInstanceId: "opencode",
+  model: "opencode/glm-5.3-flash-free",
+  links: [],
+  calls: [],
+  totals: { entriesIn: 0, entriesOut: 0, assets: 0 },
+  startedAt: 1_700_000_000_000,
+  finishedAt: null,
+  ...over,
+});
+
+/** What the server says an import would run on, resolved against its live catalogue. */
+export const importerModelView = (
+  over: Partial<ImporterModelView> = {},
+): ImporterModelView => ({
+  instanceId: "opencode",
+  model: "opencode/glm-5.3-flash-free",
+  origin: "preferred",
+  detail: "OpenCode offers opencode/glm-5.3-flash-free",
   ...over,
 });
 
@@ -815,11 +869,13 @@ export class FakeServer implements ServerClient {
     ...args: Parameters<ServerClient["createTarget"]>
   ) => Answer<"createTarget"> = (_baseUrl, draft) =>
     ok(
-      targetSummary({
-        id: draft.name,
-        name: draft.name,
-        workspacePath: draft.workspacePath,
-        scopeNote: draft.scopeNote,
+      targetCreated({
+        target: targetSummary({
+          id: draft.name,
+          name: draft.name,
+          workspacePath: draft.workspacePath,
+          scopeNote: draft.scopeNote,
+        }),
       }),
     );
 
@@ -1030,6 +1086,19 @@ export class FakeServer implements ServerClient {
 
   onHarnesses: (baseUrl: string) => Answer<"harnesses"> = () => ok([]);
 
+  onImporterModel: (baseUrl: string) => Answer<"importerModel"> = () =>
+    ok(importerModelView());
+
+  onScopeImport: (
+    ...args: Parameters<ServerClient["scopeImport"]>
+  ) => Answer<"scopeImport"> = (_baseUrl, targetId, importId) =>
+    ok(scopeImportView({ targetId, importId }));
+
+  onStopScopeImport: (
+    ...args: Parameters<ServerClient["stopScopeImport"]>
+  ) => Answer<"stopScopeImport"> = (_baseUrl, targetId, importId) =>
+    ok(scopeImportView({ targetId, importId, status: "stopped" }));
+
   onTranscript: (
     baseUrl: string,
     targetId: string,
@@ -1176,6 +1245,17 @@ export class FakeServer implements ServerClient {
 
   harnesses = (baseUrl: string) =>
     this.record("harnesses", [baseUrl], () => this.onHarnesses(baseUrl));
+
+  importerModel = (baseUrl: string) =>
+    this.record("importerModel", [baseUrl], () =>
+      this.onImporterModel(baseUrl),
+    );
+
+  scopeImport = (...args: Parameters<ServerClient["scopeImport"]>) =>
+    this.record("scopeImport", args, () => this.onScopeImport(...args));
+
+  stopScopeImport = (...args: Parameters<ServerClient["stopScopeImport"]>) =>
+    this.record("stopScopeImport", args, () => this.onStopScopeImport(...args));
 
   transcript = (baseUrl: string, targetId: string, attemptId: string) =>
     this.record("transcript", [baseUrl, targetId, attemptId], () =>
