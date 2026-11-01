@@ -40,7 +40,11 @@ import {
   Schema,
 } from "effect";
 
-import { ObservationStore, type StoredAsset } from "../persistence/store";
+import {
+  ObservationStore,
+  operatorScope,
+  type StoredAsset,
+} from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { McpCredentials, type IssuedCredential } from "./credentials";
 import { McpCallCounter } from "./server";
@@ -549,6 +553,135 @@ describe("what is refused", () => {
 
 /* ── Reading back what the hunt has found ────────────────────────────────────────── */
 
+/* ── What the tool tells the agent about scope ───────────────────────────────────── */
+
+/**
+ * D9's last sentence: "the tool reports the asset's scope state in its result, so an
+ * agent that records an out-of-scope host is told so immediately rather than finding out
+ * never."
+ *
+ * Nothing asserted it on the tool path. `RecordAssetResult` carries `scopeState` and
+ * `scopeDetail` for exactly this, and a handler that returned the constants `out` and
+ * "not covered by any in-scope entry" passed the whole suite — which would tell every
+ * agent that everything it records is outside the client's estate, on every target,
+ * forever. So both directions are asserted here, through HTTP, against a real scope
+ * authored by the only writer that may author one.
+ */
+describe("the scope state in the result", () => {
+  beforeAll(async () => {
+    await runtime.runPromise(
+      Effect.flatMap(ObservationStore, (store) =>
+        Effect.gen(function* () {
+          const operator = {
+            callerScope: operatorScope(BINDING.targetId),
+            targetId: BINDING.targetId,
+          };
+          yield* store.addScopeEntry(operator, {
+            effect: "in",
+            kind: "subtree",
+            value: "acme.test",
+            source: "operator",
+          });
+          yield* store.addScopeEntry(operator, {
+            effect: "out",
+            kind: "host",
+            value: "blog.acme.test",
+            source: "operator",
+          });
+        }),
+      ),
+    );
+  });
+
+  test("an asset an entry covers comes back in scope, naming the entry", async () => {
+    const outcome = await record({
+      operation_id: "op-scope-in",
+      kind: "host",
+      url: "https://portal.acme.test:443/",
+      method: null,
+      note: "A subdomain of the authorized apex.",
+    });
+    expect(outcome.isError).toBe(false);
+    expect(outcome.data["scopeState"]).toBe("in");
+    // The sentence, from the same renderer the prompt block and the screen use, so the
+    // agent is told *what* decided it rather than one word.
+    expect(outcome.data["scopeDetail"]).toBe(
+      "in scope: acme.test and every subdomain",
+    );
+  });
+
+  test("an asset an out entry names comes back out, and is still recorded", async () => {
+    const outcome = await record({
+      operation_id: "op-scope-out",
+      kind: "endpoint",
+      url: "https://blog.acme.test/wp-login.php",
+      method: "get",
+      note: "A login form on the host the programme excludes.",
+    });
+    expect(outcome.isError).toBe(false);
+    expect(outcome.data["scopeState"]).toBe("out");
+    expect(outcome.data["scopeDetail"]).toBe(
+      "explicitly out of scope: blog.acme.test (that host only)",
+    );
+    // Out is a label and never a gate: the row is in the file.
+    const identities = (await storedAssets()).map((asset) => asset.identity);
+    expect(identities).toContain("GET https://blog.acme.test:443/wp-login.php");
+  });
+
+  test("an asset nothing covers says so, and does not say it was denied", async () => {
+    const outcome = await record({
+      operation_id: "op-scope-uncovered",
+      kind: "host",
+      url: "https://partner-cdn.test:443/",
+      method: null,
+      note: "Named in a CORS header.",
+    });
+    expect(outcome.isError).toBe(false);
+    expect(outcome.data["scopeState"]).toBe("out");
+    /*
+     * The wording is load-bearing. "Nothing covers this yet" is a fact about the scope;
+     * "you were denied" would be a fact about the call, and this call succeeded. An agent
+     * that read the second would stop recording the discoveries the operator most needs.
+     */
+    expect(outcome.data["scopeDetail"]).toBe(
+      "not covered by any in-scope entry; recorded for the operator to review",
+    );
+    expect(String(outcome.data["scopeDetail"])).not.toContain("denied");
+  });
+
+  test("a hand label beats the entries here too, from the one ladder", async () => {
+    // Promotion is an operator act over the browser API; what is asserted here is that
+    // the tool's answer comes off the same ladder, so the agent and the screen cannot
+    // disagree about one asset.
+    await runtime.runPromise(
+      Effect.flatMap(ObservationStore, (store) =>
+        store.setHostScopeLabel(
+          {
+            callerScope: operatorScope(BINDING.targetId),
+            targetId: BINDING.targetId,
+          },
+          { host: "blog.acme.test", state: "in", reason: "carved out by hand" },
+        ),
+      ),
+    );
+    const outcome = await record({
+      operation_id: "op-scope-promoted",
+      kind: "endpoint",
+      url: "https://blog.acme.test/xmlrpc.php",
+      method: "post",
+      note: "Found after the operator promoted the host.",
+    });
+    expect(outcome.data["scopeState"]).toBe("in");
+    expect(outcome.data["scopeDetail"]).toContain(
+      "in scope, set by hand on blog.acme.test",
+    );
+    // And it says which typed entry the label beat, which is what `overrode` is for.
+    expect(outcome.data["scopeDetail"]).toContain(
+      "overriding blog.acme.test (that host only)",
+    );
+  });
+});
+
 describe("list_assets", () => {
   const list = async (): Promise<ToolOutcome> =>
     outcomeOf(
@@ -628,6 +761,47 @@ describe("list_assets", () => {
     // A host has no method and no path, and the row says so rather than omitting them.
     expect(host?.["method"]).toBeNull();
     expect(host?.["path"]).toBeNull();
+  });
+
+  test("every row says whether the scope covers it, and what decided it", async () => {
+    /*
+     * The other half of D10, and the half that was missing.
+     *
+     * "Returning the row with its label costs one field and removes the rediscovery
+     * loop" — and without the label the read is worse than the silent filter it argues
+     * against: an agent can see the host, cannot see that the operator excluded it, and
+     * goes on to test it. The wire shape carried no scope field at all, so this is the
+     * assertion that keeps it there.
+     *
+     * The three states come from the scope authored above: an entry, an `out` entry
+     * beaten by a hand label, and nothing at all.
+     */
+    const assets = rowsOf(await list());
+    const stateOf = (identity: string) =>
+      assets.find((asset) => asset["identity"] === identity);
+
+    const covered = stateOf("portal.acme.test:443");
+    expect(covered?.["scope_state"]).toBe("in");
+    expect(covered?.["scope_detail"]).toBe(
+      "in scope: acme.test and every subdomain",
+    );
+
+    const uncovered = stateOf("api.acme-cdn.test:80");
+    expect(uncovered?.["scope_state"]).toBe("out");
+    expect(uncovered?.["scope_detail"]).toContain(
+      "not covered by any in-scope entry",
+    );
+
+    // The hand label outranks the typed entry here exactly as it does on the write and
+    // on the screen, because all three read the one ladder.
+    const promoted = stateOf("GET https://blog.acme.test:443/wp-login.php");
+    expect(promoted?.["scope_state"]).toBe("in");
+    expect(promoted?.["scope_detail"]).toContain(
+      "in scope, set by hand on blog.acme.test",
+    );
+
+    // Nothing is withheld on account of any of it: every stored asset is in the answer.
+    expect(assets).toHaveLength((await storedAssets()).length);
   });
 
   test("an asset two operations found is one row carrying both discoveries", async () => {

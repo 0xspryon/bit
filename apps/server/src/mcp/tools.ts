@@ -41,6 +41,7 @@
  */
 import {
   AssetKind,
+  describeScopeState,
   RecordAssetInputWire,
   RecordAssetResultWire,
   RecordObservationInputWire,
@@ -228,6 +229,22 @@ export const AssetListingWire = Schema.Struct({
   discoveries: Schema.Int,
   /** The attempt that found it first. Null only if no discovery row exists. */
   first_attempt_id: Schema.NullOr(Schema.String),
+  /**
+   * Whether this asset is inside the client's authorized estate.
+   *
+   * **This field is the other half of D10.** Returning an out-of-scope row is only half
+   * the rule; the rule is that it comes back *labelled*. The whole argument for
+   * returning it is that an agent which cannot see a host is a known one will rediscover
+   * it — and an agent that can see the host but not that it is excluded will go on to
+   * test it, which is worse. One field per row closes both.
+   *
+   * The same two fields `record_asset` reports on the write, from the same ladder and the
+   * same renderer, so the answer an agent is given when it records a host and the answer
+   * it is given when it lists the estate cannot differ.
+   */
+  scope_state: Schema.Literals(["in", "out"]),
+  /** What decided `scope_state`, in words: an entry, a hand label, or nothing at all. */
+  scope_detail: Schema.String,
 });
 
 export const ListAssetsOutcome = Schema.Struct({
@@ -250,6 +267,11 @@ export const LIST_ASSETS_DESCRIPTION = [
   "will find it again, and again, with nothing telling it the host is known. Seeing an",
   "asset here is not authorization to test it: what you may test is what the authorized",
   "scope covers, and that is stated in your prompt.",
+  "",
+  "Every row carries scope_state and scope_detail, which say whether the operator's",
+  "scope covers it and what decided that — an entry they typed, a label they set by",
+  "hand, or nothing at all. Read them before you act on a row: out means recorded and",
+  "known, not authorized.",
   "",
   "identity is what uniqueness is on. For a host it is host:port; for an endpoint it is",
   "METHOD scheme//host:port/path, with the query string and fragment excluded. Two URLs",
@@ -531,17 +553,24 @@ export const WorkerToolkitLayer = WorkerToolkit.toLayer(
                 detail: refusal.detail,
               }),
           },
-          (store) => store.assetsWithProvenance(),
+          /*
+           * `assetsWithScope` rather than `assetsWithProvenance`, because the label is
+           * part of the answer.
+           *
+           * It is the one read that implements the D5 ladder — asset label over host
+           * label over entries — and D5 says plainly that no caller should assemble it.
+           * Mapping the rows here and deciding their state here would have been a second
+           * implementation of the ladder on the agent's side of the house, which is the
+           * anti-goal about two code paths that can disagree. It also filters to this
+           * target's own rows, which is what the credential already means.
+           */
+          (store) => store.assetsWithScope(caller.targetId),
         );
-        // Filtered before it is counted, so `total` and `assets.length` cannot disagree.
-        // The filter removes nothing on a healthy file — a target's assets live in that
-        // target's own database — and what it guards is a misfiled row.
-        const mine = assets.filter(
-          (asset) => asset.target_id === caller.targetId,
-        );
+        // Counted off the same array it returns, so `total` and `assets.length` cannot
+        // disagree.
         return {
-          total: mine.length,
-          assets: mine.map((asset) => ({
+          total: assets.length,
+          assets: assets.map(({ asset, scope }) => ({
             asset_id: asset.id,
             kind:
               asset.kind === "endpoint"
@@ -554,6 +583,8 @@ export const WorkerToolkitLayer = WorkerToolkit.toLayer(
             path: asset.path,
             discoveries: asset.discoveries,
             first_attempt_id: asset.first_attempt_id,
+            scope_state: scope.state,
+            scope_detail: describeScopeState(scope),
           })),
         };
       }),
