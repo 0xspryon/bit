@@ -38,6 +38,7 @@ import {
   OUTBOX_RECOVERY_POLICIES,
   Observation,
   ObservationTestCase,
+  ImportAssetResult,
   RecordAssetResult,
   RecordObservationResult,
   SummaryObservationConditions,
@@ -73,6 +74,7 @@ import {
   type OutboxRequestType,
   type AssetScopeLabel,
   type HostScopeLabel,
+  type ImportAssetInput,
   type RecordAssetInput,
   type RecordedEvent,
   type ScopeEntry,
@@ -1556,15 +1558,37 @@ export interface StoredAsset {
  * One asset with the provenance aggregate a reader shows beside it.
  *
  * The asset's own columns, plus what `asset_discoveries` says about how it came to be
- * known. The three nullable fields are nullable because the schema cannot promise a
- * discovery row exists — `recordAsset` always writes one in the same transaction, so an
- * asset with none came from somewhere else and is reported as such rather than refused.
+ * known. The three nullable fields are nullable because an asset need not have been
+ * *discovered*: `recordAsset` always writes a discovery in the same transaction, but
+ * `importAsset` never writes one at all (D14), so an imported host reads as zero
+ * discoveries and no attempt until a worker finds it. Reported as it is rather than
+ * refused or filled in.
  */
 export interface StoredAssetWithProvenance extends StoredAsset {
   readonly discoveries: number;
   readonly first_attempt_id: string | null;
   readonly first_intent_id: string | null;
   readonly last_discovered_at: number | null;
+}
+
+/**
+ * One recorded import of an asset, which a merge never overwrites.
+ *
+ * {@link StoredAssetDiscovery}'s sibling, and the fields that differ are the reason there
+ * are two tables (D14): a discovery names the intent and attempt that found the asset, an
+ * import names the page it was read off. Neither shape has the other's fields, so no
+ * reader has to ask whether this row's attempt is missing or merely null.
+ */
+export interface StoredAssetImport {
+  readonly asset_id: string;
+  readonly operation_id: string;
+  readonly caller_scope: string;
+  /** The program page this asset was read off. */
+  readonly source_url: string;
+  /** The submission verbatim, before normalisation — `discovered_as`' sibling. */
+  readonly imported_as: string;
+  readonly note: string;
+  readonly imported_at: number;
 }
 
 /** One recorded discovery of an asset, which a merge never overwrites. */
@@ -3243,6 +3267,234 @@ const makeStore = Effect.fnUntraced(function* () {
             },
             causedByEventId: event.eventId,
             enqueuedAt: recordedAt,
+          });
+
+          return result;
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
+  const countImports = SqlSchema.findOne({
+    Request: Schema.String,
+    Result: CountRow,
+    execute: (assetId) =>
+      sql`SELECT COUNT(*) AS value FROM asset_imports
+          WHERE asset_id = ${assetId}`,
+  });
+
+  /**
+   * Records one asset the scope importer read off a program page (D14).
+   *
+   * {@link recordAsset}'s sibling, and the differences are the decision rather than
+   * convenience.
+   *
+   * **The caller is the operator's authority, not an attempt's.** A {@link HostContext},
+   * the same thing `addScopeEntry` and `setHostScopeLabel` take, so there is no credential
+   * path that reaches here at all — which is what makes this write available to the
+   * importer in the first place. `recordAsset` opens with `attemptCallerOrFail` and this
+   * deliberately does not: there is no attempt to authenticate, because the importer
+   * finishes before any goal, intent or attempt exists. The target comes from the caller
+   * and never from the payload, exactly as it does for a worker.
+   *
+   * **The provenance row goes in `asset_imports`, and `asset_discoveries` is untouched.**
+   * Its `intent_id` and `attempt_id` stay `NOT NULL`: see `0023`'s commentary for why the
+   * invariant is worth a second table, and `0010`'s for what the invariant buys.
+   *
+   * **The `assets` row is the same row a worker would have written.** Same
+   * `assetIdentityOf`, same unique index, same `ON CONFLICT DO NOTHING` followed by a
+   * read. So a host this imports and the same host a worker later discovers are one asset
+   * with one row in each provenance table, in either order — and `created: false` with
+   * `imports: 1` is what "the worker got here first" looks like from this side.
+   *
+   * **Retry semantics are `recordAsset`'s**, keyed on `operationId` under the operator's
+   * scope: an exact retry replays the stored result having written nothing, and the same
+   * id with different input is a `conflict`. The primary key on `(asset_id, operation_id)`
+   * is the schema half of the same claim.
+   *
+   * **It enqueues no `asset.enrich` request, and that is a decision.** `recordAsset` does,
+   * because a worker's discovery happens inside a live hunt. An import happens at target
+   * creation, and D13's control rests on one property: creating a target starts no work,
+   * so the operator's review of the imported scope sits in a real gap before the first
+   * execution. Enrichment is "resolving a name, fingerprinting a service"
+   * (`contracts/event.ts`) — traffic to the client's estate. Queuing it here would put
+   * work against a scraped host *before* the person reviewing the scrape saw it, which is
+   * the one thing that property exists to prevent. The asset can be enriched when a hunt
+   * reaches it.
+   */
+  const importAsset = Effect.fn("ObservationStore.importAsset")(function* (
+    caller: HostContext,
+    input: ImportAssetInput,
+  ) {
+    const importedAt = yield* Clock.currentTimeMillis;
+    const key = `${caller.callerScope}:import_asset:${input.operationId}`;
+    const requestHash = hashRequest(caller, input);
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const existing = yield* findReceipt(key).pipe(
+            Effect.mapError(lift("command_receipts", key)),
+          );
+          if (Option.isSome(existing)) {
+            const receipt = existing.value;
+            if (receipt.request_hash !== requestHash) {
+              return yield* new MutationError({
+                reason: "conflict",
+                detail: `operation ${input.operationId} was already used with different input`,
+              });
+            }
+            const original = yield* replayResult(
+              key,
+              ImportAssetResult,
+              receipt.result,
+            );
+            return { ...original, replayed: true };
+          }
+
+          const identity = assetIdentityOf(input);
+          if (isAssetIdentityRefusal(identity)) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: identity.detail,
+            });
+          }
+
+          /*
+           * The merge, and **`created` read off the insert rather than off a timestamp.**
+           *
+           * `ON CONFLICT DO NOTHING RETURNING id` yields one row when this statement wrote
+           * the asset and no rows when the unique index already held it, which is the
+           * exact fact `created` is supposed to report. `recordAsset` derives the same
+           * boolean by comparing the stored `first_seen_at` to its own clock reading, and
+           * that is true only as long as no two writes share a millisecond. An importer is
+           * precisely the caller that breaks it: it records every host off one page in one
+           * loop, so same-millisecond writes are the normal case rather than a race, and a
+           * second import of a host already imported would report `created: true`.
+           *
+           * (That derivation is `recordAsset`'s and is left alone here — it is outside this
+           * slice — but it is a real latent bug there, and `store.test.ts`'s endpoint-merge
+           * test fails intermittently on a fast machine because of it.)
+           */
+          const inserted = yield* sql<{
+            readonly id: string;
+          }>`INSERT INTO assets (
+              id, target_id, kind, identity, host, port, scheme, method, path,
+              first_seen_at
+            ) VALUES (
+              ${identifier.newAssetId()}, ${caller.targetId}, ${identity.kind},
+              ${identity.identity}, ${identity.host}, ${identity.port},
+              ${identity.scheme}, ${identity.method}, ${identity.path},
+              ${importedAt}
+            )
+            ON CONFLICT(target_id, kind, identity) DO NOTHING
+            RETURNING id`.pipe(Effect.mapError(asDatabaseError("transaction")));
+          const created = inserted.length > 0;
+          const stored = created
+            ? undefined
+            : yield* findAssetByIdentity({
+                targetId: caller.targetId,
+                kind: identity.kind,
+                identity: identity.identity,
+              }).pipe(Effect.mapError(lift("assets", identity.identity)));
+          const assetId =
+            inserted[0]?.id ??
+            (stored !== undefined && Option.isSome(stored)
+              ? stored.value.id
+              : undefined);
+          if (assetId === undefined) {
+            // Unreachable, for `recordAsset`'s reason: the insert either wrote the row or
+            // the unique index already held it, inside this transaction. Reported rather
+            // than asserted away, because an `ON CONFLICT DO NOTHING` whose row then
+            // cannot be read would mean the index and this query disagree about identity.
+            return yield* new DatabaseError({
+              operation: "transaction",
+              reason: `asset ${identity.identity} was neither inserted nor found`,
+              cause: identity,
+            });
+          }
+
+          yield* sql`INSERT INTO asset_imports (
+              asset_id, operation_id, caller_scope, source_url, imported_as, note,
+              imported_at
+            ) VALUES (
+              ${assetId}, ${input.operationId}, ${caller.callerScope},
+              ${input.sourceUrl}, ${input.url}, ${input.note}, ${importedAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          const imports = yield* countImports(assetId).pipe(
+            Effect.mapError(lift("asset_imports", assetId)),
+          );
+
+          /*
+           * The asset's scope state, from the one ladder read.
+           *
+           * `readScope` and `scopeStateOf`, the same pair `recordAsset` and
+           * `assetsWithScope` use. D3 and D5 both forbid a second implementation of this,
+           * and the importer is the caller with the most to lose from one: it is the thing
+           * that just wrote the entries this is derived from, so a ladder that disagreed
+           * with the Scope tab would be disagreeing with its own work.
+           *
+           * Read inside the transaction, so the state reported is the state as of the
+           * moment the asset landed.
+           */
+          const scope = yield* readScope(caller.targetId);
+          const scopeState = scopeStateOf({
+            entries: scope.entries,
+            hostLabel: scope.hostLabels.get(identity.host),
+            assetLabel: scope.assetLabels.get(assetId),
+            subject: { host: identity.host },
+          });
+
+          const result: ImportAssetResult = {
+            assetId,
+            kind: identity.kind,
+            identity: identity.identity,
+            created,
+            replayed: false,
+            imports: imports.value,
+            scopeState: scopeState.state,
+            scopeDetail: describeScopeState(scopeState),
+          };
+
+          yield* sql`INSERT INTO command_receipts (
+              key, caller_scope, operation, operation_id, request_hash, result,
+              created_at
+            ) VALUES (
+              ${key}, ${caller.callerScope}, 'import_asset', ${input.operationId},
+              ${requestHash}, ${JSON.stringify(result)}, ${importedAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          yield* appendEvent({
+            kind: "asset.imported",
+            targetId: caller.targetId,
+            callerScope: caller.callerScope,
+            /*
+             * Null, and honestly so (§6, and `contracts/event.ts`'s invariant). These two
+             * columns are caller authority, and this caller has none of either kind:
+             * inventing an intent so a column could be filled is the conflation the
+             * separation exists to prevent, and is the same move a nullable
+             * `asset_discoveries.intent_id` would have made in the provenance row.
+             */
+            intentId: null,
+            attemptId: null,
+            operation: "import_asset",
+            operationId: input.operationId,
+            subjectId: assetId,
+            payload: {
+              assetId,
+              kind: identity.kind,
+              identity: identity.identity,
+              created,
+              importedAs: input.url,
+              sourceUrl: input.sourceUrl,
+            },
+            recordedAt: importedAt,
           });
 
           return result;
@@ -6608,6 +6860,44 @@ const makeStore = Effect.fnUntraced(function* () {
     },
   );
 
+  const ImportRow = Schema.Struct({
+    asset_id: Schema.String,
+    operation_id: Schema.String,
+    caller_scope: Schema.String,
+    source_url: Schema.String,
+    imported_as: Schema.String,
+    note: Schema.String,
+    imported_at: Schema.Finite,
+  });
+  const importColumns = Object.keys(ImportRow.fields).join(", ");
+
+  const selectImports = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: ImportRow,
+    execute: (assetId) =>
+      sql.unsafe(
+        `SELECT ${importColumns} FROM asset_imports WHERE asset_id = ?
+         ORDER BY imported_at, operation_id`,
+        [assetId],
+      ),
+  });
+
+  /**
+   * Every import of one asset, in the order they were recorded.
+   *
+   * {@link discoveriesOfAsset}'s sibling, and the second half of "how did this asset come
+   * to be known" — which D14 accepts as a read over two tables rather than one, and
+   * deliberately does not paper over with a union view until a caller wants it. Served by
+   * the primary key, which leads with `asset_id`.
+   */
+  const importsOfAsset = Effect.fn("ObservationStore.importsOfAsset")(
+    function* (assetId: string) {
+      return yield* selectImports(assetId).pipe(
+        Effect.mapError(lift("asset_imports", assetId)),
+      );
+    },
+  );
+
   const AssetWithProvenanceRow = Schema.Struct({
     ...AssetRow.fields,
     /** How many separate operations have recorded this asset. */
@@ -6615,11 +6905,11 @@ const makeStore = Effect.fnUntraced(function* () {
     /**
      * The attempt that found it first, and the intent that attempt was working.
      *
-     * Nullable only because the schema cannot promise otherwise. `recordAsset` writes a
-     * discovery row in the same transaction as the asset, so every asset this build
-     * writes has at least one; an asset with none would be a row some other writer put
-     * there, and reporting it as "no recorded discovery" is better than refusing to read
-     * the file.
+     * Null for an asset no attempt found, which is a real and intended case rather than a
+     * schema shortfall: the scope importer records its assets through `importAsset`, whose
+     * provenance row is in `asset_imports` and whose authority is the operator's (D14).
+     * `recordAsset` writes a discovery in the same transaction as the asset, so anything a
+     * worker found has at least one.
      */
     first_attempt_id: Schema.NullOr(Schema.String),
     first_intent_id: Schema.NullOr(Schema.String),
@@ -7282,6 +7572,7 @@ const makeStore = Effect.fnUntraced(function* () {
     recentRecoveries,
     seedAttempt,
     recordAsset,
+    importAsset,
     addIntent,
     addRoundIntent,
     openGoal,
@@ -7308,6 +7599,7 @@ const makeStore = Effect.fnUntraced(function* () {
     setAssetScopeLabel,
     clearAssetScopeLabel,
     discoveriesOfAsset,
+    importsOfAsset,
     settleAttempt,
     bindSessionToAttempt,
     recordObservation,
@@ -7418,6 +7710,21 @@ export class ObservationStore extends Context.Service<
       input: RecordAssetInput,
     ) => Effect.Effect<
       RecordAssetResult,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /**
+     * Records one asset the scope importer read off a program page, under the operator's
+     * own authority and with no intent or attempt in sight (D14).
+     *
+     * Same asset identity as {@link recordAsset} and a provenance row in `asset_imports`
+     * instead of `asset_discoveries`. `conflict` is the reused `operationId`, `invalid` is
+     * an identity refusal; see the implementation for why it queues no enrichment.
+     */
+    readonly importAsset: (
+      caller: HostContext,
+      input: ImportAssetInput,
+    ) => Effect.Effect<
+      ImportAssetResult,
       MutationError | DatabaseError | StoredRowError
     >;
     readonly addIntent: (
@@ -7650,6 +7957,13 @@ export class ObservationStore extends Context.Service<
       assetId: string,
     ) => Effect.Effect<
       readonly StoredAssetDiscovery[],
+      DatabaseError | StoredRowError
+    >;
+    /** Every import of one asset: the other half of its provenance (D14). */
+    readonly importsOfAsset: (
+      assetId: string,
+    ) => Effect.Effect<
+      readonly StoredAssetImport[],
       DatabaseError | StoredRowError
     >;
     readonly settleAttempt: (
