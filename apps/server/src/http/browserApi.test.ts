@@ -772,6 +772,75 @@ describe("creating a target", () => {
     ).not.toContain("should-not-exist");
   });
 
+  /**
+   * **D13's load-bearing property, asserted through the real creation route.**
+   *
+   * The operator's review of an imported scope is the only control on it, and that review
+   * is a real step only because there is a genuine gap between the import and the first
+   * execution. The design says so in the strongest terms it uses anywhere: anything that
+   * later starts work as part of creating a target — a default goal, an auto-run, a "start
+   * hunting" affordance on the creation screen — removes the only thing standing between a
+   * scraped page and a live hunt, and if that is ever wanted the review has to become an
+   * explicit confirmation step first.
+   *
+   * So this is checked where such a thing would be added: the handler, over HTTP, with
+   * program links on the payload. It reads the target's own database for the four tables a
+   * started hunt would have written to, and the live run list for a fiber nobody asked for.
+   */
+  test("creating a target starts no goal and no run, links or no links", async () => {
+    // Made here rather than in the shared setup, so the folder picker's own test keeps
+    // asserting the exact directory list it was written against.
+    mkdirSync(join(workspaceRoot, "quiet"), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: {
+          workspacePath: join(workspaceRoot, "quiet"),
+          name: "quiet-corp",
+          scopeNote: "",
+          // Links are given, so this is the path that *would* start something.
+          programLinks: [
+            "https://hackerone.com/quiet/policy",
+            "https://bugcrowd.com/quiet-corp",
+          ],
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+    expect(
+      (created.body["target"] as Record<string, unknown>)["available"],
+    ).toBe(true);
+
+    // This suite configures no harness, so no import could be started and the response
+    // says why in a sentence the screen shows as a toast. The target is created either
+    // way, which is D15's rule and is the same outcome as every link failing.
+    expect(created.body["scopeImport"]).toBeNull();
+    expect(String(created.body["importDetail"])).toContain(
+      "The target is created",
+    );
+
+    // Nothing in the target's own file. A goal, an intent or an attempt here would mean
+    // creation had begun work.
+    const view = await read(await signedIn("/targets/quiet-corp"));
+    expect(view.status).toBe(200);
+    expect(view.body["counts"]).toMatchObject({
+      goals: 0,
+      intents: 0,
+      attempts: 0,
+      observations: 0,
+    });
+
+    // And no run was forked. `runs` is the supervisor's live list, so a non-empty one here
+    // would be a hunt the operator never started.
+    const runs = await read(await signedIn("/runs"));
+    expect(runs.status).toBe(200);
+    expect(
+      (runs.body as unknown as ReadonlyArray<{ targetId: string }>).filter(
+        (row) => row.targetId === "quiet-corp",
+      ),
+    ).toEqual([]);
+  });
+
   test("a target whose file cannot migrate is created, unavailable, and alone in that", async () => {
     const created = await read(
       await signedIn("/targets", {
