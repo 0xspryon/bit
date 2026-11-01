@@ -9,6 +9,7 @@ export * from "./modelOption";
 export * from "./observation";
 export * from "./briefing";
 export * from "./asset";
+export * from "./scope";
 export * from "./intent";
 export * from "./goal";
 export * from "./plan";
