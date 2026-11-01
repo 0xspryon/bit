@@ -546,3 +546,111 @@ describe("what is refused", () => {
     expect(outcome.text).toContain("kind");
   });
 });
+
+/* ── Reading back what the hunt has found ────────────────────────────────────────── */
+
+describe("list_assets", () => {
+  const list = async (): Promise<ToolOutcome> =>
+    outcomeOf(
+      (await rpc("tools/call", { name: "list_assets", arguments: {} })).body,
+    );
+
+  const rowsOf = (
+    outcome: ToolOutcome,
+  ): ReadonlyArray<Record<string, unknown>> =>
+    outcome.data["assets"] as ReadonlyArray<Record<string, unknown>>;
+
+  test("it is offered to a worker and takes no arguments", async () => {
+    const tools = (
+      (await rpc("tools/list", {})).body?.["result"] as {
+        tools?: Array<{
+          name: string;
+          description: string;
+          inputSchema: { properties?: Record<string, unknown> };
+        }>;
+      }
+    )?.tools;
+    const tool = tools?.find((listed) => listed.name === "list_assets");
+    expect(tool).toBeDefined();
+    // `Tool.EmptyParams`: there is no filter and no cursor, so there is nothing to send.
+    expect(Object.keys(tool?.inputSchema.properties ?? {})).toEqual([]);
+    // D10, in the words the agent reads.
+    expect(tool?.description).toContain("Nothing is withheld from this list");
+  });
+
+  test("a worker reads back everything recorded, including what no entry covers", async () => {
+    const outcome = await list();
+    expect(outcome.isError).toBe(false);
+    const assets = rowsOf(outcome);
+
+    // `total` is the length of the list beside it, not a separate count that could drift.
+    expect(outcome.data["total"]).toBe(assets.length);
+    expect(assets.length).toBe((await storedAssets()).length);
+
+    const identities = assets.map((asset) => String(asset["identity"]));
+    /*
+     * Recorded earlier in this file: a host, an endpoint, and the host that no in-scope
+     * entry covers.
+     *
+     * D10 is that the third is returned like the others rather than silently dropped.
+     * ScopeWeaver's `GetByIDsInScope` removes out-of-scope ids from a read so "an agent
+     * cannot reach out-of-scope assets by id", and *silently* is the problem: an agent
+     * that cannot see a host it already found will find it again, and again, because
+     * nothing tells it the host is known.
+     */
+    expect(identities).toContain("app.acme.test:443");
+    expect(identities).toContain("GET https://app.acme.test:443/v1/orders");
+    expect(identities).toContain("api.acme-cdn.test:80");
+  });
+
+  test("each row carries the identity's parts and how it came to be known", async () => {
+    const assets = rowsOf(await list());
+    const endpoint = assets.find(
+      (asset) =>
+        asset["identity"] === "GET https://app.acme.test:443/v1/orders",
+    );
+    expect(endpoint?.["kind"]).toBe("endpoint");
+    // The parts sit beside the identity rather than being re-parsed from it, so a reader
+    // never has to split a string to answer "which host is this".
+    expect(endpoint?.["host"]).toBe("app.acme.test");
+    expect(endpoint?.["port"]).toBe(443);
+    expect(endpoint?.["method"]).toBe("GET");
+    expect(endpoint?.["path"]).toBe("/v1/orders");
+    // The provenance aggregate: the attempt that found it first, taken from the
+    // credential and not from anything the model sent.
+    expect(endpoint?.["first_attempt_id"]).toBe(BINDING.attemptId);
+    expect(endpoint?.["discoveries"]).toBe(1);
+
+    const host = assets.find(
+      (asset) => asset["identity"] === "app.acme.test:443",
+    );
+    expect(host?.["kind"]).toBe("host");
+    // A host has no method and no path, and the row says so rather than omitting them.
+    expect(host?.["method"]).toBeNull();
+    expect(host?.["path"]).toBeNull();
+  });
+
+  test("an asset two operations found is one row carrying both discoveries", async () => {
+    const assets = rowsOf(await list());
+    const shared = assets.filter(
+      (asset) => asset["identity"] === "shared.acme.test:443",
+    );
+    // One row, two discoveries — not two rows. The merge is what canonical identity is
+    // for, and the count is what keeps the merge visible rather than lossy.
+    expect(shared).toHaveLength(1);
+    expect(shared[0]?.["discoveries"]).toBe(2);
+  });
+
+  test("a rolled-back operation left nothing for the list to show", async () => {
+    const identities = rowsOf(await list()).map((asset) =>
+      String(asset["identity"]),
+    );
+    // The reused operation id earlier in this file was refused as a conflict, and its
+    // transaction rolled back. The asset it would have created is not here.
+    expect(identities).not.toContain("other.acme.test:443");
+    // Nor is the one whose URL could not be parsed into an identity at all.
+    expect(
+      identities.filter((identity) => identity.startsWith("app.acme.test:443")),
+    ).toHaveLength(1);
+  });
+});

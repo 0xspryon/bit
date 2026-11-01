@@ -40,6 +40,7 @@
  * inconclusive, and provenance is not the worker's to supply.
  */
 import {
+  AssetKind,
   RecordAssetInputWire,
   RecordAssetResultWire,
   RecordObservationInputWire,
@@ -208,6 +209,80 @@ export const RecordAsset = Tool.make("record_asset", {
 }).addDependency(McpInvocation);
 
 /**
+ * One asset as `list_assets` reports it.
+ *
+ * snake_case, like every other MCP payload, and declared here rather than in contracts
+ * because nothing in the browser reads it — the browser has its own camelCase `AssetView`
+ * over the same row. Two shapes over one row is deliberate: the agent needs the identity
+ * and how it came to be known, and the screen needs fields to group and sort by.
+ */
+export const AssetListingWire = Schema.Struct({
+  asset_id: Schema.String,
+  kind: AssetKind,
+  identity: Schema.String,
+  host: Schema.String,
+  port: Schema.Int,
+  method: Schema.NullOr(Schema.String),
+  path: Schema.NullOr(Schema.String),
+  /** How many separate operations have recorded it. */
+  discoveries: Schema.Int,
+  /** The attempt that found it first. Null only if no discovery row exists. */
+  first_attempt_id: Schema.NullOr(Schema.String),
+});
+
+export const ListAssetsOutcome = Schema.Struct({
+  /** How many assets this target holds. The same number as `assets.length`. */
+  total: Schema.Int,
+  assets: Schema.Array(AssetListingWire),
+});
+
+export const LIST_ASSETS_DESCRIPTION = [
+  "Every asset recorded on this target so far, oldest first: what the whole hunt has",
+  "found, not only what you found.",
+  "",
+  "Read it before recording. An asset already here does not need recording again, and",
+  "a host somebody else already found is a host you can start from rather than",
+  "rediscover. Recording it again is harmless — a second discovery on a known asset is",
+  "new provenance and is kept — but it is a call you did not need to make.",
+  "",
+  "Nothing is withheld from this list. An asset outside the authorized scope is",
+  "returned like any other, because an agent that cannot see a host it already found",
+  "will find it again, and again, with nothing telling it the host is known. Seeing an",
+  "asset here is not authorization to test it: what you may test is what the authorized",
+  "scope covers, and that is stated in your prompt.",
+  "",
+  "identity is what uniqueness is on. For a host it is host:port; for an endpoint it is",
+  "METHOD scheme//host:port/path, with the query string and fragment excluded. Two URLs",
+  "that differ only by a query parameter are one asset here.",
+  "",
+  "The whole list comes back in one answer; there is no paging and no filter.",
+].join("\n");
+
+/**
+ * A refusal of the read.
+ *
+ * Its own class rather than {@link RecordAssetRefused}, because a read has no `conflict`
+ * and no `stale`: there is no receipt to collide with and no write authority to have
+ * been superseded. A reason a tool can never return is a reason a model may still plan
+ * for, so the list is the list this tool can actually produce.
+ */
+export class ListAssetsRefused extends Schema.TaggedError<ListAssetsRefused>()(
+  "ListAssetsRefused",
+  {
+    reason: Schema.Literals(["unauthorized", "stored", "unavailable"]),
+    detail: Schema.String,
+  },
+) {}
+
+export const ListAssets = Tool.make("list_assets", {
+  description: LIST_ASSETS_DESCRIPTION,
+  parameters: Tool.EmptyParams,
+  success: ListAssetsOutcome,
+  failure: ListAssetsRefused,
+  failureMode: "return",
+}).addDependency(McpInvocation);
+
+/**
  * The worker's toolkit, and only the worker's.
  *
  * **One tool, and the narrowness is now the point rather than an accident of there being
@@ -226,7 +301,11 @@ export const RecordAsset = Tool.make("record_asset", {
  * an attempt's, by the shape of `asset_discoveries`, and no other role has an attempt to
  * record one against.
  */
-export const WorkerToolkit = Toolkit.make(RecordObservation, RecordAsset);
+export const WorkerToolkit = Toolkit.make(
+  RecordObservation,
+  RecordAsset,
+  ListAssets,
+);
 
 /** The reasons both worker tools refuse with. One list, so the two cannot diverge. */
 type WorkerRefusalReason =
@@ -240,17 +319,19 @@ type WorkerRefusalReason =
  * sibling for the round's tools, and this is deliberately the same shape: a structurally
  * typed view of the failure, a `switch` on its tag, and no hand-narrowing of the union.
  *
- * `noun` is what keeps the sentences specific. A worker has to be able to read "this
- * observation was NOT recorded" or "this asset was NOT recorded" and know which of its
- * calls is being talked about, so the noun is a parameter rather than a word baked into
- * one copy of the text.
+ * `consequence` is what keeps the sentences specific, and it is a whole clause rather
+ * than a noun because the three tools have two different consequences. A worker has to
+ * read "this asset was NOT recorded" after a failed write and "nothing was read" after a
+ * failed read; a shared noun would have produced "this asset was NOT recorded" for a
+ * list call, which is false and is the kind of sentence that makes an agent retry a
+ * write it never made.
  *
  * Two cases are not a flattening, and they are why this is a `switch` rather than a
  * passthrough. A `MutationError` keeps its own four reasons, because `conflict`,
  * `stale`, `unauthorized` and `invalid` lead a worker to four different next actions.
- * And a `DatabaseError` becomes `unavailable` with a sentence saying nothing was
- * recorded — a worker that cannot tell its write did not land is a worker that carries
- * on as though it had.
+ * And a `DatabaseError` becomes `unavailable` with a sentence naming the consequence — a
+ * worker that cannot tell its write did not land is a worker that carries on as though
+ * it had.
  */
 const workerRefusal = (
   failure: {
@@ -260,7 +341,7 @@ const workerRefusal = (
     readonly message?: string;
     readonly targetId?: string;
   },
-  noun: string,
+  consequence: string,
 ): { readonly reason: WorkerRefusalReason; readonly detail: string } => {
   switch (failure._tag) {
     case "MutationError": {
@@ -295,12 +376,12 @@ const workerRefusal = (
     case "FleetError":
       return {
         reason: "unavailable",
-        detail: `the store for target '${failure.targetId ?? "unknown"}' could not be opened, so this ${noun} was NOT recorded: ${failure.detail ?? failure.message ?? "no detail"}`,
+        detail: `the store for target '${failure.targetId ?? "unknown"}' could not be opened, so ${consequence}: ${failure.detail ?? failure.message ?? "no detail"}`,
       };
     default:
       return {
         reason: "unavailable",
-        detail: `the control-plane store could not be written; this ${noun} was NOT recorded`,
+        detail: `this target's database could not be reached, so ${consequence}`,
       };
   }
 };
@@ -323,7 +404,8 @@ const onWorkersStore = <A, E>(
   options: {
     readonly targetId: string;
     readonly tool: string;
-    readonly noun: string;
+    /** The clause the refusal ends with: what did or did not happen to the caller's call. */
+    readonly consequence: string;
     readonly refuse: (input: {
       readonly reason: WorkerRefusalReason;
       readonly detail: string;
@@ -342,7 +424,7 @@ const onWorkersStore = <A, E>(
 ): Effect.Effect<A, E> =>
   withTargetStore(stores, options.targetId, body).pipe(
     Effect.catch((error) => {
-      const refusal = workerRefusal(error, options.noun);
+      const refusal = workerRefusal(error, options.consequence);
       return refusal.reason === "unavailable"
         ? Effect.andThen(
             Effect.logError(`${options.tool} could not reach the store`, {
@@ -397,7 +479,7 @@ export const WorkerToolkitLayer = WorkerToolkit.toLayer(
           {
             targetId: caller.targetId,
             tool: "record_observation",
-            noun: "observation",
+            consequence: "this observation was NOT recorded",
             refuse: (refusal) => new RecordObservationRefused(refusal),
           },
           (store) => store.recordObservation(caller, input),
@@ -410,11 +492,70 @@ export const WorkerToolkitLayer = WorkerToolkit.toLayer(
           {
             targetId: caller.targetId,
             tool: "record_asset",
-            noun: "asset",
+            consequence: "this asset was NOT recorded",
             refuse: (refusal) => new RecordAssetRefused(refusal),
           },
           (store) => store.recordAsset(caller, input),
         );
+      }),
+      /**
+       * The estate, as the whole hunt has recorded it.
+       *
+       * No scope filter and no paging. D10 is explicit that scope state is never a filter
+       * on what the agent can read: ScopeWeaver drops out-of-scope ids from a read
+       * *silently*, and silently is the problem — an agent that cannot see a host it
+       * already found will find it again, because nothing tells it the host is known.
+       * Returning the row removes the rediscovery loop.
+       *
+       * The caller's target is the credential's, so there is no argument here that
+       * reaches another engagement's estate.
+       */
+      list_assets: Effect.fn("list_assets")(function* () {
+        const caller = yield* McpInvocation;
+        const assets = yield* onWorkersStore(
+          stores,
+          {
+            targetId: caller.targetId,
+            tool: "list_assets",
+            consequence: "nothing was read",
+            refuse: (refusal) =>
+              new ListAssetsRefused({
+                // `conflict` and `stale` cannot reach a read, so they are not in this
+                // tool's reason list. Mapped to `unavailable` rather than widened: a
+                // reason that cannot happen is better absent than declared.
+                reason:
+                  refusal.reason === "unauthorized" ||
+                  refusal.reason === "stored"
+                    ? refusal.reason
+                    : "unavailable",
+                detail: refusal.detail,
+              }),
+          },
+          (store) => store.assetsWithProvenance(),
+        );
+        // Filtered before it is counted, so `total` and `assets.length` cannot disagree.
+        // The filter removes nothing on a healthy file — a target's assets live in that
+        // target's own database — and what it guards is a misfiled row.
+        const mine = assets.filter(
+          (asset) => asset.target_id === caller.targetId,
+        );
+        return {
+          total: mine.length,
+          assets: mine.map((asset) => ({
+            asset_id: asset.id,
+            kind:
+              asset.kind === "endpoint"
+                ? ("endpoint" as const)
+                : ("host" as const),
+            identity: asset.identity,
+            host: asset.host,
+            port: asset.port,
+            method: asset.method,
+            path: asset.path,
+            discoveries: asset.discoveries,
+            first_attempt_id: asset.first_attempt_id,
+          })),
+        };
       }),
     });
   }),

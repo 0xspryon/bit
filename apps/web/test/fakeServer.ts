@@ -796,6 +796,15 @@ export class FakeServer implements ServerClient {
   onGoals: (baseUrl: string, targetId: string) => Answer<"goals"> = () =>
     ok({ goals: [] });
 
+  /**
+   * The estate read. Empty by default, like every other list here.
+   *
+   * A target with nothing found yet is the state most tests want, and "nothing recorded"
+   * is a fact a screen has to render differently from "not read yet".
+   */
+  onAssets: (baseUrl: string, targetId: string) => Answer<"assets"> = () =>
+    ok({ assets: [] });
+
   onCreateGoal: (
     ...args: Parameters<ServerClient["createGoal"]>
   ) => Answer<"createGoal"> = (_baseUrl, targetId, draft) =>
@@ -1000,6 +1009,11 @@ export class FakeServer implements ServerClient {
   goals = (baseUrl: string, targetId: string) =>
     this.record("goals", [baseUrl, targetId], () =>
       this.onGoals(baseUrl, targetId),
+    );
+
+  assets = (baseUrl: string, targetId: string) =>
+    this.record("assets", [baseUrl, targetId], () =>
+      this.onAssets(baseUrl, targetId),
     );
 
   createGoal = (...args: Parameters<ServerClient["createGoal"]>) =>

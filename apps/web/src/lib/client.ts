@@ -437,6 +437,20 @@ export const server = {
     ),
 
   /**
+   * Every asset recorded on the open target, oldest first.
+   *
+   * The whole estate in one answer, with nothing filtered: an asset no in-scope entry
+   * covers comes back like any other, and the state it is shown under is decided from the
+   * scope rather than by the server deciding what the operator may see.
+   */
+  assets: (baseUrl: string, targetId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.assets({ params: { targetId } }),
+      ),
+    ),
+
+  /**
    * Creates a goal. The draft carries an objective and an optional label and **no id**:
    * the server mints the goal id and the operation id, and this client has no way to name
    * either.

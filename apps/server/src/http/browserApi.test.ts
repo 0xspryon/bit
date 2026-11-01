@@ -3613,3 +3613,260 @@ describe("a live connection that has nothing to say", () => {
     expect(LIVE_SILENCE_LIMIT_SECONDS).toBeGreaterThan(LIVE_HEARTBEAT_SECONDS);
   });
 });
+
+/**
+ * The assets route: the estate, not a count of it.
+ *
+ * Before this route the browser could see only `counts.assets` — a number with nothing
+ * behind it — so an operator could watch the estate's size change and never see what was
+ * in it. These tests are about what the route returns and, more importantly, what it does
+ * *not* withhold.
+ *
+ * Seeded with `bun:sqlite` rather than through the store, for the reason the counts
+ * fixture gives: `recordAsset` demands an attempt, a credential and a write fence, and
+ * none of that is what this is about. The MCP side of recording is tested against a real
+ * attempt in `mcp/recordAsset.test.ts`.
+ *
+ * It registers its **own** two targets rather than reusing `acme-corp`, because a test
+ * above deletes that target's directory to prove the rail survives it. Borrowing a
+ * fixture another test destroys is how a suite acquires an order dependency.
+ */
+describe("a target's assets", () => {
+  const withRows = "assets-estate";
+  const empty = "assets-empty";
+
+  const register = async (name: string) => {
+    mkdirSync(join(workspaceRoot, name), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: {
+          workspacePath: join(workspaceRoot, name),
+          name,
+          scopeNote: "",
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+  };
+
+  const seed = (targetId: string) => {
+    const database = new Database(
+      join(fleetRoot, "targets", targetId, HUNT_FILE),
+    );
+    try {
+      database.run(
+        "INSERT INTO goals (id, target_id, description, created_at) VALUES (?, ?, ?, ?)",
+        ["goal_assets", targetId, "seeded for the assets route", 1],
+      );
+      database.run(
+        `INSERT INTO intents (id, goal_id, target_id, question, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        ["intent_assets", "goal_assets", targetId, "what is out there?", 2],
+      );
+      database.run(
+        `INSERT INTO attempts (
+           id, intent_id, target_id, worker_id, harness_session_id,
+           provider_id, model_id, status, started_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'settled', ?)`,
+        [
+          "attempt_assets",
+          "intent_assets",
+          targetId,
+          "worker_seed",
+          "ses_seed",
+          "openai",
+          "gpt-5.6-sol",
+          3,
+        ],
+      );
+
+      const asset = (
+        id: string,
+        kind: string,
+        identity: string,
+        host: string,
+        port: number,
+        scheme: string | null,
+        method: string | null,
+        path: string | null,
+        firstSeenAt: number,
+      ) => {
+        database.run(
+          `INSERT INTO assets (
+             id, target_id, kind, identity, host, port, scheme, method, path,
+             first_seen_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            id,
+            targetId,
+            kind,
+            identity,
+            host,
+            port,
+            scheme,
+            method,
+            path,
+            firstSeenAt,
+          ],
+        );
+      };
+      const discovery = (
+        assetId: string,
+        operationId: string,
+        discoveredAs: string,
+        discoveredAt: number,
+      ) => {
+        database.run(
+          `INSERT INTO asset_discoveries (
+             asset_id, operation_id, caller_scope, intent_id, attempt_id,
+             discovered_as, note, discovered_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            assetId,
+            operationId,
+            `${targetId}/attempt_assets`,
+            "intent_assets",
+            "attempt_assets",
+            discoveredAs,
+            "seeded discovery",
+            discoveredAt,
+          ],
+        );
+      };
+
+      asset(
+        "asset_host",
+        "host",
+        "app.acme.test:443",
+        "app.acme.test",
+        443,
+        null,
+        null,
+        null,
+        10,
+      );
+      asset(
+        "asset_endpoint",
+        "endpoint",
+        "GET https://app.acme.test:443/v1/orders",
+        "app.acme.test",
+        443,
+        "https:",
+        "GET",
+        "/v1/orders",
+        20,
+      );
+      // The host no in-scope entry would cover, recorded last.
+      asset(
+        "asset_uncovered",
+        "host",
+        "api.acme-cdn.test:443",
+        "api.acme-cdn.test",
+        443,
+        null,
+        null,
+        null,
+        30,
+      );
+
+      // Two discoveries of the host, one of each of the others, so the aggregate has
+      // something to be wrong about.
+      discovery("asset_host", "op-a", "https://app.acme.test/", 11);
+      discovery("asset_host", "op-b", "https://APP.acme.test.:443/", 15);
+      discovery(
+        "asset_endpoint",
+        "op-c",
+        "https://app.acme.test/v1/orders?page=2",
+        21,
+      );
+      discovery("asset_uncovered", "op-d", "https://api.acme-cdn.test/", 31);
+    } finally {
+      database.close();
+    }
+  };
+
+  beforeAll(async () => {
+    await register(withRows);
+    await register(empty);
+    seed(withRows);
+  });
+
+  test("it returns the estate, grouped by nothing and filtered by nothing", async () => {
+    const response = await read(await signedIn(`/targets/${withRows}/assets`));
+    expect(response.status).toBe(200);
+    const assets = response.body["assets"] as ReadonlyArray<
+      Record<string, unknown>
+    >;
+
+    // Oldest first, by `first_seen_at` — the order the store reads them in.
+    expect(assets.map((asset) => asset["identity"])).toEqual([
+      "app.acme.test:443",
+      "GET https://app.acme.test:443/v1/orders",
+      "api.acme-cdn.test:443",
+    ]);
+
+    /*
+     * The third row is the point of the assertion above.
+     *
+     * No scope is authored on this target, so by the default-is-out rule nothing here is
+     * covered by an in-scope entry — and all three come back anyway. A route that
+     * filtered by scope state would make this screen quietly disagree with
+     * `counts.assets`, and it would hide exactly the discoveries the operator most needs
+     * to see.
+     */
+    expect(assets).toHaveLength(3);
+  });
+
+  test("every row carries the identity's parts and its provenance", async () => {
+    const assets = (await read(await signedIn(`/targets/${withRows}/assets`)))
+      .body["assets"] as ReadonlyArray<Record<string, unknown>>;
+
+    // camelCase: this is the browser API, not an MCP tool.
+    expect(assets[0]).toEqual({
+      assetId: "asset_host",
+      kind: "host",
+      identity: "app.acme.test:443",
+      host: "app.acme.test",
+      port: 443,
+      scheme: null,
+      method: null,
+      path: null,
+      firstSeenAt: 10,
+      // Two operations found it, and both are kept.
+      discoveries: 2,
+      firstAttemptId: "attempt_assets",
+      firstIntentId: "intent_assets",
+      // The latest sighting, which is not the same fact as `firstSeenAt`.
+      lastDiscoveredAt: 15,
+    });
+
+    const endpoint = assets[1];
+    expect(endpoint?.["kind"]).toBe("endpoint");
+    expect(endpoint?.["method"]).toBe("GET");
+    expect(endpoint?.["path"]).toBe("/v1/orders");
+    expect(endpoint?.["discoveries"]).toBe(1);
+  });
+
+  test("a target with nothing found answers with an empty list, not a failure", async () => {
+    const response = await read(await signedIn(`/targets/${empty}/assets`));
+    expect(response.status).toBe(200);
+    // "Nothing found yet" is a fact, and it is a different fact from "could not read".
+    // Nothing was seeded here, so a resolver handing back `acme-corp`'s entry would show
+    // three rows.
+    expect(response.body).toEqual({ assets: [] });
+  });
+
+  test("an unknown target is refused rather than answered empty", async () => {
+    const response = await read(await signedIn("/targets/not-a-target/assets"));
+    expect(response.status).toBe(404);
+    expect(response.body["_tag"]).toBe("TargetNotFound");
+  });
+
+  test("it needs a session, like every other fleet route", async () => {
+    // No bearer at all: the estate is behind the session guard like the rest of the
+    // fleet group, so an unauthenticated caller never learns what this target holds.
+    const response = await call(`/targets/${withRows}/assets`);
+    expect(response.status).toBe(401);
+  });
+});

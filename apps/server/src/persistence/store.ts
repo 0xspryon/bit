@@ -1523,6 +1523,21 @@ export interface StoredAsset {
   readonly first_seen_at: number;
 }
 
+/**
+ * One asset with the provenance aggregate a reader shows beside it.
+ *
+ * The asset's own columns, plus what `asset_discoveries` says about how it came to be
+ * known. The three nullable fields are nullable because the schema cannot promise a
+ * discovery row exists — `recordAsset` always writes one in the same transaction, so an
+ * asset with none came from somewhere else and is reported as such rather than refused.
+ */
+export interface StoredAssetWithProvenance extends StoredAsset {
+  readonly discoveries: number;
+  readonly first_attempt_id: string | null;
+  readonly first_intent_id: string | null;
+  readonly last_discovered_at: number | null;
+}
+
 /** One recorded discovery of an asset, which a merge never overwrites. */
 export interface StoredAssetDiscovery {
   readonly asset_id: string;
@@ -6331,6 +6346,89 @@ const makeStore = Effect.fnUntraced(function* () {
     },
   );
 
+  const AssetWithProvenanceRow = Schema.Struct({
+    ...AssetRow.fields,
+    /** How many separate operations have recorded this asset. */
+    discoveries: Schema.Int,
+    /**
+     * The attempt that found it first, and the intent that attempt was working.
+     *
+     * Nullable only because the schema cannot promise otherwise. `recordAsset` writes a
+     * discovery row in the same transaction as the asset, so every asset this build
+     * writes has at least one; an asset with none would be a row some other writer put
+     * there, and reporting it as "no recorded discovery" is better than refusing to read
+     * the file.
+     */
+    first_attempt_id: Schema.NullOr(Schema.String),
+    first_intent_id: Schema.NullOr(Schema.String),
+    /** When it was most recently seen, which is not when it was first seen. */
+    last_discovered_at: Schema.NullOr(Schema.Finite),
+  });
+
+  /**
+   * Every asset with its discovery aggregate, in one statement.
+   *
+   * The aggregate is here rather than assembled by the caller because the surfaces that
+   * want it — the browser's estate list and the worker's `list_assets` — both want it per
+   * row, and reading it per asset would be one statement per row. Three correlated
+   * subqueries over `asset_discoveries`, which is indexed by its own primary key
+   * `(asset_id, operation_id)`.
+   *
+   * **No pagination, deliberately, and this is the design's live open question.** Its
+   * Deferred section leaves per-entry aggregates and pagination to be decided together,
+   * and this read is the agent-side half of that question. Returning every row matches
+   * `assets()` and `list_observations`, and it is the choice that cannot be wrong about
+   * *which* rows an operator sees; what it can be is slow, on a target with a very large
+   * estate. That is a real limit and it is recorded rather than guessed at.
+   */
+  /**
+   * `assetColumns`, qualified with the table.
+   *
+   * The statement below has correlated subqueries naming `asset_discoveries` columns, so
+   * every column from `assets` is qualified rather than bare. Derived from the same
+   * `Object.keys` list as `assetColumns`, so the `SELECT` cannot drift from the decoder.
+   */
+  const qualifiedAssetColumns = Object.keys(AssetRow.fields)
+    .map((column) => `assets.${column}`)
+    .join(", ");
+
+  const selectAssetsWithProvenance = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: AssetWithProvenanceRow,
+    execute: () =>
+      sql.unsafe(
+        `SELECT ${qualifiedAssetColumns},
+           (SELECT COUNT(*) FROM asset_discoveries
+             WHERE asset_discoveries.asset_id = assets.id) AS discoveries,
+           (SELECT attempt_id FROM asset_discoveries
+             WHERE asset_discoveries.asset_id = assets.id
+             ORDER BY discovered_at, operation_id LIMIT 1) AS first_attempt_id,
+           (SELECT intent_id FROM asset_discoveries
+             WHERE asset_discoveries.asset_id = assets.id
+             ORDER BY discovered_at, operation_id LIMIT 1) AS first_intent_id,
+           (SELECT MAX(discovered_at) FROM asset_discoveries
+             WHERE asset_discoveries.asset_id = assets.id) AS last_discovered_at
+         FROM assets
+         ORDER BY assets.first_seen_at, assets.identity`,
+        [],
+      ),
+  });
+
+  /**
+   * Every asset in this target's file with the provenance a reader needs beside it.
+   *
+   * Separate from {@link assets} rather than replacing it: `assets()` is the bare table
+   * and is what the counts and the spike read, and a caller that wants only identities
+   * should not pay for four subqueries per row.
+   */
+  const assetsWithProvenance = Effect.fn(
+    "ObservationStore.assetsWithProvenance",
+  )(function* () {
+    return yield* selectAssetsWithProvenance().pipe(
+      Effect.mapError(lift("assets", "all")),
+    );
+  });
+
   const CountsRow = Schema.Struct({
     goals: Schema.Int,
     intents: Schema.Int,
@@ -6410,6 +6508,7 @@ const makeStore = Effect.fnUntraced(function* () {
     pendingRequests,
     anchorsForIntent,
     assets,
+    assetsWithProvenance,
     discoveriesOfAsset,
     settleAttempt,
     bindSessionToAttempt,
@@ -6644,6 +6743,11 @@ export class ObservationStore extends Context.Service<
     ) => Effect.Effect<readonly string[], DatabaseError | StoredRowError>;
     readonly assets: () => Effect.Effect<
       readonly StoredAsset[],
+      DatabaseError | StoredRowError
+    >;
+    /** Every asset with its discovery aggregate. One statement, no pagination. */
+    readonly assetsWithProvenance: () => Effect.Effect<
+      readonly StoredAssetWithProvenance[],
       DatabaseError | StoredRowError
     >;
     readonly discoveriesOfAsset: (

@@ -403,11 +403,16 @@ describe("the tool surface matches the authority", () => {
      * half it can see in its own tool list.
      */
     expect(names).not.toContain("record_asset");
+    expect(names).not.toContain("list_assets");
   });
 
-  test("a worker attempt is offered both its writes and not add_intent", async () => {
+  test("a worker attempt is offered the asset tools and not add_intent", async () => {
     const names = await toolNames(workerUrl, workerToken);
-    expect(names).toEqual(["record_asset", "record_observation"]);
+    expect(names).toEqual([
+      "list_assets",
+      "record_asset",
+      "record_observation",
+    ]);
     expect(names).not.toContain("add_intent");
     expect(names).not.toContain("record_round_disposition");
   });

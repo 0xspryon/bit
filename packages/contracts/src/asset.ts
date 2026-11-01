@@ -251,3 +251,46 @@ export type RecordAssetResult = typeof RecordAssetResult.Type;
 export const RecordAssetResultWire = RecordAssetResult.pipe(
   Schema.encodeKeys({ assetId: "asset_id" }),
 );
+
+/**
+ * One recorded asset, as a browser reads it.
+ *
+ * camelCase, because this is the browser API's shape and that API is camelCase
+ * throughout; the MCP tools get the `*Wire` siblings above. The parts of the identity are
+ * carried beside it rather than re-parsed from it, for the reason {@link AssetIdentity}
+ * gives: a reader should never have to split a string to answer "which host is this".
+ *
+ * `host` is the field the estate view groups on, and it is also the field a host label is
+ * keyed by — which is why it is here as its own column and not left implicit in
+ * `identity`. Grouping by host is the only grouping that matches what a label reaches.
+ */
+export const AssetView = Schema.Struct({
+  assetId: Schema.String,
+  kind: AssetKind,
+  /** What uniqueness is on, within one target and kind. */
+  identity: Schema.String,
+  host: Schema.String,
+  port: Schema.Int,
+  /** Null for a host, and only for a host. */
+  scheme: Schema.NullOr(Schema.String),
+  /** Null for a host. Upper-cased. */
+  method: Schema.NullOr(Schema.String),
+  /** Null for a host. */
+  path: Schema.NullOr(Schema.String),
+  /** When this asset was first recorded. */
+  firstSeenAt: Schema.Number,
+  /** How many separate operations have recorded it. Never zero in practice. */
+  discoveries: Schema.Int,
+  /**
+   * The attempt that found it first, and the intent that attempt was working.
+   *
+   * Null when no discovery row exists, which `record_asset` cannot produce — it writes
+   * the discovery in the same transaction as the asset — but which a row written by
+   * anything else could. Reported rather than assumed.
+   */
+  firstAttemptId: Schema.NullOr(Schema.String),
+  firstIntentId: Schema.NullOr(Schema.String),
+  /** When it was most recently seen. Not the same fact as {@link firstSeenAt}. */
+  lastDiscoveredAt: Schema.NullOr(Schema.Number),
+});
+export type AssetView = typeof AssetView.Type;

@@ -38,6 +38,7 @@ import {
   HttpApiSecurity,
 } from "effect/http-api";
 
+import { AssetView } from "./asset";
 import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
 import {
   GoalConversationRefused,
@@ -1237,6 +1238,27 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
     HttpApiEndpoint.get("goals", "/targets/:targetId/goals", {
       params: { targetId: Schema.String },
       success: Schema.Struct({ goals: Schema.Array(GoalView) }),
+      error: [TargetNotFound, TargetUnavailable],
+    }),
+    /**
+     * Every asset the hunt has recorded on one target, oldest first.
+     *
+     * The read the Assets screen is built on. Until this existed the browser could see
+     * only `counts.assets` — a number with nothing behind it — so an operator could watch
+     * the estate's size change and never see what was in it.
+     *
+     * **Nothing is filtered out.** An asset no in-scope entry covers is returned like any
+     * other, because the whole point of the estate view is that a discovery is recorded,
+     * kept, displayed and labelled rather than hidden. The scope state each row is shown
+     * under is a separate question, answered where the entries are.
+     *
+     * Wrapped in an object rather than a bare array, so a field can be added beside
+     * `assets` — a per-host aggregate, say — without breaking every client. Read-only and
+     * one statement over the target's own file.
+     */
+    HttpApiEndpoint.get("assets", "/targets/:targetId/assets", {
+      params: { targetId: Schema.String },
+      success: Schema.Struct({ assets: Schema.Array(AssetView) }),
       error: [TargetNotFound, TargetUnavailable],
     }),
     /**

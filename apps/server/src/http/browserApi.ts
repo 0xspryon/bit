@@ -48,6 +48,7 @@ import {
   TargetRefused,
   TargetUnavailable,
   Unauthenticated,
+  type AssetView,
   type AttemptTranscript,
   type GoalBriefingView,
   type GoalObservationView,
@@ -93,6 +94,7 @@ import {
   ObservationStore,
   operatorScope,
   type MutationError,
+  type StoredAssetWithProvenance,
   type StoredGoal,
   type StoredIntent,
   type StoredRound,
@@ -439,6 +441,33 @@ const goalView = (goal: StoredGoal): GoalView => ({
     attempts: goal.attemptCount,
     observations: goal.observationCount,
   },
+});
+
+/**
+ * One stored asset as the Assets screen reads it.
+ *
+ * Field by field rather than by spreading the row, for `goalView`'s reason: the store
+ * describes a table and the contract describes a screen, and this is where a divergence
+ * becomes a compile error instead of a silently missing field. It is also where the
+ * snake_case the file holds becomes the camelCase the browser API speaks.
+ */
+const assetView = (asset: StoredAssetWithProvenance): AssetView => ({
+  assetId: asset.id,
+  // The column is `TEXT` with a `CHECK`, so the store types it as `string`; the contract
+  // narrows it to the two kinds. A third value in the column would be a row the schema
+  // already refuses, and this cast is what keeps the view's type honest about that.
+  kind: asset.kind === "endpoint" ? "endpoint" : "host",
+  identity: asset.identity,
+  host: asset.host,
+  port: asset.port,
+  scheme: asset.scheme,
+  method: asset.method,
+  path: asset.path,
+  firstSeenAt: asset.first_seen_at,
+  discoveries: asset.discoveries,
+  firstAttemptId: asset.first_attempt_id,
+  firstIntentId: asset.first_intent_id,
+  lastDiscoveredAt: asset.last_discovered_at,
 });
 
 /**
@@ -1116,6 +1145,33 @@ const fleetHandlers = HttpApiBuilder.group(
           goals: goals
             .filter((goal) => goal.targetId === row.targetId)
             .map(goalView),
+        };
+      }),
+
+      /**
+       * Every asset recorded on the open target, oldest first.
+       *
+       * Filtered by `targetId` after the read for the same reason the goals route is:
+       * a target's assets live in that target's own database, so the filter removes
+       * nothing on a healthy file; what it guards is a misfiled row, which becomes a
+       * missing asset rather than another engagement's estate on this engagement's
+       * screen.
+       *
+       * **No scope filtering, and that is the behaviour rather than an omission.** An
+       * asset no in-scope entry covers is returned like any other. Hiding it is what the
+       * design's goals rule out — a discovery is recorded, kept, displayed and labelled —
+       * and a route that dropped rows would make the Assets screen quietly disagree with
+       * `counts.assets`.
+       */
+      assets: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const assets = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.assetsWithProvenance(),
+        ).pipe(Effect.orDie);
+        return {
+          assets: assets
+            .filter((asset) => asset.target_id === row.targetId)
+            .map(assetView),
         };
       }),
 

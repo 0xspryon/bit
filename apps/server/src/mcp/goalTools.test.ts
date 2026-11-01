@@ -528,8 +528,14 @@ describe("the goal agent's tool surface", () => {
      * `record_asset` is a worker's too, for the schema reason the target-scope design's
      * D9 gives: a goal conversation has no intent and no attempt to hang a discovery's
      * provenance on. The goal agent reads the estate; it never writes to it.
+     *
+     * `list_assets` is a worker's for a weaker reason — a read needs no attempt — and it
+     * is still not here, because the goal agent's own asset read belongs with the scope
+     * query tool (slice 6) where it can answer "is this in scope" rather than only "what
+     * is there".
      */
     expect(names).not.toContain("record_asset");
+    expect(names).not.toContain("list_assets");
   });
 
   test("a goal credential at the planner endpoint is refused before any tool list", async () => {
