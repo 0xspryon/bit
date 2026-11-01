@@ -44,11 +44,16 @@ afterEach(() => {
  * asked about, the way the real one does — which is the whole point: the row, and the `×`
  * that opened the dialog, are gone by the time the dialog closes.
  */
-const openScope = async (
+const openScope = (
   ...values: string[]
+): Promise<{ app: App; fake: FakeServer }> =>
+  openScopeWith(values.map((value) => entry(value)));
+
+const openScopeWith = async (
+  initial: ScopeEntryView[],
 ): Promise<{ app: App; fake: FakeServer }> => {
   const fake = new FakeServer();
-  let entries = values.map((value) => entry(value));
+  let entries = initial;
   const scope = () =>
     ok(emptyScope({ entries, promptBlock: "[Authorized testing scope]" }));
   fake.onScope = scope;
@@ -182,7 +187,22 @@ describe("the delete question", () => {
 
   test("after deleting the last entry of a list, focus is still on that list", async () => {
     // The list's `<ul>` goes with its last row and "None." takes its place, so the
-    // fallback cannot be the `<ul>`.
+    // fallback cannot be the `<ul>`. The other list still holds an entry, so the page
+    // keeps both lists and this one is still there to take focus.
+    await openScopeWith([entry("acme.test"), entry("blog.acme.test", "out")]);
+    clickWithMouse(removeButton("acme.test"));
+    await settle();
+
+    click(confirmButton());
+    await settle();
+
+    expect(document.querySelectorAll(".entry")).toHaveLength(1);
+    expect(document.activeElement?.getAttribute("aria-label")).toBe("In scope");
+  });
+
+  test("after deleting the last entry of all, focus is on the empty state that replaces the lists", async () => {
+    // Both lists go with it: the empty state ("No scope authored", with the importer's
+    // button) takes their place, and the list that was the marked survivor is gone too.
     await openScope("acme.test");
     clickWithMouse(removeButton("acme.test"));
     await settle();
@@ -191,6 +211,9 @@ describe("the delete question", () => {
     await settle();
 
     expect(document.querySelectorAll(".entry")).toHaveLength(0);
-    expect(document.activeElement?.getAttribute("aria-label")).toBe("In scope");
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "No scope authored for this target",
+    );
   });
 });

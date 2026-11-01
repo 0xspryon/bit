@@ -33,6 +33,7 @@
   import ComposeBox from "../components/ComposeBox.svelte";
   import Goal from "./Goal.svelte";
   import Assets from "./Assets.svelte";
+  import AutoLoad from "./AutoLoad.svelte";
   import Goals from "./Goals.svelte";
   import LiveTranscript from "../components/LiveTranscript.svelte";
   import PageFrame from "../components/PageFrame.svelte";
@@ -79,7 +80,11 @@
         <Goal {app} />
       {/if}
     {:else if app.navItem === "assets"}
-      <Assets {app} />
+      {#if app.importerOpen}
+        <AutoLoad {app} />
+      {:else}
+        <Assets {app} />
+      {/if}
     {:else}
       <PageFrame
         title={label}

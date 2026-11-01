@@ -281,6 +281,13 @@
         {/snippet}
       </CrumbPicker>
     {/if}
+
+    <!-- The Auto-load page is a sub-page of Assets, the way an open goal is of Goals, so
+         it is one more crumb: where you are, with the target still the first. -->
+    {#if app.importerOpen && app.navItem === "assets"}
+      <IconAngleRight class="sep" width="12" height="12" />
+      <span class="crumb-leaf">Auto-load scope</span>
+    {/if}
   {:else if app.screen === "new-target"}
     <!--
       Above target scope, and two crumbs rather than one — the only place that happens up

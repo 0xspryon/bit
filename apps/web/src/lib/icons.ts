@@ -15,7 +15,7 @@ export { default as IconPlus } from "line-awesome/svg/plus-solid.svg?component";
 export { default as IconClose } from "line-awesome/svg/times-solid.svg?component";
 export { default as IconSearch } from "line-awesome/svg/search-solid.svg?component";
 
-/** A program link on the create-target screen. */
+/** A program link on the Auto-load page. */
 export { default as IconLink } from "line-awesome/svg/link-solid.svg?component";
 
 export { default as IconFolder } from "line-awesome/svg/folder-solid.svg?component";
@@ -51,6 +51,9 @@ export { default as IconTheme } from "line-awesome/svg/adjust-solid.svg?componen
 export { default as IconEllipsis } from "line-awesome/svg/ellipsis-v-solid.svg?component";
 export { default as IconCopy } from "line-awesome/svg/copy-solid.svg?component";
 export { default as IconExport } from "line-awesome/svg/file-export-solid.svg?component";
+
+/* ── Assets: handing the program pages to the importer ── */
+export { default as IconDownload } from "line-awesome/svg/download-solid.svg?component";
 
 /* ── Level 2 navigation ── */
 export { default as IconGoal } from "line-awesome/svg/bullseye-solid.svg?component";

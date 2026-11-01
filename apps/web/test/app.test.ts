@@ -398,7 +398,6 @@ describe("new target", () => {
     );
     // The page stays up: there is an offer on it to accept.
     expect(app.screen).toBe("new-target");
-    expect(app.newTargetPhase).toBe("form");
   });
 
   test("a folder the server may not read is denied, in its words", async () => {
@@ -452,7 +451,6 @@ describe("new target", () => {
     expect(app.createDetail).toBe(detail);
     // The page stays up, with the server's sentence on it.
     expect(app.screen).toBe("new-target");
-    expect(app.newTargetPhase).toBe("form");
     expect(app.targets).toEqual([]);
   });
 
@@ -616,7 +614,6 @@ describe("new target", () => {
     );
     // Up, so the operator reads why — and listed, because it does exist.
     expect(app.screen).toBe("new-target");
-    expect(app.newTargetPhase).toBe("form");
     expect(app.targets.map((target) => target.id)).toEqual(["example"]);
     expect(app.targets[0]?.status).toBe("missing");
   });

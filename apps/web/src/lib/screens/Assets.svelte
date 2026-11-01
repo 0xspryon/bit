@@ -50,6 +50,7 @@
   import {
     IconClose,
     IconCube,
+    IconDownload,
     IconPlus,
     IconScroll,
     IconSearch,
@@ -197,7 +198,7 @@
   title="Assets"
   description={app.assetsTab === "estate"
     ? "Everything the hunt has found on this target. Nothing here is hidden or dropped — a host no entry covers is kept and labelled, waiting for you."
-    : "The client's estate, as you authored it. These entries are only ever typed by you — nothing the agent does writes here."}
+    : "The client's estate, as you authored it. These entries are only ever written with your say-so."}
   centered={app.drawerHidden}
   detailTitle="What the agent is told"
   detailOpen={app.scopeBlockOpen &&
@@ -210,6 +211,19 @@
          is the thing to check before a hunt, not the thing to read on every visit, and a
          column of its own took the width the entries need. -->
     {#if app.assetsTab === "scope" && scope !== undefined}
+      <!-- With entries, the importer's entry point lives here (A6 D1); with none it is
+           the empty state's primary button, and a second one up here would be two
+           buttons for the one decision. -->
+      {#if scope.entries.length > 0}
+        <Button
+          variant="outline"
+          size="page"
+          onclick={() => app.openImporter()}
+        >
+          <IconDownload width="13" height="13" />
+          Auto-load…
+        </Button>
+      {/if}
       <Button
         variant="outline"
         size="page"
@@ -464,63 +478,114 @@
         <div class="lists">
           <!-- The two authored lists. Every row spells out what it covers, in the same
                words the agent's prompt uses, from the same renderer. -->
-          {#each [{ effect: "in", heading: "In scope" }, { effect: "out", heading: "Out of scope" }] as section (section.effect)}
-            {@const rows = scope.entries.filter(
-              (entry) => entry.effect === section.effect,
-            )}
-            <!-- `data-focus-fallback`: this list outlives any one of its rows, so it is
-                 where focus lands when the `×` that opened the delete question is
-                 deleted along with its row. See Modal. -->
+          {#if scope.entries.length === 0}
+            <!--
+              A6 D1's empty state: no entry at all, in either list. Two lists reading "None."
+              and a form are what an empty scope looked like before, and said nothing about
+              how to get one.
+
+              Both buttons are the same decision made two ways. The importer is a page; the
+              hand entry is the form beside this, so that button hands the operator the
+              field it names rather than describing it. `data-focus-fallback` because
+              deleting the last entry lands here: the lists it was in are gone with it.
+            -->
             <div
-              class={["list", rows.length === 0 && "none"]}
-              style:--rows={Math.min(rows.length, 2)}
+              class="empty scope-empty"
               role="group"
-              aria-label={section.heading}
+              aria-label="No scope authored for this target"
               tabindex="-1"
               data-focus-fallback
             >
-              <div class="list-head">
-                <span class="list-label">{section.heading}</span>
-                <span class="mono list-count"
-                  >{rows.length} {rows.length === 1 ? "entry" : "entries"}</span
+              <IconCube width="28" height="28" />
+              <p class="empty-lead">No scope authored for this target</p>
+              <p class="empty-more">
+                Hand the program's pages to the importer and it drafts the in
+                and out entries with you, or type the first entry yourself.
+              </p>
+              <div class="empty-actions">
+                <Button
+                  variant="primary"
+                  size="page"
+                  onclick={() => app.openImporter()}
                 >
+                  <IconDownload width="14" height="14" />
+                  Auto-load scope…
+                </Button>
+                <Button
+                  size="page"
+                  variant="outline"
+                  onclick={() => {
+                    entryField?.scrollIntoView({ block: "nearest" });
+                    entryField?.focus();
+                  }}
+                >
+                  <IconPlus width="14" height="14" />
+                  Add an entry by hand
+                </Button>
               </div>
-              {#if rows.length === 0}
-                <p class="quiet-small">None.</p>
-              {:else}
-                <ul class="entries">
-                  {#each rows as entry (entry.entryId)}
-                    <li class="entry">
-                      <span class="entry-value mono">{entry.value}</span>
-                      <span class="entry-covers"
-                        >{describeScopeEntry(entry).slice(
-                          entry.value.length + 1,
-                        )}</span
-                      >
-                      {#if entry.source === "imported"}
-                        <!-- An imported entry and a typed one are identical to the
+            </div>
+          {:else}
+            {#each [{ effect: "in", heading: "In scope" }, { effect: "out", heading: "Out of scope" }] as section (section.effect)}
+              {@const rows = scope.entries.filter(
+                (entry) => entry.effect === section.effect,
+              )}
+              <!-- `data-focus-fallback`: this list outlives any one of its rows, so it is
+                 where focus lands when the `×` that opened the delete question is
+                 deleted along with its row. See Modal. -->
+              <div
+                class={["list", rows.length === 0 && "none"]}
+                style:--rows={Math.min(rows.length, 2)}
+                role="group"
+                aria-label={section.heading}
+                tabindex="-1"
+                data-focus-fallback
+              >
+                <div class="list-head">
+                  <span class="list-label">{section.heading}</span>
+                  <span class="mono list-count"
+                    >{rows.length}
+                    {rows.length === 1 ? "entry" : "entries"}</span
+                  >
+                </div>
+                {#if rows.length === 0}
+                  <p class="quiet-small">None.</p>
+                {:else}
+                  <ul class="entries">
+                    {#each rows as entry (entry.entryId)}
+                      <li class="entry">
+                        <span class="entry-value mono">{entry.value}</span>
+                        <span class="entry-covers"
+                          >{describeScopeEntry(entry).slice(
+                            entry.value.length + 1,
+                          )}</span
+                        >
+                        {#if entry.source === "imported"}
+                          <!-- An imported entry and a typed one are identical to the
                              matcher and must be distinguishable here, because "read this
                              list before you start" is only a real step if the rows that
                              need reading are the ones a machine wrote. -->
-                        <span class="imported" title={entry.note ?? "Imported"}
-                          >Imported</span
+                          <span
+                            class="imported"
+                            title={entry.note ?? "Imported"}>Imported</span
+                          >
+                        {/if}
+                        <div class="spacer"></div>
+                        <button
+                          class="remove"
+                          aria-label={`Remove ${entry.value}`}
+                          disabled={app.scopeBusy}
+                          onclick={() =>
+                            app.askToRemoveScopeEntry(entry.entryId)}
                         >
-                      {/if}
-                      <div class="spacer"></div>
-                      <button
-                        class="remove"
-                        aria-label={`Remove ${entry.value}`}
-                        disabled={app.scopeBusy}
-                        onclick={() => app.askToRemoveScopeEntry(entry.entryId)}
-                      >
-                        <IconClose width="13" height="13" />
-                      </button>
-                    </li>
-                  {/each}
-                </ul>
-              {/if}
-            </div>
-          {/each}
+                          <IconClose width="13" height="13" />
+                        </button>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
+            {/each}
+          {/if}
 
           {#if scope.hostLabels.length > 0 || scope.assetLabels.length > 0}
             <div
@@ -1348,5 +1413,19 @@
     font: 400 13px/20px var(--font-sans);
     color: var(--text-muted);
     text-wrap: pretty;
+  }
+  /* The Scope tab's empty state sits in the lists column, and takes focus when the last
+     entry is deleted from under the delete question: no outline for a programmatic one. */
+  .scope-empty {
+    margin: 24px auto;
+  }
+  .scope-empty:focus {
+    outline: none;
+  }
+  .empty-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 4px;
   }
 </style>

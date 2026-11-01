@@ -543,6 +543,18 @@ describe("the Scope tab", () => {
     );
   });
 
+  test("the lead does not claim that only the operator writes entries", async () => {
+    const html = await scopeBody(() => {});
+    // The importer writes entries, tagged `Imported`. "Only ever typed by you — nothing the
+    // agent does writes here" was false the day it shipped alongside it, and an operator
+    // who believed it would read an imported list as their own.
+    expect(html).toContain(
+      "These entries are only ever written with your say-so.",
+    );
+    expect(html).not.toContain("typed by you");
+    expect(html).not.toContain("nothing the agent does writes here");
+  });
+
   test("an empty scope says so plainly rather than promising nothing is authorized", async () => {
     const html = await scopeBody(
       () => {},

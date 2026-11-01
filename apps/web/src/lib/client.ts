@@ -45,6 +45,7 @@ import {
   type LiveFrame,
   type ModelOptionSelection,
   type ScopeEntryDraft,
+  type ScopeImportDraft,
   type ScopeLabelDraft,
   type TargetDraft,
 } from "@bit/contracts";
@@ -799,11 +800,29 @@ export const server = {
    * **A request rather than a constant in this bundle, and that is the whole point of the
    * endpoint.** `modelOption.ts` is explicit that a descriptor is observed when the server
    * built the harness and replaced wholesale when it is rebuilt. A preferred model id
-   * written down here would outlive the catalogue entry it names, and the create-target
+   * written down here would outlive the catalogue entry it names, and the Auto-load
    * screen would keep offering a choice the server could not honour.
    */
   importerModel: (baseUrl: string) =>
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.importerModel())),
+
+  /**
+   * Starts a scope import on a target that already exists.
+   *
+   * The Auto-load page's only write. It answers as soon as the session is going, with the
+   * import to watch or the reason none started — a refusal to start is a value, so the
+   * form can stay on screen beside it.
+   */
+  startScopeImport: (
+    baseUrl: string,
+    targetId: string,
+    draft: ScopeImportDraft,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.startScopeImport({ params: { targetId }, payload: draft }),
+      ),
+    ),
 
   /** One import's links, tool calls and totals, for the "Loading the scope" panel. */
   scopeImport: (baseUrl: string, targetId: string, importId: string) =>

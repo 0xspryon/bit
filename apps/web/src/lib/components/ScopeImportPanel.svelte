@@ -86,9 +86,9 @@
 <section class="panel" aria-label="Loading the scope">
   <header class="head">
     <span class={["pip", running && "live"]} aria-hidden="true"></span>
-    <h1>Loading the scope</h1>
-    <span class="created mono">
-      {app.scopeImportTargetId} created
+    <h2>Loading the scope</h2>
+    <span class="target mono">
+      {app.scopeImportTargetId}
     </span>
   </header>
 
@@ -204,7 +204,7 @@
     align-items: center;
     gap: 11px;
   }
-  .head h1 {
+  .head h2 {
     flex: 1;
     margin: 0;
     font-size: 26px;
@@ -224,7 +224,7 @@
     background: var(--text-base);
     box-shadow: 0 0 0 3px var(--overlay-pressed);
   }
-  .created {
+  .target {
     font-size: 12px;
     color: var(--text-muted);
   }

@@ -1095,6 +1095,18 @@ export class FakeServer implements ServerClient {
   onImporterModel: (baseUrl: string) => Answer<"importerModel"> = () =>
     ok(importerModelView());
 
+  onStartScopeImport: (
+    ...args: Parameters<ServerClient["startScopeImport"]>
+  ) => Answer<"startScopeImport"> = () =>
+    ok({
+      scopeImport: {
+        importId: "imp_1",
+        harnessInstanceId: "opencode",
+        model: "opencode/glm-5.3-flash-free",
+      },
+      importDetail: null,
+    });
+
   onScopeImport: (
     ...args: Parameters<ServerClient["scopeImport"]>
   ) => Answer<"scopeImport"> = (_baseUrl, targetId, importId) =>
@@ -1255,6 +1267,11 @@ export class FakeServer implements ServerClient {
   importerModel = (baseUrl: string) =>
     this.record("importerModel", [baseUrl], () =>
       this.onImporterModel(baseUrl),
+    );
+
+  startScopeImport = (...args: Parameters<ServerClient["startScopeImport"]>) =>
+    this.record("startScopeImport", args, () =>
+      this.onStartScopeImport(...args),
     );
 
   scopeImport = (...args: Parameters<ServerClient["scopeImport"]>) =>

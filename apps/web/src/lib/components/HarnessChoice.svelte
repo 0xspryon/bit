@@ -5,7 +5,7 @@
    * ## Why this exists as a component
    *
    * It is asked in two places: the composer's popover (`HarnessPicker`) and the
-   * create-target screen's model control (`NewTarget`). Those were two implementations of
+   * Auto-load page's model control (`AutoLoad`). Those were two implementations of
    * the same screen, and they had already drifted in four ways that an operator could see:
    *
    * - **The unready harness.** One kept the row selectable and printed the harness's own

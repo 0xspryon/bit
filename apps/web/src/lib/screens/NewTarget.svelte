@@ -4,15 +4,17 @@
    *
    * **The dialog became a page, and the folder browser is the only modal left.** A3's own
    * account of why: the picker returns a path and nothing else, so it can be modal without
-   * trapping anything, while the form itself now carries a repeatable list and hands over
-   * to a progress panel — neither of which fits in a 560px dialog, and the second of which
-   * runs for a minute with the operator free to leave.
+   * trapping anything.
    *
-   * **The `Scope` field is gone and its two jobs are split.** It read `Scope` with the
-   * placeholder `*.example.test`, which promised a machine-readable pattern; nothing ever
-   * parsed it. What replaced it: program links, which feed the importer, and a plainly
-   * labelled Note for people. Links are optional and the primary button never renames, so
-   * a target with no program page is still one click.
+   * **A target is made from a folder, a name and a note, and nothing else.** It used to take
+   * program links and a model for the scope importer too; A6 moved the importer to the
+   * Assets page ("Auto-load scope…"), where the target already exists and a session can be
+   * had with it in hand. Nothing here reads a program page.
+   *
+   * **The `Scope` field is gone, and its job is a plainly labelled Note for people.** It
+   * read `Scope` with the placeholder `*.example.test`, which promised a machine-readable
+   * pattern; nothing ever parsed it. The structured scope lives on the target's own Scope
+   * tab, typed per entry.
    *
    * **Nothing on this screen starts a hunt**, and that is load-bearing rather than tidy.
    * D13 records that the operator's review of an imported scope is the only control on it,
@@ -23,10 +25,7 @@
   import Button from "../components/Button.svelte";
   import Field from "../components/Field.svelte";
   import FolderPicker from "../components/FolderPicker.svelte";
-  import HarnessChoice from "../components/HarnessChoice.svelte";
-  import ScopeImportPanel from "../components/ScopeImportPanel.svelte";
-  import { IconClose, IconFolder, IconLink, IconPlus } from "../icons";
-  import { SCOPE_IMPORT_MAX_LINKS } from "@bit/contracts";
+  import { IconFolder } from "../icons";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
@@ -62,223 +61,66 @@
   let databaseDirectory = $derived(
     app.fleetRoot === "" ? "" : `${app.fleetRoot}/targets/`,
   );
-
-  /** Whether the autoload checkbox can be offered at all. */
-  let canAutoload = $derived(app.importerModel !== undefined);
 </script>
 
-{#if app.newTargetPhase === "importing"}
-  <div class="page">
-    <ScopeImportPanel {app} />
-  </div>
-{:else}
-  <div class="page">
-    <form
-      class="form"
-      onsubmit={(event) => {
-        event.preventDefault();
-        if (canCreate) void app.createTarget();
-      }}
-    >
-      <div class="titles">
-        <h1>New target</h1>
-        <p class="lead">
-          Start from the program's own pages. The intake agent reads them and
-          loads the scope and the assets they name; the Assets page is where you
-          correct it.
-        </p>
-      </div>
+<div class="page">
+  <form
+    class="form"
+    onsubmit={(event) => {
+      event.preventDefault();
+      if (canCreate) void app.createTarget();
+    }}
+  >
+    <div class="titles">
+      <h1>New target</h1>
+      <p class="lead">
+        Point it at the engagement's folder and give it a name. The scope is
+        loaded afterwards, from the Assets page.
+      </p>
+    </div>
 
-      <!-- Folder: a read-only restatement plus a browse button. The path is not typed
+    <!-- Folder: a read-only restatement plus a browse button. The path is not typed
            here any more — the picker is where a path is chosen or typed, and it validates
            server-side on every change. -->
-      <div class="field">
-        <div class="label-row">
-          <span class="label">Workspace folder</span>
-          <span class="hint">
-            the engagement workspace: where this target's workers run
+    <div class="field">
+      <div class="label-row">
+        <span class="label">Workspace folder</span>
+        <span class="hint">
+          the engagement workspace: where this target's workers run
+        </span>
+      </div>
+      <div class="folder-row">
+        <div class="folder">
+          <span class="icon"><IconFolder width="14" height="14" /></span>
+          <span class="folder-path mono">
+            {app.dialogChosen === "" ? "No folder chosen" : app.dialogChosen}
           </span>
         </div>
-        <div class="folder-row">
-          <div class="folder">
-            <span class="icon"><IconFolder width="14" height="14" /></span>
-            <span class="folder-path mono">
-              {app.dialogChosen === "" ? "No folder chosen" : app.dialogChosen}
-            </span>
-          </div>
-          <Button variant="outline" onclick={() => app.openFolderPicker()}>
-            Browse…
-          </Button>
-        </div>
-        <!-- Said whether or not a folder is chosen: it is a fact about the field, and the
+        <Button variant="outline" onclick={() => app.openFolderPicker()}>
+          Browse…
+        </Button>
+      </div>
+      <!-- Said whether or not a folder is chosen: it is a fact about the field, and the
              operator needs it *before* choosing, not after being refused. -->
-        <span class="resolved">
-          This target's hunt database is written
-          {#if databaseDirectory === ""}
-            with this server's own fleet data, not in the workspace folder.
-          {:else}
-            under <span class="mono">{databaseDirectory}</span>, not in the
-            workspace folder.
-          {/if}
-        </span>
-      </div>
-
-      <Field
-        id="target-name"
-        label="Name"
-        bind:value={app.dialogName}
-        disabled={app.createState === "creating"}
-      />
-
-      <!-- Program links: a repeatable optional list. -->
-      <div class="field">
-        <div class="label-row">
-          <span class="label">Program links</span>
-          <span class="hint">optional</span>
-        </div>
-        <ul class="links">
-          {#each app.programLinks as link (link.id)}
-            <li class="link-row">
-              <div class="link">
-                <span class="icon"><IconLink width="13" height="13" /></span>
-                <input
-                  class="link-input mono"
-                  type="url"
-                  placeholder="https://hackerone.com/acme/policy"
-                  value={link.url}
-                  disabled={app.createState === "creating"}
-                  aria-label="Program link"
-                  oninput={(event) =>
-                    app.setProgramLink(link.id, event.currentTarget.value)}
-                />
-              </div>
-              <button
-                type="button"
-                class="remove"
-                aria-label={`Remove ${link.url === "" ? "this link" : link.url}`}
-                disabled={app.createState === "creating"}
-                onclick={() => app.removeProgramLink(link.id)}
-              >
-                <IconClose width="13" height="13" />
-              </button>
-            </li>
-          {/each}
-        </ul>
-        {#if app.programLinks.length < SCOPE_IMPORT_MAX_LINKS}
-          <button
-            type="button"
-            class="add-link"
-            disabled={app.createState === "creating"}
-            onclick={() => app.addProgramLink()}
-          >
-            <IconPlus width="13" height="13" />
-            <span>Add another link</span>
-          </button>
+      <span class="resolved">
+        This target's hunt database is written
+        {#if databaseDirectory === ""}
+          with this server's own fleet data, not in the workspace folder.
+        {:else}
+          under <span class="mono">{databaseDirectory}</span>, not in the
+          workspace folder.
         {/if}
-        <span class="hint wrap">
-          A scope table and a policy page often disagree. Paste both — the
-          disagreement is worth seeing.
-        </span>
-      </div>
+      </span>
+    </div>
 
-      <!-- The autoload checkbox, and the model picker it reveals. -->
-      <div class="autoload">
-        <label class="choice">
-          <input
-            type="checkbox"
-            checked={app.autoloadScope}
-            disabled={!canAutoload || app.createState === "creating"}
-            onchange={() => app.toggleAutoload()}
-          />
-          <span class="choice-body">
-            <span class="choice-title">Read the pages and load the scope</span>
-            <span class="choice-more">
-              An intake agent reads each link with its own browser, writes the
-              in and out lists as scope entries, and records the hosts they name
-              as assets. Nothing is tested and no hunt is started — review and
-              adjust anything on the Assets page afterwards.
-            </span>
-          </span>
-        </label>
+    <Field
+      id="target-name"
+      label="Name"
+      bind:value={app.dialogName}
+      disabled={app.createState === "creating"}
+    />
 
-        {#if !canAutoload}
-          <!-- No harness, so no import can run. Said here rather than leaving the
-               checkbox enabled and letting the operator paste links nothing will read. -->
-          <p class="unavailable" role="status">
-            {app.importModelDetail === ""
-              ? "No agent harness is ready, so program pages cannot be read."
-              : app.importModelDetail}
-          </p>
-        {:else if app.showImportModel}
-          <!--
-            The picker appears with the checkbox and hides with it, because a model choice
-            with no agent to run is a control for nothing (D15).
-
-            The model it shows is the server's answer, resolved against the live catalogue.
-            Nothing here holds a model id: `modelOption.ts` is explicit that a descriptor
-            is observed when the server built its harnesses and replaced wholesale when
-            they are rebuilt, so an id written into this bundle would outlive the catalogue
-            entry it names and this control would offer a choice the server could not
-            honour.
-          -->
-          <div class="model">
-            <div class="label-row">
-              <span class="label">Model</span>
-              <span class="hint">
-                {app.importerModel?.origin === "fallback"
-                  ? "resolved by fallback"
-                  : "resolved from the catalogue"}
-              </span>
-            </div>
-            <div class="model-row">
-              <button
-                type="button"
-                class="model-trigger"
-                aria-expanded={app.importPickerOpen}
-                onclick={() => app.toggleImportPicker()}
-              >
-                <span class="mono">{app.effectiveImportModel}</span>
-                <span class="model-on">
-                  on {app.importInstance?.displayName ??
-                    app.importerModel?.instanceId}
-                </span>
-              </button>
-            </div>
-            {#if app.importPickerOpen}
-              <!--
-                The same columns the composer's picker has, from one component. They were
-                written twice and had already diverged: this copy hid the instance rail
-                when only one harness was configured, and it disabled an unusable harness
-                with no reason where the composer's prints the harness's own sentence —
-                which is the rule, because a reason has to be readable where the choice is
-                made. `HarnessChoice`'s header has the whole list.
-
-                It also replaces this block's invalid ARIA: it was a `role="listbox"` on a
-                div holding a text input, with `role="option"` two levels down inside it.
-              -->
-              <HarnessChoice
-                layout="inline"
-                instances={app.harnesses}
-                active={app.importInstance}
-                model={app.effectiveImportModel}
-                bind:query={app.importModelQuery}
-                onPickInstance={(instanceId) =>
-                  app.pickImportInstance(instanceId)}
-                onPickModel={(modelId) => app.pickImportModel(modelId)}
-                onDismiss={() => (app.importPickerOpen = false)}
-              >
-                {#snippet note()}
-                  An import is pinned to the harness it starts on, like a run.
-                  Nothing here starts one.
-                {/snippet}
-              </HarnessChoice>
-            {/if}
-            <span class="hint wrap">{app.importerModel?.detail}</span>
-          </div>
-        {/if}
-      </div>
-
-      <!--
+    <!--
         A note for people, and presented as one.
 
         It used to read `Scope` with the placeholder `*.example.test`, which promised a
@@ -288,31 +130,31 @@
         how an operator comes to believe they have authored a boundary they have not — so it
         is plainly a description now, and not mono.
       -->
-      <Field
-        id="target-scope"
-        label="Note"
-        placeholder="Engagement window, client contacts, anything the program page does not say…"
-        bind:value={app.dialogScope}
-        disabled={app.createState === "creating"}
-      />
+    <Field
+      id="target-scope"
+      label="Note"
+      placeholder="Engagement window, client contacts, anything the program page does not say…"
+      bind:value={app.dialogScope}
+      disabled={app.createState === "creating"}
+    />
 
-      {#if app.createState === "duplicate"}
-        <div class="alert warning" role="alert">
-          <strong>Already a target.</strong>
-          {app.createDetail}. Open it instead?
-          <div class="alert-action">
-            <Button
-              size="sm"
-              onclick={() => {
-                app.select(app.duplicateOf);
-                app.openTarget(app.duplicateOf);
-              }}>Open {app.duplicateOf}</Button
-            >
-          </div>
+    {#if app.createState === "duplicate"}
+      <div class="alert warning" role="alert">
+        <strong>Already a target.</strong>
+        {app.createDetail}. Open it instead?
+        <div class="alert-action">
+          <Button
+            size="sm"
+            onclick={() => {
+              app.select(app.duplicateOf);
+              app.openTarget(app.duplicateOf);
+            }}>Open {app.duplicateOf}</Button
+          >
         </div>
-      {/if}
+      </div>
+    {/if}
 
-      <!--
+    <!--
         The folder cannot be read — and a refusal this screen has not heard of.
 
         It carries a way out of its own now. It did not, and `invalid_name` landed here:
@@ -322,20 +164,20 @@
         reason a newer server adds, and neither may leave the operator with nothing to
         press.
       -->
-      {#if app.createState === "denied"}
-        <div class="alert warning" role="alert">
-          <strong>That folder cannot be used.</strong>
-          {app.createDetail} Grant access to it and choose it again, or pick a different
-          one.
-          <div class="alert-action">
-            <Button size="sm" onclick={() => app.openFolderPicker()}>
-              Choose another folder
-            </Button>
-          </div>
+    {#if app.createState === "denied"}
+      <div class="alert warning" role="alert">
+        <strong>That folder cannot be used.</strong>
+        {app.createDetail} Grant access to it and choose it again, or pick a different
+        one.
+        <div class="alert-action">
+          <Button size="sm" onclick={() => app.openFolderPicker()}>
+            Choose another folder
+          </Button>
         </div>
-      {/if}
+      </div>
+    {/if}
 
-      <!--
+    <!--
         The name, reported as the name.
 
         Create stays enabled here, which is the whole point: the field that fixes this is
@@ -343,14 +185,14 @@
         operator corrects the name and creates the target. Every other refusal names a
         folder; this one must not, because nothing about the folder is wrong.
       -->
-      {#if app.createState === "invalid-name"}
-        <div class="alert warning" role="alert">
-          <strong>That name cannot be used.</strong>
-          {app.createDetail}. Edit the name above and create the target again.
-        </div>
-      {/if}
+    {#if app.createState === "invalid-name"}
+      <div class="alert warning" role="alert">
+        <strong>That name cannot be used.</strong>
+        {app.createDetail}. Edit the name above and create the target again.
+      </div>
+    {/if}
 
-      <!--
+    <!--
         The folder is readable and still cannot host a target.
 
         Its own state rather than the one above, because "try again" is wrong here: the
@@ -359,44 +201,42 @@
         carries both ways out — a different folder, or a different `HUNT_ROOT` — so this
         adds no advice of its own, and the picker is reopened rather than described.
       -->
-      {#if app.createState === "unusable"}
-        <div class="alert warning" role="alert">
-          <strong>That folder cannot hold a target.</strong>
-          {app.createDetail}.
-          <div class="alert-action">
-            <Button size="sm" onclick={() => app.openFolderPicker()}>
-              Choose another folder
-            </Button>
-          </div>
+    {#if app.createState === "unusable"}
+      <div class="alert warning" role="alert">
+        <strong>That folder cannot hold a target.</strong>
+        {app.createDetail}.
+        <div class="alert-action">
+          <Button size="sm" onclick={() => app.openFolderPicker()}>
+            Choose another folder
+          </Button>
         </div>
-      {/if}
-
-      {#if app.createState === "failed"}
-        <div class="alert danger" role="alert">
-          <strong>This target could not be prepared.</strong> It is registered
-          and listed, but its database did not migrate, so it shows as
-          unavailable in the rail. Your other targets are unaffected and still
-          open.
-          <code class="mono trace">{app.createDetail}</code>
-        </div>
-      {/if}
-
-      <div class="actions">
-        <Button
-          variant="primary"
-          type="submit"
-          disabled={!canCreate}
-          loading={app.createState === "creating"}
-        >
-          {app.createState === "creating" ? "Preparing…" : "Create target"}
-        </Button>
-        <Button variant="quiet" onclick={() => app.cancelNewTarget()}>
-          Cancel
-        </Button>
       </div>
-    </form>
-  </div>
-{/if}
+    {/if}
+
+    {#if app.createState === "failed"}
+      <div class="alert danger" role="alert">
+        <strong>This target could not be prepared.</strong> It is registered and
+        listed, but its database did not migrate, so it shows as unavailable in
+        the rail. Your other targets are unaffected and still open.
+        <code class="mono trace">{app.createDetail}</code>
+      </div>
+    {/if}
+
+    <div class="actions">
+      <Button
+        variant="primary"
+        type="submit"
+        disabled={!canCreate}
+        loading={app.createState === "creating"}
+      >
+        {app.createState === "creating" ? "Preparing…" : "Create target"}
+      </Button>
+      <Button variant="quiet" onclick={() => app.cancelNewTarget()}>
+        Cancel
+      </Button>
+    </div>
+  </form>
+</div>
 
 {#if app.folderPickerOpen}
   <FolderPicker {app} />
@@ -459,10 +299,6 @@
     line-height: 16px;
     color: var(--text-faint);
   }
-  .hint.wrap {
-    color: var(--text-muted);
-    text-wrap: pretty;
-  }
   .folder-row {
     display: flex;
     align-items: center;
@@ -501,162 +337,6 @@
     line-height: 17px;
     color: var(--text-faint);
     overflow-wrap: anywhere;
-  }
-  .links {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-  .link-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .link {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    height: 44px;
-    padding: 0 12px;
-    box-sizing: border-box;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-md);
-    background: var(--bg-layer-01);
-  }
-  .link-input {
-    flex: 1;
-    min-width: 0;
-    border: 0;
-    background: transparent;
-    color: var(--text-base);
-    /* 16px keeps iOS from zooming, which is `Field`'s reason too. */
-    font-size: 16px;
-    font-family: var(--font-mono);
-  }
-  .link-input:focus {
-    outline: none;
-  }
-  .link:focus-within {
-    border-color: var(--border-focus);
-  }
-  .remove,
-  .add-link {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--icon-faint);
-    cursor: pointer;
-  }
-  .remove {
-    flex: none;
-    width: 30px;
-    height: 30px;
-  }
-  .remove:hover:not(:disabled) {
-    background: var(--overlay-pressed);
-    color: var(--icon-base);
-  }
-  .add-link {
-    gap: 9px;
-    height: 44px;
-    padding: 0 12px;
-    box-sizing: border-box;
-    border: 1px dashed var(--border-strong);
-    border-radius: var(--radius-md);
-    color: var(--text-muted);
-    font-size: 13px;
-    width: calc(100% - 36px);
-  }
-  .add-link:hover:not(:disabled) {
-    background: var(--overlay-hover);
-    color: var(--text-base);
-  }
-  .remove:disabled,
-  .add-link:disabled {
-    cursor: default;
-    opacity: 0.5;
-  }
-  .autoload {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .choice {
-    display: flex;
-    gap: 11px;
-    padding: 13px;
-    box-sizing: border-box;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-md);
-    background: var(--bg-base);
-    cursor: pointer;
-  }
-  .choice input {
-    flex: none;
-    margin: 2px 0 0;
-    accent-color: var(--bg-inverse);
-  }
-  .choice-body {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-  }
-  .choice-title {
-    font-size: 12px;
-    line-height: 17px;
-    font-weight: 500;
-    color: var(--text-base);
-  }
-  .choice-more {
-    font-size: 11px;
-    line-height: 17px;
-    color: var(--text-muted);
-    text-wrap: pretty;
-  }
-  .unavailable {
-    margin: 0;
-    font-size: 11px;
-    line-height: 17px;
-    color: var(--state-fg-warning);
-    text-wrap: pretty;
-  }
-  .model {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding-left: 26px;
-  }
-  .model-row {
-    display: flex;
-  }
-  .model-trigger {
-    display: flex;
-    align-items: baseline;
-    gap: 9px;
-    height: 36px;
-    padding: 0 12px;
-    box-sizing: border-box;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-md);
-    background: var(--bg-layer-01);
-    color: var(--text-base);
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .model-trigger:hover {
-    background: var(--overlay-hover);
-  }
-  .model-on {
-    font-size: 11px;
-    color: var(--text-faint);
   }
   .alert {
     padding: 12px 14px;

@@ -16,7 +16,7 @@
    * depth, which is this screen's to offer because the composer is where a run's model
    * options are set.
    *
-   * **The columns are `HarnessChoice`'s**, shared with the create-target screen, which
+   * **The columns are `HarnessChoice`'s**, shared with the Auto-load page, which
    * asks the same question in an inline block. That component's header records what the
    * two copies had already drifted on before they were one: whether an unusable harness
    * stayed selectable with its reason, whether the rail appeared at all with one harness
@@ -145,7 +145,7 @@
 
             It is the composer's and not the importer's: `@bit/contracts`'s
             `modelOption.ts` holds the rules for what survives a model change, and the
-            create-target screen has no model options to carry.
+            Auto-load page has no model options to carry.
           -->
           <p class="rail-label">Reasoning</p>
 

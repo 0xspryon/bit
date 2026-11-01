@@ -39,6 +39,12 @@
    * opens, because by the time it closes the opener has no ancestors left to ask. If the
    * opener is gone, that ancestor gets focus instead; if there is none, behaviour is what
    * it was.
+   *
+   * **The marked ancestor can go too.** Deleting the last scope entry replaces both lists
+   * with the empty state, so the list that was marked is as gone as the `×` was. The
+   * dialog was opened from something marked, so the page has said it keeps a survivor
+   * somewhere: the first one still in the document gets focus, which on that page is the
+   * empty state, and is better than `<body>`.
    */
   $effect(() => {
     if (panel === null) return;
@@ -51,6 +57,9 @@
     return () => {
       if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
       else if (fallback !== null && fallback.isConnected) fallback.focus();
+      else if (fallback !== null) {
+        document.querySelector<HTMLElement>("[data-focus-fallback]")?.focus();
+      }
     };
   });
 
