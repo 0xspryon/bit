@@ -59,3 +59,14 @@
 - When in doubt about how to implement a functionality or how EffectV4 works, look
   the EffectV4, OpenCode/ T3Code better-agent repositories and gain inspiration
   from that about how how such a functionality should be implemented.
+- Delegate short-lived work — research, a codebase survey, a focused question —
+  to the **OpenCode** harness on GLM 5.3: `glm-5.3` from the z.ai coding plan, or
+  `glm-5.3-flash` from the OpenCode plan. Either is enough for a task that reads
+  and reports, and neither spends the frontier-model budget that long-running
+  implementation and review work needs. Implementation, code review and anything
+  holding a design decision stay on the stronger model.
+  Resolve the id from the harness's live catalogue rather than hardcoding one —
+  `@opencode/schema`'s `Agent.Info.model` is a `Model.Ref`, and the OpenCode plan
+  currently spells its entry `opencode/glm-5.3-flash-free`
+  (`apps/server/src/spike/usageProbe.ts:75`). The z.ai entry depends on the
+  provider the operator has configured and is not pinned here for the same reason.
