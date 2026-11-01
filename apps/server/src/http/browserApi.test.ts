@@ -22,6 +22,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -905,6 +906,177 @@ describe("creating a target", () => {
       expect.arrayContaining(["acme-corp", "internal-api"]),
     );
     expect(listed.find((row) => row.id === "broken")?.available).toBe(false);
+  });
+});
+
+/**
+ * A workspace folder that would hold the target's own fleet directory.
+ *
+ * **Its own listener, because the suite's fleet root is a sibling of its picker root** and
+ * so no folder a browser could choose there can contain it. That separation is the right
+ * default for every other test and it makes this refusal unreachable, which is close to
+ * how the defect shipped: the operator's layout put `HUNT_ROOT` *inside* the folder they
+ * nominated, and nothing on the creation path compared the two.
+ *
+ * What the refusal is worth: every non-worker session on a target runs in a directory
+ * under `<fleet root>/targets/<id>/`, and `gatedRoleDirectory` refuses to install the
+ * policy gate into a role directory inside the workspace. So the operator saw the import
+ * refuse, and their first planner round and first conversation would have refused
+ * identically. The refusal below moves that from four failures to one, before a row is
+ * written.
+ */
+describe("a workspace that would contain the target's own fleet directory", () => {
+  const ownBase = realpathSync(
+    mkdtempSync(join(tmpdir(), "bit-nested-fleet-")),
+  );
+  /** The picker root, and the folder the fleet root sits inside. */
+  const ownWorkspaceRoot = join(ownBase, "bit_demo");
+  /** Inside the picker root: the layout the defect needs, and the one `HUNT_ROOT` defaults to. */
+  const ownFleetRoot = join(ownWorkspaceRoot, ".runtime", "hunt");
+  /** The fixture's layout, which must keep working: a workspace *inside* the fleet root. */
+  const beside = join(ownFleetRoot, "workspaces", "bit-demo");
+  const ownFleet = FleetStore.layer(ownFleetRoot);
+
+  let ownApi = "";
+  let ownToken = "";
+  let dispose: () => Promise<void>;
+
+  beforeAll(async () => {
+    mkdirSync(beside, { recursive: true });
+    const ownPassword = "nested-fleet-pass";
+    const layer = Layer.unwrap(
+      Effect.map(Effect.context<RunNarrations>(), (shared) =>
+        ControlPlaneEndpoint.layer({
+          policy: POLICY,
+          extraRoutes: browserApiRoutes({
+            workspaceRoot: ownWorkspaceRoot,
+          }).pipe(
+            Layer.provide(BrowserSessions.layerWithPassword(ownPassword)),
+            Layer.provide(ScopeImporter.unavailable),
+            Layer.provide(TargetStores.layer.pipe(Layer.provide(ownFleet))),
+            Layer.provide(ownFleet),
+            Layer.provide(supervisorHolding),
+            Layer.provide(PlanSupervisor.unavailable),
+            Layer.provide(
+              GoalConversations.unavailable.pipe(
+                Layer.provide(TargetStores.layer.pipe(Layer.provide(ownFleet))),
+              ),
+            ),
+            Layer.provide(HarnessResolver.empty),
+            Layer.provide(Layer.succeedContext(shared)),
+            Layer.orDie,
+          ),
+        }),
+      ),
+    ).pipe(
+      Layer.provideMerge(RunNarrations.layer),
+      Layer.provideMerge(McpCredentials.layer),
+      Layer.provideMerge(McpCallCounter.layer),
+      Layer.provideMerge(PolicyDecisions.layer),
+      Layer.provide(
+        TargetStores.ofStore("t").pipe(
+          Layer.provide(ObservationStore.layer(join(ownBase, "served.sqlite"))),
+        ),
+      ),
+    );
+    const own = ManagedRuntime.make(layer);
+    dispose = () => own.dispose();
+    const endpoint = await own.runPromise(ControlPlaneEndpoint);
+    ownApi = `${endpoint.origin}/api/v1`;
+    const opened = await fetch(`${ownApi}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: ownPassword }),
+    });
+    ownToken = String(
+      ((await opened.json()) as Record<string, unknown>)["token"],
+    );
+  });
+
+  afterAll(async () => {
+    await dispose?.();
+    rmSync(ownBase, { recursive: true, force: true });
+  });
+
+  const create = async (workspacePath: string, name: string) =>
+    read(
+      await fetch(`${ownApi}/targets`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${ownToken}`,
+        },
+        body: JSON.stringify({ workspacePath, name, scopeNote: "" }),
+      }),
+    );
+
+  test("the folder holding the fleet root is refused, and nothing is registered", async () => {
+    const refused = await create(ownWorkspaceRoot, "doomed demo");
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({
+      _tag: "TargetRefused",
+      reason: "workspace_contains_fleet_root",
+      // The id that would have been registered. There is no other target to offer, which
+      // is why the screen's "Already a target" state is the wrong one for this refusal.
+      targetId: "doomed-demo",
+    });
+    const detail = String(refused.body["detail"]);
+    // Both ways out, in the refusal itself: another folder, or another fleet root.
+    expect(detail).toContain(ownFleetRoot);
+    expect(detail).toContain("HUNT_ROOT");
+    // Refused *before* the row: a registry that recorded it would leave the operator a
+    // target to open that no session can run in.
+    const listed = (
+      await read(
+        await fetch(`${ownApi}/targets`, {
+          headers: { authorization: `Bearer ${ownToken}` },
+        }),
+      )
+    ).body as unknown as ReadonlyArray<{ id: string }>;
+    expect(listed).toEqual([]);
+    expect(existsSync(join(ownFleetRoot, "targets", "doomed-demo"))).toBe(
+      false,
+    );
+  });
+
+  test("every folder that would hold the target's directory is refused, however spelled", async () => {
+    // The fleet root itself, and the two folders inside it that still contain
+    // `targets/<id>/` — proof the comparison is against the target's own directory
+    // rather than against the fleet root alone.
+    mkdirSync(join(ownFleetRoot, "targets", "squatter"), { recursive: true });
+    for (const folder of [
+      ownFleetRoot,
+      join(ownFleetRoot, "targets"),
+      join(ownFleetRoot, "targets", "squatter"),
+    ]) {
+      const refused = await create(folder, "squatter");
+      expect({ folder, status: refused.status, body: refused.body }).toEqual({
+        folder,
+        status: 409,
+        body: {
+          _tag: "TargetRefused",
+          reason: "workspace_contains_fleet_root",
+          targetId: "squatter",
+          detail: expect.any(String),
+        },
+      });
+    }
+  });
+
+  test("a workspace inside the fleet root is accepted: the role directories are beside it", async () => {
+    // The scope fixture's layout (`fixture/scopeFixture.ts`): `<fleet root>/workspaces/<id>`.
+    // Nothing of the target's is inside it, so every session can start and refusing it
+    // would break a layout that works.
+    const created = await create(beside, "bit demo");
+    expect(created.status).toBe(200);
+    expect(created.body).toMatchObject({
+      target: {
+        id: "bit-demo",
+        workspacePath: beside,
+        dataDirectory: join(ownFleetRoot, "targets", "bit-demo"),
+        available: true,
+      },
+    });
   });
 });
 

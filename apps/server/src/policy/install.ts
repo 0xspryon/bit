@@ -350,8 +350,17 @@ export const resolveThroughSymlinks = (path: string): string => {
   throw new Error(`too many levels of symbolic links resolving ${path}`);
 };
 
-/** Whether `child` is `parent` or lies inside it, both resolved as above. */
-const isWithin = (parent: string, child: string): boolean => {
+/**
+ * Whether `child` is `parent` or lies inside it, both resolved as above.
+ *
+ * Exported for one caller beyond this file: `createTarget` (`http/browserApi.ts`) refuses
+ * a workspace folder that contains this server's fleet root, because every role directory
+ * under it would then be inside the workspace and {@link gatedRoleDirectory} below would
+ * refuse every non-worker session on that target. The two checks are the same question
+ * asked at two moments, so they share this one derivation of "inside" — including the
+ * symlink resolution, which is where a second implementation would have drifted first.
+ */
+export const isWithin = (parent: string, child: string): boolean => {
   const relation = relative(
     resolveThroughSymlinks(parent),
     resolveThroughSymlinks(child),
@@ -365,7 +374,8 @@ const isWithin = (parent: string, child: string): boolean => {
 };
 
 /**
- * A planner or goal directory that exists and has the gate installed.
+ * A role directory — a planner round's, a goal agent's, a scope import's — that exists
+ * and has the gate installed.
  *
  * Only {@link gatedRoleDirectory} produces one. It is still a string, so it can be handed
  * to a harness as one; the brand is what lets a function that creates a session ask for
@@ -374,11 +384,12 @@ const isWithin = (parent: string, child: string): boolean => {
 export type GatedDirectory = string & Brand.Brand<"GatedDirectory">;
 const asGated = Brand.nominal<GatedDirectory>();
 
-/** What preparing one planner or goal directory needs. */
+/** What preparing one non-worker role's directory needs. */
 export interface GatedRoleDirectory<E> {
   /**
    * Makes the directory, idempotently. For the fleet that is
-   * `FleetStore.ensurePlanningDirectory` or `ensureGoalDirectory`; taken as an effect so
+   * `FleetStore.ensurePlanningDirectory`, `ensureGoalDirectory` or
+   * `ensureImportDirectory`; taken as an effect so
    * this file has no runtime dependence on the persistence layer (the import above is
    * type-only). What it yields is deliberately not a
    * string: see {@link UngatedRoleDirectory}.
@@ -406,8 +417,8 @@ export interface GatedRoleDirectory<E> {
 }
 
 /**
- * Makes a planner round's or a goal agent's directory and gates it, in that order, or
- * refuses.
+ * Makes one non-worker role's directory — a planner round's, a goal agent's, a scope
+ * import's — and gates it, in that order, or refuses.
  *
  * **Why the gate goes in a directory where nothing is expected to act.** "The planner does
  * not run shell commands" and "the goal agent only talks" are assumptions about what a
@@ -415,8 +426,9 @@ export interface GatedRoleDirectory<E> {
  * that does reach for `bash` or `webfetch` is denied by the same fail-closed path that
  * stops a worker, and the attempt is audited, rather than relying on nothing having been
  * asked. A gate missing from exactly the directories where no action is expected is how an
- * unexpected action goes unrecorded. So all three roles are gated, and this is the single
- * way to obtain a planner or goal directory that a session may be created in.
+ * unexpected action goes unrecorded. So every role is gated, the ones that only read and
+ * talk included, and this is the single way to obtain a directory a non-worker session may
+ * be created in.
  *
  * The directory is created first and gated before it is returned, so no caller can
  * receive a path whose gate has not been installed. Nothing here creates a session or
@@ -460,7 +472,7 @@ export const gatedRoleDirectory = <E>(
       });
       if (inWorkspace) {
         return yield* refuse(
-          `${directory} is inside the workspace ${workspace}, where workers run; a planner or goal directory must be outside it`,
+          `${directory} is inside the workspace ${workspace}, where workers run; a session that is not a worker must run outside it. That workspace holds this target's own fleet directory, so no planner, goal or import session on it can start — re-create the target against a folder that does not contain this server's fleet root, or run the server with a HUNT_ROOT outside that folder`,
         );
       }
     }

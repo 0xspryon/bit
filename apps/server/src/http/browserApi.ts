@@ -110,7 +110,7 @@ import {
 } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { renderScopeBlock } from "../scope/scopePrompt";
-import { POLICY_AUDIT_FILE } from "../policy/install";
+import { isWithin, POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
 import { chooseImporterModel } from "../import/importerModel";
 import { ScopeImporter } from "../import/scopeImporter";
@@ -1005,11 +1005,11 @@ const fleetHandlers = HttpApiBuilder.group(
        * Registers a target, migrates its file, and reports what that produced.
        *
        * The order is: check the folder with the picker's own rules, derive and check the
-       * id, refuse a folder that is already somebody's target, register, migrate, then
-       * describe. The folder is checked *first* so a permission problem is reported as a
-       * permission problem rather than as a failed registration — that is the dialog's
-       * "that folder cannot be read" state, and it must not be reachable only after a
-       * row has been written.
+       * id, refuse a folder that cannot host this target at all, refuse a folder that is
+       * already somebody's target, register, migrate, then describe. The folder is
+       * checked *first* so a permission problem is reported as a permission problem
+       * rather than as a failed registration — that is the dialog's "that folder cannot
+       * be read" state, and it must not be reachable only after a row has been written.
        *
        * A failed migration is **not** an error here. The row stays, the target is listed
        * as unavailable with the failure text, and its neighbours keep serving. That is
@@ -1029,6 +1029,56 @@ const fleetHandlers = HttpApiBuilder.group(
             targetId: payload.name,
             detail:
               "a target's name becomes a directory name: it needs at least one letter or digit, and only a-z, 0-9, '-' and '_' are kept",
+          });
+        }
+
+        /*
+         * A workspace folder that would hold this target's own fleet directory.
+         *
+         * **Refused here because every session on such a target is refused later.** The
+         * target's data lives at `fleet.paths.targetDirectory(targetId)`, and every
+         * non-worker role directory — a planner round's, a goal agent's, a scope
+         * import's — is made under it. `gatedRoleDirectory` (`policy/install.ts`) refuses
+         * to install the gate into a role directory inside the workspace, for the reason
+         * recorded there: a worker that can reach a planner's directory can tamper with
+         * what constrains it. So a folder that contains this target's fleet directory
+         * produces a target that cannot plan, cannot converse and cannot import — the
+         * operator finds out one session at a time, starting with whichever they open
+         * first, and nothing they do on the target changes the answer.
+         *
+         * **The containment test is `isWithin`, imported from the installer**, not a
+         * prefix comparison written here. The two checks are one question asked at two
+         * moments, and the failure mode of two implementations is a folder that passes
+         * creation and fails every session — exactly what this refusal exists to stop.
+         * `isWithin` also resolves symlinks, which a second implementation would have
+         * got wrong first.
+         *
+         * **Only this direction is refused.** A workspace *inside* the fleet root is a
+         * supported layout and the scope fixture uses it (`fixture/scopeFixture.ts`
+         * nominates `<hunt root>/workspaces/<id>`): the role directories are siblings of
+         * the workspace there, not inside it, and every session starts. What is refused
+         * is the folder containing this target's own directory, which covers the reported
+         * case (the workspace *is* the fleet root), a workspace above it, and the two
+         * folders inside the fleet root that still hold this target's data —
+         * `<root>/targets` and `<root>/targets/<id>`.
+         */
+        const dataDirectory = fleet.paths.targetDirectory(targetId);
+        const fleetInside = yield* Effect.try({
+          try: () => isWithin(workspacePath, dataDirectory),
+          // A path that cannot be resolved refuses rather than permits, as it does in the
+          // installer: "cannot tell whether it is inside" must not read as "is not".
+          catch: (cause) =>
+            new TargetRefused({
+              reason: "workspace_contains_fleet_root",
+              targetId,
+              detail: `${workspacePath} could not be compared with this server's fleet root ${fleet.paths.root} (${String(cause)}); refusing rather than registering a target whose sessions may all be refused later`,
+            }),
+        });
+        if (fleetInside) {
+          return yield* new TargetRefused({
+            reason: "workspace_contains_fleet_root",
+            targetId,
+            detail: `${workspacePath} contains this server's fleet root ${fleet.paths.root}, so this target's own directory ${dataDirectory} would sit inside the folder where its workers run. Every planner, goal and import session runs in a directory under that one and the policy gate refuses to install into any of them, so the target could be created and then do nothing. Pick a folder outside ${fleet.paths.root}, or restart this server with HUNT_ROOT set outside the folder you want to use`,
           });
         }
 

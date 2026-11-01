@@ -669,6 +669,9 @@ describe("a planner, a goal agent and a worker each run behind the gate", () => 
       [inside, made.workspace],
       // A symlink to the workspace is the same place under another name.
       [join(link, "goal", "goal_1"), made.workspace],
+      // The importer, which is the role an operator actually hit this refusal with, and
+      // the reason the sentence it carries no longer names only planners and goals.
+      [join(made.workspace, "import", "imp_1"), made.workspace],
     ] as const) {
       const refused = await Effect.runPromise(
         Effect.result(
@@ -687,6 +690,21 @@ describe("a planner, a goal agent and a worker each run behind the gate", () => 
       expect(refused._tag).toBe("Failure");
       if (refused._tag === "Failure") {
         expect(refused.failure).toBeInstanceOf(PolicyHookNotInstalled);
+        /*
+         * The sentence is about roles, so what it says about them is asserted.
+         *
+         * It used to read "a planner or goal directory must be outside it", which was
+         * written before the scope importer existed — and the importer is what the
+         * refusal reached an operator through: they asked for a scope import and were
+         * told about planners. The rule has never been about which roles exist, so the
+         * wording names the only distinction it actually draws.
+         */
+        const detail = (refused.failure as PolicyHookNotInstalled).detail;
+        expect(detail).toContain("a session that is not a worker");
+        expect(detail).not.toContain("a planner or goal directory");
+        // And it says the layout is the problem, not the attempt: this refusal is not
+        // one to retry.
+        expect(detail).toContain("HUNT_ROOT");
       }
       expect(existsSync(join(directory, ".opencode"))).toBe(false);
     }

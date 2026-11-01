@@ -562,6 +562,16 @@ export class ImporterModelUnavailable extends Schema.TaggedError<ImporterModelUn
  * already holds the folder, which is the state the design brief calls "Already a
  * target". A duplicate is refused rather than adopted, because an id is a directory
  * full of somebody's evidence.
+ *
+ * `workspace_contains_fleet_root` is the one reason here that is about the *layout*
+ * rather than about the registry, and it is a refusal at creation because the
+ * alternative is a target that cannot do anything. Every non-worker session on a target
+ * — planner round, goal agent, scope importer — runs in a directory under this server's
+ * fleet root, and the policy gate refuses to install into a directory inside the folder
+ * where that target's workers run. So a workspace folder that *contains* the fleet root
+ * is a target whose first planner round, first conversation and first import are all
+ * refused for the same reason, discovered one at a time. `targetId` is the id that would
+ * have been registered: there is nothing to open instead.
  */
 export class TargetRefused extends Schema.TaggedError<TargetRefused>()(
   "TargetRefused",
@@ -570,6 +580,7 @@ export class TargetRefused extends Schema.TaggedError<TargetRefused>()(
       "duplicate_target",
       "duplicate_workspace",
       "invalid_name",
+      "workspace_contains_fleet_root",
     ]),
     /** The id that was refused, or the id already holding that folder. */
     targetId: Schema.String,
