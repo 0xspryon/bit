@@ -712,6 +712,16 @@ applied to what the harness reports, not a second hardcoded id.
 The picker appears with the checkbox and hides with it, because a model choice with no
 agent to run is a control for nothing.
 
+**All the links go to one agent session, not one session per link.** A3's own copy makes
+the argument: _"A scope table and a policy page often disagree. Paste both — the
+disagreement is worth seeing."_ Only a reader that has seen both pages can notice a
+disagreement, and a session per link structurally cannot. One session is also cheaper,
+and makes the partial-failure rule above trivial rather than a merge across results.
+
+The session reads the pages in order and writes as it goes — the entries from a page it
+has already read stand whatever happens to the next one. That is what makes "one link
+parsing is enough" a property of the design rather than error handling bolted on.
+
 ## Build order
 
 Each slice ends with the gates green: `typecheck`, `test`, `test:persistence`, `build`,
