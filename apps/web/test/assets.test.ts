@@ -484,6 +484,119 @@ describe("the scope", () => {
     expect(app.viewScope?.entries).toEqual([]);
   });
 
+  describe("deleting an entry asks first", () => {
+    const withEntry = (fake: FakeServer): void => {
+      fake.onScope = () =>
+        ok(
+          emptyScope({
+            entries: [
+              {
+                entryId: "scope_7",
+                effect: "in",
+                kind: "subtree",
+                value: "acme.test",
+                source: "operator",
+                note: null,
+                createdAt: 1,
+              },
+            ],
+          }),
+        );
+      fake.onRemoveScopeEntry = () => ok(emptyScope());
+    };
+
+    test("asking sends nothing, and cancelling leaves the entry alone", async () => {
+      const [app, fake] = await onAssets(withEntry);
+      app.askToRemoveScopeEntry("scope_7");
+      expect(app.scopeEntryToRemove).toBe("scope_7");
+      // The click that opens the question is not the click that deletes. This is the
+      // whole change: before it, the `×` called `removeScopeEntry` directly.
+      expect(fake.countOf("removeScopeEntry")).toBe(0);
+
+      app.cancelRemoveScopeEntry();
+      expect(app.scopeEntryToRemove).toBe("");
+      expect(fake.countOf("removeScopeEntry")).toBe(0);
+      expect(app.viewScope?.entries).toHaveLength(1);
+    });
+
+    test("confirming deletes the entry that was asked about, and closes the question", async () => {
+      const [app, fake] = await onAssets(withEntry);
+      app.askToRemoveScopeEntry("scope_7");
+      await app.confirmRemoveScopeEntry();
+
+      expect(argsOf(fake, "removeScopeEntry")?.[2]).toBe("scope_7");
+      expect(app.scopeEntryToRemove).toBe("");
+      expect(app.viewScope?.entries).toEqual([]);
+    });
+
+    test("confirming with nothing asked about deletes nothing", async () => {
+      const [app, fake] = await onAssets(withEntry);
+      await app.confirmRemoveScopeEntry();
+      expect(fake.countOf("removeScopeEntry")).toBe(0);
+    });
+
+    test("a second confirm while the first is in flight sends nothing", async () => {
+      const [app, fake] = await onAssets(withEntry);
+      const release = fake.hold("removeScopeEntry");
+      app.askToRemoveScopeEntry("scope_7");
+      const first = app.confirmRemoveScopeEntry();
+      await settle();
+      expect(app.scopeBusy).toBe(true);
+
+      // The dialog's working state, seen from the state machine: a double-click is one
+      // delete, not a delete and a refusal that "no such entry" would have been.
+      await app.confirmRemoveScopeEntry();
+      // And the question cannot be dropped from under a request already on its way.
+      app.cancelRemoveScopeEntry();
+      expect(app.scopeEntryToRemove).toBe("scope_7");
+
+      release();
+      await first;
+      expect(fake.countOf("removeScopeEntry")).toBe(1);
+      expect(app.scopeEntryToRemove).toBe("");
+      expect(app.scopeBusy).toBe(false);
+    });
+
+    test("a refusal closes the question and is shown beside the Add form", async () => {
+      const [app] = await onAssets((fake) => {
+        withEntry(fake);
+        fake.onRemoveScopeEntry = () =>
+          refused(
+            new ScopeRefused({
+              reason: "not_found",
+              detail: "no scope entry 'scope_7' on target acme-corp",
+            }),
+          );
+      });
+      app.askToRemoveScopeEntry("scope_7");
+      await app.confirmRemoveScopeEntry();
+
+      expect(app.scopeEntryToRemove).toBe("");
+      expect(app.scopeRefusal).toContain("no scope entry 'scope_7'");
+    });
+
+    test("a deleted entry moves the verdict on its assets, so the estate is re-read", async () => {
+      const [app, fake] = await onAssets(withEntry);
+      const before = fake.countOf("assets");
+      app.askToRemoveScopeEntry("scope_7");
+      await app.confirmRemoveScopeEntry();
+      // Verdicts are derived by the server at read time. Without this the Estate tab
+      // would go on calling a host "in scope" after the entry that said so was deleted.
+      expect(fake.countOf("assets")).toBe(before + 1);
+    });
+
+    test("leaving the target drops a question that was never answered, and the open panel", async () => {
+      const [app] = await onAssets(withEntry);
+      app.askToRemoveScopeEntry("scope_7");
+      app.scopeBlockOpen = true;
+      app.openTarget("other-corp");
+      await settle();
+      expect(app.scopeEntryToRemove).toBe("");
+      // One client's scope panel must not be open on another's first visit.
+      expect(app.scopeBlockOpen).toBe(false);
+    });
+  });
+
   test("promoting a host re-reads the estate, because one click can move other rows", async () => {
     const [app, fake] = await onAssets((fake) => {
       // The server's own answer, distinguishable from the draft sent below.

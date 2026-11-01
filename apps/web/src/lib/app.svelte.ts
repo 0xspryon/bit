@@ -472,6 +472,21 @@ export class App {
   scopeRefusalContradiction = $state(false);
   /** True while a scope change is in flight, so the control can say so. */
   scopeBusy = $state(false);
+  /**
+   * The entry the operator has asked to delete and has not yet confirmed, or `""`.
+   *
+   * Held as an id and not as the entry, so the dialog is drawn from the entries as they
+   * are now: if a re-read drops the entry, there is nothing left to confirm and the
+   * dialog goes with it rather than offering to delete a row that is already gone.
+   */
+  scopeEntryToRemove = $state("");
+  /**
+   * Whether the panel holding the block the agent is given is open on the Scope tab.
+   *
+   * Held here with the tab it belongs to rather than in the screen, so that a test can
+   * open it: the markup tests render on the server, where no click can.
+   */
+  scopeBlockOpen = $state(false);
 
   /* The New goal dialog */
   goalDialogOpen = $state(false);
@@ -1919,6 +1934,8 @@ export class App {
     this.scopeRefusal = "";
     this.scopeRefusalContradiction = false;
     this.scopeBusy = false;
+    this.scopeEntryToRemove = "";
+    this.scopeBlockOpen = false;
   }
 
   #clearGoals() {
@@ -2238,18 +2255,64 @@ export class App {
     }
   }
 
-  /** Removes one entry. */
+  /**
+   * Asks to delete one entry. Nothing is sent: the screen shows the question, and
+   * {@link confirmRemoveScopeEntry} is what sends it.
+   */
+  askToRemoveScopeEntry(entryId: string) {
+    if (this.scopeBusy) return;
+    this.scopeEntryToRemove = entryId;
+  }
+
+  /** Drops the question without deleting anything. */
+  cancelRemoveScopeEntry() {
+    if (this.scopeBusy) return;
+    this.scopeEntryToRemove = "";
+  }
+
+  /**
+   * Deletes the entry the operator was asked about.
+   *
+   * The question closes whichever way the server answers (see {@link removeScopeEntry}).
+   * A refusal is shown beside the Add form, which the screen keeps in view, rather than
+   * inside a dialog that would have to hold an error slot of its own for one rare outcome.
+   */
+  async confirmRemoveScopeEntry() {
+    const entryId = this.scopeEntryToRemove;
+    if (entryId === "") return;
+    await this.removeScopeEntry(entryId);
+  }
+
+  /**
+   * Removes one entry.
+   *
+   * This is the `DELETE`, not the question: it does not ask. The screen reaches it only
+   * through {@link confirmRemoveScopeEntry}.
+   *
+   * The estate is re-read afterwards, as {@link labelScope} does, because removing an
+   * entry moves the verdict on every asset it covered and that verdict is derived by the
+   * server at read time. Patching the scope alone would leave the Estate tab saying
+   * "in scope" about a host nothing covers any more.
+   *
+   * **The question is closed while the request still counts as in flight**, so the
+   * dialog's working state hands straight to a closed dialog and the confirm button is
+   * never drawn clickable again over an entry that has just been deleted.
+   */
   async removeScopeEntry(entryId: string) {
     const id = this.viewTargetId;
     if (id === "" || this.scopeBusy) return;
     this.scopeBusy = true;
+    this.scopeRefusal = "";
+    this.scopeRefusalContradiction = false;
     const call = await this.client.removeScopeEntry(
       this.serverUrl,
       id,
       entryId,
     );
+    const applied = await this.#applyScopeChange(id, call);
+    this.scopeEntryToRemove = "";
     this.scopeBusy = false;
-    await this.#applyScopeChange(id, call);
+    if (applied) await this.loadAssets(id);
   }
 
   /**

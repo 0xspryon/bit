@@ -37,6 +37,7 @@
     describeScopeState,
     HOST_LABEL_REACH,
     type AssetView,
+    type ScopeEntryView,
     type ScopeKind,
     type ScopeState,
   } from "@bit/contracts";
@@ -44,8 +45,16 @@
   import type { App } from "../app.svelte";
   import Banner from "../components/Banner.svelte";
   import Button from "../components/Button.svelte";
+  import ConfirmAction from "../components/ConfirmAction.svelte";
   import PageFrame from "../components/PageFrame.svelte";
-  import { IconClose, IconCube, IconPlus, IconSearch } from "../icons";
+  import {
+    IconClose,
+    IconCube,
+    IconPlus,
+    IconScroll,
+    IconSearch,
+    IconTrash,
+  } from "../icons";
 
   let { app }: { app: App } = $props();
 
@@ -61,6 +70,16 @@
   let entryField = $state<HTMLInputElement | undefined>(undefined);
 
   let scope = $derived(app.viewScope);
+
+  /**
+   * The entry the delete dialog is asking about, read from the entries as they are now.
+   * `undefined` when no question is open, and also when the entry it named has gone.
+   */
+  let entryToRemove = $derived(
+    app.assetsTab === "scope"
+      ? scope?.entries.find((entry) => entry.entryId === app.scopeEntryToRemove)
+      : undefined,
+  );
   let tally = $derived(app.estateTally);
   let groups = $derived(app.shownEstateGroups);
 
@@ -180,7 +199,29 @@
     ? "Everything the hunt has found on this target. Nothing here is hidden or dropped — a host no entry covers is kept and labelled, waiting for you."
     : "The client's estate, as you authored it. These entries are only ever typed by you — nothing the agent does writes here."}
   centered={app.drawerHidden}
+  detailTitle="What the agent is told"
+  detailOpen={app.scopeBlockOpen &&
+    app.assetsTab === "scope" &&
+    scope !== undefined}
+  onclosedetail={() => (app.scopeBlockOpen = false)}
 >
+  {#snippet actions()}
+    <!-- The block the agent is given is behind a button rather than beside the lists: it
+         is the thing to check before a hunt, not the thing to read on every visit, and a
+         column of its own took the width the entries need. -->
+    {#if app.assetsTab === "scope" && scope !== undefined}
+      <Button
+        variant="outline"
+        size="page"
+        expanded={app.scopeBlockOpen}
+        onclick={() => (app.scopeBlockOpen = !app.scopeBlockOpen)}
+      >
+        <IconScroll width="13" height="13" />
+        What the agent is told
+      </Button>
+    {/if}
+  {/snippet}
+
   {#snippet filters()}
     <div class="tabs" role="tablist" aria-label="Assets views">
       <button
@@ -460,7 +501,7 @@
                         class="remove"
                         aria-label={`Remove ${entry.value}`}
                         disabled={app.scopeBusy}
-                        onclick={() => void app.removeScopeEntry(entry.entryId)}
+                        onclick={() => app.askToRemoveScopeEntry(entry.entryId)}
                       >
                         <IconClose width="13" height="13" />
                       </button>
@@ -529,124 +570,194 @@
               </ul>
             </div>
           {/if}
-
-          <form
-            class="add"
-            onsubmit={(event) => {
-              event.preventDefault();
-              void app.addScopeEntry();
-            }}
-          >
-            <span class="list-label">Add an entry</span>
-            <div class="add-row">
-              <div class="toggle">
-                <button
-                  type="button"
-                  class={["toggle-half", app.entryEffect === "in" && "on"]}
-                  aria-pressed={app.entryEffect === "in"}
-                  onclick={() => (app.entryEffect = "in")}>In</button
-                >
-                <button
-                  type="button"
-                  class={["toggle-half", app.entryEffect === "out" && "on"]}
-                  aria-pressed={app.entryEffect === "out"}
-                  onclick={() => (app.entryEffect = "out")}>Out</button
-                >
-              </div>
-              <select
-                bind:value={app.entryKind}
-                aria-label="What this entry covers"
-              >
-                {#each KINDS as kind (kind.id)}
-                  <option value={kind.id}>{kind.label}</option>
-                {/each}
-              </select>
-              <input
-                class="mono value"
-                type="text"
-                bind:this={entryField}
-                bind:value={app.entryValue}
-                placeholder="acme.test"
-                aria-label="Host, apex or address block"
-              />
-              <Button
-                type="submit"
-                variant="primary"
-                size="sm"
-                loading={app.scopeBusy}
-                disabled={app.entryValue.trim() === ""}
-              >
-                Add
-              </Button>
-            </div>
-            <!-- What this entry will mean, before it is added. The same sentence the row
-                 will show and the agent will read. -->
-            {#if app.entryValue.trim() !== ""}
-              <p class="preview-line mono">
-                {describeScopeEntry({
-                  kind: app.entryKind,
-                  value: app.entryValue.trim(),
-                })}{app.entryEffect === "out" ? " — excluded" : ""}
-              </p>
-            {/if}
-            {#if app.scopeRefusal !== ""}
-              <div
-                class={[
-                  "refusal",
-                  app.scopeRefusalContradiction && "contradiction",
-                ]}
-                role="alert"
-              >
-                {app.scopeRefusal}
-              </div>
-            {/if}
-          </form>
         </div>
 
-        <aside class="preview">
-          <span class="list-label">What the agent is told</span>
-          {#if scope.promptBlock === null}
-            <!-- A4's empty state. An empty scope says so plainly rather than showing
-                 "In scope: (nothing)" — which is what the agent would otherwise be told,
-                 and it would read as "you may touch nothing." -->
-            <div class="preview-empty">
-              <IconCube width="24" height="24" />
-              <p class="empty-lead">No scope authored for this target</p>
-              <p class="empty-more">
-                The hunt still runs and still records everything it finds — it
-                just arrives labelled <span class="mono">not covered</span>, and
-                the agent is told nothing about the client's estate.
-              </p>
-              <Button
-                variant="primary"
-                size="sm"
-                onclick={() => {
-                  entryField?.scrollIntoView({ block: "nearest" });
-                  entryField?.focus();
-                }}
+        <form
+          class="add"
+          onsubmit={(event) => {
+            event.preventDefault();
+            void app.addScopeEntry();
+          }}
+        >
+          <span class="list-label">Add an entry</span>
+          <div class="add-row">
+            <div class="toggle">
+              <button
+                type="button"
+                class={["toggle-half", app.entryEffect === "in" && "on"]}
+                aria-pressed={app.entryEffect === "in"}
+                onclick={() => (app.entryEffect = "in")}>In</button
               >
-                <IconPlus width="13" height="13" />
-                Add the first entry
-              </Button>
+              <button
+                type="button"
+                class={["toggle-half", app.entryEffect === "out" && "on"]}
+                aria-pressed={app.entryEffect === "out"}
+                onclick={() => (app.entryEffect = "out")}>Out</button
+              >
             </div>
-          {:else}
-            <pre class="block">{scope.promptBlock}</pre>
-            <ul class="notes">
-              <li>
-                A planner round gets the same block without the
-                <span class="mono">record_asset</span> line.
-              </li>
-              <li>
-                An agent already running keeps the scope it was given; the next
-                round gets this.
-              </li>
-            </ul>
+            <select
+              bind:value={app.entryKind}
+              aria-label="What this entry covers"
+            >
+              {#each KINDS as kind (kind.id)}
+                <option value={kind.id}>{kind.label}</option>
+              {/each}
+            </select>
+            <input
+              class="mono value"
+              type="text"
+              bind:this={entryField}
+              bind:value={app.entryValue}
+              placeholder="acme.test"
+              aria-label="Host, apex or address block"
+            />
+            <Button
+              type="submit"
+              variant="primary"
+              size="sm"
+              loading={app.scopeBusy}
+              disabled={app.entryValue.trim() === ""}
+            >
+              Add
+            </Button>
+          </div>
+          <!-- What this entry will mean, before it is added. The same sentence the row
+               will show and the agent will read. -->
+          {#if app.entryValue.trim() !== ""}
+            <p class="preview-line mono">
+              {describeScopeEntry({
+                kind: app.entryKind,
+                value: app.entryValue.trim(),
+              })}{app.entryEffect === "out" ? " — excluded" : ""}
+            </p>
           {/if}
-        </aside>
+          {#if app.scopeRefusal !== ""}
+            <div
+              class={[
+                "refusal",
+                app.scopeRefusalContradiction && "contradiction",
+              ]}
+              role="alert"
+            >
+              {app.scopeRefusal}
+            </div>
+          {/if}
+        </form>
       </div>
     {/if}
   {/snippet}
+
+  {#snippet detail()}
+    {#if scope !== undefined}
+      {#if scope.promptBlock === null}
+        <!-- A4's empty state. An empty scope says so plainly rather than showing
+             "In scope: (nothing)" — which is what the agent would otherwise be told,
+             and it would read as "you may touch nothing." -->
+        <div class="preview-empty">
+          <IconCube width="24" height="24" />
+          <p class="empty-lead">No scope authored for this target</p>
+          <p class="empty-more">
+            The hunt still runs and still records everything it finds — it just
+            arrives labelled <span class="mono">not covered</span>, and the
+            agent is told nothing about the client's estate.
+          </p>
+          <Button
+            variant="primary"
+            size="sm"
+            onclick={() => {
+              // The panel overlays the page below 1280px, so it has to get out of the
+              // way of the field this button names before the field is focused.
+              app.scopeBlockOpen = false;
+              entryField?.scrollIntoView({ block: "nearest" });
+              entryField?.focus();
+            }}
+          >
+            <IconPlus width="13" height="13" />
+            Add the first entry
+          </Button>
+        </div>
+      {:else}
+        <div class="preview">
+          <pre class="block">{scope.promptBlock}</pre>
+          <ul class="notes">
+            <li>
+              A planner round gets the same block without the
+              <span class="mono">record_asset</span> line.
+            </li>
+            <li>
+              An agent already running keeps the scope it was given; the next
+              round gets this.
+            </li>
+          </ul>
+        </div>
+      {/if}
+    {/if}
+  {/snippet}
 </PageFrame>
+
+{#if entryToRemove !== undefined}
+  {@const entry = entryToRemove}
+  <ConfirmAction
+    title={`Delete the entry ${entry.value}?`}
+    tone="danger"
+    confirmLabel="Delete entry"
+    workingLabel="Deleting…"
+    cancelLabel={entry.effect === "out" ? "Keep it out" : "Cancel"}
+    working={app.scopeBusy}
+    onconfirm={() => void app.confirmRemoveScopeEntry()}
+    oncancel={() => app.cancelRemoveScopeEntry()}
+  >
+    {#snippet icon()}
+      <IconTrash width="13" height="13" />
+    {/snippet}
+    {#snippet body()}
+      {@render removeConsequences(entry)}
+    {/snippet}
+  </ConfirmAction>
+{/if}
+
+<!--
+  What deleting an entry does, and nothing it does not.
+
+  Every sentence here is checked against the delete path: `DELETE FROM scope_entries`, one
+  `scope.entry.removed` event, and a re-derived prompt block. No asset row, host label or
+  asset label is written, and a verdict is derived at read time by `scopeStateOf`, so the
+  consequences are the ladder's: a hand label beats the entries, `out` beats `in`, and a
+  subject nothing covers is "not covered". There is deliberately no count of the assets
+  affected and no promise of an undo, because no contract carries either.
+-->
+{#snippet removeConsequences(entry: ScopeEntryView)}
+  <p class="lead">
+    {#if entry.effect === "in"}
+      This removes <span class="mono">{describeScopeEntry(entry)}</span> from the
+      in-scope list. Nothing the hunt found is deleted — every asset stays recorded
+      — and what the agent is told is rewritten from the entries that remain.
+    {:else}
+      This removes <span class="mono">{describeScopeEntry(entry)}</span> from the
+      out-of-scope list. Nothing the hunt found is deleted, and what the agent is
+      told no longer names it as excluded.
+    {/if}
+  </p>
+  <p class="consequence">
+    {#if entry.effect === "in"}
+      A host only this entry covered becomes <span class="mono"
+        >not covered</span
+      >
+      — which is not the same as out of scope. A host another entry still covers is
+      unaffected.
+    {:else}
+      Whatever it excluded stops being excluded: anything an in-scope entry also
+      covers becomes <span class="mono">in scope</span>, and anything else
+      becomes
+      <span class="mono">not covered</span>. Deleting it ends the exclusion; it
+      does not keep a host out of the hunt.
+    {/if}
+  </p>
+  <p class="aside">
+    Labels you set by hand are not touched, and still beat the lists. There is
+    no undo here: adding the same entry again restores what it covered.
+  </p>
+{/snippet}
 
 <style>
   /* ── The tab pair, in the filter row PageFrame already owns ────────────────── */
@@ -887,23 +998,35 @@
   }
 
   /* ── The Scope tab ─────────────────────────────────────────────────────────── */
+  /*
+   * The tab fills the body PageFrame gives it, so the lists can scroll inside it and the
+   * Add form can stay under them. PageFrame's body is itself the scroller, and a tab that
+   * only grew to its content would push "Add an entry" off the bottom of a long list.
+   */
   .scope {
-    display: flex;
-    gap: 28px;
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-  .lists {
-    flex: 1;
-    min-width: 320px;
     display: flex;
     flex-direction: column;
     gap: 22px;
+    height: 100%;
+    min-height: 0;
+    max-width: 760px;
+  }
+  /* The lists share whatever height is left, each scrolling on its own. */
+  .lists {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    gap: 22px;
+    min-height: 0;
   }
   .list {
     display: flex;
+    flex: 0 1 auto;
     flex-direction: column;
     gap: 8px;
+    /* Room for a heading and two rows. Shrinking is proportional to length, so without a
+       floor a two-entry list is squeezed to one row beside a sixteen-entry one. */
+    min-height: 112px;
   }
   .list-head {
     display: flex;
@@ -924,8 +1047,10 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+    min-height: 0;
     margin: 0;
     padding: 0;
+    overflow-y: auto;
     list-style: none;
   }
   .entry {
@@ -985,6 +1110,7 @@
 
   .add {
     display: flex;
+    flex: none;
     flex-direction: column;
     gap: 10px;
     padding: 16px;
@@ -1068,14 +1194,11 @@
     margin-bottom: 16px;
   }
 
-  /* ── The preview panel ─────────────────────────────────────────────────────── */
+  /* ── The panel holding the block the agent is given ────────────────────────── */
   .preview {
     display: flex;
-    flex: none;
     flex-direction: column;
     gap: 10px;
-    width: 420px;
-    max-width: 100%;
   }
   .block {
     margin: 0;
@@ -1110,6 +1233,33 @@
     background: var(--bg-deep);
     color: var(--icon-faint);
     text-align: center;
+  }
+
+  /* ── The delete dialog's body ──────────────────────────────────────────────── */
+  .lead,
+  .consequence,
+  .aside {
+    margin: 0;
+    font: 400 13px/20px var(--font-sans);
+    color: var(--text-muted);
+    text-wrap: pretty;
+  }
+  .lead .mono {
+    color: var(--text-base);
+  }
+  .consequence {
+    padding: 11px 12px;
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-md);
+    font-size: 12px;
+    line-height: 18px;
+  }
+  .consequence .mono {
+    color: var(--text-base);
+  }
+  .aside {
+    font-size: 12px;
+    line-height: 18px;
   }
 
   /* ── Shared states ────────────────────────────────────────────────────────── */

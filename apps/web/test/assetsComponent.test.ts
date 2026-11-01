@@ -362,6 +362,7 @@ describe("the Estate tab", () => {
 describe("the Scope tab", () => {
   const scopeBody = async (
     arrange: (fake: FakeServer) => void,
+    prepare: (app: App) => void = () => {},
   ): Promise<string> => {
     const fake = new FakeServer();
     arrange(fake);
@@ -373,6 +374,7 @@ describe("the Scope tab", () => {
     app.toSection("assets");
     await settle();
     app.toAssetsTab("scope");
+    prepare(app);
     return render(Assets, { props: { app } }).body;
   };
 
@@ -510,9 +512,14 @@ describe("the Scope tab", () => {
       "Record it with record_asset and move on; do not derive intents for it.",
     ].join("\n");
 
-    const html = await scopeBody((fake) => {
-      fake.onScope = () => ok(emptyScope({ promptBlock: block }));
-    });
+    const html = await scopeBody(
+      (fake) => {
+        fake.onScope = () => ok(emptyScope({ promptBlock: block }));
+      },
+      (app) => {
+        app.scopeBlockOpen = true;
+      },
+    );
 
     /*
      * Verbatim means verbatim: the whole block, as one string.
@@ -535,7 +542,12 @@ describe("the Scope tab", () => {
   });
 
   test("an empty scope says so plainly rather than promising nothing is authorized", async () => {
-    const html = await scopeBody(() => {});
+    const html = await scopeBody(
+      () => {},
+      (app) => {
+        app.scopeBlockOpen = true;
+      },
+    );
     /*
      * A4's empty state. "In scope: (nothing)" is what the agent would otherwise be told,
      * and it reads as "you may touch nothing" — so the screen says what is true instead:
@@ -544,6 +556,209 @@ describe("the Scope tab", () => {
     expect(html).toContain("No scope authored for this target");
     expect(html).toContain("not covered");
     expect(html).toContain("Add the first entry");
+  });
+
+  describe("what the agent is told is a button that opens a panel", () => {
+    const block = "[Authorized testing scope — highest priority]";
+    const arrange = (fake: FakeServer): void => {
+      fake.onScope = () =>
+        ok(
+          emptyScope({
+            entries: [
+              entry({ effect: "in", kind: "subtree", value: "acme.test" }),
+            ],
+            promptBlock: block,
+          }),
+        );
+    };
+
+    test("closed, the tab offers the button and does not print the block", async () => {
+      const html = await scopeBody(arrange);
+      expect(html).toContain("What the agent is told");
+      expect(html).toMatch(/aria-expanded="false"/);
+      // It used to take a column of its own, always. The block is the thing to check
+      // before a hunt, not the thing to read on every visit.
+      expect(html).not.toContain(block);
+      expect(html).not.toContain('<aside class="detail"');
+    });
+
+    test("open, the panel holds the block and the button says so", async () => {
+      const html = await scopeBody(arrange, (app) => {
+        app.scopeBlockOpen = true;
+      });
+      expect(html).toMatch(/aria-expanded="true"/);
+      const panel =
+        /<aside class="detail[^"]*" aria-label="([^"]*)">(.*?)<\/aside>/s.exec(
+          html,
+        );
+      expect(panel?.[1]).toBe("What the agent is told");
+      expect(panel?.[2]).toContain(block);
+    });
+
+    test("it is not offered on the Estate tab, where there is nothing to preview", async () => {
+      const html = await bodyOf(() => {});
+      expect(html).not.toContain("What the agent is told");
+    });
+  });
+
+  test("the Add form sits outside the scrolling lists, so it cannot scroll away", async () => {
+    const html = await scopeBody((fake) => {
+      fake.onScope = () =>
+        ok(
+          emptyScope({
+            entries: [
+              entry({ effect: "in", kind: "subtree", value: "acme.test" }),
+              entry({ effect: "out", kind: "host", value: "blog.acme.test" }),
+            ],
+            promptBlock: "[Authorized testing scope — highest priority]",
+          }),
+        );
+    });
+    const lists = html.search(/<div class="lists[ "]/);
+    const form = html.search(/<form class="add[ "]/);
+    expect(lists).toBeGreaterThan(-1);
+    expect(form).toBeGreaterThan(lists);
+    // Every `<div>` opened since the lists container began has been closed by the time
+    // the form starts, so the form is its sibling and not its child. Inside it, the form
+    // would scroll with the entries and a long list would push it out of view — the one
+    // thing this layout exists to prevent. (CSS is not rendered here; the scrolling
+    // itself is checked in a browser.)
+    const between = html.slice(lists, form);
+    const opened = (between.match(/<div[ >]/g) ?? []).length;
+    const closed = (between.match(/<\/div>/g) ?? []).length;
+    expect(closed).toBe(opened);
+    // Both lists are inside it.
+    expect(between).toContain("In scope");
+    expect(between).toContain("Out of scope");
+  });
+
+  describe("deleting an entry shows the dialog", () => {
+    const entries = [
+      entry({ effect: "in", kind: "subtree", value: "acme.test" }),
+      entry({ effect: "out", kind: "host", value: "blog.acme.test" }),
+    ];
+    const arrange = (fake: FakeServer): void => {
+      fake.onScope = () => ok(emptyScope({ entries }));
+    };
+    const rawDialogOf = (html: string): string =>
+      /<div class="panel[^"]*" role="dialog".*?<\/footer>/s.exec(html)?.[0] ??
+      "";
+    /** The words of the dialog: tags gone, and source line breaks folded to spaces. */
+    const dialogOf = (html: string): string =>
+      rawDialogOf(html)
+        .replace(/<svg.*?<\/svg>/gs, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ");
+
+    test("no question is on screen until one is asked", async () => {
+      const html = await scopeBody(arrange);
+      expect(html).not.toContain('role="dialog"');
+    });
+
+    test("an in-scope entry says what it removes, and what it leaves alone", async () => {
+      const html = await scopeBody(arrange, (app) => {
+        app.askToRemoveScopeEntry("ent_acme.test");
+      });
+      const dialog = dialogOf(html);
+      expect(rawDialogOf(html)).toContain(
+        'aria-label="Delete the entry acme.test?"',
+      );
+      expect(dialog).toContain("acme.test and every subdomain");
+      expect(dialog).toContain("from the in-scope list");
+      // The delete path touches no asset and no label, and the sentence says so.
+      expect(dialog).toContain("Nothing the hunt found is deleted");
+      expect(dialog).toContain("Labels you set by hand are not touched");
+      expect(dialog).toContain("not covered");
+      expect(dialog).toContain("Delete entry");
+      expect(dialog).toContain("Cancel");
+      expect(dialog).not.toContain("Keep it out");
+    });
+
+    test("an out-of-scope entry warns that deleting ends the exclusion", async () => {
+      const html = await scopeBody(arrange, (app) => {
+        app.askToRemoveScopeEntry("ent_blog.acme.test");
+      });
+      const dialog = dialogOf(html);
+      expect(dialog).toContain("from the out-of-scope list");
+      // Deleting an exclusion can make a host *in* scope, if an in-scope entry also
+      // covers it. That is the consequence an operator tidying the list would not guess.
+      expect(dialog).toContain("becomes");
+      expect(dialog).toContain("in scope");
+      expect(dialog).toContain("does not keep a host out of the hunt");
+      expect(dialog).toContain("Keep it out");
+    });
+
+    test("it promises no count, no undo and no alternative action", async () => {
+      /*
+       * B5 and B6 draw an asset count, an Undo and a "Move to out of scope instead"
+       * button. None has a server behind it: no contract carries a per-entry asset
+       * count, and nothing anywhere undoes a deletion. Copy that promised them would be
+       * a button that appears to work and does nothing.
+       */
+      for (const id of ["ent_acme.test", "ent_blog.acme.test"]) {
+        const dialog = dialogOf(
+          await scopeBody(arrange, (app) => {
+            app.askToRemoveScopeEntry(id);
+          }),
+        );
+        expect(dialog).not.toMatch(/\d+ assets?/);
+        expect(dialog).not.toContain("Undoable");
+        expect(dialog).not.toContain("Move to out of scope");
+        expect(dialog).toContain("There is no undo");
+      }
+    });
+
+    test("the × asks, and nothing on the screen deletes without asking", async () => {
+      /*
+       * A source check, and an honest weak one: the markup tests render on the server,
+       * where no click runs, so "the × opens the dialog instead of deleting" cannot be
+       * observed. What can be said is that the screen never reaches the `DELETE` itself.
+       * `confirmRemoveScopeEntry` is the only way in, and `assets.test.ts` shows it goes
+       * through a question that was asked.
+       */
+      const screen = await Bun.file(
+        new URL("../src/lib/screens/Assets.svelte", import.meta.url),
+      ).text();
+      expect(screen).toContain("app.askToRemoveScopeEntry(");
+      expect(screen).not.toMatch(/app\.removeScopeEntry\(/);
+    });
+
+    test("nothing in it is focused, and Delete is not disabled until it is working", async () => {
+      const html = await scopeBody(arrange, (app) => {
+        app.askToRemoveScopeEntry("ent_acme.test");
+      });
+      const dialog = rawDialogOf(html);
+      // Enter does nothing until the operator tabs to Delete. `autofocus` is the one
+      // way the markup itself could make it do something.
+      expect(dialog).not.toContain("autofocus");
+      expect(dialog).toMatch(
+        /<button[^>]*class="action confirm danger[^"]*"[^>]*aria-disabled="false"/,
+      );
+    });
+
+    test("while it works the button says so and cannot be pressed", async () => {
+      const html = await scopeBody(arrange, (app) => {
+        app.askToRemoveScopeEntry("ent_acme.test");
+        app.scopeBusy = true;
+      });
+      const dialog = rawDialogOf(html);
+      expect(dialog).toContain("Deleting…");
+      expect(dialog).not.toContain("Delete entry");
+      expect(dialog).toMatch(
+        /<button[^>]*class="action confirm danger[^"]*"[^>]*aria-disabled="true"/,
+      );
+      // Cancel is withdrawn too: the request is already on its way.
+      expect(dialog).toMatch(
+        /<button[^>]*class="action cancel[^"]*"[^>]*disabled/,
+      );
+    });
+
+    test("an entry that is gone takes its question with it", async () => {
+      const html = await scopeBody(arrange, (app) => {
+        app.askToRemoveScopeEntry("ent_already_deleted");
+      });
+      expect(html).not.toContain('role="dialog"');
+    });
   });
 
   test("the add form offers the three reaches by name, not by jargon", async () => {
