@@ -3308,10 +3308,11 @@ const makeStore = Effect.fnUntraced(function* () {
    * invariant is worth a second table, and `0010`'s for what the invariant buys.
    *
    * **The `assets` row is the same row a worker would have written.** Same
-   * `assetIdentityOf`, same unique index, same `ON CONFLICT DO NOTHING` followed by a
-   * read. So a host this imports and the same host a worker later discovers are one asset
-   * with one row in each provenance table, in either order — and `created: false` with
-   * `imports: 1` is what "the worker got here first" looks like from this side.
+   * `assetIdentityOf`, same unique index, same `ON CONFLICT DO NOTHING` letting the index
+   * decide identity rather than this function's control flow. So a host this imports and
+   * the same host a worker later discovers are one asset with one row in each provenance
+   * table, in either order — and `created: false` with `imports: 1` is what "the worker
+   * got here first" looks like from this side.
    *
    * **Retry semantics are `recordAsset`'s**, keyed on `operationId` under the operator's
    * scope: an exact retry replays the stored result having written nothing, and the same
