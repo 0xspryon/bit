@@ -796,6 +796,44 @@ Slices 9 and 10 are how a real engagement's scope gets in without being typed by
 both depend on 3 and 4 for the entries and on 8 for the screen the operator reviews them
 on.
 
+**Slice 10 shipped on 2026-11-01** (`2289d76..e2f23d8`). What it settled in building, each
+of which is a departure from what this document or A3 said and is recorded because a
+reader will otherwise meet the difference and assume a mistake:
+
+- **The importer is a fourth `CallerContext` kind**, with its own caller scope
+  (`<targetId>/import/<importId>`), its own credential, its own gated role directory and
+  its own MCP endpoint. D13 said "on its endpoint and on no other" without saying how; a
+  fourth role is what makes it structural rather than a filter, because `mcp/server.ts`
+  already refuses a grant whose kind is not the one an endpoint serves. The store's two
+  writes still take a `HostContext`, so what the scope buys is the _receipt and event
+  namespace_ — which is what keeps an imported `scope.entry.added` distinguishable in the
+  log from one the operator typed, and that distinction is what D13's review step reads.
+- **D16 is implemented by not capturing narration at all**, rather than by filtering it.
+  The importer's own toolkit records each call as it crosses our MCP boundary, after the
+  write lands; nothing in the server subscribes to the importer session's `sessionEvents`.
+  So the panel cannot show reasoning, and `ScopeImportView` has no field one could go in.
+  The cost is honest: when an import settles having written nothing, this process cannot
+  say why the model wrote nothing.
+- **A3's progress panel showed `fetch_page` rows and a `record_asset` row.** Both are
+  overridden here — there is no `fetch_page` (D13) and the importer's asset write is
+  `record_imported_asset` (D14) — so the panel lists only the three tools that exist.
+- **A3 showed no model picker.** D15 added it, and it is revealed by the autoload checkbox
+  and hidden with it. The model is read from `GET /importer-model`, which applies D15's
+  rule on the server over the catalogue it observed; nothing in the browser bundle holds a
+  model id, for the reason `modelOption.ts` argues at length.
+- **Creation answers `TargetCreated`**, a wrapper around `TargetSummary` carrying the
+  import handle, because that handle exists only at the moment of creation and would be
+  null on every row of the target list.
+- **The Estate screen's imported row was reading as an absence.** `discoveries: 0` with a
+  null attempt is correct for an imported host, but a screen with only those two fields can
+  say nothing better than "no recorded discovery". `imports` and `first_source_url` now
+  come off `asset_imports` in the same provenance statement and reach both `AssetView` and
+  `list_assets`.
+- **Links are bounded at `SCOPE_IMPORT_MAX_LINKS` (8) and extras are dropped with a
+  warning** rather than the import refused. One session reads every link (D15), so they
+  share one context window; an operator who pasted nine pages wants the first eight read
+  far more than they want to be sent back to the form.
+
 ## Calls made for you
 
 Settled without the operator, each recoverable if wrong:
