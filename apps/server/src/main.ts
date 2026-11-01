@@ -141,6 +141,8 @@ import {
   harnessResolverLayer,
   type HarnessCandidate,
 } from "./harness/resolver";
+import { ScopeImportProgress } from "./import/progress";
+import { ScopeImporter } from "./import/scopeImporter";
 import { McpCredentials } from "./mcp/credentials";
 import { GoalBriefingCeiling, GoalPlanning } from "./mcp/goalTools";
 import { PlannerHarnesses, plannerHarnessesOf } from "./mcp/plannerTools";
@@ -639,6 +641,15 @@ const withoutHarness = Layer.mergeAll(
   // which is why this variant reads the store rather than refusing both operations.
   GoalConversations.unavailable.pipe(Layer.provide(targetStores)),
   HarnessSessionStatus.fromAnswers({}),
+  // And once more: a process with no harness still creates targets, and a target created
+  // with program links still has to be told why nothing read them. `start` refuses with a
+  // sentence rather than pretending an import happened, which is what lets `createTarget`
+  // have one code path either way (D15: a failed import is not a failed creation).
+  ScopeImporter.unavailable,
+  // The registry the real importer would have written into. Empty, so the panel's read is
+  // the same `ScopeImportNotFound` a forgotten import gets — which is the true answer on a
+  // server that starts no imports.
+  ScopeImportProgress.none,
   // An empty resolver rather than no resolver, so the shape of this graph does not depend
   // on whether a harness was configured: the browser's picker asks the same service either
   // way and gets an empty list, which is the true answer.
@@ -715,6 +726,11 @@ const agent =
         // `provideMerge` below puts it in this graph's context so it can be handed across
         // the listener's memo-map boundary as a value.
         HarnessSessionStatus.layer,
+        // The scope importer, in this graph for the reason the two supervisors above are
+        // in it: it forks a fiber per import into its own layer scope, holds that import's
+        // credential, and is driven from the browser API — so there has to be exactly one,
+        // built here, handed to the listener as a value.
+        ScopeImporter.layer,
       ).pipe(
         // One resolver for the process, provided to all three: a second would be a second
         // set of built harnesses, which for OpenCode means a second child process.
@@ -726,6 +742,10 @@ const agent =
         // context and can be handed to the browser API below. With `provide` it was the
         // supervisor's private dependency, which was right while nothing subscribed.
         Layer.provideMerge(RunNarrations.layer),
+        // `provideMerge`, so the one progress registry is in this graph's context and can
+        // be handed to *both* the importer's toolkit (inside the listener) and the browser
+        // API's read. The importer above requires it; everything else just reads it.
+        Layer.provideMerge(ScopeImportProgress.layer),
         Layer.provide(workerEndpoints.layer),
         // The same reference the listener below is given, so the supervisor reads the map
         // the MCP middleware writes. See `callCounter`.
@@ -798,6 +818,16 @@ const endpoint = Layer.unwrap(
       // `PubSub` and the live transcript would subscribe to another, so a run would narrate
       // to nobody and the transcript would show the record and never the activity.
       | RunNarrations
+      // The scope importer, for `GoalConversations`' reason exactly: it holds every live
+      // import's fiber, scope and credential, and a second instance inside the router's
+      // own memo map would mint importer credentials into a registry the MCP middleware
+      // does not read. The import would connect with a good token and be offered no
+      // tools, which for this role means a session that reads pages and writes nothing.
+      | ScopeImporter
+      // The progress registry, handed to *both* halves below: the importer's toolkit
+      // records calls into it and the browser API reads them out. One instance, or the
+      // panel is a receipt for writes it cannot see.
+      | ScopeImportProgress
     >(),
     (shared) =>
       ControlPlaneEndpoint.layer({
@@ -844,6 +874,20 @@ const endpoint = Layer.unwrap(
          * environment. Decision 11 says the *configured* ceiling refuses.
          */
         briefingCeiling: GoalBriefingCeiling.at(GOAL_BRIEFING_MAX_CHARS),
+        /**
+         * The registry the importer's tool calls land in, as the one instance.
+         *
+         * Read out of *this* graph's context and handed over as a value, for the reason
+         * `harnesses` is one. The failure if it were required instead is the quietest of
+         * any on this list: the importer's toolkit would record into the map built inside
+         * the router's memo map, the panel would read the one built here, every entry and
+         * asset would land correctly in SQLite, and the "Loading the scope" panel would
+         * show an import that had made no calls at all. Nothing would error.
+         */
+        scopeImports: Layer.succeed(
+          ScopeImportProgress,
+          Context.get(shared, ScopeImportProgress),
+        ),
         extraRoutes: browserApiRoutes({
           workspaceRoot: WORKSPACE_ROOT,
           goalBriefingMaxChars: GOAL_BRIEFING_MAX_CHARS,
@@ -1013,6 +1057,7 @@ const program = Effect.gen(function* () {
     mcp: control.mcpUrl,
     plannerMcp: control.plannerMcpUrl,
     goalMcp: control.goalMcpUrl,
+    importerMcp: control.importerMcpUrl,
     policy: control.policyUrl,
   });
   yield* reconcile;

@@ -38,10 +38,12 @@ import {
   GoalBriefingRefused,
   GoalNotFound,
   GoalRefused,
+  ImporterModelUnavailable,
   IntentNotFound,
   IntentRefused,
   RoundNotFound,
   RunRefused,
+  ScopeImportNotFound,
   ScopeRefused,
   SessionActor,
   SessionGuard,
@@ -60,6 +62,7 @@ import {
   type HostScopeLabel,
   type PlanRoundView,
   type ScopeEntry,
+  type ScopeImportView,
   type ScopeState,
   type ScopeView,
   type TargetCounts,
@@ -109,6 +112,8 @@ import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { renderScopeBlock } from "../scope/scopePrompt";
 import { POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
+import { chooseImporterModel } from "../import/importerModel";
+import { ScopeImporter } from "../import/scopeImporter";
 import { GoalConversations } from "../plan/goalConversation";
 import {
   DEFAULT_UPLOAD_MAX_BYTES,
@@ -815,6 +820,48 @@ const fleetHandlers = HttpApiBuilder.group(
     // second instance built inside the router's memo map would be a second set of sessions
     // whose grants the first one could not close.
     const conversations = yield* GoalConversations;
+    // The scope importer, in the same place and for the same reason as the supervisors
+    // above: it holds every live import's fiber, scope and credential, and a second
+    // instance built inside the router's own memo map would mint importer credentials into
+    // a registry the MCP middleware does not read — a session with a perfectly good token
+    // and no tools, which is the failure `main.ts`'s header records having been observed
+    // for workers.
+    const importer = yield* ScopeImporter;
+
+    /**
+     * Reads or stops one import, after checking it belongs to the target in the path.
+     *
+     * **The target check is this function's whole reason to exist.** The progress registry
+     * is keyed by import id alone, because an import id is minted here and is never
+     * operator-supplied — so the registry does not need the target to find an entry, and
+     * a route that passed the id straight through would answer one target's screen with
+     * another target's receipt. An import whose `targetId` does not match the path is
+     * reported as unknown rather than as a mismatch: a caller holding an id for a target
+     * they are not asking about has no business learning that the id is real.
+     */
+    const readImport = Effect.fnUntraced(function* (
+      targetId: string,
+      importId: string,
+      read: (importId: string) => Effect.Effect<ScopeImportView | undefined>,
+    ) {
+      if (!isTargetId(targetId)) {
+        return yield* new ScopeImportNotFound({
+          reason: "invalid_target_id",
+          importId,
+          detail:
+            "a target id is 1-64 characters of lowercase a-z, 0-9, '-' or '_', starting with a letter or digit; this cannot name a target",
+        });
+      }
+      const view = yield* read(importId);
+      if (view === undefined || view.targetId !== targetId) {
+        return yield* new ScopeImportNotFound({
+          reason: "unknown_import",
+          importId,
+          detail: `no scope import '${importId}' is in progress on target '${targetId}'. An import's progress lives in this server's memory for the life of the import, so a restart forgets it — what it wrote is on the target's Assets screen either way.`,
+        });
+      }
+      return view;
+    });
 
     const summaries = Effect.fnUntraced(function* () {
       const rows = yield* fleet.targets();
@@ -1032,7 +1079,44 @@ const fleetHandlers = HttpApiBuilder.group(
           );
 
         yield* fleet.migrateTarget(targetId).pipe(Effect.orDie);
-        return yield* describeTarget(fleet, row).pipe(Effect.orDie);
+        const target = yield* describeTarget(fleet, row).pipe(Effect.orDie);
+
+        /*
+         * The import, when links were given — and nothing else, ever.
+         *
+         * **This is the point where D13's load-bearing property is kept or lost.**
+         * Creating a target starts no hunt: no goal, no intent, no attempt, no run. The
+         * operator's review of what the importer wrote is the only control on a scope
+         * scraped off a page they did not author, and that review is a real step only
+         * because there is a genuine gap between the import finishing and the first
+         * execution starting. Anything added here that began work — a default goal, an
+         * auto-run, a "start hunting" affordance — would close that gap, and the review
+         * would have to become an explicit confirmation step first.
+         *
+         * What is started is one agent session whose entire tool surface is three writes
+         * to this target's scope and estate. It cannot test anything.
+         */
+        const started = yield* importer.start({
+          targetId,
+          targetName: payload.name,
+          workspacePath,
+          links: payload.programLinks ?? [],
+          ...(payload.importModel === undefined
+            ? {}
+            : { choice: payload.importModel }),
+        });
+        return {
+          target,
+          scopeImport:
+            started._tag === "started"
+              ? {
+                  importId: started.importId,
+                  harnessInstanceId: started.harnessInstanceId,
+                  model: started.model,
+                }
+              : null,
+          importDetail: started._tag === "refused" ? started.detail : null,
+        };
       }),
 
       /**
@@ -1151,6 +1235,58 @@ const fleetHandlers = HttpApiBuilder.group(
        * a configured harness would leave an operator with no way to find out why it is
        * missing. The `reason` is the harness's own sentence about why it would not start.
        */
+      /**
+       * Which model an import would run on right now (D15).
+       *
+       * **The rule runs here and only here**, over `harnesses.instances` — the catalogue
+       * this server actually observed when it built them. `modelOption.ts`'s doctrine is
+       * why it is not a constant the browser holds: a descriptor is observed at build and
+       * replaced wholesale on rebuild, so a model id compiled into the create-target screen
+       * would outlive the catalogue entry it names and keep offering a choice the server
+       * could not honour. The picker preselects this answer instead of deriving its own,
+       * which is also what keeps the screen and the import from disagreeing about what the
+       * default is.
+       */
+      importerModel: () => {
+        const choice = chooseImporterModel(harnesses.instances);
+        return choice === undefined
+          ? Effect.fail(
+              new ImporterModelUnavailable({
+                reason: "no_harness",
+                detail:
+                  "no agent harness on this server is ready, so there is no catalogue to resolve a model against and no import can run",
+              }),
+            )
+          : Effect.succeed(choice);
+      },
+
+      /**
+       * One import's progress, for the "Loading the scope" panel.
+       *
+       * The id is checked against the target before anything is looked up, and an import
+       * belonging to another target is `unknown_import` rather than returned — the
+       * registry is keyed by import id alone, so this route is the only thing that keeps
+       * one target's panel from reading another's receipt.
+       */
+      scopeImport: Effect.fn(function* ({ params }) {
+        return yield* readImport(params.targetId, params.importId, (importId) =>
+          importer.view(importId),
+        );
+      }),
+
+      /**
+       * Stops one import, keeping everything it has already written.
+       *
+       * The same target check, and the same refusal for an import of another target: a
+       * stop is a mutation, and a route that would stop any import given its id would let
+       * one target's screen reach into another's work.
+       */
+      stopScopeImport: Effect.fn(function* ({ params }) {
+        return yield* readImport(params.targetId, params.importId, (importId) =>
+          importer.stop(importId),
+        );
+      }),
+
       harnesses: () =>
         Effect.succeed(
           harnesses.instances.map((listing): HarnessInstanceView => ({

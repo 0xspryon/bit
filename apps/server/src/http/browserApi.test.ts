@@ -58,6 +58,7 @@ import {
 } from "./browserApi";
 import { CONTROL_PLANE_IDLE_TIMEOUT } from "./controlPlane";
 import { BrowserSessions, ensureServerPassword } from "./browserSessions";
+import { ScopeImporter } from "../import/scopeImporter";
 import { ControlPlaneEndpoint } from "./controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
@@ -217,6 +218,12 @@ const endpoint = Layer.unwrap(
         uploadMaxFiles: SUITE_UPLOAD_MAX_FILES,
       }).pipe(
         Layer.provide(BrowserSessions.layer),
+        // No harness in this suite, so no import can be started. `unavailable` refuses one
+        // by name, which is exactly what a server without a harness answers — and keeps
+        // `createTarget` on one code path, since D15 makes a failed import a value rather
+        // than a failed creation. `importerTools.test.ts` and `scopeImporter.test.ts` drive
+        // the real thing.
+        Layer.provide(ScopeImporter.unavailable),
         // The same resolver the server builds, over the same registry: the route under test is
         // the one that opens a target's own file, so a stub here would test the stub.
         Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
@@ -608,16 +615,27 @@ describe("creating a target", () => {
       }),
     );
     expect(created.status).toBe(200);
+    // `TargetCreated` wraps the summary, because an import handle exists only at the
+    // moment of creation and would be null on every row of the target list.
     expect(created.body).toMatchObject({
-      // The name became a directory-safe id; the name itself is kept as typed.
-      id: "acme-corp",
-      name: "Acme Corp",
-      workspacePath: join(workspaceRoot, "alpha"),
-      dataDirectory: join(fleetRoot, "targets", "acme-corp"),
-      available: true,
-      unavailableReason: null,
+      target: {
+        // The name became a directory-safe id; the name itself is kept as typed.
+        id: "acme-corp",
+        name: "Acme Corp",
+        workspacePath: join(workspaceRoot, "alpha"),
+        dataDirectory: join(fleetRoot, "targets", "acme-corp"),
+        available: true,
+        unavailableReason: null,
+      },
+      // No program links were given, so no import was started and there is nothing to
+      // explain about one nobody asked for. This is also the assertion that creating a
+      // target starts no work: there is no other handle on this response for it to
+      // appear on.
+      scopeImport: null,
+      importDetail: null,
     });
-    expect(created.body["appliedThrough"]).toBeNumber();
+    const summary = created.body["target"] as Record<string, unknown>;
+    expect(summary["appliedThrough"]).toBeNumber();
 
     const listed = await read(await signedIn("/targets"));
     expect(
@@ -637,7 +655,7 @@ describe("creating a target", () => {
           "SELECT COUNT(*) AS n FROM effect_sql_migrations",
         )
         .all();
-      expect(rows[0]?.n).toBe(Number(created.body["appliedThrough"]));
+      expect(rows[0]?.n).toBe(Number(summary["appliedThrough"]));
     } finally {
       database.close();
     }
@@ -657,7 +675,9 @@ describe("creating a target", () => {
       }),
     );
     expect(created.status).toBe(200);
-    expect(created.body["id"]).toBe("internal-api");
+    expect((created.body["target"] as Record<string, unknown>)["id"]).toBe(
+      "internal-api",
+    );
     const after = await Bun.file(first).arrayBuffer();
     // Byte-for-byte: separate files is the claim the two-tier layout exists to make,
     // and a shared connection would have shown up here as a changed journal.
@@ -767,11 +787,15 @@ describe("creating a target", () => {
     // registering what the operator asked for. The policy, and why, is on `fleet.ts`.
     expect(created.status).toBe(200);
     expect(created.body).toMatchObject({
-      id: "broken",
-      available: false,
-      unavailableReason: "schema_unavailable",
+      target: {
+        id: "broken",
+        available: false,
+        unavailableReason: "schema_unavailable",
+      },
     });
-    expect(String(created.body["detail"])).toContain("Migration");
+    expect(
+      String((created.body["target"] as Record<string, unknown>)["detail"]),
+    ).toContain("Migration");
 
     const listed = (await read(await signedIn("/targets")))
       .body as unknown as ReadonlyArray<{
@@ -3352,6 +3376,7 @@ describe("a live connection that has nothing to say", () => {
             // not the heartbeat ever fired — which is the one thing being measured.
           }).pipe(
             Layer.provide(BrowserSessions.layerWithPassword(password)),
+            Layer.provide(ScopeImporter.unavailable),
             Layer.provide(TargetStores.layer.pipe(Layer.provide(ownFleet))),
             Layer.provide(ownFleet),
             Layer.provide(supervisorHolding),

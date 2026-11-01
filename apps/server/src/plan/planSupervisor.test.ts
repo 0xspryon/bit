@@ -505,6 +505,7 @@ const world = (
               mcp: "http://127.0.0.1:9/api/v1/mcp",
               plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
               goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
+              importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
               policy: "http://127.0.0.1:9/api/v1/policy/decide",
             }),
           }),

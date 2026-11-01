@@ -11,11 +11,18 @@
  * identity comes from the credential, so a model that claims a different intent ID is
  * simply describing a resource it cannot address.
  *
- * **There are three kinds of caller, and the binding says which** — a worker attempt, a
- * planner round, or a goal agent (the spec's decision 2;
- * `docs/design/goal-and-planner-flow.md`). `callerScope` is *derived* from the binding
- * ({@link callerScopeOf}) rather than passed in, so no call site can mint a credential
- * whose receipts are filed under a different name from the identity it carries.
+ * **There are four kinds of caller, and the binding says which** — a worker attempt, a
+ * planner round, a goal agent (the spec's decision 2;
+ * `docs/design/goal-and-planner-flow.md`), or the scope importer (D13). `callerScope` is
+ * *derived* from the binding ({@link callerScopeOf}) rather than passed in, so no call
+ * site can mint a credential whose receipts are filed under a different name from the
+ * identity it carries.
+ *
+ * The importer is the newest and the shortest-lived. It exists as its own kind for one
+ * reason: `mcp/server.ts` refuses a credential whose kind is not the one an endpoint
+ * serves, so a fourth kind is what makes the importer's three tools unreachable from a
+ * worker, a planner or a goal session — structurally, rather than by the store refusing
+ * each call after the fact.
  *
  * **The lifetime is owned by a scope, not by a happy path.** `issue` is an
  * `acquireRelease`, so the grant is revoked when the surrounding scope closes — whether
@@ -134,6 +141,7 @@ export type {
   AttemptBinding,
   CallerBinding,
   GoalBinding,
+  ImporterBinding,
   RoundBinding,
 } from "../persistence/store";
 
@@ -221,6 +229,13 @@ export const callerOf = (grant: Grant): CallerContext => {
         targetId: grant.targetId,
         goalId: grant.goalId,
       };
+    case "importer":
+      return {
+        _tag: "importer",
+        callerScope: grant.callerScope,
+        targetId: grant.targetId,
+        importId: grant.importId,
+      };
   }
 };
 
@@ -237,6 +252,8 @@ const grantOf = (
     case "round":
       return { ...binding, callerScope, issuedAt, expiresAt };
     case "goal":
+      return { ...binding, callerScope, issuedAt, expiresAt };
+    case "importer":
       return { ...binding, callerScope, issuedAt, expiresAt };
   }
 };
@@ -326,6 +343,22 @@ export class McpCredentials extends Context.Service<
      * which is a bug and is logged as one.
      */
     readonly revokeGoal: (goalId: string) => Effect.Effect<number>;
+    /**
+     * Revokes every live grant bound to one scope import, returning how many there were.
+     *
+     * **This is what stopping an import actually does to its authority.** The session is
+     * interrupted and its scope is closed, which revokes the grant on its own; this is
+     * called on the stop path so the credential is dead *before* the interrupt is waited
+     * on, rather than for however long the harness takes to come back. A session that is
+     * mid-call when the operator presses Stop finds its next call refused at the door.
+     *
+     * **Only importer grants.** An import holds exactly one, and it has no rounds or
+     * attempts under it to cascade to — which is the simplest version of the question
+     * {@link revokeGoal} had to answer at length, and it is simple for the reason D13
+     * makes much of: nothing runs under an import, because creating a target starts no
+     * work.
+     */
+    readonly revokeImport: (importId: string) => Effect.Effect<number>;
     /** Live grants. Used by tests to prove nothing outlived its scope. */
     readonly size: Effect.Effect<number>;
   }
@@ -420,6 +453,13 @@ export class McpCredentials extends Context.Service<
         (grant) => grant._tag === "goal" && grant.goalId === goalId,
       );
 
+    const revokeImport: McpCredentials["Service"]["revokeImport"] = (
+      importId: string,
+    ) =>
+      revokeMatching(
+        (grant) => grant._tag === "importer" && grant.importId === importId,
+      );
+
     const resolve: McpCredentials["Service"]["resolve"] = Effect.fnUntraced(
       function* (token: string) {
         const key = hash(token);
@@ -446,6 +486,7 @@ export class McpCredentials extends Context.Service<
       revokeAttempt,
       revokeRound,
       revokeGoal,
+      revokeImport,
       size: Effect.sync(() => grants.size),
     });
   });

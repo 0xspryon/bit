@@ -99,6 +99,8 @@ export const EVIDENCE_DIRECTORY = "evidence";
 export const PLANNING_DIRECTORY = "planning";
 /** Holds one directory per goal agent; see {@link FleetPaths.goalDirectory}. */
 export const GOAL_DIRECTORY = "goal";
+/** Holds one directory per scope import; see {@link FleetPaths.importDirectory}. */
+export const IMPORT_DIRECTORY = "import";
 /**
  * Where a goal conversation's attachments go, **inside** that goal's own directory.
  *
@@ -247,6 +249,21 @@ export interface FleetPaths {
    * path as its argument for exactly that reason.
    */
   readonly goalUploadsDirectory: (targetId: string, goalId: string) => string;
+  /**
+   * The directory one scope import runs in.
+   *
+   * A fourth sibling, outside the workspace and distinct from every round's and every
+   * goal's directory, for the reasons on {@link planningDirectory}. The importer is the
+   * role with the least business acting in a directory at all — it fetches a page and
+   * calls three tools — and that is exactly why it gets its own gated one: the policy hook
+   * lives in the directory a session runs in, so a session with no directory of its own is
+   * a session whose tool calls are audited somewhere else or not at all.
+   *
+   * Under `targets/<id>/` rather than anywhere global, so `DECISIONS.md` §3's deletion
+   * property survives: removing a target is still `rm -rf targets/<id>/`, and an import's
+   * audit log and harness state go with it.
+   */
+  readonly importDirectory: (targetId: string, importId: string) => string;
 }
 
 /**
@@ -286,6 +303,8 @@ export const fleetPaths = (root: string): FleetPaths => {
       `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${GOAL_DIRECTORY}/${checkedRole("goal", goalId)}`,
     goalUploadsDirectory: (targetId, goalId) =>
       `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${GOAL_DIRECTORY}/${checkedRole("goal", goalId)}/${UPLOADS_DIRECTORY}`,
+    importDirectory: (targetId, importId) =>
+      `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${IMPORT_DIRECTORY}/${checkedRole("import", importId)}`,
   };
 };
 
@@ -792,7 +811,7 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
    * Outside every transaction, like {@link ensureDirectory} it calls.
    */
   const ensureRoleDirectory = Effect.fnUntraced(function* (
-    kind: "round" | "goal",
+    kind: "round" | "goal" | "import",
     targetId: string,
     id: string,
   ) {
@@ -821,7 +840,9 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
     const path =
       kind === "round"
         ? paths.planningDirectory(targetId, id)
-        : paths.goalDirectory(targetId, id);
+        : kind === "goal"
+          ? paths.goalDirectory(targetId, id)
+          : paths.importDirectory(targetId, id);
     yield* ensureDirectory(path, targetId);
     return new UngatedRoleDirectory(path);
   });
@@ -835,6 +856,12 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
   const ensureGoalDirectory = Effect.fn("FleetStore.ensureGoalDirectory")(
     function* (targetId: string, goalId: string) {
       return yield* ensureRoleDirectory("goal", targetId, goalId);
+    },
+  );
+
+  const ensureImportDirectory = Effect.fn("FleetStore.ensureImportDirectory")(
+    function* (targetId: string, importId: string) {
+      return yield* ensureRoleDirectory("import", targetId, importId);
     },
   );
 
@@ -903,6 +930,7 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
     huntFileFor,
     ensurePlanningDirectory,
     ensureGoalDirectory,
+    ensureImportDirectory,
     ensureGoalUploads,
     setting,
     setSetting,
@@ -941,6 +969,20 @@ export class FleetStore extends Context.Service<
     readonly ensureGoalDirectory: (
       targetId: string,
       goalId: string,
+    ) => Effect.Effect<UngatedRoleDirectory, FleetError | DatabaseError>;
+    /**
+     * Makes the directory one scope import will run in, and nothing else.
+     *
+     * {@link ensureGoalDirectory}'s sibling, and it returns an
+     * {@link UngatedRoleDirectory} for the same reason: nothing that creates a session
+     * accepts one, so the only way to a usable path is `gatedRoleDirectory`, which
+     * installs the policy gate first. The importer's page fetches go through that gate
+     * (D13) — it is the only thing auditing them, because the fetch is the harness's tool
+     * and not ours.
+     */
+    readonly ensureImportDirectory: (
+      targetId: string,
+      importId: string,
     ) => Effect.Effect<UngatedRoleDirectory, FleetError | DatabaseError>;
     readonly ensureGoalUploads: (
       goalDirectory: GatedDirectory,

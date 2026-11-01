@@ -38,15 +38,23 @@
  * auth middleware is attached to the protocol layer rather than to the router, which is
  * what lets the two routes keep different postures on one port.
  *
- * ## Three endpoints, one per role, and why it is not one endpoint with a filter
+ * ## Four endpoints, one per role, and why it is not one endpoint with a filter
  *
- * A worker attempt is offered `record_observation`; a planner round is offered
- * `add_intent`, `record_round_disposition`, the graph reads and `list_harnesses`; a goal
- * agent is offered `steer_planner`, `wake_planner`, `end_goal` and reads, and **no
- * `add_intent`**. No role sees another's. That is the slice-7 ruling extended to the third
- * role, and the shape it takes here is **one `McpServer` per path** — {@link MCP_PATH},
- * {@link PLANNER_MCP_PATH}, {@link GOAL_MCP_PATH} — each with its own `Toolkit` and its own
+ * A worker attempt is offered `record_observation`, `record_asset` and `list_assets`; a
+ * planner round is offered `add_intent`, `record_round_disposition`, the graph reads and
+ * `list_harnesses`; a goal agent is offered `steer_planner`, `wake_planner`, `end_goal` and
+ * reads, and **no `add_intent`**; the scope importer is offered `add_scope_entry`,
+ * `record_imported_asset` and `read_scope`, and **nothing else is**. No role sees
+ * another's. That is the slice-7 ruling extended to the fourth role, and the shape it takes
+ * here is **one `McpServer` per path** — {@link MCP_PATH}, {@link PLANNER_MCP_PATH},
+ * {@link GOAL_MCP_PATH}, {@link IMPORTER_MCP_PATH} — each with its own `Toolkit` and its own
  * auth middleware.
+ *
+ * The importer's exclusivity is the strongest claim of the four, because `add_scope_entry`
+ * writes the list the agent is judged against. D13 permits it to the importer precisely
+ * because the importer is a different role on a different endpoint that cannot test
+ * anything — so a worker or planner that could reach it would not be a leak of a
+ * convenience, it would be the defect the whole design is built to avoid.
  *
  * It is not a per-request filter over one toolkit because `effect/ai` does not offer one
  * that can see the caller. `McpServer.addTool` takes an `EnabledWhen` annotation whose
@@ -100,7 +108,9 @@ import {
   PlannerToolkit,
   PlannerToolkitLayer,
 } from "./plannerTools";
+import { ImporterToolkit, ImporterToolkitLayer } from "./importerTools";
 import { WorkerToolkit, WorkerToolkitLayer } from "./tools";
+import { ScopeImportProgress } from "../import/progress";
 import type { CallerContext } from "../persistence/store";
 
 export const SERVER_NAME = "bit-control-plane";
@@ -132,6 +142,20 @@ export const PLANNER_MCP_PATH = apiPath("planner/mcp");
  * kind of planner. It is the opposite — it is the thing that cannot write intents.
  */
 export const GOAL_MCP_PATH = apiPath("goal/mcp");
+/**
+ * Where the **scope importer**'s MCP client connects. Its three tools live here (D13).
+ *
+ * A fourth sibling, for {@link PLANNER_MCP_PATH}'s reason, and the one whose exclusivity
+ * is the most load-bearing of the four. `add_scope_entry` writes to the list the operator
+ * is judged against; `DECISIONS.md` §5 names an agent widening its own scope as the defect
+ * this whole model exists to avoid. The importer is allowed it because it is a different
+ * role on a different endpoint, cannot test anything, and finishes before any goal exists
+ * — and that argument holds only while a worker or planner genuinely cannot reach here.
+ *
+ * `importer/mcp` rather than `import/mcp`: the path names the role, as the other three do,
+ * and `import` names the act.
+ */
+export const IMPORTER_MCP_PATH = apiPath("importer/mcp");
 
 /**
  * Authenticated MCP requests served, in total and per caller scope.
@@ -204,6 +228,7 @@ const ROLE_NAMES: Readonly<Record<CallerContext["_tag"], string>> = {
   attempt: "a worker attempt",
   round: "a planner round",
   goal: "a goal agent",
+  importer: "the scope importer",
 };
 
 /**
@@ -284,8 +309,8 @@ const authMiddlewareFor = (serves: CallerContext["_tag"]) =>
  * `McpInvocation` is a per-request service, so it cannot be in a registration layer's
  * requirements — the auth middleware provides it on each request instead. Same
  * assertion, and the same reason, as T3Code's `toolkitRegistration`
- * (`apps/server/src/mcp/McpHttpServer.ts:777-782`), now made twice because there are two
- * toolkits.
+ * (`apps/server/src/mcp/McpHttpServer.ts:777-782`), now made four times because there are
+ * four toolkits.
  */
 const workerRegistration = McpServer.toolkit(WorkerToolkit);
 const workerRegistered = workerRegistration as Layer.Layer<
@@ -306,6 +331,13 @@ const goalRegistered = goalRegistration as Layer.Layer<
   never,
   never,
   Exclude<Layer.Services<typeof goalRegistration>, McpInvocation>
+>;
+
+const importerRegistration = McpServer.toolkit(ImporterToolkit);
+const importerRegistered = importerRegistration as Layer.Layer<
+  never,
+  never,
+  Exclude<Layer.Services<typeof importerRegistration>, McpInvocation>
 >;
 
 /**
@@ -361,7 +393,7 @@ const roleEndpoint = <RIn>(options: {
     .pipe(Layer.fresh);
 
 /**
- * The whole MCP application: two endpoints, their tools, handlers, protocol and auth.
+ * The whole MCP application: four endpoints, their tools, handlers, protocol and auth.
  *
  * A function rather than a constant because the planner's `list_harnesses` needs the
  * harness catalogue, and that has to be **passed in as a value**. The reason is on
@@ -396,6 +428,22 @@ export const mcpApplicationLayer = (options?: {
    * a convenient one.
    */
   readonly briefingCeiling?: Layer.Layer<GoalBriefingCeiling> | undefined;
+  /**
+   * The registry the importer's tool calls are recorded into, as an already-built value.
+   *
+   * A fourth value across this boundary, for {@link planning}'s reason and with a failure
+   * that is quiet in the same way: the "Loading the scope" panel reads this registry
+   * through the browser API, and the importer's toolkit writes to it. If it were
+   * *required* here it would be built a second time inside `HttpRouter.toWebHandler`'s own
+   * memo map, and the two halves would be looking at different maps — so every call would
+   * land, every entry would be written, and the panel would show an import that had made
+   * no calls at all. Nothing would fail; the receipt would just be blank.
+   *
+   * Omitted, {@link ScopeImportProgress.none} answers every read `undefined`, which the
+   * browser route reports as `ScopeImportNotFound`. That is the honest default for a
+   * server with no harness, because such a server starts no imports.
+   */
+  readonly scopeImports?: Layer.Layer<ScopeImportProgress> | undefined;
 }) =>
   Layer.mergeAll(
     roleEndpoint({
@@ -433,6 +481,28 @@ export const mcpApplicationLayer = (options?: {
         Layer.provide(GoalToolkitLayer),
         Layer.provide(options?.planning ?? GoalPlanning.unavailable),
         Layer.provide(options?.briefingCeiling ?? GoalBriefingCeiling.default),
+      ),
+    }),
+    /**
+     * The scope importer's endpoint: `add_scope_entry`, `record_imported_asset`,
+     * `read_scope`, and nothing else anywhere else (D13).
+     *
+     * The fourth `Layer.fresh` pair. This module's header records what happens without it
+     * — one merged toolkit on every path — and that failure mode is worse here than for
+     * the other three, because the tool it would leak is the one that writes to the
+     * authorization boundary. A worker offered `add_scope_entry` is the exact defect
+     * `DECISIONS.md` §5 identifies in ScopeWeaver's `AddAutoScope`, and it would arrive
+     * not as a decision but as a layer that was not wrapped.
+     *
+     * `importerTools.test.ts` reads `tools/list` off this path and off the other three, and
+     * drives this credential at theirs, which is what catches it.
+     */
+    roleEndpoint({
+      path: IMPORTER_MCP_PATH,
+      serves: "importer",
+      registration: importerRegistered.pipe(
+        Layer.provide(ImporterToolkitLayer),
+        Layer.provide(options?.scopeImports ?? ScopeImportProgress.none),
       ),
     }),
   );

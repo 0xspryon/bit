@@ -244,7 +244,8 @@ export class RoundIntentRefused extends Schema.TaggedError<RoundIntentRefused>()
  * What each kind may write is in {@link callerScopeOf}'s table, in one place, beside the
  * scope string it is attributed under.
  */
-export type CallerContext = AttemptCaller | RoundCaller | GoalCaller;
+export type CallerContext =
+  AttemptCaller | RoundCaller | GoalCaller | ImporterCaller;
 
 /**
  * A worker attempt: one execution of one intent.
@@ -303,12 +304,46 @@ export interface GoalCaller {
   readonly goalId: string;
 }
 
+/**
+ * The scope importer: one session reading one target's program pages (D13).
+ *
+ * **It is a caller kind rather than a flag on an existing one, and that is the whole of
+ * why its three tools are unreachable from anywhere else.** `mcp/server.ts`'s auth
+ * middleware is parameterised on `CallerContext["_tag"]`, so a fourth tag buys a fourth
+ * endpoint that refuses the other three kinds *before protocol dispatch* — and refuses
+ * this kind at theirs. A worker, a planner or a goal agent that somehow learned the
+ * importer's URL still presents a credential of the wrong kind and gets the same `401` an
+ * unknown token gets. The anti-goal this satisfies is the one about an agent widening the
+ * scope it is judged against, and the design is explicit that the difference is structural
+ * rather than a matter of intent.
+ *
+ * **No fence, and the reason is {@link GoalCaller}'s rather than an oversight.** A fence
+ * defends against a credential minted before a restart being replayed after it. Grants
+ * live only in `mcp/credentials.ts`'s in-memory map, so an importer credential cannot
+ * survive a restart to be replayed. There is nothing durable for it to be fenced against
+ * either: an import is not a row. What it writes is rows — entries and assets — and those
+ * are the durable record.
+ *
+ * **It has no goal, no intent and no attempt, because none of those exist yet.** That is
+ * the fact D14 is built on: the importer runs at target creation, so `store.recordAsset`
+ * and `asset_discoveries` are unreachable to it, and `importAsset` is the write it has
+ * instead.
+ */
+export interface ImporterCaller {
+  readonly _tag: "importer";
+  readonly callerScope: string;
+  readonly targetId: string;
+  readonly importId: string;
+}
+
 /** An {@link AttemptCaller} before its scope is derived. What a credential is minted from. */
 export type AttemptBinding = Omit<AttemptCaller, "callerScope">;
 /** A {@link RoundCaller} before its scope is derived. */
 export type RoundBinding = Omit<RoundCaller, "callerScope">;
 /** A {@link GoalCaller} before its scope is derived. */
 export type GoalBinding = Omit<GoalCaller, "callerScope">;
+/** An {@link ImporterCaller} before its scope is derived. */
+export type ImporterBinding = Omit<ImporterCaller, "callerScope">;
 
 /**
  * What a credential may be minted against: one binding per caller tag.
@@ -318,7 +353,8 @@ export type GoalBinding = Omit<GoalCaller, "callerScope">;
  * credential whose scope disagrees with the identity it carries — which would be a
  * credential whose receipts and events are filed under somebody else's name.
  */
-export type CallerBinding = AttemptBinding | RoundBinding | GoalBinding;
+export type CallerBinding =
+  AttemptBinding | RoundBinding | GoalBinding | ImporterBinding;
 
 /** Just enough of a caller to name its scope. See {@link callerScopeOf}. */
 export type CallerIdentity =
@@ -336,6 +372,11 @@ export type CallerIdentity =
       readonly _tag: "goal";
       readonly targetId: string;
       readonly goalId: string;
+    }
+  | {
+      readonly _tag: "importer";
+      readonly targetId: string;
+      readonly importId: string;
     };
 
 /**
@@ -359,10 +400,10 @@ export interface HostContext {
 }
 
 /**
- * The four caller scopes, and what each may write.
+ * The five caller scopes, and what each may write.
  *
  * A caller scope namespaces command receipts and attributes events, so two callers cannot
- * collide on or address each other's operation ids. There are exactly four shapes, and
+ * collide on or address each other's operation ids. There are exactly five shapes, and
  * this is the one place they are defined (the spec's decision 3; ruling 2 of the slice
  * brief, which blesses the operator scope as the fourth rather than renaming it):
  *
@@ -371,7 +412,18 @@ export interface HostContext {
  * | `<targetId>/<attemptId>`     | a worker attempt | `record_observation`, `record_asset`             |
  * | `<targetId>/round/<roundId>` | a planner round  | `add_intent`, and a round disposition            |
  * | `<targetId>/goal/<goalId>`   | a goal agent     | a round steer, and the goal's own ending         |
+ * | `<targetId>/import/<importId>` | the scope importer | scope entries, and imported assets           |
  * | `<targetId>/operator`        | the host, acting for the operator | goals, intents, claims, abandonments |
+ *
+ * **The importer's row is the odd one and is worth reading twice.** Its two writes —
+ * `addScopeEntry` and `importAsset` — take a {@link HostContext} rather than a
+ * {@link CallerContext}, so there is no credential path into either and the store does not
+ * check an importer's authority at all. What the scope is for, then, is the *receipt and
+ * event namespace*: an entry the importer wrote and an entry the operator typed in the
+ * Scope tab are both `source`-stamped rows, and `events.caller_scope` is the only thing
+ * that says which hand wrote one. Filing the importer under the operator's own scope would
+ * have been simpler and would have made those two indistinguishable in the log — which is
+ * the fact D13's review step depends on.
  *
  * The right-hand column is what the **store** enforces through the authority paths, not a
  * description of a tool list: a credential of the wrong kind is refused by
@@ -391,12 +443,14 @@ export interface HostContext {
  * opens a round through `openRound`, which takes the host's context, so nothing is written
  * under the agent's own scope by it. What the goal agent writes is the two above.
  *
- * **Why the four cannot collide.** The last three are namespaced by a reserved segment,
+ * **Why the five cannot collide.** The last four are namespaced by a reserved segment,
  * and an attempt scope is two segments. A collision would need an attempt id spelled
- * `round/…`, `goal/…` or `operator`, and every id in a scope is minted by
+ * `round/…`, `goal/…`, `import/…` or `operator`, and every id in a scope is minted by
  * `identifier.ts` as `<prefix>_<26 chars>` — never operator-supplied, never
- * model-supplied, and never containing a `/`. `store.test.ts` asserts that over
- * constructed scopes rather than by inspection of this comment.
+ * model-supplied, and never containing a `/`. The prefixes are chosen against this list:
+ * `newRoundId` is `rnd` and `newImportId` is `imp` precisely so that no minted id spells
+ * the segment that namespaces it. `store.test.ts` asserts that over constructed scopes
+ * rather than by inspection of this comment.
  *
  * It takes the **identifying** fields only, not a whole {@link CallerBinding}: a scope is
  * a target and one id, and a function that demanded a fence in order to build a string
@@ -411,6 +465,8 @@ export const callerScopeOf = (binding: CallerIdentity): string => {
       return `${binding.targetId}/round/${binding.roundId}`;
     case "goal":
       return `${binding.targetId}/goal/${binding.goalId}`;
+    case "importer":
+      return `${binding.targetId}/import/${binding.importId}`;
   }
 };
 
@@ -484,6 +540,8 @@ export const describeCaller = (caller: CallerContext): string => {
       return `round ${caller.roundId} (a planner round on goal ${caller.goalId})`;
     case "goal":
       return `the goal agent for goal ${caller.goalId}`;
+    case "importer":
+      return `the scope importer for import ${caller.importId}`;
   }
 };
 
@@ -2643,6 +2701,26 @@ const makeStore = Effect.fnUntraced(function* () {
             targetId: goal.target_id,
           } satisfies CallerAuthority;
         }
+        /**
+         * The scope importer holds no stored authority, so this refuses rather than
+         * answering.
+         *
+         * **Refused, not given a fourth {@link CallerAuthority} member**, and the
+         * distinction is the point. This function's promise is "checked against stored
+         * state", and there is no state to check: an import is not a row. An
+         * `{ _tag: "importer" }` member would be a value that satisfies the type while
+         * nothing was verified, which is exactly the shape a later caller would read as
+         * clearance.
+         *
+         * Nothing calls this for an importer today, because its two writes take a
+         * {@link HostContext} and never a credential. This case exists so that a caller
+         * that tried would be told why rather than compiled against a surprise.
+         */
+        case "importer":
+          return yield* new MutationError({
+            reason: "unauthorized",
+            detail: `${describeCaller(caller)} holds no stored authority to check: an import is not a row, and the importer's writes are the operator's own (addScopeEntry, importAsset) rather than a credential's`,
+          });
       }
     },
   );

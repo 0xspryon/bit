@@ -58,11 +58,13 @@ import { HttpRouter, HttpServerResponse } from "effect/http";
 import { McpCredentials } from "../mcp/credentials";
 import {
   GOAL_MCP_PATH,
+  IMPORTER_MCP_PATH,
   MCP_PATH,
   PLANNER_MCP_PATH,
   McpCallCounter,
   mcpApplicationLayer,
 } from "../mcp/server";
+import type { ScopeImportProgress } from "../import/progress";
 import type { GoalBriefingCeiling, GoalPlanning } from "../mcp/goalTools";
 import type { PlannerHarnesses } from "../mcp/plannerTools";
 import { TargetStores } from "../persistence/targetStores";
@@ -185,6 +187,14 @@ export interface ControlPlaneHandle {
    * credential is accepted at.
    */
   readonly goalMcpUrl: string;
+  /**
+   * Where the **scope importer**'s MCP client connects.
+   *
+   * A fourth URL, for {@link plannerMcpUrl}'s reason. `add_scope_entry`,
+   * `record_imported_asset` and `read_scope` are here, and on no path any other
+   * credential is accepted at (D13).
+   */
+  readonly importerMcpUrl: string;
   /** Where the harness-side policy hook posts. */
   readonly policyUrl: string;
   /** Liveness, on the same origin as the other two. */
@@ -245,6 +255,15 @@ export class ControlPlaneEndpoint extends Context.Service<
      */
     readonly briefingCeiling?: Layer.Layer<GoalBriefingCeiling> | undefined;
     /**
+     * The registry the importer's tool calls land in, as an already-built value.
+     *
+     * Passed for {@link planning}'s reason. `mcp/server.ts`'s own option records the
+     * failure if it were required instead: the importer's toolkit and the panel's read
+     * would be looking at two different maps, so every call would land and the receipt
+     * would be blank.
+     */
+    readonly scopeImports?: Layer.Layer<ScopeImportProgress> | undefined;
+    /**
      * Seconds a connection may be idle, overriding {@link CONTROL_PLANE_IDLE_TIMEOUT}.
      *
      * For tests, and only for tests: the claim worth checking is that a heartbeat keeps a
@@ -280,6 +299,9 @@ export class ControlPlaneEndpoint extends Context.Service<
             ...(options.briefingCeiling === undefined
               ? {}
               : { briefingCeiling: options.briefingCeiling }),
+            ...(options.scopeImports === undefined
+              ? {}
+              : { scopeImports: options.scopeImports }),
           }),
           policyRoutes(options.policy),
           healthRoutes,
@@ -318,6 +340,7 @@ export class ControlPlaneEndpoint extends Context.Service<
           mcpUrl: `${origin}${MCP_PATH}`,
           plannerMcpUrl: `${origin}${PLANNER_MCP_PATH}`,
           goalMcpUrl: `${origin}${GOAL_MCP_PATH}`,
+          importerMcpUrl: `${origin}${IMPORTER_MCP_PATH}`,
           policyUrl: `${origin}${POLICY_DECIDE_PATH}`,
           healthUrl: `${origin}${HEALTH_PATH}`,
           callCount: counter.count,

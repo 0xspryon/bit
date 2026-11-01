@@ -192,6 +192,14 @@ export interface WorkerUrls {
    * is a second chance to publish only one.
    */
   readonly goalMcp: string;
+  /**
+   * Where the **scope importer**'s MCP client connects, carrying its importer credential.
+   *
+   * A fourth URL, for {@link plannerMcp}'s reason. `import/scopeImporter.ts` is what
+   * registers against it; nothing in this file uses it, and it is here because all four
+   * are answerable at the same instant by the same listener.
+   */
+  readonly importerMcp: string;
   /** Where the harness-side policy hook posts each decision request. */
   readonly policy: string;
 }
@@ -216,6 +224,7 @@ export class WorkerEndpoints extends Context.Service<
           mcp: endpoint.mcpUrl,
           plannerMcp: endpoint.plannerMcpUrl,
           goalMcp: endpoint.goalMcpUrl,
+          importerMcp: endpoint.importerMcpUrl,
           policy: endpoint.policyUrl,
         }),
       }),

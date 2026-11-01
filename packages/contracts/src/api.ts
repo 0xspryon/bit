@@ -435,8 +435,15 @@ export const TargetDraft = Schema.Struct({
    *
    * Bounded by `SCOPE_IMPORT_MAX_LINKS`, because one session reads all of them (D15) and
    * they therefore share one context window.
+   *
+   * **Optional, and absent means the same as empty**, which is the opposite of how
+   * {@link ImportModelDraft}'s `modelOptions` treats the distinction. There the difference
+   * is load-bearing: an empty list of options would claim an opinion where there is none
+   * and would stop a model applying its own default. Here there is no third thing an
+   * absent list could mean — no links and zero links are both "import nothing" — so
+   * demanding the field would be demanding that every caller say "nothing" out loud.
    */
-  programLinks: Schema.Array(Schema.NonEmptyString),
+  programLinks: Schema.optional(Schema.Array(Schema.NonEmptyString)),
   /**
    * Which model the importer runs on, when the operator chose.
    *

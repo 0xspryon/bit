@@ -155,6 +155,15 @@ export const newRoundId = (): string => prefixed("rnd");
 export const newDimensionId = (): string => prefixed("dim");
 export const newAssetId = (): string => prefixed("asset");
 export const newScopeEntryId = (): string => prefixed("scope");
+/**
+ * One run of the scope importer (D13).
+ *
+ * `imp` rather than `import`, for {@link newRoundId}'s reason exactly: an importer's
+ * caller scope is `<targetId>/import/<importId>`, so an id spelling `import` would be an
+ * id that could spell the reserved segment namespacing it. The prefix list and the
+ * reserved-segment list must stay disjoint, and this is the fourth entry on both sides.
+ */
+export const newImportId = (): string => prefixed("imp");
 
 /**
  * Resets the process-local clock and counter.
