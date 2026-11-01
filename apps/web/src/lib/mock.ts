@@ -123,8 +123,18 @@ export interface NavItem {
   readonly id: string;
   readonly label: string;
   readonly icon: string;
-  /** Rows behind this item, shown as a quiet count. */
-  readonly count?: number;
+  /**
+   * How many placeholder rows an undesigned section renders.
+   *
+   * **Not a count, and never shown as one.** It was `count`, and the rail read it as a
+   * fallback whenever the real figure was unavailable — so a brand-new target with an
+   * empty database showed Findings 2, Evidence 9, Workers 2, Blockers 1 in its rail.
+   * Invented numbers on an empty target are worse than no numbers: they put every real
+   * figure beside them in doubt. The rail now shows only counts it has read
+   * (`App.navCount`), and this stays what it always was — how many grey rows
+   * `Target.svelte` draws on a page that says "Placeholder content" on it.
+   */
+  readonly placeholderRows?: number;
   /** Only Blockers and Findings may demand attention. */
   readonly attention?: boolean;
 }
@@ -143,32 +153,35 @@ export const navGroups: ReadonlyArray<{
   {
     label: "Investigation",
     items: [
-      // Goals, Observations and Assets are driven by real rows, so they carry no `count`
-      // here on purpose: the number comes from the open target (`App.navCount`), and a
-      // prototype figure in this record would be the thing shown whenever that one was
-      // unavailable.
+      // Goals, Observations and Assets are driven by real rows and render their own
+      // pages, so they have no placeholder rows either.
       { id: "goals", label: "Goals", icon: "goals" },
       {
         id: "findings",
         label: "Findings",
         icon: "findings",
-        count: 2,
+        placeholderRows: 2,
         attention: true,
       },
       { id: "observations", label: "Observations", icon: "observations" },
       { id: "assets", label: "Assets", icon: "assets" },
-      { id: "evidence", label: "Evidence", icon: "evidence", count: 9 },
+      {
+        id: "evidence",
+        label: "Evidence",
+        icon: "evidence",
+        placeholderRows: 9,
+      },
     ],
   },
   {
     label: "Operations",
     items: [
-      { id: "workers", label: "Workers", icon: "workers", count: 2 },
+      { id: "workers", label: "Workers", icon: "workers", placeholderRows: 2 },
       {
         id: "blockers",
         label: "Blockers",
         icon: "blockers",
-        count: 1,
+        placeholderRows: 1,
         attention: true,
       },
       { id: "events", label: "Event log", icon: "events" },

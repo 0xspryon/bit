@@ -53,7 +53,7 @@
    * the prototype's, which is what keeps an undesigned page looking like a prototype
    * instead of like an empty real one.
    */
-  let count = $derived(item?.count ?? 0);
+  let count = $derived(item?.placeholderRows ?? 0);
   let rows = $derived(
     Array.from({ length: Math.min(count, 9) }, (_, index) => ({
       id: `${app.navItem}-${index}`,

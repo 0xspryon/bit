@@ -63,7 +63,6 @@ import {
 
 import {
   initialTargets,
-  navItems,
   previewCounts,
   previewGoals,
   type Target,
@@ -946,16 +945,20 @@ export class App {
   /**
    * The number a rail item shows, from wherever it really comes from.
    *
-   * Goals, Observations and Assets are read from the open target; every other item keeps
-   * the prototype's figure. `undefined` hides the count, which is what a real item does
-   * until it has a number for *this* target — the rail used to show the prototype's 148
-   * observations beside a header that had read the real figure, and the two disagreed.
+   * Goals, Observations and Assets are read from the open target. Every other item shows
+   * **nothing**, because nothing has read a number for it: `undefined` hides the count,
+   * and that is what a real item does until it has a figure for *this* target. The rail
+   * used to show the prototype's 148 observations beside a header that had read the real
+   * figure, and the two disagreed; it then fell back to the prototype's other figures, so
+   * a brand-new target with an empty database claimed Findings 2, Evidence 9, Workers 2
+   * and Blockers 1 — four numbers nobody had counted, in the same rail as three that had
+   * been. A section gets a count here when something reads one.
    */
   navCount(id: string): number | undefined {
     if (id === "goals") return this.goalCount;
     if (id === "observations") return this.viewCounts?.observations;
     if (id === "assets") return this.viewCounts?.assets;
-    return navItems.find((item) => item.id === id)?.count;
+    return undefined;
   }
 
   /* ── The harness and model picker ─────────────────────────────────────────── */
