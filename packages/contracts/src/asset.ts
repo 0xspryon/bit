@@ -320,6 +320,89 @@ export const RecordAssetResultWire = RecordAssetResult.pipe(
 );
 
 /**
+ * What the scope importer submits for one asset it read off a program page (D14).
+ *
+ * **The identity-bearing fields are literally {@link RecordAssetInput}'s**, not copies of
+ * them. `kind`, `url` and `method` go through `assetIdentityOf` on both paths, so a host
+ * the importer reads and the same host a worker later discovers reduce to one identity and
+ * merge onto one `assets` row. Re-spelling them here would be the second normalisation
+ * path §17 exists to prevent, and the first thing it would do is split that row in two.
+ *
+ * What differs is the provenance, because the facts differ. A discovery says which attempt
+ * found it; an import says which page it was read off. So this carries `sourceUrl` and no
+ * attempt — the importer has an operator behind it and runs before any goal, intent or
+ * attempt exists.
+ */
+const importAssetInputFields = {
+  operationId: recordAssetInputFields.operationId,
+  kind: recordAssetInputFields.kind,
+  url: recordAssetInputFields.url,
+  method: recordAssetInputFields.method,
+  /**
+   * The program page this asset was read off.
+   *
+   * The import's answer to "how did this come to be known", and the reason this is a
+   * separate provenance table rather than a weakened `asset_discoveries`. Not identity:
+   * two pages naming the same host give one asset with two import records.
+   */
+  sourceUrl: Schema.NonEmptyString.annotate({
+    description:
+      "The program page URL this asset was read off, as given to you.",
+  }),
+  /** Where on the page it came from, in the importer's words. */
+  note: Schema.NonEmptyString.annotate({
+    description:
+      "Where on the page you read this, for example the row of the in-scope table it came from. Recorded with the import, never used as identity.",
+  }),
+};
+
+export const ImportAssetInput = Schema.Struct(importAssetInputFields).check(
+  kindMatchesMethod,
+);
+export type ImportAssetInput = typeof ImportAssetInput.Type;
+
+/**
+ * What an import of one asset returns.
+ *
+ * {@link RecordAssetResult}'s shape with one field changed, and the change is the whole
+ * point: `imports` counts rows in `asset_imports`, not in `asset_discoveries`. An asset
+ * both paths have touched has a count in each, and neither number is the other's.
+ *
+ * It is a schema rather than an interface because the store replays it out of a command
+ * receipt: an exact retry decodes the stored JSON through this codec, so a result whose
+ * shape has drifted from the contract is a named error rather than a value that
+ * type-checks and is wrong.
+ */
+export const ImportAssetResult = Schema.Struct({
+  assetId: Schema.String,
+  kind: AssetKind,
+  identity: Schema.String,
+  /**
+   * False when this import merged onto an asset that already existed.
+   *
+   * Which includes the case the identity rules exist for: a worker discovered this host
+   * first, and the import adds provenance to it rather than a second row.
+   */
+  created: Schema.Boolean,
+  /** True when this call replayed an existing receipt rather than writing anew. */
+  replayed: Schema.Boolean,
+  /** How many separate import operations have recorded this asset. */
+  imports: Schema.Int,
+  /**
+   * Whether this asset is inside the client's authorized estate, as of the write.
+   *
+   * Reported for D9's reason, one step sharper: the importer is the thing that just
+   * authored the scope, so an asset of its own that nothing covers means the entries it
+   * wrote and the hosts it read disagree — which is worth knowing while the import is
+   * still on screen rather than never. It is not a refusal; the rows are already written.
+   */
+  scopeState: Schema.Literals(["in", "out"]),
+  /** What decided {@link ImportAssetResult.scopeState}, in words. */
+  scopeDetail: Schema.String,
+});
+export type ImportAssetResult = typeof ImportAssetResult.Type;
+
+/**
  * One recorded asset, as a browser reads it.
  *
  * camelCase, because this is the browser API's shape and that API is camelCase
@@ -346,14 +429,24 @@ export const AssetView = Schema.Struct({
   path: Schema.NullOr(Schema.String),
   /** When this asset was first recorded. */
   firstSeenAt: Schema.Number,
-  /** How many separate operations have recorded it. Never zero in practice. */
+  /**
+   * How many separate worker operations have discovered it.
+   *
+   * **Zero is a real answer, and D14 is what made it one.** An asset the scope importer
+   * read off a program page has an `asset_imports` row and no discovery row at all, until
+   * a worker finds the same host and merges onto it. So this is a count of discoveries
+   * rather than of provenance, and an asset nobody has discovered yet is not an asset
+   * nobody knows about.
+   */
   discoveries: Schema.Int,
   /**
    * The attempt that found it first, and the intent that attempt was working.
    *
-   * Null when no discovery row exists, which `record_asset` cannot produce — it writes
-   * the discovery in the same transaction as the asset — but which a row written by
-   * anything else could. Reported rather than assumed.
+   * Null when no discovery row exists. `record_asset` cannot produce that — it writes the
+   * discovery in the same transaction as the asset — but the scope importer's own write
+   * does, deliberately and for every asset it records (D14): it has an operator behind it
+   * and no attempt to name. An imported asset reads as "no recorded discovery" here until
+   * a worker finds it, and that is the honest answer rather than a fabricated attempt.
    */
   firstAttemptId: Schema.NullOr(Schema.String),
   firstIntentId: Schema.NullOr(Schema.String),

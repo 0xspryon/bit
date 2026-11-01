@@ -128,6 +128,20 @@ import { Schema } from "effect";
  */
 export const EventKind = Schema.Literals([
   "asset.recorded",
+  /**
+   * An asset the scope importer read off a program page (D14).
+   *
+   * Its own kind rather than an `asset.recorded` with null authority columns, because the
+   * two record different facts and a reader has to tell them apart: `asset.recorded`
+   * answers "which attempt found this", and this one answers "which page it was read
+   * off". Collapsing them would make the attempt columns' absence the only signal, which
+   * is the same conflation `asset_imports` exists instead of a nullable `intent_id` to
+   * avoid.
+   *
+   * `callerScope` is `<targetId>/operator` and both `intentId` and `attemptId` are null —
+   * an honest absence, not a gap: the importer finishes before any goal exists.
+   */
+  "asset.imported",
   "intent.added",
   "observation.recorded",
   "attempt.started",
