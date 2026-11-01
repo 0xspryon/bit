@@ -22,25 +22,9 @@
  * a derived from outside a reactive context, or mutating state that is not proxied — so
  * a test gets told about a misuse instead of quietly getting a stale number.
  */
-import { plugin } from "bun";
-import { compile, compileModule } from "svelte/compiler";
+import { installComponents, installIcons, installRunes } from "./transforms";
 
-const typescript = new Bun.Transpiler({ loader: "ts" });
-
-plugin({
-  name: "svelte-runes",
-  setup(build) {
-    build.onLoad({ filter: /\.svelte\.ts$/ }, async (args) => {
-      const source = await Bun.file(args.path).text();
-      const compiled = compileModule(typescript.transformSync(source), {
-        filename: args.path,
-        generate: "client",
-        dev: true,
-      });
-      return { contents: compiled.js.code, loader: "js" };
-    });
-  },
-});
+installRunes();
 
 /**
  * Lets `bun test` load a `.svelte` component, compiled for the server.
@@ -60,21 +44,7 @@ plugin({
  * Vite's business in the real build, and a test that imported them would need a CSS loader
  * to no purpose.
  */
-plugin({
-  name: "svelte-components",
-  setup(build) {
-    build.onLoad({ filter: /\.svelte$/ }, async (args) => {
-      const source = await Bun.file(args.path).text();
-      const compiled = compile(source, {
-        filename: args.path,
-        generate: "server",
-        css: "external",
-        dev: true,
-      });
-      return { contents: compiled.js.code, loader: "js" };
-    });
-  },
-});
+installComponents("server");
 
 /**
  * Lets `bun test` load an icon, which the app imports as a Svelte component.
@@ -92,18 +62,4 @@ plugin({
  * `?url`, no svgo pass — because nothing in a test asserts on an icon's path data. What it
  * buys is that a component holding an icon can be rendered at all.
  */
-plugin({
-  name: "svelte-svg",
-  setup(build) {
-    build.onLoad({ filter: /\.svg(\?.*)?$/ }, async (args) => {
-      const file = args.path.replace(/\?.*$/, "");
-      const source = await Bun.file(file).text();
-      const compiled = compile(source, {
-        filename: file,
-        generate: "server",
-        css: "external",
-      });
-      return { contents: compiled.js.code, loader: "js" };
-    });
-  },
-});
+installIcons("server");

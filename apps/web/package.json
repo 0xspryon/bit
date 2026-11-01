@@ -7,7 +7,8 @@
     "build": "bun --bun vite build",
     "preview": "bun --bun vite preview --host 127.0.0.1",
     "typecheck": "bun --bun svelte-kit sync && bun --bun svelte-check --tsconfig ./tsconfig.json",
-    "test": "bun test"
+    "test": "bun test && bun run test:dom",
+    "test:dom": "bun --conditions=browser test --config=bunfig.dom.toml test/dom"
   },
   "dependencies": {
     "@bit/contracts": "workspace:*",
@@ -16,6 +17,7 @@
     "effect": "4.0.5"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "21.0.4",
     "@poppanator/sveltekit-svg": "7.0.1",
     "@sveltejs/adapter-static": "4.0.0",
     "@sveltejs/kit": "3.1.0",

@@ -3,3 +3,7 @@
 # in this directory behaves the same as `bun run test` and as `turbo run test`.
 [test]
 preload = ["./test/runes.ts"]
+
+# Mounting a component needs a DOM and client-compiled components, which the preload above
+# cannot give: see `test:dom` in package.json and `test/dom/preload.ts`.
+pathIgnorePatterns = ["test/dom/**"]
