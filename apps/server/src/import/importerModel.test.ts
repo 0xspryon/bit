@@ -8,10 +8,15 @@
  * hardcoded id would outlive the catalogue entry it names.
  *
  * So the preferred model is a *lookup key* — present or absent in what the harness
- * reported, and nothing is assumed about it when absent — and the fallback is a *rule* over
- * the ids a harness listed, which has to produce an answer on a catalogue this code has
- * never seen. Both claims are checked against catalogues whose contents are invented here,
- * including ones where every name in the repo today has been retired.
+ * reported, and nothing is assumed about it when absent — and the fallback is the
+ * harness's own `defaultModel`, which is a value the harness reports and which every run
+ * already uses (`run/supervisor.ts`: `input.model ?? harness.instance.defaultModel`).
+ *
+ * **The assertions name the instance as well as the model**, which is the whole point of
+ * the second step: an earlier version of this suite checked only `origin === "fallback"`
+ * and `model !== PREFERRED`, which passed whichever harness the fallback landed on and
+ * whichever model it chose there. The catalogues are invented here, including ones where
+ * every model name in the repo today has been retired.
  */
 import { describe, expect, test } from "bun:test";
 
@@ -19,7 +24,6 @@ import {
   chooseImporterModel,
   PREFERRED_IMPORTER_MODEL,
   resolveImporterModel,
-  smallModelOf,
 } from "./importerModel";
 import {
   CLAUDE_CODE_DRIVER,
@@ -135,26 +139,53 @@ describe("the default resolves from the catalogue", () => {
     // The fallback triggers on absence from the *reported* catalogue, which is the whole
     // reason the preferred id is a lookup key rather than a descriptor. This is the test
     // that would fail if somebody "optimised" the lookup away and used the id directly.
+    //
+    // **And it names what it landed on.** Asserting only `origin === "fallback"` and
+    // `model !== PREFERRED` passed whichever harness and whichever model the fallback
+    // chose, which is exactly what went wrong: it was taking a heuristic's answer over the
+    // first ready harness's catalogue, and nothing here could tell.
     const choice = chooseImporterModel([openCodeWithoutGlm, claudeCode]);
-    expect(choice?.origin).toBe("fallback");
-    expect(choice?.model).not.toBe(PREFERRED_IMPORTER_MODEL);
+    expect(choice).toEqual({
+      instanceId: "opencode",
+      // OpenCode's own default, not Claude Code's anything and not the `gpt-5-mini` a
+      // name-ranking rule would have preferred. The harness answers "which model" for
+      // itself, which is what every run already does.
+      model: "openai/gpt-5.6-sol",
+      origin: "fallback",
+      detail: `no configured harness offers ${PREFERRED_IMPORTER_MODEL}, so this uses OpenCode's own default model, openai/gpt-5.6-sol`,
+    });
   });
 });
 
-describe("the fallback is a rule over what the harness reported", () => {
-  test("it finds Haiku in Claude Code's list without naming it", () => {
+describe("the fallback is the harness's own default model", () => {
+  test("it is the configured harness's defaultModel, whatever else is in its catalogue", () => {
+    // `claudeCode`'s catalogue lists a haiku, a sonnet and an opus. The fallback takes the
+    // default the harness reports — the operator's configuration — rather than ranking
+    // those names for the cheapest-looking one.
     const choice = chooseImporterModel([claudeCode]);
     expect(choice).toMatchObject({
       instanceId: "claude-code",
-      model: "claude-haiku-4-5",
+      model: "claude-sonnet-5",
       origin: "fallback",
     });
     expect(choice?.detail).toContain(PREFERRED_IMPORTER_MODEL);
+    expect(choice?.detail).toContain("claude-sonnet-5");
+  });
+
+  test("it is the first ready harness, in configuration order", () => {
+    // Which is also what `resolve(undefined)` would have picked, so the importer lands on
+    // the same harness as everything else rather than on a surprising one.
+    expect(chooseImporterModel([claudeCode, openCodeWithoutGlm])).toMatchObject(
+      {
+        instanceId: "claude-code",
+        model: "claude-sonnet-5",
+      },
+    );
   });
 
   test("it works on a catalogue where every name in the repo today is gone", () => {
-    // The point of a rule rather than a second constant. None of these ids exists
-    // anywhere in this codebase, and the fallback still picks the small one.
+    // The point of reading a reported value rather than naming a second model. None of
+    // these ids exists anywhere in this codebase and the rule still answers.
     const future = listing(
       instance({
         id: "future",
@@ -164,28 +195,20 @@ describe("the fallback is a rule over what the harness reported", () => {
         models: ["acme/colossus-9", "acme/colossus-9-nano", "acme/midsize-3"],
       }),
     );
-    expect(smallModelOf(future.instance)).toBe("acme/colossus-9-nano");
+    expect(chooseImporterModel([future])).toMatchObject({
+      instanceId: "future",
+      model: "acme/colossus-9",
+      origin: "fallback",
+    });
   });
 
-  test("the plain small model wins over a longer variant of it", () => {
+  test("an unready harness does not get to answer, even first in order", () => {
     expect(
-      smallModelOf({
-        defaultModel: "x/big",
-        models: [{ id: "x/haiku-4-5-thinking-preview" }, { id: "x/haiku-4-5" }],
-      }),
-    ).toBe("x/haiku-4-5");
-  });
-
-  test("a catalogue with no recognisable small model falls back to the harness's default", () => {
-    // Stated as the honest limit rather than hidden: this is a heuristic over names, and
-    // when it recognises nothing it defers to the claim the *harness* makes about its own
-    // default instead of picking an arbitrary id.
-    expect(
-      smallModelOf({
-        defaultModel: "x/one",
-        models: [{ id: "x/one" }, { id: "x/two" }],
-      }),
-    ).toBe("x/one");
+      chooseImporterModel([
+        listing(claudeCode.instance, { ready: false }),
+        openCodeWithoutGlm,
+      ]),
+    ).toMatchObject({ instanceId: "opencode", model: "openai/gpt-5.6-sol" });
   });
 });
 
@@ -229,7 +252,7 @@ describe("the operator's pick", () => {
     });
   });
 
-  test("picking another instance with no model gets that instance's small one", () => {
+  test("picking another instance with no model gets that instance's own default", () => {
     // Not the rule's model, which belongs to a different harness's catalogue and would be
     // a name this instance has never heard of.
     expect(
@@ -239,8 +262,22 @@ describe("the operator's pick", () => {
       }),
     ).toMatchObject({
       instanceId: "claude-code",
-      model: "claude-haiku-4-5",
+      model: "claude-sonnet-5",
     });
+  });
+
+  test("picking an instance this server does not configure substitutes nothing", () => {
+    // The module's own promise, which it used to break in exactly this case: an unknown
+    // `instanceId` fell through to the rule's answer, so the record of which harness ran
+    // the import named a harness the operator never chose. `HarnessResolver.resolve`
+    // refuses this by name, with its own sentence, which is where a bad pick belongs.
+    const choice = resolveImporterModel({
+      listings: [openCodeWithGlm],
+      choice: { instanceId: "not-configured" },
+    });
+    expect(choice?.instanceId).toBe("not-configured");
+    expect(choice?.model).toBe("");
+    expect(choice?.detail).toContain("does not configure");
   });
 
   test("empty strings are no pick rather than a pick of nothing", () => {

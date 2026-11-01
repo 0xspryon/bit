@@ -269,17 +269,17 @@ describe("the model picker appears with the checkbox", () => {
         ok(
           importerModelView({
             instanceId: "claude-code",
-            model: "claude-haiku-4-5",
+            model: "claude-sonnet-5",
             origin: "fallback",
             detail:
-              "no configured harness offers opencode/glm-5.3-flash-free, so this falls back to Claude Code's claude-haiku-4-5",
+              "no configured harness offers opencode/glm-5.3-flash-free, so this uses Claude Code's own default model, claude-sonnet-5",
           }),
         );
     });
     app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
 
     const body = bodyOf(app);
-    expect(body).toContain("claude-haiku-4-5");
+    expect(body).toContain("claude-sonnet-5");
     expect(body).toContain("resolved by fallback");
     expect(body).toContain("no configured harness offers");
   });
