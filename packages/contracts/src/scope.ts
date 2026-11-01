@@ -727,8 +727,24 @@ export const describeScopeLabel = (
   by: Extract<ScopeDecidedBy, { _tag: "assetLabel" | "hostLabel" }>,
 ): string =>
   by._tag === "hostLabel"
-    ? `${by.label.host} (set by hand: every asset on that host, now and later)`
+    ? `${by.label.host} (set by hand: ${HOST_LABEL_REACH})`
     : "this asset alone (set by hand)";
+
+/**
+ * What a host label reaches, as one clause.
+ *
+ * Exported because three surfaces have to state it and they must state it identically:
+ * {@link describeScopeLabel}'s sentence, the Scope tab's list of hand labels, and the
+ * Estate tab's promote and exclude controls — which are the place it matters most,
+ * because "and later" is the part an operator cannot infer from a button reading
+ * *Exclude host*. D8 and the view design both require every option to say what it
+ * reaches, and three copies of this clause is three chances for one of them to drift
+ * into promising less than the click does.
+ */
+export const HOST_LABEL_REACH = "every asset on that host, now and later";
+
+/** What an asset label reaches: the one row, and nothing else on its host. */
+export const ASSET_LABEL_REACH = "that one asset";
 
 /**
  * One subject's verdict as a sentence, naming what decided it.

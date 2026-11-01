@@ -485,7 +485,23 @@ describe("the scope", () => {
   });
 
   test("promoting a host re-reads the estate, because one click can move other rows", async () => {
-    const [app, fake] = await onAssets();
+    const [app, fake] = await onAssets((fake) => {
+      // The server's own answer, distinguishable from the draft sent below.
+      fake.onLabelScope = () =>
+        ok(
+          emptyScope({
+            hostLabels: [
+              {
+                host: "api.acme-cdn.test",
+                state: "in",
+                reason: null,
+                setBy: "acme-corp/operator",
+                setAt: 2,
+              },
+            ],
+          }),
+        );
+    });
     const before = fake.countOf("assets");
 
     await app.labelScope({
@@ -503,6 +519,23 @@ describe("the scope", () => {
      * browser would be a second implementation of the ladder.
      */
     expect(fake.countOf("assets")).toBe(before + 1);
+    /*
+     * And the scope on screen is the server's answer, not the draft this test sent.
+     *
+     * The assertion above only proves the draft travelled unmangled — it is the same
+     * object going out and coming back through a pass-through fake. What matters to the
+     * operator is that the label the *server* reports is the one the Scope tab then
+     * shows, which is the half a pass-through assertion cannot see.
+     */
+    expect(app.viewScope?.hostLabels).toEqual([
+      {
+        host: "api.acme-cdn.test",
+        state: "in",
+        reason: null,
+        setBy: "acme-corp/operator",
+        setAt: 2,
+      },
+    ]);
   });
 
   test("excluding one asset is the same control in the other direction", async () => {
@@ -528,7 +561,12 @@ describe("the scope", () => {
     // One route, one method, six combinations. An earlier design had promotion writing an
     // entry and exclusion writing a label, which made two buttons different mechanisms
     // wearing one shape.
-    expect(argsOf(fake, "labelScope")?.[2]).toMatchObject({
+    //
+    // The subject is asserted too: `toMatchObject({ state: "cleared" })` said nothing
+    // about *what* was being withdrawn, which is the one field a mis-wired control would
+    // get wrong.
+    expect(argsOf(fake, "labelScope")?.[2]).toEqual({
+      subject: { _tag: "host", host: "app.acme.test" },
       state: "cleared",
     });
   });

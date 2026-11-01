@@ -32,8 +32,10 @@
    * paths call, so what the operator checks is the bytes the agent gets.
    */
   import {
+    ASSET_LABEL_REACH,
     describeScopeEntry,
     describeScopeState,
+    HOST_LABEL_REACH,
     type AssetView,
     type ScopeKind,
     type ScopeState,
@@ -46,6 +48,17 @@
   import { IconClose, IconCube, IconPlus, IconSearch } from "../icons";
 
   let { app }: { app: App } = $props();
+
+  /**
+   * The entry field, so the empty state's button can reach it.
+   *
+   * The panel that carries "Add the first entry" is the Scope tab's right-hand column and
+   * the field is its left-hand one, both mounted together, so the button hands the
+   * operator the thing it names rather than setting a state flag. Before this it assigned
+   * `entryValue = ""` to an already-empty field, which is the design's "action that
+   * appears to work and does nothing" on the first screen a new target shows.
+   */
+  let entryField = $state<HTMLInputElement | undefined>(undefined);
 
   let scope = $derived(app.viewScope);
   let tally = $derived(app.estateTally);
@@ -226,33 +239,40 @@
                 <!-- One control, two directions. The host option covers every asset on
                      it, now and later, which is what makes an exclusion mean what the
                      operator meant by it. -->
-                {#if group.scope.state === "in"}
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={app.scopeBusy}
-                    onclick={() =>
-                      void app.labelScope({
-                        subject: { _tag: "host", host: group.host },
-                        state: "out",
-                      })}
-                  >
-                    Exclude host
-                  </Button>
-                {:else}
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={app.scopeBusy}
-                    onclick={() =>
-                      void app.labelScope({
-                        subject: { _tag: "host", host: group.host },
-                        state: "in",
-                      })}
-                  >
-                    Promote host
-                  </Button>
-                {/if}
+                <!-- Every option states what it reaches, from the same clause the Scope
+                     tab's hand labels and the agent's prompt use. "And later" is the part
+                     a button cannot imply on its own, and it is what makes an exclusion
+                     mean what the operator meant by it. -->
+                <span class="action">
+                  {#if group.scope.state === "in"}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={app.scopeBusy}
+                      onclick={() =>
+                        void app.labelScope({
+                          subject: { _tag: "host", host: group.host },
+                          state: "out",
+                        })}
+                    >
+                      Exclude host
+                    </Button>
+                  {:else}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={app.scopeBusy}
+                      onclick={() =>
+                        void app.labelScope({
+                          subject: { _tag: "host", host: group.host },
+                          state: "in",
+                        })}
+                    >
+                      Promote host
+                    </Button>
+                  {/if}
+                  <span class="reach">{HOST_LABEL_REACH}</span>
+                </span>
                 {#if group.scope.by._tag === "hostLabel"}
                   <Button
                     size="sm"
@@ -303,20 +323,28 @@
                       </Button>
                     {:else}
                       <span class="why mono">inherits host</span>
-                      <Button
-                        size="sm"
-                        variant="quiet"
-                        disabled={app.scopeBusy}
-                        onclick={() =>
-                          void app.labelScope({
-                            subject: { _tag: "asset", assetId: asset.assetId },
-                            state: asset.scope.state === "in" ? "out" : "in",
-                          })}
-                      >
-                        {asset.scope.state === "in"
-                          ? "Exclude this asset"
-                          : "Promote this asset"}
-                      </Button>
+                      <span class="action">
+                        <Button
+                          size="sm"
+                          variant="quiet"
+                          disabled={app.scopeBusy}
+                          onclick={() =>
+                            void app.labelScope({
+                              subject: {
+                                _tag: "asset",
+                                assetId: asset.assetId,
+                              },
+                              state: asset.scope.state === "in" ? "out" : "in",
+                            })}
+                        >
+                          {asset.scope.state === "in"
+                            ? "Exclude this asset"
+                            : "Promote this asset"}
+                        </Button>
+                        <!-- The narrower of the two directions, and it says so: this row
+                             alone, not the host it sits under. -->
+                        <span class="reach">{ASSET_LABEL_REACH}</span>
+                      </span>
                     {/if}
                   </li>
                 {/each}
@@ -404,8 +432,7 @@
                   <li class="entry">
                     <span class="entry-value mono">{label.host}</span>
                     <span class="entry-covers"
-                      >{label.state === "in" ? "in scope" : "excluded"} — every asset
-                      on that host, now and later</span
+                      >{label.state === "in" ? "in scope" : "excluded"} — {HOST_LABEL_REACH}</span
                     >
                     <div class="spacer"></div>
                     <button
@@ -426,8 +453,7 @@
                   <li class="entry">
                     <span class="entry-value mono">{label.identity}</span>
                     <span class="entry-covers"
-                      >{label.state === "in" ? "in scope" : "excluded"} — that one
-                      asset</span
+                      >{label.state === "in" ? "in scope" : "excluded"} — {ASSET_LABEL_REACH}</span
                     >
                     <div class="spacer"></div>
                     <button
@@ -482,6 +508,7 @@
               <input
                 class="mono value"
                 type="text"
+                bind:this={entryField}
                 bind:value={app.entryValue}
                 placeholder="acme.test"
                 aria-label="Host, apex or address block"
@@ -537,7 +564,10 @@
               <Button
                 variant="primary"
                 size="sm"
-                onclick={() => (app.entryValue = "")}
+                onclick={() => {
+                  entryField?.scrollIntoView({ block: "nearest" });
+                  entryField?.focus();
+                }}
               >
                 <IconPlus width="13" height="13" />
                 Add the first entry
@@ -701,6 +731,18 @@
     font: 400 12px/16px var(--font-mono);
     color: var(--text-muted);
   }
+  /* A control and the sentence saying what it reaches travel together, so neither can
+     wrap away from the other and leave a bare button promising less than it does. */
+  .action {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    gap: 8px;
+  }
+  .reach {
+    font: 400 12px/16px var(--font-sans);
+    color: var(--text-muted);
+  }
 
   /*
     Three states, three shapes, and no colour.
@@ -751,9 +793,26 @@
   .row:hover {
     background: var(--overlay-hover);
   }
+  /*
+    The identity gets a floor, and the floor is what makes the row wrap.
+
+    `flex: 1; min-width: 0` let this column shrink to nothing. With a flex basis of zero,
+    line collection measured the identity as zero-wide, so every fixed-width sibling — and
+    `.action`, which carries a whole sentence — was packed onto the first line and the
+    identity was handed whatever pixels were left over. It then broke one or two characters
+    per line: `api.acme-cdn.test:443` stood 21 lines tall at 768px and 20 at 1280px.
+
+    A basis with a real minimum is the floor. Line collection clamps the base size to
+    `min-width`, so a sibling that would push the identity under 260px is moved to the next
+    line instead of crushing it — which is flex-wrap doing the job it was already asked to
+    do, at every width rather than only the ones where the columns happened to fit.
+    `min(…, 100%)` keeps the floor from overflowing a container narrower than itself.
+    `overflow-wrap: anywhere` stays, because a path longer than the column still has to
+    break somewhere; it now breaks at thirty-odd characters rather than at one.
+  */
   .what {
-    flex: 1;
-    min-width: 0;
+    flex: 1 1 260px;
+    min-width: min(260px, 100%);
     font: 400 13px/18px var(--font-mono);
     color: var(--text-base);
     overflow-wrap: anywhere;

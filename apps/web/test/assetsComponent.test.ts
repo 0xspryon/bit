@@ -116,10 +116,20 @@ describe("the Estate tab", () => {
         });
     });
 
-    // The three chips.
-    expect(html).toContain("In scope");
-    expect(html).toContain("Excluded");
-    expect(html).toContain("Not covered");
+    /*
+     * The three chips, read off the chips.
+     *
+     * This used to be three bare `toContain` calls — which passed on the filter bar's
+     * own labels at the top of the screen, rendered unconditionally and never from a
+     * row's state. A `chipLabel` returning "In scope" for all three groups satisfied
+     * them. So the chip spans are extracted and compared as a set.
+     */
+    const chips = [
+      ...html.matchAll(/<span class="chip [^"]*">([^<]+)<\/span>/g),
+    ]
+      .map((match) => (match[1] ?? "").trim())
+      .sort();
+    expect(chips).toEqual(["Excluded", "In scope", "Not covered"]);
 
     /*
      * And the three sentences, which are the part that must not collapse. "Excluded on
@@ -166,6 +176,76 @@ describe("the Estate tab", () => {
     // One control, two directions: the same place on the row, the opposite verb.
     expect(html).toContain("Exclude host");
     expect(html).not.toContain("Promote host");
+  });
+
+  test("a row offers the direction it is not already in", async () => {
+    /*
+     * The per-asset half of "one control, two directions". The group header's half is
+     * asserted above; the row-level ternary was matched nowhere, so inverting it — asking
+     * an operator to promote what is already in scope — passed the whole suite.
+     *
+     * Two rows on two hosts, one in scope and one covered by nothing, so the two
+     * directions are asserted against each other in one render.
+     */
+    const html = await bodyOf((fake) => {
+      fake.onAssets = () =>
+        ok({
+          assets: [
+            assetView({
+              assetId: "a_in",
+              host: "app.acme.test",
+              identity: "app.acme.test:443",
+              scope: byEntry("acme.test", "in"),
+            }),
+            assetView({
+              assetId: "a_none",
+              host: "api.acme-cdn.test",
+              identity: "api.acme-cdn.test:443",
+            }),
+          ],
+        });
+    });
+
+    // Each row's own markup, so a button cannot be credited to the wrong row.
+    const rows = [...html.matchAll(/<li class="row [^"]*">(.*?)<\/li>/gs)].map(
+      (match) => match[1] ?? "",
+    );
+    expect(rows).toHaveLength(2);
+    const rowFor = (identity: string) =>
+      rows.find((row) => row.includes(identity)) ?? "";
+
+    const inScope = rowFor("app.acme.test:443");
+    expect(inScope).toContain("Exclude this asset");
+    expect(inScope).not.toContain("Promote this asset");
+
+    const uncovered = rowFor("api.acme-cdn.test:443");
+    expect(uncovered).toContain("Promote this asset");
+    expect(uncovered).not.toContain("Exclude this asset");
+
+    // And both say what they reach, which is the narrower of the two label reaches.
+    expect(inScope).toContain("that one asset");
+    expect(uncovered).toContain("that one asset");
+  });
+
+  test("the host control states what it reaches, now and later", async () => {
+    // D8 and the view design: every option states its reach. "And later" is the part a
+    // button reading *Exclude host* cannot imply, and it is what makes an exclusion mean
+    // what the operator meant by it.
+    const html = await bodyOf((fake) => {
+      fake.onAssets = () =>
+        ok({
+          assets: [
+            assetView({
+              assetId: "a_in",
+              host: "app.acme.test",
+              scope: byEntry("acme.test", "in"),
+            }),
+          ],
+        });
+    });
+    const header = /<header class="host [^"]*">(.*?)<\/header>/s.exec(html);
+    expect(header?.[1]).toContain("Exclude host");
+    expect(header?.[1]).toContain("every asset on that host, now and later");
   });
 
   test("a row whose own label decided it says so, and names the entry it beat", async () => {
@@ -351,6 +431,74 @@ describe("the Scope tab", () => {
     expect(html).toContain("listed under In scope on the programme page");
   });
 
+  test("a hand label is listed with what it reaches, and offers to withdraw it", async () => {
+    /*
+     * The whole "Set by hand" panel, which no test rendered: `hostLabels` and
+     * `assetLabels` arrived as `[]` everywhere, so deleting the panel passed — and so did
+     * swapping its two sentences, which would tell an operator that a host label reaches
+     * one asset. That is precisely the hole D5 keyed labels by host to close.
+     */
+    const html = await scopeBody((fake) => {
+      fake.onScope = () =>
+        ok(
+          emptyScope({
+            entries: [
+              entry({ effect: "in", kind: "subtree", value: "acme.test" }),
+            ],
+            hostLabels: [
+              {
+                host: "legacy.acme.test",
+                state: "out",
+                reason: "retired last quarter",
+                setBy: `${TARGET}/operator`,
+                setAt: 2,
+              },
+            ],
+            assetLabels: [
+              {
+                assetId: "a_metrics",
+                identity: "GET https://app.acme.test:443/internal/metrics",
+                state: "in",
+                reason: null,
+                setBy: `${TARGET}/operator`,
+                setAt: 3,
+              },
+            ],
+            promptBlock: "[Authorized testing scope — highest priority]",
+          }),
+        );
+    });
+
+    expect(html).toContain("Set by hand");
+    expect(html).toContain("These beat the lists above");
+
+    // Each value with the sentence beside it, as pairs, so the two reaches cannot be
+    // swapped without failing: a host label covers the host's assets now and later, an
+    // asset label covers the one row.
+    const pairs = [
+      ...html.matchAll(
+        /<span class="entry-value mono [^"]*">([^<]+)<\/span> <span class="entry-covers [^"]*">([^<]+)<\/span>/g,
+      ),
+    ].map(
+      (match) => [(match[1] ?? "").trim(), (match[2] ?? "").trim()] as const,
+    );
+    expect(pairs).toContainEqual([
+      "legacy.acme.test",
+      "excluded — every asset on that host, now and later",
+    ]);
+    expect(pairs).toContainEqual([
+      "GET https://app.acme.test:443/internal/metrics",
+      "in scope — that one asset",
+    ]);
+
+    // And each is withdrawable from here, named so the control cannot be aimed at the
+    // wrong subject.
+    expect(html).toContain('aria-label="Clear the label on legacy.acme.test"');
+    expect(html).toContain(
+      'aria-label="Clear the label on GET https://app.acme.test:443/internal/metrics"',
+    );
+  });
+
   test("the preview panel shows the server's block verbatim", async () => {
     const block = [
       "[Authorized testing scope — highest priority]",
@@ -367,14 +515,17 @@ describe("the Scope tab", () => {
     });
 
     /*
-     * Verbatim, line for line. This panel is the only place an operator can check what
-     * their list actually says before an agent acts on it, so it shows the bytes the
-     * server rendered from the same function both prompt paths call — not a
-     * reconstruction this component assembled from the lists beside it.
+     * Verbatim means verbatim: the whole block, as one string.
+     *
+     * This used to loop the non-empty lines and `toContain` each one trimmed, which
+     * discarded the blank line, the indentation that marks a wrapped continuation, the
+     * ordering and the adjacency — so a panel that reassembled the lines in another
+     * order, or dropped the indent, passed. The panel is a bare `<pre>{block}</pre>` and
+     * the fixture holds nothing HTML-escapable, so the stronger assertion was available
+     * all along. This is the only place an operator can check what their list says
+     * before an agent acts on it.
      */
-    for (const line of block.split("\n").filter((text) => text !== "")) {
-      expect(html).toContain(line.trim());
-    }
+    expect(html).toContain(block);
     // And the note that the planner's copy differs, which is the one thing a single
     // previewed block cannot show by itself.
     expect(html).toContain("A planner round gets the same block");
