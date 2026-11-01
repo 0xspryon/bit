@@ -633,6 +633,45 @@ writes carries `source = 'imported'` and the note of where on the page it came f
 the operator reads the list before the first goal. Treat the page content as data in the
 prompt, never as instruction, and say so in the importer's own framing.
 
+### D14 — The importer records assets through its own function, not `record_asset`
+
+The designed intake screen shows the agent recording the hosts a scope table names —
+"11 assets recorded". It cannot use `record_asset` to do it. `store.recordAsset` opens
+with `attemptCallerOrFail`, and `asset_discoveries.intent_id` and `.attempt_id` are
+`NOT NULL` with real foreign keys to `intents` and `attempts`. The importer has an
+operator behind it and no intent, no attempt and no goal — those rows do not exist yet
+and will not until the operator creates one.
+
+**Decided 2026-11-01: a dedicated store function, and a dedicated provenance table.**
+Not a nullable `intent_id`.
+
+```
+asset_imports
+  asset_id     TEXT NOT NULL REFERENCES assets(id)
+  operation_id TEXT NOT NULL
+  source_url   TEXT NOT NULL   -- the program page this host was read off
+  note         TEXT NOT NULL   -- where on the page, in the importer's words
+  imported_at  INTEGER NOT NULL
+  PRIMARY KEY (asset_id, operation_id)
+```
+
+The `assets` row is the same row, under the same identity rules from §17 — a host the
+importer reads and a host a worker later discovers are one asset, which is the whole
+point of having identity rules. Only the provenance record differs, and it differs
+because the facts differ: a discovery says which attempt found it, and an import says
+which page it was read off.
+
+**Why not relax `asset_discoveries`.** Making those columns nullable would weaken the
+invariant for every row in the table, including the hundreds written by workers, so that
+one caller with genuinely different provenance could share a shape it does not fit. Every
+reader of `asset_discoveries` would then have to handle a null attempt, and the question
+"which attempt found this?" would stop having an answer for reasons that have nothing to
+do with the asset. `0010`'s own commentary argues for that invariant; this keeps it.
+
+The cost is honest and small: "how did this asset come to be known" becomes a read over
+two tables rather than one. A view over the union is the obvious shape if more than one
+caller wants it, and is left to the builder.
+
 Open until the creation screen lands: what the screen shows when a fetch fails or a page
 yields no parseable scope; whether several links are one session or one each, and
 whether one failing link fails the import; and which harness and model the importer runs
@@ -654,14 +693,21 @@ Each slice ends with the gates green: `typecheck`, `test`, `test:persistence`, `
 | 6   | The scope query tool on the goal endpoint                                            | The goal agent answers "is `x` in scope" naming what decided it — entry, host label or asset label — and reflects an edit made seconds earlier                                                                                                                                                                                                          |
 | 7   | Migration `0023_observation_assets` + `record_observation` takes asset ids           | An observation records the assets it tested, in its own transaction; an id belonging to another target is refused instructively; the store answers "which assets have evidence against them" from the edge, not from a join through the discovering intent; `test:persistence` green                                                                    |
 | 8   | The scope view                                                                       | Two lists authored by hand; discovered assets with their state and what decided it; promote and exclude on any row, as one control with two directions, offering the host or the single asset; a row whose label overrode an entry says which entry it beat; imported entries are visibly imported                                                      |
-| 9   | The scope importer and the new create-target screen                                  | Creating a target with one or more program URLs registers it and runs the importer; its two tools exist on its endpoint only and a worker offered them fails the test; every written entry carries `source = 'imported'` and where it came from; a failed fetch leaves a usable target and says what happened; no goal is started by any of it          |
+| 9   | Migration `0024_asset_imports` + the importer's own asset write (D14)                | The importer records a host with no intent and no attempt in sight; `asset_discoveries` keeps both columns `NOT NULL`; a host it imported and a host a worker later discovers are **one** asset with two provenance rows; `test:persistence` green                                                                                                      |
+| 10  | The scope importer and the new create-target screen                                  | Creating a target with one or more program URLs registers it and runs the importer; its tools exist on its endpoint only and a worker offered them fails the test; every written entry carries `source = 'imported'` and where it came from; a failed fetch leaves a usable target and says what happened; no goal is started by any of it              |
 
 Slices 1 and 2 are independently useful and can ship alone. Slices 3–6 are the scope
 itself. Slice 7 is independent of all of them and could move earlier — it is recorded
 here because it is the one thing a later graph cannot be built honestly without, not
-because the scope needs it. Slice 8 is what the operator actually asked to see. Slice 9
-is how a real engagement's scope gets in without being typed by hand, and it depends on
-3 and 4 for the entries and on 8 for the screen the operator reviews them on.
+because the scope needs it. Slice 8 is what the operator actually asked to see.
+
+**Slices 1–8 shipped on 2026-11-01** (`f476cf1..97ca94c`), reviewed and fixed; see
+`docs/uat-target-scope.md` for the acceptance script.
+
+Slices 9 and 10 are how a real engagement's scope gets in without being typed by hand.
+9 is D14's provenance table and must land before 10, which is the importer that needs it;
+both depend on 3 and 4 for the entries and on 8 for the screen the operator reviews them
+on.
 
 ## Calls made for you
 
