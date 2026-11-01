@@ -69,6 +69,7 @@ import {
 } from "./plan";
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
+import { ImporterModelView, ScopeImportView } from "./scopeImport";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
@@ -85,6 +86,8 @@ export const TARGETS_PATH = apiPath("targets");
 export const FOLDERS_PATH = apiPath("folders");
 /** Which agent harnesses this server configures, and what each will run. */
 export const HARNESSES_PATH = apiPath("harnesses");
+/** Which model the scope importer will run on, resolved against the live catalogue. */
+export const IMPORTER_MODEL_PATH = apiPath("importer-model");
 
 /* ── Session ─────────────────────────────────────────────────────────────────── */
 
@@ -392,15 +395,140 @@ export class TargetUnavailable extends Schema.TaggedError<TargetUnavailable>()(
   }
 }
 
-/** What the New target dialog submits. */
+/**
+ * Which harness and model an import runs on, when the operator picked one (D15).
+ *
+ * **{@link RunDraft}'s three fields, spelled the same way and meaning the same things**,
+ * rather than a new shape: the picker on the create-target screen is the picker in the
+ * composer, and a second vocabulary for "which model" would be a second resolution path.
+ * All three are optional and the whole struct is, so a draft that says nothing about the
+ * model gets D15's rule applied to the live catalogue — which is the common case, because
+ * the screen preselects what that rule already answered.
+ */
+export const ImportModelDraft = Schema.Struct({
+  instanceId: Schema.optional(Schema.String),
+  model: Schema.optional(Schema.String),
+  modelOptions: Schema.optional(Schema.Array(ModelOptionSelection)),
+});
+export type ImportModelDraft = typeof ImportModelDraft.Type;
+
+/** What the New target screen submits. */
 export const TargetDraft = Schema.Struct({
   /** A folder inside the configured workspace root. */
   workspacePath: Schema.NonEmptyString,
   name: Schema.NonEmptyString,
-  /** Advisory prose about what is in scope. Never enforcement. */
+  /**
+   * A note for people, not for the agent.
+   *
+   * Still `scope_note` in the registry and still the target card's human description. It
+   * stopped being presented as something machine-readable when the structured scope
+   * landed, and the field that replaced its old job is {@link programLinks} below.
+   */
   scopeNote: Schema.String,
+  /**
+   * The program's own pages, for the scope importer to read (D13).
+   *
+   * **Empty is the normal case and is not a degraded one.** A target with no program page
+   * is still one click: the links are optional, the primary button never renames, and a
+   * target created with none is identical to one whose every link yielded nothing — both
+   * have no scope yet and the Assets screen says what that means.
+   *
+   * Bounded by `SCOPE_IMPORT_MAX_LINKS`, because one session reads all of them (D15) and
+   * they therefore share one context window.
+   */
+  programLinks: Schema.Array(Schema.NonEmptyString),
+  /**
+   * Which model the importer runs on, when the operator chose.
+   *
+   * Absent means "resolve the default against the live catalogue", which is what the
+   * screen sends when the operator leaves the picker alone. It is meaningless without
+   * {@link programLinks}: no links means no importer, and a model choice with no agent to
+   * run is a control for nothing — so a draft carrying one and no links is accepted and the
+   * choice is simply never used, rather than refused for a contradiction the operator
+   * cannot see.
+   */
+  importModel: Schema.optional(ImportModelDraft),
 });
 export type TargetDraft = typeof TargetDraft.Type;
+
+/**
+ * A registered target, and the import that was started alongside it.
+ *
+ * **A wrapper rather than two more fields on {@link TargetSummary}**, because that struct
+ * is one row of the target list and an `importId` on every row would be a field that is
+ * null for every target but the one just created. Creation is the only moment an import
+ * handle exists, so it belongs on creation's own answer.
+ *
+ * {@link scopeImport} being null is not a failure. It is what "no program links" looks
+ * like, and per D15 it is also what "links were given and this server has no harness to
+ * read them with" looks like — in which case {@link importDetail} says so and the operator
+ * lands on a target that is created, registered and entirely usable with no scope.
+ */
+export const TargetCreated = Schema.Struct({
+  target: TargetSummary,
+  /** The import to watch, when one started. */
+  scopeImport: Schema.NullOr(
+    Schema.Struct({
+      importId: Schema.String,
+      /** As resolved, never as asked: the picker's choice may have been a dead instance. */
+      harnessInstanceId: Schema.String,
+      model: Schema.String,
+    }),
+  ),
+  /**
+   * Why no import is running, when links were given and one could not start.
+   *
+   * Null when {@link scopeImport} is set, and null when no links were given — there is
+   * nothing to explain about an import nobody asked for.
+   */
+  importDetail: Schema.NullOr(Schema.String),
+});
+export type TargetCreated = typeof TargetCreated.Type;
+
+/**
+ * A scope import this server cannot show.
+ *
+ * In-process and not a row, which is what makes `unknown_import` the common reason rather
+ * than an exotic one: the importer's progress lives in this process's memory for the life
+ * of the import, so a restart forgets it. That is deliberate — what the import *wrote* is
+ * durable in `scope_entries` and `asset_imports`, and the panel is a receipt for a write
+ * that has already landed rather than the record of it. An operator who reloads onto a
+ * forgotten import is sent to Assets, where the entries are.
+ */
+export class ScopeImportNotFound extends Schema.TaggedError<ScopeImportNotFound>()(
+  "ScopeImportNotFound",
+  {
+    reason: Schema.Literals(["unknown_import", "invalid_target_id"]),
+    importId: Schema.String,
+    detail: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {
+  override get message(): string {
+    return `${this.reason} (${this.importId}): ${this.detail}`;
+  }
+}
+
+/**
+ * No model this server can run an import on.
+ *
+ * Reached when no harness came up at all, so there is no catalogue to resolve D15's rule
+ * against. Reported rather than answered with a guess: a model id this server invented
+ * would be a control that offers the operator a choice the server cannot honour, and the
+ * create-target screen's checkbox is better disabled than lying.
+ */
+export class ImporterModelUnavailable extends Schema.TaggedError<ImporterModelUnavailable>()(
+  "ImporterModelUnavailable",
+  {
+    reason: Schema.Literals(["no_harness"]),
+    detail: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {
+  override get message(): string {
+    return `${this.reason}: ${this.detail}`;
+  }
+}
 
 /**
  * A refused registration.
@@ -1170,10 +1298,80 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       success: TargetView,
       error: [TargetNotFound, TargetUnavailable],
     }),
+    /**
+     * Registers a target, and starts the scope importer when links were given.
+     *
+     * **It still starts no hunt, and that is load-bearing** (D13). It registers the row,
+     * migrates the file, and — when {@link TargetDraft.programLinks} is non-empty — starts
+     * one agent session whose only tools write scope entries and assets. No goal, no
+     * intent, no attempt, no run. The operator's review of what the importer wrote is the
+     * only control on it, and that review rests entirely on there being a real gap between
+     * the import and the first execution. A default goal, an auto-run or a "start hunting"
+     * affordance here would remove the one thing standing between a scraped page and a
+     * live hunt.
+     */
     HttpApiEndpoint.post("createTarget", "/targets", {
       payload: TargetDraft,
-      success: TargetSummary,
+      success: TargetCreated,
       error: [TargetRefused, PathRefused, PathNotFound],
+    }),
+    /**
+     * One scope import's progress: its links, its tool calls and its totals.
+     *
+     * A read the panel polls rather than a stream, because the import outlives the panel.
+     * "Continue in background" is a navigation away from a screen, not a change of mode:
+     * the session keeps reading and keeps writing whether or not anybody has this open.
+     *
+     * The import is under its target in the path because that is the file it writes to and
+     * the target it is scoped by, and the id is checked against the target before anything
+     * is looked up.
+     */
+    HttpApiEndpoint.get(
+      "scopeImport",
+      "/targets/:targetId/scope-import/:importId",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        success: ScopeImportView,
+        error: [ScopeImportNotFound],
+      },
+    ),
+    /**
+     * Stops one import, keeping everything it has already written.
+     *
+     * A `POST` to a sub-resource rather than a `DELETE`, for the reason `stopRun` is: it
+     * removes nothing. Every entry and every asset written before the stop stays, which is
+     * what makes stopping early a decision rather than a loss — the design's own copy says
+     * so, and D15 makes it a property of the design by having the session write as it
+     * reads rather than at the end.
+     *
+     * Answers with the import as it stands at the stop, so the panel's last render is the
+     * receipt for exactly what landed.
+     */
+    HttpApiEndpoint.post(
+      "stopScopeImport",
+      "/targets/:targetId/scope-import/:importId/stop",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        success: ScopeImportView,
+        error: [ScopeImportNotFound],
+      },
+    ),
+    /**
+     * Which model an import would run on right now (D15).
+     *
+     * **A request rather than a constant in the browser bundle**, and `modelOption.ts`'s
+     * doctrine is the reason: a descriptor is observed when the server built the harness
+     * and replaced wholesale when it is rebuilt. A preferred model id compiled into the
+     * create-target screen would outlive the catalogue entry it names, and the screen would
+     * go on offering a choice the server could not honour.
+     *
+     * So the rule — the preferred free model, or the other harness's small one when the
+     * catalogue does not offer it — runs once, on the server, over what the harnesses
+     * actually reported, and the picker preselects the answer instead of re-deriving it.
+     */
+    HttpApiEndpoint.get("importerModel", "/importer-model", {
+      success: ImporterModelView,
+      error: [ImporterModelUnavailable],
     }),
     HttpApiEndpoint.get("folders", "/folders", {
       query: { path: Schema.optional(Schema.String) },

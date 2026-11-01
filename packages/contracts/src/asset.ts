@@ -403,6 +403,38 @@ export const ImportAssetResult = Schema.Struct({
 export type ImportAssetResult = typeof ImportAssetResult.Type;
 
 /**
+ * The canonical wire encoding of {@link ImportAssetInput}, for the importer's tool.
+ *
+ * {@link RecordAssetInputWire}'s sibling and built the same way, from the same field
+ * record, so the two tools cannot come to disagree about what `url` or `method` mean. The
+ * one extra key is `source_url`, which is the import's own provenance.
+ */
+export const ImportAssetInputWire = Schema.Struct(importAssetInputFields)
+  .check(kindMatchesMethod)
+  .pipe(
+    Schema.encodeKeys({
+      operationId: "operation_id",
+      sourceUrl: "source_url",
+    }),
+  );
+
+/**
+ * The snake_case encoding of {@link ImportAssetResult}, for tool output.
+ *
+ * Every multi-word key, for {@link RecordAssetResultWire}'s reason: a result that read
+ * `asset_id` beside `scopeState` would make a model guess which convention the next field
+ * follows, and the fields most worth reading here are the ones that would have been
+ * camelCase.
+ */
+export const ImportAssetResultWire = ImportAssetResult.pipe(
+  Schema.encodeKeys({
+    assetId: "asset_id",
+    scopeState: "scope_state",
+    scopeDetail: "scope_detail",
+  }),
+);
+
+/**
  * One recorded asset, as a browser reads it.
  *
  * camelCase, because this is the browser API's shape and that API is camelCase
