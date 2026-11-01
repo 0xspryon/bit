@@ -1027,8 +1027,11 @@ const fleetHandlers = HttpApiBuilder.group(
           return yield* new TargetRefused({
             reason: "invalid_name",
             targetId: payload.name,
+            // A sentence, capitalised: it is shown to the operator after a lead-in of its
+            // own ("That name cannot be used."), and a lower-case fragment there read as
+            // a fragment of someone else's sentence.
             detail:
-              "a target's name becomes a directory name: it needs at least one letter or digit, and only a-z, 0-9, '-' and '_' are kept",
+              "A target's name becomes a directory name: it needs at least one letter or digit, and only a-z, 0-9, '-' and '_' are kept",
           });
         }
 
@@ -1057,10 +1060,23 @@ const fleetHandlers = HttpApiBuilder.group(
          * supported layout and the scope fixture uses it (`fixture/scopeFixture.ts`
          * nominates `<hunt root>/workspaces/<id>`): the role directories are siblings of
          * the workspace there, not inside it, and every session starts. What is refused
-         * is the folder containing this target's own directory, which covers the reported
-         * case (the workspace *is* the fleet root), a workspace above it, and the two
-         * folders inside the fleet root that still hold this target's data —
-         * `<root>/targets` and `<root>/targets/<id>`.
+         * is exactly `dataDirectory` and the folders above it: a workspace above the fleet
+         * root (the reported case), the fleet root itself, and the two folders inside the
+         * fleet root that still hold this target's data — `<root>/targets` and
+         * `<root>/targets/<id>`. "Inside the fleet root" is neither the test nor a
+         * description of it, and the refusal's own sentence must not claim it is.
+         *
+         * **Here and not in `fleet.register`, on layering rather than on the fixtures.**
+         * The registry stores a workspace path; it does not own the rule that relates one
+         * to the fleet layout, and the rule needs `targetDirectory(targetId)`, which is
+         * the registry's own layout being compared against its caller's argument.
+         * `createTarget` is the only production caller of `register`, and `workspace_path`
+         * is write-once, so the only path that can record a doomed workspace is the one
+         * checked here. It is *not* true that a check in `register` would refuse the
+         * fixtures: `fixture/scopeFixture.ts` nominates `<hunt root>/workspaces/<id>`,
+         * which this check allows, and `spike/persistenceProof.ts` registers with no
+         * `workspacePath` at all. The reason is the layering, and the fixtures are
+         * evidence about neither.
          */
         const dataDirectory = fleet.paths.targetDirectory(targetId);
         const fleetInside = yield* Effect.try({
@@ -1071,14 +1087,32 @@ const fleetHandlers = HttpApiBuilder.group(
             new TargetRefused({
               reason: "workspace_contains_fleet_root",
               targetId,
-              detail: `${workspacePath} could not be compared with this server's fleet root ${fleet.paths.root} (${String(cause)}); refusing rather than registering a target whose sessions may all be refused later`,
+              detail: `${workspacePath} could not be compared with ${dataDirectory}, the directory this server would record this target in (${String(cause)}); refusing rather than registering a target whose sessions may all be refused later`,
             }),
         });
         if (fleetInside) {
+          /*
+           * The sentence says what was tested, which is **not** "inside the fleet root".
+           *
+           * The test is containment of this target's own directory, and the three shapes
+           * that fire it do not share a simpler description: a folder above the fleet
+           * root (the reported case) *contains* it, `<root>/targets` is *inside* it, and
+           * the fleet root itself *is* it. The first wording said "contains this server's
+           * fleet root" and advised "pick a folder outside" it, so on the reported case it
+           * advised the folder it had just refused, on `<root>/targets` it asserted
+           * something false, and on the fleet root it said that root contains itself. Both
+           * halves are now stated against `dataDirectory`, which is the thing compared.
+           *
+           * The advice is necessary *and* sufficient, where "outside the fleet root" was
+           * neither: the refused set is exactly `dataDirectory` and its ancestors, so a
+           * folder elsewhere inside the root — `<root>/workspaces/<id>`, which the scope
+           * fixture uses and which this check deliberately allows — is named as fine. The
+           * `HUNT_ROOT` clause is correct for every case and is kept as it was.
+           */
           return yield* new TargetRefused({
             reason: "workspace_contains_fleet_root",
             targetId,
-            detail: `${workspacePath} contains this server's fleet root ${fleet.paths.root}, so this target's own directory ${dataDirectory} would sit inside the folder where its workers run. Every planner, goal and import session runs in a directory under that one and the policy gate refuses to install into any of them, so the target could be created and then do nothing. Pick a folder outside ${fleet.paths.root}, or restart this server with HUNT_ROOT set outside the folder you want to use`,
+            detail: `${workspacePath} is ${dataDirectory} — the directory this server would record this target in — or one of the folders above it, so that directory would sit inside the very folder where this target's workers run. Every planner, goal and import session runs in a directory under ${dataDirectory}, and the policy gate refuses to install into one that sits inside the workspace, so the target could be created and then do nothing. Pick a folder that is neither ${dataDirectory} nor one of the folders above it — a folder elsewhere inside ${fleet.paths.root}, such as ${fleet.paths.root}/workspaces/${targetId}, is fine — or restart this server with HUNT_ROOT set outside the folder you want to use`,
           });
         }
 

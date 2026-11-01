@@ -1078,6 +1078,65 @@ describe("a workspace that would contain the target's own fleet directory", () =
       },
     });
   });
+
+  /**
+   * The sentence has to be true of the folder it was shown for.
+   *
+   * The first wording described the refused condition as "inside the fleet root", which
+   * the condition is not. On the reported case — a workspace *above* the fleet root — it
+   * therefore advised "pick a folder outside `<root>`", which the folder it had just
+   * refused already satisfied; on `<root>/targets` it asserted that folder contains the
+   * root it is inside; and on the root itself it said the root contains itself. Three
+   * refusals, three false sentences, from one description of the wrong test.
+   *
+   * So these assert the claim rather than the wording: whatever the detail says, it must
+   * not be satisfied by the folder being refused, and the folder it offers instead must
+   * actually be accepted by the same endpoint.
+   */
+  test("the advice is not satisfied by the folder it refused, and the folder it offers is accepted", async () => {
+    const refused = await create(ownWorkspaceRoot, "advice demo");
+    const dataDirectory = join(ownFleetRoot, "targets", "advice-demo");
+    const detail = String(refused.body["detail"]);
+
+    // What was compared, named: the target's own directory, not the fleet root alone.
+    expect(detail).toContain(dataDirectory);
+    // Not the old advice. `ownWorkspaceRoot` *is* outside `ownFleetRoot` — it contains it —
+    // so "pick a folder outside the fleet root" described the folder being refused.
+    expect(detail).not.toContain(`Pick a folder outside ${ownFleetRoot}`);
+
+    // The folder it offers instead, taken from the sentence rather than assumed, and
+    // created because the picker refuses a path that is not there.
+    const offered = join(ownFleetRoot, "workspaces", "advice-demo");
+    expect(detail).toContain(offered);
+    mkdirSync(offered, { recursive: true });
+    const accepted = await create(offered, "advice demo");
+    expect({ status: accepted.status, body: accepted.body }).toMatchObject({
+      status: 200,
+      body: { target: { id: "advice-demo", workspacePath: offered } },
+    });
+  });
+
+  test("no shape of the refusal claims the folder contains a root it is inside", async () => {
+    mkdirSync(join(ownFleetRoot, "targets", "nested"), { recursive: true });
+    for (const folder of [
+      ownFleetRoot,
+      join(ownFleetRoot, "targets"),
+      join(ownFleetRoot, "targets", "nested"),
+    ]) {
+      const detail = String((await create(folder, "nested")).body["detail"]);
+      expect({
+        folder,
+        // False of all three: each is the fleet root or inside it.
+        contains: detail.includes(
+          `${folder} contains this server's fleet root`,
+        ),
+        // True of all three, and the only thing that is.
+        names: detail.includes(join(ownFleetRoot, "targets", "nested")),
+        // The clause that was right everywhere, kept.
+        huntRoot: detail.includes("HUNT_ROOT"),
+      }).toEqual({ folder, contains: false, names: true, huntRoot: true });
+    }
+  });
 });
 
 /**

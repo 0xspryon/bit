@@ -576,7 +576,7 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
         reason: "invalid_target_id",
         targetId: input.targetId,
         detail:
-          "a target id becomes a directory name: use 1-64 characters of lowercase a-z, 0-9, '-' or '_', starting with a letter or digit",
+          "A target id becomes a directory name: use 1-64 characters of lowercase a-z, 0-9, '-' or '_', starting with a letter or digit",
       });
     }
     const existing = yield* target(input.targetId);
