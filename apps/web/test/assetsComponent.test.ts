@@ -642,7 +642,16 @@ describe("an imported asset reads as provenance, not as an absence", () => {
               firstSourceUrl: "https://hackerone.com/acme/policy",
               scope: {
                 state: "in",
-                by: { _tag: "assetLabel", state: "in" },
+                by: {
+                  _tag: "assetLabel",
+                  label: {
+                    assetId: "asset_imported_labelled",
+                    state: "in",
+                    reason: null,
+                    setBy: "acme-corp/operator",
+                    setAt: 2,
+                  },
+                },
                 overrode: null,
               },
             }),

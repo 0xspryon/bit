@@ -30,6 +30,7 @@ import { App } from "../src/lib/app.svelte";
 import { FakeCountdown } from "./fakeCountdown";
 import {
   FakeServer,
+  harnessInstance,
   importerModelView,
   ok,
   refused,
@@ -303,6 +304,66 @@ describe("the model picker appears with the checkbox", () => {
     expect(body).toContain("claude-sonnet-5");
     expect(body).toContain("resolved by fallback");
     expect(body).toContain("no configured harness offers");
+  });
+
+  /**
+   * The picker on this screen is the composer's picker, from one component.
+   *
+   * These two claims were where the duplicate had already drifted, and both are about
+   * something the operator can see. They are asserted here rather than in the composer's
+   * own suite because here is where they were wrong.
+   */
+  describe("it is the same control as the composer's", () => {
+    test("an unusable harness keeps its row and its reason", async () => {
+      const { app } = await onPage((fake) => {
+        fake.onHarnesses = () =>
+          ok([
+            harnessInstance({
+              instanceId: "opencode",
+              displayName: "OpenCode",
+              isDefault: true,
+            }),
+            harnessInstance({
+              instanceId: "claude-code",
+              displayName: "Claude Code",
+              ready: false,
+              isDefault: false,
+              reason: "the Claude Agent SDK is not installed on this server",
+              setup: "bun add @anthropic-ai/claude-agent-sdk",
+            }),
+          ]);
+      });
+      app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+      app.toggleImportPicker();
+
+      const body = bodyOf(app);
+      // Visible, and carrying the harness's own sentence about why and what to do about
+      // it. This screen used to set `disabled` with `opacity: 0.5` and print neither,
+      // which leaves an operator with nothing to act on — the reason has to be readable
+      // where the choice is made.
+      expect(body).toContain("Claude Code");
+      expect(body).toContain("the Claude Agent SDK is not installed");
+      expect(body).toContain("bun add @anthropic-ai/claude-agent-sdk");
+      expect(body).toContain("unusable");
+    });
+
+    test("the instance rail is there with one harness configured", async () => {
+      const { app } = await onPage((fake) => {
+        fake.onHarnesses = () =>
+          ok([harnessInstance({ instanceId: "opencode" })]);
+      });
+      app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+      app.toggleImportPicker();
+
+      // It used to be hidden behind `harnesses.length > 1`, so configuring a second
+      // harness made a rail appear that the operator had not asked for. The composer's
+      // picker always showed it.
+      const body = bodyOf(app);
+      expect(body).toContain('aria-label="Harness instances"');
+      // A selectable row for the one harness, which is what "the rail is there" means.
+      expect(body).toContain('role="option"');
+      expect(body).toContain('aria-selected="true"');
+    });
   });
 
   test("no harness at all disables the checkbox and says why", async () => {

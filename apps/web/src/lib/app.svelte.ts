@@ -1416,14 +1416,15 @@ export class App {
         : (this.importerModel?.model ?? ""),
   );
 
-  /** Models the picked instance offers, filtered by what the operator has typed. */
-  importModelOptions = $derived.by(() => {
-    const all = this.importInstance?.models ?? [];
-    const query = this.importModelQuery.trim().toLowerCase();
-    return query === ""
-      ? all
-      : all.filter((model) => model.id.toLowerCase().includes(query));
-  });
+  /*
+   * There is no `importModelOptions` here, and `modelQuery` has no sibling derivation
+   * either: **the filter lives in `HarnessChoice`**, once, for both the composer's picker
+   * and this screen's. It was written twice — identically, with nothing keeping the two
+   * the same — and a filter that means two things in two places is the kind of drift an
+   * operator meets as "the same control behaving differently". What stays here is
+   * `importModelQuery`, because the *query* is state that has to survive the picker being
+   * closed and reopened; what was derived from it is the component's.
+   */
 
   /* ── The import in progress (D16) ─────────────────────────────────────────── */
 

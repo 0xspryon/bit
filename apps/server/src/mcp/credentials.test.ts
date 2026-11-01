@@ -23,7 +23,6 @@ import {
   McpCredentials,
   callerOf,
   type AttemptBinding,
-  type CallerBinding,
   type GoalBinding,
   type ImporterBinding,
   type RoundBinding,

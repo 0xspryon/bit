@@ -136,13 +136,18 @@ export interface ScopeImportRequest {
   /** The engagement folder, for the gate's containment check. `null` when there is none. */
   readonly workspacePath: string | null;
   readonly links: readonly string[];
+  /**
+   * The operator's pick, when they touched the picker on the create-target screen.
+   *
+   * Two fields and not three: there is no `modelOptions` here, and `ImportModelDraft`
+   * records why — the field, this one and the `options` argument they reached were plumbing
+   * with no caller, and reasoning depth on a single-turn extraction session is a control
+   * for nothing.
+   */
   readonly choice?:
     | {
         readonly instanceId?: string | undefined;
         readonly model?: string | undefined;
-        readonly modelOptions?:
-          | readonly { readonly id: string; readonly value: string }[]
-          | undefined;
       }
     | undefined;
 }
@@ -276,9 +281,6 @@ export class ScopeImporter extends Context.Service<
               // stops; there is no operator on the other end of it and nothing steers it.
               // That is also why there is no steering path here and no message queue.
               multiTurn: false,
-              ...(input.request.choice?.modelOptions === undefined
-                ? {}
-                : { options: input.request.choice.modelOptions }),
             });
 
             // `issueImport`, which takes importer bindings and nothing else, and defaults

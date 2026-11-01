@@ -23,6 +23,7 @@
   import Button from "../components/Button.svelte";
   import Field from "../components/Field.svelte";
   import FolderPicker from "../components/FolderPicker.svelte";
+  import HarnessChoice from "../components/HarnessChoice.svelte";
   import ScopeImportPanel from "../components/ScopeImportPanel.svelte";
   import { IconClose, IconFolder, IconLink, IconPlus } from "../icons";
   import { SCOPE_IMPORT_MAX_LINKS } from "@bit/contracts";
@@ -208,7 +209,6 @@
               <button
                 type="button"
                 class="model-trigger"
-                aria-haspopup="listbox"
                 aria-expanded={app.importPickerOpen}
                 onclick={() => app.toggleImportPicker()}
               >
@@ -220,59 +220,33 @@
               </button>
             </div>
             {#if app.importPickerOpen}
-              <div class="picker" role="listbox" aria-label="Importer model">
-                <label class="search">
-                  <input
-                    class="search-input"
-                    type="text"
-                    placeholder="Filter models"
-                    bind:value={app.importModelQuery}
-                    aria-label="Filter models"
-                  />
-                </label>
-                {#if app.harnesses.length > 1}
-                  <div class="instances">
-                    {#each app.harnesses as instance (instance.instanceId)}
-                      <button
-                        type="button"
-                        class={[
-                          "instance",
-                          instance.instanceId ===
-                            app.importInstance?.instanceId && "picked",
-                        ]}
-                        disabled={!instance.ready}
-                        onclick={() =>
-                          app.pickImportInstance(instance.instanceId)}
-                      >
-                        {instance.displayName}
-                      </button>
-                    {/each}
-                  </div>
-                {/if}
-                <ul class="model-list">
-                  {#each app.importModelOptions as model (model.id)}
-                    <li>
-                      <button
-                        type="button"
-                        class={[
-                          "model-option",
-                          model.id === app.effectiveImportModel && "picked",
-                        ]}
-                        role="option"
-                        aria-selected={model.id === app.effectiveImportModel}
-                        onclick={() => app.pickImportModel(model.id)}
-                      >
-                        <span class="mono">{model.id}</span>
-                      </button>
-                    </li>
-                  {/each}
-                  {#if app.importModelOptions.length === 0}
-                    <li class="model-empty">
-                      No model on this harness matches that.
-                    </li>
-                  {/if}
-                </ul>
-              </div>
+              <!--
+                The same columns the composer's picker has, from one component. They were
+                written twice and had already diverged: this copy hid the instance rail
+                when only one harness was configured, and it disabled an unusable harness
+                with no reason where the composer's prints the harness's own sentence —
+                which is the rule, because a reason has to be readable where the choice is
+                made. `HarnessChoice`'s header has the whole list.
+
+                It also replaces this block's invalid ARIA: it was a `role="listbox"` on a
+                div holding a text input, with `role="option"` two levels down inside it.
+              -->
+              <HarnessChoice
+                layout="inline"
+                instances={app.harnesses}
+                active={app.importInstance}
+                model={app.effectiveImportModel}
+                bind:query={app.importModelQuery}
+                onPickInstance={(instanceId) =>
+                  app.pickImportInstance(instanceId)}
+                onPickModel={(modelId) => app.pickImportModel(modelId)}
+                onDismiss={() => (app.importPickerOpen = false)}
+              >
+                {#snippet note()}
+                  An import is pinned to the harness it starts on, like a run.
+                  Nothing here starts one.
+                {/snippet}
+              </HarnessChoice>
             {/if}
             <span class="hint wrap">{app.importerModel?.detail}</span>
           </div>
@@ -604,81 +578,6 @@
     background: var(--overlay-hover);
   }
   .model-on {
-    font-size: 11px;
-    color: var(--text-faint);
-  }
-  .picker {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 8px;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-md);
-    background: var(--bg-deep);
-  }
-  .search-input {
-    width: 100%;
-    box-sizing: border-box;
-    height: 32px;
-    padding: 0 10px;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-sm);
-    background: var(--bg-layer-01);
-    color: var(--text-base);
-    font-size: 13px;
-  }
-  .instances {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .instance {
-    padding: 4px 9px;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 11px;
-    cursor: pointer;
-  }
-  .instance.picked {
-    background: var(--bg-layer-02);
-    color: var(--text-base);
-  }
-  .instance:disabled {
-    cursor: default;
-    opacity: 0.5;
-  }
-  .model-list {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    margin: 0;
-    padding: 0;
-    max-height: 200px;
-    overflow: auto;
-    list-style: none;
-  }
-  .model-option {
-    width: 100%;
-    display: flex;
-    padding: 6px 8px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-base);
-    font-size: 12px;
-    text-align: left;
-    cursor: pointer;
-  }
-  .model-option:hover {
-    background: var(--overlay-hover);
-  }
-  .model-option.picked {
-    background: var(--bg-layer-02);
-  }
-  .model-empty {
-    padding: 6px 8px;
     font-size: 11px;
     color: var(--text-faint);
   }

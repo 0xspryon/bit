@@ -398,17 +398,26 @@ export class TargetUnavailable extends Schema.TaggedError<TargetUnavailable>()(
 /**
  * Which harness and model an import runs on, when the operator picked one (D15).
  *
- * **{@link RunDraft}'s three fields, spelled the same way and meaning the same things**,
- * rather than a new shape: the picker on the create-target screen is the picker in the
- * composer, and a second vocabulary for "which model" would be a second resolution path.
- * All three are optional and the whole struct is, so a draft that says nothing about the
- * model gets D15's rule applied to the live catalogue — which is the common case, because
- * the screen preselects what that rule already answered.
+ * **{@link RunDraft}'s first two fields, spelled the same way and meaning the same
+ * things**, rather than a new shape: the picker on the create-target screen is the picker
+ * in the composer, and a second vocabulary for "which model" would be a second resolution
+ * path. Both are optional and so is the whole struct, so a draft that says nothing about
+ * the model gets D15's rule applied to the live catalogue — which is the common case,
+ * because the screen preselects what that rule already answered.
+ *
+ * **`modelOptions` is deliberately not here**, where `RunDraft` has it. It was, and
+ * nothing ever set it: the field, `ScopeImportRequest.choice.modelOptions` and the
+ * `options` argument it reached on `createSession` were an unbroken run of plumbing with
+ * no caller, which is a worse thing for a contract to carry than a missing feature. What
+ * it would have configured is reasoning depth, and the importer is a single-turn
+ * extraction session reading a table out of a page — D15's own argument for giving it a
+ * cheap model is the argument against paying a model to think harder about it. A later
+ * change that wants it adds the field *and* the control in one go, which is the state this
+ * now is.
  */
 export const ImportModelDraft = Schema.Struct({
   instanceId: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
-  modelOptions: Schema.optional(Schema.Array(ModelOptionSelection)),
 });
 export type ImportModelDraft = typeof ImportModelDraft.Type;
 
@@ -446,11 +455,11 @@ export const TargetDraft = Schema.Struct({
    * everything in it is this application's own words or a URL the operator typed.
    *
    * **Optional, and absent means the same as empty**, which is the opposite of how
-   * {@link ImportModelDraft}'s `modelOptions` treats the distinction. There the difference
-   * is load-bearing: an empty list of options would claim an opinion where there is none
-   * and would stop a model applying its own default. Here there is no third thing an
-   * absent list could mean — no links and zero links are both "import nothing" — so
-   * demanding the field would be demanding that every caller say "nothing" out loud.
+   * {@link RunDraft}'s `modelOptions` treats the distinction. There the difference is
+   * load-bearing: an empty list of options would claim an opinion where there is none and
+   * would stop a model applying its own default. Here there is no third thing an absent
+   * list could mean — no links and zero links are both "import nothing" — so demanding the
+   * field would be demanding that every caller say "nothing" out loud.
    */
   programLinks: Schema.optional(Schema.Array(ProgramLink)),
   /**
