@@ -36,6 +36,7 @@
       app.dialogName !== "" &&
       app.createState !== "duplicate" &&
       app.createState !== "denied" &&
+      app.createState !== "unusable" &&
       app.createState !== "creating",
   );
 
@@ -291,6 +292,27 @@
         <div class="alert warning" role="alert">
           <strong>That folder cannot be used.</strong>
           {app.createDetail} Choose another folder, or grant access and try again.
+        </div>
+      {/if}
+
+      <!--
+        The folder is readable and still cannot host a target.
+
+        Its own state rather than the one above, because "try again" is wrong here: the
+        folder contains this server's fleet root, so every planner, goal and import
+        session on the target would be refused where it starts. The server's sentence
+        carries both ways out — a different folder, or a different `HUNT_ROOT` — so this
+        adds no advice of its own, and the picker is reopened rather than described.
+      -->
+      {#if app.createState === "unusable"}
+        <div class="alert warning" role="alert">
+          <strong>That folder cannot hold a target.</strong>
+          {app.createDetail}.
+          <div class="alert-action">
+            <Button size="sm" onclick={() => app.openFolderPicker()}>
+              Choose another folder
+            </Button>
+          </div>
         </div>
       {/if}
 

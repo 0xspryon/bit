@@ -147,8 +147,19 @@ export type TargetViewState =
   "empty" | "loading" | "ready" | "unavailable" | "unreachable";
 export type Theme = "dark" | "light";
 export type ConnectError = "none" | "password" | "unreachable" | "expired";
+/**
+ * What the create-target form is showing, which is mostly which refusal.
+ *
+ * `unusable` is its own state rather than part of `denied`, and the difference is what the
+ * operator should do next. `denied` is "this folder cannot be read" — a permission or a
+ * name the server will not take, and granting access and retrying is a real answer.
+ * `unusable` is the server saying the folder *can* be read and still cannot host a target,
+ * because it contains the server's own fleet root: every planner, goal and import session
+ * on such a target would be refused. Retrying cannot help, so the screen must not suggest
+ * it.
+ */
 export type CreateState =
-  "idle" | "creating" | "failed" | "duplicate" | "denied";
+  "idle" | "creating" | "failed" | "duplicate" | "denied" | "unusable";
 /**
  * What the goals list knows about the target it is showing.
  *
@@ -3505,12 +3516,14 @@ export class App {
   /**
    * Registers the chosen folder as a target.
    *
-   * Three of the dialog's states come straight from typed server errors:
+   * Four of the dialog's states come straight from typed server errors:
    * `TargetRefused` with `duplicate_*` is the "already a target" state and carries the id
-   * to offer, `PathRefused`/`PathNotFound` is the "that folder cannot be read" state, and
-   * `invalid_name` is reported in the same place with the server's wording.
+   * to offer, `PathRefused`/`PathNotFound` is the "that folder cannot be read" state,
+   * `invalid_name` is reported in the same place with the server's wording, and
+   * `workspace_contains_fleet_root` is the one refusal retrying cannot fix — see
+   * {@link CreateState}.
    *
-   * The fourth, "migration failed", is deliberately *not* an error. A target whose file
+   * The fifth, "migration failed", is deliberately *not* an error. A target whose file
    * fails to migrate is created, recorded and listed as unavailable while its neighbours
    * keep serving — that is the fleet's partial-failure policy, and it means the created
    * row comes back with `available: false`. So the dialog reads the created target rather
@@ -3564,9 +3577,28 @@ export class App {
       this.createDetail = detail;
       if (error._tag === "TargetRefused") {
         const refused = error as { reason: string; targetId: string };
+        /*
+         * Reason by reason, and never "duplicate unless invalid_name".
+         *
+         * That is what this read before `workspace_contains_fleet_root` existed, and the
+         * default was the trap: a reason this build had not heard of rendered as "Already
+         * a target" with an Open button pointing at an id nobody registered. A reason it
+         * does not know now reads as the folder refusal, in the server's own words, which
+         * is true of every refusal this screen can be sent.
+         */
+        if (
+          refused.reason === "duplicate_workspace" ||
+          refused.reason === "duplicate_target"
+        ) {
+          this.createState = "duplicate";
+          this.duplicateOf = refused.targetId;
+          return;
+        }
         this.createState =
-          refused.reason === "invalid_name" ? "denied" : "duplicate";
-        this.duplicateOf = refused.targetId;
+          refused.reason === "workspace_contains_fleet_root"
+            ? "unusable"
+            : "denied";
+        this.duplicateOf = "";
         return;
       }
       if (error._tag === "PathRefused" || error._tag === "PathNotFound") {
@@ -4832,6 +4864,19 @@ export const scenarios: Scenario[] = [
       a.dialogName = "locked";
       a.createState = "denied";
       a.createDetail = "the server has no permission to read that folder";
+    },
+  },
+  {
+    id: "new-unusable",
+    group: "A3 New target",
+    label: "Folder holds the fleet root",
+    apply: (a) => {
+      a.reset();
+      a.openNewTarget();
+      a.dialogChosen = a.dialogRoot;
+      a.dialogName = "bit-demo";
+      a.createState = "unusable";
+      a.createDetail = `${a.dialogRoot} contains this server's fleet root ${a.dialogRoot}/.runtime/hunt, so this target's own directory ${a.dialogRoot}/.runtime/hunt/targets/bit-demo would sit inside the folder where its workers run. Every planner, goal and import session runs in a directory under that one and the policy gate refuses to install into any of them, so the target could be created and then do nothing. Pick a folder outside ${a.dialogRoot}/.runtime/hunt, or restart this server with HUNT_ROOT set outside the folder you want to use`;
     },
   },
   {

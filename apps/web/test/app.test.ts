@@ -420,6 +420,41 @@ describe("new target", () => {
     );
   });
 
+  /**
+   * The refusal the operator could not have predicted from the picker.
+   *
+   * Its own state because the two neighbouring ones are both wrong for it. "Already a
+   * target" would offer to open an id nobody registered — which is what the previous
+   * mapping did with any reason it had not heard of, since `duplicate` was its default —
+   * and "that folder cannot be read" invites a retry that cannot work: the folder is
+   * perfectly readable and still cannot hold a target.
+   */
+  test("a folder holding the server's own fleet root is unusable, not a duplicate", async () => {
+    const { app, fake } = open();
+    const detail =
+      "/work contains this server's fleet root /work/.runtime/hunt, so this target's own directory /work/.runtime/hunt/targets/demo would sit inside the folder where its workers run";
+    fake.onCreateTarget = () =>
+      refused(
+        new TargetRefused({
+          reason: "workspace_contains_fleet_root",
+          targetId: "demo",
+          detail,
+        }),
+      );
+
+    await choose(app, "/work");
+    await app.createTarget();
+
+    expect(app.createState).toBe("unusable");
+    // No offer to open anything: the id in the refusal is the one that was *not* created.
+    expect(app.duplicateOf).toBe("");
+    expect(app.createDetail).toBe(detail);
+    // The page stays up, with the server's sentence on it.
+    expect(app.screen).toBe("new-target");
+    expect(app.newTargetPhase).toBe("form");
+    expect(app.targets).toEqual([]);
+  });
+
   test("a name the server will not take is denied, not a duplicate", async () => {
     const { app, fake } = open();
     fake.onCreateTarget = () =>
