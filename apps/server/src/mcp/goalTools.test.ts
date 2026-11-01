@@ -524,6 +524,12 @@ describe("the goal agent's tool surface", () => {
     expect(names).not.toContain("add_intent");
     expect(names).not.toContain("record_observation");
     expect(names).not.toContain("record_round_disposition");
+    /*
+     * `record_asset` is a worker's too, for the schema reason the target-scope design's
+     * D9 gives: a goal conversation has no intent and no attempt to hang a discovery's
+     * provenance on. The goal agent reads the estate; it never writes to it.
+     */
+    expect(names).not.toContain("record_asset");
   });
 
   test("a goal credential at the planner endpoint is refused before any tool list", async () => {

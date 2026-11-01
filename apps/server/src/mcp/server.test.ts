@@ -657,7 +657,10 @@ describe("advertised schema parity", () => {
         }>;
       }
     )?.tools;
-    const tool = tools?.[0];
+    // Looked up by name rather than taken at index 0: the worker endpoint advertises
+    // `record_asset` beside this one, and a positional read would start asserting
+    // whichever tool `Toolkit.make` happened to list first.
+    const tool = tools?.find((listed) => listed.name === "record_observation");
     expect(tool?.name).toBe("record_observation");
     expect(tool?.description).toContain("inconclusive, not negative");
 
@@ -687,12 +690,13 @@ describe("advertised schema parity", () => {
     const tool = (
       response.body?.["result"] as {
         tools?: Array<{
+          name: string;
           inputSchema: {
             properties: Record<string, { description?: string }>;
           };
         }>;
       }
-    )?.tools?.[0];
+    )?.tools?.find((listed) => listed.name === "record_observation");
     expect(tool?.inputSchema.properties["operation_id"]?.description).toContain(
       "exact retry",
     );

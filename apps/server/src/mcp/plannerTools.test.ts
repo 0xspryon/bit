@@ -393,13 +393,58 @@ describe("the tool surface matches the authority", () => {
     // The assertion slice 5 could not make. Not "the store refuses it" — that was always
     // true — but that it is not on the list at all.
     expect(names).not.toContain("record_observation");
+    /*
+     * The target-scope design's D9, asserted on the tool *list*.
+     *
+     * `record_asset` is a worker's write because `asset_discoveries.intent_id` and
+     * `.attempt_id` are `NOT NULL` with foreign keys, and a round has neither. The store
+     * would refuse a round's call anyway — `attemptCallerOrFail` — but a refusal that
+     * only happens in the store is a turn the planner spends finding out, and this is the
+     * half it can see in its own tool list.
+     */
+    expect(names).not.toContain("record_asset");
   });
 
-  test("a worker attempt is offered record_observation and not add_intent", async () => {
+  test("a worker attempt is offered both its writes and not add_intent", async () => {
     const names = await toolNames(workerUrl, workerToken);
-    expect(names).toEqual(["record_observation"]);
+    expect(names).toEqual(["record_asset", "record_observation"]);
     expect(names).not.toContain("add_intent");
     expect(names).not.toContain("record_round_disposition");
+  });
+
+  test("a round calling record_asset on its own endpoint reaches no such tool", async () => {
+    /*
+     * The strongest form of D9's claim: the *right* credential at the *right* endpoint,
+     * naming the worker's write. There is no 401 to hide behind here — the grant is a
+     * round's and the planner endpoint serves rounds — so what refuses this is the
+     * toolkit, which is the half the model can see.
+     *
+     * Asserted as "not a success" rather than on an exact message, because an unknown
+     * tool name is the MCP runtime's refusal and not ours, and pinning its wording would
+     * make this test about `effect/ai`'s phrasing instead of about our tool surface. An
+     * unknown name comes back on the JSON-RPC `error` channel rather than as a tool
+     * error, which is why both are read here instead of going through `outcomeOf`.
+     */
+    const called = await rpc(
+      plannerUrl,
+      "tools/call",
+      {
+        name: "record_asset",
+        arguments: {
+          operation_id: "op-planner-asset",
+          kind: "host",
+          url: "https://app.acme.test/",
+          method: null,
+          note: "A round has no attempt to record a discovery against.",
+        },
+      },
+      roundToken,
+    );
+    const rpcError = called.body?.["error"];
+    const outcome = outcomeOf(called.body);
+    expect(rpcError !== undefined || outcome.isError).toBe(true);
+    // Whatever channel carried it, no asset was created for a round.
+    expect(outcome.data["asset_id"]).toBeUndefined();
   });
 
   test("a worker credential at the planner endpoint is refused before any tool list", async () => {

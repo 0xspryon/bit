@@ -1,5 +1,5 @@
 /**
- * The worker attempt's toolkit: `record_observation`, and nothing else.
+ * The worker attempt's toolkit: `record_observation` and `record_asset`.
  *
  * **This file used to be "the domain toolkit" and is now one role's.** It held a single
  * global `Toolkit`, which meant the tool surface was the same whatever credential was
@@ -10,9 +10,20 @@
  * tools its authority covers and is refused at the door if it presents the wrong kind of
  * credential for the endpoint it reached.
  *
- * `record_observation` is defined once, as an Effect `Tool` over the canonical wire
- * schema from `@bit/contracts`. Three things follow from that and used to be three
- * separate hand-maintained artefacts:
+ * ## Why `record_asset` is here and on no other endpoint
+ *
+ * The target-scope design's D9 settles it on the schema rather than on taste.
+ * `store.recordAsset` opens with `attemptCallerOrFail`, and migration `0010` makes
+ * `asset_discoveries.intent_id` and `.attempt_id` `NOT NULL` with real foreign keys to
+ * `intents` and `attempts`. A planner round has neither and a goal conversation has
+ * neither, so registering this tool on those endpoints would not be a registration — it
+ * would be a schema change plus a relaxation of the discovery-provenance invariant that
+ * `0010`'s own commentary argues for. A discovery that cannot say which attempt found it
+ * is not provenance.
+ *
+ * Both tools are defined once, as Effect `Tool`s over the canonical wire schemas from
+ * `@bit/contracts`. Three things follow from that and used to be three separate
+ * hand-maintained artefacts:
  *
  * - The advertised `inputSchema` is **derived** from the schema
  *   (`Schema.toJsonSchemaDocument` under the hood, `effect/src/ai/Tool.ts:1772-1804`),
@@ -29,6 +40,8 @@
  * inconclusive, and provenance is not the worker's to supply.
  */
 import {
+  RecordAssetInputWire,
+  RecordAssetResultWire,
   RecordObservationInputWire,
   RecordObservationResultWire,
 } from "@bit/contracts";
@@ -36,6 +49,7 @@ import { Effect, Schema } from "effect";
 import { Tool, Toolkit } from "effect/ai";
 
 import { McpInvocation } from "./invocation";
+import type { ObservationStore } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 
 export const RECORD_OBSERVATION_DESCRIPTION = [
@@ -122,6 +136,77 @@ export const RecordObservation = Tool.make("record_observation", {
   // every call, which is precisely the property we want to be unable to forget.
 }).addDependency(McpInvocation);
 
+export const RECORD_ASSET_DESCRIPTION = [
+  "Record one asset you have discovered on this target's estate.",
+  "",
+  "An asset is either a host — one network service, by address and port — or an",
+  "endpoint, which is one method on one path of one host. Send kind: 'host' with",
+  "method: null, or kind: 'endpoint' with the method you used. A host has no method and",
+  "an endpoint cannot do without one.",
+  "",
+  "url is the asset as you actually observed it, as an absolute URL. For a host only",
+  "its scheme, host and port are read; for an endpoint the path is read too. Whatever",
+  "you send is kept verbatim on the discovery record, so nothing about how you found it",
+  "is lost to normalisation.",
+  "",
+  "Identity is canonical, and two things follow that are worth knowing before you call",
+  "this a second time. The same service written three ways is one asset: host names are",
+  "lowercased and a default port is made explicit, so http://x, http://X. and",
+  "http://x:80 are one row. And the query string and fragment are NOT part of identity:",
+  "/search?q=a and /search?q=b are one endpoint. Do not call this once per parameter",
+  "value — you would be writing a request log rather than an inventory of a surface.",
+  "",
+  "Record what you find whether or not it is in scope. An asset outside the authorized",
+  "scope is still recorded, kept and shown to the operator, because recording it is how",
+  "the operator comes to know it exists. Recording is not a claim of authorization and",
+  "it does not grant any: it is bookkeeping about what is out there. What you must not",
+  "do is test something the scope does not cover.",
+  "",
+  "note is how you found this and why it matters. It is kept with the discovery and is",
+  "never used as identity, so write it for the next person rather than for a matcher.",
+  "",
+  "Provenance (target, intent, attempt, session) is derived from your authenticated",
+  "session and cannot be set here. operation_id is yours: reuse the same value to retry",
+  "a call safely, and a new value for a genuinely new discovery.",
+  "",
+  "Two fields in the result mean different things and are easy to confuse. created is",
+  "false when your discovery merged onto an asset that already existed — that is new",
+  "provenance about a known thing, and both facts are kept. replayed is true only when",
+  "you reused an operation_id and nothing was written at all.",
+].join("\n");
+
+/**
+ * A refusal the worker is meant to read and act on.
+ *
+ * Same reasons and the same `failureMode: "return"` as {@link RecordObservationRefused},
+ * for the same argument: a worker that cannot tell its discovery was not stored is a
+ * worker that carries on as though it had. `invalid` is the one that will actually be
+ * met, because it is what an unparseable `url` or a kind/method mismatch comes back as,
+ * and the detail carries `assetIdentityOf`'s own sentence.
+ */
+export class RecordAssetRefused extends Schema.TaggedError<RecordAssetRefused>()(
+  "RecordAssetRefused",
+  {
+    reason: Schema.Literals([
+      "conflict",
+      "unauthorized",
+      "invalid",
+      "stale",
+      "stored",
+      "unavailable",
+    ]),
+    detail: Schema.String,
+  },
+) {}
+
+export const RecordAsset = Tool.make("record_asset", {
+  description: RECORD_ASSET_DESCRIPTION,
+  parameters: RecordAssetInputWire,
+  success: RecordAssetResultWire,
+  failure: RecordAssetRefused,
+  failureMode: "return",
+}).addDependency(McpInvocation);
+
 /**
  * The worker's toolkit, and only the worker's.
  *
@@ -136,44 +221,170 @@ export const RecordObservation = Tool.make("record_observation", {
  * credential may use it.** Anything a round or a goal agent writes belongs in that role's
  * toolkit, because an advertised tool that always refuses is a turn the model spends
  * finding that out.
+ *
+ * `record_asset` satisfies that rule for the reason the file header gives: its write is
+ * an attempt's, by the shape of `asset_discoveries`, and no other role has an attempt to
+ * record one against.
  */
-export const WorkerToolkit = Toolkit.make(RecordObservation);
+export const WorkerToolkit = Toolkit.make(RecordObservation, RecordAsset);
+
+/** The reasons both worker tools refuse with. One list, so the two cannot diverge. */
+type WorkerRefusalReason =
+  "conflict" | "unauthorized" | "invalid" | "stale" | "stored" | "unavailable";
 
 /**
- * The handler.
+ * Turns the store's failures into a refusal one worker tool can act on.
+ *
+ * One mapper for both handlers, because the store's vocabulary is the same under each of
+ * them and a second copy is the one that drifts. `plannerTools.ts`'s `asRefusal` is the
+ * sibling for the round's tools, and this is deliberately the same shape: a structurally
+ * typed view of the failure, a `switch` on its tag, and no hand-narrowing of the union.
+ *
+ * `noun` is what keeps the sentences specific. A worker has to be able to read "this
+ * observation was NOT recorded" or "this asset was NOT recorded" and know which of its
+ * calls is being talked about, so the noun is a parameter rather than a word baked into
+ * one copy of the text.
+ *
+ * Two cases are not a flattening, and they are why this is a `switch` rather than a
+ * passthrough. A `MutationError` keeps its own four reasons, because `conflict`,
+ * `stale`, `unauthorized` and `invalid` lead a worker to four different next actions.
+ * And a `DatabaseError` becomes `unavailable` with a sentence saying nothing was
+ * recorded — a worker that cannot tell its write did not land is a worker that carries
+ * on as though it had.
+ */
+const workerRefusal = (
+  failure: {
+    readonly _tag: string;
+    readonly reason?: string;
+    readonly detail?: string;
+    readonly message?: string;
+    readonly targetId?: string;
+  },
+  noun: string,
+): { readonly reason: WorkerRefusalReason; readonly detail: string } => {
+  switch (failure._tag) {
+    case "MutationError": {
+      const detail =
+        failure.detail ?? failure.message ?? "that call was refused";
+      switch (failure.reason) {
+        case "conflict":
+          return { reason: "conflict", detail };
+        case "unauthorized":
+          return { reason: "unauthorized", detail };
+        case "stale":
+          return { reason: "stale", detail };
+        default:
+          return { reason: "invalid", detail };
+      }
+    }
+    case "StoredRowError":
+      return {
+        reason: "stored",
+        detail:
+          failure.message ?? "a stored row no longer matches the contract",
+      };
+    /**
+     * The credential names a target this server cannot open.
+     *
+     * Only reachable through a credential, so it is not a model error and not an
+     * argument problem: the attempt was authorised against a target whose database has
+     * since become unopenable — archived, moved, or left unmigrated by the last sweep.
+     * Reported with the resolver's own sentence, because the operator fixing it is the
+     * one who moved the folder.
+     */
+    case "FleetError":
+      return {
+        reason: "unavailable",
+        detail: `the store for target '${failure.targetId ?? "unknown"}' could not be opened, so this ${noun} was NOT recorded: ${failure.detail ?? failure.message ?? "no detail"}`,
+      };
+    default:
+      return {
+        reason: "unavailable",
+        detail: `the control-plane store could not be written; this ${noun} was NOT recorded`,
+      };
+  }
+};
+
+/**
+ * Borrows the caller's own target store for one tool call and maps what it refused with.
+ *
+ * **Only `Effect.catch`, and no `catchCause`.** A typed failure is the store's answer and
+ * is mapped by {@link workerRefusal}; a *defect* is a bug here and is left to propagate,
+ * where `effect/ai`'s own `internalToolError` logs it and answers with a scrubbed
+ * message. Catching the cause instead would turn every typed refusal into `unavailable`,
+ * so a receipt conflict and an unopenable database would read the same to a worker —
+ * which is the mistake `plannerTools.ts` records having paid for.
+ *
+ * `unavailable` is the one reason that gets a log line, because it is the one that says
+ * nothing about what the worker asked for and everything about this server.
+ */
+const onWorkersStore = <A, E>(
+  stores: TargetStores["Service"],
+  options: {
+    readonly targetId: string;
+    readonly tool: string;
+    readonly noun: string;
+    readonly refuse: (input: {
+      readonly reason: WorkerRefusalReason;
+      readonly detail: string;
+    }) => E;
+  },
+  body: (store: ObservationStore["Service"]) => Effect.Effect<
+    A,
+    {
+      readonly _tag: string;
+      readonly reason?: string;
+      readonly detail?: string;
+      readonly message?: string;
+      readonly targetId?: string;
+    }
+  >,
+): Effect.Effect<A, E> =>
+  withTargetStore(stores, options.targetId, body).pipe(
+    Effect.catch((error) => {
+      const refusal = workerRefusal(error, options.noun);
+      return refusal.reason === "unavailable"
+        ? Effect.andThen(
+            Effect.logError(`${options.tool} could not reach the store`, {
+              targetId: options.targetId,
+              failure: error._tag,
+              detail: refusal.detail,
+            }),
+            Effect.fail(options.refuse(refusal)),
+          )
+        : Effect.fail(options.refuse(refusal));
+    }),
+  );
+
+/**
+ * The handlers.
  *
  * Provenance comes from {@link McpInvocation}, which the transport's auth middleware
  * provides per request from the presented credential. Nothing the model sent can reach
- * it, which is the whole point of the credential boundary.
+ * it, which is the whole point of the credential boundary. That is what makes
+ * `record_asset` safe to offer without a target argument: the asset lands in the file the
+ * credential names, and there is no argument here that reaches the resolver.
  *
- * **The write is dispatched to the target the credential names.** This layer used to
+ * **Each write is dispatched to the target the credential names.** This layer used to
  * yield `ObservationStore` once, here, at construction — and that single yield *was* the
  * pin that limited the whole process to one target: every authenticated write went to
  * whichever database the entrypoint had resolved at startup, whatever the credential
  * said. What replaces it is {@link TargetStores}, yielded in the same place, with the
- * store reached inside the handler by `withTargetStore(stores, caller.targetId, …)`.
+ * store reached inside each handler by {@link onWorkersStore}.
  *
  * Three things make that safe rather than merely more flexible:
  *
  * - **`caller.targetId` is not the model's to choose.** It comes from
  *   {@link McpInvocation}, which the auth middleware builds from the presented bearer and
  *   nothing else. A worker that names another target in its arguments is describing a
- *   resource it has no way to address; there is no argument here that reaches the
- *   resolver.
+ *   resource it has no way to address.
  * - **The resolver is still one instance.** It is yielded at layer construction, not per
  *   request, so this route shares the same reference-counted handles as the browser API
  *   reading the same target — one connection and one write lock per file, rather than two
  *   contending.
  * - **The borrow is request-shaped.** `withTargetStore` holds the reference for the
  *   length of the write and returns it, which is what the resolver is for. The handle
- *   stays warm for the idle TTL, so a worker recording twenty observations opens the file
- *   once.
- *
- * It also adds a failure this handler did not have: the credential can name a target
- * whose database will not open. That is reported as `unavailable` with the resolver's own
- * words, for the reason the `DatabaseError` case below already gives — a worker that
- * cannot tell its observation was not stored is a worker that carries on as though it
- * had.
+ *   stays warm for the idle TTL, so a worker recording twenty assets opens the file once.
  */
 export const WorkerToolkitLayer = WorkerToolkit.toLayer(
   Effect.gen(function* () {
@@ -181,76 +392,28 @@ export const WorkerToolkitLayer = WorkerToolkit.toLayer(
     return WorkerToolkit.of({
       record_observation: Effect.fn("record_observation")(function* (input) {
         const caller = yield* McpInvocation;
-        return yield* withTargetStore(stores, caller.targetId, (store) =>
-          store.recordObservation(caller, input),
-        ).pipe(
-          Effect.catchTag("MutationError", (error) =>
-            Effect.fail(
-              new RecordObservationRefused({
-                reason: error.reason,
-                detail: error.detail,
-              }),
-            ),
-          ),
-          Effect.catchTag("StoredRowError", (error) =>
-            Effect.fail(
-              new RecordObservationRefused({
-                reason: "stored",
-                detail: error.message,
-              }),
-            ),
-          ),
-          /**
-           * A store failure is nobody's argument error, but the worker still has to
-           * learn that its observation did **not** land — losing the whole turn to an
-           * opaque internal error would leave it unable to tell. So it is returned as
-           * a refusal and logged here, where the cause is still structured.
-           */
-          /**
-           * The credential names a target this server cannot open.
-           *
-           * Only reachable through a credential, so it is not a model error and not an
-           * argument problem: the attempt was authorised against a target whose database
-           * has since become unopenable — archived, moved, or left unmigrated by the last
-           * sweep. Reported with the resolver's own sentence, because the operator fixing
-           * it is the one who moved the folder.
-           */
-          Effect.catchTag("FleetError", (error) =>
-            Effect.logError(
-              "record_observation could not resolve the caller's target",
-              {
-                targetId: error.targetId,
-                reason: error.reason,
-                detail: error.detail,
-              },
-            ).pipe(
-              Effect.andThen(
-                Effect.fail(
-                  new RecordObservationRefused({
-                    reason: "unavailable",
-                    detail: `the store for target '${error.targetId}' could not be opened, so this observation was NOT recorded: ${error.detail}`,
-                  }),
-                ),
-              ),
-            ),
-          ),
-          Effect.catchTag("DatabaseError", (error) =>
-            Effect.logError("record_observation could not reach the store", {
-              operation: error.operation,
-              reason: error.reason,
-              cause: error.cause,
-            }).pipe(
-              Effect.andThen(
-                Effect.fail(
-                  new RecordObservationRefused({
-                    reason: "unavailable",
-                    detail:
-                      "the control-plane store could not be written; this observation was NOT recorded",
-                  }),
-                ),
-              ),
-            ),
-          ),
+        return yield* onWorkersStore(
+          stores,
+          {
+            targetId: caller.targetId,
+            tool: "record_observation",
+            noun: "observation",
+            refuse: (refusal) => new RecordObservationRefused(refusal),
+          },
+          (store) => store.recordObservation(caller, input),
+        );
+      }),
+      record_asset: Effect.fn("record_asset")(function* (input) {
+        const caller = yield* McpInvocation;
+        return yield* onWorkersStore(
+          stores,
+          {
+            targetId: caller.targetId,
+            tool: "record_asset",
+            noun: "asset",
+            refuse: (refusal) => new RecordAssetRefused(refusal),
+          },
+          (store) => store.recordAsset(caller, input),
         );
       }),
     });
