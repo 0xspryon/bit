@@ -40,11 +40,27 @@
       app.createState !== "creating",
   );
 
-  /** The file the chosen folder and name will actually produce, restated for the operator. */
-  let resolvedFile = $derived(
-    app.dialogChosen === "" || app.dialogName === ""
-      ? ""
-      : `${app.dialogChosen}/${app.dialogName}-<id>/hunt.sqlite`,
+  /**
+   * The directory the hunt database actually goes in, which is **not** the chosen folder.
+   *
+   * This line used to preview `<chosen folder>/<name>-<id>/hunt.sqlite`, and no such file
+   * has ever been written: `fleet.paths.huntFile` is `<fleet root>/targets/<id>/hunt.sqlite`
+   * (`persistence/fleet.ts`), so the folder the operator nominates is left empty. The claim
+   * was load-bearing rather than cosmetic. An operator who reads "the database is written
+   * here" has no reason to suspect that the folder they choose has anything to do with
+   * `HUNT_ROOT` — which is how one comes to nominate a folder containing it and gets a
+   * target that cannot plan, converse or import, refused by the very screen that promised
+   * the database would land somewhere else.
+   *
+   * It names the directory and not the file. The id is `toTargetId(name)`, derived on the
+   * server, and the layout constants are in `persistence/fleet.ts`; spelling the whole
+   * path here would mean a second implementation of both, and a second implementation of
+   * this path is exactly how the first wrong preview came about. The fleet root is the
+   * server's own answer (`SessionProbe.fleetRoot`), and until it arrives the sentence is
+   * told without a path rather than with a guessed one.
+   */
+  let databaseDirectory = $derived(
+    app.fleetRoot === "" ? "" : `${app.fleetRoot}/targets/`,
   );
 
   /** Whether the autoload checkbox can be offered at all. */
@@ -78,9 +94,9 @@
            server-side on every change. -->
       <div class="field">
         <div class="label-row">
-          <span class="label">Folder</span>
+          <span class="label">Workspace folder</span>
           <span class="hint">
-            where this target's hunt database is written
+            the engagement workspace: where this target's workers run
           </span>
         </div>
         <div class="folder-row">
@@ -94,9 +110,17 @@
             Browse…
           </Button>
         </div>
-        {#if resolvedFile !== ""}
-          <span class="resolved mono">{resolvedFile}</span>
-        {/if}
+        <!-- Said whether or not a folder is chosen: it is a fact about the field, and the
+             operator needs it *before* choosing, not after being refused. -->
+        <span class="resolved">
+          This target's hunt database is written
+          {#if databaseDirectory === ""}
+            with this server's own fleet data, not in the workspace folder.
+          {:else}
+            under <span class="mono">{databaseDirectory}</span>, not in the
+            workspace folder.
+          {/if}
+        </span>
       </div>
 
       <Field

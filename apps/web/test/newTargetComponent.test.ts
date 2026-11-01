@@ -19,7 +19,13 @@ import { PathRefused, TargetRefused } from "@bit/contracts";
 import NewTarget from "../src/lib/screens/NewTarget.svelte";
 import { App } from "../src/lib/app.svelte";
 import { FakeCountdown } from "./fakeCountdown";
-import { FakeServer, folderListing, ok, refused } from "./fakeServer";
+import {
+  FakeServer,
+  folderListing,
+  ok,
+  refused,
+  unreachable,
+} from "./fakeServer";
 
 const settle = (): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, 0));
@@ -96,6 +102,50 @@ describe("a folder that cannot hold a target", () => {
     expect(html).not.toContain("Open bit-demo");
     // Nor the readable-folder advice: granting access cannot fix a layout.
     expect(html).not.toContain("grant access");
+  });
+});
+
+/**
+ * What the Folder field claims, which is the defect the refusal above was a symptom of.
+ *
+ * The field read "where this target's hunt database is written" and previewed
+ * `<chosen folder>/<name>-<id>/hunt.sqlite`. Neither is true: `fleet.paths.huntFile` is
+ * `<fleet root>/targets/<id>/hunt.sqlite`, and the reviewer's chosen folder was left
+ * empty. It is not a cosmetic defect — an operator who believes that label has no reason
+ * to think the folder they choose relates to `HUNT_ROOT` at all, which is how one
+ * nominates a folder containing it and gets a target no session can run in. The screenshot
+ * of the refusal has both claims on it at once.
+ */
+describe("the folder field", () => {
+  test("says the folder is the workspace, and where the database really goes", async () => {
+    const app = await onForm();
+    app.chooseFolder("/work/acme-corp");
+    const html = body(app);
+
+    // What the folder is for.
+    expect(html).toContain("where this target's workers run");
+    // Where the file goes: the fleet root the server reported, and not here.
+    expect(html).toContain("/fleet/targets/");
+    // A regex because Prettier wraps the sentence across lines in the markup.
+    expect(html).toMatch(/not in the\s+workspace\s+folder/);
+    // Not the old claim, and not a path that will never exist.
+    expect(html).not.toContain("where this target's hunt database is written");
+    expect(html).not.toContain("/work/acme-corp/acme-corp-");
+  });
+
+  test("with no answer from the server it names no path at all", async () => {
+    const fake = new FakeServer();
+    // The probe is how the browser learns the fleet root, and it can fail: the form words
+    // the sentence without a root rather than filling the gap with a guess.
+    fake.onProbe = () => unreachable("no server answered at this address");
+    const app = await onForm(fake);
+    app.chooseFolder("/work/acme-corp");
+    const html = body(app);
+
+    expect(html).toMatch(
+      /with this server's own fleet data, not in the\s+workspace\s+folder/,
+    );
+    expect(html).not.toContain("/targets/");
   });
 });
 

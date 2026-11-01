@@ -1318,6 +1318,16 @@ export class App {
   dialogPath = $state("");
   /** Server-fed: the configured root. Nothing above it is reachable. */
   dialogRoot = $state("");
+  /**
+   * Server-fed: where this server keeps `control.sqlite` and every target's directory.
+   *
+   * Held for one sentence on the create-target form, and that sentence is the one the
+   * field used to get wrong: the chosen folder is the workspace, and the hunt database is
+   * written under *this* root instead. It is the server's answer rather than a guess —
+   * `HUNT_ROOT` is the server's environment and the browser cannot see it — and `""` until
+   * the answer arrives, which the form words around rather than filling with a placeholder.
+   */
+  fleetRoot = $state("");
   /** Server-fed: the parent, or `null` at the root. */
   dialogParent = $state<string | null>(null);
   /** Server-fed: the immediate subdirectories of `dialogPath`. */
@@ -1581,6 +1591,7 @@ export class App {
     const call = await this.client.probe(this.serverUrl);
     if (call._tag === "Ok") {
       this.dialogRoot = call.value.workspaceRoot;
+      this.fleetRoot = call.value.fleetRoot;
       this.screen = "welcome";
       await this.loadTargets();
       await this.loadHarnesses();
@@ -3374,6 +3385,11 @@ export class App {
     void this.browseTo(this.dialogRoot === "" ? undefined : this.dialogRoot);
     void this.loadHarnesses();
     void this.loadImporterModel();
+    // The fleet root, for the one sentence on this form that says where the database goes.
+    // Asked here rather than at sign-in because this is the only screen that needs it, and
+    // asked rather than remembered because `restore` is the only other path that learns it
+    // — a tab that signed in rather than reloaded would otherwise have no answer at all.
+    void this.loadFleetRoot();
   }
 
   /**
@@ -3494,6 +3510,27 @@ export class App {
       return;
     }
     this.importModelDetail = "No server answered at this address.";
+  }
+
+  /**
+   * Asks where this server keeps its fleet data.
+   *
+   * The probe is read-only and already carries both roots, so this is the cheapest true
+   * answer available to a browser: `HUNT_ROOT` is the server's environment, and a form
+   * that wanted to name the directory its database lands in had no other way to get it
+   * right. A failure is silent on purpose — the form has a wording for "root unknown" and
+   * an operator cannot act on "the server would not say where it keeps its own files"
+   * while they are trying to name a target.
+   */
+  async loadFleetRoot() {
+    const call = await this.client.probe(this.serverUrl);
+    if (call._tag === "Ok") {
+      this.fleetRoot = call.value.fleetRoot;
+      return;
+    }
+    if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+      this.signOut("expired");
+    }
   }
 
   toggleAutoload() {

@@ -81,8 +81,9 @@
         >
         <h2>Add your first target</h2>
         <p>
-          A target is one system you are testing. It gets a folder on your
-          machine, and everything the agent learns about it is recorded there.
+          A target is one system you are testing. You give it a folder on your
+          machine for its workers to run in; what they learn is recorded by the
+          server, with its own fleet data.
         </p>
         <Button
           variant="primary"
