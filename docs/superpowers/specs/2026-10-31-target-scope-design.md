@@ -765,6 +765,38 @@ either, for a related reason, so this is the house position rather than a new on
 The harness's own page fetches do not appear, per D13 — they are not our tool calls. What
 the operator sees is the scope being written, which is what they are there to check.
 
+**One line of the model's prose is read, and it is not narration** (added 2026-11-01,
+after the first import against a real program page). The forbidden thing above is the
+model's commentary **in the call list**: the list is a receipt, each line a write that
+landed, and reasoning interleaved with it would bury the handful of lines the operator is
+there for. A single status line is a different artifact. The importer's prompt already ends
+by asking the session to "report in a few lines: which pages you could read, what you
+recorded, and anything you were unsure about" — and that report was generated and
+discarded.
+
+It is read because **an import that writes nothing cannot otherwise say why, and that is
+the most common outcome.** The program pages on the big platforms are client-rendered: a
+server-side read of `hackerone.com/<program>/policy_scopes` answers `200` with about 1800
+bytes and no scope in it. Every step of the import succeeds, the model finds nothing,
+nothing is written, and the operator was told "Nothing could be read from those pages" with
+no status code, no byte count and no page title — because nothing we own observes the fetch
+(D13), so the session's own account is the only account there is.
+
+The boundary, stated so the next change knows which side it is on:
+
+- **Read**: the session's **last message**, pulled from `AgentHarness.messages` _after_
+  `waitForIdle` has returned, bounded, and settled into `ScopeImportView.detail` by the
+  same call that sets the status. The panel renders it as its status line, and the toast
+  carries it on the path where the panel is left behind.
+- **Not read**: `sessionEvents`. Nothing subscribes to it, so nothing intermediate is
+  captured, streamed or stored — which is what keeps "no narration" a property of the
+  wiring rather than of a filter. The call list gains no field, and
+  `import/scopeImporter.test.ts` drives a harness that narrates on that stream to prove
+  none of it reaches the view.
+
+A later change that wanted to show reasoning would still have to build a capture path.
+This one did not.
+
 ## Build order
 
 Each slice ends with the gates green: `typecheck`, `test`, `test:persistence`, `build`,
@@ -812,8 +844,11 @@ reader will otherwise meet the difference and assume a mistake:
   The importer's own toolkit records each call as it crosses our MCP boundary, after the
   write lands; nothing in the server subscribes to the importer session's `sessionEvents`.
   So the panel cannot show reasoning, and `ScopeImportView` has no field one could go in.
-  The cost is honest: when an import settles having written nothing, this process cannot
-  say why the model wrote nothing.
+  ~~The cost is honest: when an import settles having written nothing, this process cannot
+  say why the model wrote nothing.~~ **That cost was not acceptable and has been paid off**:
+  the session's closing report is read once from `messages` after it settles and becomes
+  the import's `detail`. See the paragraph added to D16, which draws the line between a
+  status line and narration in the call list.
 - **A3's progress panel showed `fetch_page` rows and a `record_asset` row.** Both are
   overridden here — there is no `fetch_page` (D13) and the importer's asset write is
   `record_imported_asset` (D14) — so the panel lists only the three tools that exist.

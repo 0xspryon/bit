@@ -42,19 +42,29 @@
  * install, an MCP registration the harness refused. Those are the operator's to fix and
  * are reported with the refusing component's own sentence.
  *
- * ## The session's narration is never read
+ * ## The session's narration is never read, and its final report is (D16)
  *
- * There is no `sessionEvents` subscription here, and its absence is D16's implementation.
- * The panel lists tool calls, which the importer's own toolkit records as they cross our
- * MCP boundary (`import/progress.ts`). Narration is not filtered out of the panel — it is
- * never captured, so showing it would mean building something new. `plan/` persists no
- * narration either, for a related reason, so this is the house position rather than a new
- * one.
+ * There is no `sessionEvents` subscription here, and its absence is D16's implementation
+ * of the *call list*. The panel lists tool calls, which the importer's own toolkit records
+ * as they cross our MCP boundary (`import/progress.ts`). Narration is not filtered out of
+ * that list — it is never captured, so putting it there would mean building something new.
  *
- * What this costs, said plainly: when an import settles having written nothing, this
- * process cannot say *why* the model wrote nothing, because it did not keep what the model
- * said. The honest remedy is the one the design already chose — the operator reads the
- * pages themselves and authors the scope by hand, from a screen that is one click away.
+ * **One message is read, after the session has settled: the last thing it said.** The
+ * prompt asks for it explicitly — "stop and report in a few lines: which pages you could
+ * read, what you recorded, and anything you were unsure about" — and until this read, that
+ * report was generated and discarded. It is a single status line on the panel and in the
+ * toast, which is a different thing from narration in the list, and D16 now draws that
+ * line in as many words.
+ *
+ * The cost this removes was the common case rather than an edge: a client-rendered program
+ * page answers `200` with no scope in it, so the import succeeds at every step, writes
+ * nothing, and the operator was told only "Nothing could be read from those pages" — with
+ * no account of why. The session's own report is the only account anything in this process
+ * has, because nothing we own observes the fetch (D13).
+ *
+ * It is the model's prose and is treated as such: bounded at
+ * {@link SCOPE_IMPORT_REPORT_MAX} characters, read once from `messages` rather than
+ * streamed, and rendered as text by a browser that escapes it.
  */
 import {
   bitMcpServerName,
@@ -66,7 +76,11 @@ import { Context, Effect, Exit, Fiber, Layer, Redacted, Scope } from "effect";
 import { resolveImporterModel } from "./importerModel";
 import { assembleImporterPrompt } from "./importerPrompt";
 import { ScopeImportProgress } from "./progress";
-import { OPEN_PROMPT, type AgentHarness } from "../harness/agentHarness";
+import {
+  lastAssistantText,
+  OPEN_PROMPT,
+  type AgentHarness,
+} from "../harness/agentHarness";
 import { HarnessResolver } from "../harness/resolver";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
@@ -92,6 +106,29 @@ export type ScopeImportStarted =
     }
   /** Links were given and this server cannot read them. The target is created regardless. */
   | { readonly _tag: "refused"; readonly detail: string };
+
+/**
+ * How much of the session's closing report the panel's status line carries.
+ *
+ * A few lines is what the prompt asks for and what an operator reads at a glance. The
+ * bound is here rather than trusted to the model, because the field it lands in is
+ * `ScopeImportView.detail` — one sentence's worth of screen, polled over a browser
+ * connection — and a session that answered with the pages it read instead of a summary
+ * would otherwise put a document in it. Cut at a word boundary and marked, because a
+ * silently truncated report is a report a reader would misread.
+ */
+export const SCOPE_IMPORT_REPORT_MAX = 700;
+
+/** The session's closing report, bounded, or `null` when it said nothing. */
+export const importReport = (text: string): string | null => {
+  // Newlines collapse to spaces: this is a status line, and the model writes in lines.
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat === "") return null;
+  if (flat.length <= SCOPE_IMPORT_REPORT_MAX) return flat;
+  const cut = flat.slice(0, SCOPE_IMPORT_REPORT_MAX);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > SCOPE_IMPORT_REPORT_MAX / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
+};
 
 export interface ScopeImportRequest {
   readonly targetId: string;
@@ -339,13 +376,40 @@ export class ScopeImporter extends Context.Service<
           harness.waitForIdle(opened.success),
         );
         if (yield* progress.stopped(input.importId)) return;
+
+        /*
+         * The session's closing report, read once, after it has settled.
+         *
+         * **This is the only account anything in this process has of why an import wrote
+         * what it wrote.** The prompt asks for it in as many words, and the most common
+         * outcome of a real import needs it: a client-rendered program page answers `200`
+         * with no scope in it, so every step here succeeds, nothing is written, and
+         * without this the operator is told "nothing could be read" and no more.
+         *
+         * `messages` rather than `sessionEvents`, and that distinction is D16's: this is
+         * one message, pulled after the fact, not a stream subscribed to while the session
+         * talks. No narration is captured, nothing intermediate is kept, and the call list
+         * is untouched — what this produces is a single status line.
+         *
+         * A failure to read it is not a failure of the import. The entries are written and
+         * are the operator's to review; the report is an explanation, and an explanation
+         * that could not be fetched leaves the import exactly as `finished` as it was.
+         */
+        const report = yield* Effect.map(
+          Effect.result(harness.messages(opened.success)),
+          (read) =>
+            read._tag === "Failure"
+              ? null
+              : importReport(lastAssistantText(read.success)),
+        );
+
         yield* progress.settle({
           importId: input.importId,
           status: "finished",
           detail:
             settled._tag === "Failure"
-              ? `the importer's session ended early: ${settled.failure.message}. Anything it had already written is kept.`
-              : null,
+              ? `the importer's session ended early: ${settled.failure.message}. Anything it had already written is kept.${report === null ? "" : ` It reported: ${report}`}`
+              : report,
         });
       });
 

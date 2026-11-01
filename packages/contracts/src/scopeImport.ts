@@ -20,6 +20,10 @@
  * excluded from the panel — it is never captured, and a later change that wanted to show
  * it would have to go and fetch it, which is the kind of thing a reviewer notices.
  *
+ * **{@link ScopeImportView.detail} carries the session's closing report, and that is not
+ * the same thing.** It is one line, read once from the settled session's last message,
+ * because an import that wrote nothing has to be able to say why — see that field.
+ *
  * **There is no `fetch_page` call either.** The importer reads pages with its harness's
  * own reader (D13), so a page fetch is not one of our tool calls and does not appear here.
  * What the operator sees is the scope being written, which is what they are checking.
@@ -157,11 +161,25 @@ export const ScopeImportView = Schema.Struct({
   targetId: Schema.String,
   status: ScopeImportStatus,
   /**
-   * Why, when the status needs a why.
+   * Why, when the status needs a why: one status line, and the only thing here the model
+   * wrote.
    *
-   * Null while running and on a clean finish. Set for `failed` with the refusal's own
-   * sentence, and for `stopped` with who stopped it, because "the entries written so far
-   * stay" is the thing an operator needs told at that moment.
+   * Null while running. Set for `failed` with the refusing component's own sentence, for
+   * `stopped` with who stopped it — because "the entries written so far stay" is what an
+   * operator needs told at that moment — and on `finished` with **the session's closing
+   * report**, which the prompt asks for and the server reads once from the settled
+   * session's last message.
+   *
+   * **That report is not narration, and the distinction is D16's rather than a
+   * convenience.** The forbidden thing is the model's commentary in the *call list*: a
+   * list of writes is a receipt, and reasoning interleaved with it would bury the handful
+   * of lines the operator is there to check. One line saying what the session could read
+   * and what it could not is the opposite — it is the only account this process has of why
+   * an import wrote nothing, which is the most common real outcome, since a
+   * client-rendered program page answers `200` with no scope in it and every step of the
+   * import succeeds. Nothing intermediate is captured to produce it.
+   *
+   * It is the model's prose, so it is bounded on the server and rendered as text.
    */
   detail: Schema.NullOr(Schema.String),
   /** Which harness instance ran it, and which model. Both as resolved, never as asked. */

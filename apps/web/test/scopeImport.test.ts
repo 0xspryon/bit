@@ -146,16 +146,18 @@ describe("the panel lists tool calls and no narration", () => {
     expect(body).not.toContain("fetch_page");
   });
 
-  test("there is nowhere on this screen for narration to go", async () => {
+  test("the call list is calls, and the one line of prose is the closing report", async () => {
     const { app } = await onPage();
     app.newTargetPhase = "importing";
     app.scopeImportTargetId = "acme-corp";
-    // The view is built from the contract, so this is as close to "an import that
-    // narrated" as a test can construct: the words below are in no field of
-    // `ScopeImportView`, because the contract has no field that could hold them. That is
-    // D16 as a property of the type rather than as a filter on a render — the server
-    // captures no narration at all, so there is nothing for this screen to exclude.
+    // What the server can actually produce: a list of writes, and `detail` holding the
+    // session's closing report. The report is one status line and is read — that is the
+    // line D16 draws — while narration has no field to arrive in, because nothing in the
+    // server subscribes to the importer session's events at all (asserted against a
+    // harness that really narrates in `import/scopeImporter.test.ts`).
     app.scopeImport = scopeImportView({
+      status: "finished",
+      detail: "Read page 1. Page 2 returned a page with no scope table.",
       calls: [call("add_scope_entry", "in · subtree · acme.com", PAGE_A)],
       totals: { entriesIn: 1, entriesOut: 0, assets: 0 },
     });
@@ -163,8 +165,11 @@ describe("the panel lists tool calls and no narration", () => {
     const body = bodyOf(app);
 
     expect(body).toContain("add_scope_entry");
-    // Nothing resembling the model talking about its work. If a later change adds a
-    // narration field and renders it, these are the assertions that fail.
+    // The report is on screen, as the panel's status line. An import that wrote nothing
+    // has to be able to say why, and this is where it says it.
+    expect(body).toContain("Page 2 returned a page with no scope table");
+    // And the call list carries no prose of its own: one row per call, the tool and the
+    // value it wrote, with nothing between them.
     for (const narration of [
       "Let me",
       "I'll start by",
@@ -484,6 +489,31 @@ describe("the import is watched, and stopping keeps what landed", () => {
     await settle();
 
     expect(app.toast).toContain("Nothing could be read from those pages");
+    expect(app.navItem).toBe("assets");
+  });
+
+  test("and the toast carries why, because the panel it was on is gone", async () => {
+    // This is the path where `detail` is the whole message rather than a footnote: an
+    // import that wrote nothing takes the operator off the panel, so the panel's own
+    // status line is never read. The most common real case is a program page that answers
+    // 200 with no scope in it — every step of the import succeeds, and without the
+    // session's own report the operator is told only that nothing could be read.
+    const { app, fake } = await withImport();
+    fake.onScopeImport = () =>
+      ok(
+        scopeImportView({
+          targetId: "acme-corp",
+          status: "finished",
+          detail:
+            "hackerone.com/mars/policy_scopes returned a page with no scope table.",
+          totals: { entriesIn: 0, entriesOut: 0, assets: 0 },
+        }),
+      );
+    await app.createTarget();
+    await settle();
+
+    expect(app.toast).toContain("The importer reported");
+    expect(app.toast).toContain("no scope table");
     expect(app.navItem).toBe("assets");
   });
 

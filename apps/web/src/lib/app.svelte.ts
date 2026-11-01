@@ -3703,6 +3703,14 @@ export class App {
    * state as a target created with no links at all, and the Assets screen already says
    * what that means ("No scope authored for this target"). Keeping someone on a dead
    * progress panel to contemplate a failure they cannot fix from there would be worse.
+   *
+   * **The toast carries `detail`, because this is the path where it is the whole message.**
+   * An import that wrote nothing takes the operator off the panel, so the panel's own
+   * status line is never read — and on a `finished` import that line is the session's
+   * closing report, which is the only account of *why* nothing was written. The most
+   * common real case is a program page that answers `200` with no scope in it: without the
+   * report, "nothing could be read from those pages" is everything the operator is ever
+   * told.
    */
   settleImport(view: ScopeImportView) {
     const wrote =
@@ -3711,7 +3719,9 @@ export class App {
     this.toast =
       view.status === "failed"
         ? `The scope could not be read: ${view.detail ?? "the importer did not start"}. The target is created — author its scope here.`
-        : "Nothing could be read from those pages. The target is created and has no scope yet — author it here.";
+        : `Nothing could be read from those pages. The target is created and has no scope yet — author it here.${
+            view.detail === null ? "" : ` The importer reported: ${view.detail}`
+          }`;
     this.openAssetsFor(view.targetId);
   }
 

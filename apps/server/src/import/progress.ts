@@ -26,6 +26,13 @@
  * The harness's own page fetches do not appear here, per D13: they are not our tool calls,
  * and nothing we own observes them.
  *
+ * **The one thing the model says that does reach a screen is {@link Entry.detail}**, and
+ * it is not an exception to the above. `import/scopeImporter.ts` reads the session's last
+ * message *after* it has settled and settles the import with it, so an import that wrote
+ * nothing can say why it wrote nothing. That is one status line, written once, by the same
+ * `settle` call that records the status — not a stream, not the call list, and nothing this
+ * registry subscribes to.
+ *
  * ## In memory, for the life of the process, and deliberately
  *
  * An import is not a row. What it *writes* is rows — `scope_entries` and `asset_imports`,

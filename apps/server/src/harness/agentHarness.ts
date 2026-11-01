@@ -694,6 +694,26 @@ export class AgentHarness extends Context.Service<
 export const finalAssistantText = (entries: readonly MessageEntry[]): string =>
   entries.find((entry) => entry.type === "assistant")?.text ?? "";
 
+/**
+ * The **last** thing the assistant said, or an empty string.
+ *
+ * Not {@link finalAssistantText}, which takes the first assistant entry and is used by the
+ * spikes on sessions that produce exactly one. Both drivers answer `messages` in
+ * transcript order, so a session that spoke more than once — and the scope importer works
+ * through up to eight pages in one turn — has its report at the *end* of the list.
+ *
+ * Empty entries are skipped: a harness can record an assistant message whose text is
+ * entirely tool calls, and "the last thing it said" means the last thing it said in words.
+ */
+export const lastAssistantText = (entries: readonly MessageEntry[]): string => {
+  for (let at = entries.length - 1; at >= 0; at -= 1) {
+    const entry = entries[at];
+    if (entry?.type === "assistant" && entry.text.trim() !== "")
+      return entry.text;
+  }
+  return "";
+};
+
 /** The first error any entry reported, used to explain a `failed` outcome. */
 export const firstError = (
   entries: readonly MessageEntry[],
