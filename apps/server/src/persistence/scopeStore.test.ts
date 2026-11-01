@@ -72,6 +72,32 @@ const OPERATOR: HostContext = {
   targetId: TARGET,
 };
 
+/**
+ * A second operator authority on the same target.
+ *
+ * Attribution on a label is the caller's scope rather than a payload field, so proving
+ * that a replacement re-attributes needs two of them. One person handing a target to
+ * another mid-engagement is the real case.
+ */
+/** A second target's rows, in this one file, for the cross-target guard. */
+const OTHER = "target-2";
+
+const OTHER_WORKER: AttemptCaller = {
+  _tag: "attempt",
+  callerScope: `${OTHER}/attempt-other`,
+  targetId: OTHER,
+  intentId: "intent-other",
+  attemptId: "attempt-other",
+  harnessSessionId: "ses_other",
+  workerId: "worker-other",
+  attemptFence: 0,
+};
+
+const RELIEF_OPERATOR: HostContext = {
+  callerScope: `${TARGET}/operator-relief`,
+  targetId: TARGET,
+};
+
 const WORKER: AttemptCaller = {
   _tag: "attempt",
   callerScope: `${TARGET}/attempt-1`,
@@ -280,6 +306,46 @@ describe("scope entries", () => {
     // Nothing was written: the out entry is still the only row.
     expect(outcome.entries).toHaveLength(1);
     expect(outcome.entries[0]?.effect).toBe("out");
+  });
+
+  test("the contradiction is refused in the other direction too, and says so", async () => {
+    /*
+     * The same rule with the effects swapped, and it is not a redundant test.
+     *
+     * Every other contradiction case in this repo adds `out` first, so the lookup could
+     * have been hardcoded to `effect: "out"` and stayed green while `out` on top of an
+     * existing `in` was accepted — which is the pair the screen cannot show. It also
+     * renders the other half of the refusal's own sentence: the `an in-scope` branch,
+     * which nothing exercised.
+     */
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const existing = yield* store.addScopeEntry(OPERATOR, {
+          effect: "in",
+          kind: "host",
+          value: "portal.acme.test",
+          source: "operator",
+        });
+        const refusal = yield* Effect.flip(
+          store.addScopeEntry(OPERATOR, {
+            effect: "out",
+            kind: "host",
+            value: "portal.acme.test",
+            source: "operator",
+          }),
+        );
+        const scope = yield* store.targetScope(TARGET);
+        return { existing, refusal, entries: scope.entries };
+      }),
+    );
+    const refusal = outcome.refusal as MutationError;
+    expect(refusal.reason).toBe("conflict");
+    expect(refusal.detail).toContain(outcome.existing.entry.entryId);
+    expect(refusal.detail).toContain("is already an in-scope host entry");
+    // Nothing was written: the in entry is still the only row, and it is still `in`.
+    expect(outcome.entries).toHaveLength(1);
+    expect(outcome.entries[0]?.effect).toBe("in");
   });
 
   test("the contradiction check is per kind, not per value", async () => {
@@ -676,26 +742,44 @@ describe("the effective-state read", () => {
 
   test("a label is replaced rather than duplicated, and set_at moves", async () => {
     const path = newDatabasePath();
-    const labels = await withStore(path, (store) =>
+    const outcome = await withStore(path, (store) =>
       Effect.gen(function* () {
-        yield* store.setHostScopeLabel(OPERATOR, {
+        const first = yield* store.setHostScopeLabel(OPERATOR, {
           host: "legacy.acme.test",
           state: "out",
           reason: "first thought",
         });
-        yield* store.setHostScopeLabel(OPERATOR, {
+        // A real gap, because `set_at` comes off the clock and two writes in one
+        // millisecond would make the comparison below vacuous. And a different authority,
+        // because attribution is the other half of what the upsert replaces.
+        yield* Effect.sleep("5 millis");
+        const second = yield* store.setHostScopeLabel(RELIEF_OPERATOR, {
           host: "legacy.acme.test",
           state: "in",
           reason: "the client changed their mind",
         });
         const scope = yield* store.targetScope(TARGET);
-        return scope.hostLabels;
+        return { first, second, labels: scope.hostLabels };
       }),
     );
+    const labels = outcome.labels;
     // One current answer per host, which is what the primary key is for.
     expect(labels).toHaveLength(1);
     expect(labels[0]?.state).toBe("in");
     expect(labels[0]?.reason).toContain("changed their mind");
+    /*
+     * `set_at` and `set_by` move too, which is what the test's name claims and what the
+     * upsert's `excluded.set_at` and `excluded.set_by` are for.
+     *
+     * Without these two lines the clauses can be dropped from the `ON CONFLICT` and every
+     * relabel stays attributed and timestamped to the *first* decision — so the Scope tab
+     * would show the operator the moment they changed their mind as the moment they first
+     * decided, and the event log would be the only place the truth survived.
+     */
+    expect(labels[0]?.setAt).toBe(outcome.second.setAt);
+    expect(outcome.second.setAt).toBeGreaterThan(outcome.first.setAt);
+    expect(labels[0]?.setBy).toBe(RELIEF_OPERATOR.callerScope);
+    expect(labels[0]?.setBy).not.toBe(OPERATOR.callerScope);
   });
 
   test("clearing a label hands the subject back to the entries", async () => {
@@ -744,23 +828,133 @@ describe("the effective-state read", () => {
   });
 
   test("an asset label for another target's asset is refused", async () => {
+    /*
+     * The guard is `asset.target_id !== caller.targetId`, and reaching it needs a real
+     * asset that belongs to somebody else.
+     *
+     * This test used to pass `asset_nonexistent`, which is refused one line earlier by
+     * the row simply not being there — so the branch that matters was never run, and
+     * deleting the target check left the suite green. A second target's attempt is seeded
+     * into this file and records its own asset, which is the shape a misfiled row or a
+     * caller carrying the wrong target id would produce.
+     */
     const path = newDatabasePath();
-    const refusal = await withStore(path, (store) =>
+    const outcome = await withStore(path, (store) =>
       Effect.gen(function* () {
         yield* seed(store);
-        return yield* Effect.flip(
-          store.setAssetScopeLabel(
-            { callerScope: operatorScope("other"), targetId: "other" },
-            { assetId: "asset_nonexistent", state: "in", reason: null },
-          ),
+        yield* store.seedAttempt({
+          targetId: OTHER,
+          goalId: "goal-other",
+          goal: "Another engagement entirely.",
+          intentId: "intent-other",
+          question: "What answers over there?",
+          attemptId: "attempt-other",
+          workerId: "worker-other",
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          modelOptions: null,
+          harnessSessionId: null,
+        });
+        const theirs = yield* store.recordAsset(OTHER_WORKER, {
+          operationId: "op-other-1",
+          kind: "host",
+          url: "https://app.other.test/",
+          method: null,
+          note: "recorded under the other engagement",
+        });
+
+        const set = yield* Effect.flip(
+          store.setAssetScopeLabel(OPERATOR, {
+            assetId: theirs.assetId,
+            state: "in",
+            reason: null,
+          }),
         );
+        const cleared = yield* Effect.flip(
+          store.clearAssetScopeLabel(OPERATOR, theirs.assetId),
+        );
+        // And the row really does exist, so neither refusal is the absent-row branch.
+        const assets = yield* store.assets();
+        const scope = yield* store.targetScope(TARGET);
+        return {
+          set,
+          cleared,
+          theirs: assets.find((asset) => asset.id === theirs.assetId),
+          assetLabels: scope.assetLabels,
+        };
       }),
     );
+
+    expect(outcome.theirs?.target_id).toBe(OTHER);
     // The foreign key catches an id that is nothing at all; it cannot catch another
     // engagement's asset id, and labelling one of those would record a decision against
     // the wrong client.
-    expect((refusal as MutationError).reason).toBe("invalid");
-    expect((refusal as MutationError).detail).toContain("is not an asset of");
+    for (const refusal of [outcome.set, outcome.cleared]) {
+      expect((refusal as MutationError).reason).toBe("invalid");
+      expect((refusal as MutationError).detail).toContain("is not an asset of");
+      expect((refusal as MutationError).absent).toBe(true);
+    }
+    // Nothing was written against either target.
+    expect(outcome.assetLabels).toHaveLength(0);
+  });
+
+  test("a host label is keyed by the normalised host, so it is a label that applies", async () => {
+    /*
+     * The normaliser on the *write* path, which nothing exercised: every other test in
+     * this file hands these two functions an already-normalised host, so removing
+     * `normaliseHost` from both of them keeps every gate green and produces exactly the
+     * failure the store's own comment names — "a label keyed by `App.Acme.Com:443` would
+     * be a label that never applies to anything, and it would look set."
+     *
+     * So the operator types it the way a person types it, and the label has to decide the
+     * asset anyway. This is the anti-goal about an action that appears to work and does
+     * nothing, on the one write where it would be invisible.
+     */
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store);
+        yield* store.addScopeEntry(OPERATOR, {
+          effect: "in",
+          kind: "subtree",
+          value: "acme.test",
+          source: "operator",
+        });
+        const recorded = yield* record(store, {
+          kind: "endpoint",
+          url: "https://app.acme.test/v1/orders",
+          method: "GET",
+        });
+        yield* store.setHostScopeLabel(OPERATOR, {
+          host: "  HTTPS://App.Acme.Test:443/login  ",
+          state: "out",
+          reason: "typed the way a person types it",
+        });
+        const scope = yield* store.targetScope(TARGET);
+        const labelled = yield* store.assetsWithScope(TARGET);
+        // Cleared the same way, which is the other half of the same step.
+        yield* store.clearHostScopeLabel(OPERATOR, "APP.Acme.Test.:8443");
+        const restored = yield* store.assetsWithScope(TARGET);
+        return {
+          assetId: recorded.assetId,
+          hostLabels: scope.hostLabels,
+          labelled: labelled.find((row) => row.asset.id === recorded.assetId),
+          restored: restored.find((row) => row.asset.id === recorded.assetId),
+        };
+      }),
+    );
+
+    // Keyed by the matched form, not by what was typed.
+    expect(outcome.hostLabels).toHaveLength(1);
+    expect(outcome.hostLabels[0]?.host).toBe("app.acme.test");
+    // And it decides the asset, which is the part a key that merely looked right would
+    // not do.
+    expect(outcome.labelled?.scope.state).toBe("out");
+    expect(outcome.labelled?.scope.by._tag).toBe("hostLabel");
+    // Cleared by a third spelling of the same host, and the entry decides it again.
+    expect(outcome.restored?.scope.state).toBe("in");
+    expect(outcome.restored?.scope.by._tag).toBe("entry");
   });
 
   test("every label change lands in the event log, attributed to the operator", async () => {
