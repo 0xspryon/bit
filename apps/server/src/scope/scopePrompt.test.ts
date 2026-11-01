@@ -231,6 +231,83 @@ describe("the two lists", () => {
     expect(outOfScope).toContain("labs.acme.test and every subdomain");
   });
 
+  test("a promoted host is not also listed as out by the entry it beat", () => {
+    /*
+     * The same-host case, which is the one that was broken.
+     *
+     * `blog.acme.test` has an `out`/`host` entry and an `in` hand label. The effective
+     * state is `in` and always was — the ladder is right — but both sentences were
+     * pushed, and they never collided on the dedup because they differ by the words
+     * `, set by hand`. The agent was handed an authorization text saying the host is in
+     * scope *and* explicitly out of it.
+     *
+     * The label wins (D5), so the entry is silent and the agent sees one answer.
+     */
+    const promoted: ScopeForPrompt = {
+      entries: [
+        entry("in", "subtree", "acme.test"),
+        entry("out", "host", "blog.acme.test"),
+      ],
+      hostLabels: [hostLabel("blog.acme.test", "in")],
+      assetLabels: [],
+    };
+    const { inScope, outOfScope } = scopeListsOf(promoted);
+    expect(inScope).toContain("blog.acme.test (that host only, set by hand)");
+    expect(outOfScope).toEqual([]);
+    // Said as the property rather than as two list assertions: one mention, anywhere.
+    const mentions = [...inScope, ...outOfScope].filter((item) =>
+      item.startsWith("blog.acme.test"),
+    );
+    expect(mentions).toHaveLength(1);
+  });
+
+  test("a host excluded by hand is not also listed as in by the entry it beat", () => {
+    // The symmetric case. Nothing about the suppression is specific to a promotion: an
+    // `in`/`host` entry the operator later excluded by hand is just as contradictory
+    // read the other way round, and `out` is the direction where believing the wrong
+    // sentence costs something.
+    const excluded: ScopeForPrompt = {
+      entries: [
+        entry("in", "subtree", "acme.test"),
+        entry("in", "host", "app.partner.test"),
+      ],
+      hostLabels: [hostLabel("app.partner.test", "out")],
+      assetLabels: [],
+    };
+    const { inScope, outOfScope } = scopeListsOf(excluded);
+    expect(outOfScope).toContain(
+      "app.partner.test (that host only, set by hand)",
+    );
+    const mentions = [...inScope, ...outOfScope].filter((item) =>
+      item.startsWith("app.partner.test"),
+    );
+    expect(mentions).toHaveLength(1);
+    // The rest of the typed list is untouched: suppression is per host, not per list.
+    expect(inScope).toContain("acme.test and every subdomain");
+  });
+
+  test("a subtree entry is never suppressed, even by a label on its own apex", () => {
+    /*
+     * The limit of the rule, and it is the half that must not change.
+     *
+     * A subtree reaches more than the host its value names, so a label on that host
+     * contradicts none of what the entry says about the rest of the subtree. Dropping the
+     * entry would stop telling the agent that everything *under* the apex is excluded,
+     * which is the silent-coverage anti-goal pointing the other way.
+     */
+    const apexLabelled: ScopeForPrompt = {
+      entries: [
+        entry("in", "subtree", "acme.test"),
+        entry("out", "subtree", "labs.acme.test"),
+      ],
+      hostLabels: [hostLabel("labs.acme.test", "in")],
+      assetLabels: [],
+    };
+    const { inScope, outOfScope } = scopeListsOf(apexLabelled);
+    expect(outOfScope).toContain("labs.acme.test and every subdomain");
+    expect(inScope).toContain("labs.acme.test (that host only, set by hand)");
+  });
+
   test("an asset label is named by its identity, under its own effect", () => {
     const { inScope, outOfScope } = scopeListsOf(worked);
     expect(outOfScope).toContain(
@@ -242,18 +319,26 @@ describe("the two lists", () => {
   });
 
   test("a host both typed and promoted is listed once", () => {
-    // An operator can type `in`/`host`/`app.acme.test` and also promote that host from
-    // the Estate view. Both are true and the agent should be told once.
+    /*
+     * An operator can type `in`/`host`/`app.acme.test` and also promote that host from
+     * the Estate view. Both are true, both reach exactly that host, and the agent is told
+     * once.
+     *
+     * This used to assert `new Set(mentions).size === mentions.length`, which is
+     * tautological when the dedup is already by exact sentence — and it held while the
+     * renderer produced two mentions, which is the opposite of what the test's name
+     * claims. The property is a count.
+     */
     const doubled: ScopeForPrompt = {
       entries: [entry("in", "host", "app.acme.test")],
       hostLabels: [hostLabel("app.acme.test", "in")],
       assetLabels: [],
     };
-    const { inScope } = scopeListsOf(doubled);
-    const mentions = inScope.filter((item) => item.startsWith("app.acme.test"));
-    // Two different sentences, because they are two different reaches — but neither is a
-    // duplicate of the other, and the dedup is on the rendered sentence.
-    expect(new Set(mentions).size).toBe(mentions.length);
+    const { inScope, outOfScope } = scopeListsOf(doubled);
+    const mentions = [...inScope, ...outOfScope].filter((item) =>
+      item.startsWith("app.acme.test"),
+    );
+    expect(mentions).toEqual(["app.acme.test (that host only, set by hand)"]);
   });
 
   test("the out-of-scope heading is omitted when nothing is out", () => {

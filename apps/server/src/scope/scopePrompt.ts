@@ -34,6 +34,12 @@
  * two lists to reconcile would be doing the store's job. So each entry appears under its
  * own effect and each label under its state, and a label that overrode an entry appears
  * once, under the effect the label gave it, and not at all under the other.
+ *
+ * That last clause is a suppression rule rather than a consequence of deduplication, and
+ * it is implemented as one — see {@link scopeListsOf}. Deduplication is by rendered
+ * sentence, and the sentence a label renders differs from the sentence its entry renders
+ * by the words `, set by hand`, so two sentences about one host never collide on their
+ * own.
  */
 import {
   describeScopeEntry,
@@ -117,8 +123,24 @@ const renderList = (label: string, items: readonly string[]): string[] => {
  * subdomain" is the misread this whole model exists to prevent, and this is the one place
  * it is fixed for every surface at once.
  *
- * Deduplicated by rendered sentence: an operator can both type `in`/`host`/`app.acme.com`
- * and promote that host by hand, and the agent should be told once.
+ * Deduplicated by rendered sentence, and — the rule with teeth — **a `host` entry whose
+ * host a hand label also names is not mentioned at all.** The label speaks for that host,
+ * in both directions:
+ *
+ * - Opposite effects are a flat contradiction on the page. `out`/`host`/`blog.acme.test`
+ *   with an `in` label on `blog.acme.test` would otherwise render the host under *both*
+ *   headings — the effective state is `in`, correctly, but the authorization text the
+ *   agent reads would say two things. The label wins (D5), so the entry is silent.
+ * - Equal effects are redundant rather than contradictory, and the entry is still
+ *   silent, because the two sentences state the same reach — "that host only" — and
+ *   differ only in provenance, which the agent has no use for.
+ *
+ * **Only a `host` entry is suppressed, and only on an exact value match.** A `subtree`
+ * entry covering a promoted host is not a contradiction and stays: `out`/`subtree`/
+ * `labs.acme.test` with an `in` label on `x.labs.acme.test` is two true statements, and
+ * dropping the entry would stop telling the agent that the rest of that subtree is
+ * excluded. The same holds when a subtree's own apex is labelled — the entry still
+ * reaches every host under it, so it keeps saying so.
  */
 export const scopeListsOf = (
   scope: ScopeForPrompt,
@@ -134,7 +156,17 @@ export const scopeListsOf = (
     if (!list.includes(sentence)) list.push(sentence);
   };
 
+  /*
+   * The hosts a hand label names, which is what decides them whatever the entries say.
+   *
+   * Both sides are already normalised through `normaliseHost` — an entry value on write,
+   * a label key on write — so an exact string comparison is the whole test, and it is
+   * the same comparison the ladder itself makes when it looks a label up by host.
+   */
+  const labelledHosts = new Set(scope.hostLabels.map((label) => label.host));
+
   for (const entry of scope.entries) {
+    if (entry.kind === "host" && labelledHosts.has(entry.value)) continue;
     push(entry.effect, describeScopeEntry(entry));
   }
   for (const label of scope.hostLabels) {
