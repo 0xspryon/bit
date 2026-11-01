@@ -1347,6 +1347,55 @@ const fleetHandlers = HttpApiBuilder.group(
       },
 
       /**
+       * Starts one import against a target that already exists.
+       *
+       * The Auto-load page's write, and `createTarget`'s import step lifted out of it: the
+       * same `importer.start`, on the same inputs, so an import started here is
+       * indistinguishable from one started at creation. What changed is only who asks and
+       * when — the operator, from the Assets page, with the target open.
+       *
+       * The target is checked with {@link openableTarget}, the check every other write to a
+       * target's database goes through, so this refuses for the reasons reading the target
+       * does. Empty links are answered as a refusal *value*, not passed through: the
+       * importer's own answer to none is `none`, which on the create path means "nothing was
+       * asked for" and here would be a click that appears to do nothing.
+       *
+       * D13 holds, for the same reason it does on `createTarget`: this starts one session
+       * whose only tools write scope entries and assets. No goal, no intent, no attempt.
+       */
+      startScopeImport: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const links = payload.programLinks;
+        if (links.length === 0) {
+          return {
+            scopeImport: null,
+            importDetail:
+              "no program links were given, so there was nothing to read",
+          };
+        }
+        const started = yield* importer.start({
+          targetId: row.targetId,
+          targetName: row.name,
+          workspacePath: row.workspacePath ?? null,
+          links,
+          ...(payload.importModel === undefined
+            ? {}
+            : { choice: payload.importModel }),
+        });
+        return {
+          scopeImport:
+            started._tag === "started"
+              ? {
+                  importId: started.importId,
+                  harnessInstanceId: started.harnessInstanceId,
+                  model: started.model,
+                }
+              : null,
+          importDetail: started._tag === "refused" ? started.detail : null,
+        };
+      }),
+
+      /**
        * One import's progress, for the "Loading the scope" panel.
        *
        * The id is checked against the target before anything is looked up, and an import

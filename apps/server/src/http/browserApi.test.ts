@@ -1275,6 +1275,86 @@ describe("opening a target", () => {
     expect(served.status).toBe(200);
   });
 
+  /**
+   * The Auto-load page's route: an import against a target that already exists.
+   *
+   * This suite configures no harness (`ScopeImporter.unavailable`), so a start is refused by
+   * name, which is what the route has to carry to the page as a value. Starting for real is
+   * `scopeImporter.test.ts`'s; what is checked here is the route in front of it.
+   */
+  describe("starting an import on an existing target", () => {
+    const LINK = "https://hackerone.com/acme/policy";
+
+    test("a server that cannot read pages answers 200 with the reason, and no import", async () => {
+      const started = await read(
+        await signedIn("/targets/acme-corp/scope-import", {
+          method: "POST",
+          body: { programLinks: [LINK] },
+        }),
+      );
+      // Not an error: the page keeps its form and prints the sentence beside it.
+      expect(started.status).toBe(200);
+      expect(started.body["scopeImport"]).toBeNull();
+      expect(String(started.body["importDetail"])).toContain(
+        "no agent harness",
+      );
+    });
+
+    test("no links is a reason, not a silent nothing", async () => {
+      const started = await read(
+        await signedIn("/targets/acme-corp/scope-import", {
+          method: "POST",
+          body: { programLinks: [] },
+        }),
+      );
+      expect(started.status).toBe(200);
+      expect(started.body["scopeImport"]).toBeNull();
+      expect(String(started.body["importDetail"])).toContain(
+        "no program links",
+      );
+    });
+
+    test("an id nothing is registered under is a 404 that names it", async () => {
+      const refused = await read(
+        await signedIn("/targets/not-a-target/scope-import", {
+          method: "POST",
+          body: { programLinks: [LINK] },
+        }),
+      );
+      expect(refused.status).toBe(404);
+      expect(refused.body).toMatchObject({
+        _tag: "TargetNotFound",
+        reason: "unknown_target",
+      });
+    });
+
+    test("a target whose file will not migrate is refused by name, as reading it is", async () => {
+      const refused = await read(
+        await signedIn("/targets/broken/scope-import", {
+          method: "POST",
+          body: { programLinks: [LINK] },
+        }),
+      );
+      expect(refused.status).toBe(409);
+      expect(refused.body).toMatchObject({
+        _tag: "TargetUnavailable",
+        targetId: "broken",
+      });
+    });
+
+    test("a link that is not a web page URL is refused by the contract", async () => {
+      // The same check `createTarget` applies: the importer interpolates the link into a
+      // prompt and opens it with a page reader, so a `file:` URL must not get that far.
+      const refused = await read(
+        await signedIn("/targets/acme-corp/scope-import", {
+          method: "POST",
+          body: { programLinks: ["file:///etc/hostname"] },
+        }),
+      );
+      expect(refused.status).toBe(400);
+    });
+  });
+
   test("the list still opens nothing", async () => {
     // `GET /targets` is the cheap screen and has to stay cheap: it answers from the
     // registry plus a `stat`, so no count appears on a rail row however many targets

@@ -511,6 +511,35 @@ export const TargetCreated = Schema.Struct({
 export type TargetCreated = typeof TargetCreated.Type;
 
 /**
+ * What the Auto-load page submits: the program's pages for one import on a target that
+ * already exists.
+ *
+ * The same two fields {@link TargetDraft} carries for the same job, and the same rules —
+ * each link an absolute `http` or `https` URL checked on the server, the model absent unless
+ * the operator overrode it. This is the only way to start an import: the create-target
+ * screen no longer sends them, and a target is created from a folder, a name and a note.
+ */
+export const ScopeImportDraft = Schema.Struct({
+  programLinks: Schema.Array(ProgramLink),
+  importModel: Schema.optional(ImportModelDraft),
+});
+export type ScopeImportDraft = typeof ScopeImportDraft.Type;
+
+/**
+ * The import that started against an existing target, or why none did.
+ *
+ * The same two fields {@link TargetCreated} answers with, for the same reason: a refusal to
+ * *start* an import (no harness, a picked instance that is not ready, no links) is a value
+ * the page can print beside the form rather than an error that unmounts it. The target is
+ * untouched either way.
+ */
+export const ScopeImportStartResult = Schema.Struct({
+  scopeImport: TargetCreated.fields.scopeImport,
+  importDetail: TargetCreated.fields.importDetail,
+});
+export type ScopeImportStartResult = typeof ScopeImportStartResult.Type;
+
+/**
  * A scope import this server cannot show.
  *
  * In-process and not a row, which is what makes `unknown_import` the common reason rather
@@ -1351,6 +1380,33 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       success: TargetCreated,
       error: [TargetRefused, PathRefused, PathNotFound],
     }),
+    /**
+     * Starts one scope import against a target that already exists, and answers at once.
+     *
+     * **The Auto-load page's only write.** Creating a target no longer takes program links;
+     * the importer is started from the Assets page, with the target already in hand. The
+     * target must be one this server can open — the same `TargetNotFound` and
+     * `TargetUnavailable` as reading it — because an import writes into its database.
+     *
+     * It starts nothing but the importer, for `createTarget`'s reason (D13): no goal, no
+     * intent, no attempt, no run. Nothing here is idempotent. Two requests start two imports
+     * writing into one scope, and the server does not tell them apart — the page holds the
+     * running one's id and shows its panel instead of its form, which is the only thing
+     * between an operator and a second session.
+     *
+     * A refusal to start (no harness, a dead picked instance, no links) is a value on the
+     * answer, not an error, so the form stays on screen beside the sentence.
+     */
+    HttpApiEndpoint.post(
+      "startScopeImport",
+      "/targets/:targetId/scope-import",
+      {
+        params: { targetId: Schema.String },
+        payload: ScopeImportDraft,
+        success: ScopeImportStartResult,
+        error: [TargetNotFound, TargetUnavailable],
+      },
+    ),
     /**
      * One scope import's progress: its links, its tool calls and its totals.
      *
