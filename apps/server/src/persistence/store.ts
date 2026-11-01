@@ -6677,21 +6677,6 @@ const makeStore = Effect.fnUntraced(function* () {
   });
 
   /**
-   * Every asset in this target's file with the provenance a reader needs beside it.
-   *
-   * Separate from {@link assets} rather than replacing it: `assets()` is the bare table
-   * and is what the counts and the spike read, and a caller that wants only identities
-   * should not pay for four subqueries per row.
-   */
-  const assetsWithProvenance = Effect.fn(
-    "ObservationStore.assetsWithProvenance",
-  )(function* () {
-    return yield* selectAssetsWithProvenance().pipe(
-      Effect.mapError(lift("assets", "all")),
-    );
-  });
-
-  /**
    * The whole scope of one target: its entries and both label sets.
    *
    * What the prompt block is rendered from, and what the Scope tab shows. The labels come
@@ -7313,7 +7298,6 @@ const makeStore = Effect.fnUntraced(function* () {
     pendingRequests,
     anchorsForIntent,
     assets,
-    assetsWithProvenance,
     assetsWithScope,
     targetScope,
     scopeStateOfHost,
@@ -7557,11 +7541,6 @@ export class ObservationStore extends Context.Service<
     ) => Effect.Effect<readonly string[], DatabaseError | StoredRowError>;
     readonly assets: () => Effect.Effect<
       readonly StoredAsset[],
-      DatabaseError | StoredRowError
-    >;
-    /** Every asset with its discovery aggregate. One statement, no pagination. */
-    readonly assetsWithProvenance: () => Effect.Effect<
-      readonly StoredAssetWithProvenance[],
       DatabaseError | StoredRowError
     >;
     /**

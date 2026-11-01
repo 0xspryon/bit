@@ -302,9 +302,21 @@ export const RecordAssetResult = Schema.Struct({
 });
 export type RecordAssetResult = typeof RecordAssetResult.Type;
 
-/** The snake_case encoding of {@link RecordAssetResult}, for tool output. */
+/**
+ * The snake_case encoding of {@link RecordAssetResult}, for tool output.
+ *
+ * **Every multi-word key, not just the first one.** An earlier version encoded `assetId`
+ * alone, so the result a tool returned read `asset_id` beside `scopeState` — two
+ * conventions in one object, where `AssetListingWire` beside it is snake_case throughout.
+ * A model reading a mixed object has to guess which convention the next field follows, and
+ * the fields most worth reading here are the two that were camelCase.
+ */
 export const RecordAssetResultWire = RecordAssetResult.pipe(
-  Schema.encodeKeys({ assetId: "asset_id" }),
+  Schema.encodeKeys({
+    assetId: "asset_id",
+    scopeState: "scope_state",
+    scopeDetail: "scope_detail",
+  }),
 );
 
 /**

@@ -554,8 +554,7 @@ export const WorkerToolkitLayer = WorkerToolkit.toLayer(
               }),
           },
           /*
-           * `assetsWithScope` rather than `assetsWithProvenance`, because the label is
-           * part of the answer.
+           * `assetsWithScope`, because the label is part of the answer.
            *
            * It is the one read that implements the D5 ladder — asset label over host
            * label over entries — and D5 says plainly that no caller should assemble it.

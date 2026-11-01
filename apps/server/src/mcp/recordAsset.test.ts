@@ -602,10 +602,10 @@ describe("the scope state in the result", () => {
       note: "A subdomain of the authorized apex.",
     });
     expect(outcome.isError).toBe(false);
-    expect(outcome.data["scopeState"]).toBe("in");
+    expect(outcome.data["scope_state"]).toBe("in");
     // The sentence, from the same renderer the prompt block and the screen use, so the
     // agent is told *what* decided it rather than one word.
-    expect(outcome.data["scopeDetail"]).toBe(
+    expect(outcome.data["scope_detail"]).toBe(
       "in scope: acme.test and every subdomain",
     );
   });
@@ -619,8 +619,8 @@ describe("the scope state in the result", () => {
       note: "A login form on the host the programme excludes.",
     });
     expect(outcome.isError).toBe(false);
-    expect(outcome.data["scopeState"]).toBe("out");
-    expect(outcome.data["scopeDetail"]).toBe(
+    expect(outcome.data["scope_state"]).toBe("out");
+    expect(outcome.data["scope_detail"]).toBe(
       "explicitly out of scope: blog.acme.test (that host only)",
     );
     // Out is a label and never a gate: the row is in the file.
@@ -637,16 +637,16 @@ describe("the scope state in the result", () => {
       note: "Named in a CORS header.",
     });
     expect(outcome.isError).toBe(false);
-    expect(outcome.data["scopeState"]).toBe("out");
+    expect(outcome.data["scope_state"]).toBe("out");
     /*
      * The wording is load-bearing. "Nothing covers this yet" is a fact about the scope;
      * "you were denied" would be a fact about the call, and this call succeeded. An agent
      * that read the second would stop recording the discoveries the operator most needs.
      */
-    expect(outcome.data["scopeDetail"]).toBe(
+    expect(outcome.data["scope_detail"]).toBe(
       "not covered by any in-scope entry; recorded for the operator to review",
     );
-    expect(String(outcome.data["scopeDetail"])).not.toContain("denied");
+    expect(String(outcome.data["scope_detail"])).not.toContain("denied");
   });
 
   test("a hand label beats the entries here too, from the one ladder", async () => {
@@ -671,12 +671,12 @@ describe("the scope state in the result", () => {
       method: "post",
       note: "Found after the operator promoted the host.",
     });
-    expect(outcome.data["scopeState"]).toBe("in");
-    expect(outcome.data["scopeDetail"]).toContain(
+    expect(outcome.data["scope_state"]).toBe("in");
+    expect(outcome.data["scope_detail"]).toContain(
       "in scope, set by hand on blog.acme.test",
     );
     // And it says which typed entry the label beat, which is what `overrode` is for.
-    expect(outcome.data["scopeDetail"]).toContain(
+    expect(outcome.data["scope_detail"]).toContain(
       "overriding blog.acme.test (that host only)",
     );
   });
