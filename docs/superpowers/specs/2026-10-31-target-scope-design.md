@@ -881,7 +881,12 @@ reader will otherwise meet the difference and assume a mistake:
 - **A3 showed no model picker.** D15 added it, and it is revealed by the autoload checkbox
   and hidden with it. The model is read from `GET /importer-model`, which applies D15's
   rule on the server over the catalogue it observed; nothing in the browser bundle holds a
-  model id, for the reason `modelOption.ts` argues at length.
+  model id, for the reason `modelOption.ts` argues at length. The picker's **columns are
+  the composer's**, from `components/HarnessChoice.svelte`: it shipped as a second
+  implementation of them and had already diverged on whether an unusable harness kept its
+  reason and on whether the rail appeared with one harness configured. The two shells —
+  popover and inline — are what differ now. It offers no model _options_: the plumbing for
+  them existed with no caller and was removed.
 - **Creation answers `TargetCreated`**, a wrapper around `TargetSummary` carrying the
   import handle, because that handle exists only at the moment of creation and would be
   null on every row of the target list.
@@ -890,10 +895,13 @@ reader will otherwise meet the difference and assume a mistake:
   say nothing better than "no recorded discovery". `imports` and `first_source_url` now
   come off `asset_imports` in the same provenance statement and reach both `AssetView` and
   `list_assets`.
-- **Links are bounded at `SCOPE_IMPORT_MAX_LINKS` (8) and extras are dropped with a
-  warning** rather than the import refused. One session reads every link (D15), so they
+- **Links are bounded at `SCOPE_IMPORT_MAX_LINKS` (8) and extras are dropped and
+  reported** rather than the import refused. One session reads every link (D15), so they
   share one context window; an operator who pasted nine pages wants the first eight read
-  far more than they want to be sent back to the form.
+  far more than they want to be sent back to the form. The dropping was a `logWarning` and
+  nothing else, which meant the panel showed eight rows where nine were typed and said
+  nothing about the ninth; `ScopeImportView.droppedLinks` carries the count and the panel
+  renders it. Dropping is right, silent dropping is not.
 
 ## Calls made for you
 
