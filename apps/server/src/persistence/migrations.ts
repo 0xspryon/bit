@@ -1368,6 +1368,80 @@ const addTargetScope = statements(
 );
 
 /**
+ * `0023` — where an asset was read off, for the assets no attempt found.
+ *
+ * The scope importer (D13) records the hosts a program's scope table names. It cannot
+ * write an `asset_discoveries` row to do it: `intent_id` and `attempt_id` there are
+ * `NOT NULL` with real foreign keys, and the importer has an operator behind it and no
+ * intent, no attempt and no goal — those rows do not exist yet and will not until the
+ * operator creates one. D14 decides the shape, and the decision is **this table, not a
+ * nullable `intent_id` on that one.**
+ *
+ * **Why not relax `asset_discoveries`.** Making those two columns nullable would weaken
+ * the invariant for every row in the table, including every row a worker writes, so that
+ * one caller with genuinely different provenance could share a shape it does not fit.
+ * Every reader would then have to handle a null attempt, and "which attempt found this?"
+ * would stop having an answer for reasons that have nothing to do with the asset.
+ * `0010`'s own commentary argues for that invariant; this keeps it, and pays for it with
+ * a second small table instead.
+ *
+ * **The `assets` row is the same row.** A host the importer reads and the same host a
+ * worker later discovers are *one* asset under §17's identity rules, in either order, with
+ * one provenance row in each table — which is the whole point of having identity rules.
+ * `UNIQUE (target_id, kind, identity)` from `0010` is what makes that true in the schema
+ * rather than in a handler, and both write paths reduce their submission with the same
+ * `assetIdentityOf`. The cost is honest and small: "how did this asset come to be known"
+ * is a read over two tables rather than one, and a view over the union is the obvious
+ * shape if more than one caller ever wants it.
+ *
+ * **Keyed `(asset_id, operation_id)`, exactly like `asset_discoveries`.** One import per
+ * operation, so a replayed command adds nothing — the primary key is what makes the
+ * store's receipt replay idempotent in the schema as well as in the transaction — and two
+ * genuinely different imports of the same host both survive.
+ *
+ * ## The three columns that are not in D14's sketch
+ *
+ * `caller_scope` mirrors `asset_discoveries`: it is *whose authority wrote this*, and for
+ * an import it is always `<targetId>/operator`. Recorded rather than implied, because a
+ * provenance row whose author is a convention is a row that cannot be audited.
+ *
+ * `imported_as` is `discovered_as`' sibling and exists for the same reason `0010` gives:
+ * `identity` is normalised, so the submission as it was actually made is kept verbatim
+ * here or it is lost. `source_url` cannot stand in for it — that is the page, not the
+ * asset read off it.
+ *
+ * No foreign key on `source_url` or anything else here, and nothing references a target:
+ * the file *is* the target (§3), as with `scope_entries`.
+ *
+ * ## The index
+ *
+ * `asset_imports(source_url)` is `asset_discoveries_intent_idx`' mirror, on the axis that
+ * is not the key: a discovery is read by the intent that produced it, and an import by
+ * the page it came off. D15 is what wants it — one link with parseable scope is enough and
+ * a link that yields nothing does not fail the import, so "what did *this* page give us"
+ * is a per-link fact the intake screen reports. **Nothing in this slice reads it**, which
+ * is stated rather than hidden; `asset_discoveries_intent_idx` is in the same position and
+ * is the precedent for indexing a provenance table's other axis at schema time.
+ *
+ * The per-asset read needs no index of its own: the primary key leads with `asset_id`.
+ */
+const addAssetImports = statements(
+  `CREATE TABLE asset_imports (
+    asset_id TEXT NOT NULL REFERENCES assets(id),
+    operation_id TEXT NOT NULL,
+    caller_scope TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    imported_as TEXT NOT NULL,
+    note TEXT NOT NULL,
+    imported_at INTEGER NOT NULL,
+    PRIMARY KEY (asset_id, operation_id),
+    CHECK (length(source_url) > 0)
+  )`,
+  `CREATE INDEX IF NOT EXISTS asset_imports_source_idx
+     ON asset_imports(source_url)`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1407,6 +1481,7 @@ export const MIGRATIONS: Record<
   "0020_round_disposition_rationale": addRoundDispositionRationale,
   "0021_goal_sessions": addGoalSessions,
   "0022_target_scope": addTargetScope,
+  "0023_asset_imports": addAssetImports,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */
