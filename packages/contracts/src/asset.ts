@@ -244,6 +244,22 @@ export const RecordAssetResult = Schema.Struct({
   replayed: Schema.Boolean,
   /** How many separate operations have now recorded this asset. */
   discoveries: Schema.Int,
+  /**
+   * Whether this asset is inside the client's authorized estate.
+   *
+   * Reported on the write so an agent that records an out-of-scope host is **told so
+   * immediately** rather than finding out never. It is not a refusal and it is not a
+   * warning: the asset was recorded either way, because recording an out-of-scope
+   * discovery is how the operator comes to know it exists.
+   *
+   * `out` with no scope authored on the target is the common early case, and it means
+   * "nothing covers this yet" rather than "you were denied" — which is why
+   * {@link RecordAssetResult.scopeDetail} carries the sentence rather than leaving the
+   * agent to guess from one word.
+   */
+  scopeState: Schema.Literals(["in", "out"]),
+  /** What decided {@link RecordAssetResult.scopeState}, in words the agent can act on. */
+  scopeDetail: Schema.String,
 });
 export type RecordAssetResult = typeof RecordAssetResult.Type;
 

@@ -180,6 +180,7 @@ describe("a fresh database", () => {
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.tables).toEqual([
       "asset_discoveries",
+      "asset_scope_labels",
       "assets",
       "attempt_recoveries",
       "attempts",
@@ -188,6 +189,7 @@ describe("a fresh database", () => {
       "events",
       "goal_sessions",
       "goals",
+      "host_scope_labels",
       "intent_anchors",
       "intents",
       "observation_dimension_links",
@@ -196,6 +198,7 @@ describe("a fresh database", () => {
       "outbox",
       "planner_lineages",
       "planner_rounds",
+      "scope_entries",
       "sequence_cursor",
     ]);
     // The table `0003` left behind, not the one `0001` created or the one `0002` did.
@@ -480,6 +483,7 @@ describe("a database already at 0002", () => {
       "19_planner_lineage_by_goal",
       "20_round_disposition_rationale",
       "21_goal_sessions",
+      "22_target_scope",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -756,6 +760,7 @@ describe("a database already at 0005", () => {
       "19_planner_lineage_by_goal",
       "20_round_disposition_rationale",
       "21_goal_sessions",
+      "22_target_scope",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1476,6 +1481,7 @@ describe("a database already at 0015", () => {
       "19_planner_lineage_by_goal",
       "20_round_disposition_rationale",
       "21_goal_sessions",
+      "22_target_scope",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1618,6 +1624,7 @@ describe("a database already at 0016", () => {
       "19_planner_lineage_by_goal",
       "20_round_disposition_rationale",
       "21_goal_sessions",
+      "22_target_scope",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1789,6 +1796,7 @@ describe("a database already at 0017", () => {
       "19_planner_lineage_by_goal",
       "20_round_disposition_rationale",
       "21_goal_sessions",
+      "22_target_scope",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(

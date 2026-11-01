@@ -139,6 +139,25 @@ export const EventKind = Schema.Literals([
   "plan.round.started",
   "plan.round.settled",
   "plan.round.steered",
+  /*
+   * The scope, authored and labelled.
+   *
+   * Six kinds and not two, because the six are what an operator reading the log needs to
+   * tell apart: adding an entry and removing one are different decisions, and a hand
+   * label on a host reaches further than one on a single asset. Every one of them carries
+   * `callerScope` of `<targetId>/operator` — these are the only scope writes there are,
+   * and no agent can produce one.
+   *
+   * A cleared label is its own kind rather than a `scope.host.labelled` carrying a null
+   * state. Both label tables hold current state and the history is here, so "the operator
+   * withdrew their label" has to be a recorded fact rather than the absence of one.
+   */
+  "scope.entry.added",
+  "scope.entry.removed",
+  "scope.host.labelled",
+  "scope.host.label.cleared",
+  "scope.asset.labelled",
+  "scope.asset.label.cleared",
 ]);
 export type EventKind = typeof EventKind.Type;
 

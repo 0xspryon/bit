@@ -50,10 +50,19 @@ import {
   IntentStatus,
   ModelOptionSelection,
   OpenGoalResult,
+  ScopeEffect,
+  ScopeEntrySource,
+  ScopeKind,
+  ScopeLabelState,
   assetIdentityOf,
+  describeScopeState,
   dimensionAddress,
   isAssetIdentityRefusal,
+  isScopeValueRefusal,
+  normaliseHost,
+  normaliseScopeEntry,
   parseDimensionAddress,
+  scopeStateOf,
   type AbandonIntentInput,
   type AddIntentInput,
   type EndGoalInput,
@@ -62,8 +71,12 @@ import {
   type ObservationRecordFormat,
   type OutboxEntry,
   type OutboxRequestType,
+  type AssetScopeLabel,
+  type HostScopeLabel,
   type RecordAssetInput,
   type RecordedEvent,
+  type ScopeEntry,
+  type ScopeState,
   type RecordObservationInput,
   type RoundDisposition,
   type RoundStatus,
@@ -2848,6 +2861,188 @@ const makeStore = Effect.fnUntraced(function* () {
    * with `replayed: false` means a new command found a known asset — new knowledge about
    * where it was seen, no new asset.
    */
+  /* ── Target scope: the entries, the labels, and the one effective read ─────────── */
+
+  const ScopeEntryRow = Schema.Struct({
+    id: Schema.String,
+    target_id: Schema.String,
+    effect: ScopeEffect,
+    kind: ScopeKind,
+    value: Schema.String,
+    source: ScopeEntrySource,
+    note: Schema.NullOr(Schema.String),
+    created_at: Schema.Finite,
+  });
+  const scopeEntryColumns = Object.keys(ScopeEntryRow.fields).join(", ");
+
+  const selectScopeEntries = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: ScopeEntryRow,
+    execute: (targetId) =>
+      sql.unsafe(
+        `SELECT ${scopeEntryColumns} FROM scope_entries WHERE target_id = ?
+         ORDER BY effect, kind, value`,
+        [targetId],
+      ),
+  });
+
+  /**
+   * One entry under the opposite effect with the same kind and value, if there is one.
+   *
+   * This is what makes D2's contradiction refusal possible. The unique index is per
+   * effect, so the database would happily hold `in`/`host`/`blog.acme.com` beside
+   * `out`/`host`/`blog.acme.com`; this read is how the write path notices.
+   */
+  const findOpposingScopeEntry = SqlSchema.findOneOption({
+    Request: Schema.Struct({
+      targetId: Schema.String,
+      effect: Schema.String,
+      kind: Schema.String,
+      value: Schema.String,
+    }),
+    Result: Schema.Struct({ id: Schema.String, effect: Schema.String }),
+    execute: (request) =>
+      sql`SELECT id, effect FROM scope_entries
+          WHERE target_id = ${request.targetId}
+            AND kind = ${request.kind}
+            AND value = ${request.value}
+            AND effect = ${request.effect}`,
+  });
+
+  const findScopeEntryById = SqlSchema.findOneOption({
+    Request: Schema.Struct({ targetId: Schema.String, entryId: Schema.String }),
+    Result: ScopeEntryRow,
+    execute: (request) =>
+      sql.unsafe(
+        `SELECT ${scopeEntryColumns} FROM scope_entries
+         WHERE target_id = ? AND id = ?`,
+        [request.targetId, request.entryId],
+      ),
+  });
+
+  const HostLabelRow = Schema.Struct({
+    target_id: Schema.String,
+    host: Schema.String,
+    state: ScopeLabelState,
+    reason: Schema.NullOr(Schema.String),
+    set_by: Schema.String,
+    set_at: Schema.Finite,
+  });
+  const hostLabelColumns = Object.keys(HostLabelRow.fields).join(", ");
+
+  const selectHostLabels = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: HostLabelRow,
+    execute: (targetId) =>
+      sql.unsafe(
+        `SELECT ${hostLabelColumns} FROM host_scope_labels WHERE target_id = ?
+         ORDER BY host`,
+        [targetId],
+      ),
+  });
+
+  const AssetLabelRow = Schema.Struct({
+    asset_id: Schema.String,
+    state: ScopeLabelState,
+    reason: Schema.NullOr(Schema.String),
+    set_by: Schema.String,
+    set_at: Schema.Finite,
+  });
+  const assetLabelColumns = Object.keys(AssetLabelRow.fields).join(", ");
+
+  /**
+   * Every asset label in this file, joined to `assets` only to bound it to one target.
+   *
+   * `asset_scope_labels` has no `target_id` of its own — its key references `assets(id)`,
+   * which has one — so the target filter goes through the join rather than being a column
+   * that could disagree with the asset's.
+   */
+  const selectAssetLabels = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: AssetLabelRow,
+    execute: (targetId) =>
+      sql.unsafe(
+        `SELECT ${assetLabelColumns
+          .split(", ")
+          .map((column) => `asset_scope_labels.${column}`)
+          .join(", ")}
+         FROM asset_scope_labels
+         INNER JOIN assets ON assets.id = asset_scope_labels.asset_id
+         WHERE assets.target_id = ?
+         ORDER BY asset_scope_labels.asset_id`,
+        [targetId],
+      ),
+  });
+
+  /** The asset a label is about, so a write can refuse one for another target's row. */
+  const findAssetForLabel = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      id: Schema.String,
+      target_id: Schema.String,
+      host: Schema.String,
+      identity: Schema.String,
+    }),
+    execute: (assetId) =>
+      sql`SELECT id, target_id, host, identity FROM assets WHERE id = ${assetId}`,
+  });
+
+  /** One stored entry row as the contract's {@link ScopeEntry}. */
+  const scopeEntryOf = (row: typeof ScopeEntryRow.Type): ScopeEntry => ({
+    entryId: row.id,
+    targetId: row.target_id,
+    effect: row.effect,
+    kind: row.kind,
+    value: row.value,
+    source: row.source,
+    note: row.note,
+    createdAt: row.created_at,
+  });
+
+  const hostLabelOf = (row: typeof HostLabelRow.Type): HostScopeLabel => ({
+    targetId: row.target_id,
+    host: row.host,
+    state: row.state,
+    reason: row.reason,
+    setBy: row.set_by,
+    setAt: row.set_at,
+  });
+
+  const assetLabelOf = (row: typeof AssetLabelRow.Type): AssetScopeLabel => ({
+    assetId: row.asset_id,
+    state: row.state,
+    reason: row.reason,
+    setBy: row.set_by,
+    setAt: row.set_at,
+  });
+
+  /**
+   * Everything the derivation needs for one target, in three statements.
+   *
+   * The unit of reading, because `scopeStateOf` takes the entries and the two labels
+   * already looked up. A caller that wanted to decide one subject and read the entries
+   * itself would be the second code path that can disagree about whether a host is in
+   * scope, which is an anti-goal this design names outright.
+   */
+  const readScope = Effect.fnUntraced(function* (targetId: string) {
+    const entries = yield* selectScopeEntries(targetId).pipe(
+      Effect.mapError(lift("scope_entries", targetId)),
+    );
+    const hosts = yield* selectHostLabels(targetId).pipe(
+      Effect.mapError(lift("host_scope_labels", targetId)),
+    );
+    const assets = yield* selectAssetLabels(targetId).pipe(
+      Effect.mapError(lift("asset_scope_labels", targetId)),
+    );
+    return {
+      entries: entries.map(scopeEntryOf),
+      hostLabels: new Map(hosts.map((row) => [row.host, hostLabelOf(row)])),
+      assetLabels: new Map(
+        assets.map((row) => [row.asset_id, assetLabelOf(row)]),
+      ),
+    };
+  });
+
   const recordAsset = Effect.fn("ObservationStore.recordAsset")(function* (
     caller: CallerContext,
     input: RecordAssetInput,
@@ -2934,6 +3129,27 @@ const makeStore = Effect.fnUntraced(function* () {
           const discoveries = yield* countDiscoveries(asset.id).pipe(
             Effect.mapError(lift("asset_discoveries", asset.id)),
           );
+
+          /*
+           * The asset's scope state, reported on the write.
+           *
+           * D9: a worker that records an out-of-scope host is told so immediately rather
+           * than finding out never. It is **not** a gate — the rows above are already
+           * written and this transaction is not going to refuse them — and the sentence
+           * says so, because `out` on a target with nothing authored means "nothing
+           * covers this yet" rather than "you were denied".
+           *
+           * Read inside the same transaction as the write, so the state reported is the
+           * state as of the moment the asset landed rather than a slightly later one.
+           */
+          const scope = yield* readScope(worker.targetId);
+          const scopeState = scopeStateOf({
+            entries: scope.entries,
+            hostLabel: scope.hostLabels.get(identity.host),
+            assetLabel: scope.assetLabels.get(asset.id),
+            subject: { host: identity.host },
+          });
+
           const result: RecordAssetResult = {
             assetId: asset.id,
             kind: identity.kind,
@@ -2941,6 +3157,8 @@ const makeStore = Effect.fnUntraced(function* () {
             created,
             replayed: false,
             discoveries: discoveries.value,
+            scopeState: scopeState.state,
+            scopeDetail: describeScopeState(scopeState),
           };
 
           yield* sql`INSERT INTO command_receipts (
@@ -6429,6 +6647,544 @@ const makeStore = Effect.fnUntraced(function* () {
     );
   });
 
+  /**
+   * The whole scope of one target: its entries and both label sets.
+   *
+   * What the prompt block is rendered from, and what the Scope tab shows. The labels come
+   * with it because from the agent's side there is no difference between "excluded because
+   * you typed it" and "excluded because you clicked it" — D6 assembles both lists from
+   * all three sources.
+   */
+  const targetScope = Effect.fn("ObservationStore.targetScope")(function* (
+    targetId: string,
+  ) {
+    const scope = yield* readScope(targetId);
+    return {
+      entries: scope.entries,
+      hostLabels: [...scope.hostLabels.values()],
+      assetLabels: [...scope.assetLabels.values()],
+    };
+  });
+
+  /**
+   * Every asset with its effective scope state.
+   *
+   * **This is the one read D5 asks for, and no caller should assemble it.** An asset's
+   * state is its own label if present, else its host's label if present, else the
+   * derivation over the entries — and a caller that did that join itself would be a second
+   * implementation of the ladder.
+   *
+   * The host label is looked up by the asset's `host` column, which is why that column is
+   * normalised by the same function an entry value and a label key go through. This is the
+   * line where "a host label covers an endpoint recorded afterwards" is actually true: the
+   * endpoint is a different row with no label of its own, and it finds the host's.
+   */
+  const assetsWithScope = Effect.fn("ObservationStore.assetsWithScope")(
+    function* (targetId: string) {
+      const rows = yield* selectAssetsWithProvenance().pipe(
+        Effect.mapError(lift("assets", "all")),
+      );
+      const scope = yield* readScope(targetId);
+      return rows
+        .filter((row) => row.target_id === targetId)
+        .map((row) => ({
+          asset: row,
+          scope: scopeStateOf({
+            entries: scope.entries,
+            hostLabel: scope.hostLabels.get(row.host),
+            assetLabel: scope.assetLabels.get(row.id),
+            subject: { host: row.host },
+          }),
+        }));
+    },
+  );
+
+  /**
+   * One subject's effective state, for a host or an address with no asset behind it.
+   *
+   * The same ladder minus the asset layer, which is not an omission: a bare host is not an
+   * asset row, so there is no asset label for it to have. Used by the scope query tool and
+   * by the view when it describes a host group rather than one of its rows.
+   */
+  const scopeStateOfHost = Effect.fn("ObservationStore.scopeStateOfHost")(
+    function* (targetId: string, rawHost: string) {
+      const host = normaliseHost(rawHost);
+      const scope = yield* readScope(targetId);
+      return scopeStateOf({
+        entries: scope.entries,
+        hostLabel: scope.hostLabels.get(host),
+        subject: { host },
+      });
+    },
+  );
+
+  /**
+   * Adds one scope entry, or refuses it.
+   *
+   * **Two writers reach this and only two**: the operator typing in the Scope tab, and the
+   * scope importer at target creation. Not a worker, not a planner, not the goal agent,
+   * and not promotion — promotion writes a label instead. The caller is a
+   * {@link HostContext}, so there is no credential path that arrives here at all.
+   *
+   * Three outcomes, and the second is the one worth knowing about:
+   *
+   * - **Normalisation refuses it.** `normaliseScopeEntry` decides, and its sentence is
+   *   passed through unedited, because it names the remedy.
+   * - **A direct contradiction refuses it.** An entry whose kind and value already exist
+   *   under the opposite effect is rejected, naming the existing row, so the operator
+   *   removes or edits it deliberately. The matcher would cope — out wins — but the screen
+   *   cannot show the pair coherently and an operator who authored both did not mean to.
+   * - **It already exists, and that is a no-op.** The unique index makes authoring
+   *   idempotent, and the result says `created: false` rather than refusing: pressing Add
+   *   twice is not an error, and a duplicate row would be a second entry the matcher
+   *   evaluates.
+   */
+  const addScopeEntry = Effect.fn("ObservationStore.addScopeEntry")(function* (
+    caller: HostContext,
+    input: {
+      readonly effect: ScopeEffect;
+      readonly kind: ScopeKind;
+      readonly value: string;
+      readonly source: ScopeEntrySource;
+      readonly note?: string | null;
+    },
+  ) {
+    const normalised = normaliseScopeEntry({
+      kind: input.kind,
+      value: input.value,
+    });
+    if (isScopeValueRefusal(normalised)) {
+      return yield* new MutationError({
+        reason: "invalid",
+        detail: normalised.detail,
+      });
+    }
+    const recordedAt = yield* Clock.currentTimeMillis;
+    const opposite: ScopeEffect = input.effect === "in" ? "out" : "in";
+
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const clash = yield* findOpposingScopeEntry({
+            targetId: caller.targetId,
+            effect: opposite,
+            kind: input.kind,
+            value: normalised,
+          }).pipe(Effect.mapError(lift("scope_entries", normalised)));
+          if (Option.isSome(clash)) {
+            return yield* new MutationError({
+              reason: "conflict",
+              detail: `'${normalised}' is already ${opposite === "out" ? "an out-of-scope" : "an in-scope"} ${input.kind} entry (${clash.value.id}); an entry cannot be in and out at once. Remove that one first, or label the host by hand from the Estate view to carve it out without changing the list.`,
+            });
+          }
+
+          const existing = yield* findOpposingScopeEntry({
+            targetId: caller.targetId,
+            effect: input.effect,
+            kind: input.kind,
+            value: normalised,
+          }).pipe(Effect.mapError(lift("scope_entries", normalised)));
+          if (Option.isSome(existing)) {
+            // Idempotent, not refused. Nothing is written and nothing changed.
+            const row = yield* findScopeEntryById({
+              targetId: caller.targetId,
+              entryId: existing.value.id,
+            }).pipe(Effect.mapError(lift("scope_entries", existing.value.id)));
+            if (Option.isNone(row)) {
+              return yield* new DatabaseError({
+                operation: "transaction",
+                reason: `scope entry ${existing.value.id} was found and could not be read back`,
+                cause: existing.value,
+              });
+            }
+            return { entry: scopeEntryOf(row.value), created: false };
+          }
+
+          const entryId = identifier.newScopeEntryId();
+          yield* sql`INSERT INTO scope_entries (
+              id, target_id, effect, kind, value, source, note, created_at
+            ) VALUES (
+              ${entryId}, ${caller.targetId}, ${input.effect}, ${input.kind},
+              ${normalised}, ${input.source}, ${input.note ?? null}, ${recordedAt}
+            )`.pipe(Effect.mapError(asDatabaseError("transaction")));
+
+          yield* appendEvent({
+            kind: "scope.entry.added",
+            targetId: caller.targetId,
+            callerScope: caller.callerScope,
+            intentId: null,
+            attemptId: null,
+            operation: "add_scope_entry",
+            operationId: null,
+            subjectId: entryId,
+            payload: {
+              entryId,
+              effect: input.effect,
+              kind: input.kind,
+              value: normalised,
+              source: input.source,
+              note: input.note ?? null,
+            },
+            recordedAt,
+          });
+
+          return {
+            entry: {
+              entryId,
+              targetId: caller.targetId,
+              effect: input.effect,
+              kind: input.kind,
+              value: normalised,
+              source: input.source,
+              note: input.note ?? null,
+              createdAt: recordedAt,
+            } satisfies ScopeEntry,
+            created: true,
+          };
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
+  /**
+   * Removes one scope entry.
+   *
+   * A real `DELETE`, not a soft one. The entries are the operator's current statement of
+   * the estate rather than a record of what they once thought, and the event log holds the
+   * history — the same split both label tables use. Removing an entry an operator never
+   * had is refused rather than silently succeeding, because a button that appears to work
+   * and does nothing is one of this design's named anti-goals.
+   */
+  const removeScopeEntry = Effect.fn("ObservationStore.removeScopeEntry")(
+    function* (caller: HostContext, entryId: string) {
+      const recordedAt = yield* Clock.currentTimeMillis;
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const row = yield* findScopeEntryById({
+              targetId: caller.targetId,
+              entryId,
+            }).pipe(Effect.mapError(lift("scope_entries", entryId)));
+            if (Option.isNone(row)) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `no scope entry '${entryId}' on target ${caller.targetId}; nothing was removed`,
+              });
+            }
+            const entry = scopeEntryOf(row.value);
+            yield* sql`DELETE FROM scope_entries
+                WHERE target_id = ${caller.targetId} AND id = ${entryId}`.pipe(
+              Effect.mapError(asDatabaseError("transaction")),
+            );
+            yield* appendEvent({
+              kind: "scope.entry.removed",
+              targetId: caller.targetId,
+              callerScope: caller.callerScope,
+              intentId: null,
+              attemptId: null,
+              operation: "remove_scope_entry",
+              operationId: null,
+              subjectId: entryId,
+              payload: {
+                entryId,
+                effect: entry.effect,
+                kind: entry.kind,
+                value: entry.value,
+              },
+              recordedAt,
+            });
+            return entry;
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "SqlError"
+              ? asDatabaseError("transaction")(error)
+              : error,
+          ),
+        );
+    },
+  );
+
+  /**
+   * Sets or replaces the label on one host.
+   *
+   * An upsert, because there is exactly one current answer per host and the operator's
+   * later decision replaces the earlier one. The history of what it was is in the event
+   * log, which is the split `0022`'s own commentary argues for.
+   *
+   * The host is normalised here rather than by the caller, so a label is always keyed by a
+   * string the matcher produces. A label keyed by `App.Acme.Com:443` would be a label that
+   * never applies to anything, and it would look set.
+   */
+  const setHostScopeLabel = Effect.fn("ObservationStore.setHostScopeLabel")(
+    function* (
+      caller: HostContext,
+      input: {
+        readonly host: string;
+        readonly state: ScopeLabelState;
+        readonly reason?: string | null;
+      },
+    ) {
+      const host = normaliseHost(input.host);
+      if (host === "") {
+        return yield* new MutationError({
+          reason: "invalid",
+          detail: `'${input.host}' does not name a host, so no label was set`,
+        });
+      }
+      const recordedAt = yield* Clock.currentTimeMillis;
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO host_scope_labels (
+                target_id, host, state, reason, set_by, set_at
+              ) VALUES (
+                ${caller.targetId}, ${host}, ${input.state},
+                ${input.reason ?? null}, ${caller.callerScope}, ${recordedAt}
+              )
+              ON CONFLICT(target_id, host) DO UPDATE SET
+                state = excluded.state,
+                reason = excluded.reason,
+                set_by = excluded.set_by,
+                set_at = excluded.set_at`.pipe(
+              Effect.mapError(asDatabaseError("transaction")),
+            );
+            yield* appendEvent({
+              kind: "scope.host.labelled",
+              targetId: caller.targetId,
+              callerScope: caller.callerScope,
+              intentId: null,
+              attemptId: null,
+              operation: "set_host_scope_label",
+              operationId: null,
+              subjectId: host,
+              payload: {
+                host,
+                state: input.state,
+                reason: input.reason ?? null,
+              },
+              recordedAt,
+            });
+            return {
+              targetId: caller.targetId,
+              host,
+              state: input.state,
+              reason: input.reason ?? null,
+              setBy: caller.callerScope,
+              setAt: recordedAt,
+            } satisfies HostScopeLabel;
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "SqlError"
+              ? asDatabaseError("transaction")(error)
+              : error,
+          ),
+        );
+    },
+  );
+
+  /**
+   * Clears the label on one host, so the entries decide it again.
+   *
+   * **A delete rather than a stored `cleared` state**, which the design leaves to the
+   * builder. Either satisfies D5 because the event log holds the history regardless, and a
+   * delete is chosen because the two label tables hold *current state*: a `cleared` row
+   * would be a third value for a two-valued column, and every reader would have to know
+   * that it means "ask the entries" rather than "out".
+   */
+  const clearHostScopeLabel = Effect.fn("ObservationStore.clearHostScopeLabel")(
+    function* (caller: HostContext, rawHost: string) {
+      const host = normaliseHost(rawHost);
+      const recordedAt = yield* Clock.currentTimeMillis;
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const existing = yield* selectHostLabels(caller.targetId).pipe(
+              Effect.mapError(lift("host_scope_labels", host)),
+            );
+            if (!existing.some((row) => row.host === host)) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `no hand label on '${host}' for target ${caller.targetId}; nothing was cleared`,
+              });
+            }
+            yield* sql`DELETE FROM host_scope_labels
+                WHERE target_id = ${caller.targetId} AND host = ${host}`.pipe(
+              Effect.mapError(asDatabaseError("transaction")),
+            );
+            yield* appendEvent({
+              kind: "scope.host.label.cleared",
+              targetId: caller.targetId,
+              callerScope: caller.callerScope,
+              intentId: null,
+              attemptId: null,
+              operation: "clear_host_scope_label",
+              operationId: null,
+              subjectId: host,
+              payload: { host },
+              recordedAt,
+            });
+            return { host };
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "SqlError"
+              ? asDatabaseError("transaction")(error)
+              : error,
+          ),
+        );
+    },
+  );
+
+  /**
+   * Sets or replaces the label on one asset.
+   *
+   * Refuses an asset that is not this target's, in the instructive register the anchoring
+   * refusal uses: the foreign key would catch an id that is nothing at all, but it cannot
+   * catch another engagement's asset id, and labelling one of those would be a decision
+   * recorded against the wrong client.
+   */
+  const setAssetScopeLabel = Effect.fn("ObservationStore.setAssetScopeLabel")(
+    function* (
+      caller: HostContext,
+      input: {
+        readonly assetId: string;
+        readonly state: ScopeLabelState;
+        readonly reason?: string | null;
+      },
+    ) {
+      const recordedAt = yield* Clock.currentTimeMillis;
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const asset = yield* findAssetForLabel(input.assetId).pipe(
+              Effect.mapError(lift("assets", input.assetId)),
+            );
+            if (
+              Option.isNone(asset) ||
+              asset.value.target_id !== caller.targetId
+            ) {
+              return yield* new MutationError({
+                reason: "invalid",
+                detail: `asset '${input.assetId}' is not an asset of target ${caller.targetId}, so no label was set`,
+              });
+            }
+            yield* sql`INSERT INTO asset_scope_labels (
+                asset_id, state, reason, set_by, set_at
+              ) VALUES (
+                ${input.assetId}, ${input.state}, ${input.reason ?? null},
+                ${caller.callerScope}, ${recordedAt}
+              )
+              ON CONFLICT(asset_id) DO UPDATE SET
+                state = excluded.state,
+                reason = excluded.reason,
+                set_by = excluded.set_by,
+                set_at = excluded.set_at`.pipe(
+              Effect.mapError(asDatabaseError("transaction")),
+            );
+            yield* appendEvent({
+              kind: "scope.asset.labelled",
+              targetId: caller.targetId,
+              callerScope: caller.callerScope,
+              intentId: null,
+              attemptId: null,
+              operation: "set_asset_scope_label",
+              operationId: null,
+              subjectId: input.assetId,
+              payload: {
+                assetId: input.assetId,
+                identity: asset.value.identity,
+                state: input.state,
+                reason: input.reason ?? null,
+              },
+              recordedAt,
+            });
+            return {
+              assetId: input.assetId,
+              state: input.state,
+              reason: input.reason ?? null,
+              setBy: caller.callerScope,
+              setAt: recordedAt,
+            } satisfies AssetScopeLabel;
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "SqlError"
+              ? asDatabaseError("transaction")(error)
+              : error,
+          ),
+        );
+    },
+  );
+
+  /** Clears the label on one asset, so its host's label or the entries decide it again. */
+  const clearAssetScopeLabel = Effect.fn(
+    "ObservationStore.clearAssetScopeLabel",
+  )(function* (caller: HostContext, assetId: string) {
+    const recordedAt = yield* Clock.currentTimeMillis;
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const asset = yield* findAssetForLabel(assetId).pipe(
+            Effect.mapError(lift("assets", assetId)),
+          );
+          if (
+            Option.isNone(asset) ||
+            asset.value.target_id !== caller.targetId
+          ) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `asset '${assetId}' is not an asset of target ${caller.targetId}; nothing was cleared`,
+            });
+          }
+          const labels = yield* selectAssetLabels(caller.targetId).pipe(
+            Effect.mapError(lift("asset_scope_labels", assetId)),
+          );
+          if (!labels.some((row) => row.asset_id === assetId)) {
+            return yield* new MutationError({
+              reason: "invalid",
+              detail: `no hand label on asset '${assetId}'; nothing was cleared`,
+            });
+          }
+          yield* sql`DELETE FROM asset_scope_labels
+              WHERE asset_id = ${assetId}`.pipe(
+            Effect.mapError(asDatabaseError("transaction")),
+          );
+          yield* appendEvent({
+            kind: "scope.asset.label.cleared",
+            targetId: caller.targetId,
+            callerScope: caller.callerScope,
+            intentId: null,
+            attemptId: null,
+            operation: "clear_asset_scope_label",
+            operationId: null,
+            subjectId: assetId,
+            payload: { assetId },
+            recordedAt,
+          });
+          return { assetId };
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "SqlError"
+            ? asDatabaseError("transaction")(error)
+            : error,
+        ),
+      );
+  });
+
   const CountsRow = Schema.Struct({
     goals: Schema.Int,
     intents: Schema.Int,
@@ -6509,6 +7265,15 @@ const makeStore = Effect.fnUntraced(function* () {
     anchorsForIntent,
     assets,
     assetsWithProvenance,
+    assetsWithScope,
+    targetScope,
+    scopeStateOfHost,
+    addScopeEntry,
+    removeScopeEntry,
+    setHostScopeLabel,
+    clearHostScopeLabel,
+    setAssetScopeLabel,
+    clearAssetScopeLabel,
     discoveriesOfAsset,
     settleAttempt,
     bindSessionToAttempt,
@@ -6749,6 +7514,98 @@ export class ObservationStore extends Context.Service<
     readonly assetsWithProvenance: () => Effect.Effect<
       readonly StoredAssetWithProvenance[],
       DatabaseError | StoredRowError
+    >;
+    /**
+     * Every asset with its effective scope state: the D5 ladder, in one read.
+     *
+     * The only read that answers "is this in scope", and no caller should assemble the
+     * ladder from the parts. A second implementation of it is the anti-goal about two
+     * code paths that can disagree.
+     */
+    readonly assetsWithScope: (targetId: string) => Effect.Effect<
+      readonly {
+        readonly asset: StoredAssetWithProvenance;
+        readonly scope: ScopeState;
+      }[],
+      DatabaseError | StoredRowError
+    >;
+    /** One target's entries and both label sets, for the prompt block and the view. */
+    readonly targetScope: (targetId: string) => Effect.Effect<
+      {
+        readonly entries: readonly ScopeEntry[];
+        readonly hostLabels: readonly HostScopeLabel[];
+        readonly assetLabels: readonly AssetScopeLabel[];
+      },
+      DatabaseError | StoredRowError
+    >;
+    /** One host's or address's effective state, where there is no asset row for it. */
+    readonly scopeStateOfHost: (
+      targetId: string,
+      host: string,
+    ) => Effect.Effect<ScopeState, DatabaseError | StoredRowError>;
+    /**
+     * Adds one entry, idempotently, or refuses it.
+     *
+     * `invalid` is a normalisation refusal and `conflict` is D2's direct contradiction.
+     * An entry that already exists returns `created: false` and writes nothing.
+     */
+    readonly addScopeEntry: (
+      caller: HostContext,
+      input: {
+        readonly effect: ScopeEffect;
+        readonly kind: ScopeKind;
+        readonly value: string;
+        readonly source: ScopeEntrySource;
+        readonly note?: string | null;
+      },
+    ) => Effect.Effect<
+      { readonly entry: ScopeEntry; readonly created: boolean },
+      MutationError | DatabaseError | StoredRowError
+    >;
+    readonly removeScopeEntry: (
+      caller: HostContext,
+      entryId: string,
+    ) => Effect.Effect<
+      ScopeEntry,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /** Sets or replaces one host's label. Covers every asset on it, now and later. */
+    readonly setHostScopeLabel: (
+      caller: HostContext,
+      input: {
+        readonly host: string;
+        readonly state: ScopeLabelState;
+        readonly reason?: string | null;
+      },
+    ) => Effect.Effect<
+      HostScopeLabel,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    readonly clearHostScopeLabel: (
+      caller: HostContext,
+      host: string,
+    ) => Effect.Effect<
+      { readonly host: string },
+      MutationError | DatabaseError | StoredRowError
+    >;
+    /** Sets or replaces one asset's label, which beats its host's. */
+    readonly setAssetScopeLabel: (
+      caller: HostContext,
+      input: {
+        readonly assetId: string;
+        readonly state: ScopeLabelState;
+        readonly reason?: string | null;
+      },
+    ) => Effect.Effect<
+      AssetScopeLabel,
+      MutationError | DatabaseError | StoredRowError
+    >;
+    readonly clearAssetScopeLabel: (
+      caller: HostContext,
+      assetId: string,
+    ) => Effect.Effect<
+      { readonly assetId: string },
+      MutationError | DatabaseError | StoredRowError
     >;
     readonly discoveriesOfAsset: (
       assetId: string,

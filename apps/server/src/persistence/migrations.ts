@@ -1251,6 +1251,123 @@ const addGoalSessions = statements(
 );
 
 /**
+ * `0022` — a target carries a structured scope, and the operator's labels over it.
+ *
+ * A target used to carry one free-text `scope_note` that **nothing read**: `fleet.ts`
+ * stored it, `NewTarget.svelte` rendered it, and no code path consulted it. It was a note
+ * one human wrote for another. These three tables are what replaces it as the
+ * machine-readable answer to "what is this client's estate", and they do two jobs: they
+ * are what the agent is told it may test, and they are the frame the discovered estate is
+ * displayed in. `scope_note` stays in the registry, unchanged, as the target card's human
+ * description; it simply stops being presented as something a machine reads.
+ *
+ * **Here and not in `controlMigrations.ts`.** Entries describe one target's client estate
+ * and are read on the same paths as that target's assets, so keeping them in
+ * `targets/<id>/hunt.sqlite` means one store, one connection and one read to answer "what
+ * is the scope here". It also keeps §3's deletion property intact: removing a target is
+ * still `rm -rf targets/<id>/`, with no scope rows orphaned in the registry.
+ *
+ * ## `scope_entries` — two axes, and `UNIQUE` on all three identifying columns
+ *
+ * `effect` crossed with `kind` is six combinations, and the three-way kind split is the
+ * point: an entry reading `acme.com` that silently means "and every subdomain" is the
+ * misread the whole model exists to prevent, so the reach is a column rather than a
+ * convention. `value` is stored **normalised** — `normaliseScopeEntry` runs on write — so
+ * the stored form is the matched form and no read has to normalise anything.
+ *
+ * The unique index makes authoring idempotent: adding an entry that already exists is a
+ * no-op rather than a duplicate row the matcher would evaluate twice. It is **per
+ * effect**, which is deliberate and is why the store also refuses a direct contradiction
+ * at the write boundary: this constraint would otherwise permit `in`/`host`/`blog.acme.com`
+ * beside `out`/`host`/`blog.acme.com`. The matcher handles that pair fine — out wins — but
+ * the screen cannot show it coherently and an operator who authored both did not mean to.
+ * That check needs a read of the opposite effect, so it is a transaction rule rather than
+ * a constraint.
+ *
+ * `source` is what makes the operator's review a real step rather than a wish. An imported
+ * entry and a typed one are identical to the matcher and must be distinguishable on
+ * screen, because "read this list before you start" only means something if the rows that
+ * need reading are the ones a machine wrote. There is no `agent` source and there will not
+ * be one: no agent that tests may write an entry.
+ *
+ * ## Two label tables, because an exclusion has to reach differently in each case
+ *
+ * `host_scope_labels` is keyed `(target_id, host)` and therefore covers **every asset on
+ * that host, present and future.** That closes a real hole: with labels keyed only by
+ * asset, excluding `legacy.acme.com` today would mark that one row, and
+ * `legacy.acme.com/login` found tomorrow would be a different row with no label, would
+ * derive from the entries, and would come back in scope. The operator's exclusion would
+ * silently fail to cover the thing they meant by it. Keying on the host is what makes an
+ * exclusion mean what it says.
+ *
+ * `asset_scope_labels` is keyed by asset and beats its host's label for that one row, so a
+ * single endpoint can be excluded without excluding its host, or kept while its host is
+ * excluded. Specificity inside the label layer is fine: every row in both tables is an
+ * explicit act by the same person, and the more specific act is the later, narrower
+ * decision.
+ *
+ * **Both hold current state, not history.** Every set and clear writes to the event log
+ * from `0012`, which is append-only and is where the history lives. That follows this
+ * codebase's existing split rather than inventing two more append-only tables, and it is
+ * what lets a clear be a plain `DELETE`.
+ *
+ * ## What the `CHECK`s are for, and what they cannot do
+ *
+ * The three enumerations are checked in the database, so "effect is in or out" is a
+ * constraint a confused handler cannot get round rather than a property of the statements
+ * we happen to have written — the same argument `0012` makes for its immutability
+ * triggers. What a `CHECK` cannot express is the contradiction rule, which needs a second
+ * row, and the normalisation rule, which needs the normaliser.
+ *
+ * **No foreign key from `host_scope_labels.host` to anything**, and that is required
+ * rather than an oversight: the operator must be able to exclude a host *before* anything
+ * on it has been discovered, and a host is not a row in this schema in the first place. An
+ * `asset_scope_labels` row does reference `assets(id)`, because an asset label is about a
+ * row that necessarily exists.
+ *
+ * Indexes: `scope_entries` is read whole, per target, on every derivation, so it is
+ * indexed by `target_id`. The label tables are read by their primary keys and by target,
+ * and `host_scope_labels`' primary key already leads with `target_id`.
+ */
+const addTargetScope = statements(
+  `CREATE TABLE scope_entries (
+    id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    effect TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    source TEXT NOT NULL,
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (target_id, effect, kind, value),
+    CHECK (effect IN ('in', 'out')),
+    CHECK (kind IN ('subtree', 'host', 'cidr')),
+    CHECK (source IN ('operator', 'imported')),
+    CHECK (length(value) > 0)
+  )`,
+  `CREATE INDEX scope_entries_target_idx ON scope_entries(target_id)`,
+  `CREATE TABLE host_scope_labels (
+    target_id TEXT NOT NULL,
+    host TEXT NOT NULL,
+    state TEXT NOT NULL,
+    reason TEXT,
+    set_by TEXT NOT NULL,
+    set_at INTEGER NOT NULL,
+    PRIMARY KEY (target_id, host),
+    CHECK (state IN ('in', 'out')),
+    CHECK (length(host) > 0)
+  )`,
+  `CREATE TABLE asset_scope_labels (
+    asset_id TEXT PRIMARY KEY REFERENCES assets(id),
+    state TEXT NOT NULL,
+    reason TEXT,
+    set_by TEXT NOT NULL,
+    set_at INTEGER NOT NULL,
+    CHECK (state IN ('in', 'out'))
+  )`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1289,6 +1406,7 @@ export const MIGRATIONS: Record<
   "0019_planner_lineage_by_goal": keyPlannerLineageByGoal,
   "0020_round_disposition_rationale": addRoundDispositionRationale,
   "0021_goal_sessions": addGoalSessions,
+  "0022_target_scope": addTargetScope,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

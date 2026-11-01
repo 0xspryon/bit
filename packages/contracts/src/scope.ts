@@ -729,3 +729,41 @@ export const describeScopeLabel = (
   by._tag === "hostLabel"
     ? `${by.label.host} (set by hand: every asset on that host, now and later)`
     : "this asset alone (set by hand)";
+
+/**
+ * One subject's verdict as a sentence, naming what decided it.
+ *
+ * The three `out` cases are three different sentences and that is the point: "excluded on
+ * purpose", "excluded by hand" and "covered by nothing" lead an operator to three
+ * different next actions, and an agent reading the third as the first would stop recording
+ * the discoveries that matter most.
+ *
+ * Used by `record_asset`'s result — so a worker is told on the write, not never — and by
+ * the estate view's per-row explanation. One sentence, so the tool and the screen cannot
+ * describe the same row differently.
+ */
+export const describeScopeState = (state: ScopeState): string => {
+  const overridden =
+    state.overrode === null
+      ? ""
+      : `, overriding ${describeScopeEntry(state.overrode)}`;
+  switch (state.by._tag) {
+    case "entry":
+      return state.state === "in"
+        ? `in scope: ${describeScopeEntry(state.by.entry)}`
+        : `explicitly out of scope: ${describeScopeEntry(state.by.entry)}`;
+    case "hostLabel":
+      return state.state === "in"
+        ? `in scope, set by hand on ${state.by.label.host}${overridden}`
+        : `excluded by hand on ${state.by.label.host}${overridden}`;
+    case "assetLabel":
+      return state.state === "in"
+        ? `in scope, set by hand on this asset alone${overridden}`
+        : `excluded by hand on this asset alone${overridden}`;
+    case "default":
+      // Not "denied", and the wording is load-bearing for an agent reading it on a write:
+      // the asset was recorded, and nothing covering it yet is a fact about the scope
+      // rather than about the discovery.
+      return "not covered by any in-scope entry; recorded for the operator to review";
+  }
+};

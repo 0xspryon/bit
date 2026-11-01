@@ -154,6 +154,7 @@ export const newAttemptId = (): string => prefixed("att");
 export const newRoundId = (): string => prefixed("rnd");
 export const newDimensionId = (): string => prefixed("dim");
 export const newAssetId = (): string => prefixed("asset");
+export const newScopeEntryId = (): string => prefixed("scope");
 
 /**
  * Resets the process-local clock and counter.
