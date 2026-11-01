@@ -468,7 +468,10 @@
             {@const rows = scope.entries.filter(
               (entry) => entry.effect === section.effect,
             )}
-            <div class="list">
+            <div
+              class={["list", rows.length === 0 && "none"]}
+              style:--rows={Math.min(rows.length, 2)}
+            >
               <div class="list-head">
                 <span class="list-label">{section.heading}</span>
                 <span class="mono list-count"
@@ -513,7 +516,13 @@
           {/each}
 
           {#if scope.hostLabels.length > 0 || scope.assetLabels.length > 0}
-            <div class="list">
+            <div
+              class="list by-hand"
+              style:--rows={Math.min(
+                scope.hostLabels.length + scope.assetLabels.length,
+                2,
+              )}
+            >
               <div class="list-head">
                 <span class="list-label">Set by hand</span>
                 <span class="mono list-count"
@@ -1019,14 +1028,48 @@
     gap: 22px;
     min-height: 0;
   }
+  /*
+   * Every list is floored at what it needs to show *itself*: its heading, whatever sits
+   * between the heading and the rows, and up to two rows.
+   *
+   * Shrinking is proportional to length, so without a floor a two-entry list is squeezed
+   * to one row beside a sixteen-entry one. A single number for all three lists was not
+   * enough, because they do not hold the same things: "Set by hand" has a sentence under
+   * its heading, and its rows run to two lines. The parts are named here and the template
+   * says how many rows a list has (`--rows`, 0 to 2) and whether it has a lead (`--lead`),
+   * so the floor follows the content instead of a measurement of one of the lists.
+   *
+   * A list with fewer than two rows is floored at the rows it has, so a one-entry list is
+   * not padded to the height of two.
+   */
   .list {
+    --head: 16px;
+    --gap: 8px;
+    /* One row: 9px of padding above and below an 18px line. */
+    --row: 42px;
+    --row-gap: 2px;
+    --rows: 2;
+    /* Height of what sits between the heading and the rows, with the gap that follows it. */
+    --lead: 0px;
     display: flex;
     flex: 0 1 auto;
     flex-direction: column;
-    gap: 8px;
-    /* Room for a heading and two rows. Shrinking is proportional to length, so without a
-       floor a two-entry list is squeezed to one row beside a sixteen-entry one. */
-    min-height: 112px;
+    gap: var(--gap);
+    min-height: calc(
+      var(--head) + var(--gap) + var(--lead) + var(--rows) * var(--row) +
+        max(var(--rows) - 1, 0) * var(--row-gap)
+    );
+  }
+  /* A row of "Set by hand" is longer than the ones above and wraps to two lines. */
+  .list.by-hand {
+    --row: 54px;
+    /* The 20px sentence, and the gap before the rows. */
+    --lead: 28px;
+  }
+  /* "None." is the whole body of an empty list: a 20px line and its gap, not a row. */
+  .list.none {
+    --rows: 0;
+    --lead: 28px;
   }
   .list-head {
     display: flex;
