@@ -35,8 +35,9 @@ This design gives a target a **structured scope** that does exactly two jobs:
 
 ## Goals
 
-- An operator authors in-scope and out-of-scope entries on a target. One list per
-  target, shared by every goal ever run against it.
+- An operator authors in-scope and out-of-scope entries on a target, or has them
+  imported from the program's own page and then reads them (D13). One list per target,
+  shared by every goal ever run against it.
 - Every discovered asset carries a scope state, either derived from the entries or set
   by hand.
 - The agent is told the scope as part of its prompt, on the paths that act on the
@@ -92,10 +93,18 @@ Ways this fails even if every goal above is met:
   that means "and every subdomain" without saying so is the misread this whole model
   exists to prevent. ars0n keeps one renderer (`RenderScopeRule`) as the single source
   of the sentence every surface shows, for exactly this reason.
-- **Scope widening without an operator action.** No code path may add an in-scope entry
-  on the agent's behalf, and no code path may narrow or delete an out-entry
-  automatically. ScopeWeaver's `add_task_scope` lets the agent widen its own scope with
-  no ceiling, and `DECISIONS.md` §5 names that as the defect.
+- **An agent widening the scope it is being judged against.** ScopeWeaver's
+  `add_task_scope` lets a testing agent widen its own scope with no ceiling, and
+  `DECISIONS.md` §5 names that as the defect. No agent that tests may write an entry or
+  a label, and nothing may narrow or delete an out-entry automatically.
+
+  The scope importer (D13) is not an exception to this, and the difference is
+  structural rather than a matter of intent: it is a different role on a different MCP
+  endpoint, it runs before any goal exists, it cannot test anything, and the operator
+  reads what it wrote before the first goal is created. A worker or planner that could
+  reach its tools would be the defect, which is why they live on one endpoint and
+  nowhere else.
+
 - **An operator's hand label erased by a recompute.** ScopeWeaver guards this with
   `assets.company_source ∈ explicit | scope`, migrating existing rows conservatively as
   `explicit` "so a scope rebuild can never erase a historical manual association".
@@ -194,14 +203,20 @@ scope_entries
   effect       TEXT NOT NULL   -- 'in' | 'out'
   kind         TEXT NOT NULL   -- 'subtree' | 'host' | 'cidr'
   value        TEXT NOT NULL   -- normalised; the apex, the host, or the CIDR
-  note         TEXT
+  source       TEXT NOT NULL   -- 'operator' | 'imported'
+  note         TEXT            -- for an imported entry, where on the page it came from
   created_at   INTEGER NOT NULL
   UNIQUE (target_id, effect, kind, value)
 ```
 
-**An entry is only ever something the operator typed.** Nothing else writes this table
-— not the agent, and not promotion, which writes a label instead (D5, D8). That is why
-there is no `source` column: there is one source.
+**Two writers, and only two.** The operator typing in the Scope tab, and the scope
+importer at target creation (D13). Nothing else: not a worker, not a planner, not the
+goal agent, and not promotion, which writes a label instead (D5, D8).
+
+`source` is what makes the operator's review possible. An imported entry and a typed
+one are identical to the matcher and must be distinguishable on screen, because
+"read this list before you start" is only a real step if the rows that need reading
+are the ones a machine wrote.
 
 Six combinations, and they cover everything the operator described:
 
@@ -582,6 +597,48 @@ honestly later, and it costs one table and one field on an existing tool. Record
 now and reading it later is cheap; retrofitting an evidence edge across a hunt that has
 already run is not, and §3 makes the same argument about the target registry.
 
+### D13 — The scope importer
+
+Creating a target takes one or more bug bounty program URLs. When at least one is
+given, the target is registered and an agent is started whose only job is to read those
+pages and write the program's stated scope into `scope_entries`. It has exactly two
+tools, `add_in_scope_entry` and `add_out_of_scope_entry`, and they exist on its
+endpoint and on no other.
+
+**Why this is allowed when `AddAutoScope` is not.** The forbidden act is an agent
+widening the authorization it is about to be judged against. This agent cannot test
+anything, has no `record_asset`, no `add_intent` and no attempt behind it, and finishes
+before any goal exists. It is transcription from a document the operator chose, into a
+list the operator then reads.
+
+**The operator's review is the control, and it rests on one property of the system:
+creating a target starts no work.** `createTarget` (`http/browserApi.ts:847`) registers
+the row and returns — no goal, no run, no agent. Hunting begins only when the operator
+creates a goal, which is a separate action. So there is a real gap between import and
+first execution, and the operator's verification sits in it.
+
+> **This property is now load-bearing.** Anything that later starts work as part of
+> creating a target — a default goal, an auto-run, a "start hunting" affordance on the
+> creation screen — removes the only thing standing between a scraped page and a live
+> hunt. If that is ever wanted, the review has to become an explicit confirmation step
+> first.
+
+**The pages are untrusted input.** Program scope on HackerOne or Bugcrowd is authored
+by the program and rendered among other user-influenced content, and this agent is an
+LLM reading it and writing to the authorization boundary. That is a prompt-injection
+path whose payoff is an entry naming someone else's domain, and whose damage is legal
+rather than technical. Three things contain it, and none of them is the model's
+judgement: the importer can only write entries and can do nothing else; every entry it
+writes carries `source = 'imported'` and the note of where on the page it came from; and
+the operator reads the list before the first goal. Treat the page content as data in the
+prompt, never as instruction, and say so in the importer's own framing.
+
+Open until the creation screen lands: what the screen shows when a fetch fails or a page
+yields no parseable scope; whether several links are one session or one each, and
+whether one failing link fails the import; and which harness and model the importer runs
+on, which should be chosen for short structured extraction rather than inherited from
+whatever the hunt's workers use.
+
 ## Build order
 
 Each slice ends with the gates green: `typecheck`, `test`, `test:persistence`, `build`,
@@ -596,12 +653,15 @@ Each slice ends with the gates green: `typecheck`, `test`, `test:persistence`, `
 | 5   | The prompt block, one renderer, both act-on-target paths                             | A planner round and a worker attempt both receive the block; the planner's omits the `record_asset` line; a target with nothing in scope receives no block at all; a label that overrode an entry is listed once, under the label's effect; the briefing's bytes are unchanged; `roundPromptOverhead` accounts for it                                   |
 | 6   | The scope query tool on the goal endpoint                                            | The goal agent answers "is `x` in scope" naming what decided it — entry, host label or asset label — and reflects an edit made seconds earlier                                                                                                                                                                                                          |
 | 7   | Migration `0023_observation_assets` + `record_observation` takes asset ids           | An observation records the assets it tested, in its own transaction; an id belonging to another target is refused instructively; the store answers "which assets have evidence against them" from the edge, not from a join through the discovering intent; `test:persistence` green                                                                    |
-| 8   | The scope view                                                                       | Two lists authored by hand; discovered assets with their state and what decided it; promote and exclude on any row, as one control with two directions, offering the host or the single asset; a row whose label overrode an entry says which entry it beat                                                                                             |
+| 8   | The scope view                                                                       | Two lists authored by hand; discovered assets with their state and what decided it; promote and exclude on any row, as one control with two directions, offering the host or the single asset; a row whose label overrode an entry says which entry it beat; imported entries are visibly imported                                                      |
+| 9   | The scope importer and the new create-target screen                                  | Creating a target with one or more program URLs registers it and runs the importer; its two tools exist on its endpoint only and a worker offered them fails the test; every written entry carries `source = 'imported'` and where it came from; a failed fetch leaves a usable target and says what happened; no goal is started by any of it          |
 
 Slices 1 and 2 are independently useful and can ship alone. Slices 3–6 are the scope
 itself. Slice 7 is independent of all of them and could move earlier — it is recorded
 here because it is the one thing a later graph cannot be built honestly without, not
-because the scope needs it. Slice 8 is what the operator actually asked to see.
+because the scope needs it. Slice 8 is what the operator actually asked to see. Slice 9
+is how a real engagement's scope gets in without being typed by hand, and it depends on
+3 and 4 for the entries and on 8 for the screen the operator reviews them on.
 
 ## Calls made for you
 
