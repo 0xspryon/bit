@@ -128,11 +128,20 @@
       bind:value={app.dialogName}
       disabled={app.createState === "creating"}
     />
+    <!--
+      A note for people, and presented as one.
+
+      It used to read `Scope` with the placeholder `*.example.test`, which promised a
+      machine-readable pattern: nothing has ever parsed this field, and the structured
+      scope that the agent *is* told about lives on the target's own Scope tab, typed per
+      entry with what each one covers spelled out. A field shaped like a wildcard rule is
+      how an operator comes to believe they have authored a boundary they have not — so it
+      is plainly a description now, and not mono.
+    -->
     <Field
       id="target-scope"
-      label="Scope"
-      mono
-      placeholder="*.example.test"
+      label="Note"
+      placeholder="What this engagement is, in your own words"
       bind:value={app.dialogScope}
       disabled={app.createState === "creating"}
     />

@@ -4203,7 +4203,9 @@ export const scenarios: Scenario[] = [
       a.reset();
       a.screen = "welcome";
       a.openDialog();
-      a.dialogScope = "*.bit.test";
+      // A note for people, like the field: a pattern here would show the prototype
+      // promising something the field has never parsed.
+      a.dialogScope = "The local bit fixture, and nothing else.";
     },
   },
   {
