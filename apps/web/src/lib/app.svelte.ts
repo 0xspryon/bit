@@ -149,16 +149,24 @@ export type ConnectError = "none" | "password" | "unreachable" | "expired";
 /**
  * What the create-target form is showing, which is mostly which refusal.
  *
- * `unusable` is its own state rather than part of `denied`, and the difference is what the
- * operator should do next. `denied` is "this folder cannot be read" — a permission or a
- * name the server will not take, and granting access and retrying is a real answer.
- * `unusable` is the server saying the folder *can* be read and still cannot host a target,
- * because it contains the server's own fleet root: every planner, goal and import session
- * on such a target would be refused. Retrying cannot help, so the screen must not suggest
- * it.
+ * Every refusal is its own state, and the states differ by what the operator must change.
+ * `denied` is "this folder cannot be read": a permission, or a path the server will not
+ * take, where granting access and choosing it again is a real answer. `unusable` is the
+ * server saying the folder *can* be read and still cannot host a target, because it holds
+ * the directory the target's own data would live in; every planner, goal and import session
+ * on such a target would be refused, so retrying cannot help and the screen must not
+ * suggest it. `invalid-name` is about the **name**, and it used to land on `denied` — which
+ * told an operator who typed `###` three things about their folder, none of which was the
+ * problem, and disabled the button that would have let them fix it.
  */
 export type CreateState =
-  "idle" | "creating" | "failed" | "duplicate" | "denied" | "unusable";
+  | "idle"
+  | "creating"
+  | "failed"
+  | "duplicate"
+  | "denied"
+  | "unusable"
+  | "invalid-name";
 /**
  * What the goals list knows about the target it is showing.
  *
@@ -1318,7 +1326,41 @@ export class App {
   dialogPathError = $state("");
   dialogBusy = $state(false);
   dialogChosen = $state("");
-  dialogName = $state("");
+  /**
+   * The row the folder picker has selected, which is **not** yet the form's folder.
+   *
+   * It used to be the same field, and that is what made the picker's only exit a dead
+   * end: a stale selection outlived the listing it was made in, so typing a new path and
+   * submitting it left `dialogChosen` on the old folder, "Use this folder" handed back
+   * that old folder — the one the refusal was about — and nothing reset the refusal. Two
+   * paths were on screen, the selected one and the one being listed, and the button took
+   * the one the operator had moved away from.
+   *
+   * Held apart, the picker is free to drop a selection the moment the listing moves (see
+   * {@link App.prototype.browseTo}) without Cancel losing the folder the form already
+   * had. Only {@link App.prototype.useChosenFolder} promotes it.
+   */
+  dialogSelection = $state("");
+  #dialogName = $state("");
+  /**
+   * The target's name, as typed.
+   *
+   * An accessor rather than a plain field so that editing it clears the server's refusal
+   * *of this string*. Without that, an operator who typed `###`, was told the name could
+   * not be used and then corrected it was left reading a refusal about a name that was no
+   * longer on screen.
+   */
+  get dialogName(): string {
+    return this.#dialogName;
+  }
+  set dialogName(name: string) {
+    if (name === this.#dialogName) return;
+    this.#dialogName = name;
+    if (this.createState === "invalid-name") {
+      this.createState = "idle";
+      this.createDetail = "";
+    }
+  }
   dialogScope = $state("");
   createState = $state<CreateState>("idle");
   /** The server's own words for whichever create state is showing. */
@@ -3310,6 +3352,7 @@ export class App {
     this.screen = "new-target";
     this.newTargetPhase = "form";
     this.dialogChosen = "";
+    this.dialogSelection = "";
     this.dialogName = "";
     this.dialogScope = "";
     this.dialogPathError = "";
@@ -3351,6 +3394,9 @@ export class App {
   /** Opens the folder browser, which is the only modal A3 keeps. */
   openFolderPicker() {
     this.folderPickerOpen = true;
+    // Seeded with the folder the form already has, and the listing below lands on it, so
+    // the picker opens showing one path rather than two.
+    this.dialogSelection = this.dialogChosen;
     void this.browseTo(
       this.dialogChosen !== ""
         ? this.dialogChosen
@@ -3368,8 +3414,25 @@ export class App {
    * every other field as they left it.
    */
   useChosenFolder() {
-    if (this.dialogChosen === "") this.chooseFolder(this.dialogPath);
+    // Always through `chooseFolder`, because that is the only thing that clears a refusal
+    // — and this button is the only way out the refusal offers. It used to call it only
+    // when nothing had been selected yet, so an operator who typed a path into the picker
+    // landed back on a form still showing the old folder, still showing the refusal, with
+    // Create still disabled and no other exit on screen.
+    this.chooseFolder(
+      this.dialogSelection !== "" ? this.dialogSelection : this.dialogPath,
+    );
     this.folderPickerOpen = false;
+  }
+
+  /**
+   * Selects a row in the picker without committing it to the form.
+   *
+   * The commit is "Use this folder", and keeping the two apart is what lets Cancel mean
+   * cancel: a selection made and then abandoned leaves the form's folder alone.
+   */
+  selectFolder(path: string) {
+    this.dialogSelection = path;
   }
 
   /* ── Program links ────────────────────────────────────────────────────────── */
@@ -3480,6 +3543,11 @@ export class App {
         this.dialogRoot = call.value.root;
         this.dialogPath = call.value.path;
         this.dialogParent = call.value.parent;
+        // A selection older than the listing does not survive it. Navigating or typing a
+        // path is the more recent statement of intent, and leaving the old row selected is
+        // what put two paths on screen with the button taking the stale one. Harmless to
+        // drop, because this is the picker's own selection and not the form's folder.
+        if (this.dialogSelection !== call.value.path) this.dialogSelection = "";
         this.dialogEntries = call.value.entries.map((entry) => ({
           name: entry.name,
           path: entry.path,
@@ -3491,6 +3559,9 @@ export class App {
         return;
       }
       const error = call.error;
+      // Dropped here too: a listing that was refused is still not the selected folder, so
+      // the selection is older than what the tree is showing.
+      if (this.dialogSelection !== this.dialogPath) this.dialogSelection = "";
       this.dialogPathError =
         "detail" in error && typeof error.detail === "string"
           ? error.detail
@@ -3509,6 +3580,10 @@ export class App {
    * was how the prototype did it and it would be wrong the moment two tabs were open.
    */
   chooseFolder(path: string) {
+    // The same folder again is not a change: it must not re-propose a name the operator
+    // has since edited, and it must not wipe a refusal that is still true of this folder.
+    // "Use this folder" on the folder already in the form is a confirmation, not an edit.
+    if (path === this.dialogChosen) return;
     this.dialogChosen = path;
     this.dialogName = path.split("/").filter(Boolean).pop() ?? "";
     this.createState = "idle";
@@ -3597,10 +3672,22 @@ export class App {
           this.duplicateOf = refused.targetId;
           return;
         }
+        /*
+         * `invalid_name` is about the name and says so.
+         *
+         * It landed on `denied` — "that folder cannot be used", with three sentences about
+         * the folder and the one about the name buried among them, and Create disabled, so
+         * the one field that could fix it was the one field whose correction changed
+         * nothing. An unknown reason still lands on `denied`, which is the right default
+         * (`duplicate` offered an Open button for an id nobody registered), and that state
+         * now carries a way out of its own.
+         */
         this.createState =
           refused.reason === "workspace_contains_fleet_root"
             ? "unusable"
-            : "denied";
+            : refused.reason === "invalid_name"
+              ? "invalid-name"
+              : "denied";
         this.duplicateOf = "";
         return;
       }
@@ -4879,7 +4966,23 @@ export const scenarios: Scenario[] = [
       a.dialogChosen = a.dialogRoot;
       a.dialogName = "bit-demo";
       a.createState = "unusable";
-      a.createDetail = `${a.dialogRoot} contains this server's fleet root ${a.dialogRoot}/.runtime/hunt, so this target's own directory ${a.dialogRoot}/.runtime/hunt/targets/bit-demo would sit inside the folder where its workers run. Every planner, goal and import session runs in a directory under that one and the policy gate refuses to install into any of them, so the target could be created and then do nothing. Pick a folder outside ${a.dialogRoot}/.runtime/hunt, or restart this server with HUNT_ROOT set outside the folder you want to use`;
+      // The server's sentence, verbatim: a prototype state showing wording the server no
+      // longer sends is a state nobody can review.
+      a.createDetail = `${a.dialogRoot} is ${a.dialogRoot}/.runtime/hunt/targets/bit-demo — the directory this server would record this target in — or one of the folders above it, so that directory would sit inside the very folder where this target's workers run. Every planner, goal and import session runs in a directory under ${a.dialogRoot}/.runtime/hunt/targets/bit-demo, and the policy gate refuses to install into one that sits inside the workspace, so the target could be created and then do nothing. Pick a folder that is neither ${a.dialogRoot}/.runtime/hunt/targets/bit-demo nor one of the folders above it — a folder elsewhere inside ${a.dialogRoot}/.runtime/hunt, such as ${a.dialogRoot}/.runtime/hunt/workspaces/bit-demo, is fine — or restart this server with HUNT_ROOT set outside the folder you want to use`;
+    },
+  },
+  {
+    id: "new-invalid-name",
+    group: "A3 New target",
+    label: "Name the server will not take",
+    apply: (a) => {
+      a.reset();
+      a.openNewTarget();
+      a.dialogChosen = `${a.dialogRoot}/example`;
+      a.dialogName = "###";
+      a.createState = "invalid-name";
+      a.createDetail =
+        "A target's name becomes a directory name: it needs at least one letter or digit, and only a-z, 0-9, '-' and '_' are kept";
     },
   },
   {

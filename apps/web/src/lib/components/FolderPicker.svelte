@@ -34,9 +34,16 @@
     pathDraft = app.dialogPath;
   });
 
-  /** What "Use this folder" would hand back: the chosen row, else the folder on screen. */
+  /**
+   * What "Use this folder" would hand back: the selected row, else the folder on screen.
+   *
+   * `dialogSelection` and not `dialogChosen`: the form's folder is not this modal's
+   * selection, and reading it here is what left the button handing back a folder the
+   * operator had navigated away from — with the refusal about that folder still on the
+   * form behind it.
+   */
   let resolved = $derived(
-    app.dialogChosen !== "" ? app.dialogChosen : app.dialogPath,
+    app.dialogSelection !== "" ? app.dialogSelection : app.dialogPath,
   );
 </script>
 
@@ -54,7 +61,7 @@
     >
       <Field
         id="folder-path"
-        label="Path"
+        label="Browsing"
         mono
         bind:value={pathDraft}
         error={app.dialogPathError}
@@ -73,11 +80,11 @@
       {/if}
       {#each app.dialogEntries as entry (entry.path)}
         <button
-          class={["node", app.dialogChosen === entry.path && "chosen"]}
-          onclick={() => app.chooseFolder(entry.path)}
+          class={["node", app.dialogSelection === entry.path && "chosen"]}
+          onclick={() => app.selectFolder(entry.path)}
           ondblclick={() => void app.browseTo(entry.path)}
           role="option"
-          aria-selected={app.dialogChosen === entry.path}
+          aria-selected={app.dialogSelection === entry.path}
         >
           <span class="arrow"><IconAngleRight width="10" height="10" /></span>
           <span class="arrow"><IconFolder width="12" height="12" /></span>
@@ -89,10 +96,19 @@
       {/if}
     </div>
 
-    <!-- It confirms the chosen path in words, which A3 asks for and which is the only
-         thing standing between a double-click that navigated and one that selected. -->
-    <p class="resolved mono">
-      {resolved === "" ? "No folder chosen" : resolved}
+    <!--
+      It confirms the chosen path in words, which A3 asks for and which is the only thing
+      standing between a double-click that navigated and one that selected.
+
+      Labelled, because it is the second path on screen: the field above is the folder
+      being *listed* and this is the folder that would be *used*. Unlabelled, the two were
+      indistinguishable, which is how an operator came to type a new path and press a
+      button that handed back the old one.
+    -->
+    <p class="resolved">
+      <span class="resolved-label">Use</span>
+      <span class="mono">{resolved === "" ? "No folder chosen" : resolved}</span
+      >
     </p>
   {/snippet}
 
@@ -154,6 +170,12 @@
     padding: 8px;
     font-size: 12px;
     color: var(--text-faint);
+  }
+  .resolved-label {
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 10px;
   }
   .resolved {
     margin: -8px 0 0;

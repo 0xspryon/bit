@@ -41,6 +41,7 @@ import {
   AT,
   FakeServer,
   attemptTranscript,
+  folderListing,
   goalBriefingView,
   goalConversationView,
   goalNarrationView,
@@ -455,7 +456,15 @@ describe("new target", () => {
     expect(app.targets).toEqual([]);
   });
 
-  test("a name the server will not take is denied, not a duplicate", async () => {
+  /**
+   * A problem with the name is a problem with the name.
+   *
+   * It used to land on `denied` — "that folder cannot be used", three sentences about the
+   * folder for a fault in a different field — and `denied` disables Create, so correcting
+   * the name changed nothing the operator could see or press. Both halves are asserted:
+   * which state it is, and that editing the name leaves the form usable again.
+   */
+  test("a name the server will not take is a name refusal, and editing the name clears it", async () => {
     const { app, fake } = open();
     fake.onCreateTarget = () =>
       refused(
@@ -469,8 +478,115 @@ describe("new target", () => {
     await choose(app, "/work/odd name");
     await app.createTarget();
 
-    expect(app.createState).toBe("denied");
+    expect(app.createState).toBe("invalid-name");
     expect(app.duplicateOf).toBe("");
+
+    // The field that fixes it is on screen, and touching it withdraws a refusal that was
+    // about the string it no longer holds.
+    app.dialogName = "odd-name";
+    expect(app.createState).toBe("idle");
+    expect(app.createDetail).toBe("");
+  });
+
+  /**
+   * The exit the refusal offers, walked.
+   *
+   * "Choose another folder" opens the picker; the picker's Path field is a form that
+   * navigates on submit; "Use this folder" closes it. Every one of those steps worked and
+   * the sequence did not: the picker handed back the folder selected *before* the
+   * navigation, which was the refused one, so the form came back unchanged with the
+   * refusal still on it and Create still disabled. This drives the sequence rather than
+   * asserting the states, because each state was already correct on its own.
+   */
+  test("typing a path in the picker and using it recovers from a refusal", async () => {
+    const { app, fake } = open();
+    fake.onCreateTarget = () =>
+      refused(
+        new TargetRefused({
+          reason: "workspace_contains_fleet_root",
+          targetId: "work",
+          detail: "/work is /work/.runtime/hunt/targets/work or above it",
+        }),
+      );
+
+    await choose(app, "/work");
+    await app.createTarget();
+    expect(app.createState).toBe("unusable");
+
+    app.openFolderPicker();
+    await settle();
+    // What the Path field does on submit, with the server answering about the folder asked
+    // for — and not about the one the form is holding.
+    fake.onFolders = () =>
+      ok(
+        folderListing({
+          path: "/work/hunts/acme",
+          parent: "/work/hunts",
+          entries: [],
+        }),
+      );
+    await app.browseTo("/work/hunts/acme");
+    app.useChosenFolder();
+
+    expect(app.folderPickerOpen).toBe(false);
+    expect(app.dialogChosen).toBe("/work/hunts/acme");
+    // The name follows the folder, as it does for a row clicked in the list.
+    expect(app.dialogName).toBe("acme");
+    expect(app.createState).toBe("idle");
+    expect(app.createDetail).toBe("");
+  });
+
+  /**
+   * Cancel means cancel, which is what the picker's own selection buys.
+   *
+   * The selection and the form's folder were one field, so this could not be asked: every
+   * click in the tree edited the form. Now a selection is the modal's, and abandoning it
+   * leaves the folder and the name the operator already had.
+   */
+  /**
+   * Confirming the folder that is already there is not an edit.
+   *
+   * "Use this folder" now always commits, which is what clears a refusal — so it must not
+   * also re-propose a name over one the operator has typed, and must not withdraw a
+   * refusal that is still true of the folder it is about. Both would be new defects
+   * introduced by the fix for the dead end.
+   */
+  test("using the folder the form already has keeps the name and the refusal", async () => {
+    const { app, fake } = open();
+    fake.onCreateTarget = () =>
+      refused(
+        new TargetRefused({
+          reason: "workspace_contains_fleet_root",
+          targetId: "work",
+          detail: "/work is /work/.runtime/hunt/targets/work or above it",
+        }),
+      );
+
+    await choose(app, "/work");
+    app.dialogName = "Acme Corp";
+    await app.createTarget();
+    expect(app.createState).toBe("unusable");
+
+    app.openFolderPicker();
+    await settle();
+    app.useChosenFolder();
+
+    expect(app.dialogName).toBe("Acme Corp");
+    expect(app.createState).toBe("unusable");
+  });
+
+  test("a selection abandoned with Cancel leaves the form's folder alone", async () => {
+    const { app } = open();
+    await choose(app, "/work/acme-corp");
+    app.dialogName = "Acme Corp";
+
+    app.openFolderPicker();
+    await settle();
+    app.selectFolder("/work/elsewhere");
+    app.folderPickerOpen = false;
+
+    expect(app.dialogChosen).toBe("/work/acme-corp");
+    expect(app.dialogName).toBe("Acme Corp");
   });
 
   /**

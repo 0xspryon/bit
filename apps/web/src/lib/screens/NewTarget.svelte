@@ -288,10 +288,41 @@
         </div>
       {/if}
 
+      <!--
+        The folder cannot be read — and a refusal this screen has not heard of.
+
+        It carries a way out of its own now. It did not, and `invalid_name` landed here:
+        an operator who typed `###` was told three things about their folder, none of them
+        the problem, with Create disabled and no button on screen. The name has its own
+        state below; what still lands here is a folder the server may not read and any
+        reason a newer server adds, and neither may leave the operator with nothing to
+        press.
+      -->
       {#if app.createState === "denied"}
         <div class="alert warning" role="alert">
           <strong>That folder cannot be used.</strong>
-          {app.createDetail} Choose another folder, or grant access and try again.
+          {app.createDetail} Grant access to it and choose it again, or pick a different
+          one.
+          <div class="alert-action">
+            <Button size="sm" onclick={() => app.openFolderPicker()}>
+              Choose another folder
+            </Button>
+          </div>
+        </div>
+      {/if}
+
+      <!--
+        The name, reported as the name.
+
+        Create stays enabled here, which is the whole point: the field that fixes this is
+        on screen and editing it clears this state (`App`'s `dialogName` setter), so the
+        operator corrects the name and creates the target. Every other refusal names a
+        folder; this one must not, because nothing about the folder is wrong.
+      -->
+      {#if app.createState === "invalid-name"}
+        <div class="alert warning" role="alert">
+          <strong>That name cannot be used.</strong>
+          {app.createDetail}. Edit the name above and create the target again.
         </div>
       {/if}
 
