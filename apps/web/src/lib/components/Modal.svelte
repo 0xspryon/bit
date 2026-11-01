@@ -16,6 +16,24 @@
 
   let panel = $state<HTMLElement | null>(null);
 
+  /*
+   * Focus goes *into* the dialog when it opens, onto the panel itself and no control.
+   *
+   * Without this, focus stays on whatever opened the dialog — behind the scrim — so Tab
+   * walks the page underneath, and Enter re-activates the opener. Landing on the panel
+   * rather than a button is deliberate: a dialog that focuses its confirm button turns
+   * the Enter that opened it into the Enter that confirms it. The first Tab reaches the
+   * first control. Focus goes back to the opener on close, if it still exists.
+   */
+  $effect(() => {
+    if (panel === null) return;
+    const opener = document.activeElement;
+    if (!panel.contains(opener)) panel.focus();
+    return () => {
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+    };
+  });
+
   function onkeydown(event: KeyboardEvent) {
     if (event.key === "Escape") {
       onclose();
@@ -28,7 +46,10 @@
     const first = focusable[0];
     const last = focusable[focusable.length - 1];
     if (first === undefined || last === undefined) return;
-    if (event.shiftKey && document.activeElement === first) {
+    if (
+      event.shiftKey &&
+      (document.activeElement === first || document.activeElement === panel)
+    ) {
       event.preventDefault();
       last.focus();
     } else if (!event.shiftKey && document.activeElement === last) {
@@ -47,6 +68,7 @@
     role="dialog"
     aria-modal="true"
     aria-label={title}
+    tabindex="-1"
     bind:this={panel}
   >
     <header>
@@ -81,6 +103,10 @@
     background: var(--bg-base);
     box-shadow: var(--elevation-overlay);
     animation: rise var(--dur-panel) var(--ease-panel);
+  }
+  /* A container that is focused so Tab starts inside it, not a control: no ring. */
+  .panel:focus {
+    outline: none;
   }
   header {
     display: flex;

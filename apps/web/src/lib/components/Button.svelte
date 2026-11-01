@@ -7,6 +7,7 @@
     loading = false,
     disabled = false,
     full = false,
+    expanded,
     onclick,
     type = "button",
     children,
@@ -17,6 +18,8 @@
     loading?: boolean;
     disabled?: boolean;
     full?: boolean;
+    /** For a button that opens and closes a panel: reported as `aria-expanded`. */
+    expanded?: boolean;
     onclick?: () => void;
     type?: "button" | "submit";
     children: Snippet;
@@ -26,6 +29,7 @@
 <button
   {type}
   {onclick}
+  aria-expanded={expanded}
   disabled={disabled || loading}
   class={["btn", variant, size, full && "full", loading && "loading"]}
 >
