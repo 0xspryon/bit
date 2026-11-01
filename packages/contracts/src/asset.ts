@@ -17,6 +17,8 @@
  */
 import { Schema } from "effect";
 
+import { ScopeState } from "./scope";
+
 /**
  * The asset kinds this build knows.
  *
@@ -308,5 +310,17 @@ export const AssetView = Schema.Struct({
   firstIntentId: Schema.NullOr(Schema.String),
   /** When it was most recently seen. Not the same fact as {@link firstSeenAt}. */
   lastDiscoveredAt: Schema.NullOr(Schema.Number),
+  /**
+   * Whether this asset is in the client's estate, and what decided it.
+   *
+   * The whole state rather than one word, so the screen can say *why* without a second
+   * query — "excluded on purpose", "excluded by hand" and "covered by nothing" are three
+   * different sentences with three different affordances, and a view that had to ask the
+   * server which one applied is a view that would end up not saying.
+   *
+   * Computed by the server from the one store read that implements the D5 ladder, so a
+   * row's state here cannot disagree with what the agent was told.
+   */
+  scope: ScopeState,
 });
 export type AssetView = typeof AssetView.Type;

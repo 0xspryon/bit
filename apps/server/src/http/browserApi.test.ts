@@ -3839,6 +3839,9 @@ describe("a target's assets", () => {
       firstIntentId: "intent_assets",
       // The latest sighting, which is not the same fact as `firstSeenAt`.
       lastDiscoveredAt: 15,
+      // Nothing is authored on this target yet, so it is out by default — covered by
+      // nothing rather than excluded by anyone, which the view shows as a third state.
+      scope: { state: "out", by: { _tag: "default" }, overrode: null },
     });
 
     const endpoint = assets[1];
@@ -3868,5 +3871,278 @@ describe("a target's assets", () => {
     // fleet group, so an unauthenticated caller never learns what this target holds.
     const response = await call(`/targets/${withRows}/assets`);
     expect(response.status).toBe(401);
+  });
+
+  test("every row carries its scope state, and nothing is filtered by it", async () => {
+    const assets = (await read(await signedIn(`/targets/${withRows}/assets`)))
+      .body["assets"] as ReadonlyArray<Record<string, unknown>>;
+    for (const asset of assets) {
+      const scope = asset["scope"] as Record<string, unknown>;
+      expect(scope).toBeDefined();
+      // Nothing is authored on this target, so every row is out by default — and every
+      // one of them is still here. That is the whole claim: the state is a label on the
+      // row rather than a filter over the list.
+      expect(scope["state"]).toBe("out");
+      expect((scope["by"] as Record<string, unknown>)["_tag"]).toBe("default");
+      expect(scope["overrode"]).toBeNull();
+    }
+    expect(assets).toHaveLength(3);
+  });
+
+  /* ── Authoring the scope, and the three refusals ──────────────────────────── */
+
+  describe("the scope routes", () => {
+    test("an unauthored target has no entries and no block for the agent", async () => {
+      const body = (await read(await signedIn(`/targets/${empty}/scope`))).body;
+      expect(body).toEqual({
+        entries: [],
+        hostLabels: [],
+        assetLabels: [],
+        // Null rather than a block saying nothing is authorized: "In scope: (nothing)"
+        // would tell the agent it may touch nothing.
+        promptBlock: null,
+      });
+    });
+
+    test("an entry is normalised on write and read back with its reach", async () => {
+      const added = await read(
+        await signedIn(`/targets/${empty}/scope/entries`, {
+          method: "POST",
+          body: { effect: "in", kind: "subtree", value: "  ACME.Test.  " },
+        }),
+      );
+      expect(added.status).toBe(200);
+      const entries = added.body["entries"] as ReadonlyArray<
+        Record<string, unknown>
+      >;
+      expect(entries).toHaveLength(1);
+      // Normalised, so the stored form is the matched form.
+      expect(entries[0]?.["value"]).toBe("acme.test");
+      // `source` is the route's, not the payload's: a browser that could name its own
+      // source could mark a typed row as imported.
+      expect(entries[0]?.["source"]).toBe("operator");
+
+      // And the block the agent would get now exists, with the entry's reach spelled out.
+      expect(added.body["promptBlock"]).toContain(
+        "[Authorized testing scope — highest priority]",
+      );
+      expect(added.body["promptBlock"]).toContain(
+        "acme.test and every subdomain",
+      );
+    });
+
+    test("an unparseable value is refused with the normaliser's own sentence", async () => {
+      const refused = await read(
+        await signedIn(`/targets/${empty}/scope/entries`, {
+          method: "POST",
+          body: { effect: "in", kind: "subtree", value: "localhost" },
+        }),
+      );
+      expect(refused.status).toBe(409);
+      expect(refused.body["_tag"]).toBe("ScopeRefused");
+      expect(refused.body["reason"]).toBe("invalid");
+      // It names the remedy rather than the rule.
+      expect(String(refused.body["detail"])).toContain(
+        "single label with no dot",
+      );
+    });
+
+    test("a contradiction is refused as its own reason, naming the existing row", async () => {
+      // D2: the unique index is per effect, so the database would hold both of these. The
+      // matcher copes — out wins — but the screen cannot show the pair coherently.
+      const first = await read(
+        await signedIn(`/targets/${withRows}/scope/entries`, {
+          method: "POST",
+          body: { effect: "out", kind: "host", value: "blog.acme.test" },
+        }),
+      );
+      expect(first.status).toBe(200);
+      const existing = (
+        first.body["entries"] as ReadonlyArray<Record<string, unknown>>
+      ).find((entry) => entry["value"] === "blog.acme.test");
+
+      const clash = await read(
+        await signedIn(`/targets/${withRows}/scope/entries`, {
+          method: "POST",
+          body: { effect: "in", kind: "host", value: "blog.acme.test" },
+        }),
+      );
+      expect(clash.status).toBe(409);
+      expect(clash.body["reason"]).toBe("contradiction");
+      expect(String(clash.body["detail"])).toContain(
+        String(existing?.["entryId"]),
+      );
+    });
+
+    test("a host label covers every asset on it, and says which entry it beat", async () => {
+      // In scope by an entry first...
+      await signedIn(`/targets/${withRows}/scope/entries`, {
+        method: "POST",
+        body: { effect: "in", kind: "subtree", value: "acme.test" },
+      });
+      const labelled = await read(
+        await signedIn(`/targets/${withRows}/scope/labels`, {
+          method: "POST",
+          body: {
+            subject: { _tag: "host", host: "app.acme.test" },
+            state: "out",
+            reason: "decommissioned",
+          },
+        }),
+      );
+      expect(labelled.status).toBe(200);
+      expect(labelled.body["hostLabels"]).toEqual([
+        {
+          host: "app.acme.test",
+          state: "out",
+          reason: "decommissioned",
+          // The operator authority from the mutation boundary, never a payload field.
+          setBy: `${withRows}/operator`,
+          setAt: expect.any(Number),
+        },
+      ]);
+
+      // Both rows on that host follow the label, including the endpoint, and each says
+      // which entry the label overrode.
+      const assets = (
+        (await read(await signedIn(`/targets/${withRows}/assets`))).body[
+          "assets"
+        ] as ReadonlyArray<Record<string, unknown>>
+      ).filter((asset) => asset["host"] === "app.acme.test");
+      expect(assets).toHaveLength(2);
+      for (const asset of assets) {
+        const scope = asset["scope"] as Record<string, unknown>;
+        expect(scope["state"]).toBe("out");
+        expect((scope["by"] as Record<string, unknown>)["_tag"]).toBe(
+          "hostLabel",
+        );
+        expect((scope["overrode"] as Record<string, unknown>)["value"]).toBe(
+          "acme.test",
+        );
+      }
+
+      // The typed entry is untouched: a label never edits the list.
+      const scope = (await read(await signedIn(`/targets/${withRows}/scope`)))
+        .body;
+      expect(
+        (scope["entries"] as ReadonlyArray<Record<string, unknown>>).some(
+          (entry) => entry["value"] === "acme.test" && entry["effect"] === "in",
+        ),
+      ).toBe(true);
+      // And the agent is told about the label, under the effect the label gave it.
+      expect(scope["promptBlock"]).toContain(
+        "app.acme.test (that host only, set by hand)",
+      );
+    });
+
+    test("clearing a label hands the subject back to the entries", async () => {
+      await signedIn(`/targets/${empty}/scope/entries`, {
+        method: "POST",
+        body: { effect: "in", kind: "subtree", value: "acme.test" },
+      });
+      await signedIn(`/targets/${empty}/scope/labels`, {
+        method: "POST",
+        body: {
+          subject: { _tag: "host", host: "app.acme.test" },
+          state: "out",
+        },
+      });
+      const cleared = await read(
+        await signedIn(`/targets/${empty}/scope/labels`, {
+          method: "POST",
+          body: {
+            subject: { _tag: "host", host: "app.acme.test" },
+            state: "cleared",
+          },
+        }),
+      );
+      expect(cleared.status).toBe(200);
+      // Deleted, not stored as a third state: the subject is decided by the entries again.
+      expect(cleared.body["hostLabels"]).toEqual([]);
+    });
+
+    test("a label on another target's asset is refused", async () => {
+      const refused = await read(
+        await signedIn(`/targets/${empty}/scope/labels`, {
+          method: "POST",
+          body: {
+            subject: { _tag: "asset", assetId: "asset_endpoint" },
+            state: "in",
+          },
+        }),
+      );
+      // `asset_endpoint` exists, in the *other* target's file. The foreign key cannot
+      // catch that, and labelling it would record a decision against the wrong client.
+      expect(refused.status).toBe(409);
+      expect(refused.body["reason"]).toBe("not_found");
+      expect(String(refused.body["detail"])).toContain("is not an asset of");
+    });
+
+    test("removing an entry that is not there is refused, not shrugged off", async () => {
+      const refused = await read(
+        await signedIn(
+          `/targets/${empty}/scope/entries/scope_nonexistent/remove`,
+          { method: "POST" },
+        ),
+      );
+      expect(refused.status).toBe(409);
+      expect(refused.body["reason"]).toBe("not_found");
+    });
+
+    test("an entry can be removed, and the block goes with the last one", async () => {
+      const added = await read(
+        await signedIn(`/targets/${empty}/scope/entries`, {
+          method: "POST",
+          body: { effect: "in", kind: "cidr", value: "203.0.113.0/24" },
+        }),
+      );
+      const entryId = String(
+        (added.body["entries"] as ReadonlyArray<Record<string, unknown>>).find(
+          (entry) => entry["kind"] === "cidr",
+        )?.["entryId"],
+      );
+      const removed = await read(
+        await signedIn(`/targets/${empty}/scope/entries/${entryId}/remove`, {
+          method: "POST",
+        }),
+      );
+      expect(removed.status).toBe(200);
+      expect(
+        (
+          removed.body["entries"] as ReadonlyArray<Record<string, unknown>>
+        ).some((entry) => entry["entryId"] === entryId),
+      ).toBe(false);
+    });
+
+    test("the scope routes need a session too", async () => {
+      expect((await call(`/targets/${withRows}/scope`)).status).toBe(401);
+      expect(
+        (
+          await call(`/targets/${withRows}/scope/entries`, {
+            method: "POST",
+            body: { effect: "in", kind: "subtree", value: "acme.test" },
+          })
+        ).status,
+      ).toBe(401);
+      expect(
+        (
+          await call(`/targets/${withRows}/scope/labels`, {
+            method: "POST",
+            body: {
+              subject: { _tag: "host", host: "app.acme.test" },
+              state: "in",
+            },
+          })
+        ).status,
+      ).toBe(401);
+    });
+
+    test("an unknown target is refused rather than given an empty scope", async () => {
+      const response = await read(
+        await signedIn("/targets/not-a-target/scope"),
+      );
+      expect(response.status).toBe(404);
+      expect(response.body["_tag"]).toBe("TargetNotFound");
+    });
   });
 });

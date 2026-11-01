@@ -39,6 +39,7 @@ import {
 } from "effect/http-api";
 
 import { AssetView } from "./asset";
+import { ScopeEntryDraft, ScopeLabelDraft, ScopeView } from "./scope";
 import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
 import {
   GoalConversationRefused,
@@ -745,6 +746,39 @@ export class GoalRefused extends Schema.TaggedError<GoalRefused>()(
 }
 
 /**
+ * A refused scope change.
+ *
+ * Three reasons, because they lead the operator to three different actions and the Scope
+ * tab shows them differently:
+ *
+ * - `invalid` — the value is not a host, an apex or a block. The normaliser's own
+ *   sentence comes through in `detail`, naming the remedy rather than the rule, so the
+ *   form can show it verbatim.
+ * - `contradiction` — the entry's kind and value already exist under the opposite
+ *   effect. An entry cannot be in and out at once; `detail` names the existing row. This
+ *   is the one refusal in the whole flow, and A4 gives it the only danger-red in the
+ *   screen for that reason.
+ * - `not_found` — the entry or asset named is not this target's. A control that appears to
+ *   work and does nothing is an anti-goal, so this is a refusal rather than a shrug.
+ *
+ * `409` rather than `400`, because `contradiction` is a conflict with stored state rather
+ * than a malformed request, and one status for one error keeps the client's branching on
+ * `reason` where the three sentences are.
+ */
+export class ScopeRefused extends Schema.TaggedError<ScopeRefused>()(
+  "ScopeRefused",
+  {
+    reason: Schema.Literals(["invalid", "contradiction", "not_found"]),
+    detail: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {
+  override get message(): string {
+    return `${this.reason}: ${this.detail}`;
+  }
+}
+
+/**
  * The briefing a planner round would be given for one goal, and how big it is.
  *
  * **The rendered text, not the structured briefing.** A planner round is prompted with
@@ -1260,6 +1294,71 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       params: { targetId: Schema.String },
       success: Schema.Struct({ assets: Schema.Array(AssetView) }),
       error: [TargetNotFound, TargetUnavailable],
+    }),
+    /**
+     * One target's authored scope, and the block an agent would be given right now.
+     *
+     * Read-only. `promptBlock` is rendered by the same function both prompt paths use, so
+     * the preview an operator checks is the bytes an agent gets rather than a second
+     * renderer's impression of them.
+     */
+    HttpApiEndpoint.get("scope", "/targets/:targetId/scope", {
+      params: { targetId: Schema.String },
+      success: ScopeView,
+      error: [TargetNotFound, TargetUnavailable],
+    }),
+    /**
+     * Adds one scope entry.
+     *
+     * `201` would be wrong here: adding an entry that already exists is a deliberate
+     * no-op rather than a conflict, so this is not reliably a creation. It answers with
+     * the whole scope instead of the new row, because every scope change moves the
+     * prompt block the operator is reading beside the list.
+     *
+     * Refused as {@link ScopeRefused} when the value cannot be normalised, or when it
+     * would contradict an entry that already exists under the opposite effect.
+     */
+    HttpApiEndpoint.post("addScopeEntry", "/targets/:targetId/scope/entries", {
+      params: { targetId: Schema.String },
+      payload: ScopeEntryDraft,
+      success: ScopeView,
+      error: [ScopeRefused, TargetNotFound, TargetUnavailable],
+    }),
+    /**
+     * Removes one scope entry.
+     *
+     * A `POST` to a sub-resource rather than a `DELETE`, which is this API's convention
+     * throughout. Removing an entry that is not there is refused rather than answered
+     * cheerfully: a control that appears to work and does nothing is one of the scope
+     * design's named anti-goals.
+     */
+    HttpApiEndpoint.post(
+      "removeScopeEntry",
+      "/targets/:targetId/scope/entries/:entryId/remove",
+      {
+        params: { targetId: Schema.String, entryId: Schema.String },
+        success: ScopeView,
+        error: [ScopeRefused, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * Promotes, excludes, or withdraws a label on one host or one asset.
+     *
+     * One route for all three, because they are one control with two directions plus an
+     * undo — which is how the scope view presents them, and how the store implements
+     * them. **It never touches the typed entries**, and no amount of labelling can widen
+     * or narrow the list the operator authored: a label beats an entry for one subject and
+     * leaves the entry exactly as written, which is what lets the view say which entry was
+     * overridden rather than losing the fact a carve-out was made.
+     *
+     * Answers with the whole scope, because a label changes what the agent is told and the
+     * preview beside the list has to move with it.
+     */
+    HttpApiEndpoint.post("labelScope", "/targets/:targetId/scope/labels", {
+      params: { targetId: Schema.String },
+      payload: ScopeLabelDraft,
+      success: ScopeView,
+      error: [ScopeRefused, TargetNotFound, TargetUnavailable],
     }),
     /**
      * Creates a goal under one target.

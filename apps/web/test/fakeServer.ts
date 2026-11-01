@@ -30,6 +30,7 @@ import {
   openCodeToolName,
 } from "@bit/contracts";
 import type {
+  AssetView,
   AttemptTranscript,
   FolderListing,
   GoalBriefingView,
@@ -51,6 +52,7 @@ import type {
   RunStopped,
   RunningAttempt,
   RunningRound,
+  ScopeView,
   SessionOpened,
   SessionProbe,
   TargetCounts,
@@ -100,6 +102,46 @@ export const unreachable = (detail: string): Call<never, never> => ({
  * clock a test cannot control reads whatever the machine was doing.
  */
 export const AT = 1_700_000_000_000;
+
+/**
+ * A target with nothing authored: no entries, no labels, and no block for the agent.
+ *
+ * The state every target has the moment migration `0022` runs, and the one A4's empty
+ * screen describes — the hunt still records everything it finds, it just arrives labelled
+ * "not covered". A test that wants a scope builds one.
+ */
+export const emptyScope = (over: Partial<ScopeView> = {}): ScopeView => ({
+  entries: [],
+  hostLabels: [],
+  assetLabels: [],
+  promptBlock: null,
+  ...over,
+});
+
+/**
+ * One asset row, in scope by default and with its provenance filled in.
+ *
+ * `scope` defaults to "covered by nothing", because that is what an asset on a target
+ * with no scope authored actually is, and a fixture that defaulted to `in` would let a
+ * screen that ignores the state look correct.
+ */
+export const assetView = (over: Partial<AssetView> = {}): AssetView => ({
+  assetId: "asset_1",
+  kind: "host",
+  identity: "app.acme.test:443",
+  host: "app.acme.test",
+  port: 443,
+  scheme: null,
+  method: null,
+  path: null,
+  firstSeenAt: AT,
+  discoveries: 1,
+  firstAttemptId: "attempt_1",
+  firstIntentId: "intent_1",
+  lastDiscoveredAt: AT,
+  scope: { state: "out", by: { _tag: "default" }, overrode: null },
+  ...over,
+});
 
 export const targetSummary = (
   over: Partial<TargetSummary> = {},
@@ -805,6 +847,44 @@ export class FakeServer implements ServerClient {
   onAssets: (baseUrl: string, targetId: string) => Answer<"assets"> = () =>
     ok({ assets: [] });
 
+  /**
+   * The scope read. Nothing authored, so `promptBlock` is null.
+   *
+   * Null is the state A4's empty screen describes and the state every target has the
+   * moment migration `0022` runs, so it is the right default for a double: a test that
+   * wants a scope says so.
+   */
+  onScope: (baseUrl: string, targetId: string) => Answer<"scope"> = () =>
+    ok(emptyScope());
+
+  onAddScopeEntry: (
+    ...args: Parameters<ServerClient["addScopeEntry"]>
+  ) => Answer<"addScopeEntry"> = (_baseUrl, _targetId, draft) =>
+    ok({
+      ...emptyScope(),
+      entries: [
+        {
+          entryId: "scope_fake",
+          effect: draft.effect,
+          kind: draft.kind,
+          // Echoed rather than normalised: this double is not a second copy of the rule,
+          // and a test that cares about normalisation should assert it server-side.
+          value: draft.value,
+          source: "operator",
+          note: null,
+          createdAt: 1,
+        },
+      ],
+    });
+
+  onRemoveScopeEntry: (
+    ...args: Parameters<ServerClient["removeScopeEntry"]>
+  ) => Answer<"removeScopeEntry"> = () => ok(emptyScope());
+
+  onLabelScope: (
+    ...args: Parameters<ServerClient["labelScope"]>
+  ) => Answer<"labelScope"> = () => ok(emptyScope());
+
   onCreateGoal: (
     ...args: Parameters<ServerClient["createGoal"]>
   ) => Answer<"createGoal"> = (_baseUrl, targetId, draft) =>
@@ -1015,6 +1095,22 @@ export class FakeServer implements ServerClient {
     this.record("assets", [baseUrl, targetId], () =>
       this.onAssets(baseUrl, targetId),
     );
+
+  scope = (baseUrl: string, targetId: string) =>
+    this.record("scope", [baseUrl, targetId], () =>
+      this.onScope(baseUrl, targetId),
+    );
+
+  addScopeEntry = (...args: Parameters<ServerClient["addScopeEntry"]>) =>
+    this.record("addScopeEntry", args, () => this.onAddScopeEntry(...args));
+
+  removeScopeEntry = (...args: Parameters<ServerClient["removeScopeEntry"]>) =>
+    this.record("removeScopeEntry", args, () =>
+      this.onRemoveScopeEntry(...args),
+    );
+
+  labelScope = (...args: Parameters<ServerClient["labelScope"]>) =>
+    this.record("labelScope", args, () => this.onLabelScope(...args));
 
   createGoal = (...args: Parameters<ServerClient["createGoal"]>) =>
     this.record("createGoal", args, () => this.onCreateGoal(...args));

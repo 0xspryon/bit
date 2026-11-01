@@ -42,12 +42,14 @@ import {
   IntentRefused,
   RoundNotFound,
   RunRefused,
+  ScopeRefused,
   SessionActor,
   SessionGuard,
   TargetNotFound,
   TargetRefused,
   TargetUnavailable,
   Unauthenticated,
+  type AssetScopeLabel,
   type AssetView,
   type AttemptTranscript,
   type GoalBriefingView,
@@ -55,7 +57,11 @@ import {
   type GoalView,
   type HarnessInstanceView,
   type IntentView,
+  type HostScopeLabel,
   type PlanRoundView,
+  type ScopeEntry,
+  type ScopeState,
+  type ScopeView,
   type TargetCounts,
   type TargetSummary,
 } from "@bit/contracts";
@@ -100,6 +106,7 @@ import {
   type StoredRound,
 } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
+import { renderScopeBlock } from "../scope/scopePrompt";
 import { POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
 import { GoalConversations } from "../plan/goalConversation";
@@ -451,7 +458,11 @@ const goalView = (goal: StoredGoal): GoalView => ({
  * becomes a compile error instead of a silently missing field. It is also where the
  * snake_case the file holds becomes the camelCase the browser API speaks.
  */
-const assetView = (asset: StoredAssetWithProvenance): AssetView => ({
+const assetView = (
+  asset: StoredAssetWithProvenance,
+  scope: ScopeState,
+): AssetView => ({
+  scope,
   assetId: asset.id,
   // The column is `TEXT` with a `CHECK`, so the store types it as `string`; the contract
   // narrows it to the two kinds. A third value in the column would be a row the schema
@@ -469,6 +480,86 @@ const assetView = (asset: StoredAssetWithProvenance): AssetView => ({
   firstIntentId: asset.first_intent_id,
   lastDiscoveredAt: asset.last_discovered_at,
 });
+
+/**
+ * One target's scope as the Scope tab reads it, with the block the agent would get.
+ *
+ * `promptBlock` comes from `renderScopeBlock` — the same function both prompt paths call
+ * — rather than from anything assembled here. That is what makes the preview panel's
+ * claim true: it is the bytes an agent would be given, not a second rendering of the same
+ * lists. The `worker` variant is previewed because it is the longer of the two; the
+ * planner's differs only in dropping the `record_asset` line.
+ */
+const scopeView = (scope: {
+  readonly entries: readonly ScopeEntry[];
+  readonly hostLabels: readonly HostScopeLabel[];
+  readonly assetLabels: readonly {
+    readonly label: AssetScopeLabel;
+    readonly identity: string;
+    readonly host: string;
+  }[];
+}): ScopeView => ({
+  entries: scope.entries.map((entry) => ({
+    entryId: entry.entryId,
+    effect: entry.effect,
+    kind: entry.kind,
+    value: entry.value,
+    source: entry.source,
+    note: entry.note,
+    createdAt: entry.createdAt,
+  })),
+  hostLabels: scope.hostLabels.map((label) => ({
+    host: label.host,
+    state: label.state,
+    reason: label.reason,
+    setBy: label.setBy,
+    setAt: label.setAt,
+  })),
+  assetLabels: scope.assetLabels.map((labelled) => ({
+    assetId: labelled.label.assetId,
+    identity: labelled.identity,
+    state: labelled.label.state,
+    reason: labelled.label.reason,
+    setBy: labelled.label.setBy,
+    setAt: labelled.label.setAt,
+  })),
+  promptBlock:
+    renderScopeBlock({
+      scope: {
+        entries: scope.entries,
+        hostLabels: scope.hostLabels,
+        assetLabels: scope.assetLabels,
+      },
+      audience: "worker",
+    }) ?? null,
+});
+
+/**
+ * What a refused scope change becomes at the HTTP surface.
+ *
+ * The store's `MutationError` reasons do not map one-to-one, and the translation is the
+ * point rather than an inconvenience: `conflict` from `addScopeEntry` is always D2's
+ * contradiction, and it becomes its own reason so the Scope tab can give it the one
+ * danger-red banner in the screen. An `invalid` that names a missing row becomes
+ * `not_found`, because "you typed something unparseable" and "that entry is gone" are
+ * different problems with different next actions.
+ */
+const scopeRefusal = (error: MutationError): ScopeRefused => {
+  if (error.reason === "conflict") {
+    return new ScopeRefused({
+      reason: "contradiction",
+      detail: error.detail,
+    });
+  }
+  const missing =
+    error.detail.includes("nothing was removed") ||
+    error.detail.includes("nothing was cleared") ||
+    error.detail.includes("is not an asset of");
+  return new ScopeRefused({
+    reason: missing ? "not_found" : "invalid",
+    detail: error.detail,
+  });
+};
 
 /**
  * What a refused mutation becomes at the HTTP surface, for the goal routes.
@@ -1165,14 +1256,179 @@ const fleetHandlers = HttpApiBuilder.group(
        */
       assets: Effect.fn(function* ({ params }) {
         const row = yield* openableTarget(fleet, params.targetId);
+        // `assetsWithScope` is the one read that implements the D5 ladder, and it already
+        // filters to this target. A handler that read the assets and the scope separately
+        // and joined them here would be a second implementation of the ladder.
         const assets = yield* withTargetStore(stores, row.targetId, (store) =>
-          store.assetsWithProvenance(),
+          store.assetsWithScope(row.targetId),
         ).pipe(Effect.orDie);
         return {
-          assets: assets
-            .filter((asset) => asset.target_id === row.targetId)
-            .map(assetView),
+          assets: assets.map((entry) => assetView(entry.asset, entry.scope)),
         };
+      }),
+
+      /** One target's authored scope, and the block an agent would be given now. */
+      scope: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const scope = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.targetScope(row.targetId),
+        ).pipe(Effect.orDie);
+        return scopeView(scope);
+      }),
+
+      /**
+       * Adds one entry, as the operator.
+       *
+       * `source: "operator"` is set here and is not in the payload: a browser that could
+       * name its own source could mark a row it typed as `imported`, and the operator's
+       * review of the imported list would then be reviewing the wrong rows.
+       */
+      addScopeEntry: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const scope = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            yield* store
+              .addScopeEntry(
+                {
+                  callerScope: operatorScope(row.targetId),
+                  targetId: row.targetId,
+                },
+                {
+                  effect: payload.effect,
+                  kind: payload.kind,
+                  value: payload.value,
+                  source: "operator",
+                },
+              )
+              .pipe(
+                Effect.catchTag("MutationError", (error) =>
+                  Effect.fail(scopeRefusal(error)),
+                ),
+              );
+            return yield* store.targetScope(row.targetId);
+          }),
+        ).pipe(
+          // Not `orDie` over the whole thing: that would turn the refusal just produced
+          // into a defect. What is left to die is what an operator can do nothing about.
+          Effect.catchTag("FleetError", Effect.die),
+          Effect.catchTag("DatabaseError", Effect.die),
+          Effect.catchTag("StoredRowError", Effect.die),
+        );
+        return scopeView(scope);
+      }),
+
+      removeScopeEntry: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const scope = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            yield* store
+              .removeScopeEntry(
+                {
+                  callerScope: operatorScope(row.targetId),
+                  targetId: row.targetId,
+                },
+                params.entryId,
+              )
+              .pipe(
+                Effect.catchTag("MutationError", (error) =>
+                  Effect.fail(scopeRefusal(error)),
+                ),
+              );
+            return yield* store.targetScope(row.targetId);
+          }),
+        ).pipe(
+          Effect.catchTag("FleetError", Effect.die),
+          Effect.catchTag("DatabaseError", Effect.die),
+          Effect.catchTag("StoredRowError", Effect.die),
+        );
+        return scopeView(scope);
+      }),
+
+      /**
+       * Promotes, excludes or withdraws one label.
+       *
+       * Six combinations over one route — two subjects crossed with three directions —
+       * dispatched here rather than at six endpoints, because the operator is using one
+       * control and a route per combination would be six places for the authority
+       * argument to be got wrong.
+       *
+       * `cleared` deletes the row. Nothing stores a cleared state: the subject goes back
+       * to being decided by the entries, and the event log keeps the fact that a label was
+       * withdrawn.
+       */
+      labelScope: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const caller = {
+          callerScope: operatorScope(row.targetId),
+          targetId: row.targetId,
+        };
+        const reason =
+          payload.reason === undefined || payload.reason === ""
+            ? null
+            : payload.reason;
+        const scope = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.gen(function* () {
+            /*
+             * Four branches rather than a nested conditional building one Effect.
+             *
+             * The two subjects' store methods answer with different shapes, so a ternary
+             * chain over them produces a union of two unrelated `Effect` types that
+             * inference cannot reconcile against one `catchTag`. Yielding inside each
+             * branch keeps each call's own type local, and the handler's own answer —
+             * the refreshed scope — is read once at the end regardless of which ran.
+             */
+            const subject = payload.subject;
+            if (subject._tag === "host") {
+              if (payload.state === "cleared") {
+                yield* store
+                  .clearHostScopeLabel(caller, subject.host)
+                  .pipe(
+                    Effect.catchTag("MutationError", (error) =>
+                      Effect.fail(scopeRefusal(error)),
+                    ),
+                  );
+              } else {
+                yield* store
+                  .setHostScopeLabel(caller, {
+                    host: subject.host,
+                    state: payload.state,
+                    reason,
+                  })
+                  .pipe(
+                    Effect.catchTag("MutationError", (error) =>
+                      Effect.fail(scopeRefusal(error)),
+                    ),
+                  );
+              }
+            } else if (payload.state === "cleared") {
+              yield* store
+                .clearAssetScopeLabel(caller, subject.assetId)
+                .pipe(
+                  Effect.catchTag("MutationError", (error) =>
+                    Effect.fail(scopeRefusal(error)),
+                  ),
+                );
+            } else {
+              yield* store
+                .setAssetScopeLabel(caller, {
+                  assetId: subject.assetId,
+                  state: payload.state,
+                  reason,
+                })
+                .pipe(
+                  Effect.catchTag("MutationError", (error) =>
+                    Effect.fail(scopeRefusal(error)),
+                  ),
+                );
+            }
+            return yield* store.targetScope(row.targetId);
+          }),
+        ).pipe(
+          Effect.catchTag("FleetError", Effect.die),
+          Effect.catchTag("DatabaseError", Effect.die),
+          Effect.catchTag("StoredRowError", Effect.die),
+        );
+        return scopeView(scope);
       }),
 
       /**

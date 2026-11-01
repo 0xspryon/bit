@@ -29,6 +29,7 @@ import {
   droppedModelOptionIds,
   explicitModelOptionSelections,
   modelOptionDescriptors,
+  type AssetView,
   type AttemptTranscript,
   LIVE_SILENCE_LIMIT_SECONDS,
   type GoalEndStatus,
@@ -48,6 +49,10 @@ import {
   type PlanRoundView,
   type RunningAttempt,
   type RunningRound,
+  type ScopeKind,
+  type ScopeLabelDraft,
+  type ScopeState,
+  type ScopeView,
   type TargetView,
   type TargetCounts,
   type TargetSummary,
@@ -119,6 +124,27 @@ export type CreateState =
  * the empty-state sentence flashing up before the answer arrives.
  */
 export type GoalsState = "idle" | "loading" | "ready" | "failed";
+
+/**
+ * How the estate read is going. The same four as {@link GoalsState}, for the same reason.
+ *
+ * "Nothing found yet" is a fact about a target, and it is a different fact from "not read
+ * yet" and from "could not read". An empty-state sentence shown while the request is in
+ * flight tells the operator, falsely and for a moment, that their hunt has found nothing.
+ */
+export type AssetsState = "idle" | "loading" | "ready" | "failed";
+
+/** Which tab of the Assets screen is showing. */
+export type AssetsTab = "estate" | "scope";
+
+/**
+ * Which rows the Estate tab is showing.
+ *
+ * Filters by *scope state*, which is the only grouping that matches what a label reaches,
+ * and never removes a row from the underlying list: "Not covered" is the one an operator
+ * actually works from, and it is the whole reason the view exists.
+ */
+export type EstateFilter = "all" | "in" | "out" | "uncovered";
 
 export interface Scenario {
   readonly id: string;
@@ -341,6 +367,60 @@ export class App {
   goalsDetail = $state("");
   /** The goal being looked at, or `""` for the list. */
   openGoalId = $state("");
+
+  /* ── The estate, and the scope that frames it ──────────────────────────────── */
+
+  /**
+   * Every asset the open target has recorded, with the scope state of each.
+   *
+   * Server-fed and one target's at a time, like {@link goals}: {@link assetsTargetId}
+   * says whose, and nothing renders a row without agreeing with it.
+   *
+   * **Nothing is filtered out of this list.** An asset no in-scope entry covers is here
+   * like any other, because the whole point of the estate view is that a discovery is
+   * recorded, kept, displayed and labelled. {@link estateFilter} changes what is *shown*
+   * and never what was read.
+   */
+  assets = $state<AssetView[]>([]);
+  /** Which target {@link assets} were read for. Empty until the first answer. */
+  assetsTargetId = $state("");
+  assetsState = $state<AssetsState>("idle");
+  /** The server's own words for a failed read. */
+  assetsDetail = $state("");
+
+  /**
+   * The open target's authored scope, and the block an agent would be given now.
+   *
+   * `undefined` until the first answer. `promptBlock` inside it is `null` when nothing is
+   * in scope, which is a different thing from not having read it yet.
+   */
+  scope = $state<ScopeView | undefined>(undefined);
+  scopeTargetId = $state("");
+  scopeState = $state<AssetsState>("idle");
+  scopeDetail = $state("");
+
+  /** Which tab of the Assets screen is open. Estate first: it is what the hunt produced. */
+  assetsTab = $state<AssetsTab>("estate");
+  estateFilter = $state<EstateFilter>("all");
+  /** The host-or-path filter box. Matches on either, because a row shows both. */
+  estateQuery = $state("");
+
+  /* The Add an entry form, on the Scope tab */
+  entryEffect = $state<"in" | "out">("in");
+  entryKind = $state<ScopeKind>("subtree");
+  entryValue = $state("");
+  /**
+   * The server's refusal of the last scope change, or `""`.
+   *
+   * Kept apart from {@link scopeDetail}, which is a failed *read*: a refusal is an answer
+   * about what the operator just asked for and belongs beside the control that caused it,
+   * where a read failure belongs at the top of the panel.
+   */
+  scopeRefusal = $state("");
+  /** Whether the refusal above is D2's contradiction, which is the one danger-red case. */
+  scopeRefusalContradiction = $state(false);
+  /** True while a scope change is in flight, so the control can say so. */
+  scopeBusy = $state(false);
 
   /* The New goal dialog */
   goalDialogOpen = $state(false);
@@ -693,6 +773,131 @@ export class App {
       ? this.counts
       : undefined,
   );
+
+  /**
+   * Only the open target's asset rows, whatever else an earlier visit left behind.
+   *
+   * The same guard the Goals screen applies to {@link goals}, and for the same reason: a
+   * row from another engagement rendered under this one's name is misattribution at the
+   * UI layer.
+   */
+  estateRows = $derived(
+    this.assetsTargetId === this.viewTargetId ? this.assets : [],
+  );
+
+  /** The open target's scope, or `undefined` if it belongs to a target left behind. */
+  viewScope = $derived(
+    this.scopeTargetId === this.viewTargetId ? this.scope : undefined,
+  );
+
+  /**
+   * The estate grouped by host, as A4 shows it.
+   *
+   * **Host is the grouping because it is the unit a label reaches.** A host label covers
+   * every asset on that host, present and future, so grouping by anything else would put
+   * the promote control somewhere it does not correspond to what the click does.
+   *
+   * The group's own state is the host's: taken from a row whose scope was decided at the
+   * host level or by the entries, rather than from one asset's own label — an endpoint
+   * excluded by hand inside an in-scope host must not relabel its whole group. Where no
+   * row settles it, the first row's state stands, which is the honest fallback: every row
+   * in a group shares a host, so they agree unless an asset label disagrees, and that
+   * disagreement is shown on the row that carries it.
+   */
+  estateGroups = $derived.by(() => {
+    const groups = new Map<
+      string,
+      { host: string; rows: AssetView[]; scope: ScopeState }
+    >();
+    for (const asset of this.estateRows) {
+      const existing = groups.get(asset.host);
+      if (existing === undefined) {
+        groups.set(asset.host, {
+          host: asset.host,
+          rows: [asset],
+          scope: asset.scope,
+        });
+        continue;
+      }
+      existing.rows.push(asset);
+      // Prefer a host-level verdict over an asset-level one for the header.
+      if (
+        existing.scope.by._tag === "assetLabel" &&
+        asset.scope.by._tag !== "assetLabel"
+      ) {
+        existing.scope = asset.scope;
+      }
+    }
+    return [...groups.values()];
+  });
+
+  /**
+   * The groups the Estate tab is showing, after the filter and the query.
+   *
+   * A group survives if it or any of its rows matches, and the rows shown are the
+   * matching ones — so filtering to "Not covered" on a mostly-in-scope host shows that
+   * host with the rows that need a decision, rather than hiding the host entirely.
+   *
+   * Nothing is removed from {@link assets} by any of this. The filter changes what is on
+   * screen and never what was read, which is the difference between a view and a gate.
+   */
+  shownEstateGroups = $derived.by(() => {
+    const query = this.estateQuery.trim().toLowerCase();
+    const matchesFilter = (scope: ScopeState): boolean => {
+      if (this.estateFilter === "all") return true;
+      if (this.estateFilter === "in") return scope.state === "in";
+      if (this.estateFilter === "out") {
+        // "Excluded" means somebody said so — an entry or a hand label. A subject nothing
+        // covers is `out` too, and lumping the two together is exactly the collapse the
+        // three-sentence rule forbids.
+        return scope.state === "out" && scope.by._tag !== "default";
+      }
+      return scope.by._tag === "default";
+    };
+    const matchesQuery = (asset: AssetView): boolean =>
+      query === "" ||
+      asset.host.toLowerCase().includes(query) ||
+      (asset.path ?? "").toLowerCase().includes(query) ||
+      asset.identity.toLowerCase().includes(query);
+
+    return this.estateGroups
+      .map((group) => ({
+        ...group,
+        rows: group.rows.filter(
+          (asset) => matchesFilter(asset.scope) && matchesQuery(asset),
+        ),
+      }))
+      .filter(
+        (group) =>
+          group.rows.length > 0 ||
+          (matchesFilter(group.scope) &&
+            (query === "" || group.host.toLowerCase().includes(query))),
+      );
+  });
+
+  /**
+   * How many assets fall under each of the Estate tab's four filters.
+   *
+   * Counted off the rows already on hand rather than asked of the server. The design
+   * defers per-*entry* aggregates and pagination together, and these are neither: they are
+   * four counts over one list the browser is already holding whole.
+   */
+  estateTally = $derived.by(() => {
+    let inScope = 0;
+    let excluded = 0;
+    let uncovered = 0;
+    for (const asset of this.estateRows) {
+      if (asset.scope.state === "in") inScope += 1;
+      else if (asset.scope.by._tag === "default") uncovered += 1;
+      else excluded += 1;
+    }
+    return {
+      all: this.estateRows.length,
+      in: inScope,
+      out: excluded,
+      uncovered,
+    };
+  });
 
   /**
    * The number a rail item shows, from wherever it really comes from.
@@ -1252,6 +1457,11 @@ export class App {
     // Cleared before the read, like the counts: between two targets the only honest
     // answer is "reading", and the previous target's objectives must not be on screen.
     this.#clearGoals();
+    // Cleared for the same reason the goals are, and *not* read here: the Assets screen is
+    // one section of several and the operator lands on Goals. Reading the estate of every
+    // target they open would spend a request per open on a screen they may never go to.
+    // `toSection` asks for it when they do.
+    this.#clearEstate();
     void this.refreshTarget(id);
     void this.loadGoals(id);
     // Asked on every open, because a run started in another tab — or by this one before a
@@ -1416,6 +1626,18 @@ export class App {
   toSection(id: string) {
     this.navItem = id;
     if (id === "goals") this.closeGoal();
+    /*
+     * The estate is read when the operator goes to look at it.
+     *
+     * Read on every visit rather than once, because both of these move while the operator
+     * is elsewhere: a worker records assets as it works, and the scope is what the next
+     * attempt will be told. A cached list would show an operator a stale estate and let
+     * them promote a host off a row that had already changed.
+     */
+    if (id === "assets" && this.viewTargetId !== "") {
+      void this.loadAssets(this.viewTargetId);
+      void this.loadScope(this.viewTargetId);
+    }
   }
 
   /** Back above target scope, to every target. */
@@ -1427,6 +1649,35 @@ export class App {
   /* ── Goals ───────────────────────────────────────────────────────────────── */
 
   /** Puts every goal field back where a fresh target leaves it. */
+  /**
+   * Forgets the open target's estate and scope.
+   *
+   * Called when the target changes, before the new read goes out, for
+   * {@link #clearGoals}'s reason: between two targets the only honest answer is "reading",
+   * and one client's estate must never be on screen under another client's name. The tab
+   * and the filters go too — an operator who left the Scope tab open on one engagement
+   * should not land on it in another.
+   */
+  #clearEstate() {
+    this.assets = [];
+    this.assetsTargetId = "";
+    this.assetsState = "idle";
+    this.assetsDetail = "";
+    this.scope = undefined;
+    this.scopeTargetId = "";
+    this.scopeState = "idle";
+    this.scopeDetail = "";
+    this.assetsTab = "estate";
+    this.estateFilter = "all";
+    this.estateQuery = "";
+    this.entryEffect = "in";
+    this.entryKind = "subtree";
+    this.entryValue = "";
+    this.scopeRefusal = "";
+    this.scopeRefusalContradiction = false;
+    this.scopeBusy = false;
+  }
+
   #clearGoals() {
     this.goals = [];
     this.goalsTargetId = "";
@@ -1591,6 +1842,201 @@ export class App {
     }
     this.goals = call.value.goals.map((goal) => ({ ...goal }));
     this.goalsState = "ready";
+  }
+
+  /* ── The estate and its scope ────────────────────────────────────────────────── */
+
+  /**
+   * Reads the open target's estate.
+   *
+   * The {@link loadGoals} template, and the two owner-id guards are load-bearing for the
+   * same reason: the one before spends no request on a target the operator has left, and
+   * the one after drops an answer about a target that is no longer open. Showing one
+   * client's assets under another client's name is the single thing this product may not
+   * do.
+   */
+  async loadAssets(id: string) {
+    if (this.viewTargetId !== id) return;
+    if (this.assetsTargetId !== id) {
+      this.assets = [];
+      this.assetsTargetId = id;
+    }
+    this.assetsState = "loading";
+    this.assetsDetail = "";
+
+    const call = await this.client.assets(this.serverUrl, id);
+    if (this.viewTargetId !== id) return;
+
+    if (call._tag === "Unreachable") {
+      this.assetsState = "failed";
+      this.assetsDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.assetsState = "failed";
+      this.assetsDetail = this.#refusalText(
+        call.error,
+        "This target's assets could not be read.",
+      );
+      return;
+    }
+    this.assets = call.value.assets.map((asset) => ({ ...asset }));
+    this.assetsState = "ready";
+  }
+
+  /** Reads the open target's authored scope, and the block an agent would be given. */
+  async loadScope(id: string) {
+    if (this.viewTargetId !== id) return;
+    if (this.scopeTargetId !== id) {
+      this.scope = undefined;
+      this.scopeTargetId = id;
+    }
+    this.scopeState = "loading";
+    this.scopeDetail = "";
+
+    const call = await this.client.scope(this.serverUrl, id);
+    if (this.viewTargetId !== id) return;
+
+    if (call._tag === "Unreachable") {
+      this.scopeState = "failed";
+      this.scopeDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.scopeState = "failed";
+      this.scopeDetail = this.#refusalText(
+        call.error,
+        "This target's scope could not be read.",
+      );
+      return;
+    }
+    this.scope = call.value;
+    this.scopeState = "ready";
+  }
+
+  /**
+   * Applies whatever the server answered a scope change with.
+   *
+   * Every scope mutation answers with the **whole scope**, because every one of them moves
+   * the block the operator is checking beside the list. Shared by all four actions so
+   * there is one place that decides what a successful change does to the screen, and one
+   * place that turns a refusal into the sentence beside the control.
+   *
+   * A refusal is not a failed read: {@link scopeState} stays `ready` and the list on
+   * screen stays exactly as it was, because the server refused and therefore changed
+   * nothing. Setting `failed` here would blank a correct list over a rejected keystroke.
+   */
+  async #applyScopeChange(
+    id: string,
+    call: Awaited<ReturnType<ServerClient["labelScope"]>>,
+  ): Promise<boolean> {
+    if (this.viewTargetId !== id) return false;
+
+    if (call._tag === "Unreachable") {
+      this.scopeRefusal = "No server answered at this address.";
+      this.scopeRefusalContradiction = false;
+      return false;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return false;
+      }
+      this.scopeRefusal = this.#refusalText(
+        call.error,
+        "That scope change was refused.",
+      );
+      // The one refusal in the whole flow, and the only place A4 spends danger red.
+      this.scopeRefusalContradiction =
+        "reason" in call.error && call.error.reason === "contradiction";
+      return false;
+    }
+    this.scope = call.value;
+    this.scopeTargetId = id;
+    this.scopeState = "ready";
+    this.scopeRefusal = "";
+    this.scopeRefusalContradiction = false;
+    return true;
+  }
+
+  /**
+   * Adds the entry in the form.
+   *
+   * The value goes as typed. Normalising here would be a second implementation of a rule
+   * that has one, and the server's refusal names the remedy — "write the apex alone",
+   * "add it as a CIDR entry instead" — which is worth more than the round trip saves.
+   */
+  async addScopeEntry() {
+    const id = this.viewTargetId;
+    const value = this.entryValue.trim();
+    if (id === "" || value === "" || this.scopeBusy) return;
+
+    this.scopeBusy = true;
+    this.scopeRefusal = "";
+    this.scopeRefusalContradiction = false;
+    const call = await this.client.addScopeEntry(this.serverUrl, id, {
+      effect: this.entryEffect,
+      kind: this.entryKind,
+      value,
+    });
+    this.scopeBusy = false;
+    if (await this.#applyScopeChange(id, call)) {
+      // Cleared only on success, so a refused value stays in the box for the operator to
+      // fix rather than having to be retyped from the error message.
+      this.entryValue = "";
+    }
+  }
+
+  /** Removes one entry. */
+  async removeScopeEntry(entryId: string) {
+    const id = this.viewTargetId;
+    if (id === "" || this.scopeBusy) return;
+    this.scopeBusy = true;
+    const call = await this.client.removeScopeEntry(
+      this.serverUrl,
+      id,
+      entryId,
+    );
+    this.scopeBusy = false;
+    await this.#applyScopeChange(id, call);
+  }
+
+  /**
+   * Promotes, excludes or withdraws a label on one host or one asset.
+   *
+   * One method for all six combinations, because it is one control with two directions
+   * and an undo. **It never touches the typed entries**, which is what lets the operator
+   * carve one host out of their own exclusion and still see the exclusion they wrote.
+   *
+   * The estate is re-read afterwards, not patched: a host label covers every asset on
+   * that host — present and future — so one click can change the state of rows the
+   * operator did not click, and guessing which from here would be a second
+   * implementation of the ladder.
+   */
+  async labelScope(draft: ScopeLabelDraft) {
+    const id = this.viewTargetId;
+    if (id === "" || this.scopeBusy) return;
+    this.scopeBusy = true;
+    const call = await this.client.labelScope(this.serverUrl, id, draft);
+    this.scopeBusy = false;
+    if (await this.#applyScopeChange(id, call)) {
+      await this.loadAssets(id);
+    }
+  }
+
+  /** Switches tab. Clears a refusal, which belonged to the control the operator left. */
+  toAssetsTab(tab: AssetsTab) {
+    this.assetsTab = tab;
+    this.scopeRefusal = "";
+    this.scopeRefusalContradiction = false;
   }
 
   /**

@@ -767,3 +767,116 @@ export const describeScopeState = (state: ScopeState): string => {
       return "not covered by any in-scope entry; recorded for the operator to review";
   }
 };
+
+/* ── What the browser sends and reads ────────────────────────────────────────────── */
+
+/**
+ * What the Scope tab submits to add an entry.
+ *
+ * **No id and no source.** The server mints the entry id, and `source` is `operator` by
+ * construction on this route — a browser that could name its own source could write
+ * `imported` on a row a person typed, which would mean the operator's review of the
+ * imported list was reviewing the wrong rows. The importer writes `imported` from its own
+ * endpoint and nowhere else.
+ *
+ * `value` is sent as typed, not normalised. Normalising in the browser would be a second
+ * implementation of the rule, and the refusals are worth more than the round trip saves:
+ * the server's sentence names the remedy.
+ */
+export const ScopeEntryDraft = Schema.Struct({
+  effect: ScopeEffect,
+  kind: ScopeKind,
+  /** As the operator typed it. The server normalises it and may refuse it. */
+  value: Schema.String,
+});
+export type ScopeEntryDraft = typeof ScopeEntryDraft.Type;
+
+/**
+ * Which subject a label is about.
+ *
+ * The two layers of the ladder, as a tagged union rather than two nullable fields, so a
+ * payload naming both or neither cannot be constructed.
+ */
+export const ScopeLabelSubject = Schema.Union([
+  Schema.Struct({ _tag: Schema.Literal("host"), host: Schema.String }),
+  Schema.Struct({ _tag: Schema.Literal("asset"), assetId: Schema.String }),
+]);
+export type ScopeLabelSubject = typeof ScopeLabelSubject.Type;
+
+/**
+ * What the promote/exclude control submits.
+ *
+ * One draft for all three actions, because they are one control with directions rather
+ * than three mechanisms: promote is `in`, exclude is `out`, and withdrawing is `cleared`.
+ * An earlier design had promotion writing a scope entry and exclusion writing a label,
+ * which made two buttons different mechanisms wearing one shape.
+ *
+ * **`cleared` is an action, not a stored state.** Nothing in either label table ever
+ * holds it: the row is deleted, and the subject goes back to being decided by the
+ * entries. It is spelled here because "withdraw my label" is a thing the operator does,
+ * and a route that expressed it as an absence would be a route that could not tell it
+ * from "I sent you a malformed payload".
+ */
+export const ScopeLabelDraft = Schema.Struct({
+  subject: ScopeLabelSubject,
+  state: Schema.Literals(["in", "out", "cleared"]),
+  /** Why, in the operator's words. Absent and empty both mean none. */
+  reason: Schema.optional(Schema.Trim),
+});
+export type ScopeLabelDraft = typeof ScopeLabelDraft.Type;
+
+/** One entry as the Scope tab reads it. */
+export const ScopeEntryView = Schema.Struct({
+  entryId: Schema.String,
+  effect: ScopeEffect,
+  kind: ScopeKind,
+  value: Schema.String,
+  source: ScopeEntrySource,
+  note: Schema.NullOr(Schema.String),
+  createdAt: Schema.Number,
+});
+export type ScopeEntryView = typeof ScopeEntryView.Type;
+
+/** One host label as the Scope tab reads it. */
+export const HostScopeLabelView = Schema.Struct({
+  host: Schema.String,
+  state: ScopeLabelState,
+  reason: Schema.NullOr(Schema.String),
+  setBy: Schema.String,
+  setAt: Schema.Number,
+});
+export type HostScopeLabelView = typeof HostScopeLabelView.Type;
+
+/** One asset label as the Scope tab reads it, named by the asset it sits on. */
+export const AssetScopeLabelView = Schema.Struct({
+  assetId: Schema.String,
+  /** The asset's canonical identity, so the row says what it is about. */
+  identity: Schema.String,
+  state: ScopeLabelState,
+  reason: Schema.NullOr(Schema.String),
+  setBy: Schema.String,
+  setAt: Schema.Number,
+});
+export type AssetScopeLabelView = typeof AssetScopeLabelView.Type;
+
+/**
+ * One target's whole scope, as the Scope tab reads it.
+ *
+ * `promptBlock` is the thing that makes this view worth having. It is **the bytes an
+ * agent would be given right now**, rendered server-side by the same function both prompt
+ * paths use — not a reconstruction the browser assembled from the lists above it. A4 is
+ * explicit that the preview panel is not decoration: it is the only place an operator can
+ * check what their list actually says before an agent acts on it, and a preview built by
+ * a second renderer would be exactly the drift the one-renderer rule exists to stop.
+ *
+ * Null when nothing is in scope, which is the state A4's empty screen describes: the hunt
+ * still runs and still records everything, it just arrives labelled "not covered", and
+ * the agent is told nothing about the estate.
+ */
+export const ScopeView = Schema.Struct({
+  entries: Schema.Array(ScopeEntryView),
+  hostLabels: Schema.Array(HostScopeLabelView),
+  assetLabels: Schema.Array(AssetScopeLabelView),
+  promptBlock: Schema.NullOr(Schema.String),
+});
+export type ScopeView = typeof ScopeView.Type;

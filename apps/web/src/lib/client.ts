@@ -44,6 +44,8 @@ import {
   type IntentDraft,
   type LiveFrame,
   type ModelOptionSelection,
+  type ScopeEntryDraft,
+  type ScopeLabelDraft,
   type TargetDraft,
 } from "@bit/contracts";
 import { Effect, Fiber, Layer, Result, Stream } from "effect";
@@ -209,6 +211,14 @@ export const REFUSAL_TAGS = new Set([
   // answer carrying two numbers the panel prints, and classifying it as transport trouble
   // would tell an operator no server answered when one answered precisely.
   "GoalBriefingRefused",
+  // Scope: every reason is a sentence the Scope tab prints beside the control that caused
+  // it. `contradiction` names the entry an operator would have to remove first and is the
+  // one danger-red banner in that screen; `invalid` carries the normaliser's own words,
+  // which name the remedy rather than the rule — "write the apex alone", "add it as a CIDR
+  // entry instead". Classifying either as transport trouble would replace the one
+  // instruction the operator needs with a connectivity complaint about a server that
+  // answered precisely.
+  "ScopeRefused",
   // Intents: an intent this target does not hold, and one that cannot be changed because a
   // run holds it or it is already answered or abandoned. `IntentRefused`'s `detail` is the
   // store's own sentence and **is written to teach** — it says what an offending anchor id
@@ -447,6 +457,54 @@ export const server = {
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.assets({ params: { targetId } }),
+      ),
+    ),
+
+  /**
+   * The open target's authored scope, with the block an agent would be given now.
+   *
+   * `promptBlock` is the server's own rendering, from the same function both prompt paths
+   * call. The preview panel shows it verbatim rather than rebuilding it here, because a
+   * preview assembled by a second renderer is the drift the one-renderer rule exists to
+   * stop — and the panel's whole purpose is to be the place an operator can trust.
+   */
+  scope: (baseUrl: string, targetId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.scope({ params: { targetId } }),
+      ),
+    ),
+
+  /**
+   * Adds one scope entry. The value goes as typed; the server normalises and may refuse.
+   *
+   * Deliberately not normalised here: a browser copy of the rule would be a second
+   * implementation of it, and the refusals are worth more than the round trip saves.
+   */
+  addScopeEntry: (baseUrl: string, targetId: string, draft: ScopeEntryDraft) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.addScopeEntry({ params: { targetId }, payload: draft }),
+      ),
+    ),
+
+  removeScopeEntry: (baseUrl: string, targetId: string, entryId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.removeScopeEntry({ params: { targetId, entryId } }),
+      ),
+    ),
+
+  /**
+   * Promotes, excludes or withdraws a label on one host or one asset.
+   *
+   * One call for all six combinations, because the operator is using one control with two
+   * directions and an undo. It never touches the typed entries.
+   */
+  labelScope: (baseUrl: string, targetId: string, draft: ScopeLabelDraft) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.labelScope({ params: { targetId }, payload: draft }),
       ),
     ),
 
