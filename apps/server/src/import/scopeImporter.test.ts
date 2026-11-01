@@ -29,7 +29,7 @@
  *   operator's review of an imported scope is the only control on it, and that review
  *   exists only because there is a real gap between the import and the first execution.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

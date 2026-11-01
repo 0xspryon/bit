@@ -8,7 +8,7 @@
     "start": "bun dist/main.js",
     "typecheck": "tsc -p tsconfig.json",
     "test": "bun test",
-    "test:persistence": "bun test src/persistence src/plan src/briefing src/recovery src/run src/harness/claudeCodeClient.test.ts src/mcp/dispatch.test.ts src/mcp/plannerTools.test.ts src/mcp/recordAsset.test.ts src/policy/install.test.ts src/policy/claudeCodeGate.test.ts"
+    "test:persistence": "bun test src/persistence src/plan src/briefing src/recovery src/run src/harness/claudeCodeClient.test.ts src/mcp/dispatch.test.ts src/mcp/plannerTools.test.ts src/mcp/recordAsset.test.ts src/mcp/importerTools.test.ts src/import src/policy/install.test.ts src/policy/claudeCodeGate.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.310",
