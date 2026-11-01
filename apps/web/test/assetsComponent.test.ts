@@ -18,7 +18,9 @@
  * **It is server output, so no `$effect` runs**, and that is the limit `runes.ts` records.
  * Nothing here exercises a click: the promote and exclude handlers are plain methods on
  * `App` and are tested directly in `assets.test.ts`, which is the division this repo
- * already draws for the chat's scrolling.
+ * already draws for the chat's scrolling. What a click and a key *do* — the `×` opening a
+ * question, Escape closing it, where focus lands afterwards — is `test/dom/`, which mounts
+ * the screen in a DOM.
  */
 import { describe, expect, test } from "bun:test";
 import { render } from "svelte/server";
@@ -706,21 +708,6 @@ describe("the Scope tab", () => {
         expect(dialog).not.toContain("Move to out of scope");
         expect(dialog).toContain("There is no undo");
       }
-    });
-
-    test("the × asks, and nothing on the screen deletes without asking", async () => {
-      /*
-       * A source check, and an honest weak one: the markup tests render on the server,
-       * where no click runs, so "the × opens the dialog instead of deleting" cannot be
-       * observed. What can be said is that the screen never reaches the `DELETE` itself.
-       * `confirmRemoveScopeEntry` is the only way in, and `assets.test.ts` shows it goes
-       * through a question that was asked.
-       */
-      const screen = await Bun.file(
-        new URL("../src/lib/screens/Assets.svelte", import.meta.url),
-      ).text();
-      expect(screen).toContain("app.askToRemoveScopeEntry(");
-      expect(screen).not.toMatch(/app\.removeScopeEntry\(/);
     });
 
     test("nothing in it is focused, and Delete is not disabled until it is working", async () => {

@@ -23,14 +23,34 @@
    * walks the page underneath, and Enter re-activates the opener. Landing on the panel
    * rather than a button is deliberate: a dialog that focuses its confirm button turns
    * the Enter that opened it into the Enter that confirms it. The first Tab reaches the
-   * first control. Focus goes back to the opener on close, if it still exists.
+   * first control.
+   *
+   * ## Where focus goes back to
+   *
+   * To the opener, if it still exists. The dialogs that matter most are the ones that
+   * *delete the thing that opened them* — the `×` on an entry row is gone once the entry
+   * is — and an opener that is no longer in the document cannot take focus, which leaves
+   * it on `<body>` and the next Tab at the first control on the page, nowhere near where
+   * the operator was.
+   *
+   * So a page that opens a dialog from something deletable marks a survivor with
+   * `data-focus-fallback` (and `tabindex="-1"`, so it can take focus without becoming a
+   * tab stop). The nearest marked ancestor of the opener is remembered when the dialog
+   * opens, because by the time it closes the opener has no ancestors left to ask. If the
+   * opener is gone, that ancestor gets focus instead; if there is none, behaviour is what
+   * it was.
    */
   $effect(() => {
     if (panel === null) return;
     const opener = document.activeElement;
+    const fallback =
+      opener instanceof Element
+        ? opener.closest<HTMLElement>("[data-focus-fallback]")
+        : null;
     if (!panel.contains(opener)) panel.focus();
     return () => {
       if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+      else if (fallback !== null && fallback.isConnected) fallback.focus();
     };
   });
 

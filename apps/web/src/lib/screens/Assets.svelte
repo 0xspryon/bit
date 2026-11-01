@@ -468,9 +468,16 @@
             {@const rows = scope.entries.filter(
               (entry) => entry.effect === section.effect,
             )}
+            <!-- `data-focus-fallback`: this list outlives any one of its rows, so it is
+                 where focus lands when the `×` that opened the delete question is
+                 deleted along with its row. See Modal. -->
             <div
               class={["list", rows.length === 0 && "none"]}
               style:--rows={Math.min(rows.length, 2)}
+              role="group"
+              aria-label={section.heading}
+              tabindex="-1"
+              data-focus-fallback
             >
               <div class="list-head">
                 <span class="list-label">{section.heading}</span>
