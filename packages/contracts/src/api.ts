@@ -69,7 +69,7 @@ import {
 } from "./plan";
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
-import { ImporterModelView, ScopeImportView } from "./scopeImport";
+import { ImporterModelView, ProgramLink, ScopeImportView } from "./scopeImport";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
@@ -433,8 +433,17 @@ export const TargetDraft = Schema.Struct({
    * target created with none is identical to one whose every link yielded nothing — both
    * have no scope yet and the Assets screen says what that means.
    *
-   * Bounded by `SCOPE_IMPORT_MAX_LINKS`, because one session reads all of them (D15) and
-   * they therefore share one context window.
+   * **Not bounded here, and the ceiling is applied rather than enforced.** One session
+   * reads all of them (D15), so they share one context window and there has to be a limit
+   * — but a draft carrying nine links is accepted and the first `SCOPE_IMPORT_MAX_LINKS`
+   * are read, with the rest reported on `ScopeImportView.droppedLinks` and shown on the
+   * panel. An operator who pasted nine pages wants the first eight read far more than they
+   * want the creation refused for a bound they cannot see from the form.
+   *
+   * Each link is a {@link ProgramLink}: an absolute `http` or `https` URL, checked on the
+   * server rather than trusted from the browser's `type="url"`, because
+   * `importerPrompt.ts` interpolates these into the prompt and says of itself that
+   * everything in it is this application's own words or a URL the operator typed.
    *
    * **Optional, and absent means the same as empty**, which is the opposite of how
    * {@link ImportModelDraft}'s `modelOptions` treats the distinction. There the difference
@@ -443,7 +452,7 @@ export const TargetDraft = Schema.Struct({
    * absent list could mean — no links and zero links are both "import nothing" — so
    * demanding the field would be demanding that every caller say "nothing" out loud.
    */
-  programLinks: Schema.optional(Schema.Array(Schema.NonEmptyString)),
+  programLinks: Schema.optional(Schema.Array(ProgramLink)),
   /**
    * Which model the importer runs on, when the operator chose.
    *

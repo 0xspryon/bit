@@ -130,11 +130,12 @@ class Seeded extends Context.Service<
         importId: IMPORT,
         targetId: TARGET,
         urls: [PAGE_A, PAGE_B],
+        droppedLinks: 0,
         harnessInstanceId: "opencode",
         model: "opencode/glm-5.3-flash-free",
       });
 
-      const importer = yield* credentials.issue({
+      const importer = yield* credentials.issueImport({
         _tag: "importer",
         targetId: TARGET,
         importId: IMPORT,

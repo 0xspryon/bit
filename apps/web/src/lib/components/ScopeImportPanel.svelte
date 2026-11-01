@@ -32,12 +32,15 @@
   import Banner from "./Banner.svelte";
   import Button from "./Button.svelte";
   import { IconCube, IconSearch } from "../icons";
+  import { SCOPE_IMPORT_MAX_LINKS } from "@bit/contracts";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
 
   let view = $derived(app.scopeImport);
   let running = $derived(view === undefined || view.status === "running");
+  /** Links the operator gave that this import is not reading. Usually none. */
+  let dropped = $derived(view?.droppedLinks ?? 0);
 
   /** What each link's state reads as beside its URL, with what it produced. */
   const linkState = (link: {
@@ -102,6 +105,24 @@
       </li>
     {/each}
   </ul>
+
+  {#if dropped > 0}
+    <!--
+      One session reads every link (D15), so they share one context window and there is a
+      ceiling on how many. Extra links are dropped rather than the import refused — an
+      operator who pasted nine pages wants the first eight read far more than they want to
+      be sent back to the form — but the dropping is said out loud here, because the rows
+      above would otherwise show eight links where they typed nine. Importing the rest is
+      something they can go and do.
+    -->
+    <Banner tone="warning">
+      {dropped}
+      {dropped === 1 ? "link was" : "links were"} not read: one session reads every
+      page, so an import takes at most {SCOPE_IMPORT_MAX_LINKS}. The pages
+      listed above are the ones it has; anything on the others is yours to add
+      on this target's Scope page.
+    </Banner>
+  {/if}
 
   <div class="calls">
     <span class="calls-label">What it wrote</span>

@@ -120,13 +120,25 @@
   <!--
     The import's error toast (D15).
 
-    Every link failing is not an error state: the operator has already been moved on to the
-    target's Assets screen by the time this shows, and this says why. It is the one toast in
-    the application, and it is here rather than in a screen because the screen it belongs to
-    is not the screen that raised it.
+    Every link failing is not an error state *for the target*: the operator has already been
+    moved on to its Assets screen by the time this shows, and this says why. It is the one
+    toast in the application, and it is here rather than in a screen because the screen it
+    belongs to is not the screen that raised it.
+
+    **`role="alert"`, and the danger tones.** It is still not an error state, but it is a
+    failure being reported: the import read nothing, or could not start. `role="status"` is
+    polite — a screen reader finishes what it is saying and may never reach this — and the
+    amber of a warning said something milder than the panel's own `tone="danger"` banner
+    about the same event. One event, one severity, on both surfaces.
+
+    **It does not time out, on purpose.** On the path that matters this toast carries the
+    importer's own account of why nothing was read, which can be the only explanation the
+    operator ever gets (the panel it would have been on is gone by then). A message that
+    takes itself away mid-sentence would be worse than one that waits to be dismissed, and
+    it blocks nothing while it waits.
   -->
   {#if app.toast !== ""}
-    <div class="toast" role="status">
+    <div class="toast" role="alert">
       <p>{app.toast}</p>
       <button
         class="toast-close"
@@ -160,10 +172,12 @@
     max-width: 560px;
     padding: 12px 14px;
     box-sizing: border-box;
-    border: 1px solid var(--state-border-warning);
+    /* The panel's banner for the same event is `tone="danger"`. One severity, both
+       surfaces — and never colour alone, since the toast says what happened in words. */
+    border: 1px solid var(--state-border-danger);
     border-radius: var(--radius-md);
-    background: var(--state-bg-warning);
-    color: var(--state-fg-warning);
+    background: var(--state-bg-danger);
+    color: var(--state-fg-danger);
     box-shadow: var(--elevation-overlay);
   }
   .toast p {

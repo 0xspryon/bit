@@ -130,6 +130,7 @@ import {
   type CallerBinding,
   type CallerContext,
   type GoalBinding,
+  type ImporterBinding,
 } from "../persistence/store";
 
 /**
@@ -164,18 +165,37 @@ export type Grant = CallerContext & {
 export const DEFAULT_LIFETIME_MS = 6 * 60 * 60 * 1000;
 
 /**
+ * How long a scope import's credential lives.
+ *
+ * **Minutes, not the default six hours.** An import is one session reading at most
+ * `SCOPE_IMPORT_MAX_LINKS` program pages and writing what it found; it takes a minute or
+ * two, and `createTarget` answers without waiting for it. A worker's six hours is sized
+ * for a hunt that genuinely runs that long, and handing the same window to a session whose
+ * work is measured in minutes leaves a live credential for a session nobody is watching —
+ * for no gain, since the import's own scope revokes it the moment the fiber ends.
+ *
+ * Thirty minutes rather than five, because the clock is a backstop and not the mechanism:
+ * a slow provider, a page that takes a while, or eight links against a rate-limited
+ * account should not have the credential expire *during* the import, which would surface
+ * as entries silently stopping part-way through a page. The scope is what normally ends it.
+ */
+export const IMPORT_LIFETIME_MS = 30 * 60 * 1000;
+
+/**
  * A credential this module refused to mint.
  *
- * One reason so far, and it is ruling 3's teeth: no-expiry is a goal's property, and
- * asking for an attempt or round credential that never expires is refused rather than
- * quietly granted. The *type* of {@link McpCredentials.issueWithoutExpiry} already makes
- * it unrepresentable; this is what happens when a cast, a decoded payload or a future
- * caller gets past the type.
+ * Two reasons, and both are a ruling's teeth rather than input validation. No-expiry is a
+ * goal's property, so asking for an attempt or round credential that never expires is
+ * refused rather than quietly granted (ruling 3). And the importer's mint takes importer
+ * bindings only, because that role's capability is writing a target's authorization
+ * boundary (D13). The *types* of {@link McpCredentials.issueWithoutExpiry} and
+ * {@link McpCredentials.issueImport} already make both unrepresentable; this is what
+ * happens when a cast, a decoded payload or a future caller gets past the type.
  */
 export class CredentialRefused extends Schema.TaggedError<CredentialRefused>()(
   "CredentialRefused",
   {
-    reason: Schema.Literals(["expiry_required"]),
+    reason: Schema.Literals(["expiry_required", "wrong_kind"]),
     detail: Schema.String,
   },
 ) {
@@ -264,14 +284,38 @@ export class McpCredentials extends Context.Service<
     /**
      * Mints a clock-bounded credential for one caller, owned by the current scope.
      *
-     * Takes a {@link CallerBinding} of any kind and derives `callerScope` from it, so
-     * command receipts and event attribution cannot disagree with the identity the
-     * credential carries.
+     * Derives `callerScope` from the binding, so command receipts and event attribution
+     * cannot disagree with the identity the credential carries.
+     *
+     * **An importer binding is not one of the kinds this takes.** It used to be — the
+     * parameter was `CallerBinding`, so any holder of this service could mint
+     * `{ _tag: "importer" }` and reach the three tools that write a target's authorization
+     * boundary. That is the same reasoning {@link issueWithoutExpiry} already applies to
+     * goals: the type is where "only this caller may mint this" is checkable, and
+     * {@link issueImport} is the one door. Defence in depth — `mcp/server.ts` refuses an
+     * importer grant at every other endpoint, and the importer's endpoint refuses every
+     * other grant — but the importer is the one role whose capability is *writing scope*,
+     * and narrowing the mint costs a type parameter.
      */
     readonly issue: (
-      binding: CallerBinding,
+      binding: Exclude<CallerBinding, ImporterBinding>,
       lifetimeMs?: number,
     ) => Effect.Effect<IssuedCredential, never, Scope.Scope>;
+    /**
+     * Mints the credential for one scope import, owned by the current scope.
+     *
+     * Separate from {@link issue} and taking only an {@link ImporterBinding}, for the
+     * reason that signature now states. It still refuses a binding of another kind at run
+     * time — see {@link CredentialRefused} — because a cast or a decoded payload can get
+     * past a type and this is the role that writes to the authorization boundary.
+     *
+     * The default lifetime is {@link IMPORT_LIFETIME_MS} rather than six hours: an import
+     * is a session of minutes, and its own scope is what normally revokes this.
+     */
+    readonly issueImport: (
+      binding: ImporterBinding,
+      lifetimeMs?: number,
+    ) => Effect.Effect<IssuedCredential, CredentialRefused, Scope.Scope>;
     /**
      * Mints a goal credential with **no clock expiry**, owned by the current scope.
      *
@@ -418,6 +462,25 @@ export class McpCredentials extends Context.Service<
         return yield* mint(binding, issuedAt, null);
       });
 
+    const issueImport: McpCredentials["Service"]["issueImport"] = Effect.fn(
+      "McpCredentials.issueImport",
+    )(function* (binding, lifetimeMs = IMPORT_LIFETIME_MS) {
+      // Unreachable through the signature, which takes an importer binding only. Kept for
+      // `issueWithoutExpiry`'s reason, one step sharper: the importer's three tools write
+      // scope entries and imported assets, which is the authorization boundary every later
+      // judgement is made against, and a credential minted for it from a cast binding
+      // would be a caller writing that boundary under a name it chose.
+      const kind = (binding as CallerBinding)._tag;
+      if (kind !== "importer") {
+        return yield* new CredentialRefused({
+          reason: "wrong_kind",
+          detail: `only a scope import's binding may be issued an importer credential, and this is a ${kind}'s`,
+        });
+      }
+      const issuedAt = yield* Clock.currentTimeMillis;
+      return yield* mint(binding, issuedAt, issuedAt + lifetimeMs);
+    });
+
     /** Revokes every grant of one kind matching one id. Returns how many there were. */
     const revokeMatching = (
       matches: (grant: Grant) => boolean,
@@ -481,6 +544,7 @@ export class McpCredentials extends Context.Service<
     return McpCredentials.of({
       issue,
       issueWithoutExpiry,
+      issueImport,
       resolve,
       revoke,
       revokeAttempt,

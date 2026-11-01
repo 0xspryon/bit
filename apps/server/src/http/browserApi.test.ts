@@ -841,6 +841,35 @@ describe("creating a target", () => {
     ).toEqual([]);
   });
 
+  test("a program link that is not a web page URL is refused by the contract", async () => {
+    // `importerPrompt.ts` interpolates these verbatim and says of itself that everything
+    // in the prompt is this application's own words or a URL the operator typed. The only
+    // thing enforcing the second half was the browser's `type="url"`, so the server took
+    // any non-empty string — including one the session's own page reader would open.
+    mkdirSync(join(workspaceRoot, "schemes"), { recursive: true });
+    for (const link of ["not a url at all", "file:///etc/hostname"]) {
+      const refused = await read(
+        await signedIn("/targets", {
+          method: "POST",
+          body: {
+            workspacePath: join(workspaceRoot, "schemes"),
+            name: "schemes",
+            scopeNote: "",
+            programLinks: [link],
+          },
+        }),
+      );
+      // A decode refusal, before any handler runs: there is no target and no import.
+      expect(refused.status).toBe(400);
+    }
+    const listed = await read(await signedIn("/targets"));
+    expect(
+      (listed.body as unknown as ReadonlyArray<{ id: string }>).map(
+        (row) => row.id,
+      ),
+    ).not.toContain("schemes");
+  });
+
   test("a target whose file cannot migrate is created, unavailable, and alone in that", async () => {
     const created = await read(
       await signedIn("/targets", {

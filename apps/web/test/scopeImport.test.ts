@@ -205,6 +205,27 @@ describe("the panel lists tool calls and no narration", () => {
     expect(stopped).not.toContain("Continue in background");
   });
 
+  test("links dropped for the ceiling are said out loud, not just logged", async () => {
+    const { app } = await onPage();
+    app.newTargetPhase = "importing";
+    app.scopeImportTargetId = "acme-corp";
+    // The server reads the first `SCOPE_IMPORT_MAX_LINKS` and drops the rest — which is
+    // right, because an operator who pasted eleven pages wants the first eight read. What
+    // was wrong was doing it silently: the rows below showed eight links where they typed
+    // eleven, and the only account of the other three was a line in the server's log.
+    app.scopeImport = scopeImportView({
+      status: "running",
+      links: [
+        { url: PAGE_A, state: "read", entriesIn: 1, entriesOut: 0, assets: 1 },
+      ],
+      droppedLinks: 3,
+    });
+
+    const body = bodyOf(app);
+    expect(body).toContain("3 links were not read");
+    expect(body).toContain("Scope page");
+  });
+
   test("a link that yielded nothing says so once the import has settled", async () => {
     const { app } = await onPage();
     app.newTargetPhase = "importing";

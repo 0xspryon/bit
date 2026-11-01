@@ -184,6 +184,7 @@ export const scopeImportView = (
   harnessInstanceId: "opencode",
   model: "opencode/glm-5.3-flash-free",
   links: [],
+  droppedLinks: 0,
   calls: [],
   totals: { entriesIn: 0, entriesOut: 0, assets: 0 },
   startedAt: 1_700_000_000_000,

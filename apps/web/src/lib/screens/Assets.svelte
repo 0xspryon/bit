@@ -104,18 +104,29 @@
    * A worker's later discovery of the same host wins the sentence, because by then the
    * more informative fact is that somebody has actually been there. Both provenance rows
    * are kept either way; this column has room for one.
+   *
+   * **A hand-written scope label is not provenance and is checked last**, which is the
+   * other half of the same mistake. `scope.by._tag === "assetLabel"` means an operator
+   * decided this one asset's scope state — a decision about whether it may be tested — and
+   * it says nothing about where the asset came from. Read first, as it was, it erased the
+   * "imported from …" sentence from every imported host the operator promoted or excluded:
+   * one click on a row and its provenance read "by hand". The row already says a label
+   * decided its state, in its own chip and its own "why" column, so this column does not
+   * need to say it again — and when it does say it, it is because nothing else accounts
+   * for the asset at all.
    */
   const foundBy = (asset: AssetView): string => {
-    if (asset.scope.by._tag === "assetLabel") return "by hand";
     if (asset.firstAttemptId !== null)
       return `via ${asset.firstAttemptId.slice(0, 11)}`;
     if (asset.imports > 0)
       return asset.firstSourceUrl === null
         ? "imported from the program page"
         : `imported from ${hostOfUrl(asset.firstSourceUrl)}`;
-    // Neither provenance table has a row for it, which should not happen: both writes put
-    // their provenance row in the same transaction as the asset. Said plainly rather than
-    // dressed up, because an asset nothing accounts for is worth noticing.
+    // No provenance row of either kind, which should not happen: both writes put their
+    // provenance row in the same transaction as the asset. An operator's own label is the
+    // most that can be said about such a row, and nothing at all is said if there is not
+    // even one — because an asset nothing accounts for is worth noticing.
+    if (asset.scope.by._tag === "assetLabel") return "by hand";
     return "no recorded provenance";
   };
 

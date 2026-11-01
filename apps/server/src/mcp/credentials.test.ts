@@ -19,11 +19,13 @@ import { callerScopeOf, operatorScope } from "../persistence/store";
 import {
   CredentialRefused,
   DEFAULT_LIFETIME_MS,
+  IMPORT_LIFETIME_MS,
   McpCredentials,
   callerOf,
   type AttemptBinding,
   type CallerBinding,
   type GoalBinding,
+  type ImporterBinding,
   type RoundBinding,
 } from "./credentials";
 
@@ -406,10 +408,60 @@ describe("what a binding cannot do", () => {
     const binding = {
       ...ROUND,
       callerScope: "target-1/att_pretending",
-    } as unknown as CallerBinding;
+    } as unknown as RoundBinding;
     const grant = await withCredentials((credentials) =>
       Effect.map(credentials.issue(binding), (issued) => issued.grant),
     );
     expect(grant.callerScope).toBe("target-1/round/rnd_1");
+  });
+
+  /**
+   * The importer's mint takes importer bindings and nothing else.
+   *
+   * `issue` used to take a `CallerBinding` of any kind, so any holder of this service
+   * could mint `{ _tag: "importer" }` — and the importer is the one role whose capability
+   * is *writing a target's authorization boundary*: scope entries and imported assets,
+   * which every later judgement about what may be tested is made against. The module
+   * already established the stronger pattern for goals and no-expiry; this is the same
+   * pattern applied to the same kind of claim.
+   *
+   * **The first half of it is not testable here and is checked by `typecheck`**: `issue`'s
+   * parameter is `Exclude<CallerBinding, ImporterBinding>`, so a call site passing an
+   * importer binding does not compile — which is how `scopeImporter.ts` came to be the
+   * only caller of `issueImport`. What is testable is the run-time backstop, below.
+   */
+  test("`issueImport` refuses a binding of another kind at run time", async () => {
+    // Unreachable through the signature. Kept because a cast or a decoded payload can get
+    // past a type, and this is the role that writes the boundary.
+    const refused = await withCredentials((credentials) =>
+      Effect.result(
+        credentials.issueImport(ROUND as unknown as ImporterBinding),
+      ),
+    );
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure.reason).toBe("wrong_kind");
+      expect(refused.failure.detail).toContain("round");
+    }
+  });
+
+  test("an import's credential expires in minutes, not a worker's six hours", async () => {
+    // An import is one session reading at most eight pages, and `createTarget` answers
+    // without waiting for it. A worker's window is sized for a hunt that runs that long;
+    // handing it to a session whose work is minutes leaves a live credential nobody is
+    // watching, for no gain — the import's own scope revokes it when the fiber ends.
+    const grant = await withCredentials((credentials) =>
+      Effect.map(
+        credentials.issueImport({
+          _tag: "importer",
+          targetId: "target-1",
+          importId: "imp_1",
+        }),
+        (issued) => issued.grant,
+      ),
+    );
+    expect(grant.expiresAt).not.toBeNull();
+    expect((grant.expiresAt ?? 0) - grant.issuedAt).toBe(IMPORT_LIFETIME_MS);
+    expect(IMPORT_LIFETIME_MS).toBeLessThan(DEFAULT_LIFETIME_MS);
   });
 });

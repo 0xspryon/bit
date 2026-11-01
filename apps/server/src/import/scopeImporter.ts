@@ -281,10 +281,12 @@ export class ScopeImporter extends Context.Service<
                 : { options: input.request.choice.modelOptions }),
             });
 
-            const credential = yield* credentials.issue({
-              // The importer, said rather than implied. A fourth caller kind is what makes
-              // this session's three tools unreachable from a worker, a planner or a goal
-              // agent: each endpoint refuses a grant whose tag is not the role it serves.
+            // `issueImport`, which takes importer bindings and nothing else, and defaults
+            // to a lifetime measured in minutes rather than a worker's six hours. A
+            // fourth caller kind is what makes this session's three tools unreachable
+            // from a worker, a planner or a goal agent: each endpoint refuses a grant
+            // whose tag is not the role it serves.
+            const credential = yield* credentials.issueImport({
               _tag: "importer",
               targetId: input.request.targetId,
               importId: input.importId,
@@ -427,7 +429,11 @@ export class ScopeImporter extends Context.Service<
          * first eight read far more than they want to be sent back to the form.
          */
         const links = request.links.slice(0, SCOPE_IMPORT_MAX_LINKS);
-        if (links.length < request.links.length) {
+        const droppedLinks = request.links.length - links.length;
+        if (droppedLinks > 0) {
+          // Logged *and* reported. The log is for whoever is reading the server's output;
+          // `droppedLinks` on the view is for the operator, who is the one who typed the
+          // ninth link and is otherwise shown eight rows with no account of the other.
           yield* Effect.logWarning(
             "a scope import was given more links than one session can read; the extras are ignored",
             {
@@ -474,6 +480,7 @@ export class ScopeImporter extends Context.Service<
           importId,
           targetId: request.targetId,
           urls: links,
+          droppedLinks,
           harnessInstanceId: harness.instance.instanceId,
           model: choice.model,
         });

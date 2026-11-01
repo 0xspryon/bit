@@ -620,6 +620,43 @@ describe("an imported asset reads as provenance, not as an absence", () => {
     expect(html).toContain("2 sightings");
   });
 
+  test("hand-labelling an imported host does not erase where it came from", async () => {
+    // The regression this is written against: `foundBy` checked `assetLabel` first, so one
+    // click of Promote or Exclude on an imported row replaced "imported from hackerone.com"
+    // with "by hand". A scope label is a decision about whether the asset may be tested; it
+    // is not a claim about where the asset came from, and the row says which label decided
+    // its state in its own chip and its own "why" column already.
+    const html = await bodyOf((fake) => {
+      fake.onAssets = () =>
+        ok({
+          assets: [
+            assetView({
+              assetId: "asset_imported_labelled",
+              identity: "app.acme.test:443",
+              host: "app.acme.test",
+              discoveries: 0,
+              firstAttemptId: null,
+              firstIntentId: null,
+              lastDiscoveredAt: null,
+              imports: 1,
+              firstSourceUrl: "https://hackerone.com/acme/policy",
+              scope: {
+                state: "in",
+                by: { _tag: "assetLabel", state: "in" },
+                overrode: null,
+              },
+            }),
+          ],
+        });
+    });
+
+    // The provenance column says where the host came from…
+    expect(html).toContain(">imported from hackerone.com<");
+    // …and the label is still visible as what decided the scope state, which is a
+    // different claim and has its own column.
+    expect(html).toContain("in scope, set by hand on this asset alone");
+  });
+
   test("an asset neither path accounts for says so plainly", async () => {
     const html = await bodyOf((fake) => {
       fake.onAssets = () =>

@@ -186,6 +186,21 @@ export const ScopeImportView = Schema.Struct({
   harnessInstanceId: Schema.String,
   model: Schema.String,
   links: Schema.Array(ScopeImportLink),
+  /**
+   * How many links were dropped for exceeding {@link SCOPE_IMPORT_MAX_LINKS}.
+   *
+   * Usually `0`. One session reads every link (D15), so they share one context window and
+   * there has to be a ceiling; extras are **dropped rather than the import refused**,
+   * because an operator who pasted nine pages wants the first eight read far more than
+   * they want to be sent back to the form.
+   *
+   * **It is on the view because dropping is right and silent dropping is not.** This was a
+   * server-side `logWarning` and nothing else: the extra links simply did not appear in
+   * {@link links}, and the one surface that could have said so showed eight rows where the
+   * operator had typed nine. A count the panel can render is the cheapest honest version —
+   * the operator knows to import the rest afterwards, which is a thing they can do.
+   */
+  droppedLinks: Schema.Int,
   calls: Schema.Array(ScopeImportCall),
   totals: ScopeImportTotals,
   startedAt: Schema.Int,
@@ -408,6 +423,54 @@ export const scopeImportLinks = (input: {
  * window becomes the thing that fails.
  */
 export const SCOPE_IMPORT_MAX_LINKS = 8;
+
+/**
+ * One program page the operator pasted: an absolute `http` or `https` URL.
+ *
+ * **Checked here because the prompt claims it.** `importerPrompt.ts` interpolates these
+ * verbatim and says of itself that everything in the prompt "is either this application's
+ * own words or a URL the operator typed" — and until this schema, the only thing enforcing
+ * the second half was the browser's `type="url"` on the input. The server took
+ * `NonEmptyString`, so any caller that was not that form could put an arbitrary line of
+ * text into the prompt's numbered list, where the model reads it as a page to fetch.
+ *
+ * What it rules out is the whole of what can be checked without fetching anything: a
+ * string that is not a URL at all, and a scheme that is not the web's. `file:`, `data:`
+ * and `javascript:` are refused by name rather than by accident, which matters because the
+ * session's reader is a general-purpose page reader and `file:///etc/passwd` is a URL.
+ *
+ * What it cannot rule out is where the page leads, and nothing in a schema could: the
+ * operator is pasting a bug bounty program's own page, which is untrusted content by
+ * construction (D13), and the containment for that is the importer's three tools, the
+ * `imported` marking on every entry, and the operator's own review.
+ */
+export const ProgramLink = Schema.NonEmptyString.check(
+  Schema.makeFilter<string>(
+    (value) => {
+      let parsed: URL;
+      try {
+        parsed = new URL(value.trim());
+      } catch {
+        return {
+          path: [],
+          issue: `'${value}' is not a URL, so there is no page to read. Paste the program's page as an absolute address, for example https://hackerone.com/acme/policy`,
+        };
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return {
+          path: [],
+          issue: `'${value}' is not an http or https address, and a program's page is one. The importer reads web pages and nothing else.`,
+        };
+      }
+      return undefined;
+    },
+    { expected: "an absolute http or https URL" },
+  ),
+).annotate({
+  description:
+    "A bug bounty program's own page, as an absolute URL, for example https://hackerone.com/acme/policy.",
+});
+export type ProgramLink = typeof ProgramLink.Type;
 
 /**
  * What the importer is told, and the one rule its framing exists to carry (D13).

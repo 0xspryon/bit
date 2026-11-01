@@ -43,6 +43,8 @@ import {
   Stream,
 } from "effect";
 
+import { SCOPE_IMPORT_MAX_LINKS } from "@bit/contracts";
+
 import { ScopeImportProgress } from "./progress";
 import { ScopeImporter } from "./scopeImporter";
 import type { McpRegistration } from "../harness/agentHarness";
@@ -611,6 +613,65 @@ describe("the session's closing report, and nothing else it said", () => {
     const prompt = built.script.prompts[0] ?? "";
     expect(prompt).toContain("no scope table");
     expect(prompt).toContain("naming the page and");
+    await runtime.dispose();
+  });
+});
+
+/**
+ * The ceiling, and the fact that it is said out loud.
+ *
+ * `SCOPE_IMPORT_MAX_LINKS` appeared in no test at all, which is how a bound that reached
+ * nobody survived: the extras were sliced off and a `logWarning` was the whole of the
+ * report, so the panel showed eight rows where the operator had typed nine and said
+ * nothing about the ninth.
+ */
+describe("more links than one session can read", () => {
+  test("the first few are read, the rest are reported rather than refused", async () => {
+    const built = world([]);
+    const runtime = ManagedRuntime.make(built.layer);
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const fleet = yield* FleetStore;
+        const importer = yield* ScopeImporter;
+        yield* fleet.register({
+          targetId: "many-corp",
+          name: "Many Corp",
+          scopeNote: "",
+          workspacePath: workspace,
+        });
+        yield* fleet.migrateTarget("many-corp");
+        return yield* importer.start({
+          targetId: "many-corp",
+          targetName: "Many Corp",
+          workspacePath: workspace,
+          links: Array.from(
+            { length: SCOPE_IMPORT_MAX_LINKS + 3 },
+            (_, at) => `https://example.test/page-${String(at)}`,
+          ),
+        });
+      }),
+    );
+
+    // Not refused. An operator who pasted eleven pages wants the first eight read far
+    // more than they want to be sent back to the form.
+    expect(started._tag).toBe("started");
+    const view =
+      started._tag === "started"
+        ? await runtime.runPromise(
+            Effect.flatMap(ScopeImporter, (importer) =>
+              importer.view(started.importId),
+            ),
+          )
+        : undefined;
+    expect(view?.links).toHaveLength(SCOPE_IMPORT_MAX_LINKS);
+    // And the operator is told, on the one surface that could have told them.
+    expect(view?.droppedLinks).toBe(3);
+    await runtime.dispose();
+  });
+
+  test("the usual case reports nothing, because nothing was dropped", async () => {
+    const { runtime, view } = await importWith([PAGE_GOOD]);
+    expect(view?.droppedLinks).toBe(0);
     await runtime.dispose();
   });
 });

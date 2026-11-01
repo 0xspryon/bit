@@ -70,6 +70,8 @@ interface Entry {
   readonly importId: string;
   readonly targetId: string;
   readonly urls: readonly string[];
+  /** How many of the links the operator gave are not in {@link urls}. Usually 0. */
+  readonly droppedLinks: number;
   readonly harnessInstanceId: string;
   readonly model: string;
   readonly startedAt: number;
@@ -116,6 +118,7 @@ const viewOf = (entry: Entry): ScopeImportView => {
       calls: entry.calls,
       running,
     }),
+    droppedLinks: entry.droppedLinks,
     calls: [...entry.calls],
     totals: { entriesIn, entriesOut, assets },
     startedAt: entry.startedAt,
@@ -137,6 +140,11 @@ export class ScopeImportProgress extends Context.Service<
       readonly importId: string;
       readonly targetId: string;
       readonly urls: readonly string[];
+      /**
+       * Links the operator gave that this import will not read, because one session reads
+       * all of them and there is a ceiling. Reported on the view rather than only logged.
+       */
+      readonly droppedLinks: number;
       readonly harnessInstanceId: string;
       readonly model: string;
     }) => Effect.Effect<void>;
@@ -231,6 +239,7 @@ export class ScopeImportProgress extends Context.Service<
             importId: input.importId,
             targetId: input.targetId,
             urls: [...input.urls],
+            droppedLinks: input.droppedLinks,
             harnessInstanceId: input.harnessInstanceId,
             model: input.model,
             startedAt,

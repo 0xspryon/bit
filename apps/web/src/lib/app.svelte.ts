@@ -3285,6 +3285,13 @@ export class App {
    * held, for `importerModel`'s reason.
    */
   openNewTarget() {
+    // The poller first, before `scopeImportId` is cleared out from under it. `cancelNewTarget`
+    // already does this and this did not: the loop reschedules itself after every answer, so
+    // clearing the id alone leaves a fiber polling an import whose panel is gone — forever,
+    // because the only paths that stop it are the ones that call this. Not reachable today
+    // (nothing navigates from a running panel back to the form), which is exactly how a
+    // latent leak survives a review.
+    this.stopWatchingImport();
     this.screen = "new-target";
     this.newTargetPhase = "form";
     this.dialogChosen = "";
