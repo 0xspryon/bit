@@ -36,13 +36,16 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  assetIdentityOf,
   describeScopeEntry,
   describeScopeLabel,
+  isAssetIdentityRefusal,
   isIpAddress,
   isScopeValueRefusal,
   normaliseHost,
   normaliseScopeEntry,
   scopeStateOf,
+  type AssetIdentity,
   type AssetScopeLabel,
   type HostScopeLabel,
   type ScopeEntry,
@@ -163,14 +166,72 @@ describe("the normaliser", () => {
     });
 
     test("a bracketed literal and its entry value actually match", () => {
-      // The end-to-end form of the rule, through the matcher rather than the normaliser:
-      // an operator types `::1`, the asset's host column holds `[::1]`, and the subject
-      // is in scope.
+      /*
+       * The end-to-end form of the rule, and it has to be end-to-end to mean anything.
+       *
+       * An earlier version of this test wrote `stateOf(entries, normaliseHost("[::1]"))`
+       * — wrapping the subject in the very normaliser the production path omitted — so it
+       * asserted that `normaliseHost` works, which the table above already covers. It
+       * passed while an IPv6 asset could not be in scope and could not be hand-labelled,
+       * because `assetIdentityOf` filled the `host` column from `new URL().hostname` with
+       * its brackets still on.
+       *
+       * So the subject here is derived **the way an asset row is**: through
+       * `assetIdentityOf`, which is the only thing that writes `assets.host`. If that
+       * function ever stops sharing the step, this fails.
+       */
       const typed = normaliseScopeEntry({ kind: "host", value: "::1" });
       expect(isScopeValueRefusal(typed)).toBe(false);
       const entries = [entry("in", "host", typed as string)];
-      expect(stateOf(entries, normaliseHost("[::1]"))).toBe("in");
-      expect(stateOf(entries, normaliseHost("http://[::1]:8080/x"))).toBe("in");
+
+      const recorded = assetIdentityOf({
+        kind: "endpoint",
+        url: "http://[::1]:8080/x",
+        method: "get",
+      });
+      expect(isAssetIdentityRefusal(recorded)).toBe(false);
+      const asset = recorded as AssetIdentity;
+      // The stored host column, verbatim: the matched form, not the authority form.
+      expect(asset.host).toBe("::1");
+      expect(stateOf(entries, asset.host)).toBe("in");
+
+      const bareHost = assetIdentityOf({
+        kind: "host",
+        url: "https://[2001:DB8::1]/",
+        method: null,
+      }) as AssetIdentity;
+      expect(bareHost.host).toBe("2001:db8::1");
+      expect(stateOf([entry("in", "host", "2001:db8::1")], bareHost.host)).toBe(
+        "in",
+      );
+      // And the identity an agent and an operator read keeps its brackets, because there
+      // the host is part of an authority: `::1:8080` would be unreadable as a pair.
+      expect(asset.identity).toBe("GET http://[::1]:8080/x");
+      expect(bareHost.identity).toBe("[2001:db8::1]:443");
+    });
+
+    test("a hand label on an IPv6 asset is a label that applies", () => {
+      /*
+       * The anti-goal this closes: "an operator action that appears to work and does
+       * nothing". A host label is keyed by the normalised host, and the ladder looks it
+       * up by the asset's `host` column. If those two spellings differ the operator's
+       * click is written, is visible in the label list, and decides nothing.
+       */
+      const asset = assetIdentityOf({
+        kind: "endpoint",
+        url: "http://[::1]:8080/x",
+        method: "get",
+      }) as AssetIdentity;
+      const keyed = normaliseHost("::1");
+      expect(asset.host).toBe(keyed);
+
+      const state = scopeStateOf({
+        entries: [entry("in", "cidr", "::/0")],
+        hostLabel: hostLabel(keyed, "out"),
+        subject: { host: asset.host },
+      });
+      expect(state.state).toBe("out");
+      expect(state.by._tag).toBe("hostLabel");
     });
   });
 
@@ -301,11 +362,21 @@ describe("addresses and names do not borrow each other's rules", () => {
   test("an address is never read as a subdomain of its own tail", () => {
     /*
      * The structural form of the bug: with label arithmetic applied to addresses,
-     * `10.0.0.18` ends with `.0.18` and would be matched by a subtree entry on `0.18`.
-     * Treating an address as an address makes that impossible rather than unlikely.
+     * `198.51.100.7` ends with `.100.7` and would be matched by a subtree entry on
+     * `100.7`. Treating an address as an address makes that impossible rather than
+     * unlikely.
+     *
+     * The addresses are this repo's own documentation-range fixtures. An earlier version
+     * used the one distinctive literal pair this file shared with ars0n-framework-v2,
+     * which is GPL-3.0 and is cited here only for the reasoning; the rule under test is
+     * unchanged.
      */
-    const entries = [entry("in", "subtree", "0.18")];
-    expect(stateOf(entries, "10.0.0.18")).toBe("out");
+    const entries = [entry("in", "subtree", "100.7")];
+    expect(stateOf(entries, "198.51.100.7")).toBe("out");
+    // The same shape one level up, so a lucky tail is not what passes it.
+    expect(stateOf([entry("in", "subtree", "51.100.7")], "198.51.100.7")).toBe(
+      "out",
+    );
   });
 
   test("a name never matches a CIDR entry", () => {

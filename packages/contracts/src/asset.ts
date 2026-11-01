@@ -17,7 +17,7 @@
  */
 import { Schema } from "effect";
 
-import { ScopeState } from "./scope";
+import { normaliseHost, ScopeState } from "./scope";
 
 /**
  * The asset kinds this build knows.
@@ -120,6 +120,14 @@ export const AssetIdentity = Schema.Struct({
   kind: AssetKind,
   /** What uniqueness is on, within one target and kind. */
   identity: Schema.String,
+  /**
+   * The host, reduced by `normaliseHost` — the **same** function a scope entry value and
+   * a hand label key go through, which is what makes the stored form the matched form.
+   *
+   * It is therefore bracket-free for an IPv6 literal: `[::1]` is stored as `::1`. The
+   * identity string above keeps the brackets, because there it is part of an authority
+   * and `::1:8080` cannot be told from the address `::1:8080`.
+   */
   host: Schema.String,
   port: Schema.Int,
   /** Null for a host. */
@@ -131,6 +139,18 @@ export const AssetIdentity = Schema.Struct({
 });
 export type AssetIdentity = typeof AssetIdentity.Type;
 
+/**
+ * The host as it appears inside an identity string, which is an authority and not a key.
+ *
+ * `normaliseHost` strips the brackets an IPv6 literal carries, because the matched form
+ * has to be the form an operator types. An identity is read rather than matched, and
+ * `::1:8080` is both a plausible address and this host and port, so the brackets go back
+ * on for the printed form. After normalisation a colon can only be an IPv6 literal — the
+ * port is gone by then — so that is the whole test.
+ */
+const authorityOf = (host: string): string =>
+  host.includes(":") ? `[${host}]` : host;
+
 /** Why a submission could not be reduced to an identity. */
 export interface AssetIdentityRefusal {
   readonly _tag: "refused";
@@ -140,10 +160,12 @@ export interface AssetIdentityRefusal {
 /**
  * The canonical identity of one submitted asset, or an instructive refusal.
  *
- * **The host rule.** Lowercased hostname with a trailing dot removed, and the port made
- * explicit from the scheme's default when it was not given. Identity is `host:port`. That
- * is the narrow answer to §17's "duplicate representations of one host": the same service
- * written three ways is one row.
+ * **The host rule.** The hostname through `normaliseHost` — lowercased, trailing dot
+ * removed, IPv6 brackets removed — and the port made explicit from the scheme's default
+ * when it was not given. Identity is `host:port`, with an IPv6 host bracketed because
+ * there it is an authority. That is the narrow answer to §17's "duplicate representations
+ * of one host": the same service written three ways is one row, and the one spelling it
+ * is stored under is the one the scope matcher uses.
  *
  * **The endpoint rule.** `METHOD scheme://host:port/path`, method upper-cased, scheme
  * lowercased, port explicit, path as `URL` normalised it — which resolves `.` and `..`
@@ -188,7 +210,22 @@ export const assetIdentityOf = (
     };
   }
   const port = parsed.port === "" ? (defaultPort ?? 0) : Number(parsed.port);
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  /*
+   * The host, through the scope normaliser rather than through a second one here.
+   *
+   * This is D4.1's whole point and it was the one step not shared. `new URL(...)
+   * .hostname` yields `[::1]` for `http://[::1]:8080/x`, brackets included, while an
+   * operator types `::1` and the entry stores `::1` — so an IPv6 asset could never be in
+   * scope and could never be hand-labelled, because the label was keyed by one spelling
+   * and the asset row by the other. Sharing the step is what makes a missed match
+   * impossible rather than unlikely; normalising in the store instead would have been the
+   * second code path that can disagree.
+   *
+   * It subsumes the lowercasing and the trailing-dot strip this line used to do itself,
+   * and nothing else it does can reach a `hostname`: there is no scheme, no port, no path
+   * and no userinfo left in one.
+   */
+  const host = normaliseHost(parsed.hostname);
   if (host === "") {
     return {
       _tag: "refused",
@@ -198,7 +235,7 @@ export const assetIdentityOf = (
   if (input.kind === "host") {
     return {
       kind: "host",
-      identity: `${host}:${String(port)}`,
+      identity: `${authorityOf(host)}:${String(port)}`,
       host,
       port,
       scheme: null,
@@ -216,7 +253,7 @@ export const assetIdentityOf = (
   const path = parsed.pathname === "" ? "/" : parsed.pathname;
   return {
     kind: "endpoint",
-    identity: `${method} ${scheme}//${host}:${String(port)}${path}`,
+    identity: `${method} ${scheme}//${authorityOf(host)}:${String(port)}${path}`,
     host,
     port,
     scheme,
