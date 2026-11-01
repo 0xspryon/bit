@@ -2252,6 +2252,11 @@ export class App {
       // Cleared only on success, so a refused value stays in the box for the operator to
       // fix rather than having to be retyped from the error message.
       this.entryValue = "";
+      // An exclude entry is the one action whose whole purpose is to change the verdict on
+      // assets already in the estate, so the Estate tab is re-read, not left saying "in
+      // scope" about a host the server now excludes. The same rule, and the same guard,
+      // as {@link removeScopeEntry}.
+      await this.loadAssets(id);
     }
   }
 

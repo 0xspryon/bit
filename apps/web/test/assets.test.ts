@@ -449,6 +449,30 @@ describe("the scope", () => {
     expect(app.viewScope?.entries).toHaveLength(1);
   });
 
+  test("an added entry moves the verdict on assets already in the estate, so the estate is re-read", async () => {
+    const [app, fake] = await onAssets();
+    const before = fake.countOf("assets");
+    app.entryEffect = "out";
+    app.entryKind = "host";
+    app.entryValue = "app.acme.test";
+    await app.addScopeEntry();
+    // Verdicts are derived by the server at read time. An exclusion is the entry whose whole
+    // purpose is to change them, so without this the Estate tab went on saying "in scope"
+    // about a host the server now excluded: stale in the permissive direction.
+    expect(fake.countOf("assets")).toBe(before + 1);
+  });
+
+  test("a refused entry changed nothing, so the estate is not re-read", async () => {
+    const [app, fake] = await onAssets((fake) => {
+      fake.onAddScopeEntry = () =>
+        refused(new ScopeRefused({ reason: "invalid", detail: "not a host" }));
+    });
+    const before = fake.countOf("assets");
+    app.entryValue = "localhost";
+    await app.addScopeEntry();
+    expect(fake.countOf("assets")).toBe(before);
+  });
+
   test("a contradiction is flagged as the one danger case in the flow", async () => {
     const [app] = await onAssets((fake) => {
       fake.onAddScopeEntry = () =>
