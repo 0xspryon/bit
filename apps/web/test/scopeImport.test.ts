@@ -1,0 +1,560 @@
+/**
+ * The create-target screen and the "Loading the scope" panel.
+ *
+ * Two kinds of claim, and they are checked in two ways for the reason
+ * `assetsComponent.test.ts` records: the state machine is checked against `App` directly,
+ * and the claims that are *about rendered output* are checked against markup because there
+ * is no other way to check them.
+ *
+ * The markup claims that earn a test here:
+ *
+ * - **The panel renders tool calls and does not render narration** (D16). This one is the
+ *   slice's, and the way it is asserted matters: `ScopeImportView` has no field for
+ *   narration, so the only way a reasoning line could reach this screen is if somebody
+ *   added a capture path and a field. The test therefore checks that what *is* rendered is
+ *   the tool and the value it wrote, and that text which exists nowhere in the view —
+ *   because the contract cannot carry it — is nowhere in the output.
+ * - **The model picker appears with the checkbox and hides with it** (D15), and the model
+ *   it shows is the one the server resolved rather than one this bundle holds.
+ *
+ * Server output, so no `$effect` runs — the limit `runes.ts` records. Nothing here clicks:
+ * the handlers are plain methods on `App` and are driven directly below.
+ */
+import { describe, expect, test } from "bun:test";
+import { render } from "svelte/server";
+
+import { ImporterModelUnavailable, type ScopeImportCall } from "@bit/contracts";
+
+import NewTarget from "../src/lib/screens/NewTarget.svelte";
+import { App } from "../src/lib/app.svelte";
+import { FakeCountdown } from "./fakeCountdown";
+import {
+  FakeServer,
+  importerModelView,
+  ok,
+  refused,
+  scopeImportView,
+  targetCreated,
+  targetSummary,
+} from "./fakeServer";
+
+const settle = (): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, 0));
+
+const PAGE_A = "https://hackerone.com/acme/policy";
+const PAGE_B = "https://bugcrowd.com/acme-corp";
+
+let sequence = 0;
+const call = (
+  tool: ScopeImportCall["tool"],
+  wrote: string,
+  sourceUrl: string | null,
+): ScopeImportCall => ({
+  sequence: (sequence += 1),
+  tool,
+  wrote,
+  sourceUrl,
+  at: 1_700_000_000_000 + sequence,
+});
+
+/** A signed-in app sitting on the create-target page. */
+const onPage = async (
+  arrange: (fake: FakeServer) => void = () => {},
+): Promise<{ app: App; fake: FakeServer }> => {
+  const fake = new FakeServer();
+  arrange(fake);
+  const app = new App(fake, new FakeCountdown());
+  app.password = "correct-horse";
+  await app.connect();
+  app.openNewTarget();
+  await settle();
+  return { app, fake };
+};
+
+/**
+ * The rendered body, with runs of whitespace collapsed.
+ *
+ * Svelte keeps the newlines and indentation of the source template inside a text node, so
+ * a sentence written across two lines in the component arrives as `"1\n      asset"`.
+ * Collapsing is what lets an assertion be about the sentence the operator reads rather
+ * than about where the component's source happened to wrap.
+ */
+const bodyOf = (app: App): string =>
+  render(NewTarget, { props: { app } }).body.replace(/\s+/g, " ");
+
+describe("the panel lists tool calls and no narration", () => {
+  test("every line names the tool and the value it wrote", async () => {
+    const { app } = await onPage();
+    app.newTargetPhase = "importing";
+    app.scopeImportTargetId = "acme-corp";
+    app.scopeImport = scopeImportView({
+      links: [
+        {
+          url: PAGE_A,
+          state: "read",
+          entriesIn: 1,
+          entriesOut: 1,
+          assets: 1,
+        },
+        {
+          url: PAGE_B,
+          state: "reading",
+          entriesIn: 0,
+          entriesOut: 0,
+          assets: 0,
+        },
+      ],
+      calls: [
+        call(
+          "add_scope_entry",
+          "in · subtree · acme.com and every subdomain",
+          PAGE_A,
+        ),
+        call(
+          "add_scope_entry",
+          "out · host · blog.acme.com, that host only",
+          PAGE_A,
+        ),
+        call("record_imported_asset", "www.acme.com:443", PAGE_A),
+        call("read_scope", "read 2 entries", null),
+      ],
+      totals: { entriesIn: 1, entriesOut: 1, assets: 1 },
+    });
+
+    const body = bodyOf(app);
+
+    // The tool, and the value it wrote. A tool call is a fact about what landed, which is
+    // what makes this panel a receipt rather than a progress indicator.
+    expect(body).toContain("add_scope_entry");
+    expect(body).toContain("record_imported_asset");
+    expect(body).toContain("read_scope");
+    expect(body).toContain("and every subdomain");
+    expect(body).toContain("www.acme.com:443");
+
+    // Per-link state, derived from the `source_url` on those calls and from nothing else.
+    expect(body).toContain(PAGE_A);
+    expect(body).toContain("read · 1 in, 1 out");
+    expect(body).toContain("reading…");
+
+    // Running totals.
+    expect(body).toContain("1 in-scope · 1 out-of-scope · 1 asset recorded");
+
+    // **There is no `fetch_page` line**, because there is no such tool (D13). The harness
+    // reads the page with its own reader, so a page fetch is not one of our tool calls and
+    // cannot appear on a receipt of what we wrote. A3's own mockup showed `fetch_page`
+    // rows here; the design overrode it, and this is the line that keeps it overridden.
+    expect(body).not.toContain("fetch_page");
+  });
+
+  test("there is nowhere on this screen for narration to go", async () => {
+    const { app } = await onPage();
+    app.newTargetPhase = "importing";
+    app.scopeImportTargetId = "acme-corp";
+    // The view is built from the contract, so this is as close to "an import that
+    // narrated" as a test can construct: the words below are in no field of
+    // `ScopeImportView`, because the contract has no field that could hold them. That is
+    // D16 as a property of the type rather than as a filter on a render — the server
+    // captures no narration at all, so there is nothing for this screen to exclude.
+    app.scopeImport = scopeImportView({
+      calls: [call("add_scope_entry", "in · subtree · acme.com", PAGE_A)],
+      totals: { entriesIn: 1, entriesOut: 0, assets: 0 },
+    });
+
+    const body = bodyOf(app);
+
+    expect(body).toContain("add_scope_entry");
+    // Nothing resembling the model talking about its work. If a later change adds a
+    // narration field and renders it, these are the assertions that fail.
+    for (const narration of [
+      "Let me",
+      "I'll start by",
+      "Looking at the page",
+      "thinking",
+      "reasoning",
+    ]) {
+      expect(body).not.toContain(narration);
+    }
+  });
+
+  test("the three exits are on it while it runs, and Stop goes when it does not", async () => {
+    const { app } = await onPage();
+    app.newTargetPhase = "importing";
+    app.scopeImportTargetId = "acme-corp";
+    app.scopeImport = scopeImportView({ status: "running" });
+    const running = bodyOf(app);
+    expect(running).toContain("Open assets");
+    expect(running).toContain("Continue in background");
+    expect(running).toContain("Stop");
+
+    // Stopped early is not a failure: the entries written so far stay, and the panel says
+    // so rather than reporting an error.
+    app.scopeImport = scopeImportView({
+      status: "stopped",
+      detail:
+        "stopped by the operator. Everything written up to this point is kept.",
+    });
+    const stopped = bodyOf(app);
+    expect(stopped).toContain("Open assets");
+    expect(stopped).toContain("Everything written up to that point is kept");
+    // Nothing left to stop.
+    expect(stopped).not.toContain("Continue in background");
+  });
+
+  test("a link that yielded nothing says so once the import has settled", async () => {
+    const { app } = await onPage();
+    app.newTargetPhase = "importing";
+    app.scopeImportTargetId = "acme-corp";
+    app.scopeImport = scopeImportView({
+      status: "finished",
+      links: [
+        {
+          url: PAGE_A,
+          state: "waiting",
+          entriesIn: 0,
+          entriesOut: 0,
+          assets: 0,
+        },
+      ],
+    });
+    // `waiting` under a settled import is a page that gave us nothing, which per D15 is
+    // not a failure. The word changes because the same state means two things and the
+    // status is what tells them apart.
+    expect(bodyOf(app)).toContain("nothing read");
+  });
+});
+
+describe("the model picker appears with the checkbox", () => {
+  test("no links means no picker, however the checkbox is set", async () => {
+    const { app } = await onPage();
+    expect(app.autoloadScope).toBe(true);
+    // A model choice with no agent to run is a control for nothing (D15).
+    expect(app.showImportModel).toBe(false);
+    expect(bodyOf(app)).not.toContain("opencode/glm-5.3-flash-free");
+  });
+
+  test("a link plus the checkbox reveals it, and it shows what the server resolved", async () => {
+    const { app } = await onPage();
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+    expect(app.showImportModel).toBe(true);
+
+    const body = bodyOf(app);
+    // The model the *server* resolved against its live catalogue. Nothing in the browser
+    // holds this id: `modelOption.ts` is explicit that a descriptor is observed at build
+    // and replaced wholesale on rebuild, so an id in this bundle would outlive the
+    // catalogue entry it names.
+    expect(body).toContain("opencode/glm-5.3-flash-free");
+    expect(body).toContain("resolved from the catalogue");
+  });
+
+  test("unchecking it hides the picker again", async () => {
+    const { app } = await onPage();
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+    app.toggleAutoload();
+    expect(app.autoloadScope).toBe(false);
+    expect(app.showImportModel).toBe(false);
+    expect(bodyOf(app)).not.toContain("opencode/glm-5.3-flash-free");
+  });
+
+  test("the fallback is labelled as one", async () => {
+    const { app } = await onPage((fake) => {
+      // What the server answers when its catalogue does not offer the preferred model.
+      // The rule ran on the server, over what the harnesses reported; the screen only
+      // shows which branch it took.
+      fake.onImporterModel = () =>
+        ok(
+          importerModelView({
+            instanceId: "claude-code",
+            model: "claude-haiku-4-5",
+            origin: "fallback",
+            detail:
+              "no configured harness offers opencode/glm-5.3-flash-free, so this falls back to Claude Code's claude-haiku-4-5",
+          }),
+        );
+    });
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+
+    const body = bodyOf(app);
+    expect(body).toContain("claude-haiku-4-5");
+    expect(body).toContain("resolved by fallback");
+    expect(body).toContain("no configured harness offers");
+  });
+
+  test("no harness at all disables the checkbox and says why", async () => {
+    const { app } = await onPage((fake) => {
+      fake.onImporterModel = () =>
+        refused(
+          new ImporterModelUnavailable({
+            reason: "no_harness",
+            detail:
+              "no agent harness on this server is ready, so there is no catalogue to resolve a model against and no import can run",
+          }),
+        );
+    });
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+
+    expect(app.importerModel).toBeUndefined();
+    const body = bodyOf(app);
+    // Said, rather than leaving the checkbox enabled and letting the operator paste links
+    // nothing will ever read.
+    expect(body).toContain("no agent harness on this server is ready");
+    expect(body).toContain("disabled");
+  });
+});
+
+describe("program links are a repeatable optional list", () => {
+  test("it starts with one empty row, so pasting one URL is one action", async () => {
+    const { app } = await onPage();
+    expect(app.programLinks).toHaveLength(1);
+    expect(app.usableLinks).toEqual([]);
+  });
+
+  test("rows are added, filled and removed, and the last one is emptied not removed", async () => {
+    const { app } = await onPage();
+    const first = app.programLinks[0]?.id ?? 1;
+    app.setProgramLink(first, PAGE_A);
+    app.addProgramLink();
+    const second = app.programLinks[1]?.id ?? 2;
+    app.setProgramLink(second, PAGE_B);
+    expect(app.usableLinks).toEqual([PAGE_A, PAGE_B]);
+
+    app.removeProgramLink(second);
+    expect(app.usableLinks).toEqual([PAGE_A]);
+
+    // Removing the last one leaves a field to type into rather than an empty space with a
+    // button under it.
+    app.removeProgramLink(app.programLinks[0]?.id ?? 1);
+    expect(app.programLinks).toHaveLength(1);
+    expect(app.usableLinks).toEqual([]);
+  });
+
+  test("blank rows and duplicates are not sent", async () => {
+    const { app } = await onPage();
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+    app.addProgramLink();
+    app.addProgramLink();
+    const ids = app.programLinks.map((link) => link.id);
+    app.setProgramLink(ids[1] ?? 2, `  ${PAGE_A}  `);
+    app.setProgramLink(ids[2] ?? 3, "");
+    // Trimmed, deduplicated, in order — and a blank row is not an empty-string link.
+    expect(app.usableLinks).toEqual([PAGE_A]);
+  });
+});
+
+describe("creating a target with links", () => {
+  test("the links are sent and the page becomes the panel", async () => {
+    const created = targetSummary({ id: "acme-corp", name: "acme-corp" });
+    const { app, fake } = await onPage((server) => {
+      server.onCreateTarget = () =>
+        ok(
+          targetCreated({
+            target: created,
+            scopeImport: {
+              importId: "imp_1",
+              harnessInstanceId: "opencode",
+              model: "opencode/glm-5.3-flash-free",
+            },
+          }),
+        );
+      server.onTargets = () => ok([created]);
+    });
+    app.chooseFolder("/work/acme-corp");
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+    await app.createTarget();
+
+    const sent = fake.calls.find((entry) => entry.method === "createTarget");
+    expect(
+      (sent?.args[1] as { programLinks: readonly string[] }).programLinks,
+    ).toEqual([PAGE_A]);
+    // No model is sent, because the operator overrode nothing — which is what lets the
+    // server apply D15's rule to the catalogue it observed rather than to a model id this
+    // page happened to be showing.
+    expect(
+      (sent?.args[1] as { importModel?: unknown }).importModel,
+    ).toBeUndefined();
+
+    expect(app.newTargetPhase).toBe("importing");
+    expect(app.scopeImportId).toBe("imp_1");
+    expect(app.scopeImportTargetId).toBe("acme-corp");
+  });
+
+  test("an override is sent, and only then", async () => {
+    const created = targetSummary({ id: "acme-corp", name: "acme-corp" });
+    const { app, fake } = await onPage((server) => {
+      server.onCreateTarget = () => ok(targetCreated({ target: created }));
+      server.onTargets = () => ok([created]);
+    });
+    app.chooseFolder("/work/acme-corp");
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+    app.pickImportModel("openai/gpt-5.6-sol");
+    await app.createTarget();
+
+    const sent = fake.calls.find((entry) => entry.method === "createTarget");
+    expect((sent?.args[1] as { importModel?: unknown }).importModel).toEqual({
+      model: "openai/gpt-5.6-sol",
+    });
+  });
+
+  test("the checkbox off sends no links at all", async () => {
+    const created = targetSummary({ id: "acme-corp", name: "acme-corp" });
+    const { app, fake } = await onPage((server) => {
+      server.onCreateTarget = () => ok(targetCreated({ target: created }));
+      server.onTargets = () => ok([created]);
+    });
+    app.chooseFolder("/work/acme-corp");
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+    app.toggleAutoload();
+    await app.createTarget();
+
+    const sent = fake.calls.find((entry) => entry.method === "createTarget");
+    expect(
+      (sent?.args[1] as { programLinks: readonly string[] }).programLinks,
+    ).toEqual([]);
+    // No import, so the panel is never reached and the operator lands on the target.
+    expect(app.newTargetPhase).toBe("form");
+    expect(app.screen).toBe("target");
+  });
+
+  test("links given and no harness to read them is a toast and the Assets screen", async () => {
+    const created = targetSummary({ id: "acme-corp", name: "acme-corp" });
+    const { app } = await onPage((server) => {
+      server.onCreateTarget = () =>
+        ok(
+          targetCreated({
+            target: created,
+            importDetail:
+              "this server is configured with no agent harness, so program pages cannot be read. The target is created; author its scope by hand on the Assets screen.",
+          }),
+        );
+      server.onTargets = () => ok([created]);
+    });
+    app.chooseFolder("/work/acme-corp");
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+    await app.createTarget();
+
+    // Per D15: not an error state. The target was created and is entirely usable with no
+    // scope, which is the same state as a target created with no links at all — so the
+    // operator is told in a toast and moved on to where they would author it.
+    expect(app.toast).toContain("The target is created");
+    expect(app.screen).toBe("target");
+    expect(app.navItem).toBe("assets");
+  });
+});
+
+describe("the import is watched, and stopping keeps what landed", () => {
+  const started = targetSummary({ id: "acme-corp", name: "acme-corp" });
+  const withImport = async () => {
+    const { app, fake } = await onPage((server) => {
+      server.onCreateTarget = () =>
+        ok(
+          targetCreated({
+            target: started,
+            scopeImport: {
+              importId: "imp_1",
+              harnessInstanceId: "opencode",
+              model: "opencode/glm-5.3-flash-free",
+            },
+          }),
+        );
+      server.onTargets = () => ok([started]);
+    });
+    app.chooseFolder("/work/acme-corp");
+    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
+    return { app, fake };
+  };
+
+  test("the first poll happens without waiting for the timer", async () => {
+    const { app } = await withImport();
+    await app.createTarget();
+    await settle();
+    // The panel has something to render immediately rather than a blank minute.
+    expect(app.scopeImport?.importId).toBe("imp_1");
+  });
+
+  test("an import that wrote nothing ends in a toast on the Assets screen", async () => {
+    const { app, fake } = await withImport();
+    fake.onScopeImport = () =>
+      ok(
+        scopeImportView({
+          targetId: "acme-corp",
+          status: "finished",
+          totals: { entriesIn: 0, entriesOut: 0, assets: 0 },
+        }),
+      );
+    await app.createTarget();
+    await settle();
+
+    expect(app.toast).toContain("Nothing could be read from those pages");
+    expect(app.navItem).toBe("assets");
+  });
+
+  test("an import that wrote something leaves the operator on the panel", async () => {
+    const { app, fake } = await withImport();
+    fake.onScopeImport = () =>
+      ok(
+        scopeImportView({
+          targetId: "acme-corp",
+          status: "finished",
+          totals: { entriesIn: 4, entriesOut: 2, assets: 7 },
+        }),
+      );
+    await app.createTarget();
+    await settle();
+
+    // The receipt stays, because reading it is why they are here. A screen that jumped
+    // away the instant the import finished would take the receipt with it.
+    expect(app.toast).toBe("");
+    expect(app.newTargetPhase).toBe("importing");
+    expect(app.scopeImport?.totals.assets).toBe(7);
+  });
+
+  test("stopping answers with what landed, and does not clear it", async () => {
+    const { app, fake } = await withImport();
+    await app.createTarget();
+    await settle();
+    fake.onStopScopeImport = () =>
+      ok(
+        scopeImportView({
+          targetId: "acme-corp",
+          status: "stopped",
+          detail: "stopped by the operator.",
+          totals: { entriesIn: 3, entriesOut: 1, assets: 5 },
+          calls: [call("add_scope_entry", "in · subtree · acme.com", PAGE_A)],
+        }),
+      );
+    await app.stopImport();
+
+    // Everything written before the stop stays. That is what makes stopping early a
+    // decision rather than a loss, and it is true because the importer writes as it reads.
+    expect(app.scopeImport?.status).toBe("stopped");
+    expect(app.scopeImport?.totals).toEqual({
+      entriesIn: 3,
+      entriesOut: 1,
+      assets: 5,
+    });
+    expect(app.scopeImport?.calls).toHaveLength(1);
+  });
+
+  test("leaving it in the background stops polling and leaves the import alone", async () => {
+    const { app, fake } = await withImport();
+    await app.createTarget();
+    await settle();
+    const before = fake.calls.filter(
+      (entry) => entry.method === "scopeImport",
+    ).length;
+
+    app.continueImportInBackground();
+    await settle();
+
+    // No stop was sent: the import is a server-side fiber and was never driven from here,
+    // which is what makes this a navigation rather than a mode.
+    expect(fake.calls.some((entry) => entry.method === "stopScopeImport")).toBe(
+      false,
+    );
+    // And the panel stopped asking.
+    const after = fake.calls.filter(
+      (entry) => entry.method === "scopeImport",
+    ).length;
+    expect(after).toBe(before);
+    expect(app.screen).toBe("target");
+  });
+});
