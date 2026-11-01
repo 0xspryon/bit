@@ -82,6 +82,9 @@
     flex: 1;
     min-width: 0;
     min-height: 0;
+    /* So the panel can ask how wide the *page* is, which is not the window: the rail takes
+       232px of it, and hides. See the container query below. */
+    container-type: inline-size;
   }
   .main {
     display: flex;
@@ -211,6 +214,24 @@
       inset: 0 0 0 auto;
       box-shadow: var(--elevation-overlay);
       z-index: 5;
+    }
+  }
+
+  /*
+   * Where even the overlay leaves nothing: the panel is 420px, and a page narrower than
+   * 760px is left under 340px of what it covers — an Add form with its fields hidden and
+   * its button wrapped, which is a view of the page with nothing on it to use. The panel
+   * takes the whole page instead, and its close button is how back is reached.
+   *
+   * The page's width, not the window's: the window is 768px wide on a tablet in portrait
+   * and the page is 536 of it, but it is 1000px of a 1232px window with the rail hidden.
+   * A media query would be right for one of those and wrong for the other. `min(420px,
+   * 100%)` would not help here at all: 100% of 536px is more than 420px.
+   */
+  @container (max-width: 760px) {
+    .detail {
+      width: 100%;
+      border-left: 0;
     }
   }
 </style>
