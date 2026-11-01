@@ -126,6 +126,7 @@ import {
   type StoredIntentSuggestion,
 } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
+import { renderScopeBlock } from "../scope/scopePrompt";
 import { RunNarrations } from "./narration";
 import {
   SETTLEMENT_ASK_TIMEOUT,
@@ -447,7 +448,13 @@ interface Dispatch extends RunInput {
   readonly goal: string;
   /** The intent's question. */
   readonly question: string;
-  /** The prompt text. The question verbatim; never contains a credential. */
+  /**
+   * The prompt text. Never contains a credential.
+   *
+   * The question verbatim, or the authorized-scope block followed by the question when
+   * this target has a scope. A worker gets no preamble and no briefing, so this field is
+   * the whole of what it is told.
+   */
   readonly task: string;
   readonly fallback: HarnessChoice["fallback"];
 }
@@ -1677,13 +1684,62 @@ const make = Effect.fnUntraced(function* (options?: {
           },
         );
       }
+      /**
+       * The authorized testing scope, prepended to the question this worker is sent.
+       *
+       * A worker gets `claim.question` and nothing else — no preamble, no briefing — so
+       * the block has nowhere else to go, and until now the agent was never told what the
+       * client's estate was. Any boundary it respected was one it inferred from the
+       * objective's prose.
+       *
+       * Read here, after the claim, so what the worker is told is the scope as it stood
+       * when the attempt started. D7: an agent already holding a prompt keeps working from
+       * the scope it was told, and the next attempt gets the new text. That is a stated
+       * property rather than a limitation to work around — making a live scope change
+       * reach a running session needs the steering path and only matters once scope is
+       * enforced.
+       *
+       * A read failure is local and non-fatal, for the reason the planner's is: an
+       * unreadable auxiliary table must not become an outage on the path that does the
+       * work. The fallback is the prompt a target with nothing in scope gets, which is the
+       * prompt this path sent before `0022` existed.
+       */
+      const scope = yield* Effect.result(
+        Effect.scoped(
+          Effect.flatMap(stores.open(input.targetId), (store) =>
+            store.targetScope(input.targetId),
+          ),
+        ),
+      );
+      if (scope._tag === "Failure") {
+        yield* Effect.logWarning(
+          "a worker's scope could not be read; it was prompted without a scope block",
+          {
+            targetId: input.targetId,
+            intentId: claim.intentId,
+            failure: scope.failure._tag,
+          },
+        );
+      }
+      const scopeBlock =
+        scope._tag === "Failure"
+          ? undefined
+          : renderScopeBlock({ scope: scope.success, audience: "worker" });
+
       const dispatch: Dispatch = {
         ...input,
         model: choice.model,
         modelOptions: choice.modelOptions,
         goal: claim.goal,
         question: claim.question,
-        task: claim.question,
+        // The question verbatim when there is nothing in scope, so a pre-`0022` target's
+        // worker gets exactly the prompt it got before. Otherwise the block, a blank line,
+        // and then the question — the block first, because it is the frame the question is
+        // to be answered inside.
+        task:
+          scopeBlock === undefined
+            ? claim.question
+            : `${scopeBlock}\n\n${claim.question}`,
         fallback: choice.fallback,
       };
       const ids = {

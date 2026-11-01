@@ -78,6 +78,7 @@ import {
   type PlanRefused,
 } from "./planSupervisor";
 import { assembleRoundPrompt, roundPromptOverhead } from "./roundPrompt";
+import { renderScopeBlock } from "../scope/scopePrompt";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -726,6 +727,133 @@ describe("the prompt a round is opened with", () => {
     expect(prompt).toContain("at most 4 intent(s)");
     // And the disposition is demanded rather than suggested.
     expect(prompt).toContain("THIS IS NOT OPTIONAL");
+  });
+
+  test("carries the authorized scope, above the briefing and outside its ceiling", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor } = scripts({ narration: [], status: undefined });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder, {
+      budget: 4,
+    });
+    await ready;
+
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const input = yield* goal(root, workspace, "goal_scope");
+        // Authored before the round is opened, which is the only order that matters: the
+        // block is a point-in-time copy taken when the prompt is fixed.
+        yield* Effect.flatMap(TargetStores, (stores) =>
+          withTargetStore(stores, TARGET, (store) =>
+            Effect.gen(function* () {
+              const caller = {
+                callerScope: operatorScope(TARGET),
+                targetId: TARGET,
+              };
+              yield* store.addScopeEntry(caller, {
+                effect: "in",
+                kind: "subtree",
+                value: "acme.test",
+                source: "operator",
+              });
+              yield* store.addScopeEntry(caller, {
+                effect: "out",
+                kind: "host",
+                value: "blog.acme.test",
+                source: "operator",
+              });
+            }),
+          ),
+        ).pipe(Effect.orDie);
+        const planner = yield* PlanSupervisor;
+        return yield* planner.start(input);
+      }).pipe(Effect.orDie),
+    );
+
+    const prompt = recorder.prompts[0] ?? "";
+
+    // The round is told the scope, which it never was before this slice.
+    expect(prompt).toContain("[Authorized testing scope — highest priority]");
+    expect(prompt).toContain("acme.test and every subdomain");
+    expect(prompt).toContain("blog.acme.test (that host only)");
+    // The planner's variant: it cannot call `record_asset`, so it is not told to.
+    expect(prompt).not.toContain("record_asset");
+    expect(prompt).toContain("does not grant authorization");
+
+    /*
+     * **Above the briefing, and the briefing's bytes are unchanged.**
+     *
+     * The briefing is appended verbatim so the briefing panel can claim it shows the same
+     * bytes the planner received. The block goes in the preamble for exactly that reason,
+     * and these two assertions are what keep the claim true: the prompt still *ends* with
+     * the briefing, and the block appears before it.
+     */
+    const briefing = await runtime.runPromise(
+      Effect.flatMap(TargetStores, (stores) =>
+        withTargetStore(stores, TARGET, (store) =>
+          buildGoalBriefing("goal_scope").pipe(
+            Effect.provideService(ObservationStore, store),
+          ),
+        ),
+      ).pipe(Effect.orDie),
+    );
+    expect(prompt.endsWith(briefing.rendered)).toBe(true);
+    expect(briefing.rendered).not.toContain("Authorized testing scope");
+    expect(prompt.indexOf("[Authorized testing scope")).toBeLessThan(
+      prompt.indexOf("THE RECORD FOLLOWS"),
+    );
+
+    /*
+     * **The block is outside the briefing ceiling, and the overhead accounts for it.**
+     *
+     * `briefingChars` is unchanged by the block — it bounds the briefing and the block is
+     * not part of it — while `promptChars` grew. `roundPromptOverhead` is what makes that
+     * checkable rather than a sentence in a comment, and it now takes the block.
+     */
+    expect(started.briefingChars).toBe(briefing.rendered.length);
+    expect(started.promptChars).toBe(prompt.length);
+    const scopeBlock = renderScopeBlock({
+      scope: {
+        entries: [
+          {
+            entryId: "ignored",
+            targetId: TARGET,
+            effect: "in",
+            kind: "subtree",
+            value: "acme.test",
+            source: "operator",
+            note: null,
+            createdAt: 0,
+          },
+          {
+            entryId: "ignored-2",
+            targetId: TARGET,
+            effect: "out",
+            kind: "host",
+            value: "blog.acme.test",
+            source: "operator",
+            note: null,
+            createdAt: 0,
+          },
+        ],
+        hostLabels: [],
+        assetLabels: [],
+      },
+      audience: "planner",
+    });
+    expect(started.promptChars - started.briefingChars).toBe(
+      roundPromptOverhead({
+        goalId: "goal_scope",
+        budget: 4,
+        scopeBlock,
+      }),
+    );
+    // And the figure genuinely moved: an overhead computed without the block would now be
+    // wrong, which is the regression this guards.
+    expect(
+      roundPromptOverhead({ goalId: "goal_scope", budget: 4 }),
+    ).toBeLessThan(
+      roundPromptOverhead({ goalId: "goal_scope", budget: 4, scopeBlock }),
+    );
   });
 
   test("tells the planner what to do if its tools have not reached it yet", async () => {

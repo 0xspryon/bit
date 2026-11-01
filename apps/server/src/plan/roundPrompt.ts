@@ -107,6 +107,22 @@ const preamble = (input: {
    * briefing stays the last thing the model reads.
    */
   readonly directive?: string | undefined;
+  /**
+   * The authorized testing scope, rendered by `scope/scopePrompt.ts`, or nothing.
+   *
+   * **It goes in the preamble, not in the briefing.** The briefing is appended verbatim
+   * so the briefing panel can claim it shows the same bytes the planner received, and
+   * inserting anything into it would make that claim false. This is above the
+   * `THE RECORD FOLLOWS` line, with the rules, because it is a rule.
+   *
+   * It sits **above** a directive for the same reason the other rules do: a steer from
+   * the goal agent must not read as permission to widen what may be tested.
+   *
+   * `undefined` when nothing is in scope, in which case the preamble is byte-for-byte
+   * what it was before this existed — which is what keeps every pre-`0022` target's
+   * prompt unchanged.
+   */
+  readonly scopeBlock?: string | undefined;
 }): readonly string[] => [
   `You are a planner round in bit, a security-testing tool. You are planning one goal:`,
   `${input.goalId}. One round is one bounded unit of planning work, and this is yours.`,
@@ -159,6 +175,7 @@ const preamble = (input: {
   `a record, nobody will act on it, and a round that says so honestly is one an`,
   `operator can simply run again.`,
   ``,
+  ...(input.scopeBlock === undefined ? [] : [input.scopeBlock, ``]),
   ...(input.directive === undefined
     ? []
     : [
@@ -209,6 +226,15 @@ export const assembleRoundPrompt = (input: {
   readonly briefing: string;
   /** An instruction from the goal agent, when this round was opened to carry one out. */
   readonly directive?: string | undefined;
+  /**
+   * The authorized testing scope, or nothing when this target has none.
+   *
+   * Counted in `promptChars` and **not** in `briefingChars`, which is the honest split:
+   * `GOAL_BRIEFING_MAX_CHARS` bounds the briefing and this is not part of it. It is never
+   * truncated — truncating an in-scope list would be the silent-coverage anti-goal with
+   * extra steps, and truncating the out-list would tell an agent a host is fair game.
+   */
+  readonly scopeBlock?: string | undefined;
 }): AssembledRoundPrompt => {
   const prompt = [...preamble(input), input.briefing].join("\n");
   return {
@@ -219,15 +245,22 @@ export const assembleRoundPrompt = (input: {
 };
 
 /**
- * How many characters the framing adds, for a given goal id and budget.
+ * How many characters the framing adds, for a given goal id, budget and scope block.
  *
  * Exported so a test can assert the arithmetic rather than trust it, and so the figure in
  * the report is derived rather than counted by hand. It depends on the goal id's length
  * and the budget's digits, which is why it is a function.
+ *
+ * **The scope block is part of the overhead and is variable-length**, which is the one
+ * thing that changed about this figure. It is measured here rather than added by the
+ * caller, so "the preamble costs this much" stays a single derived number: a caller that
+ * computed the base overhead and added the block's own length separately would have two
+ * places to get the newline accounting wrong.
  */
 export const roundPromptOverhead = (input: {
   readonly goalId: string;
   readonly budget: number;
+  readonly scopeBlock?: string | undefined;
 }): number => assembleRoundPrompt({ ...input, briefing: "" }).promptChars;
 
 /**

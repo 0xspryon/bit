@@ -2957,15 +2957,30 @@ const makeStore = Effect.fnUntraced(function* () {
    * which has one — so the target filter goes through the join rather than being a column
    * that could disagree with the asset's.
    */
+  /**
+   * Every asset label in this file, with the identity and host of the asset it is on.
+   *
+   * The join is already needed to bound the read to one target — `asset_scope_labels` has
+   * no `target_id` of its own, by design, because its key references `assets(id)` which
+   * has one — so the asset's `identity` and `host` come back for free. The prompt block
+   * names a labelled asset by its identity, and a host-keyed lookup needs its host, so
+   * carrying both here is cheaper than a second read and cannot disagree with the row.
+   */
   const selectAssetLabels = SqlSchema.findAll({
     Request: Schema.String,
-    Result: AssetLabelRow,
+    Result: Schema.Struct({
+      ...AssetLabelRow.fields,
+      identity: Schema.String,
+      host: Schema.String,
+    }),
     execute: (targetId) =>
       sql.unsafe(
         `SELECT ${assetLabelColumns
           .split(", ")
           .map((column) => `asset_scope_labels.${column}`)
-          .join(", ")}
+          .join(", ")},
+           assets.identity AS identity,
+           assets.host AS host
          FROM asset_scope_labels
          INNER JOIN assets ON assets.id = asset_scope_labels.asset_id
          WHERE assets.target_id = ?
@@ -3040,6 +3055,19 @@ const makeStore = Effect.fnUntraced(function* () {
       assetLabels: new Map(
         assets.map((row) => [row.asset_id, assetLabelOf(row)]),
       ),
+      /**
+       * The labelled assets with the identity the prompt block names them by.
+       *
+       * Kept beside the map rather than folded into it: the ladder looks a label up by
+       * asset id and does not care what the asset is called, while the block has to print
+       * `GET https://app.acme.test:443/internal/metrics` for a reader to act on. One read
+       * answers both.
+       */
+      labelledAssets: assets.map((row) => ({
+        label: assetLabelOf(row),
+        identity: row.identity,
+        host: row.host,
+      })),
     };
   });
 
@@ -6662,7 +6690,7 @@ const makeStore = Effect.fnUntraced(function* () {
     return {
       entries: scope.entries,
       hostLabels: [...scope.hostLabels.values()],
-      assetLabels: [...scope.assetLabels.values()],
+      assetLabels: scope.labelledAssets,
     };
   });
 
@@ -7534,7 +7562,18 @@ export class ObservationStore extends Context.Service<
       {
         readonly entries: readonly ScopeEntry[];
         readonly hostLabels: readonly HostScopeLabel[];
-        readonly assetLabels: readonly AssetScopeLabel[];
+        /**
+         * Each asset label with the identity and host of the asset it sits on.
+         *
+         * The prompt block names a labelled asset by its identity, and the join that
+         * bounds this read to one target already carries both, so neither needs a second
+         * read and neither can disagree with the row.
+         */
+        readonly assetLabels: readonly {
+          readonly label: AssetScopeLabel;
+          readonly identity: string;
+          readonly host: string;
+        }[];
       },
       DatabaseError | StoredRowError
     >;

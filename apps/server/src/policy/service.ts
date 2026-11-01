@@ -152,16 +152,23 @@ export const DEFAULT_POLICY: PolicyConfig = {
  * and a control plane that cannot be reached still fails the call closed. What is absent
  * is a *rule*, not the mechanism.
  *
- * Why no rule yet. The engine's host boundary is an allowlist, and the only thing this
- * application knows about an engagement's scope is `scopeNote` — free text an operator
- * wrote for another human. There is no way to derive an allowlist from it, so the choice
- * was between permitting and denying every remote target; a gate that refused every
- * engagement would not be protecting anything, it would be unusable.
+ * Why no rule yet. **A structured scope now exists and this deliberately does not read
+ * it.** Migration `0022` gives a target `scope_entries` and two label tables, and
+ * `contracts/scope.ts` can decide any host against them — so the old reason recorded
+ * here, that there was nothing to derive an allowlist from, stopped being true. The
+ * reason is now a choice: the target-scope design's Non-goals say in as many words that
+ * the operator asked for a starting point that **tells the agent what it may test**, and
+ * explicitly not a gate that stops it testing anything else. Scope is a label, not a
+ * boundary, and deriving `hostScope` from it would turn every mislabelled discovery into
+ * a blocked tool call.
  *
- * What changes when scope becomes structured: this constant gains a derived `hosts`
- * scope. Installing the hook now rather than later is what makes that a **config change
- * instead of a wiring change** — the plumbing, the audit trail and the fail-closed
- * behaviour are already in place and under test.
+ * What changes when that decision is revisited: this constant gains a `hosts` scope
+ * derived from the in-scope entries and the in labels, and the one thing to settle first
+ * is what happens to a host the operator has not got round to promoting — which under an
+ * allowlist is a denial rather than a row on a screen. Installing the hook now rather
+ * than later is what makes that a **config change instead of a wiring change** — the
+ * plumbing, the audit trail and the fail-closed behaviour are already in place and under
+ * test.
  *
  * `forbiddenPathFragments` is empty for the same reason, and the reasoning recorded on
  * `WORKER_POLICY` applies: a constraint invented here would make a denial look like a
@@ -172,7 +179,7 @@ export const PERMISSIVE_POLICY: PolicyConfig = {
   hostScope: {
     _tag: "unrestricted",
     because:
-      "this installation has no structured engagement scope to derive a host allowlist from; the gate records every decision and denies on policy outage, but places no host boundary",
+      "this installation's engagement scope is a label rather than a boundary, and a host allowlist is deliberately not derived from it; the gate records every decision and denies on policy outage, but places no host boundary",
   },
 };
 

@@ -70,7 +70,7 @@ import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { FleetStore } from "../persistence/fleet";
-import type { ObservationStore } from "../persistence/store";
+import { operatorScope, type ObservationStore } from "../persistence/store";
 import * as identifier from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import {
@@ -3411,6 +3411,85 @@ describe("running an existing intent", () => {
     expect(observed.intent?.status).toBe("claimed");
     expect(observed.intent?.claimedByAttemptId).toBe(observed.run.attemptId);
     expect(observed.intent?.attemptCount).toBe(1);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("a worker is told the authorized scope, above its question", async () => {
+    /*
+     * The first of the two reasons this work exists: the agent is never told what it is
+     * authorized to test. A worker gets `claim.question` and nothing else — no preamble,
+     * no briefing — so until now any boundary it respected was one it inferred from the
+     * objective's prose.
+     *
+     * The test above this one asserts the other half, and the two belong together: with
+     * nothing in scope the prompt is the question verbatim, so every target that existed
+     * before migration `0022` is unaffected.
+     */
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = quiet();
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const input = yield* draft(root, "alpha", "does login rate-limit?");
+        // Authored before the run starts: the block is a point-in-time copy taken when
+        // the prompt is fixed, so a scope written afterwards reaches the next attempt.
+        yield* Effect.flatMap(TargetStores, (stores) =>
+          withTargetStore(stores, "alpha", (store) =>
+            Effect.gen(function* () {
+              const host = {
+                callerScope: operatorScope("alpha"),
+                targetId: "alpha",
+              };
+              yield* store.addScopeEntry(host, {
+                effect: "in",
+                kind: "subtree",
+                value: "acme.test",
+                source: "operator",
+              });
+              yield* store.addScopeEntry(host, {
+                effect: "in",
+                kind: "cidr",
+                value: "203.0.113.0/24",
+                source: "operator",
+              });
+              yield* store.addScopeEntry(host, {
+                effect: "out",
+                kind: "host",
+                value: "blog.acme.test",
+                source: "operator",
+              });
+            }),
+          ),
+        ).pipe(Effect.orDie);
+        const run = yield* supervisor.start(input);
+        return { run };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(recorder.prompts).toHaveLength(1);
+    const prompt = (recorder.prompts[0] ?? "").slice(
+      `${observed.run.harnessSessionId}:`.length,
+    );
+
+    // The block, with every item spelling out its reach.
+    expect(
+      prompt.startsWith("[Authorized testing scope — highest priority]"),
+    ).toBe(true);
+    expect(prompt).toContain("acme.test and every subdomain");
+    expect(prompt).toContain("203.0.113.0/24 (every address in the block)");
+    expect(prompt).toContain("blog.acme.test (that host only)");
+    // The worker's variant: it *can* record an asset, so it is told to.
+    expect(prompt).toContain("Record it with record_asset and move on");
+    expect(prompt).toContain("does not grant authorization");
+
+    // And the question is still there, after the block, unaltered. The block is a frame
+    // around the question rather than a replacement for it.
+    expect(prompt.endsWith("does login rate-limit?")).toBe(true);
 
     await runtime.runPromise(releaseAll(held));
     await runtime.dispose();

@@ -113,6 +113,7 @@ import {
   assembleSteerPrompt,
   type AssembledRoundPrompt,
 } from "./roundPrompt";
+import { renderScopeBlock } from "../scope/scopePrompt";
 import { HarnessResolver, type ResolvedHarness } from "../harness/resolver";
 import { FleetStore } from "../persistence/fleet";
 import * as identifier from "../persistence/identifier";
@@ -1761,6 +1762,46 @@ const make = Effect.fnUntraced(function* (options?: {
       }
       return yield* refuse(failure);
     }
+    /**
+     * The authorized testing scope, read fresh for this round.
+     *
+     * Read here rather than carried on the input, because this is the point at which a
+     * round's prompt is fixed: D7's staleness is a property of the *prompt*, and the next
+     * round getting the current scope is exactly what makes a scope edit take effect.
+     *
+     * A read failure is **not** fatal to the round. `Effect.result` keeps it local, and
+     * the fallback is no block — which is the same text a target with nothing in scope
+     * gets, and therefore a shape the prompt already handles. The alternative, refusing to
+     * plan because the scope could not be read, would turn an unreadable auxiliary table
+     * into an outage on the main path. It is logged, because a round planned without the
+     * scope it should have had is something an operator needs to be able to find.
+     */
+    const scope = yield* Effect.result(
+      Effect.scoped(
+        Effect.flatMap(stores.open(input.targetId), (store) =>
+          store.targetScope(input.targetId),
+        ),
+      ),
+    );
+    if (scope._tag === "Failure") {
+      yield* Effect.logWarning(
+        "a planner round's scope could not be read; it was prompted without a scope block",
+        {
+          targetId: input.targetId,
+          goalId: input.goalId,
+          failure: scope.failure._tag,
+        },
+      );
+    }
+    const scopeBlock =
+      scope._tag === "Failure"
+        ? undefined
+        : renderScopeBlock({
+            scope: scope.success,
+            // The planner cannot call `record_asset`, so its variant drops that line.
+            audience: "planner",
+          });
+
     const assembled = assembleRoundPrompt({
       goalId: input.goalId,
       budget,
@@ -1768,6 +1809,9 @@ const make = Effect.fnUntraced(function* (options?: {
       // Forwarded only when there is one, so a round an operator opened reads exactly as
       // it did before this slice: no directive section at all.
       ...(input.directive === undefined ? {} : { directive: input.directive }),
+      // Likewise: a target with nothing in scope gets the prompt it got before `0022`,
+      // byte for byte.
+      ...(scopeBlock === undefined ? {} : { scopeBlock }),
     });
 
     /**
