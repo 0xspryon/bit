@@ -27,7 +27,7 @@ import {
   type Observation,
   type RecordObservationInput as Input,
 } from "@bit/contracts";
-import { Effect, Schema } from "effect";
+import { Clock, Effect, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { SqlClient } from "effect/sql";
 
@@ -1699,6 +1699,68 @@ describe("recording an asset", () => {
       }),
     );
   };
+
+  /**
+   * A clock that does not move, so two writes are indistinguishable by time.
+   *
+   * The only way to tell a merge from a creation on this clock is to ask the schema,
+   * which is what the test below exists to hold.
+   */
+  const FROZEN_MILLIS = 1_700_000_000_000;
+  const FROZEN: Clock.Clock = {
+    currentTimeMillisUnsafe: () => FROZEN_MILLIS,
+    currentTimeMillis: Effect.succeed(FROZEN_MILLIS),
+    currentTimeNanosUnsafe: () => 1_700_000_000_000_000_000n,
+    currentTimeNanos: Effect.succeed(1_700_000_000_000_000_000n),
+    monotonicTimeNanosUnsafe: () => 0n,
+    monotonicTimeNanos: Effect.succeed(0n),
+    sleep: () => Effect.void,
+  };
+
+  const withFrozenSeeded = <A, E>(
+    use: (store: Store) => Effect.Effect<A, E>,
+  ) => {
+    const path = newDatabasePath();
+    return Effect.runPromise(
+      Effect.provideService(
+        Effect.scoped(
+          Effect.flatMap(ObservationStore, (store) =>
+            Effect.gen(function* () {
+              yield* migrated(store);
+              return yield* use(store);
+            }),
+          ).pipe(Effect.provide(ObservationStore.layer(path))),
+        ),
+        Clock.Clock,
+        FROZEN,
+      ),
+    );
+  };
+
+  test("merges rather than reporting a second creation inside one millisecond", async () => {
+    // `created` is read off the insert — `ON CONFLICT DO NOTHING RETURNING id` returns a
+    // row only when this statement wrote one — and never off a timestamp comparison.
+    // The earlier form compared the stored `first_seen_at` to this call's own clock
+    // reading, which holds only while no two writes share a millisecond; this test used
+    // to fail intermittently on a fast machine for exactly that reason, and `importAsset`
+    // would have had the collision as its normal case rather than as a race.
+    const outcome = await withFrozenSeeded((store) =>
+      Effect.gen(function* () {
+        const first = yield* store.recordAsset(CALLER, assetInput());
+        const second = yield* store.recordAsset(
+          CALLER,
+          assetInput({ operationId: "asset-2" }),
+        );
+        return { first, second, assets: yield* store.assets() };
+      }),
+    );
+
+    expect(outcome.first.created).toBe(true);
+    expect(outcome.second.assetId).toBe(outcome.first.assetId);
+    expect(outcome.second.created).toBe(false);
+    expect(outcome.second.discoveries).toBe(2);
+    expect(outcome.assets).toHaveLength(1);
+  });
 
   test("canonicalises an endpoint, and merges a second discovery of it", async () => {
     const outcome = await withSeeded((store) =>

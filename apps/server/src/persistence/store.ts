@@ -3154,7 +3154,23 @@ const makeStore = Effect.fnUntraced(function* () {
             });
           }
 
-          yield* sql`INSERT INTO assets (
+          /*
+           * `created` is read off the insert, not off a timestamp.
+           *
+           * `ON CONFLICT DO NOTHING RETURNING id` yields one row when this statement wrote
+           * the asset and none when the unique index already held it, which is exactly
+           * what `created` reports. The earlier form compared the stored `first_seen_at`
+           * to this call's own clock reading, which holds only while no two writes share a
+           * millisecond — so a second discovery landing in the same millisecond as the
+           * first reported `created: true` and claimed a known asset was new.
+           *
+           * It was not theoretical: `store.test.ts`'s endpoint-merge case failed
+           * intermittently on a fast machine, and `importAsset` — which records every host
+           * off one page in one loop — would have had the collision as its normal case.
+           */
+          const inserted = yield* sql<{
+            readonly id: string;
+          }>`INSERT INTO assets (
               id, target_id, kind, identity, host, port, scheme, method, path,
               first_seen_at
             ) VALUES (
@@ -3163,9 +3179,9 @@ const makeStore = Effect.fnUntraced(function* () {
               ${identity.scheme}, ${identity.method}, ${identity.path},
               ${recordedAt}
             )
-            ON CONFLICT(target_id, kind, identity) DO NOTHING`.pipe(
-            Effect.mapError(asDatabaseError("transaction")),
-          );
+            ON CONFLICT(target_id, kind, identity) DO NOTHING
+            RETURNING id`.pipe(Effect.mapError(asDatabaseError("transaction")));
+          const created = inserted.length > 0;
           const stored = yield* findAssetByIdentity({
             targetId: worker.targetId,
             kind: identity.kind,
@@ -3183,7 +3199,6 @@ const makeStore = Effect.fnUntraced(function* () {
             });
           }
           const asset = stored.value;
-          const created = asset.first_seen_at === recordedAt;
 
           yield* sql`INSERT INTO asset_discoveries (
               asset_id, operation_id, caller_scope, intent_id, attempt_id,
