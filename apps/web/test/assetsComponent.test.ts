@@ -556,3 +556,89 @@ describe("the Scope tab", () => {
     expect(html).toContain("Address block");
   });
 });
+
+describe("an imported asset reads as provenance, not as an absence", () => {
+  /**
+   * The gotcha this whole block exists for.
+   *
+   * A host the scope importer read off a program page has `discoveries: 0` and
+   * `firstAttemptId: null` — both correct, because the importer runs before any attempt
+   * exists (D14). A screen with only those two fields can say nothing better than "no
+   * recorded discovery" and "0 sightings", which are two phrasings of a gap. There is no
+   * gap: the program's own page named the host, and `asset_imports` records which page.
+   *
+   * So this checks the sentence, because the sentence is the only place the distinction
+   * exists. A state-machine test would pass either way.
+   */
+  test("it says which program page it was read off", async () => {
+    const html = await bodyOf((fake) => {
+      fake.onAssets = () =>
+        ok({
+          assets: [
+            assetView({
+              assetId: "asset_imported",
+              identity: "app.acme.test:443",
+              host: "app.acme.test",
+              discoveries: 0,
+              firstAttemptId: null,
+              firstIntentId: null,
+              lastDiscoveredAt: null,
+              imports: 1,
+              firstSourceUrl: "https://hackerone.com/acme/policy",
+            }),
+          ],
+        });
+    });
+
+    expect(html).toContain("imported from hackerone.com");
+    // The two sentences that read as absence are gone.
+    expect(html).not.toContain("no recorded discovery");
+    expect(html).not.toContain("0 sightings");
+    // Zero discoveries is still said, because it is still true — but as a fact about what
+    // has happened to the host rather than as a count of nothing.
+    expect(html).toContain("not yet seen");
+  });
+
+  test("a worker's later discovery of the same host wins the sentence", async () => {
+    const html = await bodyOf((fake) => {
+      fake.onAssets = () =>
+        ok({
+          assets: [
+            assetView({
+              assetId: "asset_both",
+              discoveries: 2,
+              firstAttemptId: "att_01HQZX9",
+              imports: 1,
+              firstSourceUrl: "https://hackerone.com/acme/policy",
+            }),
+          ],
+        });
+    });
+    // By then the more informative fact is that somebody has actually been there. Both
+    // provenance rows are kept either way; the column has room for one.
+    expect(html).toContain("via att_01HQZX9");
+    expect(html).toContain("2 sightings");
+  });
+
+  test("an asset neither path accounts for says so plainly", async () => {
+    const html = await bodyOf((fake) => {
+      fake.onAssets = () =>
+        ok({
+          assets: [
+            assetView({
+              discoveries: 0,
+              firstAttemptId: null,
+              firstIntentId: null,
+              lastDiscoveredAt: null,
+              imports: 0,
+              firstSourceUrl: null,
+            }),
+          ],
+        });
+    });
+    // Should not happen — both writes put their provenance row in the same transaction as
+    // the asset — so it is said rather than dressed up as something ordinary.
+    expect(html).toContain("no recorded provenance");
+    expect(html).toContain("no sightings");
+  });
+});

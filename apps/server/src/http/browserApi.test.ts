@@ -3933,6 +3933,11 @@ describe("a target's assets", () => {
       firstIntentId: "intent_assets",
       // The latest sighting, which is not the same fact as `firstSeenAt`.
       lastDiscoveredAt: 15,
+      // A worker's discovery, so no import recorded it. The pair of counts is what lets
+      // the Estate screen tell an imported host from a row nothing accounts for — see
+      // `assetsComponent.test.ts`, where the sentence is asserted.
+      imports: 0,
+      firstSourceUrl: null,
       // Nothing is authored on this target yet, so it is out by default — covered by
       // nothing rather than excluded by anyone, which the view shows as a third state.
       scope: { state: "out", by: { _tag: "default" }, overrode: null },

@@ -142,6 +142,11 @@ export const assetView = (over: Partial<AssetView> = {}): AssetView => ({
   firstAttemptId: "attempt_1",
   firstIntentId: "intent_1",
   lastDiscoveredAt: AT,
+  // A worker's discovery by default, which is the common row. An imported asset is the
+  // mirror image — `discoveries: 0`, `firstAttemptId: null`, `imports: 1` — and tests that
+  // want one say so.
+  imports: 0,
+  firstSourceUrl: null,
   scope: { state: "out", by: { _tag: "default" }, overrode: null },
   ...over,
 });

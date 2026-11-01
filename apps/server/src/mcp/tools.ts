@@ -230,6 +230,21 @@ export const AssetListingWire = Schema.Struct({
   /** The attempt that found it first. Null only if no discovery row exists. */
   first_attempt_id: Schema.NullOr(Schema.String),
   /**
+   * How many times the scope importer recorded it off a program page (D14).
+   *
+   * **Here so that `discoveries: 0` reads as provenance rather than as an absence**, which
+   * matters to a worker for the same reason it matters to the operator's screen: a host
+   * with no discovery and no import is a row nothing accounts for, and a host with no
+   * discovery and an import is one the program's own page named. The second is a host
+   * worth starting from; the first would be a reason to look twice.
+   *
+   * Zero for anything a worker found. Both counts can be non-zero on one asset, which is
+   * what "the importer read this host and you later discovered it" looks like.
+   */
+  imports: Schema.Int,
+  /** The program page it was first read off, or null if it was never imported. */
+  first_source_url: Schema.NullOr(Schema.String),
+  /**
    * Whether this asset is inside the client's authorized estate.
    *
    * **This field is the other half of D10.** Returning an out-of-scope row is only half
@@ -272,6 +287,11 @@ export const LIST_ASSETS_DESCRIPTION = [
   "scope covers it and what decided that — an entry they typed, a label they set by",
   "hand, or nothing at all. Read them before you act on a row: out means recorded and",
   "known, not authorized.",
+  "",
+  "Two rows are worth telling apart. An asset with discoveries: 0 and imports: 1 or more",
+  "was read off the program's own scope page before any hunt began — the program named it,",
+  "so it is a good place to start. An asset with both at zero should not exist; if you see",
+  "one, record what you find about it and say so.",
   "",
   "identity is what uniqueness is on. For a host it is host:port; for an endpoint it is",
   "METHOD scheme//host:port/path, with the query string and fragment excluded. Two URLs",
@@ -582,6 +602,8 @@ export const WorkerToolkitLayer = WorkerToolkit.toLayer(
             path: asset.path,
             discoveries: asset.discoveries,
             first_attempt_id: asset.first_attempt_id,
+            imports: asset.imports,
+            first_source_url: asset.first_source_url,
             scope_state: scope.state,
             scope_detail: describeScopeState(scope),
           })),

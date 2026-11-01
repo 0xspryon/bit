@@ -90,13 +90,61 @@
       ? `${asset.method ?? ""} ${asset.path ?? "/"}`.trim()
       : asset.identity;
 
-  /** Who found it, for the provenance column. */
-  const foundBy = (asset: AssetView): string =>
-    asset.scope.by._tag === "assetLabel"
-      ? "by hand"
-      : asset.firstAttemptId === null
-        ? "no recorded discovery"
-        : `via ${asset.firstAttemptId.slice(0, 11)}`;
+  /**
+   * How this asset came to be known, for the provenance column.
+   *
+   * **An imported asset reads as provenance, not as an absence**, and the order of these
+   * branches is what makes that true. A host the scope importer read off a program page
+   * has `discoveries: 0` and `firstAttemptId: null` — both correct, because the importer
+   * runs before any attempt exists (D14) — and a column that checked only those two could
+   * say nothing better than "no recorded discovery". That is a sentence about a gap, and
+   * there is no gap: the program's own page named the host. So `imports` is checked first,
+   * and the row says where it was read off.
+   *
+   * A worker's later discovery of the same host wins the sentence, because by then the
+   * more informative fact is that somebody has actually been there. Both provenance rows
+   * are kept either way; this column has room for one.
+   */
+  const foundBy = (asset: AssetView): string => {
+    if (asset.scope.by._tag === "assetLabel") return "by hand";
+    if (asset.firstAttemptId !== null)
+      return `via ${asset.firstAttemptId.slice(0, 11)}`;
+    if (asset.imports > 0)
+      return asset.firstSourceUrl === null
+        ? "imported from the program page"
+        : `imported from ${hostOfUrl(asset.firstSourceUrl)}`;
+    // Neither provenance table has a row for it, which should not happen: both writes put
+    // their provenance row in the same transaction as the asset. Said plainly rather than
+    // dressed up, because an asset nothing accounts for is worth noticing.
+    return "no recorded provenance";
+  };
+
+  /**
+   * The host of a program page URL, for the provenance column.
+   *
+   * The whole URL would push the scope chips off a tablet-width row, and the host is the
+   * part that identifies the program. The full page is on the import row for anyone who
+   * needs it, and the entries the same import wrote carry it in their note.
+   */
+  const hostOfUrl = (url: string): string => {
+    try {
+      return new URL(url).host;
+    } catch {
+      // Not parseable as a URL. It is still the string the importer was given, so it is
+      // shown rather than replaced with a complaint about its shape.
+      return url;
+    }
+  };
+
+  /** How many sightings a row reports, said so that zero reads correctly. */
+  const sightings = (asset: AssetView): string =>
+    asset.discoveries === 0
+      ? // Not "0 sightings". Zero is the normal, correct state of an imported host, and a
+        // count of nothing beside a row that was legitimately recorded reads as a defect.
+        asset.imports > 0
+        ? "not yet seen"
+        : "no sightings"
+      : `${String(asset.discoveries)} ${asset.discoveries === 1 ? "sighting" : "sightings"}`;
 
   const KINDS: ReadonlyArray<{
     readonly id: ScopeKind;
@@ -295,10 +343,7 @@
                     <span class="what mono">{rowLabel(asset)}</span>
                     <span class="kind">{asset.kind}</span>
                     <span class="found mono">{foundBy(asset)}</span>
-                    <span class="seen mono"
-                      >{asset.discoveries}
-                      {asset.discoveries === 1 ? "sighting" : "sightings"}</span
-                    >
+                    <span class="seen mono">{sightings(asset)}</span>
                     <!-- A row whose own label decided it says so, and says which entry it
                          beat. Rows that merely inherit the host's say that instead, so
                          the two are never read as the same decision. -->

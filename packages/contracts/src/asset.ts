@@ -477,13 +477,36 @@ export const AssetView = Schema.Struct({
    * Null when no discovery row exists. `record_asset` cannot produce that — it writes the
    * discovery in the same transaction as the asset — but the scope importer's own write
    * does, deliberately and for every asset it records (D14): it has an operator behind it
-   * and no attempt to name. An imported asset reads as "no recorded discovery" here until
-   * a worker finds it, and that is the honest answer rather than a fabricated attempt.
+   * and no attempt to name. Read together with {@link imports}, which is what tells an
+   * imported asset apart from one nothing knows anything about.
    */
   firstAttemptId: Schema.NullOr(Schema.String),
   firstIntentId: Schema.NullOr(Schema.String),
   /** When it was most recently seen. Not the same fact as {@link firstSeenAt}. */
   lastDiscoveredAt: Schema.NullOr(Schema.Number),
+  /**
+   * How many separate import operations recorded it (D14).
+   *
+   * **This field exists so that an imported asset reads as provenance rather than as an
+   * absence.** With only {@link discoveries} and {@link firstAttemptId}, a host the scope
+   * importer read off a program page — `0` and `null`, both correct — is indistinguishable
+   * from a row nobody can account for, and the best sentence a screen could write was "no
+   * recorded discovery". That is a statement about a gap, and there is no gap: the host was
+   * named on the program's own page, which is how it came to be known.
+   *
+   * Zero for an asset only a worker found. An asset both paths have touched has a non-zero
+   * count here *and* a non-null attempt, which is the two-provenance-tables shape D14
+   * chose over relaxing `asset_discoveries` — and a reader never has to ask whether a null
+   * attempt means "imported" or "unexplained".
+   */
+  imports: Schema.Int,
+  /**
+   * The program page it was first read off, or null if it was never imported.
+   *
+   * The page rather than the note, because the page is the part an operator can go and
+   * check for themselves — which is the point of the whole review step D13 rests on.
+   */
+  firstSourceUrl: Schema.NullOr(Schema.String),
   /**
    * Whether this asset is in the client's estate, and what decided it.
    *

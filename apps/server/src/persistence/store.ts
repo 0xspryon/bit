@@ -1627,6 +1627,10 @@ export interface StoredAssetWithProvenance extends StoredAsset {
   readonly first_attempt_id: string | null;
   readonly first_intent_id: string | null;
   readonly last_discovered_at: number | null;
+  /** How many import operations recorded it (D14). Zero for a worker's own discovery. */
+  readonly imports: number;
+  /** The program page it was first read off, or null if it was never imported. */
+  readonly first_source_url: string | null;
 }
 
 /**
@@ -7009,6 +7013,30 @@ const makeStore = Effect.fnUntraced(function* () {
     first_intent_id: Schema.NullOr(Schema.String),
     /** When it was most recently seen, which is not when it was first seen. */
     last_discovered_at: Schema.NullOr(Schema.Finite),
+    /**
+     * How many separate import operations have recorded this asset (D14).
+     *
+     * **The other half of "how did this come to be known", and without it the Estate
+     * screen reads an imported asset as an absence.** `discoveries: 0` with a null first
+     * attempt is exactly right for a host the importer read off a program page — there was
+     * no attempt, because the importer runs before any exist — but a screen that has only
+     * those two fields can say nothing better than "no recorded discovery", which is a
+     * sentence about a gap. An asset the importer recorded is not a gap: it is a host the
+     * program's own page named, which is provenance, and `asset_imports` is where it is.
+     *
+     * Zero for an asset only a worker found, which is the mirror image and equally real.
+     * An asset both paths have touched has a count in each, and neither number is the
+     * other's — which is the whole reason D14 gave the importer its own table rather than
+     * relaxing `asset_discoveries`.
+     */
+    imports: Schema.Int,
+    /**
+     * The program page it was first read off, or null if it was never imported.
+     *
+     * The page rather than the note, because the page is the part an operator can go and
+     * check. The note — where on the page — is on the import row for anyone who opens it.
+     */
+    first_source_url: Schema.NullOr(Schema.String),
   });
 
   /**
@@ -7053,7 +7081,12 @@ const makeStore = Effect.fnUntraced(function* () {
              WHERE asset_discoveries.asset_id = assets.id
              ORDER BY discovered_at, operation_id LIMIT 1) AS first_intent_id,
            (SELECT MAX(discovered_at) FROM asset_discoveries
-             WHERE asset_discoveries.asset_id = assets.id) AS last_discovered_at
+             WHERE asset_discoveries.asset_id = assets.id) AS last_discovered_at,
+           (SELECT COUNT(*) FROM asset_imports
+             WHERE asset_imports.asset_id = assets.id) AS imports,
+           (SELECT source_url FROM asset_imports
+             WHERE asset_imports.asset_id = assets.id
+             ORDER BY imported_at, operation_id LIMIT 1) AS first_source_url
          FROM assets
          ORDER BY assets.first_seen_at, assets.identity`,
         [],

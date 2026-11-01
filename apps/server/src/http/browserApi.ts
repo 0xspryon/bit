@@ -484,6 +484,8 @@ const assetView = (
   firstAttemptId: asset.first_attempt_id,
   firstIntentId: asset.first_intent_id,
   lastDiscoveredAt: asset.last_discovered_at,
+  imports: asset.imports,
+  firstSourceUrl: asset.first_source_url,
 });
 
 /**
