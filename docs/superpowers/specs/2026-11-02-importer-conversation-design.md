@@ -22,25 +22,19 @@
 | S7a   | Recovery tells the truth after a restart: `activity` on `SessionStatus`, the `abandoned` answer                                                           |
 | S7b   | The continuation turn: resume for the two conversations, a replacement attempt for a worker, the cap, the outbox dispatcher, the opt-out                  |
 | S8.x  | The list's three reporting gaps: importer liveness is "this process holds it" (`ScopeImporter.holds`), three states named, `goal_sessions.model` (`0030`) |
+| S7c   | The three stale-answer defects: Claude Code's `abandoned`, OpenCode's outcome-per-turn, `narrated` cleared on an accepted steer                           |
 
 Gates on `main`: **1540 server · 455 web · 84 DOM · 971 persistence**, migrations contiguous `0001`–`0030`.
 
-**In flight:** nothing. S7 is complete; S7.6 records the second half and what running it found.
+**In flight:** nothing. S7 is complete, and so are the three defects S7a and S7b recorded
+against settlement and recovery — each one is a stale or missing answer being believed, and
+each is now either answered or suppressed at its source. All three entries under Known
+defects record what shipped.
 
 **Still to do:**
 
-1. **Two findings from S7b's live run, both recorded under S7.6 and neither fixed there**,
-   because both change what the recovery seam answers at rank 1 and so what an attempt or a
-   round settles to. **Claude Code produces no `abandoned` after a restart** — its
-   `sessionStatus` fails for any session this process does not hold — so nothing is
-   continued on that driver; the fix is for that driver to answer
-   `{ activity: "idle", outcome: undefined }` for a transcript it still holds. And
-   **OpenCode never clears `idle_outcome` when a turn starts**, so after a restart a
-   conversation past its first completed turn reports the earlier turn's outcome and is read
-   as finished; it fails safe, and it narrows the continuation to conversations interrupted
-   on their first turn.
-2. **Narrow the importer session's tool set.** Recorded under Known defects. The three MCP tools are the only ones that can _write_, but the session also holds whatever else the harness gives it — a live run used `Bash` to `curl` a page. The gated directory is the control and always was; the sentence we showed the operator was what was wrong, and that is already corrected. The fix is `allowedTools` on `createSession`, done with a live import to verify against, because the live run reached for `curl` rather than `WebFetch`.
-3. **The end-to-end pass**, now possible on both drivers.
+1. **Narrow the importer session's tool set.** Recorded under Known defects. The three MCP tools are the only ones that can _write_, but the session also holds whatever else the harness gives it — a live run used `Bash` to `curl` a page. The gated directory is the control and always was; the sentence we showed the operator was what was wrong, and that is already corrected. The fix is `allowedTools` on `createSession`, done with a live import to verify against, because the live run reached for `curl` rather than `WebFetch`.
+2. **The end-to-end pass**, now possible on both drivers.
 
 ## What has been verified against live agents, and on which driver
 
@@ -879,17 +873,26 @@ untouched predecessor, the claim moving to the replacement, the summary above th
 and the question still last, plus both refusals — and `recovery/continuationDispatcher.test.ts`
 drives sweep → queue → dispatch over a real file.
 
-#### What the demonstration found, and neither of these is fixed here
+#### What the demonstration found, and both are fixed as of 2 Nov 2026
 
-**1. On Claude Code nothing is continued after a restart.** `claudeCodeClient.sessionStatus`
-_fails_ for any session this process does not hold — the SDK's live query dies with the
-process that spawned it and there is no re-attach — so `harnessStatus.ts` answers `missing`
+Recorded here as found; what shipped for each is under Known defects.
+
+**1. On Claude Code nothing was continued after a restart.** `claudeCodeClient.sessionStatus`
+_failed_ for any session this process does not hold — the SDK's live query dies with the
+process that spawned it and there is no re-attach — so `harnessStatus.ts` answered `missing`
 or `unreachable`, and both are refusals. The conversation is still there (
 `sessionContinuation` answers `resumable` off the transcript, which is what S6 shipped), so
-what is missing is only the _liveness_ half. The fix is for that driver to answer
-`{ activity: "idle", outcome: undefined }` for a transcript it still holds, which is honest
-now that `activity` exists and was not expressible before it; it is a driver change with its
-own tests and it is named here rather than smuggled into this slice.
+what was missing was only the _liveness_ half.
+
+**Fixed as suggested**: a transcript this process holds now answers
+`{ activity: "idle", outcome: undefined }` — `abandoned`, which is `uncertain` with the
+fence bumped, the same disposition the refusal reached but for a stated reason rather than
+an unanswered question. An id the session store has never heard of still fails with the
+not-found tag, so `missing` stays apart from `abandoned`: the second asserts the
+conversation is still there and nothing may claim that without having seen the transcript. A
+read that throws is still `unreachable`. The comment that argued for failing both branches
+was correct before `activity` existed and is rewritten rather than left to contradict the
+code.
 
 **2. OpenCode's stale `idle_outcome` means a conversation past its first completed turn is
 not continued either.** Found by running the demonstration a second time on the same
@@ -904,16 +907,21 @@ time_busy    1793640472326     <- turn two started here, after it
 idle_outcome succeeded         <- turn one's, never cleared
 ```
 
-`sessionStatus` therefore answers `succeeded`, `continuationTrigger` says "the harness
-stated how this session's last turn ended", and the interrupted second turn is left alone.
-It fails in the safe direction — under-continuing rather than prompting a model about work
-that may have finished — but it narrows S7 to conversations interrupted on their **first**
-turn, which is not what this slice assumed. Two candidate fixes, neither taken here because
-both change what rank 1 answers and so what an attempt or a round _settles_ to, which this
-slice was told not to touch: have `openCodeClient` suppress a recorded outcome when
-`time.busy > time.idle` (an unknown-field read — the live server exposes `time.busy` and the
-pinned `@opencode/schema@2.1.0` does not, which is why S7a warned against building on those
-timestamps), or widen the seam so `SessionStatus` says _which turn_ its outcome belongs to.
+`sessionStatus` therefore answered `succeeded`, `continuationTrigger` said "the harness
+stated how this session's last turn ended", and the interrupted second turn was left alone.
+It failed in the safe direction — under-continuing rather than prompting a model about work
+that may have finished — but it narrowed S7 to conversations interrupted on their **first**
+turn, which is not what this slice assumed.
+
+**Fixed by the first of the two candidates, with the warning on it honoured rather than
+overridden**: a recorded outcome is suppressed when `time.busy > time.idle`. S7a was right
+that this cannot be an unknown-field read — the pinned schema omits `busy` and Effect Schema
+strips what it does not declare, so such a read would have compiled and done nothing — so
+the two timestamps are decoded through a schema that declares them, over the same route and
+transport, and only when an outcome is recorded and nothing is running. The seam was _not_
+widened to say which turn an outcome belongs to: the driver that knows answers the question
+itself, and `SessionStatus` keeps its two members. Full reasoning, the rejected
+alternatives and the failure direction are under Known defects.
 
 ### Done criteria
 
@@ -1177,34 +1185,102 @@ basis for the answer. If an upgrade ever attached that sweep under `--stdio`, `a
 start reporting our abandoned sessions as running again — which would be _honest_ (something
 would indeed be running them) and would make the credential problem the real one to solve.
 
-#### What this did _not_ fix: `narrated` has the same staleness one rank down
+#### `narrated` had the same staleness one rank down — fixed on 2 Nov 2026
 
 `run/settlement.ts` ranks the harness's answer first and the **narration's** terminal event
 second. Both supervisors keep `narrated` as the last terminal `session.execution.*` the
 stream carried, and that is per-_stream_, not per-turn — so a round whose first turn
-terminalised and was then steered holds turn one's event in `narrated` while turn two runs.
-Suppressing the stale outcome at rank 1 therefore narrows the window rather than closing it:
-when narration is present it carries the same stale value, and the practical difference
-appears only when the stream dropped, where settlement now reaches `interrupted` (for a stop)
-or `uncertain` instead of asserting turn one's answer about turn two.
+terminalised and was then steered held turn one's event in `narrated` while turn two ran.
+Suppressing the stale outcome at rank 1 narrowed the window rather than closing it: when
+narration was present it carried the same stale value.
 
-Left alone deliberately — this slice was not to change how an attempt or a round settles
-beyond making its _recovery_ status honest. The fix would be to clear `report.narrated` when
-a steer is accepted, in both supervisors, which is a settlement change with its own tests to
-write.
+**An accepted steer now clears `report.narrated`**, in `plan/planSupervisor.ts`, inside the
+same permit the settlement competes for — so it cannot race the finalizer: either the steer
+clears it and the settlement that follows reads the new turn, or the settlement had the
+permit, `settled` is already true and nothing was delivered to clear for. The `report` is
+held on the `steerable` entry for that reason, which is also the honest statement of who
+knows: a steer is the only thing outside the round's own fiber that starts a turn on its
+session.
 
-#### And the half of the stale outcome the `activity` field did not close
+**After acceptance and not before**, and that order is pinned by its own test. A refused
+steer started no new turn, so turn one's event is still the last turn's and still the right
+thing to settle from; clearing above the prompt loses it and the test fails. The cost of
+that order is a window between the harness taking the message and the clear, where a turn
+terminalising inside it loses its rank-2 reading and settles from `sessionStatus` instead —
+a lost corroborating read, which is not the same kind of error as asserting the wrong turn's
+outcome.
 
-**Found on 2 Nov 2026 by running S7's own live demonstration twice**, and recorded in full
-under S7.6. The fix above drops a recorded outcome while `activity` is `running`; after a
-restart nothing is running, so a multi-turn session reports **turn one's** outcome about
-turn two — `Execution.Started` updates `time_busy` and never clears `idle_outcome`. The
-consequence lands on the continuation rather than on recovery: such a session reads
-`succeeded`, so nothing was left half-finished as far as this seam can tell, and the
-interrupted turn is not carried on. It fails in the safe direction and it narrows S7 to
-conversations interrupted on their first turn. Left alone here for the same reason as the
-`narrated` defect above: both candidate fixes change what rank 1 answers, and therefore what
-an attempt or a round settles to.
+**`run/supervisor.ts` has nothing to clear**, which is the one place the recorded fix
+direction ("in both supervisors") turned out not to apply. Nothing steers a worker attempt:
+`RunSupervisor` offers `start`, `continueAttempt`, `stop` and `running`, no route or tool
+reaches a running attempt's session with a message, and `continueAttempt` opens a _new_
+attempt with a new session and a new report — which is `agentHarness.ts`'s rule that
+carrying work on after an interruption means a new attempt identity. It is written down on
+that file's `report` declaration rather than left as an apparent omission, with what the
+day a steer reaches an attempt would have to do.
+
+#### The half of the stale outcome the `activity` field did not close — fixed on 2 Nov 2026
+
+**Found by running S7's own live demonstration twice**, recorded in full under S7.6. The
+`activity` fix drops a recorded outcome while a turn is in flight; after a restart nothing
+is in flight, so a multi-turn session reported **turn one's** outcome about turn two —
+`Execution.Started` updates `time_busy` and never clears `idle_outcome`. Such a session read
+`succeeded`, so nothing looked half-finished, and the interrupted turn was not carried on.
+It failed in the safe direction and it narrowed S7 to conversations interrupted on their
+**first** turn.
+
+**The answer is `time.busy` against `time.idle`, and it is the server's own statement rather
+than an inference.** Re-verified against OpenCode's source rather than taken from the note
+above: `projectIdle` writes `time_idle` and `idle_outcome` in one `set`, and
+`Execution.Started` writes `time_busy` and clears neither
+(`core/src/session/projector.ts`). The current schema documents the consequence in as many
+words — _"Start of the most recent execution. While it runs, `idle` still holds the previous
+execution's end."_ So `idle >= busy` means the most recent execution recorded its own
+terminal and the outcome is that execution's; `busy > idle` means it recorded nothing and
+any outcome on the row is an **earlier** turn's. `openCodeClient.ts`'s `outcomeIsLastTurns`
+is that comparison, tested on its own.
+
+**Two candidates were rejected, each for a reason worth keeping.** `time.updated` against
+`time.idle` would need no new read at all — both fields are in the pinned schema — and it is
+wrong: the projector sets `time_updated` on a title change (line 677), and OpenCode generates
+titles asynchronously _after_ a turn, so a settled session would read as stale and the
+continuation would prompt a model about finished work. That is the unsafe direction. Reading
+the last message's `time.completed`, the way OpenCode's own `recoverSubagent` does, has the
+same flaw from a different side: a turn that genuinely _failed_ may leave an assistant
+message with no completion, and `failed` is a common outcome.
+
+**S7a's warning about those timestamps held, and shaped the implementation rather than
+blocking it.** The pinned `@opencode/schema@2.1.0` does not declare `time.busy` even though
+the live server sends it, and Effect Schema strips excess properties — confirmed by decoding
+`Session.Info` against a body carrying `busy`, which comes back without it. So an
+unknown-field read off `api.session.get`'s answer would have compiled, run, and silently
+done nothing. The timestamps are read over the same route and the same authenticated
+transport through a schema that declares the one missing field; `outcome`, `cost` and
+`tokens` still come from the generated client's published decode, and the read can be
+deleted the day a pinned upgrade carries `busy`.
+
+Two properties it is built around, both tested:
+
+- **Asked only when it can change the answer.** No outcome recorded, or a turn in flight,
+  and nothing extra is read — so a session that never recorded anything still costs two
+  requests, and nothing polls `sessionStatus` (only settlement and the recovery sweep ask).
+- **Every failure believes the outcome.** A transport failure, a non-2xx, an undecodable
+  body: each reverts to the pre-fix behaviour, which under-continues. Treating an unreadable
+  timestamp as evidence of staleness would let one flaky GET turn a settled attempt into
+  `uncertain`, bump its fence and revoke its credential. The read has no error channel and
+  logs a warning, so a build where it silently reverted is visible.
+
+The `active`-before-`get` order is untouched, and the normal settle path does not move: the
+terminal that wrote the outcome advanced `time_idle` past `time_busy` in the same
+transition, so a turn that completed normally reads as the current one. The existing
+"an outcome on an idle session is reported" test fails if the comparison is inverted, which
+is the guard that says so.
+
+One edge, stated because it is a real inequality: `time_idle` is written as
+`max(event.created, time_idle + 1)` so every terminal advances the column even inside one
+millisecond. A turn that _started_ in the same millisecond its predecessor terminalised
+therefore reads `idle >= busy` and its predecessor's outcome is believed. The window is a
+millisecond or two and it errs towards under-continuing.
 
 #### One limit, stated
 
