@@ -27,7 +27,7 @@ import {
   ok,
   unreachable,
 } from "../fakeServer";
-import { click, mountInto, settle, type Mounted } from "./dom";
+import { click, mountInto, press, settle, type Mounted } from "./dom";
 
 let mounted: Mounted[] = [];
 afterEach(() => {
@@ -66,6 +66,18 @@ const hasButton = (label: string): boolean =>
 const strip = (): Element | null =>
   document.querySelector('[aria-label="Last importer session"]');
 
+const harness = (instanceId: string, displayName: string) => ({
+  instanceId,
+  driver: "opencode" as const,
+  displayName,
+  version: "1.0.0",
+  ready: true,
+  auth: "authenticated" as const,
+  isDefault: false,
+  defaultModel: "m",
+  models: [{ id: "m" }],
+});
+
 /** The newest session, then an older one: the shape the route answers in. */
 const SESSIONS: ImporterSessionView[] = [
   importerSessionView({
@@ -95,6 +107,13 @@ const openScope = async (
   const fake = new FakeServer();
   fake.onScope = () => ok(emptyScope({ entries: entries.map(entry) }));
   fake.onImporterSessions = () => ok({ sessions });
+  // The harnesses the sessions above ran on are ones this server runs: a session from one it
+  // does not is its own describe, below.
+  fake.onHarnesses = () =>
+    ok([
+      harness("claude-code", "Claude Code"),
+      harness("opencode", "OpenCode"),
+    ]);
   const app = new App(fake, new FakeCountdown());
   app.password = "correct-horse";
   await app.connect();
@@ -150,9 +169,38 @@ describe("the last-session strip", () => {
     expect(hasButton("Auto-load scope…")).toBe(true);
   });
 
-  test("is not there once the scope has entries: D1 draws it under the empty state", async () => {
+  test("is there once the scope has entries, which is where a session that wrote anything leaves the target", async () => {
+    // D1: "On a target that already has entries this strip is the only thing that changes;
+    // the primary button moves into the Scope tab's header." A successful import writes
+    // entries, entries remove the empty state, so a strip gated on the empty state could only
+    // ever name a session that wrote nothing.
     await openScope(SESSIONS, ["acme.test"]);
-    expect(strip()).toBeNull();
+
+    expect(document.querySelector(".scope-empty")).toBeNull();
+    expect(strip()?.textContent?.replace(/\s+/g, " ")).toContain(
+      "wrote 7 in · 3 out · 14 assets.",
+    );
+    // The primary button has moved to the header, and is the only door in beside the strip.
+    expect(hasButton("Auto-load…")).toBe(true);
+    expect(hasButton("Auto-load scope…")).toBe(false);
+    // At the bottom, with the Add bar, rather than among the lists.
+    const add = document.querySelector("form.add");
+    expect(
+      add !== null &&
+        strip() !== null &&
+        strip()?.compareDocumentPosition(add) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  test("Continue works from a populated target, and the session it opens is the one named", async () => {
+    const { app } = await openScope(SESSIONS, ["acme.test"]);
+
+    click(button("Continue that session"));
+    await settle();
+
+    expect(app.importerOpen).toBe(true);
+    expect(app.importer.currentId).toBe("ses_newest");
   });
 
   test("a failed read of the index leaves the empty state exactly as it was", async () => {
@@ -268,6 +316,152 @@ describe("Continue that session", () => {
     await settle();
 
     expect(app.importer.current?.harness).toBe("Claude Code");
+  });
+});
+
+const composer = (): HTMLTextAreaElement => {
+  const box = document.querySelector<HTMLTextAreaElement>("#importer-message");
+  if (box === null) throw new Error("no composer");
+  return box;
+};
+
+const typeInto = (box: HTMLTextAreaElement, value: string): void => {
+  box.value = value;
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+};
+
+/** Continue the newest session of a server that lists `harnesses`, and wait for the page. */
+const continueOn = async (
+  sessions: ImporterSessionView[],
+  harnesses: ReturnType<typeof harness>[] | "unreachable",
+): Promise<{ app: App; fake: FakeServer }> => {
+  const fake = new FakeServer();
+  fake.onScope = () => ok(emptyScope());
+  fake.onImporterSessions = () => ok({ sessions });
+  fake.onHarnesses = () =>
+    harnesses === "unreachable" ? unreachable("no route") : ok(harnesses);
+  const app = new App(fake, new FakeCountdown());
+  app.password = "correct-horse";
+  await app.connect();
+  app.openTarget("acme-corp");
+  await settle();
+  app.toSection("assets");
+  await settle();
+  app.toAssetsTab("scope");
+  await settle();
+  mounted.push(mountInto(TitleBar, { app }), mountInto(Target, { app }));
+  await settle();
+  click(button("Continue that session"));
+  await settle();
+  return { app, fake };
+};
+
+describe("typing into a session the server lists", () => {
+  test("the note that its words cannot be read stays above the first message", async () => {
+    await continueOn(SESSIONS, [harness("claude-code", "Claude Code")]);
+    expect(text()).toContain("does not read the session's messages");
+
+    const box = composer();
+    typeInto(box, "Also load the staging hosts");
+    box.focus();
+    press("Enter");
+    await settle();
+
+    // One message in, this still must not read as a brand-new session.
+    expect(text()).toContain("Also load the staging hosts");
+    expect(text()).toContain("does not read the session's messages");
+  });
+
+  test("a later reading of the index keeps what the operator typed and takes the server's figures", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    const box = composer();
+    typeInto(box, "Also load the staging hosts");
+    box.focus();
+    press("Enter");
+    await settle();
+
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: [
+          importerSessionView({
+            sessionId: "ses_newest",
+            harnessInstanceId: "claude-code",
+            openedAt: 1_700_000_200_000,
+            tally: { entriesIn: 9, entriesOut: 3, assets: 14 },
+          }),
+        ],
+      });
+    await app.loadImporterSessions("acme-corp");
+    await settle();
+
+    expect(text()).toContain("Also load the staging hosts");
+    expect(app.importer.current?.id).toBe("ses_newest");
+    expect(app.importer.current?.tally.in).toBe(9);
+    expect(
+      app.importer.sessions.filter((session) => session.id === "ses_newest"),
+    ).toHaveLength(1);
+  });
+
+  test("a session the server stopped listing is kept while it holds the operator's words", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    const box = composer();
+    typeInto(box, "Also load the staging hosts");
+    box.focus();
+    press("Enter");
+    await settle();
+
+    fake.onImporterSessions = () => ok({ sessions: [] });
+    await app.loadImporterSessions("acme-corp");
+    await settle();
+
+    expect(app.importer.currentId).toBe("ses_newest");
+    expect(text()).toContain("Also load the staging hosts");
+  });
+});
+
+describe("a session from a harness this server does not run", () => {
+  const STRANDED = [
+    importerSessionView({
+      sessionId: "ses_gone",
+      harnessInstanceId: "retired-harness",
+      openedAt: 1_700_000_200_000,
+    }),
+  ];
+
+  test("says so, and cannot be typed into", async () => {
+    const { app, fake } = await continueOn(STRANDED, [
+      harness("claude-code", "Claude Code"),
+    ]);
+
+    expect(app.importer.current?.strandedOn).toBe("retired-harness");
+    expect(text()).toContain('ran on "retired-harness"');
+    expect(composer().disabled).toBe(true);
+    // The rule is in the model too, not only on the control.
+    app.importer.draft = "hello";
+    app.importer.send();
+    expect(app.importer.current?.items).toEqual([]);
+    expect(fake.countOf("startScopeImport")).toBe(0);
+  });
+
+  test("is not called gone before the harness listing has said what is here", async () => {
+    const { app } = await continueOn(STRANDED, "unreachable");
+
+    expect(app.harnessesLoaded).toBe(false);
+    expect(app.importer.current?.strandedOn).toBeUndefined();
+    expect(text()).not.toContain('ran on "retired-harness"');
+    expect(composer().disabled).toBe(false);
+  });
+
+  test("a session whose harness this server runs is not stranded", async () => {
+    const { app } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    expect(app.importer.current?.strandedOn).toBeUndefined();
+    expect(composer().disabled).toBe(false);
   });
 });
 

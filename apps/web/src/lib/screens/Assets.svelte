@@ -526,38 +526,6 @@
                 </Button>
               </div>
             </div>
-            {#if app.lastImporterSession !== undefined}
-              {@const last = app.lastImporterSession}
-              <!--
-                A6 D1's strip. Sessions are sticky per target, so an abandoned one is named
-                here rather than left for the operator to start a second beside it. What it
-                says is about what the session did (running, wrote nothing, wrote this
-                much) and never about what was said: the server keeps none of that.
-
-                "Continue" selects the session and opens the page; it does not prompt it.
-              -->
-              <div
-                class="last-session"
-                role="group"
-                aria-label="Last importer session"
-              >
-                <IconHistory width="14" height="14" />
-                <span class="last-text"
-                  >Last importer session
-                  <span class="mono last-when"
-                    >{sessionWhen(last.openedAt, Date.now())}</span
-                  >
-                  {lastSessionSentence(last)}</span
-                >
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onclick={() => app.openImporter(last.sessionId)}
-                >
-                  Continue that session
-                </Button>
-              </div>
-            {/if}
           {:else}
             {#each [{ effect: "in", heading: "In scope" }, { effect: "out", heading: "Out of scope" }] as section (section.effect)}
               {@const rows = scope.entries.filter(
@@ -686,6 +654,46 @@
             </div>
           {/if}
         </div>
+
+        {#if app.lastImporterSession !== undefined}
+          {@const last = app.lastImporterSession}
+          <!--
+            A6 D1's strip, at the bottom of the tab beside the Add bar, **whether or not the
+            scope has entries**. D1's caption: "On a target that already has entries this
+            strip is the only thing that changes; the primary button moves into the Scope
+            tab's header." It is not inside the empty state, because a session that wrote
+            anything has removed the empty state, and a strip behind it could then only name
+            a session that wrote nothing.
+
+            Sessions are sticky per target, so an abandoned one is named here rather than
+            left for the operator to start a second beside it. What it says is about what
+            the session did (running, wrote nothing, wrote this much) and never about what
+            was said: the server keeps none of that.
+
+            "Continue" selects the session and opens the page; it does not prompt it.
+          -->
+          <div
+            class="last-session"
+            role="group"
+            aria-label="Last importer session"
+          >
+            <IconHistory width="14" height="14" />
+            <span class="last-text"
+              >Last importer session
+              <span class="mono last-when"
+                >{sessionWhen(last.openedAt, Date.now())}</span
+              >
+              {lastSessionSentence(last)}</span
+            >
+            <Button
+              variant="outline"
+              size="sm"
+              onclick={() => app.openImporter(last.sessionId)}
+            >
+              Continue that session
+            </Button>
+          </div>
+        {/if}
 
         <form
           class="add"
@@ -1451,6 +1459,8 @@
   /* The Scope tab's empty state sits in the lists column, and takes focus when the last
      entry is deleted from under the delete question: no outline for a programmatic one. */
   .scope-empty {
+    flex: 1;
+    justify-content: center;
     margin: 24px auto;
   }
   .scope-empty:focus {

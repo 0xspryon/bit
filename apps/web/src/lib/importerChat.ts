@@ -136,7 +136,24 @@ export interface ImporterSession {
   readonly reading: boolean;
   /** True when the server lists this session. Absent on the page's own. */
   readonly indexed?: boolean;
+  /**
+   * The harness instance this session was minted by when this server **does not run it**,
+   * and absent otherwise.
+   *
+   * The session may be alive on that harness elsewhere, and the harness this server does
+   * have would answer "no such session" about it: so it must not be asked, and a message
+   * typed into it must not be sent. Only an indexed session can carry it, and only once the
+   * harness listing has arrived: before that an unknown instance is unknown, not gone.
+   */
+  readonly strandedOn?: string;
 }
+
+/**
+ * What the page says of a session whose harness this server no longer runs, and why it
+ * cannot be continued rather than merely not yet.
+ */
+export const strandedNote = (instanceId: string): string =>
+  `This session ran on "${instanceId}", which this server does not run. It may still exist there, and asking another harness about it would only be told there is no such session, so it cannot be continued from here. What it wrote is on the Scope tab and in the Estate.`;
 
 /** What a session is built from. */
 export interface ImporterChatInput {
@@ -205,6 +222,10 @@ const cutReplay = (
  * leading group is just records, and the sentence is about why they are up here.
  */
 const leadingProse = (history: ImporterHistory, other: boolean): RoundProse => {
+  // Said whether or not the session has turns of its own: see `buildImporterChat`.
+  if (history.source === "pending") {
+    return { _tag: "pending", note: history.note };
+  }
   if (other) {
     return {
       _tag: "none",
@@ -214,8 +235,6 @@ const leadingProse = (history: ImporterHistory, other: boolean): RoundProse => {
   switch (history.source) {
     case "loading":
       return { _tag: "loading" };
-    case "pending":
-      return { _tag: "pending", note: history.note };
     case "forgotten":
       return { _tag: "forgotten", note: history.note };
     case "none":
@@ -245,10 +264,11 @@ export const buildImporterChat = (
   const groups: ImporterGroup[] = [];
 
   /*
-   * The leading group exists for three reasons and no others: replayed words before the
-   * first user message, records with no operator row before them, and a session whose
-   * history the harness answered with an absence while nothing else is on screen. In the
-   * last case the group is the only place the absence can be said.
+   * The leading group exists for four reasons and no others: replayed words before the
+   * first user message, records with no operator row before them, a session whose history
+   * the harness answered with an absence while nothing else is on screen (the group is the
+   * only place the absence can be said), and a history this page cannot read at all, which
+   * stays said above every message typed into it.
    */
   const absent =
     turnCount === 0 &&
@@ -256,7 +276,20 @@ export const buildImporterChat = (
     (history.source === "loading" ||
       history.source === "pending" ||
       history.source === "forgotten");
-  if (replay.leading.length > 0 || live.leading.length > 0 || absent) {
+  /*
+   * A `pending` history is the page saying it cannot read this session's words, and that does
+   * not stop being true when the operator types. Without this, one message in an indexed
+   * continuation looks exactly like a brand-new session: the note is gone and nothing says
+   * the thread above it is missing. The other absences are about arriving (`loading`) or
+   * about a session that is gone (`forgotten`), and each is said once, before anything else.
+   */
+  const unreadable = history.source === "pending";
+  if (
+    replay.leading.length > 0 ||
+    live.leading.length > 0 ||
+    absent ||
+    unreadable
+  ) {
     const prose: RoundProse =
       replay.leading.length > 0
         ? {
@@ -340,37 +373,33 @@ export const buildImporterChat = (
 /**
  * What a session wrote, for the picker. Counts of its own, not derived from the feed.
  *
- * `messages` is `null` when it is not known, which is every indexed session today: what was
- * said is the harness's and this server keeps none of it, so a count of it is something only
- * a read of the harness could supply. `null` is not zero — zero is the empty session, and is
- * what separates "a thread to type into" from "a session that exists".
+ * **`messages` is `0` or `null`, and cannot be a count.** `0` is the empty thread the operator
+ * types into, which is what separates "a thread to type into" from "a session that exists".
+ * `null` is every other session: what was said is the harness's and this server keeps none of
+ * it, so a number of messages is something only a read of the harness could supply and no
+ * session here can claim one. The type is narrow on purpose, so no fixture can put a count in
+ * the picker that a real session could never show.
  */
 export interface ImporterTally {
   readonly in: number;
   readonly out: number;
   readonly assets: number;
-  readonly messages: number | null;
+  readonly messages: 0 | null;
 }
 
 /**
  * The picker's second line: what the session actually wrote.
  *
  * "Nothing written" is its own sentence rather than three zeros, because "the session where
- * the agent only asked a question" is the one worth recognising at a glance.
+ * the agent only asked a question" is the one worth recognising at a glance. It says nothing
+ * of messages: see {@link ImporterTally}.
  */
-export const tallyLine = (tally: ImporterTally): string => {
-  const wrote =
-    tally.in === 0 && tally.out === 0 && tally.assets === 0
-      ? "nothing written"
-      : `${String(tally.in)} in · ${String(tally.out)} out · ${String(tally.assets)} ${
-          tally.assets === 1 ? "asset" : "assets"
-        }`;
-  // An unknown count is left off rather than printed as a number it is not.
-  if (tally.messages === null) return wrote;
-  return `${wrote} · ${String(tally.messages)} ${
-    tally.messages === 1 ? "message" : "messages"
-  }`;
-};
+export const tallyLine = (tally: ImporterTally): string =>
+  tally.in === 0 && tally.out === 0 && tally.assets === 0
+    ? "nothing written"
+    : `${String(tally.in)} in · ${String(tally.out)} out · ${String(tally.assets)} ${
+        tally.assets === 1 ? "asset" : "assets"
+      }`;
 
 /**
  * When a session started, as the picker words it: the time today, the date and time before.
@@ -431,11 +460,13 @@ export const INDEXED_HISTORY: ImporterHistory = {
  * `harness` is a display name the caller resolves from the harness listing, because the
  * server's row carries the instance id and the avatar letter wants the name. `reading` is
  * true: an indexed session is opened to be read, and the first message the operator types
- * resumes it. `messages` is `null` — see {@link ImporterTally}.
+ * resumes it. `messages` is `null` — see {@link ImporterTally}. `strandedOn` is the caller's
+ * to work out from the harness listing, and is set only for a harness this server lacks.
  */
 export const indexedSession = (
   view: ImporterSessionView,
   harness: string,
+  strandedOn?: string,
 ): ImporterSession => ({
   id: view.sessionId,
   startedAt: view.openedAt,
@@ -452,6 +483,7 @@ export const indexedSession = (
   },
   reading: true,
   indexed: true,
+  ...(strandedOn === undefined ? {} : { strandedOn }),
 });
 
 /**

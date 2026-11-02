@@ -46,6 +46,7 @@
     IconLink,
     IconPlus,
   } from "../icons";
+  import { strandedNote } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import Chat from "./Chat.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
@@ -56,7 +57,11 @@
   let session = $derived(importer.current);
   let groups = $derived(importer.groups);
   let target = $derived(app.selected?.name ?? app.viewTargetId);
-  let canSend = $derived(importer.draft.trim() !== "");
+  /** Set when the session's harness is one this server does not run: see `strandedNote`. */
+  let stranded = $derived(session?.strandedOn);
+  let canSend = $derived(
+    importer.draft.trim() !== "" && stranded === undefined,
+  );
   let working = $derived(session?.working ?? false);
   /** A session that has started keeps its model; only an empty one may choose. */
   let pinned = $derived(
@@ -100,9 +105,11 @@
   }
 
   let placeholder = $derived(
-    groups.length === 0
-      ? "Paste a policy or scope URL, or say what is in and out of scope…"
-      : "Correct it, or add what the pages do not say…",
+    stranded !== undefined
+      ? "This session's harness is not on this server, so it cannot be continued."
+      : groups.length === 0
+        ? "Paste a policy or scope URL, or say what is in and out of scope…"
+        : "Correct it, or add what the pages do not say…",
   );
 </script>
 
@@ -112,9 +119,11 @@
     {groups}
     readonly={false}
     layout="thread"
-    note={session?.reading
-      ? "You are reading an earlier session. Your first message resumes it, with the scope as it stands now, not as it stood then."
-      : ""}
+    note={stranded !== undefined
+      ? strandedNote(stranded)
+      : session?.reading
+        ? "You are reading an earlier session. Your first message resumes it, with the scope as it stands now, not as it stood then."
+        : ""}
     empty="Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread."
   >
     {#snippet separator(group)}
@@ -177,6 +186,7 @@
             rows="1"
             class={[groups.length === 0 && "first"]}
             {placeholder}
+            disabled={stranded !== undefined}
             bind:value={importer.draft}
             {onkeydown}></textarea>
           <div class="strip">

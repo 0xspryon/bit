@@ -1029,6 +1029,13 @@ export class App {
    */
   harnesses = $state<HarnessInstanceView[]>([]);
   /**
+   * Whether {@link harnesses} is the server's answer rather than its initial `[]`.
+   *
+   * An empty list is also what a server with no harness configured says, so emptiness cannot
+   * stand for "not read yet". A session's harness is only declared gone once this is true.
+   */
+  harnessesLoaded = $state(false);
+  /**
    * Which instance the operator has picked, or `""` for the server's default.
    *
    * `""` is not the same as the default instance's id, and the difference is deliberate:
@@ -2263,16 +2270,22 @@ export class App {
 
   /** The index as the Auto-load page holds sessions, harness names resolved. */
   #indexedSessions() {
-    return this.importerIndex.map((view) =>
-      indexedSession(
+    return this.importerIndex.map((view) => {
+      const listed = this.harnesses.find(
+        (entry) => entry.instanceId === view.harnessInstanceId,
+      );
+      return indexedSession(
         view,
-        this.harnesses.find(
-          (entry) => entry.instanceId === view.harnessInstanceId,
-        )?.displayName ??
-          view.harnessInstanceId ??
-          "Unknown harness",
-      ),
-    );
+        listed?.displayName ?? view.harnessInstanceId ?? "Unknown harness",
+        // Gone only once the listing has said what is here: until then every instance is
+        // merely unknown. A session recorded without an instance has nothing to compare.
+        this.harnessesLoaded &&
+          view.harnessInstanceId !== null &&
+          listed === undefined
+          ? view.harnessInstanceId
+          : undefined,
+      );
+    });
   }
 
   /**
@@ -4359,6 +4372,7 @@ export class App {
     }
     if (call._tag === "Unreachable") return;
     this.harnesses = call.value.map((entry) => ({ ...entry }));
+    this.harnessesLoaded = true;
     // The Auto-load page names each session's harness, and may be showing the id until now.
     if (this.importerOpen) this.importer.syncIndexed(this.#indexedSessions());
     // A picked instance the server no longer configures is dropped back to the default
@@ -5277,6 +5291,7 @@ export const scenarios: Scenario[] = [
       // There is no server to ask which harnesses are ready or which model an import would
       // run on, so the chip's picker is given declared ones.
       a.harnesses = mockHarnesses();
+      a.harnessesLoaded = true;
       a.importerModel = mockImporterModel();
       a.importer.load(state);
     },
@@ -5309,6 +5324,7 @@ export const scenarios: Scenario[] = [
       a.importerIndex = mockImporterIndex(Date.now());
       a.importerIndexTargetId = "acme-corp";
       a.harnesses = mockHarnesses();
+      a.harnessesLoaded = true;
       a.importerModel = mockImporterModel();
     },
   },

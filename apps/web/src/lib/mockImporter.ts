@@ -323,7 +323,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
       history: NO_HISTORY,
       items,
       working: true,
-      tally: { in: 3, out: 0, assets: 0, messages: 1 },
+      tally: { in: 3, out: 0, assets: 0, messages: null },
       reading: false,
     };
   }
@@ -448,7 +448,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
         ? items.filter((item) => item.origin === "record")
         : items,
     working: false,
-    tally: { in: 4, out: 3, assets: 3, messages: 4 },
+    tally: { in: 4, out: 3, assets: 3, messages: null },
     reading: false,
   };
 };
@@ -522,7 +522,7 @@ export const mockAwaitingSession = (now: number): ImporterSession => {
       ),
     ],
     working: true,
-    tally: { in: 0, out: 0, assets: 0, messages: 1 },
+    tally: { in: 0, out: 0, assets: 0, messages: null },
     reading: false,
   };
 };
@@ -571,7 +571,7 @@ const questionSession = (now: number): ImporterSession => ({
   },
   items: [],
   working: false,
-  tally: { in: 0, out: 0, assets: 0, messages: 2 },
+  tally: { in: 0, out: 0, assets: 0, messages: null },
   reading: true,
 });
 
@@ -627,7 +627,7 @@ export const mockForgottenSession = (now: number): ImporterSession => {
     },
     items,
     working: false,
-    tally: { in: 3, out: 0, assets: 5, messages: 9 },
+    tally: { in: 3, out: 0, assets: 5, messages: null },
     reading: true,
   };
 };

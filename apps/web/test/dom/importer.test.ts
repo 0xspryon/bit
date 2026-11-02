@@ -395,9 +395,12 @@ describe("D5: sessions are sticky per target", () => {
       "false",
     ]);
     const said = rows.map((row) => row.textContent?.replace(/\s+/g, " ") ?? "");
-    expect(said[0]).toContain("4 in · 3 out · 3 assets · 4 messages");
-    expect(said[1]).toContain("nothing written · 2 messages");
-    expect(said[2]).toContain("3 in · 0 out · 5 assets · 9 messages");
+    expect(said[0]).toContain("4 in · 3 out · 3 assets");
+    expect(said[1]).toContain("nothing written");
+    expect(said[2]).toContain("3 in · 0 out · 5 assets");
+    // The state picker is the reference for what a state looks like, so it must not print
+    // what a real session cannot: this server keeps no prose and so has no message count.
+    expect(said.join(" ")).not.toContain("message");
     expect(said[1]).toContain("anthropic/claude-code");
     expect(text()).toContain("Start a new session");
   });

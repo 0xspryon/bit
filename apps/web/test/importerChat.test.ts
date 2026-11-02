@@ -24,6 +24,7 @@ import {
   splitCode,
 } from "../src/lib/chat";
 import {
+  INDEXED_HISTORY,
   NO_HISTORY,
   buildImporterChat,
   indexedSession,
@@ -158,6 +159,31 @@ describe("one group per operator message", () => {
     expect(groups[0]?.prose._tag === "none" && groups[0].prose.note).toContain(
       "Nothing on the record says which message",
     );
+  });
+
+  test("a history this page cannot read is still said once a message has been typed into it", () => {
+    // `INDEXED_HISTORY` is the page saying it cannot read this session's words. That does not
+    // stop being true after one message, and without it the continuation of an old session
+    // looks exactly like a brand-new one.
+    const groups = buildImporterChat({
+      history: INDEXED_HISTORY,
+      working: false,
+      items: [operator(1, "also the staging hosts")],
+    });
+
+    expect(groups.map((group) => group.key)).toEqual(["earlier", "turn:1"]);
+    expect(groups[0]?.prose).toEqual({
+      _tag: "pending",
+      note: INDEXED_HISTORY.note,
+    });
+    // And it is not said when there is nothing to say: a plain history opens at the turn.
+    expect(
+      buildImporterChat({
+        history: NO_HISTORY,
+        working: false,
+        items: [operator(1, "go")],
+      }).map((group) => group.key),
+    ).toEqual(["turn:1"]);
   });
 
   test("an empty session has no groups at all", () => {
@@ -379,18 +405,21 @@ describe("the harness's copy is cut at each user entry", () => {
 });
 
 describe("the picker's second line", () => {
-  test("says what was written", () => {
-    expect(tallyLine({ in: 7, out: 3, assets: 14, messages: 4 })).toBe(
-      "7 in · 3 out · 14 assets · 4 messages",
+  test("says what was written, and nothing about messages", () => {
+    expect(tallyLine({ in: 7, out: 3, assets: 14, messages: null })).toBe(
+      "7 in · 3 out · 14 assets",
+    );
+    expect(tallyLine({ in: 7, out: 3, assets: 14, messages: 0 })).not.toContain(
+      "message",
     );
   });
 
   test("says 'nothing written' rather than three zeros, and keeps the singular honest", () => {
-    expect(tallyLine({ in: 0, out: 0, assets: 0, messages: 2 })).toBe(
-      "nothing written · 2 messages",
+    expect(tallyLine({ in: 0, out: 0, assets: 0, messages: null })).toBe(
+      "nothing written",
     );
-    expect(tallyLine({ in: 1, out: 0, assets: 1, messages: 1 })).toBe(
-      "1 in · 0 out · 1 asset · 1 message",
+    expect(tallyLine({ in: 1, out: 0, assets: 1, messages: null })).toBe(
+      "1 in · 0 out · 1 asset",
     );
   });
 });

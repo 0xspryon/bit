@@ -152,12 +152,40 @@ export class ImporterSessions {
    * listed keeps its place, and so does the empty one they are typing into. Only an open
    * session the server no longer lists falls back to the empty one, since there is nothing
    * left to show for it.
+   *
+   * **"Untouched" is "has nothing of the operator's in it", not "was indexed".** An indexed
+   * session the operator has typed into is indexed *and* holds their words, which exist
+   * nowhere else: replacing it with the server's row would hand back a session whose thread
+   * is empty. So a touched session keeps its thread (history, items, whether it is being
+   * read) and takes the server's *figures* (model, tally, running), which are the part a
+   * newer reading is for. One the server no longer lists is kept too, for the same reason.
    */
   syncIndexed(indexed: readonly ImporterSession[]): void {
+    const touched = new Map(
+      this.sessions
+        .filter(
+          (session) => session.indexed === true && session.items.length > 0,
+        )
+        .map((session) => [session.id, session]),
+    );
     const own = this.sessions.filter((session) => session.indexed !== true);
-    this.sessions = [...own, ...indexed];
+    const refreshed = indexed.map((session) => {
+      const kept = touched.get(session.id);
+      return kept === undefined
+        ? session
+        : {
+            ...session,
+            history: kept.history,
+            items: kept.items,
+            reading: kept.reading,
+          };
+    });
+    const unlisted = [...touched.values()].filter(
+      (kept) => !indexed.some((session) => session.id === kept.id),
+    );
+    this.sessions = [...own, ...refreshed, ...unlisted];
     if (!this.sessions.some((session) => session.id === this.currentId)) {
-      this.currentId = own[0]?.id ?? indexed[0]?.id ?? "";
+      this.currentId = own[0]?.id ?? refreshed[0]?.id ?? "";
     }
   }
 
@@ -260,6 +288,10 @@ export class ImporterSessions {
     const text = this.draft.trim();
     const session = this.current;
     if (text === "" || session === undefined) return;
+    // A session on a harness this server does not run is not asked, and not typed into:
+    // the harness it does have would answer "no such session" for one that may be alive
+    // elsewhere. The composer is disabled too; this is the rule, that is its face.
+    if (session.strandedOn !== undefined) return;
     const at = this.#now();
     /** How many this tab's feed already holds: the id's namespace, not the turn's number. */
     const index = session.items.filter(
@@ -293,13 +325,10 @@ export class ImporterSessions {
           outcome: null,
         },
       ],
-      tally: {
-        ...before.tally,
-        // An indexed session's count is unknown, and a stand-in exchange is not a reason
-        // to start printing one.
-        messages:
-          before.tally.messages === null ? null : before.tally.messages + 2,
-      },
+      // Once anything is said the thread is no longer the empty one, and its message count is
+      // unknown like every other session's: a stand-in exchange is not a reason to start
+      // printing one.
+      tally: { ...before.tally, messages: null },
     }));
   }
 
