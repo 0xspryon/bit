@@ -46,13 +46,18 @@ import {
 } from "effect";
 
 import {
+  SCOPE_IMPORT_DATA_NOT_INSTRUCTIONS,
   SCOPE_IMPORT_MAX_LINKS,
   type ModelOptionSelection,
 } from "@bit/contracts";
 
 import { ScopeImportProgress } from "./progress";
 import { ScopeImporter, type ScopeImportRequest } from "./scopeImporter";
-import type { AgentHarness, McpRegistration } from "../harness/agentHarness";
+import type {
+  AgentHarness,
+  McpRegistration,
+  PromptDelivery,
+} from "../harness/agentHarness";
 import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
 import { STUB_INSTANCE, stubHarness } from "../harness/stubHarness";
@@ -171,6 +176,8 @@ interface Script {
   /** Every registration taken back, by session. */
   readonly unregistered: string[];
   readonly prompts: string[];
+  /** How each prompt was delivered, in the same order as `prompts`. */
+  readonly deliveries: PromptDelivery[];
   readonly interrupted: string[];
   /** Sessions whose narration stream was subscribed to. Expected to stay empty. */
   readonly subscribed: string[];
@@ -180,6 +187,19 @@ interface Script {
   failCreate: boolean;
   /** Makes the opening prompt fail, for a session the harness refuses to start. */
   failPrompt: boolean;
+  /** Makes a later (steered) prompt fail, for a session that refuses a second message. */
+  failSteer: boolean;
+  /**
+   * What the scripted agent does with a later message, given the message and the
+   * credential of the session it landed in. Nothing, unless a test says.
+   */
+  onSteer:
+    | ((input: {
+        readonly text: string;
+        readonly url: string;
+        readonly bearer: string;
+      }) => Promise<void>)
+    | undefined;
   /**
    * Parks the opening prompt — published, registered, not yet preambled — until `gate`
    * opens, signalling `entered` on the way in. For a stop that lands mid-open.
@@ -198,11 +218,14 @@ const newScript = (readable: readonly string[]): Script => ({
   created: [],
   unregistered: [],
   prompts: [],
+  deliveries: [],
   interrupted: [],
   subscribed: [],
   done: Promise.resolve(),
   failCreate: false,
   failPrompt: false,
+  failSteer: false,
+  onSteer: undefined,
   holdPrompt: undefined,
 });
 
@@ -214,9 +237,15 @@ const newScript = (readable: readonly string[]): Script => ({
  * what a 404, a login wall or an unparseable page looks like from this server's side,
  * because nothing we own observes the fetch (D13).
  */
-const scriptedHarness = (script: Script) =>
-  stubHarness({
-    newSessionId: () => "ses_import",
+const scriptedHarness = (script: Script) => {
+  // The first session is `ses_import`, as every S1/S2 test expects; a reopened conversation's
+  // fresh session is a different harness session, as it is on a real harness.
+  let minted = 0;
+  return stubHarness({
+    newSessionId: () => {
+      minted += 1;
+      return minted === 1 ? "ses_import" : `ses_import_${String(minted)}`;
+    },
     installGate: () => Effect.void,
     createSession: (input) =>
       script.failCreate
@@ -251,56 +280,82 @@ const scriptedHarness = (script: Script) =>
           ).replace("Bearer ", ""),
         });
       }),
-    prompt: (_sessionId, text) =>
-      script.failPrompt
-        ? Effect.fail(
-            new HarnessTransportError({
-              operation: "prompt",
-              status: 503,
-              tag: undefined,
-              detail: "the scripted harness would not take the prompt",
-              cause: undefined,
-            }),
-          )
-        : Effect.sync(() => {
-            script.prompts.push(text);
-            const registration = script.registrations[0];
-            if (registration === undefined) return { delivered: true };
-            const url = registration.url;
-            const bearer = registration.bearer;
-            // Kicked off here and awaited by `waitForIdle` below, so the import is genuinely
-            // asynchronous with respect to `start` — which is the property `createTarget`
-            // depends on and which a synchronous script would quietly remove.
-            script.done = (async () => {
-              for (const page of [PAGE_GOOD, PAGE_BAD]) {
-                if (!script.readable.has(page)) continue;
-                const prefix = page === PAGE_GOOD ? "acme" : "acmelabs";
-                await callTool(url, bearer, "add_scope_entry", {
-                  effect: "in",
-                  kind: "subtree",
-                  value: `${prefix}.com`,
-                  source_url: page,
-                  note: "scope table, row 1",
-                });
-                await callTool(url, bearer, "add_scope_entry", {
-                  effect: "out",
-                  kind: "host",
-                  value: `blog.${prefix}.com`,
-                  source_url: page,
-                  note: "out of scope, item 1",
-                });
-                await callTool(url, bearer, "record_imported_asset", {
-                  operation_id: `op-${prefix}-1`,
-                  kind: "host",
-                  url: `https://www.${prefix}.com`,
-                  method: null,
-                  source_url: page,
-                  note: "scope table, row 1",
+    prompt: (_sessionId, text, delivery = { _tag: "open" as const }) =>
+      delivery._tag === "steer"
+        ? script.failSteer
+          ? Effect.fail(
+              new HarnessTransportError({
+                operation: "prompt",
+                status: 409,
+                tag: undefined,
+                detail: "the scripted harness would not take the message",
+                cause: undefined,
+              }),
+            )
+          : Effect.sync(() => {
+              script.prompts.push(text);
+              script.deliveries.push(delivery);
+              const registration = script.registrations.at(-1);
+              const onSteer = script.onSteer;
+              if (registration !== undefined && onSteer !== undefined) {
+                script.done = onSteer({
+                  text,
+                  url: registration.url,
+                  bearer: registration.bearer,
                 });
               }
-            })();
-            return { delivered: true };
-          }),
+              return { delivered: true };
+            })
+        : script.failPrompt
+          ? Effect.fail(
+              new HarnessTransportError({
+                operation: "prompt",
+                status: 503,
+                tag: undefined,
+                detail: "the scripted harness would not take the prompt",
+                cause: undefined,
+              }),
+            )
+          : Effect.sync(() => {
+              script.prompts.push(text);
+              script.deliveries.push(delivery);
+              const registration = script.registrations.at(-1);
+              if (registration === undefined) return { delivered: true };
+              const url = registration.url;
+              const bearer = registration.bearer;
+              // Kicked off here and awaited by `waitForIdle` below, so the import is genuinely
+              // asynchronous with respect to `start` — which is the property `createTarget`
+              // depends on and which a synchronous script would quietly remove.
+              script.done = (async () => {
+                for (const page of [PAGE_GOOD, PAGE_BAD]) {
+                  if (!script.readable.has(page)) continue;
+                  const prefix = page === PAGE_GOOD ? "acme" : "acmelabs";
+                  await callTool(url, bearer, "add_scope_entry", {
+                    effect: "in",
+                    kind: "subtree",
+                    value: `${prefix}.com`,
+                    source_url: page,
+                    note: "scope table, row 1",
+                  });
+                  await callTool(url, bearer, "add_scope_entry", {
+                    effect: "out",
+                    kind: "host",
+                    value: `blog.${prefix}.com`,
+                    source_url: page,
+                    note: "out of scope, item 1",
+                  });
+                  await callTool(url, bearer, "record_imported_asset", {
+                    operation_id: `op-${prefix}-1`,
+                    kind: "host",
+                    url: `https://www.${prefix}.com`,
+                    method: null,
+                    source_url: page,
+                    note: "scope table, row 1",
+                  });
+                }
+              })();
+              return { delivered: true };
+            }),
     waitForIdle: () => Effect.promise(() => script.done),
     interruptSession: (sessionId) =>
       Effect.sync(() => {
@@ -350,6 +405,7 @@ const scriptedHarness = (script: Script) =>
         ),
       ),
   });
+};
 
 /**
  * A whole world: a registered target, a real endpoint, and an importer over a script.
@@ -1171,5 +1227,337 @@ describe("a session that outlives its first turn", () => {
     await runtime.dispose();
     // The finalizer, later, does not relabel it either.
     expect(endings(built.root)[0]?.ended_reason).toBe("operator");
+  });
+});
+
+/* ── S3: a turn sent into the session ────────────────────────────────────────── */
+
+/** A page the operator names in a later message, and that no import was given at the start. */
+const PAGE_LATER = "https://hackerone.com/acme/scope-update";
+
+/** The session index as the store reads it: one row per harness session, with tallies. */
+const indexOf = (
+  runtime: ManagedRuntime.ManagedRuntime<TargetStores, DatabaseError>,
+) =>
+  runtime.runPromise(
+    Effect.flatMap(TargetStores, (stores) =>
+      withTargetStore(stores, TARGET, (store) => store.importSessions(TARGET)),
+    ).pipe(Effect.orDie),
+  );
+
+/**
+ * A later message makes the scripted agent write one entry citing the first page address in
+ * it — through the real endpoint, with the credential of the session it landed in — and
+ * records what the call answered, so a refusal is visible to the test.
+ */
+const writesWhatItIsTold = (script: Script) => {
+  const answers: { isError: boolean; text: string }[] = [];
+  script.onSteer = async ({ text, url, bearer }) => {
+    const page = /https?:\/\/\S+/.exec(text)?.[0] ?? PAGE_GOOD;
+    answers.push(
+      await callTool(url, bearer, "add_scope_entry", {
+        effect: "in",
+        kind: "host",
+        value: "staging.acme.com",
+        source_url: page,
+        note: "named in the operator's message",
+      }),
+    );
+  };
+  return answers;
+};
+
+const sendTo = (
+  runtime: ManagedRuntime.ManagedRuntime<ScopeImporter, unknown>,
+  importId: string,
+  text: string,
+) =>
+  runtime.runPromise(
+    Effect.result(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.send({ targetId: TARGET, importId, text }),
+      ),
+    ),
+  );
+
+describe("a turn into a live session", () => {
+  test("is delivered as a queued steer, carrying the operator's words and no copy of the rules", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const message = "Also load the staging hosts.";
+
+    const sent = await sendTo(runtime, started.importId, message);
+    expect(sent._tag).toBe("Success");
+    if (sent._tag !== "Success") return;
+    expect(sent.success).toMatchObject({
+      importId: started.importId,
+      harnessSessionId: "ses_import",
+      conversation: "continued",
+    });
+
+    // The opener was `open`; the follow-up is a steer that lets work in flight finish.
+    expect(built.script.deliveries[0]?._tag).toBe("open");
+    const steer = built.script.deliveries[1];
+    expect(steer?._tag).toBe("steer");
+    expect(steer?._tag === "steer" ? steer.urgency : undefined).toBe("queued");
+
+    // The operator's words, verbatim, and nothing the session already has.
+    const followUp = built.script.prompts[1] ?? "";
+    expect(followUp).toBe(message);
+    expect(followUp).not.toContain(PAGE_GOOD);
+    expect(followUp).not.toContain(SCOPE_IMPORT_DATA_NOT_INSTRUCTIONS);
+    expect(followUp).not.toContain("Rules that matter");
+    expect(followUp).not.toContain("add_scope_entry");
+
+    // One session, one registration: a turn is not an opening.
+    expect(built.script.created).toHaveLength(1);
+    expect(built.script.registrations).toHaveLength(1);
+    await runtime.dispose();
+  });
+
+  test("its writes land under the same import, so the session's tally keeps counting", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const before = await indexOf(runtime);
+    expect(before[0]?.entriesIn).toBe(1);
+
+    const answers = writesWhatItIsTold(built.script);
+    const sent = await sendTo(
+      runtime,
+      started.importId,
+      `The program added a page, ${PAGE_LATER} — load the staging host from it.`,
+    );
+    expect(sent._tag).toBe("Success");
+    await built.script.done;
+
+    // The page the operator named is one this import may cite: the write was not refused.
+    expect(answers[0]?.isError).toBe(false);
+    const after = await indexOf(runtime);
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({
+      harnessSessionId: "ses_import",
+      importIds: [started.importId],
+      latestImportId: started.importId,
+      entriesIn: 2,
+    });
+    await runtime.dispose();
+  });
+
+  test("a page nobody gave is still refused: the operator's messages widen the list, the model does not", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const answers: { isError: boolean; text: string }[] = [];
+    built.script.onSteer = async ({ url, bearer }) => {
+      answers.push(
+        await callTool(url, bearer, "add_scope_entry", {
+          effect: "in",
+          kind: "host",
+          value: "evil.acme.com",
+          source_url: "https://attacker.example/scope",
+          note: "a page the operator never named",
+        }),
+      );
+    };
+    await sendTo(runtime, started.importId, "Anything else on that page?");
+    await built.script.done;
+
+    expect(answers[0]?.isError).toBe(true);
+    const scope = await scopeOf(runtime);
+    expect(scope.entries.some((entry) => entry.value === "evil.acme.com")).toBe(
+      false,
+    );
+    await runtime.dispose();
+  });
+});
+
+describe("a conversation opened with no links", () => {
+  test("is opened rather than answered none, and its operator's page can be cited", async () => {
+    const built = world([PAGE_GOOD]);
+    const runtime = ManagedRuntime.make(built.layer);
+    const message = `Read the program page at ${PAGE_GOOD} and load what is in scope.`;
+    const opened = await runtime.runPromise(
+      Effect.gen(function* () {
+        const fleet = yield* FleetStore;
+        yield* fleet.register({
+          targetId: TARGET,
+          name: "Acme Corp",
+          scopeNote: "",
+          workspacePath: workspace,
+        });
+        yield* fleet.migrateTarget(TARGET);
+        return yield* Effect.result(
+          (yield* ScopeImporter).converse({
+            targetId: TARGET,
+            targetName: "Acme Corp",
+            workspacePath: workspace,
+            text: message,
+          }),
+        );
+      }),
+    );
+    expect(opened._tag).toBe("Success");
+    if (opened._tag !== "Success") return;
+    expect(opened.success.conversation).toBe("opened");
+    await built.script.done;
+
+    // The opener carries the rules once, and the operator's words last and verbatim.
+    const opener = built.script.prompts[0] ?? "";
+    expect(opener).toContain(SCOPE_IMPORT_DATA_NOT_INSTRUCTIONS);
+    expect(opener).toContain("has not given you any pages yet");
+    expect(opener.endsWith(`\n${message}`)).toBe(true);
+
+    // The scripted agent cited the page the operator typed, and it was not refused.
+    const scope = await scopeOf(runtime);
+    expect(scope.entries.map((entry) => entry.value).sort()).toEqual([
+      "acme.com",
+      "blog.acme.com",
+    ]);
+    const index = await indexOf(runtime);
+    expect(index[0]?.latestImportId).toBe(opened.success.importId);
+    await runtime.dispose();
+  });
+
+  test("the create-target path still answers none for no links and no message", async () => {
+    const { started } = await importWith([], { links: [] });
+    expect(started).toEqual({ _tag: "none" });
+  });
+});
+
+describe("a turn into a session that is not live", () => {
+  test("an import the operator ended is refused, in the importer's own sentence", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.stop(started.importId),
+      ),
+    );
+
+    const sent = await sendTo(runtime, started.importId, "One more thing.");
+    expect(sent._tag).toBe("Failure");
+    if (sent._tag !== "Failure") return;
+    expect(sent.failure).toMatchObject({
+      _tag: "ImporterConversationRefused",
+      reason: "import_ended",
+    });
+    expect(String((sent.failure as { detail: string }).detail)).toContain(
+      "ended by the operator",
+    );
+    // Nothing was opened for it.
+    expect(built.script.created).toHaveLength(1);
+    await runtime.dispose();
+  });
+
+  test("an import id this target does not hold is unknown, not opened", async () => {
+    const { built, runtime } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    const sent = await sendTo(runtime, "imp_nobody", "hello");
+    expect(sent._tag).toBe("Failure");
+    if (sent._tag !== "Failure") return;
+    expect(sent.failure).toMatchObject({
+      _tag: "ScopeImportNotFound",
+      reason: "unknown_import",
+    });
+    expect(built.script.created).toHaveLength(1);
+    await runtime.dispose();
+  });
+
+  test("a refused message closes the session; the next opens a fresh one under a new import id whose writes land", async () => {
+    // The first session reads nothing, so what the fresh one writes is new and counted.
+    const { built, runtime, started } = await importWith([], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+
+    built.script.failSteer = true;
+    const refusedTurn = await sendTo(runtime, started.importId, "First try.");
+    expect(refusedTurn._tag).toBe("Failure");
+    if (refusedTurn._tag !== "Failure") return;
+    expect(refusedTurn.failure).toMatchObject({
+      reason: "harness_unreachable",
+    });
+    // The spine closed it as `refused`: the grant and the registration are gone.
+    expect(built.script.unregistered).toEqual(["ses_import"]);
+    expect((await authorityOf(runtime, "")).size).toBe(0);
+    expect(
+      endings(built.root).find((row) => row.import_id === started.importId)
+        ?.ended_reason,
+    ).toBe("refused");
+
+    built.script.failSteer = false;
+    built.script.readable.add(PAGE_GOOD);
+    // The fresh session's opener is an `open` prompt, so the scripted agent's own opening
+    // writes are what show its authority works.
+    const reopened = await sendTo(
+      runtime,
+      started.importId,
+      `Try again: ${PAGE_GOOD}`,
+    );
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+    const fresh = reopened.success;
+    expect(fresh.conversation).toBe("opened");
+    // A new authority period: a new import id, never the ended one revived.
+    expect(fresh.importId).not.toBe(started.importId);
+    expect(fresh.harnessSessionId).toBe("ses_import_2");
+    expect(fresh.note).toContain(started.importId);
+
+    // Its writes were not refused: the new import's row is not ended, and it wrote.
+    const rows = endings(built.root);
+    expect(
+      rows.find((row) => row.import_id === fresh.importId)?.ended_at,
+    ).toBeNull();
+    const index = await indexOf(runtime);
+    const freshRow = index.find(
+      (row) => row.harnessSessionId === "ses_import_2",
+    );
+    expect(freshRow?.latestImportId).toBe(fresh.importId);
+    expect(freshRow?.entriesIn).toBe(1);
+
+    // A message to the old id now reaches the new session rather than opening a third.
+    const again = await sendTo(runtime, started.importId, "And the blog?");
+    expect(again._tag).toBe("Success");
+    if (again._tag !== "Success") return;
+    expect(again.success).toMatchObject({
+      importId: fresh.importId,
+      conversation: "continued",
+    });
+    expect(built.script.created).toHaveLength(2);
+    await runtime.dispose();
+  });
+
+  test("two messages racing to a closed import open one fresh session, not two", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    built.script.failSteer = true;
+    await sendTo(runtime, started.importId, "First try.");
+    built.script.failSteer = false;
+
+    const [one, two] = await Promise.all([
+      sendTo(runtime, started.importId, "Message one."),
+      sendTo(runtime, started.importId, "Message two."),
+    ]);
+    expect(one._tag).toBe("Success");
+    expect(two._tag).toBe("Success");
+    if (one._tag !== "Success" || two._tag !== "Success") return;
+    expect(one.success.importId).toBe(two.success.importId);
+    expect([one.success.conversation, two.success.conversation].sort()).toEqual(
+      ["continued", "opened"],
+    );
+    expect(built.script.created).toHaveLength(2);
+    expect((await authorityOf(runtime, "")).size).toBe(1);
+    await runtime.dispose();
   });
 });

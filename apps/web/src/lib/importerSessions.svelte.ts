@@ -16,9 +16,24 @@
  * wholly declared (`mockImporter.ts`), which is what lets an operator inspect a state
  * without reproducing it.
  *
- * ## What sending does, and the one fake in it
+ * ## Sending, when there is a server
  *
- * Sending appends the operator's message to the session's feed — as the same minted
+ * {@link begin} is given an {@link ImporterServer} when the page is a real target's, and then
+ * a message is posted rather than answered here (the importer conversation design, S3). The
+ * empty session's first message **opens** a conversation; a message in a session the server
+ * lists goes to that session's import. The draft is cleared **on acceptance**, not on submit,
+ * so a refusal leaves the operator's words where they were beside the server's sentence.
+ *
+ * What comes back decides where the turn lands. `continued` appends to the session on
+ * screen. `opened` is a **new harness session** — the first message of a conversation, or a
+ * message to an import the server no longer held, which it reopened under a new import id —
+ * so the page moves to it, keeping the operator's words on it. What the importer then says
+ * is not shown yet: that is live narration, a later slice.
+ *
+ * ## What sending does without a server, and the one fake in it
+ *
+ * In the state picker's scenarios there is no server.
+ * Sending there appends the operator's message to the session's feed — as the same minted
  * `turn.operator` row the goal chat uses — and then a single stand-in reply, labelled as
  * one. Nothing is attached to answer, and a chat that took a message and went quiet would be
  * judged on its silence rather than on its layout. The reply is the only invented content
@@ -29,8 +44,11 @@
  * `pending` for ever. The same is true of Stop, which is what lets the prototype show that
  * state at all.
  */
+import type { ImporterTurnAccepted } from "@bit/contracts";
+
 import { operatorTurn } from "./chat";
 import {
+  NO_HISTORY,
   buildImporterChat,
   type ImporterGroup,
   type ImporterSession,
@@ -77,6 +95,28 @@ export type ImporterScenario =
   | "forgotten"
   | "opening";
 
+/** What the server answered a message with, as the page needs it. */
+export type ImporterSent =
+  | { readonly _tag: "accepted"; readonly turn: ImporterTurnAccepted }
+  | { readonly _tag: "refused"; readonly detail: string };
+
+/**
+ * The page's way to the server, handed in by the app when the page is a real target's.
+ *
+ * Absent in the state picker's scenarios, which never touch a server and answer with the
+ * stand-in reply instead.
+ */
+export interface ImporterServer {
+  /** Opens a conversation whose first turn is `text`. */
+  readonly open: (text: string) => Promise<ImporterSent>;
+  /** Says `text` to one import's session. */
+  readonly send: (importId: string, text: string) => Promise<ImporterSent>;
+  /** After an accepted message, so the session list can be read again. */
+  readonly accepted: () => void;
+  /** A harness instance's display name, for the avatar on the session's header. */
+  readonly harnessName: (instanceId: string) => string;
+}
+
 /** What a stand-in reply says, so no one reads it as the importer's own words. */
 export const STAND_IN_REPLY =
   "Understood. This is a prototype: nothing is attached to answer, so this line is a stand-in for the importer's reply.";
@@ -93,6 +133,16 @@ export class ImporterSessions {
   draft = $state("");
   /** Whether the crumb bar's session list is open. */
   pickerOpen = $state(false);
+  /** True while a message is with the server and not yet answered. */
+  sending = $state(false);
+  /**
+   * What the server last said about a message, in its words: a refusal, or the note on an
+   * accepted one (a reopened session says why). Empty when there is nothing to say.
+   */
+  notice = $state("");
+  /** Whether {@link notice} is a refusal, which the composer shows as one. */
+  refused = $state(false);
+  #server: ImporterServer | undefined = undefined;
 
   constructor(now: () => number = () => Date.now()) {
     this.#now = now;
@@ -136,9 +186,13 @@ export class ImporterSessions {
    * sessions are the target's and a list that kept another visit's local ones would be
    * showing one of them as if the server had it.
    */
-  begin(indexed: readonly ImporterSession[]): void {
+  begin(indexed: readonly ImporterSession[], server?: ImporterServer): void {
     const fresh = mockNewSession(this.#now());
+    this.#server = server;
     this.draft = "";
+    this.notice = "";
+    this.refused = false;
+    this.sending = false;
     this.pickerOpen = false;
     this.#sent = 0;
     this.sessions = [fresh, ...indexed];
@@ -193,6 +247,10 @@ export class ImporterSessions {
   load(scenario: ImporterScenario): void {
     const now = this.#now();
     const earlier = mockEarlierSessions(now);
+    this.#server = undefined;
+    this.notice = "";
+    this.refused = false;
+    this.sending = false;
     this.draft = "";
     this.pickerOpen = false;
     this.#sent = 0;
@@ -256,6 +314,8 @@ export class ImporterSessions {
   /** Opens a session from the picker. An older one is read-only until the operator types. */
   open(id: string): void {
     this.pickerOpen = false;
+    this.notice = "";
+    this.refused = false;
     if (this.sessions.some((session) => session.id === id)) {
       this.currentId = id;
       this.draft = "";
@@ -271,6 +331,8 @@ export class ImporterSessions {
   start(): void {
     this.pickerOpen = false;
     this.draft = "";
+    this.notice = "";
+    this.refused = false;
     if (this.current?.tally.messages === 0) return;
     this.#sent += 1;
     const fresh = mockNewSession(this.#now(), `ses_new_${String(this.#sent)}`);
@@ -292,6 +354,12 @@ export class ImporterSessions {
     // the harness it does have would answer "no such session" for one that may be alive
     // elsewhere. The composer is disabled too; this is the rule, that is its face.
     if (session.strandedOn !== undefined) return;
+    // The operator ended it; the server would refuse, and the composer says so instead.
+    if (session.ended === true) return;
+    if (this.#server !== undefined) {
+      void this.#post(this.#server, session, text);
+      return;
+    }
     const at = this.#now();
     /** How many this tab's feed already holds: the id's namespace, not the turn's number. */
     const index = session.items.filter(
@@ -330,6 +398,84 @@ export class ImporterSessions {
       // printing one.
       tally: { ...before.tally, messages: null },
     }));
+  }
+
+  /**
+   * Posts one message and puts the answer where it belongs. See this module's header.
+   *
+   * The session is captured at submit: an operator who switches sessions while the request
+   * is in flight still has the turn land on the one they wrote it in.
+   */
+  async #post(
+    server: ImporterServer,
+    session: ImporterSession,
+    text: string,
+  ): Promise<void> {
+    if (this.sending) return;
+    this.sending = true;
+    this.notice = "";
+    this.refused = false;
+    const answer =
+      session.importId === undefined
+        ? await server.open(text)
+        : await server.send(session.importId, text);
+    this.sending = false;
+    // The page was left or reset meanwhile: nothing here is the answer's to change.
+    if (this.#server !== server) return;
+    if (answer._tag === "refused") {
+      this.notice = answer.detail;
+      this.refused = true;
+      return;
+    }
+    const turn = answer.turn;
+    if (this.draft.trim() === text) this.draft = "";
+    this.notice = turn.note;
+    const at = this.#now();
+    const landed = (before: ImporterSession): ImporterSession => {
+      const index = before.items.filter(
+        (item) => item.kind === "turn.operator",
+      ).length;
+      return {
+        ...before,
+        id: turn.harnessSessionId,
+        importId: turn.importId,
+        model: turn.model,
+        harness: server.harnessName(turn.harnessInstanceId),
+        indexed: true,
+        reading: false,
+        working: true,
+        items: [
+          ...before.items,
+          operatorTurn({ index: index + 1, text, at, after: 0 }),
+        ],
+        tally: { ...before.tally, messages: null },
+      };
+    };
+    const stillThere = this.sessions.some((each) => each.id === session.id);
+    if (turn.harnessSessionId === session.id || session.indexed !== true) {
+      // The same session, or the page's own empty one becoming the session the server
+      // opened for it: one thread, under the server's id from here on.
+      const before =
+        this.sessions.find((each) => each.id === session.id) ?? session;
+      const after = landed(before);
+      this.sessions = stillThere
+        ? this.sessions.map((each) => (each.id === session.id ? after : each))
+        : [...this.sessions, after];
+      if (this.currentId === session.id) this.currentId = after.id;
+    } else {
+      // A fresh session opened in place of one the server no longer held: a new thread,
+      // and the old one stays in the list as what it was.
+      const after = landed({
+        ...session,
+        startedAt: at,
+        history: NO_HISTORY,
+        items: [],
+        tally: { in: 0, out: 0, assets: 0, messages: null },
+      });
+      this.sessions = [...this.sessions, after];
+      if (this.currentId === session.id) this.currentId = after.id;
+    }
+    server.accepted();
   }
 
   /** Stops the importer mid-turn. Whatever it had not finished stays visibly unfinished. */

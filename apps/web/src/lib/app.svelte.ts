@@ -85,6 +85,8 @@ import { indexedSession } from "./importerChat";
 import {
   ImporterSessions,
   type ImporterScenario,
+  type ImporterSent,
+  type ImporterServer,
 } from "./importerSessions.svelte";
 import {
   mockHarnesses,
@@ -2356,6 +2358,68 @@ export class App {
   }
 
   /**
+   * The Auto-load page's way to the server for one target (the importer conversation
+   * design, S3): its composer posts through this, and an accepted message reads the session
+   * list again so the session it landed in is listed with the server's figures.
+   *
+   * The model pick goes with an *opening* message exactly as `startScopeImport` sends it —
+   * absent unless the operator overrode something — and never with a later one: a session
+   * keeps the model it was opened on.
+   */
+  #importerServer(targetId: string): ImporterServer {
+    const answer = (
+      call: Awaited<ReturnType<ServerClient["sendImporterMessage"]>>,
+    ): ImporterSent => {
+      if (call._tag === "Ok") return { _tag: "accepted", turn: call.value };
+      if (call._tag === "Refused") {
+        if (call.error._tag === "Unauthenticated") this.signOut("expired");
+        return {
+          _tag: "refused",
+          detail: this.#refusalText(
+            call.error,
+            "That message was not delivered.",
+          ),
+        };
+      }
+      return { _tag: "refused", detail: "No server answered at this address." };
+    };
+    return {
+      open: async (text) =>
+        answer(
+          await this.client.openImporterConversation(this.serverUrl, targetId, {
+            text,
+            ...(this.pickedImportInstanceId !== "" ||
+            this.pickedImportModel !== ""
+              ? {
+                  importModel: {
+                    ...(this.pickedImportInstanceId === ""
+                      ? {}
+                      : { instanceId: this.pickedImportInstanceId }),
+                    ...(this.pickedImportModel === ""
+                      ? {}
+                      : { model: this.pickedImportModel }),
+                  },
+                }
+              : {}),
+          }),
+        ),
+      send: async (importId, text) =>
+        answer(
+          await this.client.sendImporterMessage(
+            this.serverUrl,
+            targetId,
+            importId,
+            text,
+          ),
+        ),
+      accepted: () => void this.loadImporterSessions(targetId),
+      harnessName: (instanceId) =>
+        this.harnesses.find((entry) => entry.instanceId === instanceId)
+          ?.displayName ?? instanceId,
+    };
+  }
+
+  /**
    * Applies whatever the server answered a scope change with.
    *
    * Every scope mutation answers with the **whole scope**, because every one of them moves
@@ -3701,6 +3765,7 @@ export class App {
     // blank for the length of a round trip.
     this.importer.begin(
       this.importerIndexTargetId === targetId ? this.#indexedSessions() : [],
+      this.#importerServer(targetId),
     );
     // "Continue that session": select it. Prompting it is a later slice, so this only puts
     // it on screen, read-only until the operator types.

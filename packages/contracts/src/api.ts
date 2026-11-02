@@ -70,8 +70,11 @@ import {
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
 import {
+  ImporterConversationRefused,
+  ImporterMessageDraft,
   ImporterModelView,
   ImporterSessionsView,
+  ImporterTurnAccepted,
   ProgramLink,
   ScopeImportView,
 } from "./scopeImport";
@@ -543,6 +546,21 @@ export const ScopeImportStartResult = Schema.Struct({
   importDetail: TargetCreated.fields.importDetail,
 });
 export type ScopeImportStartResult = typeof ScopeImportStartResult.Type;
+
+/**
+ * What the Auto-load page's composer sends to open a conversation with the importer.
+ *
+ * The operator's first message, and the model pick exactly as {@link ScopeImportDraft}
+ * carries it — absent unless the operator overrode something, so the server applies D15's
+ * rule to the catalogue it observed. **No links**: a conversation opened here may have
+ * none, and a page the operator wants read is one they type into the message, where the
+ * server finds it (the importer conversation design, S3.4).
+ */
+export const ImporterConversationDraft = Schema.Struct({
+  text: ImporterMessageDraft.fields.text,
+  importModel: Schema.optional(ImportModelDraft),
+});
+export type ImporterConversationDraft = typeof ImporterConversationDraft.Type;
 
 /**
  * A scope import this server cannot show.
@@ -1470,6 +1488,49 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         params: { targetId: Schema.String },
         success: ImporterSessionsView,
         error: [TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * Opens a conversation with the importer: a new session, the operator's message its
+     * first turn. Answers once the session has the message, with the new import's id.
+     *
+     * **It does not need links**, unlike {@link startScopeImport}, whose empty list is
+     * answered "nothing was asked for". Here the operator's message is the thing asked
+     * for. It starts nothing but the importer (D13): no goal, no intent, no attempt, no run.
+     */
+    HttpApiEndpoint.post(
+      "openImporterConversation",
+      "/targets/:targetId/importer-sessions",
+      {
+        params: { targetId: Schema.String },
+        payload: ImporterConversationDraft,
+        success: ImporterTurnAccepted.pipe(HttpApiSchema.status(202)),
+        error: [ImporterConversationRefused, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * Says something to one import's session, and answers without waiting for the turn.
+     *
+     * A live session is given the message as a queued steer: work in flight finishes, then
+     * the message runs (DECISIONS.md §24.1). An import the operator ended is refused, because
+     * its authority is over. An import whose session this server no longer holds — closed
+     * after a refused prompt, or lost to a restart — gets a fresh session under a **new
+     * import id**, which the answer carries and says so. An id this target does not hold is a
+     * `404`.
+     */
+    HttpApiEndpoint.post(
+      "sendImporterMessage",
+      "/targets/:targetId/importer-sessions/:importId/messages",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        payload: ImporterMessageDraft,
+        success: ImporterTurnAccepted.pipe(HttpApiSchema.status(202)),
+        error: [
+          ImporterConversationRefused,
+          ScopeImportNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
       },
     ),
     /**

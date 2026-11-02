@@ -39,6 +39,7 @@ import type {
   HarnessInstanceView,
   ImporterModelView,
   ImporterSessionView,
+  ImporterTurnAccepted,
   LiveCursor,
   LiveFrame,
   LiveItem,
@@ -219,7 +220,24 @@ export const importerSessionView = (
   openedAt: AT,
   running: false,
   endedAt: null,
+  endedReason: null,
+  importId: "imp_1",
   tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+  ...over,
+});
+
+/** One message to the importer, accepted into a live session unless a test says otherwise. */
+export const importerTurnAccepted = (
+  over: Partial<ImporterTurnAccepted> = {},
+): ImporterTurnAccepted => ({
+  targetId: "acme-corp",
+  importId: "imp_1",
+  harnessSessionId: "ses_1",
+  harnessInstanceId: "opencode",
+  model: "openai/gpt-5.6-sol",
+  conversation: "continued",
+  note: "",
+  acceptedAt: AT,
   ...over,
 });
 
@@ -1119,6 +1137,16 @@ export class FakeServer implements ServerClient {
     ...args: Parameters<ServerClient["importerSessions"]>
   ) => Answer<"importerSessions"> = () => ok({ sessions: [] });
 
+  onOpenImporterConversation: (
+    ...args: Parameters<ServerClient["openImporterConversation"]>
+  ) => Answer<"openImporterConversation"> = (_baseUrl, targetId) =>
+    ok(importerTurnAccepted({ targetId, conversation: "opened" }));
+
+  onSendImporterMessage: (
+    ...args: Parameters<ServerClient["sendImporterMessage"]>
+  ) => Answer<"sendImporterMessage"> = (_baseUrl, targetId, importId) =>
+    ok(importerTurnAccepted({ targetId, importId }));
+
   onStartScopeImport: (
     ...args: Parameters<ServerClient["startScopeImport"]>
   ) => Answer<"startScopeImport"> = () =>
@@ -1296,6 +1324,20 @@ export class FakeServer implements ServerClient {
   importerSessions = (...args: Parameters<ServerClient["importerSessions"]>) =>
     this.record("importerSessions", args, () =>
       this.onImporterSessions(...args),
+    );
+
+  openImporterConversation = (
+    ...args: Parameters<ServerClient["openImporterConversation"]>
+  ) =>
+    this.record("openImporterConversation", args, () =>
+      this.onOpenImporterConversation(...args),
+    );
+
+  sendImporterMessage = (
+    ...args: Parameters<ServerClient["sendImporterMessage"]>
+  ) =>
+    this.record("sendImporterMessage", args, () =>
+      this.onSendImporterMessage(...args),
     );
 
   startScopeImport = (...args: Parameters<ServerClient["startScopeImport"]>) =>

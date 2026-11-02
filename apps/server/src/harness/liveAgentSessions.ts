@@ -260,6 +260,36 @@ export interface LiveAgentSessions<Meta> {
     entry: LiveAgentSession<Meta>,
     reason: LiveSessionCloseReason,
   ) => Effect.Effect<void>;
+  /**
+   * Gives one later message to a session that has had its opening prompt.
+   *
+   * **A `steer` at `queued` urgency, and the spine decides that rather than each surface**
+   * (DECISIONS.md §24.1): the work in flight finishes, then the message runs. `preemptive`
+   * would cut off whatever the agent was in the middle of — including a tool call it was
+   * about to report on — and an operator sending a second message has not asked for that.
+   * Two conversations deciding delivery timing separately is the drift this module exists
+   * to prevent.
+   *
+   * **A refusal closes the session, as `refused`**, which is the third item on the list of
+   * things that close one: the session has been prompted-and-failed, this seam never
+   * resubmits, and on Claude Code a refusal includes a query that has already closed. So
+   * the *next* message opens a fresh session rather than failing the same way forever.
+   * Closing is the spine's because it is lifetime; what the next message opens, and under
+   * which id, is the surface's.
+   *
+   * **The message id is minted, not derived.** A derived id needs an operation identity to
+   * derive from, and an operator message has none: the draft carries the operator's words
+   * and nothing else, and deriving from the text would silently swallow a legitimately
+   * repeated sentence. So a double-submitted "yes" is two messages, because that is what was
+   * sent twice.
+   *
+   * The prompt is the surface's, already assembled: what a follow-up carries is what the
+   * session *means*, which this module does not own.
+   */
+  readonly deliver: (
+    entry: LiveAgentSession<Meta>,
+    prompt: string,
+  ) => Effect.Effect<void, HarnessFailure>;
   /** {@link closeSession} by id. Idempotent, and safe for an id with nothing live. */
   readonly close: (
     id: string,
@@ -482,10 +512,19 @@ export const makeLiveAgentSessions = <Meta>(
           // the prompt, so an entry reachable from in here is preambled or already gone.
           const raced = live.get(input.id);
           if (raced !== undefined) return yield* input.joined(raced);
-          // Before anything is acquired, so a close already in flight for this id sees it.
-          builds.set(input.id, (builds.get(input.id) ?? 0) + 1);
 
           const plan = yield* input.prepare;
+          /*
+           * Counted once `prepare` has said this open will build, and before anything is
+           * acquired, so a close already in flight for this id sees it. Not before `prepare`:
+           * a surface may come in here only to join, with a `prepare` that refuses rather than
+           * builds — the importer does, because nothing is ever built under an import id that
+           * has been opened before — and counting that would make a concurrent close skip its
+           * belt-and-braces revoke for a build that never happened. `prepare` acquires
+           * nothing by contract (the surface's checks and its harness choice), so nothing it
+           * does can be what the revoke would wrongly hit.
+           */
+          builds.set(input.id, (builds.get(input.id) ?? 0) + 1);
           const urls = yield* endpoints.urls;
           const harness = plan.harness;
 
@@ -622,11 +661,27 @@ export const makeLiveAgentSessions = <Meta>(
         }),
       );
 
+    const deliver: LiveAgentSessions<Meta>["deliver"] = (entry, prompt) =>
+      Effect.gen(function* () {
+        const accepted = yield* Effect.result(
+          entry.harness.prompt(entry.sessionId, prompt, {
+            _tag: "steer",
+            urgency: "queued",
+            messageId: crypto.randomUUID().replaceAll("-", ""),
+          }),
+        );
+        if (accepted._tag === "Failure") {
+          yield* closeSession(entry, "refused");
+          return yield* Effect.fail(accepted.failure);
+        }
+      });
+
     return {
       get: (id) => live.get(id),
       ready,
       open,
       closeSession,
+      deliver,
       close: (id, reason) => {
         const entry = live.get(id);
         return entry === undefined ? Effect.void : closeSession(entry, reason);

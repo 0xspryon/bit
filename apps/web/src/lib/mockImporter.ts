@@ -660,6 +660,8 @@ export const mockImporterIndex = (now: number): ImporterSessionView[] => [
     openedAt: now - 9 * DAY,
     running: false,
     endedAt: now - 9 * DAY + 4 * 60_000,
+    endedReason: "shutdown",
+    importId: "imp_indexed_quiet",
     tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
   },
   {
@@ -669,6 +671,8 @@ export const mockImporterIndex = (now: number): ImporterSessionView[] => [
     openedAt: now - 12 * DAY,
     running: false,
     endedAt: now - 12 * DAY + 6 * 60_000,
+    endedReason: "operator",
+    importId: "imp_indexed_wrote",
     tally: { entriesIn: 3, entriesOut: 0, assets: 5 },
   },
 ];

@@ -6469,6 +6469,8 @@ const makeStore = Effect.fnUntraced(function* () {
     entries_out: Schema.Finite,
     assets: Schema.Finite,
     ended_at: Schema.NullOr(Schema.Finite),
+    latest_import_id: Schema.String,
+    ended_reason: Schema.NullOr(ImportSessionEndReason),
   });
 
   /**
@@ -6508,6 +6510,11 @@ const makeStore = Effect.fnUntraced(function* () {
    * `import_ids` is a comma-joined list because an import id is minted (`imp_` and a
    * timestamp-ordered identifier) and never contains one, and because the route needs them
    * to ask the in-memory registry whether any run is still going.
+   *
+   * `latest_import_id` is the session's newest confirmed run — the one a message to the
+   * session is addressed to, because an import id names one authority period and only the
+   * latest can still hold one — and `ended_reason` is that run's (`0027`), read only once
+   * the session as a whole has ended, so it is `NULL` exactly when `ended_at` is.
    */
   const selectImportSessions = SqlSchema.findAll({
     Request: Schema.String,
@@ -6544,7 +6551,25 @@ const makeStore = Effect.fnUntraced(function* () {
               FROM import_sessions r
               WHERE r.target_id = s.target_id
                 AND r.harness_session_id = s.harness_session_id
-                AND r.session_created_at IS NOT NULL) AS ended_at
+                AND r.session_created_at IS NOT NULL) AS ended_at,
+            (SELECT r.import_id FROM import_sessions r
+              WHERE r.target_id = s.target_id
+                AND r.harness_session_id = s.harness_session_id
+                AND r.session_created_at IS NOT NULL
+              ORDER BY r.opened_at DESC, r.import_id DESC
+              LIMIT 1) AS latest_import_id,
+            (SELECT CASE WHEN (SELECT count(*) FROM import_sessions o
+                                WHERE o.target_id = s.target_id
+                                  AND o.harness_session_id = s.harness_session_id
+                                  AND o.session_created_at IS NOT NULL
+                                  AND o.ended_at IS NULL) = 0
+                         THEN r.ended_reason END
+              FROM import_sessions r
+              WHERE r.target_id = s.target_id
+                AND r.harness_session_id = s.harness_session_id
+                AND r.session_created_at IS NOT NULL
+              ORDER BY r.opened_at DESC, r.import_id DESC
+              LIMIT 1) AS ended_reason
           FROM import_sessions s
           WHERE s.target_id = ${targetId}
             AND s.session_created_at IS NOT NULL
@@ -6581,6 +6606,8 @@ const makeStore = Effect.fnUntraced(function* () {
         entriesOut: row.entries_out,
         assets: row.assets,
         endedAt: row.ended_at,
+        endedReason: row.ended_at === null ? null : row.ended_reason,
+        latestImportId: row.latest_import_id,
       }));
     },
   );
@@ -6703,6 +6730,49 @@ const makeStore = Effect.fnUntraced(function* () {
       });
     },
   );
+
+  const selectImportSession = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({
+      target_id: Schema.String,
+      harness_session_id: Schema.String,
+      harness_instance_id: Schema.NullOr(Schema.String),
+      model: Schema.String,
+      ended_at: Schema.NullOr(Schema.Finite),
+      ended_reason: Schema.NullOr(ImportSessionEndReason),
+    }),
+    execute: (importId) =>
+      sql`SELECT target_id, harness_session_id, harness_instance_id, model,
+                 ended_at, ended_reason
+            FROM import_sessions
+            WHERE import_id = ${importId}`,
+  });
+
+  /**
+   * One import run's row, or `undefined` when this file holds none — what a message
+   * addressed to an import reads before deciding whether to deliver, refuse or reopen.
+   *
+   * Unconfirmed rows are returned too: the caller asks about an id it was handed, and a row
+   * whose session never opened is still a run that ended (`open_failed`).
+   */
+  const importSession = Effect.fn("ObservationStore.importSession")(function* (
+    importId: string,
+  ) {
+    const row = yield* selectImportSession(importId).pipe(
+      Effect.mapError(lift("import_sessions", importId)),
+    );
+    return Option.match(row, {
+      onNone: () => undefined,
+      onSome: (value) => ({
+        targetId: value.target_id,
+        harnessSessionId: value.harness_session_id,
+        harnessInstanceId: value.harness_instance_id,
+        model: value.model,
+        endedAt: value.ended_at,
+        endedReason: value.ended_reason,
+      }),
+    });
+  });
 
   /** What a recorded steer answers with, and what a retry of one replays. */
   const SteerResult = Schema.Struct({
@@ -8026,6 +8096,7 @@ const makeStore = Effect.fnUntraced(function* () {
     confirmImportSession,
     endImportSession,
     importSessionEnd,
+    importSession,
     endGoalAsAgent,
     attemptsForGoal,
   });
@@ -8645,6 +8716,10 @@ export class ObservationStore extends Context.Service<
         readonly assets: number;
         /** When the session was ended (`0026`), or `null` while any run of it is open. */
         readonly endedAt: number | null;
+        /** Why its latest run ended (`0027`), or `null` while {@link endedAt} is. */
+        readonly endedReason: ImportSessionEndReason | null;
+        /** The newest run, which a message to the session is addressed to. */
+        readonly latestImportId: string;
       }[],
       DatabaseError | StoredRowError
     >;
@@ -8665,6 +8740,19 @@ export class ObservationStore extends Context.Service<
       | {
           readonly endedAt: number;
           readonly reason: ImportSessionEndReason | null;
+        }
+      | undefined,
+      DatabaseError | StoredRowError
+    >;
+    /** One import run's row, or `undefined` for an id this file does not hold. */
+    readonly importSession: (importId: string) => Effect.Effect<
+      | {
+          readonly targetId: string;
+          readonly harnessSessionId: string;
+          readonly harnessInstanceId: string | null;
+          readonly model: string;
+          readonly endedAt: number | null;
+          readonly endedReason: ImportSessionEndReason | null;
         }
       | undefined,
       DatabaseError | StoredRowError

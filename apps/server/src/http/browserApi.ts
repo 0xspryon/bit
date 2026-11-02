@@ -1436,6 +1436,8 @@ const fleetHandlers = HttpApiBuilder.group(
                 openedAt: session.openedAt,
                 running: views.some((view) => view?.status === "running"),
                 endedAt: session.endedAt,
+                endedReason: session.endedReason,
+                importId: session.latestImportId,
                 tally: {
                   entriesIn: session.entriesIn,
                   entriesOut: session.entriesOut,
@@ -1445,6 +1447,43 @@ const fleetHandlers = HttpApiBuilder.group(
             ),
           ),
         };
+      }),
+
+      /**
+       * Opens a conversation with the importer, its first turn the operator's message.
+       *
+       * **Not `startScopeImport` with empty links**, which that route answers "nothing was
+       * asked for". The operator's message is what was asked for here, and the importer's
+       * `start` treats it so (the importer conversation design, S3.4). The model pick is
+       * passed exactly as `startScopeImport` passes it.
+       */
+      openImporterConversation: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.converse({
+          targetId: row.targetId,
+          targetName: row.name,
+          workspacePath: row.workspacePath ?? null,
+          text: payload.text,
+          ...(payload.importModel === undefined
+            ? {}
+            : { choice: payload.importModel }),
+        });
+      }),
+
+      /**
+       * Says something to one import's session (S3).
+       *
+       * The target is checked first, as every route here checks it; the import is checked
+       * against the target by the importer, which reads its row from this target's own file
+       * — so an id belonging to another target is `unknown_import`, never delivered.
+       */
+      sendImporterMessage: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.send({
+          targetId: row.targetId,
+          importId: params.importId,
+          text: payload.text,
+        });
       }),
 
       /**

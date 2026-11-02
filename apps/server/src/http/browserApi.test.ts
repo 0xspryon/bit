@@ -4292,6 +4292,9 @@ describe("a target's importer sessions", () => {
           // This process holds LIVE_IMPORT_ID as running, and nothing stored says so.
           running: true,
           endedAt: null,
+          endedReason: null,
+          // The run a message to this session is addressed to.
+          importId: LIVE_IMPORT_ID,
           tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
         },
         {
@@ -4302,10 +4305,64 @@ describe("a target's importer sessions", () => {
           running: false,
           // Stored (`0026`), so it survives the process that ended it.
           endedAt: 1_500,
+          // Seeded with no reason, as a row ended before `0027` has none.
+          endedReason: null,
+          importId: "imp_old",
           tally: { entriesIn: 2, entriesOut: 1, assets: 1 },
         },
       ],
     });
+  });
+
+  test("a message to an import is refused by name on a server with no harness", async () => {
+    const response = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/messages`,
+        { method: "POST", body: { text: "Also load the staging hosts" } },
+      ),
+    );
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      _tag: "ImporterConversationRefused",
+      reason: "no_harness",
+    });
+  });
+
+  test("opening a conversation with no links is refused by name, not answered with nothing", async () => {
+    const response = await read(
+      await signedIn(`/targets/${withSessions}/importer-sessions`, {
+        method: "POST",
+        body: { text: "Read https://hackerone.com/acme/policy" },
+      }),
+    );
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      _tag: "ImporterConversationRefused",
+      reason: "no_harness",
+    });
+  });
+
+  test("an empty message is refused before anything is asked of the importer", async () => {
+    const response = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/messages`,
+        { method: "POST", body: { text: "   " } },
+      ),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  test("a message to an unknown target is a 404 before the importer is asked", async () => {
+    const response = await read(
+      await signedIn(
+        "/targets/not-a-target/importer-sessions/imp_old/messages",
+        {
+          method: "POST",
+          body: { text: "hello" },
+        },
+      ),
+    );
+    expect(response.status).toBe(404);
   });
 
   test("another target's sessions are not in it", async () => {

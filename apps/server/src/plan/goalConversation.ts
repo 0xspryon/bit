@@ -460,8 +460,6 @@ const make = Effect.fnUntraced(function* () {
     },
   );
 
-  const closeSession = sessions.closeSession;
-
   /**
    * Gives one message to a conversation that is already live.
    *
@@ -470,19 +468,10 @@ const make = Effect.fnUntraced(function* () {
    * the conversation it was about to create had been created by somebody else. A second
    * copy of this would be a second decision about delivery timing.
    *
-   * Delivered as a `steer` at `queued` urgency, which is the same seam a goal agent's
-   * `steer_planner` uses into a round and the same reasoning (DECISIONS.md §24.1): the work
-   * in flight finishes, then the message runs. `preemptive` would cut off whatever the
-   * agent was in the middle of — including a tool call it was about to report on — and an
-   * operator sending a second message has not asked for that.
-   *
-   * **The message id is minted, not derived, and that is the one place in this slice where
-   * it is.** A derived id needs an operation identity to derive from, and an operator
-   * message has none: `GoalMessageDraft` carries the operator's words and nothing else,
-   * deliberately, and the alternative — deriving from the text — would silently swallow a
-   * legitimately repeated sentence. So a double-submitted "yes" is two messages, because
-   * that is what was sent twice. `steer_planner`'s id *is* derived, from the `operation_id`
-   * its own tool contract requires.
+   * The delivery itself is the spine's {@link LiveAgentSessions.deliver}: a `steer` at
+   * `queued` urgency with a minted message id, and a refusal closes the session as
+   * `refused` so the next message opens a fresh one. The scope importer's conversation
+   * delivers through the same call, which is why it is there rather than here.
    */
   const deliverInto = Effect.fnUntraced(function* (
     entry: LiveConversation,
@@ -498,23 +487,8 @@ const make = Effect.fnUntraced(function* () {
       attachments: attachmentsFor(fleet.paths, entry.targetId, entry.id),
       message: text,
     });
-    const accepted = yield* Effect.result(
-      entry.harness.prompt(entry.sessionId, prompt, {
-        _tag: "steer",
-        urgency: "queued",
-        messageId: crypto.randomUUID().replaceAll("-", ""),
-      }),
-    );
-    if (accepted._tag === "Failure") {
-      /*
-       * The session would not take it. On Claude Code that includes a session whose query
-       * has closed — a stream that died, or a harness that was torn down — and the honest
-       * move is to give up on this conversation so the *next* message opens a new one
-       * rather than failing the same way forever.
-       */
-      yield* closeSession(entry, "refused");
-      return yield* refuse(accepted.failure);
-    }
+    const accepted = yield* Effect.result(sessions.deliver(entry, prompt));
+    if (accepted._tag === "Failure") return yield* refuse(accepted.failure);
     return {
       targetId: entry.targetId,
       goalId: entry.id,

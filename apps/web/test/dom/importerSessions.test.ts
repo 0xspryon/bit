@@ -9,12 +9,19 @@
  * claims here, and each is driven through `Target` and `TitleBar` the way a person reaches
  * it: open the target, go to Assets, click.
  *
- * Nothing here prompts a session. That is a later slice, and the first assertion about
- * Continue is that it sends nothing.
+ * Continuing a session sends nothing by itself — the first assertion about Continue is that
+ * — and typing into it posts to the session's import (the importer conversation design,
+ * S3): the last describes here are the composer against a fake server that answers as the
+ * real one does.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 
-import type { ImporterSessionView, ScopeEntryView } from "@bit/contracts";
+import {
+  ImporterConversationRefused,
+  ImporterModelUnavailable,
+  type ImporterSessionView,
+  type ScopeEntryView,
+} from "@bit/contracts";
 
 import { App, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
@@ -24,7 +31,9 @@ import {
   FakeServer,
   emptyScope,
   importerSessionView,
+  importerTurnAccepted,
   ok,
+  refused,
   unreachable,
 } from "../fakeServer";
 import { click, mountInto, press, settle, type Mounted } from "./dom";
@@ -82,6 +91,7 @@ const harness = (instanceId: string, displayName: string) => ({
 const SESSIONS: ImporterSessionView[] = [
   importerSessionView({
     sessionId: "ses_newest",
+    importId: "imp_newest",
     model: "anthropic/claude-newest",
     harnessInstanceId: "claude-code",
     openedAt: 1_700_000_200_000,
@@ -89,6 +99,7 @@ const SESSIONS: ImporterSessionView[] = [
   }),
   importerSessionView({
     sessionId: "ses_older",
+    importId: "imp_older",
     model: "openai/gpt-older",
     openedAt: 1_700_000_100_000,
   }),
@@ -340,6 +351,19 @@ const continueOn = async (
   fake.onImporterSessions = () => ok({ sessions });
   fake.onHarnesses = () =>
     harnesses === "unreachable" ? unreachable("no route") : ok(harnesses);
+  // As the server answers a live session: the same import, the same harness session.
+  fake.onSendImporterMessage = (_baseUrl, targetId, importId) => {
+    const listed = sessions.find((each) => each.importId === importId);
+    return ok(
+      importerTurnAccepted({
+        targetId,
+        importId,
+        harnessSessionId: listed?.sessionId ?? "ses_unknown",
+        harnessInstanceId: listed?.harnessInstanceId ?? "opencode",
+        model: listed?.model ?? "m",
+      }),
+    );
+  };
   const app = new App(fake, new FakeCountdown());
   app.password = "correct-horse";
   await app.connect();
@@ -497,5 +521,152 @@ describe("the nine importer states are still the declared ones", () => {
     click(button("Continue that session"));
     await settle();
     expect(app.importer.currentId).toBe("ses_indexed_quiet");
+  });
+});
+
+/** The arguments of every call one method was given, oldest first. */
+const argsOf = (
+  fake: FakeServer,
+  method: "sendImporterMessage" | "openImporterConversation",
+) =>
+  fake.calls.filter((call) => call.method === method).map((call) => call.args);
+
+describe("the composer posts to the server", () => {
+  const send = async (value: string): Promise<void> => {
+    const box = composer();
+    typeInto(box, value);
+    box.focus();
+    press("Enter");
+    await settle();
+  };
+
+  test("a listed session's message goes to its import, and the box clears on acceptance", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    await send("Also load the staging hosts");
+
+    expect(fake.countOf("sendImporterMessage")).toBe(1);
+    expect(fake.countOf("openImporterConversation")).toBe(0);
+    const [, targetId, importId, text] =
+      argsOf(fake, "sendImporterMessage")[0] ?? [];
+    expect([targetId, importId, text]).toEqual([
+      "acme-corp",
+      "imp_newest",
+      "Also load the staging hosts",
+    ]);
+    expect(composer().value).toBe("");
+    expect(app.importer.current?.id).toBe("ses_newest");
+    // The session list is read again, so the server's figures follow the turn.
+    expect(fake.countOf("importerSessions")).toBeGreaterThan(1);
+  });
+
+  test("a refusal keeps the words in the box and prints the server's sentence", async () => {
+    const { fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.onSendImporterMessage = () =>
+      refused(
+        new ImporterConversationRefused({
+          reason: "harness_unreachable",
+          detail: "the harness would not take the message",
+        }),
+      );
+    await send("Also load the staging hosts");
+
+    expect(composer().value).toBe("Also load the staging hosts");
+    expect(text()).toContain("the harness would not take the message");
+  });
+
+  test("the empty session's first message opens a conversation, with no links", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    app.importer.start();
+    await settle();
+    fake.onOpenImporterConversation = (_baseUrl, targetId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId: "imp_opened",
+          harnessSessionId: "ses_opened",
+          conversation: "opened",
+          note: "A new importer session was opened for this message.",
+        }),
+      );
+    await send("Read https://hackerone.com/acme/policy");
+
+    expect(fake.countOf("openImporterConversation")).toBe(1);
+    expect(fake.countOf("sendImporterMessage")).toBe(0);
+    const draft = argsOf(fake, "openImporterConversation")[0]?.[2];
+    expect(draft).toEqual({ text: "Read https://hackerone.com/acme/policy" });
+    // The page's empty session became the server's, under its id and import.
+    expect(app.importer.current?.id).toBe("ses_opened");
+    expect(app.importer.current?.importId).toBe("imp_opened");
+    expect(text()).toContain("A new importer session was opened");
+  });
+
+  test("a session the operator ended cannot be typed into, and says why", async () => {
+    const { app, fake } = await continueOn(
+      [
+        importerSessionView({
+          sessionId: "ses_ended",
+          importId: "imp_ended",
+          harnessInstanceId: "claude-code",
+          endedAt: 1_700_000_300_000,
+          endedReason: "operator",
+        }),
+      ],
+      [harness("claude-code", "Claude Code")],
+    );
+    expect(app.importer.current?.ended).toBe(true);
+    expect(composer().disabled).toBe(true);
+    expect(text()).toContain("This session was ended");
+    app.importer.draft = "hello";
+    app.importer.send();
+    await settle();
+    expect(fake.countOf("sendImporterMessage")).toBe(0);
+  });
+
+  test("a session the server let go of is not disabled: a message to it is the server's to reopen", async () => {
+    await continueOn(
+      [
+        importerSessionView({
+          sessionId: "ses_shut",
+          importId: "imp_shut",
+          harnessInstanceId: "claude-code",
+          endedAt: 1_700_000_300_000,
+          endedReason: "shutdown",
+        }),
+      ],
+      [harness("claude-code", "Claude Code")],
+    );
+    expect(composer().disabled).toBe(false);
+  });
+
+  test("no harness on the server disables it, in the server's words", async () => {
+    const fake = new FakeServer();
+    fake.onScope = () => ok(emptyScope());
+    fake.onImporterModel = () =>
+      refused(
+        new ImporterModelUnavailable({
+          reason: "no_harness",
+          detail: "no agent harness on this server is ready",
+        }),
+      );
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    app.toSection("assets");
+    await settle();
+    app.openImporter();
+    await settle();
+    mounted.push(mountInto(Target, { app }));
+    await settle();
+
+    expect(composer().disabled).toBe(true);
+    expect(text()).toContain("no agent harness on this server is ready");
   });
 });

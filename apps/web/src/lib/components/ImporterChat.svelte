@@ -28,6 +28,17 @@
    * working, because stopping it is a control and correcting it is a message, and an older
    * session opened from the picker is writeable too: its first new message resumes it.
    *
+   * **It posts, on a real target** (the importer conversation design, S3): the empty
+   * session's first message opens a conversation, and a listed session's goes to its import
+   * as a queued message. The draft clears when the server accepts, not on submit, so a
+   * refusal leaves the words in the box beside the server's sentence.
+   *
+   * **Every state that disables it is the server's**, never a guess from here: no harness
+   * (the server answered `no_harness` to which model an import would run on), a stranded
+   * session (its harness is not one the server lists), and a session the operator ended
+   * (`endedReason` on the server's row). A session the *server* let go of is not disabled —
+   * a message to it opens a fresh one, and the answer's note says so.
+   *
    * ## Not wired, and said
    *
    * Attach is inert for the reason `ComposeBox`'s `+` is: nothing behind it, so it is
@@ -46,7 +57,7 @@
     IconLink,
     IconPlus,
   } from "../icons";
-  import { strandedNote } from "../importerChat";
+  import { ENDED_NOTE, strandedNote } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import Chat from "./Chat.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
@@ -59,8 +70,18 @@
   let target = $derived(app.selected?.name ?? app.viewTargetId);
   /** Set when the session's harness is one this server does not run: see `strandedNote`. */
   let stranded = $derived(session?.strandedOn);
+  /** The operator ended it: the server refuses a message to it. */
+  let ended = $derived(session?.ended === true);
+  /**
+   * The server answered that no harness is ready, so there is nothing to talk to. Only the
+   * server's answer counts: an import model not asked for yet is not "no harness".
+   */
+  let noHarness = $derived(
+    app.importerModel === undefined && app.importModelDetail !== "",
+  );
+  let blocked = $derived(stranded !== undefined || ended || noHarness);
   let canSend = $derived(
-    importer.draft.trim() !== "" && stranded === undefined,
+    importer.draft.trim() !== "" && !blocked && !importer.sending,
   );
   let working = $derived(session?.working ?? false);
   /** A session that has started keeps its model; only an empty one may choose. */
@@ -107,9 +128,13 @@
   let placeholder = $derived(
     stranded !== undefined
       ? "This session's harness is not on this server, so it cannot be continued."
-      : groups.length === 0
-        ? "Paste a policy or scope URL, or say what is in and out of scope…"
-        : "Correct it, or add what the pages do not say…",
+      : ended
+        ? "This session was ended, so it cannot be continued."
+        : noHarness
+          ? "No agent harness on this server is ready, so there is no importer to talk to."
+          : groups.length === 0
+            ? "Paste a policy or scope URL, or say what is in and out of scope…"
+            : "Correct it, or add what the pages do not say…",
   );
 </script>
 
@@ -121,9 +146,13 @@
     layout="thread"
     note={stranded !== undefined
       ? strandedNote(stranded)
-      : session?.reading
-        ? "You are reading an earlier session. Your first message resumes it, with the scope as it stands now, not as it stood then."
-        : ""}
+      : ended
+        ? ENDED_NOTE
+        : noHarness
+          ? app.importModelDetail
+          : session?.reading
+            ? "You are reading an earlier session. Your first message resumes it, with the scope as it stands now, not as it stood then."
+            : ""}
     empty="Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread."
   >
     {#snippet separator(group)}
@@ -176,7 +205,19 @@
 
     {#snippet composer()}
       <div class="stack">
-        <form class="box" onsubmit={submit}>
+        {#if importer.notice !== ""}
+          <!--
+            The server's sentence about the last message: a refusal, or the note on one it
+            accepted (a session it had to open afresh says why). Its words, never ours.
+          -->
+          <p
+            class={["notice", importer.refused && "refusal"]}
+            role={importer.refused ? "alert" : "status"}
+          >
+            {importer.notice}
+          </p>
+        {/if}
+        <form class="box" onsubmit={submit} aria-busy={importer.sending}>
           <label class="visually-hidden" for="importer-message"
             >Message the importer</label
           >
@@ -186,7 +227,7 @@
             rows="1"
             class={[groups.length === 0 && "first"]}
             {placeholder}
-            disabled={stranded !== undefined}
+            disabled={blocked}
             bind:value={importer.draft}
             {onkeydown}></textarea>
           <div class="strip">
@@ -458,6 +499,18 @@
   }
   .agent-chip :global(svg) {
     color: var(--icon-muted);
+  }
+
+  /* ── The server's sentence about the last message ──────────────────────────── */
+  .notice {
+    margin: 0;
+    color: var(--text-muted);
+    font: 400 12px/18px var(--font-sans);
+    text-wrap: pretty;
+    overflow-wrap: anywhere;
+  }
+  .notice.refusal {
+    color: var(--text-danger, var(--text-base));
   }
 
   /* ── The two starters: dashed pills under the box ─────────────────────────── */

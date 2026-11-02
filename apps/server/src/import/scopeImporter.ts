@@ -107,15 +107,22 @@
  * streamed, and rendered as text by a browser that escapes it.
  */
 import {
+  ImporterConversationRefused,
   SCOPE_IMPORT_MAX_LINKS,
+  ScopeImportNotFound,
+  type ImporterTurnAccepted,
   type ImportModelDraft,
   type ModelOptionSelection,
   type ScopeImportView,
 } from "@bit/contracts";
-import { Context, Effect, Fiber, Layer } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, Semaphore } from "effect";
 
 import { resolveImporterModel } from "./importerModel";
-import { assembleImporterPrompt } from "./importerPrompt";
+import {
+  assembleImporterFollowUpPrompt,
+  assembleImporterPrompt,
+  operatorPages,
+} from "./importerPrompt";
 import { ScopeImportProgress } from "./progress";
 import { lastAssistantText, type AgentHarness } from "../harness/agentHarness";
 import {
@@ -149,7 +156,12 @@ export type ScopeImportStarted =
       readonly model: string;
     }
   /** Links were given and this server cannot read them. The target is created regardless. */
-  | { readonly _tag: "refused"; readonly detail: string };
+  | {
+      readonly _tag: "refused";
+      /** Which of the two: no harness at all, or the chosen one cannot take a session. */
+      readonly reason: "no_harness" | "harness_not_ready";
+      readonly detail: string;
+    };
 
 /**
  * How much of the session's closing report the panel's status line carries.
@@ -174,12 +186,94 @@ export const importReport = (text: string): string | null => {
   return `${(space > SCOPE_IMPORT_REPORT_MAX / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 };
 
+/** Where an import's first turn says how its open went, for a caller that waits on it. */
+type Opening = Deferred.Deferred<
+  LiveAgentSession<undefined>,
+  ImporterConversationRefused
+>;
+
+/**
+ * Turns a failure to open an importer session into the refusal a composer prints.
+ *
+ * `plan/goalConversation.ts`'s `refuse`, for the same failures and in the importer's
+ * words: every component's own sentence is kept as the detail.
+ */
+const refusal = (failure: {
+  readonly _tag: string;
+  readonly message?: string;
+  readonly reason?: string;
+}): ImporterConversationRefused => {
+  switch (failure._tag) {
+    case "FleetError":
+      return new ImporterConversationRefused({
+        reason:
+          failure.reason === "invalid_role_id"
+            ? "import_directory_unusable"
+            : "target_unavailable",
+        detail: failure.message ?? "that target could not be opened",
+      });
+    case "PolicyHookNotInstalled":
+      return new ImporterConversationRefused({
+        reason: "import_ungated",
+        detail:
+          failure.message ??
+          "the pre-execution policy gate could not be installed into this import's directory, so no session was opened",
+      });
+    case "HarnessTransportError":
+    case "HarnessDecodeError":
+      return new ImporterConversationRefused({
+        reason: "harness_unreachable",
+        detail: failure.message ?? "the agent harness did not answer",
+      });
+    case "HarnessNotReady":
+      return new ImporterConversationRefused({
+        reason: "harness_not_ready",
+        detail:
+          failure.message ??
+          "that harness instance is not usable on this server",
+      });
+    default:
+      return new ImporterConversationRefused({
+        reason: "store_unavailable",
+        detail:
+          failure.message ?? "this target's database could not be written to",
+      });
+  }
+};
+
+/**
+ * Why an import's session is not live in this process, in a sentence for the note on the
+ * fresh session a message to it opens.
+ */
+const notHeldBecause = (reason: string | null): string => {
+  switch (reason) {
+    case "refused":
+      return "the harness refused a message into it, which closed it";
+    case "shutdown":
+      return "the server was shut down after it was opened";
+    case "open_failed":
+      return "it never finished opening";
+    default:
+      return "the server has restarted since it was opened, and its authority lived only in that process";
+  }
+};
+
+/** A join attempt that found nothing to join. Never leaves this module. */
+const NOT_LIVE = { _tag: "NotLive" } as const;
+
 export interface ScopeImportRequest {
   readonly targetId: string;
   readonly targetName: string;
   /** The engagement folder, for the gate's containment check. `null` when there is none. */
   readonly workspacePath: string | null;
   readonly links: readonly string[];
+  /**
+   * The operator's first message, for a conversation opened from the Auto-load page's
+   * composer (S3.4). **Present means the operator asked for something**, so zero links is
+   * not `none` on this path: `none` belongs to the create-target route, which asked whether
+   * there were links to read. Absent for an import started from links alone.
+   */
+  readonly message?: string | undefined;
   /**
    * The operator's pick, when they touched the importer's picker: `ImportModelDraft` as it
    * arrived.
@@ -230,6 +324,35 @@ export class ScopeImporter extends Context.Service<
     readonly view: (
       importId: string,
     ) => Effect.Effect<ScopeImportView | undefined>;
+    /**
+     * Opens a conversation: a new import whose first turn is the operator's message.
+     *
+     * {@link start} with a message, and answering once the opening prompt has been accepted
+     * rather than as soon as the fiber is forked — the operator is at a composer waiting to
+     * be told whether it worked, not at a create-target form that must not wait.
+     */
+    readonly converse: (
+      input: Omit<ScopeImportRequest, "links" | "message"> & {
+        readonly text: string;
+      },
+    ) => Effect.Effect<ImporterTurnAccepted, ImporterConversationRefused>;
+    /**
+     * Gives one operator message to an import (S3).
+     *
+     * Live in this process: delivered into its session as a queued steer, under the **same**
+     * import id, so its writes count toward the same tally. Ended by the operator: refused.
+     * Anything else — closed after a refused prompt, lost to a restart — opens a fresh
+     * session under a **new** import id, because an import id names one authority period
+     * and an ended one is never revived (`0027`).
+     */
+    readonly send: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+      readonly text: string;
+    }) => Effect.Effect<
+      ImporterTurnAccepted,
+      ImporterConversationRefused | ScopeImportNotFound
+    >;
   }
 >()("bit/import/ScopeImporter") {
   /**
@@ -371,6 +494,10 @@ export class ScopeImporter extends Context.Service<
         readonly options: readonly ModelOptionSelection[] | undefined;
         readonly links: readonly string[];
         readonly sessionId: string;
+        /** The operator's first message, for a conversation. See `ScopeImportRequest`. */
+        readonly message: string | undefined;
+        /** Completed once the open is known, for a caller that waits on it (`converse`). */
+        readonly opening: Opening | undefined;
       }) {
         const harness = input.harness;
         const opened = yield* Effect.result(
@@ -430,6 +557,7 @@ export class ScopeImporter extends Context.Service<
                 assembleImporterPrompt({
                   targetName: input.request.targetName,
                   links: input.links,
+                  message: input.message,
                 }),
               meta: undefined,
             }),
@@ -437,6 +565,20 @@ export class ScopeImporter extends Context.Service<
           }),
         );
 
+        if (input.opening !== undefined) {
+          yield* opened._tag === "Failure"
+            ? Deferred.fail(input.opening, refusal(opened.failure))
+            : opened.success === undefined
+              ? Deferred.fail(
+                  input.opening,
+                  new ImporterConversationRefused({
+                    reason: "store_unavailable",
+                    detail:
+                      "this import already had a session open in this process, so a second was not opened",
+                  }),
+                )
+              : Deferred.succeed(input.opening, opened.success);
+        }
         if (opened._tag === "Failure" || opened.success === undefined) {
           const detail =
             opened._tag === "Failure"
@@ -466,8 +608,21 @@ export class ScopeImporter extends Context.Service<
           }
           return;
         }
-        const sessionId = opened.success.sessionId;
+        yield* settleTurn(input.importId, harness, opened.success.sessionId);
+      });
 
+      /**
+       * Waits for one turn of an import's session to go idle, then settles its view.
+       *
+       * The first turn's tail, and a later turn's whole fiber: a message delivered into a
+       * session marks the import `running` again (`progress.resume`) and this is what settles
+       * it once the session has finished with it.
+       */
+      const settleTurn = Effect.fnUntraced(function* (
+        importId: string,
+        harness: AgentHarness["Service"],
+        sessionId: string,
+      ) {
         /*
          * Wait for the session to go idle, then settle.
          *
@@ -483,7 +638,7 @@ export class ScopeImporter extends Context.Service<
          * to review. The detail carries what went wrong so the panel can say so.
          */
         const settled = yield* Effect.result(harness.waitForIdle(sessionId));
-        if (yield* progress.stopped(input.importId)) return;
+        if (yield* progress.stopped(importId)) return;
 
         /*
          * The session's closing report, read once, after it has settled.
@@ -512,7 +667,7 @@ export class ScopeImporter extends Context.Service<
         );
 
         yield* progress.settle({
-          importId: input.importId,
+          importId: importId,
           status: "finished",
           detail:
             settled._tag === "Failure"
@@ -521,10 +676,20 @@ export class ScopeImporter extends Context.Service<
         });
       });
 
-      const start: ScopeImporter["Service"]["start"] = Effect.fn(
-        "ScopeImporter.start",
-      )(function* (request) {
-        if (request.links.length === 0) return { _tag: "none" } as const;
+      const startWith = Effect.fn("ScopeImporter.start")(function* (
+        request: ScopeImportRequest,
+        opening?: Opening,
+      ) {
+        // `none` is the create-target route's answer — it asked whether there were links to
+        // read — and a conversation opened from the composer asked something else (S3.4).
+        if (request.links.length === 0 && request.message === undefined) {
+          return { _tag: "none" } as const;
+        }
+        // Said to a conversation rather than to the form that created a target.
+        const consequence =
+          request.message === undefined
+            ? " The target is created; author its scope by hand on the Assets screen."
+            : "";
 
         /*
          * Bounded here rather than refused in the contract.
@@ -569,8 +734,11 @@ export class ScopeImporter extends Context.Service<
         if (choice === undefined) {
           return {
             _tag: "refused",
+            reason: "no_harness",
             detail:
-              "no agent harness on this server is ready, so the program pages could not be read. The target is created; author its scope by hand on the Assets screen, or configure a harness and import it later.",
+              request.message === undefined
+                ? "no agent harness on this server is ready, so the program pages could not be read. The target is created; author its scope by hand on the Assets screen, or configure a harness and import it later."
+                : "no agent harness on this server is ready, so there is no importer to talk to. Configure a harness, or author the scope by hand on the Assets screen.",
           } as const;
         }
 
@@ -584,7 +752,8 @@ export class ScopeImporter extends Context.Service<
           // which harness ran this a lie.
           return {
             _tag: "refused",
-            detail: `${resolved.failure.detail} The target is created; author its scope by hand on the Assets screen.`,
+            reason: "harness_not_ready",
+            detail: `${resolved.failure.detail}${consequence}`,
           } as const;
         }
 
@@ -649,6 +818,11 @@ export class ScopeImporter extends Context.Service<
           harnessInstanceId: harness.instance.instanceId,
           model: choice.model,
         });
+        // A page the operator typed into their message is one this import may cite, exactly
+        // as a pasted link is. See `progress.addLinks`.
+        if (request.message !== undefined) {
+          yield* progress.addLinks(importId, operatorPages(request.message));
+        }
 
         /*
          * The first turn, forked into this layer's scope so `start` answers without it.
@@ -668,7 +842,24 @@ export class ScopeImporter extends Context.Service<
             options,
             links,
             sessionId,
-          }).pipe(Effect.ensuring(Effect.sync(() => turns.delete(importId)))),
+            message: request.message,
+            opening,
+          }).pipe(
+            Effect.ensuring(Effect.sync(() => turns.delete(importId))),
+            // A turn stopped before its open was known still answers whoever is waiting on
+            // it. A no-op when the open already completed the deferred.
+            Effect.ensuring(
+              opening === undefined
+                ? Effect.void
+                : Deferred.fail(
+                    opening,
+                    new ImporterConversationRefused({
+                      reason: "import_ended",
+                      detail: `import ${importId} was stopped before its session had opened, so nothing was said to it`,
+                    }),
+                  ),
+            ),
+          ),
           own,
         );
         turns.set(importId, fiber);
@@ -750,10 +941,250 @@ export class ScopeImporter extends Context.Service<
         return view;
       });
 
+      const start: ScopeImporter["Service"]["start"] = (request) =>
+        startWith(request);
+
+      /** What an accepted message answers with. */
+      const accepted = (
+        entry: LiveAgentSession<undefined>,
+        conversation: ImporterTurnAccepted["conversation"],
+        note: string,
+      ): ImporterTurnAccepted => ({
+        targetId: entry.targetId,
+        importId: entry.id,
+        harnessSessionId: entry.sessionId,
+        harnessInstanceId: entry.instanceId,
+        model: entry.model,
+        conversation,
+        note,
+        acceptedAt: Date.now(),
+      });
+
+      /**
+       * Gives one message to an import whose session is live and preambled.
+       *
+       * Delivery is the spine's (`LiveAgentSessions.deliver`): a `steer` at `queued` urgency,
+       * the goal conversation's seam and reasoning (DECISIONS.md §24.1), and a refusal closes
+       * the session as `refused`. **The import id does not change**: this is the same
+       * authority period, so the writes this turn makes are filed under the same
+       * `caller_scope` and the session's tally keeps counting (S3.3).
+       *
+       * Two things are the importer's own. A page the operator typed is added to the pages
+       * this import may cite, **before** the message is delivered, so a write citing it is
+       * never refused for a page the operator has just given. And the import is marked
+       * working again, with a fiber to settle it once the session goes idle — unless a turn's
+       * fiber is already waiting, which will.
+       */
+      const deliverTurn = Effect.fnUntraced(function* (
+        entry: LiveAgentSession<undefined>,
+        text: string,
+      ) {
+        yield* progress.addLinks(entry.id, operatorPages(text));
+        const delivered = yield* Effect.result(
+          sessions.deliver(
+            entry,
+            assembleImporterFollowUpPrompt({ message: text }),
+          ),
+        );
+        if (delivered._tag === "Failure") {
+          return yield* new ImporterConversationRefused({
+            reason: "harness_unreachable",
+            detail: `${delivered.failure.message}. The harness would not take the message, so this import's session has been closed; your next message opens a fresh one under a new import.`,
+          });
+        }
+        if ((yield* progress.resume(entry.id)) && !turns.has(entry.id)) {
+          const fiber = yield* Effect.forkIn(
+            settleTurn(entry.id, entry.harness, entry.sessionId).pipe(
+              Effect.ensuring(Effect.sync(() => turns.delete(entry.id))),
+            ),
+            own,
+          );
+          turns.set(entry.id, fiber);
+        }
+        return accepted(entry, "continued", "");
+      });
+
+      /**
+       * Starts an import with the operator's message as its first turn, and waits for the
+       * open to be known.
+       */
+      const openWith = Effect.fnUntraced(function* (
+        request: ScopeImportRequest,
+      ) {
+        const opening: Opening = yield* Deferred.make<
+          LiveAgentSession<undefined>,
+          ImporterConversationRefused
+        >();
+        const started = yield* startWith(request, opening);
+        if (started._tag === "none") {
+          // Unreachable: a request with a message is never `none`. Answered rather than died
+          // on, in the same words a reader of the code would use.
+          return yield* new ImporterConversationRefused({
+            reason: "store_unavailable",
+            detail: "there was nothing to say to the importer",
+          });
+        }
+        if (started._tag === "refused") {
+          return yield* new ImporterConversationRefused({
+            reason: started.reason,
+            detail: started.detail,
+          });
+        }
+        return yield* Deferred.await(opening);
+      });
+
+      const converse: ScopeImporter["Service"]["converse"] = Effect.fn(
+        "ScopeImporter.converse",
+      )(function* (input) {
+        const entry = yield* openWith({
+          targetId: input.targetId,
+          targetName: input.targetName,
+          workspacePath: input.workspacePath,
+          links: [],
+          message: input.text,
+          ...(input.choice === undefined ? {} : { choice: input.choice }),
+        });
+        return accepted(
+          entry,
+          "opened",
+          "A new importer session was opened for this message: the importer has its rules and its three tools, and has read nothing else yet.",
+        );
+      });
+
+      /**
+       * Which import took over from one whose session this process no longer held.
+       *
+       * Written when a message to a dead import opens a fresh session under a new id, and
+       * read by the next message to the old id, which goes to the new one rather than
+       * opening a third. Bounded by the number of reopenings an operator causes, and not
+       * swept, for `liveAgentSessions.ts`'s `opening` map's reason.
+       */
+      const successors = new Map<string, string>();
+
+      /**
+       * One permit per dead import id, held while a fresh session is opened in its place.
+       *
+       * The spine's per-id permit does not cover this: the fresh session is opened under a
+       * **new** id, so two concurrent messages to one dead import would each take a
+       * different permit and open two sessions — the goal path's measured double-open bug in
+       * a new shape. This permit is on the *old* id, and the successor is re-read inside it.
+       */
+      const reopening = new Map<string, Semaphore.Semaphore>();
+      const reopenLock = (importId: string): Semaphore.Semaphore => {
+        const held = reopening.get(importId);
+        if (held !== undefined) return held;
+        const made = Semaphore.makeUnsafe(1);
+        reopening.set(importId, made);
+        return made;
+      };
+
+      const send: ScopeImporter["Service"]["send"] = Effect.fn(
+        "ScopeImporter.send",
+      )(function* (input) {
+        // The fast path: live, preambled, and this target's.
+        const live = sessions.ready(input.importId);
+        if (live !== undefined && live.targetId === input.targetId) {
+          return yield* deliverTurn(live, input.text);
+        }
+
+        const row = yield* withTargetStore(stores, input.targetId, (store) =>
+          store.importSession(input.importId),
+        ).pipe(Effect.mapError(refusal));
+        if (row === undefined || row.targetId !== input.targetId) {
+          return yield* new ScopeImportNotFound({
+            reason: "unknown_import",
+            importId: input.importId,
+            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no session to say this to`,
+          });
+        }
+        // The one end that is final, and the one the importer's tools refuse writes on.
+        if (row.endedReason === "operator") {
+          return yield* new ImporterConversationRefused({
+            reason: "import_ended",
+            detail: `import ${input.importId} was ended by the operator, so its session's authority has ended with it and its tools refuse every write. An ended import is not reopened; start a new session to carry on.`,
+          });
+        }
+
+        /*
+         * Still opening: join it, under the spine's permit. `prepare` refuses rather than
+         * builds, because **nothing is ever built under an import id that has been opened
+         * before** — a fresh session is a new authority period and gets a new id (S3.3). So a
+         * joiner that finds the opener's session gone falls through to the reopen below.
+         */
+        if (sessions.get(input.importId) !== undefined) {
+          const joined = yield* Effect.result(
+            sessions.open<
+              ImporterTurnAccepted,
+              ImporterConversationRefused | typeof NOT_LIVE,
+              never
+            >({
+              id: input.importId,
+              joined: (entry) => deliverTurn(entry, input.text),
+              prepare: Effect.fail(NOT_LIVE),
+              refuse: refusal,
+              opened: () => Effect.fail(NOT_LIVE),
+            }),
+          );
+          if (joined._tag === "Success") return joined.success;
+          const failure = joined.failure;
+          if (failure._tag !== "NotLive") return yield* Effect.fail(failure);
+        }
+
+        /*
+         * Not live in this process and not ended by the operator: closed after a refused
+         * prompt, shut down, never opened, or lost to a restart. A fresh session, under a
+         * **new** import id — `ended_at` is never cleared, and a session under the old id
+         * would be a second authority period wearing the first one's name.
+         */
+        return yield* Semaphore.withPermit(reopenLock(input.importId))(
+          Effect.gen(function* () {
+            const successor = successors.get(input.importId);
+            if (successor !== undefined) {
+              return yield* send({ ...input, importId: successor });
+            }
+            const target = yield* fleet
+              .target(input.targetId)
+              .pipe(Effect.mapError(refusal));
+            if (target === undefined) {
+              return yield* new ImporterConversationRefused({
+                reason: "target_unavailable",
+                detail: `no target '${input.targetId}' is registered on this server`,
+              });
+            }
+            const entry = yield* openWith({
+              targetId: input.targetId,
+              targetName: target.name,
+              workspacePath: target.workspacePath ?? null,
+              links: [],
+              message: input.text,
+              // The same harness and model the earlier session ran on, so the conversation
+              // does not quietly change models under the operator. A row from before
+              // instances were recorded has nothing to pin, and D15's rule applies.
+              ...(row.harnessInstanceId === null
+                ? {}
+                : {
+                    choice: {
+                      instanceId: row.harnessInstanceId,
+                      model: row.model,
+                    },
+                  }),
+            });
+            successors.set(input.importId, entry.id);
+            return accepted(
+              entry,
+              "opened",
+              `Import ${input.importId}'s session is not held by this server — ${notHeldBecause(row.endedReason)} — so this message opened a new session, under import ${entry.id}. The importer in it has not read the earlier session; what that session wrote is on the Scope tab and in the Estate.`,
+            );
+          }),
+        );
+      });
+
       return ScopeImporter.of({
         start,
         stop,
         view: progress.view,
+        converse,
+        send,
       });
     }),
   );
@@ -774,12 +1205,22 @@ export class ScopeImporter extends Context.Service<
             ? { _tag: "none" }
             : {
                 _tag: "refused",
+                reason: "no_harness",
                 detail:
                   "this server is configured with no agent harness, so program pages cannot be read. The target is created; author its scope by hand on the Assets screen.",
               },
         ),
       stop: () => Effect.succeed(undefined),
       view: () => Effect.succeed(undefined),
+      converse: () => Effect.fail(noHarness),
+      send: () => Effect.fail(noHarness),
     }),
   );
 }
+
+/** What a server with no harness answers every message with. */
+const noHarness = new ImporterConversationRefused({
+  reason: "no_harness",
+  detail:
+    "this server is configured with no agent harness, so there is no importer to talk to. Author the scope by hand on the Assets screen.",
+});

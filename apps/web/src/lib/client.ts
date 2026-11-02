@@ -40,6 +40,7 @@ import {
   SessionGuard,
   type GoalDraft,
   type GoalEndDraft,
+  type ImporterConversationDraft,
   type IntentAbandonDraft,
   type IntentDraft,
   type LiveFrame,
@@ -271,6 +272,11 @@ export const REFUSAL_TAGS = new Set([
   // on the create-target screen and says why. A connectivity complaint here would leave the
   // checkbox enabled and the operator pasting links nothing will ever read.
   "ImporterModelUnavailable",
+  // A message to the importer. Every reason is a sentence about the conversation — the
+  // operator ended this import, the harness would not take the message and the session was
+  // closed, no harness is ready — that the composer prints beside itself. As transport
+  // trouble it would read "No server answered" about a server that answered precisely.
+  "ImporterConversationRefused",
 ]);
 
 /**
@@ -833,6 +839,48 @@ export const server = {
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.startScopeImport({ params: { targetId }, payload: draft }),
+      ),
+    ),
+
+  /**
+   * Opens a conversation with the importer, its first turn the operator's message.
+   *
+   * `202` once the session has the message, with the new import's id — which is what the
+   * next message is addressed to. No links: a page the operator wants read is in the text.
+   */
+  openImporterConversation: (
+    baseUrl: string,
+    targetId: string,
+    draft: ImporterConversationDraft,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.openImporterConversation({
+          params: { targetId },
+          payload: draft,
+        }),
+      ),
+    ),
+
+  /**
+   * Says something to one import's session.
+   *
+   * The answer's `importId` is the one the next message goes to: the same on a `continued`
+   * turn, a new one when the server had to open a fresh session in place of one it no
+   * longer held.
+   */
+  sendImporterMessage: (
+    baseUrl: string,
+    targetId: string,
+    importId: string,
+    text: string,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.sendImporterMessage({
+          params: { targetId, importId },
+          payload: { text },
+        }),
       ),
     ),
 

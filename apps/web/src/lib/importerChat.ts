@@ -146,7 +146,24 @@ export interface ImporterSession {
    * harness listing has arrived: before that an unknown instance is unknown, not gone.
    */
   readonly strandedOn?: string;
+  /**
+   * The import a message to this session is addressed to, as the server answered it. Absent
+   * on the page's own empty session until its first message is accepted, which is what
+   * makes that message open a conversation rather than continue one.
+   */
+  readonly importId?: string;
+  /**
+   * True when the operator ended this session (`ended_reason = 'operator'`). Its authority is
+   * over and the server refuses a message to it, so the composer is disabled rather than
+   * offered. A session the *server* let go of — shut down, a refused prompt — is not this:
+   * a message to it opens a fresh session, and the server says so.
+   */
+  readonly ended?: boolean;
 }
+
+/** What the page says of a session the operator ended, and why it cannot be continued. */
+export const ENDED_NOTE =
+  "This session was ended, so its authority has ended with it: the importer's tools refuse every write under it, and it is not continued. Start a new session to carry on. What it wrote is on the Scope tab and in the Estate.";
 
 /**
  * What the page says of a session whose harness this server no longer runs, and why it
@@ -483,6 +500,8 @@ export const indexedSession = (
   },
   reading: true,
   indexed: true,
+  importId: view.importId,
+  ...(view.endedReason === "operator" ? { ended: true } : {}),
   ...(strandedOn === undefined ? {} : { strandedOn }),
 });
 

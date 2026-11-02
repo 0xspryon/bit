@@ -69,7 +69,8 @@ export const KEPT = 32;
 interface Entry {
   readonly importId: string;
   readonly targetId: string;
-  readonly urls: readonly string[];
+  /** Grows when the operator gives a page in a later message: see `addLinks`. */
+  readonly urls: string[];
   /** How many of the links the operator gave are not in {@link urls}. Usually 0. */
   readonly droppedLinks: number;
   readonly harnessInstanceId: string;
@@ -215,6 +216,29 @@ export class ScopeImportProgress extends Context.Service<
     ) => Effect.Effect<ScopeImportView | undefined>;
     /** Whether an import has been asked to stop. Read by the importer's own fiber. */
     readonly stopped: (importId: string) => Effect.Effect<boolean>;
+    /**
+     * Adds pages the operator gave in a message to the ones this import may attribute to.
+     *
+     * **The attribution rule is unchanged by this, only who supplies the list.** A
+     * `source_url` must still name a page the *operator* pointed this import at
+     * (`pageOf`); in a conversation they point at one by typing it, so a page in an
+     * accepted operator message joins the list exactly as a pasted link did. A page already
+     * on the list — by {@link scopeImportLinkIndex}'s comparison — is not added twice.
+     * Nothing a model said ever reaches this.
+     */
+    readonly addLinks: (
+      importId: string,
+      urls: readonly string[],
+    ) => Effect.Effect<void>;
+    /**
+     * Marks a `finished` import as working again, because a new turn was given to it.
+     *
+     * Answers whether it is now `running`. A `stopped` import is not reopened — the
+     * operator ended it, which is final — and neither is a `failed` one, whose session never
+     * opened; both answer `false`. One that is already running answers `true` and changes
+     * nothing.
+     */
+    readonly resume: (importId: string) => Effect.Effect<boolean>;
   }
 >()("bit/import/ScopeImportProgress") {
   static readonly layer = Layer.sync(ScopeImportProgress, () => {
@@ -312,6 +336,28 @@ export class ScopeImportProgress extends Context.Service<
 
       stopped: (importId) =>
         Effect.sync(() => entries.get(importId)?.status === "stopped"),
+
+      addLinks: (importId, urls) =>
+        Effect.sync(() => {
+          const entry = entries.get(importId);
+          if (entry === undefined) return;
+          for (const url of urls) {
+            if (scopeImportLinkIndex(entry.urls, url) === -1)
+              entry.urls.push(url);
+          }
+        }),
+
+      resume: (importId) =>
+        Effect.sync(() => {
+          const entry = entries.get(importId);
+          if (entry === undefined) return false;
+          if (entry.status === "running") return true;
+          if (entry.status !== "finished") return false;
+          entry.status = "running";
+          entry.detail = null;
+          entry.finishedAt = null;
+          return true;
+        }),
     });
   });
 
@@ -335,6 +381,8 @@ export class ScopeImportProgress extends Context.Service<
         view: () => Effect.succeed(undefined),
         stop: () => Effect.succeed(undefined),
         stopped: () => Effect.succeed(false),
+        addLinks: () => Effect.void,
+        resume: () => Effect.succeed(false),
       }),
   );
 }
