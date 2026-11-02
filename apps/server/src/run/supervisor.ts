@@ -1423,6 +1423,19 @@ const make = Effect.fnUntraced(function* (options?: {
          * only writer is that one fiber and the only reader is this one's finalizer, after
          * it has been interrupted. A `Ref` would be ceremony around a single field with no
          * contention on it.
+         *
+         * **It cannot go stale here, and that is a property of this file rather than of
+         * the field.** `report.narrated` is per-*stream*, not per-turn, so it holds a
+         * previous turn's event for any session that takes a second one — which
+         * `plan/planSupervisor.ts` fixes by clearing it when a steer is accepted. Nothing
+         * steers a worker attempt: {@link RunSupervisor} offers `start`,
+         * `continueAttempt`, `stop` and `running`, and no route or tool reaches a running
+         * attempt's session with a message. An attempt's session takes exactly one turn,
+         * and `continueAttempt` is a *new* attempt with a new session and a new report of
+         * its own — which is `agentHarness.ts`'s rule that carrying work on after an
+         * interruption means a new attempt identity, and the reason there is nothing to
+         * clear on this side. The day a steer reaches an attempt, it has to clear this the
+         * way the planner's does.
          */
         const report: { narrated: TerminalOutcome | undefined } = {
           narrated: undefined,

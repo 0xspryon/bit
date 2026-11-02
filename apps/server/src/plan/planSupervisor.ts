@@ -721,6 +721,16 @@ const make = Effect.fnUntraced(function* (options?: {
       readonly targetId: string;
       readonly harnessSessionId: string;
       readonly harness: AgentHarness["Service"];
+      /**
+       * The round's narration report, so an accepted steer can clear it.
+       *
+       * The same object the round's narration fiber writes and its finalizer reads — see
+       * {@link PlanSupervisor.steer} for what clearing it is for. Held here because a
+       * steer is the only thing outside the round's own fiber that starts a new turn on
+       * its session, so it is the only thing that can know the recorded event is now a
+       * previous turn's.
+       */
+      readonly report: { narrated: TerminalOutcome | undefined };
       /** Set by the round's own finalizer, under {@link lock}, before it settles. */
       settled: boolean;
       /** One permit. A steer and a settlement cannot both hold it. */
@@ -1584,6 +1594,7 @@ const make = Effect.fnUntraced(function* (options?: {
           targetId: input.targetId,
           harnessSessionId,
           harness: resolved.harness,
+          report,
           settled: false,
           lock: steerLock,
         });
@@ -1999,6 +2010,33 @@ const make = Effect.fnUntraced(function* (options?: {
           );
           return yield* refuse(accepted.failure);
         }
+        /*
+         * A new turn has started on this session, so the terminal event the narration
+         * stream carried is a **previous** turn's. Dropped here, which is the only place
+         * that knows it.
+         *
+         * `report.narrated` is per-*stream*, not per-turn: `narrateRound` records the last
+         * terminal `session.execution.*` the subscription has seen, and the subscription
+         * spans the whole round. A round whose first turn terminalised and was then steered
+         * therefore held turn one's event while turn two ran, and `roundSettlementFor`
+         * ranks it second — so a settlement that could not get an answer out of
+         * `sessionStatus` asserted turn one's outcome about turn two. S7a narrowed that by
+         * suppressing the stale outcome at rank 1 and said in as many words that it did not
+         * close it; this is the close.
+         *
+         * **After acceptance, not before.** A refused steer started no new turn, so turn
+         * one's event is still the last turn's and still the right thing to settle from.
+         * The cost of that order is a window between the harness taking the message and
+         * this line: a turn that terminalised inside it loses its rank-2 reading and
+         * settles from `sessionStatus` instead, which is rank 1 and the authority anyway.
+         * Losing a corroborating read is not the same kind of error as asserting the wrong
+         * turn's outcome.
+         *
+         * Inside the permit, so it cannot race the finalizer: either this clears it and
+         * the settlement that follows reads the new turn, or the settlement got the permit
+         * first, `settled` is true above and nothing was delivered to clear for.
+         */
+        live.report.narrated = undefined;
         yield* Effect.logInfo("a planner round was steered", {
           roundId: live.roundId,
           goalId: input.goalId,

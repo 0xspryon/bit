@@ -110,6 +110,14 @@ interface Script {
   /** When true, `prompt` fails, so the round is never watched. */
   readonly promptFails?: boolean;
   /**
+   * When true, a **steer** fails while the opening prompt still succeeds.
+   *
+   * Separate from {@link promptFails}, which refuses both: a steer the harness will not
+   * take is a state the round survives — it is live, it has a turn, and the directive
+   * simply did not land — and the settlement afterwards is the thing under test.
+   */
+  readonly steerFails?: boolean;
+  /**
    * When set, a **steer** into this session parks until it is resolved.
    *
    * The only way to drive the race DECISIONS.md §24.1 consequence 5 is about: a steer that
@@ -307,6 +315,14 @@ const fakeClient = (
           : delivery._tag === "steer"
             ? Effect.gen(function* () {
                 const script = scriptFor(sessionId);
+                if (script.steerFails === true) {
+                  return yield* Effect.fail(
+                    transport(
+                      "session.prompt",
+                      "the harness would not take it",
+                    ),
+                  );
+                }
                 if (script.steerEntered !== undefined) {
                   yield* Deferred.succeed(script.steerEntered, undefined);
                 }
@@ -2101,6 +2117,179 @@ describe("steering the round that is live on a goal", () => {
     expect(recorder.steers[0]?.text).not.toContain("THE RECORD FOLLOWS");
 
     await runtime.runPromise(releaseAll());
+    await runtime.dispose();
+  });
+
+  /**
+   * The settlement defect S7a recorded one rank down from the harness's answer, and did
+   * not fix.
+   *
+   * `report.narrated` is per-*stream*, not per-turn: the narration fiber records the last
+   * terminal `session.execution.*` the subscription has seen, and the subscription spans
+   * the whole round. So a round whose first turn terminalised and was then steered held
+   * turn one's event while turn two ran, and `roundSettlementFor` ranks it **second** — so
+   * a settlement that got nothing out of `sessionStatus` asserted turn one's outcome about
+   * turn two. Here that is a `settled` round for a turn nothing ever said anything about.
+   *
+   * `status: undefined` is what makes the rank visible rather than hidden behind rank 1:
+   * the harness has no outcome to give, which is the common case on a session whose turn
+   * was interrupted. `uncertain` is the right answer — "we could not find out" — and it is
+   * never `failed`.
+   *
+   * **Two narration entries, and the second one is the synchronisation.** `narrateRound`
+   * publishes an entry and *then* records its outcome, in that order, and
+   * `Stream.runForEach` processes entries one at a time — so receiving the second entry
+   * over the bus proves the first one's outcome has already landed in `report.narrated`.
+   * Waiting for the terminal entry alone would leave a window in which the steer cleared a
+   * field nothing had written yet, and the test would pass for the wrong reason.
+   */
+  test("a steered round does not settle from the previous turn's terminal event", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [
+        {
+          type: "session.execution.succeeded",
+          sequence: 1,
+          at: 1_700_000_000_000,
+          // Turn one's, and the only outcome anything in this test states.
+          outcome: "succeeded",
+          detail: { _tag: "opaque" },
+        },
+        {
+          type: "session.text.ended",
+          sequence: 2,
+          at: 1_700_000_000_001,
+          outcome: undefined,
+          detail: { _tag: "reply", text: "turn one is done" },
+        },
+      ],
+      status: undefined,
+    });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const narrations = yield* RunNarrations;
+        const collected = yield* Effect.forkChild(
+          Stream.runCollect(
+            Stream.take(narrations.subscribe({ targetId: TARGET }), 2),
+          ),
+        );
+        yield* Effect.timeout(
+          Effect.gen(function* () {
+            while ((yield* narrations.subscriberCount) === 0) {
+              yield* Effect.sleep("5 millis");
+            }
+          }),
+          "10 seconds",
+        );
+        const input = yield* goal(root, workspace, "goal_steered");
+        const planner = yield* PlanSupervisor;
+        const round = yield* planner.start(input);
+        // Both entries seen, so turn one's outcome is in the report before the steer.
+        yield* Fiber.join(collected);
+        const steered = yield* planner.steer({
+          goalId: "goal_steered",
+          directive: "Carry on with the second dimension.",
+          urgency: "queued",
+          messageId: "cccc0000dddd1111eeee2222ffff3333",
+        });
+        // Turn two's long poll returns having said nothing about how it went, which is
+        // what an interrupted or a dropped turn leaves behind.
+        yield* release(round.harnessSessionId);
+        yield* awaitSettled(round.roundId);
+        const stores = yield* TargetStores;
+        const row = yield* withTargetStore(stores, TARGET, (store) =>
+          store.loadRound(round.roundId),
+        );
+        return { steered, row };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.steered._tag).toBe("steered");
+    expect(recorder.steers).toHaveLength(1);
+    // Not `settled`: that would be turn one's `succeeded` read as the round's answer.
+    expect(observed.row?.status).toBe("uncertain");
+    // And the round concluded nothing, which the honest record says alongside it.
+    expect(observed.row?.disposition).toBeNull();
+
+    await runtime.dispose();
+  });
+
+  /**
+   * The other order, which must not change: a steer the harness **refused** started no new
+   * turn, so the terminal event the stream carried is still the last turn's and still the
+   * right thing to settle from. Clearing before the prompt rather than after acceptance
+   * would have lost it.
+   */
+  test("a refused steer leaves the terminal event it has not superseded", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [
+        {
+          type: "session.execution.succeeded",
+          sequence: 1,
+          at: 1_700_000_000_000,
+          outcome: "succeeded",
+          detail: { _tag: "opaque" },
+        },
+        {
+          type: "session.text.ended",
+          sequence: 2,
+          at: 1_700_000_000_001,
+          outcome: undefined,
+          detail: { _tag: "reply", text: "turn one is done" },
+        },
+      ],
+      status: undefined,
+      steerFails: true,
+    });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const narrations = yield* RunNarrations;
+        const collected = yield* Effect.forkChild(
+          Stream.runCollect(
+            Stream.take(narrations.subscribe({ targetId: TARGET }), 2),
+          ),
+        );
+        yield* Effect.timeout(
+          Effect.gen(function* () {
+            while ((yield* narrations.subscriberCount) === 0) {
+              yield* Effect.sleep("5 millis");
+            }
+          }),
+          "10 seconds",
+        );
+        const input = yield* goal(root, workspace, "goal_refused");
+        const planner = yield* PlanSupervisor;
+        const round = yield* planner.start(input);
+        yield* Fiber.join(collected);
+        const refused = yield* Effect.result(
+          planner.steer({
+            goalId: "goal_refused",
+            directive: "A directive the harness will not take.",
+            urgency: "queued",
+            messageId: "eeee0000ffff11112222333344445555",
+          }),
+        );
+        yield* release(round.harnessSessionId);
+        yield* awaitSettled(round.roundId);
+        const stores = yield* TargetStores;
+        const row = yield* withTargetStore(stores, TARGET, (store) =>
+          store.loadRound(round.roundId),
+        );
+        return { refused, row };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.refused._tag).toBe("Failure");
+    // Turn one's event, still the only turn there was, still the round's answer.
+    expect(observed.row?.status).toBe("settled");
+
     await runtime.dispose();
   });
 

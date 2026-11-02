@@ -96,6 +96,14 @@ export interface Settleable {
    *
    * The harness stating an outcome in its own event stream. Absent when the stream was
    * never established, died early, or simply had not reached the terminal event.
+   *
+   * **It must be the *last* turn's, and that is the supervisor's job rather than this
+   * module's.** The field a supervisor fills from is per-stream, not per-turn, so a
+   * session that takes a second turn holds the first turn's event in it — and this
+   * function ranks it second, which made a settlement assert turn one's answer about turn
+   * two whenever rank 1 had nothing. `plan/planSupervisor.ts` clears it when a steer is
+   * accepted; `run/supervisor.ts` has nothing to clear because nothing steers an attempt.
+   * Both notes are on the `report` declarations there.
    */
   readonly narrated: TerminalOutcome | undefined;
   /**
