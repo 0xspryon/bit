@@ -1033,13 +1033,34 @@ are "three tools and no others". On Claude Code that is not true, and the note h
 corrected to say what is: three tools that write, plus whatever the harness gives it for
 reading, inside a gated directory.
 
-**The fix worth making, as its own slice:** pass `allowedTools` on the importer's
-`createSession` so the session holds the MCP trio plus what it needs to read a page, and nothing
-else. The Claude Agent SDK takes it in the query options and T3 Code already pairs it with an
-MCP allowlist wildcard. Two cautions: the live run reached for `curl` rather than `WebFetch`, so
-restricting without checking which read path actually works would break imports; and the same
-question applies to the planner, goal and worker sessions, which were never audited for it
-either. Do it with a live import to verify against, not blind.
+**Ruled against narrowing the tool set — 2 Nov 2026, the operator's decision.**
+
+The obvious fix was `allowedTools` on the importer's `createSession`, leaving it the three MCP
+tools plus a named read path. It is not being taken, and the reason generalises past the
+examples: "restrict it to `WebFetch`" encodes an assumption that **scope lives on web pages**. A
+private invitation in a Markdown file, a WAF-protected page only a real browser can reach, a
+scope table shipped as a CSV, a short shell script that assembles one — each breaks it, and each
+restriction has to be guessed in advance. Every guess narrows what an importer is for.
+
+**The containment was never the tool list**, and `fleet.ts` says so in the original: the importer
+"fetches a page and calls three tools — and that is exactly why it gets its own gated one". Four
+things carry it instead:
+
+1. **The gated directory.** The policy hook lives in the directory a session runs in and decides
+   every call, per call. A session with no directory of its own is a session whose calls are
+   audited somewhere else or not at all.
+2. **The write surface.** Three MCP tools, and that part _is_ structural: the endpoint selects
+   the toolkit and `authMiddlewareFor` refuses a grant whose tag is not the role it serves. It is
+   a property of the registration, not a filter.
+3. **The citable-pages rule** (S3): provenance can only name a page the operator's own message was
+   about, because any provenance the agent chooses is forgeable.
+4. **The operator's review** of every imported entry, which D13 already makes the only control on
+   an imported scope.
+
+**What this hands to the policy, and should be decided separately:** with the tool list open, the
+gate is carrying the containment alone. In the development configuration that gate **records and
+permits**, so today the per-call control is nominal and only the audit is real. Whatever policy
+ships is what makes this containment true.
 
 ### OpenCode sessions survive a restart — fixed in S7's first half
 
