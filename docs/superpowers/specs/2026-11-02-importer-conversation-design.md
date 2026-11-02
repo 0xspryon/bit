@@ -364,9 +364,15 @@ operator sends another message, a fresh one opens" mints a new id rather than re
 ended one — `ended_at` is never cleared, and a fresh session under an ended id would have
 every write refused.
 
-This is affordable because the index already absorbs it: the session query groups by
-`harness_session_id` and the tally counts across every `caller_scope` of the session, so a new
-id per opening leaves both the session row and its tally intact.
+The **tally** absorbs this for free: the session query groups by `harness_session_id` and the
+tally counts across every `caller_scope` of the session, so a new id per opening keeps counting
+correctly.
+
+**The session row does not, and an earlier draft of this section was wrong to say it did.**
+Until S6's resume lands, a reopen is a _new harness session_, so the picker gains a second row
+and the composer moves to it — one conversation shown as two. That is the honest degradation
+and the picker should not pretend otherwise. It becomes genuinely free only when a reopen can
+resume the same harness session, which is S6.
 
 ### S3.4 — A session the operator opens with no links
 
