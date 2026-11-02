@@ -33,7 +33,8 @@
  *    MCP registration are both acquired in it. {@link GoalConversations.close} closes that
  *    scope, and this layer's finalizer closes every one still open.
  * 2. **`revokeGoal`.** Called after the scope closes, as the check that it did its job —
- *    see {@link closeSession} on why a non-zero count there is a bug and is logged as one.
+ *    see `closeSession` in `harness/liveAgentSessions.ts` on why a non-zero count there is a
+ *    bug and is logged as one.
  * 3. **Process death.** Grants live only in `mcp/credentials.ts`'s in-memory map.
  *
  * **Ending the goal is deliberately not on that list**, and this is the cascade decision
@@ -60,24 +61,12 @@
 import {
   GoalConversationRefused,
   GoalUploadRefused,
-  bitMcpServerName,
   type GoalConversationView,
   type GoalTurnAccepted,
   type GoalUploadView,
   type GoalUploadsAccepted,
 } from "@bit/contracts";
-import {
-  Context,
-  Effect,
-  Exit,
-  Fiber,
-  Layer,
-  Redacted,
-  Scope,
-  Semaphore,
-  Stream,
-  type Duration,
-} from "effect";
+import { Context, Effect, Layer, Stream, type Duration } from "effect";
 
 import {
   closeSync,
@@ -89,7 +78,11 @@ import {
 } from "node:fs";
 import { isAbsolute, relative } from "node:path";
 
-import { AgentHarness, OPEN_PROMPT } from "../harness/agentHarness";
+import type { AgentHarness } from "../harness/agentHarness";
+import {
+  makeLiveAgentSessions,
+  type LiveAgentSession,
+} from "../harness/liveAgentSessions";
 import { HarnessResolver } from "../harness/resolver";
 import { FleetStore, type FleetPaths } from "../persistence/fleet";
 import { McpCredentials } from "../mcp/credentials";
@@ -116,30 +109,6 @@ import {
   uploadNameRefusal,
   type CollectedUpload,
 } from "./goalUploads";
-
-/**
- * `AgentHarness.createSession`, narrowed so that the directory must be gated.
- *
- * The same three lines `plan/planSupervisor.ts`'s `createPlannerSession` is, and here for
- * the same reason: `GatedDirectory` is a brand, `createSession` takes `directory: string`,
- * and a brand that is never *asked for* at a call site constrains nothing. This is the one
- * call in this file that opens a goal session, so passing a path that has not been through
- * `gatedRoleDirectory` is a compile error rather than a convention.
- *
- * `multiTurn: true` is set here rather than by the caller, because it is not a choice a
- * caller of this function could sensibly make differently: a goal conversation is prompted
- * again for every message the operator sends, and a session closed when it went idle could
- * not take the second one.
- */
-const createGoalSession = (
-  harness: AgentHarness["Service"],
-  input: {
-    readonly title: string;
-    readonly model: string;
-    readonly directory: GatedDirectory;
-    readonly sessionId: string;
-  },
-) => harness.createSession({ ...input, multiTurn: true });
 
 /**
  * One file as the HTTP layer hands it over: read off the wire, not yet anywhere on disk.
@@ -190,44 +159,20 @@ const attachmentsFor = (
   };
 };
 
-/** One goal's live conversation, as this process holds it. */
-interface LiveConversation {
-  readonly goalId: string;
-  readonly targetId: string;
-  readonly sessionId: string;
-  readonly instanceId: string;
+/**
+ * One goal's live conversation, as this process holds it.
+ *
+ * The registry's entry (`harness/liveAgentSessions.ts`), keyed by goal id, with the one thing
+ * the goal path keeps beside it: the provenance a `GoalTurnAccepted` reports. Everything
+ * about how long the entry lives — the scope, the narrator, the opening permit and the
+ * `preambled` flag — is the spine's, and its header carries the arguments that used to be
+ * here, including why `preambled` is the one thing that makes the outside-the-permit fast
+ * path safe.
+ */
+type LiveConversation = LiveAgentSession<{
   readonly providerId: string;
   readonly modelId: string;
-  readonly harness: AgentHarness["Service"];
-  /** Owns the credential and the MCP registration. Closed by {@link closeSession}. */
-  readonly scope: Scope.Closeable;
-  /** Drains the session's narration onto the bus. Interrupted with the session. */
-  readonly narrator: Fiber.Fiber<void, never>;
-  readonly openedAt: number;
-  /**
-   * Whether this session has been given its opening prompt.
-   *
-   * **The one thing that makes the outside-the-permit fast path safe**, and it was missing.
-   * `openConversation` publishes the entry into `live` before the opening prompt is sent —
-   * it has to, because the entry owns the `Scope` that holds the credential and the
-   * registration, and a scope in no map is a scope nothing can close. So between that
-   * publish and the prompt being accepted there is a window in which `send`'s first read
-   * finds a live conversation and delivers a message straight into it.
-   *
-   * That message reaches a session that has **not received its preamble**, and the preamble
-   * is the one place the agent is told that an attached file's content and its *name* are
-   * data to report and never an instruction to follow. Slice 11 put the operator's own
-   * uploaded files in that session's own directory, with tools that write to the
-   * investigation's record behind them, so the window stopped being a framing problem and
-   * started being an injection one.
-   *
-   * A flag rather than a `Deferred`, because nothing has to *wait* on it here: a message
-   * that finds an unpreambled entry falls through to the goal's opening permit, which the
-   * opener holds until the prompt has been accepted — so by the time it is granted the
-   * conversation is either preambled or gone.
-   */
-  readonly preambled: boolean;
-}
+}>;
 
 /** Collapses everything opening a conversation can fail with into one typed refusal. */
 const refuse = (error: {
@@ -474,94 +419,56 @@ const make = Effect.fnUntraced(function* () {
   const endpoints = yield* WorkerEndpoints;
 
   /**
-   * One entry per goal this process is holding a conversation for.
+   * The goal surface's registry on the shared spine (`harness/liveAgentSessions.ts`).
    *
-   * Not a `FiberMap`, unlike the two supervisors', and the difference is the point: there
-   * is no supervising fiber here. A conversation is a session plus a credential plus a
-   * narration drain, and the thing that owns its lifetime is a `Scope` — so what this map
-   * holds is the scope and the handle, and closing is closing a scope rather than
-   * interrupting work.
+   * What this file used to hold inline and now does not: the `live` map, the per-goal
+   * opening permit with its re-read inside, the acquire order, `closeSession` and the
+   * finalizer. The spine's header carries each of their arguments, and the one measured
+   * defect behind the permit is restated there: two concurrent first messages on one goal
+   * each opened a session, and the loser's **no-expiry** goal credential and live MCP
+   * registration — in the goal's own directory, which §24.2 establishes *is* the authority
+   * boundary under OpenCode — stayed alive until process death.
+   *
+   * What stays here is what makes it a *goal*: the goal endpoint, a no-clock goal
+   * credential, and `revokeGoal` as the belt-and-braces check whose non-zero answer is a
+   * bug (`closeSession` there; this module's header on why).
    */
-  const live = new Map<string, LiveConversation>();
+  const sessions = yield* makeLiveAgentSessions<LiveConversation["meta"]>(
+    { fleet, endpoints },
+    {
+      // The **goal** endpoint. A goal credential at the planner URL is a `401` before any
+      // tool list is produced — which is what makes "no `add_intent`" a property of the
+      // registration rather than of a filter.
+      endpoint: (urls) => urls.goalMcp,
+      issue: (input) =>
+        credentials.issueWithoutExpiry({
+          // A goal agent, said rather than implied: the registry takes a tagged binding,
+          // and only a goal binding may be issued without a clock expiry.
+          _tag: "goal",
+          targetId: input.targetId,
+          goalId: input.id,
+        }),
+      revokeStray: credentials.revokeGoal,
+      words: {
+        unregisterRefused:
+          "a harness would not take back a goal agent's MCP registration; the credential behind it is revoked either way",
+        strayCredential:
+          "a goal credential outlived its session's scope and had to be revoked explicitly; the scope that acquired it should have done that",
+        closed: "a goal conversation was closed",
+        idKey: "goalId",
+      },
+    },
+  );
 
-  /**
-   * One permit per goal, held while a conversation is being opened for it.
-   *
-   * **Without it two concurrent first messages on one goal each opened a session**, and a
-   * review measured exactly that against the running server: two `POST
-   * …/conversation` calls on a fresh goal both answered `conversation: "opened"` with two
-   * different session ids. `live.set` keeps one, so the loser's `Scope` is in no map and
-   * neither {@link GoalConversations.close} nor this layer's finalizer can ever close it —
-   * leaving a **no-expiry** goal credential and a live MCP registration in the goal's own
-   * directory, which §24.2 establishes *is* the authority boundary under OpenCode. Only
-   * process death would have ended it, which contradicts the list of bounds this module's
-   * header gives.
-   *
-   * It is the same shape of claim the two supervisors already take — `claimedGoals` in
-   * `plan/planSupervisor.ts`, the workspace claim in `run/supervisor.ts` — and it covers
-   * the same stretch those do: the whole of "decide there is nothing, then build it", with
-   * the check **re-read inside the permit** so the loser finds the winner's session and
-   * carries on into it rather than opening a second one.
-   *
-   * It also makes the two places a new conversation is written agree: `live.set` happens
-   * inside `openConversation` and `recordGoalSession` after it, and under one permit no
-   * interleaving can leave the map naming one session while the row names another.
-   *
-   * One entry per goal ever talked to, which is bounded by the goals an operator has
-   * opened — the same bound `claimedGoals` has, and for the same reason it is not swept.
-   */
-  const opening = new Map<string, Semaphore.Semaphore>();
-  const openingLock = (goalId: string): Semaphore.Semaphore => {
-    const held = opening.get(goalId);
-    if (held !== undefined) return held;
-    const made = Semaphore.makeUnsafe(1);
-    opening.set(goalId, made);
-    return made;
-  };
-
-  /**
-   * Gives up on one session: narration first, then its scope, then the belt-and-braces
-   * revoke.
-   *
-   * The order matters in one direction only. The narrator is interrupted first so that no
-   * entry is published for a session whose credential is about to go — an entry arriving
-   * after the registration was removed would be narration about a session nothing can
-   * authorise. Closing the scope is what actually revokes: the credential and the
-   * registration are both acquired in it.
-   *
-   * **`revokeGoal` after the close is a check, not the mechanism.** It returns how many
-   * grants it found, and the expected answer is zero, because the scope has just revoked
-   * this goal's. A non-zero count means a goal grant existed that no scope owned, which is
-   * a bug in this file rather than a condition to handle — so it is logged as one and the
-   * grant is gone either way. It is also the only thing that would bound a leaked goal
-   * credential in a process that keeps running, which is why the call is here rather than
-   * trusted away.
-   */
-  const closeSession = Effect.fnUntraced(function* (entry: LiveConversation) {
-    live.delete(entry.goalId);
-    yield* Fiber.interrupt(entry.narrator);
-    yield* Scope.close(entry.scope, Exit.void);
-    const stray = yield* credentials.revokeGoal(entry.goalId);
-    if (stray > 0) {
-      yield* Effect.logError(
-        "a goal credential outlived its session's scope and had to be revoked explicitly; the scope that acquired it should have done that",
-        { goalId: entry.goalId, sessionId: entry.sessionId, revoked: stray },
-      );
-    }
-    yield* Effect.logInfo("a goal conversation was closed", {
-      goalId: entry.goalId,
-      targetId: entry.targetId,
-      sessionId: entry.sessionId,
-    });
-  });
+  const closeSession = sessions.closeSession;
 
   /**
    * Gives one message to a conversation that is already live.
    *
-   * Extracted because there are now **two** places that reach it: an operator message with
-   * a live entry already in hand, and one that waited on {@link opening} and found that the
-   * conversation it was about to create had been created by somebody else. A second copy of
-   * this would be a second decision about delivery timing.
+   * Extracted because there are **two** places that reach it: an operator message with a
+   * live entry already in hand, and one that waited on the opening permit and found that
+   * the conversation it was about to create had been created by somebody else. A second
+   * copy of this would be a second decision about delivery timing.
    *
    * Delivered as a `steer` at `queued` urgency, which is the same seam a goal agent's
    * `steer_planner` uses into a round and the same reasoning (DECISIONS.md §24.1): the work
@@ -588,7 +495,7 @@ const make = Effect.fnUntraced(function* () {
      * while the rules do not.
      */
     const prompt = assembleGoalFollowUpPrompt({
-      attachments: attachmentsFor(fleet.paths, entry.targetId, entry.goalId),
+      attachments: attachmentsFor(fleet.paths, entry.targetId, entry.id),
       message: text,
     });
     const accepted = yield* Effect.result(
@@ -610,23 +517,17 @@ const make = Effect.fnUntraced(function* () {
     }
     return {
       targetId: entry.targetId,
-      goalId: entry.goalId,
+      goalId: entry.id,
       harnessSessionId: entry.sessionId,
       instanceId: entry.instanceId,
-      providerId: entry.providerId,
-      modelId: entry.modelId,
+      providerId: entry.meta.providerId,
+      modelId: entry.meta.modelId,
       conversation: "continued",
       priorUnavailable: false,
       note: "",
       acceptedAt: Date.now(),
     } satisfies GoalTurnAccepted;
   });
-
-  // Owned by this layer's scope, so a `SIGINT` closes every conversation rather than
-  // dropping it with a live credential behind it.
-  yield* Effect.addFinalizer(() =>
-    Effect.forEach([...live.values()], closeSession, { discard: true }),
-  );
 
   /**
    * Publishes one session's narration under its goal, for as long as the session lives.
@@ -668,160 +569,39 @@ const make = Effect.fnUntraced(function* () {
   });
 
   /**
-   * Opens a conversation: the directory, the session, the credential, the registration.
+   * Records the session id, so a reload can ask the harness for the words.
    *
-   * Every step can fail and the refusals are the ones an operator can act on. The order is
-   * `plan/planSupervisor.ts`'s `prepareRound`, minus the row it has no equivalent of:
-   *
-   * **1. The directory, through `gatedRoleDirectory` and no other way.** The policy gate is
-   * installed into a directory where the goal agent is not expected to run a shell command,
-   * and that is the point rather than an oversight: "the goal agent does not run commands"
-   * is an assumption about what a model will choose to do, and the gate is what makes it a
-   * fact. Under OpenCode this directory is also the authority boundary (DECISIONS.md §24.2)
-   * — the only session in it is this one, which is what makes a credential with no expiry
-   * containable.
-   *
-   * **2. The session, with `multiTurn` set.** No lineage and no parent: the planner's
-   * lineage belongs to planner rounds, and parenting a conversation onto it would hand the
-   * goal agent a prompt-cache prefix built from a different role's prompts.
-   *
-   * **3. The credential, then the registration**, in that order and both in the session's
-   * own scope — so both go when {@link closeSession} closes it.
-   *
-   * **4. The row, last, and only once everything above worked.** A `goal_sessions` row for
-   * a session that was never registered would make the next message report
-   * `priorUnavailable` about a conversation that never existed.
+   * A failure is **not** a refusal: the conversation is open, the operator's message is
+   * about to be delivered, and refusing would throw away a working session over a row that
+   * only matters to a *later* page load. Logged, because the consequence is real — a reload
+   * will report this conversation as absent — and the next message that opens a session
+   * will try the row again.
    */
-  const openConversation = Effect.fnUntraced(function* (input: {
-    readonly targetId: string;
-    readonly goalId: string;
-    readonly targetName: string;
-    readonly workspace: string | undefined;
-  }) {
-    const urls = yield* endpoints.urls;
-    /*
-     * The harness, resolved first, so a server that cannot give this conversation one
-     * leaves nothing behind: no directory, no session, no credential, no row.
-     *
-     * Mapped through `refuse` here rather than leaking `HarnessNotReady` out of this
-     * function, for `plan/planSupervisor.ts`'s reason: every failure a caller of this
-     * service can see is a `GoalConversationRefused`, and a second error type on the
-     * channel would be a second thing every call site had to learn.
-     */
-    const chosen = yield* Effect.result(resolver.resolve(undefined));
-    if (chosen._tag === "Failure") return yield* refuse(chosen.failure);
-    const resolved = chosen.success;
-    const harness = resolved.harness;
-    const sessionId = harness.newSessionId();
-    const model = harness.instance.defaultModel;
-    const provenance = harness.modelProvenance(model);
-
-    /**
-     * The conversation's own scope, which outlives this request.
-     *
-     * `Scope.make` rather than the caller's scope, because the caller is an HTTP handler
-     * that is about to answer: a credential acquired in the request's scope would be
-     * revoked the moment the operator's message was accepted. Closed by
-     * {@link closeSession}, and by this layer's finalizer for anything still open.
-     */
-    const scope = yield* Scope.make();
-    const opened = yield* Effect.result(
-      Effect.gen(function* () {
-        const directory: GatedDirectory = yield* gatedRoleDirectory({
-          ensure: fleet.ensureGoalDirectory(input.targetId, input.goalId),
-          install: harness.installGate,
-          policyUrl: urls.policy,
-          // Outside the goal's directory, like a round's: the gate's own record must not
-          // be somewhere the gated agent can read or rewrite.
-          auditPath: `${fleet.paths.evidenceDirectory(input.targetId)}/${POLICY_AUDIT_FILE}`,
-          // Passed so the containment check can refuse a goal directory inside the
-          // engagement folder. `undefined` says this target has no folder, which is a
-          // statement rather than an omission.
-          workspace: input.workspace,
-        });
-        const created = yield* createGoalSession(harness, {
-          title: `bit goal agent: ${input.targetName}`,
-          model,
-          directory,
-          sessionId,
-        });
-        const credential = yield* credentials.issueWithoutExpiry({
-          // A goal agent, said rather than implied: the registry takes a tagged binding,
-          // and only a goal binding may be issued without a clock expiry.
-          _tag: "goal",
-          targetId: input.targetId,
-          goalId: input.goalId,
-        });
-        const serverName = bitMcpServerName(input.goalId);
-        yield* Effect.acquireRelease(
-          harness.registerMcpServer(created.id, serverName, {
-            // The **goal** endpoint. This is the line that decides which tool list this
-            // session is offered: `mcp/server.ts` serves one toolkit per path, and each
-            // endpoint's middleware refuses a resolved grant whose tag is not the role it
-            // serves. A goal credential at the planner URL is a `401` before any tool list
-            // is produced — which is what makes "no `add_intent`" a property of the
-            // registration rather than of a filter.
-            url: urls.goalMcp,
-            headers: {
-              authorization: Redacted.make(
-                `Bearer ${Redacted.value(credential.token)}`,
-              ),
-            },
-            directory,
+  const recordRow = Effect.fnUntraced(function* (entry: LiveConversation) {
+    const recorded = yield* Effect.result(
+      stores.open(entry.targetId).pipe(
+        Effect.flatMap((store) =>
+          store.recordGoalSession({
+            goalId: entry.id,
+            targetId: entry.targetId,
+            harnessSessionId: entry.sessionId,
+            harnessInstanceId: entry.instanceId,
           }),
-          () =>
-            harness.unregisterMcpServer(created.id, serverName).pipe(
-              Effect.catch((failure) =>
-                Effect.logWarning(
-                  "a harness would not take back a goal agent's MCP registration; the credential behind it is revoked either way",
-                  {
-                    goalId: input.goalId,
-                    server: serverName,
-                    detail: failure.message,
-                  },
-                ),
-              ),
-            ),
-        );
-        return created.id;
-      }).pipe(Scope.provide(scope)),
+        ),
+        Effect.scoped,
+      ),
     );
-    if (opened._tag === "Failure") {
-      // Nothing was registered or the session could not be made: close the scope rather
-      // than leave a credential behind a conversation that does not exist.
-      yield* Scope.close(scope, Exit.void);
-      return yield* refuse(opened.failure);
+    if (recorded._tag === "Failure") {
+      yield* Effect.logError(
+        "a goal conversation's session could not be recorded; a reload will not find it",
+        {
+          goalId: entry.id,
+          targetId: entry.targetId,
+          sessionId: entry.sessionId,
+          detail: recorded.failure.message,
+        },
+      );
     }
-
-    const narrator = yield* Effect.forkIn(
-      narrate({
-        harness,
-        targetId: input.targetId,
-        goalId: input.goalId,
-        sessionId: opened.success,
-      }),
-      scope,
-    );
-    const entry: LiveConversation = {
-      goalId: input.goalId,
-      targetId: input.targetId,
-      sessionId: opened.success,
-      instanceId: harness.instance.instanceId,
-      providerId: provenance.providerId,
-      modelId: provenance.modelId,
-      harness,
-      scope,
-      narrator,
-      openedAt: Date.now(),
-      // Nothing has been said to this session yet. The entry is published anyway — its
-      // `Scope` holds the credential and the registration, and a scope in no map is a scope
-      // neither `close` nor this layer's finalizer can reach — so what keeps a message out
-      // of it until the preamble has landed is the flag rather than the absence of a row.
-      // See {@link LiveConversation.preambled}.
-      preambled: false,
-    };
-    live.set(input.goalId, entry);
-    return entry;
   });
 
   const send: GoalConversations["Service"]["send"] = Effect.fn(
@@ -876,44 +656,39 @@ const make = Effect.fnUntraced(function* () {
      * never an instruction to follow. An unpreambled entry falls through to the permit
      * below, which the opener holds until the prompt has been accepted.
      */
-    const existing = live.get(input.goalId);
-    if (existing !== undefined && existing.preambled) {
+    const existing = sessions.ready(input.goalId);
+    if (existing !== undefined) {
       return yield* deliverInto(existing, input.text);
     }
 
     /*
-     * Nothing live, so one is opened — under this goal's permit, from here to the end.
+     * Nothing live and preambled, so one is opened — under this goal's permit, from here to
+     * the end.
      *
      * The permit covers the decision *and* the building, and the first thing inside it is
-     * the same read again: a message that waited here while another opened the conversation
-     * must carry on into that one rather than build a second. See {@link opening} for what
-     * two sessions on one goal cost.
+     * the same read again: a message that waited while another opened the conversation goes
+     * to `joined` and carries on into that one rather than building a second.
      */
-    return yield* Semaphore.withPermit(openingLock(input.goalId))(
-      Effect.gen(function* () {
-        /*
-         * The winner's session, if one was built while this message waited here.
-         *
-         * No `preambled` check is needed and its absence is not an oversight: the opener
-         * holds this permit across the prompt, so an entry reachable from inside it has
-         * either been preambled or — on a prompt that failed — closed and removed. That is
-         * the invariant the flag exists to make true of the read *outside* the permit.
-         */
-        const raced = live.get(input.goalId);
-        if (raced !== undefined) return yield* deliverInto(raced, input.text);
-
-        /**
-         * No live conversation, so one is opened — and whether there *was* one is the fact the
-         * next few lines exist for.
-         *
-         * The recorded session id survives a restart and the credential does not (grants are
-         * in memory only), so a row with no live entry means the previous conversation is
-         * unreachable: it cannot be prompted, because its agent has no authority, and
-         * prompting it anyway would produce a session with no tools answering into a chat whose
-         * beginning the operator cannot see. The brief's requirement is that the next message
-         * **opens a new session and says so**, and this is both halves of it.
-         */
-        const priorUnavailable = read.success.session !== undefined;
+    /**
+     * Whether there *was* a conversation is the fact the next line exists for.
+     *
+     * The recorded session id survives a restart and the credential does not (grants are
+     * in memory only), so a row with no live entry means the previous conversation is
+     * unreachable: it cannot be prompted, because its agent has no authority, and prompting
+     * it anyway would produce a session with no tools answering into a chat whose beginning
+     * the operator cannot see. The brief's requirement is that the next message **opens a
+     * new session and says so**, and this is both halves of it.
+     */
+    const priorUnavailable = read.success.session !== undefined;
+    return yield* sessions.open<
+      GoalTurnAccepted,
+      GoalConversationRefused,
+      never
+    >({
+      id: input.goalId,
+      joined: (raced) => deliverInto(raced, input.text),
+      refuse,
+      prepare: Effect.gen(function* () {
         const row = yield* Effect.result(fleet.target(input.targetId));
         if (row._tag === "Failure") return yield* refuse(row.failure);
         if (row.success === undefined) {
@@ -922,54 +697,54 @@ const make = Effect.fnUntraced(function* () {
             detail: `no target '${input.targetId}' is registered on this server`,
           });
         }
-        const entry = yield* openConversation({
+        const targetName = row.success.name;
+        /*
+         * The harness, resolved before anything is built, so a server that cannot give
+         * this conversation one leaves nothing behind: no directory, no session, no
+         * credential, no row. Mapped through `refuse`, for `plan/planSupervisor.ts`'s
+         * reason: every failure a caller of this service can see is a
+         * `GoalConversationRefused`.
+         */
+        const chosen = yield* Effect.result(resolver.resolve(undefined));
+        if (chosen._tag === "Failure") return yield* refuse(chosen.failure);
+        const harness = chosen.success.harness;
+        const model = harness.instance.defaultModel;
+        const provenance = harness.modelProvenance(model);
+        return {
           targetId: input.targetId,
-          goalId: input.goalId,
-          targetName: row.success.name,
-          workspace: row.success.workspacePath ?? undefined,
-        });
-
-        // The row last, and only now: see `openConversation`'s step 4.
-        const recorded = yield* Effect.result(
-          stores.open(input.targetId).pipe(
-            Effect.flatMap((store) =>
-              store.recordGoalSession({
-                goalId: input.goalId,
-                targetId: input.targetId,
-                harnessSessionId: entry.sessionId,
-                harnessInstanceId: entry.instanceId,
-              }),
-            ),
-            Effect.scoped,
+          harness,
+          model,
+          sessionId: harness.newSessionId(),
+          // No lineage and no parent: the planner's lineage belongs to planner rounds, and
+          // parenting a conversation onto it would hand the goal agent a prompt-cache
+          // prefix built from a different role's prompts.
+          title: `bit goal agent: ${targetName}`,
+          ensureDirectory: fleet.ensureGoalDirectory(
+            input.targetId,
+            input.goalId,
           ),
-        );
-        if (recorded._tag === "Failure") {
-          /*
-           * The session exists and cannot be found again after a reload.
-           *
-           * Not a refusal: the conversation is open, the operator's message is about to be
-           * delivered, and refusing would throw away a working session over a row that only
-           * matters to a *later* page load. Logged, because the consequence is real — a reload
-           * will report this conversation as absent — and the next message that opens a
-           * session will try the row again.
-           */
-          yield* Effect.logError(
-            "a goal conversation's session could not be recorded; a reload will not find it",
-            {
-              goalId: input.goalId,
+          // Passed so the containment check can refuse a goal directory inside the
+          // engagement folder. `undefined` says this target has no folder.
+          workspace: row.success.workspacePath ?? undefined,
+          narrate: (sessionId: string) =>
+            narrate({
+              harness,
               targetId: input.targetId,
-              sessionId: entry.sessionId,
-              detail: recorded.failure.message,
-            },
-          );
-        }
-
-        const prompted = yield* Effect.result(
-          entry.harness.prompt(
-            entry.sessionId,
+              goalId: input.goalId,
+              sessionId,
+            }),
+          /*
+           * The row, after everything above worked and before the prompt. A
+           * `goal_sessions` row for a session that was never registered would make the next
+           * message report `priorUnavailable` about a conversation that never existed. Under
+           * one permit no interleaving can leave the map naming one session while the row
+           * names another.
+           */
+          beforePrompt: (entry: LiveConversation) => recordRow(entry),
+          openingPrompt: () =>
             assembleGoalOpeningPrompt({
               goalId: input.goalId,
-              targetName: row.success.name,
+              targetName,
               name: goal.name,
               objective: goal.description,
               // Read now, not at upload time: a file attached before the first message is
@@ -981,50 +756,37 @@ const make = Effect.fnUntraced(function* () {
               ),
               message: input.text,
             }),
-            OPEN_PROMPT,
-          ),
-        );
-        if (prompted._tag === "Failure") {
-          // Nothing ran, and the session is useless: it has been prompted-and-failed, and this
-          // seam never resubmits a prompt. Closed so the next message opens a fresh one.
-          yield* closeSession(entry);
-          return yield* refuse(prompted.failure);
-        }
-        /*
-         * The preamble has landed, so the session may now be messaged from outside the
-         * permit.
-         *
-         * Set here and nowhere else — after the prompt was *accepted* and before the permit
-         * is released, so no interleaving can observe a preambled entry that has not been
-         * preambled. Written as a replacement entry rather than a mutation because
-         * `LiveConversation` is readonly throughout; the `Scope` and the narrator fiber are
-         * the same objects, so `closeSession` closes the same things either way.
-         */
-        live.set(input.goalId, { ...entry, preambled: true });
-
-        yield* Effect.logInfo("a goal conversation was opened", {
-          goalId: input.goalId,
-          targetId: input.targetId,
-          sessionId: entry.sessionId,
-          instanceId: entry.instanceId,
-          priorUnavailable,
-        });
-        return {
-          targetId: input.targetId,
-          goalId: input.goalId,
-          harnessSessionId: entry.sessionId,
-          instanceId: entry.instanceId,
-          providerId: entry.providerId,
-          modelId: entry.modelId,
-          conversation: "opened",
-          priorUnavailable,
-          note: priorUnavailable
-            ? `This goal had a conversation on session ${read.success.session?.harnessSessionId ?? "an earlier session"}, which this server process no longer holds — a restart ends a conversation, because the agent's authority lives only in memory. A new conversation has been opened and the agent in it has not read any of the previous one.`
-            : "This is the first message on this goal, so a conversation was opened for it: the agent has the goal's objective and its own tools, and has not read anything else yet.",
-          acceptedAt: Date.now(),
-        } satisfies GoalTurnAccepted;
+          meta: {
+            providerId: provenance.providerId,
+            modelId: provenance.modelId,
+          },
+        };
       }),
-    );
+      opened: (entry) =>
+        Effect.gen(function* () {
+          yield* Effect.logInfo("a goal conversation was opened", {
+            goalId: input.goalId,
+            targetId: input.targetId,
+            sessionId: entry.sessionId,
+            instanceId: entry.instanceId,
+            priorUnavailable,
+          });
+          return {
+            targetId: input.targetId,
+            goalId: input.goalId,
+            harnessSessionId: entry.sessionId,
+            instanceId: entry.instanceId,
+            providerId: entry.meta.providerId,
+            modelId: entry.meta.modelId,
+            conversation: "opened",
+            priorUnavailable,
+            note: priorUnavailable
+              ? `This goal had a conversation on session ${read.success.session?.harnessSessionId ?? "an earlier session"}, which this server process no longer holds — a restart ends a conversation, because the agent's authority lives only in memory. A new conversation has been opened and the agent in it has not read any of the previous one.`
+              : "This is the first message on this goal, so a conversation was opened for it: the agent has the goal's objective and its own tools, and has not read anything else yet.",
+            acceptedAt: Date.now(),
+          } satisfies GoalTurnAccepted;
+        }),
+    });
   });
 
   const replay: GoalConversations["Service"]["replay"] = Effect.fn(
@@ -1035,7 +797,7 @@ const make = Effect.fnUntraced(function* () {
       input.targetId,
       input.goalId,
     );
-    const here = live.get(input.goalId);
+    const here = sessions.get(input.goalId);
     return yield* goalConversationNarration({
       resolver,
       targetId: input.targetId,
@@ -1426,10 +1188,7 @@ const make = Effect.fnUntraced(function* () {
   return GoalConversations.of({
     send,
     replay,
-    close: (goalId) => {
-      const entry = live.get(goalId);
-      return entry === undefined ? Effect.void : closeSession(entry);
-    },
+    close: sessions.close,
     attach,
   });
 });
