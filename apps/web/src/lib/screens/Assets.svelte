@@ -890,6 +890,17 @@
     gap: 6px;
     align-self: flex-start;
     padding: 3px;
+    /*
+     * Pulled out of the page edge by its own chrome, so the *label* lands on it.
+     *
+     * The same trick `.entries` uses, and for the same reason: this control's visible
+     * left edge is "Estate", not the group's border, and 3px of padding plus a 1px
+     * border put that text 4px inside the edge every other line of the page sits on —
+     * the title, the section labels, the entry values. Four pixels is enough to read as
+     * a wobble when they are stacked vertically. Padding the group to zero would do it
+     * too, and would put the selected pill's background hard against the border.
+     */
+    margin-left: -4px;
     border: 1px solid var(--border-muted);
     border-radius: var(--radius-md);
     background: var(--bg-deep);
