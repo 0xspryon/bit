@@ -1373,6 +1373,76 @@ fresh snapshot, bounded by explicit budgets — 128 replay events, 1 MiB encoded
 **This is the fix for ScopeWeaver's SSE Broadcaster, which has no cursor and silently
 loses the gap on a dropped connection.** Copy it.
 
+### `FIX` — conversation history is the harness's, and we do not keep a copy
+
+Decided 2026-11-02. **We read an agent session's history from the harness that minted it,
+and we accept losing it when that harness purges it.** We do not persist conversation
+prose — not in a table, not in a file beside the evidence.
+
+Claude Code sweeps transcripts older than `cleanupPeriodDays` (default 30, minimum 1,
+configurable). OpenCode keeps sessions in its own SQLite store with no age-based expiry.
+Both can be asked for a past session's messages
+(`getSessionMessages` / `api.message.list`), which is what `AgentHarness.messages` already
+abstracts.
+
+**Why not keep our own copy.** Because it is a second record of the same thing, and two
+records of one conversation is a synchronisation problem we would own forever: which is
+authoritative when they disagree, what happens to ours when the harness compacts theirs,
+what a reader is looking at when both exist. The harness already does this job. Paying to
+duplicate it buys a retention guarantee we have not been asked for.
+
+**What this costs, stated plainly.** An attempt's conversation is unreadable once the
+harness drops it. On Claude Code that is roughly thirty days, and not reliably ours to
+extend — the sweep covers `~/.claude` wholesale, so any other `claude` process with a
+lower `cleanupPeriodDays` deletes ours too. That loss is accepted.
+
+#### What survives a purge, and why it is the right half
+
+**The prose is perishable; the consequences are not.** Every fact an agent established is
+already a durable event in this database, written because it is provenance rather than
+because it is chat — `asset.recorded`, `asset.imported`, `scope.entry.added`,
+`observation.recorded`, `attempt.settled`. A session whose transcript Claude Code deleted
+on day thirty-one still renders what it _did_: the entries it wrote, the assets it
+recorded, the observations it produced.
+
+So the honest degradation is the inverse of the obvious fear. We lose the narration and
+keep the record, which is the half that matters for an engagement.
+
+#### The one thing that stays ours
+
+**An index of where to look, which is not history.** To ask a harness for a session you
+need its id _and which harness minted it_ — a session is only readable from the harness
+that created it, and the two answer differently. `goal_sessions`
+(`goal_id, target_id, harness_session_id, harness_instance_id, opened_at`) is already that
+shape, and anything else wanting resumable sessions needs the same handful of columns.
+
+That index is also what makes an honest tombstone possible. **Neither harness can tell you
+a session expired** — Claude Code's `getSessionMessages` returns `[]` for an expired
+session, a missing file, a permission error and a bad id alike; OpenCode raises a clean 404. So the harness can only say _"I do not hold this"_. We supply _"it existed"_ from our
+own row, and the two together make "this session is gone" a statement rather than a guess.
+
+#### The contract this implies
+
+`AgentHarness.messages` answers `Retained | NotHeld`, with unreachable staying in the
+error channel. Three outcomes, three screens: a conversation, a tombstone, a retry.
+Collapsing _expired_ into _unreachable_ turns an expected outcome into something that
+reads like a fault, and collapsing either into an empty list is how a reader concludes
+nothing was ever said.
+
+Claude Code needs a store-reachability check to hold up its end, since an unmounted config
+directory is indistinguishable from an expired session through the SDK alone.
+
+#### What this retracts
+
+`run/transcript.ts` wrote a copy of each attempt's conversation to
+`targets/<id>/evidence/` at settlement. That is retracted by this decision and the writer
+is removed; `readTranscript` keeps only the harness read. `TranscriptSource` loses
+`recorded` and becomes _harness_ or _absent_.
+
+The evidence directory keeps `policy-audit.log`, which is a different kind of artefact: it
+is **our** record of our own gate's decisions, which no harness holds and nothing else
+would retain.
+
 ### Handoff — what it actually is
 
 **Not a transcript replay.** Strategies, from `CommandPolicy.ensureContextHandoff`:
