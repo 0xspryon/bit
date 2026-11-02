@@ -35,6 +35,7 @@ import {
   CONTINUATION_CHAIN_MAX,
   type ContinuationPolicy,
 } from "./continuation";
+import { CONTINUATION_SESSIONS_ASKED } from "./continuationDispatcher";
 import {
   dispatchContinuations,
   enqueueContinuations,
@@ -530,6 +531,68 @@ describe("the conversations a restart interrupted", () => {
       after: ({ dispatched }) => Effect.succeed(dispatched),
     });
     expect(outcome).toEqual([]);
+  });
+
+  /**
+   * The bound on how many conversations one boot asks about, and the fact that it is a
+   * *recency* rule: the indexes grow and are never pruned, so without it a long-lived
+   * target would make one HTTP round trip per authority period it has ever had, on a boot
+   * that is holding the listener's first requests.
+   *
+   * What falls outside it is not continued, which is the safe direction — and a
+   * conversation whose turn was cut off twenty-five conversations ago is not something to
+   * prompt a model about now without being asked.
+   */
+  test("only the newest conversations are asked about, and the rest are reported", async () => {
+    const path = newDatabasePath();
+    const total = CONTINUATION_SESSIONS_ASKED + 3;
+    const double = recordingRouting();
+    // Goals rather than imports, so the chain cap cannot be what decides: each goal is its
+    // own chain, where every import of one target shares one (`chainKeyFor`).
+    const outcome = await boot({
+      path,
+      answers: Object.fromEntries(
+        Array.from({ length: total }, (_, at) => [
+          `ses_goal_${String(at)}`,
+          "abandoned" as const,
+        ]),
+      ),
+      routing: double.make,
+      before: (store) =>
+        Effect.gen(function* () {
+          const host = {
+            callerScope: operatorScope(TARGET),
+            targetId: TARGET,
+          };
+          for (let at = 0; at < total; at += 1) {
+            const goalId = `goal_${String(at).padStart(3, "0")}`;
+            yield* store.openGoal(host, {
+              operationId: `op_${goalId}`,
+              goalId,
+              name: "",
+              description: `Objective ${String(at)}.`,
+            });
+            yield* store.recordGoalSession({
+              goalId,
+              targetId: TARGET,
+              harnessSessionId: `ses_goal_${String(at)}`,
+              harnessInstanceId: "opencode",
+            });
+          }
+        }).pipe(Effect.orDie),
+      after: ({ dispatched }) => Effect.succeed(dispatched),
+    });
+
+    expect(outcome).toHaveLength(CONTINUATION_SESSIONS_ASKED);
+    expect(double.delivered).toHaveLength(CONTINUATION_SESSIONS_ASKED);
+    // The newest, not the first written: both conversation indexes answer newest first, so
+    // the bound reads as "the conversations nobody has touched for longest fall outside it".
+    expect(double.delivered.map((entry) => entry.subject)).toContain(
+      `goal_${String(total - 1).padStart(3, "0")}`,
+    );
+    expect(double.delivered.map((entry) => entry.subject)).not.toContain(
+      "goal_000",
+    );
   });
 });
 

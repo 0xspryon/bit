@@ -63,6 +63,24 @@ import type { Reconciliation } from "./reconcile";
 /** How long a dispatcher's lease on one continuation row runs. */
 export const CONTINUATION_LEASE = 120_000;
 
+/**
+ * How many of a target's conversations, per kind, the queueing pass asks the harness about.
+ *
+ * A bound is needed because the two conversation indexes **grow and are never pruned**: a
+ * target accumulates one `import_sessions` row per authority period and one
+ * `goal_sessions` row per goal, and asking the harness about each one is an HTTP round trip
+ * on a boot that is holding the listener's first requests. `workerSessionsForTarget`'s
+ * `WORKER_SESSIONS_LISTED` is the same argument one screen over.
+ *
+ * **Newest first, which makes the bound a recency rule rather than an arbitrary cut.** Both
+ * reads answer newest first, so what falls outside it is the conversations nobody has
+ * touched for longest — and a conversation whose turn was cut off weeks and twenty-five
+ * conversations ago is not something to prompt a model about now without being asked. A
+ * session that is not asked about is not continued, which is the safe direction, and the
+ * count of them is reported rather than dropped silently.
+ */
+export const CONTINUATION_SESSIONS_ASKED = 25;
+
 /* ── Pass one: decide, and queue ─────────────────────────────────────────────── */
 
 /** One continuation this pass decided about, queued or not. */
@@ -198,8 +216,12 @@ export const enqueueContinuations = Effect.fn("enqueueContinuations")(
       });
     }
 
-    /* The importer's conversations: one per harness session, newest period addressed. */
-    for (const session of yield* store.importSessions(input.targetId)) {
+    /*
+     * The importer's conversations: one per harness session, newest period addressed, and
+     * only the newest {@link CONTINUATION_SESSIONS_ASKED} of them.
+     */
+    const imports = yield* store.importSessions(input.targetId);
+    for (const session of imports.slice(0, CONTINUATION_SESSIONS_ASKED)) {
       const subject: ContinuationSubject = {
         kind: "importer",
         importId: session.latestImportId,
@@ -237,8 +259,9 @@ export const enqueueContinuations = Effect.fn("enqueueContinuations")(
       });
     }
 
-    /* The goal conversations: one per goal, the latest session each. */
-    for (const session of yield* store.goalSessionsForTarget(input.targetId)) {
+    /* The goal conversations: one per goal, the latest session each, same bound. */
+    const goals = yield* store.goalSessionsForTarget(input.targetId);
+    for (const session of goals.slice(0, CONTINUATION_SESSIONS_ASKED)) {
       const subject: ContinuationSubject = {
         kind: "goal",
         goalId: session.goalId,
@@ -276,7 +299,20 @@ export const enqueueContinuations = Effect.fn("enqueueContinuations")(
       });
     }
 
-    return decided as readonly ContinuationDecided[];
+    const notAsked =
+      Math.max(0, imports.length - CONTINUATION_SESSIONS_ASKED) +
+      Math.max(0, goals.length - CONTINUATION_SESSIONS_ASKED);
+    if (notAsked > 0) {
+      yield* Effect.logInfo(
+        "older conversations were not asked about, so nothing of them was continued",
+        {
+          targetId: input.targetId,
+          notAsked,
+          askedPerKind: CONTINUATION_SESSIONS_ASKED,
+        },
+      );
+    }
+    return { decided: decided as readonly ContinuationDecided[], notAsked };
   },
 );
 
@@ -452,7 +488,11 @@ export const dispatchContinuations = Effect.fn("dispatchContinuations")(
           outboxId: row.outboxId,
           subject: request.subject,
           status: "cancelled",
-          detail: `${describeSubject(request.subject)} has already been continued ${String(chain.length)} time(s) in the last ${String(Math.round(CONTINUATION_CHAIN_WINDOW / 60_000))} minutes, which is the cap (${String(CONTINUATION_CHAIN_MAX)}); nothing further is dispatched for it, because a process that keeps dying mid-turn would otherwise keep prompting a model unattended`,
+          // The *chain* and not the subject, and the key is named: for a worker and a goal
+          // they are nearly the same thing, but every importer conversation on one target
+          // shares one chain (`chainKeyFor`), so saying "this conversation has already been
+          // continued three times" would be wrong about which thing hit the cap.
+          detail: `the continuation chain '${request.chainKey}' has already been continued ${String(chain.length)} time(s) in the last ${String(Math.round(CONTINUATION_CHAIN_WINDOW / 60_000))} minutes, which is the cap (${String(CONTINUATION_CHAIN_MAX)}); nothing further is dispatched for ${describeSubject(request.subject)}, because a process that keeps dying mid-turn would otherwise keep prompting a model unattended`,
         });
         continue;
       }

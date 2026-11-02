@@ -164,6 +164,7 @@ import {
   continuationAllowed,
   continuationSettingFor,
   readTranscriptSummary,
+  type ContinuationRequest,
 } from "./recovery/continuation";
 import {
   dispatchContinuations,
@@ -1157,13 +1158,13 @@ const continueInterrupted = (swept: readonly SweptTarget[]) =>
        * identity rather than a message into an old one.
        */
       const deliver = Effect.fnUntraced(function* (input: {
-        readonly request: { readonly subject: unknown };
+        readonly request: ContinuationRequest;
         readonly instruction: string;
       }) {
-        const subject = input.request.subject as
-          | { readonly kind: "attempt"; readonly attemptId: string }
-          | { readonly kind: "importer"; readonly importId: string }
-          | { readonly kind: "goal"; readonly goalId: string };
+        // The decoded subject, not a cast of it: the switch below is exhaustive over
+        // `ContinuationSubject`, so a fourth surface is a compile error here rather than a
+        // continuation that is queued and silently never delivered.
+        const subject = input.request.subject;
         switch (subject.kind) {
           case "attempt": {
             const started = yield* Effect.result(
@@ -1229,7 +1230,7 @@ const continueInterrupted = (swept: readonly SweptTarget[]) =>
         Effect.scoped(
           Effect.flatMap(stores.open(target.targetId), (store) =>
             Effect.gen(function* () {
-              const decided = yield* enqueueContinuations({
+              const queueing = yield* enqueueContinuations({
                 targetId: target.targetId,
                 attempts: target.attempts,
               });
@@ -1243,7 +1244,7 @@ const continueInterrupted = (swept: readonly SweptTarget[]) =>
                   leaseOwner: `pid:${String(process.pid)}`,
                 },
               });
-              return { decided, dispatched };
+              return { decided: queueing.decided, dispatched };
             }).pipe(Effect.provideService(ObservationStore, store)),
           ),
         ),
