@@ -52,7 +52,9 @@ import {
   type ModelOptionSelection,
 } from "@bit/contracts";
 
+import { operatorTextOf } from "./importerPrompt";
 import { ScopeImportProgress } from "./progress";
+import { continuationMessage } from "../recovery/continuation";
 import { ScopeImporter, type ScopeImportRequest } from "./scopeImporter";
 import type {
   AgentHarness,
@@ -2282,6 +2284,55 @@ describe("a reopen that resumes", () => {
      * inflate because a conversation was taken back over.
      */
     expect(index[0]?.entriesIn).toBe(1);
+    await restarted.dispose();
+  });
+
+  /**
+   * S7's continuation, down the path it actually takes.
+   *
+   * The restart dispatcher does not write a second resume: it addresses the newest import
+   * of the session with the synthetic message `recovery/continuation.ts` assembles, through
+   * the same `send` an operator's message goes through. So what this asserts is that the
+   * continuation turn **is** a resume — same session, new authority period — and that the
+   * server's own message is what the agent is given, below the resume framing and marked as
+   * not the operator's.
+   */
+  test("a restart continuation goes down the same resume path, with the server's own message", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    built.script.holds.set(
+      "ses_import",
+      directoryOf(built.root, started.importId),
+    );
+    await runtime.dispose();
+
+    const restarted = ManagedRuntime.make(built.layer);
+    const message = continuationMessage({
+      kind: "importer",
+      importId: started.importId,
+    });
+    const continued = await sendTo(restarted, started.importId, message);
+    expect(continued._tag).toBe("Success");
+    if (continued._tag !== "Success") return;
+    await built.script.done;
+
+    // The conversation is resumed rather than replaced, which is the done criterion for
+    // this surface: the agent keeps its own history and this process did not write a
+    // second resume to get it.
+    expect(continued.success.conversation).toBe("resumed");
+    expect(continued.success.harnessSessionId).toBe("ses_import");
+    expect(built.script.created.at(-1)?.resume).toBe("ses_import");
+
+    // What the agent was handed: the resume framing this server puts above the delimiter,
+    // and below it the server's own message, marked.
+    const prompt = built.script.prompts.at(-1) ?? "";
+    expect(prompt).toContain("reconnected");
+    expect(operatorTextOf(prompt)).toBe(message);
+    expect(operatorTextOf(prompt)?.startsWith("[bit] ")).toBe(true);
+    expect(prompt).toContain("read_scope");
+
     await restarted.dispose();
   });
 

@@ -188,6 +188,16 @@ const supervisorHolding: Layer.Layer<RunSupervisor> = Layer.succeed(
           }),
         ),
       ),
+    // No route reaches it: a continuation is dispatched by the startup sweep, not asked
+    // for over HTTP. Refused by name so this double stays the shape of a server that can
+    // report but not run.
+    continueAttempt: (input) =>
+      Effect.fail(
+        new RunRefused({
+          reason: "no_harness",
+          detail: `attempt ${input.replacesAttemptId} cannot be carried on: this suite configures no harness`,
+        }),
+      ),
     stop: (attemptId) =>
       Effect.fail(
         new RunRefused({

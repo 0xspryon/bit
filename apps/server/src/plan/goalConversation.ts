@@ -84,7 +84,16 @@ import {
   type LiveAgentSession,
 } from "../harness/liveAgentSessions";
 import { HarnessResolver } from "../harness/resolver";
-import { FleetStore, type FleetPaths } from "../persistence/fleet";
+import {
+  roleDirectoryMatcher,
+  sessionReopen,
+  type SessionReopen,
+} from "../harness/sessionReopen";
+import {
+  FleetStore,
+  isRoleDirectoryId,
+  type FleetPaths,
+} from "../persistence/fleet";
 import { McpCredentials } from "../mcp/credentials";
 import { TargetStores } from "../persistence/targetStores";
 import {
@@ -98,6 +107,7 @@ import { WorkerEndpoints } from "../run/supervisor";
 import {
   assembleGoalFollowUpPrompt,
   assembleGoalOpeningPrompt,
+  assembleGoalResumePrompt,
   type PromptAttachment,
 } from "./goalPrompt";
 import { goalConversationNarration } from "./goalNarration";
@@ -590,6 +600,81 @@ const make = Effect.fnUntraced(function* () {
     }
   });
 
+  /**
+   * Whether this goal's recorded session can be carried on, and on which harness (S7).
+   *
+   * `import/importerHistory.ts`'s `importerReopenFor`, one surface along and through the
+   * same {@link sessionReopen}: the harness is asked, every uncertainty is a `fresh`
+   * session, and the directory it names has to be one this server gated. Two refusals are
+   * this function's own and both come before the harness is asked at all — no harness to
+   * ask, and a row naming an instance this server does not run, which must not be asked
+   * about because the harness we *do* have would answer a confident "no such session" for
+   * a session that may be alive elsewhere.
+   *
+   * **A goal's directory is named after the goal**, and unlike an import id a goal id does
+   * not change between authority periods, so the only acceptable answer is this goal's own
+   * directory. Another goal's is refused rather than gated: the gate is per directory, and
+   * resuming goal A's conversation in goal B's directory would run it behind B's gate and
+   * write B's audit file.
+   *
+   * It answers with the harness it resolved, so a resume runs on the instance the
+   * conversation was opened on rather than on today's default — the same rule the importer
+   * reopen keeps, and for the same reason: a conversation that quietly changed model under
+   * the operator is a conversation whose provenance lies.
+   */
+  const goalReopen = Effect.fnUntraced(function* (input: {
+    readonly targetId: string;
+    readonly goalId: string;
+    readonly session: {
+      readonly harnessSessionId: string;
+      readonly harnessInstanceId: string | null;
+    };
+  }) {
+    const resolved = yield* Effect.result(
+      resolver.resolve(input.session.harnessInstanceId ?? undefined),
+    );
+    if (resolved._tag === "Failure") {
+      return {
+        reopen: {
+          _tag: "fresh",
+          detail: resolved.failure.message,
+        } as const satisfies SessionReopen,
+        harness: undefined,
+      };
+    }
+    if (
+      input.session.harnessInstanceId !== null &&
+      resolved.success.instance.instanceId !== input.session.harnessInstanceId
+    ) {
+      return {
+        reopen: {
+          _tag: "fresh",
+          detail: `it ran on harness instance '${input.session.harnessInstanceId}', which this server does not configure, so it cannot be asked about from here`,
+        } as const satisfies SessionReopen,
+        harness: undefined,
+      };
+    }
+    const reopen = yield* sessionReopen({
+      harness: resolved.success.harness,
+      sessionId: input.session.harnessSessionId,
+      gatedRoleId: roleDirectoryMatcher({
+        isRoleId: isRoleDirectoryId,
+        rebuild: (goalId) => fleet.paths.goalDirectory(input.targetId, goalId),
+      }),
+      directoryWords: "goal directories",
+    });
+    if (reopen._tag === "resume" && reopen.roleId !== input.goalId) {
+      return {
+        reopen: {
+          _tag: "fresh",
+          detail: `the harness resolves session ${input.session.harnessSessionId} in goal ${reopen.roleId}'s directory rather than in ${input.goalId}'s, and a conversation is only resumed behind its own goal's gate`,
+        } as const satisfies SessionReopen,
+        harness: undefined,
+      };
+    }
+    return { reopen, harness: resolved.success.harness };
+  });
+
   const send: GoalConversations["Service"]["send"] = Effect.fn(
     "GoalConversations.send",
   )(function* (input) {
@@ -666,6 +751,17 @@ const make = Effect.fnUntraced(function* () {
      * new session and says so**, and this is both halves of it.
      */
     const priorUnavailable = read.success.session !== undefined;
+    const priorSession = read.success.session;
+    /**
+     * What the resume decision was, once `prepare` has made it.
+     *
+     * Written inside `prepare` and read by `opened`, which is the only way round that
+     * works: the decision needs the permit (it is part of deciding what to build) and the
+     * sentence the operator is given needs the answer. Both run inside one `open` call and
+     * `prepare` always runs before `opened`, so there is no interleaving to worry about —
+     * and a joiner never reaches either.
+     */
+    let resumed: SessionReopen | undefined = undefined;
     return yield* sessions.open<
       GoalTurnAccepted,
       GoalConversationRefused,
@@ -691,16 +787,44 @@ const make = Effect.fnUntraced(function* () {
          * reason: every failure a caller of this service can see is a
          * `GoalConversationRefused`.
          */
-        const chosen = yield* Effect.result(resolver.resolve(undefined));
+        /*
+         * The resume question first, because its answer decides which harness this open
+         * runs on: a resumed conversation runs on the instance it was opened on, and only
+         * a fresh one takes this server's default. Asked inside the permit, which is where
+         * `prepare` runs, and it acquires nothing — it is one read of the harness.
+         */
+        const reopen =
+          priorSession === undefined
+            ? undefined
+            : yield* goalReopen({
+                targetId: input.targetId,
+                goalId: input.goalId,
+                session: priorSession,
+              });
+        resumed = reopen?.reopen;
+        const chosen =
+          reopen?.reopen._tag === "resume" && reopen.harness !== undefined
+            ? ({
+                _tag: "Success",
+                success: { harness: reopen.harness },
+              } as const)
+            : yield* Effect.result(resolver.resolve(undefined));
         if (chosen._tag === "Failure") return yield* refuse(chosen.failure);
         const harness = chosen.success.harness;
         const model = harness.instance.defaultModel;
         const provenance = harness.modelProvenance(model);
+        const resume =
+          reopen?.reopen._tag === "resume"
+            ? reopen.reopen.sessionId
+            : undefined;
         return {
           targetId: input.targetId,
           harness,
           model,
+          // Ignored beside `resume`, and minted anyway rather than conditionally: the spine
+          // takes one or the other and says so once, so a surface does not have to.
           sessionId: harness.newSessionId(),
+          ...(resume === undefined ? {} : { resume }),
           // No lineage and no parent: the planner's lineage belongs to planner rounds, and
           // parenting a conversation onto it would hand the goal agent a prompt-cache
           // prefix built from a different role's prompts.
@@ -727,21 +851,37 @@ const make = Effect.fnUntraced(function* () {
            * names another.
            */
           beforePrompt: (entry: LiveConversation) => recordRow(entry),
+          /*
+           * Three situations and two assemblers, which is the split S3.1 argues for: a
+           * session this process created gets the whole preamble, and one it **resumed**
+           * gets three lines about the new authority above the operator's words, because
+           * the preamble is already in the conversation the agent is reading.
+           */
           openingPrompt: () =>
-            assembleGoalOpeningPrompt({
-              goalId: input.goalId,
-              targetName,
-              name: goal.name,
-              objective: goal.description,
-              // Read now, not at upload time: a file attached before the first message is
-              // one the agent must be told about in the prompt that opens the session.
-              attachments: attachmentsFor(
-                fleet.paths,
-                input.targetId,
-                input.goalId,
-              ),
-              message: input.text,
-            }),
+            resume === undefined
+              ? assembleGoalOpeningPrompt({
+                  goalId: input.goalId,
+                  targetName,
+                  name: goal.name,
+                  objective: goal.description,
+                  // Read now, not at upload time: a file attached before the first message
+                  // is one the agent must be told about in the prompt that opens the
+                  // session.
+                  attachments: attachmentsFor(
+                    fleet.paths,
+                    input.targetId,
+                    input.goalId,
+                  ),
+                  message: input.text,
+                })
+              : assembleGoalResumePrompt({
+                  attachments: attachmentsFor(
+                    fleet.paths,
+                    input.targetId,
+                    input.goalId,
+                  ),
+                  message: input.text,
+                }),
           meta: {
             providerId: provenance.providerId,
             modelId: provenance.modelId,
@@ -750,13 +890,20 @@ const make = Effect.fnUntraced(function* () {
       }),
       opened: (entry) =>
         Effect.gen(function* () {
-          yield* Effect.logInfo("a goal conversation was opened", {
-            goalId: input.goalId,
-            targetId: input.targetId,
-            sessionId: entry.sessionId,
-            instanceId: entry.instanceId,
-            priorUnavailable,
-          });
+          const carriedOn = resumed?._tag === "resume";
+          yield* Effect.logInfo(
+            carriedOn
+              ? "a goal conversation was resumed"
+              : "a goal conversation was opened",
+            {
+              goalId: input.goalId,
+              targetId: input.targetId,
+              sessionId: entry.sessionId,
+              instanceId: entry.instanceId,
+              priorUnavailable,
+              continuation: resumed?.detail ?? "none, this goal had no session",
+            },
+          );
           return {
             targetId: input.targetId,
             goalId: input.goalId,
@@ -764,11 +911,17 @@ const make = Effect.fnUntraced(function* () {
             instanceId: entry.instanceId,
             providerId: entry.meta.providerId,
             modelId: entry.meta.modelId,
-            conversation: "opened",
+            // A resumed conversation is a new *authority period* on the session the words
+            // above belong to, which is neither of the other two answers: `continued`
+            // would claim this process had been holding it all along, and `opened` would
+            // tell the operator the agent has read none of what is on their screen.
+            conversation: carriedOn ? "resumed" : "opened",
             priorUnavailable,
-            note: priorUnavailable
-              ? `This goal had a conversation on session ${read.success.session?.harnessSessionId ?? "an earlier session"}, which this server process no longer holds — a restart ends a conversation, because the agent's authority lives only in memory. A new conversation has been opened and the agent in it has not read any of the previous one.`
-              : "This is the first message on this goal, so a conversation was opened for it: the agent has the goal's objective and its own tools, and has not read anything else yet.",
+            note: carriedOn
+              ? `The server process that opened this conversation is no longer running, so the authority behind it was gone — but the conversation itself was not: ${resumed?.detail ?? ""}. This message took it back over on the same session, and the agent in it keeps everything above.`
+              : priorUnavailable
+                ? `This goal had a conversation on session ${read.success.session?.harnessSessionId ?? "an earlier session"}, which this server process no longer holds — a restart ends an authority period, because the agent's credential lives only in memory — and the conversation itself could not be carried on either: ${resumed?.detail ?? "the harness was not asked"}. A new conversation has been opened and the agent in it has not read any of the previous one.`
+                : "This is the first message on this goal, so a conversation was opened for it: the agent has the goal's objective and its own tools, and has not read anything else yet.",
             acceptedAt: Date.now(),
           } satisfies GoalTurnAccepted;
         }),

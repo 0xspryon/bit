@@ -1318,6 +1318,218 @@ describe("stopping a run", () => {
   });
 });
 
+/* ── Carrying an interrupted attempt on (S7.3) ───────────────────────────────── */
+
+describe("carrying an interrupted attempt on", () => {
+  /**
+   * The shape the operator chose in S7.3, and the whole of why it is not a resume: **end
+   * the interrupted attempt, open a new one, and seed the new one with a summary of the
+   * dead one's transcript.**
+   *
+   * A resumed attempt would make its settlement record lie — the observations filed under
+   * that id, the fence its credential was minted against and the disposition recovery gave
+   * it all describe the interrupted run. So what is asserted here is that the two attempts
+   * stay apart and that exactly one thing crosses between them: the prompt.
+   *
+   * The restart is modelled by stopping the first run, which is what a test can arrange and
+   * what leaves the row in the state a sweep leaves it in: terminal, with its authority
+   * revoked. The `uncertain` flavour a real sweep writes is covered in
+   * `recovery/continuationDispatcher.test.ts`, against a real sweep.
+   */
+  test("opens a new attempt linked to the old one, with the summary above the question", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const note = [
+      "CARRYING ON FROM AN INTERRUPTED ATTEMPT",
+      "",
+      "It got as far as reading the login page.",
+    ].join("\n");
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const input = yield* draft(root, "alpha", "probe it");
+        const first = yield* supervisor.start(input);
+        // The process that owned it is gone. Stopping it is how a test reaches the state a
+        // restart sweep leaves: the attempt is terminal and its authority is revoked.
+        yield* supervisor.stop(first.attemptId);
+
+        const continued = yield* supervisor.continueAttempt({
+          targetId: "alpha",
+          replacesAttemptId: first.attemptId,
+          workspace: input.workspace,
+          auditPath: input.auditPath,
+          title: input.title,
+          note,
+        });
+
+        return {
+          first,
+          continued,
+          rows: yield* withTargetStore(stores, "alpha", (store) =>
+            Effect.all({
+              old: store.loadAttempt(first.attemptId, "alpha"),
+              fresh: store.loadAttempt(continued.attemptId, "alpha"),
+              intent: store.intent(input.intentId),
+              events: attemptEventsOf(store),
+            }),
+          ),
+          prompts: [...recorder.prompts],
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    // A new identity, and the link is the only thing that joins them.
+    expect(observed.continued.attemptId).not.toBe(observed.first.attemptId);
+    expect(observed.rows.fresh?.replaces_attempt_id).toBe(
+      observed.first.attemptId,
+    );
+    expect(observed.rows.fresh?.status).toBe("running");
+    // Its own fence, from zero: the dead attempt's credential is not inherited and could
+    // not be, because the fence it was minted against belongs to the other row.
+    expect(observed.rows.fresh?.write_fence).toBe(0);
+    // A new session, too. Nothing of the attempt is resumed — that is the half of S7.3
+    // that separates a worker from a conversation.
+    expect(observed.continued.harnessSessionId).not.toBe(
+      observed.first.harnessSessionId,
+    );
+
+    // The old attempt is untouched by the continuation: still terminal, still ended, and
+    // its own account of what it did stands.
+    expect(observed.rows.old?.status).toBe("interrupted");
+    expect(observed.rows.old?.ended_at).not.toBeNull();
+    expect(observed.rows.old?.replaces_attempt_id).toBeNull();
+
+    // The slice is claimed by the new attempt, so nothing else can take it.
+    expect(observed.rows.intent?.status).toBe("claimed");
+    expect(observed.rows.intent?.claimedByAttemptId).toBe(
+      observed.continued.attemptId,
+    );
+
+    // The one thing that crosses: the summary, above the question and not instead of it.
+    const prompt =
+      observed.prompts.find((entry) =>
+        entry.startsWith(`${observed.continued.harnessSessionId}:`),
+      ) ?? "";
+    expect(prompt).toContain("CARRYING ON FROM AN INTERRUPTED ATTEMPT");
+    expect(prompt).toContain("It got as far as reading the login page.");
+    // Last, as every assembler in this codebase puts the task's own words last.
+    expect(prompt.endsWith("probe it")).toBe(true);
+
+    // And the log says a replacement was opened rather than a run started from nothing.
+    expect(observed.rows.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "attempt.settled",
+      "attempt.started",
+    ]);
+    expect(observed.rows.events[2]?.payload).toMatchObject({
+      replacesAttemptId: observed.first.attemptId,
+    });
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  /**
+   * The durable half of "terminalize first, then continue".
+   *
+   * Even if a caller got the order wrong, nothing happens: the store refuses to open a
+   * replacement for a `running` predecessor, and this refuses before it even asks, so no
+   * second worker can be put on a slice something is still working.
+   */
+  test("refuses an attempt that still says running, and writes nothing", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const stores = yield* TargetStores;
+        const input = yield* draft(root, "alpha", "probe it");
+        const first = yield* supervisor.start(input);
+        const refused = yield* Effect.result(
+          supervisor.continueAttempt({
+            targetId: "alpha",
+            replacesAttemptId: first.attemptId,
+            workspace: input.workspace,
+            auditPath: input.auditPath,
+            title: input.title,
+            note: "",
+          }),
+        );
+        return {
+          refused,
+          attempts: yield* withTargetStore(stores, "alpha", (store) =>
+            store.unsettledAttempts(),
+          ),
+        };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.refused._tag).toBe("Failure");
+    expect(
+      observed.refused._tag === "Failure"
+        ? observed.refused.failure.detail
+        : "",
+    ).toContain("has not been reconciled yet");
+    // One attempt, not two: the refusal wrote no row.
+    expect(observed.attempts).toHaveLength(1);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+
+  test("refuses an attempt this target does not have", async () => {
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [],
+      stream: "open",
+      status: undefined,
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const refused = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const input = yield* draft(root, "alpha", "probe it");
+        return yield* Effect.result(
+          supervisor.continueAttempt({
+            targetId: "alpha",
+            replacesAttemptId: "ats_never_existed",
+            workspace: input.workspace,
+            auditPath: input.auditPath,
+            title: input.title,
+            note: "",
+          }),
+        );
+      }).pipe(Effect.orDie),
+    );
+
+    expect(refused._tag).toBe("Failure");
+    expect(refused._tag === "Failure" ? refused.failure.reason : "").toBe(
+      "unknown_attempt",
+    );
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
+});
+
 describe("when the harness stops being readable", () => {
   test("a narration stream that dies does not settle the run", async () => {
     // The clearest form of "a stream ending is not an outcome": the stream fails

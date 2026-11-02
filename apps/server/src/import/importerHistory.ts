@@ -84,6 +84,7 @@ import {
   type AgentHarness,
 } from "../harness/agentHarness";
 import type { HarnessResolver } from "../harness/resolver";
+import { roleDirectoryMatcher, sessionReopen } from "../harness/sessionReopen";
 import { isRoleDirectoryId } from "../persistence/fleet";
 
 /** How long the harness is given to answer about one conversation. */
@@ -121,33 +122,16 @@ export type ImporterReopen =
 /**
  * Whether a message to this import can continue its harness session, asked of the harness.
  *
- * **Never fails, and a harness that cannot be asked answers `fresh`.** A fresh session
- * always works; a resume that was promised and then refused is a message the operator
- * loses. So every uncertainty resolves to the answer that cannot fail, with the reason in
- * the sentence.
+ * The importer's half of {@link sessionReopen}, which is where the reasoning now lives:
+ * never fails, every uncertainty is a `fresh` session with the reason in its sentence, and
+ * the directory the harness names has to be **one of this target's own import
+ * directories** — rebuilt from the id in its last segment through
+ * `FleetPaths.importDirectory` and compared — because the policy gate lives in the
+ * directory the session runs in.
  *
- * ## The directory check, which is the half that is about authority rather than about resume
- *
- * Both drivers resolve the conversation through the directory the session was created in —
- * OpenCode through the session's stored directory, answering `LocationNotFoundError` for
- * one that is gone, and Claude Code through the project its `cwd` belongs to. That is the
- * caveat S2.5 says to verify rather than assume, and verifying it costs one comparison.
- *
- * But the *reason* to verify is stronger than the caveat. **The pre-execution policy gate
- * lives in the directory the session runs in** (`policy/install.ts`, and `fleet.ts`'s note
- * on why the importer gets a directory of its own at all). A resume into a directory this
- * server did not gate is an agent whose tool calls nothing is consulting — so the path the
- * harness reports is not merely checked for existence, it is required to be **one of this
- * target's own import directories**, rebuilt from the id in its last segment through
- * `FleetPaths.importDirectory` and compared. Nothing is parsed out of the path and trusted:
- * a segment that is not a usable role id, or a rebuilt path that does not match, is a
- * `fresh` session.
- *
- * A harness that reports no directory at all is `fresh` for the same reason: there is
- * nothing to match, and "we could not tell where it runs" is not permission to resume into
- * it. The directory does not have to *exist* — the reopen calls `ensureImportDirectory` for
- * it, which recreates a swept one and reinstalls the gate, which is also the answer to
- * OpenCode's `LocationNotFoundError`.
+ * What is the importer's own here is the word in the refusal and the name of the id in the
+ * answer: `directoryImportId`, the import whose directory the harness resolves the session
+ * in, which is the original opening's and not the successor's.
  */
 export const importerReopen = Effect.fnUntraced(function* (input: {
   readonly harness: AgentHarness["Service"];
@@ -156,42 +140,30 @@ export const importerReopen = Effect.fnUntraced(function* (input: {
   /** `FleetPaths.importDirectory`, so this module builds no paths of its own. */
   readonly importDirectory: (targetId: string, importId: string) => string;
 }) {
-  const asked = yield* Effect.result(
-    input.harness.sessionContinuation(input.sessionId),
-  );
-  if (asked._tag === "Failure") {
-    return {
-      _tag: "fresh",
-      detail: `the harness could not be asked whether it still holds session ${input.sessionId} — ${asked.failure.message}`,
-    } as const satisfies ImporterReopen;
-  }
-  if (asked.success._tag === "unresumable") {
-    return {
-      _tag: "fresh",
-      detail: asked.success.detail,
-    } as const satisfies ImporterReopen;
-  }
-  const directory = asked.success.directory;
-  if (directory === undefined) {
-    return {
-      _tag: "fresh",
-      detail: `the harness still holds session ${input.sessionId} but did not say which directory it resolves it in, and a session is only resumed into a directory this server has gated`,
-    } as const satisfies ImporterReopen;
-  }
-  const segment = directory.slice(directory.lastIndexOf("/") + 1);
-  const mine =
-    isRoleDirectoryId(segment) &&
-    input.importDirectory(input.targetId, segment) === directory;
-  return mine
+  const reopen = yield* sessionReopen({
+    harness: input.harness,
+    sessionId: input.sessionId,
+    gatedRoleId: roleDirectoryMatcher({
+      isRoleId: isRoleDirectoryId,
+      rebuild: (importId) => input.importDirectory(input.targetId, importId),
+    }),
+    directoryWords: "import directories",
+  });
+  // The spine's `roleId` read as what it is on this surface: the import whose directory
+  // the harness resolves the session in, which is the original opening's and not the
+  // successor's. Renamed rather than passed through, because `ScopeImportRequest.resume`
+  // takes `directoryImportId` and a reader of that field should not have to know that the
+  // shared decision calls it something more general.
+  return reopen._tag === "fresh"
     ? ({
-        _tag: "resume",
-        sessionId: input.sessionId,
-        directoryImportId: segment,
-        detail: asked.success.detail,
+        _tag: "fresh",
+        detail: reopen.detail,
       } as const satisfies ImporterReopen)
     : ({
-        _tag: "fresh",
-        detail: `the harness still holds session ${input.sessionId}, but it resolves it in '${directory}', which is not one of this target's own import directories — so it is not a directory this server gates, and the session is not resumed into it`,
+        _tag: "resume",
+        sessionId: reopen.sessionId,
+        directoryImportId: reopen.roleId,
+        detail: reopen.detail,
       } as const satisfies ImporterReopen);
 });
 

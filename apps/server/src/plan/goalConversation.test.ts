@@ -46,7 +46,11 @@ import {
   Stream,
 } from "effect";
 
-import { AgentHarness, type McpRegistration } from "../harness/agentHarness";
+import {
+  AgentHarness,
+  type McpRegistration,
+  type SessionContinuation,
+} from "../harness/agentHarness";
 import { HarnessResolver } from "../harness/resolver";
 import { STUB_INSTANCE, stubHarness } from "../harness/stubHarness";
 import { McpCredentials } from "../mcp/credentials";
@@ -85,6 +89,8 @@ interface Recorder {
     sessionId: string;
     directory: string;
     multiTurn: boolean;
+    /** The session this create **continued** rather than made, if any (S7). */
+    resumed: string | undefined;
   }[];
   readonly gated: string[];
   readonly registrations: { name: string; url: string; bearer: string }[];
@@ -147,6 +153,14 @@ const fakeHarness = (
     readonly openPromptGate?: Deferred.Deferred<void> | undefined;
     /** Resolved when the opening prompt is entered, before it parks. */
     readonly openPromptEntered?: Deferred.Deferred<void> | undefined;
+    /**
+     * What the harness says when asked whether it still holds a session (S7).
+     *
+     * The stub's own default answers `resumable` with **no directory**, which is the safe
+     * dull answer and reaches `fresh`. A test about resuming states the directory it means,
+     * because the directory is the half of the decision that is about authority.
+     */
+    readonly continuation?: SessionContinuation | undefined;
   },
 ): AgentHarness["Service"] =>
   stubHarness({
@@ -163,11 +177,14 @@ const fakeHarness = (
         if (options?.createGate !== undefined) {
           yield* Deferred.await(options.createGate);
         }
-        const id = input.sessionId ?? "ses_unchosen";
+        // `resume` first, as the seam says: a continued session keeps its own id, and
+        // `sessionId` is ignored beside it.
+        const id = input.resume ?? input.sessionId ?? "ses_unchosen";
         recorder.created.push({
           sessionId: id,
           directory: input.directory,
           multiTurn: input.multiTurn === true,
+          resumed: input.resume,
         });
         return { id };
       }),
@@ -222,6 +239,12 @@ const fakeHarness = (
         ).map((entry) => ({ ...entry, error: undefined })),
       ),
     sessionEvents: () => Stream.never,
+    ...(options?.continuation === undefined
+      ? {}
+      : {
+          sessionContinuation: (): Effect.Effect<SessionContinuation> =>
+            Effect.succeed(options.continuation as SessionContinuation),
+        }),
   });
 
 /**
@@ -237,6 +260,7 @@ const world = (options?: {
   readonly createEntered?: Deferred.Deferred<void> | undefined;
   readonly openPromptGate?: Deferred.Deferred<void> | undefined;
   readonly openPromptEntered?: Deferred.Deferred<void> | undefined;
+  readonly continuation?: SessionContinuation | undefined;
 }) => {
   const scratch = newScratch();
   const root = join(scratch, "fleet");
@@ -263,6 +287,7 @@ const world = (options?: {
    */
   const make = (over?: {
     readonly messages?: readonly { type: string; text: string }[];
+    readonly continuation?: SessionContinuation | undefined;
   }) => {
     const recorder = emptyRecorder();
     const settings = { ...options, ...over };
@@ -1233,6 +1258,104 @@ describe("a restart with a goal conversation live", () => {
       ).pipe(Effect.orDie),
     );
     expect(recorded?.harnessSessionId).toBe(after.harnessSessionId);
+
+    await second.runtime.dispose();
+  });
+
+  /**
+   * S7's first done criterion for this surface: the goal conversation continues by
+   * **resuming** its session.
+   *
+   * The restart case above is the same world with the harness answering that it no longer
+   * resolves the session anywhere we gate — which is still the honest default. This is the
+   * case the drivers actually produce after a restart: the conversation is on disk (Claude
+   * Code) or a row in the harness's own store (OpenCode), and it resolves in the goal's own
+   * directory, which this server gated when it opened it.
+   *
+   * What the assertions are about, in order: the session id does not change, so the words on
+   * the operator's screen stay this conversation's; the create was a *continue* and not a
+   * create; the prompt is the resume framing rather than 2.4 KB of preamble the agent
+   * already has; and the row still names the same session.
+   */
+  test("a session the harness still holds in this goal's own directory is resumed, not replaced", async () => {
+    const { first, make, ready, root } = world();
+    await ready;
+
+    const before = await sending(first.runtime, "what is happening?");
+    await first.runtime.dispose();
+
+    const second = make({
+      continuation: {
+        _tag: "resumable",
+        // The goal's own gated directory, which is where this server opened it.
+        directory: join(root, "targets", TARGET, "goal", GOAL),
+        detail: "the transcript is still on disk",
+      },
+    });
+    const after = await sending(second.runtime, "are you still there?");
+
+    expect(after.conversation).toBe("resumed");
+    // One conversation, a second authority period: the same session id, so the replay
+    // already on screen is still about the session that is now live.
+    expect(after.harnessSessionId).toBe(before.harnessSessionId);
+    expect(second.recorder.created[0]?.resumed).toBe(before.harnessSessionId);
+    // And it is gated and run in the goal's own directory, which is the half of the
+    // decision that is about authority rather than about resuming.
+    expect(second.recorder.created[0]?.directory).toBe(
+      join(root, "targets", TARGET, "goal", GOAL),
+    );
+    expect(second.recorder.gated).toEqual([
+      join(root, "targets", TARGET, "goal", GOAL),
+    ]);
+    // The resume framing, not the preamble: the rules and the objective are in the
+    // conversation the agent is reading.
+    const prompt = second.recorder.prompts[0]?.text ?? "";
+    expect(prompt).not.toContain("You are the goal agent in bit");
+    expect(prompt).toContain("This conversation has been reconnected");
+    expect(prompt).toContain("Nothing of this goal's work is still running");
+    // The operator's words, below the same delimiter an opener uses, so a replay trims
+    // this framing exactly as it trims an opening prompt's.
+    expect(operatorTextOf(prompt)).toBe("are you still there?");
+    expect(after.note).toContain("took it back over");
+
+    const recorded = await second.runtime.runPromise(
+      Effect.flatMap(TargetStores, (stores) =>
+        withTargetStore(stores, TARGET, (store) => store.goalSession(GOAL)),
+      ).pipe(Effect.orDie),
+    );
+    expect(recorded?.harnessSessionId).toBe(before.harnessSessionId);
+
+    await second.runtime.dispose();
+  });
+
+  /**
+   * The other half of the directory check, and the reason it is not a formality.
+   *
+   * The policy gate lives in the directory a session runs in, so a resume into a directory
+   * this server did not gate is an agent whose tool calls nothing is consulting. A harness
+   * that resolves our session somewhere else — another goal's directory, the operator's home
+   * folder, a path we cannot rebuild — gets a fresh session instead.
+   */
+  test("a session the harness resolves in another goal's directory is not resumed into it", async () => {
+    const { first, make, ready, root } = world();
+    await ready;
+
+    const before = await sending(first.runtime, "what is happening?");
+    await first.runtime.dispose();
+
+    const second = make({
+      continuation: {
+        _tag: "resumable",
+        directory: join(root, "targets", TARGET, "goal", "goal_other"),
+        detail: "still on disk",
+      },
+    });
+    const after = await sending(second.runtime, "are you still there?");
+
+    expect(after.conversation).toBe("opened");
+    expect(after.harnessSessionId).not.toBe(before.harnessSessionId);
+    expect(second.recorder.created[0]?.resumed).toBeUndefined();
+    expect(after.note).toContain("goal_other");
 
     await second.runtime.dispose();
   });

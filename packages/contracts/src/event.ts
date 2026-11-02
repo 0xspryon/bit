@@ -172,6 +172,25 @@ export const EventKind = Schema.Literals([
   "scope.host.label.cleared",
   "scope.asset.labelled",
   "scope.asset.label.cleared",
+  /**
+   * A continuation this server owes a session whose process is gone (S7).
+   *
+   * **The one kind here whose whole purpose is to explain an outbox row.** Every other
+   * event records a change to the graph; this one records a *decision to dispatch a turn
+   * later*, and it exists because `outbox.caused_by_event_id` is a real foreign key: an
+   * obligation with no event behind it would be an obligation nobody can explain.
+   *
+   * Written by the startup sweep, after every non-terminal run has been terminalized and
+   * never before — the ordering S7.1 asks for. The payload names the surface (an attempt,
+   * an importer conversation, a goal conversation), the subject, the harness session the
+   * answer came from, what the harness said about it (`abandoned`), and the chain key the
+   * continuation cap counts on. Host-originated, so the three caller-authority columns are
+   * null and the subject is the attempt, import or goal.
+   *
+   * It is **not** a claim that anything was continued. The outbox row is what says whether
+   * it was dispatched, and its `last_error` is what says why it was not.
+   */
+  "agent.continuation.requested",
 ]);
 export type EventKind = typeof EventKind.Type;
 
@@ -226,7 +245,7 @@ export type OutboxRecoveryPolicy = typeof OutboxRecoveryPolicy.Type;
 /**
  * The side-effect request types this build enqueues.
  *
- * Two, and the shortfall is deliberate. §18's accepted entries are what makes each one a
+ * Three, and the shortfall is deliberate. §18's accepted entries are what makes each one a
  * real obligation rather than a decorative row: `asset.enrich` is "deterministic asset
  * enrichment with explicit policy", and `notification.deliver` is the notification
  * subsystem, which §18 says to build "using the existing transactional outbox".
@@ -236,10 +255,18 @@ export type OutboxRecoveryPolicy = typeof OutboxRecoveryPolicy.Type;
  * atomic claim), not the outbox — so inventing one would make the mechanism look more
  * exercised than it is. A mutation that was obliged to write an outbox row would be a
  * design error, and this is what proves it is not.
+ *
+ * `agent.continue` is the third and the first one anything dispatches (S7). A continuation
+ * is a *prompt into a model*: it costs money, it is visible to an operator, and the thing
+ * that owes it is a startup sweep that has just established the process which owned the
+ * work is gone. That is precisely a durable side-effect request — committed with the event
+ * explaining it, dispatched afterwards by something that may itself die mid-way — which is
+ * what the outbox is for and why S7.4 says this is where its dispatcher goes.
  */
 export const OutboxRequestType = Schema.Literals([
   "asset.enrich",
   "notification.deliver",
+  "agent.continue",
 ]);
 export type OutboxRequestType = typeof OutboxRequestType.Type;
 
@@ -255,13 +282,32 @@ export type OutboxRequestType = typeof OutboxRequestType.Type;
  * repeating, not to repeat and hope. It is not `idempotency_key` because no receiver is
  * wired, and claiming a key the other side honours would be a claim about a system that
  * does not exist here yet.
+ *
+ * `agent.continue` is `reconcile_first`, and it is the type that makes the distinction earn
+ * its keep. A continuation whose outcome we lost must not be repeated on the strength of a
+ * `pending` row: the turn may be running, the attempt may already have been replaced, and
+ * repeating would spend a model call and could put two workers on one slice. So the
+ * dispatcher reads the state before it acts — which is the same read that decided to
+ * enqueue the row — and a row it cannot establish the state for is left alone rather than
+ * sent again. It is not `safe_to_retry` because a model call is not free, and not
+ * `do_not_repeat` because the state genuinely can be read.
  */
 export const OUTBOX_RECOVERY_POLICIES = {
   "asset.enrich": "safe_to_retry",
   "notification.deliver": "reconcile_first",
+  "agent.continue": "reconcile_first",
 } as const satisfies Record<OutboxRequestType, OutboxRecoveryPolicy>;
 
-/** The delivery states an outbox row can hold. Sprint 02 writes only `pending`. */
+/**
+ * The delivery states an outbox row can hold.
+ *
+ * Sprint 02 wrote only `pending` and nothing moved it. S7's continuation dispatcher moves
+ * `agent.continue` rows through all five: `in_flight` under a lease while it is being
+ * dispatched, `succeeded` for a continuation the surface accepted, `failed` for one it
+ * refused, and `cancelled` for one this server decided not to send at all — the operator
+ * switched continuation off, or the chain had already been continued as often as the cap
+ * allows. The other two types are still only ever `pending`.
+ */
 export const OutboxStatus = Schema.Literals([
   "pending",
   "in_flight",

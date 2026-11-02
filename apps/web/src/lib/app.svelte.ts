@@ -3367,8 +3367,11 @@ export class App {
       },
     ];
     this.goalMessage = "";
+    // Not on a `continued` turn, which changes nothing the operator can see. On an
+    // `opened` *or* a `resumed` one it does: both mean this process was not holding the
+    // session when the message arrived, and the note is the sentence saying which happened.
     this.goalSessionNote =
-      call.value.conversation === "opened" ? call.value.note : "";
+      call.value.conversation === "continued" ? "" : call.value.note;
     // What the agent is actually running on, which only an accepted turn states. See
     // {@link goalAgentRuntime}.
     this.goalAgentRuntime = {
@@ -3379,13 +3382,15 @@ export class App {
     /*
      * The conversation is live now, which the replay read before it was.
      *
-     * Only on the turn that **opened** one: a `continued` turn changes nothing the replay
-     * said, and re-reading it would replace the block an operator is reading mid-sentence.
-     * On an opened one the replay is about a session this process no longer holds — or
-     * about no session at all — and leaving it on screen would attribute the last
-     * conversation's words to this one.
+     * Not on a `continued` turn: it changes nothing the replay said, and re-reading it
+     * would replace the block an operator is reading mid-sentence. On an `opened` one the
+     * replay is about a session this process no longer holds — or about no session at all
+     * — and leaving it on screen would attribute the last conversation's words to this
+     * one. On a `resumed` one the words on screen are still this conversation's, and the
+     * re-read is what makes them *live* rather than a replay: the same session, now held
+     * here, so the feed and the history agree about which session is speaking.
      */
-    if (call.value.conversation === "opened") {
+    if (call.value.conversation !== "continued") {
       void this.loadGoalConversation(goalId);
     }
   }

@@ -49,6 +49,15 @@
  * `plan/goalNarration.ts`, whose replay now trims framing from more than one entry and
  * whose operator-facing note says so.
  *
+ * ## The second exception: the first message into a session this process resumed (S7)
+ *
+ * {@link assembleGoalResumePrompt} puts its own framing above the same delimiter, and it is
+ * an exception of the same kind rather than a repeat of the preamble: it says that the
+ * authority behind the conversation is new and what the restart cancelled, neither of which
+ * is in the session's history, and it restates no rule that is. It is sent once per
+ * *authority period* rather than once per session, which is why "sent exactly once" above
+ * means once per opening.
+ *
  * ## Why it is this short
  *
  * It does not restate what each tool does: the MCP client puts every tool's own description
@@ -372,6 +381,60 @@ export const assembleGoalOpeningPrompt = (input: {
   };
   readonly message: string;
 }): string => [...goalAgentPreamble(input), input.message].join("\n");
+
+/**
+ * The first message into a session this process has **resumed** (S7).
+ *
+ * `import/importerPrompt.ts`'s `assembleImporterResumePrompt`, one surface along, for the
+ * same reason and with the same shape — which is why the two read alike: the situation is
+ * neither an opening nor a later message. The preamble, the tool guidance and the goal's
+ * objective are already in the session's own history, so resending them would be the cost
+ * and the drift one prompt assembler per situation exists to avoid. But it is not an
+ * ordinary follow-up either: **the authority behind it is new.** The process that minted
+ * the goal agent's credential is gone, the MCP server has been registered again under a
+ * fresh grant, and the agent has no way to notice except by being told — or by getting a
+ * `401` from a tool it used a minute of its own time ago.
+ *
+ * It also says that nothing of the goal's work is still running, because the goal agent is
+ * the one surface that can be *wrong* about that: it steers planner rounds and reads
+ * `list_attempts`, and a round or an attempt in flight when the process died has been
+ * settled `uncertain` by the sweep before this prompt is sent (S7.1's ordering). An agent
+ * that assumed its last round carried on would report work that is not happening. It is
+ * said on every resume rather than only when something was swept, because it is true on
+ * every resume: this process is not the one that started that work, and no fiber here is
+ * watching it.
+ *
+ * The operator's words go below the same {@link GOAL_PROMPT_DELIMITER} as an opener's, so
+ * `plan/goalNarration.ts` trims this framing out of a later replay exactly as it trims an
+ * opener's — and, as on the importer, a resumed conversation therefore has framing on more
+ * than one of its `user` entries.
+ */
+export const assembleGoalResumePrompt = (input: {
+  readonly attachments: {
+    readonly directory: string;
+    readonly files: readonly PromptAttachment[];
+    readonly unlistable?: number | undefined;
+  };
+  readonly message: string;
+}): string =>
+  [
+    `This conversation has been reconnected. The server process that opened this session is`,
+    `no longer running, so your tools have been registered again under a fresh grant: they`,
+    `work, and they are the same tools. Your goal, your rules and everything you and the`,
+    `operator have already said are above, in this same conversation.`,
+    ``,
+    `Nothing of this goal's work is still running. A planner round or a worker attempt that`,
+    `was in flight when that process died has been settled 'uncertain' by this server's`,
+    `startup sweep — which means its authority was revoked and nobody established what it`,
+    `did. Call list_attempts before you tell the operator what is happening, and do not`,
+    `assume a round you opened earlier carried on.`,
+    ``,
+    // The attachment list, as every other goal prompt carries it: it is state that changes
+    // between turns, and files may have been attached while this conversation was down.
+    ...goalAttachmentBlock(input.attachments),
+    ...GOAL_PROMPT_DELIMITER.split("\n").slice(0, -1),
+    input.message,
+  ].join("\n");
 
 /**
  * A later message: the operator's words verbatim, or the attachment list above them.

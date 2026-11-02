@@ -153,11 +153,25 @@ import { McpCallCounter } from "./mcp/server";
 import { FleetStore } from "./persistence/fleet";
 import { ObservationStore } from "./persistence/store";
 import { TargetStores } from "./persistence/targetStores";
+import { POLICY_AUDIT_FILE } from "./policy/install";
 import { PERMISSIVE_POLICY, PolicyDecisions } from "./policy/service";
 import { harnessSelection, renderSelection, KNOWN_DRIVERS } from "./run/model";
 import { RunNarrations } from "./run/narration";
 import { RunSupervisor, WorkerEndpoints } from "./run/supervisor";
 import { HarnessSessionStatus } from "./recovery/harnessStatus";
+import {
+  CONTINUATION_SETTING,
+  continuationAllowed,
+  continuationSettingFor,
+  readTranscriptSummary,
+} from "./recovery/continuation";
+import {
+  dispatchContinuations,
+  enqueueContinuations,
+  renderContinuationDecided,
+  renderContinuationDispatched,
+  type ContinuationOutcome,
+} from "./recovery/continuationDispatcher";
 import {
   reconcileRunningRounds,
   reconcileUnsettledAttempts,
@@ -165,6 +179,7 @@ import {
   renderReleasedClaim,
   renderReconciliation,
   renderRoundReconciliation,
+  type Reconciliation,
 } from "./recovery/reconcile";
 
 /**
@@ -950,14 +965,28 @@ const endpoint = Layer.unwrap(
  * supervisor, and the supervisor cannot be asked for one until the MCP URL is published —
  * which happens on the line above the call to this.
  */
+/**
+ * One target the sweep got through, and what it concluded about its attempts.
+ *
+ * The handover between the two halves of S7, and the reason it is a value rather than a
+ * second read: the continuation pass acts on what reconciliation *concluded*, so it cannot
+ * be called about an attempt nothing terminalized. A target the sweep could not open is not
+ * in this list at all, and nothing of it is continued.
+ */
+interface SweptTarget {
+  readonly targetId: string;
+  readonly attempts: readonly Reconciliation[];
+}
+
 const reconcile = Effect.gen(function* () {
   if (process.env["RECONCILE_ON_START"] === "0") {
     console.log("startup reconciliation skipped (RECONCILE_ON_START=0)");
-    return;
+    return [] as readonly SweptTarget[];
   }
   const registry = yield* FleetStore;
   const stores = yield* TargetStores;
   const rows = yield* registry.targets();
+  const sweptTargets: SweptTarget[] = [];
   let swept = 0;
   let attempts = 0;
   let rounds = 0;
@@ -989,6 +1018,13 @@ const reconcile = Effect.gen(function* () {
     swept += 1;
     attempts += outcome.success.attempts.length;
     rounds += outcome.success.rounds.length;
+    // Carried out of here for the continuation pass, which acts on what the sweep
+    // *concluded* rather than re-reading the rows — so there is no way to continue
+    // something this pass did not terminalize first (S7.1).
+    sweptTargets.push({
+      targetId: row.targetId,
+      attempts: outcome.success.attempts,
+    });
     for (const entry of outcome.success.attempts)
       console.log(`  ${row.targetId}: ${renderReconciliation(entry)}`);
     for (const entry of outcome.success.rounds)
@@ -999,7 +1035,244 @@ const reconcile = Effect.gen(function* () {
       ? `startup reconciliation: no attempt or planner round was left unsettled across ${String(swept)} target(s)`
       : `startup reconciliation: ${String(attempts)} attempt(s) and ${String(rounds)} planner round(s) across ${String(swept)} target(s)`,
   );
+  return sweptTargets as readonly SweptTarget[];
 });
+
+/**
+ * The environment variable that writes the global continuation setting.
+ *
+ * `CONTINUATION=0` or `=off` stores `off`; `=1` or `=on` stores `on`. It is how the switch
+ * is *set* on a build with no screen for it, exactly as `BIT_PASSWORD` is how the browser
+ * password is set — and like that one, what is stored in `control.sqlite` is what later
+ * boots read, so it only has to be passed once.
+ *
+ * **A value that is neither is a refusal for this boot**, and nothing is stored: a server
+ * that cannot tell what it was told does not prompt a model (S7.4, "never resume on a
+ * guess"). Storing the odd value instead would make the mistake permanent.
+ */
+const CONTINUATION_ENV_VAR = "CONTINUATION";
+
+const continuationFromEnvironment = ():
+  | { readonly _tag: "unset" }
+  | { readonly _tag: "set"; readonly value: "on" | "off" }
+  | { readonly _tag: "unreadable"; readonly raw: string } => {
+  const raw = process.env[CONTINUATION_ENV_VAR];
+  if (raw === undefined || raw === "") return { _tag: "unset" };
+  if (raw === "0" || raw === "off") return { _tag: "set", value: "off" };
+  if (raw === "1" || raw === "on") return { _tag: "set", value: "on" };
+  return { _tag: "unreadable", raw };
+};
+
+/**
+ * The turn that gets dispatched after the sweep: S7's second half.
+ *
+ * **Everything half-finished has already been terminalized by the time this runs**, and
+ * that is the one property S7.1 asks for. It is arranged by two independent things rather
+ * than by this function being careful: it takes the sweep's own conclusions as its input
+ * (`SweptTarget`), and the store refuses to open a replacement for an attempt that is still
+ * `running`. A target the sweep could not open contributes nothing here.
+ *
+ * Two passes per target, both on one borrow of its store: queue what is owed, then dispatch
+ * it. `recovery/continuationDispatcher.ts` carries the argument for the split and for what
+ * each check protects.
+ *
+ * **The operator's switch is read per target, before anything is queued.** A target with
+ * continuation off is skipped with one line and leaves no rows behind — the alternative,
+ * queueing and then cancelling, would write an event and an outbox row on every boot for a
+ * feature the operator has turned off. The cap's refusals *are* written, because a crash
+ * loop is exactly when a durable trace is worth having.
+ *
+ * `CONTINUE_ON_START=0` skips the whole thing for one boot without storing anything, for an
+ * operator who wants to look at what the sweep did before a model is prompted. It is the
+ * sibling of `RECONCILE_ON_START=0` and deliberately not the same variable: skipping
+ * reconciliation leaves rows lying, while skipping this only means nothing is picked back
+ * up — and the queued rows are still there on the next boot.
+ */
+const continueInterrupted = (swept: readonly SweptTarget[]) =>
+  Effect.gen(function* () {
+    if (process.env["CONTINUE_ON_START"] === "0") {
+      console.log(
+        "startup continuation skipped (CONTINUE_ON_START=0): nothing interrupted was picked back up, and anything already queued stays queued",
+      );
+      return;
+    }
+    const asked = continuationFromEnvironment();
+    if (asked._tag === "unreadable") {
+      console.error(
+        `startup continuation skipped: ${CONTINUATION_ENV_VAR}='${asked.raw}' is neither 'on'/'1' nor 'off'/'0', and a continuation is a prompt into a model — this server does not send one on a setting it cannot read. Nothing was stored; fix the value or unset it.`,
+      );
+      return;
+    }
+    const registry = yield* FleetStore;
+    if (asked._tag === "set") {
+      const stored = yield* Effect.result(
+        registry.setSetting(CONTINUATION_SETTING, asked.value),
+      );
+      console.log(
+        stored._tag === "Success"
+          ? `continuation after a restart: ${asked.value}, from ${CONTINUATION_ENV_VAR} and now stored in control.sqlite (per target: '${continuationSettingFor("<targetId>")}')`
+          : `continuation after a restart: ${CONTINUATION_ENV_VAR}=${asked.value} could not be stored (${stored.failure.message}); the stored setting still decides`,
+      );
+    }
+    if (swept.length === 0) return;
+
+    const stores = yield* TargetStores;
+    const supervisor = yield* RunSupervisor;
+    const importer = yield* ScopeImporter;
+    const conversations = yield* GoalConversations;
+    const resolver = yield* HarnessResolver;
+    let queued = 0;
+    let sent = 0;
+    let refused = 0;
+
+    for (const target of swept) {
+      const row = yield* Effect.result(registry.target(target.targetId));
+      if (row._tag === "Failure" || row.success === undefined) {
+        console.error(
+          `startup continuation: ${target.targetId} is not readable in the registry, so nothing of it was continued`,
+        );
+        continue;
+      }
+      const engagement = row.success;
+      const policy = yield* continuationAllowed({
+        fleet: registry,
+        targetId: target.targetId,
+      });
+      if (policy._tag === "off") {
+        console.log(
+          `startup continuation: ${target.targetId} — ${policy.detail}`,
+        );
+        continue;
+      }
+
+      /**
+       * How a continuation reaches its surface, and the only place the three are named.
+       *
+       * Each one is the surface's *ordinary* entry point, which is the point of S7.3's
+       * split: the two conversations take a message through the same `send` an operator's
+       * message goes through — so the resume it performs is slice 6's and there is not a
+       * second one — and the worker takes `continueAttempt`, which is a new attempt
+       * identity rather than a message into an old one.
+       */
+      const deliver = Effect.fnUntraced(function* (input: {
+        readonly request: { readonly subject: unknown };
+        readonly instruction: string;
+      }) {
+        const subject = input.request.subject as
+          | { readonly kind: "attempt"; readonly attemptId: string }
+          | { readonly kind: "importer"; readonly importId: string }
+          | { readonly kind: "goal"; readonly goalId: string };
+        switch (subject.kind) {
+          case "attempt": {
+            const started = yield* Effect.result(
+              supervisor.continueAttempt({
+                targetId: target.targetId,
+                replacesAttemptId: subject.attemptId,
+                workspace: engagement.workspacePath ?? WORKSPACE_ROOT,
+                auditPath: `${registry.paths.evidenceDirectory(target.targetId)}/${POLICY_AUDIT_FILE}`,
+                title: `bit: ${engagement.name}`,
+                note: input.instruction,
+              }),
+            );
+            return started._tag === "Success"
+              ? ({
+                  _tag: "dispatched",
+                  detail: `attempt ${started.success.attemptId} carries on from ${subject.attemptId} on session ${started.success.harnessSessionId}`,
+                } as const satisfies ContinuationOutcome)
+              : ({
+                  _tag: "refused",
+                  detail: `${started.failure.reason}: ${started.failure.detail}`,
+                } as const satisfies ContinuationOutcome);
+          }
+          case "importer": {
+            const accepted = yield* Effect.result(
+              importer.send({
+                targetId: target.targetId,
+                importId: subject.importId,
+                text: input.instruction,
+              }),
+            );
+            return accepted._tag === "Success"
+              ? ({
+                  _tag: "dispatched",
+                  detail: `import ${accepted.success.importId} (${accepted.success.conversation}) on session ${accepted.success.harnessSessionId}`,
+                } as const satisfies ContinuationOutcome)
+              : ({
+                  _tag: "refused",
+                  detail: `${accepted.failure.reason}: ${accepted.failure.detail}`,
+                } as const satisfies ContinuationOutcome);
+          }
+          case "goal": {
+            const accepted = yield* Effect.result(
+              conversations.send({
+                targetId: target.targetId,
+                goalId: subject.goalId,
+                text: input.instruction,
+              }),
+            );
+            return accepted._tag === "Success"
+              ? ({
+                  _tag: "dispatched",
+                  detail: `goal ${subject.goalId} (${accepted.success.conversation}) on session ${accepted.success.harnessSessionId}`,
+                } as const satisfies ContinuationOutcome)
+              : ({
+                  _tag: "refused",
+                  detail: `${accepted.failure.reason}: ${accepted.failure.detail}`,
+                } as const satisfies ContinuationOutcome);
+          }
+        }
+      });
+
+      const outcome = yield* Effect.result(
+        Effect.scoped(
+          Effect.flatMap(stores.open(target.targetId), (store) =>
+            Effect.gen(function* () {
+              const decided = yield* enqueueContinuations({
+                targetId: target.targetId,
+                attempts: target.attempts,
+              });
+              const dispatched = yield* dispatchContinuations({
+                targetId: target.targetId,
+                policy,
+                routing: {
+                  deliver,
+                  summarise: (input) =>
+                    readTranscriptSummary({ resolver, ...input }),
+                  leaseOwner: `pid:${String(process.pid)}`,
+                },
+              });
+              return { decided, dispatched };
+            }).pipe(Effect.provideService(ObservationStore, store)),
+          ),
+        ),
+      );
+      if (outcome._tag === "Failure") {
+        console.error(
+          `startup continuation: ${target.targetId} could not be continued — ${outcome.failure.message}`,
+        );
+        continue;
+      }
+      for (const entry of outcome.success.decided) {
+        if (entry.outboxId === undefined) continue;
+        queued += 1;
+        console.log(
+          `  ${target.targetId}: ${renderContinuationDecided(entry)}`,
+        );
+      }
+      for (const entry of outcome.success.dispatched) {
+        if (entry.status === "succeeded") sent += 1;
+        else refused += 1;
+        console.log(
+          `  ${target.targetId}: ${renderContinuationDispatched(entry)}`,
+        );
+      }
+    }
+    console.log(
+      queued === 0 && sent === 0 && refused === 0
+        ? "startup continuation: nothing was interrupted by the loss of a process, so nothing was continued"
+        : `startup continuation: ${String(queued)} queued, ${String(sent)} dispatched, ${String(refused)} not sent`,
+    );
+  });
 
 /**
  * Gives back intent claims a dead process left with no attempt to settle them.
@@ -1062,7 +1335,15 @@ const program = Effect.gen(function* () {
     importerMcp: control.importerMcpUrl,
     policy: control.policyUrl,
   });
-  yield* reconcile;
+  /*
+   * The two halves of S7, in the order the whole slice rests on: terminalize everything a
+   * dead process left non-terminal, and only then dispatch the turns that carry the work
+   * on. `continueInterrupted` takes the sweep's own conclusions as its argument, so the
+   * ordering is not a matter of these two lines being in this order — but they are in this
+   * order, and the value passing between them is why they cannot be swapped.
+   */
+  const swept = yield* reconcile;
+  yield* continueInterrupted(swept);
   console.log(`bit control plane: ${control.healthUrl}`);
   console.log(`  mcp, worker tools (bearer required):  ${control.mcpUrl}`);
   console.log(

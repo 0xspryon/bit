@@ -5823,6 +5823,45 @@ const makeStore = Effect.fnUntraced(function* () {
     },
   );
 
+  const selectReplaced = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ replaces_attempt_id: Schema.String }),
+    execute: () =>
+      sql.unsafe(
+        `SELECT DISTINCT replaces_attempt_id FROM attempts
+         WHERE replaces_attempt_id IS NOT NULL`,
+        [],
+      ),
+  });
+
+  /**
+   * Every attempt that some later attempt already carries on from (S7).
+   *
+   * The guard that stops a continuation being owed for ever. A continued attempt keeps its
+   * `uncertain` row — recovery never regresses a status and nothing refines "we could not
+   * find out" into an answer — so {@link unsettledAttempts} returns it on every boot from
+   * now until the file is deleted. Without this, every boot would read the same abandoned
+   * attempt, be told the same `abandoned` by the harness, and open another replacement for
+   * a slice something is already working.
+   *
+   * It is a read of the `replaces_attempt_id` column and nothing cleverer, which is what
+   * makes it true rather than nearly true: a replacement exists exactly when a row names
+   * this attempt, and that row is written in the same transaction as the replacement
+   * itself.
+   *
+   * A replacement that was *itself* abandoned is not in this set, so it is continued in
+   * turn — which is correct, because the slice is still owed — and it is the chain the cap
+   * counts.
+   */
+  const replacedAttemptIds = Effect.fn("ObservationStore.replacedAttemptIds")(
+    function* () {
+      const rows = yield* selectReplaced().pipe(
+        Effect.mapError(lift("attempts", "replaces_attempt_id")),
+      );
+      return new Set(rows.map((row) => row.replaces_attempt_id));
+    },
+  );
+
   const selectRecoveries = SqlSchema.findAll({
     Request: Schema.String,
     Result: AttemptRecoveryRow,
@@ -6488,6 +6527,16 @@ const makeStore = Effect.fnUntraced(function* () {
     harness_session_id: Schema.String,
     harness_instance_id: Schema.NullOr(Schema.String),
     opened_at: Schema.Finite,
+    /**
+     * The goal's own status, read along the join this already makes (S7).
+     *
+     * The session list does not show it — a goal conversation is live or dormant and never
+     * ended (`http/agentSessions.ts`) — but the restart sweep needs it: a conversation on a
+     * goal that is `met` or `abandoned` must not be continued, because its agent's every
+     * write would be refused and the turn could only disappoint. Read here rather than in a
+     * second query, because the join to `goals` is already paid for.
+     */
+    status: Schema.String,
   });
 
   const selectGoalSessionsForTarget = SqlSchema.findAll({
@@ -6497,7 +6546,7 @@ const makeStore = Effect.fnUntraced(function* () {
       sql`SELECT s.goal_id AS goal_id, g.name AS name, g.description AS description,
                  s.harness_session_id AS harness_session_id,
                  s.harness_instance_id AS harness_instance_id,
-                 s.opened_at AS opened_at
+                 s.opened_at AS opened_at, g.status AS status
           FROM goal_sessions s
           JOIN goals g ON g.id = s.goal_id
           WHERE s.target_id = ${targetId}
@@ -6526,6 +6575,7 @@ const makeStore = Effect.fnUntraced(function* () {
       harnessSessionId: row.harness_session_id,
       harnessInstanceId: row.harness_instance_id,
       openedAt: row.opened_at,
+      goalStatus: row.status,
     }));
   });
 
@@ -7381,6 +7431,223 @@ const makeStore = Effect.fnUntraced(function* () {
           }),
         ),
       );
+    },
+  );
+
+  /**
+   * One outbox row as a caller reads it, with its payload parsed.
+   *
+   * Shared by every read below rather than written per query: the mapping is fifteen
+   * fields, and a second copy is a place for one of them to be forgotten.
+   */
+  const toOutboxEntry = (row: typeof OutboxRow.Type) =>
+    Effect.map(
+      Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+        row.payload,
+      ).pipe(
+        Effect.mapError(
+          (issue) =>
+            new StoredRowError({
+              table: "outbox",
+              rowId: row.id,
+              detail: "payload is not JSON",
+              cause: issue,
+            }),
+        ),
+      ),
+      (payload): OutboxEntry => ({
+        outboxId: row.id,
+        sequence: row.sequence,
+        targetId: row.target_id,
+        requestType: row.request_type,
+        payload,
+        recoveryPolicy: row.recovery_policy,
+        causedByEventId: row.caused_by_event_id,
+        status: row.status,
+        attempts: row.attempts,
+        leaseOwner: row.lease_owner,
+        leaseExpiresAt: row.lease_expires_at,
+        nextAttemptAt: row.next_attempt_at,
+        lastError: row.last_error,
+        enqueuedAt: row.enqueued_at,
+        completedAt: row.completed_at,
+      }),
+    );
+
+  const selectContinuations = SqlSchema.findAll({
+    Request: Schema.Struct({
+      status: Schema.String,
+      since: Schema.Finite,
+      includeCancelled: Schema.Int,
+    }),
+    Result: OutboxRow,
+    execute: (request) =>
+      sql.unsafe(
+        `SELECT ${outboxColumns} FROM outbox
+          WHERE request_type = 'agent.continue'
+            AND (? = '' OR status = ?)
+            AND enqueued_at >= ?
+            AND (? = 1 OR status <> 'cancelled')
+          ORDER BY sequence`,
+        [
+          request.status,
+          request.status,
+          request.since,
+          request.includeCancelled,
+        ],
+      ),
+  });
+
+  /**
+   * Continuation requests, filtered the two ways the dispatcher needs (S7).
+   *
+   * One query rather than three, because the three differ only in a `WHERE`: the rows to
+   * dispatch (`pending`, from the beginning of time), the rows a *lease* was taken on and
+   * never settled (`in_flight`), and the rows the chain cap counts (any status but
+   * `cancelled`, inside the cap's window). A cancelled row is excluded from the count
+   * deliberately: it is a continuation this server *refused*, and counting a refusal
+   * towards the cap would make one cap breach silence the chain for ever.
+   */
+  const continuationRequests = Effect.fn(
+    "ObservationStore.continuationRequests",
+  )(function* (filter?: {
+    readonly status?: "pending" | "in_flight" | undefined;
+    readonly since?: number | undefined;
+    readonly includeCancelled?: boolean | undefined;
+  }) {
+    const rows = yield* selectContinuations({
+      status: filter?.status ?? "",
+      since: filter?.since ?? 0,
+      includeCancelled: filter?.includeCancelled === true ? 1 : 0,
+    }).pipe(Effect.mapError(lift("outbox", "agent.continue")));
+    return yield* Effect.forEach(rows, toOutboxEntry);
+  });
+
+  /**
+   * Records that a continuation is owed, and queues it, in one transaction (S7.4).
+   *
+   * **This is what the outbox is for**, and the two writes are why it is one transaction.
+   * The `agent.continuation.requested` event is the fact — this server established that a
+   * session's process is gone and decided a turn is owed — and the row is the *obligation*
+   * it implies. Written separately, a crash in between would leave either an obligation
+   * nobody can explain (which the `caused_by_event_id` foreign key refuses outright) or a
+   * recorded decision that silently never happens.
+   *
+   * It writes **nothing about the continuation's outcome**, because none has been reached:
+   * dispatching is a separate pass, possibly in a later process, and what it did is the
+   * row's own `status` and `last_error`.
+   *
+   * Note what is *not* folded in here: the terminalization. That is `recordRecovery`'s
+   * transaction and it has already committed by the time this runs — S7.1's ordering, and
+   * the reason this is a second pass rather than a flag on the first. A crash between the
+   * two loses nothing: the next boot's sweep re-asks the harness about a row that is
+   * `uncertain` (which is still swept) and enqueues then.
+   */
+  const enqueueContinuation = Effect.fn("ObservationStore.enqueueContinuation")(
+    function* (input: {
+      readonly targetId: string;
+      /** The attempt, import or goal this is about. The event's `subject_id`. */
+      readonly subjectId: string;
+      readonly payload: Record<string, unknown>;
+    }) {
+      const now = yield* Clock.currentTimeMillis;
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const event = yield* appendEvent({
+              kind: "agent.continuation.requested",
+              targetId: input.targetId,
+              // Host-originated, like `attempt.started` and `attempt.settled`: the startup
+              // sweep presents no credential, and filling these in would claim the subject
+              // asked for its own continuation.
+              callerScope: null,
+              intentId: null,
+              attemptId: null,
+              operation: "enqueue_continuation",
+              operationId: null,
+              subjectId: input.subjectId,
+              payload: input.payload,
+              recordedAt: now,
+            });
+            const queued = yield* enqueueRequest({
+              requestType: "agent.continue",
+              targetId: input.targetId,
+              payload: input.payload,
+              causedByEventId: event.eventId,
+              enqueuedAt: now,
+            });
+            return { ...queued, eventId: event.eventId, requestedAt: now };
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            error._tag === "SqlError"
+              ? asDatabaseError("transaction")(error)
+              : error,
+          ),
+        );
+    },
+  );
+
+  /**
+   * Takes a lease on one continuation request, or answers `false`.
+   *
+   * The `0013` lease columns, used for the first time and for what they are for. A single
+   * `UPDATE` whose `WHERE` is the whole claim — `pending`, or `in_flight` under a lease
+   * that has expired — so two dispatchers cannot both believe they own a row even though
+   * this deployment has one writer. `attempts` is incremented here rather than at
+   * settlement, because what it counts is dispatch attempts, and a dispatcher that died
+   * mid-way made one.
+   */
+  const claimContinuation = Effect.fn("ObservationStore.claimContinuation")(
+    function* (input: {
+      readonly outboxId: string;
+      readonly leaseOwner: string;
+      readonly leaseFor: number;
+    }) {
+      const now = yield* Clock.currentTimeMillis;
+      const claimed = yield* sql<{ id: string }>`UPDATE outbox
+          SET status = 'in_flight',
+              attempts = attempts + 1,
+              lease_owner = ${input.leaseOwner},
+              lease_expires_at = ${now + input.leaseFor}
+          WHERE id = ${input.outboxId}
+            AND request_type = 'agent.continue'
+            AND (status = 'pending'
+                 OR (status = 'in_flight' AND lease_expires_at < ${now}))
+          RETURNING id`.pipe(Effect.mapError(asDatabaseError("query")));
+      return claimed.length > 0;
+    },
+  );
+
+  /**
+   * Records what became of one continuation request.
+   *
+   * Three terminal answers and each says something different, which is why the column is
+   * not a boolean: `succeeded` is a turn the surface accepted, `failed` is one it refused
+   * or one whose outcome was lost, and `cancelled` is one this server decided not to send —
+   * the operator switched continuation off, or the chain is at its cap. `last_error` carries
+   * the sentence in every case but the first, because "why did nothing happen" is the
+   * question an operator will have.
+   *
+   * Guarded to `in_flight`, so only the dispatcher holding the lease settles it.
+   */
+  const settleContinuation = Effect.fn("ObservationStore.settleContinuation")(
+    function* (input: {
+      readonly outboxId: string;
+      readonly status: "succeeded" | "failed" | "cancelled";
+      readonly detail?: string | undefined;
+    }) {
+      const now = yield* Clock.currentTimeMillis;
+      const settled = yield* sql<{ id: string }>`UPDATE outbox
+          SET status = ${input.status},
+              completed_at = ${now},
+              lease_owner = NULL,
+              lease_expires_at = NULL,
+              last_error = ${input.detail ?? null}
+          WHERE id = ${input.outboxId} AND status = 'in_flight'
+          RETURNING id`.pipe(Effect.mapError(asDatabaseError("query")));
+      return settled.length > 0;
     },
   );
 
@@ -8264,6 +8531,10 @@ const makeStore = Effect.fnUntraced(function* () {
     releaseOrphanedClaims,
     eventsAfter,
     pendingRequests,
+    continuationRequests,
+    enqueueContinuation,
+    claimContinuation,
+    settleContinuation,
     anchorsForIntent,
     assets,
     assetsWithScope,
@@ -8295,6 +8566,7 @@ const makeStore = Effect.fnUntraced(function* () {
     loadIntent,
     loadAttempt,
     unsettledAttempts,
+    replacedAttemptIds,
     recoveriesForAttempt,
     plannerLineage,
     recordPlannerLineage,
@@ -8529,6 +8801,45 @@ export class ObservationStore extends Context.Service<
       readonly OutboxEntry[],
       DatabaseError | StoredRowError
     >;
+    /**
+     * The continuation requests the restart dispatcher reads (S7): the `pending` ones to
+     * send, the `in_flight` ones a dead process left a lease on, and — with `since` — the
+     * ones the chain cap counts. `cancelled` rows are excluded unless asked for.
+     */
+    readonly continuationRequests: (filter?: {
+      readonly status?: "pending" | "in_flight" | undefined;
+      readonly since?: number | undefined;
+      readonly includeCancelled?: boolean | undefined;
+    }) => Effect.Effect<readonly OutboxEntry[], DatabaseError | StoredRowError>;
+    /**
+     * Records that a continuation is owed and queues it, in one transaction: the
+     * `agent.continuation.requested` event and the `agent.continue` outbox row it explains.
+     */
+    readonly enqueueContinuation: (input: {
+      readonly targetId: string;
+      readonly subjectId: string;
+      readonly payload: Record<string, unknown>;
+    }) => Effect.Effect<
+      {
+        readonly outboxId: string;
+        readonly sequence: number;
+        readonly eventId: string;
+        readonly requestedAt: number;
+      },
+      DatabaseError | StoredRowError
+    >;
+    /** Takes a lease on one continuation request, or answers `false`. */
+    readonly claimContinuation: (input: {
+      readonly outboxId: string;
+      readonly leaseOwner: string;
+      readonly leaseFor: number;
+    }) => Effect.Effect<boolean, DatabaseError>;
+    /** Records what became of one continuation request. Guarded to `in_flight`. */
+    readonly settleContinuation: (input: {
+      readonly outboxId: string;
+      readonly status: "succeeded" | "failed" | "cancelled";
+      readonly detail?: string | undefined;
+    }) => Effect.Effect<boolean, DatabaseError>;
     readonly anchorsForIntent: (
       intentId: string,
     ) => Effect.Effect<readonly string[], DatabaseError | StoredRowError>;
@@ -8740,6 +9051,14 @@ export class ObservationStore extends Context.Service<
       readonly AttemptRow[],
       DatabaseError | StoredRowError
     >;
+    /**
+     * Every attempt some later attempt already replaces (S7): the set a restart
+     * continuation must not open a second replacement for.
+     */
+    readonly replacedAttemptIds: () => Effect.Effect<
+      ReadonlySet<string>,
+      DatabaseError | StoredRowError
+    >;
     readonly recoveriesForAttempt: (
       attemptId: string,
     ) => Effect.Effect<
@@ -8930,6 +9249,8 @@ export class ObservationStore extends Context.Service<
         readonly harnessSessionId: string;
         readonly harnessInstanceId: string | null;
         readonly openedAt: number;
+        /** The goal's status, for the restart sweep. See {@link GoalSessionListRow}. */
+        readonly goalStatus: string;
       }[],
       DatabaseError | StoredRowError
     >;

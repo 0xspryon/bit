@@ -439,6 +439,17 @@ export const chooseHarness = (
  * the claim and not from the caller, so a run is exactly the intent that was claimed.
  */
 interface Dispatch extends RunInput {
+  /**
+   * The attempt this one carries on from, when it is a continuation (S7).
+   *
+   * Present means the attempt row is written by `openReplacementAttempt` rather than by
+   * `seedAttempt`: a new id, a new fence, no inherited harness session, and
+   * `replaces_attempt_id` naming the interrupted one. It is the field that keeps
+   * `agentHarness.ts`'s rule intact rather than breaking it — carrying work on after an
+   * interruption means a new attempt identity, so a settlement record never has to lie
+   * about what one attempt did.
+   */
+  readonly replaces?: string | undefined;
   /** The goal's objective. Advisory prose; never enforcement (§4). */
   readonly goal: string;
   /** The intent's question. */
@@ -479,6 +490,35 @@ interface Supervised extends RunningAttempt {
   readonly workspace: string;
 }
 
+/**
+ * What continuing one interrupted attempt needs (S7.3).
+ *
+ * Deliberately **not** `RunInput` with two extra fields: an intent id is absent, because a
+ * continuation runs the slice the dead attempt was running and taking a second source for
+ * that would let a caller point a continuation at a different intent. Everything else is
+ * the same per-target layout a start needs.
+ */
+export interface ContinueAttemptInput {
+  readonly targetId: string;
+  /** The interrupted attempt. Its intent, and only its intent, is what this carries on. */
+  readonly replacesAttemptId: string;
+  /** See {@link RunInput.workspace}. */
+  readonly workspace: string;
+  /** See {@link RunInput.auditPath}. */
+  readonly auditPath: string;
+  /** See {@link RunInput.title}. */
+  readonly title: string;
+  /**
+   * What the new worker is told about the attempt it is carrying on from, above the
+   * question.
+   *
+   * Assembled by the caller — `recovery/continuation.ts`, from the harness's own
+   * `messages()` — and **may be empty**: failing to produce a summary does not stop the
+   * continuation, because a continuation with no summary is better than no continuation.
+   */
+  readonly note: string;
+}
+
 export class RunSupervisor extends Context.Service<
   RunSupervisor,
   {
@@ -490,6 +530,28 @@ export class RunSupervisor extends Context.Service<
      * its two lifecycle events under it in the target's own database.
      */
     readonly start: (input: RunInput) => Effect.Effect<RunStarted, RunRefused>;
+    /**
+     * Carries an interrupted attempt's slice on under a **new** attempt identity (S7.3).
+     *
+     * The shape of a worker continuation after a restart, and the reason it is not a resume:
+     * an attempt has a fence, a settlement and observations filed under its id, so a second
+     * run beneath that id would make its record lie. The interrupted attempt keeps whatever
+     * the sweep gave it (`uncertain`, with the harness's own sentence on its
+     * `attempt_recoveries` row), this one is a fresh attempt linked by
+     * `replaces_attempt_id`, and {@link ContinueAttemptInput.note} is what carries the dead
+     * attempt's transcript into the new one's prompt.
+     *
+     * **It never ends the predecessor.** Terminalizing is the sweep's, it has already
+     * happened by the time anything is dispatched, and a predecessor still `running` is a
+     * refusal here rather than a row this call moves.
+     *
+     * The workspace and the audit path are the caller's, as they are for {@link start} and
+     * for the same reason: they are facts about the target that live in the registry, and
+     * this service does not hold it.
+     */
+    readonly continueAttempt: (
+      input: ContinueAttemptInput,
+    ) => Effect.Effect<RunStarted, RunRefused>;
     /**
      * Interrupts one run, settles its attempt and revokes its authority.
      *
@@ -578,6 +640,17 @@ export class RunSupervisor extends Context.Service<
               "this server has no agent harness, so there is nothing to run a worker in: either the harness HARNESS names could not be started, or it was switched off with HARNESS=0. Check that the harness is installed and authenticated, then restart.",
           }),
         ),
+      // Refused for the same reason a start is, and it matters on the recovery path: a
+      // server with no harness still sweeps, so it can reach the point of owing a
+      // continuation. It cannot run one, and the outbox row records that refusal rather
+      // than being dropped.
+      continueAttempt: (input) =>
+        Effect.fail(
+          new RunRefused({
+            reason: "no_harness",
+            detail: `this server has no agent harness, so attempt ${input.replacesAttemptId}'s slice cannot be carried on here: either the harness HARNESS names could not be started, or it was switched off with HARNESS=0`,
+          }),
+        ),
       stop: (attemptId) =>
         Effect.fail(
           new RunRefused({
@@ -650,6 +723,22 @@ const refuse = (error: {
         reason: "harness_not_ready",
         detail:
           error.message ?? "that harness instance is not usable on this server",
+      });
+    /*
+     * A replacement attempt's own refusals, from `openReplacementAttempt`: there is no such
+     * predecessor, it is still `running`, it belongs to another slice, or the new id is
+     * already in use. The store's own sentence is carried through rather than translated,
+     * because none of these is a request an operator made — a continuation is this server's
+     * own dispatch (S7) — and the useful audience is the log line and the outbox row's
+     * `last_error`.
+     */
+    case "MutationError":
+      return new RunRefused({
+        reason: "store_unavailable",
+        detail:
+          error.detail ??
+          error.message ??
+          "a replacement attempt could not be opened",
       });
     default:
       return new RunRefused({
@@ -987,31 +1076,63 @@ const make = Effect.fnUntraced(function* (options?: {
       "the run",
     );
 
-    // The goal and the intent already exist — the claim in `start` proved it — so every
-    // insert in `seedAttempt` but the attempt's own is an `ON CONFLICT(id) DO NOTHING` that
-    // matches and writes nothing. The text passed for them is therefore never stored; it is
-    // the claimed intent's own, so it is correct even in the case where it would matter.
-    // `supervisor.test.ts` asserts the goal and intent counts do not move.
-    const authority = yield* store.seedAttempt({
-      targetId: input.targetId,
-      goalId: ids.goalId,
-      goal: input.goal,
-      intentId: ids.intentId,
-      question: input.question,
-      attemptId: ids.attemptId,
-      workerId: ids.workerId,
-      // Pinned here and never updated: moving work to another harness is a replacement
-      // attempt, not a retarget.
-      harnessInstanceId: harness.instance.instanceId,
-      providerId: provenance.providerId,
-      modelId: provenance.modelId,
-      // What the run will actually carry, not what the caller asked for: the same
-      // resolved list `createSession` is handed below, so the row cannot record an option
-      // that was dropped or a value that fell back. `undefined` here means the operator
-      // set nothing and the harness applies its own default, which the row stores as NULL.
-      modelOptions: modelOptions ?? null,
-      harnessSessionId,
-    });
+    /*
+     * The attempt row, and the one branch in this function.
+     *
+     * **An ordinary start seeds**: the goal and the intent already exist — the claim in
+     * `begin` proved it — so every insert in `seedAttempt` but the attempt's own is an
+     * `ON CONFLICT(id) DO NOTHING` that matches and writes nothing. The text passed for
+     * them is therefore never stored; it is the claimed intent's own, so it is correct
+     * even in the case where it would matter. `supervisor.test.ts` asserts the goal and
+     * intent counts do not move.
+     *
+     * **A continuation opens a replacement** (S7.3). Same shape, one extra fact recorded:
+     * `replaces_attempt_id`, which is the only link between the interrupted attempt and
+     * this one. It is not a seed with a column set afterwards, and that matters — the
+     * store's `openReplacementAttempt` does every check and the insert in one transaction,
+     * because a replacement whose link was written separately is indistinguishable from a
+     * worker simply starting fresh. It also refuses to replace an attempt that is still
+     * `running`, which is the durable half of "terminalize first, then continue": if the
+     * sweep had not moved that row, this call writes nothing.
+     */
+    const authority =
+      input.replaces === undefined
+        ? yield* store.seedAttempt({
+            targetId: input.targetId,
+            goalId: ids.goalId,
+            goal: input.goal,
+            intentId: ids.intentId,
+            question: input.question,
+            attemptId: ids.attemptId,
+            workerId: ids.workerId,
+            // Pinned here and never updated: moving work to another harness is a
+            // replacement attempt, not a retarget.
+            harnessInstanceId: harness.instance.instanceId,
+            providerId: provenance.providerId,
+            modelId: provenance.modelId,
+            // What the run will actually carry, not what the caller asked for: the same
+            // resolved list `createSession` is handed below, so the row cannot record an
+            // option that was dropped or a value that fell back. `undefined` here means
+            // the operator set nothing and the harness applies its own default, which the
+            // row stores as NULL.
+            modelOptions: modelOptions ?? null,
+            harnessSessionId,
+          })
+        : yield* store.openReplacementAttempt({
+            replacesAttemptId: input.replaces,
+            targetId: input.targetId,
+            intentId: ids.intentId,
+            attemptId: ids.attemptId,
+            workerId: ids.workerId,
+            harnessInstanceId: harness.instance.instanceId,
+            providerId: provenance.providerId,
+            modelId: provenance.modelId,
+            // This attempt's own, resolved against this attempt's model: a replacement is
+            // new work and does not inherit the abandoned attempt's choices, which would
+            // record something nobody chose.
+            modelOptions: modelOptions ?? null,
+            harnessSessionId,
+          });
 
     const session = yield* harness.createSession({
       title: input.title,
@@ -1504,9 +1625,39 @@ const make = Effect.fnUntraced(function* (options?: {
     );
   };
 
-  const start: RunSupervisor["Service"]["start"] = Effect.fn(
-    "RunSupervisor.start",
-  )(function* (input) {
+  /**
+   * One run, from the intent claim to a forked supervisor — whether an operator asked for
+   * it or a restart continuation did.
+   *
+   * {@link RunSupervisor.start} is this with no `continuation`, and
+   * {@link RunSupervisor.continueAttempt} is this with one. There is one body rather than
+   * two because everything a continuation needs is what a start needs: the intent has to be
+   * claimed (a continuation that cannot claim it must not run — something else is working
+   * that slice), the harness has to be chosen, the folder has to be claimed, and the fiber
+   * has to be forked into this layer's scope. Two copies of that would be two places for
+   * the claim ordering to drift, and the claim ordering is the safety argument.
+   *
+   * What a continuation changes is exactly two fields of the dispatch: `replaces`, which
+   * sends the attempt row through `openReplacementAttempt`, and a block above the question
+   * saying what the interrupted attempt did.
+   */
+  const begin = Effect.fnUntraced(function* (
+    input: RunInput,
+    continuation?: {
+      /** The interrupted attempt. Already terminalized by the sweep; the store re-checks. */
+      readonly replacesAttemptId: string;
+      /**
+       * What goes above the question: this server's sentence about the interrupted attempt
+       * and, when one could be produced, a summary of its transcript.
+       *
+       * Assembled by the caller (`recovery/continuation.ts`) rather than here, because what
+       * a worker is told is a prompt question and this file assembles no prompts beyond the
+       * scope block. Empty is a legitimate value and means the harness could not be read —
+       * a continuation with no summary is better than no continuation.
+       */
+      readonly note: string;
+    },
+  ) {
     // Only the attempt and the worker are minted. The goal and the intent are the claimed
     // intent's own, taken from the claim below: a run no longer creates what it runs.
     const attemptId = identifier.newAttemptId();
@@ -1663,15 +1814,28 @@ const make = Effect.fnUntraced(function* (options?: {
         modelOptions: choice.modelOptions,
         goal: claim.goal,
         question: claim.question,
-        // The question verbatim when there is nothing in scope, so a pre-`0022` target's
-        // worker gets exactly the prompt it got before. Otherwise the block, a blank line,
-        // and then the question — the block first, because it is the frame the question is
-        // to be answered inside.
-        task:
-          scopeBlock === undefined
-            ? claim.question
-            : `${scopeBlock}\n\n${claim.question}`,
+        /*
+         * The question verbatim when there is nothing in scope, so a pre-`0022` target's
+         * worker gets exactly the prompt it got before. Otherwise the block, a blank line,
+         * and then the question — the block first, because it is the frame the question is
+         * to be answered inside, and the question last for the reason every assembler in
+         * this codebase puts the operator's or the task's own words last.
+         *
+         * A continuation's note sits between them, for both reasons at once: it is framing
+         * ("you are carrying on from an attempt that was interrupted, and here is what it
+         * did"), and it must not displace the question from the end.
+         */
+        task: [
+          ...(scopeBlock === undefined ? [] : [scopeBlock]),
+          ...(continuation === undefined || continuation.note === ""
+            ? []
+            : [continuation.note]),
+          claim.question,
+        ].join("\n\n"),
         fallback: choice.fallback,
+        ...(continuation === undefined
+          ? {}
+          : { replaces: continuation.replacesAttemptId }),
       };
       const ids = {
         goalId: claim.goalId,
@@ -1756,6 +1920,81 @@ const make = Effect.fnUntraced(function* (options?: {
     );
   });
 
+  const start: RunSupervisor["Service"]["start"] = Effect.fn(
+    "RunSupervisor.start",
+  )(function* (input) {
+    return yield* begin(input);
+  });
+
+  /**
+   * Carries one interrupted attempt's slice on, under a new attempt identity (S7.3).
+   *
+   * **It ends nothing itself, and that is the ordering this depends on rather than
+   * implements.** The startup sweep has already asked the harness and terminalized the row
+   * — that is S7's first done criterion and it ran before anything was dispatched — and
+   * `openReplacementAttempt` refuses a predecessor that is still `running`, so if the sweep
+   * had somehow not moved it, this writes nothing instead of putting a second worker on a
+   * live slice.
+   *
+   * **A new attempt and not a resumed one**, which is the whole of the operator's decision
+   * in S7.3. A resumed attempt would make its settlement record lie about what that attempt
+   * did: the observations it holds, the fence its credential was minted against, and the
+   * disposition recovery gave it all describe the interrupted run, and a second run under
+   * the same id would be filed under them. So the predecessor keeps its `uncertain` row and
+   * its observations, this one gets its own id, and `replaces_attempt_id` is the only link.
+   * `note` is what carries the dead attempt's transcript across that boundary.
+   *
+   * **The intent is claimed again**, by {@link begin}, and a claim it cannot take is a
+   * continuation that does not happen: an intent that is `claimed` means something else is
+   * working that slice, and one that is `answered` or `abandoned` means the question is no
+   * longer open. Recovery released the claim in the same transaction as it terminalized the
+   * attempt, so the ordinary case is an `open` intent — and the refusal is the honest
+   * answer to every other one.
+   */
+  const continueAttempt: RunSupervisor["Service"]["continueAttempt"] =
+    Effect.fn("RunSupervisor.continueAttempt")(function* (input) {
+      const row = yield* Effect.result(
+        Effect.scoped(
+          Effect.flatMap(stores.open(input.targetId), (store) =>
+            store.loadAttempt(input.replacesAttemptId, input.targetId),
+          ),
+        ),
+      );
+      if (row._tag === "Failure") return yield* refuse(row.failure);
+      const attempt = row.success;
+      if (attempt === undefined) {
+        return yield* new RunRefused({
+          reason: "unknown_attempt",
+          detail: `no attempt ${input.replacesAttemptId} is recorded in target ${input.targetId}, so there is nothing to carry on from`,
+        });
+      }
+      if (attempt.status === "running") {
+        // The sweep's job, not this one's. Said as a refusal rather than done here, because
+        // a continuation that terminalized its own predecessor would be deciding what became
+        // of work it never watched — which is exactly what `recovery/reconcile.ts` asks the
+        // harness about.
+        return yield* new RunRefused({
+          reason: "store_unavailable",
+          detail: `attempt ${input.replacesAttemptId} still says 'running', so it has not been reconciled yet; nothing is continued under it until the sweep has asked the harness what became of it`,
+        });
+      }
+      return yield* begin(
+        {
+          targetId: input.targetId,
+          intentId: attempt.intent_id,
+          workspace: input.workspace,
+          auditPath: input.auditPath,
+          title: input.title,
+          // No instance and no model, deliberately: a replacement is new work, so it takes
+          // the intent's own suggestion and then this server's default, exactly as a fresh
+          // start would. Pinning it to the dead attempt's instance would re-run the choice
+          // nobody made for *this* attempt, and `ReplacementInput.modelOptions` says the same
+          // thing about options.
+        },
+        { replacesAttemptId: input.replacesAttemptId, note: input.note },
+      );
+    });
+
   const stop: RunSupervisor["Service"]["stop"] = Effect.fn(
     "RunSupervisor.stop",
   )(function* (attemptId) {
@@ -1787,6 +2026,7 @@ const make = Effect.fnUntraced(function* (options?: {
 
   return RunSupervisor.of({
     start,
+    continueAttempt,
     stop,
     running: Effect.sync(() =>
       // Projected rather than returned whole: `Supervised` carries the workspace, which is

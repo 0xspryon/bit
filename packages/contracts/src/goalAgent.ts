@@ -49,15 +49,27 @@ export const GoalMessageDraft = Schema.Struct({
 export type GoalMessageDraft = typeof GoalMessageDraft.Type;
 
 /**
- * Whether this message opened the conversation or carried on one.
+ * Whether this message opened the conversation, resumed one, or carried one on.
  *
  * - `opened` — a session was created for this message. The first message on a goal, and
- *   also the first message after a restart; see {@link GoalTurnAccepted.priorUnavailable}
- *   for how those two are told apart.
+ *   also the first message after a restart whose session could not be carried on; see
+ *   {@link GoalTurnAccepted.priorUnavailable} for how those two are told apart.
+ * - `resumed` — the harness still held the goal's session and this message **continued
+ *   it**: the same session id, a new authority period, and an agent that keeps every word
+ *   of what is already on the operator's screen (S7). The importer's own answer carries
+ *   the same name for the same thing (`ImporterTurnStart`).
  * - `continued` — the session was already live in this process and the message was
  *   delivered into it.
+ *
+ * A reader that cares only about "is what is on screen still the truth" treats `resumed`
+ * like `opened`: both mean this process did not hold the session when the message arrived,
+ * so a replay taken before it is stale. What separates them is whether the agent read it.
  */
-export const GoalConversationStart = Schema.Literals(["opened", "continued"]);
+export const GoalConversationStart = Schema.Literals([
+  "opened",
+  "resumed",
+  "continued",
+]);
 export type GoalConversationStart = typeof GoalConversationStart.Type;
 
 /**
