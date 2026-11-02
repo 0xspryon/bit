@@ -167,6 +167,7 @@ const withImporterSessions = async <A>(
         workspacePath: workspace,
       });
       const ended: string[] = [];
+      const reasons: string[] = [];
       // The layer's scope, closed by hand so the finalizer is observable.
       const layerScope = yield* Scope.make();
       const sessions = yield* makeLiveAgentSessions<undefined>(
@@ -180,9 +181,10 @@ const withImporterSessions = async <A>(
               importId: input.id,
             }),
           revokeStray: credentials.revokeImport,
-          afterClose: (entry) =>
+          afterClose: (entry, reason) =>
             Effect.sync(() => {
               ended.push(entry.id);
+              reasons.push(reason);
             }),
           words: {
             unregisterRefused: "unregister refused",
@@ -208,6 +210,7 @@ const withImporterSessions = async <A>(
       return {
         result,
         ended,
+        reasons,
         afterRelease: yield* credentials.size,
       };
     }).pipe(
@@ -279,6 +282,8 @@ describe("opening an import session", () => {
     expect(outcome.afterRelease).toBe(0);
     expect(recorder.unregistrations).toEqual(["ses_1"]);
     expect(outcome.ended).toEqual([IMPORT]);
+    // The layer finalizer's close is a shutdown, not the operator ending it.
+    expect(outcome.reasons).toEqual(["shutdown"]);
   });
 
   test("an opener interrupted before publish leaves no scope behind", async () => {
@@ -366,6 +371,7 @@ describe("opening an import session", () => {
     expect(outcome.result.live).toBeUndefined();
     expect(recorder.unregistrations).toEqual(["ses_1"]);
     expect(outcome.ended).toEqual([IMPORT]);
+    expect(outcome.reasons).toEqual(["open_failed"]);
   });
 });
 
@@ -392,10 +398,10 @@ describe("closing an import session that is no longer the id's", () => {
           yield* opening(sessions, plan);
           const first = sessions.get(IMPORT);
           if (first === undefined) return yield* Effect.die("no first session");
-          yield* sessions.closeSession(first);
+          yield* sessions.closeSession(first, "refused");
           yield* opening(sessions, { ...plan, sessionId: "ses_second" });
           // The stale close, holding the first entry.
-          yield* sessions.closeSession(first);
+          yield* sessions.closeSession(first, "refused");
           return {
             live: sessions.get(IMPORT)?.sessionId,
             grants: yield* credentials.size,
@@ -411,6 +417,8 @@ describe("closing an import session that is no longer the id's", () => {
     expect(outcome.result.unregistered).toEqual(["ses_1"]);
     // One end for the first close and one for the finalizer's: the stale close records none.
     expect(outcome.ended).toEqual([IMPORT, IMPORT]);
+    // The first close's reason and the finalizer's; nothing for the stale close.
+    expect(outcome.reasons).toEqual(["refused", "shutdown"]);
     expect(outcome.afterRelease).toBe(0);
   });
 
@@ -431,7 +439,9 @@ describe("closing an import session that is no longer the id's", () => {
           const first = sessions.get(IMPORT);
           if (first === undefined) return yield* Effect.die("no first session");
           // The close deletes the entry, then parks in the unregister round trip...
-          const closing = yield* Effect.forkChild(sessions.closeSession(first));
+          const closing = yield* Effect.forkChild(
+            sessions.closeSession(first, "refused"),
+          );
           yield* Deferred.await(unregisterEntered);
           // ...and a message that arrives now finds nothing live and opens a new one.
           const reopened = yield* opening(sessions, {
@@ -530,5 +540,7 @@ describe("an opener that dies", () => {
     expect(outcome.result.live?.sessionId).toBe("ses_second");
     expect(outcome.result.live?.preambled).toBe(true);
     expect(recorder.unregistrations[0]).toBe("ses_1");
+    // The died opener's close, then the finalizer's for the second session.
+    expect(outcome.reasons).toEqual(["open_failed", "shutdown"]);
   });
 });

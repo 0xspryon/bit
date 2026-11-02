@@ -854,6 +854,19 @@ export type { RoundDisposition, RoundStatus } from "@bit/contracts";
 export type RoundTerminalStatus = Exclude<RoundStatus, "running">;
 
 /**
+ * Why an import's authority period ended (`0027`), and the whole list of things that end
+ * one. Only `operator` means the authority is over; the other three are a process letting
+ * go of a session it can no longer, or no longer wants to, hold. See `0027` for the rule.
+ */
+export const ImportSessionEndReason = Schema.Literals([
+  "operator",
+  "shutdown",
+  "refused",
+  "open_failed",
+]);
+export type ImportSessionEndReason = typeof ImportSessionEndReason.Type;
+
+/**
  * What opening a planner round needs. Host-owned ids, like {@link SeedInput}'s.
  *
  * No `targetId`: the {@link HostContext} that opens the round carries it, and a second
@@ -6633,18 +6646,21 @@ const makeStore = Effect.fnUntraced(function* () {
   });
 
   /**
-   * Records that an import's session has ended (`0026`). Called when the session is
-   * closed, by whatever closed it.
+   * Records that an import's authority period has ended, and why (`0026`, `0027`). Called
+   * when the session is closed, by whatever closed it.
    *
-   * Idempotent — `ended_at IS NULL` keeps the first instant, so a stop followed by the
-   * layer's finalizer records the stop — and an unknown import id updates nothing rather
-   * than failing, because the row's own write is advisory and may not have landed.
+   * `ended_at` and `ended_reason` are written together and by the first close only —
+   * `ended_at IS NULL` keeps the first instant and its reason, so a stop followed by the
+   * layer's finalizer records the stop as `operator`, not `shutdown`. Never cleared: a later
+   * authority period on the same harness session is a new import id and a new row. An
+   * unknown import id updates nothing rather than failing, because the row's own write is
+   * advisory and may not have landed.
    */
   const endImportSession = Effect.fn("ObservationStore.endImportSession")(
-    function* (importId: string) {
+    function* (importId: string, reason: ImportSessionEndReason) {
       const endedAt = yield* Clock.currentTimeMillis;
       yield* sql`UPDATE import_sessions
-            SET ended_at = ${endedAt}
+            SET ended_at = ${endedAt}, ended_reason = ${reason}
             WHERE import_id = ${importId} AND ended_at IS NULL`.pipe(
         Effect.mapError(asDatabaseError("query")),
       );
@@ -6653,29 +6669,37 @@ const makeStore = Effect.fnUntraced(function* () {
 
   const selectImportSessionEnd = SqlSchema.findOneOption({
     Request: Schema.String,
-    Result: Schema.Struct({ ended_at: Schema.NullOr(Schema.Finite) }),
+    Result: Schema.Struct({
+      ended_at: Schema.NullOr(Schema.Finite),
+      ended_reason: Schema.NullOr(ImportSessionEndReason),
+    }),
     execute: (importId) =>
-      sql`SELECT ended_at FROM import_sessions WHERE import_id = ${importId}`,
+      sql`SELECT ended_at, ended_reason FROM import_sessions
+            WHERE import_id = ${importId}`,
   });
 
   /**
-   * Whether an import's session has been ended — the importer toolkit's
-   * `checkGoalAuthority`.
+   * How an import's authority period ended, or `undefined` while it has not — what the
+   * importer toolkit's `checkGoalAuthority` analogue reads.
    *
-   * **`false` for an import with no row**, and that is the index being advisory rather
+   * **`undefined` for an import with no row**, and that is the index being advisory rather
    * than a hole: `recordImportSession`'s failure is logged and the import runs regardless,
    * so refusing an unindexed import's writes would turn a failed index write into a failed
-   * import. The credential is the door; this is the second gate behind a credential with no
-   * clock, and it closes on the one fact that row exists to carry.
+   * import. `reason` is `null` for a row ended before `0027` recorded why.
+   *
+   * Which reasons refuse a write is the toolkit's rule, not this read's (`0027`).
    */
-  const importSessionEnded = Effect.fn("ObservationStore.importSessionEnded")(
+  const importSessionEnd = Effect.fn("ObservationStore.importSessionEnd")(
     function* (importId: string) {
       const row = yield* selectImportSessionEnd(importId).pipe(
         Effect.mapError(lift("import_sessions", importId)),
       );
       return Option.match(row, {
-        onNone: () => false,
-        onSome: (value) => value.ended_at !== null,
+        onNone: () => undefined,
+        onSome: (value) =>
+          value.ended_at === null
+            ? undefined
+            : { endedAt: value.ended_at, reason: value.ended_reason },
       });
     },
   );
@@ -8001,7 +8025,7 @@ const makeStore = Effect.fnUntraced(function* () {
     recordImportSession,
     confirmImportSession,
     endImportSession,
-    importSessionEnded,
+    importSessionEnd,
     endGoalAsAgent,
     attemptsForGoal,
   });
@@ -8624,17 +8648,27 @@ export class ObservationStore extends Context.Service<
       }[],
       DatabaseError | StoredRowError
     >;
-    /** Records that an import's session has ended (`0026`). Idempotent. */
+    /**
+     * Records that an import's authority period has ended, and why (`0026`, `0027`). The
+     * first close wins; idempotent after it.
+     */
     readonly endImportSession: (
       importId: string,
+      reason: ImportSessionEndReason,
     ) => Effect.Effect<void, DatabaseError>;
     /**
-     * Whether an import's session has been ended. `false` for an import with no row: the
-     * index is advisory, and its absence is not an ending.
+     * How an import's authority period ended, or `undefined` while it has not. `undefined`
+     * too for an import with no row: the index is advisory, and its absence is not an
+     * ending. `reason` is `null` for a row ended before `0027`.
      */
-    readonly importSessionEnded: (
-      importId: string,
-    ) => Effect.Effect<boolean, DatabaseError | StoredRowError>;
+    readonly importSessionEnd: (importId: string) => Effect.Effect<
+      | {
+          readonly endedAt: number;
+          readonly reason: ImportSessionEndReason | null;
+        }
+      | undefined,
+      DatabaseError | StoredRowError
+    >;
     /**
      * Records that the harness created the session an import run's row names (`0025`). Until
      * it has, {@link importSessions} does not list the row.

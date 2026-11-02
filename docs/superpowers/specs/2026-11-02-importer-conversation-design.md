@@ -203,6 +203,21 @@ durable record of "this conversation is over" the same object the picker already
 It also pays for itself on the screen: `ended_at` is what lets the picker mark a session
 closed instead of inferring it from the absence of a live entry in this process's memory.
 
+**Amended: `ended_at` alone conflated two events, so `0027` records why.** Every close stamps
+`ended_at`, the layer finalizer's included — so as first built, a graceful shutdown ended
+every open import (and refused its writes forever) while a crash ended none, and S7 could
+never continue a gracefully restarted import. `0027_import_session_end_reason` adds
+`ended_reason`: `operator` | `shutdown` | `refused` | `open_failed`, written with `ended_at`
+by the first close and never cleared. **The toolkit refuses writes only on `operator`**, the
+one case where the authority is genuinely over; the other three are this process letting go,
+and the credential behind them is already gone with the in-memory grant.
+
+The rule: `ended_at` plus `ended_reason` describe one _authority period_. A session may have
+several, and **the import id is what changes between them** — a later opening gets a new
+import id and a new row rather than reviving an ended one. The index still reads them as one
+session, because it groups by `harness_session_id` and tallies across every `caller_scope`
+of the session. S3.3's reuse of the import id is _within_ one authority period.
+
 ### S2.5 — Reviving a session, and what each harness actually keeps
 
 **Researched rather than assumed, after an earlier draft of this section got both drivers
@@ -303,6 +318,7 @@ built and has no dispatcher; that is what it is for.
 - [ ] A refused `prompt` closes the session, so the next message opens a fresh one.
 - [ ] Migration `0026_import_session_end` adds `ended_at`; set on close; the importer toolkit
       refuses a write under an ended import; `bun run test:persistence` covers both paths.
+      _Amended by `0027`: the refusal is for an `operator` end only (S2.4)._
 - [ ] `GET .../importer-sessions` reports `ended_at`.
 - [ ] The two comments asserting a session cannot outlive the process — the Claude Code
       sentence at `claudeCodeClient.ts:1630` and the OpenCode claim beside it — are corrected

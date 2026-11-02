@@ -37,6 +37,7 @@ import { join } from "node:path";
 
 import {
   Context,
+  Deferred,
   Effect,
   Layer,
   ManagedRuntime,
@@ -48,7 +49,7 @@ import { SCOPE_IMPORT_MAX_LINKS } from "@bit/contracts";
 
 import { ScopeImportProgress } from "./progress";
 import { ScopeImporter } from "./scopeImporter";
-import type { McpRegistration } from "../harness/agentHarness";
+import type { AgentHarness, McpRegistration } from "../harness/agentHarness";
 import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
 import { STUB_INSTANCE, stubHarness } from "../harness/stubHarness";
@@ -172,6 +173,16 @@ interface Script {
   failCreate: boolean;
   /** Makes the opening prompt fail, for a session the harness refuses to start. */
   failPrompt: boolean;
+  /**
+   * Parks the opening prompt — published, registered, not yet preambled — until `gate`
+   * opens, signalling `entered` on the way in. For a stop that lands mid-open.
+   */
+  holdPrompt:
+    | {
+        readonly entered: Deferred.Deferred<void>;
+        readonly gate: Deferred.Deferred<void>;
+      }
+    | undefined;
 }
 
 const newScript = (readable: readonly string[]): Script => ({
@@ -185,6 +196,7 @@ const newScript = (readable: readonly string[]): Script => ({
   done: Promise.resolve(),
   failCreate: false,
   failPrompt: false,
+  holdPrompt: undefined,
 });
 
 /**
@@ -381,7 +393,7 @@ const world = (readable: readonly string[]) => {
       Layer.succeed(
         HarnessResolver,
         HarnessResolver.fromEntries([
-          { instance: STUB_INSTANCE, harness: scriptedHarness(script) },
+          { instance: STUB_INSTANCE, harness: heldOpening(script) },
         ]),
       ),
     ),
@@ -392,6 +404,27 @@ const world = (readable: readonly string[]) => {
   );
 
   return { script, layer, root };
+};
+
+/**
+ * The scripted harness, with its opening prompt parked while `script.holdPrompt` is set.
+ * Read at call time, so a test may set it after the world is built.
+ */
+const heldOpening = (script: Script): AgentHarness["Service"] => {
+  const harness = scriptedHarness(script);
+  return {
+    ...harness,
+    prompt: (sessionId, text, delivery) => {
+      const held = script.holdPrompt;
+      const sent = harness.prompt(sessionId, text, delivery);
+      return held === undefined
+        ? sent
+        : Deferred.succeed(held.entered, undefined).pipe(
+            Effect.andThen(Deferred.await(held.gate)),
+            Effect.andThen(sent),
+          );
+    },
+  };
 };
 
 /**
@@ -862,15 +895,22 @@ describe("no harness", () => {
 
 /* ── S2: a session that outlives its first turn ──────────────────────────────── */
 
-/** The raw `ended_at` of every import row, read off the file rather than through a reader. */
+/**
+ * The raw `ended_at` and `ended_reason` of every import row, read off the file rather than
+ * through a reader.
+ */
 const endings = (root: string) => {
   const database = new Database(join(root, "targets", TARGET, HUNT_FILE), {
     readonly: true,
   });
   try {
     return database
-      .query("SELECT import_id, ended_at FROM import_sessions")
-      .all() as { import_id: string; ended_at: number | null }[];
+      .query("SELECT import_id, ended_at, ended_reason FROM import_sessions")
+      .all() as {
+      import_id: string;
+      ended_at: number | null;
+      ended_reason: string | null;
+    }[];
   } finally {
     database.close();
   }
@@ -938,6 +978,8 @@ describe("a session that outlives its first turn", () => {
     const ended = endings(built.root);
     expect(ended).toHaveLength(1);
     expect(typeof ended[0]?.ended_at).toBe("number");
+    // The process letting go, not the authority ending: S7 may continue this import.
+    expect(ended[0]?.ended_reason).toBe("shutdown");
   });
 
   test("stopping a finished import ends its session and its writes with it", async () => {
@@ -959,6 +1001,8 @@ describe("a session that outlives its first turn", () => {
     expect(after.size).toBe(0);
     expect(after.grant).toBeUndefined();
     expect(typeof endings(built.root)[0]?.ended_at).toBe("number");
+    // And the finalizer that runs later must not relabel the operator's end.
+    expect(endings(built.root)[0]?.ended_reason).toBe("operator");
 
     // The bearer the session held is refused at the door now.
     const late = await callTool(
@@ -989,6 +1033,7 @@ describe("a session that outlives its first turn", () => {
     expect(endings(built.root).map((row) => typeof row.ended_at)).toEqual([
       "number",
     ]);
+    expect(endings(built.root)[0]?.ended_reason).toBe("open_failed");
     const { size } = await authorityOf(runtime, "");
     expect(size).toBe(0);
     await runtime.dispose();
@@ -1005,6 +1050,53 @@ describe("a session that outlives its first turn", () => {
     expect(built.script.unregistered).toEqual(["ses_import"]);
     expect((await authorityOf(runtime, "")).size).toBe(0);
     expect(typeof endings(built.root)[0]?.ended_at).toBe("number");
+    // Not `open_failed`, which the import also records on its way out: the first end wins.
+    expect(endings(built.root)[0]?.ended_reason).toBe("refused");
     await runtime.dispose();
+  });
+
+  test("an operator's stop that lands mid-open is recorded as the operator's", async () => {
+    // Interrupting an opener makes the spine close what it built as `open_failed`, and the
+    // first recorded end wins — so the stop has to record its own end before it interrupts.
+    const built = world([PAGE_GOOD]);
+    const held = {
+      entered: Effect.runSync(Deferred.make<void>()),
+      gate: Effect.runSync(Deferred.make<void>()),
+    };
+    built.script.holdPrompt = held;
+    const runtime = ManagedRuntime.make(built.layer);
+    const started = await runtime.runPromise(
+      Effect.gen(function* () {
+        const fleet = yield* FleetStore;
+        yield* fleet.register({
+          targetId: TARGET,
+          name: "Acme Corp",
+          scopeNote: "",
+          workspacePath: workspace,
+        });
+        yield* fleet.migrateTarget(TARGET);
+        return yield* (yield* ScopeImporter).start({
+          targetId: TARGET,
+          targetName: "Acme Corp",
+          workspacePath: workspace,
+          links: [PAGE_GOOD],
+        });
+      }),
+    );
+    if (started._tag !== "started") throw new Error("the import did not start");
+
+    await Effect.runPromise(Deferred.await(held.entered));
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.stop(started.importId),
+      ),
+    );
+
+    expect(built.script.unregistered).toEqual(["ses_import"]);
+    expect((await authorityOf(runtime, "")).size).toBe(0);
+    expect(endings(built.root)[0]?.ended_reason).toBe("operator");
+    await runtime.dispose();
+    // The finalizer, later, does not relabel it either.
+    expect(endings(built.root)[0]?.ended_reason).toBe("operator");
   });
 });

@@ -441,7 +441,7 @@ const importerOrRefuse = Effect.fnUntraced(function* (write: string) {
 });
 
 /**
- * Refuses a write under an import whose session has ended — the importer's
+ * Refuses a write under an import whose operator ended it — the importer's
  * `checkGoalAuthority`.
  *
  * **Why this exists now and did not before.** The importer's credential used to carry a
@@ -449,14 +449,26 @@ const importerOrRefuse = Effect.fnUntraced(function* (write: string) {
  * goal's no-expiry credential has a durable gate behind it — every write under an ended goal
  * is refused by a column — and an import had none, so a no-expiry importer grant whose
  * scope was somehow not closed would have been a grant with nothing behind it. This reads
- * `import_sessions.ended_at` (`0026`), which closing the session sets.
+ * `import_sessions.ended_at` and `ended_reason` (`0026`, `0027`), which closing the session
+ * sets.
  *
- * **Not in the write's transaction**, unlike `checkGoalAuthority`: `addScopeEntry` and
- * `importAsset` take the operator's `HostContext` and know nothing of imports. The window
- * that leaves is a call already through the door when the session closes, and the close
- * revokes the credential *before* it records the end — so a call that races it was made
- * under a grant that was live when it arrived. The gate is for the call that comes after,
- * which is the one a leaked grant would make.
+ * **Only an `operator` end refuses.** Every close stamps `ended_at`, because the picker
+ * needs an honest "nothing holds this", but only the operator's stop means the authority is
+ * genuinely over. `shutdown`, `refused` and `open_failed` are this process letting go: the
+ * credential behind them went with the in-memory grant, so there is nothing left to gate,
+ * and refusing on them would be what stops a gracefully restarted import from ever being
+ * continued (S7). A row ended before `0027` has no reason and is not refused, for the same
+ * reason. The rule in full is `0027`'s header: one row is one authority period, and a later
+ * period gets a new import id rather than reviving this one.
+ *
+ * **Not in the write's transaction**, unlike `checkGoalAuthority`, and the race that
+ * leaves is reviewed and accepted rather than missed. `addScopeEntry` and `importAsset`
+ * take the operator's `HostContext` and know nothing of imports, so a call that resolved its
+ * grant before the close may still land one write after it. Accepted because the close
+ * revokes the credential *before* it records the end: nothing new gets through the door
+ * once the stop begins, and the one write that can land was made under a grant that was
+ * live when it arrived. The gate is for the call that comes after, which is the one a
+ * leaked grant would make.
  *
  * Writes only. `read_scope` stays readable under an ended import for the goal path's
  * reason: a read changes nothing, and it is not what this gate defends.
@@ -473,12 +485,12 @@ const refuseIfEnded = Effect.fnUntraced(function* (
       tool: input.tool,
       consequence: input.consequence,
     },
-    (store) => store.importSessionEnded(caller.importId),
+    (store) => store.importSessionEnd(caller.importId),
   );
-  if (!ended) return;
+  if (ended?.reason !== "operator") return;
   return yield* new ScopeImportRefused({
     reason: "unauthorized",
-    detail: `import ${caller.importId} has ended, so its session's authority has ended with it and ${input.consequence}. An ended import is not reopened.`,
+    detail: `import ${caller.importId} was ended by the operator, so its session's authority has ended with it and ${input.consequence}. An ended import is not reopened.`,
   });
 });
 

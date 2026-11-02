@@ -21,12 +21,20 @@
  *    failed, so the next open builds a fresh one rather than failing the same way forever;
  *    on Claude Code that includes a session whose query has closed.
  *
- * Each close records `import_sessions.ended_at` (`0026`), and the importer's toolkit refuses
- * every write under an ended import. That column is what stands behind a credential that has
- * no clock: the grant is issued without expiry, as a goal's is, because a conversation the
- * operator leaves and comes back to would otherwise be a live session whose every tool call
- * is a `401` with no cause anyone can see — and a longer clock is the same failure further
- * away.
+ * Each close records `import_sessions.ended_at` and why (`ended_reason`, `0027`): `operator`
+ * for 1, `shutdown` for 2, `refused` for 3, and `open_failed` for an open that never got as
+ * far as a working session. The importer's toolkit refuses every write under an import the
+ * **operator** ended. That is what stands behind a credential that has no clock: the grant
+ * is issued without expiry, as a goal's is, because a conversation the operator leaves and
+ * comes back to would otherwise be a live session whose every tool call is a `401` with no
+ * cause anyone can see — and a longer clock is the same failure further away.
+ *
+ * **One row is one authority period, not one session.** The other three reasons are this
+ * process letting go — the credential went with the in-memory grant, so there is nothing
+ * left to gate — and refusing on them would stop a gracefully restarted import from ever
+ * being continued (S7). The row's end is never cleared: a later opening on the same harness
+ * session gets a new import id and a new row, and the index still reads it as one session
+ * because it groups by `harness_session_id`. `0027`'s header has the rule in full.
  *
  * ## No idle timeout, and that is a decision rather than an omission
  *
@@ -108,6 +116,7 @@ import { lastAssistantText, type AgentHarness } from "../harness/agentHarness";
 import {
   makeLiveAgentSessions,
   type LiveAgentSession,
+  type LiveSessionCloseReason,
   type LiveSessionOpenFailure,
 } from "../harness/liveAgentSessions";
 import { HarnessResolver } from "../harness/resolver";
@@ -250,19 +259,24 @@ export class ScopeImporter extends Context.Service<
       const own = yield* Effect.scope;
 
       /**
-       * Records that an import's session has ended (`0026`), which is what the importer
-       * toolkit refuses writes on. Advisory in the way the row is: a failure is logged and
-       * nothing else, because the credential has already gone with the scope and this is
-       * the gate *behind* it.
+       * Records that an import's authority period has ended, and why (`0026`, `0027`). An
+       * `operator` end is what the importer toolkit refuses writes on. The first recorded
+       * end wins, so the order the close sites run in decides the reason. Advisory in the
+       * way the row is: a failure is logged and nothing else, because the credential has
+       * already gone with the scope and this is the gate *behind* it.
        */
-      const markEnded = (targetId: string, importId: string) =>
+      const markEnded = (
+        targetId: string,
+        importId: string,
+        reason: LiveSessionCloseReason,
+      ) =>
         withTargetStore(stores, targetId, (store) =>
-          store.endImportSession(importId),
+          store.endImportSession(importId, reason),
         ).pipe(
           Effect.catch((failure) =>
             Effect.logWarning(
               "a scope import's session ended but the end could not be recorded; its credential is revoked regardless",
-              { targetId, importId, detail: failure.message },
+              { targetId, importId, reason, detail: failure.message },
             ),
           ),
         );
@@ -279,7 +293,7 @@ export class ScopeImporter extends Context.Service<
        *
        * The importer's half of the descriptor: the importer endpoint, an importer
        * credential with no clock, `revokeImport` as the belt-and-braces check, and `ended_at`
-       * recorded once the session is closed.
+       * with its reason recorded once the session is closed.
        */
       const sessions = yield* makeLiveAgentSessions<undefined>(
         { fleet, endpoints },
@@ -293,8 +307,8 @@ export class ScopeImporter extends Context.Service<
           // No clock, as a goal's has none (S2.3). A fourth caller kind is still what
           // makes this session's three tools unreachable from a worker, a planner or a goal
           // agent: each endpoint refuses a grant whose tag is not the role it serves. What
-          // stands behind the missing clock is `ended_at` (`0026`), which the toolkit reads
-          // before every write.
+          // stands behind the missing clock is an `operator` end (`0026`, `0027`), which the
+          // toolkit reads before every write.
           issue: (input) =>
             credentials.issueWithoutExpiry({
               _tag: "importer",
@@ -302,7 +316,8 @@ export class ScopeImporter extends Context.Service<
               importId: input.id,
             }),
           revokeStray: credentials.revokeImport,
-          afterClose: (entry) => markEnded(entry.targetId, entry.id),
+          afterClose: (entry, reason) =>
+            markEnded(entry.targetId, entry.id, reason),
           words: {
             unregisterRefused:
               "a harness would not take back the scope importer's MCP registration; the credential behind it is revoked either way",
@@ -424,8 +439,14 @@ export class ScopeImporter extends Context.Service<
           // Whatever was built is gone — the spine closed it — so the import is over. A
           // session the harness created and then could not be given tools is a session
           // this process will never prompt again.
+          // `open_failed` unless the spine already recorded `refused` for a prompt the
+          // harness would not take: the first end wins.
           if (opened._tag === "Failure") {
-            yield* markEnded(input.request.targetId, input.importId);
+            yield* markEnded(
+              input.request.targetId,
+              input.importId,
+              "open_failed",
+            );
           }
           return;
         }
@@ -644,7 +665,7 @@ export class ScopeImporter extends Context.Service<
          * the door rather than having however long the harness takes to come back. Then
          * the harness is told to stop, the first turn's fiber is interrupted if it is still
          * running, and the session is closed: the operator ending it is the one intentional
-         * close on this module's list, and it records `ended_at`.
+         * close on this module's list, and the one end the toolkit refuses writes on.
          *
          * Everything written before this stays. That is what makes stopping early a
          * decision rather than a loss, and it is true because the session wrote as it read.
@@ -660,6 +681,16 @@ export class ScopeImporter extends Context.Service<
         if (entry === undefined && turn === undefined) return view;
 
         yield* credentials.revokeImport(importId);
+        /*
+         * The end is recorded as the operator's **here**, after the revoke and before
+         * anything is interrupted, and the order is what makes the reason true. Interrupting
+         * a first turn that is still opening makes the spine close what it built as
+         * `open_failed`, and the first recorded end wins — so recorded after the interrupt,
+         * an operator's stop mid-open would read as a failed open, and the toolkit would not
+         * refuse on it. Also covers the stop that landed before any entry was published:
+         * there was no session to close, and the import is over all the same.
+         */
+        yield* markEnded(view.targetId, importId, "operator");
         if (entry !== undefined) {
           yield* entry.harness
             .interruptSession(entry.sessionId)
@@ -678,10 +709,7 @@ export class ScopeImporter extends Context.Service<
         // An interrupt mid-open is the spine's to clean up: it closes a scope in no map,
         // and an entry it had published but not yet prompted.
         if (turn !== undefined) yield* Fiber.interrupt(turn);
-        yield* sessions.close(importId);
-        // Recorded here as well as by the close, for the stop that landed before any entry
-        // was published: there was no session to close, and the import is over all the same.
-        yield* markEnded(view.targetId, importId);
+        yield* sessions.close(importId, "operator");
         return view;
       });
 

@@ -290,8 +290,10 @@ export const ImporterSessionView = Schema.Struct({
    * When the session was ended, in epoch milliseconds, or null while it is open.
    *
    * Stored (`0026`), unlike `running`: set when the operator stops it, when the server
-   * shuts down, or when the harness refuses a prompt into it — and never cleared. It is what
-   * lets the picker mark a session closed rather than infer it from this process's memory.
+   * shuts down, when the harness refuses a prompt into it, or when an open fails — and never
+   * cleared. It is what lets the picker mark a session closed rather than infer it from this
+   * process's memory. It says nothing holds the session's authority, not that the session
+   * is over: the server records why beside it (`0027`), and only an operator's end is final.
    * **Null is not "live"**: a session open when the server died reads null and is
    * unreachable through this process all the same.
    */

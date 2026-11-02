@@ -307,35 +307,52 @@ describe("an import session's tally", () => {
   });
 });
 
-describe("an import session's end (0026)", () => {
-  test("an open session reads not-ended, and ending it is recorded once", async () => {
+describe("an import session's end (0026, 0027)", () => {
+  test("an open session reads not-ended, and the first end is recorded with its reason", async () => {
     const path = newDatabasePath();
     const outcome = await withStore(path, (store) =>
       Effect.gen(function* () {
         yield* open(store, "imp_a");
         const before = {
-          ended: yield* store.importSessionEnded("imp_a"),
+          ended: yield* store.importSessionEnd("imp_a"),
           listed: yield* store.importSessions(TARGET),
         };
-        yield* store.endImportSession("imp_a");
+        yield* store.endImportSession("imp_a", "operator");
         const first = (yield* store.importSessions(TARGET))[0]?.endedAt;
         yield* Effect.sleep("5 millis");
-        // A stop then the layer's finalizer: the second close must not move the instant.
-        yield* store.endImportSession("imp_a");
+        // A stop then the layer's finalizer: the second close must move neither the instant
+        // nor the reason, or an operator's stop would read as a shutdown and stop gating.
+        yield* store.endImportSession("imp_a", "shutdown");
         return {
           before,
           first,
-          ended: yield* store.importSessionEnded("imp_a"),
+          ended: yield* store.importSessionEnd("imp_a"),
           second: (yield* store.importSessions(TARGET))[0]?.endedAt,
         };
       }),
     );
-    expect(outcome.before.ended).toBe(false);
+    expect(outcome.before.ended).toBeUndefined();
     expect(outcome.before.listed[0]?.endedAt).toBeNull();
     expect(typeof outcome.first).toBe("number");
-    expect(outcome.ended).toBe(true);
+    expect(outcome.ended?.endedAt).toBe(outcome.first ?? -1);
+    expect(outcome.ended?.reason).toBe("operator");
     expect(outcome.second).toBe(outcome.first);
   });
+
+  test.each(["operator", "shutdown", "refused", "open_failed"] as const)(
+    "a %s end round-trips through the column's check",
+    async (reason) => {
+      const path = newDatabasePath();
+      const outcome = await withStore(path, (store) =>
+        Effect.gen(function* () {
+          yield* open(store, "imp_a");
+          yield* store.endImportSession("imp_a", reason);
+          return yield* store.importSessionEnd("imp_a");
+        }),
+      );
+      expect(outcome?.reason).toBe(reason);
+    },
+  );
 
   test("an import with no row is not ended, and ending it fails nothing", async () => {
     // The index is advisory: a failed `recordImportSession` must not turn into refused
@@ -343,24 +360,26 @@ describe("an import session's end (0026)", () => {
     const path = newDatabasePath();
     const outcome = await withStore(path, (store) =>
       Effect.gen(function* () {
-        yield* store.endImportSession("imp_not_there");
-        return yield* store.importSessionEnded("imp_not_there");
+        yield* store.endImportSession("imp_not_there", "operator");
+        return yield* store.importSessionEnd("imp_not_there");
       }),
     );
-    expect(outcome).toBe(false);
+    expect(outcome).toBeUndefined();
   });
 
   test("a session is ended only once every run of it has ended", async () => {
+    // Several authority periods on one harness session, each its own import id: the index
+    // reads them as one session, ended once the last period is.
     const path = newDatabasePath();
     const outcome = await withStore(path, (store) =>
       Effect.gen(function* () {
         yield* open(store, "imp_a", { session: "ses_shared" });
         yield* Effect.sleep("5 millis");
         yield* open(store, "imp_b", { session: "ses_shared" });
-        yield* store.endImportSession("imp_a");
+        yield* store.endImportSession("imp_a", "shutdown");
         const partly = (yield* store.importSessions(TARGET))[0]?.endedAt;
         yield* Effect.sleep("5 millis");
-        yield* store.endImportSession("imp_b");
+        yield* store.endImportSession("imp_b", "operator");
         const fully = (yield* store.importSessions(TARGET))[0]?.endedAt;
         return { partly, fully };
       }),

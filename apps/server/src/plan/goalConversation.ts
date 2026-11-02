@@ -512,7 +512,7 @@ const make = Effect.fnUntraced(function* () {
        * move is to give up on this conversation so the *next* message opens a new one
        * rather than failing the same way forever.
        */
-      yield* closeSession(entry);
+      yield* closeSession(entry, "refused");
       return yield* refuse(accepted.failure);
     }
     return {
@@ -1188,7 +1188,9 @@ const make = Effect.fnUntraced(function* () {
   return GoalConversations.of({
     send,
     replay,
-    close: sessions.close,
+    // The surface's intentional close. The goal surface records no ending of its own (the
+    // goal's status is its authority), so the reason reaches nothing yet.
+    close: (goalId) => sessions.close(goalId, "operator"),
     attach,
   });
 });

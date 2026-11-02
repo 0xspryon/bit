@@ -343,8 +343,9 @@ export class McpCredentials extends Context.Service<
      * cause the operator can see. A longer clock is the same failure further away. What
      * bounds an importer's grant instead is the goal's list — scope close,
      * {@link revokeImport} as the check after it, process death — plus the durable gate a
-     * goal has in `checkGoalAuthority`: `import_sessions.ended_at` (`0026`), which the
-     * importer's toolkit reads before every write.
+     * goal has in `checkGoalAuthority`: `import_sessions.ended_at` and `ended_reason`
+     * (`0026`, `0027`), which the importer's toolkit reads before every write, refusing it
+     * under an import the operator ended.
      *
      * See this module's header for what bounds the resulting credential.
      */

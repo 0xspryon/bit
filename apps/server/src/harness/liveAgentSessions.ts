@@ -123,6 +123,22 @@ export interface LiveAgentSession<Meta> {
   readonly meta: Meta;
 }
 
+/**
+ * Why a session was closed, which is the whole list of things that close one.
+ *
+ * - `operator` — the surface's own intentional close: the operator ended it.
+ * - `shutdown` — this registry's layer finalizer, on the way down.
+ * - `refused` — the harness refused a prompt, so the session was given up on.
+ * - `open_failed` — an open that published its entry and then never reached `ready`.
+ *
+ * Every close ends the session's authority period in this process — the credential and the
+ * registration go either way. Only `operator` says the authority is *over*; the other three
+ * are this process letting go. The spine passes the reason through to `afterClose` and
+ * does nothing else with it; a surface that persists an ending is what gives it meaning.
+ */
+export type LiveSessionCloseReason =
+  "operator" | "shutdown" | "refused" | "open_failed";
+
 /** Everything opening a session can fail with, before the surface maps it to its own refusal. */
 export type LiveSessionOpenFailure =
   | FleetError
@@ -149,8 +165,14 @@ export interface LiveSessionRole<Meta> {
   }) => Effect.Effect<IssuedCredential, CredentialRefused, Scope.Scope>;
   /** Revokes every grant of this surface's kind for one id, answering how many there were. */
   readonly revokeStray: (id: string) => Effect.Effect<number>;
-  /** Runs after a session is closed and its revoke checked. Must not fail. */
-  readonly afterClose?: (entry: LiveAgentSession<Meta>) => Effect.Effect<void>;
+  /**
+   * Runs after a session is closed and its revoke checked, with why it was closed. Must
+   * not fail. Not run for a stale close (see `closeSession`).
+   */
+  readonly afterClose?: (
+    entry: LiveAgentSession<Meta>,
+    reason: LiveSessionCloseReason,
+  ) => Effect.Effect<void>;
   /** The log lines, in the surface's own words. */
   readonly words: {
     readonly unregisterRefused: string;
@@ -228,9 +250,15 @@ export interface LiveAgentSessions<Meta> {
    * Safe to call with a stale entry: if the map no longer holds this exact entry, only the
    * entry's own narrator and scope are closed, and nothing keyed by its id is touched.
    */
-  readonly closeSession: (entry: LiveAgentSession<Meta>) => Effect.Effect<void>;
+  readonly closeSession: (
+    entry: LiveAgentSession<Meta>,
+    reason: LiveSessionCloseReason,
+  ) => Effect.Effect<void>;
   /** {@link closeSession} by id. Idempotent, and safe for an id with nothing live. */
-  readonly close: (id: string) => Effect.Effect<void>;
+  readonly close: (
+    id: string,
+    reason: LiveSessionCloseReason,
+  ) => Effect.Effect<void>;
 }
 
 /**
@@ -315,6 +343,7 @@ export const makeLiveAgentSessions = <Meta>(
      */
     const closeSession = Effect.fnUntraced(function* (
       entry: LiveAgentSession<Meta>,
+      reason: LiveSessionCloseReason,
     ) {
       const current = live.get(entry.id)?.scope === entry.scope;
       if (current) live.delete(entry.id);
@@ -343,14 +372,18 @@ export const makeLiveAgentSessions = <Meta>(
           annotate(entry),
         );
       }
-      if (role.afterClose !== undefined) yield* role.afterClose(entry);
+      if (role.afterClose !== undefined) yield* role.afterClose(entry, reason);
       yield* Effect.logInfo(role.words.closed, annotate(entry));
     });
 
     // Owned by the calling layer's scope, so a `SIGINT` closes every session rather than
     // dropping it with a live credential behind it.
     yield* Effect.addFinalizer(() =>
-      Effect.forEach([...live.values()], closeSession, { discard: true }),
+      Effect.forEach(
+        [...live.values()],
+        (entry) => closeSession(entry, "shutdown"),
+        { discard: true },
+      ),
     );
 
     /**
@@ -543,7 +576,7 @@ export const makeLiveAgentSessions = <Meta>(
                     // Nothing ran, and the session is useless: it has been
                     // prompted-and-failed, and this seam never resubmits a prompt. Closed
                     // so the next open builds a fresh one.
-                    yield* closeSession(entry);
+                    yield* closeSession(entry, "refused");
                     stage = { _tag: "closed" };
                     return yield* Effect.fail(input.refuse(prompted.failure));
                   }
@@ -572,7 +605,7 @@ export const makeLiveAgentSessions = <Meta>(
                   return reached._tag === "building"
                     ? Scope.close(scope, Exit.void)
                     : reached._tag === "published"
-                      ? closeSession(reached.entry)
+                      ? closeSession(reached.entry, "open_failed")
                       : Effect.void;
                 }),
               );
@@ -587,9 +620,9 @@ export const makeLiveAgentSessions = <Meta>(
       ready,
       open,
       closeSession,
-      close: (id) => {
+      close: (id, reason) => {
         const entry = live.get(id);
-        return entry === undefined ? Effect.void : closeSession(entry);
+        return entry === undefined ? Effect.void : closeSession(entry, reason);
       },
     } satisfies LiveAgentSessions<Meta>;
   });

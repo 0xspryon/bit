@@ -1561,7 +1561,8 @@ const addImportSessionConfirmation = statements(
  * and the toolkit refuses a write under an import whose row has one.
  *
  * Set when the session is closed — by the operator, by the layer's finalizer, or because
- * the harness refused a prompt — and never cleared. A row written before this column
+ * the harness refused a prompt — and never cleared. `0027` adds *why*, and narrows the
+ * toolkit's refusal to an operator's end; this column alone no longer gates anything. A row written before this column
  * existed reads `NULL`, which is "not known to be ended": nothing was published, and those
  * rows' credentials died with the process that minted them, so there is no grant for the
  * gate to stand behind.
@@ -1572,6 +1573,45 @@ const addImportSessionConfirmation = statements(
  */
 const addImportSessionEnd = statements(
   `ALTER TABLE import_sessions ADD COLUMN ended_at INTEGER`,
+);
+
+/**
+ * `0027` — why an import's authority period ended, beside `0026`'s when.
+ *
+ * **`ended_at` alone conflated two different events.** Every close stamped it, the layer's
+ * finalizer included, so a graceful shutdown ended every open import while a crash ended
+ * none; and the toolkit refused every write under a stamped row. A gracefully restarted
+ * import could then never be continued (S7), and a fresh session opened under the same
+ * import id after a refused prompt had every write refused.
+ *
+ * **The rule.** `ended_at` plus `ended_reason` describe one *authority period*: the span in
+ * which one process held one credential and one registration for this import's session.
+ * Both are written together, by the first close, and never cleared. A harness session may
+ * have several authority periods; **the import id is what changes between them** — a later
+ * opening gets a new import id and a new row rather than reviving this one, and the index
+ * still reads as one session because it groups by `harness_session_id` and tallies across
+ * every `caller_scope` of the session.
+ *
+ * The reasons, which are the whole list of things that close a session:
+ *
+ * - `operator` — the operator ended it. **The only reason the importer toolkit refuses a
+ *   write on**, because it is the only one where the authority is genuinely over.
+ * - `shutdown` — this process's layer finalizer, on its way down.
+ * - `refused` — the harness refused a prompt, so the session was given up on.
+ * - `open_failed` — the open never got as far as a working session.
+ *
+ * The last three are this process letting go. The credential behind them is already gone
+ * with the in-memory grant, so there is nothing left to gate, and gating would be the thing
+ * that stops a later period from continuing the session.
+ *
+ * A row ended under `0026` alone reads `ended_at` set and `ended_reason` `NULL`: not
+ * backfilled, because nothing recorded why, and not refused, because the process that
+ * minted its grant is gone. A `CHECK` holds the column to the four reasons; `NULL` passes
+ * it, which is the open row and the pre-`0027` row.
+ */
+const addImportSessionEndReason = statements(
+  `ALTER TABLE import_sessions ADD COLUMN ended_reason TEXT
+    CHECK (ended_reason IN ('operator', 'shutdown', 'refused', 'open_failed'))`,
 );
 
 /**
@@ -1618,6 +1658,7 @@ export const MIGRATIONS: Record<
   "0024_import_sessions": addImportSessions,
   "0025_import_session_confirmation": addImportSessionConfirmation,
   "0026_import_session_end": addImportSessionEnd,
+  "0027_import_session_end_reason": addImportSessionEndReason,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

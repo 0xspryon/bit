@@ -490,6 +490,7 @@ describe("a database already at 0002", () => {
       "24_import_sessions",
       "25_import_session_confirmation",
       "26_import_session_end",
+      "27_import_session_end_reason",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -771,6 +772,7 @@ describe("a database already at 0005", () => {
       "24_import_sessions",
       "25_import_session_confirmation",
       "26_import_session_end",
+      "27_import_session_end_reason",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1496,6 +1498,7 @@ describe("a database already at 0015", () => {
       "24_import_sessions",
       "25_import_session_confirmation",
       "26_import_session_end",
+      "27_import_session_end_reason",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1643,6 +1646,7 @@ describe("a database already at 0016", () => {
       "24_import_sessions",
       "25_import_session_confirmation",
       "26_import_session_end",
+      "27_import_session_end_reason",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1819,6 +1823,7 @@ describe("a database already at 0017", () => {
       "24_import_sessions",
       "25_import_session_confirmation",
       "26_import_session_end",
+      "27_import_session_end_reason",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(
@@ -2049,6 +2054,7 @@ describe("0025 import session confirmation", () => {
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "25_import_session_confirmation",
       "26_import_session_end",
+      "27_import_session_end_reason",
     ]);
     expect(outcome.columns).toContain("session_created_at");
     // Not backfilled: nothing in a 0024 row says the harness ever held the session.
@@ -2087,10 +2093,63 @@ describe("0026 import session end", () => {
 
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "26_import_session_end",
+      "27_import_session_end_reason",
     ]);
     expect(outcome.columns).toContain("ended_at");
     // Not backfilled: a row from before the column says nothing about an ending.
     expect(outcome.upgraded).toEqual([{ ended_at: null }]);
     expect(outcome.ended).toEqual([{ ended_at: 300 }]);
+  });
+});
+
+describe("0027 import session end reason", () => {
+  test("a row ended under 0026 upgrades with no reason, and the column takes only the four reasons", async () => {
+    const path = newDatabasePath();
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* runMigrations({ loader: chainThrough(26) });
+        yield* sql`INSERT INTO import_sessions (
+            import_id, target_id, harness_session_id, harness_instance_id, model,
+            caller_scope, opened_at, session_created_at, ended_at
+          ) VALUES ('imp_old', 'acme-corp', 'ses_old', 'opencode', 'p/m',
+                    'acme-corp/import/imp_old', 100, 150, 300)`;
+        const applied = yield* migrate;
+        const upgraded = yield* sql<{
+          ended_at: number | null;
+          ended_reason: string | null;
+        }>`SELECT ended_at, ended_reason FROM import_sessions`;
+        yield* sql`INSERT INTO import_sessions (
+            import_id, target_id, harness_session_id, harness_instance_id, model,
+            caller_scope, opened_at, session_created_at, ended_at, ended_reason
+          ) VALUES ('imp_new', 'acme-corp', 'ses_new', 'opencode', 'p/m',
+                    'acme-corp/import/imp_new', 400, 450, 500, 'shutdown')`;
+        const unknown = yield* Effect.exit(
+          sql`UPDATE import_sessions SET ended_reason = 'crashed'
+            WHERE import_id = 'imp_new'`,
+        );
+        return {
+          applied,
+          upgraded,
+          unknownRefused: unknown._tag === "Failure",
+          columns: yield* columnsOf(sql, "import_sessions"),
+          reasons: yield* sql<{
+            import_id: string;
+            ended_reason: string | null;
+          }>`SELECT import_id, ended_reason FROM import_sessions ORDER BY import_id`,
+        };
+      }),
+    );
+
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "27_import_session_end_reason",
+    ]);
+    expect(outcome.columns).toContain("ended_reason");
+    // Not backfilled: nothing under 0026 recorded why a row ended.
+    expect(outcome.upgraded).toEqual([{ ended_at: 300, ended_reason: null }]);
+    expect(outcome.unknownRefused).toBe(true);
+    expect(outcome.reasons).toEqual([
+      { import_id: "imp_new", ended_reason: "shutdown" },
+      { import_id: "imp_old", ended_reason: null },
+    ]);
   });
 });

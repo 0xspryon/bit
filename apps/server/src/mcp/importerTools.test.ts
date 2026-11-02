@@ -57,8 +57,14 @@ const TARGET = "target-1";
 const GOAL = "goal-1";
 const ROUND = "rnd-1";
 const IMPORT = "imp-1";
-/** An import whose session has been ended (`0026`), for the gate behind a no-clock grant. */
+/** An import the operator ended (`0026`, `0027`), for the gate behind a no-clock grant. */
 const IMPORT_ENDED = "imp-ended";
+/**
+ * The ends that are this process letting go rather than the authority ending (`0027`). Each
+ * gets an import of its own, ended for that reason, with a live credential.
+ */
+const LET_GO = ["shutdown", "refused", "open_failed"] as const;
+const letGoImport = (reason: (typeof LET_GO)[number]) => `imp-let-go-${reason}`;
 const BUDGET = 3;
 
 const HOST = { callerScope: operatorScope(TARGET), targetId: TARGET } as const;
@@ -94,6 +100,7 @@ class Seeded extends Context.Service<
     readonly roundToken: string;
     readonly goalToken: string;
     readonly endedImporterToken: string;
+    readonly letGoTokens: Readonly<Record<(typeof LET_GO)[number], string>>;
   }
 >()("test/ImporterSeeded") {
   static readonly layer = Layer.effect(
@@ -184,12 +191,42 @@ class Seeded extends Context.Service<
         model: "opencode/glm-5.3-flash-free",
       });
       yield* store.confirmImportSession(IMPORT_ENDED);
-      yield* store.endImportSession(IMPORT_ENDED);
+      yield* store.endImportSession(IMPORT_ENDED, "operator");
       const ended = yield* credentials.issueWithoutExpiry({
         _tag: "importer",
         targetId: TARGET,
         importId: IMPORT_ENDED,
       });
+
+      // Ended for each reason that is not the operator's, each with a live credential: what
+      // a later authority period on a continued session would hold (S7).
+      const letGo: Record<string, string> = {};
+      for (const reason of LET_GO) {
+        const importId = letGoImport(reason);
+        yield* progress.open({
+          importId,
+          targetId: TARGET,
+          urls: [PAGE_A],
+          droppedLinks: 0,
+          harnessInstanceId: "opencode",
+          model: "opencode/glm-5.3-flash-free",
+        });
+        yield* store.recordImportSession({
+          importId,
+          targetId: TARGET,
+          harnessSessionId: `ses_${reason}`,
+          harnessInstanceId: "opencode",
+          model: "opencode/glm-5.3-flash-free",
+        });
+        yield* store.confirmImportSession(importId);
+        yield* store.endImportSession(importId, reason);
+        const issued = yield* credentials.issueWithoutExpiry({
+          _tag: "importer",
+          targetId: TARGET,
+          importId,
+        });
+        letGo[reason] = Redacted.value(issued.token);
+      }
 
       return Seeded.of({
         importerToken: Redacted.value(importer.token),
@@ -197,6 +234,11 @@ class Seeded extends Context.Service<
         roundToken: Redacted.value(round.token),
         goalToken: Redacted.value(goal.token),
         endedImporterToken: Redacted.value(ended.token),
+        letGoTokens: {
+          shutdown: letGo["shutdown"] ?? "",
+          refused: letGo["refused"] ?? "",
+          open_failed: letGo["open_failed"] ?? "",
+        },
       });
     }),
   );
@@ -251,6 +293,11 @@ let workerToken = "";
 let roundToken = "";
 let goalToken = "";
 let endedImporterToken = "";
+let letGoTokens: Readonly<Record<(typeof LET_GO)[number], string>> = {
+  shutdown: "",
+  refused: "",
+  open_failed: "",
+};
 
 beforeAll(async () => {
   await runtime.runPromise(
@@ -266,6 +313,7 @@ beforeAll(async () => {
       roundToken = seeded.roundToken;
       goalToken = seeded.goalToken;
       endedImporterToken = seeded.endedImporterToken;
+      letGoTokens = seeded.letGoTokens;
     }),
   );
 });
@@ -741,7 +789,7 @@ describe("source_url must be one of this import's own pages", () => {
 });
 
 describe("an import whose session has ended", () => {
-  test("refuses every write, even under a credential that is still live", async () => {
+  test("refuses every write after the operator ended it, even under a credential that is still live", async () => {
     // `checkGoalAuthority`'s analogue: a no-clock importer grant has the column behind it.
     const entry = await callTool(
       importerUrl,
@@ -757,7 +805,7 @@ describe("an import whose session has ended", () => {
     );
     expect(entry.isError).toBe(true);
     expect(entry.text).toContain("unauthorized");
-    expect(entry.text).toContain("has ended");
+    expect(entry.text).toContain("ended by the operator");
 
     const asset = await callTool(
       importerUrl,
@@ -773,7 +821,7 @@ describe("an import whose session has ended", () => {
       },
     );
     expect(asset.isError).toBe(true);
-    expect(asset.text).toContain("has ended");
+    expect(asset.text).toContain("ended by the operator");
 
     const stored = await runtime.runPromise(
       Effect.flatMap(ObservationStore, (store) => store.targetScope(TARGET)),
@@ -782,6 +830,32 @@ describe("an import whose session has ended", () => {
       stored.entries.some((row) => row.value === "after-the-end.acme.com"),
     ).toBe(false);
   });
+
+  test.each(LET_GO)(
+    "does not refuse a write after a %s end, because the process let go rather than the authority ending",
+    async (reason) => {
+      // The grant here is what a later authority period would hold. Gating on this end is
+      // what would stop a gracefully restarted import from being continued (S7).
+      const value = `after-a-${reason.replace("_", "-")}.acme.com`;
+      const entry = await callTool(
+        importerUrl,
+        letGoTokens[reason],
+        "add_scope_entry",
+        {
+          effect: "in",
+          kind: "host",
+          value,
+          source_url: PAGE_A,
+          note: "scope table, row 10",
+        },
+      );
+      expect(entry.isError).toBe(false);
+      const stored = await runtime.runPromise(
+        Effect.flatMap(ObservationStore, (store) => store.targetScope(TARGET)),
+      );
+      expect(stored.entries.some((row) => row.value === value)).toBe(true);
+    },
+  );
 
   test("still reads, because a read is not what the gate defends", async () => {
     const called = await callTool(
