@@ -5296,20 +5296,44 @@ export const scenarios: Scenario[] = [
       a.importer.load(state);
     },
   })),
-  {
-    id: "importer-strip",
-    // Its own group: the A6 Auto-load nine are the importer page's states, and each of those
-    // mounts the chat. This one is the Assets screen that leads to it.
+  // Its own group: the A6 Auto-load nine are the importer page's states, and each of those
+  // mounts the chat. These two are the Assets screen that leads to it, with and without
+  // entries: D1 draws the strip on both, and moves the primary button into the header once
+  // there are entries.
+  ...(
+    [
+      ["importer-strip", "D1 · Assets, an earlier session to continue", []],
+      [
+        "importer-strip-entries",
+        "D1 · Assets with entries, the same strip",
+        [
+          ["in", "subtree", "acme.com", "imported"],
+          ["in", "host", "api.acme.com", "imported"],
+          ["out", "host", "status.acme.com", "operator"],
+        ],
+      ],
+    ] as const
+  ).map(([id, label, entries]): Scenario => ({
+    id,
     group: "A6 Assets",
-    label: "D1 · Assets, an earlier session to continue",
+    label,
     apply: (a) => {
       a.reset();
       a.previewTarget("acme-corp");
       a.navItem = "assets";
       a.assetsTab = "scope";
-      // An empty scope, declared: the strip lives in its empty state.
+      // The scope is declared: with no entries the strip sits under the empty state, with
+      // some it sits under the lists.
       a.scope = {
-        entries: [],
+        entries: entries.map(([effect, kind, value, source], index) => ({
+          entryId: `ent_mock_${String(index)}`,
+          effect,
+          kind,
+          value,
+          source,
+          note: null,
+          createdAt: Date.now() - index * 60_000,
+        })),
         hostLabels: [],
         assetLabels: [],
         promptBlock: null,
@@ -5327,5 +5351,5 @@ export const scenarios: Scenario[] = [
       a.harnessesLoaded = true;
       a.importerModel = mockImporterModel();
     },
-  },
+  })),
 ];

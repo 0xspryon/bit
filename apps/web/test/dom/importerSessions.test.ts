@@ -185,11 +185,11 @@ describe("the last-session strip", () => {
     expect(hasButton("Auto-load scope…")).toBe(false);
     // At the bottom, with the Add bar, rather than among the lists.
     const add = document.querySelector("form.add");
+    const found = strip();
+    if (add === null || found === null)
+      throw new Error("no strip or no Add bar");
     expect(
-      add !== null &&
-        strip() !== null &&
-        strip()?.compareDocumentPosition(add) &
-          Node.DOCUMENT_POSITION_FOLLOWING,
+      found.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
 
