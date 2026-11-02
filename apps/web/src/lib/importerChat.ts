@@ -22,8 +22,10 @@
  *   there is. Replayed prose, labelled as the harness's, which it may have deleted.
  * - **The live feed** (`items`), where the operator's own message is a minted
  *   `turn.operator` row (see {@link operatorTurn}) and a turn opens at each of those. The
- *   importer's replies and thinking arrive here, filed by import id ({@link importerFeed});
- *   tool calls, their results and the records they produced will (S5).
+ *   importer's replies, thinking, tool calls and their results arrive here as narration,
+ *   and the records its writes produced (`scope.entry.added`, `asset.imported`) as
+ *   records, all filed by import id ({@link importerFeed}). `rowsFor` folds each write call
+ *   into its record, so a call and its receipt are one row (S5).
  *
  * Replayed turns come first, then live ones; the caller owns the floor between them (the
  * same job `buildGoalConversation`'s `narrationFloor` does), so nothing is shown from both.
@@ -36,6 +38,12 @@
  * leading group, "earlier in this session", rather than under a turn they may not belong
  * to. Placing them by timestamp would be a guess, and `LiveItem.at` is documented as not an
  * ordering key. This is the honest degradation, and the group's own note says it.
+ *
+ * **This is decided, not pending** (the importer conversation design, S5.2): no turn ordinal
+ * is carried on the wire to place them. That would be a durable column on `scope_entries`
+ * and `asset_imports`, or a side table, for a cosmetic grouping on a screen whose durable
+ * half is reviewed on the Assets list anyway. Live records are placed by the narration
+ * around them, which needs no ordinal; only a reload's records go to the leading group.
  *
  * ## The notes in here are stand-ins
  *

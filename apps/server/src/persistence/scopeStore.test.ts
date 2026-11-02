@@ -239,6 +239,52 @@ describe("scope entries", () => {
     expect(outcome.count).toBe(1);
   });
 
+  test("a no-op add writes one record saying so, naming the entry already there", async () => {
+    // Every add produces exactly one record, so a chat can fold the Nth call into the Nth
+    // record (the importer conversation design, S5.1). The no-op's record describes the
+    // existing entry — its note and source are the first writer's, not this caller's.
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const first = yield* store.addScopeEntry(OPERATOR, {
+          effect: "in",
+          kind: "subtree",
+          value: "acme.test",
+          source: "operator",
+          note: "typed by hand",
+        });
+        yield* store.addScopeEntry(OPERATOR, {
+          effect: "in",
+          kind: "subtree",
+          value: "ACME.test",
+          source: "imported",
+          note: "a second page",
+        });
+        const events = yield* store.eventsAfter(0, 100);
+        const scope = yield* store.targetScope(TARGET);
+        return { first, events, scope };
+      }),
+    );
+    const added = outcome.events.filter(
+      (event) => event.kind === "scope.entry.added",
+    );
+    expect(added).toHaveLength(2);
+    expect(added[0]?.payload).toMatchObject({ created: true });
+    expect(added[1]?.subjectId).toBe(outcome.first.entry.entryId);
+    expect(added[1]?.payload).toEqual({
+      entryId: outcome.first.entry.entryId,
+      effect: "in",
+      kind: "subtree",
+      value: "acme.test",
+      source: "operator",
+      note: "typed by hand",
+      created: false,
+    });
+    // Nothing else changed: one entry, still the first writer's.
+    expect(outcome.scope.entries).toHaveLength(1);
+    expect(outcome.scope.entries[0]?.note).toBe("typed by hand");
+  });
+
   test("an unnormalisable value is refused and nothing is written", async () => {
     const path = newDatabasePath();
     const outcome = await withStore(path, (store) =>

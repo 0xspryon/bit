@@ -181,7 +181,11 @@ export const AddScopeEntryOutcome = Schema.Struct({
    * can notice it meant the host alone; one told only `created: true` cannot.
    */
   covers: Schema.String,
-  /** False when this entry already existed. Nothing was written and nothing changed. */
+  /**
+   * False when this entry already existed. The scope did not change; the only thing written
+   * is a `scope.entry.added` record saying so, which is how the operator's chat can show
+   * this call as "already in scope" rather than losing count of which call wrote what.
+   */
   created: Schema.Boolean,
 });
 

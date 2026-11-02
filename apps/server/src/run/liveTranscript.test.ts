@@ -565,6 +565,104 @@ describe("projecting the record", () => {
     ).toBe("known");
   });
 
+  test("an importer's entry reads as D3's receipt, and is filed under its import", () => {
+    const importScope = `${TARGET}/import/imp_01`;
+    const entry = (over: Record<string, unknown>) =>
+      projectEvent(
+        event({
+          kind: "scope.entry.added",
+          callerScope: importScope,
+          intentId: null,
+          attemptId: null,
+          operation: "add_scope_entry",
+          operationId: null,
+          subjectId: "scope_1",
+          payload: {
+            entryId: "scope_1",
+            effect: "in",
+            kind: "subtree",
+            value: "acme.com",
+            source: "imported",
+            note: null,
+            ...over,
+          },
+        }),
+      );
+    const made = entry({ created: true });
+    expect(made.kind).toBe("scope.entry.added");
+    expect(made.importId).toBe("imp_01");
+    expect(made.goalId).toBeNull();
+    expect(made.roundId).toBeNull();
+    expect(made.attemptId).toBeNull();
+    expect(made.headline).toBe("acme.com");
+    expect(made.body).toBe(
+      "entry scope_1 created · in · subtree · acme.com and every subdomain",
+    );
+    expect(made.outcome).toBe("new");
+
+    // A no-op add has a record too, and it must not read as an addition.
+    const again = entry({ created: false });
+    expect(again.body).toBe(
+      "already in scope as entry scope_1 · in · subtree · acme.com and every subdomain · nothing changed",
+    );
+    expect(again.outcome).toBe("known");
+
+    // An event written before `created` existed was always a real addition.
+    expect(entry({}).outcome).toBe("new");
+  });
+
+  test("an entry the operator typed is not filed under any import", () => {
+    const item = projectEvent(
+      event({
+        kind: "scope.entry.added",
+        callerScope: `${TARGET}/operator`,
+        intentId: null,
+        attemptId: null,
+        payload: {
+          entryId: "scope_2",
+          effect: "out",
+          kind: "host",
+          value: "a.test",
+        },
+      }),
+    );
+    expect(item.kind).toBe("scope.entry.added");
+    expect(item.importId).toBeNull();
+  });
+
+  test("an imported asset names its page, and says when the estate already held it", () => {
+    const asset = (created: boolean) =>
+      projectEvent(
+        event({
+          kind: "asset.imported",
+          callerScope: `${TARGET}/import/imp_02`,
+          intentId: null,
+          attemptId: null,
+          operation: "import_asset",
+          subjectId: "asset_1",
+          payload: {
+            assetId: "asset_1",
+            kind: "host",
+            identity: "app.acme.com",
+            created,
+            importedAs: "https://app.acme.com",
+            sourceUrl: "https://hackerone.test/acme",
+          },
+        }),
+      );
+    const made = asset(true);
+    expect(made.kind).toBe("asset.imported");
+    expect(made.importId).toBe("imp_02");
+    expect(made.headline).toBe("app.acme.com");
+    expect(made.body).toBe(
+      "app.acme.com recorded as a new host asset · read off https://hackerone.test/acme",
+    );
+    expect(made.outcome).toBe("new");
+    const known = asset(false);
+    expect(known.body).toContain("already on the estate");
+    expect(known.outcome).toBe("known");
+  });
+
   test("an added intent reads as its question", () => {
     const item = projectEvent(
       event({

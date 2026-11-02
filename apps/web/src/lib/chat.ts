@@ -60,21 +60,10 @@ const KIND_LABELS: Record<string, string | undefined> = {
   "asset.recorded": "Asset",
   /**
    * An entry written onto a target's scope: the importer's `add_scope_entry`, or an
-   * operator typing one in.
-   *
-   * **A real event kind (`event.ts`) that is not yet a live item kind.** `scope.entry.added`
-   * is beside `scope.entry.removed` in `EventKind`; what it is missing from is
-   * `LIVE_ITEM_KINDS` in `live.ts`, a narrower list of what the live feed carries. Until the
-   * API slice adds it there, no real feed delivers this kind, and this label and the
-   * importer rows in {@link WRITE_TOOLS} are the importer chat prototype's, with nothing yet
-   * to merge against. An unknown kind renders as itself, so the label is a nicety.
+   * operator typing one in. Only the importer's reach a chat (`LiveItem.importId`).
    */
   "scope.entry.added": "Scope entry",
-  /**
-   * An asset the importer read off a program page (`record_imported_asset`, D14).
-   *
-   * An event kind, not yet a live item kind: see `scope.entry.added` above.
-   */
+  /** An asset the importer read off a program page (`record_imported_asset`, D14). */
   "asset.imported": "Asset",
   "intent.added": "Intent",
   "goal.added": "Goal",
@@ -230,16 +219,18 @@ const WRITE_TOOLS: Record<string, string | undefined> = {
    * record, which would look like a merge bug when the feed arrives. They are keyed on the
    * reduced name, as the others are.
    *
-   * **The records they name are event kinds, not yet live item kinds.** `scope.entry.added`
-   * and `asset.imported` are in `EventKind` (`event.ts`) and absent from `LIVE_ITEM_KINDS`
-   * (`live.ts`), so no real feed carries them yet. The API slice has to add them there; these
-   * rows are written against that and are exercised today only by the importer chat's mock.
+   * **Every `add_scope_entry` that was not refused writes exactly one record**, including an
+   * add of an entry that already exists: that writes nothing to the scope and a
+   * `scope.entry.added` carrying `created: false`, whose sentence says "already in scope".
+   * It used to write no record at all, and since {@link pairWrites} pairs by position, every
+   * call after a no-op was folded into the record of the call before it. The fix is in the
+   * store rather than here (the importer conversation design, S5.1), so this pairing needs
+   * no knowledge of it.
    *
-   * **The in-order pairing has a known gap for the importer.** `add_scope_entry` on an entry
-   * that already exists "is not an error and writes nothing" (`created: false`), so it
-   * produces a call and no record, and `pairWrites` would then pair every later call with
-   * the wrong record. The tool's result says which happened; teaching the pairing to read
-   * it is the API slice's job, not something to guess at from a mock.
+   * `record_imported_asset` writes one record per new `operation_id`, `created` or not. An
+   * exact retry of one replays the stored answer and writes nothing — idempotence, not a
+   * gap the store could close — so {@link pairWrites} skips a call whose result says
+   * `replayed`, as it skips a refused one.
    *
    * `read_scope` is deliberately absent: it is a read and writes nothing.
    */
@@ -590,6 +581,7 @@ export const activityOrder = (item: LiveItem): number | undefined => {
  */
 const pairWrites = (
   items: readonly LiveItem[],
+  results: ReadonlyMap<string, LiveItem>,
 ): ReadonlyMap<string, LiveItem> => {
   /** Unclaimed records per kind, oldest first. */
   const unclaimed = new Map<string, LiveItem[]>();
@@ -604,10 +596,54 @@ const pairWrites = (
     if (item.kind !== "tool.call" || item.toolName === null) continue;
     const wanted = WRITE_TOOLS[item.toolName];
     if (wanted === undefined) continue;
+    /*
+     * A call whose result says it wrote nothing takes no place in the queue.
+     *
+     * Position is the whole of the pairing, so a call that claims a record it did not write
+     * hands every later call the record of the one before it. Two results say so
+     * definitively: a **failed** one (a refused write rolled back — the store commits a
+     * record in the same transaction as the write or not at all), and a **replayed** one (an
+     * exact retry, answered from its receipt). A call whose result has not arrived yet still
+     * claims the next record: that is the ordinary in-flight case, and the result arriving
+     * re-derives this.
+     */
+    const result = item.callId === null ? undefined : results.get(item.callId);
+    if (result !== undefined && wroteNothing(result)) continue;
     const record = unclaimed.get(wanted)?.shift();
     if (record !== undefined) paired.set(item.id, record);
   }
   return paired;
+};
+
+/**
+ * Whether a write's result says no record was produced: refused, or an exact replay.
+ *
+ * `replayed` is read from the result's own JSON, and only a literal `true` counts. A result
+ * cut at the server's field cap is invalid JSON and reads as "wrote something", which is the
+ * reading every result had before this existed — so a parse failure can leave a pairing
+ * where it was, never move one.
+ */
+const wroteNothing = (result: LiveItem): boolean =>
+  result.outcome === "failed" || replayed(result);
+
+/**
+ * Whether a result is an exact retry answered from its receipt (`replayed: true`).
+ *
+ * Such a call is rendered as a plain call with its answer rather than as a write: it is not
+ * `unresolved` — the store said plainly that it wrote nothing — and not `refused` either.
+ */
+const replayed = (result: LiveItem): boolean => {
+  if (result.output === null) return false;
+  try {
+    const parsed: unknown = JSON.parse(result.output);
+    return (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      (parsed as Record<string, unknown>)["replayed"] === true
+    );
+  } catch {
+    return false;
+  }
 };
 
 /** Which write state a call with no record is in. */
@@ -638,7 +674,6 @@ export const rowsFor = (
   items: readonly LiveItem[],
   roundRunning: boolean,
 ): readonly ChatRow[] => {
-  const paired = pairWrites(items);
   /** Results by the call they answer. A result with no `callId` cannot be paired at all. */
   const results = new Map<string, LiveItem>();
   for (const item of items) {
@@ -646,6 +681,7 @@ export const rowsFor = (
       results.set(item.callId, item);
     }
   }
+  const paired = pairWrites(items, results);
   /** Records that have been claimed by a call, so they are not also rendered alone. */
   const claimed = new Set([...paired.values()].map((record) => record.id));
   const rows: ChatRow[] = [];
@@ -665,7 +701,9 @@ export const rowsFor = (
       const result =
         (item.callId === null ? undefined : results.get(item.callId)) ?? null;
       const isWrite =
-        item.toolName !== null && WRITE_TOOLS[item.toolName] !== undefined;
+        item.toolName !== null &&
+        WRITE_TOOLS[item.toolName] !== undefined &&
+        !(result !== null && replayed(result));
       const summary = domainSummary(item);
       const record = paired.get(item.id);
       if (record !== undefined) {

@@ -175,6 +175,43 @@ export const LIVE_ITEM_KINDS = [
   "run.settled",
   "observation.recorded",
   "asset.recorded",
+  /**
+   * An asset the scope importer read off a program page (D14) — `asset.recorded`'s
+   * sibling, and a separate item for the reason it is a separate event (`event.ts`): that
+   * one answers "which attempt found this" and this one "which page it was read off".
+   *
+   * A second rendering of an `asset_imports` row, as `asset.recorded` is of an
+   * `asset_discoveries` one, and treated the same way: `outcome` is `new` or `known`,
+   * because a host the estate already held is a second provenance row on an existing
+   * asset and must not read as a new one. It reaches the importer's chat through
+   * {@link LiveItem.importId}, read from the caller scope, where it is the receipt of the
+   * `record_imported_asset` call that wrote it.
+   *
+   * An **exact retry** of that call (`operation_id` reused) replays the stored result and
+   * writes nothing, so it has no record — which is correct for an idempotent write and
+   * means a reader pairing calls to records must not count a replayed call. The tool's
+   * own result says `replayed: true`.
+   */
+  "asset.imported",
+  /**
+   * An entry written onto a target's scope: by the importer's `add_scope_entry`, or by the
+   * operator in the Scope tab.
+   *
+   * Here for the importer's chat, which has nothing else durable to show: its prose is the
+   * harness's and may be gone after a reload, and these records — with `asset.imported` —
+   * are what the session actually did. {@link LiveItem.importId} is set only for the
+   * importer's own writes, from the caller scope, so an operator's typing reaches no chat.
+   *
+   * **Every `add_scope_entry` produces exactly one**, including an add of an entry that
+   * already exists, which writes nothing to the scope and a record carrying
+   * `created: false` (the importer conversation design, S5.1). That is what lets a chat
+   * fold the Nth call into the Nth record: before it, a no-op produced a call and no
+   * record and every later receipt named the wrong entry. `outcome` is `new` or `known`,
+   * as on the asset kinds, and the body of a no-op says the entry was already in scope.
+   * A refused add writes nothing — the transaction rolls back — and its call carries a
+   * failed result instead.
+   */
+  "scope.entry.added",
   "intent.added",
   "goal.added",
   "goal.ended",
@@ -364,14 +401,16 @@ export const LiveItem = Schema.Struct({
    * session is not an attempt, a round or a goal's agent, so all three are null on
    * everything it says.
    *
-   * It is set exactly one way: **the importer's own narration**, published under the import
-   * whose session the importer opened, exactly as a goal agent's is published under its
-   * goal.
+   * It is set two ways, as {@link goalId} is:
    *
-   * `null` for everything else — including, for now, every record the importer wrote. Its
-   * `scope.entry.added` and `asset.imported` events are not projected onto this feed at all
-   * yet (the importer conversation design, S5), and attributing them here is that slice's
-   * work, from the event's caller scope, rather than a guess made from this one.
+   * - **The importer's own narration** — published under the import whose session the
+   *   importer opened, exactly as a goal agent's is published under its goal.
+   * - **A record the importer wrote** — read from the event's caller scope,
+   *   `<targetId>/import/<importId>`. That is its `scope.entry.added` and `asset.imported`
+   *   (the importer conversation design, S5).
+   *
+   * `null` for everything else, including the same two kinds written by the operator from
+   * the Scope tab, whose scope is `<targetId>/operator`.
    */
   importId: Schema.NullOr(Schema.String),
   /** A short label: the tool's name, `Denied`, `Observation recorded`. */

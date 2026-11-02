@@ -100,8 +100,10 @@
  */
 import {
   LIVE_HEARTBEAT_SECONDS,
+  ScopeKind,
   bareToolName,
   bitMcpServerName,
+  describeScopeEntry,
   type LiveCursor,
   type LiveFrame,
   type LiveItem,
@@ -115,10 +117,15 @@ import {
   Filter,
   Option,
   Result,
+  Schema,
   Stream,
 } from "effect";
 
-import { goalIdFromScope, roundIdFromScope } from "../persistence/store";
+import {
+  goalIdFromScope,
+  importIdFromScope,
+  roundIdFromScope,
+} from "../persistence/store";
 import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
 import type {
   NarrationSubject,
@@ -192,6 +199,33 @@ const text = (payload: unknown, name: string): string => {
 const count = (payload: unknown, name: string): number => {
   const value = field(payload, name);
   return typeof value === "number" ? value : 0;
+};
+
+/**
+ * Whether a write record says it changed something.
+ *
+ * `false` only when the payload says `false`. `asset.imported` has always carried the
+ * field; `scope.entry.added` carries it from the slice that began writing a record for a
+ * no-op add (the importer conversation design, S5.1), and every one written before that
+ * was a real addition — so a missing field reads as `true`, not as unknown.
+ */
+const created = (payload: unknown): boolean =>
+  field(payload, "created") !== false;
+
+const isScopeKind = Schema.is(ScopeKind);
+
+/**
+ * An entry in the words every other surface uses for it: the effect, the kind, and what it
+ * covers from `describeScopeEntry` — the same sentence the importer's own tool result and
+ * the Scope tab carry, so a receipt cannot describe the entry differently from either.
+ */
+const entryPhrase = (payload: unknown): string => {
+  const kind = text(payload, "kind");
+  const value = text(payload, "value");
+  const covers = isScopeKind(kind)
+    ? describeScopeEntry({ kind, value })
+    : value;
+  return `${text(payload, "effect")} · ${kind} · ${covers}`;
 };
 
 /* ── Projecting the record ───────────────────────────────────────────────────── */
@@ -314,12 +348,17 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
      */
     goalId: goalIdFromScope(event.callerScope) ?? null,
     /**
-     * Null on every record, for now. The importer's records are not on this feed yet —
-     * `scope.entry.added` and `asset.imported` are not in `LIVE_ITEM_KINDS` — and placing
-     * them under an import is the importer conversation design's S5, read from the caller
-     * scope as `goalId` is above. Only the importer's narration carries one today.
+     * Which import's **conversation** this item belongs to, from the caller scope only —
+     * `goalId`'s rule above, for the same reason.
+     *
+     * `<targetId>/import/<importId>` is the importer's scope, and only the importer writes
+     * under it, so this is set on exactly the records it wrote: its `scope.entry.added`
+     * and `asset.imported`. The same two kinds written from the Scope tab carry
+     * `<targetId>/operator` and get null, which is what keeps an operator's own typing out
+     * of an importer's chat. No subject fallback: an entry's subject is the entry, and it
+     * says nothing about who wrote it.
      */
-    importId: null,
+    importId: importIdFromScope(event.callerScope) ?? null,
     tool: null,
     // Null together with `tool`, always: a committed event is not a tool call, and the
     // record channel never names one.
@@ -382,6 +421,49 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
         // of it, which is a different fact from a new asset and must not read as one.
         outcome: field(event.payload, "created") === true ? "new" : "known",
       };
+    case "scope.entry.added": {
+      const entryId = text(event.payload, "entryId") || event.subjectId;
+      const phrase = entryPhrase(event.payload);
+      /*
+       * The receipt a chat folds the `add_scope_entry` call into, so the sentence is the
+       * one D3 draws: `entry <id> created`, then what the entry covers.
+       *
+       * A no-op add has a record too (`store.ts`'s `addScopeEntry` says why) and must not
+       * read as an addition: it names the entry that was already there and says nothing
+       * changed. `outcome` carries the same distinction in `asset.recorded`'s words, so a
+       * reader filtering for what an import actually added has a field to filter on rather
+       * than a sentence to parse.
+       */
+      const isNew = created(event.payload);
+      return {
+        ...base,
+        kind: "scope.entry.added",
+        headline: text(event.payload, "value"),
+        body: isNew
+          ? `entry ${entryId} created · ${phrase}`
+          : `already in scope as entry ${entryId} · ${phrase} · nothing changed`,
+        outcome: isNew ? "new" : "known",
+      };
+    }
+    case "asset.imported": {
+      const identity = text(event.payload, "identity");
+      const page = text(event.payload, "sourceUrl");
+      // Read off which page, because that is the fact this kind exists to record rather
+      // than `asset.recorded` (`event.ts`). `created: false` is a host the estate already
+      // held — a worker found it, or an earlier import did — and this import is now a
+      // second provenance row on it; it must not read as a new asset.
+      const isNew = created(event.payload);
+      const from = page === "" ? "" : ` · read off ${page}`;
+      return {
+        ...base,
+        kind: "asset.imported",
+        headline: identity,
+        body: isNew
+          ? `${identity} recorded as a new ${text(event.payload, "kind")} asset${from}`
+          : `${identity} was already on the estate; this import is recorded against it${from}`,
+        outcome: isNew ? "new" : "known",
+      };
+    }
     case "intent.added":
       return {
         ...base,

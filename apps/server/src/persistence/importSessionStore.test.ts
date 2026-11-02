@@ -169,6 +169,35 @@ describe("an import session's tally", () => {
     expect(second).toMatchObject({ entriesIn: 1, entriesOut: 0, assets: 0 });
   });
 
+  test("a no-op add leaves a record and does not count as an entry", async () => {
+    // `addScopeEntry` writes a `scope.entry.added` with `created: false` for an entry that
+    // already exists, so a chat can pair each call with its record by position. The tally
+    // counts entries added, so that record must not count — and an event written before
+    // the field existed (no `created` at all) still must.
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* open(store, "imp_dup");
+        const caller = importerOf("imp_dup");
+        yield* addEntry(store, caller, "in", "acme.com");
+        const again = yield* addEntry(store, caller, "in", "acme.com");
+        yield* addEntry(store, caller, "out", "status.acme.com");
+        yield* addEntry(store, caller, "out", "status.acme.com");
+        const events = yield* store.eventsAfter(0, 100);
+        const sessions = yield* store.importSessions(TARGET);
+        return { again, events, sessions };
+      }),
+    );
+    expect(outcome.again.created).toBe(false);
+    const added = outcome.events.filter(
+      (event) => event.kind === "scope.entry.added",
+    );
+    expect(
+      added.map((event) => (event.payload as { created: boolean }).created),
+    ).toEqual([true, false, true, false]);
+    expect(outcome.sessions[0]).toMatchObject({ entriesIn: 1, entriesOut: 1 });
+  });
+
   test("a session that wrote nothing is listed with zeros", async () => {
     const path = newDatabasePath();
     const sessions = await withStore(path, (store) =>

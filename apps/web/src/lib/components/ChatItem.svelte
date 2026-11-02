@@ -192,25 +192,25 @@
       {#if call === null && item.kind !== "tool.result" && item.body !== ""}
         <div class="ret mono">{item.body}</div>
       {/if}
-      {#if answer !== null}
+      <!--
+        A write folded into its record answers with the **record's** sentence — D3's
+        `→ entry 1 created`, or "already in scope" for a no-op — rather than the tool's
+        own output: the record is what was committed, and the output is the harness's
+        copy of what the tool returned, still one disclosure away under "Full call". A
+        record with no body falls back to the result's line, then to the chip alone.
+      -->
+      {#if write === "recorded"}
+        <div class="ret mono">
+          → {item.body !== "" ? item.body : (answer ?? "")}
+          <span class="chip" data-tint="success" title={item.id}>recorded</span>
+        </div>
+      {:else if answer !== null}
         <div class="ret mono" data-failed={result?.outcome === "failed"}>
           → {answer}
-          {#if write === "recorded"}
-            <span class="chip" data-tint="success" title={item.id}
-              >recorded</span
-            >
-          {/if}
         </div>
       {:else if write === "pending"}
         <div class="ret writing mono">
           <StreamCursor label="writing…" />
-        </div>
-      {:else if write === "recorded"}
-        <div class="ret mono">
-          → <span class="chip" data-tint="success" title={item.id}
-            >recorded</span
-          >
-          {item.body}
         </div>
       {/if}
       {#if write === "unresolved" || write === "refused"}

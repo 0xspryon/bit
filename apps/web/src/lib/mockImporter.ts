@@ -25,9 +25,10 @@
  * is prose here and not a tool-call row. A row for a tool the importer does not have would
  * teach the design something false.
  *
- * **The record kinds are real events but not yet live item kinds.** `scope.entry.added` and
- * `asset.imported` are in `EventKind` and absent from `LIVE_ITEM_KINDS`, so the feed that
- * would deliver them is the API slice's to build. See `chat.ts`' `WRITE_TOOLS`.
+ * **The record kinds are real live item kinds**, `scope.entry.added` and `asset.imported`,
+ * and their headline and body here are worded as `run/liveTranscript.ts`'s `projectEvent`
+ * words them, so a declared session and a real one fold the same way. See `chat.ts`'
+ * `WRITE_TOOLS` for how a call is folded into its record.
  */
 import {
   bitMcpServerName,
@@ -225,7 +226,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
         f.record(
           "scope.entry.added",
           value,
-          `${effect} · ${kind} · ${covers(kind, value)}`,
+          `entry ent_${String(entries)} created · ${effect} · ${kind} · ${covers(kind, value)}`,
           seconds + 1,
         ),
       );
@@ -257,7 +258,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
       f.record(
         "asset.imported",
         host,
-        `${host} recorded as an asset of acme-corp, read off ${POLICY}.`,
+        `${host} recorded as a new host asset · read off ${POLICY}`,
         seconds + 1,
       ),
     );
@@ -594,7 +595,7 @@ export const mockForgottenSession = (now: number): ImporterSession => {
       f.record(
         "scope.entry.added",
         value,
-        `in · ${kind} · ${covers(kind, value)}`,
+        `entry ent_${String(index + 1)} created · in · ${kind} · ${covers(kind, value)}`,
         10 + index,
       ),
     );
@@ -610,7 +611,7 @@ export const mockForgottenSession = (now: number): ImporterSession => {
       f.record(
         "asset.imported",
         host,
-        `${host} recorded as an asset of acme-corp, read off ${POLICY}.`,
+        `${host} recorded as a new host asset · read off ${POLICY}`,
         20,
       ),
     );

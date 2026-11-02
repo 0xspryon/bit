@@ -525,6 +525,28 @@ export const goalIdFromScope = (
   return goalId === "" ? undefined : goalId;
 };
 
+/** The reserved segment the scope importer's caller scope is namespaced by. */
+const IMPORT_SCOPE_SEGMENT = "/import/";
+
+/**
+ * Reads the import out of a caller scope, or `undefined` when it is not the importer's.
+ *
+ * {@link goalIdFromScope}'s sibling, with the same one caller and the same narrowness: it
+ * says "the scope importer wrote this under this import", which is what places a
+ * `scope.entry.added` or `asset.imported` in that import's conversation. An entry the
+ * operator typed carries `<targetId>/operator` and yields nothing, so the Scope tab's own
+ * writes never land in an importer's chat.
+ */
+export const importIdFromScope = (
+  callerScope: string | null,
+): string | undefined => {
+  if (callerScope === null) return undefined;
+  const at = callerScope.indexOf(IMPORT_SCOPE_SEGMENT);
+  if (at < 0) return undefined;
+  const importId = callerScope.slice(at + IMPORT_SCOPE_SEGMENT.length);
+  return importId === "" ? undefined : importId;
+};
+
 /**
  * How a caller is named in a refusal it reads.
  *
@@ -6478,7 +6500,9 @@ const makeStore = Effect.fnUntraced(function* () {
    *
    * **The three figures are counted here, from the rows the writes themselves left, and are
    * stored nowhere** — `0024`'s commentary has the argument. `scope.entry.added` events
-   * carry the entry's `effect` in their payload and the scope they were written under;
+   * carry the entry's `effect` in their payload and the scope they were written under, and
+   * only those with `created` true (or absent, on an event older than the field) count: a
+   * no-op add writes a record too (see `addScopeEntry`) and added nothing;
    * `asset_imports` rows carry the scope too. Both are inserted in the same transaction as
    * the entry or asset they describe, so they cannot disagree with it, and a figure that
    * is read from them cannot go stale.
@@ -6531,6 +6555,7 @@ const makeStore = Effect.fnUntraced(function* () {
             (SELECT count(*) FROM events e
               WHERE e.kind = 'scope.entry.added'
                 AND json_extract(e.payload, '$.effect') = 'in'
+                AND coalesce(json_extract(e.payload, '$.created'), 1) = 1
                 AND e.caller_scope IN (
                   SELECT r.caller_scope FROM import_sessions r
                   WHERE r.target_id = s.target_id
@@ -6538,6 +6563,7 @@ const makeStore = Effect.fnUntraced(function* () {
             (SELECT count(*) FROM events e
               WHERE e.kind = 'scope.entry.added'
                 AND json_extract(e.payload, '$.effect') = 'out'
+                AND coalesce(json_extract(e.payload, '$.created'), 1) = 1
                 AND e.caller_scope IN (
                   SELECT r.caller_scope FROM import_sessions r
                   WHERE r.target_id = s.target_id
@@ -7541,6 +7567,23 @@ const makeStore = Effect.fnUntraced(function* () {
    *   idempotent, and the result says `created: false` rather than refusing: pressing Add
    *   twice is not an error, and a duplicate row would be a second entry the matcher
    *   evaluates.
+   *
+   * **The no-op still appends a `scope.entry.added`, carrying `created: false`**, and it is
+   * the only thing it writes — `scope_entries` is untouched. Two reasons, and the first is
+   * structural. A chat folds each `add_scope_entry` call into the record it produced by
+   * position (`pairWrites` in the web chat): there is no shared id between a harness's
+   * call and a store event. A call that produced no record would hand every later call
+   * the record of the one before it, and the receipt under the operator's eye would name
+   * the wrong entry from there on. Fixing that here makes every reader right at once;
+   * teaching each reader to compensate would make each of them a place to get it wrong
+   * (the importer conversation design, S5.1). The second is that the fact is worth
+   * keeping: "the agent tried to add something already in scope" is what an operator
+   * reviewing an import wants to know, and the payload names the existing entry.
+   *
+   * Every count of entries added must therefore read `created` and not the event's kind
+   * alone; `selectImportSessions` is the one that does today. An event written before this
+   * field existed has none and was always a real addition, so a missing `created` reads as
+   * `true`.
    */
   const addScopeEntry = Effect.fn("ObservationStore.addScopeEntry")(function* (
     caller: HostContext,
@@ -7600,7 +7643,31 @@ const makeStore = Effect.fnUntraced(function* () {
                 cause: existing.value,
               });
             }
-            return { entry: scopeEntryOf(row.value), created: false };
+            const entry = scopeEntryOf(row.value);
+            // The existing entry as it stands, not the call's input: the note and source
+            // are the original writer's, and the record says what is in scope rather than
+            // what this caller would have written. See the doc comment for why it exists.
+            yield* appendEvent({
+              kind: "scope.entry.added",
+              targetId: caller.targetId,
+              callerScope: caller.callerScope,
+              intentId: null,
+              attemptId: null,
+              operation: "add_scope_entry",
+              operationId: null,
+              subjectId: entry.entryId,
+              payload: {
+                entryId: entry.entryId,
+                effect: entry.effect,
+                kind: entry.kind,
+                value: entry.value,
+                source: entry.source,
+                note: entry.note,
+                created: false,
+              },
+              recordedAt,
+            });
+            return { entry, created: false };
           }
 
           const entryId = identifier.newScopeEntryId();
@@ -7627,6 +7694,7 @@ const makeStore = Effect.fnUntraced(function* () {
               value: normalised,
               source: input.source,
               note: input.note ?? null,
+              created: true,
             },
             recordedAt,
           });

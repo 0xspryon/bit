@@ -470,7 +470,7 @@ mid-sentence is worse than one that lingers.
 
 ### What it is
 
-`scope.entry.added` and `asset.imported` are real `EventKind`s (`event.ts:144` and `:169`) that
+`scope.entry.added` and `asset.imported` are real `EventKind`s (`event.ts:169` and `:144`) that
 are not members of `LIVE_ITEM_KINDS`, so they cannot reach a chat. S5 adds them, carrying the call _and_
 its result, because D3's receipt reads `→ entry 1 created`.
 
@@ -488,6 +488,22 @@ The first is preferred: it fixes the data rather than teaching every reader to c
 "the agent tried to add something already there" is information an operator reviewing an import
 wants.
 
+**Built that way.** `addScopeEntry`'s no-op branch appends a `scope.entry.added` naming the
+existing entry, with `created: false`, and touches nothing else; the added branch now says
+`created: true`. The session tally (`selectImportSessions`) counts only records whose `created`
+is true or absent, so the no-op record does not inflate the picker's figures. The no-op branch
+writes for every caller, the operator's Scope tab included — the store does not distinguish
+them, and an operator's no-op is no less a fact.
+
+**The asset side had no no-op gap.** `importAsset` already appended `asset.imported` with
+`created` read off the insert, for a host new or already known. What it does not record is an
+**exact retry** — the same `operation_id` replays the stored receipt and writes nothing — and that
+is idempotence working, not a gap: a record there would claim a second write that never
+happened. A **refused** write of either kind likewise has no record (the transaction rolls back).
+For those two cases only, the reader does compensate, and from the call's own result rather than
+a guess: `pairWrites` skips a call whose result is `failed` or says `replayed: true`. Neither is
+a case the data can fix.
+
 ### S5.2 — Nothing links a record to the message it answered
 
 This is the question D6 surfaced and the one S5 has to answer rather than discover. After a
@@ -498,20 +514,27 @@ not an ordering key).
 
 If per-turn placement is wanted, the wire must carry it: a turn ordinal on the record, minted
 when the message is accepted and stamped on every write under it. That is a column on
-`scope_entries` and `asset_imports`, or a side table. **The recommendation is not to**: the
-leading group is honest, it is already built and labelled, and a turn ordinal is a durable schema
-cost for a cosmetic grouping on a screen whose durable half — the entries themselves — is
-reviewed on the Assets list anyway. Decide it here either way; do not leave it open past this
-slice.
+`scope_entries` and `asset_imports`, or a side table.
+
+**Decided: no turn ordinal.** The leading "earlier in this session" group is honest, already
+built and already labelled, and a turn ordinal is a durable schema cost for a cosmetic grouping
+on a screen whose durable half — the entries themselves — is reviewed on the Assets list anyway.
+This is a ruling, not a deferral; do not reopen it without a use beyond grouping.
+
+The ruling covers records after a **reload** only. Live records already sit under the message
+they answered: `importerFeed` places narration by publish-order floor against each operator row,
+and a record arriving live lands among the narration around it, so it is grouped with the call
+it answered and folded into it. A reload has no narration to place against, and its records go
+to the leading group.
 
 ### Done criteria
 
-- [ ] `scope.entry.added` and `asset.imported` are in `LIVE_ITEM_KINDS` with doc comments in the
+- [x] `scope.entry.added` and `asset.imported` are in `LIVE_ITEM_KINDS` with doc comments in the
       register of their neighbours.
-- [ ] A tool call and its result render as one folded row, with the receipt text.
-- [ ] A no-op `add_scope_entry` produces a row that says so; a test covers the pairing across a
+- [x] A tool call and its result render as one folded row, with the receipt text.
+- [x] A no-op `add_scope_entry` produces a row that says so; a test covers the pairing across a
       no-op.
-- [ ] The record-to-message question has a written answer in this document.
+- [x] The record-to-message question has a written answer in this document.
 
 ---
 

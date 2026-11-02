@@ -228,6 +228,135 @@ describe("the importer's three tools", () => {
     expect(group?.rows.every((row) => row.proposedBy !== null)).toBe(true);
   });
 
+  /** A result for `callId`, as the narration's `tool.result` carries one. */
+  const answer = (
+    callId: string,
+    output: Record<string, unknown>,
+    failed = false,
+  ): LiveItem =>
+    item({
+      kind: "tool.result",
+      callId,
+      toolName: "add_scope_entry",
+      output: JSON.stringify(output),
+      outcome: failed ? "failed" : "ok",
+    });
+  /** A `scope.entry.added` worded as `projectEvent` words it. */
+  const entryReceipt = (id: string, value: string, created: boolean) => {
+    const made = record("scope.entry.added", value);
+    return {
+      ...made,
+      body: created
+        ? `entry ${id} created · in · host · ${value} (that host only)`
+        : `already in scope as entry ${id} · in · host · ${value} (that host only) · nothing changed`,
+      outcome: created ? "new" : "known",
+    };
+  };
+
+  test("pairing holds across a no-op add: each call folds into its own record, call and result in one row", () => {
+    // The case that shifted everything before S5.1: an add of an entry already in scope
+    // wrote no record, so the third call here was folded into the second record and every
+    // receipt after it named the wrong entry. The store now writes a `created: false`
+    // record for it, and position lines up again.
+    const [group] = buildImporterChat({
+      history: NO_HISTORY,
+      working: false,
+      items: [
+        operator(1, "go"),
+        write("c1", "acme.com"),
+        answer("c1", { entry_id: "scope_1", created: true }),
+        entryReceipt("scope_1", "acme.com", true),
+        write("c2", "acme.com"),
+        answer("c2", { entry_id: "scope_1", created: false }),
+        entryReceipt("scope_1", "acme.com", false),
+        write("c3", "app.acme.com"),
+        answer("c3", { entry_id: "scope_2", created: true }),
+        entryReceipt("scope_2", "app.acme.com", true),
+      ],
+    });
+    // Three calls, three rows: no result and no record left standing on its own.
+    expect(group?.rows).toHaveLength(3);
+    expect(
+      group?.rows.map((row) => [
+        row.proposedBy?.callId,
+        row.result?.callId,
+        row.write,
+        row.item.body,
+      ]),
+    ).toEqual([
+      [
+        "c1",
+        "c1",
+        "recorded",
+        "entry scope_1 created · in · host · acme.com (that host only)",
+      ],
+      [
+        "c2",
+        "c2",
+        "recorded",
+        "already in scope as entry scope_1 · in · host · acme.com (that host only) · nothing changed",
+      ],
+      [
+        "c3",
+        "c3",
+        "recorded",
+        "entry scope_2 created · in · host · app.acme.com (that host only)",
+      ],
+    ]);
+  });
+
+  test("a refused add claims no record, so the next call still gets its own", () => {
+    // A refusal rolls back and writes nothing. Its failed result is the definitive answer,
+    // and letting it take a place in the queue would shift every receipt after it.
+    const [group] = buildImporterChat({
+      history: NO_HISTORY,
+      working: false,
+      items: [
+        operator(1, "go"),
+        write("c1", "acme.com"),
+        answer("c1", { reason: "conflict" }, true),
+        write("c2", "app.acme.com"),
+        answer("c2", { entry_id: "scope_2", created: true }),
+        entryReceipt("scope_2", "app.acme.com", true),
+      ],
+    });
+    expect(group?.rows.map((row) => [row.write, row.item.headline])).toEqual([
+      ["refused", "add_scope_entry"],
+      ["recorded", "app.acme.com"],
+    ]);
+  });
+
+  test("an exact retry of an asset claims no record: the store replays it and writes nothing", () => {
+    const [group] = buildImporterChat({
+      history: NO_HISTORY,
+      working: false,
+      items: [
+        operator(1, "go"),
+        asset("c1", "acme.com"),
+        answer("c1", { identity: "acme.com", replayed: false }),
+        record("asset.imported", "acme.com"),
+        asset("c2", "acme.com"),
+        answer("c2", { identity: "acme.com", replayed: true }),
+        asset("c3", "shop.acme.com"),
+        answer("c3", { identity: "shop.acme.com", replayed: false }),
+        record("asset.imported", "shop.acme.com"),
+      ],
+    });
+    expect(
+      group?.rows.map((row) => [
+        row.proposedBy?.callId ?? row.item.callId,
+        row.write,
+        row.item.headline,
+      ]),
+    ).toEqual([
+      ["c1", "recorded", "acme.com"],
+      // Not a write and not unresolved: the store's answer said it wrote nothing new, so it
+      // is a plain call with that answer folded in.
+      ["c2", null, "record_imported_asset"],
+      ["c3", "recorded", "shop.acme.com"],
+    ]);
+  });
+
   test("a pending write shows what it covers, from the argument that says so", () => {
     const [group] = buildImporterChat({
       history: NO_HISTORY,
