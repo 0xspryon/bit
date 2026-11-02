@@ -1295,7 +1295,7 @@ export class ScopeImporter extends Context.Service<
         return accepted(
           entry,
           "opened",
-          "A new importer session was opened for this message: the importer has its rules and its three tools, and has read nothing else yet.",
+          "A new importer session was opened for this message: the importer has its rules, the three tools that let it write, and whatever its harness gives it for reading a page — all inside its own gated directory. It has read nothing else yet.",
           { added: started.pagesAdded, notAdded: started.pagesNotAdded },
         );
       });

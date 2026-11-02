@@ -717,6 +717,36 @@ this session" is a deep link, and today navigation is in-memory state. So:
 
 ## Known defects, found while building this and not fixed here
 
+### "Three tools" is true of writing and false of the session
+
+**Observed live during S5, on Claude Code.** Told to read a program page, the importer ran
+`Bash` (a `curl`), and also had `Agent`, `WebFetch` and `ToolSearch` available to it.
+
+The three MCP tools — `add_scope_entry`, `record_imported_asset`, `read_scope` — really are the
+only tools that can **write** anything, and that part is structural: the endpoint selects the
+toolkit and `authMiddlewareFor` refuses a grant whose tag is not the role it serves. But the
+session is an ordinary harness session, so it also holds whatever that harness gives every
+session, shell included.
+
+**What held this up until now** is the gated directory, and `fleet.ts`'s comment is explicit
+that this is the design: the importer "fetches a page and calls three tools — and that is
+exactly why it gets its own gated one", because the policy hook lives in the directory a session
+runs in. So the control was always the gate, never the tool list.
+
+**What was wrong is what we said.** The operator-facing note claimed "its rules and its three
+tools", and `scopeImporter.test.ts`'s comment asserts containment is structural because there
+are "three tools and no others". On Claude Code that is not true, and the note has been
+corrected to say what is: three tools that write, plus whatever the harness gives it for
+reading, inside a gated directory.
+
+**The fix worth making, as its own slice:** pass `allowedTools` on the importer's
+`createSession` so the session holds the MCP trio plus what it needs to read a page, and nothing
+else. The Claude Agent SDK takes it in the query options and T3 Code already pairs it with an
+MCP allowlist wildcard. Two cautions: the live run reached for `curl` rather than `WebFetch`, so
+restricting without checking which read path actually works would break imports; and the same
+question applies to the planner, goal and worker sessions, which were never audited for it
+either. Do it with a live import to verify against, not blind.
+
 ### OpenCode sessions survive a restart, and recovery assumes they do not
 
 **Confirmed against OpenCode's source during S2's review. Pre-existing, in worker and round
