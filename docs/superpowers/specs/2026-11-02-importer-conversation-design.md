@@ -1,7 +1,9 @@
-# The importer conversation — API design
+# The agent conversation — API design
 
-> Six slices that turn the mock-driven importer chat into a real one. Written after slice 1
-> shipped, so S1 below records what was built rather than what was planned.
+> Eight slices that turn the mock-driven importer chat into a real one — written for the
+> importer, built so the goal agent and the worker attempt inherit it rather than repeat it.
+> See "The generic spine" for what is shared and where the sharing honestly stops. Written
+> after slice 1 shipped, so S1 records what was built rather than what was planned.
 
 ## Intent
 
@@ -28,18 +30,64 @@ lives and how much of it a browser can see.
 | Tool-call rows and their receipts (D3) | `mockImporter.ts`           | S5              |
 | Replayed history, tombstone (D6)       | `mockImporter.ts`           | S6              |
 
-## The shape all six converge on
+## The generic spine, and where it honestly stops
 
 There is already a long-lived agent session in this process, and it is not the importer:
-`plan/goalConversation.ts`. It is created on the operator's first message, prompted again
-for every message after it, holds its credential and its MCP registration in a per-session
-`Scope`, and ends when something closes that scope or when the process dies. Its module
-header is a written argument for every one of those choices.
+`plan/goalConversation.ts`. It is created on the operator's first message, prompted again for
+every message after it, holds its credential and its MCP registration in a per-session `Scope`,
+and ends when something closes that scope or when the process dies. Its module header is a
+written argument for every one of those choices.
 
-**The importer conversation is that file's second instance, and the slices below are mostly
-transliterations of it.** Where they diverge from it, the divergence is named and reasoned
-in place. Inventing a second lifecycle for the same shape of thing is the failure these
-slices are sequenced to avoid.
+**The importer is the second of four, and the worker and planner are the other two.** So the
+instruction for S2 is _extract_, not copy. A transliteration would produce the second of four
+copies of the same lifecycle, and the fourth is the one nobody will reconcile.
+
+### What is genuinely one implementation
+
+A service — call it `LiveAgentSessions` — owning the part of a session that is about
+**authority and lifetime**, and nothing about what the session is for:
+
+1. **The registry.** `id → { scope, harness, sessionId, instanceId, model, narrator }`, plus
+   the per-id `Semaphore` that guards opening. A scope in no map is a scope nothing can close,
+   and a review already measured that bug on the goal path: two concurrent first messages, two
+   sessions, the loser's credential and registration alive until process death.
+2. **The acquire order**, because each step rules out the next step's ambiguity: gated
+   directory → session → credential → MCP registration → prompt. A failure at any step closes
+   the scope, which revokes the credential and unregisters the server — including when the
+   _next_ step is what failed.
+3. **`closeSession`.** Narrator interrupted first, so nothing is published for a session whose
+   credential is about to go; then the scope; then a belt-and-braces revoke whose expected
+   answer is zero and whose non-zero answer is a logged bug rather than a handled condition.
+4. **The layer finalizer**, closing every session still open, which is what makes "no longer
+   than the process" true.
+5. **The session index.** One row per session, written before the session exists and marked
+   once the harness confirms it — `goal_sessions` (`0021`) and `import_sessions`
+   (`0024`/`0025`) are already the same table twice.
+6. **The chat.** `Chat.svelte` is already generic: groups plus a `separator` snippet, with the
+   group's subject an opaque type parameter. `RoundProse`, `rowsFor`, the record-versus-activity
+   distinction and the folding of a tool result into its call are shared with it.
+7. **The restart sweep** (S7): terminalize every non-terminal run _first_, then dispatch.
+
+### What stays per-surface, as a descriptor rather than a fork
+
+Role and endpoint URL; credential kind and lifetime; `multiTurn`; the prompt assemblers, opener
+and follow-up; the grouping rule; whether there is a settlement; and the continuation shape. The
+four role endpoints already exist and `authMiddlewareFor` already refuses a grant whose tag is
+not the role it serves, so "which tools this session can reach" is a property of the
+registration rather than of a filter — that part needs no generalising, only passing through.
+
+### Where the abstraction stops, and this is the important line
+
+**A worker attempt is not a conversation.** It is supervised, it has an attempt identity, a
+fence, a settlement table and an outcome; it is prompted once and nobody is on the other end of
+it. It shares the spine's _authority lifetime_ — scope, credential, registration, close — and it
+shares none of the conversation semantics: no follow-up assembler, no chat grouping, no
+composer.
+
+So the spine owns **how long a session's authority lives and who can end it**. It does not own
+what a session means. An abstraction that tried to own both would have to invent a settlement
+for a goal conversation and a composer for a worker, which is exactly the failure
+`Chat.svelte`'s own header records having already been caught once.
 
 ---
 
@@ -531,6 +579,68 @@ removed the transcript writer at settlement (DECISIONS §8) and this does not br
 - [ ] The dispatcher rides the `0013` outbox.
 - [ ] Nothing continues on a guess: an unreadable setting means no continuation.
 
+---
+
+## S8 — One list of every agent session
+
+The last slice, and the one that pays the spine off: if four surfaces hold long-running
+sessions, an operator needs one place that answers "what is running right now".
+
+A tab **Agent sessions** in the rail, in the **Operations** group beside Workers, Blockers and
+Event log (`apps/web/src/lib/mock.ts`, `navGroups`; it needs an entry in `navGlyphs` too).
+
+### S8.1 — Nothing fancy, and that is the specification
+
+A basic list. One row per session: which kind it is, what it is about, the harness and model it
+runs on, when it started, whether it is live or ended, and whatever tally that kind already
+derives. No grouping, no filters, no detail pane. The screens that show a session _properly_ are
+the surfaces' own, and this one's job is to get you there.
+
+### S8.2 — Read-time union, not a fourth table
+
+The three indexes stay where they are and the route unions them.
+
+A shared `agent_sessions` table is the obvious alternative and is wrong here: each index row is
+written inside its own surface's transaction — a goal session with the goal, an import session
+with the import — and one table would make a single write path the owner of three surfaces'
+invariants. The subjects differ too (`goal_id`, `import_id`, an attempt's identity), so a merged
+table means a nullable triple and a check constraint standing in for a type.
+
+The list is a _read_ concern. Union at read, behind one route, and if a fourth table ever earns
+itself the route's shape does not change.
+
+Per target, not global: the rail is target-scoped, so the list is the sessions of the target you
+are in.
+
+### S8.3 — Clicking a row opens that surface's chat, and that part waits
+
+Clicking an importer row opens the importer's chat on that session. Clicking a goal row opens
+the goal conversation. That is the whole interaction.
+
+**It cannot be built properly yet, because the app has no URL routing.** "Open the importer at
+this session" is a deep link, and today navigation is in-memory state. So:
+
+- Build the list and the route now.
+- Wire the click to whatever in-memory navigation exists, if that is honest; otherwise leave the
+  row inert.
+- **Leave a comment in the list component** naming this: that the destination is a deep link,
+  that it waits on real URL routing, and what it will look like when that lands. A comment the
+  next reader finds is the deliverable here — not a half-built router.
+
+### Done criteria
+
+- [ ] `Agent sessions` appears in the rail under Operations, with a glyph.
+- [ ] One route returns the target's sessions across every kind that has an index, as a
+      read-time union; a test covers a target with sessions of more than one kind.
+- [ ] The list renders kind, subject, harness and model, start time, live/ended state, and the
+      per-kind tally where one exists.
+- [ ] A target with no sessions says so rather than rendering an empty frame.
+- [ ] A session whose harness is no longer configured is marked, not hidden — S1 already
+      established `strandedOn` for this.
+- [ ] The component carries a comment explaining that row-click deep linking waits on URL
+      routing, and what it will become.
+- [ ] No URL routing is invented for this slice.
+
 ## Deferred
 
 - **A concurrent-import guard on one target.** The server does not prevent two imports on one
@@ -545,5 +655,5 @@ removed the transcript writer at settlement (DECISIONS §8) and this does not br
 
 ## Build order
 
-S1 → **S2** → S3 → S4 → S5 → S6. S2 before S3 and not alongside it: S3's route is meaningless
+S1 → **S2** → S3 → S4 → S5 → S6 → S7 → S8. S2 before S3 and not alongside it: S3's route is meaningless
 against a session that destroys itself, and writing them together means writing S3 twice.
