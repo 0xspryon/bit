@@ -5202,6 +5202,39 @@ export const scenarios: Scenario[] = [
     },
   },
   {
+    id: "run-picker",
+    group: "Run composer",
+    label: "Harness picker open",
+    // The run composer's popover, open, against the importer's declared harnesses: no other
+    // state renders `ComposeBox`, which only appears with an intent aimed at, so without
+    // this its picker's layout could only be inferred from the CSS it shares.
+    apply: (a) => {
+      a.reset();
+      a.previewTarget("acme-corp");
+      a.navItem = "goals";
+      a.harnesses = mockHarnesses();
+      a.harnessesLoaded = true;
+      a.intents = [
+        {
+          intentId: "int_preview",
+          goalId: "goal_preview_open",
+          question: "Does the limiter key on the forwarded address?",
+          status: "open",
+          anchoredTo: [],
+          addressesDimension: null,
+          createdAt: 1_700_000_000_000,
+          claimedByAttemptId: null,
+          suggestion: { instanceId: null, model: null, modelOptions: null },
+          attempts: 0,
+        },
+      ];
+      a.intentsGoalId = "goal_preview_open";
+      a.intentsState = "ready";
+      a.runIntentId = "int_preview";
+      a.pickerOpen = true;
+    },
+  },
+  {
     id: "target-shell",
     group: "Level 2 shell",
     label: "Open target",

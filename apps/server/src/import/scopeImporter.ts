@@ -108,6 +108,7 @@
  */
 import {
   SCOPE_IMPORT_MAX_LINKS,
+  type ImportModelDraft,
   type ModelOptionSelection,
   type ScopeImportView,
 } from "@bit/contracts";
@@ -183,18 +184,23 @@ export interface ScopeImportRequest {
    * The operator's pick, when they touched the importer's picker: `ImportModelDraft` as it
    * arrived.
    *
+   * The contract's own type rather than a copy of its fields, and `start` names every one
+   * of them when it reads it (see {@link everyFieldRead}), so a field added to the draft is
+   * a compile error there until something reads it — instead of arriving decoded and being
+   * dropped without a word, which a hand-written shape here could not catch.
+   *
    * `modelOptions` is what was set *of* the model, unresolved. It is resolved in `start`
    * against the model the importer actually resolved — which may not be the one the browser
    * was showing — and reaches `createSession` as `options`, absent when nothing survives.
    */
-  readonly choice?:
-    | {
-        readonly instanceId?: string | undefined;
-        readonly model?: string | undefined;
-        readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
-      }
-    | undefined;
+  readonly choice?: ImportModelDraft | undefined;
 }
+
+/**
+ * Compiles only when `_rest` has no fields: the remainder of a destructure that named every
+ * field it reads. It does nothing at runtime; the check is the parameter's type.
+ */
+const everyFieldRead = (_rest: Record<string, never>): void => {};
 
 export class ScopeImporter extends Context.Service<
   ScopeImporter,
@@ -544,9 +550,21 @@ export class ScopeImporter extends Context.Service<
           );
         }
 
+        // Every field of the pick by name, so the next one added to the contract does not
+        // compile until it is read here (`ScopeImportRequest.choice`).
+        const pick: ImportModelDraft = request.choice ?? {};
+        const {
+          instanceId: pickedInstanceId,
+          model: pickedModel,
+          modelOptions: pickedOptions,
+          ...unread
+        } = pick;
+        everyFieldRead(unread);
         const choice = resolveImporterModel({
           listings: resolver.instances,
-          ...(request.choice === undefined ? {} : { choice: request.choice }),
+          ...(request.choice === undefined
+            ? {}
+            : { choice: { instanceId: pickedInstanceId, model: pickedModel } }),
         });
         if (choice === undefined) {
           return {
@@ -576,7 +594,7 @@ export class ScopeImporter extends Context.Service<
         const options = yield* resolveSessionModelOptions(
           harness,
           choice.model,
-          request.choice?.modelOptions,
+          pickedOptions,
           "a scope import",
         );
         const importId = newImportId();

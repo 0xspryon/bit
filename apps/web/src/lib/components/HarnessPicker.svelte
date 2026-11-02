@@ -235,13 +235,20 @@
     background: var(--bg-layer-01);
   }
   /*
-    Narrow viewports: the panel narrows and `HarnessChoice` stacks its own columns (§3.5).
-    920px is where the columns stop fitting beside each other — the trigger sits about
-    280px in with the sidebar open, and 280 + 622 is the whole of a 900px window.
+    Narrow viewports: the panel narrows and `HarnessChoice` moves the rail above the other
+    two columns (§3.5). 920px is where the columns stop fitting beside each other — the
+    trigger sits about 280px in with the sidebar open, and 280 + 622 is the whole of a
+    900px window.
+
+    As wide as what is right of the trigger allows, up to 470px: under the rail the model
+    list and the options column still share a row, and at the old 360px that row left a
+    model name about 150px. `100vw - 310px` is the trigger's ~290px offset plus a margin,
+    so the panel ends inside the window at 768px; the 360px floor is the old width, for a
+    window narrower than the tablets this app is for.
   */
   @media (max-width: 920px) {
     .panel {
-      width: min(92vw, 360px);
+      width: min(92vw, clamp(360px, calc(100vw - 310px), 470px));
     }
   }
 </style>

@@ -220,75 +220,82 @@
     {/each}
   </div>
 
-  <div class="models" bind:this={modelColumn}>
-    <div class="search-wrap">
-      <IconSearch class="search-icon" width="13" height="13" />
-      <input
-        class="search"
-        type="search"
-        placeholder="Filter models"
-        aria-label="Filter models"
-        bind:this={searchInput}
-        bind:value={query}
-      />
-    </div>
+  <!--
+    The model list and the options column, held together so that when the popover stacks
+    on a narrow window they stay side by side under the rail rather than each taking a
+    third of 340px. On a wide window this is one more flex row and changes nothing.
+  -->
+  <div class="body">
+    <div class="models" bind:this={modelColumn}>
+      <div class="search-wrap">
+        <IconSearch class="search-icon" width="13" height="13" />
+        <input
+          class="search"
+          type="search"
+          placeholder="Filter models"
+          aria-label="Filter models"
+          bind:this={searchInput}
+          bind:value={query}
+        />
+      </div>
 
-    {#if active === undefined}
-      <p class="models-empty">Nothing to choose from.</p>
-    {:else if !active.ready}
-      <!--
+      {#if active === undefined}
+        <p class="models-empty">Nothing to choose from.</p>
+      {:else if !active.ready}
+        <!--
         The models of an unusable instance are still listed: it is the same catalogue, and
         hiding it would be a second way of saying what the rail already says.
       -->
-      <p class="models-empty">
-        {active.displayName} is not usable on this server, so a run on it is refused.
-        Its models are listed for reference.
-      </p>
-    {/if}
-
-    <ul class="model-list">
-      {#each shown as entry (entry.id)}
-        <li>
-          <button
-            class="model-row"
-            class:selected={entry.id === model}
-            type="button"
-            onclick={() => onPickModel(entry.id)}
-          >
-            <span class="model-name mono">{entry.id}</span>
-            {#if entry.id === active?.defaultModel}
-              <span class="model-tag">default</span>
-            {/if}
-          </button>
-        </li>
-      {/each}
-      {#if active !== undefined && shown.length === 0}
-        <li class="no-results">
-          <p>
-            No model here matches that. This list is what the harness reported
-            when this server started it, and an operator may still name one that
-            is not on it — whether a model runs is the harness's answer.
-          </p>
-        </li>
+        <p class="models-empty">
+          {active.displayName} is not usable on this server, so a run on it is refused.
+          Its models are listed for reference.
+        </p>
       {/if}
-    </ul>
 
-    {#if active !== undefined && note !== undefined}
-      <p class="models-note">{@render note()}</p>
-    {/if}
-  </div>
+      <ul class="model-list">
+        {#each shown as entry (entry.id)}
+          <li>
+            <button
+              class="model-row"
+              class:selected={entry.id === model}
+              type="button"
+              onclick={() => onPickModel(entry.id)}
+            >
+              <span class="model-name mono">{entry.id}</span>
+              {#if entry.id === active?.defaultModel}
+                <span class="model-tag">default</span>
+              {/if}
+            </button>
+          </li>
+        {/each}
+        {#if active !== undefined && shown.length === 0}
+          <li class="no-results">
+            <p>
+              No model here matches that. This list is what the harness reported
+              when this server started it, and an operator may still name one
+              that is not on it — whether a model runs is the harness's answer.
+            </p>
+          </li>
+        {/if}
+      </ul>
 
-  {#if options !== undefined}
-    <!--
+      {#if active !== undefined && note !== undefined}
+        <p class="models-note">{@render note()}</p>
+      {/if}
+    </div>
+
+    {#if options !== undefined}
+      <!--
       The third column, rendered from the caller's markup: what the *model* on the left
       offers, which on both harnesses today is how hard it should think. It is a column of
       the same control rather than one of its own, because it is a setting of the model —
       it changes when the model does and is meaningless without one.
     -->
-    <div class="options" bind:this={optionColumn}>
-      {@render options()}
-    </div>
-  {/if}
+      <div class="options" bind:this={optionColumn}>
+        {@render options()}
+      </div>
+    {/if}
+  </div>
 </div>
 
 <style>
@@ -403,6 +410,14 @@
     margin-top: 4px;
     color: var(--state-fg-warning);
   }
+  /* The same clamp one level down: stretched to the choice's height, and stretching its
+     two columns to its own. */
+  .body {
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+  }
   .models {
     display: flex;
     flex: 1 1 240px;
@@ -504,26 +519,47 @@
   }
 
   /*
-    Narrow viewports: the columns stack rather than overflowing whatever holds them (§3.5).
-    920px is where three columns stop fitting beside the composer's trigger; the inline
-    block stacks at the width its own form does.
+    Narrow viewports: the rail moves above the other two rather than overflowing whatever
+    holds them (§3.5). 920px is where three columns stop fitting beside the composer's
+    trigger; the inline block stacks at the width its own form does.
+
+    Only the rail moves. Stacking all three into a 340px panel — the cap that keeps the
+    importer's panel on screen when its composer sits mid-page — left each a third of it:
+    the rail scrolled with its second harness under the fold and missed by a click, and
+    the model list showed under two rows. So the rail becomes a strip with the harnesses
+    side by side, and it never shrinks — every harness stays on screen and clickable,
+    whatever the lists below need — and the model list and the options column keep
+    sharing a row under it, each scrolling in what is left. Both popovers are at least
+    ~450px wide here, which is room for the two of them.
   */
   @media (max-width: 920px) {
     .choice.popover {
       flex-direction: column;
     }
     .choice.popover .rail {
-      flex: 0 1 auto;
+      flex: 0 0 auto;
+      flex-flow: row wrap;
+      align-items: stretch;
+      gap: 4px;
+      overflow: visible;
       border-right: 0;
       border-bottom: 1px solid var(--border-base);
     }
-    .choice.popover .models {
-      flex: 1 1 auto;
+    .choice.popover .rail-label,
+    .choice.popover .rail-empty,
+    .choice.popover .rail-reason {
+      flex: 0 0 100%;
+      box-sizing: border-box;
     }
-    .choice.popover .options {
-      flex: 0 1 auto;
-      border-left: 0;
-      border-top: 1px solid var(--border-base);
+    .choice.popover .rail-label {
+      margin-bottom: 0;
+    }
+    .choice.popover .rail-reason {
+      margin: 0;
+    }
+    .choice.popover .rail-row {
+      flex: 1 1 160px;
+      min-width: 0;
     }
   }
   @media (width < 700px) {
