@@ -2,8 +2,11 @@
  * The Auto-load page and the "Loading the scope" panel.
  *
  * The importer used to start from the create-target page, as a side effect of creating a
- * target. A6 moved it to the Assets page: the page below is the form and the panel it
- * always was, pointed at a target that already exists, and `createTarget` takes no links.
+ * target. A6 moved it to the Assets page, and A6 D2–D5 then replaced the Auto-load page's
+ * link form and model picker with a chat (`importerChat.test.ts`, `dom/importer.test.ts`).
+ * What is left here is the **state machine** behind that form and the **panel** — both
+ * still in the app, neither on screen from the page — so the panel is rendered directly,
+ * and the form's own markup claims went with the form.
  *
  * Two kinds of claim, and they are checked in two ways for the reason
  * `assetsComponent.test.ts` records: the state machine is checked against `App` directly,
@@ -18,8 +21,6 @@
  *   added a capture path and a field. The test therefore checks that what *is* rendered is
  *   the tool and the value it wrote, and that text which exists nowhere in the view —
  *   because the contract cannot carry it — is nowhere in the output.
- * - **The model picker shows the model the server resolved** (D15), rather than one this
- *   bundle holds.
  *
  * Server output, so no `$effect` runs — the limit `runes.ts` records. Nothing here clicks:
  * the handlers are plain methods on `App` and are driven directly below.
@@ -27,19 +28,13 @@
 import { describe, expect, test } from "bun:test";
 import { render } from "svelte/server";
 
-import {
-  ImporterModelUnavailable,
-  TargetUnavailable,
-  type ScopeImportCall,
-} from "@bit/contracts";
+import { TargetUnavailable, type ScopeImportCall } from "@bit/contracts";
 
-import AutoLoad from "../src/lib/screens/AutoLoad.svelte";
+import ScopeImportPanel from "../src/lib/components/ScopeImportPanel.svelte";
 import { App, IMPORT_POLL_MS } from "../src/lib/app.svelte";
 import { FakeCountdown } from "./fakeCountdown";
 import {
   FakeServer,
-  harnessInstance,
-  importerModelView,
   ok,
   refused,
   scopeImportView,
@@ -97,20 +92,7 @@ const pollTimers = (countdown: FakeCountdown) =>
  * than about where the component's source happened to wrap.
  */
 const bodyOf = (app: App): string =>
-  render(AutoLoad, { props: { app } }).body.replace(/\s+/g, " ");
-
-/**
- * Whether the operator can press Start import, read off the rendered button.
- *
- * `canImport` and the link count are the component's rules, so the claim cannot be made
- * from `App`. SSR emits `disabled` only when it is true.
- */
-const startEnabled = (html: string): boolean => {
-  const buttons = html.match(/<button[\s\S]*?<\/button>/g) ?? [];
-  const start = buttons.find((button) => button.includes("Start import"));
-  if (start === undefined) throw new Error("the page rendered no Start import");
-  return !/\sdisabled(?:=|[\s>])/.test(start.slice(0, start.indexOf(">") + 1));
-};
+  render(ScopeImportPanel, { props: { app } }).body.replace(/\s+/g, " ");
 
 describe("the panel lists tool calls and no narration", () => {
   test("every line names the tool and the value it wrote", async () => {
@@ -279,136 +261,11 @@ describe("the panel lists tool calls and no narration", () => {
   });
 });
 
-describe("the model picker", () => {
-  test("it shows what the server resolved, before any link is typed", async () => {
-    const { app } = await onPage();
-    expect(app.usableLinks).toEqual([]);
-
-    const body = bodyOf(app);
-    // The model the *server* resolved against its live catalogue. Nothing in the browser
-    // holds this id: `modelOption.ts` is explicit that a descriptor is observed at build
-    // and replaced wholesale on rebuild, so an id in this bundle would outlive the
-    // catalogue entry it names. And it is on screen with no checkbox and no link: this
-    // page exists to import, so there is nothing to reveal it for.
-    expect(body).toContain("opencode/glm-5.3-flash-free");
-    expect(body).toContain("resolved from the catalogue");
-  });
-
-  test("the fallback is labelled as one", async () => {
-    const { app } = await onPage((fake) => {
-      // What the server answers when its catalogue does not offer the preferred model.
-      // The rule ran on the server, over what the harnesses reported; the screen only
-      // shows which branch it took.
-      fake.onImporterModel = () =>
-        ok(
-          importerModelView({
-            instanceId: "claude-code",
-            model: "claude-sonnet-5",
-            origin: "fallback",
-            detail:
-              "no configured harness offers opencode/glm-5.3-flash-free, so this uses Claude Code's own default model, claude-sonnet-5",
-          }),
-        );
-    });
-
-    const body = bodyOf(app);
-    expect(body).toContain("claude-sonnet-5");
-    expect(body).toContain("resolved by fallback");
-    expect(body).toContain("no configured harness offers");
-  });
-
-  /**
-   * The picker on this page is the composer's picker, from one component.
-   *
-   * These two claims were where the duplicate had already drifted, and both are about
-   * something the operator can see. They are asserted here rather than in the composer's
-   * own suite because here is where they were wrong.
-   */
-  describe("it is the same control as the composer's", () => {
-    test("an unusable harness keeps its row and its reason", async () => {
-      const { app } = await onPage((fake) => {
-        fake.onHarnesses = () =>
-          ok([
-            harnessInstance({
-              instanceId: "opencode",
-              displayName: "OpenCode",
-              isDefault: true,
-            }),
-            harnessInstance({
-              instanceId: "claude-code",
-              displayName: "Claude Code",
-              ready: false,
-              isDefault: false,
-              reason: "the Claude Agent SDK is not installed on this server",
-              setup: "bun add @anthropic-ai/claude-agent-sdk",
-            }),
-          ]);
-      });
-      app.toggleImportPicker();
-
-      const body = bodyOf(app);
-      // Visible, and carrying the harness's own sentence about why and what to do about
-      // it. This screen used to set `disabled` with `opacity: 0.5` and print neither,
-      // which leaves an operator with nothing to act on — the reason has to be readable
-      // where the choice is made.
-      expect(body).toContain("Claude Code");
-      expect(body).toContain("the Claude Agent SDK is not installed");
-      expect(body).toContain("bun add @anthropic-ai/claude-agent-sdk");
-      expect(body).toContain("unusable");
-    });
-
-    test("the instance rail is there with one harness configured", async () => {
-      const { app } = await onPage((fake) => {
-        fake.onHarnesses = () =>
-          ok([harnessInstance({ instanceId: "opencode" })]);
-      });
-      app.toggleImportPicker();
-
-      // It used to be hidden behind `harnesses.length > 1`, so configuring a second
-      // harness made a rail appear that the operator had not asked for. The composer's
-      // picker always showed it.
-      const body = bodyOf(app);
-      expect(body).toContain('aria-label="Harness instances"');
-      // A selectable row for the one harness, which is what "the rail is there" means.
-      expect(body).toContain('role="option"');
-      expect(body).toContain('aria-selected="true"');
-    });
-  });
-
-  test("no harness at all says why, and Start cannot be pressed", async () => {
-    const { app } = await onPage((fake) => {
-      fake.onImporterModel = () =>
-        refused(
-          new ImporterModelUnavailable({
-            reason: "no_harness",
-            detail:
-              "no agent harness on this server is ready, so there is no catalogue to resolve a model against and no import can run",
-          }),
-        );
-    });
-    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
-
-    expect(app.importerModel).toBeUndefined();
-    const body = bodyOf(app);
-    // Said, rather than leaving Start enabled and letting the operator paste links
-    // nothing will ever read.
-    expect(body).toContain("no agent harness on this server is ready");
-    expect(startEnabled(body)).toBe(false);
-  });
-});
-
 describe("program links are a repeatable list", () => {
   test("it starts with one empty row, so pasting one URL is one action", async () => {
     const { app } = await onPage();
     expect(app.programLinks).toHaveLength(1);
     expect(app.usableLinks).toEqual([]);
-  });
-
-  test("Start cannot be pressed until there is a link to read", async () => {
-    const { app } = await onPage();
-    expect(startEnabled(bodyOf(app))).toBe(false);
-    app.setProgramLink(app.programLinks[0]?.id ?? 1, PAGE_A);
-    expect(startEnabled(bodyOf(app))).toBe(true);
   });
 
   test("rows are added, filled and removed, and the last one is emptied not removed", async () => {
@@ -531,7 +388,7 @@ describe("starting an import on a target that exists", () => {
     expect(fake.countOf("startScopeImport")).toBe(1);
   });
 
-  test("a server that cannot read pages leaves the form up, with its sentence", async () => {
+  test("a server that cannot read pages leaves the form state alone", async () => {
     const { app } = await onPage((server) => {
       server.onStartScopeImport = () =>
         ok({
@@ -547,7 +404,6 @@ describe("starting an import on a target that exists", () => {
     expect(app.importerPhase).toBe("form");
     expect(app.importerOpen).toBe(true);
     expect(app.usableLinks).toEqual([PAGE_A]);
-    expect(bodyOf(app)).toContain("no agent harness");
     expect(app.scopeImportId).toBe("");
   });
 
@@ -567,7 +423,6 @@ describe("starting an import on a target that exists", () => {
 
     expect(app.importerPhase).toBe("form");
     expect(app.importStartDetail).toBe('Migration "1_x" failed');
-    expect(bodyOf(app)).toContain("Migration");
   });
 });
 

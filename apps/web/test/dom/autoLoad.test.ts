@@ -74,12 +74,6 @@ const hasButton = (label: string): boolean =>
     (each) => each.textContent?.trim() === label,
   );
 
-/** What typing into a field does: set the value, then tell the handler. */
-const type = (input: HTMLInputElement, value: string): void => {
-  input.value = value;
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-};
-
 describe("an empty Scope tab", () => {
   test("offers the importer first and typing an entry second, under D1's copy", async () => {
     await openScope();
@@ -107,14 +101,11 @@ describe("an empty Scope tab", () => {
     await settle();
 
     expect(app.importerOpen).toBe(true);
-    // The page, in place of Assets: its form is on screen and the empty state is not.
-    expect(
-      document.querySelector('input[aria-label="Program link"]'),
-    ).not.toBeNull();
+    // The page, in place of Assets: its composer is on screen and the empty state is not.
+    expect(document.querySelector("#importer-message")).not.toBeNull();
     expect(hasButton("Auto-load scope…")).toBe(false);
-    // The target was not asked for again; the page reads the model, not the target.
+    // The target was not asked for again.
     expect(app.viewTargetId).toBe("acme-corp");
-    expect(fake.countOf("importerModel")).toBeGreaterThan(0);
     // Opening it starts nothing.
     expect(fake.countOf("startScopeImport")).toBe(0);
   });
@@ -144,49 +135,11 @@ describe("a Scope tab with entries", () => {
     click(button("Auto-load…"));
     await settle();
     expect(app.importerOpen).toBe(true);
-    expect(
-      document.querySelector('input[aria-label="Program link"]'),
-    ).not.toBeNull();
+    expect(document.querySelector("#importer-message")).not.toBeNull();
   });
 });
 
 describe("the Auto-load page", () => {
-  test("typing a link and pressing Start starts an import on this target and shows its panel", async () => {
-    const { app, fake } = await openScope();
-    click(button("Auto-load scope…"));
-    await settle();
-
-    const start = button("Start import");
-    expect(start.disabled).toBe(true);
-
-    const link = document.querySelector<HTMLInputElement>(
-      'input[aria-label="Program link"]',
-    );
-    if (link === null) throw new Error("no link field");
-    type(link, "https://hackerone.com/acme/policy");
-    await settle();
-    expect(button("Start import").disabled).toBe(false);
-
-    click(button("Start import"));
-    await settle();
-
-    const started = fake.calls.find(
-      (each) => each.method === "startScopeImport",
-    );
-    expect(started?.args[1]).toBe("acme-corp");
-    expect(
-      (started?.args[2] as { programLinks: string[] }).programLinks,
-    ).toEqual(["https://hackerone.com/acme/policy"]);
-    // The form became the panel it always handed over to.
-    expect(app.importerPhase).toBe("importing");
-    expect(
-      document.querySelector('[aria-label="Loading the scope"]'),
-    ).not.toBeNull();
-    expect(
-      document.querySelector('input[aria-label="Program link"]'),
-    ).toBeNull();
-  });
-
   test("Back to Assets returns to the Scope tab and starts nothing", async () => {
     const { app, fake } = await openScope();
     click(button("Auto-load scope…"));
