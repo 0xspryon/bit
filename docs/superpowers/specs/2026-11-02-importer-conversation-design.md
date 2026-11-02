@@ -455,6 +455,82 @@ replayed turns first and live ones after, and expects the caller to hold the flo
 
 ---
 
+---
+
+## S7 — Continuation after a restart
+
+Decided by the operator on 2 Nov 2026, after the research in S2.5. **All three agent surfaces
+get it**: the importer, the goal conversation and the worker attempt.
+
+### S7.1 — It is a new turn, not a resurrection
+
+T3 Code's threads appear to survive a reboot and carry on. They do not, and the mechanism is
+worth copying exactly because its honesty is what makes it safe: on boot, every run left
+non-terminal is **terminalized first**, with a reason naming the restart, and pending
+permission requests are marked not-resumable. Only then is a fresh turn started, carrying a
+synthetic operator message and a note listing what the restart cancelled. The agent reads its
+own history and decides what to redo.
+
+Nothing half-finished is ever presented as still running. That is the property to preserve.
+
+### S7.2 — The trigger is a lost process, not a reboot
+
+Any loss of the process that owned the work: a crash, a `SIGKILL`, an OOM, a deploy, an
+operator restarting the server. The condition is "a run is non-terminal and the process that
+owned it is gone", which `recovery/` already establishes for attempts.
+
+### S7.3 — Two shapes, because an attempt is not a conversation
+
+**The importer and the goal conversation resume the session.** A fresh
+`query({ resume: <id> })` on Claude Code, an ordinary prompt on OpenCode, then the synthetic
+continue message. The conversation is the unit, it keeps its identity, and the agent keeps its
+own context from the harness's copy.
+
+**A worker attempt does not.** The operator's decision: **end the interrupted attempt, open a
+new one, and seed the new one with a summary of the dead attempt's transcript.** The summary is
+for attempt workers only — not for the importer, not for the goal agent, both of which get
+their real history back by resuming.
+
+That split is the one that keeps `agentHarness.ts`'s existing rule intact rather than breaking
+it: _carrying work on after an interruption means a new attempt identity_. A resumed attempt
+would have made the settlement record lie about what a given attempt did. A new attempt seeded
+with a summary says exactly what happened. It is also the shape T3 falls back to when a resume
+fails — a fresh session plus a generated thread summary — so it is a travelled path, not an
+invention.
+
+Consequence worth stating: the summary is generated from the harness's own `messages()` read at
+continuation time, which both drivers answer for a session this process no longer holds. We
+removed the transcript writer at settlement (DECISIONS §8) and this does not bring it back.
+
+### S7.4 — Open questions this slice must answer
+
+- **How the summary is made.** A model call costs money and can fail on the recovery path, which
+  is the worst place for a new failure mode; a mechanical reduction is free and worse. Decide,
+  and make the failure non-fatal either way — a continuation with no summary is better than no
+  continuation.
+- **The bound.** T3 caps at three chained continuations in a five-minute window and refuses to
+  continue at all when its settings cannot be decoded ("never resume threads on a guess").
+  Without a bound, a crash loop becomes an auto-prompt loop that spends real money. Take the cap.
+- **Where the dispatcher lives.** The transactional outbox (migration `0013`) is built and has
+  no dispatcher. This is what it is for.
+- **Whether the operator can turn it off**, per target or globally. T3 makes it a project
+  setting defaulting on.
+
+### Done criteria
+
+- [ ] On boot, every non-terminal run is terminalized with a reason naming the restart, and
+      pending permission requests are marked not-resumable, **before** anything is continued.
+- [ ] The importer and the goal conversation continue by resuming their session; a test covers
+      each.
+- [ ] A worker attempt continues by ending the old attempt and opening a new one; the new
+      attempt's prompt carries a summary of the old one's transcript; a test covers the
+      end-to-new handoff.
+- [ ] The summary is read from the harness, not from a transcript we persist, and a failure to
+      produce it does not stop the continuation.
+- [ ] A chained-continuation cap exists and is tested against a crash loop.
+- [ ] The dispatcher rides the `0013` outbox.
+- [ ] Nothing continues on a guess: an unreadable setting means no continuation.
+
 ## Deferred
 
 - **A concurrent-import guard on one target.** The server does not prevent two imports on one
