@@ -155,31 +155,87 @@ durable record of "this conversation is over" the same object the picker already
 It also pays for itself on the screen: `ended_at` is what lets the picker mark a session
 closed instead of inferring it from the absence of a live entry in this process's memory.
 
-### S2.5 — Reviving a session, and the one place the two harnesses genuinely differ
+### S2.5 — Reviving a session, and what each harness actually keeps
 
-Within a process, nothing needs reviving: an idle session is promptable, which is S3.
+**Researched rather than assumed, after an earlier draft of this section got both drivers
+wrong.** The sources are the installed `@anthropic-ai/claude-agent-sdk@0.3.310` declarations,
+OpenCode 2.x's own source, and T3 Code's Claude adapter, which has shipped this for a while.
+
+Within a process, nothing needs reviving: an idle `multiTurn` session is promptable, which is
+S3.
 
 Across a **close**, revival is real on both drivers. The harness still holds the session and
 its messages; what was lost is ours — a credential from an in-memory map and a registration.
-Reopening is: reissue, re-register, prompt the same session id. The agent gets its own prior
-context back from the harness, because that context was never ours.
+Reopening is reissue, re-register, prompt.
 
-Across a **restart**, revival is driver-dependent, and this is the honest statement of it:
+Across a **restart**, revival is _also_ real on both drivers, and the reason is the same in
+both cases: the conversation was never ours and was never in memory.
 
-- **OpenCode** — revivable. The session lives in OpenCode's own server. Registration is
-  directory-scoped (DECISIONS §24.2), so re-registering into the import's directory is the
-  same call that made it in the first place.
-- **Claude Code** — not revivable. `claudeCodeClient.ts` says it in as many words: _"a Claude
-  Code session does not outlive the process that spawned it."_ There is no `resume` on
-  `createSession` and no `resumeSessionId` in the client. A restart means a new session.
+|                                       | Claude Code                                                                                                                                                            | OpenCode                                                                                                                    |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Where the conversation lives          | the CLI's own JSONL transcript under `~/.claude/projects/<dir>/<id>.jsonl`                                                                                             | one SQLite file at `$XDG_DATA_HOME/opencode/opencode.db`                                                                    |
+| Read its messages after a restart     | yes — `getSessionMessages`, which searches every project when given no `dir`                                                                                           | yes — the messages route is a plain row read with no location middleware                                                    |
+| Continue the conversation             | yes — a **fresh** `query({ options: { resume: id } })`. The SDK's own `forkSession` doc says the result is "Resumable via `query({ options: { resume: sessionId } })`" | yes — `POST …/prompt`. Session lookup, admission and model context are all DB reads; nothing in-memory is required          |
+| Auto-resume a turn that was in flight | no                                                                                                                                                                     | **not for us** — the sweep runs only when a lifecycle is attached, which is `--service` mode only; we spawn `serve --stdio` |
 
-Both drivers can still **read** a dead session's messages — Claude Code's `messages` calls
-`sdk.sessionMessages`, which reads the transcript from disk for a session this process does
-not hold. So after a restart the chat can always show what was said; it is only continuing
-that is conditional. That split is exactly S6's `Retained | NotHeld`, and D1's "Continue that
-session" strip must read it: on a Claude Code session from a dead process the strip offers a
-new session with a sentence saying so, in the register `goalConversation.ts`'s
-`priorUnavailable` note already uses.
+**So "a Claude Code session does not outlive the process that spawned it"
+(`claudeCodeClient.ts:1630`) is true of the live `Query` handle and false of the
+conversation.** The SDK offers no re-attach to another process's query — control requests,
+stream input and close all travel over the open stream — but it offers `resume`, and we have
+never passed it. The non-use is ours, not the SDK's. The matching OpenCode comment in the same
+file is simply wrong: a fresh server finds the session by primary key.
+
+**MCP re-registration is not an obstacle.** `Query.setMcpServers` is a control request valid on
+any live query, not only the one that first registered — so a resumed session can be given a
+fresh bearer token. T3 Code does exactly this, and strips `mcpServers` out of the query options
+for our reason: the SDK would pass them as an inline `--mcp-config` argv that any local user can
+read. Our `registerMcpServer` seam is the right shape; what it lacks is the ability to run
+against a session this process did not create (`recordFor` refuses the id), plus the
+already-recorded gap that a late registration never re-pushes (§24.2).
+
+**What this slice does with all that: nothing yet, deliberately.** S2 keeps a session alive
+within one process, which is the whole of what S3 needs. Resume is a capability we now know we
+have, and it belongs to S6 — where the question is already on the table as `Retained | NotHeld`
+— because that is the slice that reads a session the operator came back to.
+
+What S2 must do is **stop asserting the false thing**: the comments that say a session cannot
+outlive the process are corrected in place, so S6 does not inherit a reason not to try.
+
+### Caveats to carry into S6, each from the source
+
+- **The import's directory must still exist.** OpenCode resolves a prompt through the session's
+  _stored_ directory and answers `LocationNotFoundError` if it is gone. Our import directories
+  are per-import under the fleet root, so a swept directory is a session that reads but cannot
+  continue. Verify before relying on resume.
+- **`sessionId` cannot be reused as a resume.** Passing `sessionId` for an id that already has
+  turns fails "already in use"; turn two onward must pass `resume` instead. T3 Code decides this
+  from a persisted turn count.
+- **A resume can raise a dialog.** The SDK can answer a resume with a `resume_return`
+  user-dialog — a compaction question — which has to be answered or the resume stalls.
+- **A session killed before its first prompt was saved** leaves a metadata-only transcript that
+  can be neither resumed nor created. The fallback is a fresh session plus a summary.
+- **OpenCode's database filename depends on the build channel** (`opencode-<channel>.db` outside
+  `latest|dev|beta|next|prod`, and `OPENCODE_DB` overrides both), so a channel change makes old
+  sessions unreachable rather than missing.
+- **Retention is the harness's.** Claude Code sweeps transcripts on `cleanupPeriodDays`; the
+  default is not stated in the declarations. This is DECISIONS §8 as already accepted: the
+  conversation history is the harness's and we keep no copy.
+
+### A thing we are not building here, and the rule it would break
+
+T3 Code's threads _appear_ to survive a reboot and carry on working. They do not: every
+in-flight run is terminalized on boot with "cancelled because the server restarted", and a
+project setting (`continueThreadsAfterServerUpdate`, default on) then dispatches a synthetic
+`"Continue where you left off."` user message, with a note listing the cancelled background
+work, capped at three chained continuations. The seamlessness is an automatic new turn, not a
+resurrection.
+
+bit should not take that for **worker attempts**: it is an agent resuming offensive work against
+a target with no operator present, and `agentHarness.ts` already holds the opposing rule —
+carrying work on after an interruption means a new attempt identity. Whether it is wanted for a
+_conversation_ — importer or goal — is a separate decision, outside these six slices. If it is
+ever taken, the dispatcher belongs on the transactional outbox (migration `0013`), which is
+built and has no dispatcher; that is what it is for.
 
 ### Done criteria
 
@@ -199,8 +255,11 @@ new session with a sentence saying so, in the register `goalConversation.ts`'s
 - [ ] A refused `prompt` closes the session, so the next message opens a fresh one.
 - [ ] Migration `0026_import_session_end` adds `ended_at`; set on close; the importer toolkit
       refuses a write under an ended import; `bun run test:persistence` covers both paths.
-- [ ] `GET .../importer-sessions` reports `ended_at`, and does not report a session as
-      resumable on a driver that cannot resume it.
+- [ ] `GET .../importer-sessions` reports `ended_at`.
+- [ ] The two comments asserting a session cannot outlive the process — the Claude Code
+      sentence at `claudeCodeClient.ts:1630` and the OpenCode claim beside it — are corrected
+      to say what is actually true: the live handle dies, the conversation does not. S6
+      inherits no reason not to resume.
 - [ ] **No idle timeout exists**, and the module header says why.
 - [ ] A single-link import through `createTarget` still behaves exactly as before: it writes
       its entries, settles `finished`, and its closing report still reaches the toast. The
