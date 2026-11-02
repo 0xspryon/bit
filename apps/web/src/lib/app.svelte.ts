@@ -79,6 +79,10 @@ import {
   type SentTurn,
 } from "./chat";
 import { server, type ServerClient } from "./client";
+import {
+  ImporterSessions,
+  type ImporterScenario,
+} from "./importerSessions.svelte";
 
 /**
  * A cancellable one-shot timer.
@@ -1411,10 +1415,15 @@ export class App {
    * ({@link openImporter}) and left by going anywhere else — `toSection` and `openTarget`
    * both close it, and stop watching an import on the way out.
    *
-   * It is the form and the progress panel the create-target page used to carry, relocated.
-   * A6 turns it into a chat; nothing here is a chat yet.
+   * It is a chat with the importer (A6 D2–D5), **driven by mock data**: there is no importer
+   * API yet, so {@link importer} holds a declared list of sessions and nothing on this page
+   * reaches the server. The form, the model picker and the polled progress panel it used to
+   * carry are still here as state ({@link importerPhase}, {@link programLinks},
+   * {@link startScopeImport}) and no longer on screen; they go when the chat has a source.
    */
   importerOpen = $state(false);
+  /** The Auto-load chat's sessions, the one on screen and its composer. Mock. */
+  importer = new ImporterSessions();
   /**
    * Which half of the Auto-load page is showing: the links and the model, or the import's
    * progress. `importing` once an import has started on this target in this tab.
@@ -3538,6 +3547,9 @@ export class App {
     const targetId = this.viewTargetId;
     if (targetId === "") return;
     this.importerOpen = true;
+    // Mock: a fresh session beside the earlier ones. A real source would resume the
+    // target's newest, which is what "sticky per target" means.
+    this.importer.load("default");
     this.importStartDetail = "";
     this.importStarting = false;
     void this.loadHarnesses();
@@ -4847,6 +4859,7 @@ export class App {
     // link list or a settled import behind would show the next scenario somebody else's
     // receipt, which is the one thing the state picker must not do.
     this.importerOpen = false;
+    this.importer.load("default");
     this.importerPhase = "form";
     this.importStarting = false;
     this.importStartDetail = "";
@@ -5152,4 +5165,36 @@ export const scenarios: Scenario[] = [
       a.createDetail = `${a.dialogRoot}/acme-corp is already registered as 'acme-corp'`;
     },
   },
+  ...(
+    [
+      ["importer-first", "D2 · New session, first on this target", "first"],
+      ["importer-new", "D2 · New session, earlier ones exist", "default"],
+      ["importer-awaiting", "D3 · Sent, not answered yet", "awaiting"],
+      ["importer-streaming", "D3 · Mid-stream, a write in flight", "streaming"],
+      ["importer-complete", "D4 · Multi-turn, correcting it", "complete"],
+      ["importer-picker", "D5 · Session picker", "picker"],
+      ["importer-reloaded", "Reloaded · harness still has it", "reloaded"],
+      [
+        "importer-forgotten",
+        "Reloaded · harness no longer has it",
+        "forgotten",
+      ],
+      ["importer-opening", "Opening an older session", "opening"],
+    ] as const satisfies readonly (readonly [
+      string,
+      string,
+      ImporterScenario,
+    ])[]
+  ).map(([id, label, state]): Scenario => ({
+    id,
+    group: "A6 Auto-load",
+    label,
+    apply: (a) => {
+      a.reset();
+      a.previewTarget("acme-corp");
+      a.navItem = "assets";
+      a.importerOpen = true;
+      a.importer.load(state);
+    },
+  })),
 ];

@@ -32,6 +32,7 @@
   } from "../icons";
   import { countsLine, goalTitle, statusLabel, whenText } from "../goalFormat";
   import { navGlyphs } from "../navGlyphs";
+  import { sessionLabel, sessionWhen, tallyLine } from "../importerChat";
   import { navItems } from "../mock";
   import type { App } from "../app.svelte";
 
@@ -43,6 +44,27 @@
   let sectionQuery = $state("");
   let goalOpen = $state(false);
   let goalQuery = $state("");
+  let sessionQuery = $state("");
+
+  /**
+   * The importer's session crumb (A6 D5), on the bar's right because the design puts it
+   * there: it belongs to the target, not to the message being typed.
+   */
+  let importer = $derived(app.importer);
+  let sessionsShown = $derived(
+    app.screen === "target" && app.importerOpen && app.navItem === "assets",
+  );
+  let sessionName = $derived(
+    importer.current === undefined ? "" : sessionLabel(importer.current),
+  );
+  let sessionRows = $derived(
+    importer.listed.filter((session) =>
+      matches(
+        `${sessionWhen(session.startedAt, Date.now())} ${session.model}`,
+        sessionQuery,
+      ),
+    ),
+  );
 
   const matches = (text: string, query: string) =>
     text.toLowerCase().includes(query.trim().toLowerCase());
@@ -310,6 +332,66 @@
   {/if}
 
   <div class="right">
+    {#if sessionsShown && importer.current !== undefined}
+      <CrumbPicker
+        label="Importer sessions"
+        placeholder="Find a session…"
+        width={360}
+        align="end"
+        bind:open={importer.pickerOpen}
+        bind:query={sessionQuery}
+        onenter={() => {
+          const first = sessionRows[0];
+          if (first !== undefined) importer.open(first.id);
+        }}
+      >
+        {#snippet trigger()}
+          {#if importer.current?.working}
+            <span class="working-dot" aria-hidden="true"></span>
+          {/if}
+          <span class="crumb-text">{sessionName}</span>
+        {/snippet}
+        {#snippet rows()}
+          <p class="group-label">Importer sessions · {app.selected?.name}</p>
+          {#each sessionRows as session (session.id)}
+            {@const current = session.id === importer.currentId}
+            <button
+              class="option"
+              aria-current={current}
+              onclick={() => importer.open(session.id)}
+            >
+              <span class="option-main">
+                <span class="option-name">
+                  {sessionWhen(session.startedAt, Date.now())}
+                  <span class="session-model">{session.model}</span>
+                </span>
+                <span class="option-sub">{tallyLine(session.tally)}</span>
+              </span>
+              {#if current}
+                <IconCheck class="option-end" width="14" height="14" />
+              {/if}
+            </button>
+          {:else}
+            <p class="none">No session matches.</p>
+          {/each}
+        {/snippet}
+        {#snippet footer()}
+          <button
+            class="foot-item new-session"
+            onclick={() => importer.start()}
+          >
+            <IconPlus width="14" height="14" />
+            <span class="new-session-text">
+              <span>Start a new session</span>
+              <span class="new-session-sub">
+                Empty thread, same target. What it writes adds to the scope that
+                is already there.
+              </span>
+            </span>
+          </button>
+        {/snippet}
+      </CrumbPicker>
+    {/if}
     {#if app.reconnecting}
       <span class="chip" role="status">Reconnecting…</span>
     {/if}
@@ -439,6 +521,41 @@
     font: 500 10px/14px var(--font-sans);
     letter-spacing: 0.06em;
     text-transform: uppercase;
+  }
+
+  .working-dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--state-fg-success);
+  }
+  .group-label {
+    margin: 0;
+    padding: 6px 8px 4px;
+    color: var(--text-faint);
+    font: 600 10px/1 var(--font-sans);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .session-model {
+    margin-left: 8px;
+    color: var(--text-muted);
+    font: 400 11px/15px var(--font-mono);
+  }
+  .new-session {
+    align-items: flex-start;
+  }
+  .new-session-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    text-align: left;
+  }
+  .new-session-sub {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 15px;
   }
 
   .right {

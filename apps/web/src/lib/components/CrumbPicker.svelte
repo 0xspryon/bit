@@ -24,6 +24,7 @@
     query = $bindable(""),
     open = $bindable(false),
     width = 324,
+    align = "start",
     onenter,
     trigger,
     rows,
@@ -35,6 +36,11 @@
     query?: string;
     open?: boolean;
     width?: number;
+    /**
+     * Which edge of the crumb the popover lines up with. `end` for a crumb on the bar's
+     * right-hand side, where a popover opening rightwards would run off the window.
+     */
+    align?: "start" | "end";
     /** Enter in the search field: usually, take the first match. */
     onenter?: () => void;
     trigger: Snippet;
@@ -85,7 +91,7 @@
 
   {#if open}
     <div
-      class="picker"
+      class={["picker", align === "end" && "end"]}
       role="dialog"
       aria-label={label}
       style:width="{width}px"
@@ -162,6 +168,10 @@
     border-radius: var(--radius-lg);
     background: var(--bg-layer-01);
     box-shadow: 0 18px 48px #00000070;
+  }
+  .picker.end {
+    right: 0;
+    left: auto;
   }
   .search {
     display: flex;
