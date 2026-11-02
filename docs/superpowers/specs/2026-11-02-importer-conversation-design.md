@@ -335,11 +335,22 @@ The same seam and the same reasoning as a goal message (DECISIONS §24.1): work 
 finishes, then the message runs. `preemptive` would cut off a tool call the agent was about to
 report on, and an operator typing a second message has not asked for that.
 
-### S3.3 — The import id is reused, which is S1's constraint
+### S3.3 — The same import id within one authority period, a new one per opening
 
-A second turn writes under the same `caller_scope`, so the picker's tally keeps counting. A new
-`import_sessions` row per turn is the alternative and is wrong: the row is a _session_ index,
-and one session would then have several.
+A second turn in a live conversation writes under the same `caller_scope`, so the picker's
+tally keeps counting. A new `import_sessions` row per _turn_ would be wrong: the row is a
+session index, and one session would then have several.
+
+**But a new opening is a new import id**, and that is the correction S2's review forced.
+`ended_at` plus `ended_reason` describe one _authority period_, not a session: a session may
+have several, and the import id is what changes between them. So "the session was closed, the
+operator sends another message, a fresh one opens" mints a new id rather than reviving the
+ended one — `ended_at` is never cleared, and a fresh session under an ended id would have
+every write refused.
+
+This is affordable because the index already absorbs it: the session query groups by
+`harness_session_id` and the tally counts across every `caller_scope` of the session, so a new
+id per opening leaves both the session row and its tally intact.
 
 ### S3.4 — A session the operator opens with no links
 
@@ -640,6 +651,45 @@ this session" is a deep link, and today navigation is in-memory state. So:
 - [ ] The component carries a comment explaining that row-click deep linking waits on URL
       routing, and what it will become.
 - [ ] No URL routing is invented for this slice.
+
+## Known defects, found while building this and not fixed here
+
+### OpenCode sessions survive a restart, and recovery assumes they do not
+
+**Confirmed against OpenCode's source during S2's review. Pre-existing, in worker and round
+recovery, and deliberately untouched by S2.**
+
+`openCodeClient.ts`'s `sessionStatus` reads `session.outcome`, which OpenCode fills from
+`session_v2.idle_outcome` — written only on a terminal execution event. Two paths therefore
+leave a session that exists with no outcome after a restart:
+
+- an unclean death, where no terminal event is ever written; and
+- a **graceful** shutdown, where the interrupt is tagged `reason: "shutdown"` and the projector
+  returns early without setting the outcome, deliberately, to support restart continuity.
+
+`harnessStatus.ts:152` maps "no outcome" to `running`, and reconciliation then records
+`still_running`: the attempt row stays `running`, the fence is not bumped, and a round is left
+alone. **That is the pile of stuck `running` rows recovery exists to prevent** — the same
+failure the Claude Code branch of that function carries a comment about, reached from the
+other side.
+
+The reason it was invisible is the comment beside it, now corrected: it asserted that a
+restarted `opencode serve` has never heard of the old session. It has. Sessions are rows in one
+SQLite file under the user's XDG data dir, and a fresh server finds them by primary key.
+
+There is a worse possibility in the same area that is **not established**: OpenCode's own
+`resumeSuspendedSessions` sweep would continue a worker turn under a dead credential — the
+auto-continuation S7 explicitly rejects for workers. `process.ts` gates that sweep on a
+lifecycle and we spawn `serve --stdio`, which should not attach one, but `fetch.ts:49` forks it
+unconditionally, and which path `--stdio` takes was not established. **Settle this before S7.**
+
+A second, smaller defect alongside it: `Execution.Started` updates `time_busy` but never clears
+`idle_outcome`, so a multi-turn OpenCode session mid-turn-two reports turn one's outcome.
+Nothing reads `sessionStatus` for importer or goal sessions today. S6 and S7 will.
+
+Suggested direction, not a decision: treat "no outcome while not busy in this process" as
+uncertain rather than `running`, deriving it from `time_busy`/`time_idle` and the execution
+claim.
 
 ## Deferred
 
