@@ -1171,19 +1171,23 @@ export type HarnessInstanceView = typeof HarnessInstanceView.Type;
 /* ── Transcripts ─────────────────────────────────────────────────────────────── */
 
 /**
- * Where one attempt's transcript came from. Never collapsed into "we have a transcript".
+ * What asking the harness for one attempt's transcript found. Never collapsed into "we have
+ * a transcript" — and, now that the harness is the only source, never collapsed into "we do
+ * not" either. This application keeps no copy of an agent's conversation.
  *
- * - `recorded` — **ours**, written into the target's `evidence/` directory when the attempt
- *   settled, content-hashed and keyed to the attempt. The system of record: still there in
- *   a year.
- * - `harness` — the harness's own log of that session, asked for now. The richer view while
- *   it lasts, and it lasts exactly as long as the harness feels like keeping it.
- * - `absent` — neither. Not an error: for an older attempt it is the expected answer.
+ * - `harness` — the harness answered with its log of that session. Real, and it lasts
+ *   exactly as long as the harness feels like keeping it.
+ * - `absent` — the harness was asked and does not hold it: it has forgotten the session,
+ *   holds nothing under it, or the attempt never had a session. **Gone**, and for an older
+ *   attempt that is the expected answer, not a fault.
+ * - `unreachable` — the harness could not be asked: it will not start, the instance is not
+ *   one this server configures, or the request failed or timed out. This says **nothing**
+ *   about whether the transcript still exists, so it must not be shown as gone.
  */
 export const TranscriptSource = Schema.Literals([
-  "recorded",
   "harness",
   "absent",
+  "unreachable",
 ]);
 export type TranscriptSource = typeof TranscriptSource.Type;
 
@@ -1198,19 +1202,20 @@ export const TranscriptEntry = Schema.Struct({
 export type TranscriptEntry = typeof TranscriptEntry.Type;
 
 /**
- * One attempt's transcript, with where it came from attached.
+ * One attempt's transcript, with what asking for it found attached.
  *
- * **Both sources are wanted and they are not equal-status.** Ours is the record and is
- * preferred whenever we have one; the harness's is the fallback and the live-poking view.
- * {@link ephemeral} is the field that keeps a screen from presenting them as the same kind
- * of thing — Claude Code deletes its local transcripts after `cleanupPeriodDays`, 30 by
- * default, and an OpenCode session lives in a server process that restarts.
+ * **The harness is the only source, and it deletes.** Claude Code removes its local
+ * transcripts after `cleanupPeriodDays` — 30 by default — and an OpenCode session lives in
+ * a server process that restarts. This application keeps no copy, so for any old attempt
+ * the transcript is simply gone and that is the ordinary end of every attempt. {@link
+ * ephemeral} is the field that keeps a screen from presenting what is shown as permanent.
  *
- * So a harness-sourced transcript must read as **"from the harness, may be gone"**, and an
- * absent one must read as **normal** rather than as a failure. That is why this is a 200
- * with `source: "absent"` and not a 404: "we did not keep one and the harness has forgotten
- * it" is the ordinary end state of every attempt old enough, and an error status would make
- * a browser treat the common case as a fault.
+ * So a `harness` transcript must read as **"from the harness, may be gone"**; an `absent`
+ * one must read as **gone, and normal** — not as a failure and not as an empty
+ * conversation; and an `unreachable` one must read as **"could not ask"**, which is neither.
+ * That is why this is a 200 for all three and not a 404: "the harness has forgotten it" is
+ * the ordinary end state of every attempt old enough, and an error status would make a
+ * browser treat the common case as a fault.
  */
 export const AttemptTranscript = Schema.Struct({
   attemptId: Schema.String,
@@ -1220,15 +1225,10 @@ export const AttemptTranscript = Schema.Struct({
   ephemeral: Schema.Boolean,
   /** A sentence for the operator, set on every source including a successful read. */
   note: Schema.String,
+  /** Empty unless `source` is `harness`. */
   entries: Schema.Array(TranscriptEntry),
   /** Entries this answer stopped short of. A transcript can be very long. */
   truncated: Schema.Boolean,
-  /** Where our own artefact is on the server. Set only for `recorded`. */
-  path: Schema.optional(Schema.String),
-  /** The content hash in that artefact's filename. Set only for `recorded`. */
-  contentHash: Schema.optional(Schema.String),
-  /** When we wrote it. Set only for `recorded`. */
-  writtenAt: Schema.optional(EpochMillis),
 });
 export type AttemptTranscript = typeof AttemptTranscript.Type;
 

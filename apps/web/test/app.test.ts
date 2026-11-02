@@ -2203,30 +2203,27 @@ describe("a round trip that outlives the view it started in", () => {
   });
 });
 
-/* ── The stale-row inference ─────────────────────────────────────────────────── */
+/* ── Reading a transcript says nothing about whether a run is over ───────────── */
 
 /**
- * A transcript is evidence about whether a run is over, and only one of the three
- * sources is evidence that it is.
+ * No transcript source is evidence that a run has settled, so reading one never touches
+ * the running list.
  *
- * The server writes its own artefact inside the settlement finalizer, after the attempt
- * row and its `attempt.settled` event — so `source: "recorded"` cannot exist for a run
- * that is still going, and seeing one is grounds to go and re-read the running list.
- * `harness` says only that the harness still holds the session, which says nothing about
- * whether the run finished; `absent` is also what a foreign instance and an attempt with
- * no session return. Inferring from either would clear a row for a run that is still
- * working, which is the worse of the two mistakes.
- *
- * This is the most recently changed behaviour in the file and had been checked only by
- * hand, which is why all three sources are pinned rather than just the interesting one.
+ * There used to be one: a transcript the server had written itself could only exist once
+ * the attempt settled, so seeing it was grounds to re-read the running list. That copy is
+ * gone and the harness is the only source. `harness` says only that the harness still holds
+ * the session, which a live run does too; `absent` and `unreachable` are also what a
+ * foreign instance or an attempt with no session return. Inferring from any of them would
+ * clear a row for a run that is still working, which is the worse mistake. A run that ends
+ * while the tab watches is cleared by the live feed's `run.settled` frame instead.
  */
-describe("a transcript that settles a running row", () => {
+describe("reading a transcript leaves the running list alone", () => {
   /**
    * One running row, one transcript read, and a server that has since noticed the run is
-   * over. Whether the row clears is then entirely down to the source.
+   * over, which the transcript read must not act on whatever it answers.
    */
   const afterReading = async (
-    source: "recorded" | "harness" | "absent",
+    source: "harness" | "absent" | "unreachable",
   ): Promise<{ app: App; fake: FakeServer; runsBefore: number }> => {
     const { app, fake } = open();
     fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
@@ -2247,15 +2244,8 @@ describe("a transcript that settles a running row", () => {
     return { app, fake, runsBefore };
   };
 
-  test("a recorded transcript clears the running row", async () => {
-    const { app } = await afterReading("recorded");
-    expect(app.transcript?.source).toBe("recorded");
-    expect(app.runs).toEqual([]);
-    expect(app.activeRun).toBeUndefined();
-  });
-
-  test.each(["harness", "absent"] as const)(
-    "a %s transcript leaves the running row alone",
+  test.each(["harness", "absent", "unreachable"] as const)(
+    "a transcript that reads as %s leaves the running row alone",
     async (source) => {
       const { app, fake, runsBefore } = await afterReading(source);
       expect(app.transcript?.source).toBe(source);
@@ -2265,12 +2255,20 @@ describe("a transcript that settles a running row", () => {
     },
   );
 
-  /** An absent transcript is a success. `transcriptDetail` is for a silent server only. */
-  test("an absent transcript is not an error", async () => {
-    const { app } = await afterReading("absent");
-    expect(app.transcriptDetail).toBe("");
-    expect(app.transcriptLoading).toBe(false);
-  });
+  /**
+   * Neither "gone" nor "could not ask" is an error: both are successful answers, and each
+   * keeps its own source so the panel can tell them apart. `transcriptDetail` is for a
+   * silent server only.
+   */
+  test.each(["absent", "unreachable"] as const)(
+    "a transcript that reads as %s is an answer, not an error",
+    async (source) => {
+      const { app } = await afterReading(source);
+      expect(app.transcript?.source).toBe(source);
+      expect(app.transcriptDetail).toBe("");
+      expect(app.transcriptLoading).toBe(false);
+    },
+  );
 
   test("a server that does not answer is reported as unreachable", async () => {
     const { app, fake } = open();

@@ -200,8 +200,9 @@ export const REFUSAL_TAGS = new Set([
   // box shows next to itself, not transport trouble.
   "RunRefused",
   // Asking for a transcript: an attempt this target does not hold is an answer. A
-  // transcript nobody kept is *not* in this list, because it is not an error at all — it
-  // comes back `200` with `source: "absent"`.
+  // transcript the harness has purged, or could not be asked about, is *not* in this list,
+  // because it is not an error at all — it comes back `200` with `source: "absent"` or
+  // `"unreachable"`.
   "AttemptNotFound",
   // Goals: a goal this target does not hold, and a goal that is already ended, are both
   // answers the goals screen puts in a sentence next to the control that caused them.
@@ -841,11 +842,13 @@ export const server = {
     ),
 
   /**
-   * One past attempt's transcript — the server's own copy, or the harness's.
+   * One past attempt's transcript, asked of the harness: the server keeps no copy.
    *
-   * `source` says which, and `ephemeral` says whether it can disappear. A transcript
-   * nobody kept comes back as a success with `source: "absent"`, because for an older
-   * attempt that is the expected answer rather than a fault.
+   * `source` says what asking found, and `ephemeral` says whether what is shown can
+   * disappear. A transcript the harness has purged comes back as a success with
+   * `source: "absent"`, because for an older attempt that is the expected answer rather
+   * than a fault; one the harness could not be asked about is `"unreachable"`, which says
+   * nothing about whether it still exists.
    */
   transcript: (baseUrl: string, targetId: string, attemptId: string) =>
     run(

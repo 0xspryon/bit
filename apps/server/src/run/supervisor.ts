@@ -134,7 +134,6 @@ import {
   settlementFor,
   type SupervisionEnd,
 } from "./settlement";
-import { captureTranscript } from "./transcript";
 
 /**
  * Where a worker calls back into, as something that can be asked later.
@@ -327,17 +326,6 @@ export interface RunInput {
    * audit trail can read the shape of the boundary it is inside.
    */
   readonly auditPath: string;
-  /**
-   * The target's own `evidence/` directory, where the settled attempt's transcript lands.
-   *
-   * Supplied by the caller for exactly the reason {@link auditPath} is: it is a *fleet
-   * layout* question and the supervisor does not hold the registry. The two come from the
-   * same place and are two fields rather than one because `auditPath` names a file the
-   * *harness-side gate* appends to and this names a directory *we* write into — one is
-   * handed to another process, the other is not, and collapsing them would make the gate's
-   * configuration depend on where we happen to put transcripts.
-   */
-  readonly evidenceDirectory: string;
   /** Shown as the session's title in the harness's own UI. */
   readonly title: string;
 }
@@ -558,16 +546,6 @@ export class RunSupervisor extends Context.Service<
    */
   static readonly layerWith = (options: {
     readonly askTimeout: Duration.Input;
-    /**
-     * The bound on fetching a settled attempt's transcript, when it should not be the
-     * default.
-     *
-     * A separate knob from `askTimeout` because they are separate bounds with separate
-     * reasoning — one is on deciding an outcome, the other on an artefact that is allowed
-     * to be absent — and because a test that watched a settlement *not* wait for a
-     * transcript would otherwise sit out `TRANSCRIPT_FETCH_TIMEOUT` per run.
-     */
-    readonly transcriptTimeout?: Duration.Input | undefined;
   }): Layer.Layer<
     RunSupervisor,
     never,
@@ -686,10 +664,8 @@ const refuse = (error: {
 
 const make = Effect.fnUntraced(function* (options?: {
   readonly askTimeout?: Duration.Input | undefined;
-  readonly transcriptTimeout?: Duration.Input | undefined;
 }) {
   const askTimeout = options?.askTimeout ?? SETTLEMENT_ASK_TIMEOUT;
-  const transcriptTimeout = options?.transcriptTimeout;
   /**
    * The only thing in this file that knows there is more than one harness.
    *
@@ -1388,46 +1364,6 @@ const make = Effect.fnUntraced(function* (options?: {
               narrated: report.narrated,
             });
             remember(ids.attemptId, settled);
-
-            /**
-             * The transcript, **after** the settlement and never in its way.
-             *
-             * Three properties, in the order they matter:
-             *
-             * 1. **Settle first.** The attempt row and its `attempt.settled` event are the
-             *    durable record and both are written above. This is an artefact beside
-             *    them, so it runs after and its failure is logged rather than raised —
-             *    `captureTranscript` swallows its own, which is why there is no
-             *    `Effect.result` here.
-             * 2. **Bounded, and it cannot block a shutdown.** The ask is cut short by
-             *    `TRANSCRIPT_FETCH_TIMEOUT`, for the same reason
-             *    {@link SETTLEMENT_ASK_TIMEOUT} exists: this runs in a finalizer, which on
-             *    a `SIGINT` means asking a harness child that is being torn down at the
-             *    same moment. An absence is recorded as normal, not as an error.
-             * 3. **It is the harness's own log, not the drained stream.** See
-             *    `run/transcript.ts`: `sessionEvents` has a gap between subscribing and
-             *    prompting and `messages` does not.
-             */
-            yield* captureTranscript({
-              directory: input.evidenceDirectory,
-              ...(transcriptTimeout === undefined
-                ? {}
-                : { fetchTimeout: transcriptTimeout }),
-              header: {
-                attemptId: ids.attemptId,
-                targetId: input.targetId,
-                harnessSessionId,
-                instanceId: resolved.instance.instanceId,
-                // Re-derived from the instance rather than read off a column, because
-                // there is no driver column and there is not going to be one: it is a fact
-                // about configuration, and a stored copy would be free to disagree
-                // (migration `0014`).
-                driver: resolved.instance.driver,
-                providerId: provenance.providerId,
-                modelId: provenance.modelId,
-                status: settled.status,
-              },
-            });
           }),
         );
 

@@ -1428,9 +1428,9 @@ describe("availability in the list", () => {
  *
  * What is worth checking on the wire rather than in the service: that an unusable instance
  * survives serialisation with its reason attached, and that an attempt with no transcript
- * is a **200** rather than a 404. The second is a decision rather than an accident — "we
- * kept none and the harness has forgotten it" is the ordinary end state of every attempt
- * old enough, and an error status would make a browser treat the common case as a fault.
+ * is a **200** rather than a 404. The second is a decision rather than an accident — "the
+ * harness has forgotten it" is the ordinary end state of every attempt old enough, and an
+ * error status would make a browser treat the common case as a fault.
  */
 describe("the harness listing", () => {
   test("every configured instance is listed, including one that will not start", async () => {
@@ -1482,6 +1482,8 @@ describe("the harness listing", () => {
 describe("reading an attempt's transcript", () => {
   const targetId = "transcripts";
   const attemptId = "at_no_transcript";
+  /** An attempt that did have a session, on an instance this server configured but cannot start. */
+  const unaskableAttemptId = "at_unaskable";
 
   /**
    * One target of this block's own, with one attempt row and nothing else.
@@ -1531,6 +1533,25 @@ describe("reading an attempt's transcript", () => {
           0,
         ],
       );
+      database.run(
+        `INSERT INTO attempts
+           (id, intent_id, target_id, worker_id, harness_session_id,
+            harness_instance_id, provider_id, model_id, status, started_at, write_fence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          unaskableAttemptId,
+          "in_u",
+          targetId,
+          "wk_u",
+          "ses_unaskable",
+          "absent-harness",
+          "stub",
+          "scripted/model",
+          "succeeded",
+          2,
+          0,
+        ],
+      );
     } finally {
       database.close();
     }
@@ -1548,9 +1569,9 @@ describe("reading an attempt's transcript", () => {
   /**
    * An attempt with no transcript answers 200 and says so.
    *
-   * Not a 404: "we kept none and the harness has forgotten it" is the ordinary end state
-   * of every attempt old enough, and an error status would make a browser treat the common
-   * case as a fault. The sentence is the server's own, not the browser's guess.
+   * Not a 404: "the harness has forgotten it" is the ordinary end state of every attempt
+   * old enough, and an error status would make a browser treat the common case as a fault.
+   * The sentence is the server's own, not the browser's guess.
    */
   test("an attempt with no transcript is a success that says there is none", async () => {
     const answered = await read(
@@ -1563,6 +1584,65 @@ describe("reading an attempt's transcript", () => {
       "no harness session recorded",
     );
     expect(answered.body["entries"]).toEqual([]);
+  });
+
+  /**
+   * A harness that cannot be asked is a different answer from one that has forgotten.
+   *
+   * The attempt names an instance this server configures but could not start. That says
+   * nothing about whether its transcript still exists, so the wire must not say `absent` —
+   * and it is still a 200, because a browser should not treat "could not ask" as the
+   * request failing.
+   */
+  test("an attempt on a harness that will not start is unreachable, not absent", async () => {
+    const answered = await read(
+      await signedIn(
+        `/targets/${targetId}/attempts/${unaskableAttemptId}/transcript`,
+      ),
+    );
+    expect(answered.status).toBe(200);
+    expect(answered.body["source"]).toBe("unreachable");
+    expect(answered.body["ephemeral"]).toBe(false);
+    expect(answered.body["entries"]).toEqual([]);
+    expect(String(answered.body["note"])).toContain("no such binary");
+  });
+
+  /**
+   * A transcript file an earlier version wrote is an orphan, and nothing reads it.
+   *
+   * Earlier versions wrote `<attemptId>-<hash>.transcript.jsonl` into the target's
+   * `evidence/` directory. bit now keeps no copy of an agent's conversation, so a reader
+   * that could still find one would answer from a copy the operator decided not to keep —
+   * and, once the harness purged its own, would show it as though it were still there.
+   * The file is planted where the old writer put it, in the old format, and the answer must
+   * not contain a word of it.
+   */
+  test("an orphaned transcript file from an earlier version is not read", async () => {
+    const evidence = join(fleetRoot, "targets", targetId, "evidence");
+    mkdirSync(evidence, { recursive: true });
+    writeFileSync(
+      join(evidence, `${attemptId}-0123456789ab.transcript.jsonl`),
+      [
+        { record: "transcript.header", attemptId, writtenAt: 1 },
+        {
+          record: "message",
+          index: 0,
+          type: "assistant",
+          text: "ORPHANED-CONVERSATION",
+          error: null,
+        },
+        { record: "transcript.footer", truncated: false },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n"),
+    );
+    const answered = await read(
+      await signedIn(`/targets/${targetId}/attempts/${attemptId}/transcript`),
+    );
+    expect(answered.status).toBe(200);
+    expect(answered.body["source"]).toBe("absent");
+    expect(answered.body["entries"]).toEqual([]);
+    expect(JSON.stringify(answered.body)).not.toContain("ORPHANED");
   });
 });
 

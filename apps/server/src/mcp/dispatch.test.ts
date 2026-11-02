@@ -502,7 +502,6 @@ describe("one endpoint, two targets", () => {
           // pre-execution policy gate into it before creating the session.
           workspace: workspaceFor("alpha"),
           auditPath: join(directory, "alpha-policy-audit.log"),
-          evidenceDirectory: join(directory, "alpha-evidence"),
           title: "bit: alpha",
         });
         return { started, supervisor };

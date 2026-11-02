@@ -26,8 +26,9 @@
    * harness's narration and the policy gate's denials as live activity — and says which is
    * which. It is about the target rather than any one page, so it is under all of them.
    * {@link TranscriptPanel} remains the different thing beside it: what a *settled*
-   * attempt left behind, the server's own artefact when it has one, and the harness's own
-   * copy, labelled as the thing that may be gone, when it does not.
+   * attempt left behind, read from the harness (the server keeps no copy), labelled as the
+   * thing that may be gone, and told apart from a transcript that is gone and from a
+   * harness that could not be asked.
    */
   import Button from "../components/Button.svelte";
   import ComposeBox from "../components/ComposeBox.svelte";

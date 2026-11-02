@@ -1,28 +1,27 @@
 <script lang="ts">
   /**
-   * What a settled attempt left behind, and how durable it is.
+   * What the harness still holds of a settled attempt's conversation.
    *
    * **The minimum that makes the read path real**, and no more. It is not the live view:
    * the live stream and the tool-call rendering are `LiveTranscript.svelte`, which sits
-   * above this one and is about a run that is still happening. This is the read-back of
-   * what a *settled* attempt left behind, and its two sources are not equal-status data.
-   * What this does is prove the thing Part 3 is about — that an attempt's transcript can be
-   * read back after the harness session is gone, and that the two sources are not presented
-   * as the same kind of thing.
+   * above this one and is about a run that is still happening. This is the read-back of a
+   * *settled* attempt, and the harness is its only source: bit keeps no copy of an agent's
+   * conversation, so it is gone when the harness purges it — Claude Code deletes local
+   * transcripts after `cleanupPeriodDays`, 30 by default.
    *
    * ## Three answers, and they read differently on purpose
    *
-   * - **Ours** (`recorded`) — written into the target's `evidence/` directory when the
-   *   attempt settled, content-hashed. The system of record. Shown plainly, with the hash
-   *   so it can be matched against the file.
-   * - **The harness's** (`harness`) — asked for now, and labelled **"from the harness, may
-   *   be gone"**. It is the richer view while it lasts and it lasts only as long as the
-   *   harness keeps it: Claude Code deletes local transcripts after `cleanupPeriodDays`, 30
-   *   by default. A screen that showed it as equal-status data would be promising a
-   *   durability it does not have.
-   * - **Neither** (`absent`) — rendered as **normal**, not as an error. For anything old
-   *   enough that is the expected answer, and the server says so in its own `note` rather
-   *   than this component guessing at a reason.
+   * - **The harness has it** (`harness`) — shown, and labelled **"from the harness, may be
+   *   gone"**. A screen that showed it as permanent would be promising a durability it
+   *   does not have.
+   * - **The harness does not hold it** (`absent`) — **gone**, rendered as normal and not as
+   *   an error. For anything old enough that is the expected answer. It is not an empty
+   *   conversation either: there are no entries to show, so none are drawn.
+   * - **The harness could not be asked** (`unreachable`) — **neither**. It says nothing
+   *   about whether the transcript still exists, so it is not shown as gone; it is shown as
+   *   a failure to ask, which a retry can change.
+   *
+   * The server says why in its own `note` rather than this component guessing at a reason.
    */
   import Button from "./Button.svelte";
   import type { App } from "../app.svelte";
@@ -60,20 +59,20 @@
         The source label is text and not only a colour (§9): "may be gone" is the whole
         point of showing the harness's copy, and a tint nobody reads would not carry it.
       -->
-      <p class="source" class:ephemeral={read.ephemeral}>
+      <p
+        class="source"
+        class:ephemeral={read.ephemeral}
+        class:unreachable={read.source === "unreachable"}
+      >
         <span class="source-tag">
-          {read.source === "recorded"
-            ? "Recorded by this server"
-            : read.source === "harness"
-              ? "From the harness, may be gone"
-              : "No transcript"}
+          {read.source === "harness"
+            ? "From the harness, may be gone"
+            : read.source === "unreachable"
+              ? "Could not ask the harness"
+              : "No longer available"}
         </span>
         {read.note}
       </p>
-
-      {#if read.source === "recorded" && read.contentHash !== undefined}
-        <p class="meta mono">sha256 {read.contentHash}</p>
-      {/if}
 
       {#if read.entries.length > 0}
         <ol class="entries">
@@ -150,6 +149,12 @@
     border-color: var(--state-border-warning);
     background: var(--state-bg-warning);
     color: var(--state-fg-warning);
+  }
+  /* Red, because "could not ask" is a failure a retry can change and "gone" is not. */
+  .source.unreachable .source-tag {
+    border-color: var(--state-border-danger);
+    background: var(--state-bg-danger);
+    color: var(--state-fg-danger);
   }
   .meta {
     color: var(--text-faint);

@@ -1,488 +1,207 @@
 /**
- * Real-file tests for the transcript artefact and the two ways of reading one back.
+ * What `readTranscript` answers, in each of the states it has to tell apart.
  *
- * Every claim is about a file on disk or about what the read path answers when there is
- * no file, which is why this suite is part of `test:persistence` rather than a unit test
- * over a mock filesystem: the content hash in a name, the rename out of `.partial` and the
- * directory listing that finds an attempt's file are all things nothing checks at compile
- * time.
+ * bit keeps no copy of an agent's conversation, so every transcript is the harness's and
+ * every one of them ends in a purge. The suite is organised around the three screens that
+ * implies, because collapsing any two of them is the failure it exists to catch:
  *
- * What is **not** real here is the harness. `messages` is a scripted answer, because what
- * is under test is the artefact and the fallback — not a harness — and because "the harness
- * has forgotten this session" is a state a live one cannot be asked to be in on demand.
+ * - the harness **has** it (`harness`),
+ * - the harness **does not hold** it (`absent` — gone, and normal),
+ * - the harness **could not be reached** (`unreachable` — says nothing about whether it
+ *   still exists).
+ *
+ * What is not real here is the harness. `messages` is a scripted answer, because "the
+ * harness has forgotten this session" is a state a live one cannot be asked to be in on
+ * demand. No filesystem is involved: there is no artefact to read.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
 
-import { Effect, type Duration } from "effect";
+import { Effect } from "effect";
 
-import { AgentHarness, type MessageEntry } from "../harness/agentHarness";
+import { type AgentHarness, type MessageEntry } from "../harness/agentHarness";
 import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
 import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
-import {
-  TRANSCRIPT_MAX_ENTRIES,
-  TRANSCRIPT_SUFFIX,
-  captureTranscript,
-  harnessTranscript,
-  readRecordedTranscript,
-  readTranscript,
-  transcriptFilesFor,
-  writeTranscript,
-} from "./transcript";
+import { readTranscript, type TranscriptRead } from "./transcript";
 
-const directories: string[] = [];
-afterEach(() => {
-  while (directories.length > 0) {
-    const directory = directories.pop();
-    if (directory !== undefined)
-      rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-const newEvidence = (): string => {
-  const directory = mkdtempSync(join(tmpdir(), "bit-transcript-"));
-  directories.push(directory);
-  // Deliberately *not* created: `writeTranscript` makes it, the way a first run does.
-  return join(directory, "targets", "alpha", "evidence");
-};
-
-const header = (attemptId = "at_1") => ({
-  attemptId,
-  targetId: "alpha",
-  harnessSessionId: "ses_1",
-  instanceId: STUB_INSTANCE.instanceId,
-  driver: STUB_INSTANCE.driver,
-  providerId: "stub",
-  modelId: "model",
-  status: "succeeded",
-});
-
-const entries = (count: number, text = "hello"): readonly MessageEntry[] =>
+const entries = (count: number): readonly MessageEntry[] =>
   Array.from({ length: count }, (_, index) => ({
     type: index % 2 === 0 ? "assistant" : "tool",
-    text: `${text} ${String(index)}`,
+    text: `message ${String(index)}`,
     error: undefined,
   }));
+
+const transport = (
+  over: Partial<ConstructorParameters<typeof HarnessTransportError>[0]>,
+) =>
+  new HarnessTransportError({
+    operation: "message.list",
+    status: undefined,
+    tag: "RequestError",
+    detail: "connection refused",
+    cause: "none",
+    ...over,
+  });
 
 /** A resolver over one scripted harness, which is what the read path takes. */
 const resolverOver = (harness: AgentHarness["Service"]) =>
   HarnessResolver.fromEntries([{ instance: harness.instance, harness }]);
 
-describe("writing one", () => {
-  test("the file is named for the attempt and its content hash, and the directory is made", async () => {
-    const directory = newEvidence();
-    const written = await Effect.runPromise(
-      writeTranscript({ directory, header: header(), entries: entries(3) }),
+/** One read, against a resolver, for the session this suite uses everywhere. */
+const read = (
+  harness: AgentHarness["Service"],
+  over: Partial<Parameters<typeof readTranscript>[0]> = {},
+): Promise<TranscriptRead> =>
+  Effect.runPromise(
+    readTranscript({
+      resolver: resolverOver(harness),
+      harnessSessionId: "ses_1",
+      harnessInstanceId: STUB_INSTANCE.instanceId,
+      ...over,
+    }),
+  );
+
+describe("the harness has it", () => {
+  test("its messages are shown in order, marked as the thing that can be gone", async () => {
+    const asked: string[] = [];
+    const answer = await read(
+      stubHarness({
+        messages: (sessionId) =>
+          Effect.sync(() => {
+            asked.push(sessionId);
+            return entries(3);
+          }),
+      }),
     );
-    expect(written.entries).toBe(3);
-    expect(written.offered).toBe(3);
-    expect(written.truncated).toBe(false);
-    expect(written.path).toBe(
-      join(
-        directory,
-        `at_1-${written.contentHash.slice(0, 12)}${TRANSCRIPT_SUFFIX}`,
-      ),
-    );
-    // One file, and no `.partial` left behind: the write lands on a dotted name and is
-    // renamed once it is closed, so a reader never sees a half-written transcript.
-    expect(readdirSync(directory)).toEqual([
-      `at_1-${written.contentHash.slice(0, 12)}${TRANSCRIPT_SUFFIX}`,
+    expect(asked).toEqual(["ses_1"]);
+    expect(answer.source).toBe("harness");
+    expect(answer.ephemeral).toBe(true);
+    expect(answer.entries.map((entry) => entry.index)).toEqual([0, 1, 2]);
+    expect(answer.entries.map((entry) => entry.text)).toEqual([
+      "message 0",
+      "message 1",
+      "message 2",
     ]);
+    // The sentence an operator reads has to say that this is the only copy.
+    expect(answer.note).toContain("may delete it");
+    expect(answer.note).toContain("30 days");
+    expect(answer.note).toContain("keeps no copy");
+    expect(answer.truncated).toBe(false);
   });
 
-  test("the same entries hash the same and different ones do not", async () => {
-    const directory = newEvidence();
-    const first = await Effect.runPromise(
-      writeTranscript({ directory, header: header(), entries: entries(2) }),
-    );
-    const second = await Effect.runPromise(
-      writeTranscript({
-        directory,
-        header: header(),
-        entries: entries(2, "other"),
-      }),
-    );
-    expect(second.contentHash).not.toBe(first.contentHash);
-    // Two files, not one overwritten: re-settling an attempt — a recovery sweep refining
-    // an `uncertain` — must not destroy the transcript the first settlement wrote.
-    expect(readdirSync(directory)).toHaveLength(2);
-  });
-
-  test("the file is JSONL: a header, one line per message, a footer", async () => {
-    const directory = newEvidence();
-    const written = await Effect.runPromise(
-      writeTranscript({ directory, header: header(), entries: entries(2) }),
-    );
-    const lines = (await Bun.file(written.path).text())
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(lines).toHaveLength(4);
-    expect(lines[0]).toMatchObject({
-      record: "transcript.header",
-      attemptId: "at_1",
-      instanceId: STUB_INSTANCE.instanceId,
-      // Re-derived from the instance at write time; there is no driver column and there is
-      // not going to be one.
-      driver: STUB_INSTANCE.driver,
-      status: "succeeded",
-      entriesOffered: 2,
-    });
-    expect(lines[1]).toMatchObject({ record: "message", index: 0 });
-    expect(lines[3]).toMatchObject({
-      record: "transcript.footer",
-      entriesWritten: 2,
-      truncated: false,
-      limit: null,
-    });
-  });
-
-  /**
-   * What happens at the limit, which is the decision rather than the number.
-   *
-   * The file is **closed and kept**, with a footer saying it was shortened and which cap
-   * bit. A truncated transcript is a better artefact than none, and one that did not say
-   * so would be worse than either.
-   */
-  test("past the entry cap the file is kept and says it was shortened", async () => {
-    const directory = newEvidence();
-    const written = await Effect.runPromise(
-      writeTranscript({
-        directory,
-        header: header(),
-        entries: entries(TRANSCRIPT_MAX_ENTRIES + 5),
-      }),
-    );
-    expect(written.truncated).toBe(true);
-    expect(written.entries).toBe(TRANSCRIPT_MAX_ENTRIES);
-    expect(written.offered).toBe(TRANSCRIPT_MAX_ENTRIES + 5);
-    const text = await Bun.file(written.path).text();
-    expect(text).toContain('"truncated":true');
-    expect(text).toContain('"limit":"entries"');
-    // And a read of it says so too, so a reader is never shown a shortened transcript as
-    // if it were whole.
-    const read = await Effect.runPromise(
-      readRecordedTranscript({ directory, attemptId: "at_1", limit: 10 }),
-    );
-    expect(read?.truncated).toBe(true);
-  });
-});
-
-describe("capturing one at settlement", () => {
-  const capture = (
-    harness: AgentHarness["Service"],
-    directory: string,
-    fetchTimeout?: Duration.Input,
-  ) =>
-    Effect.runPromise(
-      captureTranscript({
-        directory,
-        header: header(),
-        ...(fetchTimeout === undefined ? {} : { fetchTimeout }),
-      }).pipe(Effect.provideService(AgentHarness, harness)),
-    );
-
-  test("it is written from the harness's own message log", async () => {
-    const directory = newEvidence();
-    const written = await capture(
-      stubHarness({ messages: () => Effect.succeed(entries(4)) }),
-      directory,
-    );
-    expect(written?.entries).toBe(4);
-  });
-
-  /**
-   * A fetch that fails writes nothing and raises nothing.
-   *
-   * The settlement has already happened by the time this runs, so a failure here must be a
-   * log line and not an error channel — which is why `captureTranscript` swallows its own
-   * and the supervisor does not wrap it.
-   */
-  test("a harness that cannot be asked produces no transcript and no failure", async () => {
-    const directory = newEvidence();
-    const written = await capture(
+  test("an entry's error is carried, not dropped", async () => {
+    const answer = await read(
       stubHarness({
         messages: () =>
-          Effect.fail(
-            new HarnessTransportError({
-              operation: "message.list",
-              status: undefined,
-              tag: "RequestError",
-              detail: "connection refused",
-              cause: "none",
-            }),
-          ),
+          Effect.succeed([
+            { type: "tool", text: "ran it", error: "exit status 2" },
+          ]),
       }),
-      directory,
     );
-    expect(written).toBeUndefined();
-    expect(transcriptFilesFor(directory, "at_1")).toHaveLength(0);
+    expect(answer.entries[0]?.error).toBe("exit status 2");
   });
 
-  /**
-   * A fetch that never answers is cut short.
-   *
-   * The case the bound exists for: settlement runs in a finalizer, so on a `SIGINT` this
-   * asks a harness child that is being torn down at the same moment. Without the bound a
-   * shutdown would wedge on it.
-   */
-  test("a harness that never answers is bounded, not waited for", async () => {
-    const directory = newEvidence();
-    const started = Date.now();
-    const written = await capture(
-      stubHarness({ messages: () => Effect.never }),
-      directory,
-      "50 millis",
+  test("a long session is cut at the limit, in order, and says so", async () => {
+    const answer = await read(
+      stubHarness({ messages: () => Effect.succeed(entries(20)) }),
+      { limit: 5 },
     );
-    expect(written).toBeUndefined();
-    expect(Date.now() - started).toBeLessThan(2_000);
-  });
-
-  test("a session the harness holds no messages for writes nothing", async () => {
-    const directory = newEvidence();
-    const written = await capture(
-      stubHarness({ messages: () => Effect.succeed([]) }),
-      directory,
-    );
-    expect(written).toBeUndefined();
+    expect(answer.source).toBe("harness");
+    expect(answer.entries.map((entry) => entry.text)).toEqual([
+      "message 0",
+      "message 1",
+      "message 2",
+      "message 3",
+      "message 4",
+    ]);
+    expect(answer.truncated).toBe(true);
+    expect(answer.note).toContain("Shortened");
   });
 });
 
-describe("reading one back", () => {
-  /** Ours is the record, so it wins even when the harness still has its own copy. */
-  test("our own artefact is preferred over the harness's", async () => {
-    const directory = newEvidence();
-    await Effect.runPromise(
-      writeTranscript({
-        directory,
-        header: header(),
-        entries: [
-          { type: "assistant", text: "from our file", error: undefined },
-        ],
+/**
+ * The harness was asked, answered, and does not hold it. This is *gone*: Claude Code
+ * deletes local transcripts after `cleanupPeriodDays` (30 by default), so for anything old
+ * it is the expected answer and must read as normal. None of these is a conversation with
+ * no entries, and none of them is a failure to ask.
+ */
+describe("the harness does not hold it", () => {
+  test.each([
+    ["by its not-found tag", { tag: "SessionNotFoundError", status: 500 }],
+    ["by a 404", { tag: "RequestError", status: 404 }],
+  ])("a forgotten session is gone, %s", async (_name, failure) => {
+    const answer = await read(
+      stubHarness({
+        messages: () => Effect.fail(transport(failure)),
       }),
     );
-    const read = await Effect.runPromise(
-      readTranscript({
-        resolver: resolverOver(
-          stubHarness({
-            messages: () =>
-              Effect.succeed([
-                {
-                  type: "assistant",
-                  text: "from the harness",
-                  error: undefined,
-                },
-              ]),
-          }),
-        ),
-        directory,
-        attemptId: "at_1",
-        harnessSessionId: "ses_1",
-        harnessInstanceId: STUB_INSTANCE.instanceId,
-      }),
-    );
-    expect(read.source).toBe("recorded");
-    expect(read.ephemeral).toBe(false);
-    expect(read.entries[0]?.text).toBe("from our file");
-    expect(read.contentHash).toBeDefined();
+    expect(answer.source).toBe("absent");
+    expect(answer.ephemeral).toBe(false);
+    expect(answer.entries).toEqual([]);
+    expect(answer.note).toContain("No longer available");
+    expect(answer.note).toContain("normal answer");
   });
 
   /**
-   * An attempt whose transcript we wrote is readable after the harness session is gone.
-   *
-   * The whole point of writing one: the harness answers `SessionNotFoundError` and the
-   * transcript is still there, from our own file, as the record.
+   * A session the harness still knows but holds nothing under is gone, not an empty
+   * conversation: `harness` with no entries would draw a transcript with nothing in it,
+   * which is a claim that the agent said nothing.
    */
-  test("our artefact outlives the harness session", async () => {
-    const directory = newEvidence();
-    await Effect.runPromise(
-      writeTranscript({
-        directory,
-        header: header(),
-        entries: entries(2),
+  test("a session with no messages is gone, not an empty conversation", async () => {
+    const answer = await read(
+      stubHarness({ messages: () => Effect.succeed([]) }),
+    );
+    expect(answer.source).toBe("absent");
+    expect(answer.ephemeral).toBe(false);
+    expect(answer.entries).toEqual([]);
+    expect(answer.note).toContain("holds no messages");
+  });
+
+  test.each([null, ""])(
+    "an attempt that never had a session (%p) is gone without asking anything",
+    async (sessionId) => {
+      const asked: string[] = [];
+      const answer = await read(
+        stubHarness({
+          messages: (id) =>
+            Effect.sync(() => {
+              asked.push(id);
+              return entries(1);
+            }),
+        }),
+        { harnessSessionId: sessionId },
+      );
+      expect(answer.source).toBe("absent");
+      expect(answer.note).toContain("no harness session recorded");
+      expect(asked).toEqual([]);
+    },
+  );
+});
+
+/**
+ * The harness could not be asked. That tells us **nothing** about whether the transcript
+ * still exists, so it must not read as gone — and it must not read as an empty
+ * conversation either. Each of these used to be indistinguishable from the case above
+ * except by a sentence.
+ */
+describe("the harness could not be reached", () => {
+  test("a transport failure that is not a missing session is unreachable, not gone", async () => {
+    const answer = await read(
+      stubHarness({
+        messages: () =>
+          Effect.fail(transport({ detail: "connection refused" })),
       }),
     );
-    const forgetful = stubHarness({
-      messages: () =>
-        Effect.fail(
-          new HarnessTransportError({
-            operation: "message.list",
-            status: 404,
-            tag: "SessionNotFoundError",
-            detail: "no such session",
-            cause: "none",
-          }),
-        ),
-    });
-    const read = await Effect.runPromise(
+    expect(answer.source).toBe("unreachable");
+    expect(answer.ephemeral).toBe(false);
+    expect(answer.entries).toEqual([]);
+    expect(answer.note).toContain("connection refused");
+    expect(answer.note).toContain("may still exist");
+  });
+
+  test("an unusable instance is unreachable, with the resolver's reason", async () => {
+    const answer = await Effect.runPromise(
       readTranscript({
-        resolver: resolverOver(forgetful),
-        directory,
-        attemptId: "at_1",
-        harnessSessionId: "ses_1",
-        harnessInstanceId: STUB_INSTANCE.instanceId,
-      }),
-    );
-    expect(read.source).toBe("recorded");
-    expect(read.entries).toHaveLength(2);
-  });
-
-  /** With no artefact, the harness's copy is offered — labelled as the thing that goes. */
-  test("with no artefact the harness's copy is offered and marked as ephemeral", async () => {
-    const directory = newEvidence();
-    const read = await Effect.runPromise(
-      readTranscript({
-        resolver: resolverOver(
-          stubHarness({
-            messages: () =>
-              Effect.succeed([
-                {
-                  type: "assistant",
-                  text: "still in the harness",
-                  error: undefined,
-                },
-              ]),
-          }),
-        ),
-        directory,
-        attemptId: "at_1",
-        harnessSessionId: "ses_1",
-        harnessInstanceId: STUB_INSTANCE.instanceId,
-      }),
-    );
-    expect(read.source).toBe("harness");
-    expect(read.ephemeral).toBe(true);
-    expect(read.note).toContain("may delete it");
-    expect(read.entries[0]?.text).toBe("still in the harness");
-  });
-
-  /**
-   * A session the harness has forgotten answers "no longer available" rather than erroring.
-   *
-   * Claude Code deletes local transcripts after `cleanupPeriodDays`, 30 by default, so for
-   * anything old this is the *expected* answer and has to read as normal.
-   */
-  test("a forgotten session is absent and normal, not an error", async () => {
-    const read = await Effect.runPromise(
-      harnessTranscript({
-        resolver: resolverOver(
-          stubHarness({
-            messages: () =>
-              Effect.fail(
-                new HarnessTransportError({
-                  operation: "message.list",
-                  status: 404,
-                  tag: "SessionNotFoundError",
-                  detail: "no such session",
-                  cause: "none",
-                }),
-              ),
-          }),
-        ),
-        harnessSessionId: "ses_gone",
-        harnessInstanceId: STUB_INSTANCE.instanceId,
-      }),
-    );
-    expect(read.source).toBe("absent");
-    expect(read.note).toContain("No longer available");
-    expect(read.note).toContain("normal answer");
-  });
-
-  test("an attempt that never had a session says so without asking anything", async () => {
-    const asked: string[] = [];
-    const read = await Effect.runPromise(
-      harnessTranscript({
-        resolver: resolverOver(
-          stubHarness({
-            messages: (sessionId) =>
-              Effect.sync(() => {
-                asked.push(sessionId);
-                return [];
-              }),
-          }),
-        ),
-        harnessSessionId: null,
-        harnessInstanceId: STUB_INSTANCE.instanceId,
-      }),
-    );
-    expect(read.source).toBe("absent");
-    expect(read.note).toContain("no harness session recorded");
-    expect(asked).toHaveLength(0);
-  });
-
-  /**
-   * A foreign instance is not asked, which is the same honesty `harnessStatus.ts` keeps.
-   *
-   * Asking the harness we *do* have would get a confident "no such session" for a session
-   * that may be alive somewhere else.
-   */
-  test("a session on an instance this server does not configure is not asked about", async () => {
-    const asked: string[] = [];
-    const read = await Effect.runPromise(
-      harnessTranscript({
-        resolver: resolverOver(
-          stubHarness({
-            messages: (sessionId) =>
-              Effect.sync(() => {
-                asked.push(sessionId);
-                return [];
-              }),
-          }),
-        ),
-        harnessSessionId: "ses_elsewhere",
-        harnessInstanceId: "some-other-instance",
-      }),
-    );
-    expect(read.source).toBe("absent");
-    expect(read.note).toContain("No longer available");
-    expect(asked).toHaveLength(0);
-  });
-
-  test("a line that will not parse is skipped rather than refusing the file", async () => {
-    const directory = newEvidence();
-    const written = await Effect.runPromise(
-      writeTranscript({ directory, header: header(), entries: entries(1) }),
-    );
-    // A transcript is an artefact and half of one is more use than none; nothing
-    // reconciles against it, so there is no decision a bad line could corrupt.
-    writeFileSync(
-      written.path,
-      `${await Bun.file(written.path).text()}{not json\n`,
-    );
-    const read = await Effect.runPromise(
-      readRecordedTranscript({ directory, attemptId: "at_1" }),
-    );
-    expect(read?.entries).toHaveLength(1);
-  });
-
-  test("a read is capped, and says it stopped", async () => {
-    const directory = newEvidence();
-    await Effect.runPromise(
-      writeTranscript({ directory, header: header(), entries: entries(20) }),
-    );
-    const read = await Effect.runPromise(
-      readRecordedTranscript({ directory, attemptId: "at_1", limit: 5 }),
-    );
-    expect(read?.entries).toHaveLength(5);
-    expect(read?.truncated).toBe(true);
-  });
-
-  test("a directory that does not exist is no transcript, not a failure", async () => {
-    const read = await Effect.runPromise(
-      readRecordedTranscript({
-        directory: join(tmpdir(), "bit-no-such-evidence-directory"),
-        attemptId: "at_1",
-      }),
-    );
-    expect(read).toBeUndefined();
-  });
-
-  test("an unusable instance's session is absent with the resolver's reason", async () => {
-    const read = await Effect.runPromise(
-      harnessTranscript({
         resolver: HarnessResolver.fromEntries([
           {
             instance: STUB_INSTANCE,
@@ -494,7 +213,42 @@ describe("reading one back", () => {
         harnessInstanceId: STUB_INSTANCE.instanceId,
       }),
     );
-    expect(read.source).toBe("absent");
-    expect(read.note).toContain("the harness would not start");
+    expect(answer.source).toBe("unreachable");
+    expect(answer.note).toContain("the harness would not start");
+  });
+
+  /**
+   * A foreign instance is not asked, which is the same honesty `harnessStatus.ts` keeps.
+   * Asking the harness we *do* have would get a confident "no such session" for a session
+   * that may be alive somewhere else — and reporting that as gone would be the lie.
+   */
+  test("a session on an instance this server does not configure is not asked, and not called gone", async () => {
+    const asked: string[] = [];
+    const answer = await read(
+      stubHarness({
+        messages: (sessionId) =>
+          Effect.sync(() => {
+            asked.push(sessionId);
+            return [];
+          }),
+      }),
+      { harnessInstanceId: "some-other-instance" },
+    );
+    expect(answer.source).toBe("unreachable");
+    expect(answer.note).toContain("some-other-instance");
+    expect(asked).toEqual([]);
+  });
+
+  /**
+   * The ask is bounded. A harness child may be dying at the moment it is asked, and a read
+   * that waited on it would hang the request instead of saying it could not ask.
+   */
+  test("a harness that never answers is bounded, and unreachable", async () => {
+    const started = Date.now();
+    const answer = await read(stubHarness({ messages: () => Effect.never }), {
+      fetchTimeout: "50 millis",
+    });
+    expect(answer.source).toBe("unreachable");
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });

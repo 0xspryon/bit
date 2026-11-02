@@ -1273,9 +1273,6 @@ const fleetHandlers = HttpApiBuilder.group(
           ...(payload.modelOptions === undefined
             ? {}
             : { modelOptions: payload.modelOptions }),
-          // Where the settled attempt's transcript lands. The same directory the audit
-          // file below sits in, and outside the workspace for the same reason.
-          evidenceDirectory: fleet.paths.evidenceDirectory(row.targetId),
           // The target's own `evidence/` directory, which the registry already creates
           // for things that are not database rows — and which is deliberately *outside*
           // the workspace the worker runs in, so the worker cannot read the record of
@@ -1440,17 +1437,17 @@ const fleetHandlers = HttpApiBuilder.group(
         ),
 
       /**
-       * One past attempt's transcript: ours if we kept one, the harness's if we did not.
+       * One past attempt's transcript, asked of the harness now. This server keeps no copy.
        *
        * The attempt row is read first, for two reasons that are not the same. It is where
-       * the harness session id and the pinned instance live, which is what the fallback
-       * needs. And it is what tells an attempt this target does not hold — a genuine
-       * mistake, refused — from an attempt with no transcript, which is the *normal* end
-       * state of anything old enough and answers 200 with `source: "absent"`.
+       * the harness session id and the pinned instance live, which is what the read needs.
+       * And it is what tells an attempt this target does not hold — a genuine mistake,
+       * refused — from an attempt whose transcript is gone, which is the *normal* end state
+       * of anything old enough and answers 200 with `source: "absent"`.
        *
-       * Everything after that is `run/transcript.ts`: prefer our own artefact, fall back to
-       * the harness and label it as the thing that may be gone, and never present the two
-       * as equal-status data.
+       * Everything after that is `run/transcript.ts`, which keeps three answers apart: the
+       * harness has it (`harness`), the harness does not hold it (`absent`), and the harness
+       * could not be asked (`unreachable`).
        */
       transcript: Effect.fn(function* ({ params }) {
         const row = yield* openableTarget(fleet, params.targetId);
@@ -1465,8 +1462,6 @@ const fleetHandlers = HttpApiBuilder.group(
         }
         const read = yield* readTranscript({
           resolver: harnesses,
-          directory: fleet.paths.evidenceDirectory(row.targetId),
-          attemptId: params.attemptId,
           harnessSessionId: attempt.harness_session_id,
           harnessInstanceId: attempt.harness_instance_id,
         });
@@ -1483,13 +1478,6 @@ const fleetHandlers = HttpApiBuilder.group(
             ...(entry.error === undefined ? {} : { error: entry.error }),
           })),
           truncated: read.truncated,
-          ...(read.path === undefined ? {} : { path: read.path }),
-          ...(read.contentHash === undefined
-            ? {}
-            : { contentHash: read.contentHash }),
-          ...(read.writtenAt === undefined
-            ? {}
-            : { writtenAt: read.writtenAt }),
         } satisfies AttemptTranscript;
       }),
 

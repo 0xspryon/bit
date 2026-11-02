@@ -19,10 +19,10 @@
    * **There is deliberately no *live* transcript.** The run narrates — the server publishes
    * every step of it onto an in-process bus — and nothing subscribes yet; the stream is
    * Day 6's. What a *settled* attempt left behind is readable, and that is a different
-   * thing: the server writes the harness's own log into the target's `evidence/` directory
-   * when the attempt settles, and {@link TranscriptPanel} reads it back. What this box
-   * shows while a run is going is still the honest minimum: that it is going, how long it
-   * has been going, and the attempt it is going under.
+   * thing: {@link TranscriptPanel} asks the harness for its own log of the session, and the
+   * server keeps no copy. What this box shows while a run is going is still the honest
+   * minimum: that it is going, how long it has been going, and the attempt it is going
+   * under.
    *
    * **The harness and the model are chosen here.** {@link HarnessPicker} is a popover on
    * this row, which is why it is here rather than in the shell: the choice belongs to the

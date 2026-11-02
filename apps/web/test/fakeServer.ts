@@ -568,9 +568,9 @@ export const runStopped = (over: Partial<RunStopped> = {}): RunStopped => ({
 /**
  * A transcript, `absent` by default.
  *
- * The default is the uninteresting one on purpose: `recorded` is the source the app
- * draws a conclusion from, so a test that wants that conclusion has to ask for it in so
- * many words rather than getting it by not saying anything.
+ * The default is the uninteresting one on purpose: `harness` is the source with
+ * something to show, so a test that wants entries has to ask for them in so many words
+ * rather than getting them by not saying anything.
  */
 export const attemptTranscript = (
   over: Partial<AttemptTranscript> = {},

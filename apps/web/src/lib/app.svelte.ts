@@ -4798,34 +4798,6 @@ export class App {
         return;
       }
       this.transcript = call.value;
-
-      /**
-       * A recorded transcript is proof the attempt settled, so stop claiming it is running.
-       *
-       * The server writes its own artefact inside the settlement finalizer, *after* the
-       * attempt row and its `attempt.settled` event — so `source: "recorded"` cannot exist
-       * for a run that is still going. This tab's running list is refreshed on open, on
-       * start and on stop and nowhere else, so a run that settled on its own leaves the
-       * composer showing "Running for Ns" beside a transcript of the finished run: a
-       * screen contradicting itself, where the part that looks wrong is the part that is
-       * right.
-       *
-       * **This is not a live feed.** There is no interval, no poll and no subscription —
-       * Day 6 owns those. It is one refetch, on evidence already in hand, declining to keep
-       * showing data it has just been told is stale.
-       *
-       * **Only for `recorded`.** A `harness` source says the harness still holds the
-       * session, which says nothing about whether the run finished; and `absent` is also
-       * what a foreign instance and an attempt with no session return, so neither supports
-       * the inference. Guarded on the composer actually showing it, so a read of an old
-       * attempt costs no request.
-       */
-      if (
-        call.value.source === "recorded" &&
-        this.runs.some((entry) => entry.attemptId === attemptId)
-      ) {
-        await this.loadRuns();
-      }
     } finally {
       if (this.transcriptAttemptId === attemptId)
         this.transcriptLoading = false;

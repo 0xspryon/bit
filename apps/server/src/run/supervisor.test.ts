@@ -91,7 +91,6 @@ import {
   chooseHarness,
   type RunInput,
 } from "./supervisor";
-import { readRecordedTranscript, transcriptFilesFor } from "./transcript";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -495,9 +494,6 @@ const draft = (
       intentId,
       workspace: base,
       auditPath: join(root, "..", "work", `${targetId}-policy-audit.log`),
-      // The target's own `evidence/` directory, where a settled attempt's transcript lands.
-      // Beside the workspace for the same reason the audit path is: outside it.
-      evidenceDirectory: join(root, "targets", targetId, "evidence"),
       title: `bit: ${targetId}`,
     } satisfies RunInput;
   });
@@ -2891,40 +2887,33 @@ describe("two configured instances", () => {
   });
 });
 
-/* ── The transcript, written at settlement ───────────────────────────────────── */
+/* ── Settlement keeps no transcript ──────────────────────────────────────────── */
 
 /**
- * The ceiling the bounded-fetch test asserts under.
+ * A settled attempt leaves its row and its events, and **asks the harness for no copy of
+ * the conversation**.
  *
- * Generous — it is a machine running a real SQLite write and a scoped teardown — and still
- * far below what an *unbounded* fetch would cost: a harness that never answers would hold
- * the finalizer open for as long as the test runner allowed.
+ * bit reads an agent's history from the harness when someone looks, and accepts losing it
+ * when the harness purges it. Settlement used to fetch the harness's message log and write
+ * it into the target's `evidence/` directory; asking for that log at settlement is the
+ * first step of keeping a copy again, so it is what is pinned. (Whether a *file* appears
+ * is `http/browserApi.test.ts`'s side: an old transcript file is not read.)
+ *
+ * The scripted `messages` never answers, so a settlement that still waited on it would also
+ * hang this test rather than merely fail it.
  */
-const TRANSCRIPT_WAIT_CEILING = 5_000;
-
-/**
- * What a settled attempt leaves beside its row, and what happens when it cannot.
- *
- * The three properties the brief put above the format, each as a behaviour:
- *
- * 1. **Settle first, then write.** The row and the `attempt.settled` event are there in
- *    every case below, including the two where no transcript is.
- * 2. **The fetch is bounded and cannot block.** A harness that never answers `messages`
- *    settles anyway, promptly.
- * 3. **It comes from `messages`, not from the drained stream.** The scripted narration and
- *    the scripted message log are deliberately different here, and the file holds the
- *    second.
- */
-describe("the transcript at settlement", () => {
-  const transcriptWorld = (
-    scriptFor: (sessionId: string) => Script,
-    recorder: Recorder,
-    messages: AgentHarness["Service"]["messages"],
-  ) => {
+describe("settlement keeps no transcript", () => {
+  const settledWorld = (messages: AgentHarness["Service"]["messages"]) => {
     const root = newRoot();
     const fleet = FleetStore.layer(root);
     const stores = TargetStores.layer.pipe(Layer.provide(fleet));
     const credentials = McpCredentials.layer;
+    const recorder = emptyRecorder();
+    const { scriptFor, release } = scripts({
+      narration: [narration("session.text.delta", 1)],
+      stream: "open",
+      status: "succeeded",
+    });
     const harness = Layer.succeed(
       AgentHarness,
       AgentHarness.of({ ...fakeHarnessShape(scriptFor, recorder), messages }),
@@ -2933,10 +2922,7 @@ describe("the transcript at settlement", () => {
       fleet,
       stores,
       credentials,
-      RunSupervisor.layerWith({
-        askTimeout: "100 millis",
-        transcriptTimeout: "100 millis",
-      }).pipe(
+      RunSupervisor.layerWith({ askTimeout: "100 millis" }).pipe(
         Layer.provide(HarnessResolver.single),
         Layer.provide(harness),
         Layer.provide(stores),
@@ -2970,133 +2956,19 @@ describe("the transcript at settlement", () => {
         yield* registry.migrateFleet();
       }).pipe(Effect.orDie),
     );
-    return { root, runtime, ready };
+    return { root, runtime, ready, release };
   };
 
-  /** The evidence directory `draft` points the run at, so a test can read the artefact. */
-  const evidenceOf = (root: string) =>
-    join(root, "targets", "alpha", "evidence");
-
-  test("a settled attempt's transcript is written from the harness's message log", async () => {
-    const recorder = emptyRecorder();
-    const { scriptFor, release } = scripts({
-      // The narration says one thing and the message log says another, on purpose: the
-      // file must hold the *log*, because the stream has a gap between subscribing and
-      // prompting and `messages` does not.
-      narration: [narration("session.text.delta", 1)],
-      stream: "open",
-      status: "succeeded",
-    });
-    const { root, runtime, ready } = transcriptWorld(scriptFor, recorder, () =>
-      Effect.succeed([
-        {
-          type: "assistant",
-          text: "what the harness retained",
-          error: undefined,
-        },
-        { type: "tool", text: "a tool call", error: undefined },
-      ]),
-    );
-    await ready;
-
-    const started = await runtime.runPromise(
-      Effect.gen(function* () {
-        const supervisor = yield* RunSupervisor;
-        const run = yield* supervisor.start(
-          yield* draft(root, "alpha", "probe it"),
-        );
-        yield* release(run.harnessSessionId);
-        // Settled: `stop` awaits the finalizer, which settles and then writes.
-        yield* Effect.result(supervisor.stop(run.attemptId));
-        return run;
-      }).pipe(Effect.orDie),
-    );
-
-    const read = await runtime.runPromise(
-      readRecordedTranscript({
-        directory: evidenceOf(root),
-        attemptId: started.attemptId,
+  test("a settled attempt is settled, and the harness is never asked for its message log", async () => {
+    const asked: string[] = [];
+    const { root, runtime, ready, release } = settledWorld((sessionId) =>
+      Effect.suspend(() => {
+        asked.push(sessionId);
+        return Effect.never;
       }),
     );
-    expect(read).toBeDefined();
-    expect(read?.source).toBe("recorded");
-    expect(read?.entries.map((entry) => entry.text)).toEqual([
-      "what the harness retained",
-      "a tool call",
-    ]);
-
-    // And the row is settled, which is the thing the transcript must never be allowed to
-    // come before.
-    const rows = readAfterShutdown(root, "alpha");
-    expect(rows.attempts[0]?.status).toBe("succeeded");
-    await runtime.dispose();
-  });
-
-  /**
-   * A fetch that fails does not prevent or delay the settlement.
-   *
-   * The row says `succeeded`, the `attempt.settled` event is in the log, and there is no
-   * transcript — which the read path reports as normal rather than as an error.
-   */
-  test("a settlement still happens when the transcript fetch fails", async () => {
-    const recorder = emptyRecorder();
-    const { scriptFor, release } = scripts({
-      narration: [],
-      stream: "open",
-      status: "succeeded",
-    });
-    const { root, runtime, ready } = transcriptWorld(scriptFor, recorder, () =>
-      Effect.fail(transport("message.list", "the harness is gone")),
-    );
     await ready;
 
-    const started = await runtime.runPromise(
-      Effect.gen(function* () {
-        const supervisor = yield* RunSupervisor;
-        const run = yield* supervisor.start(
-          yield* draft(root, "alpha", "probe it"),
-        );
-        yield* release(run.harnessSessionId);
-        yield* Effect.result(supervisor.stop(run.attemptId));
-        return run;
-      }).pipe(Effect.orDie),
-    );
-    await runtime.dispose();
-
-    const rows = readAfterShutdown(root, "alpha");
-    expect(rows.attempts[0]?.status).toBe("succeeded");
-    expect(rows.events.map((event) => event.kind)).toEqual([
-      "attempt.started",
-      "attempt.settled",
-    ]);
-    expect(
-      transcriptFilesFor(evidenceOf(root), started.attemptId),
-    ).toHaveLength(0);
-  });
-
-  /**
-   * A fetch that never answers is cut short, and the settlement is prompt.
-   *
-   * This is the shutdown case: the finalizer runs while the harness child is being torn
-   * down, and an unbounded ask there would wedge the exit. The `askTimeout` above is
-   * 100ms, and the transcript's own bound is separate; what is asserted is that the whole
-   * settlement still finishes in well under the real five-second default.
-   */
-  test("a transcript fetch that never answers does not block settlement", async () => {
-    const recorder = emptyRecorder();
-    const { scriptFor, release } = scripts({
-      narration: [],
-      stream: "open",
-      status: "succeeded",
-    });
-    const { root, runtime, ready } = transcriptWorld(
-      scriptFor,
-      recorder,
-      () => Effect.never,
-    );
-    await ready;
-
-    const started = Date.now();
     await runtime.runPromise(
       Effect.gen(function* () {
         const supervisor = yield* RunSupervisor;
@@ -3104,17 +2976,21 @@ describe("the transcript at settlement", () => {
           yield* draft(root, "alpha", "probe it"),
         );
         yield* release(run.harnessSessionId);
+        // `stop` awaits the finalizer, so when this returns settlement has finished.
         yield* Effect.result(supervisor.stop(run.attemptId));
       }).pipe(Effect.orDie),
     );
-    const elapsed = Date.now() - started;
     await runtime.dispose();
 
-    // The real bound is five seconds; a settlement that waited it out per run would make
-    // a shutdown with three runs in flight a quarter of a minute of nothing.
-    expect(elapsed).toBeLessThan(TRANSCRIPT_WAIT_CEILING);
+    expect(asked).toEqual([]);
+
+    // The durable record is exactly what it was: the row and its two events.
     const rows = readAfterShutdown(root, "alpha");
     expect(rows.attempts[0]?.status).toBe("succeeded");
+    expect(rows.events.map((event) => event.kind)).toEqual([
+      "attempt.started",
+      "attempt.settled",
+    ]);
   });
 });
 
