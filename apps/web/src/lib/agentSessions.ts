@@ -20,22 +20,24 @@ export const KIND_LABEL: Record<AgentSessionKind, string> = {
 /**
  * The state's word, with the kind's own word beside it where the kind has one.
  *
- * "Not running" is `dormant`: the index has the session and this server is not holding it —
- * which is every goal conversation after a restart, and an importer session between turns.
- * It is deliberately not "ended", and the title says what it does and does not claim.
+ * Three states, three sentences. **`Not running` is `dormant`, and it is not "ended"**: this
+ * server is not holding the session — every goal conversation after a restart, an importer
+ * session a shutdown closed — and nothing recorded that its authority was over for good, so a
+ * message reopens it. `Ended` is the other fact: the operator ended it and it stays ended.
+ * The words differ on purpose; the composer's disabled states rely on the same difference.
  */
 export const stateLabel = (
   session: Pick<AgentSessionView, "state" | "detail">,
 ): string => {
+  const reason =
+    session.detail === null ? "" : ` · ${session.detail.replaceAll("_", " ")}`;
   switch (session.state) {
     case "live":
       return "Live";
     case "ended":
-      return session.detail === null
-        ? "Ended"
-        : `Ended · ${session.detail.replaceAll("_", " ")}`;
+      return `Ended${reason}`;
     case "dormant":
-      return "Not running";
+      return `Not running${reason}`;
   }
 };
 
@@ -44,11 +46,11 @@ export const stateTitle = (
 ): string => {
   switch (session.state) {
     case "live":
-      return "This server holds the session right now.";
+      return "This server is holding the session right now: its scope and credential are open, whether or not a turn is running.";
     case "ended":
-      return "The session's authority is over.";
+      return "Ended for good: the session's authority is over and its writes are refused. Sending a message does not reopen it.";
     case "dormant":
-      return "The session is on record, but this server is not holding it. It may still exist in its harness; nothing here can act through it.";
+      return "This server is not holding the session, but nothing recorded its authority ending. It may still exist in its harness; sending a message reopens it.";
   }
 };
 

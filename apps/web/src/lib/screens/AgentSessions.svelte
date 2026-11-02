@@ -10,12 +10,13 @@
    * page, the importer), and this page's job is to get you to them. Adding a filter row here
    * is how it becomes a fourth place that is wrong about what a session means.
    *
-   * ## Live, ended, and the third thing
+   * ## Live, not running, ended — three states, not two
    *
-   * `Live` is "this server holds the session right now" and `Ended` is "something recorded
-   * that its authority is over". `Not running` is the honest third: the index has the row and
-   * nothing here holds the session — every goal conversation after a restart. It is not
-   * "ended", and a restart does not turn the list into one.
+   * `Live` is "this server holds the session right now" (between turns too). `Not running` is
+   * the third, and a first-class one: the index has the row and this server is not holding it
+   * — every goal conversation after a restart — but nothing recorded its authority ending for
+   * good, so a message reopens it. `Ended` is the operator's explicit end, which stays ended.
+   * `Not running` is not "ended", and a restart does not turn the list into one.
    *
    * A session whose harness this server no longer runs is **marked, not hidden**: the harness
    * may still hold it, and an operator looking for a session should find the row that says so.

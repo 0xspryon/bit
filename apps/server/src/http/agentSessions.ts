@@ -46,8 +46,13 @@ export interface AgentSessionSources {
     readonly model: string;
     readonly openedAt: number;
     readonly latestImportId: string;
-    /** Whether any run of the session is going in this process right now. */
-    readonly running: boolean;
+    /**
+     * Whether this process **holds** the session: its scope, credential and MCP registration
+     * are live. True between turns too, which is the point — slice 2 made the session outlive
+     * a turn. Not "a run is in flight", which is a lower bound that calls an idle conversation
+     * "not running".
+     */
+    readonly held: boolean;
     readonly endedAt: number | null;
     readonly endedReason: ImporterSessionEndReason | null;
     readonly entriesIn: number;
@@ -105,16 +110,18 @@ export const unionAgentSessions = (
     harnessInstanceId: session.harnessInstanceId,
     model: session.model,
     startedAt: session.openedAt,
-    // A run in flight beats a stored ending: the ending is for the session's *latest*
-    // authority period and a run in flight means a newer one is open.
-    state: session.running
+    // Three readings, and `ended` is only the one that is final. An operator's end is the one
+    // end that refuses every write and is never reopened (`0027`); a shutdown, a refused
+    // prompt or a failed open recorded that *a* period closed, and a message to the session
+    // opens a fresh one. So those read `dormant` — this server does not hold it — with the
+    // recorded reason beside it, never `ended`. A held session beats a stored ending: the
+    // ending is for the session's *latest* authority period and a held one means a newer is open.
+    state: session.held
       ? "live"
-      : session.endedAt !== null
+      : session.endedReason === "operator"
         ? "ended"
         : "dormant",
-    // A run in flight supersedes a stored ending, so the ending's reason is not shown beside it.
-    detail:
-      session.running || session.endedAt === null ? null : session.endedReason,
+    detail: session.held ? null : session.endedReason,
     tally: {
       entriesIn: session.entriesIn,
       entriesOut: session.entriesOut,

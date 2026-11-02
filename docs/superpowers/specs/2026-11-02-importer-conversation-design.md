@@ -960,8 +960,18 @@ Event log (`apps/web/src/lib/mock.ts`, `navGroups`; it needs an entry in `navGly
 ### S8.1 — Nothing fancy, and that is the specification
 
 A basic list. One row per session: which kind it is, what it is about, the harness and model it
-runs on, when it started, whether it is live or ended, and whatever tally that kind already
-derives. No grouping, no filters, no detail pane. The screens that show a session _properly_ are
+runs on, when it started, which of **three** states it is in, and whatever tally that kind
+already derives.
+
+The three states are not "live or ended" with a fallback. **Live**: this server holds the
+session right now. **Not running** (`dormant` on the wire): this server does not hold it and
+nothing recorded its authority ending for good — what every goal conversation and unended
+importer session reads after a restart, and what an importer session a shutdown closed reads
+with its reason beside it; a message reopens it. **Ended**: the operator ended it, its tools
+refuse every write, and a message does not reopen it (a worker attempt in a final status reads
+the same). "Not running" is a fact about this server's memory and "Ended" about the session's
+authority, and the composer's disabled states (S3) already turn on that difference, so the list
+must not collapse them. No grouping, no filters, no detail pane. The screens that show a session _properly_ are
 the surfaces' own, and this one's job is to get you there.
 
 ### S8.2 — Read-time union, not a fourth table

@@ -14,20 +14,26 @@ export const AgentSessionKind = Schema.Literals(["goal", "importer", "worker"]);
 export type AgentSessionKind = typeof AgentSessionKind.Type;
 
 /**
- * Whether this server process holds the session, which is not the same as whether the harness
- * does.
+ * Three states, because there are three different things an operator can be told, and the
+ * composer's disabled states (importer-conversation design, S3) already turn on the difference
+ * between the last two.
  *
- * - `live` — this process holds the session's authority **right now**. For a goal
- *   conversation that is "its scope is open"; for a worker, "its attempt is running"; for an
- *   importer, only "a run is in flight", because the importer's registry offers no more than
- *   that. An importer session held open between turns therefore reads `dormant`: this is a
- *   lower bound, and it never reports a session live that is not.
- * - `ended` — something recorded that the session's authority is over: an importer session
- *   whose `ended_at` is set, a worker attempt in a final status.
- * - `dormant` — an index row exists and neither of the above is true. After a restart this is
- *   what every goal conversation and every unended importer session reads: the harness may
- *   still hold the session, but nothing here can act through it. **It is not "ended"**, and
- *   the list does not pretend a restart settled anything.
+ * - `live` — this process **holds** the session right now: for a goal conversation, its scope
+ *   is open; for an importer, its scope, credential and MCP registration are live — which is
+ *   true between turns as well as during one, because the session outlives a turn; for a
+ *   worker, its attempt is running.
+ * - `dormant` — an index row exists, this process does not hold it, and **nothing recorded
+ *   its authority ending for good**. After a restart this is every goal conversation and every
+ *   unended importer session; an importer session closed by a shutdown, a refused prompt or a
+ *   failed open reads the same, with the reason in `detail`. The harness may still have the
+ *   session; nothing here can act through it; **a message to it opens it again**.
+ * - `ended` — something recorded that the session's authority is over *for good*: an importer
+ *   session the operator ended (its tools refuse every write and a message does not reopen
+ *   it), a worker attempt in a final status.
+ *
+ * `dormant` and `ended` are not two shades of "not running". One is a fact about this
+ * server's memory and is undone by a message; the other is a fact about the session's
+ * authority and is not.
  */
 export const AgentSessionState = Schema.Literals(["live", "ended", "dormant"]);
 export type AgentSessionState = typeof AgentSessionState.Type;
@@ -76,7 +82,8 @@ export const AgentSessionView = Schema.Struct({
   state: AgentSessionState,
   /**
    * One word of why, where the kind has it: a worker attempt's execution status, an importer
-   * session's end reason. Null where the kind has nothing to add.
+   * session's recorded end reason (beside `ended` for an operator's end, beside `dormant` for
+   * a shutdown, a refused prompt or a failed open). Null where the kind has nothing to add.
    */
   detail: Schema.NullOr(Schema.String),
   /** What the session wrote, for the one kind that derives it (the importer), else null. */

@@ -1643,7 +1643,7 @@ const fleetHandlers = HttpApiBuilder.group(
             ),
             (views) => ({
               ...session,
-              running: views.some((view) => view?.status === "running"),
+              held: views.some((view) => view?.status === "running"),
             }),
           ),
         );

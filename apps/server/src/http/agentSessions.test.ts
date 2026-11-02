@@ -67,7 +67,7 @@ describe("an importer session", () => {
     model: "openai/gpt-5.6-sol",
     openedAt: 1,
     latestImportId: "imp_1",
-    running: false,
+    held: false,
     endedAt: null,
     endedReason: null,
     entriesIn: 1,
@@ -75,28 +75,39 @@ describe("an importer session", () => {
     assets: 3,
   } as const;
 
-  test("a run in flight is live even beside an earlier ending", () => {
+  test("a held session is live even beside an earlier ending", () => {
     const [row] = unionAgentSessions(
       sources({
         importers: [
-          { ...importer, running: true, endedAt: 5, endedReason: "shutdown" },
+          { ...importer, held: true, endedAt: 5, endedReason: "shutdown" },
         ],
       }),
     ).sessions;
     expect(row).toMatchObject({ state: "live", detail: null });
   });
 
-  test("an ending carries its reason; no ending and no run is dormant, not live", () => {
+  test("three states: the operator's end is ended; anything else this server does not hold is dormant", () => {
     const rows = unionAgentSessions(
       sources({
         importers: [
-          { ...importer, openedAt: 2, endedAt: 5, endedReason: "operator" },
-          { ...importer, latestImportId: "imp_2" },
+          { ...importer, openedAt: 4, endedAt: 5, endedReason: "operator" },
+          { ...importer, openedAt: 3, latestImportId: "imp_2" },
+          {
+            ...importer,
+            openedAt: 2,
+            latestImportId: "imp_3",
+            endedAt: 5,
+            endedReason: "shutdown",
+          },
+          // An ending recorded before `0027` named no reason, and a message reopens it.
+          { ...importer, openedAt: 1, latestImportId: "imp_4", endedAt: 5 },
         ],
       }),
     ).sessions;
     expect(rows.map((r) => [r.state, r.detail])).toEqual([
       ["ended", "operator"],
+      ["dormant", null],
+      ["dormant", "shutdown"],
       ["dormant", null],
     ]);
   });
