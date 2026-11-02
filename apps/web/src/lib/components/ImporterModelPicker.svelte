@@ -49,6 +49,20 @@
   } = $props();
 
   let panel = $state<HTMLElement | null>(null);
+  /** The chip, so a picker closed by keyboard can hand focus back to what opened it. */
+  let trigger = $state<HTMLButtonElement | null>(null);
+
+  /**
+   * Closes the picker and puts focus back on the chip that opened it.
+   *
+   * `Modal`'s rule, for the reason its tests state: a dialog dismissed by keyboard leaves
+   * the keyboard nowhere, and `body` is nowhere. Escape reaches this through
+   * {@link HarnessChoice}'s `onDismiss`; the scrim's click reaches it directly.
+   */
+  function closeToTrigger(): void {
+    app.importPickerOpen = false;
+    trigger?.focus();
+  }
 
   let harness = $derived(
     pinned?.harness ?? app.importInstance?.displayName ?? "",
@@ -82,64 +96,67 @@
 <svelte:window {onkeydown} />
 
 {#if pinned === null}
-  <button
-    class="chip"
-    type="button"
-    aria-haspopup="dialog"
-    aria-expanded={app.importPickerOpen}
-    aria-label="Harness and model: {model}"
-    onclick={() => app.toggleImportPicker()}
-  >
-    <span class="glyph" aria-hidden="true">{letter}</span>
-    <span class="model">{model === "" ? "No model" : model}</span>
-    <IconAngleDown class="caret" width="11" height="11" />
-  </button>
-
-  {#if app.importPickerOpen}
-    <!-- Transparent, under the panel, only to catch the click that closes it. -->
+  <div class="picker">
     <button
-      class="dismiss"
+      class="chip"
       type="button"
-      tabindex="-1"
-      aria-label="Close the harness picker"
-      onclick={() => (app.importPickerOpen = false)}
-    ></button>
-    <div
-      class="panel"
-      role="dialog"
-      aria-label="Choose a harness and model"
-      bind:this={panel}
+      aria-haspopup="dialog"
+      aria-expanded={app.importPickerOpen}
+      aria-label="Harness and model: {model}"
+      bind:this={trigger}
+      onclick={() => app.toggleImportPicker()}
     >
-      <HarnessChoice
-        instances={app.harnesses}
-        active={app.importInstance}
-        model={app.effectiveImportModel}
-        bind:query={app.importModelQuery}
-        onPickInstance={(instanceId) => app.pickImportInstance(instanceId)}
-        onPickModel={(modelId) => app.pickImportModel(modelId)}
-        onDismiss={() => (app.importPickerOpen = false)}
-      >
-        {#snippet note()}
-          A session is pinned to the harness it starts on. Changing harness
-          starts a new session; it never moves this one.
-        {/snippet}
+      <span class="glyph" aria-hidden="true">{letter}</span>
+      <span class="model">{model === "" ? "No model" : model}</span>
+      <IconAngleDown class="caret" width="11" height="11" />
+    </button>
 
-        {#snippet options()}
-          <ModelOptionsColumn
-            instance={app.importInstance}
-            model={app.effectiveImportModel}
-            modelView={app.importModelView}
-            descriptors={app.importModelDescriptors}
-            selections={app.pickedImportModelOptions}
-            dropped={app.droppedImportModelOptions}
-            onPick={(descriptorId, value) =>
-              app.pickImportModelOption(descriptorId, value)}
-            subject="A session"
-          />
-        {/snippet}
-      </HarnessChoice>
-    </div>
-  {/if}
+    {#if app.importPickerOpen}
+      <!-- Transparent, under the panel, only to catch the click that closes it. -->
+      <button
+        class="dismiss"
+        type="button"
+        tabindex="-1"
+        aria-label="Close the harness picker"
+        onclick={() => closeToTrigger()}
+      ></button>
+      <div
+        class="panel"
+        role="dialog"
+        aria-label="Choose a harness and model"
+        bind:this={panel}
+      >
+        <HarnessChoice
+          instances={app.harnesses}
+          active={app.importInstance}
+          model={app.effectiveImportModel}
+          bind:query={app.importModelQuery}
+          onPickInstance={(instanceId) => app.pickImportInstance(instanceId)}
+          onPickModel={(modelId) => app.pickImportModel(modelId)}
+          onDismiss={closeToTrigger}
+        >
+          {#snippet note()}
+            A session is pinned to the harness it starts on. Changing harness
+            starts a new session; it never moves this one.
+          {/snippet}
+
+          {#snippet options()}
+            <ModelOptionsColumn
+              instance={app.importInstance}
+              model={app.effectiveImportModel}
+              modelView={app.importModelView}
+              descriptors={app.importModelDescriptors}
+              selections={app.pickedImportModelOptions}
+              dropped={app.droppedImportModelOptions}
+              onPick={(descriptorId, value) =>
+                app.pickImportModelOption(descriptorId, value)}
+              subject="A session"
+            />
+          {/snippet}
+        </HarnessChoice>
+      </div>
+    {/if}
+  </div>
 {:else}
   <span
     class={["chip", "held", dimmed && "dim"]}
@@ -214,22 +231,64 @@
     cursor: default;
   }
   /*
-   * Anchored to the composer's box, not to the chip: D6 draws the panel as wide as the
-   * composer and lined up with its left edge. The box is `position: relative` and this
-   * chip's wrapper is not, so `left`/`right` resolve against the box.
+   * The chip's own wrapper, so the panel below hangs off the chip rather than off the
+   * composer's box: `position: relative` here is what `left`/`right` resolve against.
+   * One flex item on the strip, exactly as the chip alone was, so wrapping it moves
+   * nothing.
+   */
+  .picker {
+    position: relative;
+    display: flex;
+    /* Gives way before the send button does, as every control on this strip does. */
+    min-width: 0;
+  }
+  /*
+   * The floating panel: `HarnessPicker`'s approach on this side of the composer too —
+   * absolutely positioned out of a relative trigger, so opening it moves no pixel of
+   * the composer's layout, and sized by the columns it holds rather than by the width
+   * of whatever is under it.
+   *
+   * Opens leftwards from the chip, where the run composer's opens rightwards from its
+   * trigger for the same reason: that is where this trigger's room is. This chip is
+   * the third control on its strip, ~410px in from the left even on a 768px window,
+   * so a panel lined up with the chip's *left* edge runs past the window's right edge
+   * (410 + 622 > 1024); lined up with its right edge, 622px ends ~45px inside even at
+   * 1024 and ~218px in at 1440.
    */
   .panel {
     position: absolute;
     right: 0;
     bottom: calc(100% + 6px);
-    left: 0;
     z-index: 2;
     display: flex;
-    max-height: 340px;
+    /* 196 + 240 + 184, plus the two 1px dividers between them. */
+    width: 622px;
+    /*
+     * 340 is the cap the columns resolve their scrolling against, and the composer
+     * picker's number. The second arm is the importer's own case, and the reason a
+     * taller panel was reverted once: the picker only opens on a *new* session, whose
+     * composer sits at the vertical centre of the page rather than at the bottom, and
+     * the chip then holds only about half the window above it (measured: chip top ≈
+     * 50vh + 34), so a 340px panel runs off the top of any window shorter than ~700px.
+     * `50dvh` keeps the panel inside the room the chip actually has, and stops binding
+     * — leaving the full 340 — wherever the window is tall enough to give it.
+     */
+    max-height: min(340px, calc(50dvh + 12px));
     overflow: hidden;
     border: 1px solid var(--border-base);
     border-radius: var(--radius-lg);
     box-shadow: var(--elevation-floating);
     background: var(--bg-layer-01);
+  }
+  /*
+     Narrow viewports: the composer picker's own numbers, because `HarnessChoice`
+     stacks the same way for both popovers and its stacked layout was measured against
+     this width. Right-aligned to the chip, the 470px cap ends well inside the window:
+     the chip's right edge is ~100px in from the window's right at 768px.
+   */
+  @media (max-width: 920px) {
+    .panel {
+      width: min(92vw, clamp(360px, calc(100vw - 310px), 470px));
+    }
   }
 </style>
