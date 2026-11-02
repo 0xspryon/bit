@@ -1139,6 +1139,14 @@
    * The tab fills the body PageFrame gives it, so the lists can scroll inside it and the
    * Add form can stay under them. PageFrame's body is itself the scroller, and a tab that
    * only grew to its content would push "Add an entry" off the bottom of a long list.
+   *
+   * The tab is the page's whole column, and the 760px reading cap sits on each list and the
+   * Add bar rather than here. A cap here pinned every list to the column's left edge —
+   * which is where the rows belong — but it pinned the *empty state* with them, so the one
+   * centred composition on the tab was centred in the 760px the lists want rather than in
+   * the column the title and the Estate tab's empty state answer to: 140px left of centre
+   * on a 1040px column, and further left the wider the window. The empty state centres in
+   * `.lists`, which now spans the column.
    */
   .scope {
     display: flex;
@@ -1146,7 +1154,6 @@
     gap: 22px;
     height: 100%;
     min-height: 0;
-    max-width: 760px;
   }
   /* The lists share whatever height is left, each scrolling on its own. */
   .lists {
@@ -1183,6 +1190,9 @@
     flex: 0 1 auto;
     flex-direction: column;
     gap: var(--gap);
+    /* The reading width the lists are held to. See `.scope` for why it is here and not on
+       the tab. */
+    max-width: 760px;
     min-height: calc(
       var(--head) + var(--gap) + var(--lead) + var(--rows) * var(--row) +
         max(var(--rows) - 1, 0) * var(--row-gap)
@@ -1287,6 +1297,8 @@
     flex: none;
     flex-direction: column;
     gap: 10px;
+    /* The reading width the lists are held to; it sat on `.scope` before. See `.scope`. */
+    max-width: 760px;
     padding: 16px;
     border: 1px solid var(--border-base);
     border-radius: var(--radius-lg);
@@ -1487,6 +1499,8 @@
   .last-session {
     display: flex;
     flex: none;
+    /* The reading width the lists are held to; it sat on `.scope` before. See `.scope`. */
+    max-width: 760px;
     align-items: center;
     gap: 10px;
     padding: 11px 13px;
