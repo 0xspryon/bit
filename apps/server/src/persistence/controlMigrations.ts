@@ -15,9 +15,13 @@
  * is written for. {@link FleetStore} is what keeps them apart, by construction — it is
  * the only thing that opens either.
  *
- * Append-only, and for the same reasons as the hunt chain: there is no `down`, no `redo`
- * and no `undo` in `effect/sql`'s migrator, the ids must strictly increase, and a gap is
- * permanent because the migrator applies only ids above the highest already applied.
+ * **Collapsed to a baseline once, on the same one-off licence `migrations.ts` explains:**
+ * nothing is deployed, there is no production data, and the two entries this replaces were
+ * a `CREATE TABLE` set plus one `ALTER TABLE` that belonged in it. The schema is
+ * byte-for-byte what they produced. From here the rule is `AGENTS.md`'s and nothing else:
+ * append only, ids must strictly increase, a gap is permanent because the migrator applies
+ * only ids above the highest already applied, and there is no `down`, no `redo` and no
+ * `undo` in `effect/sql`'s migrator to walk one back with.
  */
 import { SqliteMigrator } from "@effect/sql-sqlite-bun";
 import { Effect } from "effect";
@@ -50,6 +54,23 @@ const statements = (
  * whose directory is gone is a fact worth keeping rather than a dangling pointer, since
  * it is the only remaining record that the engagement happened at all.
  *
+ * **`workspace_path` is not where a target's data lives.** A target's data has always
+ * been at `<root>/targets/<id>/`. This is the folder on the operator's machine that the
+ * engagement is *about*: the one chosen in the New target dialog, the one shown in the
+ * target rail, and the one whose absence is a reason to dim a row. The two are separate
+ * because they have separate lifetimes — `rm -rf targets/<id>/` destroys the recorded
+ * evidence, while deleting the workspace folder destroys nothing we hold and must not
+ * remove a target from the list.
+ *
+ * It is nullable rather than `NOT NULL DEFAULT ''` so that "no folder was recorded" is a
+ * value a reader can test for, which is the honest state of a target with no
+ * operator-chosen folder at all — including the one `main.ts` registers at startup to
+ * serve a fixture. Nothing enforces uniqueness in the schema: registering two targets
+ * against one folder is refused above this table, where the refusal can name the target
+ * already holding it, and a `UNIQUE` constraint would surface the same mistake as a
+ * driver fault with nothing useful to tell the operator — besides forbidding the several
+ * legitimate `NULL`s.
+ *
  * **`target_schema_state` is derived, and is the one table here that is rewritten.** It
  * records what the last fleet migration found out about one target's file: whether it is
  * `ready` to be opened, or `unavailable` because its migration failed and the reason. It
@@ -62,11 +83,10 @@ const statements = (
  * sit at different ids — one migrated cleanly and one failed half way up — and a single
  * global "schema version" would be a lie about a fleet.
  *
- * `settings` is a key/value table with no schema over the values on purpose. Nothing in
- * this sprint reads a setting for behaviour; it exists because §3 names settings as
- * control-tier content, and giving it a home now costs one table and avoids a second
- * migration when the first real setting arrives. A value is TEXT and its meaning belongs
- * to whatever writes it.
+ * `settings` is a key/value table with no schema over the values on purpose. Nothing reads
+ * a setting for behaviour yet; it exists because §3 names settings as control-tier content,
+ * and giving it a home costs one table and avoids a migration when the first real setting
+ * arrives. A value is TEXT and its meaning belongs to whatever writes it.
  */
 const createRegistry = statements(
   `CREATE TABLE targets (
@@ -74,7 +94,8 @@ const createRegistry = statements(
     name TEXT NOT NULL,
     scope_note TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    archived_at INTEGER
+    archived_at INTEGER,
+    workspace_path TEXT
   )`,
   `CREATE TABLE target_schema_state (
     target_id TEXT PRIMARY KEY REFERENCES targets(id),
@@ -91,41 +112,12 @@ const createRegistry = statements(
   )`,
 );
 
-/**
- * `0002` — the folder the operator picked for an engagement.
- *
- * A target's *data* has always lived at `<root>/targets/<id>/`, and that is not what this
- * column holds. This is the folder on the operator's machine that the engagement is
- * about: the one chosen in the New target dialog, the one shown in the target rail, and
- * the one whose absence is a reason to dim a row. The two are separate because they have
- * separate lifetimes — `rm -rf targets/<id>/` destroys the recorded evidence, while
- * deleting the workspace folder destroys nothing we hold and must not remove a target
- * from the list.
- *
- * It is a new column rather than an edit to `0001` because `0001` has been applied: the
- * chain is append-only, there is no `down`, and the migrator only applies ids above the
- * highest already applied. It is nullable rather than `NOT NULL DEFAULT ''` so that "no
- * folder was recorded" is a value a reader can test for, which is the honest state of
- * every row created before this migration — including the target `main.ts` registers at
- * startup, which exists to serve a fixture and has no operator-chosen folder at all.
- *
- * Nothing enforces uniqueness in the schema. Registering two targets against one folder
- * is refused above this table, where the refusal can name the target already holding it;
- * a `UNIQUE` constraint would surface the same mistake as a driver fault with nothing
- * useful to tell the operator, and would also forbid the several `NULL`s that are
- * legitimate here.
- */
-const addWorkspacePath = statements(
-  `ALTER TABLE targets ADD COLUMN workspace_path TEXT`,
-);
-
 /** The ordered control chain. Append only; ids must increase and a gap is permanent. */
 export const CONTROL_MIGRATIONS: Record<
   string,
   Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient>
 > = {
-  "0001_control_registry": createRegistry,
-  "0002_target_workspace_path": addWorkspacePath,
+  "0001_control_baseline": createRegistry,
 };
 
 export const controlMigrationLoader =
