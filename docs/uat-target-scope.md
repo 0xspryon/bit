@@ -1,5 +1,10 @@
 # UAT — target scope and the Assets screen
 
+> **Superseded in part.** Anything to do with the scope importer — opening a conversation,
+> sending turns, narration, records, replay, resume, the Agent sessions list, or recovery after a
+> restart — is in `docs/uat-importer-conversation.md`. This document still covers the scope model
+> itself: entries, labels, promotion and what the agent is told.
+
 A step-by-step script for the work in `f476cf1..HEAD`: the scope a target carries, the
 estate the hunt discovers under it, and the text an agent is actually given.
 
