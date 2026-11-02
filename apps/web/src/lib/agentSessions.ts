@@ -50,7 +50,7 @@ export const stateTitle = (
     case "ended":
       return "Ended for good: the session's authority is over and its writes are refused. Sending a message does not reopen it.";
     case "dormant":
-      return "This server is not holding the session, but nothing recorded its authority ending. It may still exist in its harness; sending a message reopens it.";
+      return "This server is not holding the session, and nothing recorded the operator ending it. It may still exist in its harness; sending a message reopens it.";
   }
 };
 

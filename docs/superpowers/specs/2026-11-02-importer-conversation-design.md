@@ -9,20 +9,21 @@
 
 **Merged to `main`**, each verified green at merge:
 
-| Slice | What landed                                                                                                                                              |
-| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| S1    | The session index (`import_sessions`, `0024`/`0025`)                                                                                                     |
-| S2    | `LiveAgentSessions` extracted from the goal path; the importer session outlives its turn; no-clock credential; `ended_at`/`ended_reason` (`0026`/`0027`) |
-| S3    | Open and continue a conversation; citable pages; the in-flight guard; `0028`/`0029`                                                                      |
-| S3.5  | The Reasoning column, resolved options reaching `createSession` and recorded                                                                             |
-| S4    | Live narration — a fourth `import` tag on the narration bus                                                                                              |
-| S5    | `scope.entry.added` and `asset.imported` on the feed, folded into their calls                                                                            |
-| S6    | Replay from the harness, and resuming a session this process no longer holds                                                                             |
-| S8    | One list of every agent session, under Operations                                                                                                        |
-| S7a   | Recovery tells the truth after a restart: `activity` on `SessionStatus`, the `abandoned` answer                                                          |
-| S7b   | The continuation turn: resume for the two conversations, a replacement attempt for a worker, the cap, the outbox dispatcher, the opt-out                 |
+| Slice | What landed                                                                                                                                               |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S1    | The session index (`import_sessions`, `0024`/`0025`)                                                                                                      |
+| S2    | `LiveAgentSessions` extracted from the goal path; the importer session outlives its turn; no-clock credential; `ended_at`/`ended_reason` (`0026`/`0027`)  |
+| S3    | Open and continue a conversation; citable pages; the in-flight guard; `0028`/`0029`                                                                       |
+| S3.5  | The Reasoning column, resolved options reaching `createSession` and recorded                                                                              |
+| S4    | Live narration — a fourth `import` tag on the narration bus                                                                                               |
+| S5    | `scope.entry.added` and `asset.imported` on the feed, folded into their calls                                                                             |
+| S6    | Replay from the harness, and resuming a session this process no longer holds                                                                              |
+| S8    | One list of every agent session, under Operations                                                                                                         |
+| S7a   | Recovery tells the truth after a restart: `activity` on `SessionStatus`, the `abandoned` answer                                                           |
+| S7b   | The continuation turn: resume for the two conversations, a replacement attempt for a worker, the cap, the outbox dispatcher, the opt-out                  |
+| S8.x  | The list's three reporting gaps: importer liveness is "this process holds it" (`ScopeImporter.holds`), three states named, `goal_sessions.model` (`0030`) |
 
-Gates on `main`: **1540 server · 455 web · 84 DOM · 971 persistence**, migrations contiguous `0001`–`0029`.
+Gates on `main`: **1540 server · 455 web · 84 DOM · 971 persistence**, migrations contiguous `0001`–`0030`.
 
 **In flight:** nothing. S7 is complete; S7.6 records the second half and what running it found.
 
@@ -39,10 +40,7 @@ Gates on `main`: **1540 server · 455 web · 84 DOM · 971 persistence**, migrat
    as finished; it fails safe, and it narrows the continuation to conversations interrupted
    on their first turn.
 2. **Narrow the importer session's tool set.** Recorded under Known defects. The three MCP tools are the only ones that can _write_, but the session also holds whatever else the harness gives it — a live run used `Bash` to `curl` a page. The gated directory is the control and always was; the sentence we showed the operator was what was wrong, and that is already corrected. The fix is `allowedTools` on `createSession`, done with a live import to verify against, because the live run reached for `curl` rather than `WebFetch`.
-3. **Importer liveness in the S8 list is a lower bound.** A session held open _between_ turns — exactly what S2 built — reads "Not running", because the registry only exposes "a run is in flight". Needs `scopeImporter.ts`, which was off-limits while S6 and S8 ran in parallel.
-4. **A third state in the S8 list.** A restart leaves goal conversations and unended importer sessions neither live nor ended — nothing recorded their authority ending, which is `ended_reason` working as designed. "Not running" is the honest reading; S8.1 says "live or ended" and should say three.
-5. **`goal_sessions` has no model column**, so a dormant goal shows "model not recorded". A migration, held back while slices were taking `0028`/`0029`.
-6. **The end-to-end pass**, now possible on both drivers.
+3. **The end-to-end pass**, now possible on both drivers.
 
 ## What has been verified against live agents, and on which driver
 
