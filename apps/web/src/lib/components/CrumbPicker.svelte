@@ -228,6 +228,18 @@
   .options {
     display: flex;
     flex-direction: column;
+    /*
+     * A gap between the rows, because every row here is two lines — a name, and a fact
+     * about it underneath — and with none the rows read as one block of text: the current
+     * row's highlight runs straight into the next row's name, and the only thing marking
+     * a boundary is the 1px between a row's own two lines, which says the opposite.
+     *
+     * 4px against that 1px is what makes a row's two lines bind to each other and the
+     * rows come apart. It is the rail's own number for a column of selectable rows
+     * (`Sidebar`'s `.groups`, at the smaller 2px a one-line row needs); there is no
+     * spacing scale in `tokens.css` to take it from.
+     */
+    gap: 4px;
     min-height: 0;
     overflow-y: auto;
   }
@@ -236,7 +248,12 @@
     align-items: center;
     gap: 10px;
     width: 100%;
-    padding: 8px;
+    /*
+     * 10px down the sides of two lines, where a one-line row in the rail takes 7px of
+     * one. The horizontal 8px is unchanged: it is what lines a row's text up with the
+     * group label above it.
+     */
+    padding: 10px 8px;
     border: 0;
     border-radius: var(--radius-md);
     background: transparent;
