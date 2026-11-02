@@ -2297,7 +2297,9 @@ describe("0030: a goal conversation's model", () => {
         // The closest reachable state to the one the skipped migration left. The index goes
         // first: SQLite refuses to drop a column an index depends on.
         yield* sql.unsafe(`DROP INDEX IF EXISTS attempts_harness_instance_idx`);
-        yield* sql.unsafe(`ALTER TABLE attempts DROP COLUMN harness_instance_id`);
+        yield* sql.unsafe(
+          `ALTER TABLE attempts DROP COLUMN harness_instance_id`,
+        );
         const before = yield* columnsOf(sql, "attempts");
         const applied = yield* Effect.scoped(
           runMigrations({ loader: SqliteMigrator.fromRecord(MIGRATIONS) }).pipe(
