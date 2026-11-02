@@ -217,7 +217,9 @@
   }
   .rows {
     list-style: none;
-    margin: 0;
+    /* The rows' hover surface bleeds out of the page's edge by their own padding, so their
+       text is on it. */
+    margin: 0 -10px;
     padding: 0;
   }
   .row {
@@ -249,7 +251,7 @@
     color: var(--text-faint);
   }
   .empty {
-    margin: 24px 10px;
+    margin: 24px 0;
     font-size: 13px;
     color: var(--text-faint);
   }

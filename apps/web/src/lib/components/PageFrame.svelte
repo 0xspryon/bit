@@ -78,6 +78,21 @@
 
 <style>
   .frame {
+    /*
+     * The one left and right edge of the page: the title, the filter row and the body's
+     * content all sit on it. It is a variable because it has two values and the three
+     * places that use it must never disagree: 32px, or, with the rail hidden, whatever
+     * centres a 1040px column (1104px less this same 32px on each side).
+     *
+     * `100%` is resolved where the variable is *used*, and all three users are block
+     * children of `.main`, so it is `.main`'s width in each. Writing the centred case as a
+     * `max-width` and `margin: auto` on the header and a `calc()` on the body is what let the
+     * two drift 12px apart: the same column, computed twice.
+     *
+     * A row inside the body that has its own hover surface bleeds out of this edge with a
+     * negative inline margin equal to its own padding, so that its *text* is on the edge.
+     */
+    --edge: 32px;
     display: flex;
     flex: 1;
     min-width: 0;
@@ -98,7 +113,7 @@
     align-items: flex-start;
     justify-content: space-between;
     gap: 32px;
-    padding: 28px 32px 24px;
+    padding: 28px var(--edge) 24px;
     flex: none;
   }
   .titles {
@@ -132,27 +147,21 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 0 32px 16px;
+    padding: 0 var(--edge) 16px;
     flex: none;
   }
   .body {
     flex: 1;
     min-height: 0;
     overflow: auto;
-    padding: 0 20px 28px;
+    padding: 0 var(--edge) 28px;
   }
   /*
    * The rail is hidden: hold the header and the list to a reading width, centred, rather
    * than letting a row run 1400px from its title to its timestamp.
    */
-  .centered .page-head,
-  .centered .filters {
-    width: 100%;
-    max-width: 1104px;
-    margin: 0 auto;
-  }
-  .centered .body {
-    padding-inline: max(20px, calc((100% - 1088px) / 2));
+  .centered {
+    --edge: max(32px, calc((100% - 1040px) / 2));
   }
 
   /* Reflows the list instead of covering it: you keep your place. */

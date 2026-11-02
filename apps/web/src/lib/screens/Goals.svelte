@@ -156,7 +156,7 @@
 
 <style>
   .quiet {
-    margin: 24px 10px;
+    margin: 24px 0;
     font-size: 13px;
     color: var(--text-faint);
   }
@@ -165,7 +165,7 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 12px;
-    margin: 8px 8px 0;
+    margin: 8px 0 0;
   }
   .empty {
     display: flex;
@@ -173,7 +173,7 @@
     align-items: flex-start;
     gap: 8px;
     max-width: 460px;
-    margin: 24px 10px;
+    margin: 24px 0;
   }
   .empty-lead {
     margin: 0;
@@ -191,7 +191,9 @@
     flex-direction: column;
     gap: 2px;
     list-style: none;
-    margin: 0;
+    /* The rows' hover surface bleeds out of the page's edge by their own padding, so their
+       text is on it. */
+    margin: 0 -12px;
     padding: 0;
   }
   .row {

@@ -984,6 +984,9 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    /* The host header's hover surface bleeds out of the page's edge by its padding and its
+       transparent border, so the host's name is on the edge. */
+    margin-inline: -13px;
   }
   .group {
     display: flex;
@@ -1205,7 +1208,10 @@
     flex-direction: column;
     gap: 2px;
     min-height: 0;
-    margin: 0;
+    /* The rows' hover surface bleeds out of the page's edge by their own padding, so their
+       text is on it. It is on this list rather than on each row because the list scrolls,
+       and a scroller clips whatever a child pushes outside of it. */
+    margin: 0 -10px;
     padding: 0;
     overflow-y: auto;
     list-style: none;

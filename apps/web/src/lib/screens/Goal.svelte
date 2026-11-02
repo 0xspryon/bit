@@ -255,7 +255,7 @@
 
 <style>
   .quiet {
-    margin: 24px 10px;
+    margin: 24px 0;
     font-size: 13px;
     color: var(--text-faint);
   }
@@ -264,7 +264,6 @@
     flex-direction: column;
     gap: 20px;
     max-width: 720px;
-    padding: 0 8px;
   }
   .title-line {
     display: flex;
