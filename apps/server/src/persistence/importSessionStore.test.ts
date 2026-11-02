@@ -75,17 +75,30 @@ const importerOf = (importId: string, targetId = TARGET): HostContext => ({
   targetId,
 });
 
+/**
+ * Records a run and, unless told otherwise, confirms the harness created its session.
+ *
+ * Confirmed by default because that is the shape of every session worth listing; the
+ * unconfirmed one is the exception a test asks for by name.
+ */
 const open = (
   store: Store,
   importId: string,
-  over: { readonly session?: string; readonly targetId?: string } = {},
+  over: {
+    readonly session?: string;
+    readonly targetId?: string;
+    readonly confirmed?: boolean;
+  } = {},
 ) =>
-  store.recordImportSession({
-    importId,
-    targetId: over.targetId ?? TARGET,
-    harnessSessionId: over.session ?? `ses_${importId}`,
-    harnessInstanceId: "opencode",
-    model: "openai/gpt-5.6-sol",
+  Effect.gen(function* () {
+    yield* store.recordImportSession({
+      importId,
+      targetId: over.targetId ?? TARGET,
+      harnessSessionId: over.session ?? `ses_${importId}`,
+      harnessInstanceId: "opencode",
+      model: "openai/gpt-5.6-sol",
+    });
+    if (over.confirmed !== false) yield* store.confirmImportSession(importId);
   });
 
 const addEntry = (
@@ -230,6 +243,39 @@ describe("an import session's tally", () => {
       }),
     );
     expect(sessions[0]).toMatchObject({ entriesIn: 1 });
+  });
+
+  test("a run whose session the harness never confirmed is not listed, a quiet confirmed one is", async () => {
+    const path = newDatabasePath();
+    const sessions = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        // Opened first and confirmed, having written nothing: a real session that has not
+        // yet written. Zero writes must not hide it.
+        yield* open(store, "imp_quiet");
+        yield* Effect.sleep("5 millis");
+        // The newest row, and the one that never opened.
+        yield* open(store, "imp_ghost", { confirmed: false });
+        return yield* store.importSessions(TARGET);
+      }),
+    );
+    expect(sessions.map((session) => session.harnessSessionId)).toEqual([
+      "ses_imp_quiet",
+    ]);
+  });
+
+  test("confirming twice, or an import that has no row, changes nothing and fails nothing", async () => {
+    const path = newDatabasePath();
+    const sessions = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* open(store, "imp_a");
+        yield* store.confirmImportSession("imp_a");
+        yield* store.confirmImportSession("imp_not_there");
+        return yield* store.importSessions(TARGET);
+      }),
+    );
+    expect(sessions.map((session) => session.harnessSessionId)).toEqual([
+      "ses_imp_a",
+    ]);
   });
 
   test("lists only the target it was asked about", async () => {

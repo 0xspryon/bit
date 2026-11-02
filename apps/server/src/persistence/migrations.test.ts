@@ -488,6 +488,7 @@ describe("a database already at 0002", () => {
       "22_target_scope",
       "23_asset_imports",
       "24_import_sessions",
+      "25_import_session_confirmation",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -767,6 +768,7 @@ describe("a database already at 0005", () => {
       "22_target_scope",
       "23_asset_imports",
       "24_import_sessions",
+      "25_import_session_confirmation",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1490,6 +1492,7 @@ describe("a database already at 0015", () => {
       "22_target_scope",
       "23_asset_imports",
       "24_import_sessions",
+      "25_import_session_confirmation",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1635,6 +1638,7 @@ describe("a database already at 0016", () => {
       "22_target_scope",
       "23_asset_imports",
       "24_import_sessions",
+      "25_import_session_confirmation",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1809,6 +1813,7 @@ describe("a database already at 0017", () => {
       "22_target_scope",
       "23_asset_imports",
       "24_import_sessions",
+      "25_import_session_confirmation",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(
@@ -2005,5 +2010,43 @@ describe("a failing migration", () => {
     if (failure._tag === "Failure") {
       expect((failure.failure as DatabaseError).reason).toContain("Duplicates");
     }
+  });
+});
+
+describe("0025 import session confirmation", () => {
+  test("a row written under 0024 upgrades unconfirmed, and can then be confirmed", async () => {
+    const path = newDatabasePath();
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* runMigrations({ loader: chainThrough(24) });
+        yield* sql`INSERT INTO import_sessions (
+            import_id, target_id, harness_session_id, harness_instance_id, model,
+            caller_scope, opened_at
+          ) VALUES ('imp_old', 'acme-corp', 'ses_old', 'opencode', 'p/m',
+                    'acme-corp/import/imp_old', 100)`;
+        const applied = yield* migrate;
+        const upgraded = yield* sql<{
+          session_created_at: number | null;
+        }>`SELECT session_created_at FROM import_sessions`;
+        yield* sql`UPDATE import_sessions SET session_created_at = 200
+          WHERE import_id = 'imp_old'`;
+        return {
+          applied,
+          upgraded,
+          columns: yield* columnsOf(sql, "import_sessions"),
+          confirmed: yield* sql<{
+            session_created_at: number | null;
+          }>`SELECT session_created_at FROM import_sessions`,
+        };
+      }),
+    );
+
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "25_import_session_confirmation",
+    ]);
+    expect(outcome.columns).toContain("session_created_at");
+    // Not backfilled: nothing in a 0024 row says the harness ever held the session.
+    expect(outcome.upgraded).toEqual([{ session_created_at: null }]);
+    expect(outcome.confirmed).toEqual([{ session_created_at: 200 }]);
   });
 });

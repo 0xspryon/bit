@@ -29,6 +29,7 @@
  *   operator's review of an imported scope is the only control on it, and that review
  *   exists only because there is a real gap between the import and the first execution.
  */
+import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -54,7 +55,7 @@ import { STUB_INSTANCE, stubHarness } from "../harness/stubHarness";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
-import { FleetStore } from "../persistence/fleet";
+import { FleetStore, HUNT_FILE } from "../persistence/fleet";
 import type { DatabaseError } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
@@ -524,6 +525,25 @@ describe("every link failing is not an error state", () => {
  * pass every store test.
  */
 describe("the session index", () => {
+  /** The raw rows, because the unconfirmed one is exactly what the store's reader hides. */
+  const confirmations = async (root: string) => {
+    const database = new Database(join(root, "targets", TARGET, HUNT_FILE), {
+      readonly: true,
+    });
+    try {
+      return database
+        .query(
+          "SELECT harness_session_id, session_created_at FROM import_sessions",
+        )
+        .all() as {
+        harness_session_id: string;
+        session_created_at: number | null;
+      }[];
+    } finally {
+      database.close();
+    }
+  };
+
   const sessionsOf = (
     runtime: ManagedRuntime.ManagedRuntime<TargetStores, DatabaseError>,
   ) =>
@@ -555,23 +575,31 @@ describe("the session index", () => {
     await runtime.dispose();
   });
 
-  test("a session that never opened is indexed too, and wrote nothing", async () => {
-    const { runtime, view } = await importWith([PAGE_GOOD], {
+  test("a session that never opened is recorded but not listed", async () => {
+    const { built, runtime, view } = await importWith([PAGE_GOOD], {
       failCreate: true,
     });
     expect(view?.status).toBe("failed");
 
     // The row is written before the session exists (the attempt rows' arrangement), so a
-    // crash between creating a session and recording it cannot lose one. The price is this:
-    // an entry for a session the harness never had, which reads as one that wrote nothing.
-    const sessions = await sessionsOf(runtime);
-    expect(sessions).toHaveLength(1);
-    expect(sessions[0]).toMatchObject({
-      harnessSessionId: "ses_import",
-      entriesIn: 0,
-      entriesOut: 0,
-      assets: 0,
-    });
+    // crash between creating a session and recording it cannot lose one. It stays unconfirmed
+    // because `createSession` never returned, and the list reads only confirmed rows: the
+    // Assets screen's "Continue" must not be offered an id the harness never minted.
+    expect(await sessionsOf(runtime)).toEqual([]);
+    expect(await confirmations(built.root)).toEqual([
+      { harness_session_id: "ses_import", session_created_at: null },
+    ]);
+    await runtime.dispose();
+  });
+
+  test("a session the harness created is confirmed once createSession returns", async () => {
+    const { built, runtime, view } = await importWith([PAGE_GOOD]);
+    expect(view?.status).toBe("finished");
+
+    const rows = await confirmations(built.root);
+    expect(rows).toHaveLength(1);
+    expect(typeof rows[0]?.session_created_at).toBe("number");
+    expect(await sessionsOf(runtime)).toHaveLength(1);
     await runtime.dispose();
   });
 });

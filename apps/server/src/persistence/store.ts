@@ -6476,6 +6476,17 @@ const makeStore = Effect.fnUntraced(function* () {
    * both recorded a host are one asset, and summing per-run counts would put a figure on the
    * picker that the Assets page disagrees with.
    *
+   * **Only sessions the harness confirmed creating are listed** (`session_created_at`,
+   * `0025`). A row is written before its session exists, so an unconfirmed row may name an id
+   * the harness never minted, and offering it for "Continue" is offering a resume against
+   * nothing. A confirmed session that has written nothing is listed with zeros: zero writes
+   * does not mean it never existed.
+   *
+   * **What the index covers.** `import_sessions_target_idx` serves the outer scan (a
+   * target's rows, newest first). The dedup `NOT EXISTS` and the correlated subqueries probe
+   * `(target_id, harness_session_id)`, which that index does not serve: they are per-session
+   * scans of one target's small table, not an indexed lookup, and nothing here claims more.
+   *
    * `import_ids` is a comma-joined list because an import id is minted (`imp_` and a
    * timestamp-ordered identifier) and never contains one, and because the route needs them
    * to ask the in-memory registry whether any run is still going.
@@ -6513,10 +6524,12 @@ const makeStore = Effect.fnUntraced(function* () {
                   AND r.harness_session_id = s.harness_session_id)) AS assets
           FROM import_sessions s
           WHERE s.target_id = ${targetId}
+            AND s.session_created_at IS NOT NULL
             AND NOT EXISTS (
               SELECT 1 FROM import_sessions o
               WHERE o.target_id = s.target_id
                 AND o.harness_session_id = s.harness_session_id
+                AND o.session_created_at IS NOT NULL
                 AND (o.opened_at < s.opened_at
                   OR (o.opened_at = s.opened_at AND o.import_id < s.import_id)))
           ORDER BY s.opened_at DESC, s.import_id DESC`,
@@ -6554,8 +6567,9 @@ const makeStore = Effect.fnUntraced(function* () {
    * **Called with the session id before the session exists**, which is the attempt rows'
    * arrangement (`AgentHarness.newSessionId`): the row names the session first, so a crash
    * between creating it and writing this leaves no live session nobody can find. The cost is
-   * the one that arrangement already accepts — an id for a session that was never created —
-   * and an index that is asked about it gets the harness's honest "no such session".
+   * the one that arrangement already accepts — an id for a session that was never created.
+   * Such a row is **not listed** until {@link confirmImportSession} records that the harness
+   * created the session (`0025`), so an unconfirmed row cannot be offered for a resume.
    *
    * The caller scope is {@link callerScopeOf}'s, computed here and stored, so the tallies
    * join on the exact string the importer's writes are filed under. `DO NOTHING` on the
@@ -6587,6 +6601,25 @@ const makeStore = Effect.fnUntraced(function* () {
       );
     },
   );
+
+  /**
+   * Records that the harness created the session an import run's row names.
+   *
+   * Called once `createSession` has returned, and by nothing else: this is the only thing that
+   * makes {@link importSessions} list the row. It is idempotent (`session_created_at IS NULL`
+   * keeps the first instant), and an unknown import id updates nothing rather than failing,
+   * because the row's own write is advisory and may not have landed.
+   */
+  const confirmImportSession = Effect.fn(
+    "ObservationStore.confirmImportSession",
+  )(function* (importId: string) {
+    const confirmedAt = yield* Clock.currentTimeMillis;
+    yield* sql`UPDATE import_sessions
+          SET session_created_at = ${confirmedAt}
+          WHERE import_id = ${importId} AND session_created_at IS NULL`.pipe(
+      Effect.mapError(asDatabaseError("query")),
+    );
+  });
 
   /** What a recorded steer answers with, and what a retry of one replays. */
   const SteerResult = Schema.Struct({
@@ -7907,6 +7940,7 @@ const makeStore = Effect.fnUntraced(function* () {
     recordGoalSession,
     importSessions,
     recordImportSession,
+    confirmImportSession,
     endGoalAsAgent,
     attemptsForGoal,
   });
@@ -8507,8 +8541,8 @@ export class ObservationStore extends Context.Service<
       readonly harnessInstanceId: string | null;
     }) => Effect.Effect<void, DatabaseError>;
     /**
-     * The harness sessions this target's scope imports have run on, newest first, each with
-     * what it wrote.
+     * The harness sessions this target's scope imports have run on **and the harness confirmed
+     * creating**, newest first, each with what it wrote.
      *
      * An index of the harness's storage and never a claim the harness still holds a session.
      * The figures are counted from the rows the writes left (`0024`), so they cannot go stale.
@@ -8527,6 +8561,13 @@ export class ObservationStore extends Context.Service<
       }[],
       DatabaseError | StoredRowError
     >;
+    /**
+     * Records that the harness created the session an import run's row names (`0025`). Until
+     * it has, {@link importSessions} does not list the row.
+     */
+    readonly confirmImportSession: (
+      importId: string,
+    ) => Effect.Effect<void, DatabaseError>;
     /** Records that an import run is on a harness session. See `0024`. */
     readonly recordImportSession: (input: {
       readonly importId: string;

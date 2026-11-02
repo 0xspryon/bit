@@ -1476,7 +1476,12 @@ const addAssetImports = statements(
  * entry's `effect` is in the payload) and `asset_imports` rows, both carrying
  * `caller_scope`. `caller_scope` here is that exact string, recorded rather than rebuilt in
  * SQL, so the join is on the value the writes were made under and not on a second spelling
- * of `callerScopeOf`'s format. A continued session's tally keeps up because its writes land
+ * of `callerScopeOf`'s format. (`0023`'s commentary above says an import's `caller_scope` is
+ * always `<targetId>/operator`; that was true when it was written and stopped being true when
+ * importer writes were routed through `callerScopeOf({ _tag: "importer" })`. An applied
+ * migration's comment is not edited, so the retraction is here: the join below is on the
+ * importer's scope, not the operator's, and a join on `<targetId>/operator` would match
+ * nothing.) A continued session's tally keeps up because its writes land
  * under a scope this table already names.
  *
  * What the derivation counts is what the session **wrote**, not what is still there: an
@@ -1487,8 +1492,11 @@ const addAssetImports = statements(
  * picker's reasons: the instance is what says which harness may be asked about the session,
  * and the model is shown on every row. Neither can be recovered from the harness cheaply.
  *
- * No foreign key from `target_id` (the file *is* the target, §3). The one index is the one
- * read: a target's sessions, newest first.
+ * No foreign key from `target_id` (the file *is* the target, §3). The index serves the one
+ * read that scans: a target's sessions, newest first. The dedup `NOT EXISTS` and the
+ * tally subqueries in `importSessions` probe `(target_id, harness_session_id)`, which this
+ * index does not serve; they run per session over a handful of rows, so it is a scan of a
+ * small table and not a cost worth a second index, but it is not covered either.
  */
 const addImportSessions = statements(
   `CREATE TABLE import_sessions (
@@ -1501,7 +1509,44 @@ const addImportSessions = statements(
     opened_at INTEGER NOT NULL,
     CHECK (length(harness_session_id) > 0)
   )`,
-  `CREATE INDEX import_sessions_target_idx ON import_sessions(target_id, opened_at)`,
+  `CREATE INDEX IF NOT EXISTS import_sessions_target_idx
+     ON import_sessions(target_id, opened_at)`,
+);
+
+/**
+ * `0025` — whether the harness confirmed it created the session an `import_sessions` row names.
+ *
+ * `0024`'s row is written **before** the session exists, for the attempt rows' reason: an id
+ * recorded first cannot be lost to a crash between creating the session and writing the row.
+ * The price is a row for a session that was never created (a gate that would not install, a
+ * harness that refused). Such a session wrote nothing, so its target is in exactly the
+ * empty-scope state the Assets screen offers "Continue that session" in, and the newest row
+ * is the likeliest thing to be offered. A resume against it is a resume against an id the
+ * harness never minted.
+ *
+ * **A column rather than a heuristic.** The alternative is to prefer sessions with a non-zero
+ * tally, and it is wrong in the direction that matters: a session that was really created
+ * and has so far written nothing (the operator is mid-conversation with the importer, or the
+ * agent asked a question and stopped) has the same tally as one that never opened. Zero
+ * writes cannot tell "never existed" from "exists and has not written yet", and the first is
+ * the only one a resume must refuse. The column costs one `UPDATE` per import run, after
+ * `createSession` returns.
+ *
+ * `session_created_at` is the instant the harness answered `createSession`, `NULL` until it
+ * does. **`NULL` means "not confirmed", and the reader lists only confirmed rows.** That
+ * includes every row `0024` wrote before this column existed: they are not backfilled
+ * because nothing in them says whether the harness ever held the session, and nothing has
+ * been published. The two windows this leaves are the same two the index already accepts
+ * (a failed index write, and a crash between creating the session and this `UPDATE`): a
+ * real session the list does not show, never an unreal one it offers. The row is still
+ * there, and `session_created_at IS NULL` finds it by hand.
+ *
+ * `0024` is not edited to carry this: the column is a different fact from the row's
+ * `opened_at` (when the import asked for a session, not when it got one), and a database
+ * already at `0024` needs a forward migration either way.
+ */
+const addImportSessionConfirmation = statements(
+  `ALTER TABLE import_sessions ADD COLUMN session_created_at INTEGER`,
 );
 
 /**
@@ -1546,6 +1591,7 @@ export const MIGRATIONS: Record<
   "0022_target_scope": addTargetScope,
   "0023_asset_imports": addAssetImports,
   "0024_import_sessions": addImportSessions,
+  "0025_import_session_confirmation": addImportSessionConfirmation,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

@@ -4213,8 +4213,8 @@ describe("a target's importer sessions", () => {
         database.run(
           `INSERT INTO import_sessions (
              import_id, target_id, harness_session_id, harness_instance_id, model,
-             caller_scope, opened_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+             caller_scope, opened_at, session_created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             r.importId,
             r.targetId,
@@ -4223,6 +4223,7 @@ describe("a target's importer sessions", () => {
             "openai/gpt-5.6-sol",
             r.scope,
             r.openedAt,
+            r.openedAt + 1,
           ],
         );
       }

@@ -286,6 +286,29 @@ export class ScopeImporter extends Context.Service<
               multiTurn: false,
             });
 
+            /*
+             * The session now exists, and the index is told so. Until this lands the row
+             * `start` wrote names an id the harness may never have minted, and the session
+             * list does not show it (`0025`). Advisory like the row itself: a failure is
+             * logged with the id and the import carries on, and the session is merely not
+             * listed.
+             */
+            yield* withTargetStore(stores, input.request.targetId, (store) =>
+              store.confirmImportSession(input.importId),
+            ).pipe(
+              Effect.catch((failure) =>
+                Effect.logWarning(
+                  "a scope import's session was created but could not be marked as such; the session will not appear in the target's list",
+                  {
+                    targetId: input.request.targetId,
+                    importId: input.importId,
+                    sessionId: input.sessionId,
+                    detail: failure.message,
+                  },
+                ),
+              ),
+            );
+
             // `issueImport`, which takes importer bindings and nothing else, and defaults
             // to a lifetime measured in minutes rather than a worker's six hours. A
             // fourth caller kind is what makes this session's three tools unreachable
@@ -487,8 +510,9 @@ export class ScopeImporter extends Context.Service<
          * index is the only way an operator finds this one again, and an id recorded first
          * cannot be lost to a crash between creating the session and writing the row. The
          * price is an entry for a session that never opened (a gate that would not
-         * install), which reads as a session that wrote nothing and, asked about, as one
-         * the harness does not have. Both are true.
+         * install). That entry is not listed: it is marked once `createSession` returns
+         * (`confirmImportSession`, `0025`), and the session list reads only marked ones, so
+         * an id the harness never minted cannot be offered for a resume.
          *
          * **A failure to write it does not refuse the import.** The index is a way of
          * finding a session and is advisory in the way `ScopeImportView` is: the import's
