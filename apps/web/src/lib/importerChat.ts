@@ -27,8 +27,19 @@
  *   records, all filed by import id ({@link importerFeed}). `rowsFor` folds each write call
  *   into its record, so a call and its receipt are one row (S5).
  *
- * Replayed turns come first, then live ones; the caller owns the floor between them (the
- * same job `buildGoalConversation`'s `narrationFloor` does), so nothing is shown from both.
+ * Replayed turns come first, then live ones, and the floor between them is
+ * {@link ImporterSession.historyFloor} — the activity publish order this tab had seen when
+ * the replay was asked for, held against each live entry by {@link importerFeed}. That is the
+ * same job `buildGoalConversation`'s `narrationFloor` does and it is what makes "no message
+ * appears twice" structural rather than hopeful: everything the server's answer contains was
+ * published at or below the floor, and everything after it is only live.
+ *
+ * The operator's own rows need no such cancellation, unlike the goal chat's, and the reason is
+ * the arrangement rather than luck: the replay is asked for when a session is **opened** and
+ * never again, so every `turn.operator` row this tab mints is minted after the answer it
+ * could have collided with. The goal chat re-reads after a send and therefore needs
+ * `replayedThrough` and a text match; this does not, and must not start re-reading without
+ * building one.
  *
  * ## What is not joined, and says so
  *
@@ -45,14 +56,20 @@
  * half is reviewed on the Assets list anyway. Live records are placed by the narration
  * around them, which needs no ordinal; only a reload's records go to the leading group.
  *
- * ## The notes in here are stand-ins
+ * ## The notes are the server's now, except the two that are about this page
  *
- * The sentences on a group with no prose are the server's to write once there is a server
- * (`RoundNarration.note` for a round, `GoalConversationView.note` for a goal). There is no
- * importer endpoint, so they are written here, in the same register.
+ * They used to be stand-ins written here, because there was no endpoint to write them. There
+ * is one (S6): `ImporterConversationView.note` carries a sentence for every one of the five
+ * answers, and {@link ImporterHistory} passes it through untouched. What is still written
+ * here is the handful that are **not** about the harness's copy — the leading group's "nothing
+ * on the record says which message each one answered", {@link ENDED_NOTE} and
+ * {@link strandedNote} — each of which is a fact about this screen or about a row the page
+ * already holds, not an answer only the server could give.
  */
 import type {
   GoalNarrationView,
+  ImporterContinuation,
+  ImporterConversationView,
   ImporterSessionView,
   LiveItem,
 } from "@bit/contracts";
@@ -97,17 +114,35 @@ export type ImporterGroup = ChatGroup<ImporterTurn>;
 /**
  * What the harness answered when asked for this session's messages.
  *
- * The same five answers a goal conversation has, minus the one that never reaches a group:
- * `none` is "nothing has ever been said here" and renders no group at all.
+ * The server's five answers (`ImporterConversationSource`) plus one of the page's own:
+ * `loading`, which is "this tab has asked and has no answer yet" and is therefore not a fact
+ * about the session at all. `none` is the harness holding nothing under a session it still
+ * knows; `absent` is nothing ever having been said in the import, which is a different fact
+ * and gets a different sentence.
  */
 export interface ImporterHistory {
-  readonly source: "loading" | "none" | "harness" | "pending" | "forgotten";
+  readonly source:
+    "loading" | "none" | "absent" | "harness" | "pending" | "forgotten";
   /** A sentence for the operator. Empty when `source` is `none` or `loading`. */
   readonly note: string;
-  /** True when the harness holds more than it returned. */
+  /** True when the harness holds more than it returned — and it stopped short of the oldest. */
   readonly truncated: boolean;
   /** Oldest first. Empty unless `source` is `harness`. */
   readonly messages: readonly ReplayedMessage[];
+  /**
+   * What the server will do with the next message, in its words rather than this page's.
+   *
+   * **The field the composer is enabled from**, and it is the server's because only the
+   * server can know it: whether this process still holds the session, and — for one it does
+   * not — whether the harness will continue it, which is a round trip to the harness. A page
+   * that guessed would offer a composer for a message the server then refuses, which is a
+   * message the operator writes and loses.
+   *
+   * Absent until the server has answered, which is the `loading` case: a composer is offered
+   * meanwhile, because an unknown is not a refusal and the server's own refusal is the one
+   * that counts.
+   */
+  readonly continuation?: ImporterContinuation;
 }
 
 export const NO_HISTORY: ImporterHistory = {
@@ -116,6 +151,22 @@ export const NO_HISTORY: ImporterHistory = {
   truncated: false,
   messages: [],
 };
+
+/**
+ * The server's answer as the page holds it (S6).
+ *
+ * A straight reduction: the view carries two things this type does not keep — `live` and
+ * `harnessSessionId` — because {@link ImporterHistory.continuation} already answers the only
+ * question the screen asks of them, and a page holding both would start deriving its own
+ * answer from them beside the server's.
+ */
+export const historyOf = (view: ImporterConversationView): ImporterHistory => ({
+  source: view.source,
+  note: view.note,
+  truncated: view.truncated,
+  messages: view.messages,
+  continuation: view.continuation,
+});
 
 /**
  * One importer session as the page holds it.
@@ -162,6 +213,28 @@ export interface ImporterSession {
   readonly reading: boolean;
   /** True when the server lists this session. Absent on the page's own. */
   readonly indexed?: boolean;
+  /**
+   * True once the server has answered about this session's messages (S6).
+   *
+   * **What separates "its thread is empty" from "its thread has not arrived".** A re-read of
+   * the session list replaces an untouched indexed session wholesale, which would otherwise
+   * put the `loading` history back over an answer that had already come — and then ask for it
+   * again, for ever. A loaded session is kept the way a typed-into one is.
+   */
+  readonly loaded?: boolean;
+  /**
+   * The activity publish order this tab had seen when the replay was **asked for**.
+   *
+   * The replay/live boundary, and the caller's to hold:
+   * {@link importerFeed} drops live narration at or below it, because the server's answer
+   * already contains it. `buildGoalConversation`'s `narrationFloor` exactly, and a count of
+   * publish order rather than a time for its reason — the browser's clock and the server's
+   * are different clocks.
+   *
+   * Absent on a session whose replay was never asked for, which takes nothing away: the
+   * page's own empty session has no history to double up with.
+   */
+  readonly historyFloor?: number;
   /**
    * The harness instance this session was minted by when this server **does not run it**,
    * and absent otherwise.
@@ -248,10 +321,33 @@ export const importerFeed = (input: {
   readonly floors: Readonly<Record<string, number>> | undefined;
   readonly live: readonly LiveItem[];
   readonly importId: string | undefined;
+  /**
+   * The replay's floor, if a replay has been asked for. See
+   * {@link ImporterSession.historyFloor}.
+   */
+  readonly historyFloor?: number | undefined;
 }): readonly LiveItem[] => {
   const { importId } = input;
   if (importId === undefined) return input.own;
-  const mine = input.live.filter((item) => item.importId === importId);
+  /*
+   * Everything this import published, minus what the replay already holds.
+   *
+   * **This is the replay/live boundary, and it is one comparison.** The server's answer
+   * contains every word the harness held when it answered, so narration published at or
+   * below the floor is on screen twice unless it is dropped here — and it is dropped here
+   * rather than in `buildImporterChat` because that function is given one list and cuts it,
+   * and a filter in there would need a floor for a list that no longer knows its order.
+   *
+   * A record (`scope.entry.added`, `asset.imported`) carries no activity order and is kept
+   * whatever the floor: it is durable, the replay never contains one, and dropping it would
+   * lose the half of the screen that survives a reload.
+   */
+  const mine = input.live.filter(
+    (item) =>
+      item.importId === importId &&
+      (input.historyFloor === undefined ||
+        (activityOrder(item) ?? Number.POSITIVE_INFINITY) > input.historyFloor),
+  );
   if (mine.length === 0) return input.own;
 
   // The page's own rows in runs, each opened by an operator row and carrying its floor.
@@ -368,6 +464,11 @@ const leadingProse = (history: ImporterHistory, other: boolean): RoundProse => {
       return { _tag: "loading" };
     case "forgotten":
       return { _tag: "forgotten", note: history.note };
+    case "absent":
+      // Nothing was ever said in this import, which is not an absence of words but an
+      // absence of a conversation — so the server's own sentence, in the slot that says
+      // "there is nothing here" rather than the one that says "the words are gone".
+      return { _tag: "none", note: history.note };
     case "none":
     case "harness":
       return {
@@ -406,21 +507,18 @@ export const buildImporterChat = (
     live.leading.length === 0 &&
     (history.source === "loading" ||
       history.source === "pending" ||
+      history.source === "absent" ||
       history.source === "forgotten");
   /*
-   * A `pending` history is the page saying it cannot read this session's words, and that does
-   * not stop being true when the operator types. Without this, one message in an indexed
-   * continuation looks exactly like a brand-new session: the note is gone and nothing says
-   * the thread above it is missing. The other absences are about arriving (`loading`) or
-   * about a session that is gone (`forgotten`), and each is said once, before anything else.
+   * **There is no longer a sixth reason, and the one there was is worth recording as gone.**
+   * Until S6 this page could not read a session's words at all, so an indexed session opened
+   * with a stand-in `pending` history whose note said so — and that note had to stay said
+   * after the operator typed, or one message in an old session looked exactly like a
+   * brand-new one. The page reads the session now, so `pending` is back to meaning what the
+   * server means by it (a session that has not spoken yet), and a turn's own prose says that
+   * better than a group above it. Each absence is said once, before anything else.
    */
-  const unreadable = history.source === "pending";
-  if (
-    replay.leading.length > 0 ||
-    live.leading.length > 0 ||
-    absent ||
-    unreadable
-  ) {
+  if (replay.leading.length > 0 || live.leading.length > 0 || absent) {
     const prose: RoundProse =
       replay.leading.length > 0
         ? {
@@ -571,16 +669,20 @@ export const sessionLabel = (
       })}`;
 
 /**
- * What the page says in place of a conversation it cannot read.
+ * What the page holds for a session it has asked the server about and not heard back on.
  *
- * The harness holds what was said in a session, and reading it back is a later slice's. So
- * an indexed session opens with this, in the `pending` slot, rather than as the empty thread
- * — which would say nothing was ever said — or as `forgotten`, which would claim the harness
- * had been asked and had answered.
+ * `loading` and not `pending`: `pending` is the server's answer about a session that exists
+ * and has not spoken, and this is the page having no answer at all. The distinction is the
+ * one this type's comment on `loading` makes — one is a fact about the session, the other is
+ * a fact about this tab — and it matters because the empty thread, a session that said
+ * nothing, and a session whose words are still in flight read as three different things.
+ *
+ * It carries **no note**, deliberately. Every other sentence on this screen is the server's
+ * ({@link ImporterHistory.note}), and "still loading" is drawn rather than written.
  */
-export const INDEXED_HISTORY: ImporterHistory = {
-  source: "pending",
-  note: "This page does not read the session's messages yet; the harness holds them. What the session wrote is on the Scope tab and in the Estate, and its tally is in the session list.",
+export const LOADING_HISTORY: ImporterHistory = {
+  source: "loading",
+  note: "",
   truncated: false,
   messages: [],
 };
@@ -591,8 +693,13 @@ export const INDEXED_HISTORY: ImporterHistory = {
  * `harness` is a display name the caller resolves from the harness listing, because the
  * server's row carries the instance id and the avatar letter wants the name. `reading` is
  * true: an indexed session is opened to be read, and the first message the operator types
- * resumes it. `messages` is `null` — see {@link ImporterTally}. `strandedOn` is the caller's
- * to work out from the harness listing, and is set only for a harness this server lacks.
+ * carries it on. `messages` is `null` — see {@link ImporterTally}. `strandedOn` is the
+ * caller's to work out from the harness listing, and is set only for a harness this server
+ * lacks.
+ *
+ * `history` is {@link LOADING_HISTORY}: the row says the session exists and says nothing
+ * about what was said in it, so the words are a second request (S6) and this is the page
+ * waiting for it.
  */
 export const indexedSession = (
   view: ImporterSessionView,
@@ -603,7 +710,7 @@ export const indexedSession = (
   startedAt: view.openedAt,
   model: view.model,
   harness,
-  history: INDEXED_HISTORY,
+  history: LOADING_HISTORY,
   items: [],
   working: view.running,
   tally: {

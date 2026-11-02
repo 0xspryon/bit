@@ -485,4 +485,35 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
     expect(outcome.widened?.pages).toEqual([PAGE, later]);
     expect(outcome.missing).toBeUndefined();
   });
+
+  test("the row says whether its session was ever created, which is what a replay needs (S6)", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        for (const importId of ["imp_opened", "imp_never"]) {
+          yield* store.recordImportSession({
+            importId,
+            targetId: TARGET,
+            harnessSessionId: `ses_${importId}`,
+            harnessInstanceId: "opencode",
+            model: "openai/gpt-5.6-sol",
+          });
+        }
+        yield* store.confirmImportSession("imp_opened");
+        return {
+          opened: yield* store.importSession("imp_opened"),
+          never: yield* store.importSession("imp_never"),
+        };
+      }),
+    );
+    expect(outcome.opened?.confirmedAt).toBeGreaterThan(0);
+    /*
+     * `null`, and it is the one fact that separates "nothing was ever said in this import"
+     * from every other kind of silence. The row is written before the session exists
+     * (`0025`), so an unconfirmed row names an id the harness may never have minted — and a
+     * replay of it has to answer "nobody has talked to this yet" rather than the harness's
+     * "I no longer hold that session", which would tell an operator their message was lost.
+     */
+    expect(outcome.never?.confirmedAt).toBeNull();
+  });
 });

@@ -884,6 +884,22 @@ export const server = {
       ),
     ),
 
+  /**
+   * One importer session's conversation, replayed from the harness (S6).
+   *
+   * {@link goalConversation}'s sibling for the importer, and the same promise: every answer
+   * but a `404` is a success. `source` distinguishes an import nobody ever said anything in
+   * (`absent`) from one whose words the harness has deleted (`forgotten`) from a live session
+   * that has not spoken yet (`pending`), and `continuation` says what the composer's next
+   * message will actually do — which is the one field a browser must not guess.
+   */
+  importerMessages: (baseUrl: string, targetId: string, importId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.importerMessages({ params: { targetId, importId } }),
+      ),
+    ),
+
   /** One import's links, tool calls and totals, for the "Loading the scope" panel. */
   scopeImport: (baseUrl: string, targetId: string, importId: string) =>
     run(

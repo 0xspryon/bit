@@ -9,8 +9,8 @@
  * harness cannot answer" states a test could not produce on demand.
  *
  * It lives in `src/` rather than in one of those files for a reason that only appeared with
- * the second harness: {@link AgentHarness} has thirteen members, and three hand-written
- * copies of a thirteen-member object is three places to forget the fourteenth. `persistence/
+ * the second harness: {@link AgentHarness} has fourteen members, and three hand-written
+ * copies of a fourteen-member object is three places to forget the fifteenth. `persistence/
  * fixtures.ts` is here on the same grounds.
  *
  * **Every member is overridable and the defaults are the dullest possible answers**: a
@@ -29,6 +29,7 @@ import {
   AgentHarness,
   type HarnessNarration,
   type MessageEntry,
+  type SessionContinuation,
   type SessionStatus,
 } from "./agentHarness";
 import {
@@ -115,8 +116,12 @@ export const stubHarness = (
     // Nothing on disk: a test that wants the real gate installed passes a real installer,
     // which `run/supervisor.test.ts` does for both harnesses' gates.
     installGate: () => Effect.void,
+    // A resume names the session it continues, as the seam says: the id comes back
+    // unchanged, which is what keeps the conversation's identity.
     createSession: (input) =>
-      Effect.succeed({ id: input.sessionId ?? "ses_chosen_by_harness" }),
+      Effect.succeed({
+        id: input.resume ?? input.sessionId ?? "ses_chosen_by_harness",
+      }),
     registerMcpServer: () => Effect.void,
     // Succeeds without recording anything, like the registration above: a test that cares
     // which registrations were taken away says so by overriding it.
@@ -127,6 +132,20 @@ export const stubHarness = (
     prompt: () => Effect.succeed({ delivered: true }),
     waitForIdle: () => Effect.void,
     sessionStatus: () => Effect.succeed({} satisfies SessionStatus),
+    /*
+     * Resumable, with no directory stated.
+     *
+     * The dull answer, as every other default here is, and the *safe* dull answer: a caller
+     * that must gate the directory a resumed session runs in has to refuse a continuation
+     * whose directory it cannot match, so a stub that said nothing cannot trick one into
+     * resuming blind. A test about resuming states the directory it means.
+     */
+    sessionContinuation: () =>
+      Effect.succeed({
+        _tag: "resumable",
+        directory: undefined,
+        detail: "the scripted harness still holds this session",
+      } satisfies SessionContinuation),
     messages: () => Effect.succeed([] as readonly MessageEntry[]),
     interruptSession: () => Effect.succeed(false),
     // Empty rather than open: a suite that wants a stream which stays up until it is

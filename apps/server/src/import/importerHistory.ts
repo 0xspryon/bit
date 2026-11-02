@@ -1,0 +1,584 @@
+/**
+ * An importer conversation's prose, replayed from the harness, and whether it can be
+ * carried on (S6).
+ *
+ * Sibling of `plan/goalNarration.ts` and built on the same accepted cost: nothing in this
+ * build stores a word of a conversation (DECISIONS.md §8), so the only other copy belongs
+ * to the **harness**, and this module asks for it. Claude Code sweeps its transcripts on
+ * `cleanupPeriodDays`; OpenCode's retention is its own. For an import opened a while ago,
+ * *gone* is the normal answer and must read as one rather than as a fault — which is why
+ * this has no error channel at all past the row it is given.
+ *
+ * ## Five answers, and the one that is not about prose
+ *
+ * `harness` with messages, `pending` while a live session has produced nothing yet,
+ * `forgotten` for a session the harness will not or cannot answer about, `none` for a
+ * session it still knows and holds nothing under — and `absent`, which is **not** an
+ * absence of prose but an absence of a conversation.
+ *
+ * `absent` is reachable here for a reason that is the importer's own rather than a goal's.
+ * An import's index row is written *before* its session exists (`0025`), so a row whose
+ * `session_created_at` is null names a session the harness may never have minted: the gate
+ * would not install, the harness refused, the process died in between. Nobody has said
+ * anything in that import, and reporting it with the harness's "I no longer hold that
+ * session" sentence would tell an operator their message had been lost. The goal path makes
+ * the same distinction for the same reason, one row earlier.
+ *
+ * ## `live`, `continuation` and the three different questions in there
+ *
+ * Whether **this process** holds the session (`live`), whether the **harness** still has
+ * its prose (`source`), and whether the conversation can be **carried on**
+ * (`continuation`) are three questions with three answers, and the restart case is the one
+ * that proves they do not collapse:
+ *
+ * - after a restart the recorded session id is ours;
+ * - Claude Code may still have every word of it on disk, so the prose is `harness`;
+ * - the in-memory grant that let the agent act is gone, so `live` is false;
+ * - and the SDK *will* resume it, so `continuation` is `resume` and the conversation is
+ *   genuinely continuable.
+ *
+ * Collapsing the first two makes a readable conversation look dead. Collapsing the last two
+ * — which is what this screen did before S6 — makes every post-restart session look dead
+ * when both drivers would have continued it. And **getting `continuation` wrong in the
+ * other direction is worse**: a composer offered for a session the driver cannot continue is
+ * a message the operator writes and loses. So it is decided by asking the harness
+ * ({@link AgentHarness.sessionContinuation}) rather than by assuming, and by
+ * {@link importerReopen}, which is the *same* function `ScopeImporter.send` takes the
+ * decision with — so the promise this screen makes and the thing the server then does
+ * cannot disagree.
+ *
+ * ## The operator's own words are kept; this server's framing above them is not
+ *
+ * A planner round's replay drops its prompt whole: it is this server's assembly of a
+ * briefing and never the agent speaking. A conversation's `user` entries are **the
+ * operator**, so dropping one would leave the agent answering a question nobody can see —
+ * **except** that the first of them is not only the operator. The harness stores the
+ * opening prompt as one message, and that message is `assembleImporterPrompt`'s three
+ * kilobytes of rules with the operator's sentence at the bottom; replayed as it stands, the
+ * framing is the dominant content of the operator's own chat.
+ *
+ * So the framing is trimmed and the words are kept, and **there is nothing to guess**:
+ * `import/importerPrompt.ts` ends its framing with `IMPORTER_PROMPT_DELIMITER`, a fixed
+ * string it writes itself, and appends the operator's text after it unaltered — so
+ * {@link operatorTextOf} is an exact split. It is the same technique the goal replay uses
+ * one directory over, for the same reason.
+ *
+ * **It is not only the first entry.** A session this process has resumed gets
+ * `assembleImporterResumePrompt`, which puts its own three lines above the same delimiter,
+ * so a conversation that has been reconnected has framing on more than one of its `user`
+ * entries. The trim is per entry and the delimiter is the same string, so nothing here
+ * needed to change — but the note must not promise that only the first message was
+ * trimmed, and it does not.
+ */
+import {
+  type ImporterContinuation,
+  type ImporterConversationMessage,
+  type ImporterConversationView,
+  type ImporterSessionEndReason,
+} from "@bit/contracts";
+import { Effect, type Duration } from "effect";
+
+import { operatorTextOf } from "./importerPrompt";
+import {
+  SESSION_NOT_FOUND_TAG,
+  type AgentHarness,
+} from "../harness/agentHarness";
+import type { HarnessResolver } from "../harness/resolver";
+import { isRoleDirectoryId } from "../persistence/fleet";
+
+/** How long the harness is given to answer about one conversation. */
+export const IMPORTER_HISTORY_FETCH_TIMEOUT: Duration.Input = "5 seconds";
+
+/** How many messages one session's replay answers with before it says it stopped. */
+export const IMPORTER_HISTORY_READ_LIMIT = 400;
+
+/** The `import_sessions` row this reader needs, as the store answers it. */
+export interface RecordedImportSession {
+  readonly harnessSessionId: string;
+  readonly harnessInstanceId: string | null;
+  readonly endedReason: ImporterSessionEndReason | null;
+  /** `null` while the harness never confirmed creating the session. See the header. */
+  readonly confirmedAt: number | null;
+}
+
+/**
+ * What a message to an import this process does not hold will do.
+ *
+ * `resume` carries everything the reopen needs and nothing it would have to re-derive: the
+ * session to continue and the import whose directory the harness resolves it in — because
+ * that directory is where the policy gate has to be, and it is not the new import's.
+ */
+export type ImporterReopen =
+  | {
+      readonly _tag: "resume";
+      readonly sessionId: string;
+      /** The import whose directory the session runs in. The gate goes there. */
+      readonly directoryImportId: string;
+      readonly detail: string;
+    }
+  | { readonly _tag: "fresh"; readonly detail: string };
+
+/**
+ * Whether a message to this import can continue its harness session, asked of the harness.
+ *
+ * **Never fails, and a harness that cannot be asked answers `fresh`.** A fresh session
+ * always works; a resume that was promised and then refused is a message the operator
+ * loses. So every uncertainty resolves to the answer that cannot fail, with the reason in
+ * the sentence.
+ *
+ * ## The directory check, which is the half that is about authority rather than about resume
+ *
+ * Both drivers resolve the conversation through the directory the session was created in —
+ * OpenCode through the session's stored directory, answering `LocationNotFoundError` for
+ * one that is gone, and Claude Code through the project its `cwd` belongs to. That is the
+ * caveat S2.5 says to verify rather than assume, and verifying it costs one comparison.
+ *
+ * But the *reason* to verify is stronger than the caveat. **The pre-execution policy gate
+ * lives in the directory the session runs in** (`policy/install.ts`, and `fleet.ts`'s note
+ * on why the importer gets a directory of its own at all). A resume into a directory this
+ * server did not gate is an agent whose tool calls nothing is consulting — so the path the
+ * harness reports is not merely checked for existence, it is required to be **one of this
+ * target's own import directories**, rebuilt from the id in its last segment through
+ * `FleetPaths.importDirectory` and compared. Nothing is parsed out of the path and trusted:
+ * a segment that is not a usable role id, or a rebuilt path that does not match, is a
+ * `fresh` session.
+ *
+ * A harness that reports no directory at all is `fresh` for the same reason: there is
+ * nothing to match, and "we could not tell where it runs" is not permission to resume into
+ * it. The directory does not have to *exist* — the reopen calls `ensureImportDirectory` for
+ * it, which recreates a swept one and reinstalls the gate, which is also the answer to
+ * OpenCode's `LocationNotFoundError`.
+ */
+export const importerReopen = Effect.fnUntraced(function* (input: {
+  readonly harness: AgentHarness["Service"];
+  readonly targetId: string;
+  readonly sessionId: string;
+  /** `FleetPaths.importDirectory`, so this module builds no paths of its own. */
+  readonly importDirectory: (targetId: string, importId: string) => string;
+}) {
+  const asked = yield* Effect.result(
+    input.harness.sessionContinuation(input.sessionId),
+  );
+  if (asked._tag === "Failure") {
+    return {
+      _tag: "fresh",
+      detail: `the harness could not be asked whether it still holds session ${input.sessionId} — ${asked.failure.message}`,
+    } as const satisfies ImporterReopen;
+  }
+  if (asked.success._tag === "unresumable") {
+    return {
+      _tag: "fresh",
+      detail: asked.success.detail,
+    } as const satisfies ImporterReopen;
+  }
+  const directory = asked.success.directory;
+  if (directory === undefined) {
+    return {
+      _tag: "fresh",
+      detail: `the harness still holds session ${input.sessionId} but did not say which directory it resolves it in, and a session is only resumed into a directory this server has gated`,
+    } as const satisfies ImporterReopen;
+  }
+  const segment = directory.slice(directory.lastIndexOf("/") + 1);
+  const mine =
+    isRoleDirectoryId(segment) &&
+    input.importDirectory(input.targetId, segment) === directory;
+  return mine
+    ? ({
+        _tag: "resume",
+        sessionId: input.sessionId,
+        directoryImportId: segment,
+        detail: asked.success.detail,
+      } as const satisfies ImporterReopen)
+    : ({
+        _tag: "fresh",
+        detail: `the harness still holds session ${input.sessionId}, but it resolves it in '${directory}', which is not one of this target's own import directories — so it is not a directory this server gates, and the session is not resumed into it`,
+      } as const satisfies ImporterReopen);
+});
+
+/**
+ * {@link importerReopen} from a resolver and a row, for a caller that has not resolved the
+ * harness yet.
+ *
+ * `ScopeImporter.send` is that caller: the reopen path has a row and no harness. The two
+ * refusals it adds are the two the replay reports as `forgotten` for the same facts — no
+ * harness to ask, and a row naming an instance this server does not run, which must not be
+ * asked about because the harness we *do* have would answer a confident "no such session"
+ * for a session that may be alive elsewhere.
+ *
+ * Both answer `fresh`, which is what the composer was promised in those cases.
+ */
+export const importerReopenFor = Effect.fnUntraced(function* (input: {
+  readonly resolver: HarnessResolver["Service"];
+  readonly targetId: string;
+  readonly harnessSessionId: string;
+  readonly harnessInstanceId: string | null;
+  readonly importDirectory: (targetId: string, importId: string) => string;
+}) {
+  const resolved = yield* Effect.result(
+    input.resolver.resolve(input.harnessInstanceId ?? undefined),
+  );
+  if (resolved._tag === "Failure") {
+    return {
+      _tag: "fresh",
+      detail: resolved.failure.message,
+    } as const satisfies ImporterReopen;
+  }
+  if (
+    input.harnessInstanceId !== null &&
+    resolved.success.instance.instanceId !== input.harnessInstanceId
+  ) {
+    return {
+      _tag: "fresh",
+      detail: `it ran on harness instance '${input.harnessInstanceId}', which this server does not configure, so it cannot be asked about from here`,
+    } as const satisfies ImporterReopen;
+  }
+  return yield* importerReopen({
+    harness: resolved.success.harness,
+    targetId: input.targetId,
+    sessionId: input.harnessSessionId,
+    importDirectory: input.importDirectory,
+  });
+});
+
+/**
+ * What the chat says of a session this process does not hold, beside whatever prose came
+ * back.
+ *
+ * One sentence per continuation rather than one for all of them, because the operator's
+ * next action differs: a `resume` continues the conversation the words above belong to, and
+ * a `fresh` one starts a conversation the agent in it will not have read.
+ */
+const continuationNote = (reopen: ImporterReopen): string =>
+  reopen._tag === "resume"
+    ? ` This conversation was opened by a server process that is no longer running, so the authority behind it is gone — but the conversation itself is not: ${reopen.detail}. Your next message takes it back over, under a new import, and the importer in it keeps everything above.`
+    : ` This conversation was opened by a server process that is no longer running, and it cannot be carried on: ${reopen.detail}. Your next message starts a new session, and the importer in it will not have read any of this — what this session wrote is on the Scope tab and in the Estate.`;
+
+const empty = (input: {
+  readonly targetId: string;
+  readonly importId: string;
+  readonly harnessSessionId: string | null;
+  readonly live: boolean;
+  readonly continuation: ImporterContinuation;
+  readonly source: "pending" | "forgotten" | "none" | "absent";
+  readonly note: string;
+}): ImporterConversationView => ({
+  targetId: input.targetId,
+  importId: input.importId,
+  harnessSessionId: input.harnessSessionId,
+  live: input.live,
+  source: input.source,
+  continuation: input.continuation,
+  ephemeral: false,
+  note: input.note,
+  messages: [],
+  truncated: false,
+  // Nothing was left out, because nothing came back. A count here would imply there had
+  // been something to count.
+  omittedBlank: 0,
+  at: Date.now(),
+});
+
+/**
+ * What is said when framing was trimmed off one or more of the operator's own messages.
+ *
+ * Said rather than silent, for the reason every other omission on this shape is counted: a
+ * trimmed message looks shorter here than the thing the agent was actually given, and an
+ * operator comparing this screen against the harness's own log would otherwise find a
+ * message that does not match.
+ *
+ * **"Your messages", not "your first message".** It is the first one on a session that was
+ * opened once and never reconnected; a resumed session carries framing above the same
+ * delimiter on the first message of each authority period, so the count is *n*. A sentence
+ * naming only the first would be the understatement this note exists to prevent.
+ */
+const FRAMING_NOTE =
+  "Your messages are shown as you wrote them; the rules and instructions this server puts above them for the importer are not replayed.";
+
+/**
+ * The sentence appended to an answer about an import the operator ended.
+ *
+ * Separate from the two continuation notes because the fact is different in kind: the
+ * others are this process having let go of a session, and this one is the authority being
+ * over. The composer is disabled on it rather than offered.
+ */
+const ENDED_NOTE =
+  " You ended this import, so its authority has ended with it: the importer's tools refuse every write under it and no message is accepted. Start a new session to carry on.";
+
+/**
+ * One importer session's conversation, as the harness still has it.
+ *
+ * Never fails: every way of not having the prose is one of the five sources with a sentence
+ * of its own. A reader of this cannot be made to render an error for a session whose words
+ * the harness simply deleted.
+ */
+export const importerConversation = Effect.fnUntraced(function* (input: {
+  /**
+   * The resolver, as a parameter rather than from the context.
+   *
+   * `plan/goalNarration.ts`'s reason verbatim: a requirement yielded inside an HTTP handler
+   * becomes a per-request requirement of the *route*. `undefined` is a server with no
+   * harness configured at all, which is a different answer from a harness that would not
+   * answer and is reported as such.
+   */
+  readonly resolver: HarnessResolver["Service"] | undefined;
+  readonly targetId: string;
+  readonly importId: string;
+  readonly recorded: RecordedImportSession;
+  /** The session **this process** is holding for this import, if any. */
+  readonly liveSessionId: string | undefined;
+  /** `FleetPaths.importDirectory`. Passed in; see {@link importerReopen}. */
+  readonly importDirectory: (targetId: string, importId: string) => string;
+  readonly limit?: number | undefined;
+  readonly fetchTimeout?: Duration.Input | undefined;
+}) {
+  const limit = input.limit ?? IMPORTER_HISTORY_READ_LIMIT;
+  const base = { targetId: input.targetId, importId: input.importId };
+  const sessionId = input.recorded.harnessSessionId;
+  const live = input.liveSessionId === sessionId;
+  /*
+   * The operator's end is checked before anything else, and before the harness is asked.
+   *
+   * It is the one end that is final (`0027`): the toolkit refuses every write under it, so
+   * a composer offered here would be a message accepted into a session that can do nothing.
+   * The prose is still read and still shown — what was said is worth reading after the
+   * authority is over — but the continuation is `refused` whatever the harness answers.
+   */
+  const ended = input.recorded.endedReason === "operator";
+
+  /*
+   * Nothing has ever been said here: the row exists and the session does not.
+   *
+   * Before the harness is asked, because there is nothing to ask about — the id on the row
+   * may never have been minted. See this module's header on why this is its own answer.
+   */
+  if (input.recorded.confirmedAt === null) {
+    return empty({
+      ...base,
+      harnessSessionId: null,
+      live: false,
+      continuation: ended ? "refused" : "fresh",
+      source: "absent",
+      note: ended
+        ? `Nothing was ever said in import ${input.importId}: its session was never created.${ENDED_NOTE}`
+        : `Nothing was ever said in import ${input.importId}. Its index entry was written before its session existed, and the session was never created — so there is no conversation here rather than no words. Your next message opens one.`,
+    });
+  }
+
+  if (input.resolver === undefined) {
+    return empty({
+      ...base,
+      harnessSessionId: sessionId,
+      live,
+      continuation: ended ? "refused" : "fresh",
+      source: "forgotten",
+      note: `This server has no agent harness configured, so session ${sessionId} cannot be asked about and no message can be sent to it.${ended ? ENDED_NOTE : ""}`,
+    });
+  }
+
+  const resolved = yield* Effect.result(
+    input.resolver.resolve(input.recorded.harnessInstanceId ?? undefined),
+  );
+  if (resolved._tag === "Failure") {
+    return empty({
+      ...base,
+      harnessSessionId: sessionId,
+      live,
+      continuation: ended ? "refused" : "fresh",
+      source: "forgotten",
+      note: `${resolved.failure.message} This conversation's words can only come from the harness, so they are unavailable here. What this import wrote is unaffected: its entries are on the Scope tab and its assets in the Estate.${ended ? ENDED_NOTE : ""}`,
+    });
+  }
+  /*
+   * A row naming a *different* instance is foreign and is not asked about at all: the
+   * harness we do have would answer a confident "no such session" for a session that may be
+   * alive elsewhere. `run/transcript.ts`, `plan/roundNarration.ts` and the goal replay all
+   * refuse the same inference, and the picker disables the composer on the same fact.
+   */
+  if (
+    input.recorded.harnessInstanceId !== null &&
+    resolved.success.instance.instanceId !== input.recorded.harnessInstanceId
+  ) {
+    return empty({
+      ...base,
+      harnessSessionId: sessionId,
+      live,
+      continuation: ended ? "refused" : "fresh",
+      source: "forgotten",
+      note: `This session ran on harness instance '${input.recorded.harnessInstanceId}', which this server does not configure, so its words cannot be asked for here and it cannot be continued from here.${ended ? ENDED_NOTE : ""}`,
+    });
+  }
+
+  const harness = resolved.success.harness;
+  const displayName = resolved.success.instance.displayName;
+  /*
+   * What the next message will do, asked once and reported.
+   *
+   * Only for a session this process does not hold: a live one is continued by delivering
+   * into it, which needs no harness round trip and is the registry's answer rather than the
+   * harness's. Not asked for an ended import either — nothing will be sent to it.
+   */
+  const reopen: ImporterReopen | undefined =
+    live || ended
+      ? undefined
+      : yield* importerReopen({
+          harness,
+          targetId: input.targetId,
+          sessionId,
+          importDirectory: input.importDirectory,
+        });
+  const continuation: ImporterContinuation = ended
+    ? "refused"
+    : live
+      ? "live"
+      : (reopen?._tag ?? "fresh");
+  /** Appended to every note, because it is the same fact whether the prose came back or not. */
+  const standing = ended
+    ? ENDED_NOTE
+    : reopen === undefined
+      ? ""
+      : continuationNote(reopen);
+
+  const fetched = yield* Effect.result(
+    Effect.timeout(
+      harness.messages(sessionId),
+      input.fetchTimeout ?? IMPORTER_HISTORY_FETCH_TIMEOUT,
+    ),
+  );
+  if (fetched._tag === "Failure") {
+    const failure = fetched.failure;
+    /*
+     * "The harness has never heard of this session" and "we could not ask" are told apart
+     * and said differently, which is what `SESSION_NOT_FOUND_TAG` is on the seam for. Both
+     * are `forgotten` — the prose is not available either way — but an operator reading
+     * "harnesses delete their transcripts" knows there is nothing to wait for, and one
+     * reading "did not answer" knows there might be.
+     */
+    const deleted =
+      failure._tag === "HarnessTransportError" &&
+      (failure.tag === SESSION_NOT_FOUND_TAG || failure.status === 404);
+    return empty({
+      ...base,
+      harnessSessionId: sessionId,
+      live,
+      continuation,
+      source: "forgotten",
+      note:
+        (deleted
+          ? `${displayName} no longer holds session ${sessionId}. Harnesses keep their own transcripts for a while and then delete them, so this is the normal answer for a session left for a while. What it wrote is not affected: its entries are on the Scope tab and its assets in the Estate.`
+          : `${displayName} could not be asked about session ${sessionId} — ${failure.message} This is about reaching the harness, not about the conversation.`) +
+        standing,
+    });
+  }
+
+  if (fetched.success.length === 0) {
+    return empty({
+      ...base,
+      harnessSessionId: sessionId,
+      live,
+      continuation,
+      source: live ? "pending" : "none",
+      note: live
+        ? `${displayName} holds nothing for this session yet. What the importer says will appear here as it says it.`
+        : `${displayName} still holds session ${sessionId} and there are no messages under it: this session produced nothing. That is not the same as the harness having forgotten it.${standing}`,
+    });
+  }
+
+  /*
+   * The framing above each of the operator's messages, taken off before anything else.
+   *
+   * Before the blanks and before the limit, for the goal replay's reason in the same
+   * position: an entry whose text is about to change size should change size before a budget
+   * is spent on it. An entry with no delimiter in it is untouched — which is every entry
+   * but the openers, and is also the whole of an import started from links alone, whose
+   * opening prompt has no operator message below the line at all.
+   */
+  const trimmed = fetched.success.map((entry) => {
+    const operator = operatorTextOf(entry.text);
+    return operator === undefined ? entry : { ...entry, text: operator };
+  });
+  const framingOmitted = trimmed.some(
+    (entry, index) => entry.text !== fetched.success[index]?.text,
+  );
+  /*
+   * The blanks, dropped and counted.
+   *
+   * The reduced shape has no text for a `tool_use` or `tool_result` block, so each one
+   * arrives as an entry with an empty `text` and no error. That is the *majority* of an
+   * importer session — reading eight pages and writing thirty entries is almost all tool
+   * calls — which is why the count is said rather than quietly swallowed. An entry carrying
+   * an `error` is kept even with no text: a failure with no prose is still the importer
+   * telling us something.
+   *
+   * Unlike a round's replay, no `user` entry is dropped: they are the operator's. See this
+   * module's header.
+   */
+  const speaking = trimmed.filter(
+    (entry) => entry.text.trim() !== "" || entry.error !== undefined,
+  );
+  const omittedBlank = trimmed.length - speaking.length;
+  if (speaking.length === 0) {
+    return {
+      ...base,
+      harnessSessionId: sessionId,
+      live,
+      // Still `harness`, not `none`: the harness **does** hold this session and did answer
+      // about it. The session made tool calls and said nothing in words, which is a real
+      // state, and reporting it as `none` would collapse it into "the harness held nothing
+      // at all".
+      source: "harness",
+      continuation,
+      ephemeral: true,
+      note:
+        `From ${displayName}, which may delete it. Nothing here is words: everything the harness holds for this session is ` +
+        `${String(omittedBlank)} tool ${omittedBlank === 1 ? "call or result" : "calls and results"}, which the reduced replay shape carries no text for. What they wrote is on the Scope tab and in the Estate.` +
+        (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
+        standing,
+      messages: [],
+      truncated: false,
+      omittedBlank,
+      at: Date.now(),
+    } satisfies ImporterConversationView;
+  }
+
+  /*
+   * The newest messages, not the oldest, when there are more than the limit — and still
+   * oldest-first in the answer.
+   *
+   * The same end the goal replay keeps and for its reason: a conversation is read to pick up
+   * where it left off, which is at its end. What `truncated` therefore says is that the
+   * answer stopped short of the *oldest* messages, and the note says so in words so an
+   * operator does not read the first group on screen as the start of the session.
+   */
+  const kept =
+    speaking.length > limit
+      ? speaking.slice(speaking.length - limit)
+      : speaking;
+  return {
+    ...base,
+    harnessSessionId: sessionId,
+    live,
+    source: "harness",
+    continuation,
+    ephemeral: true,
+    note:
+      `From ${displayName}, which may delete it: this build stores no part of a conversation, so what is here lasts exactly as long as the harness keeps it. What the importer *wrote* is durable and is on the Scope tab and in the Estate.` +
+      ` Replayed messages carry no tool arguments and no call ids, so a tool call and its result are not paired as they are live.` +
+      (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
+      (omittedBlank > 0
+        ? ` ${String(omittedBlank)} tool ${omittedBlank === 1 ? "call or result is" : "calls and results are"} left out: the reduced shape carries no text for them.`
+        : "") +
+      (kept.length < speaking.length
+        ? ` Shortened to the most recent ${String(kept.length)} messages, so this does not start at the beginning of the session.`
+        : "") +
+      standing,
+    messages: kept.map((entry, index): ImporterConversationMessage => ({
+      index,
+      type: entry.type,
+      text: entry.text,
+      ...(entry.error === undefined ? {} : { error: entry.error }),
+    })),
+    truncated: kept.length < speaking.length,
+    omittedBlank,
+    at: Date.now(),
+  } satisfies ImporterConversationView;
+});

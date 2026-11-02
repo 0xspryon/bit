@@ -645,6 +645,8 @@ const withoutHarness = Layer.mergeAll(
   // with program links still has to be told why nothing read them. `start` refuses with a
   // sentence rather than pretending an import happened, which is what lets `createTarget`
   // have one code path either way (D15: a failed import is not a failed creation).
+  // `replay` still answers on this variant, with no resolver: an import nobody ever said
+  // anything in reads as absent rather than as a conversation something has forgotten.
   ScopeImporter.unavailable,
   // The registry the real importer would have written into. Empty, so the panel's read is
   // the same `ScopeImportNotFound` a forgotten import gets — which is the true answer on a

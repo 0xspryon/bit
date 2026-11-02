@@ -170,10 +170,23 @@ interface Script {
   /** Pages the scripted agent "could read". Anything else yields no calls at all. */
   readonly readable: Set<string>;
   readonly registrations: { url: string; bearer: string }[];
+  /**
+   * Sessions this scripted harness still holds, and the directory it resolves each in.
+   *
+   * Empty by default, which is a **restart with nothing resumable** — the state every S2 and
+   * S3 test was written against, and the state a harness that has swept its transcript is
+   * in. A test about resuming puts the session in here, with the directory the real drivers
+   * would report: the one it was created in.
+   */
+  readonly holds: Map<string, string>;
   /** Every `createSession`, with the flag that decides whether it outlives a turn. */
   readonly created: {
     sessionId: string;
     multiTurn: boolean;
+    /** The session continued rather than created, when this was a resume (S6). */
+    resume: string | undefined;
+    /** Where the session runs, which is where the gate went. */
+    directory: string;
     options: readonly ModelOptionSelection[] | undefined;
   }[];
   /** Every registration taken back, by session. */
@@ -236,6 +249,7 @@ interface Script {
 
 const newScript = (readable: readonly string[]): Script => ({
   readable: new Set(readable),
+  holds: new Map<string, string>(),
   registrations: [],
   created: [],
   unregistered: [],
@@ -272,6 +286,26 @@ const scriptedHarness = (script: Script) => {
       return minted === 1 ? "ses_import" : `ses_import_${String(minted)}`;
     },
     installGate: () => Effect.void,
+    /*
+     * What the harness still holds, which is the question S6 asks and `sessionStatus` is the
+     * wrong one for. `script.holds` is what a test says about it; anything not in there reads
+     * as swept, which is the default every other test here was written against.
+     */
+    sessionContinuation: (sessionId) => {
+      const directory = script.holds.get(sessionId);
+      return Effect.succeed(
+        directory === undefined
+          ? {
+              _tag: "unresumable",
+              detail: `the scripted harness holds no transcript for ${sessionId}`,
+            }
+          : {
+              _tag: "resumable",
+              directory,
+              detail: `the scripted harness still holds ${sessionId}`,
+            },
+      );
+    },
     createSession: (input) =>
       script.failCreate
         ? Effect.fail(
@@ -284,10 +318,14 @@ const scriptedHarness = (script: Script) => {
             }),
           )
         : Effect.sync(() => {
-            const id = input.sessionId ?? "ses_x";
+            // A resume names the session it continues and `sessionId` is ignored beside it,
+            // exactly as the seam says and as the Claude Agent SDK requires.
+            const id = input.resume ?? input.sessionId ?? "ses_x";
             script.created.push({
               sessionId: id,
               multiTurn: input.multiTurn === true,
+              resume: input.resume,
+              directory: input.directory,
               options: input.options,
             });
             return { id };
@@ -1292,10 +1330,16 @@ describe("a session that outlives its first turn", () => {
       "blog.acme.com",
     ]);
 
-    // The difference: one session, still registered, its grant still live.
-    expect(built.script.created).toEqual([
-      { sessionId: "ses_import", multiTurn: true, options: undefined },
-    ]);
+    // The difference: one session, still registered, its grant still live. Created rather
+    // than resumed, and in this import's own directory, which is where its gate went.
+    expect(built.script.created).toHaveLength(1);
+    expect(built.script.created[0]).toMatchObject({
+      sessionId: "ses_import",
+      multiTurn: true,
+      options: undefined,
+      resume: undefined,
+    });
+    expect(built.script.created[0]?.directory).toContain("/import/");
     expect(built.script.unregistered).toEqual([]);
     const bearer = built.script.registrations[0]?.bearer ?? "";
     const held = await authorityOf(runtime, bearer);
@@ -1493,6 +1537,38 @@ const sendTo = (
         importer.send({ targetId: TARGET, importId, text }),
       ),
     ),
+  );
+
+/**
+ * The replay, as the route asks for it: the row from this target's file, then the service.
+ *
+ * The row read is the route's own (`browserApi.ts`), copied here rather than reached for,
+ * because what is under test is the answer and not the HTTP shape — and because it is the
+ * read that decides a `404`, which this helper's callers never want.
+ */
+const replayOf = (
+  runtime: ManagedRuntime.ManagedRuntime<ScopeImporter | TargetStores, unknown>,
+  importId: string,
+) =>
+  runtime.runPromise(
+    Effect.gen(function* () {
+      const stores = yield* TargetStores;
+      const importer = yield* ScopeImporter;
+      const row = yield* withTargetStore(stores, TARGET, (store) =>
+        store.importSession(importId),
+      ).pipe(Effect.orDie);
+      if (row === undefined) throw new Error(`no row for ${importId}`);
+      return yield* importer.replay({
+        targetId: TARGET,
+        importId,
+        recorded: {
+          harnessSessionId: row.harnessSessionId,
+          harnessInstanceId: row.harnessInstanceId,
+          endedReason: row.endedReason,
+          confirmedAt: row.confirmedAt,
+        },
+      });
+    }),
   );
 
 describe("a turn into a live session", () => {
@@ -2133,6 +2209,221 @@ describe("a reopen", () => {
       null,
       null,
     ]);
+    await restarted.dispose();
+  });
+});
+
+/**
+ * Taking a conversation back over, rather than starting another one (S6).
+ *
+ * This is the half of S3.3's recorded cost that S6 pays off. Until now a reopen was always a
+ * *new harness session*, so one conversation became two rows in the picker and the composer
+ * moved to the second — the honest degradation the spec said would last "until S6 lands".
+ * It lands here: when the harness still holds the session and resolves it in a directory this
+ * server gates, the successor import continues that same session.
+ *
+ * What does **not** go away is the second import id. An import id names one authority period
+ * (`0027`), the credential behind the old one is gone with the process that held it, and
+ * `ended_at` is never cleared — so a new period gets a new id and a new row. The session index
+ * groups by `harness_session_id`, which is exactly why that cost was always invisible.
+ */
+describe("a reopen that resumes", () => {
+  /** Where the harness resolves a session it created for one import. */
+  const directoryOf = (root: string, importId: string) =>
+    join(root, "targets", TARGET, "import", importId);
+
+  test("continues the same harness session under a new import id, and the picker shows one row", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    // The harness keeps the conversation after this process is gone, and resolves it where
+    // it was created — which is the *first* import's directory, not the successor's.
+    built.script.holds.set(
+      "ses_import",
+      directoryOf(built.root, started.importId),
+    );
+    await runtime.dispose();
+
+    // A new process over the same files: nothing in memory, the row is all there is.
+    const restarted = ManagedRuntime.make(built.layer);
+    const reopened = await sendTo(restarted, started.importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+
+    expect(reopened.success.conversation).toBe("resumed");
+    // The conversation keeps its identity. This is the assertion S3.3 was waiting for.
+    expect(reopened.success.harnessSessionId).toBe("ses_import");
+    // And the authority period does not: a new id, a new row, a new credential.
+    expect(reopened.success.importId).not.toBe(started.importId);
+    expect(reopened.success.note).toContain("took the conversation back over");
+    expect(reopened.success.note).toContain("the same one");
+
+    // Resumed, not created, and in the directory the harness named — which is where the
+    // gate is installed, because the gate lives in the directory a session runs in.
+    const second = built.script.created.at(-1);
+    expect(built.script.created).toHaveLength(2);
+    expect(second?.resume).toBe("ses_import");
+    expect(second?.directory).toBe(directoryOf(built.root, started.importId));
+    expect(second?.multiTurn).toBe(true);
+
+    // Two authority periods on one session: two rows in the table, one row in the index.
+    expect(carriedOf(built.root)).toHaveLength(2);
+    const index = await indexOf(restarted);
+    expect(index).toHaveLength(1);
+    expect(index[0]?.harnessSessionId).toBe("ses_import");
+    expect(index[0]?.latestImportId).toBe(reopened.success.importId);
+    /*
+     * One entry in, not two, and the reason is worth the assertion: the resumed session's
+     * scripted agent added the same entry again, which is a no-op. S5.1's rule holds across
+     * a resume — the no-op writes a `scope.entry.added` with `created: false`, and the tally
+     * counts only the ones that created something, so the figure on the picker does not
+     * inflate because a conversation was taken back over.
+     */
+    expect(index[0]?.entriesIn).toBe(1);
+    await restarted.dispose();
+  });
+
+  test("the resumed session is not told the rules again: its history already has them", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    built.script.holds.set(
+      "ses_import",
+      directoryOf(built.root, started.importId),
+    );
+    const opener = built.script.prompts[0] ?? "";
+    await runtime.dispose();
+
+    const restarted = ManagedRuntime.make(built.layer);
+    await sendTo(restarted, started.importId, "Also the staging hosts.");
+    await built.script.done;
+
+    const resumed = built.script.prompts.at(-1) ?? "";
+    expect(resumed).not.toBe(opener);
+    expect(resumed).toContain("reconnected");
+    expect(resumed).toContain("Also the staging hosts.");
+    // None of the opener's rules, and none of its "read these pages": the session has both
+    // in its own history, and telling it to read them again would make it re-read them.
+    expect(resumed).not.toContain(SCOPE_IMPORT_DATA_NOT_INSTRUCTIONS);
+    expect(resumed).not.toContain("continues an earlier session");
+    expect(resumed.length).toBeLessThan(opener.length / 2);
+    await restarted.dispose();
+  });
+
+  test("a harness that has swept the session opens a fresh one instead, and says why", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    // `holds` left empty: the transcript is gone, which is the ordinary state of anything
+    // old enough on either driver.
+    await runtime.dispose();
+
+    const restarted = ManagedRuntime.make(built.layer);
+    const reopened = await sendTo(restarted, started.importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+
+    expect(reopened.success.conversation).toBe("opened");
+    expect(reopened.success.harnessSessionId).not.toBe("ses_import");
+    expect(reopened.success.note).toContain("could not be carried on");
+    expect(reopened.success.note).toContain("holds no transcript");
+    expect(built.script.created.at(-1)?.resume).toBeUndefined();
+    // And the picker is honest about it: two sessions, because there are two.
+    expect(await indexOf(restarted)).toHaveLength(2);
+    await restarted.dispose();
+  });
+
+  test("a session the harness resolves somewhere this server does not gate is not resumed", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    /*
+     * The harness says it still holds the session — and would resume it — but it runs it in
+     * the operator's own home directory. Resuming there is an agent whose tool calls nothing
+     * is consulting, because the pre-execution policy gate lives in the directory a session
+     * runs in. So a fresh session, in a directory this server gates.
+     */
+    built.script.holds.set("ses_import", workspace);
+    await runtime.dispose();
+
+    const restarted = ManagedRuntime.make(built.layer);
+    const reopened = await sendTo(restarted, started.importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+
+    expect(reopened.success.conversation).toBe("opened");
+    expect(reopened.success.note).toContain(
+      "not one of this target's own import directories",
+    );
+    expect(built.script.created.at(-1)?.resume).toBeUndefined();
+    expect(built.script.created.at(-1)?.directory).toContain("/import/");
+    await restarted.dispose();
+  });
+
+  test("a session closed by a refused prompt is resumed too, in the same process", async () => {
+    // Not only the restart case: a refused prompt closes the session (S2.2) and the
+    // conversation is still there to take back over.
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    built.script.holds.set(
+      "ses_import",
+      directoryOf(built.root, started.importId),
+    );
+    built.script.failSteer = true;
+    await sendTo(runtime, started.importId, "First try.");
+    built.script.failSteer = false;
+
+    const reopened = await sendTo(runtime, started.importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+
+    expect(reopened.success.conversation).toBe("resumed");
+    expect(reopened.success.harnessSessionId).toBe("ses_import");
+    expect(built.script.created.at(-1)?.resume).toBe("ses_import");
+    // One live grant: the closed session's went with its scope, and the resumed session has
+    // its own.
+    expect((await authorityOf(runtime, "")).size).toBe(1);
+    await runtime.dispose();
+  });
+
+  test("the replay reads the resumed conversation as one session, and offers to continue it", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    built.script.holds.set(
+      "ses_import",
+      directoryOf(built.root, started.importId),
+    );
+    await runtime.dispose();
+
+    const restarted = ManagedRuntime.make(built.layer);
+    // Before the message: the replay says the session is not held here and can be resumed,
+    // which is what the composer is enabled from.
+    const before = await replayOf(restarted, started.importId);
+    expect(before.live).toBe(false);
+    expect(before.continuation).toBe("resume");
+    expect(before.note).toContain("takes it back over");
+
+    const reopened = await sendTo(restarted, started.importId, "Continue.");
+    if (reopened._tag !== "Success") throw new Error("the message was refused");
+    await built.script.done;
+
+    // After it: the same session, now this process's, so the next message is delivered.
+    const after = await replayOf(restarted, reopened.success.importId);
+    expect(after.harnessSessionId).toBe("ses_import");
+    expect(after.live).toBe(true);
+    expect(after.continuation).toBe("live");
     await restarted.dispose();
   });
 });

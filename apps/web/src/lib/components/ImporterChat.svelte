@@ -38,8 +38,11 @@
    * **Every state that disables it is the server's**, never a guess from here: no harness
    * (the server answered `no_harness` to which model an import would run on), a stranded
    * session (its harness is not one the server lists), and a session the operator ended
-   * (`endedReason` on the server's row). A session the *server* let go of is not disabled —
-   * a message to it opens a fresh one, and the answer's note says so.
+   * (`endedReason` on the server's row, or `continuation: "refused"` on its replay). A
+   * session the *server* let go of is not disabled — a message to it either takes the
+   * conversation back over or opens a fresh one, and `ImporterHistory.continuation` is which
+   * of the two, so the note above the thread says what the next message will do rather than
+   * promising a resume the driver may not give (S6).
    *
    * ## Not wired, and said
    *
@@ -73,8 +76,17 @@
   let target = $derived(app.selected?.name ?? app.viewTargetId);
   /** Set when the session's harness is one this server does not run: see `strandedNote`. */
   let stranded = $derived(session?.strandedOn);
-  /** The operator ended it: the server refuses a message to it. */
-  let ended = $derived(session?.ended === true);
+  /**
+   * The operator ended it: the server refuses a message to it.
+   *
+   * From the index row's `endedReason`, and from the replay's `continuation` once that has
+   * answered — the same fact from two reads, and either is enough. The second matters
+   * because a row read before the operator ended the session in another tab says nothing
+   * about it, and a composer offered on that row is a message that will be refused.
+   */
+  let ended = $derived(
+    session?.ended === true || session?.history.continuation === "refused",
+  );
   /**
    * Which model an import would run on could not be had, so there is nothing to talk to. Only
    * an answer counts: an import model not asked for yet is not this. Two different
@@ -132,6 +144,24 @@
     box.setSelectionRange(box.value.length, box.value.length);
   }
 
+  /**
+   * What the page says above an earlier session the operator is reading, which depends on
+   * what the next message will actually do (S6).
+   *
+   * **The server decides, and this only words it.** `continuation` is the server's answer —
+   * it knows whether this process holds the session and, for one it does not, whether the
+   * harness will continue it, which is a round trip this page cannot make. Three readings,
+   * because the operator's next message lands somewhere different in each, and the one thing
+   * that must not happen is "resumes it" over a session that cannot be resumed.
+   */
+  let readingNote = $derived(
+    session?.history.continuation === "resume"
+      ? "You are reading an earlier session. Your next message takes it back over: the importer keeps everything above, and works against the scope as it stands now, not as it stood then."
+      : session?.history.continuation === "fresh"
+        ? "You are reading an earlier session that cannot be carried on. Your next message starts a new one, and the importer in it will not have read any of this — what this session wrote is on the Scope tab and in the Estate."
+        : "You are reading an earlier session. Your next message continues it, with the scope as it stands now, not as it stood then.",
+  );
+
   let placeholder = $derived(
     stranded !== undefined
       ? "This session's harness is not on this server, so it cannot be continued."
@@ -160,7 +190,7 @@
         : noModel
           ? app.importModelDetail
           : session?.reading
-            ? "You are reading an earlier session. Your first message resumes it, with the scope as it stands now, not as it stood then."
+            ? readingNote
             : ""}
     empty="Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread."
   >

@@ -6,11 +6,14 @@
  *
  * **The list is real.** {@link begin} and {@link syncIndexed} put the target's indexed
  * sessions (`GET .../importer-sessions`) in the picker, each with its model, time, running
- * flag and tally. **What was said before this page opened is not**: there is no way to read
- * a session's history yet (S6), so an indexed session opens empty with a note saying why.
- * Sending into one posts, and what the importer says back is live (below).
- * `ImporterChat.svelte` and `TitleBar.svelte` read these fields and know nothing about which
- * is which; {@link ImporterSession.indexed} is what tells them apart.
+ * flag and tally. **And what was said in one is real too, since S6**: opening an indexed
+ * session reads its conversation back from the harness
+ * (`GET .../importer-sessions/:importId/messages`, {@link #loadHistory}) and with it the
+ * server's own account of what the next message will do — continue the live session, resume
+ * one this process let go of, open a fresh one, or be refused. Sending into one posts, and
+ * what the importer says back is live (below). `ImporterChat.svelte` and `TitleBar.svelte`
+ * read these fields and know nothing about which is which;
+ * {@link ImporterSession.indexed} is what tells them apart.
  *
  * The nine scenarios the state picker loads ({@link load}) never touch the server and are
  * wholly declared (`mockImporter.ts`), which is what lets an operator inspect a state
@@ -55,12 +58,17 @@
  * `pending` for ever. The same is true of Stop, which is what lets the prototype show that
  * state at all.
  */
-import type { ImporterTurnAccepted, LiveItem } from "@bit/contracts";
+import type {
+  ImporterConversationView,
+  ImporterTurnAccepted,
+  LiveItem,
+} from "@bit/contracts";
 
 import { operatorTurn } from "./chat";
 import {
   NO_HISTORY,
   buildImporterChat,
+  historyOf,
   importerFeed,
   type ImporterGroup,
   type ImporterSession,
@@ -133,6 +141,22 @@ export interface ImporterServer {
   /** Says `text` to one import's session. */
   readonly send: (importId: string, text: string) => Promise<ImporterSent>;
   /**
+   * Reads one import's conversation back from the harness (S6), with the activity publish
+   * order the read is to be joined at.
+   *
+   * The floor comes back from here rather than being taken by the caller because it must be
+   * taken **before the request leaves**: anything published after that is the live tail and
+   * must not be dropped. `undefined` is a read that did not answer, which leaves the session
+   * exactly as it was — a thread that will not load is better than one that claims the
+   * harness said nothing.
+   */
+  readonly history: (
+    importId: string,
+  ) => Promise<
+    | { readonly view: ImporterConversationView; readonly floor: number }
+    | undefined
+  >;
+  /**
    * Reads the session list again: after an accepted message, so the session it landed in
    * is listed with the server's figures, and after an `import_ended` refusal, so the
    * session the operator ended reads as ended and the composer stops offering it.
@@ -172,6 +196,17 @@ export class ImporterSessions {
    */
   #live: () => readonly LiveItem[] = () => [];
   #sent = 0;
+  /**
+   * The imports whose conversation is being read right now, by import id.
+   *
+   * **One request per session, and this is what makes that true rather than nearly true.**
+   * {@link #loadHistory} is reached from two places — opening a session, and the index
+   * arriving, because a session can be opened by id before the list naming it has come back
+   * — and `loaded` is only set when an answer lands, so without this the two overlap and ask
+   * twice. Three times, measured: `openImporter` opens the session and then reads the index,
+   * which reads it again.
+   */
+  readonly #reading = new Set<string>();
   /** Stops watching the turn in flight, if one is being watched. */
   #unwatch: (() => void) | undefined = undefined;
   /** The import {@link #unwatch} is for. */
@@ -220,6 +255,9 @@ export class ImporterSessions {
             floors: this.current.floors,
             live: this.#live(),
             importId: this.current.importId,
+            // The replay/live boundary. Undefined on a session whose words were never asked
+            // for, which takes nothing away: it has no replay to collide with.
+            historyFloor: this.current.historyFloor,
           }),
           working: this.current.working,
         }),
@@ -250,6 +288,7 @@ export class ImporterSessions {
   begin(indexed: readonly ImporterSession[], server?: ImporterServer): void {
     const fresh = mockNewSession(this.#now());
     this.#stopWatching();
+    this.#reading.clear();
     this.#server = server;
     this.draft = "";
     this.notice = "";
@@ -280,7 +319,14 @@ export class ImporterSessions {
     const touched = new Map(
       this.sessions
         .filter(
-          (session) => session.indexed === true && session.items.length > 0,
+          (session) =>
+            session.indexed === true &&
+            // Anything of the operator's in it, **or** a replay that has already arrived
+            // (S6). Without the second half a re-read would put the `loading` history back
+            // over an answer that had come, and the page would ask for it again for ever —
+            // and the floor would go with it, so the live tail would double up against the
+            // replay that replaced it.
+            (session.items.length > 0 || session.loaded === true),
         )
         .map((session) => [session.id, session]),
     );
@@ -294,6 +340,10 @@ export class ImporterSessions {
             history: kept.history,
             items: kept.items,
             ...(kept.floors === undefined ? {} : { floors: kept.floors }),
+            ...(kept.historyFloor === undefined
+              ? {}
+              : { historyFloor: kept.historyFloor }),
+            ...(kept.loaded === undefined ? {} : { loaded: kept.loaded }),
             reading: kept.reading,
           };
     });
@@ -314,6 +364,9 @@ export class ImporterSessions {
     ) {
       this.#watch(current.importId);
     }
+    // And its words, if this is the first list that named it: `openImporter` can open a
+    // session by id before the index has arrived, so the read cannot only hang off `open`.
+    if (current !== undefined) void this.#loadHistory(current);
   }
 
   /** Puts the prototype into one of the states the brief shows. */
@@ -321,6 +374,7 @@ export class ImporterSessions {
     const now = this.#now();
     const earlier = mockEarlierSessions(now);
     this.#stopWatching();
+    this.#reading.clear();
     this.#server = undefined;
     this.notice = "";
     this.refused = false;
@@ -399,7 +453,65 @@ export class ImporterSessions {
       if (opened.working && opened.importId !== undefined) {
         this.#watch(opened.importId);
       }
+      void this.#loadHistory(opened);
     }
+  }
+
+  /**
+   * Reads one session's conversation back from the harness, once (S6).
+   *
+   * **Once, and that is what keeps a message off the screen twice.** The replay contains
+   * every word the harness held when it answered, and the floor it is joined at is taken
+   * before the request leaves — so everything this tab mints or receives afterwards is
+   * strictly after it. A second read would need the goal chat's `replayedThrough` machinery
+   * to cancel this tab's own rows against it, and there is nothing to gain by it: what the
+   * importer says after the read arrives live.
+   *
+   * Does nothing without a server (the state picker's scenarios declare their own history),
+   * for a session with no import to address, or for one that has already been read. A read
+   * that fails leaves the session alone, `loading`, rather than claiming an answer.
+   *
+   * **And nothing for a session this tab has anything of its own in**, which is the other
+   * half of "no message appears twice" and the half the floor cannot do. The operator's
+   * first message comes back in the replay as a `user` entry — the harness stores it, and
+   * the server trims its framing off — so a replay installed over a thread that already
+   * holds this tab's own `turn.operator` row for the same sentence shows it twice. The goal
+   * chat answers that with `replayedThrough` and a counted text match because it re-reads
+   * after every opening send; this reads once, before anything has been typed, so the bound
+   * is simply "has anything been typed" — checked again when the answer lands, because the
+   * operator may have typed during the round trip, and then the answer is **dropped**. A
+   * replay that is not shown is a worse screen than one that is; a sentence shown twice is a
+   * screen the operator cannot trust.
+   */
+  async #loadHistory(session: ImporterSession): Promise<void> {
+    const server = this.#server;
+    const importId = session.importId;
+    if (
+      server === undefined ||
+      importId === undefined ||
+      session.loaded === true ||
+      session.items.length > 0 ||
+      this.#reading.has(importId)
+    ) {
+      return;
+    }
+    this.#reading.add(importId);
+    const answered = await server
+      .history(importId)
+      .finally(() => this.#reading.delete(importId));
+    if (answered === undefined) return;
+    // The page was left or reset meanwhile: nothing here is the answer's to change.
+    if (this.#server !== server) return;
+    this.#replace(session.id, (before) =>
+      before.loaded === true || before.items.length > 0
+        ? before
+        : {
+            ...before,
+            history: historyOf(answered.view),
+            historyFloor: answered.floor,
+            loaded: true,
+          },
+    );
   }
 
   /**

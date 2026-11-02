@@ -30,7 +30,10 @@
  * 7. {@link AgentHarness.prompt} — give the session its task.
  * 8. {@link AgentHarness.waitForIdle} — block until the session is no longer running.
  * 9. {@link AgentHarness.sessionStatus}, {@link AgentHarness.interruptSession},
- *    {@link AgentHarness.messages} — settle, stop, read back.
+ *    {@link AgentHarness.messages} — settle, stop, read back. And
+ *    {@link AgentHarness.sessionContinuation} beside them, which asks the one thing a
+ *    conversation needs and a run does not: whether a session this process no longer holds
+ *    can be talked to again.
  * 10. {@link AgentHarness.unregisterMcpServer} — take the registration away again when
  *    the credential it carried is revoked.
  *
@@ -46,7 +49,10 @@
  *   here because both harnesses happen to offer a read-back, and it is *not* built on in
  *   this slice: the two retain transcripts very differently and choosing a transcript
  *   format is a later slice's decision. What this interface promises is that asking is
- *   possible, not that the answer is durable.
+ *   possible, not that the answer is durable. {@link AgentHarness.sessionContinuation} is
+ *   the same promise about *continuing* rather than reading, and it answers "no" as a value
+ *   rather than as a failure, because "the harness swept it" is the ordinary end state of
+ *   anything old enough.
  * - **A separate "create" and "prompt".** Nothing here says those are two round trips.
  *   OpenCode's are; Claude Code's `query()` is one call that does session, prompt and
  *   stream together, and its implementation closes that gap by holding the session's
@@ -137,6 +143,41 @@ export interface SessionStatus {
 export interface SessionRef {
   readonly id: string;
 }
+
+/**
+ * Whether a session **this process does not hold** can be carried on, and where.
+ *
+ * Asked because the two drivers keep a conversation after the process that opened it is
+ * gone, and neither keeps it unconditionally. S2.5's research settled what each one does;
+ * this is the seam that makes the answer a value instead of an assumption, so a composer is
+ * never offered for a message that would fail.
+ *
+ * `_tag: "resumable"` means the harness will continue this conversation if asked —
+ * {@link AgentHarness.createSession}'s `resume`. It is **not** a claim that the session is
+ * running: it is not, on either driver, and nothing here says otherwise.
+ *
+ * `directory` is where the harness itself will resolve the session's work, and the caller
+ * has to care about it for two reasons rather than one. OpenCode resolves a prompt through
+ * the session's *stored* directory and answers `LocationNotFoundError` if it is gone; Claude
+ * Code finds a transcript under the project its `cwd` hashes to. And the pre-execution
+ * policy gate lives *in* that directory, so a resume into a directory we did not gate is an
+ * ungated agent. A caller that cannot match this against the directory it is about to gate
+ * must open a fresh session instead of resuming.
+ *
+ * `undefined` is "the harness did not say", which is not permission to guess.
+ */
+export type SessionContinuation =
+  | {
+      readonly _tag: "resumable";
+      readonly directory: string | undefined;
+      /** The harness's own sentence about what it still holds. */
+      readonly detail: string;
+    }
+  | {
+      readonly _tag: "unresumable";
+      /** The harness's own sentence about why not: swept, never saved, unknown. */
+      readonly detail: string;
+    };
 
 /** One entry of a session's message log, reduced to what this application reads. */
 export interface MessageEntry {
@@ -541,6 +582,32 @@ export class AgentHarness extends Context.Service<
        * conversation unanswerable from its second message on.
        */
       readonly multiTurn?: boolean | undefined;
+      /**
+       * Continue this existing session of this harness instead of creating one.
+       *
+       * **The conversation was never ours and was never in memory** (S2.5): Claude Code
+       * keeps a JSONL transcript on disk and OpenCode a row in one SQLite file, so both can
+       * be talked to again by a process that did not open them. What died with the old
+       * process is the live handle and the credential — so a resume is: this call, then the
+       * credential, then the MCP registration, then a prompt. The acquire order is unchanged
+       * and `harness/liveAgentSessions.ts` is still the only thing that runs it.
+       *
+       * The answer's `id` is this same session id: a resume keeps the conversation's
+       * identity, which is the point of it.
+       *
+       * **{@link sessionId} is ignored when this is set**, and that is not a convenience —
+       * the Claude Agent SDK refuses `sessionId` for an id that already has turns ("already
+       * in use") and documents the two as mutually exclusive unless forking. A caller passes
+       * one or the other.
+       *
+       * {@link directory} must be the directory the harness itself resolves the session in
+       * ({@link SessionContinuation.directory}), not a fresh one: see there.
+       *
+       * Nothing checks here that the session exists. Ask
+       * {@link sessionContinuation} first; this call reports the harness's refusal if you
+       * did not.
+       */
+      readonly resume?: string | undefined;
     }) => Effect.Effect<SessionRef, HarnessFailure>;
     /**
      * Makes our MCP endpoint reachable from one session, under one credential.
@@ -644,6 +711,23 @@ export class AgentHarness extends Context.Service<
     readonly sessionStatus: (
       sessionId: string,
     ) => Effect.Effect<SessionStatus, HarnessFailure>;
+    /**
+     * Whether a session this process no longer holds can be continued (S6).
+     *
+     * **A different question from {@link sessionStatus}, deliberately asked separately.**
+     * That one asks how a session's last turn *ended* and both drivers answer it badly for a
+     * session from a dead process — which is a recorded defect in worker and round recovery,
+     * and is S7's to fix. This asks only whether the conversation is still there to be
+     * talked to, which both drivers answer precisely: Claude Code from the transcript's own
+     * metadata, OpenCode from the session row. Nothing here reads an outcome, and a caller
+     * of this learns nothing about whether a turn is running.
+     *
+     * Never used to decide that a session *is* live. A session this process holds is live
+     * because this process holds it, and that is the registry's answer, not the harness's.
+     */
+    readonly sessionContinuation: (
+      sessionId: string,
+    ) => Effect.Effect<SessionContinuation, HarnessFailure>;
     /**
      * One session's messages, as the harness retains them: **oldest first, and all of
      * them.**

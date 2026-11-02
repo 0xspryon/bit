@@ -101,8 +101,23 @@ const createGatedSession = (
     readonly directory: GatedDirectory;
     readonly sessionId: string;
     readonly options?: readonly ModelOptionSelection[] | undefined;
+    /** An existing session to continue rather than create. See {@link OpenPlan.resume}. */
+    readonly resume?: string | undefined;
   },
-) => harness.createSession({ ...input, multiTurn: true });
+) =>
+  harness.createSession({
+    title: input.title,
+    model: input.model,
+    directory: input.directory,
+    ...(input.options === undefined ? {} : { options: input.options }),
+    // One or the other, never both: the seam says `sessionId` is ignored beside `resume`,
+    // and the Claude Agent SDK refuses the pair for an id that already has turns. Said
+    // here, once, so no surface has to remember it.
+    ...(input.resume === undefined
+      ? { sessionId: input.sessionId }
+      : { resume: input.resume }),
+    multiTurn: true,
+  });
 
 /** One session this process is holding, as the registry knows it. */
 export interface LiveAgentSession<Meta> {
@@ -195,6 +210,25 @@ export interface OpenPlan<Meta> {
    */
   readonly options?: readonly ModelOptionSelection[] | undefined;
   readonly sessionId: string;
+  /**
+   * An existing session of this harness to **continue** instead of creating one (S6).
+   *
+   * The whole acquire order is unchanged — gated directory, session, credential,
+   * registration, prompt — and that is the point: a resumed session gets a fresh credential
+   * and a fresh registration in a scope this registry owns, so it is held and closed exactly
+   * like one this process opened. What differs is only that step two creates nothing.
+   *
+   * **{@link ensureDirectory} must make the directory the harness itself resolves that
+   * session in** (`AgentHarness.sessionContinuation`), not a new one. Both drivers need it:
+   * OpenCode resolves a prompt through the session's stored directory and refuses a missing
+   * one, and Claude Code finds a transcript under the project its `cwd` belongs to. More
+   * importantly it is where the policy gate goes, so a resume into a directory the surface
+   * did not gate would be an ungated agent — and the surface, not this module, is what can
+   * tell whether the harness's path is one of ours.
+   *
+   * {@link sessionId} is ignored when this is set.
+   */
+  readonly resume?: string | undefined;
   readonly title: string;
   /** Makes the role directory. Gated by the spine and by no other code path. */
   readonly ensureDirectory: Effect.Effect<
@@ -431,9 +465,10 @@ export const makeLiveAgentSessions = <Meta>(
      * also the authority boundary (DECISIONS.md §24.2) — the only session in it is this one,
      * which is what makes a credential with no expiry containable.
      *
-     * **2. The session, `multiTurn`.** Set here rather than by the plan, because a session
-     * this registry holds is by definition one that outlives a turn; a session closed when it
-     * went idle could not take the second message.
+     * **2. The session, `multiTurn`** — or, with {@link OpenPlan.resume}, the session the
+     * harness already has, named rather than created. `multiTurn` is set here rather than by
+     * the plan, because a session this registry holds is by definition one that outlives a
+     * turn; a session closed when it went idle could not take the second message.
      *
      * **3. The credential, then the registration**, both in the session's scope, so both go
      * when {@link closeSession} closes it.
@@ -456,6 +491,7 @@ export const makeLiveAgentSessions = <Meta>(
           directory,
           sessionId: plan.sessionId,
           ...(plan.options === undefined ? {} : { options: plan.options }),
+          ...(plan.resume === undefined ? {} : { resume: plan.resume }),
         });
         if (plan.afterCreate !== undefined) yield* plan.afterCreate(created.id);
         return { created, directory };

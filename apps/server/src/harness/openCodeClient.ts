@@ -978,6 +978,26 @@ export const openCodeHarness = (
       const createSession: AgentHarness["Service"]["createSession"] = Effect.fn(
         "openCodeHarness.createSession",
       )(function* (input) {
+        /*
+         * A resume creates nothing, because there is nothing to create.
+         *
+         * An OpenCode session is a row in one SQLite file under the user's XDG data
+         * directory, and a freshly spawned server finds it by primary key — so "continue the
+         * conversation" is an ordinary `session.prompt`, and this call has no work to do but
+         * name the session the rest of the acquire order will register and prompt. Calling
+         * `session.create` with the existing id would be asking the server to create
+         * something it already has.
+         *
+         * **The model and its variant are not re-pinned**, and that is a statement rather
+         * than an omission: OpenCode keeps both on the session's own model reference, set at
+         * creation, with `session.switchModel` as the only other way in. A resumed session
+         * therefore runs on what it was opened with — which is what the caller wants, since
+         * a reopen passes the earlier session's model and options back. The context limit is
+         * not noted either: this process never saw this session created, and the honest
+         * answer for its window is no answer rather than the catalogue's figure for a model
+         * reference we are guessing at.
+         */
+        if (input.resume !== undefined) return { id: input.resume };
         const session = yield* bounded(
           "session.create",
           timeouts.control,
@@ -1128,6 +1148,51 @@ export const openCodeHarness = (
           tokens: session.tokens as Record<string, unknown> | undefined,
         };
       });
+
+      /**
+       * Whether the server still has this session to prompt, and the directory it runs in.
+       *
+       * **`session.get`, reading `location.directory` and deliberately not `outcome`.** The
+       * outcome field is the one the known OpenCode recovery defect turns on — a restarted
+       * server answers no outcome for a session that is not running, and `harnessStatus.ts`
+       * maps that to `running` — and nothing here touches it. The question asked is only
+       * whether the row is there, which is the question `session.prompt` will put to the
+       * same server a moment later.
+       *
+       * The directory is reported because it is the one thing that can make a resume fail
+       * after the lookup succeeds: OpenCode resolves a prompt through the session's *stored*
+       * directory and answers `LocationNotFoundError` for one that no longer exists. The
+       * caller is the only thing that knows whether that path is a directory it is prepared
+       * to gate and to recreate, so it gets the path rather than a verdict.
+       *
+       * A `404` is an answer — the session is gone, and on this driver that means the
+       * database no longer holds it — while any other failure is a failure: "we could not
+       * ask" must not read as "it is not there".
+       */
+      const sessionContinuation: AgentHarness["Service"]["sessionContinuation"] =
+        Effect.fn("openCodeHarness.sessionContinuation")(function* (sessionId) {
+          const asked = yield* Effect.result(
+            bounded(
+              "session.get",
+              timeouts.control,
+              api.session.get({ sessionID: sessionId as Session.ID }),
+            ),
+          );
+          if (asked._tag === "Failure") {
+            if (asked.failure.status === 404) {
+              return {
+                _tag: "unresumable",
+                detail: `this OpenCode server holds no session ${sessionId}; its sessions live in one database under the user's data directory, so a session it cannot find has been deleted rather than merely not loaded`,
+              };
+            }
+            return yield* Effect.fail(asked.failure);
+          }
+          return {
+            _tag: "resumable",
+            directory: asked.success.location.directory,
+            detail: `OpenCode still holds session ${sessionId}, so the conversation can be carried on with an ordinary prompt`,
+          };
+        });
 
       /**
        * The session's messages, oldest first, all of them.
@@ -1281,6 +1346,7 @@ export const openCodeHarness = (
         prompt,
         waitForIdle,
         sessionStatus,
+        sessionContinuation,
         messages,
         interruptSession,
         sessionEvents,

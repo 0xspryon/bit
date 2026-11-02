@@ -1,9 +1,10 @@
 /**
- * The importer's two prompts, against plain strings (S3.1).
+ * The importer's three prompts, against plain strings (S3.1, S6).
  *
  * `scopeImporter.test.ts` asserts what reaches a scripted harness; this is the arrangement
- * itself: the opener carries the rules once, the follow-up carries none of them, and a page
- * the operator types is read out of their words exactly.
+ * itself: the opener carries the rules once, the follow-up and the resume carry none of
+ * them, a page the operator types is read out of their words exactly, and the operator's own
+ * sentence comes back out of a stored prompt exactly.
  */
 import { describe, expect, test } from "bun:test";
 
@@ -13,7 +14,9 @@ import {
   IMPORTER_PROMPT_DELIMITER,
   assembleImporterFollowUpPrompt,
   assembleImporterPrompt,
+  assembleImporterResumePrompt,
   operatorPages,
+  operatorTextOf,
 } from "./importerPrompt";
 
 const PAGE = "https://hackerone.com/acme/policy";
@@ -117,5 +120,74 @@ describe("the pages in an operator's message", () => {
     expect(
       operatorPages(["ftp://acme.test", "acme.com", "https://"].join("\n")),
     ).toEqual([]);
+  });
+});
+
+describe("the resume prompt (S6)", () => {
+  const message = "Also load the staging hosts";
+
+  test("carries none of the opener: the session has the rules in its own history", () => {
+    const prompt = assembleImporterResumePrompt({ message });
+    expect(prompt).not.toContain(SCOPE_IMPORT_DATA_NOT_INSTRUCTIONS);
+    expect(prompt).not.toContain("Rules that matter more than coverage");
+    expect(prompt).not.toContain("add_scope_entry");
+    expect(prompt).not.toContain("has not given you any pages");
+  });
+
+  test("says what actually changed — the authority, not the job — and that earlier writes stand", () => {
+    const prompt = assembleImporterResumePrompt({ message });
+    expect(prompt).toContain("reconnected");
+    expect(prompt).toContain("new import");
+    // The failure this prevents: an agent that cannot tell its earlier writes are recorded
+    // re-reads every page, and one not told its grant is new finds out through a 401.
+    expect(prompt).toContain("recorded earlier is still");
+    expect(prompt).toContain("read_scope");
+  });
+
+  test("puts the operator's words below the same delimiter, so a later replay trims it", () => {
+    const prompt = assembleImporterResumePrompt({ message });
+    expect(prompt.endsWith(`${IMPORTER_PROMPT_DELIMITER}${message}`)).toBe(
+      true,
+    );
+    expect(operatorTextOf(prompt)).toBe(message);
+  });
+});
+
+describe("the operator's words out of a stored prompt (S6)", () => {
+  test("an opener splits exactly, framing above and the sentence below", () => {
+    const message = "Read the policy page and say what is in scope";
+    const prompt = assembleImporterPrompt({
+      targetName: "Acme",
+      links: [],
+      message,
+    });
+    expect(operatorTextOf(prompt)).toBe(message);
+  });
+
+  test("a message with the delimiter's own words in it still splits at the real boundary", () => {
+    // `indexOf` takes the first occurrence, and the only operator-supplied strings above the
+    // line are page addresses — which cannot contain whitespace. So a delimiter typed *in*
+    // the message is below the boundary and stays in the message.
+    const message = `before\n${IMPORTER_PROMPT_DELIMITER}after`;
+    const prompt = assembleImporterPrompt({
+      targetName: "Acme",
+      links: [],
+      message,
+    });
+    expect(operatorTextOf(prompt)).toBe(message);
+  });
+
+  test("a prompt this module put no framing above is undefined, not a guess", () => {
+    // A caller that gets `undefined` shows the text as it is. Inventing a boundary would be
+    // rewriting a stored message.
+    expect(
+      operatorTextOf(assembleImporterFollowUpPrompt({ message: "go" })),
+    ).toBe(undefined);
+    expect(
+      operatorTextOf(
+        assembleImporterPrompt({ targetName: "Acme", links: [PAGE] }),
+      ),
+    ).toBe(undefined);
+    expect(operatorTextOf("something from another build")).toBe(undefined);
   });
 });

@@ -24,7 +24,7 @@ import {
   splitCode,
 } from "../src/lib/chat";
 import {
-  INDEXED_HISTORY,
+  LOADING_HISTORY,
   NO_HISTORY,
   buildImporterChat,
   importerFeed,
@@ -164,22 +164,30 @@ describe("one group per operator message", () => {
     );
   });
 
-  test("a history this page cannot read is still said once a message has been typed into it", () => {
-    // `INDEXED_HISTORY` is the page saying it cannot read this session's words. That does not
-    // stop being true after one message, and without it the continuation of an old session
-    // looks exactly like a brand-new one.
-    const groups = buildImporterChat({
-      history: INDEXED_HISTORY,
-      working: false,
-      items: [operator(1, "also the staging hosts")],
-    });
-
-    expect(groups.map((group) => group.key)).toEqual(["earlier", "turn:1"]);
-    expect(groups[0]?.prose).toEqual({
-      _tag: "pending",
-      note: INDEXED_HISTORY.note,
-    });
-    // And it is not said when there is nothing to say: a plain history opens at the turn.
+  test("an absence is said before anything else, and only while there is nothing else", () => {
+    /*
+     * Each absence gets the leading group while the session is otherwise empty, and loses it
+     * once there is a turn to speak for itself. That changed with S6: until then an indexed
+     * session carried a stand-in `pending` note saying this page could not read its words,
+     * and that note had to survive the first message. The page reads them now, so `pending`
+     * means what the server means by it — a session that has not spoken yet — and a turn's
+     * own prose says that better than a group above it.
+     */
+    expect(
+      buildImporterChat({
+        history: LOADING_HISTORY,
+        working: false,
+        items: [],
+      }).map((group) => group.key),
+    ).toEqual(["earlier"]);
+    expect(
+      buildImporterChat({
+        history: LOADING_HISTORY,
+        working: false,
+        items: [operator(1, "also the staging hosts")],
+      }).map((group) => group.key),
+    ).toEqual(["turn:1"]);
+    // And nothing is said when there is nothing to say: a plain history opens at the turn.
     expect(
       buildImporterChat({
         history: NO_HISTORY,
@@ -187,6 +195,21 @@ describe("one group per operator message", () => {
         items: [operator(1, "go")],
       }).map((group) => group.key),
     ).toEqual(["turn:1"]);
+  });
+
+  test("an import nobody ever said anything in says so, in the server's words", () => {
+    // `absent` is not an absence of words but an absence of a conversation: the row was
+    // written before the session existed and the session was never created. Reporting it
+    // with the harness's "I no longer hold that session" would tell an operator their
+    // message had been lost.
+    const note = "Nothing was ever said in import imp_7.";
+    const groups = buildImporterChat({
+      history: history({ source: "absent", note }),
+      working: false,
+      items: [],
+    });
+    expect(groups.map((group) => group.key)).toEqual(["earlier"]);
+    expect(groups[0]?.prose).toEqual({ _tag: "none", note });
   });
 
   test("an empty session has no groups at all", () => {
@@ -569,7 +592,7 @@ describe("a session the server lists", () => {
     );
   });
 
-  test("is held with the server's figures, its running flag, and no invented conversation", () => {
+  test("is held with the server's figures, its running flag, and a conversation not yet asked for", () => {
     const held = indexedSession(
       importerSessionView({
         sessionId: "ses_x",
@@ -587,9 +610,16 @@ describe("a session the server lists", () => {
       tally: { in: 7, out: 3, assets: 14, messages: null },
       items: [],
     });
-    // It says why there is no conversation, rather than showing the empty thread.
-    expect(held.history.source).toBe("pending");
-    expect(held.history.note).toContain("does not read the session's messages");
+    /*
+     * `loading`, which is this tab having asked and not heard back — not `pending`, which is
+     * the *server's* answer about a session that exists and has not spoken. The row says the
+     * session exists and says nothing about what was said in it, so the words are a second
+     * request (S6) and this is the page waiting for it. It carries no note: "still loading"
+     * is drawn rather than written, and every sentence on this screen is the server's.
+     */
+    expect(held.history.source).toBe("loading");
+    expect(held.history.note).toBe("");
+    expect(held.loaded).toBeUndefined();
     // And an unknown count is not the empty session: it keeps a time label.
     expect(sessionLabel(held)).toMatch(/^Session /);
   });
@@ -818,5 +848,93 @@ describe("the importer's words from the live feed", () => {
     ]);
     // The latest turn is live: something has been said in it.
     expect(groups.at(-1)?.prose._tag).toBe("live");
+  });
+
+  /**
+   * The replay/live boundary (S6), which is one comparison and has to be exactly right.
+   *
+   * The replay contains every word the harness held when it answered, so narration published
+   * at or below the floor is on screen twice unless it is dropped — and narration published
+   * *after* it is the live tail and must not be.
+   */
+  test("narration the replay already holds is dropped, and everything after the floor is kept", () => {
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [
+        said(10, "in the replay"),
+        said(20, "also in the replay"),
+        said(21, "arrived after the read"),
+      ],
+      importId: "imp_1",
+      historyFloor: 20,
+    });
+    expect(feed.map((each) => each.body)).toEqual(["arrived after the read"]);
+  });
+
+  test("a record is kept whatever the floor: it is durable, and the replay never holds one", () => {
+    // `scope.entry.added` carries no activity order, and dropping it would lose the half of
+    // the screen that survives a reload.
+    const record = {
+      ...item({ kind: "scope.entry.added", body: "acme.com" }),
+      id: "event:7",
+      origin: "record" as const,
+      importId: "imp_1",
+    } satisfies LiveItem;
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [record, said(5, "in the replay")],
+      importId: "imp_1",
+      historyFloor: 99,
+    });
+    expect(feed).toEqual([record]);
+  });
+
+  test("no floor keeps everything: a session whose words were never asked for has no replay to collide with", () => {
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [said(5, "early"), said(6, "later")],
+      importId: "imp_1",
+    });
+    expect(feed.map((each) => each.body)).toEqual(["early", "later"]);
+  });
+
+  test("the whole boundary: a replayed turn, then a live one, and nothing in both", () => {
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        messages: [
+          { index: 0, type: "user", text: "Read the page" },
+          { index: 1, type: "assistant", text: "two in, one out" },
+        ],
+      }),
+      items: importerFeed({
+        own: [second],
+        floors,
+        live: [
+          // The same words the replay holds, as narration published before the read.
+          said(10, "two in, one out"),
+          said(25, "and staging is in too"),
+        ],
+        importId: "imp_1",
+        historyFloor: 20,
+      }),
+      working: false,
+    });
+    expect(
+      groups.map((group) => [
+        group.subject.message,
+        group.replayed.map((message) => message.text),
+        group.rows.map((row) => row.item.body),
+      ]),
+    ).toEqual([
+      // The replayed turn: the operator's own sentence, with the reply under it.
+      ["Read the page", ["two in, one out"], []],
+      // Then the live one. The reply is in exactly one of them.
+      ["And staging", [], ["and staging is in too"]],
+    ]);
   });
 });

@@ -1487,6 +1487,59 @@ const fleetHandlers = HttpApiBuilder.group(
       }),
 
       /**
+       * One import session's conversation, replayed from the harness (S6).
+       *
+       * The target is checked here and the import inside the importer — which reads the row
+       * from this target's own file — so a stale deep link, or an id belonging to another
+       * target, is a `404` rather than a `200` about somebody else's session. After that
+       * this route **cannot fail**: every way of having no prose is one of
+       * `ImporterConversationSource`'s five answers with a sentence, and for a session last
+       * opened weeks ago "the harness has deleted it" is the expected answer rather than a
+       * fault.
+       *
+       * Three things it says that no other route can. `live` is whether *this process* holds
+       * the session. `continuation` is whether the next message will continue it, resume it,
+       * open a new one, or be refused — asked of the harness, with the same function `send`
+       * acts on, so the composer this enables is one that will work. And `source: "absent"`
+       * is an import whose session was never created, which is a different fact from a
+       * conversation whose words are gone.
+       */
+      importerMessages: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        /*
+         * The import's own row, read here rather than inside the importer.
+         *
+         * `transcript`'s arrangement one route up, and for its two reasons. It is where the
+         * harness session id and the pinned instance live, which is what the read needs. And
+         * it is what tells an import this target does not hold — a genuine mistake, refused —
+         * from an import whose prose is gone, which is the *normal* end state of anything old
+         * enough and answers `200` with a sentence. The row also carries a third thing
+         * neither of those is: `confirmedAt`, which is null for an import whose session was
+         * never created, where nothing was ever said.
+         */
+        const session = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.importSession(params.importId),
+        ).pipe(Effect.orDie);
+        if (session === undefined || session.targetId !== row.targetId) {
+          return yield* new ScopeImportNotFound({
+            reason: "unknown_import",
+            importId: params.importId,
+            detail: `no scope import '${params.importId}' is recorded on target '${row.targetId}', so there is no conversation to read`,
+          });
+        }
+        return yield* importer.replay({
+          targetId: row.targetId,
+          importId: params.importId,
+          recorded: {
+            harnessSessionId: session.harnessSessionId,
+            harnessInstanceId: session.harnessInstanceId,
+            endedReason: session.endedReason,
+            confirmedAt: session.confirmedAt,
+          },
+        });
+      }),
+
+      /**
        * Stops one import, keeping everything it has already written.
        *
        * The same target check, and the same refusal for an import of another target: a

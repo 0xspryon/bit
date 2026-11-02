@@ -55,7 +55,17 @@
  * Auto-load page's composer may have no links at all, only what the operator typed. That
  * message goes **last and below {@link IMPORTER_PROMPT_DELIMITER}**, unaltered, so the
  * framing above it is plainly this server's and the words below it plainly a person's — and
- * so a replay (S6) can split the stored first prompt exactly rather than guess.
+ * so a replay (S6) can split the stored first prompt exactly rather than guess. That split
+ * is {@link operatorTextOf}, and it is this file's half of S6.
+ *
+ * ## A third, for a session that is resumed rather than opened
+ *
+ * {@link assembleImporterResumePrompt} is the first message into a session this process has
+ * taken back over from a process that is gone (S6). The rules and the pages are already in
+ * the session's own history — resending them would be the opener's cost paid twice — but the
+ * grant behind the tools is new, and so is the import the writes are filed under. Its three
+ * lines say that and nothing about the job. The operator's words sit below the same
+ * delimiter, so a later replay trims it the same way.
  *
  * ## What a page is, in a conversation
  *
@@ -78,6 +88,32 @@ import { SCOPE_IMPORT_DATA_NOT_INSTRUCTIONS } from "@bit/contracts";
  * replay to trim the framing at rather than a heuristic over prose.
  */
 export const IMPORTER_PROMPT_DELIMITER = `THE OPERATOR'S MESSAGE FOLLOWS.\n\n${"-".repeat(70)}\n\n`;
+
+/**
+ * The operator's own words out of a stored prompt, or `undefined`.
+ *
+ * `plan/goalPrompt.ts`'s `operatorTextOf`, for its reasons and with its contract.
+ * `undefined` for anything this module did not put framing above — a later message, which
+ * travels verbatim ({@link assembleImporterFollowUpPrompt}), or an entry from some other
+ * build — and a caller that gets `undefined` must show the text exactly as it is: inventing
+ * a boundary would be rewriting a stored message.
+ *
+ * **This is what makes S6's split of the first message exact rather than a heuristic.** The
+ * harness stores an opening prompt as one `user` message, and that message is this server's
+ * framing — about three kilobytes of rules — with the operator's sentence at the bottom.
+ * Replayed whole it is the dominant content of the operator's own chat. The boundary is a
+ * fixed string this module writes and the operator's text is appended after it unaltered,
+ * so the split is exact.
+ *
+ * It splits at the **first** occurrence, which is safe because the only operator-supplied
+ * strings above the line are program page addresses, and {@link operatorPages} and
+ * `ProgramLink` both refuse anything with whitespace in it — so no page can carry the
+ * delimiter's two lines and move the boundary.
+ */
+export const operatorTextOf = (text: string): string | undefined => {
+  const at = text.indexOf(IMPORTER_PROMPT_DELIMITER);
+  return at < 0 ? undefined : text.slice(at + IMPORTER_PROMPT_DELIMITER.length);
+};
 
 export interface ImporterPromptInput {
   readonly targetName: string;
@@ -246,6 +282,45 @@ export const assembleImporterPrompt = (input: ImporterPromptInput): string => {
 export const assembleImporterFollowUpPrompt = (input: {
   readonly message: string;
 }): string => input.message;
+
+/**
+ * The first message into a session this process has **resumed** (S6).
+ *
+ * Not {@link assembleImporterPrompt} and not
+ * {@link assembleImporterFollowUpPrompt}, because the situation is neither of theirs. The
+ * rules, the tool guidance and the pages are already in the session's own history — this is
+ * the same conversation, read back from the harness — so resending the opener would be the
+ * cost and the drift S3.1 exists to avoid, and would tell the agent to read pages it has
+ * already read. But it is not quite a later message either: the authority behind it is new.
+ *
+ * **Three lines of framing, and they are about authority rather than about the job.** The
+ * session was opened by a server process that is gone; its MCP server has been registered
+ * again, under a new credential and a new import id, so the tools work but are a different
+ * grant. An agent told nothing would be the one that notices by getting a `401` — and, worse
+ * for the operator, might re-read every page because it cannot tell that its earlier writes
+ * are still recorded. So it is told that its earlier work stands and to call `read_scope`
+ * before writing.
+ *
+ * The operator's words go below the same {@link IMPORTER_PROMPT_DELIMITER} as an opener's,
+ * so {@link operatorTextOf} trims this framing out of a later replay exactly as it trims an
+ * opener's. A resumed conversation therefore has *two* entries with framing on it rather
+ * than one, which is why nothing downstream promises that only the first message was
+ * trimmed.
+ */
+export const assembleImporterResumePrompt = (input: {
+  readonly message: string;
+}): string =>
+  [
+    `This conversation has been reconnected. The server process that opened this session is`,
+    `no longer running, so your tools have been registered again under a fresh grant: they`,
+    `work, and they now write under a new import. Everything you recorded earlier is still`,
+    `recorded — call read_scope before you write anything, and do not record an entry twice.`,
+    `Your rules, the pages you were given and what you have already said are above, in this`,
+    `same conversation.`,
+    "",
+    ...IMPORTER_PROMPT_DELIMITER.split("\n").slice(0, -1),
+    input.message,
+  ].join("\n");
 
 /**
  * The pages an operator's message is *about*, in the order they were typed.

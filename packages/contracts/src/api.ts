@@ -71,6 +71,7 @@ import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
 import {
   ImporterConversationRefused,
+  ImporterConversationView,
   ImporterMessageDraft,
   ImporterModelView,
   ImporterSessionsView,
@@ -1531,6 +1532,33 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
           TargetNotFound,
           TargetUnavailable,
         ],
+      },
+    ),
+    /**
+     * One importer session's conversation, replayed from the harness (S6).
+     *
+     * **Oldest first and all of them**, which is what `AgentHarness.messages` promises after
+     * the `openCodeClient` fix (`order: "asc"`, following the cursor): a conversation is read
+     * to pick up where it left off, and a replay that started at the newest would hand an
+     * operator the end of a thread with no beginning. `truncated` says when the answer
+     * stopped short, and it stops short of the **oldest**.
+     *
+     * Reduced to the `{ type, text, error }` shape the goal replay already answers with, so
+     * the chat needs no second renderer. A `user` entry is the operator's own words, with
+     * this server's framing trimmed off at the delimiter it wrote itself.
+     *
+     * The import is checked against the target first, so a stale deep link is a `404` rather
+     * than a `200` about somebody else's session. After that this **cannot fail**: every way
+     * of having no prose is one of {@link ImporterConversationSource}'s five answers with a
+     * sentence of its own.
+     */
+    HttpApiEndpoint.get(
+      "importerMessages",
+      "/targets/:targetId/importer-sessions/:importId/messages",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        success: ImporterConversationView,
+        error: [ScopeImportNotFound, TargetNotFound, TargetUnavailable],
       },
     ),
     /**

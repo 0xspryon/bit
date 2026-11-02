@@ -6791,10 +6791,11 @@ const makeStore = Effect.fnUntraced(function* () {
       pages: Schema.NullOr(Schema.fromJsonString(Schema.Array(Schema.String))),
       ended_at: Schema.NullOr(Schema.Finite),
       ended_reason: Schema.NullOr(ImportSessionEndReason),
+      session_created_at: Schema.NullOr(Schema.Finite),
     }),
     execute: (importId) =>
       sql`SELECT target_id, harness_session_id, harness_instance_id, model,
-                 model_options, pages, ended_at, ended_reason
+                 model_options, pages, ended_at, ended_reason, session_created_at
             FROM import_sessions
             WHERE import_id = ${importId}`,
   });
@@ -6823,6 +6824,7 @@ const makeStore = Effect.fnUntraced(function* () {
         pages: value.pages,
         endedAt: value.ended_at,
         endedReason: value.ended_reason,
+        confirmedAt: value.session_created_at,
       }),
     });
   });
@@ -8853,6 +8855,18 @@ export class ObservationStore extends Context.Service<
           readonly pages: readonly string[] | null;
           readonly endedAt: number | null;
           readonly endedReason: ImportSessionEndReason | null;
+          /**
+           * When the harness confirmed creating the session this row names (`0025`), or
+           * `null` while it never did.
+           *
+           * **`null` is "nothing was ever said in this import", which is a different fact
+           * from every other kind of silence.** The row is written before the session exists,
+           * so an unconfirmed row names an id the harness may never have minted — and a
+           * replay of it must answer "nobody has talked to this yet" rather than the
+           * harness's "I no longer hold that session", which would tell an operator their
+           * message had been lost.
+           */
+          readonly confirmedAt: number | null;
         }
       | undefined,
       DatabaseError | StoredRowError

@@ -37,6 +37,7 @@ import type {
   GoalView,
   IntentView,
   HarnessInstanceView,
+  ImporterConversationView,
   ImporterModelView,
   ImporterSessionView,
   ImporterTurnAccepted,
@@ -240,6 +241,35 @@ export const importerTurnAccepted = (
   pagesAdded: [],
   pagesNotAdded: [],
   acceptedAt: AT,
+  ...over,
+});
+
+/**
+ * One importer session's replay (S6), as the harness still has it.
+ *
+ * `harness` with two messages by default, because that is the answer every other field on
+ * the shape is about; a test that wants one of the other four sources says which, and
+ * `continuation` is separate from it on purpose — a `forgotten` session may still be
+ * resumable and a `harness` one may not be.
+ */
+export const importerConversationView = (
+  over: Partial<ImporterConversationView> = {},
+): ImporterConversationView => ({
+  targetId: "acme-corp",
+  importId: "imp_1",
+  harnessSessionId: "ses_1",
+  live: false,
+  source: "harness",
+  continuation: "resume",
+  ephemeral: true,
+  note: "From the harness, which may delete it.",
+  messages: [
+    { index: 0, type: "user", text: "Read the policy page" },
+    { index: 1, type: "assistant", text: "Two entries in, one out." },
+  ],
+  truncated: false,
+  omittedBlank: 0,
+  at: AT,
   ...over,
 });
 
@@ -1145,6 +1175,11 @@ export class FakeServer implements ServerClient {
   ) => Answer<"openImporterConversation"> = (_baseUrl, targetId) =>
     ok(importerTurnAccepted({ targetId, conversation: "opened" }));
 
+  onImporterMessages: (
+    ...args: Parameters<ServerClient["importerMessages"]>
+  ) => Answer<"importerMessages"> = (_baseUrl, targetId, importId) =>
+    ok(importerConversationView({ targetId, importId }));
+
   onSendImporterMessage: (
     ...args: Parameters<ServerClient["sendImporterMessage"]>
   ) => Answer<"sendImporterMessage"> = (_baseUrl, targetId, importId) =>
@@ -1341,6 +1376,11 @@ export class FakeServer implements ServerClient {
   ) =>
     this.record("sendImporterMessage", args, () =>
       this.onSendImporterMessage(...args),
+    );
+
+  importerMessages = (...args: Parameters<ServerClient["importerMessages"]>) =>
+    this.record("importerMessages", args, () =>
+      this.onImporterMessages(...args),
     );
 
   startScopeImport = (...args: Parameters<ServerClient["startScopeImport"]>) =>

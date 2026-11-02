@@ -374,6 +374,27 @@ and the composer moves to it — one conversation shown as two. That is the hone
 and the picker should not pretend otherwise. It becomes genuinely free only when a reopen can
 resume the same harness session, which is S6.
 
+**Half of that cost is now gone, and S6 says which half.** When the harness still holds the
+session and resolves it in a directory this server gates, a reopen passes `resume` and the
+successor import runs on the **same `harness_session_id`** — so the session index, which
+groups by that column, shows one conversation as one row again, the composer stays on it, and
+the tally keeps counting. The accepted turn says `conversation: "resumed"` rather than
+`"opened"`, and the chat's thread continues rather than starting over.
+
+**The import id still changes, and that half is not a degradation.** An import id names one
+_authority period_: the credential behind the old one died with the process that held it,
+`ended_at` is never cleared, and a fresh session under the old id would have every write
+refused. A new period gets a new id and a new row. That was never the cost the picker paid —
+the index groups by session and tallies across every `caller_scope` of it — so there is
+nothing left to pay off.
+
+**What remains is the case the harness cannot answer for**: a swept transcript, a session
+killed before its first prompt was saved (neither resumable nor re-creatable), a session the
+harness resolves in a directory this server does not gate, or a harness that could not be
+asked. Each of those is still a new session and still two rows, and the replay says which and
+why before the operator types — `ImporterConversationView.continuation`, which is `resume` or
+`fresh` and never a guess.
+
 ### S3.4 — A session the operator opens with no links
 
 Today an import exists because `createTarget` was given links. The Assets screen's composer can
@@ -565,15 +586,56 @@ and we do not keep a copy).
 The goal chat solves this with a narration floor the caller owns; `importerChat.ts` already takes
 replayed turns first and live ones after, and expects the caller to hold the floor. S6 supplies it.
 
+### S6.4 — Continuing a session this process no longer holds, and the two checks it needs
+
+`AgentHarness.createSession` takes a `resume`, and the spine passes one or the other — never
+both, because the Claude Agent SDK documents `sessionId` and `resume` as mutually exclusive
+and refuses a `sessionId` that already has turns ("already in use"). On Claude Code a resume is
+a fresh `query({ options: { resume: id } })`; on OpenCode `createSession` does nothing at all
+and the ordinary prompt continues the row.
+
+**The `resume_return` dialog cannot stall us, and that is checkable rather than hopeful.** The
+SDK emits a `request_user_dialog` only for a `dialog_kind` the client declared in
+`supportedDialogKinds`, and its own doc says "omitting the option entirely means no dialogs are
+emitted, even with `onUserDialog` wired". We pass neither, so a dialog-gated flow degrades to
+its no-dialog behaviour. If either option is ever added, this caveat comes back.
+
+**Whether a session can be continued is a seam question, not an assumption**:
+`AgentHarness.sessionContinuation` answers `resumable` with the directory the harness resolves
+the session in, or `unresumable` with a reason. Claude Code answers it from
+`getSessionInfo` — no info is a swept transcript, info with no `firstPrompt` is the
+metadata-only transcript that can be neither resumed nor recreated, and info with one is
+resumable in its `cwd`. OpenCode answers it from `session.get`, reading `location.directory`
+and deliberately **not** `outcome`: that field is the one the recorded OpenCode recovery defect
+turns on, and nothing added in S6 reads it.
+
+**The directory is checked, and the reason is authority rather than resume.** Both drivers
+resolve a conversation through the directory it was created in, so a swept directory is
+OpenCode's `LocationNotFoundError` — which `ensureImportDirectory` fixes by recreating it. But
+the pre-execution policy gate lives _in_ that directory, so a resume into a directory this
+server did not gate is an agent whose tool calls nothing is consulting. The path the harness
+reports is therefore required to be one of **this target's own import directories**, rebuilt
+from the id in its last segment through `FleetPaths.importDirectory` and compared; anything
+else, including a harness that reports no directory, is a fresh session. That also means the
+resumed session is gated and run in the **original** import's directory, not the successor's.
+
 ### Done criteria
 
-- [ ] The route exists and answers the reduced shape, oldest first, with a `truncated` flag.
-- [ ] All five `source` values are reachable and each renders its own sentence; a test covers
+- [x] The route exists and answers the reduced shape, oldest first, with a `truncated` flag.
+- [x] All five `source` values are reachable and each renders its own sentence; a test covers
       `forgotten`.
-- [ ] A session reopened after a close shows its history and accepts a new message (OpenCode).
-- [ ] A session from a dead process on Claude Code shows its history and offers a _new_ session
-      with a sentence saying why, not a composer that will fail.
-- [ ] No message appears twice across the replay/live boundary.
+- [x] A session reopened after a close shows its history and accepts a new message. _Verified
+      against Claude Code live, and in tests for both paths; OpenCode's free tier and the z.ai
+      plan were exhausted, so the OpenCode driver's half is tests only._
+- [x] A session from a dead process shows its history and offers either a continuation or a
+      _new_ session with a sentence saying which and why, never a composer that will fail.
+      `ImporterConversationView.continuation` is the field, and `ScopeImporter.send` acts on
+      the same function that answers it, so the promise and the behaviour cannot drift.
+- [x] No message appears twice across the replay/live boundary. Two mechanisms, because there
+      are two kinds of duplicate: narration is dropped at or below `historyFloor`, the activity
+      publish order taken before the read; and the replay is asked for **once**, when a session
+      is opened and before anything is typed into it, so this tab's own `turn.operator` rows
+      cannot collide with the `user` entries the harness holds for the same sentences.
 
 ---
 
@@ -778,7 +840,14 @@ unconditionally, and which path `--stdio` takes was not established. **Settle th
 
 A second, smaller defect alongside it: `Execution.Started` updates `time_busy` but never clears
 `idle_outcome`, so a multi-turn OpenCode session mid-turn-two reports turn one's outcome.
-Nothing reads `sessionStatus` for importer or goal sessions today. S6 and S7 will.
+Nothing reads `sessionStatus` for importer or goal sessions today. **S6 shipped without
+reading it, deliberately**: "how did this session's last turn end" and "is this conversation
+still there to talk to" are two questions, the first is the one both drivers answer badly for a
+session from a dead process, and only the second is S6's. So S6 added
+`AgentHarness.sessionContinuation` beside `sessionStatus` rather than leaning on it — Claude
+Code answers it from the transcript's own metadata, OpenCode from `session.get`'s
+`location.directory` — and nothing in the importer's replay or reopen path reads an outcome.
+The defect is untouched and no wider. S7 is still where it is fixed.
 
 Suggested direction, not a decision: treat "no outcome while not busy in this process" as
 uncertain rather than `running`, deriving it from `time_busy`/`time_idle` and the execution

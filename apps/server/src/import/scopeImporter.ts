@@ -118,6 +118,7 @@ import {
   ImporterConversationRefused,
   SCOPE_IMPORT_MAX_LINKS,
   ScopeImportNotFound,
+  type ImporterConversationView,
   type ImporterTurnAccepted,
   type ImportModelDraft,
   type ModelOptionSelection,
@@ -132,12 +133,19 @@ import {
   Layer,
   Semaphore,
   Stream,
+  type Duration,
 } from "effect";
 
+import {
+  importerConversation,
+  importerReopenFor,
+  type RecordedImportSession,
+} from "./importerHistory";
 import { resolveImporterModel } from "./importerModel";
 import {
   assembleImporterFollowUpPrompt,
   assembleImporterPrompt,
+  assembleImporterResumePrompt,
   operatorPages,
 } from "./importerPrompt";
 import { ScopeImportProgress, widenPages } from "./progress";
@@ -313,6 +321,25 @@ export interface ScopeImportRequest {
    */
   readonly predecessor?: string | undefined;
   /**
+   * The harness session this import **continues** rather than creates (S6).
+   *
+   * Present when the harness said it still holds the predecessor's session and resolves it
+   * in a directory this server gates ({@link importerReopen}). Then the new import is a new
+   * *authority period* on the same conversation: a new id, a new row, a new credential and a
+   * new registration — and the same `harness_session_id`, which is what makes the session
+   * index show one conversation as one row again (S3.3's recorded cost, half paid off).
+   *
+   * `directoryImportId` is the import whose directory the **harness** resolves the session
+   * in, which is the original opening's and not this one's. The session is created — or
+   * rather continued — in that directory, so the gate is installed there, which is the only
+   * place it can be: the hook lives in the directory the agent runs commands in.
+   *
+   * Absent for every other open, including a reopen that could not resume.
+   */
+  readonly resume?:
+    | { readonly sessionId: string; readonly directoryImportId: string }
+    | undefined;
+  /**
    * The operator's pick, when they touched the importer's picker: `ImportModelDraft` as it
    * arrived.
    *
@@ -394,6 +421,26 @@ export class ScopeImporter extends Context.Service<
       ImporterTurnAccepted,
       ImporterConversationRefused | ScopeImportNotFound
     >;
+    /**
+     * One import session's conversation as a reloaded tab replays it, from the harness (S6).
+     *
+     * **Cannot fail**, which is `import/importerHistory.ts`'s whole shape: every way of
+     * having no prose is one of five answers with a sentence of its own. The row is the
+     * caller's to read and to refuse an unknown id on — a stale deep link is a mistake and a
+     * swept transcript is not, and only the route knows which store to look in.
+     *
+     * It also answers what the **next message** will do — deliver, resume, open a fresh
+     * session, or be refused — by asking the harness, with the same function {@link send}
+     * then acts on. That is what makes a composer offered here one that will work.
+     */
+    readonly replay: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+      /** The import's own row, read by the caller. See {@link RecordedImportSession}. */
+      readonly recorded: RecordedImportSession;
+      readonly limit?: number | undefined;
+      readonly fetchTimeout?: Duration.Input | undefined;
+    }) => Effect.Effect<ImporterConversationView>;
   }
 >()("bit/import/ScopeImporter") {
   /**
@@ -640,6 +687,15 @@ export class ScopeImporter extends Context.Service<
         /** The earlier session's pages, for the opener. See `ScopeImportRequest`. */
         readonly earlierPages: readonly string[];
       }) {
+        /*
+         * A resume continues a conversation; everything else about this function is the same.
+         *
+         * Two things change and they are both in `prepare`: the directory is the one the
+         * harness resolves the session in (so the gate goes where the agent runs), and the
+         * opening prompt is the short reconnection note rather than the whole opener, because
+         * the rules and the pages are already in the session's own history.
+         */
+        const resume = input.request.resume;
         const harness = input.harness;
         const opened = yield* Effect.result(
           sessions.open<
@@ -662,9 +718,19 @@ export class ScopeImporter extends Context.Service<
                 : { options: input.options }),
               sessionId: input.sessionId,
               title: `bit scope importer: ${input.request.targetName}`,
+              ...(resume === undefined ? {} : { resume: resume.sessionId }),
+              /*
+               * The session's directory, which on a resume is **not** this import's.
+               *
+               * Both drivers resolve a conversation through the directory it was created in,
+               * and the gate lives in that directory — so a resumed session is gated and run
+               * where the harness will actually resolve it (`importerReopen` checked that the
+               * path is one of this target's own). `ensureImportDirectory` recreates it if it
+               * was swept, which is also the answer to OpenCode's `LocationNotFoundError`.
+               */
               ensureDirectory: fleet.ensureImportDirectory(
                 input.request.targetId,
-                input.importId,
+                resume?.directoryImportId ?? input.importId,
               ),
               // The engagement folder, so the containment check can refuse an import
               // directory inside it. `undefined` says this target has none.
@@ -702,12 +768,14 @@ export class ScopeImporter extends Context.Service<
                   sessionId,
                 }),
               openingPrompt: () =>
-                assembleImporterPrompt({
-                  targetName: input.request.targetName,
-                  links: input.links,
-                  message: input.message,
-                  earlierPages: input.earlierPages,
-                }),
+                resume !== undefined && input.message !== undefined
+                  ? assembleImporterResumePrompt({ message: input.message })
+                  : assembleImporterPrompt({
+                      targetName: input.request.targetName,
+                      links: input.links,
+                      message: input.message,
+                      earlierPages: input.earlierPages,
+                    }),
               meta: undefined,
             }),
             opened: (entry) => Effect.succeed(entry),
@@ -929,7 +997,9 @@ export class ScopeImporter extends Context.Service<
           "a scope import",
         );
         const importId = newImportId();
-        const sessionId = harness.newSessionId();
+        // A resume names the session it continues: minting a fresh id would start a second
+        // conversation and leave the session index showing one as two (S3.3).
+        const sessionId = request.resume?.sessionId ?? harness.newSessionId();
         /*
          * Still opening, from this instant: see `inFlight`. And, for a reopen, the old id's
          * successor — written here rather than once the session opens, so a caller that stops
@@ -1416,6 +1486,24 @@ export class ScopeImporter extends Context.Service<
               (yield* progress.linksOf(input.importId)) ?? [],
               row.pages ?? [],
             ).pages;
+            /*
+             * Resume the conversation, or open a new one, according to what the harness
+             * actually still holds (S6).
+             *
+             * The same function the replay route answers `continuation` with, so what the
+             * composer was told and what happens here cannot disagree — which is the whole
+             * point of it being a function rather than a branch in each place. It never
+             * fails: a harness that cannot be asked, a transcript that was swept, a session
+             * killed before its first prompt, a directory this server does not gate — all
+             * four are a fresh session, with the reason in the sentence.
+             */
+            const reopen = yield* importerReopenFor({
+              resolver,
+              targetId: input.targetId,
+              harnessSessionId: row.harnessSessionId,
+              harnessInstanceId: row.harnessInstanceId,
+              importDirectory: fleet.paths.importDirectory,
+            });
             const { entry, started } = yield* openWith({
               targetId: input.targetId,
               targetName: target.name,
@@ -1424,6 +1512,14 @@ export class ScopeImporter extends Context.Service<
               message: input.text,
               earlierPages,
               predecessor: input.importId,
+              ...(reopen._tag === "resume"
+                ? {
+                    resume: {
+                      sessionId: reopen.sessionId,
+                      directoryImportId: reopen.directoryImportId,
+                    },
+                  }
+                : {}),
               // The same harness and model the earlier session ran on, so the conversation
               // does not quietly change models under the operator. A row from before
               // instances were recorded has nothing to pin, and D15's rule applies.
@@ -1442,14 +1538,48 @@ export class ScopeImporter extends Context.Service<
                   }),
             });
             const carried = started.pagesCarried.length;
+            const pages =
+              carried === 0
+                ? ""
+                : `, and the ${carried === 1 ? "page" : `${String(carried)} pages`} you gave it ${carried === 1 ? "is" : "are"} carried forward`;
             return accepted(
               entry,
-              "opened",
-              `Import ${input.importId}'s session is not held by this server — ${notHeldBecause(row.endedReason)} — so this message opened a new session, under import ${entry.id}. The importer in it has not read the earlier session; what that session wrote is on the Scope tab and in the Estate${carried === 0 ? "" : `, and the ${carried === 1 ? "page" : `${String(carried)} pages`} you gave it ${carried === 1 ? "is" : "are"} carried forward`}.`,
+              reopen._tag === "resume" ? "resumed" : "opened",
+              reopen._tag === "resume"
+                ? // One conversation, a second authority period. The session id is the same
+                  // one — which is why the session list still shows one row — and the import
+                  // id is not, because an import id names one authority period (`0027`).
+                  `Import ${input.importId}'s authority is not held by this server — ${notHeldBecause(row.endedReason)} — so this message took the conversation back over under import ${entry.id}. The session itself is the same one: ${reopen.detail}, and the importer in it has its own history${pages}.`
+                : `Import ${input.importId}'s session is not held by this server — ${notHeldBecause(row.endedReason)} — and could not be carried on: ${reopen.detail}. So this message opened a new session, under import ${entry.id}. The importer in it has not read the earlier session; what that session wrote is on the Scope tab and in the Estate${pages}.`,
               { added: started.pagesAdded, notAdded: started.pagesNotAdded },
             );
           }),
         );
+      });
+
+      /**
+       * The replay: this process's answer to `live`, and the harness's to everything else.
+       *
+       * `sessions.get` rather than `ready`: an entry that is published and not yet preambled
+       * is still a session **this process holds**, which is what `live` means, and this
+       * describes a session rather than delivering into one.
+       */
+      const replay: ScopeImporter["Service"]["replay"] = Effect.fn(
+        "ScopeImporter.replay",
+      )(function* (input) {
+        const held = sessions.get(input.importId);
+        return yield* importerConversation({
+          resolver,
+          targetId: input.targetId,
+          importId: input.importId,
+          recorded: input.recorded,
+          liveSessionId: held?.sessionId,
+          importDirectory: fleet.paths.importDirectory,
+          ...(input.limit === undefined ? {} : { limit: input.limit }),
+          ...(input.fetchTimeout === undefined
+            ? {}
+            : { fetchTimeout: input.fetchTimeout }),
+        });
       });
 
       return ScopeImporter.of({
@@ -1458,6 +1588,7 @@ export class ScopeImporter extends Context.Service<
         view: progress.view,
         converse,
         send,
+        replay,
       });
     }),
   );
@@ -1468,6 +1599,12 @@ export class ScopeImporter extends Context.Service<
    * `start` refuses with links and answers `none` without them, which is the same shape the
    * real one produces — so `createTarget` has one code path and a server configured with
    * `HARNESS=0` still creates targets. It does not pretend an import happened.
+   *
+   * **`replay` still answers**, with `resolver: undefined`, which is why the reader takes the
+   * resolver as a parameter: "this server has no agent harness configured" is a different
+   * sentence from "the harness would not answer", and an import whose session was never
+   * created still reads as `absent` rather than as a conversation something has forgotten.
+   * Those are different facts and a build with no harness has no reason to confuse them.
    */
   static readonly unavailable: Layer.Layer<ScopeImporter> = Layer.succeed(
     ScopeImporter,
@@ -1487,6 +1624,23 @@ export class ScopeImporter extends Context.Service<
       view: () => Effect.succeed(undefined),
       converse: () => Effect.fail(noHarness),
       send: () => Effect.fail(noHarness),
+      replay: (input) =>
+        importerConversation({
+          resolver: undefined,
+          targetId: input.targetId,
+          importId: input.importId,
+          recorded: input.recorded,
+          liveSessionId: undefined,
+          // Never called: with no resolver the reader asks no harness anything, so no
+          // directory is ever rebuilt. Passed because the parameter is not optional, and a
+          // function that threw would be worse than one that answers.
+          importDirectory: (targetId, importId) =>
+            `${targetId}/import/${importId}`,
+          ...(input.limit === undefined ? {} : { limit: input.limit }),
+          ...(input.fetchTimeout === undefined
+            ? {}
+            : { fetchTimeout: input.fetchTimeout }),
+        }),
     }),
   );
 }

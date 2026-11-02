@@ -4379,6 +4379,107 @@ describe("a target's importer sessions", () => {
     expect(response.status).toBe(404);
   });
 
+  /**
+   * The replay route (S6), on a server with no harness.
+   *
+   * This suite configures `ScopeImporter.unavailable`, which is the right half of the answer
+   * to test here: the route's job is the row — a `404` for an import this target does not
+   * hold, `absent` for one whose session was never created, and `forgotten` for one whose
+   * session exists and cannot be asked about. The harness-side answers (`harness`, `pending`,
+   * `none`, and what `continuation` becomes against a real driver) are
+   * `import/importerHistory.test.ts`'s and `import/scopeImporter.test.ts`'s, where there is a
+   * harness to script.
+   */
+  describe("one importer session's conversation", () => {
+    test("a session the harness cannot be asked about is 200 and forgotten, not an error", async () => {
+      const response = await read(
+        await signedIn(
+          `/targets/${withSessions}/importer-sessions/imp_old/messages`,
+        ),
+      );
+      // `200`, because "gone" is the ordinary end state of anything old enough and an error
+      // status would make a browser treat it as a fault.
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({
+        targetId: withSessions,
+        importId: "imp_old",
+        harnessSessionId: "ses_old",
+        live: false,
+        source: "forgotten",
+        // No harness to continue it with, so the composer is told a new session — never a
+        // resume it would then be refused.
+        continuation: "fresh",
+        messages: [],
+        truncated: false,
+      });
+      expect(String(response.body["note"])).toContain(
+        "no agent harness configured",
+      );
+    });
+
+    test("an import whose session was never created is absent: nothing was ever said in it", async () => {
+      // A row with no `session_created_at`, which is what a gate that would not install or a
+      // process that died between the row and the session leaves behind. The index does not
+      // list it (`0025`); the replay still has to answer about it.
+      const database = new Database(
+        join(fleetRoot, "targets", withSessions, HUNT_FILE),
+      );
+      try {
+        database.run(
+          `INSERT INTO import_sessions (
+             import_id, target_id, harness_session_id, harness_instance_id, model,
+             caller_scope, opened_at
+           ) VALUES ('imp_never', ?, 'ses_never', 'opencode', 'openai/gpt-5.6-sol', ?, 3000)`,
+          [withSessions, `${withSessions}/import/imp_never`],
+        );
+      } finally {
+        database.close();
+      }
+      const response = await read(
+        await signedIn(
+          `/targets/${withSessions}/importer-sessions/imp_never/messages`,
+        ),
+      );
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({
+        source: "absent",
+        // Nothing to name as the session this was read from: the id on the row may never
+        // have been minted.
+        harnessSessionId: null,
+        continuation: "fresh",
+      });
+      expect(String(response.body["note"])).toContain("Nothing was ever said");
+    });
+
+    test("an import this target does not hold is a 404, not an empty conversation", async () => {
+      // The one refusal: a stale deep link is a mistake, and a swept transcript is not.
+      const response = await read(
+        await signedIn(
+          `/targets/${withSessions}/importer-sessions/imp_elsewhere/messages`,
+        ),
+      );
+      expect(response.status).toBe(404);
+      expect(response.body["_tag"]).toBe("ScopeImportNotFound");
+    });
+
+    test("an unknown target is refused before the import is looked up", async () => {
+      const response = await read(
+        await signedIn(
+          "/targets/not-a-target/importer-sessions/imp_old/messages",
+        ),
+      );
+      expect(response.status).toBe(404);
+      expect(response.body["_tag"]).toBe("TargetNotFound");
+    });
+
+    test("it needs a session, like every other fleet route", async () => {
+      const response = await call(
+        `/targets/${withSessions}/importer-sessions/imp_old/messages`,
+      );
+      expect(response.status).toBe(401);
+    });
+  });
+
   test("another target's sessions are not in it", async () => {
     const response = await read(
       await signedIn(`/targets/${withSessions}/importer-sessions`),

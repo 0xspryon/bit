@@ -373,6 +373,20 @@ interface SessionRecord {
    */
   readonly multiTurn: boolean;
   /**
+   * Whether this record stands for a session the CLI already has, to be **resumed**.
+   *
+   * From `createSession`'s `resume`. It changes exactly one thing, in `launch`: the query
+   * is started with `resume: <id>` instead of `sessionId: <id>`. The SDK documents the two
+   * as mutually exclusive unless forking, and refuses `sessionId` for an id that already has
+   * turns ("already in use"), so a resumed session that passed both would fail at the one
+   * call that matters.
+   *
+   * Everything else about the record is the same, which is the point: a resumed session gets
+   * its MCP registration over the same control channel, publishes to the same narration
+   * queue and settles through the same pump.
+   */
+  readonly resumed: boolean;
+  /**
    * Completed by the pump when every accepted message has produced its `result`.
    *
    * **Replaced, not reused, when an idle session accepts another message.** A `Deferred`
@@ -1218,7 +1232,34 @@ export const claudeCodeHarness = (
                 options: {
                   cwd: record.directory,
                   model: record.model,
-                  sessionId: record.sessionId,
+                  /*
+                   * `resume` or `sessionId`, never both.
+                   *
+                   * The SDK's own doc on `sessionId`: "Cannot be used with `continue` or
+                   * `resume` unless `forkSession` is also set", and a `sessionId` naming a
+                   * session that already has turns is refused "already in use". So a resumed
+                   * session names itself through `resume`, which the SDK documents as
+                   * "Loads the conversation history from the specified session" — the same
+                   * option `forkSession`'s doc points at as how a session is resumed.
+                   *
+                   * **No `forkSession` and no `resumeSessionAt`.** A fork would mint a new
+                   * session id, which would lose the one thing a resume is for: the session
+                   * index groups by `harness_session_id`, and a fork would show one
+                   * conversation as two rows again. `resumeSessionAt` truncates a resume to
+                   * a chosen point, which is a rewind and is nobody's intent here.
+                   *
+                   * **A resume cannot raise a dialog on this transport**, which is worth
+                   * stating because the dialog is the caveat S2.5 carries. The CLI emits a
+                   * `request_user_dialog` only for a `dialog_kind` the client declared in
+                   * `supportedDialogKinds`, fails closed on absence, and the SDK's doc is
+                   * explicit that "omitting the option entirely means no dialogs are
+                   * emitted, even with `onUserDialog` wired". This query passes neither, so
+                   * a dialog-gated flow degrades to its no-dialog behaviour rather than
+                   * parking on an answer nothing here would give it.
+                   */
+                  ...(record.resumed
+                    ? { resume: record.sessionId }
+                    : { sessionId: record.sessionId }),
                   // Spread rather than passed as `undefined`: the SDK reads an absent
                   // `effort` as "whatever this model does", and an explicit `undefined`
                   // is the same thing said less clearly.
@@ -1342,7 +1383,10 @@ export const claudeCodeHarness = (
       const createSession: AgentHarness["Service"]["createSession"] = Effect.fn(
         "claudeCodeHarness.createSession",
       )(function* (input) {
-        const sessionId = input.sessionId ?? newClaudeCodeSessionId();
+        // A resume names the session it is continuing; `sessionId` is ignored beside it,
+        // as the seam says and as the SDK requires. See `SessionRecord.resumed`.
+        const sessionId =
+          input.resume ?? input.sessionId ?? newClaudeCodeSessionId();
         const narration = yield* Queue.sliding<HarnessNarration, Cause.Done>(
           NARRATION_BUFFER,
         );
@@ -1356,6 +1400,7 @@ export const claudeCodeHarness = (
           mcpServers: {},
           narration,
           multiTurn: input.multiTurn === true,
+          resumed: input.resume !== undefined,
           idle,
           accepted: 0,
           completed: 0,
@@ -1647,6 +1692,63 @@ export const claudeCodeHarness = (
             );
       });
 
+      /**
+       * Whether the CLI still has this conversation to continue, read off its transcript.
+       *
+       * **Not {@link sessionStatus}**, which asks how the last turn ended and answers a
+       * failure for every session this process does not hold. This asks the only question a
+       * conversation needs and the transcript can answer precisely: is the chain there, and
+       * where was it running.
+       *
+       * Three answers, from the two things `getSessionInfo` carries:
+       *
+       * - **No info at all** — the id is unknown to the session store. The CLI sweeps
+       *   transcripts on `cleanupPeriodDays`, so for anything old enough this is the normal
+       *   answer and there is nothing to wait for.
+       * - **Info with no `firstPrompt`** — a metadata-only transcript, which is S2.5's
+       *   nastiest case: a session killed before its first prompt was saved can be neither
+       *   resumed (there is no chain to load) nor created again (the id is taken). The field
+       *   is documented as "First meaningful user prompt in the session", so its absence is
+       *   exactly that state, and the caller's only way on is a fresh session.
+       * - **Info with a `firstPrompt`** — resumable, in `cwd`. The directory is reported
+       *   rather than assumed because the caller has to gate it: see
+       *   {@link SessionContinuation.directory}.
+       *
+       * A read that *fails* is a failure, not an answer: "we could not look" and "there is
+       * nothing there" are different facts and a caller that conflated them would open a new
+       * session every time the disk was busy.
+       */
+      const sessionContinuation: AgentHarness["Service"]["sessionContinuation"] =
+        Effect.fn("claudeCodeHarness.sessionContinuation")(
+          function* (sessionId) {
+            const info = yield* Effect.tryPromise({
+              try: () => sdk.sessionInfo(sessionId, {}),
+              catch: (cause) =>
+                transport(
+                  "session.get",
+                  `could not read the Claude Code session store: ${String(cause)}`,
+                ),
+            });
+            if (info === undefined) {
+              return {
+                _tag: "unresumable",
+                detail: `the Claude Code session store holds no transcript for session ${sessionId}; the CLI deletes them on its own retention schedule, so this is the ordinary answer for a conversation left for a while`,
+              };
+            }
+            if (info.firstPrompt === undefined) {
+              return {
+                _tag: "unresumable",
+                detail: `session ${sessionId} has a transcript with no first prompt in it, which is what a session killed before its opening message was saved leaves behind: there is no conversation to load, and the id cannot be created again either`,
+              };
+            }
+            return {
+              _tag: "resumable",
+              directory: info.cwd,
+              detail: `Claude Code still holds session ${sessionId}'s transcript on disk, so the conversation can be carried on`,
+            };
+          },
+        );
+
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(
         "claudeCodeHarness.messages",
       )(function* (sessionId) {
@@ -1729,6 +1831,7 @@ export const claudeCodeHarness = (
         prompt,
         waitForIdle,
         sessionStatus,
+        sessionContinuation,
         messages,
         interruptSession,
         sessionEvents,

@@ -2432,6 +2432,31 @@ export class App {
             text,
           ),
         ),
+      /**
+       * One session's conversation, with the floor the live tail is joined at (S6).
+       *
+       * **The floor is taken before the request leaves**, like every other join on this
+       * page and for its reason: what an answer can possibly contain is decided at the
+       * moment it is asked for, so narration published during the round trip is the live
+       * tail and must not be dropped against it.
+       *
+       * A refusal or an unreachable server answers `undefined`, which leaves the session's
+       * thread as it was rather than claiming the harness said nothing. The one thing it
+       * acts on is an expired session, like every other call here.
+       */
+      history: async (importId) => {
+        const floor = this.#activityHighWater() ?? 0;
+        const call = await this.client.importerMessages(
+          this.serverUrl,
+          targetId,
+          importId,
+        );
+        if (call._tag === "Ok") return { view: call.value, floor };
+        if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+          this.signOut("expired");
+        }
+        return undefined;
+      },
       reread: () => void this.loadImporterSessions(targetId),
       harnessName: (instanceId) =>
         this.harnesses.find((entry) => entry.instanceId === instanceId)

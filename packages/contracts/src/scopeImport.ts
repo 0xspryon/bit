@@ -636,17 +636,28 @@ export const ImporterMessageDraft = Schema.Struct({
 export type ImporterMessageDraft = typeof ImporterMessageDraft.Type;
 
 /**
- * Whether a message opened a session or was given to one that was already live.
+ * Whether a message opened a session, resumed one, or was given to one already live.
  *
- * - `opened` — a session was created for this message: the first message of a new
- *   conversation, or a message to an import whose session this server no longer holds
- *   (closed after a refused prompt, or lost to a restart). The second case mints a **new
- *   import id**, which {@link ImporterTurnAccepted.importId} carries.
+ * - `opened` — a session was **created** for this message: the first message of a new
+ *   conversation, or a message to an import whose session cannot be carried on at all (the
+ *   harness swept its transcript, or holds one that was killed before its first prompt was
+ *   saved). The importer in it has read nothing of what came before.
+ * - `resumed` — the session this process no longer held was **continued** (S6): a fresh
+ *   `query({ resume })` on Claude Code, an ordinary prompt on OpenCode. The conversation
+ *   keeps its identity — {@link ImporterTurnAccepted.harnessSessionId} is the same session
+ *   id as before — and the agent in it has its own history back.
  * - `continued` — the session was live in this process and the message was delivered into
  *   it, queued behind whatever it was doing.
+ *
+ * **`opened` and `resumed` both mint a new import id**, which
+ * {@link ImporterTurnAccepted.importId} carries, because an import id names one *authority
+ * period* and a new credential is a new period (`0027`). `continued` keeps the id it was
+ * addressed with. The distinction between the first two is therefore not about the id: it is
+ * about whether the conversation survived, which is the only part an operator can see.
  */
 export const ImporterConversationStart = Schema.Literals([
   "opened",
+  "resumed",
   "continued",
 ]);
 export type ImporterConversationStart = typeof ImporterConversationStart.Type;
@@ -730,3 +741,147 @@ export class ImporterConversationRefused extends Schema.TaggedError<ImporterConv
     return `${this.reason}: ${this.detail}`;
   }
 }
+
+/**
+ * Where an importer conversation's prose came from, or why there is none.
+ *
+ * {@link GoalConversationSource}'s five answers, with the same five meanings, because they
+ * are the same five facts about the same kind of absence — and said separately here only
+ * because a goal and an import are not the same resource.
+ *
+ * - `harness` — the harness answered with messages. Ephemeral: it may delete them.
+ * - `pending` — this process holds the session and the harness holds nothing under it yet.
+ *   The first second of the first message.
+ * - `forgotten` — the harness no longer holds the session, or cannot be asked about it.
+ *   **A note, never an error**: Claude Code sweeps its transcripts on `cleanupPeriodDays`
+ *   and OpenCode's retention is its own, so for an import opened weeks ago this is the
+ *   expected answer. What the session *wrote* is unaffected — the entries are on the Scope
+ *   tab and the assets in the Estate, which is what makes losing the prose acceptable
+ *   (DECISIONS.md §8).
+ * - `none` — the harness still knows the session and holds nothing under it. The session
+ *   really produced nothing.
+ * - `absent` — nothing has ever been said in this import: its row was written before the
+ *   session existed (`0025`) and the session was never created, so there is no conversation
+ *   rather than no prose. Reporting that with the harness's "I no longer hold that session"
+ *   sentence would tell an operator their message had been lost.
+ */
+export const ImporterConversationSource = Schema.Literals([
+  "harness",
+  "pending",
+  "forgotten",
+  "none",
+  "absent",
+]);
+export type ImporterConversationSource = typeof ImporterConversationSource.Type;
+
+/**
+ * What the next message to this import will do, decided by the server and never guessed by
+ * a browser.
+ *
+ * **This is the field that stops a composer being offered for a message that will fail.**
+ * The four answers are the four things the server will actually do, each checked against
+ * the driver rather than assumed:
+ *
+ * - `live` — this process holds the session: the message is delivered into it as a queued
+ *   steer, under this same import id.
+ * - `resume` — this process does not hold it and the harness can continue it: a fresh
+ *   `query({ resume })` on Claude Code, an ordinary prompt on OpenCode. The conversation
+ *   keeps its identity and the agent keeps its own history; what changes is the import id,
+ *   because an import id names one authority period (`0027`) and a new period gets a new
+ *   one.
+ * - `fresh` — the conversation cannot be continued, so the next message opens a **new
+ *   session**: the harness has swept the transcript, or it holds a session that was killed
+ *   before its first prompt was saved — which can be neither continued nor recreated. The
+ *   note says which, and what is carried forward.
+ * - `refused` — the operator ended this import. Its authority is over, the importer's tools
+ *   refuse every write under it, and no message is accepted. A new session is the way on.
+ */
+export const ImporterContinuation = Schema.Literals([
+  "live",
+  "resume",
+  "fresh",
+  "refused",
+]);
+export type ImporterContinuation = typeof ImporterContinuation.Type;
+
+/**
+ * One replayed message of an importer conversation.
+ *
+ * The reduced `{ type, text, error }` shape a goal conversation's replay already answers
+ * with, so `ImporterChat.svelte` renders it through the same component and needs no second
+ * renderer. A `user` entry here is **the operator's own words**: the server trims its own
+ * framing off the stored opening prompt at the delimiter it wrote itself
+ * (`import/importerPrompt.ts`), which is an exact split rather than a guess at where a
+ * person's sentence starts.
+ */
+export const ImporterConversationMessage = Schema.Struct({
+  /** Position in **this answer**, from zero. A render key, not a cursor. */
+  index: Schema.Int,
+  /** The harness's own word for the entry: `user`, `assistant`. Unmapped. */
+  type: Schema.String,
+  text: Schema.String,
+  error: Schema.optional(Schema.String),
+});
+export type ImporterConversationMessage =
+  typeof ImporterConversationMessage.Type;
+
+/**
+ * One importer session as a reloaded tab replays it (S6).
+ *
+ * **The harness's copy, and nothing of ours.** This build stores no word of a conversation
+ * (DECISIONS.md §8), so this is the only thing a refresh can show and the harness decides
+ * how long it lasts. The durable half of the same screen is the import's own work: the
+ * entries on the Scope tab, the assets in the Estate, the tally in the session list — all
+ * rows, all there whatever this answers.
+ *
+ * `200` in every case, including a session the harness has entirely forgotten, for the
+ * reason the goal replay is a `200`: "gone" is the ordinary end state of anything old
+ * enough, and an error status would make a browser treat it as a fault.
+ */
+export const ImporterConversationView = Schema.Struct({
+  targetId: Schema.String,
+  /** The import asked about, as addressed. */
+  importId: Schema.String,
+  /** The session this was read from, or null when the import never got one. */
+  harnessSessionId: Schema.NullOr(Schema.String),
+  /**
+   * Whether **this process** is holding that session.
+   *
+   * False with a non-null session id is the restart case: the id is ours, the prose may
+   * still come back, and the in-memory grant that let the agent act is gone. Whether the
+   * conversation can be carried on from there is a *separate* question, and
+   * {@link continuation} is the one that answers it — collapsing the two would make a
+   * readable conversation look continuable, or a continuable one look dead.
+   */
+  live: Schema.Boolean,
+  source: ImporterConversationSource,
+  continuation: ImporterContinuation,
+  /** True only for `harness`: what is shown can disappear. */
+  ephemeral: Schema.Boolean,
+  /** A sentence for the operator, set on every source including a successful read. */
+  note: Schema.String,
+  /** Oldest first, and all of them up to the limit. */
+  messages: Schema.Array(ImporterConversationMessage),
+  /** Messages this answer stopped short of. */
+  truncated: Schema.Boolean,
+  /**
+   * How many entries were left out because the reduced shape holds nothing to show.
+   *
+   * A `tool_use` or `tool_result` block reduces to an entry with empty text, and rendering
+   * those as turns is a column of labels with nothing under them. Counted so the omission
+   * is not silent — and it is a large count here, because the importer's whole job is tool
+   * calls.
+   */
+  omittedBlank: Schema.Int,
+  /**
+   * When this answer was built, on the server's clock.
+   *
+   * **Not the replay/live floor**, and it must not be used as one: the floor is an activity
+   * *publish order*, which the browser takes before the request leaves and holds against
+   * each live entry's `activity:<n>` (`importerFeed`). A floor taken from a timestamp would
+   * be comparing the server's clock with the browser's. This is here for the same reason
+   * `GoalConversationView.at` is — so a reader can tell how old the answer on screen is.
+   */
+  at: EpochMillis,
+});
+export type ImporterConversationView = typeof ImporterConversationView.Type;

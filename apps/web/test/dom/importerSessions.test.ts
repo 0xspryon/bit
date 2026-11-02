@@ -30,6 +30,7 @@ import { FakeCountdown } from "../fakeCountdown";
 import {
   FakeServer,
   emptyScope,
+  importerConversationView,
   importerSessionView,
   importerTurnAccepted,
   liveActivity,
@@ -249,9 +250,15 @@ describe("Continue that session", () => {
     expect(app.importer.currentId).toBe("ses_newest");
     expect(app.importer.current?.indexed).toBe(true);
     expect(document.querySelector("#importer-message")).not.toBeNull();
-    // It is read-only until the operator types, and says why there is no conversation.
+    // It is read-only until the operator types, and says so.
     expect(text()).toContain("You are reading an earlier session");
-    expect(text()).toContain("does not read the session's messages");
+    // And its words are on screen, read back from the harness (S6): the operator's own
+    // message as the heading of the turn it opened, and the importer's reply under it.
+    expect(text()).toContain("Read the policy page");
+    expect(text()).toContain("Two entries in, one out.");
+    expect(text()).toContain("From the harness, which may delete it.");
+    // Selecting a session is not reading it twice.
+    expect(fake.countOf("importerMessages")).toBe(1);
     // Selecting a session is not starting or prompting one.
     expect(fake.countOf("startScopeImport")).toBe(0);
   });
@@ -344,6 +351,33 @@ const typeInto = (box: HTMLTextAreaElement, value: string): void => {
   box.dispatchEvent(new Event("input", { bubbles: true }));
 };
 
+/**
+ * Continue the newest session of a server a test has already set up, and wait for the page.
+ *
+ * {@link continueOn}'s tail, split out for the describes whose subject is the *replay*: they
+ * have to answer `importerMessages` themselves, so they build the server rather than being
+ * handed one.
+ */
+const continueWith = async (fake: FakeServer): Promise<App> => {
+  fake.onScope = () => ok(emptyScope());
+  fake.onImporterSessions = () => ok({ sessions: SESSIONS });
+  fake.onHarnesses = () => ok([harness("claude-code", "Claude Code")]);
+  const app = new App(fake, new FakeCountdown());
+  app.password = "correct-horse";
+  await app.connect();
+  app.openTarget("acme-corp");
+  await settle();
+  app.toSection("assets");
+  await settle();
+  app.toAssetsTab("scope");
+  await settle();
+  mounted.push(mountInto(TitleBar, { app }), mountInto(Target, { app }));
+  await settle();
+  click(button("Continue that session"));
+  await settle();
+  return app;
+};
+
 /** Continue the newest session of a server that lists `harnesses`, and wait for the page. */
 const continueOn = async (
   sessions: ImporterSessionView[],
@@ -384,9 +418,11 @@ const continueOn = async (
 };
 
 describe("typing into a session the server lists", () => {
-  test("the note that its words cannot be read stays above the first message", async () => {
-    await continueOn(SESSIONS, [harness("claude-code", "Claude Code")]);
-    expect(text()).toContain("does not read the session's messages");
+  test("the replayed thread stays above the message typed under it, and nothing is shown twice", async () => {
+    const { fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    expect(text()).toContain("Read the policy page");
 
     const box = composer();
     typeInto(box, "Also load the staging hosts");
@@ -394,9 +430,18 @@ describe("typing into a session the server lists", () => {
     press("Enter");
     await settle();
 
-    // One message in, this still must not read as a brand-new session.
-    expect(text()).toContain("Also load the staging hosts");
-    expect(text()).toContain("does not read the session's messages");
+    // One message in, the thread above it is still there: this is a continuation and reads
+    // as one, which is what the stand-in note used to have to say in words.
+    const after = text();
+    expect(after).toContain("Read the policy page");
+    expect(after).toContain("Also load the staging hosts");
+    // Once, each. The replay is read when the session is opened and never again, which is
+    // what keeps the operator's own row from colliding with the `user` entry the harness
+    // holds for the same sentence.
+    expect(after.indexOf("Read the policy page")).toBe(
+      after.lastIndexOf("Read the policy page"),
+    );
+    expect(fake.countOf("importerMessages")).toBe(1);
   });
 
   test("a later reading of the index keeps what the operator typed and takes the server's figures", async () => {
@@ -906,5 +951,92 @@ describe("the importer's words, as they are produced", () => {
     const message = words.indexOf("Load the staging hosts");
     expect(words.indexOf("From an earlier turn.")).toBeLessThan(message);
     expect(words.indexOf("Starting on it.")).toBeGreaterThan(message);
+  });
+});
+
+/**
+ * What a session from a dead process offers, which is whatever its driver can actually do
+ * (S6).
+ *
+ * The replay carries `continuation`, and it is the one field on this screen a browser must
+ * not derive for itself: it is the server's answer about whether *this process* holds the
+ * session and, for one it does not, whether the harness will continue it — a round trip this
+ * page cannot make. Offering a composer against a wrong guess costs the operator the message
+ * they wrote, so each of the four answers is asserted here as a different screen.
+ */
+describe("a session this server no longer holds", () => {
+  const replayed = (
+    over: Partial<Parameters<typeof importerConversationView>[0]> = {},
+  ) =>
+    importerConversationView({
+      importId: "imp_newest",
+      harnessSessionId: "ses_newest",
+      ...over,
+    });
+
+  test("one the harness will continue says the next message takes it back over", async () => {
+    const { fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    void fake;
+    expect(text()).toContain("takes it back over");
+    expect(text()).not.toContain("will not have read any of this");
+    // Offered, because the server said the message will land.
+    expect(composer().disabled).toBe(false);
+  });
+
+  test("one the harness has swept says a new session, and why, instead of promising a resume", async () => {
+    const fake = new FakeServer();
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        replayed({
+          targetId,
+          importId,
+          source: "forgotten",
+          continuation: "fresh",
+          messages: [],
+          note: "Claude Code no longer holds session ses_newest.",
+        }),
+      );
+    await continueWith(fake);
+
+    expect(text()).toContain("cannot be carried on");
+    expect(text()).toContain("will not have read any of this");
+    expect(text()).toContain("no longer holds session ses_newest");
+    // Still offered — a new session is a thing that works — and the sentence says what it
+    // will be, which is the done criterion: never a composer that will fail, and never one
+    // that claims a continuation.
+    expect(composer().disabled).toBe(false);
+  });
+
+  test("one the operator ended is refused: the composer is disabled rather than offered", async () => {
+    const fake = new FakeServer();
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        replayed({
+          targetId,
+          importId,
+          source: "harness",
+          continuation: "refused",
+          note: "You ended this import, so its authority has ended with it.",
+        }),
+      );
+    await continueWith(fake);
+
+    // The row the index answered says nothing about an end — this is the replay's answer
+    // alone, which is what makes a session ended in another tab safe to look at here.
+    expect(composer().disabled).toBe(true);
+    expect(text()).toContain("ended");
+  });
+
+  test("a replay that does not answer leaves the thread alone rather than claiming silence", async () => {
+    const fake = new FakeServer();
+    fake.onImporterMessages = () => unreachable("no route");
+    await continueWith(fake);
+
+    // No invented sentence about the harness, and the composer still works: the server's
+    // refusal is the one that counts, and this page has not had one.
+    expect(text()).not.toContain("no longer holds");
+    expect(composer().disabled).toBe(false);
   });
 });
