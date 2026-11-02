@@ -20,14 +20,24 @@
 | S6    | Replay from the harness, and resuming a session this process no longer holds                                                                             |
 | S8    | One list of every agent session, under Operations                                                                                                        |
 | S7a   | Recovery tells the truth after a restart: `activity` on `SessionStatus`, the `abandoned` answer                                                          |
+| S7b   | The continuation turn: resume for the two conversations, a replacement attempt for a worker, the cap, the outbox dispatcher, the opt-out                 |
 
 Gates on `main`: **1540 server · 455 web · 84 DOM · 971 persistence**, migrations contiguous `0001`–`0029`.
 
-**In flight:** S7b — the continuation turn.
+**In flight:** nothing. S7 is complete; S7.6 records the second half and what running it found.
 
 **Still to do:**
 
-1. **S7b** (in flight): the dispatched continuation, the summary for worker attempts only, the chained-continuation cap, the outbox dispatcher, the opt-out.
+1. **Two findings from S7b's live run, both recorded under S7.6 and neither fixed there**,
+   because both change what the recovery seam answers at rank 1 and so what an attempt or a
+   round settles to. **Claude Code produces no `abandoned` after a restart** — its
+   `sessionStatus` fails for any session this process does not hold — so nothing is
+   continued on that driver; the fix is for that driver to answer
+   `{ activity: "idle", outcome: undefined }` for a transcript it still holds. And
+   **OpenCode never clears `idle_outcome` when a turn starts**, so after a restart a
+   conversation past its first completed turn reports the earlier turn's outcome and is read
+   as finished; it fails safe, and it narrows the continuation to conversations interrupted
+   on their first turn.
 2. **Narrow the importer session's tool set.** Recorded under Known defects. The three MCP tools are the only ones that can _write_, but the session also holds whatever else the harness gives it — a live run used `Bash` to `curl` a page. The gated directory is the control and always was; the sentence we showed the operator was what was wrong, and that is already corrected. The fix is `allowedTools` on `createSession`, done with a live import to verify against, because the live run reached for `curl` rather than `WebFetch`.
 3. **Importer liveness in the S8 list is a lower bound.** A session held open _between_ turns — exactly what S2 built — reads "Not running", because the registry only exposes "a run is in flight". Needs `scopeImporter.ts`, which was off-limits while S6 and S8 ran in parallel.
 4. **A third state in the S8 list.** A restart leaves goal conversations and unended importer sessions neither live nor ended — nothing recorded their authority ending, which is `ended_reason` working as designed. "Not running" is the honest reading; S8.1 says "live or ended" and should say three.
@@ -40,8 +50,9 @@ This matters because several claims in this document were wrong until someone ra
 
 - **Claude Code (`claude-sonnet-5`)** — live narration with real timings (prose under the right message before the turn settled); records folded into their calls, including across a no-op; replay and resume across a real server restart, with the agent quoting its earlier reply.
 - **OpenCode (`zai-coding-plan/glm-5.3-flash`)** — open, continue, and resume across a restart that killed the `opencode serve` holding the session, with the resumed agent quoting _both_ earlier replies verbatim; `turn.reply` **and** `turn.thinking` reaching the feed keyed by `importId` (Claude Sonnet emitted no thinking, so that had been test-only); `scope.entry.added` carrying `importId: null` for an operator's own entry, confirming the isolation rule; the recovery sweep's before/after on a real abandoned session.
+- **S7b's whole cycle, on the same instance** — a conversation interrupted mid-turn by a graceful restart, terminalized, queued on the outbox, dispatched as a resume of the same session, and answered: the agent called `read_scope` first, said what had and had not been recorded, and carried on from where it was cut off. The operator's switch was exercised on the same database in both directions, and `spike/continuationSummaryProbe.ts` read the summary off that real transcript for a session its own process never opened.
 
-**Not observed live:** the `fresh`-session fallbacks (a swept transcript, a metadata-only transcript, an ungated directory), a refused tool call, and a retried asset call. All test-only, and all say so.
+**Not observed live:** the `fresh`-session fallbacks (a swept transcript, a metadata-only transcript, an ungated directory), a refused tool call, a retried asset call, and **the worker continuation's end-to-new handoff** — nothing creates an intent over HTTP, so a live worker continuation needs a planner round first. All test-only, and all say so.
 
 ## Environment notes, rediscovered too many times
 
