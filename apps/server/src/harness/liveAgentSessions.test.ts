@@ -455,3 +455,80 @@ describe("closing an import session that is no longer the id's", () => {
     expect(outcome.afterRelease).toBe(0);
   });
 });
+
+describe("an opener that dies", () => {
+  test("a defect before publish leaves no scope and no credential behind", async () => {
+    const recorder = freshRecorder();
+    const harness: AgentHarness["Service"] = {
+      ...gatedHarness(recorder, {}),
+      // After the credential is minted into a scope that is in no map.
+      registerMcpServer: () =>
+        Effect.die("the harness threw while registering"),
+    };
+
+    const outcome = await withImporterSessions(
+      harness,
+      ({ sessions, plan, credentials }) =>
+        Effect.gen(function* () {
+          const exit = yield* Effect.exit(opening(sessions, plan));
+          return {
+            died: Exit.hasDies(exit),
+            grants: yield* credentials.size,
+            live: sessions.get(IMPORT),
+          };
+        }),
+    );
+
+    expect(outcome.result.died).toBe(true);
+    expect(outcome.result.grants).toBe(0);
+    expect(outcome.result.live).toBeUndefined();
+  });
+
+  test("a defect after publish closes the unpreambled session, so the next opener builds rather than joins", async () => {
+    const recorder = freshRecorder();
+    const base = gatedHarness(recorder, {});
+    let dies = true;
+    const harness: AgentHarness["Service"] = {
+      ...base,
+      // The opening prompt throws once: published, registered, never told what it is.
+      prompt: (sessionId, text, delivery) =>
+        dies
+          ? Effect.suspend(() => {
+              dies = false;
+              return Effect.die("the harness threw while prompting");
+            })
+          : base.prompt(sessionId, text, delivery),
+    };
+
+    const outcome = await withImporterSessions(
+      harness,
+      ({ sessions, plan, credentials }) =>
+        Effect.gen(function* () {
+          const exit = yield* Effect.exit(opening(sessions, plan));
+          const after = {
+            grants: yield* credentials.size,
+            live: sessions.get(IMPORT),
+          };
+          // The permit is released. Without the close, this would find the unpreambled
+          // entry inside the permit, skip the `preambled` test, and join it.
+          const next = yield* opening(sessions, {
+            ...plan,
+            sessionId: "ses_second",
+          });
+          return {
+            died: Exit.hasDies(exit),
+            after,
+            next,
+            live: sessions.get(IMPORT),
+          };
+        }),
+    );
+
+    expect(outcome.result.died).toBe(true);
+    expect(outcome.result.after).toEqual({ grants: 0, live: undefined });
+    expect(outcome.result.next).toBe("opened");
+    expect(outcome.result.live?.sessionId).toBe("ses_second");
+    expect(outcome.result.live?.preambled).toBe(true);
+    expect(recorder.unregistrations[0]).toBe("ses_1");
+  });
+});

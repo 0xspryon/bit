@@ -456,17 +456,23 @@ export const makeLiveAgentSessions = <Meta>(
            * about to answer or a fiber about to finish its first turn: a credential acquired
            * in either would be revoked the moment the caller moved on. Made under
            * `uninterruptibleMask`, so there is no instant at which it exists and the
-           * interrupt handler below does not cover it.
+           * exit handler below does not cover it.
            *
-           * How far this open got, for the interrupt handler below and nothing else.
+           * How far this open got, for the exit handler below and nothing else.
            *
-           * An opener can be interrupted — an HTTP handler whose client went away, an
-           * importer's first-turn fiber the operator stopped. Interrupted while `building`,
-           * the scope is in no map and nothing else could ever close it. Interrupted while
-           * `published`, the entry is in the map unpreambled, and the next caller *inside*
-           * the permit — which does not check the flag — would deliver into a session that
-           * was never framed. So both are closed here, which keeps "an entry reachable inside
-           * the permit is preambled or gone" true on the interrupted path too.
+           * An opener can end without reaching `ready` in two ways the typed-failure paths
+           * do not see. It can be **interrupted** — an HTTP handler whose client went away,
+           * an importer's first-turn fiber the operator stopped. Or it can **die** — a
+           * harness, a surface callback or a prompt assembler throwing — and a defect passes
+           * through `Effect.result` exactly as an interrupt does. Either way: ended while
+           * `building`, the scope is in no map and nothing else could ever close it; ended
+           * while `published`, the entry is in the map unpreambled, the permit is released,
+           * and the next caller *inside* the permit — which does not check the flag — would
+           * deliver into a session that was never framed. So the handler acts on every exit
+           * that is not a success, which keeps "an entry reachable inside the permit is
+           * preambled or gone" true on every path. The typed-failure paths close what they
+           * built themselves and then say so by moving to `closed`, so nothing is closed
+           * twice.
            */
           let stage:
             | { readonly _tag: "building" }
@@ -474,6 +480,7 @@ export const makeLiveAgentSessions = <Meta>(
                 readonly _tag: "published";
                 readonly entry: LiveAgentSession<Meta>;
               }
+            | { readonly _tag: "closed" }
             | { readonly _tag: "ready" } = { _tag: "building" };
 
           const preambledEntry = yield* Effect.uninterruptibleMask((restore) =>
@@ -493,6 +500,7 @@ export const makeLiveAgentSessions = <Meta>(
                     // the scope rather than leave a credential behind a session that
                     // does not exist.
                     yield* Scope.close(scope, Exit.void);
+                    stage = { _tag: "closed" };
                     return yield* Effect.fail(input.refuse(opened.failure));
                   }
 
@@ -536,6 +544,7 @@ export const makeLiveAgentSessions = <Meta>(
                     // prompted-and-failed, and this seam never resubmits a prompt. Closed
                     // so the next open builds a fresh one.
                     yield* closeSession(entry);
+                    stage = { _tag: "closed" };
                     return yield* Effect.fail(input.refuse(prompted.failure));
                   }
                   /*
@@ -555,7 +564,10 @@ export const makeLiveAgentSessions = <Meta>(
                   return preambledEntry;
                 }),
               ).pipe(
-                Effect.onInterrupt(() => {
+                // Every exit, not only an interrupt: see `stage` above for why a defect
+                // needs exactly what an interrupt does.
+                Effect.onExit((exit) => {
+                  if (Exit.isSuccess(exit)) return Effect.void;
                   const reached = stage;
                   return reached._tag === "building"
                     ? Scope.close(scope, Exit.void)
