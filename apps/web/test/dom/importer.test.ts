@@ -234,9 +234,23 @@ describe("D4: multi-turn", () => {
     );
     expect(kinds.filter((kind) => kind === "Scope entry")).toHaveLength(7);
     expect(kinds.filter((kind) => kind === "Asset")).toHaveLength(3);
-    // The reads and the relabel are calls with no record to collapse into.
-    expect(kinds.filter((kind) => kind === "Tool call")).toHaveLength(2);
+    // The one read, `read_scope`, is a call with no record to collapse into.
+    expect(kinds.filter((kind) => kind === "Tool call")).toHaveLength(1);
+    // And no row for a tool the importer does not have: it reads pages with its harness's
+    // own reader (D13), so reading is prose and never a page-fetch call.
+    expect(text()).not.toContain("fetch_page");
+    expect(text()).not.toContain("write_scope_entry");
     expect(chips().filter((chip) => chip === "unresolved")).toHaveLength(0);
+  });
+});
+
+describe("the list's height", () => {
+  test("the importer's chat is the page, so it lifts Chat's 420px bound through the prop", async () => {
+    await show("importer-complete");
+
+    const style = document.querySelector('[role="log"]')?.getAttribute("style");
+    expect(style).toContain("max-height");
+    expect(style).toContain("100vh");
   });
 });
 

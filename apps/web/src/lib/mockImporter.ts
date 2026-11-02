@@ -9,8 +9,32 @@
  * in and out, assets recorded, an operator correcting it — because the point of building
  * the chat before its API is to judge the design against something that reads like the
  * work, not like filler.
+ *
+ * ## What is real in here, and what is invented
+ *
+ * **Everything the agent says is invented.** The prose, the order it works in, the notes it
+ * writes on an entry, the questions it ends on and the numbers it reports are all written
+ * by hand to look plausible. Nothing here is a specification of what the importer will say
+ * or how it will behave, and none of it should be read as one; the importer's real wording
+ * comes from its prompt (`importerTools.ts`) and its model.
+ *
+ * **The tools are real.** The importer has exactly three — `add_scope_entry`,
+ * `record_imported_asset` and `read_scope` (`ScopeImportTool`, D13) — and the arguments
+ * below are the shapes `importerTools.ts` declares. There is deliberately **no page-fetch
+ * tool** (D13): the importer reads pages with its harness's own reader, so reading a page
+ * is prose here and not a tool-call row. A row for a tool the importer does not have would
+ * teach the design something false.
+ *
+ * **The record kinds are real events but not yet live item kinds.** `scope.entry.added` and
+ * `asset.imported` are in `EventKind` and absent from `LIVE_ITEM_KINDS`, so the feed that
+ * would deliver them is the API slice's to build. See `chat.ts`' `WRITE_TOOLS`.
  */
-import type { LiveItem } from "@bit/contracts";
+import {
+  bitMcpServerName,
+  claudeCodeToolName,
+  type LiveItem,
+  type ScopeImportTool,
+} from "@bit/contracts";
 
 import { operatorTurn } from "./chat";
 import { NO_HISTORY, type ImporterSession } from "./importerChat";
@@ -72,14 +96,16 @@ const feed = (prefix: string, start: number) => {
       }),
     /** A tool call and the result that answers it; a `result` of `null` is a call in flight. */
     call: (
-      name: string,
+      name: ScopeImportTool,
       args: Record<string, unknown>,
-      result: string | null,
+      result: Record<string, unknown> | null,
       seconds: number,
     ): readonly LiveItem[] => {
       call += 1;
       const callId = `${prefix}_${String(call).padStart(2, "0")}`;
-      const tool = name === "fetch_page" ? name : `mcp__bit-importer__${name}`;
+      // Claude Code's spelling of the importer's own MCP registration, built from the same
+      // module the reducer is written against so the two cannot drift.
+      const tool = claudeCodeToolName(bitMcpServerName("imp_acme"), name);
       const calling = base({
         id: `activity:${String((activity += 1))}`,
         kind: "tool.call",
@@ -101,7 +127,7 @@ const feed = (prefix: string, start: number) => {
           tool,
           toolName: name,
           callId,
-          output: result,
+          output: JSON.stringify(result),
           outcome: "ok",
         }),
       ];
@@ -125,13 +151,18 @@ const feed = (prefix: string, start: number) => {
   };
 };
 
-const entryBody = (
-  host: string,
-  effect: "in" | "out",
-  subdomains: boolean,
-  source: string,
-): string =>
-  `${host}${subdomains ? " and every subdomain" : ", host only"}, ${effect} of scope. Source ${source}.`;
+const POLICY = "https://hackerone.com/acme/policy";
+
+type Effect = "in" | "out";
+type Kind = "subtree" | "host" | "cidr";
+
+/** What an entry covers, in the words `describeScopeEntry` uses on the Scope tab. */
+const covers = (kind: Kind, value: string): string =>
+  kind === "subtree"
+    ? `${value} and every subdomain`
+    : kind === "host"
+      ? `${value}, that host only`
+      : `every address in ${value}`;
 
 type Stage = "streaming" | "complete" | "records-only";
 
@@ -147,21 +178,32 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
   const startedAt = now - 41 * MINUTE;
   const f = feed("tod", startedAt);
   const items: LiveItem[] = [];
+  let entries = 0;
 
+  /** One `add_scope_entry`, its result, and the record it produced (unless in flight). */
   const entry = (
-    n: number,
-    host: string,
-    effect: "in" | "out",
-    subdomains: boolean,
-    source: string,
+    effect: Effect,
+    kind: Kind,
+    value: string,
+    note: string,
     seconds: number,
     settled = true,
   ): void => {
+    entries += 1;
     items.push(
       ...f.call(
-        "write_scope_entry",
-        { host, subdomains, direction: effect, source },
-        settled ? `entry ${String(n)} created` : null,
+        "add_scope_entry",
+        { effect, kind, value, source_url: POLICY, note },
+        settled
+          ? {
+              entry_id: `ent_${String(entries)}`,
+              effect,
+              kind,
+              value,
+              covers: covers(kind, value),
+              created: true,
+            }
+          : null,
         seconds,
       ),
     );
@@ -169,46 +211,77 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
       items.push(
         f.record(
           "scope.entry.added",
-          host,
-          entryBody(host, effect, subdomains, source),
+          value,
+          `${effect} · ${kind} · ${covers(kind, value)}`,
           seconds + 1,
         ),
       );
     }
   };
-  const asset = (host: string, seconds: number): void => {
+  /** One `record_imported_asset`, its result, and the record it produced. */
+  const asset = (host: string, scopeState: Effect, seconds: number): void => {
     items.push(
-      ...f.call("record_asset", { host }, `asset recorded: ${host}`, seconds),
+      ...f.call(
+        "record_imported_asset",
+        {
+          url: `https://${host}`,
+          kind: "host",
+          method: null,
+          source_url: POLICY,
+          note: "Named in the scope table.",
+          operation_id: `op_${host}`,
+        },
+        {
+          identity: host,
+          scope_state: scopeState,
+          scope_detail: `decided by the ${scopeState === "in" ? "in-scope" : "out-of-scope"} entries written so far`,
+        },
+        seconds,
+      ),
       f.record(
-        "asset.recorded",
+        "asset.imported",
         host,
-        `${host} recorded as an asset of acme-corp.`,
+        `${host} recorded as an asset of acme-corp, read off ${POLICY}.`,
         seconds + 1,
       ),
     );
   };
 
+  // Reading the page is the harness's own reader doing the work (D13), so it is prose here
+  // and not a row: the importer has no page-fetch tool.
   items.push(
     f.operator(
       1,
-      "Load the scope from https://hackerone.com/acme/policy — and the SOW says the partner portal is in too.",
+      `Load the scope from ${POLICY} — and the SOW says the partner portal is in too.`,
       0,
     ),
-    f.reply("Fetching the policy page.", 2),
-    ...f.call(
-      "fetch_page",
-      { url: "https://hackerone.com/acme/policy" },
-      "200 · 48 KB · scope table found at line 212",
-      3,
-    ),
+    f.reply("Reading the policy page.", 2),
     f.reply(
-      "The table has five rows. Three are in scope — acme.com and acmelabs.io are written with wildcards, so I am taking them as the host and every subdomain. Writing them now.",
+      "The scope table is at line 212 and has five rows. Three are in scope — acme.com and acmelabs.io are written with wildcards, so I am taking them as the apex and every subdomain. Writing them now.",
       8,
     ),
   );
-  entry(1, "acme.com", "in", true, "policy:212", 10);
-  entry(2, "acmelabs.io", "in", true, "policy:213", 14);
-  entry(3, "203.0.113.0/24", "in", false, "policy:216", 18);
+  entry(
+    "in",
+    "subtree",
+    "acme.com",
+    "Row 1 of the in-scope table, written *.acme.com.",
+    10,
+  );
+  entry(
+    "in",
+    "subtree",
+    "acmelabs.io",
+    "Row 2 of the in-scope table, written *.acmelabs.io.",
+    14,
+  );
+  entry(
+    "in",
+    "cidr",
+    "203.0.113.0/24",
+    "Row 3 of the in-scope table, an address block.",
+    18,
+  );
   items.push(
     f.reply(
       "Row four reads “No WordPress properties”, which is prose rather than a host. The only WordPress property the page names is blog.acme.com, so I am writing that one host out and leaving the rule itself for you —",
@@ -219,7 +292,14 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
   if (stage === "streaming") {
     // The write in flight: the call has gone out and neither its result nor its record has
     // come back. It is `pending` for exactly as long as the importer is working.
-    entry(4, "blog.acme.com", "out", true, "policy:214", 27, false);
+    entry(
+      "out",
+      "host",
+      "blog.acme.com",
+      "Row 4: the only WordPress property the page names.",
+      27,
+      false,
+    );
     return {
       id: "ses_today",
       startedAt,
@@ -232,18 +312,30 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
     };
   }
 
-  entry(4, "blog.acme.com", "out", true, "policy:214", 27);
+  entry(
+    "out",
+    "host",
+    "blog.acme.com",
+    "Row 4: the only WordPress property the page names.",
+    27,
+  );
   items.push(
     f.reply(
       "Row five, status.acme.com, is hosted by a third party and the page says so. That one is out.",
       31,
     ),
   );
-  entry(5, "status.acme.com", "out", false, "policy:215", 33);
+  entry(
+    "out",
+    "host",
+    "status.acme.com",
+    "Row 5: hosted by a third party, per the page.",
+    33,
+  );
   items.push(f.reply("Now the hosts the page names, as assets.", 38));
-  asset("acme.com", 40);
-  asset("www.acme.com", 43);
-  asset("shop.acme.com", 46);
+  asset("acme.com", "in", 40);
+  asset("shop.acme.com", "in", 43);
+  asset("status.acme.com", "out", 46);
   items.push(
     f.reply(
       "…that is the whole table. I wrote 3 in-scope entries and 2 out, and recorded 3 hosts as assets. One row I could not turn into an entry: “No WordPress properties” — I excluded blog.acme.com because the page names it, but the rule may reach further.",
@@ -254,20 +346,75 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
       "It does — shop.acme.com is WordPress too. Put it out, and the partner portal app.partner.com is in, host only, no subdomains.",
       180,
     ),
-    f.reply("Two entries to write, and one asset to relabel.", 182),
-  );
-  entry(6, "shop.acme.com", "out", true, "operator", 184);
-  entry(7, "app.partner.com", "in", false, "operator", 188);
-  items.push(
+    f.reply("Let me read back what is there before I change it.", 182),
     ...f.call(
-      "relabel_asset",
-      { host: "shop.acme.com", label: "excluded" },
-      "already recorded, relabelled excluded",
-      192,
+      "read_scope",
+      {},
+      {
+        total: 5,
+        entries: [
+          {
+            entry_id: "ent_1",
+            effect: "in",
+            kind: "subtree",
+            value: "acme.com",
+            source: "imported",
+          },
+          {
+            entry_id: "ent_2",
+            effect: "in",
+            kind: "subtree",
+            value: "acmelabs.io",
+            source: "imported",
+          },
+          {
+            entry_id: "ent_3",
+            effect: "in",
+            kind: "cidr",
+            value: "203.0.113.0/24",
+            source: "imported",
+          },
+          {
+            entry_id: "ent_4",
+            effect: "out",
+            kind: "host",
+            value: "blog.acme.com",
+            source: "imported",
+          },
+          {
+            entry_id: "ent_5",
+            effect: "out",
+            kind: "host",
+            value: "status.acme.com",
+            source: "imported",
+          },
+        ],
+      },
+      184,
     ),
     f.reply(
-      "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. The scope now reads 4 in, 3 out. Anything else from the SOW that the program page would not know about?",
-      196,
+      "Nothing there clashes. The policy page is the only page I was given, so both entries are attributed to it, and the notes say they come from you.",
+      188,
+    ),
+  );
+  entry(
+    "out",
+    "host",
+    "shop.acme.com",
+    "Added at the operator's instruction: also a WordPress property.",
+    190,
+  );
+  entry(
+    "in",
+    "host",
+    "app.partner.com",
+    "Added at the operator's instruction: the partner portal, from the SOW.",
+    194,
+  );
+  items.push(
+    f.reply(
+      "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. shop.acme.com was already recorded as an asset and will now read as out. The scope now reads 4 in, 3 out. Anything else from the SOW that the program page would not know about?",
+      198,
     ),
   );
 
@@ -413,33 +560,33 @@ const questionSession = (now: number): ImporterSession => ({
 export const mockForgottenSession = (now: number): ImporterSession => {
   const f = feed("old", now - 12 * DAY);
   const items: LiveItem[] = [];
-  const hosts: readonly (readonly [string, boolean])[] = [
-    ["acme.com", true],
-    ["acmelabs.io", true],
-    ["203.0.113.0/24", false],
+  const written: readonly (readonly [Kind, string])[] = [
+    ["subtree", "acme.com"],
+    ["subtree", "acmelabs.io"],
+    ["cidr", "203.0.113.0/24"],
   ];
-  hosts.forEach(([host, subdomains], index) => {
+  written.forEach(([kind, value], index) => {
     items.push(
       f.record(
         "scope.entry.added",
-        host,
-        entryBody(host, "in", subdomains, "policy"),
+        value,
+        `in · ${kind} · ${covers(kind, value)}`,
         10 + index,
       ),
     );
   });
   for (const host of [
     "acme.com",
-    "www.acme.com",
+    "app.acme.com",
     "api.acme.com",
-    "api.acmelabs.io",
-    "203.0.113.7",
+    "acmelabs.io",
+    "labs.acmelabs.io",
   ]) {
     items.push(
       f.record(
-        "asset.recorded",
+        "asset.imported",
         host,
-        `${host} recorded as an asset of acme-corp.`,
+        `${host} recorded as an asset of acme-corp, read off ${POLICY}.`,
         20,
       ),
     );

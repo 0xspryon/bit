@@ -10,7 +10,12 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import type { LiveItem } from "@bit/contracts";
+import {
+  bitMcpServerName,
+  claudeCodeToolName,
+  type LiveItem,
+  type ScopeImportTool,
+} from "@bit/contracts";
 
 import { operatorTurn } from "../src/lib/chat";
 import {
@@ -50,26 +55,47 @@ const operator = (index: number, text: string): LiveItem =>
   operatorTurn({ index, text, at: AT + index, after: 0 });
 const reply = (body: string): LiveItem =>
   item({ kind: "turn.reply", headline: "Importer", body });
-const write = (callId: string, host: string): LiveItem =>
+/**
+ * A call to one of the importer's three tools, named the way a harness names it.
+ *
+ * Built from `mcpToolName.ts` and typed by `ScopeImportTool`, not typed out: the merge rule
+ * shipped broken once because fixtures fabricated a tool-name space the system never
+ * produces, and a tool name that matches nothing in `WRITE_TOOLS` fails silently.
+ */
+const call = (
+  name: ScopeImportTool,
+  callId: string,
+  input: Record<string, unknown>,
+): LiveItem =>
   item({
     kind: "tool.call",
-    headline: "write_scope_entry",
-    tool: "mcp__bit-importer__write_scope_entry",
-    toolName: "write_scope_entry",
+    headline: name,
+    tool: claudeCodeToolName(bitMcpServerName("imp_1"), name),
+    toolName: name,
     callId,
-    input: JSON.stringify({ host }),
+    input: JSON.stringify(input),
   });
-const entryRecord = (host: string): LiveItem => {
+const write = (callId: string, value: string): LiveItem =>
+  call("add_scope_entry", callId, {
+    effect: "in",
+    kind: "host",
+    value,
+    source_url: "https://hackerone.com/acme/policy",
+    note: "a row",
+  });
+const record = (kind: string, value: string): LiveItem => {
   order += 1;
   return item({
-    kind: "scope.entry.added",
+    kind,
     id: `record:evt_${String(order)}`,
     origin: "record",
     sequence: order,
-    headline: host,
-    body: `${host} in scope`,
+    headline: value,
+    body: `${value} in scope`,
   });
 };
+const entryRecord = (value: string): LiveItem =>
+  record("scope.entry.added", value);
 
 const history = (over: Partial<ImporterHistory>): ImporterHistory => ({
   ...NO_HISTORY,
@@ -129,6 +155,67 @@ describe("one group per operator message", () => {
     expect(
       buildImporterChat({ history: NO_HISTORY, items: [], working: false }),
     ).toEqual([]);
+  });
+});
+
+describe("the importer's three tools", () => {
+  const POLICY = "https://hackerone.com/acme/policy";
+  const asset = (callId: string, host: string): LiveItem =>
+    call("record_imported_asset", callId, {
+      url: `https://${host}`,
+      kind: "host",
+      method: null,
+      source_url: POLICY,
+      note: "named in the table",
+      operation_id: `op_${host}`,
+    });
+
+  test("add_scope_entry and record_imported_asset each collapse into the record they produced", () => {
+    const [group] = buildImporterChat({
+      history: NO_HISTORY,
+      working: false,
+      items: [
+        operator(1, "go"),
+        write("c1", "acme.com"),
+        entryRecord("acme.com"),
+        asset("c2", "acme.com"),
+        record("asset.imported", "acme.com"),
+      ],
+    });
+    // Two writes, two rows: a call and its record are one row, not two.
+    expect(group?.rows.map((row) => [row.item.kind, row.write])).toEqual([
+      ["scope.entry.added", "recorded"],
+      ["asset.imported", "recorded"],
+    ]);
+    expect(group?.rows.every((row) => row.proposedBy !== null)).toBe(true);
+  });
+
+  test("a pending write shows what it covers, from the argument that says so", () => {
+    const [group] = buildImporterChat({
+      history: NO_HISTORY,
+      working: true,
+      items: [
+        operator(1, "go"),
+        write("c1", "blog.acme.com"),
+        asset("c2", "shop.acme.com"),
+      ],
+    });
+    expect(group?.rows.map((row) => row.summary)).toEqual([
+      "blog.acme.com",
+      "https://shop.acme.com",
+    ]);
+    expect(group?.rows.map((row) => row.write)).toEqual(["pending", "pending"]);
+  });
+
+  test("read_scope is a read: a plain call with no write state, never pending or unresolved", () => {
+    const [group] = buildImporterChat({
+      history: NO_HISTORY,
+      working: false,
+      items: [operator(1, "go"), call("read_scope", "c1", {})],
+    });
+    expect(group?.rows).toHaveLength(1);
+    expect(group?.rows[0]?.write).toBeNull();
+    expect(group?.rows[0]?.summary).toBeNull();
   });
 });
 

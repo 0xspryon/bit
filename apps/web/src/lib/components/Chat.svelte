@@ -57,6 +57,7 @@
     meter,
     detail = "",
     empty,
+    maxHeight,
   }: {
     /** The heading, and the list's accessible name. */
     label: string;
@@ -112,6 +113,13 @@
     detail?: string;
     /** What to say when there is no conversation at all. */
     empty: string;
+    /**
+     * How tall the list may grow before it scrolls, as a CSS length. Omitted keeps the 420px
+     * the planner and goal panels want, "because the page under them has other things to
+     * reach". A caller whose chat *is* the page (the importer's) passes a larger bound
+     * instead of reaching into this component's class from outside.
+     */
+    maxHeight?: string;
   } = $props();
 
   /**
@@ -196,6 +204,7 @@
     bind:this={list}
     onscroll={trackPinned}
     class={["groups", !anything && "hollow"]}
+    style:max-height={maxHeight}
     role="log"
     aria-label="{label}, oldest first"
   >

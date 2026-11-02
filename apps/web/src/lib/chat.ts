@@ -59,14 +59,23 @@ const KIND_LABELS: Record<string, string | undefined> = {
   "observation.recorded": "Observation",
   "asset.recorded": "Asset",
   /**
-   * An entry the scope importer wrote onto a target's scope.
+   * An entry written onto a target's scope: the importer's `add_scope_entry`, or an
+   * operator typing one in.
    *
-   * **A kind the contract does not have yet.** `LIVE_ITEM_KINDS` is what the server writes
-   * and no importer feed exists, so this label and the `write_scope_entry` row in
-   * {@link WRITE_TOOLS} are the browser's stand-in for it, there for the importer chat
-   * prototype. An unknown kind renders as itself, so this is a nicety and not a dependency.
+   * **A real event kind (`event.ts`) that is not yet a live item kind.** `scope.entry.added`
+   * is beside `scope.entry.removed` in `EventKind`; what it is missing from is
+   * `LIVE_ITEM_KINDS` in `live.ts`, a narrower list of what the live feed carries. Until the
+   * API slice adds it there, no real feed delivers this kind, and this label and the
+   * importer rows in {@link WRITE_TOOLS} are the importer chat prototype's, with nothing yet
+   * to merge against. An unknown kind renders as itself, so the label is a nicety.
    */
   "scope.entry.added": "Scope entry",
+  /**
+   * An asset the importer read off a program page (`record_imported_asset`, D14).
+   *
+   * An event kind, not yet a live item kind: see `scope.entry.added` above.
+   */
+  "asset.imported": "Asset",
   "intent.added": "Intent",
   "goal.added": "Goal",
   "goal.ended": "Goal ended",
@@ -214,14 +223,28 @@ const WRITE_TOOLS: Record<string, string | undefined> = {
   /** The agent ending its own goal, one `goal.ended`. One-way, so exactly one of each. */
   end_goal: "goal.ended",
   /**
-   * The scope importer's two writes. **Prototype rows**: the importer has no server yet, so
-   * `scope.entry.added` is a kind the contract does not carry (see {@link KIND_LABELS}) and
-   * `record_asset` pairs with the one that does. They are here so the importer chat shows a
-   * write the way the planner's does — pending until its record lands, then collapsed into
-   * it — instead of as an unremarkable tool call.
+   * The scope importer's two writes (`ScopeImportTool` in `scopeImport.ts`; D13, D14).
+   *
+   * **The names are the tools' real ones, and a name that matches nothing here fails
+   * silently**: the call renders as an ordinary tool call and never collapses into its
+   * record, which would look like a merge bug when the feed arrives. They are keyed on the
+   * reduced name, as the others are.
+   *
+   * **The records they name are event kinds, not yet live item kinds.** `scope.entry.added`
+   * and `asset.imported` are in `EventKind` (`event.ts`) and absent from `LIVE_ITEM_KINDS`
+   * (`live.ts`), so no real feed carries them yet. The API slice has to add them there; these
+   * rows are written against that and are exercised today only by the importer chat's mock.
+   *
+   * **The in-order pairing has a known gap for the importer.** `add_scope_entry` on an entry
+   * that already exists "is not an error and writes nothing" (`created: false`), so it
+   * produces a call and no record, and `pairWrites` would then pair every later call with
+   * the wrong record. The tool's result says which happened; teaching the pairing to read
+   * it is the API slice's job, not something to guess at from a mock.
+   *
+   * `read_scope` is deliberately absent: it is a read and writes nothing.
    */
-  write_scope_entry: "scope.entry.added",
-  record_asset: "asset.recorded",
+  add_scope_entry: "scope.entry.added",
+  record_imported_asset: "asset.imported",
   /*
    * `wake_planner` is **deliberately absent**, which is a decision rather than the
    * oversight that left the two above out.
@@ -310,10 +333,13 @@ const WRITE_SUMMARY_FIELDS: Record<string, string | undefined> = {
   add_intent: "question",
   /** One of the four answers. `plannerTools.ts` takes it as `disposition`. */
   record_round_disposition: "disposition",
-  /** The importer's writes name the host they are about; its reads, the page. */
-  write_scope_entry: "host",
-  record_asset: "host",
-  fetch_page: "url",
+  /**
+   * The importer's writes name what they cover: the apex, host or block an entry is about,
+   * and the host URL an asset is. `read_scope` takes no arguments, so it has no summary and
+   * its row is just the call and its result.
+   */
+  add_scope_entry: "value",
+  record_imported_asset: "url",
 };
 
 /** The four the planner may record, for turning a disposition into the panel's words. */

@@ -106,6 +106,7 @@
     label={`Load the scope for ${target}`}
     {groups}
     readonly={false}
+    maxHeight="max(320px, calc(100vh - 420px))"
     count={turns === 0
       ? ""
       : `${String(turns)} ${turns === 1 ? "message" : "messages"} from you`}
@@ -231,18 +232,6 @@
   .importer {
     display: flex;
     flex-direction: column;
-  }
-  /*
-   * The chat is the page here, where on a goal it is a panel among others, so the bound
-   * `Chat` puts on its list (420px, "because the page under it has an intent list, a
-   * briefing and an end control") is lifted for this caller. It reaches into `Chat`'s
-   * scrolling list by class, which is a coupling this component would rather not have: if
-   * a second page-sized chat appears, the right fix is a prop on `Chat` and not a second
-   * copy of this rule. The floor keeps a short window from collapsing the list to nothing.
-   */
-  .importer :global(.groups) {
-    max-height: max(320px, calc(100vh - 420px));
-    min-height: 200px;
   }
   /*
    * The separator's own type. Its layout — the rule above it — belongs to {@link Chat}. The
