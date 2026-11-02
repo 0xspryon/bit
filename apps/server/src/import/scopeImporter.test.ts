@@ -242,8 +242,9 @@ const scriptedHarness = (script: Script) =>
         script.interrupted.push(sessionId);
         return true;
       }),
-    // The transcript, in the order both real drivers answer in: the narration the session
-    // produced along the way, and its closing report last. `lastAssistantText` has to find
+    // The transcript, in the order `AgentHarness.messages` promises - oldest first, which
+    // each real driver has its own test for: the narration the session produced along the
+    // way, and its closing report last. `lastAssistantText` has to find
     // the report rather than the first thing said, which is why there is more than one
     // assistant entry here.
     messages: () =>

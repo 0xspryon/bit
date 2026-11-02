@@ -645,13 +645,31 @@ export class AgentHarness extends Context.Service<
       sessionId: string,
     ) => Effect.Effect<SessionStatus, HarnessFailure>;
     /**
-     * One session's messages, as the harness retains them.
+     * One session's messages, as the harness retains them: **oldest first, and all of
+     * them.**
      *
-     * Here so the capability is not foreclosed, not because anything in this slice reads
-     * it. The two harnesses retain very differently — OpenCode answers from a running
-     * server's store, Claude Code from a transcript on disk that outlives the process —
-     * and a consumer that depended on either would be depending on a retention policy
-     * neither interface states.
+     * That order and that completeness are this interface's promise, and each
+     * implementation has to make it true rather than inherit it, because neither
+     * harness's bare read does:
+     *
+     * - OpenCode's `message.list` answers the newest 50, newest first, unless told
+     *   otherwise. `openCodeHarness` asks for `order: "asc"` and follows `cursor.next`
+     *   until a page comes back empty.
+     * - Claude Code's `getSessionMessages` returns the conversation chain from its root
+     *   to its leaf, which is chronological, and has no default limit; `claudeCodeHarness`
+     *   passes none.
+     *
+     * "All of them" means all the harness *holds*: the two retain very differently —
+     * OpenCode answers from a running server's store, Claude Code from a transcript on
+     * disk that outlives the process — and what a harness has deleted or never kept is
+     * not here. It also means the harness's own notion of a message: Claude Code's list
+     * is user and assistant messages only, OpenCode's carries its `idle`, `shell` and
+     * `synthetic` entries too, so a caller counts neither as "turns".
+     *
+     * Callers lean on the order: {@link lastAssistantText} scans from the end, and the
+     * transcript and the round and goal narrations replay it as it stands. A new
+     * implementation that cannot keep the promise must sort or refuse; it must not
+     * return a truncated or reversed list under this type.
      */
     readonly messages: (
       sessionId: string,
@@ -698,9 +716,13 @@ export const finalAssistantText = (entries: readonly MessageEntry[]): string =>
  * The **last** thing the assistant said, or an empty string.
  *
  * Not {@link finalAssistantText}, which takes the first assistant entry and is used by the
- * spikes on sessions that produce exactly one. Both drivers answer `messages` in
- * transcript order, so a session that spoke more than once — and the scope importer works
- * through up to eight pages in one turn — has its report at the *end* of the list.
+ * spikes on sessions that produce exactly one. {@link AgentHarness.messages} promises
+ * oldest first and complete, so a session that spoke more than once — and the scope
+ * importer works through up to eight pages in one turn — has its report at the *end* of
+ * the list. That is a guarantee each driver makes, not a property of the harnesses:
+ * OpenCode's own default is the newest 50 *newest-first*, and this scan read the oldest
+ * reply on such a list until `openCodeHarness.messages` asked for `order: "asc"` and
+ * followed the cursor. It trusts the order it is given and does not re-sort.
  *
  * Empty entries are skipped: a harness can record an assistant message whose text is
  * entirely tool calls, and "the last thing it said" means the last thing it said in words.

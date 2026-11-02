@@ -39,6 +39,7 @@ import { Effect, Fiber, Redacted, Stream } from "effect";
 import { CLAUDE_CODE_MINIMUM, compareVersions } from "../policy/claudeCodeGate";
 import {
   AgentHarness,
+  lastAssistantText,
   NARRATION_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
   SESSION_NOT_FOUND_TAG,
@@ -80,6 +81,8 @@ interface Script {
   readonly messages?: readonly SDKMessage[];
   /** The transcript `getSessionInfo` knows about, by session id. */
   readonly stored?: readonly string[];
+  /** What `getSessionMessages` answers, oldest first as the SDK documents it. */
+  readonly transcript?: readonly SessionMessage[];
 }
 
 const result = (
@@ -178,16 +181,18 @@ const scriptedSdk = (script: Script = {}) => {
       return query;
     },
     sessionMessages: (sessionId) =>
-      Promise.resolve([
-        {
-          type: "assistant",
-          uuid: "u",
-          session_id: sessionId,
-          message: { content: [{ type: "text", text: "stored reply" }] },
-          parent_tool_use_id: null,
-          parent_agent_id: null,
-        } satisfies SessionMessage,
-      ]),
+      Promise.resolve(
+        script.transcript ?? [
+          {
+            type: "assistant",
+            uuid: "u",
+            session_id: sessionId,
+            message: { content: [{ type: "text", text: "stored reply" }] },
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+          } satisfies SessionMessage,
+        ],
+      ),
     sessionInfo: (sessionId) =>
       Promise.resolve(
         (script.stored ?? []).includes(sessionId)
@@ -1209,6 +1214,43 @@ describe("a session this process does not hold", () => {
     expect(entries).toEqual([
       { type: "assistant", text: "stored reply", error: undefined },
     ]);
+  });
+
+  test("messages keep the order the SDK read them in, so the last reply is the last entry", async () => {
+    // `AgentHarness.messages` promises oldest first, and `lastAssistantText` scans from the
+    // end on that promise. The SDK documents `getSessionMessages` as chronological; this is
+    // the half of the promise that is ours to keep for it: nothing here re-sorts or
+    // reverses what it was given.
+    const said = (
+      type: "user" | "assistant",
+      uuid: string,
+      text: string,
+    ): SessionMessage => ({
+      type,
+      uuid,
+      session_id: "11111111-0000-4000-8000-000000000004",
+      message: { content: [{ type: "text", text }] },
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+    });
+    const entries = await withHarness(
+      {
+        transcript: [
+          said("user", "a", "start"),
+          said("assistant", "b", "first reply"),
+          said("user", "c", "continue"),
+          said("assistant", "d", "closing report"),
+        ],
+      },
+      (harness) => harness.messages("11111111-0000-4000-8000-000000000004"),
+    );
+    expect(entries.map((entry) => entry.text)).toEqual([
+      "start",
+      "first reply",
+      "continue",
+      "closing report",
+    ]);
+    expect(lastAssistantText(entries)).toBe("closing report");
   });
 });
 

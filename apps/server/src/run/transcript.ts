@@ -53,11 +53,11 @@
  *   transcript, and a truncated one that did not say so would be worse than either.
  *
  * What is *not* bounded here is the fetch. `messages` answers with an array — OpenCode's
- * `message.list` is one HTTP response and the SDK's `getSessionMessages` resolves one
- * promise — so the harness's own API buffers the whole log before this module sees a byte
- * of it. Streaming the fetch would mean a `Stream` on the seam, which neither harness can
- * honestly provide. What bounds that instead is {@link TRANSCRIPT_FETCH_TIMEOUT}: the ask
- * is cut short, the absence is recorded as normal, and the settlement it runs after has
+ * implementation walks `message.list` page by page to the end and the SDK's
+ * `getSessionMessages` resolves one promise — so the whole log is buffered before this
+ * module sees a byte of it. Streaming the fetch would mean a `Stream` on the seam, which
+ * neither harness can honestly provide. What bounds that instead is
+ * {@link TRANSCRIPT_FETCH_TIMEOUT}: the ask is cut short, the absence is recorded as normal, and the settlement it runs after has
  * already happened.
  *
  * ## Content-hashed, keyed to the attempt
