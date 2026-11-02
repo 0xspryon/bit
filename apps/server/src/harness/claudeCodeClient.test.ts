@@ -34,9 +34,11 @@ import type {
   SessionMessage,
   SDKSessionInfo,
 } from "@anthropic-ai/claude-agent-sdk";
-import { Effect, Fiber, Redacted, Stream } from "effect";
+import { Effect, Fiber, Layer, Redacted, Stream } from "effect";
 
+import { HarnessSessionStatus } from "../recovery/harnessStatus";
 import { CLAUDE_CODE_MINIMUM, compareVersions } from "../policy/claudeCodeGate";
+import { HarnessResolver } from "./resolver";
 import {
   AgentHarness,
   lastAssistantText,
@@ -1168,27 +1170,59 @@ describe("outcomes", () => {
 /* ── Reading back ───────────────────────────────────────────────────────────── */
 
 describe("a session this process does not hold", () => {
-  test("an id the transcript knows cannot be asked about, and says why", async () => {
-    // A Claude Code session is run by a subprocess the SDK owns, so an id this process
-    // does not hold is a session that is *not running* — whatever the transcript says.
-    // Reporting "exists, nothing definite" here made recovery record `still_running` and
-    // leave the row `running` forever, which a live crash-and-restart caught; see
-    // `claudeCodeClient.ts`. So this fails, and recovery reads it as uncertain.
-    const failure = await withHarness(
+  /**
+   * The answer S7's live demonstration found missing, and the reason nothing on this
+   * driver was continued after a restart.
+   *
+   * A Claude Code session is run by a subprocess the SDK owns, so an id this process does
+   * not hold is a session that is *not running* — whatever the transcript says. That much
+   * was always true; what changed is that the seam can now say it. This used to **fail**,
+   * because with only an `outcome` field there was no way to report "exists, nothing
+   * running it, outcome unknown" without `{}` implying `running` — and `{}` is exactly
+   * what made recovery record `still_running` and leave the row `running` for ever.
+   *
+   * `activity` is that missing sentence. `idle` with no outcome is `abandoned` in
+   * `recovery/harnessStatus.ts`, which is `uncertain` for an attempt — the same
+   * disposition the refusal reached, for a stated reason instead of an unanswered
+   * question, and the only one a continuation can be decided from.
+   */
+  test("a transcript this process holds is idle with no outcome, not a refusal", async () => {
+    const status = await withHarness(
       { stored: ["11111111-0000-4000-8000-000000000001"] },
       (harness) =>
-        Effect.result(
-          harness.sessionStatus("11111111-0000-4000-8000-000000000001"),
+        harness.sessionStatus("11111111-0000-4000-8000-000000000001"),
+    );
+    expect(status.activity).toBe("idle");
+    // Not `failed`, and not anything else: nothing recorded one and nothing may invent it.
+    expect(status.outcome).toBeUndefined();
+    // Both live on the session record this process no longer has. Absent is the seam's
+    // word for "the harness does not know", not zero.
+    expect(status.cost).toBeUndefined();
+    expect(status.tokens).toBeUndefined();
+  });
+
+  /**
+   * The mapping the fix exists for, asserted through the real adapter rather than assumed
+   * from the driver's answer.
+   */
+  test("recovery reads that session as abandoned, not missing or unreachable", async () => {
+    const report = await withHarness(
+      { stored: ["11111111-0000-4000-8000-000000000001"] },
+      (harness) =>
+        Effect.provide(
+          Effect.flatMap(HarnessSessionStatus, (service) =>
+            service.of(
+              "11111111-0000-4000-8000-000000000001",
+              harness.instance.instanceId,
+            ),
+          ),
+          HarnessSessionStatus.layer.pipe(
+            Layer.provide(HarnessResolver.fromHarnesses([harness])),
+          ),
         ),
     );
-    expect(failure._tag).toBe("Failure");
-    if (failure._tag === "Failure") {
-      const error = failure.failure as { tag?: string; message: string };
-      // Not the not-found tag: we *do* have its transcript, and recovery's detail should
-      // say so rather than claiming the harness has never heard of it.
-      expect(error.tag).not.toBe(SESSION_NOT_FOUND_TAG);
-      expect(error.message).toContain("is not running in this process");
-    }
+    expect(report.observed).toBe("abandoned");
+    expect(report.detail).toContain("no turn in flight");
   });
 
   test("an id nobody has is reported with the taxonomy's not-found tag", async () => {

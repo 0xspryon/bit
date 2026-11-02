@@ -129,6 +129,7 @@ import {
   type MessageEntry,
   type NarrationDetail,
   type PromptDelivery,
+  type SessionStatus,
   type TerminalOutcome,
 } from "./agentHarness";
 import { HarnessProcessError, HarnessTransportError } from "./errors";
@@ -1648,47 +1649,60 @@ export const claudeCodeHarness = (
           };
         }
         /**
-         * Not ours, so there is nothing that can be asked — and that is a *definite*
-         * fact here, which is the one place this harness could not copy OpenCode's
-         * answer.
+         * Not ours. The session is **not running** — that much is definite here — and
+         * since `activity` exists, that is now something this seam can say.
          *
          * A Claude Code session is run by a CLI subprocess the SDK owns, and its live
          * `Query` handle — the open stream that control requests, stream input and close
          * all travel over — does not outlive the process that spawned it. The SDK offers
          * no re-attach to another process's query. So a session id this process does not
-         * hold is a session that is **not running**, whatever the transcript on disk says.
+         * hold is a session that is not running, whatever the transcript on disk says.
          *
          * **The conversation does outlive it**, and that is a different claim from the
-         * one above. The CLI's transcript is on disk, `getSessionMessages` reads it after a
-         * restart, and a *fresh* `query({ options: { resume: id } })` continues it — the
-         * SDK's own `forkSession` doc names that as how a session is resumed. Nothing here
-         * passes `resume` yet; the importer conversation design's S2.5 records what each
-         * harness keeps and leaves resuming to S6. This comment used to say the session
-         * itself does not outlive the process, which would have been a reason not to try.
+         * one above. The CLI's transcript is on disk, `getSessionMessages` reads it after
+         * a restart, and a *fresh* `query({ options: { resume: id } })` continues it —
+         * which {@link sessionContinuation} answers and S6 shipped.
          *
-         * Reporting `{}` here — "exists, nothing definite", which is what the transcript
-         * literally supports — was wrong, and a live crash-and-restart is what showed it:
+         * ## Why this used to fail, and what changed
+         *
+         * Reporting `{}` here was wrong, and a live crash-and-restart is what showed it:
          * recovery read `{}` as `running`, recorded `still_running`, left the row
-         * `running` and bumped no fence. Nothing would ever have refined it, because the
-         * transcript will never gain an outcome. That is exactly the pile of stuck
-         * `running` rows recovery exists to prevent.
+         * `running` and bumped no fence, and nothing would ever refine it because the
+         * transcript will never gain an outcome. So both branches were made to *fail*,
+         * and the argument for that was sound at the time: with only an `outcome` field
+         * in the seam there was no way to say "this session exists, nothing is running
+         * it, and how its last turn ended is unknown" — `{}` implied `running` and
+         * anything else would have invented an outcome. A refusal was the honest answer
+         * available.
          *
-         * So both branches fail, and the failure is honest in both: we could not ask.
-         * `recovery/harnessStatus.ts` maps them to `missing` and `unreachable`, which are
-         * both `uncertain` — the right answer, reached for the right reason. The
-         * transcript lookup is still worth doing, because "we have this session's
-         * transcript" and "we have never heard of this id" are different facts to an
-         * operator, and the detail says which.
+         * `SessionActivity` is that missing sentence, and it changes the answer rather
+         * than the reasoning. **A transcript this process holds now answers
+         * `{ activity: "idle", outcome: undefined }`**, which `recovery/harnessStatus.ts`
+         * reads as `abandoned`: the session is there, nothing is running it, nothing ever
+         * recorded an outcome. That is `uncertain` for an attempt and a round — the same
+         * disposition the refusal reached — but it is `uncertain` for the *stated* reason
+         * rather than because we could not ask, and `abandoned` is the one answer a
+         * continuation can be decided from (the design's S7.5). While the refusal stood,
+         * nothing on this driver was ever continued after a restart.
          *
-         * OpenCode does **not** land here by the same route, and an earlier version of
-         * this comment said it did — that a restarted `opencode serve` "has never heard of
-         * the old session" and answers `SessionNotFoundError`. That was wrong. OpenCode's
-         * sessions are rows in one SQLite file (`$XDG_DATA_HOME/opencode/opencode.db`), so
-         * a fresh server finds an old session by primary key: its messages read, and a
-         * prompt into it continues the conversation. What a restart *does* lose there is
-         * the turn that was in flight — the sweep that would resume it is attached only in
-         * `--service` mode, and we spawn `serve --stdio` — so the session is reachable and
-         * its interrupted turn is not running.
+         * No `cost` and no `tokens`: both live on the {@link SessionRecord} this process
+         * no longer has, and the transcript read here does not carry them. Absent is what
+         * the seam means by "the harness does not know".
+         *
+         * **A session id the store has never heard of still fails**, with
+         * {@link SESSION_NOT_FOUND_TAG} — `missing`, not `abandoned`. That distinction is
+         * load-bearing in the other direction: `missing` says nothing about what the
+         * session did, while `abandoned` asserts the conversation is still there. Nothing
+         * is entitled to the second claim without having seen the transcript.
+         *
+         * A read that *throws* is still a failure — `unreachable`. "We could not look" is
+         * not "it is not running".
+         *
+         * OpenCode reaches the same `abandoned` answer by a different route: its sessions
+         * are rows in one SQLite file (`$XDG_DATA_HOME/opencode/opencode.db`), so a fresh
+         * server finds an old session by primary key and reports it idle out of
+         * `GET /api/session/active`. The two drivers now agree on what a restart looks
+         * like, which they did not before.
          */
         const info = yield* Effect.tryPromise({
           try: () => sdk.sessionInfo(sessionId, {}),
@@ -1698,16 +1712,19 @@ export const claudeCodeHarness = (
               `could not read the Claude Code session store: ${String(cause)}`,
             ),
         });
-        return yield* info === undefined
-          ? transport(
-              "session.get",
-              `the Claude Code session store holds no session ${sessionId}`,
-              { tag: SESSION_NOT_FOUND_TAG, status: 404 },
-            )
-          : transport(
-              "session.get",
-              `session ${sessionId} has a transcript on disk but is not running in this process: its live query ended with the process that spawned it, though the conversation itself is still on disk and resumable. How its last turn ended cannot be established from here`,
-            );
+        if (info === undefined) {
+          return yield* transport(
+            "session.get",
+            `the Claude Code session store holds no session ${sessionId}`,
+            { tag: SESSION_NOT_FOUND_TAG, status: 404 },
+          );
+        }
+        return {
+          activity: "idle",
+          outcome: undefined,
+          cost: undefined,
+          tokens: undefined,
+        } satisfies SessionStatus;
       });
 
       /**
