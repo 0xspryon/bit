@@ -1187,7 +1187,7 @@ describe("a session this process does not hold", () => {
       // Not the not-found tag: we *do* have its transcript, and recovery's detail should
       // say so rather than claiming the harness has never heard of it.
       expect(error.tag).not.toBe(SESSION_NOT_FOUND_TAG);
-      expect(error.message).toContain("does not outlive the process");
+      expect(error.message).toContain("is not running in this process");
     }
   });
 

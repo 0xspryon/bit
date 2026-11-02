@@ -158,6 +158,10 @@ interface Script {
   /** Pages the scripted agent "could read". Anything else yields no calls at all. */
   readonly readable: Set<string>;
   readonly registrations: { url: string; bearer: string }[];
+  /** Every `createSession`, with the flag that decides whether it outlives a turn. */
+  readonly created: { sessionId: string; multiTurn: boolean }[];
+  /** Every registration taken back, by session. */
+  readonly unregistered: string[];
   readonly prompts: string[];
   readonly interrupted: string[];
   /** Sessions whose narration stream was subscribed to. Expected to stay empty. */
@@ -166,16 +170,21 @@ interface Script {
   done: Promise<void>;
   /** Makes `createSession` fail, for a session that never opens. */
   failCreate: boolean;
+  /** Makes the opening prompt fail, for a session the harness refuses to start. */
+  failPrompt: boolean;
 }
 
 const newScript = (readable: readonly string[]): Script => ({
   readable: new Set(readable),
   registrations: [],
+  created: [],
+  unregistered: [],
   prompts: [],
   interrupted: [],
   subscribed: [],
   done: Promise.resolve(),
   failCreate: false,
+  failPrompt: false,
 });
 
 /**
@@ -201,7 +210,18 @@ const scriptedHarness = (script: Script) =>
               cause: undefined,
             }),
           )
-        : Effect.succeed({ id: input.sessionId ?? "ses_x" }),
+        : Effect.sync(() => {
+            const id = input.sessionId ?? "ses_x";
+            script.created.push({
+              sessionId: id,
+              multiTurn: input.multiTurn === true,
+            });
+            return { id };
+          }),
+    unregisterMcpServer: (sessionId) =>
+      Effect.sync(() => {
+        script.unregistered.push(sessionId);
+      }),
     registerMcpServer: (_sessionId, _name, config: McpRegistration) =>
       Effect.sync(() => {
         script.registrations.push({
@@ -212,45 +232,55 @@ const scriptedHarness = (script: Script) =>
         });
       }),
     prompt: (_sessionId, text) =>
-      Effect.sync(() => {
-        script.prompts.push(text);
-        const registration = script.registrations[0];
-        if (registration === undefined) return { delivered: true };
-        const url = registration.url;
-        const bearer = registration.bearer;
-        // Kicked off here and awaited by `waitForIdle` below, so the import is genuinely
-        // asynchronous with respect to `start` — which is the property `createTarget`
-        // depends on and which a synchronous script would quietly remove.
-        script.done = (async () => {
-          for (const page of [PAGE_GOOD, PAGE_BAD]) {
-            if (!script.readable.has(page)) continue;
-            const prefix = page === PAGE_GOOD ? "acme" : "acmelabs";
-            await callTool(url, bearer, "add_scope_entry", {
-              effect: "in",
-              kind: "subtree",
-              value: `${prefix}.com`,
-              source_url: page,
-              note: "scope table, row 1",
-            });
-            await callTool(url, bearer, "add_scope_entry", {
-              effect: "out",
-              kind: "host",
-              value: `blog.${prefix}.com`,
-              source_url: page,
-              note: "out of scope, item 1",
-            });
-            await callTool(url, bearer, "record_imported_asset", {
-              operation_id: `op-${prefix}-1`,
-              kind: "host",
-              url: `https://www.${prefix}.com`,
-              method: null,
-              source_url: page,
-              note: "scope table, row 1",
-            });
-          }
-        })();
-        return { delivered: true };
-      }),
+      script.failPrompt
+        ? Effect.fail(
+            new HarnessTransportError({
+              operation: "prompt",
+              status: 503,
+              tag: undefined,
+              detail: "the scripted harness would not take the prompt",
+              cause: undefined,
+            }),
+          )
+        : Effect.sync(() => {
+            script.prompts.push(text);
+            const registration = script.registrations[0];
+            if (registration === undefined) return { delivered: true };
+            const url = registration.url;
+            const bearer = registration.bearer;
+            // Kicked off here and awaited by `waitForIdle` below, so the import is genuinely
+            // asynchronous with respect to `start` — which is the property `createTarget`
+            // depends on and which a synchronous script would quietly remove.
+            script.done = (async () => {
+              for (const page of [PAGE_GOOD, PAGE_BAD]) {
+                if (!script.readable.has(page)) continue;
+                const prefix = page === PAGE_GOOD ? "acme" : "acmelabs";
+                await callTool(url, bearer, "add_scope_entry", {
+                  effect: "in",
+                  kind: "subtree",
+                  value: `${prefix}.com`,
+                  source_url: page,
+                  note: "scope table, row 1",
+                });
+                await callTool(url, bearer, "add_scope_entry", {
+                  effect: "out",
+                  kind: "host",
+                  value: `blog.${prefix}.com`,
+                  source_url: page,
+                  note: "out of scope, item 1",
+                });
+                await callTool(url, bearer, "record_imported_asset", {
+                  operation_id: `op-${prefix}-1`,
+                  kind: "host",
+                  url: `https://www.${prefix}.com`,
+                  method: null,
+                  source_url: page,
+                  note: "scope table, row 1",
+                });
+              }
+            })();
+            return { delivered: true };
+          }),
     waitForIdle: () => Effect.promise(() => script.done),
     interruptSession: (sessionId) =>
       Effect.sync(() => {
@@ -373,10 +403,16 @@ const world = (readable: readonly string[]) => {
  */
 const importWith = async (
   readable: readonly string[],
-  options: { readonly failCreate?: boolean } = {},
+  options: {
+    readonly failCreate?: boolean;
+    readonly failPrompt?: boolean;
+    /** The links pasted. Both pages unless a test says otherwise. */
+    readonly links?: readonly string[];
+  } = {},
 ) => {
   const built = world(readable);
   built.script.failCreate = options.failCreate === true;
+  built.script.failPrompt = options.failPrompt === true;
   const runtime = ManagedRuntime.make(built.layer);
   const outcome = await runtime.runPromise(
     Effect.gen(function* () {
@@ -394,7 +430,7 @@ const importWith = async (
         targetId: TARGET,
         targetName: "Acme Corp",
         workspacePath: workspace,
-        links: [PAGE_GOOD, PAGE_BAD],
+        links: options.links ?? [PAGE_GOOD, PAGE_BAD],
       });
       return started;
     }),
@@ -820,6 +856,155 @@ describe("no harness", () => {
       ),
     );
     expect(started._tag).toBe("none");
+    await runtime.dispose();
+  });
+});
+
+/* ── S2: a session that outlives its first turn ──────────────────────────────── */
+
+/** The raw `ended_at` of every import row, read off the file rather than through a reader. */
+const endings = (root: string) => {
+  const database = new Database(join(root, "targets", TARGET, HUNT_FILE), {
+    readonly: true,
+  });
+  try {
+    return database
+      .query("SELECT import_id, ended_at FROM import_sessions")
+      .all() as { import_id: string; ended_at: number | null }[];
+  } finally {
+    database.close();
+  }
+};
+
+/** The live grant count and what the registered bearer resolves to, from the runtime. */
+const authorityOf = (
+  runtime: ManagedRuntime.ManagedRuntime<McpCredentials, unknown>,
+  bearer: string,
+) =>
+  runtime.runPromise(
+    Effect.gen(function* () {
+      const credentials = yield* McpCredentials;
+      return {
+        credentials,
+        size: yield* credentials.size,
+        grant: yield* credentials.resolve(bearer),
+      };
+    }),
+  );
+
+describe("a session that outlives its first turn", () => {
+  test("a single-link import writes, settles finished and reports — and the session stays open", async () => {
+    // The regression this slice must not cause: `start` is called exactly as `createTarget`
+    // calls it, after the same `register` and `migrateTarget`. Everything an import did
+    // before it still does; the only difference is that its authority survives the turn.
+    const { built, runtime, view } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    expect(view?.status).toBe("finished");
+    expect(view?.detail).toBe(REPORT);
+    const scope = await scopeOf(runtime);
+    expect(scope.entries.map((entry) => entry.value).sort()).toEqual([
+      "acme.com",
+      "blog.acme.com",
+    ]);
+
+    // The difference: one session, still registered, its grant still live.
+    expect(built.script.created).toEqual([
+      { sessionId: "ses_import", multiTurn: true },
+    ]);
+    expect(built.script.unregistered).toEqual([]);
+    const bearer = built.script.registrations[0]?.bearer ?? "";
+    const held = await authorityOf(runtime, bearer);
+    expect(held.size).toBe(1);
+    expect(held.grant?._tag).toBe("importer");
+    // No clock: the conversation is bounded by what closes it, not by a lifetime.
+    expect(held.grant?.expiresAt).toBeNull();
+    expect(endings(built.root).map((row) => row.ended_at)).toEqual([null]);
+    await runtime.dispose();
+  });
+
+  test("the layer's finalizer closes the session: zero live grants, unregistered, ended", async () => {
+    const { built, runtime, view } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    expect(view?.status).toBe("finished");
+    const { credentials } = await authorityOf(runtime, "");
+
+    await runtime.dispose();
+
+    // The registry outlives the runtime as an object, so it can be asked after release.
+    expect(await Effect.runPromise(credentials.size)).toBe(0);
+    expect(built.script.unregistered).toEqual(["ses_import"]);
+    const ended = endings(built.root);
+    expect(ended).toHaveLength(1);
+    expect(typeof ended[0]?.ended_at).toBe("number");
+  });
+
+  test("stopping a finished import ends its session and its writes with it", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const bearer = built.script.registrations[0]?.bearer ?? "";
+
+    const stopped = await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.stop(started.importId),
+      ),
+    );
+    expect(stopped).toBeDefined();
+    expect(built.script.interrupted).toEqual(["ses_import"]);
+    expect(built.script.unregistered).toEqual(["ses_import"]);
+    const after = await authorityOf(runtime, bearer);
+    expect(after.size).toBe(0);
+    expect(after.grant).toBeUndefined();
+    expect(typeof endings(built.root)[0]?.ended_at).toBe("number");
+
+    // The bearer the session held is refused at the door now.
+    const late = await callTool(
+      built.script.registrations[0]?.url ?? "",
+      bearer,
+      "add_scope_entry",
+      {
+        effect: "in",
+        kind: "host",
+        value: "late.acme.com",
+        source_url: PAGE_GOOD,
+        note: "after the stop",
+      },
+    );
+    expect(late.text).not.toContain("late.acme.com");
+    const scope = await scopeOf(runtime);
+    expect(scope.entries.some((entry) => entry.value === "late.acme.com")).toBe(
+      false,
+    );
+    await runtime.dispose();
+  });
+
+  test("a session that could not be opened is ended, not left looking open", async () => {
+    const { built, runtime, view } = await importWith([PAGE_GOOD], {
+      failCreate: true,
+    });
+    expect(view?.status).toBe("failed");
+    expect(endings(built.root).map((row) => typeof row.ended_at)).toEqual([
+      "number",
+    ]);
+    const { size } = await authorityOf(runtime, "");
+    expect(size).toBe(0);
+    await runtime.dispose();
+  });
+
+  test("a prompt the harness refuses closes the session it was sent to", async () => {
+    // The third close on the list: a session that has been prompted-and-failed is given
+    // up on, so its grant and registration go and the import is recorded as ended.
+    const { built, runtime, view } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      failPrompt: true,
+    });
+    expect(view?.status).toBe("failed");
+    expect(built.script.unregistered).toEqual(["ses_import"]);
+    expect((await authorityOf(runtime, "")).size).toBe(0);
+    expect(typeof endings(built.root)[0]?.ended_at).toBe("number");
     await runtime.dispose();
   });
 });

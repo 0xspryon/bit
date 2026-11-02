@@ -2,9 +2,41 @@
  * The scope importer: one agent session that reads a program's pages and writes its scope.
  *
  * Started by `createTarget` when the operator pasted at least one program link (D13), and
- * by nothing else. It runs once per target creation, finishes before any goal exists, and
- * has three tools — `add_scope_entry`, `record_imported_asset`, `read_scope` — on its own
- * MCP endpoint.
+ * by nothing else. Its first turn runs once per target creation and finishes before any goal
+ * exists, and it has three tools — `add_scope_entry`, `record_imported_asset`, `read_scope` —
+ * on its own MCP endpoint.
+ *
+ * ## The session outlives its first turn
+ *
+ * The importer is becoming a conversation (the importer conversation design, S2), so the
+ * session — and the credential and MCP registration its scope holds — no longer ends when
+ * the first turn goes idle. It lives in the shared registry `harness/liveAgentSessions.ts`,
+ * the same spine the goal conversation runs on, created `multiTurn` and keyed by import id.
+ * Three things close it, and they are the whole list:
+ *
+ * 1. **The operator ends it** — {@link ScopeImporter.stop}, the one intentional close.
+ * 2. **This layer's finalizer**, which closes every session still open. A `SIGINT` ends
+ *    every importer conversation, which is what makes "no longer than the process" true.
+ * 3. **A prompt the harness refuses.** The spine closes a session whose opening prompt
+ *    failed, so the next open builds a fresh one rather than failing the same way forever;
+ *    on Claude Code that includes a session whose query has closed.
+ *
+ * Each close records `import_sessions.ended_at` (`0026`), and the importer's toolkit refuses
+ * every write under an ended import. That column is what stands behind a credential that has
+ * no clock: the grant is issued without expiry, as a goal's is, because a conversation the
+ * operator leaves and comes back to would otherwise be a live session whose every tool call
+ * is a `401` with no cause anyone can see — and a longer clock is the same failure further
+ * away.
+ *
+ * ## No idle timeout, and that is a decision rather than an omission
+ *
+ * The goal path's argument, and it transfers without modification. An idle import session
+ * costs an entry in a map and, on Claude Code, one parked `query()` whose generator is
+ * waiting on a promise; neither accumulates with time, and both die with the process. A
+ * timeout would introduce the one failure this design exists to avoid — a conversation that
+ * stops working for a reason the operator cannot see — in exchange for releasing memory
+ * bounded by the number of imports an operator has open. If a bound is ever wanted it is a
+ * count, not a clock.
  *
  * ## It starts no work, and this file is where that is true or false
  *
@@ -66,27 +98,23 @@
  * {@link SCOPE_IMPORT_REPORT_MAX} characters, read once from `messages` rather than
  * streamed, and rendered as text by a browser that escapes it.
  */
-import {
-  bitMcpServerName,
-  SCOPE_IMPORT_MAX_LINKS,
-  type ScopeImportView,
-} from "@bit/contracts";
-import { Context, Effect, Exit, Fiber, Layer, Redacted, Scope } from "effect";
+import { SCOPE_IMPORT_MAX_LINKS, type ScopeImportView } from "@bit/contracts";
+import { Context, Effect, Fiber, Layer } from "effect";
 
 import { resolveImporterModel } from "./importerModel";
 import { assembleImporterPrompt } from "./importerPrompt";
 import { ScopeImportProgress } from "./progress";
+import { lastAssistantText, type AgentHarness } from "../harness/agentHarness";
 import {
-  lastAssistantText,
-  OPEN_PROMPT,
-  type AgentHarness,
-} from "../harness/agentHarness";
+  makeLiveAgentSessions,
+  type LiveAgentSession,
+  type LiveSessionOpenFailure,
+} from "../harness/liveAgentSessions";
 import { HarnessResolver } from "../harness/resolver";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { newImportId } from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
-import { gatedRoleDirectory, POLICY_AUDIT_FILE } from "../policy/install";
 import { WorkerEndpoints } from "../run/supervisor";
 
 /**
@@ -193,8 +221,9 @@ export class ScopeImporter extends Context.Service<
    *
    * That lifetime is the one that is correct: longer than the HTTP request that started an
    * import, and no longer than the process. Shutting the server down closes this scope,
-   * which interrupts any import still reading and takes its credential and registration
-   * with it.
+   * which interrupts any first turn still reading and then — the session registry's
+   * finalizer was registered first, so it runs last — closes every import session, taking
+   * its credential and registration with it.
    */
   static readonly layer: Layer.Layer<
     ScopeImporter,
@@ -214,32 +243,98 @@ export class ScopeImporter extends Context.Service<
       const endpoints = yield* WorkerEndpoints;
       const progress = yield* ScopeImportProgress;
       const stores = yield* TargetStores;
-      // This layer's own scope, which every import's fiber is forked into. Shutting the
-      // server down closes it, which interrupts any import still reading and — through
-      // each import's own inner scope — revokes its credential and takes back its MCP
+      // This layer's own scope, which every import's first turn is forked into. Shutting
+      // the server down closes it, which interrupts any turn still reading; the session
+      // registry's finalizer then revokes each credential and takes back each MCP
       // registration.
       const own = yield* Effect.scope;
 
-      /** Live imports, so a stop can reach the fiber a route does not hold. */
-      const live = new Map<
-        string,
-        {
-          readonly fiber: Fiber.Fiber<void>;
-          readonly harness: AgentHarness["Service"];
-          readonly sessionId: string;
-        }
-      >();
+      /**
+       * Records that an import's session has ended (`0026`), which is what the importer
+       * toolkit refuses writes on. Advisory in the way the row is: a failure is logged and
+       * nothing else, because the credential has already gone with the scope and this is
+       * the gate *behind* it.
+       */
+      const markEnded = (targetId: string, importId: string) =>
+        withTargetStore(stores, targetId, (store) =>
+          store.endImportSession(importId),
+        ).pipe(
+          Effect.catch((failure) =>
+            Effect.logWarning(
+              "a scope import's session ended but the end could not be recorded; its credential is revoked regardless",
+              { targetId, importId, detail: failure.message },
+            ),
+          ),
+        );
 
       /**
-       * The whole life of one import session, inside its own scope.
+       * Every import session this process holds, on the shared spine
+       * (`harness/liveAgentSessions.ts`), keyed by import id.
        *
-       * The order is the goal conversation's, and each step rules out the next step's
+       * **This is the line that makes a session outlive its first turn.** The import used to
+       * own its scope inside the fiber that ran it and close it on the fiber's exit, so the
+       * credential and the registration went the moment `waitForIdle` returned — there was
+       * nothing to send a second message to. The scope now lives here, and only the three
+       * things this module's header lists close it.
+       *
+       * The importer's half of the descriptor: the importer endpoint, an importer
+       * credential with no clock, `revokeImport` as the belt-and-braces check, and `ended_at`
+       * recorded once the session is closed.
+       */
+      const sessions = yield* makeLiveAgentSessions<undefined>(
+        { fleet, endpoints },
+        {
+          // The **importer** endpoint. The path selects the toolkit and the grant decides
+          // whether the request is served at all: an importer credential at the worker URL
+          // is a `401` before any tool list is produced, and a worker's credential here is
+          // the same — which is what makes "three tools, and nowhere else" a property of
+          // the registration rather than of a filter.
+          endpoint: (urls) => urls.importerMcp,
+          // No clock, as a goal's has none (S2.3). A fourth caller kind is still what
+          // makes this session's three tools unreachable from a worker, a planner or a goal
+          // agent: each endpoint refuses a grant whose tag is not the role it serves. What
+          // stands behind the missing clock is `ended_at` (`0026`), which the toolkit reads
+          // before every write.
+          issue: (input) =>
+            credentials.issueWithoutExpiry({
+              _tag: "importer",
+              targetId: input.targetId,
+              importId: input.id,
+            }),
+          revokeStray: credentials.revokeImport,
+          afterClose: (entry) => markEnded(entry.targetId, entry.id),
+          words: {
+            unregisterRefused:
+              "a harness would not take back the scope importer's MCP registration; the credential behind it is revoked either way",
+            strayCredential:
+              "a scope importer's credential outlived its session's scope and had to be revoked explicitly; the scope that acquired it should have done that",
+            closed: "a scope import's session was closed",
+            idKey: "importId",
+          },
+        },
+      );
+
+      /**
+       * The first turn of each import still running, so a stop can reach the fiber a route
+       * does not hold. Separate from {@link sessions}: the turn ends when the session goes
+       * idle, and the session does not.
+       */
+      const turns = new Map<string, Fiber.Fiber<void>>();
+
+      /**
+       * The first turn of one import: open the session, let it work, settle the view.
+       *
+       * The acquire order is the spine's, and each step rules out the next step's
        * ambiguity: the gated directory before the session, so a session is never created
        * in a directory nothing is auditing; the credential before the registration, so
        * there is something to register; the registration before the prompt, so turn one has
        * the tools. A failure at any step closes the scope, which revokes the credential and
        * unregisters the server — including the case where the *next* step is the thing that
        * failed.
+       *
+       * **When this returns the session is still open**, which is the only observable
+       * difference from before: the entries, the settle and the closing report are exactly
+       * what they were.
        */
       const run = Effect.fnUntraced(function* (input: {
         readonly importId: string;
@@ -248,145 +343,93 @@ export class ScopeImporter extends Context.Service<
         readonly model: string;
         readonly links: readonly string[];
         readonly sessionId: string;
-        readonly scope: Scope.Scope;
       }) {
-        const urls = yield* endpoints.urls;
         const harness = input.harness;
-
         const opened = yield* Effect.result(
-          Effect.gen(function* () {
-            const directory = yield* gatedRoleDirectory({
-              ensure: fleet.ensureImportDirectory(
+          sessions.open<
+            LiveAgentSession<undefined> | undefined,
+            LiveSessionOpenFailure,
+            never
+          >({
+            id: input.importId,
+            // Unreachable: every `start` mints a fresh import id, so nothing can have
+            // opened this one first. Answered rather than died on, and without touching a
+            // session this run did not open.
+            joined: () => Effect.succeed(undefined),
+            refuse: (failure) => failure,
+            prepare: Effect.succeed({
+              targetId: input.request.targetId,
+              harness,
+              model: input.model,
+              sessionId: input.sessionId,
+              title: `bit scope importer: ${input.request.targetName}`,
+              ensureDirectory: fleet.ensureImportDirectory(
                 input.request.targetId,
                 input.importId,
               ),
-              install: harness.installGate,
-              policyUrl: urls.policy,
-              // Outside the import's own directory, like a round's and a goal's: a session
-              // that can read the gate's record can read the shape of the boundary it is
-              // inside. `gatedRoleDirectory` refuses the nesting rather than trusting this
-              // call site to get it right.
-              auditPath: `${fleet.paths.evidenceDirectory(input.request.targetId)}/${POLICY_AUDIT_FILE}`,
               // The engagement folder, so the containment check can refuse an import
-              // directory inside it. `undefined` says this target has none, which is a
-              // statement rather than an omission.
-              ...(input.request.workspacePath === null
-                ? { workspace: undefined }
-                : { workspace: input.request.workspacePath }),
-            });
-
-            const created = yield* harness.createSession({
-              title: `bit scope importer: ${input.request.targetName}`,
-              model: input.model,
-              directory,
-              sessionId: input.sessionId,
-              // Single-turn. The importer is prompted once, works through every link, and
-              // stops; there is no operator on the other end of it and nothing steers it.
-              // That is also why there is no steering path here and no message queue.
-              multiTurn: false,
-            });
-
-            /*
-             * The session now exists, and the index is told so. Until this lands the row
-             * `start` wrote names an id the harness may never have minted, and the session
-             * list does not show it (`0025`). Advisory like the row itself: a failure is
-             * logged with the id and the import carries on, and the session is merely not
-             * listed.
-             */
-            yield* withTargetStore(stores, input.request.targetId, (store) =>
-              store.confirmImportSession(input.importId),
-            ).pipe(
-              Effect.catch((failure) =>
-                Effect.logWarning(
-                  "a scope import's session was created but could not be marked as such; the session will not appear in the target's list",
-                  {
-                    targetId: input.request.targetId,
-                    importId: input.importId,
-                    sessionId: input.sessionId,
-                    detail: failure.message,
-                  },
-                ),
-              ),
-            );
-
-            // `issueImport`, which takes importer bindings and nothing else, and defaults
-            // to a lifetime measured in minutes rather than a worker's six hours. A
-            // fourth caller kind is what makes this session's three tools unreachable
-            // from a worker, a planner or a goal agent: each endpoint refuses a grant
-            // whose tag is not the role it serves.
-            const credential = yield* credentials.issueImport({
-              _tag: "importer",
-              targetId: input.request.targetId,
-              importId: input.importId,
-            });
-
-            const serverName = bitMcpServerName(input.importId);
-            yield* Effect.acquireRelease(
-              harness.registerMcpServer(created.id, serverName, {
-                // The **importer** endpoint. This line is what decides the tool list: the
-                // path selects the toolkit and the grant decides whether the request is
-                // served at all. An importer credential at the worker URL is a `401`
-                // before any tool list is produced, and a worker's credential here is the
-                // same — which is what makes "three tools, and nowhere else" a property of
-                // the registration rather than of a filter.
-                url: urls.importerMcp,
-                headers: {
-                  authorization: Redacted.make(
-                    `Bearer ${Redacted.value(credential.token)}`,
-                  ),
-                },
-                directory,
-              }),
-              () =>
-                harness.unregisterMcpServer(created.id, serverName).pipe(
+              // directory inside it. `undefined` says this target has none.
+              workspace: input.request.workspacePath ?? undefined,
+              /*
+               * The session now exists, and the index is told so. Until this lands the row
+               * `start` wrote names an id the harness may never have minted, and the session
+               * list does not show it (`0025`). Advisory like the row itself: a failure is
+               * logged with the id and the import carries on, and the session is merely not
+               * listed.
+               */
+              afterCreate: () =>
+                withTargetStore(stores, input.request.targetId, (store) =>
+                  store.confirmImportSession(input.importId),
+                ).pipe(
                   Effect.catch((failure) =>
                     Effect.logWarning(
-                      "a harness would not take back the scope importer's MCP registration; the credential behind it is revoked either way",
+                      "a scope import's session was created but could not be marked as such; the session will not appear in the target's list",
                       {
+                        targetId: input.request.targetId,
                         importId: input.importId,
-                        server: serverName,
+                        sessionId: input.sessionId,
                         detail: failure.message,
                       },
                     ),
                   ),
                 ),
-            );
-            return created.id;
-          }).pipe(Scope.provide(input.scope)),
+              // No narrator. D16: the importer's narration is never captured, and S4 is
+              // the slice that changes that.
+              openingPrompt: () =>
+                assembleImporterPrompt({
+                  targetName: input.request.targetName,
+                  links: input.links,
+                }),
+              meta: undefined,
+            }),
+            opened: (entry) => Effect.succeed(entry),
+          }),
         );
 
-        if (opened._tag === "Failure") {
+        if (opened._tag === "Failure" || opened.success === undefined) {
+          const detail =
+            opened._tag === "Failure"
+              ? opened.failure.message
+              : "this import already has a session open in this process, so a second was not opened";
           yield* progress.settle({
             importId: input.importId,
             status: "failed",
-            detail: opened.failure.message,
+            detail,
           });
           yield* Effect.logWarning("a scope import could not be opened", {
             targetId: input.request.targetId,
             importId: input.importId,
-            detail: opened.failure.message,
+            detail,
           });
+          // Whatever was built is gone — the spine closed it — so the import is over. A
+          // session the harness created and then could not be given tools is a session
+          // this process will never prompt again.
+          if (opened._tag === "Failure") {
+            yield* markEnded(input.request.targetId, input.importId);
+          }
           return;
         }
-
-        const prompted = yield* Effect.result(
-          harness.prompt(
-            opened.success,
-            assembleImporterPrompt({
-              targetName: input.request.targetName,
-              links: input.links,
-            }),
-            OPEN_PROMPT,
-          ),
-        );
-        if (prompted._tag === "Failure") {
-          yield* progress.settle({
-            importId: input.importId,
-            status: "failed",
-            detail: prompted.failure.message,
-          });
-          return;
-        }
+        const sessionId = opened.success.sessionId;
 
         /*
          * Wait for the session to go idle, then settle.
@@ -402,9 +445,7 @@ export class ScopeImporter extends Context.Service<
          * already read produced entries. Those entries are written and are the operator's
          * to review. The detail carries what went wrong so the panel can say so.
          */
-        const settled = yield* Effect.result(
-          harness.waitForIdle(opened.success),
-        );
+        const settled = yield* Effect.result(harness.waitForIdle(sessionId));
         if (yield* progress.stopped(input.importId)) return;
 
         /*
@@ -426,7 +467,7 @@ export class ScopeImporter extends Context.Service<
          * that could not be fetched leaves the import exactly as `finished` as it was.
          */
         const report = yield* Effect.map(
-          Effect.result(harness.messages(opened.success)),
+          Effect.result(harness.messages(sessionId)),
           (read) =>
             read._tag === "Failure"
               ? null
@@ -553,14 +594,14 @@ export class ScopeImporter extends Context.Service<
         });
 
         /*
-         * The import's own scope, which outlives this request.
+         * The first turn, forked into this layer's scope so `start` answers without it.
          *
-         * `Scope.make` rather than the caller's: the caller is an HTTP handler about to
-         * answer, and a credential acquired in the request's scope would be revoked the
-         * instant the target was created — leaving a session with no tools, which is the
-         * failure `main.ts`'s header records having been observed for workers.
+         * **Its exit no longer closes anything.** The session's scope is the spine's, made
+         * there with `Scope.make` rather than the caller's for the reason it always was —
+         * the caller is an HTTP handler about to answer, and a credential acquired in the
+         * request's scope would be revoked the instant the target was created — and closed
+         * only by what this module's header lists. The fiber ending is the end of a turn.
          */
-        const scope = yield* Scope.make();
         const fiber = yield* Effect.forkIn(
           run({
             importId,
@@ -569,16 +610,10 @@ export class ScopeImporter extends Context.Service<
             model: choice.model,
             links,
             sessionId,
-            scope,
-          }).pipe(
-            // The scope closes however the fiber ends — finished, failed or interrupted —
-            // so the credential is revoked and the registration taken back on every path.
-            Effect.onExit(() => Scope.close(scope, Exit.void)),
-            Effect.ensuring(Effect.sync(() => live.delete(importId))),
-          ),
+          }).pipe(Effect.ensuring(Effect.sync(() => turns.delete(importId)))),
           own,
         );
-        live.set(importId, { fiber, harness, sessionId });
+        turns.set(importId, fiber);
 
         yield* Effect.logInfo("a scope import started", {
           targetId: request.targetId,
@@ -607,7 +642,9 @@ export class ScopeImporter extends Context.Service<
          * immediately with the receipt for what landed. Then the credential goes — before
          * the interrupt is waited on, so a session mid-call finds its next call refused at
          * the door rather than having however long the harness takes to come back. Then
-         * the session is interrupted and its fiber killed, which closes its scope.
+         * the harness is told to stop, the first turn's fiber is interrupted if it is still
+         * running, and the session is closed: the operator ending it is the one intentional
+         * close on this module's list, and it records `ended_at`.
          *
          * Everything written before this stays. That is what makes stopping early a
          * decision rather than a loss, and it is true because the session wrote as it read.
@@ -618,24 +655,33 @@ export class ScopeImporter extends Context.Service<
         );
         if (view === undefined) return undefined;
 
-        const entry = live.get(importId);
-        if (entry === undefined) return view;
+        const entry = sessions.get(importId);
+        const turn = turns.get(importId);
+        if (entry === undefined && turn === undefined) return view;
 
         yield* credentials.revokeImport(importId);
-        yield* entry.harness
-          .interruptSession(entry.sessionId)
-          .pipe(
-            Effect.catch((failure) =>
-              Effect.as(
-                Effect.logWarning(
-                  "a harness would not interrupt a scope import; its credential is revoked and its fiber is interrupted either way",
-                  { importId, detail: failure.message },
+        if (entry !== undefined) {
+          yield* entry.harness
+            .interruptSession(entry.sessionId)
+            .pipe(
+              Effect.catch((failure) =>
+                Effect.as(
+                  Effect.logWarning(
+                    "a harness would not interrupt a scope import; its credential is revoked and its session is closed either way",
+                    { importId, detail: failure.message },
+                  ),
+                  false,
                 ),
-                false,
               ),
-            ),
-          );
-        yield* Fiber.interrupt(entry.fiber);
+            );
+        }
+        // An interrupt mid-open is the spine's to clean up: it closes a scope in no map,
+        // and an entry it had published but not yet prompted.
+        if (turn !== undefined) yield* Fiber.interrupt(turn);
+        yield* sessions.close(importId);
+        // Recorded here as well as by the close, for the stop that landed before any entry
+        // was published: there was no session to close, and the import is over all the same.
+        yield* markEnded(view.targetId, importId);
         return view;
       });
 

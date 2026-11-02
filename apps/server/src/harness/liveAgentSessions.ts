@@ -401,74 +401,118 @@ export const makeLiveAgentSessions = <Meta>(
            *
            * `Scope.make` rather than the caller's scope, because the caller is an HTTP handler
            * about to answer or a fiber about to finish its first turn: a credential acquired
-           * in either would be revoked the moment the caller moved on.
+           * in either would be revoked the moment the caller moved on. Made under
+           * `uninterruptibleMask`, so there is no instant at which it exists and the
+           * interrupt handler below does not cover it.
+           *
+           * How far this open got, for the interrupt handler below and nothing else.
+           *
+           * An opener can be interrupted — an HTTP handler whose client went away, an
+           * importer's first-turn fiber the operator stopped. Interrupted while `building`,
+           * the scope is in no map and nothing else could ever close it. Interrupted while
+           * `published`, the entry is in the map unpreambled, and the next caller *inside*
+           * the permit — which does not check the flag — would deliver into a session that
+           * was never framed. So both are closed here, which keeps "an entry reachable inside
+           * the permit is preambled or gone" true on the interrupted path too.
            */
-          const scope = yield* Scope.make();
+          let stage:
+            | { readonly _tag: "building" }
+            | {
+                readonly _tag: "published";
+                readonly entry: LiveAgentSession<Meta>;
+              }
+            | { readonly _tag: "ready" } = { _tag: "building" };
 
-          const opened = yield* Effect.result(
+          const preambledEntry = yield* Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
-              const { created, directory } = yield* acquire(plan, urls);
-              yield* register(plan, input.id, urls, created, directory);
-              return created.id;
-            }).pipe(Scope.provide(scope)),
+              const scope = yield* Scope.make();
+              return yield* restore(
+                Effect.gen(function* () {
+                  const opened = yield* Effect.result(
+                    Effect.gen(function* () {
+                      const { created, directory } = yield* acquire(plan, urls);
+                      yield* register(plan, input.id, urls, created, directory);
+                      return created.id;
+                    }).pipe(Scope.provide(scope)),
+                  );
+                  if (opened._tag === "Failure") {
+                    // Nothing was registered or the session could not be made: close
+                    // the scope rather than leave a credential behind a session that
+                    // does not exist.
+                    yield* Scope.close(scope, Exit.void);
+                    return yield* Effect.fail(input.refuse(opened.failure));
+                  }
+
+                  const narrate = plan.narrate;
+                  const narrator =
+                    narrate === undefined
+                      ? undefined
+                      : yield* Effect.forkIn(narrate(opened.success), scope);
+                  const entry: LiveAgentSession<Meta> = {
+                    id: input.id,
+                    targetId: plan.targetId,
+                    sessionId: opened.success,
+                    instanceId: harness.instance.instanceId,
+                    model: plan.model,
+                    harness,
+                    scope,
+                    narrator,
+                    openedAt: Date.now(),
+                    // Nothing has been said to this session yet. Published anyway — a
+                    // scope in no map is a scope nothing can close — so what keeps a
+                    // message out of it until the opening prompt has landed is this
+                    // flag rather than the absence of an entry.
+                    preambled: false,
+                    meta: plan.meta,
+                  };
+                  live.set(input.id, entry);
+                  stage = { _tag: "published", entry };
+
+                  if (plan.beforePrompt !== undefined)
+                    yield* plan.beforePrompt(entry);
+
+                  const prompted = yield* Effect.result(
+                    harness.prompt(
+                      entry.sessionId,
+                      plan.openingPrompt(entry),
+                      OPEN_PROMPT,
+                    ),
+                  );
+                  if (prompted._tag === "Failure") {
+                    // Nothing ran, and the session is useless: it has been
+                    // prompted-and-failed, and this seam never resubmits a prompt. Closed
+                    // so the next open builds a fresh one.
+                    yield* closeSession(entry);
+                    return yield* Effect.fail(input.refuse(prompted.failure));
+                  }
+                  /*
+                   * The opening prompt has landed, so the session may be reached from
+                   * outside the permit. Set here and nowhere else — after acceptance and
+                   * before the permit is released. A replacement entry rather than a
+                   * mutation, because the entry is readonly; the `Scope` and the narrator
+                   * are the same objects, so `closeSession` closes the same things either
+                   * way.
+                   */
+                  const preambledEntry: LiveAgentSession<Meta> = {
+                    ...entry,
+                    preambled: true,
+                  };
+                  live.set(input.id, preambledEntry);
+                  stage = { _tag: "ready" };
+                  return preambledEntry;
+                }),
+              ).pipe(
+                Effect.onInterrupt(() => {
+                  const reached = stage;
+                  return reached._tag === "building"
+                    ? Scope.close(scope, Exit.void)
+                    : reached._tag === "published"
+                      ? closeSession(reached.entry)
+                      : Effect.void;
+                }),
+              );
+            }),
           );
-          if (opened._tag === "Failure") {
-            // Nothing was registered or the session could not be made: close the scope
-            // rather than leave a credential behind a session that does not exist.
-            yield* Scope.close(scope, Exit.void);
-            return yield* Effect.fail(input.refuse(opened.failure));
-          }
-
-          const narrate = plan.narrate;
-          const narrator =
-            narrate === undefined
-              ? undefined
-              : yield* Effect.forkIn(narrate(opened.success), scope);
-          const entry: LiveAgentSession<Meta> = {
-            id: input.id,
-            targetId: plan.targetId,
-            sessionId: opened.success,
-            instanceId: harness.instance.instanceId,
-            model: plan.model,
-            harness,
-            scope,
-            narrator,
-            openedAt: Date.now(),
-            // Nothing has been said to this session yet. Published anyway — a scope in no
-            // map is a scope nothing can close — so what keeps a message out of it until the
-            // opening prompt has landed is this flag rather than the absence of an entry.
-            preambled: false,
-            meta: plan.meta,
-          };
-          live.set(input.id, entry);
-
-          if (plan.beforePrompt !== undefined) yield* plan.beforePrompt(entry);
-
-          const prompted = yield* Effect.result(
-            harness.prompt(
-              entry.sessionId,
-              plan.openingPrompt(entry),
-              OPEN_PROMPT,
-            ),
-          );
-          if (prompted._tag === "Failure") {
-            // Nothing ran, and the session is useless: it has been prompted-and-failed, and
-            // this seam never resubmits a prompt. Closed so the next open builds a fresh one.
-            yield* closeSession(entry);
-            return yield* Effect.fail(input.refuse(prompted.failure));
-          }
-          /*
-           * The opening prompt has landed, so the session may be reached from outside the
-           * permit. Set here and nowhere else — after acceptance and before the permit is
-           * released. A replacement entry rather than a mutation, because the entry is
-           * readonly; the `Scope` and the narrator are the same objects, so `closeSession`
-           * closes the same things either way.
-           */
-          const preambledEntry: LiveAgentSession<Meta> = {
-            ...entry,
-            preambled: true,
-          };
-          live.set(input.id, preambledEntry);
           return yield* input.opened(preambledEntry);
         }),
       );

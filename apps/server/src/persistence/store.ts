@@ -6455,6 +6455,7 @@ const makeStore = Effect.fnUntraced(function* () {
     entries_in: Schema.Finite,
     entries_out: Schema.Finite,
     assets: Schema.Finite,
+    ended_at: Schema.NullOr(Schema.Finite),
   });
 
   /**
@@ -6486,6 +6487,10 @@ const makeStore = Effect.fnUntraced(function* () {
    * target's rows, newest first). The dedup `NOT EXISTS` and the correlated subqueries probe
    * `(target_id, harness_session_id)`, which that index does not serve: they are per-session
    * scans of one target's small table, not an indexed lookup, and nothing here claims more.
+   *
+   * `ended_at` is the session's, not a run's (`0026`): the latest run's ending once every
+   * confirmed run of it has one, and `NULL` while any of them is still open. `count(*)`
+   * against `count(ended_at)` is that test — the second counts only the ended runs.
    *
    * `import_ids` is a comma-joined list because an import id is minted (`imp_` and a
    * timestamp-ordered identifier) and never contains one, and because the route needs them
@@ -6521,7 +6526,12 @@ const makeStore = Effect.fnUntraced(function* () {
               WHERE a.caller_scope IN (
                 SELECT r.caller_scope FROM import_sessions r
                 WHERE r.target_id = s.target_id
-                  AND r.harness_session_id = s.harness_session_id)) AS assets
+                  AND r.harness_session_id = s.harness_session_id)) AS assets,
+            (SELECT CASE WHEN count(*) = count(r.ended_at) THEN max(r.ended_at) END
+              FROM import_sessions r
+              WHERE r.target_id = s.target_id
+                AND r.harness_session_id = s.harness_session_id
+                AND r.session_created_at IS NOT NULL) AS ended_at
           FROM import_sessions s
           WHERE s.target_id = ${targetId}
             AND s.session_created_at IS NOT NULL
@@ -6557,6 +6567,7 @@ const makeStore = Effect.fnUntraced(function* () {
         entriesIn: row.entries_in,
         entriesOut: row.entries_out,
         assets: row.assets,
+        endedAt: row.ended_at,
       }));
     },
   );
@@ -6620,6 +6631,54 @@ const makeStore = Effect.fnUntraced(function* () {
       Effect.mapError(asDatabaseError("query")),
     );
   });
+
+  /**
+   * Records that an import's session has ended (`0026`). Called when the session is
+   * closed, by whatever closed it.
+   *
+   * Idempotent — `ended_at IS NULL` keeps the first instant, so a stop followed by the
+   * layer's finalizer records the stop — and an unknown import id updates nothing rather
+   * than failing, because the row's own write is advisory and may not have landed.
+   */
+  const endImportSession = Effect.fn("ObservationStore.endImportSession")(
+    function* (importId: string) {
+      const endedAt = yield* Clock.currentTimeMillis;
+      yield* sql`UPDATE import_sessions
+            SET ended_at = ${endedAt}
+            WHERE import_id = ${importId} AND ended_at IS NULL`.pipe(
+        Effect.mapError(asDatabaseError("query")),
+      );
+    },
+  );
+
+  const selectImportSessionEnd = SqlSchema.findOneOption({
+    Request: Schema.String,
+    Result: Schema.Struct({ ended_at: Schema.NullOr(Schema.Finite) }),
+    execute: (importId) =>
+      sql`SELECT ended_at FROM import_sessions WHERE import_id = ${importId}`,
+  });
+
+  /**
+   * Whether an import's session has been ended — the importer toolkit's
+   * `checkGoalAuthority`.
+   *
+   * **`false` for an import with no row**, and that is the index being advisory rather
+   * than a hole: `recordImportSession`'s failure is logged and the import runs regardless,
+   * so refusing an unindexed import's writes would turn a failed index write into a failed
+   * import. The credential is the door; this is the second gate behind a credential with no
+   * clock, and it closes on the one fact that row exists to carry.
+   */
+  const importSessionEnded = Effect.fn("ObservationStore.importSessionEnded")(
+    function* (importId: string) {
+      const row = yield* selectImportSessionEnd(importId).pipe(
+        Effect.mapError(lift("import_sessions", importId)),
+      );
+      return Option.match(row, {
+        onNone: () => false,
+        onSome: (value) => value.ended_at !== null,
+      });
+    },
+  );
 
   /** What a recorded steer answers with, and what a retry of one replays. */
   const SteerResult = Schema.Struct({
@@ -7941,6 +8000,8 @@ const makeStore = Effect.fnUntraced(function* () {
     importSessions,
     recordImportSession,
     confirmImportSession,
+    endImportSession,
+    importSessionEnded,
     endGoalAsAgent,
     attemptsForGoal,
   });
@@ -8558,9 +8619,22 @@ export class ObservationStore extends Context.Service<
         readonly entriesIn: number;
         readonly entriesOut: number;
         readonly assets: number;
+        /** When the session was ended (`0026`), or `null` while any run of it is open. */
+        readonly endedAt: number | null;
       }[],
       DatabaseError | StoredRowError
     >;
+    /** Records that an import's session has ended (`0026`). Idempotent. */
+    readonly endImportSession: (
+      importId: string,
+    ) => Effect.Effect<void, DatabaseError>;
+    /**
+     * Whether an import's session has been ended. `false` for an import with no row: the
+     * index is advisory, and its absence is not an ending.
+     */
+    readonly importSessionEnded: (
+      importId: string,
+    ) => Effect.Effect<boolean, DatabaseError | StoredRowError>;
     /**
      * Records that the harness created the session an import run's row names (`0025`). Until
      * it has, {@link importSessions} does not list the row.

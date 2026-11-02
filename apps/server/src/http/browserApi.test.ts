@@ -4195,11 +4195,13 @@ describe("a target's importer sessions", () => {
     importId: string,
     session: string,
     openedAt: number,
+    endedAt: number | null = null,
   ) => ({
     importId,
     targetId,
     session,
     openedAt,
+    endedAt,
     scope: `${targetId}/import/${importId}`,
   });
 
@@ -4213,8 +4215,8 @@ describe("a target's importer sessions", () => {
         database.run(
           `INSERT INTO import_sessions (
              import_id, target_id, harness_session_id, harness_instance_id, model,
-             caller_scope, opened_at, session_created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+             caller_scope, opened_at, session_created_at, ended_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             r.importId,
             r.targetId,
@@ -4224,6 +4226,7 @@ describe("a target's importer sessions", () => {
             r.scope,
             r.openedAt,
             r.openedAt + 1,
+            r.endedAt,
           ],
         );
       }
@@ -4268,7 +4271,7 @@ describe("a target's importer sessions", () => {
     await register(quiet);
     await register(other);
     seed(withSessions, [
-      run(withSessions, "imp_old", "ses_old", 1_000),
+      run(withSessions, "imp_old", "ses_old", 1_000, 1_500),
       run(withSessions, LIVE_IMPORT_ID, "ses_new", 2_000),
     ]);
     seed(other, [run(other, "imp_elsewhere", "ses_elsewhere", 9_000)]);
@@ -4288,6 +4291,7 @@ describe("a target's importer sessions", () => {
           openedAt: 2_000,
           // This process holds LIVE_IMPORT_ID as running, and nothing stored says so.
           running: true,
+          endedAt: null,
           tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
         },
         {
@@ -4296,6 +4300,8 @@ describe("a target's importer sessions", () => {
           model: "openai/gpt-5.6-sol",
           openedAt: 1_000,
           running: false,
+          // Stored (`0026`), so it survives the process that ended it.
+          endedAt: 1_500,
           tally: { entriesIn: 2, entriesOut: 1, assets: 1 },
         },
       ],

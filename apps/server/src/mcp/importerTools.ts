@@ -441,6 +441,48 @@ const importerOrRefuse = Effect.fnUntraced(function* (write: string) {
 });
 
 /**
+ * Refuses a write under an import whose session has ended — the importer's
+ * `checkGoalAuthority`.
+ *
+ * **Why this exists now and did not before.** The importer's credential used to carry a
+ * thirty-minute clock, and it lost it when the importer became a conversation (S2.3). A
+ * goal's no-expiry credential has a durable gate behind it — every write under an ended goal
+ * is refused by a column — and an import had none, so a no-expiry importer grant whose
+ * scope was somehow not closed would have been a grant with nothing behind it. This reads
+ * `import_sessions.ended_at` (`0026`), which closing the session sets.
+ *
+ * **Not in the write's transaction**, unlike `checkGoalAuthority`: `addScopeEntry` and
+ * `importAsset` take the operator's `HostContext` and know nothing of imports. The window
+ * that leaves is a call already through the door when the session closes, and the close
+ * revokes the credential *before* it records the end — so a call that races it was made
+ * under a grant that was live when it arrived. The gate is for the call that comes after,
+ * which is the one a leaked grant would make.
+ *
+ * Writes only. `read_scope` stays readable under an ended import for the goal path's
+ * reason: a read changes nothing, and it is not what this gate defends.
+ */
+const refuseIfEnded = Effect.fnUntraced(function* (
+  stores: TargetStores["Service"],
+  caller: ImporterCaller,
+  input: { readonly tool: string; readonly consequence: string },
+) {
+  const ended = yield* onImportersStore(
+    stores,
+    {
+      targetId: caller.targetId,
+      tool: input.tool,
+      consequence: input.consequence,
+    },
+    (store) => store.importSessionEnded(caller.importId),
+  );
+  if (!ended) return;
+  return yield* new ScopeImportRefused({
+    reason: "unauthorized",
+    detail: `import ${caller.importId} has ended, so its session's authority has ended with it and ${input.consequence}. An ended import is not reopened.`,
+  });
+});
+
+/**
  * The host context the importer's writes are made under.
  *
  * The target comes from the credential and the scope from the credential's own import id,
@@ -527,6 +569,10 @@ export const ImporterToolkitLayer = ImporterToolkit.toLayer(
        */
       add_scope_entry: Effect.fn("add_scope_entry")(function* (input) {
         const caller = yield* importerOrRefuse("added to the scope");
+        yield* refuseIfEnded(stores, caller, {
+          tool: "add_scope_entry",
+          consequence: "this entry was NOT added",
+        });
         // Before the write, not after: an entry whose page cannot be named is an entry
         // whose note the operator cannot act on, and the whole of their review is that
         // note.
@@ -583,6 +629,10 @@ export const ImporterToolkitLayer = ImporterToolkit.toLayer(
       record_imported_asset: Effect.fn("record_imported_asset")(
         function* (input) {
           const caller = yield* importerOrRefuse("recorded");
+          yield* refuseIfEnded(stores, caller, {
+            tool: "record_imported_asset",
+            consequence: "this asset was NOT recorded",
+          });
           const page = yield* pageOrRefuse(progress, {
             importId: caller.importId,
             sourceUrl: input.sourceUrl,

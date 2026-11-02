@@ -286,6 +286,16 @@ export const ImporterSessionView = Schema.Struct({
    * known to be running" and a session that was running when the server died reads `false`.
    */
   running: Schema.Boolean,
+  /**
+   * When the session was ended, in epoch milliseconds, or null while it is open.
+   *
+   * Stored (`0026`), unlike `running`: set when the operator stops it, when the server
+   * shuts down, or when the harness refuses a prompt into it — and never cleared. It is what
+   * lets the picker mark a session closed rather than infer it from this process's memory.
+   * **Null is not "live"**: a session open when the server died reads null and is
+   * unreachable through this process all the same.
+   */
+  endedAt: Schema.NullOr(Schema.Int),
   tally: ImporterSessionTally,
 });
 export type ImporterSessionView = typeof ImporterSessionView.Type;

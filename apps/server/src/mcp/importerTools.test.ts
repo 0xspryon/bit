@@ -57,6 +57,8 @@ const TARGET = "target-1";
 const GOAL = "goal-1";
 const ROUND = "rnd-1";
 const IMPORT = "imp-1";
+/** An import whose session has been ended (`0026`), for the gate behind a no-clock grant. */
+const IMPORT_ENDED = "imp-ended";
 const BUDGET = 3;
 
 const HOST = { callerScope: operatorScope(TARGET), targetId: TARGET } as const;
@@ -91,6 +93,7 @@ class Seeded extends Context.Service<
     readonly workerToken: string;
     readonly roundToken: string;
     readonly goalToken: string;
+    readonly endedImporterToken: string;
   }
 >()("test/ImporterSeeded") {
   static readonly layer = Layer.effect(
@@ -162,11 +165,38 @@ class Seeded extends Context.Service<
         goalId: GOAL,
       });
 
+      // An import that has ended, with a live credential still in hand: what a grant whose
+      // scope was somehow not closed looks like. Minted the way the importer session now
+      // mints its own — no clock — so the only thing that can refuse it is the column.
+      yield* progress.open({
+        importId: IMPORT_ENDED,
+        targetId: TARGET,
+        urls: [PAGE_A],
+        droppedLinks: 0,
+        harnessInstanceId: "opencode",
+        model: "opencode/glm-5.3-flash-free",
+      });
+      yield* store.recordImportSession({
+        importId: IMPORT_ENDED,
+        targetId: TARGET,
+        harnessSessionId: "ses_ended",
+        harnessInstanceId: "opencode",
+        model: "opencode/glm-5.3-flash-free",
+      });
+      yield* store.confirmImportSession(IMPORT_ENDED);
+      yield* store.endImportSession(IMPORT_ENDED);
+      const ended = yield* credentials.issueWithoutExpiry({
+        _tag: "importer",
+        targetId: TARGET,
+        importId: IMPORT_ENDED,
+      });
+
       return Seeded.of({
         importerToken: Redacted.value(importer.token),
         workerToken: Redacted.value(worker.token),
         roundToken: Redacted.value(round.token),
         goalToken: Redacted.value(goal.token),
+        endedImporterToken: Redacted.value(ended.token),
       });
     }),
   );
@@ -220,6 +250,7 @@ let importerToken = "";
 let workerToken = "";
 let roundToken = "";
 let goalToken = "";
+let endedImporterToken = "";
 
 beforeAll(async () => {
   await runtime.runPromise(
@@ -234,6 +265,7 @@ beforeAll(async () => {
       workerToken = seeded.workerToken;
       roundToken = seeded.roundToken;
       goalToken = seeded.goalToken;
+      endedImporterToken = seeded.endedImporterToken;
     }),
   );
 });
@@ -705,5 +737,59 @@ describe("source_url must be one of this import's own pages", () => {
     );
     const entry = stored.entries.find((row) => row.value === "near.acme.com");
     expect(entry?.note).toBe(`${PAGE_A} · scope table, row 4`);
+  });
+});
+
+describe("an import whose session has ended", () => {
+  test("refuses every write, even under a credential that is still live", async () => {
+    // `checkGoalAuthority`'s analogue: a no-clock importer grant has the column behind it.
+    const entry = await callTool(
+      importerUrl,
+      endedImporterToken,
+      "add_scope_entry",
+      {
+        effect: "in",
+        kind: "host",
+        value: "after-the-end.acme.com",
+        source_url: PAGE_A,
+        note: "scope table, row 9",
+      },
+    );
+    expect(entry.isError).toBe(true);
+    expect(entry.text).toContain("unauthorized");
+    expect(entry.text).toContain("has ended");
+
+    const asset = await callTool(
+      importerUrl,
+      endedImporterToken,
+      "record_imported_asset",
+      {
+        operation_id: "op-after-the-end",
+        kind: "host",
+        url: "https://after-the-end.acme.com",
+        method: null,
+        source_url: PAGE_A,
+        note: "scope table, row 9",
+      },
+    );
+    expect(asset.isError).toBe(true);
+    expect(asset.text).toContain("has ended");
+
+    const stored = await runtime.runPromise(
+      Effect.flatMap(ObservationStore, (store) => store.targetScope(TARGET)),
+    );
+    expect(
+      stored.entries.some((row) => row.value === "after-the-end.acme.com"),
+    ).toBe(false);
+  });
+
+  test("still reads, because a read is not what the gate defends", async () => {
+    const called = await callTool(
+      importerUrl,
+      endedImporterToken,
+      "read_scope",
+      {},
+    );
+    expect(called.isError).toBe(false);
   });
 });

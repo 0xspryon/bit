@@ -212,9 +212,39 @@ describe("the clock", () => {
     expect(outcome.bounded).toBeUndefined();
   });
 
+  test("an importer grant with no expiry still authorises after IMPORT_LIFETIME_MS", async () => {
+    // S2.3: once an import is a conversation the operator can leave and come back to, the
+    // clock is the failure — a live session whose every tool call is a 401. The importer's
+    // session is minted through `issueWithoutExpiry`; the clock-bounded `issueImport` is
+    // kept beside it here so the advance is shown to be one that *would* have expired it.
+    const outcome = await withTestClock((credentials) =>
+      Effect.gen(function* () {
+        const binding = {
+          _tag: "importer" as const,
+          targetId: "target-1",
+          importId: "imp_1",
+        };
+        const conversation = yield* credentials.issueWithoutExpiry(binding);
+        const clocked = yield* credentials.issueImport(binding);
+        yield* TestClock.adjust(IMPORT_LIFETIME_MS + 1);
+        return {
+          expiresAt: conversation.grant.expiresAt,
+          conversation: yield* credentials.resolve(
+            Redacted.value(conversation.token),
+          ),
+          clocked: yield* credentials.resolve(Redacted.value(clocked.token)),
+        };
+      }),
+    );
+
+    expect(outcome.expiresAt).toBeNull();
+    expect(outcome.conversation?._tag).toBe("importer");
+    expect(outcome.clocked).toBeUndefined();
+  });
+
   test("an attempt or round binding cannot be issued without an expiry", async () => {
     // The signature already makes this unrepresentable — `issueWithoutExpiry` takes a
-    // goal binding — so the casts here are what a future caller, or a binding decoded
+    // goal or importer binding — so the casts here are what a future caller, or a binding decoded
     // from somewhere, would have to do to get past the type. The run-time refusal is what
     // it meets. This is a security boundary, so it is defended twice.
     const outcome = await withCredentials((credentials) =>

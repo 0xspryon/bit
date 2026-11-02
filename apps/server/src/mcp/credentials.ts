@@ -44,7 +44,9 @@
  * ## A goal credential has no clock expiry, and what bounds it instead
  *
  * `expiresAt` is `number | null`, and **null means no expiry at all** (the spec's
- * decision 4). Only a goal binding may be issued that way, through
+ * decision 4). Only a goal binding — and, since the scope importer became a conversation,
+ * an importer binding (see {@link McpCredentials.issueWithoutExpiry} for what bounds that
+ * one) — may be issued that way, through
  * {@link McpCredentials.issueWithoutExpiry}; an attempt or a round cannot, because its
  * row's own lifecycle is short and a clock backstop costs it nothing. `null` rather than
  * a sentinel like `Infinity`, because a sentinel in a numeric comparison is a bug waiting
@@ -165,7 +167,15 @@ export type Grant = CallerContext & {
 export const DEFAULT_LIFETIME_MS = 6 * 60 * 60 * 1000;
 
 /**
- * How long a scope import's credential lives.
+ * How long a scope import's credential lives **when it is minted with a clock** — through
+ * {@link McpCredentials.issueImport}, which the importer session no longer uses.
+ *
+ * The importer session itself is issued without expiry since it became a conversation
+ * (the importer conversation design, S2.3; {@link McpCredentials.issueWithoutExpiry}). This
+ * constant and `issueImport` stay for a caller that wants a clock-bounded importer grant,
+ * and the paragraphs below are its original reasoning, kept because they are why a longer
+ * clock was rejected rather than adopted: thirty minutes was a backstop for one batch of
+ * page reads, and a conversation blows through any backstop sized for that.
  *
  * **Minutes, not the default six hours.** An import is one session reading at most
  * `SCOPE_IMPORT_MAX_LINKS` program pages and writing what it found; it takes a minute or
@@ -317,19 +327,29 @@ export class McpCredentials extends Context.Service<
       lifetimeMs?: number,
     ) => Effect.Effect<IssuedCredential, CredentialRefused, Scope.Scope>;
     /**
-     * Mints a goal credential with **no clock expiry**, owned by the current scope.
+     * Mints a credential with **no clock expiry** for a long-lived conversation — a goal
+     * agent's or a scope importer's — owned by the current scope.
      *
-     * Separate from {@link issue}, and taking only a {@link GoalBinding}, because that is
-     * what makes "no attempt or round credential may be issued without an expiry"
-     * unrepresentable rather than merely checked: there is no argument a caller holding an
-     * attempt binding can pass here. It still refuses one at run time — see
-     * {@link CredentialRefused} — because a cast can get past a type and this is a
-     * security boundary.
+     * Separate from {@link issue}, and taking only a {@link GoalBinding} or an
+     * {@link ImporterBinding}, because that is what makes "no attempt or round credential
+     * may be issued without an expiry" unrepresentable rather than merely checked: there
+     * is no argument a caller holding an attempt binding can pass here. It still refuses
+     * one at run time — see {@link CredentialRefused} — because a cast can get past a type
+     * and this is a security boundary.
+     *
+     * **Why the importer joined the goal here** (the importer conversation design, S2.3):
+     * once an import is a conversation the operator can leave and come back to, any clock
+     * is a conversation that stops working mid-sentence — every tool call a `401` with no
+     * cause the operator can see. A longer clock is the same failure further away. What
+     * bounds an importer's grant instead is the goal's list — scope close,
+     * {@link revokeImport} as the check after it, process death — plus the durable gate a
+     * goal has in `checkGoalAuthority`: `import_sessions.ended_at` (`0026`), which the
+     * importer's toolkit reads before every write.
      *
      * See this module's header for what bounds the resulting credential.
      */
     readonly issueWithoutExpiry: (
-      binding: GoalBinding,
+      binding: GoalBinding | ImporterBinding,
     ) => Effect.Effect<IssuedCredential, CredentialRefused, Scope.Scope>;
     /** Resolves a bearer token to its grant, or `undefined` if unknown or expired. */
     readonly resolve: (token: string) => Effect.Effect<Grant | undefined>;
@@ -446,16 +466,16 @@ export class McpCredentials extends Context.Service<
 
     const issueWithoutExpiry: McpCredentials["Service"]["issueWithoutExpiry"] =
       Effect.fn("McpCredentials.issueWithoutExpiry")(function* (binding) {
-        // Unreachable through the signature, which takes a goal binding only. Kept
-        // because the type is a compile-time claim and this is a security boundary: a
-        // cast, or a binding decoded from somewhere, would otherwise be granted a
-        // credential that never expires for a row whose authority is supposed to be
-        // short-lived.
+        // Unreachable through the signature, which takes a goal or importer binding
+        // only. Kept because the type is a compile-time claim and this is a security
+        // boundary: a cast, or a binding decoded from somewhere, would otherwise be
+        // granted a credential that never expires for a row whose authority is supposed
+        // to be short-lived.
         const kind = (binding as CallerBinding)._tag;
-        if (kind !== "goal") {
+        if (kind !== "goal" && kind !== "importer") {
           return yield* new CredentialRefused({
             reason: "expiry_required",
-            detail: `a ${kind} credential must carry a clock expiry; only a goal credential may be issued without one`,
+            detail: `a ${kind} credential must carry a clock expiry; only a goal's or a scope importer's conversation credential may be issued without one`,
           });
         }
         const issuedAt = yield* Clock.currentTimeMillis;

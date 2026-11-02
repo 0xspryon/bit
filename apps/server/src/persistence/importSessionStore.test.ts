@@ -306,3 +306,66 @@ describe("an import session's tally", () => {
     ]);
   });
 });
+
+describe("an import session's end (0026)", () => {
+  test("an open session reads not-ended, and ending it is recorded once", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* open(store, "imp_a");
+        const before = {
+          ended: yield* store.importSessionEnded("imp_a"),
+          listed: yield* store.importSessions(TARGET),
+        };
+        yield* store.endImportSession("imp_a");
+        const first = (yield* store.importSessions(TARGET))[0]?.endedAt;
+        yield* Effect.sleep("5 millis");
+        // A stop then the layer's finalizer: the second close must not move the instant.
+        yield* store.endImportSession("imp_a");
+        return {
+          before,
+          first,
+          ended: yield* store.importSessionEnded("imp_a"),
+          second: (yield* store.importSessions(TARGET))[0]?.endedAt,
+        };
+      }),
+    );
+    expect(outcome.before.ended).toBe(false);
+    expect(outcome.before.listed[0]?.endedAt).toBeNull();
+    expect(typeof outcome.first).toBe("number");
+    expect(outcome.ended).toBe(true);
+    expect(outcome.second).toBe(outcome.first);
+  });
+
+  test("an import with no row is not ended, and ending it fails nothing", async () => {
+    // The index is advisory: a failed `recordImportSession` must not turn into refused
+    // writes for an import that is still running.
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.endImportSession("imp_not_there");
+        return yield* store.importSessionEnded("imp_not_there");
+      }),
+    );
+    expect(outcome).toBe(false);
+  });
+
+  test("a session is ended only once every run of it has ended", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* open(store, "imp_a", { session: "ses_shared" });
+        yield* Effect.sleep("5 millis");
+        yield* open(store, "imp_b", { session: "ses_shared" });
+        yield* store.endImportSession("imp_a");
+        const partly = (yield* store.importSessions(TARGET))[0]?.endedAt;
+        yield* Effect.sleep("5 millis");
+        yield* store.endImportSession("imp_b");
+        const fully = (yield* store.importSessions(TARGET))[0]?.endedAt;
+        return { partly, fully };
+      }),
+    );
+    expect(outcome.partly).toBeNull();
+    expect(typeof outcome.fully).toBe("number");
+  });
+});

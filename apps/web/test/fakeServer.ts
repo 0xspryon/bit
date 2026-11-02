@@ -207,8 +207,8 @@ export const importerModelView = (
 /**
  * One indexed importer session as the route answers it.
  *
- * Wrote nothing and not running by default, which is the strip's plainest sentence; a test
- * that wants a tally or a live session says so.
+ * Wrote nothing, not running and not ended by default, which is the strip's plainest
+ * sentence; a test that wants a tally, a live session or an ended one says so.
  */
 export const importerSessionView = (
   over: Partial<ImporterSessionView> = {},
@@ -218,6 +218,7 @@ export const importerSessionView = (
   model: "openai/gpt-5.6-sol",
   openedAt: AT,
   running: false,
+  endedAt: null,
   tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
   ...over,
 });

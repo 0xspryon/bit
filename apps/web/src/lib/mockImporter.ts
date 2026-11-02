@@ -659,6 +659,7 @@ export const mockImporterIndex = (now: number): ImporterSessionView[] => [
     model: "anthropic/claude-code",
     openedAt: now - 9 * DAY,
     running: false,
+    endedAt: now - 9 * DAY + 4 * 60_000,
     tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
   },
   {
@@ -667,6 +668,7 @@ export const mockImporterIndex = (now: number): ImporterSessionView[] => [
     model: "openai/gpt-5.5",
     openedAt: now - 12 * DAY,
     running: false,
+    endedAt: now - 12 * DAY + 6 * 60_000,
     tally: { entriesIn: 3, entriesOut: 0, assets: 5 },
   },
 ];

@@ -489,6 +489,7 @@ describe("a database already at 0002", () => {
       "23_asset_imports",
       "24_import_sessions",
       "25_import_session_confirmation",
+      "26_import_session_end",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -769,6 +770,7 @@ describe("a database already at 0005", () => {
       "23_asset_imports",
       "24_import_sessions",
       "25_import_session_confirmation",
+      "26_import_session_end",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1493,6 +1495,7 @@ describe("a database already at 0015", () => {
       "23_asset_imports",
       "24_import_sessions",
       "25_import_session_confirmation",
+      "26_import_session_end",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1639,6 +1642,7 @@ describe("a database already at 0016", () => {
       "23_asset_imports",
       "24_import_sessions",
       "25_import_session_confirmation",
+      "26_import_session_end",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1814,6 +1818,7 @@ describe("a database already at 0017", () => {
       "23_asset_imports",
       "24_import_sessions",
       "25_import_session_confirmation",
+      "26_import_session_end",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(
@@ -2043,10 +2048,49 @@ describe("0025 import session confirmation", () => {
 
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "25_import_session_confirmation",
+      "26_import_session_end",
     ]);
     expect(outcome.columns).toContain("session_created_at");
     // Not backfilled: nothing in a 0024 row says the harness ever held the session.
     expect(outcome.upgraded).toEqual([{ session_created_at: null }]);
     expect(outcome.confirmed).toEqual([{ session_created_at: 200 }]);
+  });
+});
+
+describe("0026 import session end", () => {
+  test("a row written under 0025 upgrades not-ended, and can then be ended", async () => {
+    const path = newDatabasePath();
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* runMigrations({ loader: chainThrough(25) });
+        yield* sql`INSERT INTO import_sessions (
+            import_id, target_id, harness_session_id, harness_instance_id, model,
+            caller_scope, opened_at, session_created_at
+          ) VALUES ('imp_old', 'acme-corp', 'ses_old', 'opencode', 'p/m',
+                    'acme-corp/import/imp_old', 100, 150)`;
+        const applied = yield* migrate;
+        const upgraded = yield* sql<{
+          ended_at: number | null;
+        }>`SELECT ended_at FROM import_sessions`;
+        yield* sql`UPDATE import_sessions SET ended_at = 300
+          WHERE import_id = 'imp_old'`;
+        return {
+          applied,
+          upgraded,
+          columns: yield* columnsOf(sql, "import_sessions"),
+          ended: yield* sql<{
+            ended_at: number | null;
+          }>`SELECT ended_at FROM import_sessions`,
+        };
+      }),
+    );
+
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "26_import_session_end",
+    ]);
+    expect(outcome.columns).toContain("ended_at");
+    // Not backfilled: a row from before the column says nothing about an ending.
+    expect(outcome.upgraded).toEqual([{ ended_at: null }]);
+    expect(outcome.ended).toEqual([{ ended_at: 300 }]);
   });
 });

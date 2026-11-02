@@ -1435,6 +1435,7 @@ const fleetHandlers = HttpApiBuilder.group(
                 model: session.model,
                 openedAt: session.openedAt,
                 running: views.some((view) => view?.status === "running"),
+                endedAt: session.endedAt,
                 tally: {
                   entriesIn: session.entriesIn,
                   entriesOut: session.entriesOut,

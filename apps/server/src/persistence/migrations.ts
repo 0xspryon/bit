@@ -1550,6 +1550,31 @@ const addImportSessionConfirmation = statements(
 );
 
 /**
+ * `0026` — when an import's session was ended, `NULL` while it is open.
+ *
+ * **The durable gate behind a credential with no clock.** An importer session became a
+ * conversation (the importer conversation design, S2), and its credential lost its expiry
+ * for the reason a goal's has none. A goal's no-expiry grant has a second gate behind it —
+ * `checkGoalAuthority` refuses every write under an ended goal, so even a leaked grant
+ * writes nothing — and an import had none: the importer toolkit writes under
+ * `<target>/import/<importId>` and nothing consulted a status. This column is that status,
+ * and the toolkit refuses a write under an import whose row has one.
+ *
+ * Set when the session is closed — by the operator, by the layer's finalizer, or because
+ * the harness refused a prompt — and never cleared. A row written before this column
+ * existed reads `NULL`, which is "not known to be ended": nothing was published, and those
+ * rows' credentials died with the process that minted them, so there is no grant for the
+ * gate to stand behind.
+ *
+ * Not backfilled from the absence of a live session either: a restart makes every
+ * unended row's session unreachable through this process, but "unreachable" is the
+ * harness's question (S2.5), not an ending anyone chose.
+ */
+const addImportSessionEnd = statements(
+  `ALTER TABLE import_sessions ADD COLUMN ended_at INTEGER`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1592,6 +1617,7 @@ export const MIGRATIONS: Record<
   "0023_asset_imports": addAssetImports,
   "0024_import_sessions": addImportSessions,
   "0025_import_session_confirmation": addImportSessionConfirmation,
+  "0026_import_session_end": addImportSessionEnd,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

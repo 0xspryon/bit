@@ -1589,9 +1589,19 @@ export const claudeCodeHarness = (
          * fact here, which is the one place this harness could not copy OpenCode's
          * answer.
          *
-         * A Claude Code session is run by a CLI subprocess the SDK owns. It does not
-         * outlive the process that spawned it, so a session id this process does not hold
-         * is a session that is **not running**, whatever the transcript on disk says.
+         * A Claude Code session is run by a CLI subprocess the SDK owns, and its live
+         * `Query` handle — the open stream that control requests, stream input and close
+         * all travel over — does not outlive the process that spawned it. The SDK offers
+         * no re-attach to another process's query. So a session id this process does not
+         * hold is a session that is **not running**, whatever the transcript on disk says.
+         *
+         * **The conversation does outlive it**, and that is a different claim from the
+         * one above. The CLI's transcript is on disk, `getSessionMessages` reads it after a
+         * restart, and a *fresh* `query({ options: { resume: id } })` continues it — the
+         * SDK's own `forkSession` doc names that as how a session is resumed. Nothing here
+         * passes `resume` yet; the importer conversation design's S2.5 records what each
+         * harness keeps and leaves resuming to S6. This comment used to say the session
+         * itself does not outlive the process, which would have been a reason not to try.
          *
          * Reporting `{}` here — "exists, nothing definite", which is what the transcript
          * literally supports — was wrong, and a live crash-and-restart is what showed it:
@@ -1607,9 +1617,15 @@ export const claudeCodeHarness = (
          * transcript" and "we have never heard of this id" are different facts to an
          * operator, and the detail says which.
          *
-         * OpenCode lands in the same place by a different route: a restart spawns a new
-         * `opencode serve` that has never heard of the old session, so it answers
-         * `SessionNotFoundError` → `missing` → `uncertain`.
+         * OpenCode does **not** land here by the same route, and an earlier version of
+         * this comment said it did — that a restarted `opencode serve` "has never heard of
+         * the old session" and answers `SessionNotFoundError`. That was wrong. OpenCode's
+         * sessions are rows in one SQLite file (`$XDG_DATA_HOME/opencode/opencode.db`), so
+         * a fresh server finds an old session by primary key: its messages read, and a
+         * prompt into it continues the conversation. What a restart *does* lose there is
+         * the turn that was in flight — the sweep that would resume it is attached only in
+         * `--service` mode, and we spawn `serve --stdio` — so the session is reachable and
+         * its interrupted turn is not running.
          */
         const info = yield* Effect.tryPromise({
           try: () => sdk.sessionInfo(sessionId, {}),
@@ -1627,7 +1643,7 @@ export const claudeCodeHarness = (
             )
           : transport(
               "session.get",
-              `session ${sessionId} has a transcript on disk but is not running in this process, and a Claude Code session does not outlive the process that spawned it; how it ended cannot be established from here`,
+              `session ${sessionId} has a transcript on disk but is not running in this process: its live query ended with the process that spawned it, though the conversation itself is still on disk and resumable. How its last turn ended cannot be established from here`,
             );
       });
 
