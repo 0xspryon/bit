@@ -159,6 +159,34 @@ harness is out of quota.
 > had never heard of the old session — it has; sessions are rows in one SQLite file under the
 > user's XDG data directory.
 
+### 6b · The continuation that is dispatched for you (S7b)
+
+Continuation is **on by default**. Turn it off globally or per target with `CONTINUATION=0`
+at boot, the same way `BIT_PASSWORD` is set. A setting that cannot be decoded — `"true"`,
+`"1"`, a typo — is a refusal, not a default: nothing continues on a guess.
+
+1. Open a conversation and, **on its first turn**, ask for something long enough to still be
+   running when you stop the server. Stop it mid-turn.
+2. Restart. ✅ Without you sending anything, the conversation picks up: the agent is given a
+   fresh turn and carries on, saying what it was doing when it was cut off.
+3. ✅ The session list shows **one** `harness_session_id` with two `import_sessions` rows —
+   one conversation, two authority periods.
+4. ✅ A worker attempt does **not** resume. The interrupted attempt ends, a new one opens
+   linked by `replaces_attempt_id`, and its prompt carries a **summary** of the dead one —
+   a message count, the last reply bounded and marked where it was cut, and the first recorded
+   error. If the transcript cannot be read, the block says so and the continuation still
+   happens.
+5. ✅ A crash loop does not become a spend loop: three continuations per chain in five minutes,
+   counted off the outbox queue itself.
+
+> **The limitation worth knowing before you test.** Continuation fires only for a conversation
+> interrupted on its **first** turn. OpenCode never clears `idle_outcome` when a turn starts, so
+> after a restart turn one's `succeeded` is still believed about turn two, and the sweep reads
+> the session as finished rather than abandoned. On Claude Code the liveness half is missing
+> too: its `sessionStatus` refuses outright for a session the process does not hold. Both fail
+> **safe** — nothing is continued that should not be — and both are recorded as defects with
+> their fixes, which were left alone because each changes what an attempt _settles_ to.
+
 ---
 
 ## 7 · Refusals, and the things that should be refused
