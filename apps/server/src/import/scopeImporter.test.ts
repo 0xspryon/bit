@@ -1871,4 +1871,74 @@ describe("a reopen", () => {
     ).toBe(1);
     await restarted.dispose();
   });
+
+  test("a reopen keeps the operator's effort setting, read back from the row", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      choice: {
+        model: "scripted/model",
+        modelOptions: [{ id: "effort", value: "high" }],
+      },
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    expect(built.script.created[0]?.options).toEqual([
+      { id: "effort", value: "high" },
+    ]);
+    // What was dispatched is what was recorded (`0028`) — the resolved list, not null.
+    const first = carriedOf(built.root).find(
+      (each) => each.import_id === started.importId,
+    );
+    expect(JSON.parse(first?.model_options ?? "null")).toEqual([
+      { id: "effort", value: "high" },
+    ]);
+    await runtime.dispose();
+
+    // A new process: the session went with the old one, and nothing of the first import's
+    // pick is in memory. The only place the setting can come from is the row.
+    const restarted = ManagedRuntime.make(built.layer);
+    const reopened = await sendTo(restarted, started.importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+    expect(reopened.success.conversation).toBe("opened");
+
+    expect(built.script.created).toHaveLength(2);
+    expect(built.script.created[1]?.options).toEqual([
+      { id: "effort", value: "high" },
+    ]);
+    // And the successor records it in turn, so a second reopen keeps it as well.
+    const successor = carriedOf(built.root).find(
+      (each) => each.import_id === reopened.success.importId,
+    );
+    expect(JSON.parse(successor?.model_options ?? "null")).toEqual([
+      { id: "effort", value: "high" },
+    ]);
+    await restarted.dispose();
+  });
+
+  test("a reopen of an import opened with nothing set sends nothing, and records nothing", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      choice: { model: "scripted/model" },
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    await runtime.dispose();
+
+    const restarted = ManagedRuntime.make(built.layer);
+    const reopened = await sendTo(restarted, started.importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+
+    // Absent, not `[]` and not the default pinned: on the wire and in both rows.
+    expect(built.script.created.map((each) => each.options)).toEqual([
+      undefined,
+      undefined,
+    ]);
+    expect(carriedOf(built.root).map((each) => each.model_options)).toEqual([
+      null,
+      null,
+    ]);
+    await restarted.dispose();
+  });
 });
