@@ -58,6 +58,15 @@ const KIND_LABELS: Record<string, string | undefined> = {
   "run.settled": "Run settled",
   "observation.recorded": "Observation",
   "asset.recorded": "Asset",
+  /**
+   * An entry the scope importer wrote onto a target's scope.
+   *
+   * **A kind the contract does not have yet.** `LIVE_ITEM_KINDS` is what the server writes
+   * and no importer feed exists, so this label and the `write_scope_entry` row in
+   * {@link WRITE_TOOLS} are the browser's stand-in for it, there for the importer chat
+   * prototype. An unknown kind renders as itself, so this is a nicety and not a dependency.
+   */
+  "scope.entry.added": "Scope entry",
   "intent.added": "Intent",
   "goal.added": "Goal",
   "goal.ended": "Goal ended",
@@ -204,6 +213,15 @@ const WRITE_TOOLS: Record<string, string | undefined> = {
   steer_planner: "plan.round.steered",
   /** The agent ending its own goal, one `goal.ended`. One-way, so exactly one of each. */
   end_goal: "goal.ended",
+  /**
+   * The scope importer's two writes. **Prototype rows**: the importer has no server yet, so
+   * `scope.entry.added` is a kind the contract does not carry (see {@link KIND_LABELS}) and
+   * `record_asset` pairs with the one that does. They are here so the importer chat shows a
+   * write the way the planner's does — pending until its record lands, then collapsed into
+   * it — instead of as an unremarkable tool call.
+   */
+  write_scope_entry: "scope.entry.added",
+  record_asset: "asset.recorded",
   /*
    * `wake_planner` is **deliberately absent**, which is a decision rather than the
    * oversight that left the two above out.
@@ -292,6 +310,10 @@ const WRITE_SUMMARY_FIELDS: Record<string, string | undefined> = {
   add_intent: "question",
   /** One of the four answers. `plannerTools.ts` takes it as `disposition`. */
   record_round_disposition: "disposition",
+  /** The importer's writes name the host they are about; its reads, the page. */
+  write_scope_entry: "host",
+  record_asset: "host",
+  fetch_page: "url",
 };
 
 /** The four the planner may record, for turning a disposition into the panel's words. */
@@ -498,8 +520,13 @@ const unrecorded = (
  * Arrival order is kept and nothing is re-sorted: `liveItems` is already in arrival order
  * and on the record channel that *is* the store's order, so re-sorting would either break
  * it or invent a sequence for activity items the contract refuses to claim.
+ *
+ * Exported for `importerChat.ts`, which cuts a conversation into groups by a rule of its
+ * own and then needs exactly this per group. `roundRunning` is whether anything more can
+ * still arrive *in this group*, which is what separates a `pending` write from an
+ * `unresolved` one.
  */
-const rowsFor = (
+export const rowsFor = (
   items: readonly LiveItem[],
   roundRunning: boolean,
 ): readonly ChatRow[] => {
