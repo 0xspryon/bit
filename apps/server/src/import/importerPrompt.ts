@@ -61,8 +61,9 @@
  *
  * `source_url` must still name a page the operator gave this import, because the toolkit
  * checks it (`mcp/importerTools.ts`'s `pageOrRefuse`). In a conversation the operator gives
- * pages by typing them: a URL in one of their messages is added to the import's pages when
- * the message is accepted (`import/scopeImporter.ts`). Scope pasted as **text** has no page
+ * pages by typing them: a URL standing alone on its own line of one of their messages is
+ * added to the import's pages when the message is accepted (`import/scopeImporter.ts`), and a
+ * URL merely mentioned inside prose or a paste is not ({@link operatorPages}). Scope pasted as **text** has no page
  * to name, and the toolkit has no way to attribute an entry to the operator's own message
  * without letting the model attribute anything to it — so the prompt says plainly that such
  * scope cannot be recorded yet and to ask for the page's address.
@@ -88,6 +89,13 @@ export interface ImporterPromptInput {
    * links alone, whose prompt is exactly what it always was.
    */
   readonly message?: string | undefined;
+  /**
+   * Pages the operator gave an earlier session of this conversation, carried forward when a
+   * message to an import this server no longer holds opens a fresh one. Listed as pages the
+   * session may cite, not as pages to read now: the earlier session already read them, and
+   * its entries are recorded. Ignored when `links` is non-empty.
+   */
+  readonly earlierPages?: readonly string[] | undefined;
 }
 
 /**
@@ -103,17 +111,37 @@ export const assembleImporterPrompt = (input: ImporterPromptInput): string => {
   const none = input.links.length === 0;
   const many = input.links.length > 1;
   const message = input.message;
+  const earlier = none ? (input.earlierPages ?? []) : [];
 
   const framing = [
     `You are reading the published scope of a bug bounty program so that an operator can`,
     `review it before any testing begins. The engagement is called ${input.targetName}.`,
     "",
-    ...(none
+    ...(none && earlier.length > 0
+      ? [
+          `This conversation continues an earlier session, which this one has not seen. The`,
+          `operator gave it these pages, and you may read and cite them:`,
+          "",
+          earlier.map((url, at) => `${at + 1}. ${url}`).join("\n"),
+          "",
+          `What the earlier session recorded from them is already written, so call`,
+          `read_scope before you write anything, and do not record an entry twice. Read a`,
+          `page again only if the operator's message asks for something it did not cover.`,
+          `The operator's message is at the end of this prompt, and they may say more in`,
+          `later messages: each later message is the`,
+        ]
+      : []),
+    ...(none && earlier.length === 0
       ? [
           `The operator has not given you any pages yet. Their message is at the end of`,
           `this prompt, and they may say more in later messages: each later message is the`,
-          `operator's own words, and a page address in one of them is a page you may read`,
-          `and cite.`,
+        ]
+      : []),
+    ...(none
+      ? [
+          `operator's own words. A page address the operator puts on a line of its own is`,
+          `a page you may read and cite; an address merely mentioned inside other text is`,
+          `not, and the tools will refuse it.`,
         ]
       : [
           `Read ${many ? "each of these pages, in this order" : "this page"}:`,
@@ -220,21 +248,51 @@ export const assembleImporterFollowUpPrompt = (input: {
 }): string => input.message;
 
 /**
- * The page addresses in an operator's message, in the order they were typed.
+ * The pages an operator's message is *about*, in the order they were typed.
  *
- * `http` and `https` only, because those are what a page reader fetches and what the
- * create-target form accepts. Trailing sentence punctuation is not part of an address — "read
- * https://acme.test/policy." means the page, not a page ending in a full stop — and neither
- * is a closing bracket the address sat inside.
+ * **A URL becomes citable only when the message is about it, not when it merely contains
+ * it.** The list this feeds is what the importer's toolkit checks every `source_url`
+ * against (`progress.pageOf`), so anything that reaches it is a page an entry may be
+ * blamed on. A URL anywhere in the text would let a pasted program page choose that list:
+ * an operator pasting a scope section brings its links with it, and an instruction in the
+ * same paste can then ask the model to cite one of them — the forgery the toolkit's refusal
+ * exists to stop, arriving through the operator's own paste. So:
+ *
+ * - **A page stands alone on its own line**, after trimming. A message that is nothing but
+ *   a URL is the same case. A URL inside prose, a table row or a pasted document is not
+ *   taken: the operator typing a page on its own line is choosing it, and a paste that
+ *   happens to mention one is not.
+ * - **`http` and `https` only**, because those are what a page reader fetches and what the
+ *   create-target form accepts.
+ * - **No userinfo.** `https://hackerone.com@evil.example/acme` is a page on `evil.example`
+ *   whose first characters read as another host. It has no legitimate use here and exists
+ *   only to spoof the prefix an operator glances at, so it is refused outright rather than
+ *   cleaned.
+ * - Trailing sentence punctuation is not part of an address — a line reading
+ *   "https://acme.test/policy." means the page — and neither are the brackets it sat in.
  *
  * What this returns is the operator's own text, never a model's: it is called on the message
- * the route accepted and on nothing else.
+ * the route accepted and on nothing else. The cap on how many an import holds is
+ * `progress.addLinks`'s, not this function's.
  */
 export const operatorPages = (text: string): readonly string[] => {
   const found: string[] = [];
-  for (const match of text.matchAll(/https?:\/\/[^\s<>"'`]+/g)) {
-    const url = match[0].replace(/[.,;:!?)\]}]+$/, "");
-    if (url.length > "https://".length && !found.includes(url)) found.push(url);
+  for (const line of text.split(/\r?\n/)) {
+    const candidate = line
+      .trim()
+      .replace(/^[(<[]+/, "")
+      .replace(/[.,;:!?)\]}>]+$/, "");
+    if (!/^https?:\/\/\S+$/i.test(candidate)) continue;
+    let parsed: URL;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      continue;
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
+    if (parsed.username !== "" || parsed.password !== "") continue;
+    if (parsed.hostname === "") continue;
+    if (!found.includes(candidate)) found.push(candidate);
   }
   return found;
 };

@@ -73,13 +73,17 @@
   /** The operator ended it: the server refuses a message to it. */
   let ended = $derived(session?.ended === true);
   /**
-   * The server answered that no harness is ready, so there is nothing to talk to. Only the
-   * server's answer counts: an import model not asked for yet is not "no harness".
+   * Which model an import would run on could not be had, so there is nothing to talk to. Only
+   * an answer counts: an import model not asked for yet is not this. Two different
+   * conditions, said differently: the server answering that no harness is ready
+   * (`noHarness`), and the lookup failing some other way — no server answered, say — which
+   * is not a claim about harnesses at all.
    */
-  let noHarness = $derived(
+  let noModel = $derived(
     app.importerModel === undefined && app.importModelDetail !== "",
   );
-  let blocked = $derived(stranded !== undefined || ended || noHarness);
+  let noHarness = $derived(noModel && app.importModelNoHarness);
+  let blocked = $derived(stranded !== undefined || ended || noModel);
   let canSend = $derived(
     importer.draft.trim() !== "" && !blocked && !importer.sending,
   );
@@ -132,9 +136,11 @@
         ? "This session was ended, so it cannot be continued."
         : noHarness
           ? "No agent harness on this server is ready, so there is no importer to talk to."
-          : groups.length === 0
-            ? "Paste a policy or scope URL, or say what is in and out of scope…"
-            : "Correct it, or add what the pages do not say…",
+          : noModel
+            ? "The server could not be asked which model the importer would run on, so there is nothing to send to yet."
+            : groups.length === 0
+              ? "Paste a policy or scope URL, or say what is in and out of scope…"
+              : "Correct it, or add what the pages do not say…",
   );
 </script>
 
@@ -148,7 +154,7 @@
       ? strandedNote(stranded)
       : ended
         ? ENDED_NOTE
-        : noHarness
+        : noModel
           ? app.importModelDetail
           : session?.reading
             ? "You are reading an earlier session. Your first message resumes it, with the scope as it stands now, not as it stood then."

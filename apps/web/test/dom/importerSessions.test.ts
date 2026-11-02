@@ -668,5 +668,88 @@ describe("the composer posts to the server", () => {
 
     expect(composer().disabled).toBe(true);
     expect(text()).toContain("no agent harness on this server is ready");
+    expect(composer().placeholder).toContain("No agent harness");
+  });
+
+  test("a lookup no server answered is not called 'no harness'", async () => {
+    const fake = new FakeServer();
+    fake.onScope = () => ok(emptyScope());
+    fake.onImporterModel = () => unreachable("no route");
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    app.toSection("assets");
+    await settle();
+    app.openImporter();
+    await settle();
+    mounted.push(mountInto(Target, { app }));
+    await settle();
+
+    expect(composer().disabled).toBe(true);
+    expect(text()).toContain("No server answered at this address.");
+    // The placeholder says what happened, not a claim about harnesses nobody was asked.
+    expect(composer().placeholder).not.toContain("No agent harness");
+    expect(composer().placeholder).toContain("could not be asked");
+  });
+
+  test("an import_ended refusal reads the list again, and the composer then disables", async () => {
+    const live = importerSessionView({
+      sessionId: "ses_newest",
+      importId: "imp_newest",
+      harnessInstanceId: "claude-code",
+    });
+    const { fake } = await continueOn(
+      [live],
+      [harness("claude-code", "Claude Code")],
+    );
+    // Ended elsewhere since the list was read: the server refuses, and its row now says so.
+    fake.onSendImporterMessage = () =>
+      refused(
+        new ImporterConversationRefused({
+          reason: "import_ended",
+          detail: "import imp_newest was ended by the operator",
+        }),
+      );
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: [
+          {
+            ...live,
+            endedAt: 1_700_000_300_000,
+            endedReason: "operator",
+          },
+        ],
+      });
+    const before = fake.countOf("importerSessions");
+    await send("One more thing");
+
+    expect(fake.countOf("importerSessions")).toBeGreaterThan(before);
+    expect(composer().disabled).toBe(true);
+    expect(text()).toContain("was ended by the operator");
+  });
+
+  test("an accepted message names the pages it made citable, and those it could not", async () => {
+    const { fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_newest",
+          pagesAdded: ["https://hackerone.com/acme/scope-update"],
+          pagesNotAdded: ["https://hackerone.com/acme/ninth"],
+        }),
+      );
+    await send("https://hackerone.com/acme/scope-update");
+
+    expect(text()).toContain(
+      "Added as a page this import may cite: https://hackerone.com/acme/scope-update.",
+    );
+    expect(text()).toContain("Not added");
+    expect(text()).toContain("https://hackerone.com/acme/ninth");
   });
 });

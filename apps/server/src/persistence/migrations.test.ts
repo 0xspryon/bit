@@ -491,6 +491,8 @@ describe("a database already at 0002", () => {
       "25_import_session_confirmation",
       "26_import_session_end",
       "27_import_session_end_reason",
+      "28_import_session_model_options",
+      "29_import_session_pages",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -773,6 +775,8 @@ describe("a database already at 0005", () => {
       "25_import_session_confirmation",
       "26_import_session_end",
       "27_import_session_end_reason",
+      "28_import_session_model_options",
+      "29_import_session_pages",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1499,6 +1503,8 @@ describe("a database already at 0015", () => {
       "25_import_session_confirmation",
       "26_import_session_end",
       "27_import_session_end_reason",
+      "28_import_session_model_options",
+      "29_import_session_pages",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1647,6 +1653,8 @@ describe("a database already at 0016", () => {
       "25_import_session_confirmation",
       "26_import_session_end",
       "27_import_session_end_reason",
+      "28_import_session_model_options",
+      "29_import_session_pages",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1824,6 +1832,8 @@ describe("a database already at 0017", () => {
       "25_import_session_confirmation",
       "26_import_session_end",
       "27_import_session_end_reason",
+      "28_import_session_model_options",
+      "29_import_session_pages",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(
@@ -2055,6 +2065,8 @@ describe("0025 import session confirmation", () => {
       "25_import_session_confirmation",
       "26_import_session_end",
       "27_import_session_end_reason",
+      "28_import_session_model_options",
+      "29_import_session_pages",
     ]);
     expect(outcome.columns).toContain("session_created_at");
     // Not backfilled: nothing in a 0024 row says the harness ever held the session.
@@ -2094,6 +2106,8 @@ describe("0026 import session end", () => {
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "26_import_session_end",
       "27_import_session_end_reason",
+      "28_import_session_model_options",
+      "29_import_session_pages",
     ]);
     expect(outcome.columns).toContain("ended_at");
     // Not backfilled: a row from before the column says nothing about an ending.
@@ -2142,6 +2156,8 @@ describe("0027 import session end reason", () => {
 
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "27_import_session_end_reason",
+      "28_import_session_model_options",
+      "29_import_session_pages",
     ]);
     expect(outcome.columns).toContain("ended_reason");
     // Not backfilled: nothing under 0026 recorded why a row ended.
@@ -2150,6 +2166,55 @@ describe("0027 import session end reason", () => {
     expect(outcome.reasons).toEqual([
       { import_id: "imp_new", ended_reason: "shutdown" },
       { import_id: "imp_old", ended_reason: null },
+    ]);
+  });
+});
+
+describe("0028 and 0029: an import session's model options and pages", () => {
+  test("a row written under 0027 upgrades with neither recorded, and both then take JSON", async () => {
+    const path = newDatabasePath();
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* runMigrations({ loader: chainThrough(27) });
+        yield* sql`INSERT INTO import_sessions (
+            import_id, target_id, harness_session_id, harness_instance_id, model,
+            caller_scope, opened_at, session_created_at
+          ) VALUES ('imp_old', 'acme-corp', 'ses_old', 'opencode', 'p/m',
+                    'acme-corp/import/imp_old', 100, 150)`;
+        const applied = yield* migrate;
+        const upgraded = yield* sql<{
+          model_options: string | null;
+          pages: string | null;
+        }>`SELECT model_options, pages FROM import_sessions`;
+        yield* sql`UPDATE import_sessions
+          SET model_options = '[{"id":"effort","value":"high"}]',
+              pages = '["https://hackerone.com/acme"]'
+          WHERE import_id = 'imp_old'`;
+        return {
+          applied,
+          upgraded,
+          columns: yield* columnsOf(sql, "import_sessions"),
+          written: yield* sql<{
+            model_options: string | null;
+            pages: string | null;
+          }>`SELECT model_options, pages FROM import_sessions`,
+        };
+      }),
+    );
+
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "28_import_session_model_options",
+      "29_import_session_pages",
+    ]);
+    expect(outcome.columns).toContain("model_options");
+    expect(outcome.columns).toContain("pages");
+    // Not backfilled: nothing under 0027 recorded either.
+    expect(outcome.upgraded).toEqual([{ model_options: null, pages: null }]);
+    expect(outcome.written).toEqual([
+      {
+        model_options: '[{"id":"effort","value":"high"}]',
+        pages: '["https://hackerone.com/acme"]',
+      },
     ]);
   });
 });

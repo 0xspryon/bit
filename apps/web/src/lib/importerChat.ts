@@ -161,6 +161,34 @@ export interface ImporterSession {
   readonly ended?: boolean;
 }
 
+/**
+ * What the composer says under a message the server accepted: the server's own note, then
+ * which pages the message made citable.
+ *
+ * **The pages are said, never left silent.** A page address the operator put on a line of
+ * its own becomes one the importer's entries may name as their source, and that includes an
+ * address that arrived on its own line inside something pasted. Naming each one is what lets
+ * the operator notice a page they did not mean to vouch for; the panel lists them as rows
+ * too. Pages refused for the cap are said as well, so a page that was not added is not
+ * mistaken for one that was.
+ */
+export const acceptedNotice = (turn: {
+  readonly note: string;
+  readonly pagesAdded: readonly string[];
+  readonly pagesNotAdded: readonly string[];
+}): string =>
+  [
+    turn.note,
+    turn.pagesAdded.length === 0
+      ? ""
+      : `Added as ${turn.pagesAdded.length === 1 ? "a page" : "pages"} this import may cite: ${turn.pagesAdded.join(", ")}.`,
+    turn.pagesNotAdded.length === 0
+      ? ""
+      : `Not added, because this import already holds as many pages as one session reads: ${turn.pagesNotAdded.join(", ")}.`,
+  ]
+    .filter((part) => part !== "")
+    .join(" ");
+
 /** What the page says of a session the operator ended, and why it cannot be continued. */
 export const ENDED_NOTE =
   "This session was ended, so its authority has ended with it: the importer's tools refuse every write under it, and it is not continued. Start a new session to carry on. What it wrote is on the Scope tab and in the Estate.";

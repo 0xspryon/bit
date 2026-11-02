@@ -46,6 +46,7 @@
  * this is comfortably above it.
  */
 import {
+  SCOPE_IMPORT_MAX_LINKS,
   scopeImportLinkIndex,
   scopeImportLinks,
   type ScopeImportCall,
@@ -64,6 +65,46 @@ import { Clock, Context, Effect, Layer } from "effect";
  * where they start.
  */
 export const KEPT = 32;
+
+/** What widening an import's pages did. See {@link widenPages}. */
+export interface PagesWidened {
+  /** The import's pages afterwards, in the order they were given. */
+  readonly pages: readonly string[];
+  /** The additions that were not already there and fit, in the operator's spelling. */
+  readonly added: readonly string[];
+  /** The additions that were new but did not fit under the cap. */
+  readonly notAdded: readonly string[];
+}
+
+/**
+ * Adds pages to the ones an import may cite, up to {@link SCOPE_IMPORT_MAX_LINKS} in all.
+ *
+ * **The cap is the pasted links' cap, shared rather than a second bound.** Both lists are
+ * the same list: what the toolkit checks `source_url` against and what the panel renders as
+ * rows, and one session reads every page on it (D15), so the ceiling that keeps a pasted form
+ * inside one context window is the ceiling on pages given in conversation too. A second,
+ * larger bound would let a conversation do what the form is refused, and a paste of a few
+ * hundred lines could otherwise fill the panel with `waiting` rows. Pages already present —
+ * by {@link scopeImportLinkIndex}'s comparison — are neither added nor counted.
+ */
+export const widenPages = (
+  pages: readonly string[],
+  additions: readonly string[],
+): PagesWidened => {
+  const next = [...pages];
+  const added: string[] = [];
+  const notAdded: string[] = [];
+  for (const url of additions) {
+    if (scopeImportLinkIndex(next, url) !== -1) continue;
+    if (next.length >= SCOPE_IMPORT_MAX_LINKS) {
+      if (scopeImportLinkIndex(notAdded, url) === -1) notAdded.push(url);
+      continue;
+    }
+    next.push(url);
+    added.push(url);
+  }
+  return { pages: next, added, notAdded };
+};
 
 /** One import's mutable state. The view is derived from it on every read. */
 interface Entry {
@@ -221,15 +262,18 @@ export class ScopeImportProgress extends Context.Service<
      *
      * **The attribution rule is unchanged by this, only who supplies the list.** A
      * `source_url` must still name a page the *operator* pointed this import at
-     * (`pageOf`); in a conversation they point at one by typing it, so a page in an
-     * accepted operator message joins the list exactly as a pasted link did. A page already
-     * on the list — by {@link scopeImportLinkIndex}'s comparison — is not added twice.
+     * (`pageOf`); in a conversation they point at one by typing it on a line of its own
+     * (`importerPrompt.ts`'s `operatorPages`), so such a page joins the list exactly as a
+     * pasted link did. Bounded by {@link widenPages}, whose cap is the pasted links' own.
      * Nothing a model said ever reaches this.
+     *
+     * Answers what it did, so the composer can tell the operator which pages were added;
+     * `undefined` for an import this process does not know.
      */
     readonly addLinks: (
       importId: string,
       urls: readonly string[],
-    ) => Effect.Effect<void>;
+    ) => Effect.Effect<PagesWidened | undefined>;
     /**
      * Marks a `finished` import as working again, because a new turn was given to it.
      *
@@ -340,11 +384,10 @@ export class ScopeImportProgress extends Context.Service<
       addLinks: (importId, urls) =>
         Effect.sync(() => {
           const entry = entries.get(importId);
-          if (entry === undefined) return;
-          for (const url of urls) {
-            if (scopeImportLinkIndex(entry.urls, url) === -1)
-              entry.urls.push(url);
-          }
+          if (entry === undefined) return undefined;
+          const widened = widenPages(entry.urls, urls);
+          entry.urls.push(...widened.added);
+          return widened;
         }),
 
       resume: (importId) =>
@@ -381,7 +424,7 @@ export class ScopeImportProgress extends Context.Service<
         view: () => Effect.succeed(undefined),
         stop: () => Effect.succeed(undefined),
         stopped: () => Effect.succeed(false),
-        addLinks: () => Effect.void,
+        addLinks: () => Effect.succeed(undefined),
         resume: () => Effect.succeed(false),
       }),
   );

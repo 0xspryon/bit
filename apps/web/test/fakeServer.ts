@@ -237,6 +237,8 @@ export const importerTurnAccepted = (
   model: "openai/gpt-5.6-sol",
   conversation: "continued",
   note: "",
+  pagesAdded: [],
+  pagesNotAdded: [],
   acceptedAt: AT,
   ...over,
 });

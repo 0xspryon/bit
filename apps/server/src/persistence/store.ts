@@ -6633,8 +6633,12 @@ const makeStore = Effect.fnUntraced(function* () {
       readonly harnessSessionId: string;
       readonly harnessInstanceId: string | null;
       readonly model: string;
+      readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
+      readonly pages?: readonly string[] | undefined;
     }) {
       const openedAt = yield* Clock.currentTimeMillis;
+      // `0015`'s encoding, so the two columns compare byte for byte.
+      const modelOptions = canonicalModelOptions(input.modelOptions ?? null);
       const callerScope = callerScopeOf({
         _tag: "importer",
         targetId: input.targetId,
@@ -6642,12 +6646,31 @@ const makeStore = Effect.fnUntraced(function* () {
       });
       yield* sql`INSERT INTO import_sessions (
             import_id, target_id, harness_session_id, harness_instance_id, model,
-            caller_scope, opened_at
+            model_options, pages, caller_scope, opened_at
           ) VALUES (
             ${input.importId}, ${input.targetId}, ${input.harnessSessionId},
-            ${input.harnessInstanceId}, ${input.model}, ${callerScope}, ${openedAt}
+            ${input.harnessInstanceId}, ${input.model},
+            ${modelOptions === null ? null : JSON.stringify(modelOptions)},
+            ${input.pages === undefined ? null : JSON.stringify(input.pages)},
+            ${callerScope}, ${openedAt}
           )
           ON CONFLICT(import_id) DO NOTHING`.pipe(
+        Effect.mapError(asDatabaseError("query")),
+      );
+    },
+  );
+
+  /**
+   * Rewrites the pages an import's entries may cite (`0029`), after a message widened them.
+   *
+   * The whole list rather than an append, because the list's owner is the in-memory registry
+   * that decided it (`progress.addLinks`) and this is its durable copy. An unknown import id
+   * updates nothing rather than failing: the row's own write is advisory.
+   */
+  const recordImportPages = Effect.fn("ObservationStore.recordImportPages")(
+    function* (importId: string, pages: readonly string[]) {
+      yield* sql`UPDATE import_sessions SET pages = ${JSON.stringify(pages)}
+            WHERE import_id = ${importId}`.pipe(
         Effect.mapError(asDatabaseError("query")),
       );
     },
@@ -6738,12 +6761,14 @@ const makeStore = Effect.fnUntraced(function* () {
       harness_session_id: Schema.String,
       harness_instance_id: Schema.NullOr(Schema.String),
       model: Schema.String,
+      model_options: Schema.NullOr(jsonModelOptions),
+      pages: Schema.NullOr(Schema.fromJsonString(Schema.Array(Schema.String))),
       ended_at: Schema.NullOr(Schema.Finite),
       ended_reason: Schema.NullOr(ImportSessionEndReason),
     }),
     execute: (importId) =>
       sql`SELECT target_id, harness_session_id, harness_instance_id, model,
-                 ended_at, ended_reason
+                 model_options, pages, ended_at, ended_reason
             FROM import_sessions
             WHERE import_id = ${importId}`,
   });
@@ -6768,6 +6793,8 @@ const makeStore = Effect.fnUntraced(function* () {
         harnessSessionId: value.harness_session_id,
         harnessInstanceId: value.harness_instance_id,
         model: value.model,
+        modelOptions: value.model_options,
+        pages: value.pages,
         endedAt: value.ended_at,
         endedReason: value.ended_reason,
       }),
@@ -8093,6 +8120,7 @@ const makeStore = Effect.fnUntraced(function* () {
     recordGoalSession,
     importSessions,
     recordImportSession,
+    recordImportPages,
     confirmImportSession,
     endImportSession,
     importSessionEnd,
@@ -8751,6 +8779,10 @@ export class ObservationStore extends Context.Service<
           readonly harnessSessionId: string;
           readonly harnessInstanceId: string | null;
           readonly model: string;
+          /** What the session was opened with (`0028`); `null` for none, or not recorded. */
+          readonly modelOptions: readonly ModelOptionSelection[] | null;
+          /** The pages its entries may cite (`0029`); `null` on a row from before that. */
+          readonly pages: readonly string[] | null;
           readonly endedAt: number | null;
           readonly endedReason: ImportSessionEndReason | null;
         }
@@ -8771,7 +8803,16 @@ export class ObservationStore extends Context.Service<
       readonly harnessSessionId: string;
       readonly harnessInstanceId: string | null;
       readonly model: string;
+      /** The resolved selections the session is opened with. See `0028`. */
+      readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
+      /** The pages its entries may cite, as the import starts. See `0029`. */
+      readonly pages?: readonly string[] | undefined;
     }) => Effect.Effect<void, DatabaseError>;
+    /** Rewrites the pages an import's entries may cite, once a message widened them (`0029`). */
+    readonly recordImportPages: (
+      importId: string,
+      pages: readonly string[],
+    ) => Effect.Effect<void, DatabaseError>;
     /**
      * Ends the caller's own goal, recorded as `endedBy: "goal_agent"`.
      *

@@ -52,6 +52,7 @@ import {
   buildImporterChat,
   type ImporterGroup,
   type ImporterSession,
+  acceptedNotice,
 } from "./importerChat";
 import {
   mockAwaitingSession,
@@ -98,7 +99,15 @@ export type ImporterScenario =
 /** What the server answered a message with, as the page needs it. */
 export type ImporterSent =
   | { readonly _tag: "accepted"; readonly turn: ImporterTurnAccepted }
-  | { readonly _tag: "refused"; readonly detail: string };
+  | {
+      readonly _tag: "refused";
+      readonly detail: string;
+      /**
+       * The server refused because the import was ended (`import_ended`): its row changed
+       * since the list was read, so the list is read again and the composer disables on it.
+       */
+      readonly ended?: boolean;
+    };
 
 /**
  * The page's way to the server, handed in by the app when the page is a real target's.
@@ -111,8 +120,12 @@ export interface ImporterServer {
   readonly open: (text: string) => Promise<ImporterSent>;
   /** Says `text` to one import's session. */
   readonly send: (importId: string, text: string) => Promise<ImporterSent>;
-  /** After an accepted message, so the session list can be read again. */
-  readonly accepted: () => void;
+  /**
+   * Reads the session list again: after an accepted message, so the session it landed in
+   * is listed with the server's figures, and after an `import_ended` refusal, so the
+   * session the operator ended reads as ended and the composer stops offering it.
+   */
+  readonly reread: () => void;
   /** A harness instance's display name, for the avatar on the session's header. */
   readonly harnessName: (instanceId: string) => string;
 }
@@ -425,11 +438,12 @@ export class ImporterSessions {
     if (answer._tag === "refused") {
       this.notice = answer.detail;
       this.refused = true;
+      if (answer.ended === true) server.reread();
       return;
     }
     const turn = answer.turn;
     if (this.draft.trim() === text) this.draft = "";
-    this.notice = turn.note;
+    this.notice = acceptedNotice(turn);
     const at = this.#now();
     const landed = (before: ImporterSession): ImporterSession => {
       const index = before.items.filter(
@@ -475,7 +489,7 @@ export class ImporterSessions {
       this.sessions = [...this.sessions, after];
       if (this.currentId === session.id) this.currentId = after.id;
     }
-    server.accepted();
+    server.reread();
   }
 
   /** Stops the importer mid-turn. Whatever it had not finished stays visibly unfinished. */

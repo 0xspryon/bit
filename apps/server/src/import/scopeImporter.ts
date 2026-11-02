@@ -115,7 +115,15 @@ import {
   type ModelOptionSelection,
   type ScopeImportView,
 } from "@bit/contracts";
-import { Context, Deferred, Effect, Fiber, Layer, Semaphore } from "effect";
+import {
+  Context,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Semaphore,
+} from "effect";
 
 import { resolveImporterModel } from "./importerModel";
 import {
@@ -123,7 +131,7 @@ import {
   assembleImporterPrompt,
   operatorPages,
 } from "./importerPrompt";
-import { ScopeImportProgress } from "./progress";
+import { ScopeImportProgress, widenPages } from "./progress";
 import { lastAssistantText, type AgentHarness } from "../harness/agentHarness";
 import {
   makeLiveAgentSessions,
@@ -154,6 +162,12 @@ export type ScopeImportStarted =
       /** As resolved. The operator's pick may have been a dead instance. */
       readonly harnessInstanceId: string;
       readonly model: string;
+      /** Pages the operator's message made citable. Empty without a message. */
+      readonly pagesAdded: readonly string[];
+      /** Pages the message gave that did not fit under the cap. */
+      readonly pagesNotAdded: readonly string[];
+      /** Pages carried forward from the import this one continues. */
+      readonly pagesCarried: readonly string[];
     }
   /** Links were given and this server cannot read them. The target is created regardless. */
   | {
@@ -275,6 +289,20 @@ export interface ScopeImportRequest {
    */
   readonly message?: string | undefined;
   /**
+   * Pages an earlier import of the same conversation could cite, carried forward when a
+   * message to it opens a fresh session (finding 4 of the S3 review). They were the
+   * operator's — pasted links and pages on a line of their own in a message, never a model's
+   * or a fetched page's — and the successor is the same conversation, so it may cite them
+   * too. Bounded by the same cap as every other page list (`progress.widenPages`).
+   */
+  readonly earlierPages?: readonly string[] | undefined;
+  /**
+   * The import this one takes over from, when a message to an import this server no longer
+   * holds opens it. Recorded as that import's successor the moment this one's id is minted,
+   * so a disconnect while it opens cannot lose the link (see `successors`).
+   */
+  readonly predecessor?: string | undefined;
+  /**
    * The operator's pick, when they touched the importer's picker: `ImportModelDraft` as it
    * arrived.
    *
@@ -286,6 +314,9 @@ export interface ScopeImportRequest {
    * `modelOptions` is what was set *of* the model, unresolved. It is resolved in `start`
    * against the model the importer actually resolved — which may not be the one the browser
    * was showing — and reaches `createSession` as `options`, absent when nothing survives.
+   * A reopen passes back what the earlier session was opened with, read from
+   * `import_sessions.model_options` (`0028`), so the operator's setting is not silently
+   * dropped with the session that carried it; already resolved, it resolves to itself.
    */
   readonly choice?: ImportModelDraft | undefined;
 }
@@ -472,6 +503,47 @@ export class ScopeImporter extends Context.Service<
       const turns = new Map<string, Fiber.Fiber<void>>();
 
       /**
+       * Every import whose first turn has not yet learned how its open went, by import id.
+       *
+       * **What makes "still opening" visible before the spine publishes anything.** The
+       * spine puts an entry in its map only once the credential and the MCP registration
+       * exist, but the index row is written — and confirmed, so the picker lists it — before
+       * either. A message to the import in that window found no entry, read a row that was
+       * neither live nor ended, and took the reopen path: a second session under a new id,
+       * answered with a note claiming the server had restarted. A message now waits on this
+       * instead, and then asks again, by which time the open is known either way.
+       *
+       * Set the instant the id is minted and released by the first of: the open being known
+       * (`run`), the turn ending, or `startWith` failing before it forked the turn. Releasing
+       * twice is a no-op.
+       */
+      const inFlight = new Map<
+        string,
+        { readonly targetId: string; readonly known: Deferred.Deferred<void> }
+      >();
+      const releaseOpening = (importId: string) =>
+        Effect.suspend(() => {
+          const held = inFlight.get(importId);
+          if (held === undefined) return Effect.void;
+          inFlight.delete(importId);
+          return Deferred.succeed(held.known, undefined);
+        });
+
+      /**
+       * Which import took over from one whose session this process no longer held.
+       *
+       * Written **the moment the successor's id is minted** (`startWith`), not once its
+       * session has opened: a message whose request is dropped while the fresh session opens
+       * would otherwise skip the write — the session itself is forked into this layer's scope
+       * and opens regardless — and the next message to the old id would open a third. A
+       * message that follows the link to a successor still opening waits on {@link inFlight}.
+       * Taken back if that open fails, so the next message reopens from the id the operator
+       * knows. Bounded by the number of reopenings an operator causes, and not swept, for
+       * `liveAgentSessions.ts`'s `opening` map's reason.
+       */
+      const successors = new Map<string, string>();
+
+      /**
        * The first turn of one import: open the session, let it work, settle the view.
        *
        * The acquire order is the spine's, and each step rules out the next step's
@@ -498,6 +570,10 @@ export class ScopeImporter extends Context.Service<
         readonly message: string | undefined;
         /** Completed once the open is known, for a caller that waits on it (`converse`). */
         readonly opening: Opening | undefined;
+        /** The import this one takes over from, if any. See `ScopeImportRequest`. */
+        readonly predecessor: string | undefined;
+        /** The earlier session's pages, for the opener. See `ScopeImportRequest`. */
+        readonly earlierPages: readonly string[];
       }) {
         const harness = input.harness;
         const opened = yield* Effect.result(
@@ -558,6 +634,7 @@ export class ScopeImporter extends Context.Service<
                   targetName: input.request.targetName,
                   links: input.links,
                   message: input.message,
+                  earlierPages: input.earlierPages,
                 }),
               meta: undefined,
             }),
@@ -565,6 +642,17 @@ export class ScopeImporter extends Context.Service<
           }),
         );
 
+        // A successor that could not open is not one: the next message to the import it was
+        // to replace reopens from there, under the id the operator knows.
+        if (
+          (opened._tag === "Failure" || opened.success === undefined) &&
+          input.predecessor !== undefined &&
+          successors.get(input.predecessor) === input.importId
+        ) {
+          successors.delete(input.predecessor);
+        }
+        // The open is known: a message that arrived while it was in flight may now ask again.
+        yield* releaseOpening(input.importId);
         if (input.opening !== undefined) {
           yield* opened._tag === "Failure"
             ? Deferred.fail(input.opening, refusal(opened.failure))
@@ -768,99 +856,156 @@ export class ScopeImporter extends Context.Service<
         );
         const importId = newImportId();
         const sessionId = harness.newSessionId();
-
         /*
-         * The index entry, written before the session exists.
-         *
-         * That is the attempt rows' arrangement and for their reason: the harness holds
-         * every session of every project and cannot be asked which were ours, so the
-         * index is the only way an operator finds this one again, and an id recorded first
-         * cannot be lost to a crash between creating the session and writing the row. The
-         * price is an entry for a session that never opened (a gate that would not
-         * install). That entry is not listed: it is marked once `createSession` returns
-         * (`confirmImportSession`, `0025`), and the session list reads only marked ones, so
-         * an id the harness never minted cannot be offered for a resume.
-         *
-         * **A failure to write it does not refuse the import.** The index is a way of
-         * finding a session and is advisory in the way `ScopeImportView` is: the import's
-         * work is its entries and assets, and they land whether or not this row does. It is
-         * logged with the id, which is what recovers it by hand.
+         * Still opening, from this instant: see `inFlight`. And, for a reopen, the old id's
+         * successor — written here rather than once the session opens, so a caller that stops
+         * waiting cannot lose it. Both synchronous with the mint, so no interrupt can land
+         * between an id existing and these knowing about it.
          */
-        yield* withTargetStore(stores, request.targetId, (store) =>
-          store.recordImportSession({
-            importId,
-            targetId: request.targetId,
-            harnessSessionId: sessionId,
-            harnessInstanceId: harness.instance.instanceId,
-            model: choice.model,
-          }),
-        ).pipe(
-          Effect.catch((failure) =>
-            Effect.logWarning(
-              "a scope import's session could not be indexed; the import runs regardless, and the session will not appear in the target's list",
-              {
-                targetId: request.targetId,
-                importId,
-                sessionId,
-                detail: failure.message,
-              },
-            ),
-          ),
-        );
-
-        // Opened before the fiber starts, so the panel's first poll finds an import with
-        // every link `waiting` rather than a `404` for the first moment of its life.
-        yield* progress.open({
-          importId,
+        inFlight.set(importId, {
           targetId: request.targetId,
-          urls: links,
-          droppedLinks,
-          harnessInstanceId: harness.instance.instanceId,
-          model: choice.model,
+          known: Deferred.makeUnsafe<void>(),
         });
-        // A page the operator typed into their message is one this import may cite, exactly
-        // as a pasted link is. See `progress.addLinks`.
-        if (request.message !== undefined) {
-          yield* progress.addLinks(importId, operatorPages(request.message));
+        if (request.predecessor !== undefined) {
+          successors.set(request.predecessor, importId);
         }
 
         /*
-         * The first turn, forked into this layer's scope so `start` answers without it.
-         *
-         * **Its exit no longer closes anything.** The session's scope is the spine's, made
-         * there with `Scope.make` rather than the caller's for the reason it always was —
-         * the caller is an HTTP handler about to answer, and a credential acquired in the
-         * request's scope would be revoked the instant the target was created — and closed
-         * only by what this module's header lists. The fiber ending is the end of a turn.
+         * The pages this import may cite: the pasted links, then the earlier session's when
+         * this continues one, then the pages the operator's message is about — each step
+         * under the one shared cap (`widenPages`). Only the operator's text reaches this:
+         * `operatorPages` takes a URL standing alone on a line, never one inside prose or a
+         * pasted page, and refuses a URL carrying userinfo.
          */
-        const fiber = yield* Effect.forkIn(
-          run({
-            importId,
-            request,
-            harness,
-            model: choice.model,
-            options,
-            links,
-            sessionId,
-            message: request.message,
-            opening,
-          }).pipe(
-            Effect.ensuring(Effect.sync(() => turns.delete(importId))),
-            // A turn stopped before its open was known still answers whoever is waiting on
-            // it. A no-op when the open already completed the deferred.
-            Effect.ensuring(
-              opening === undefined
-                ? Effect.void
-                : Deferred.fail(
-                    opening,
-                    new ImporterConversationRefused({
-                      reason: "import_ended",
-                      detail: `import ${importId} was stopped before its session had opened, so nothing was said to it`,
-                    }),
-                  ),
+        const carried = widenPages(links, request.earlierPages ?? []);
+        const given =
+          request.message === undefined
+            ? { pages: carried.pages, added: [], notAdded: [] }
+            : widenPages(carried.pages, operatorPages(request.message));
+        /*
+         * What the session is opened with *of* its model, recorded beside the model (`0028`)
+         * so a reopen can open the successor the same way: the resolved list, the very value
+         * `run` hands `createSession` as `options`, not the operator's unresolved pick. Absent
+         * stays absent — `undefined`, so the row stores null rather than `[]` — because a
+         * harness told nothing applies its own default, and one told the default has been
+         * pinned to it.
+         */
+        const dispatchedOptions: readonly ModelOptionSelection[] | undefined =
+          options;
+
+        const fiber = yield* Effect.gen(function* () {
+          /*
+           * The index entry, written before the session exists.
+           *
+           * That is the attempt rows' arrangement and for their reason: the harness holds
+           * every session of every project and cannot be asked which were ours, so the
+           * index is the only way an operator finds this one again, and an id recorded first
+           * cannot be lost to a crash between creating the session and writing the row. The
+           * price is an entry for a session that never opened (a gate that would not
+           * install). That entry is not listed: it is marked once `createSession` returns
+           * (`confirmImportSession`, `0025`), and the session list reads only marked ones, so
+           * an id the harness never minted cannot be offered for a resume.
+           *
+           * **A failure to write it does not refuse the import.** The index is a way of
+           * finding a session and is advisory in the way `ScopeImportView` is: the import's
+           * work is its entries and assets, and they land whether or not this row does. It is
+           * logged with the id, which is what recovers it by hand.
+           */
+          yield* withTargetStore(stores, request.targetId, (store) =>
+            store.recordImportSession({
+              importId,
+              targetId: request.targetId,
+              harnessSessionId: sessionId,
+              harnessInstanceId: harness.instance.instanceId,
+              model: choice.model,
+              modelOptions: dispatchedOptions,
+              pages: given.pages,
+            }),
+          ).pipe(
+            Effect.catch((failure) =>
+              Effect.logWarning(
+                "a scope import's session could not be indexed; the import runs regardless, and the session will not appear in the target's list",
+                {
+                  targetId: request.targetId,
+                  importId,
+                  sessionId,
+                  detail: failure.message,
+                },
+              ),
             ),
+          );
+
+          // Opened before the fiber starts, so the panel's first poll finds an import with
+          // every link `waiting` rather than a `404` for the first moment of its life.
+          yield* progress.open({
+            importId,
+            targetId: request.targetId,
+            urls: given.pages,
+            droppedLinks,
+            harnessInstanceId: harness.instance.instanceId,
+            model: choice.model,
+          });
+
+          /*
+           * The first turn, forked into this layer's scope so `start` answers without it.
+           *
+           * **Its exit no longer closes anything.** The session's scope is the spine's, made
+           * there with `Scope.make` rather than the caller's for the reason it always was —
+           * the caller is an HTTP handler about to answer, and a credential acquired in the
+           * request's scope would be revoked the instant the target was created — and closed
+           * only by what this module's header lists. The fiber ending is the end of a turn.
+           */
+          return yield* Effect.forkIn(
+            run({
+              importId,
+              request,
+              harness,
+              model: choice.model,
+              options: dispatchedOptions,
+              links,
+              sessionId,
+              message: request.message,
+              opening,
+              predecessor: request.predecessor,
+              earlierPages: carried.added,
+            }).pipe(
+              Effect.ensuring(Effect.sync(() => turns.delete(importId))),
+              Effect.ensuring(releaseOpening(importId)),
+              // A turn stopped before its open was known still answers whoever is waiting on
+              // it. A no-op when the open already completed the deferred.
+              Effect.ensuring(
+                opening === undefined
+                  ? Effect.void
+                  : Deferred.fail(
+                      opening,
+                      new ImporterConversationRefused({
+                        reason: "import_ended",
+                        detail: `import ${importId} was stopped before its session had opened, so nothing was said to it`,
+                      }),
+                    ),
+              ),
+            ),
+            own,
+          );
+        }).pipe(
+          // Failed or interrupted before the turn existed — a dropped request lands here —
+          // so nothing will learn how an open went: release whoever waits, and take back a
+          // successor link to an import that will never open.
+          Effect.onExit((exit) =>
+            Exit.isSuccess(exit)
+              ? Effect.void
+              : Effect.andThen(
+                  Effect.sync(() => {
+                    if (
+                      request.predecessor !== undefined &&
+                      successors.get(request.predecessor) === importId
+                    ) {
+                      successors.delete(request.predecessor);
+                    }
+                  }),
+                  releaseOpening(importId),
+                ),
           ),
-          own,
         );
         turns.set(importId, fiber);
 
@@ -878,6 +1023,9 @@ export class ScopeImporter extends Context.Service<
           importId,
           harnessInstanceId: harness.instance.instanceId,
           model: choice.model,
+          pagesAdded: given.added,
+          pagesNotAdded: given.notAdded,
+          pagesCarried: carried.added,
         } as const;
       });
 
@@ -949,6 +1097,10 @@ export class ScopeImporter extends Context.Service<
         entry: LiveAgentSession<undefined>,
         conversation: ImporterTurnAccepted["conversation"],
         note: string,
+        pages: {
+          readonly added: readonly string[];
+          readonly notAdded: readonly string[];
+        },
       ): ImporterTurnAccepted => ({
         targetId: entry.targetId,
         importId: entry.id,
@@ -957,6 +1109,8 @@ export class ScopeImporter extends Context.Service<
         model: entry.model,
         conversation,
         note,
+        pagesAdded: [...pages.added],
+        pagesNotAdded: [...pages.notAdded],
         acceptedAt: Date.now(),
       });
 
@@ -979,7 +1133,22 @@ export class ScopeImporter extends Context.Service<
         entry: LiveAgentSession<undefined>,
         text: string,
       ) {
-        yield* progress.addLinks(entry.id, operatorPages(text));
+        const widened = yield* progress.addLinks(entry.id, operatorPages(text));
+        // The durable copy (`0029`), so a session reopened after a restart can carry these
+        // forward. Advisory like the row it lives on: the in-memory list is what the toolkit
+        // checks while this process holds the import.
+        if (widened !== undefined && widened.added.length > 0) {
+          yield* withTargetStore(stores, entry.targetId, (store) =>
+            store.recordImportPages(entry.id, widened.pages),
+          ).pipe(
+            Effect.catch((failure) =>
+              Effect.logWarning(
+                "the pages a scope import may cite were widened but could not be recorded; a session reopened after a restart will not carry them forward",
+                { importId: entry.id, detail: failure.message },
+              ),
+            ),
+          );
+        }
         const delivered = yield* Effect.result(
           sessions.deliver(
             entry,
@@ -1001,7 +1170,12 @@ export class ScopeImporter extends Context.Service<
           );
           turns.set(entry.id, fiber);
         }
-        return accepted(entry, "continued", "");
+        return accepted(
+          entry,
+          "continued",
+          "",
+          widened ?? { added: [], notAdded: [] },
+        );
       });
 
       /**
@@ -1030,13 +1204,13 @@ export class ScopeImporter extends Context.Service<
             detail: started.detail,
           });
         }
-        return yield* Deferred.await(opening);
+        return { entry: yield* Deferred.await(opening), started };
       });
 
       const converse: ScopeImporter["Service"]["converse"] = Effect.fn(
         "ScopeImporter.converse",
       )(function* (input) {
-        const entry = yield* openWith({
+        const { entry, started } = yield* openWith({
           targetId: input.targetId,
           targetName: input.targetName,
           workspacePath: input.workspacePath,
@@ -1048,18 +1222,9 @@ export class ScopeImporter extends Context.Service<
           entry,
           "opened",
           "A new importer session was opened for this message: the importer has its rules and its three tools, and has read nothing else yet.",
+          { added: started.pagesAdded, notAdded: started.pagesNotAdded },
         );
       });
-
-      /**
-       * Which import took over from one whose session this process no longer held.
-       *
-       * Written when a message to a dead import opens a fresh session under a new id, and
-       * read by the next message to the old id, which goes to the new one rather than
-       * opening a third. Bounded by the number of reopenings an operator causes, and not
-       * swept, for `liveAgentSessions.ts`'s `opening` map's reason.
-       */
-      const successors = new Map<string, string>();
 
       /**
        * One permit per dead import id, held while a fresh session is opened in its place.
@@ -1087,6 +1252,21 @@ export class ScopeImporter extends Context.Service<
           return yield* deliverTurn(live, input.text);
         }
 
+        /*
+         * Still opening: wait until the open is known, then ask again (see `inFlight`).
+         *
+         * Before the index row, because that row exists — and is confirmed, so the picker
+         * lists it — before the spine has published anything, and a row that is neither live
+         * nor ended is what the reopen below acts on. Asked again rather than continued
+         * from here, because what the open became decides everything after: live, so the
+         * fast path delivers; refused or stopped, so the row says which.
+         */
+        const opening = inFlight.get(input.importId);
+        if (opening !== undefined && opening.targetId === input.targetId) {
+          yield* Deferred.await(opening.known);
+          return yield* send(input);
+        }
+
         const row = yield* withTargetStore(stores, input.targetId, (store) =>
           store.importSession(input.importId),
         ).pipe(Effect.mapError(refusal));
@@ -1106,10 +1286,11 @@ export class ScopeImporter extends Context.Service<
         }
 
         /*
-         * Still opening: join it, under the spine's permit. `prepare` refuses rather than
-         * builds, because **nothing is ever built under an import id that has been opened
-         * before** — a fresh session is a new authority period and gets a new id (S3.3). So a
-         * joiner that finds the opener's session gone falls through to the reopen below.
+         * Published but not yet preambled: join it, under the spine's permit. `prepare`
+         * refuses rather than builds, because **nothing is ever built under an import id that
+         * has been opened before** — a fresh session is a new authority period and gets a new
+         * id (S3.3). So a joiner that finds the opener's session gone falls through to the
+         * reopen below. (An import still opening *before* it was published waited above.)
          */
         if (sessions.get(input.importId) !== undefined) {
           const joined = yield* Effect.result(
@@ -1151,12 +1332,24 @@ export class ScopeImporter extends Context.Service<
                 detail: `no target '${input.targetId}' is registered on this server`,
               });
             }
-            const entry = yield* openWith({
+            /*
+             * The earlier session's pages, carried forward: they were the operator's, and
+             * this is the same conversation. From memory when this process still holds the
+             * old import's list (a refused prompt), and from the row (`0029`) when it does
+             * not (a restart). Bounded by the shared cap in `startWith`.
+             */
+            const earlierPages = widenPages(
+              (yield* progress.linksOf(input.importId)) ?? [],
+              row.pages ?? [],
+            ).pages;
+            const { entry, started } = yield* openWith({
               targetId: input.targetId,
               targetName: target.name,
               workspacePath: target.workspacePath ?? null,
               links: [],
               message: input.text,
+              earlierPages,
+              predecessor: input.importId,
               // The same harness and model the earlier session ran on, so the conversation
               // does not quietly change models under the operator. A row from before
               // instances were recorded has nothing to pin, and D15's rule applies.
@@ -1166,14 +1359,20 @@ export class ScopeImporter extends Context.Service<
                     choice: {
                       instanceId: row.harnessInstanceId,
                       model: row.model,
+                      // And the same setting of it (`0028`): a reopen that dropped the
+                      // operator's reasoning choice would be a silent downgrade.
+                      ...(row.modelOptions === null
+                        ? {}
+                        : { modelOptions: row.modelOptions }),
                     },
                   }),
             });
-            successors.set(input.importId, entry.id);
+            const carried = started.pagesCarried.length;
             return accepted(
               entry,
               "opened",
-              `Import ${input.importId}'s session is not held by this server — ${notHeldBecause(row.endedReason)} — so this message opened a new session, under import ${entry.id}. The importer in it has not read the earlier session; what that session wrote is on the Scope tab and in the Estate.`,
+              `Import ${input.importId}'s session is not held by this server — ${notHeldBecause(row.endedReason)} — so this message opened a new session, under import ${entry.id}. The importer in it has not read the earlier session; what that session wrote is on the Scope tab and in the Estate${carried === 0 ? "" : `, and the ${carried === 1 ? "page" : `${String(carried)} pages`} you gave it ${carried === 1 ? "is" : "are"} carried forward`}.`,
+              { added: started.pagesAdded, notAdded: started.pagesNotAdded },
             );
           }),
         );

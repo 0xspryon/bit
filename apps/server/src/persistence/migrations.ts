@@ -1615,6 +1615,49 @@ const addImportSessionEndReason = statements(
 );
 
 /**
+ * `0028` — what was chosen *of* the model an import's session runs on.
+ *
+ * `0015`'s column, for an import: `0024` recorded which harness and model, and nothing
+ * recorded how hard that model was asked to think. Two things needed the answer. The
+ * operator asking "what effort did this import run at?", which nothing could say; and a
+ * message to an import whose session this process no longer holds, which opens a fresh
+ * session on the **same** harness and model read back from this row — and, without this
+ * column, silently at the harness's default effort rather than the one the operator chose.
+ * A quiet downgrade of a setting someone chose is the same class of lie as a quiet harness
+ * substitution, which `RunDraft.instanceId` already refuses.
+ *
+ * `0015`'s encoding exactly: the canonical JSON of the selections the session was **opened
+ * with**, sorted by id, never what a picker displayed. `NULL` is "nothing was dispatched,
+ * and the harness applied its own default" — and, on a row written before this column, "not
+ * recorded". Not backfilled, for `0015`'s reason.
+ */
+const addImportSessionModelOptions = statements(
+  `ALTER TABLE import_sessions ADD COLUMN model_options TEXT`,
+);
+
+/**
+ * `0029` — the pages an import's entries may name as their source, durably.
+ *
+ * The list the importer toolkit checks every `source_url` against lived only in this
+ * process's memory (`import/progress.ts`), which was right while an import was one turn.
+ * It is a conversation now, and a message to an import whose session a restart took away
+ * opens a fresh one under a new import id — whose list then held only what that one message
+ * named, so "continue" could not cite a page the operator had already given. The successor
+ * is the same conversation, so it carries its predecessor's pages forward, and this column
+ * is where it reads them from when the process that held them is gone.
+ *
+ * JSON, an array of URLs in the operator's spelling and the order given: the pasted links,
+ * then pages the operator put on a line of their own in a message. Written when the row is
+ * and rewritten when a message widens the list, and bounded by the same cap the in-memory
+ * list is (`SCOPE_IMPORT_MAX_LINKS`). **Only ever the operator's text**: nothing a model said
+ * or a page contained reaches it, which is what makes carrying it forward safe. `NULL` on a
+ * row from before this column, which carries nothing forward.
+ */
+const addImportSessionPages = statements(
+  `ALTER TABLE import_sessions ADD COLUMN pages TEXT`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1659,6 +1702,8 @@ export const MIGRATIONS: Record<
   "0025_import_session_confirmation": addImportSessionConfirmation,
   "0026_import_session_end": addImportSessionEnd,
   "0027_import_session_end_reason": addImportSessionEndReason,
+  "0028_import_session_model_options": addImportSessionModelOptions,
+  "0029_import_session_pages": addImportSessionPages,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

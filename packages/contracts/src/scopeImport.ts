@@ -608,6 +608,16 @@ const EpochMillis = Schema.Finite.annotate({
 });
 
 /**
+ * The longest message the importer takes, in characters.
+ *
+ * A bound so a request body cannot carry an unbounded prompt into a harness session, set
+ * well above what an operator types or pastes from one program page: a long policy page's
+ * scope section, pasted whole, is a few thousand characters. A message over it is refused by
+ * the decoder before anything is opened for it.
+ */
+export const IMPORTER_MESSAGE_MAX_CHARS = 32_000;
+
+/**
  * What a browser sends to say something to an importer session.
  *
  * The operator's words and nothing else, for `GoalMessageDraft`'s reason: the session is the
@@ -616,8 +626,11 @@ const EpochMillis = Schema.Finite.annotate({
  * composer submit is refused by the decoder before a session is opened for it.
  */
 export const ImporterMessageDraft = Schema.Struct({
-  text: Schema.Trim.check(Schema.isNonEmpty()).annotate({
-    description: "What to say to the importer. Trimmed, and never empty.",
+  text: Schema.Trim.check(
+    Schema.isNonEmpty(),
+    Schema.isMaxLength(IMPORTER_MESSAGE_MAX_CHARS),
+  ).annotate({
+    description: `What to say to the importer. Trimmed, never empty, and at most ${String(IMPORTER_MESSAGE_MAX_CHARS)} characters.`,
   }),
 });
 export type ImporterMessageDraft = typeof ImporterMessageDraft.Type;
@@ -662,6 +675,18 @@ export const ImporterTurnAccepted = Schema.Struct({
    * Empty on an ordinary `continued` turn.
    */
   note: Schema.String,
+  /**
+   * Pages this message made citable: addresses the operator put on a line of their own,
+   * newly added to the pages the import's entries may name as their source. The composer
+   * says which, so a page that arrived in a paste is visible rather than silently trusted.
+   * Empty when the message gave none.
+   */
+  pagesAdded: Schema.Array(Schema.String),
+  /**
+   * Pages the message gave that were **not** added, because the import already holds as many
+   * as one session reads (`SCOPE_IMPORT_MAX_LINKS`). Empty in the usual case.
+   */
+  pagesNotAdded: Schema.Array(Schema.String),
   acceptedAt: EpochMillis,
 });
 export type ImporterTurnAccepted = typeof ImporterTurnAccepted.Type;

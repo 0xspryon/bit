@@ -388,3 +388,72 @@ describe("an import session's end (0026, 0027)", () => {
     expect(typeof outcome.fully).toBe("number");
   });
 });
+
+describe("what an import's session was opened with, and may cite (0028, 0029)", () => {
+  test("model options are stored canonically and read back; none reads null", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.recordImportSession({
+          importId: "imp_effort",
+          targetId: TARGET,
+          harnessSessionId: "ses_effort",
+          harnessInstanceId: "claude",
+          model: "anthropic/claude-sonnet-5",
+          // Out of order on purpose: the row holds `0015`'s sorted encoding.
+          modelOptions: [
+            { id: "thinking", value: "on" },
+            { id: "effort", value: "high" },
+          ],
+          pages: [PAGE],
+        });
+        yield* store.recordImportSession({
+          importId: "imp_default",
+          targetId: TARGET,
+          harnessSessionId: "ses_default",
+          harnessInstanceId: "claude",
+          model: "anthropic/claude-sonnet-5",
+          modelOptions: [],
+        });
+        return {
+          effort: yield* store.importSession("imp_effort"),
+          plain: yield* store.importSession("imp_default"),
+        };
+      }),
+    );
+    expect(outcome.effort?.modelOptions).toEqual([
+      { id: "effort", value: "high" },
+      { id: "thinking", value: "on" },
+    ]);
+    expect(outcome.effort?.pages).toEqual([PAGE]);
+    // An empty list would claim an opinion; nothing set is `null`, as on an attempt.
+    expect(outcome.plain?.modelOptions).toBeNull();
+    // A row written without pages says "not recorded", not "none".
+    expect(outcome.plain?.pages).toBeNull();
+  });
+
+  test("a widened page list is rewritten whole; an unknown import changes nothing", async () => {
+    const path = newDatabasePath();
+    const later = "https://hackerone.test/acme/scope-update";
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* store.recordImportSession({
+          importId: "imp_pages",
+          targetId: TARGET,
+          harnessSessionId: "ses_pages",
+          harnessInstanceId: "opencode",
+          model: "openai/gpt-5.6-sol",
+          pages: [PAGE],
+        });
+        yield* store.recordImportPages("imp_pages", [PAGE, later]);
+        yield* store.recordImportPages("imp_not_there", [later]);
+        return {
+          widened: yield* store.importSession("imp_pages"),
+          missing: yield* store.importSession("imp_not_there"),
+        };
+      }),
+    );
+    expect(outcome.widened?.pages).toEqual([PAGE, later]);
+    expect(outcome.missing).toBeUndefined();
+  });
+});

@@ -1550,6 +1550,13 @@ export class App {
   importerModel = $state<ImporterModelView | undefined>(undefined);
   /** Why there is no resolved model, in the server's words. Empty when there is one. */
   importModelDetail = $state("");
+  /**
+   * Whether the server *answered* that no harness is ready (`ImporterModelUnavailable`), as
+   * opposed to the lookup failing some other way — no server at the address, a refusal of
+   * another kind. Both leave {@link importerModel} unset; only this one makes "no agent
+   * harness is ready" a true sentence.
+   */
+  importModelNoHarness = $state(false);
   /** The operator's override, or "" for "whatever the server resolved". */
   pickedImportInstanceId = $state("");
   pickedImportModel = $state("");
@@ -2379,6 +2386,10 @@ export class App {
             call.error,
             "That message was not delivered.",
           ),
+          ...(call.error._tag === "ImporterConversationRefused" &&
+          call.error.reason === "import_ended"
+            ? { ended: true }
+            : {}),
         };
       }
       return { _tag: "refused", detail: "No server answered at this address." };
@@ -2412,7 +2423,7 @@ export class App {
             text,
           ),
         ),
-      accepted: () => void this.loadImporterSessions(targetId),
+      reread: () => void this.loadImporterSessions(targetId),
       harnessName: (instanceId) =>
         this.harnesses.find((entry) => entry.instanceId === instanceId)
           ?.displayName ?? instanceId,
@@ -3923,9 +3934,12 @@ export class App {
     if (call._tag === "Ok") {
       this.importerModel = call.value;
       this.importModelDetail = "";
+      this.importModelNoHarness = false;
       return;
     }
     this.importerModel = undefined;
+    this.importModelNoHarness =
+      call._tag === "Refused" && call.error._tag === "ImporterModelUnavailable";
     if (call._tag === "Refused") {
       if (call.error._tag === "Unauthenticated") {
         this.signOut("expired");
@@ -5112,6 +5126,7 @@ export class App {
     this.#nextLinkId = 2;
     this.importerModel = undefined;
     this.importModelDetail = "";
+    this.importModelNoHarness = false;
     this.pickedImportInstanceId = "";
     this.pickedImportModel = "";
     this.importModelOptionsByModel = {};

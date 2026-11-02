@@ -34,6 +34,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  IMPORTER_MESSAGE_MAX_CHARS,
   LIVE_HEARTBEAT_SECONDS,
   LIVE_SILENCE_LIMIT_SECONDS,
   RunRefused,
@@ -4347,6 +4348,19 @@ describe("a target's importer sessions", () => {
       await signedIn(
         `/targets/${withSessions}/importer-sessions/imp_old/messages`,
         { method: "POST", body: { text: "   " } },
+      ),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  test("a message over the length bound is refused before anything is asked of the importer", async () => {
+    const response = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/messages`,
+        {
+          method: "POST",
+          body: { text: "x".repeat(IMPORTER_MESSAGE_MAX_CHARS + 1) },
+        },
       ),
     );
     expect(response.status).toBe(400);

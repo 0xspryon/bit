@@ -32,6 +32,7 @@ import {
   sessionLabel,
   tallyLine,
   type ImporterHistory,
+  acceptedNotice,
 } from "../src/lib/importerChat";
 import { importerSessionView } from "./fakeServer";
 
@@ -568,5 +569,42 @@ describe("prose with code in it", () => {
 
   test("leaves an unmatched backtick as typed", () => {
     expect(splitCode("a ` b")).toEqual([{ code: false, text: "a ` b" }]);
+  });
+});
+
+describe("what the composer says under an accepted message", () => {
+  test("the server's note alone when no page was given", () => {
+    expect(
+      acceptedNotice({ note: "Opened.", pagesAdded: [], pagesNotAdded: [] }),
+    ).toBe("Opened.");
+    expect(
+      acceptedNotice({ note: "", pagesAdded: [], pagesNotAdded: [] }),
+    ).toBe("");
+  });
+
+  test("every page made citable is named, so one from a paste is not silent", () => {
+    expect(
+      acceptedNotice({
+        note: "",
+        pagesAdded: ["https://a.test/1", "https://a.test/2"],
+        pagesNotAdded: [],
+      }),
+    ).toBe(
+      "Added as pages this import may cite: https://a.test/1, https://a.test/2.",
+    );
+  });
+
+  test("pages refused for the cap are said apart from those added", () => {
+    const notice = acceptedNotice({
+      note: "Opened.",
+      pagesAdded: ["https://a.test/1"],
+      pagesNotAdded: ["https://a.test/9"],
+    });
+    expect(notice).toStartWith(
+      "Opened. Added as a page this import may cite: https://a.test/1.",
+    );
+    expect(notice).toEndWith(
+      "Not added, because this import already holds as many pages as one session reads: https://a.test/9.",
+    );
   });
 });
