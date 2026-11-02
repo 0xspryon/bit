@@ -84,6 +84,7 @@ import {
   HttpClient,
   HttpClientError,
   HttpClientRequest,
+  HttpClientResponse,
 } from "effect/http";
 
 import { installOpenCodeGate } from "../policy/install";
@@ -106,6 +107,75 @@ import {
   type ModelProvenance,
 } from "./identity";
 import { OpenCodeServer } from "./openCodeServer";
+
+/**
+ * The two execution timestamps that say whether a recorded outcome is the *last* turn's.
+ *
+ * ## Why this is read outside the generated client
+ *
+ * `session_v2.idle_outcome` — the `outcome` field — is written by `projectIdle` **together
+ * with `time_idle`**, and `Execution.Started` writes `time_busy` and clears neither. Both
+ * verified against OpenCode's own projector (`core/src/session/projector.ts`), and its
+ * schema states the consequence in as many words: *"Start of the most recent execution.
+ * While it runs, `idle` still holds the previous execution's end."* So one comparison
+ * answers the question exactly:
+ *
+ * - `idle >= busy` — the most recent execution recorded its own terminal. The outcome is
+ *   that execution's and is current.
+ * - `busy > idle`, or `idle` absent with `busy` set — the most recent execution recorded
+ *   nothing. Any outcome on the row belongs to an **earlier** turn.
+ *
+ * The second case is what a restart leaves behind on turn two or later, and believing the
+ * column there is what limited S7's continuation to conversations interrupted on their
+ * *first* turn: the row read `succeeded`, so nothing looked half-finished, and the
+ * interrupted turn was left alone.
+ *
+ * **The pinned `@opencode/schema@2.1.0` does not declare `time.busy`**, though the live
+ * server (2.2.5) sends it and the current schema declares and documents it. Effect Schema
+ * strips excess properties, so a `busy` read off `api.session.get`'s decoded answer is
+ * always `undefined` — the unknown-field read S7a warned against, and it would have
+ * silently done nothing. Hence this: the same route, over the same authenticated
+ * transport, decoded through a schema that declares the one field the pinned one is
+ * missing. Nothing else is re-derived — `outcome`, `cost` and `tokens` still come from the
+ * generated client's published decode — and the moment a pinned upgrade carries `busy`,
+ * this can be deleted in favour of reading it there.
+ *
+ * Raw milliseconds rather than `DateTime`, because the only thing done with them is `>=`
+ * against each other. They are OpenCode's own clock on both sides of the comparison.
+ */
+const ExecutionTimes = Schema.Struct({
+  data: Schema.Struct({
+    time: Schema.Struct({
+      busy: Schema.optionalKey(Schema.Finite),
+      idle: Schema.optionalKey(Schema.Finite),
+    }),
+  }),
+});
+
+/**
+ * Whether a recorded outcome describes the session's most recent execution.
+ *
+ * Pure, and exported so the comparison can be tested without a server.
+ *
+ * **Absence believes the outcome**, in both directions, and that is the safe direction
+ * rather than the convenient one. No `busy` at all means either a session that has never
+ * executed — in which case there is no outcome to doubt — or a server that does not send
+ * the field, in which case this is back to the behaviour before the fix: under-continuing
+ * rather than prompting a model about work that may have finished.
+ *
+ * One edge, stated because it is a real inequality and not a rounding worry: `time_idle`
+ * is written as `max(event.created, time_idle + 1)` so that every terminal advances the
+ * column even inside one millisecond. A turn that *started* in the same millisecond its
+ * predecessor terminalised therefore reads `idle >= busy` and its predecessor's outcome is
+ * believed. The window is a millisecond or two and it errs towards under-continuing.
+ */
+export const outcomeIsLastTurns = (times: {
+  readonly busy?: number | undefined;
+  readonly idle?: number | undefined;
+}): boolean =>
+  times.busy === undefined
+    ? true
+    : times.idle !== undefined && times.idle >= times.busy;
 
 /**
  * The model a worker runs on when nothing names one.
@@ -1134,6 +1204,51 @@ export const openCodeHarness = (
       });
 
       /**
+       * Whether the session's recorded outcome is its most recent execution's.
+       *
+       * {@link ExecutionTimes} carries the reasoning and why this does not go through the
+       * generated client. What is decided here is the **failure direction**, and it is the
+       * one thing about this read that a caller depends on:
+       *
+       * **Every failure answers `true` — believe the outcome.** A transport failure, a
+       * non-2xx, a body in a shape this does not understand: each leaves this back at the
+       * behaviour before the fix, which under-continues. The alternative — treating an
+       * unreadable timestamp as evidence that a recorded outcome is stale — would let one
+       * flaky GET turn a settled attempt into `uncertain`, bump its fence and revoke its
+       * credential, and on the continuation path prompt a model about work that finished.
+       * That is the direction this whole file refuses to fail in.
+       *
+       * So it is `Effect.Effect<boolean>` with no error channel, and it is **advisory**:
+       * {@link sessionStatus}'s existing answers cannot be made worse by it, only
+       * narrowed. A failure is logged rather than swallowed, because a build whose every
+       * status read silently reverted to the defect should be visible in a log.
+       *
+       * Not bounded by `timeouts.control` through `bounded`, which maps into the harness
+       * error taxonomy this has no channel for — the timeout is applied directly and joins
+       * the other failures at `true`.
+       */
+      const outcomeIsCurrent = (sessionId: string): Effect.Effect<boolean> =>
+        http
+          .get(`${server.baseUrl}/api/session/${encodeURIComponent(sessionId)}`)
+          .pipe(
+            Effect.flatMap(HttpClientResponse.filterStatusOk),
+            Effect.flatMap(HttpClientResponse.schemaBodyJson(ExecutionTimes)),
+            Effect.map((body) => outcomeIsLastTurns(body.data.time)),
+            Effect.timeout(timeouts.control),
+            Effect.tapError((cause) =>
+              Effect.logWarning(
+                "could not read a session's execution timestamps, so its recorded outcome is being read as its last turn's",
+                {
+                  sessionId,
+                  detail:
+                    cause instanceof Error ? cause.message : String(cause),
+                },
+              ),
+            ),
+            Effect.orElseSucceed(() => true),
+          );
+
+      /**
        * Whether a turn is in flight, and how the last completed one ended.
        *
        * ## Why this asks twice, and why `session.active` is asked first
@@ -1157,6 +1272,15 @@ export const openCodeHarness = (
        * `recovery/harnessStatus.ts` turned the first of those into a `still_running`
        * attempt row that nothing would ever settle.
        *
+       * **Each of those two states needs its own question, and that is why there are two
+       * reads beside `session.get`.** `session.active` answers the first. The second —
+       * which turn the column's outcome belongs to — is `time.busy` against `time.idle`,
+       * read through {@link outcomeIsCurrent} because the pinned schema does not declare
+       * `busy`; {@link ExecutionTimes} carries that reasoning. Dropping the outcome while
+       * `activity` is `running` covers only the in-flight half of the staleness, and after
+       * a restart nothing is running, which is how an interrupted second turn came to
+       * report turn one's `succeeded` and be left alone.
+       *
        * `GET /api/session/active` is the fix and it is the server's own answer rather than
        * an inference: *"foreground Session drains currently owned by this OpenCode
        * process. Sessions absent from the result are inactive"*, backed by
@@ -1174,10 +1298,15 @@ export const openCodeHarness = (
        * fences a live attempt. The normal settle path is unaffected either way:
        * `waitForIdle` is `session.wait`, which resolves on `awaitIdle` — "resolves once
        * this process owns no active execution" — so by the time the supervisor asks, the
-       * session has already left `active` and the outcome it reads is the real one.
+       * session has already left `active` and the outcome it reads is the real one. The
+       * timestamp read does not move that either: the terminal that wrote the outcome
+       * advanced `time_idle` past `time_busy` in the same transition, so a turn that
+       * completed normally reads as the current one.
        *
-       * Both reads are bounded on their own; a caller that wants the pair bounded wraps
-       * the call, as `run/supervisor.ts`'s settle does.
+       * Each read is bounded on its own; a caller that wants the set bounded wraps the
+       * call, as `run/supervisor.ts`'s settle does. The third one is asked only when it
+       * can change the answer — an outcome is recorded and nothing is running — so a
+       * session that never recorded anything still costs two.
        *
        * One limit, stated because it is the honest reading of "owned by this OpenCode
        * process": the sessions live in one SQLite file under the user's data directory, so
@@ -1206,16 +1335,37 @@ export const openCodeHarness = (
           timeouts.control,
           api.session.get({ sessionID: sessionId as Session.ID }),
         );
-        const outcome = (session as { outcome?: unknown }).outcome;
+        const recorded = (session as { outcome?: unknown }).outcome;
+        const outcome = Schema.is(TerminalOutcome)(recorded)
+          ? recorded
+          : undefined;
+        /*
+         * Reported only when it is the *last* turn's, which takes two checks rather than
+         * one and neither covers the other.
+         *
+         * `running` is the in-flight half: `Execution.Started` leaves the column alone, so
+         * whatever is in it belongs to a turn that has already finished and reporting it
+         * would answer about the wrong turn.
+         *
+         * `outcomeIsLastTurns` is the half that only shows **after a restart**, when
+         * nothing is running and the in-flight check therefore passes. A session
+         * interrupted on its second turn reports turn one's `succeeded`, which read as "the
+         * harness stated how this session's last turn ended" and left the interrupted turn
+         * alone — the single thing that narrowed S7's continuation to first-turn
+         * interruptions.
+         *
+         * Asked **only when it can change the answer**: no outcome to doubt, or a turn in
+         * flight, and nothing is read. So the extra round trip is one bounded GET on
+         * loopback, on the settle and recovery paths only (nothing polls `sessionStatus`),
+         * and it is skipped entirely for a session that never recorded anything.
+         */
+        const current =
+          running || outcome === undefined
+            ? true
+            : yield* outcomeIsCurrent(sessionId);
         return {
           activity: running ? "running" : "idle",
-          // Dropped while a turn is in flight, because of `Execution.Started`: whatever is
-          // in the column belongs to a turn that has already finished, and reporting it
-          // would answer about the wrong turn.
-          outcome:
-            running || !Schema.is(TerminalOutcome)(outcome)
-              ? undefined
-              : outcome,
+          outcome: running || !current ? undefined : outcome,
           cost: session.cost,
           tokens: session.tokens as Record<string, unknown> | undefined,
         };

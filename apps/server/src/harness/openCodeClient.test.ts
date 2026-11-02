@@ -30,7 +30,10 @@ import {
   openCodeCompactionAt,
   openCodeHarness,
   openCodeNarration,
+  outcomeIsLastTurns,
 } from "./openCodeClient";
+import { HarnessResolver } from "./resolver";
+import { HarnessSessionStatus } from "../recovery/harnessStatus";
 import { OpenCodeServer } from "./openCodeServer";
 
 const FAKE_SERVER = {
@@ -715,6 +718,208 @@ describe("what became of an opencode session", () => {
         expect(result.failure.status).toBe(404);
       }
     }
+  });
+
+  /* ── Which turn the outcome belongs to ─────────────────────────────────────── */
+
+  /**
+   * The defect that limited S7's continuation to conversations interrupted on their
+   * **first** turn, and the reason it survived S7a.
+   *
+   * `Execution.Started` writes `time_busy` and never clears `idle_outcome`; `projectIdle`
+   * writes `time_idle` and `idle_outcome` together. So `busy > idle` says the most recent
+   * execution recorded no terminal of its own and whatever is in the column is an
+   * **earlier** turn's. S7a dropped a recorded outcome while `activity` was `running`,
+   * which covers the in-flight case and nothing else — after a restart nothing is running,
+   * so turn one's `succeeded` was reported about an interrupted turn two, read as "the
+   * harness stated how this session's last turn ended", and the turn was left alone.
+   *
+   * The row below is the one S7's second live demonstration read off a restarted server.
+   */
+  describe("which turn a recorded outcome belongs to", () => {
+    /** Two reads of the session row: the generated client's, then the timestamps'. */
+    const timedStub =
+      (answers: {
+        readonly active?: readonly string[];
+        readonly session?: Record<string, unknown>;
+        /** Fails the Nth read of the session row, 1-based. Nothing fails by default. */
+        readonly failSessionRead?: number;
+      }) =>
+      () => {
+        let reads = 0;
+        return (url: string) => {
+          if (url.includes("/api/session/active"))
+            return json(activeSessions(...(answers.active ?? [])));
+          // Only the session row is counted. The model catalogue is read once while the
+          // layer is built and would otherwise take the first number.
+          if (!url.includes("/api/session/")) return json({ data: [] });
+          reads += 1;
+          return reads === answers.failSessionRead
+            ? json({ error: "boom" }, 503)
+            : json(sessionInfo(answers.session));
+        };
+      };
+
+    const statusOf = (answers: Parameters<typeof timedStub>[0]) => {
+      const { layer, recorded } = clientWith(timedStub(answers)());
+      return Effect.runPromise(
+        Effect.scoped(
+          Effect.provide(
+            Effect.map(
+              Effect.flatMap(AgentHarness, (client) =>
+                client.sessionStatus("ses_1"),
+              ),
+              (status) => ({ status, recorded }),
+            ),
+            layer,
+          ),
+        ),
+      );
+    };
+
+    /** `time_idle 1793640432141`, `time_busy 1793640472326`, `idle_outcome succeeded`. */
+    const interruptedSecondTurn = {
+      outcome: "succeeded",
+      time: {
+        created: 1_793_640_000_000,
+        updated: 1_793_640_472_326,
+        idle: 1_793_640_432_141,
+        busy: 1_793_640_472_326,
+      },
+    };
+
+    test("a session interrupted on its second turn reports no outcome at all", async () => {
+      const { status } = await statusOf({
+        active: [],
+        session: interruptedSecondTurn,
+      });
+      expect(status.activity).toBe("idle");
+      // Not `succeeded`: that is turn one's, and turn two recorded nothing.
+      expect(status.outcome).toBeUndefined();
+    });
+
+    /**
+     * The same session, through the adapter the continuation decision is actually taken
+     * from. `abandoned` is what makes a continuation decidable; `succeeded` is what left
+     * the interrupted turn alone.
+     */
+    test("recovery reads that session as abandoned rather than succeeded", async () => {
+      const { layer } = clientWith(
+        timedStub({ active: [], session: interruptedSecondTurn })(),
+      );
+      const report = await Effect.runPromise(
+        Effect.scoped(
+          Effect.provide(
+            Effect.flatMap(HarnessSessionStatus, (service) =>
+              service.of("ses_1", null),
+            ),
+            HarnessSessionStatus.layer.pipe(
+              Layer.provide(HarnessResolver.single),
+              Layer.provide(layer),
+            ),
+          ),
+        ),
+      );
+      expect(report.observed).toBe("abandoned");
+    });
+
+    /**
+     * A completed turn is the normal settle path and must be untouched: `waitForIdle` is
+     * `session.wait`, the session has left `active`, and the terminal that wrote the
+     * outcome also advanced `time_idle` past `time_busy`.
+     */
+    test("an outcome recorded by the most recent execution is still reported", async () => {
+      const { status } = await statusOf({
+        active: [],
+        session: {
+          outcome: "succeeded",
+          time: {
+            created: 1_793_640_000_000,
+            updated: 1_793_640_432_141,
+            busy: 1_793_640_400_000,
+            idle: 1_793_640_432_141,
+          },
+        },
+      });
+      expect(status.outcome).toBe("succeeded");
+    });
+
+    /**
+     * The timestamps are asked for only when they can change the answer, which keeps the
+     * extra round trip off every status read rather than on it.
+     */
+    test("nothing extra is read when no outcome was recorded", async () => {
+      const { recorded } = await statusOf({ active: [] });
+      expect(recorded.urls).toHaveLength(2);
+    });
+
+    test("nothing extra is read while a turn is in flight", async () => {
+      const { recorded, status } = await statusOf({
+        active: ["ses_1"],
+        session: interruptedSecondTurn,
+      });
+      expect(status.activity).toBe("running");
+      expect(recorded.urls).toHaveLength(2);
+    });
+
+    /**
+     * The failure direction, and it is the one thing a caller depends on here.
+     *
+     * An unreadable timestamp must not be evidence that a recorded outcome is stale: that
+     * would let one flaky GET turn a settled attempt into `uncertain`, bump its fence and
+     * revoke its credential. So the read is advisory and every failure believes the
+     * outcome — back to the behaviour before the fix, which under-continues.
+     */
+    test("an unreadable timestamp read leaves the recorded outcome believed", async () => {
+      const { status } = await statusOf({
+        active: [],
+        session: { outcome: "failed", time: { created: 1, updated: 2 } },
+        failSessionRead: 2,
+      });
+      expect(status.outcome).toBe("failed");
+    });
+
+    /**
+     * And the whole status read must not fail because of it, which is a different claim
+     * from the one above: this read has no error channel at all.
+     */
+    test("a session with a stale outcome whose timestamps 404 still answers", async () => {
+      const { status } = await statusOf({
+        active: [],
+        session: { outcome: "failed" },
+        failSessionRead: 2,
+      });
+      expect(status.activity).toBe("idle");
+    });
+  });
+
+  /**
+   * The comparison on its own, including the two absences.
+   *
+   * `time_idle` is written as `max(event.created, time_idle + 1)` so every terminal
+   * advances the column inside one millisecond, which is why equality believes the
+   * outcome: a turn that started and ended in the same millisecond reads `idle === busy`.
+   */
+  describe("the outcome-is-current comparison", () => {
+    test("a terminal at or after the last start is the current turn's", () => {
+      expect(outcomeIsLastTurns({ busy: 10, idle: 11 })).toBe(true);
+      expect(outcomeIsLastTurns({ busy: 10, idle: 10 })).toBe(true);
+    });
+
+    test("a start after the last terminal makes the outcome an earlier turn's", () => {
+      expect(outcomeIsLastTurns({ busy: 11, idle: 10 })).toBe(false);
+      // A first turn interrupted before anything terminalised: `busy` set, `idle` never
+      // written. There is no outcome on such a row today, and if one appears it is not
+      // this turn's.
+      expect(outcomeIsLastTurns({ busy: 11 })).toBe(false);
+    });
+
+    test("no start at all believes whatever was recorded", () => {
+      // Either a session that never executed — nothing to doubt — or a server that does
+      // not send the field, where this must stay at the pre-fix behaviour.
+      expect(outcomeIsLastTurns({})).toBe(true);
+      expect(outcomeIsLastTurns({ idle: 10 })).toBe(true);
+    });
   });
 
   /** "We could not read the active set" must not read as "nothing is running". */
