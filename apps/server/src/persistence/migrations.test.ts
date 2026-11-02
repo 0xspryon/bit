@@ -494,6 +494,7 @@ describe("a database already at 0002", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -779,6 +780,7 @@ describe("a database already at 0005", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1508,6 +1510,7 @@ describe("a database already at 0015", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1659,6 +1662,7 @@ describe("a database already at 0016", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1839,6 +1843,7 @@ describe("a database already at 0017", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(
@@ -2073,6 +2078,7 @@ describe("0025 import session confirmation", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     expect(outcome.columns).toContain("session_created_at");
     // Not backfilled: nothing in a 0024 row says the harness ever held the session.
@@ -2115,6 +2121,7 @@ describe("0026 import session end", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     expect(outcome.columns).toContain("ended_at");
     // Not backfilled: a row from before the column says nothing about an ending.
@@ -2166,6 +2173,7 @@ describe("0027 import session end reason", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     expect(outcome.columns).toContain("ended_reason");
     // Not backfilled: nothing under 0026 recorded why a row ended.
@@ -2214,6 +2222,7 @@ describe("0028 and 0029: an import session's model options and pages", () => {
       "28_import_session_model_options",
       "29_import_session_pages",
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     expect(outcome.columns).toContain("model_options");
     expect(outcome.columns).toContain("pages");
@@ -2258,10 +2267,69 @@ describe("0030: a goal conversation's model", () => {
 
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "30_goal_session_model",
+      "31_attempt_harness_instance_repair",
     ]);
     expect(outcome.columns).toContain("model");
     // Not backfilled: a 0021 row says nothing about what the conversation ran on.
     expect(outcome.upgraded).toEqual([{ model: null }]);
     expect(outcome.written).toEqual([{ model: "anthropic/claude-sonnet-5" }]);
+  });
+
+  test("0031 repairs attempts.harness_instance_id on a database that skipped 0014", async () => {
+    /*
+     * The failure this exists for, found by driving the app rather than by a test.
+     *
+     * `0014_attempt_harness_instance` was inserted into the middle of the list after
+     * databases already existed, so those databases recorded id 14 as `outbox` and the
+     * migrator — which skips every entry at or below the highest applied id — never ran it.
+     * `attempts` kept no `harness_instance_id`, and nothing noticed until the Agent sessions
+     * list selected it: the route answered 500 and startup reconciliation logged
+     * `query failed` on every target.
+     *
+     * Simulated the way a real upgrade is: take a file forward through the chain, drop the
+     * column to put it in the state the renumber left, then migrate the rest of the way.
+     */
+    const path = newDatabasePath();
+    await runChain(path, chainThrough(30));
+
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        // The closest reachable state to the one the skipped migration left. The index goes
+        // first: SQLite refuses to drop a column an index depends on.
+        yield* sql.unsafe(`DROP INDEX IF EXISTS attempts_harness_instance_idx`);
+        yield* sql.unsafe(`ALTER TABLE attempts DROP COLUMN harness_instance_id`);
+        const before = yield* columnsOf(sql, "attempts");
+        const applied = yield* Effect.scoped(
+          runMigrations({ loader: SqliteMigrator.fromRecord(MIGRATIONS) }).pipe(
+            Effect.provide(sqliteLayer(path)),
+          ),
+        );
+        return {
+          before,
+          applied,
+          after: yield* columnsOf(sql, "attempts"),
+        };
+      }),
+    );
+
+    expect(outcome.before).not.toContain("harness_instance_id");
+    expect(outcome.after).toContain("harness_instance_id");
+  });
+
+  test("0031 is a no-op on a database that already has the column", async () => {
+    const path = newDatabasePath();
+    await runChain(path, chainThrough(31));
+    // Running the whole chain again must not fail on a bare ALTER TABLE.
+    const columns = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* Effect.scoped(
+          runMigrations({ loader: SqliteMigrator.fromRecord(MIGRATIONS) }).pipe(
+            Effect.provide(sqliteLayer(path)),
+          ),
+        );
+        return yield* columnsOf(sql, "attempts");
+      }),
+    );
+    expect(columns).toContain("harness_instance_id");
   });
 });

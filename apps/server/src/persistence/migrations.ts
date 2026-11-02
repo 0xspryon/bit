@@ -63,6 +63,28 @@ import { DatabaseError, asDatabaseError } from "./sql";
  * bypasses that and reports only SQLite's own message, with no indication of which
  * migration produced it.
  */
+/**
+ * Adds a column only when the table does not already have it.
+ *
+ * SQLite has no `ADD COLUMN IF NOT EXISTS`, and this exists because one migration needed to
+ * be re-run on databases that had skipped it. See `0031`.
+ */
+const addColumnIfMissing = (
+  table: string,
+  column: string,
+  definition: string,
+): Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient> =>
+  Effect.gen(function* () {
+    const client = yield* SqlClient.SqlClient;
+    const columns = yield* client.unsafe<{ readonly name: string }>(
+      `PRAGMA table_info(${table})`,
+    );
+    if (columns.some((row) => row.name === column)) return;
+    yield* client.unsafe(
+      `ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`,
+    );
+  });
+
 const statements = (
   ...sql: ReadonlyArray<string>
 ): Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient> =>
@@ -1691,6 +1713,35 @@ const addGoalSessionModel = statements(
  * database already past it: the two diverge and the journal reports both as current.
  * There is no gap here. Append with a number above every key.
  */
+/**
+ * `0031` — repairs `attempts.harness_instance_id` on a database that never received `0014`.
+ *
+ * **Not a new column: a migration that was inserted into the middle of the list.** `0014` is
+ * `0014_attempt_harness_instance`, but a database created before it existed recorded id 14 as
+ * `outbox` — the list was renumbered under it, and `effect/sql`'s migrator skips every entry at
+ * or below the highest id already applied. So on every such database `0014` never ran, and
+ * `attempts` has no `harness_instance_id`. `0015_attempt_model_options` survived the same
+ * renumber only because its id happened not to move.
+ *
+ * It stayed invisible until something selected the column: the Agent sessions list (S8) did, and
+ * the route answered `500` while startup reconciliation logged `query failed` on every target.
+ *
+ * Idempotent through {@link addColumnIfMissing}, because a database created *after* the
+ * renumber has the column already and a bare `ALTER TABLE` would fail on it. The index is
+ * `IF NOT EXISTS` for the same reason.
+ *
+ * `AGENTS.md`'s rule — append, never edit an applied migration — is what this is the cost of.
+ * The forward repair is the only remedy available: there is no `down` and no `redo`.
+ */
+const repairAttemptHarnessInstance = Effect.gen(function* () {
+  yield* addColumnIfMissing("attempts", "harness_instance_id", "TEXT");
+  yield* statements(
+    `CREATE INDEX IF NOT EXISTS attempts_harness_instance_idx
+       ON attempts(harness_instance_id)
+       WHERE harness_instance_id IS NOT NULL`,
+  );
+});
+
 export const MIGRATIONS: Record<
   string,
   Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient>
@@ -1725,6 +1776,7 @@ export const MIGRATIONS: Record<
   "0028_import_session_model_options": addImportSessionModelOptions,
   "0029_import_session_pages": addImportSessionPages,
   "0030_goal_session_model": addGoalSessionModel,
+  "0031_attempt_harness_instance_repair": repairAttemptHarnessInstance,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */
