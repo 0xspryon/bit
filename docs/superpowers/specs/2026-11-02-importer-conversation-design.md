@@ -5,6 +5,53 @@
 > See "The generic spine" for what is shared and where the sharing honestly stops. Written
 > after slice 1 shipped, so S1 records what was built rather than what was planned.
 
+## State of play — 2 Nov 2026
+
+**Merged to `main`**, each verified green at merge:
+
+| Slice | What landed                                                                                                                                              |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S1    | The session index (`import_sessions`, `0024`/`0025`)                                                                                                     |
+| S2    | `LiveAgentSessions` extracted from the goal path; the importer session outlives its turn; no-clock credential; `ended_at`/`ended_reason` (`0026`/`0027`) |
+| S3    | Open and continue a conversation; citable pages; the in-flight guard; `0028`/`0029`                                                                      |
+| S3.5  | The Reasoning column, resolved options reaching `createSession` and recorded                                                                             |
+| S4    | Live narration — a fourth `import` tag on the narration bus                                                                                              |
+| S5    | `scope.entry.added` and `asset.imported` on the feed, folded into their calls                                                                            |
+| S6    | Replay from the harness, and resuming a session this process no longer holds                                                                             |
+| S8    | One list of every agent session, under Operations                                                                                                        |
+| S7a   | Recovery tells the truth after a restart: `activity` on `SessionStatus`, the `abandoned` answer                                                          |
+
+Gates on `main`: **1540 server · 455 web · 84 DOM · 971 persistence**, migrations contiguous `0001`–`0029`.
+
+**In flight:** S7b — the continuation turn.
+
+**Still to do:**
+
+1. **S7b** (in flight): the dispatched continuation, the summary for worker attempts only, the chained-continuation cap, the outbox dispatcher, the opt-out.
+2. **Narrow the importer session's tool set.** Recorded under Known defects. The three MCP tools are the only ones that can _write_, but the session also holds whatever else the harness gives it — a live run used `Bash` to `curl` a page. The gated directory is the control and always was; the sentence we showed the operator was what was wrong, and that is already corrected. The fix is `allowedTools` on `createSession`, done with a live import to verify against, because the live run reached for `curl` rather than `WebFetch`.
+3. **Importer liveness in the S8 list is a lower bound.** A session held open _between_ turns — exactly what S2 built — reads "Not running", because the registry only exposes "a run is in flight". Needs `scopeImporter.ts`, which was off-limits while S6 and S8 ran in parallel.
+4. **A third state in the S8 list.** A restart leaves goal conversations and unended importer sessions neither live nor ended — nothing recorded their authority ending, which is `ended_reason` working as designed. "Not running" is the honest reading; S8.1 says "live or ended" and should say three.
+5. **`goal_sessions` has no model column**, so a dormant goal shows "model not recorded". A migration, held back while slices were taking `0028`/`0029`.
+6. **The end-to-end pass**, now possible on both drivers.
+
+## What has been verified against live agents, and on which driver
+
+This matters because several claims in this document were wrong until someone ran them.
+
+- **Claude Code (`claude-sonnet-5`)** — live narration with real timings (prose under the right message before the turn settled); records folded into their calls, including across a no-op; replay and resume across a real server restart, with the agent quoting its earlier reply.
+- **OpenCode (`zai-coding-plan/glm-5.3-flash`)** — open, continue, and resume across a restart that killed the `opencode serve` holding the session, with the resumed agent quoting _both_ earlier replies verbatim; `turn.reply` **and** `turn.thinking` reaching the feed keyed by `importId` (Claude Sonnet emitted no thinking, so that had been test-only); `scope.entry.added` carrying `importId: null` for an operator's own entry, confirming the isolation rule; the recovery sweep's before/after on a real abandoned session.
+
+**Not observed live:** the `fresh`-session fallbacks (a swept transcript, a metadata-only transcript, an ungated directory), a refused tool call, and a retried asset call. All test-only, and all say so.
+
+## Environment notes, rediscovered too many times
+
+- The browser reaches the control plane **same-origin through vite's proxy**; the server serves **no CORS headers**, so the Connect screen's Server URL must be the vite origin, never the API port.
+- The stored server password is an **argon2id hash and unrecoverable**. Set `BIT_PASSWORD` at boot to know it.
+- `preview_*` tools are unreliable here. **Headless Chrome over CDP works.**
+- A synthetic `el.click()` does **not** fire Svelte handlers — dispatch a real mouse event.
+- `bun run format` rewrites `sprint-roadmap.html`, which is the one file `format:check` is expected to fail on. Do not run it.
+- A dev server may be serving a **git worktree rather than the main checkout** — check `/proc/<pid>/cwd` before trusting a measurement.
+
 ## Intent
 
 The scope importer is today a **single-turn batch job**: `createTarget` prompts it once, it
