@@ -44,6 +44,16 @@ This matters because several claims in this document were wrong until someone ra
 - **OpenCode (`zai-coding-plan/glm-5.3-flash`)** — open, continue, and resume across a restart that killed the `opencode serve` holding the session, with the resumed agent quoting _both_ earlier replies verbatim; `turn.reply` **and** `turn.thinking` reaching the feed keyed by `importId` (Claude Sonnet emitted no thinking, so that had been test-only); `scope.entry.added` carrying `importId: null` for an operator's own entry, confirming the isolation rule; the recovery sweep's before/after on a real abandoned session.
 - **S7b's whole cycle, on the same instance** — a conversation interrupted mid-turn by a graceful restart, terminalized, queued on the outbox, dispatched as a resume of the same session, and answered: the agent called `read_scope` first, said what had and had not been recorded, and carried on from where it was cut off. The operator's switch was exercised on the same database in both directions, and `spike/continuationSummaryProbe.ts` read the summary off that real transcript for a session its own process never opened.
 
+- **S7c's three fixes** — Claude Code answering `abandoned` for a transcript it holds, with
+  an unknown id still `missing` (`claudeAbandonedProbe.ts`, `claude-sonnet-5`); OpenCode's
+  `time.busy`/`time.idle` reading on a session interrupted on its **second** turn, where
+  `continuationTrigger` moves from `none` to `owed` (`secondTurnStatusProbe.ts`,
+  `zai-coding-plan/glm-5.3-flash`); and the whole cycle A-against-B over the browser API —
+  the same sequence run with the comparison reverted and with it in place, queuing nothing
+  in the first and dispatching a resumed session in the second, with the agent telling the
+  interrupted turn from the completed one. The `narrated` fix is **test-only**: it needs a
+  steered planner round, and nothing creates one over HTTP without a goal agent driving it.
+
 **Not observed live:** the `fresh`-session fallbacks (a swept transcript, a metadata-only transcript, an ungated directory), a refused tool call, a retried asset call, and **the worker continuation's end-to-new handoff** — nothing creates an intent over HTTP, so a live worker continuation needs a planner round first. All test-only, and all say so.
 
 ## Environment notes, rediscovered too many times
@@ -1356,6 +1366,60 @@ The contrast line is the distinction the fix had to keep: a session with a trans
 `abandoned`, an id nobody has is `missing`, and only the first asserts the conversation is
 still there. The held reading above it is the normal path, unmoved — a completed turn
 reports its real outcome with its cost and tokens.
+
+##### The end-to-end run: a second-turn interruption continued, A against B
+
+The probes above show the seam. This is the feature: a real importer conversation on
+`zai-coding-plan/glm-5.3-flash`, driven over the browser API with a throwaway `HUNT_ROOT`
+and `BIT_PASSWORD` at boot, a turn that **completed**, a second turn, a `SIGINT` ten seconds
+into it, and a fresh boot over the same database. Run twice on identical sequences — once
+with the comparison reverted to `true` and once with it in place — so the difference is one
+line of code and not one build apart.
+
+```
+BEFORE after turn one   (busy 1793646493549, idle 1793646497642, 'succeeded')
+BEFORE during turn two  (busy 1793646518705, idle 1793646497642, 'succeeded')
+BEFORE after shutdown   (busy 1793646518705, idle 1793646497642, 'succeeded')
+BEFORE boot B           startup continuation: nothing was interrupted by the loss of a
+                        process, so nothing was continued
+
+AFTER  after turn one   (busy 1793646585882, idle 1793646592935, 'succeeded')
+AFTER  during turn two  (busy 1793646611045, idle 1793646592935, 'succeeded')
+AFTER  after shutdown   (busy 1793646611045, idle 1793646592935, 'succeeded')
+AFTER  boot B           acme: importer conversation imp_1a19daad7f1… session=ses_e6255280effe…
+                          continuation=queued as out_000001  the harness knows this session,
+                          is running no turn on it and recorded no outcome, so its last turn
+                          was interrupted by the loss of the process that owned it — …
+                        acme: out_000001  outcome=succeeded
+                          import imp_1a19dab891b… (resumed) on session ses_e6255280effe…
+                        startup continuation: 1 queued, 1 dispatched, 0 not sent
+```
+
+Both rows are read straight out of `session_v2`, and they are the same shape in both runs:
+turn one's terminal advanced `time_idle` past its `time_busy`, turn two's start moved
+`time_busy` 18 seconds past that `time_idle`, and the graceful shutdown changed nothing —
+`projectIdle` returning early for `reason: "shutdown"`, exactly as S7a's reasoning said. The
+only thing that differs is what the boot made of it.
+
+The durable trace of the first run of the same cycle, read out of the file: one `outbox` row
+(`agent.continue`, `reconcile_first`, `succeeded`, `attempts: 1`) whose payload carries
+`"observed":"abandoned"` and whose `caused_by_event_id` is the
+`agent.continuation.requested` event, and two `import_sessions` rows on **one**
+`harness_session_id` — the first ended `shutdown`, the second with no ending.
+
+What the agent did with it is the part that matters, and it is a four-message replay rather
+than a claim: `one`, then the interrupted counting, then the synthetic continue message,
+then —
+
+> read_scope confirms the position: **0 entries recorded**. That's correct — no program
+> pages have been given to me yet in this engagement, so there was no scope work in flight
+> when the server restarted, and nothing to re-record or duplicate. The only turn that was
+> actually cut off was the counting …
+
+It read `read_scope` before writing, as the synthetic message asks, and it told the
+interrupted turn from the completed one. The session's row afterwards reads
+`idle >= busy` with `succeeded` — the continuation turn settling normally through the same
+comparison, which is the normal path exercised on the other side of the fix.
 
 #### One limit, stated
 
