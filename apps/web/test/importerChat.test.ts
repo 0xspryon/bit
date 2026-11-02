@@ -17,7 +17,12 @@ import {
   type ScopeImportTool,
 } from "@bit/contracts";
 
-import { operatorTurn } from "../src/lib/chat";
+import {
+  callSignature,
+  operatorTurn,
+  resultLine,
+  splitCode,
+} from "../src/lib/chat";
 import {
   NO_HISTORY,
   buildImporterChat,
@@ -383,5 +388,77 @@ describe("the picker's second line", () => {
     expect(tallyLine({ in: 1, out: 0, assets: 1, messages: 1 })).toBe(
       "1 in · 0 out · 1 asset · 1 message",
     );
+  });
+});
+
+describe("a call as one line of the thread", () => {
+  const callItem = (input: string | null): LiveItem =>
+    item({
+      kind: "tool.call",
+      toolName: "add_scope_entry",
+      headline: "add_scope_entry",
+      input,
+    });
+
+  test("prints the arguments the call carried, leaves a null out, and adds nothing", () => {
+    expect(
+      callSignature(
+        callItem(
+          JSON.stringify({
+            effect: "in",
+            kind: "subtree",
+            value: "acme.com",
+            method: null,
+            subdomains: true,
+          }),
+        ),
+      ),
+    ).toBe(
+      'add_scope_entry(effect="in", kind="subtree", value="acme.com", subdomains=true)',
+    );
+    expect(callSignature(callItem(null))).toBe("add_scope_entry()");
+  });
+
+  test("never guesses at a call the server cut short", () => {
+    // Arguments are capped with a marker appended, so a large one is not valid JSON.
+    expect(
+      callSignature(callItem('{"value":"acme.com","note":"a long no…')),
+    ).toBe("add_scope_entry(…)");
+  });
+
+  test("a result prints the server's sentence when it wrote one, else its own output cut short", () => {
+    const answer = (over: Partial<LiveItem>): LiveItem =>
+      item({ kind: "tool.result", ...over });
+    expect(resultLine(null)).toBeNull();
+    expect(resultLine(answer({ body: "entry ent_1 created" }))).toBe(
+      "entry ent_1 created",
+    );
+    expect(resultLine(answer({ output: '{ "total": 5 }' }))).toBe(
+      '{"total":5}',
+    );
+    const long = resultLine(answer({ output: "x".repeat(400) }));
+    expect(long?.endsWith("…")).toBe(true);
+    expect(long?.length).toBe(161);
+    expect(resultLine(answer({ body: "refused", outcome: "failed" }))).toBe(
+      "failed: refused",
+    );
+  });
+});
+
+describe("prose with code in it", () => {
+  test("splits at backticks into runs, as data, so nothing the agent wrote is read as markup", () => {
+    expect(
+      splitCode("Three are in scope — `acme.com` and `<b>x</b>`."),
+    ).toEqual([
+      { code: false, text: "Three are in scope — " },
+      { code: true, text: "acme.com" },
+      { code: false, text: " and " },
+      { code: true, text: "<b>x</b>" },
+      { code: false, text: "." },
+    ]);
+  });
+
+  test("leaves an unmatched backtick as typed", () => {
+    expect(splitCode("a ` b")).toEqual([{ code: false, text: "a ` b" }]);
   });
 });

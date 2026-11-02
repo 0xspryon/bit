@@ -5,21 +5,22 @@
    * **Driven by mock data.** Every field it reads is on `app.importer`
    * (`importerSessions.svelte.ts`), which holds declared sessions; nothing here reaches a
    * server. See that file for the one fake in the interface (the stand-in reply to a sent
-   * message) and `mockImporter.ts` for the content.
+   * message) and `mockImporter.ts` for the content, whose narration is invented.
    *
-   * ## It is {@link Chat}, with its own subject and its own separator
+   * ## It is {@link Chat}, laid out as a page
    *
-   * `Chat` takes the group's subject as a type parameter it never looks inside, because
-   * hard-coding the planner's round into it was the mistake it was built to undo. This is
-   * the third caller and changes nothing there: {@link ImporterTurn} is the importer's own
-   * subject, one group per operator message, and the `separator` snippet below renders it —
-   * the operator's words as the heading of the stretch of work they asked for, or "Earlier
-   * in this session" for what came before the first message this page can see.
+   * `Chat` takes the group's subject as a type parameter it never looks inside, so this is
+   * the third caller and the importer's own subject ({@link ImporterTurn}) and separator are
+   * written here. `layout="thread"` is the one thing `Chat` was taught for it: A6 draws the
+   * chat as the whole page — an 800px column, no frame, the composer pinned under the log —
+   * where the planner's and the goal agent's are panels among other things. Rows go through
+   * {@link ChatItem} too, `narrated`: prose as prose and a call as a mono block, with the
+   * same record/activity distinction and write states as the ledger reading.
    *
-   * The five prose states are `Chat`'s and are all reachable from here: `live` (a turn the
-   * importer is narrating), `pending` (sent, not answered), `replayed` (the harness's copy),
-   * `forgotten` (it no longer has it, said as a note and not an alert), `loading` (opening
-   * an older session) and `none` (a turn that said nothing).
+   * One group per operator message. The separator is the operator's bubble and, under it,
+   * the importer's header (the harness's letter, "Importer", the model); what the importer
+   * said and called follows as rows. The five prose states are `Chat`'s and are all
+   * reachable from here: `live`, `pending`, `replayed`, `forgotten`, `loading` and `none`.
    *
    * ## The composer is enabled, unlike the planner's
    *
@@ -29,19 +30,25 @@
    *
    * ## Not wired, and said
    *
-   * The model and harness chips are display only. A session's model is fixed once it has
-   * started — "changing harness starts a new session and never moves this one" — and a
-   * new session's choice belongs to the same harness picker the other composers use,
-   * which needs the server's catalogue this page does not have. Attach is inert for the
-   * reason `ComposeBox`'s `+` is: nothing behind it, so it is `aria-disabled` and says why.
+   * Attach is inert for the reason `ComposeBox`'s `+` is: nothing behind it, so it is
+   * `aria-disabled` and says why. The "Importer" chip is a label and not the agent selector
+   * D7 draws: there is no second agent to select. The model chip is the real picker
+   * ({@link ImporterModelPicker}) over whatever harnesses the app holds — the server's when
+   * connected, `mockHarnesses` in the state picker.
    */
   import { tick } from "svelte";
 
   import type { App } from "../app.svelte";
-  import { IconArrowUp, IconPaperclip, IconPlus } from "../icons";
+  import {
+    IconArrowUp,
+    IconDownload,
+    IconFile,
+    IconLink,
+    IconPlus,
+  } from "../icons";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
-  import Button from "./Button.svelte";
   import Chat from "./Chat.svelte";
+  import ImporterModelPicker from "./ImporterModelPicker.svelte";
 
   let { app }: { app: App } = $props();
 
@@ -51,9 +58,14 @@
   let target = $derived(app.selected?.name ?? app.viewTargetId);
   let canSend = $derived(importer.draft.trim() !== "");
   let working = $derived(session?.working ?? false);
-  let turns = $derived(
-    groups.filter((group) => group.subject.message !== null).length,
+  /** A session that has started keeps its model; only an empty one may choose. */
+  let pinned = $derived(
+    session === undefined || session.tally.messages === 0
+      ? null
+      : { harness: session.harness, model: session.model },
   );
+  /** The importer's header in a group names the session's own harness and model. */
+  let letter = $derived((session?.harness.slice(0, 1) || "?").toLowerCase());
 
   let box = $state<HTMLTextAreaElement | undefined>(undefined);
 
@@ -92,13 +104,6 @@
       ? "Paste a policy or scope URL, or say what is in and out of scope…"
       : "Correct it, or add what the pages do not say…",
   );
-
-  function clock(at: number): string {
-    return new Date(at).toLocaleTimeString(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  }
 </script>
 
 <div class="importer">
@@ -106,51 +111,57 @@
     label={`Load the scope for ${target}`}
     {groups}
     readonly={false}
-    maxHeight="max(320px, calc(100vh - 420px))"
-    count={turns === 0
-      ? ""
-      : `${String(turns)} ${turns === 1 ? "message" : "messages"} from you`}
+    layout="thread"
     note={session?.reading
       ? "You are reading an earlier session. Your first message resumes it, with the scope as it stands now, not as it stood then."
       : ""}
     empty="Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread."
   >
     {#snippet separator(group)}
-      <!--
-        The operator's message is the heading of the stretch of work it asked for. It is the
-        one part of a group that survives anything — it is in the harness's copy as a `user`
-        entry, and in this tab's feed as a minted row — so a group whose words and calls
-        have both gone is still legible as "this is what you asked".
-      -->
       {#if group.subject.message === null}
-        <span class="sep-title">Earlier in this session</span>
+        <!--
+          What came before the first message this page can see: a hairline and a few faint
+          words, as D4 draws the seam between what scrolled away and what is here.
+        -->
+        <div class="earlier"><span>earlier in this session</span></div>
       {:else}
-        <span class="sep-who">You</span>
-        <span class="sep-said">{group.subject.message}</span>
-        {#if group.subject.at !== null}
-          <span class="sep-when">{clock(group.subject.at)}</span>
-        {/if}
-        {#if group.subject.working}
-          <span class="chip" data-tint="warning">working</span>
-        {/if}
+        <!--
+          The operator's message is the heading of the stretch of work it asked for, set as
+          D3 draws it: right-aligned in a bubble, with the importer's header beneath. It is
+          the one part of a group that survives anything — it is in the harness's copy as a
+          `user` entry and in this tab's feed as a minted row — so a group whose words and
+          calls have both gone is still legible as "this is what you asked".
+        -->
+        <div class="turn">
+          <div class="you">
+            <div class="bubble">{group.subject.message}</div>
+          </div>
+          <div class="agent">
+            <span class="avatar" aria-hidden="true">{letter}</span>
+            <span class="who">Importer</span>
+            <span class="model">{session?.model ?? ""}</span>
+            {#if group.subject.working}
+              <span class="visually-hidden" role="status"
+                >The importer is working.</span
+              >
+            {/if}
+          </div>
+        </div>
       {/if}
     {/snippet}
 
     {#snippet footnote()}
-      Rows marked <strong>record</strong> are committed events, in the order the
-      store assigned them, and stay on the Assets page whatever happens to this
-      thread. Rows marked <strong>activity</strong> — including your own messages
-      — are the importer narrating its own calls: not stored, and gone on a reload.
-      What it said comes back from the harness for as long as the harness keeps it.
+      A call marked <strong>recorded</strong> is a committed event and stays on the
+      Assets page. A dashed call, the importer's words and your messages are narration:
+      not stored, and gone on a reload unless the harness still has them.
     {/snippet}
 
     {#snippet controls()}
       {#if working}
-        <span class="pulse" aria-hidden="true"></span>
-        <span class="status" role="status">The importer is working…</span>
-        <Button size="sm" variant="outline" onclick={() => importer.stop()}>
-          Stop
-        </Button>
+        <button class="stop" type="button" onclick={() => importer.stop()}>
+          <span class="stop-mark" aria-hidden="true"></span>
+          <span>Stop</span>
+        </button>
       {/if}
     {/snippet}
 
@@ -163,36 +174,32 @@
           <textarea
             bind:this={box}
             id="importer-message"
-            rows="3"
+            rows="1"
+            class={[groups.length === 0 && "first"]}
             {placeholder}
             bind:value={importer.draft}
             {onkeydown}></textarea>
           <div class="strip">
             <button
-              class="square attach"
+              class="icon-btn"
               type="button"
               aria-disabled="true"
-              aria-label="Attach files the importer can read"
+              aria-label="Attach"
               title="Attaching files is not wired to anything yet."
             >
-              <IconPaperclip width="14" height="14" />
+              <IconPlus width="14" height="14" />
             </button>
-            <span class="chip-ui" title="The agent this chat talks to.">
+            <span class="agent-chip" title="The agent this chat talks to.">
+              <IconDownload width="12" height="12" aria-hidden="true" />
               Importer
             </span>
-            <span
-              class="chip-ui mono"
-              title="The model this session runs on. Changing it starts a new session; it never moves this one."
-            >
-              {session?.model ?? ""}
-            </span>
+            <ImporterModelPicker {app} {pinned} dimmed={working} />
             {#if working}
               <span class="hint">pinned while the session is running</span>
-            {:else}
-              <span class="hint">Enter sends, Shift+Enter for a new line.</span>
             {/if}
+            <span class="grow"></span>
             <button
-              class="square submit"
+              class="send"
               type="submit"
               disabled={!canSend}
               aria-label="Send to the importer"
@@ -205,22 +212,30 @@
 
         {#if groups.length === 0}
           <!--
-          Two suggestions that are really just pre-written first messages (D2). They go
-          away with the first message: after that the thread is the prompt.
-        -->
+            Two suggestions that are really just pre-written first messages (D2). They go
+            away with the first message: after that the thread is the prompt.
+          -->
           <ul class="starters" aria-label="Ways to start">
-            {#each Object.entries(STARTERS) as [key, starter] (key)}
-              <li>
-                <button
-                  class="starter"
-                  type="button"
-                  onclick={() => void choose(key as StarterKey)}
-                >
-                  <IconPlus width="12" height="12" />
-                  <span>{starter.label}</span>
-                </button>
-              </li>
-            {/each}
+            <li>
+              <button
+                class="starter"
+                type="button"
+                onclick={() => void choose("program")}
+              >
+                <IconLink width="12" height="12" aria-hidden="true" />
+                <span>{STARTERS.program.label}</span>
+              </button>
+            </li>
+            <li>
+              <button
+                class="starter"
+                type="button"
+                onclick={() => void choose("sow")}
+              >
+                <IconFile width="12" height="12" aria-hidden="true" />
+                <span>{STARTERS.sow.label}</span>
+              </button>
+            </li>
           </ul>
         {/if}
       </div>
@@ -231,116 +246,165 @@
 <style>
   .importer {
     display: flex;
+    flex: 1;
+    min-height: 0;
     flex-direction: column;
+    padding: 0 32px;
   }
-  /*
-   * The separator's own type. Its layout — the rule above it — belongs to {@link Chat}. The
-   * operator's words are the most prominent text in a group because they are what the group
-   * is for; the agent's rows beneath are the work done about them.
-   */
-  .sep-title {
-    font: 600 12px/var(--lh-compact) var(--font-sans);
-    color: var(--text-base);
-  }
-  .sep-who {
-    flex: none;
-    font: 600 11px/var(--lh-compact) var(--font-sans);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-muted);
-  }
-  .sep-said {
-    flex: 1 1 24ch;
+
+  /* ── The separator: the operator's bubble, then the importer's header ──────── */
+  .turn {
+    display: flex;
+    flex: 1 1 100%;
     min-width: 0;
-    font: 500 13px/var(--lh-base) var(--font-sans);
+    flex-direction: column;
+    gap: 26px;
+  }
+  .you {
+    display: flex;
+    justify-content: flex-end;
+  }
+  .bubble {
+    max-width: 560px;
+    padding: 11px 14px;
+    box-sizing: border-box;
+    border-radius: 10px;
+    background: var(--bg-layer-02);
     color: var(--text-base);
+    font: 400 13px/20px var(--font-sans);
+    text-wrap: pretty;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  .sep-when {
+  .agent {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .avatar {
+    display: inline-flex;
     flex: none;
-    font-size: 11px;
-    color: var(--text-muted);
-    font-variant-numeric: tabular-nums;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    background: var(--bg-layer-03);
+    color: var(--text-base);
+    font: 500 10px/18px var(--font-mono);
   }
-  .chip {
-    display: inline-block;
-    padding: 1px 6px;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-sm);
-    background: var(--bg-layer-01);
+  .who {
+    font: 500 12px/16px var(--font-sans);
     color: var(--text-muted);
-    font: 600 10px/var(--lh-tight) var(--font-sans);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    white-space: nowrap;
   }
-  .chip[data-tint="warning"] {
-    border-color: var(--state-border-warning);
-    background: var(--state-bg-warning);
-    color: var(--state-fg-warning);
+  .model {
+    font: 400 11px/16px var(--font-mono);
+    /* Faint is below AA at this size; this is decoration beside "Importer", which says it. */
+    color: var(--text-muted);
+    opacity: 0.8;
+  }
+  .earlier {
+    display: flex;
+    flex: 1 1 100%;
+    align-items: center;
+    gap: 12px;
+    color: var(--text-muted);
+    font: 400 11px/16px var(--font-sans);
+  }
+  .earlier::before,
+  .earlier::after {
+    flex: 1;
+    height: 1px;
+    background: var(--border-muted);
+    content: "";
   }
 
-  /* The box and the starters under it as one column, inside `Chat`'s wrapping row. */
+  /* ── Stop: a pill above the composer, centred ─────────────────────────────── */
+  .stop {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 28px;
+    padding: 0 12px;
+    box-sizing: border-box;
+    border: 1px solid var(--border-strong);
+    border-radius: 14px;
+    background: var(--bg-layer-01);
+    color: var(--text-base);
+    font: 500 12px/26px var(--font-sans);
+    cursor: pointer;
+  }
+  .stop:hover {
+    background: var(--overlay-pressed);
+  }
+  .stop:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 1px;
+  }
+  .stop-mark {
+    width: 8px;
+    height: 8px;
+    border: 1.5px solid currentColor;
+    border-radius: 2px;
+  }
+
+  /* ── The composer: one box, the strip inside its border ──────────────────── */
   .stack {
     display: flex;
     flex: 1 1 100%;
     min-width: 0;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
   }
-  /* One container with the strip inside its border: `GoalAgentChat`'s arrangement. */
   .box {
+    position: relative;
     display: flex;
-    flex: 1;
-    min-width: 0;
     flex-direction: column;
+    gap: 10px;
+    padding: 14px;
+    box-sizing: border-box;
     border: 1px solid var(--border-base);
-    border-radius: var(--radius-md);
+    border-radius: 10px;
     background: var(--bg-layer-01);
   }
   textarea {
     width: 100%;
-    padding: 10px 12px;
+    min-height: 22px;
+    max-height: 180px;
+    padding: 0;
     border: 0;
-    border-radius: var(--radius-md) var(--radius-md) 0 0;
     background: transparent;
     color: var(--text-base);
-    font: 400 16px/24px var(--font-sans);
-    resize: vertical;
+    font: 400 13px/20px var(--font-sans);
+    field-sizing: content;
+    resize: none;
+  }
+  /* D2's empty box is taller than D3's: room for a pasted URL before the first line. */
+  textarea.first {
+    min-height: 46px;
+  }
+  textarea::placeholder {
+    color: var(--text-faint);
   }
   textarea:focus-visible {
     outline: 2px solid var(--border-focus);
-    outline-offset: -2px;
+    outline-offset: 4px;
+    border-radius: 2px;
   }
   .strip {
     display: flex;
     align-items: center;
     gap: 8px;
-    min-height: 44px;
-    padding: 0 8px 0 8px;
+  }
+  .grow {
+    flex: 1;
   }
   .hint {
-    flex: 1;
-    min-width: 0;
-    font-size: 11px;
-    line-height: var(--lh-compact);
+    font: 400 11px/16px var(--font-sans);
     color: var(--text-muted);
   }
-  /* Read-only facts about the session, in the shape of the product's other chips. */
-  .chip-ui {
-    flex: none;
-    max-width: 24ch;
-    overflow: hidden;
-    padding: 3px 8px;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    font: 500 11px/var(--lh-compact) var(--font-sans);
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-  .square {
+  .icon-btn,
+  .send {
     display: inline-flex;
     flex: none;
     align-items: center;
@@ -348,29 +412,45 @@
     width: 28px;
     height: 28px;
     border: 0;
-    border-radius: var(--radius-sm);
+    border-radius: 6px;
     cursor: pointer;
   }
-  .submit {
+  .icon-btn {
+    background: transparent;
+    color: var(--icon-muted);
+    cursor: not-allowed;
+  }
+  .send {
     background: var(--bg-inverse);
     color: var(--text-inverse);
   }
-  .submit:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
+  .send:disabled {
+    background: var(--bg-layer-02);
+    color: var(--text-faint);
+    cursor: default;
   }
-  .attach {
-    background: transparent;
-    color: var(--text-muted);
-    opacity: 0.55;
-    cursor: not-allowed;
-  }
-  .attach:focus-visible,
-  .submit:focus-visible {
+  .send:focus-visible {
     outline: 2px solid var(--border-focus);
     outline-offset: 1px;
   }
+  .agent-chip {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    gap: 7px;
+    height: 28px;
+    padding: 0 9px;
+    box-sizing: border-box;
+    border: 1px solid var(--border-base);
+    border-radius: 6px;
+    color: var(--text-base);
+    font: 500 12px/16px var(--font-sans);
+  }
+  .agent-chip :global(svg) {
+    color: var(--icon-muted);
+  }
 
+  /* ── The two starters: dashed pills under the box ─────────────────────────── */
   .starters {
     display: flex;
     flex-wrap: wrap;
@@ -383,12 +463,14 @@
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 12px;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-md);
+    height: 28px;
+    padding: 0 12px;
+    box-sizing: border-box;
+    border: 1px dashed var(--border-strong);
+    border-radius: 14px;
     background: transparent;
     color: var(--text-muted);
-    font: 400 12px/var(--lh-compact) var(--font-sans);
+    font: 400 12px/16px var(--font-sans);
     cursor: pointer;
   }
   .starter:hover {
@@ -400,32 +482,6 @@
     outline-offset: 1px;
   }
 
-  .pulse {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--text-muted);
-    animation: pulse 1.6s ease-in-out infinite;
-  }
-  @keyframes pulse {
-    0%,
-    100% {
-      opacity: 0.35;
-    }
-    50% {
-      opacity: 1;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .pulse {
-      animation: none;
-      opacity: 0.7;
-    }
-  }
-  .status {
-    font-size: 12px;
-    color: var(--text-base);
-  }
   .visually-hidden {
     position: absolute;
     width: 1px;

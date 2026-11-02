@@ -16,6 +16,12 @@
    * sticky per target, and the control for them lives in the crumb bar (`TitleBar`) because
    * a session belongs to the target and not to the message being typed.
    *
+   * **There is no page header, and that is the design's.** A6 D2–D5 draw the chat directly
+   * under the crumb bar: no title, no description, no button. The way back to Assets is the
+   * "Assets" crumb (`TitleBar` shows it on this page whether or not the rail is), which is
+   * where the design puts it; the page's title is the crumb's last segment and the lead the
+   * chat opens with.
+   *
    * **It is driven by mock data**, for want of an importer API: see `app.importer`. The
    * link list, the model picker and the polled progress panel this page used to carry are
    * gone from it, and the state machine behind them (`startScopeImport`, `importerPhase`,
@@ -27,31 +33,9 @@
    * is a real step only because an import never begins work.
    */
   import type { App } from "../app.svelte";
-  import Button from "../components/Button.svelte";
   import ImporterChat from "../components/ImporterChat.svelte";
-  import PageFrame from "../components/PageFrame.svelte";
 
   let { app }: { app: App } = $props();
-
-  let target = $derived(app.selected?.name ?? app.viewTargetId);
 </script>
 
-<PageFrame
-  title="Auto-load scope"
-  description={`Talk the importer through ${target}'s program. It reads each page with its own browser, narrates every call it makes, and writes the in and out lists as scope entries and the hosts they name as assets.`}
-  centered={app.drawerHidden}
->
-  {#snippet actions()}
-    <Button
-      variant="outline"
-      size="page"
-      onclick={() => app.toSection("assets")}
-    >
-      Back to Assets
-    </Button>
-  {/snippet}
-
-  {#snippet body()}
-    <ImporterChat {app} />
-  {/snippet}
-</PageFrame>
+<ImporterChat {app} />

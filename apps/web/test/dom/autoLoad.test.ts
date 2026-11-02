@@ -14,6 +14,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ScopeEntryView } from "@bit/contracts";
 
 import { App } from "../../src/lib/app.svelte";
+import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import { FakeServer, emptyScope, ok } from "../fakeServer";
@@ -140,13 +141,41 @@ describe("a Scope tab with entries", () => {
 });
 
 describe("the Auto-load page", () => {
-  test("Back to Assets returns to the Scope tab and starts nothing", async () => {
-    const { app, fake } = await openScope();
+  test("the page has no header of its own: A6 puts the way back in the crumb bar, as 'Assets'", async () => {
+    const { app } = await openScope();
     click(button("Auto-load scope…"));
     await settle();
 
-    click(button("Back to Assets"));
+    expect(hasButton("Back to Assets")).toBe(false);
+    expect(document.querySelector("h1")).toBeNull();
+    // The bar is mounted beside the page; the rail is up, and the crumb is there anyway.
+    const bar = mountInto(TitleBar, { app });
     await settle();
+    expect(app.drawerHidden).toBe(false);
+    expect(document.querySelector(".crumb-leaf")?.textContent?.trim()).toBe(
+      "Auto-load",
+    );
+    bar.destroy();
+  });
+
+  test("the Assets crumb returns to the Scope tab and starts nothing", async () => {
+    const { app, fake } = await openScope();
+    click(button("Auto-load scope…"));
+    await settle();
+    const bar = mountInto(TitleBar, { app });
+    await settle();
+
+    click(button("Assets"));
+    await settle();
+    const option = [
+      ...document.querySelectorAll<HTMLButtonElement>(
+        '[aria-label="Switch section"] button.option',
+      ),
+    ].find((each) => each.textContent?.includes("Assets"));
+    if (option === undefined) throw new Error("no Assets in the section list");
+    click(option);
+    await settle();
+    bar.destroy();
 
     expect(app.importerOpen).toBe(false);
     expect(hasButton("Auto-load scope…")).toBe(true);

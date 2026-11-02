@@ -32,6 +32,8 @@
 import {
   bitMcpServerName,
   claudeCodeToolName,
+  type HarnessInstanceView,
+  type ImporterModelView,
   type LiveItem,
   type ScopeImportTool,
 } from "@bit/contracts";
@@ -98,7 +100,10 @@ const feed = (prefix: string, start: number) => {
     call: (
       name: ScopeImportTool,
       args: Record<string, unknown>,
-      result: Record<string, unknown> | null,
+      result: {
+        readonly say: string;
+        readonly output: Record<string, unknown>;
+      } | null,
       seconds: number,
     ): readonly LiveItem[] => {
       call += 1;
@@ -127,7 +132,10 @@ const feed = (prefix: string, start: number) => {
           tool,
           toolName: name,
           callId,
-          output: JSON.stringify(result),
+          // `body` is "a sentence for the operator", the server's own; the transcript prints
+          // it after the arrow. The output beside it is the tool's payload, verbatim.
+          body: result.say,
+          output: JSON.stringify(result.output),
           outcome: "ok",
         }),
       ];
@@ -196,12 +204,15 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
         { effect, kind, value, source_url: POLICY, note },
         settled
           ? {
-              entry_id: `ent_${String(entries)}`,
-              effect,
-              kind,
-              value,
-              covers: covers(kind, value),
-              created: true,
+              say: `entry ent_${String(entries)} created · ${covers(kind, value)}`,
+              output: {
+                entry_id: `ent_${String(entries)}`,
+                effect,
+                kind,
+                value,
+                covers: covers(kind, value),
+                created: true,
+              },
             }
           : null,
         seconds,
@@ -232,9 +243,12 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
           operation_id: `op_${host}`,
         },
         {
-          identity: host,
-          scope_state: scopeState,
-          scope_detail: `decided by the ${scopeState === "in" ? "in-scope" : "out-of-scope"} entries written so far`,
+          say: `${host} recorded · ${scopeState === "in" ? "covered by an in-scope entry" : "excluded by an out entry"}`,
+          output: {
+            identity: host,
+            scope_state: scopeState,
+            scope_detail: `decided by the ${scopeState === "in" ? "in-scope" : "out-of-scope"} entries written so far`,
+          },
         },
         seconds,
       ),
@@ -257,7 +271,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
     ),
     f.reply("Reading the policy page.", 2),
     f.reply(
-      "The scope table is at line 212 and has five rows. Three are in scope — acme.com and acmelabs.io are written with wildcards, so I am taking them as the apex and every subdomain. Writing them now.",
+      "The scope table is at line 212 and has five rows. Three are in scope — `acme.com` and `acmelabs.io` are written with wildcards, so I am taking them as the apex and every subdomain. Writing them now.",
       8,
     ),
   );
@@ -284,7 +298,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
   );
   items.push(
     f.reply(
-      "Row four reads “No WordPress properties”, which is prose rather than a host. The only WordPress property the page names is blog.acme.com, so I am writing that one host out and leaving the rule itself for you —",
+      "Row four reads “No WordPress properties”, which is prose rather than a host. The only WordPress property the page names is `blog.acme.com`, so I am writing that one host out and leaving the rule itself for you —",
       24,
     ),
   );
@@ -304,6 +318,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
       id: "ses_today",
       startedAt,
       model: IMPORTER_MODEL,
+      harness: "OpenCode",
       history: NO_HISTORY,
       items,
       working: true,
@@ -321,7 +336,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
   );
   items.push(
     f.reply(
-      "Row five, status.acme.com, is hosted by a third party and the page says so. That one is out.",
+      "Row five, `status.acme.com`, is hosted by a third party and the page says so. That one is out.",
       31,
     ),
   );
@@ -338,7 +353,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
   asset("status.acme.com", "out", 46);
   items.push(
     f.reply(
-      "…that is the whole table. I wrote 3 in-scope entries and 2 out, and recorded 3 hosts as assets. One row I could not turn into an entry: “No WordPress properties” — I excluded blog.acme.com because the page names it, but the rule may reach further.",
+      "…that is the whole table. I wrote 3 in-scope entries and 2 out, and recorded 3 hosts as assets. One row I could not turn into an entry: “No WordPress properties” — I excluded `blog.acme.com` because the page names it, but the rule may reach further.",
       52,
     ),
     f.operator(
@@ -351,44 +366,47 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
       "read_scope",
       {},
       {
-        total: 5,
-        entries: [
-          {
-            entry_id: "ent_1",
-            effect: "in",
-            kind: "subtree",
-            value: "acme.com",
-            source: "imported",
-          },
-          {
-            entry_id: "ent_2",
-            effect: "in",
-            kind: "subtree",
-            value: "acmelabs.io",
-            source: "imported",
-          },
-          {
-            entry_id: "ent_3",
-            effect: "in",
-            kind: "cidr",
-            value: "203.0.113.0/24",
-            source: "imported",
-          },
-          {
-            entry_id: "ent_4",
-            effect: "out",
-            kind: "host",
-            value: "blog.acme.com",
-            source: "imported",
-          },
-          {
-            entry_id: "ent_5",
-            effect: "out",
-            kind: "host",
-            value: "status.acme.com",
-            source: "imported",
-          },
-        ],
+        say: "read 5 entries",
+        output: {
+          total: 5,
+          entries: [
+            {
+              entry_id: "ent_1",
+              effect: "in",
+              kind: "subtree",
+              value: "acme.com",
+              source: "imported",
+            },
+            {
+              entry_id: "ent_2",
+              effect: "in",
+              kind: "subtree",
+              value: "acmelabs.io",
+              source: "imported",
+            },
+            {
+              entry_id: "ent_3",
+              effect: "in",
+              kind: "cidr",
+              value: "203.0.113.0/24",
+              source: "imported",
+            },
+            {
+              entry_id: "ent_4",
+              effect: "out",
+              kind: "host",
+              value: "blog.acme.com",
+              source: "imported",
+            },
+            {
+              entry_id: "ent_5",
+              effect: "out",
+              kind: "host",
+              value: "status.acme.com",
+              source: "imported",
+            },
+          ],
+        },
       },
       184,
     ),
@@ -413,7 +431,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
   );
   items.push(
     f.reply(
-      "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. shop.acme.com was already recorded as an asset and will now read as out. The scope now reads 4 in, 3 out. Anything else from the SOW that the program page would not know about?",
+      "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. `shop.acme.com` was already recorded as an asset and will now read as out. The scope now reads 4 in, 3 out. Anything else from the SOW that the program page would not know about?",
       198,
     ),
   );
@@ -422,6 +440,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
     id: "ses_today",
     startedAt,
     model: IMPORTER_MODEL,
+    harness: "OpenCode",
     history: NO_HISTORY,
     items:
       stage === "records-only"
@@ -492,6 +511,7 @@ export const mockAwaitingSession = (now: number): ImporterSession => {
     id: "ses_awaiting",
     startedAt: now - 20_000,
     model: IMPORTER_MODEL,
+    harness: "OpenCode",
     history: NO_HISTORY,
     items: [
       f.operator(
@@ -514,6 +534,7 @@ export const mockNewSession = (
   id,
   startedAt: now,
   model: IMPORTER_MODEL,
+  harness: "OpenCode",
   history: NO_HISTORY,
   items: [],
   working: false,
@@ -529,6 +550,7 @@ const questionSession = (now: number): ImporterSession => ({
   id: "ses_question",
   startedAt: now - 9 * DAY,
   model: "anthropic/claude-code",
+  harness: "Claude Code",
   history: {
     source: "harness",
     note: "The harness still holds this session's messages. This is its copy, not ours, and it may delete it.",
@@ -595,6 +617,7 @@ export const mockForgottenSession = (now: number): ImporterSession => {
     id: "ses_forgotten",
     startedAt: now - 12 * DAY,
     model: "openai/gpt-5.5",
+    harness: "OpenCode",
     history: {
       source: "forgotten",
       note: "The harness no longer has this session, so what was said in it is gone. What it recorded is below, and on the Assets page.",
@@ -619,3 +642,51 @@ export const mockEarlierSessions = (now: number): ImporterSession[] => [
   questionSession(now),
   mockForgottenSession(now),
 ];
+
+/**
+ * The harnesses the composer's chip offers while there is no server to ask.
+ *
+ * Mock, and shaped as the contract's `HarnessInstanceView` so `HarnessChoice` renders them
+ * unmodified. The state picker loads these into `app.harnesses` for the A6 scenarios; a
+ * connected app has the server's own, read by `openImporter`.
+ */
+export const mockHarnesses = (): HarnessInstanceView[] => [
+  {
+    instanceId: "opencode",
+    driver: "opencode",
+    displayName: "OpenCode",
+    version: "2.1.2",
+    ready: true,
+    auth: "authenticated",
+    isDefault: true,
+    defaultModel: IMPORTER_MODEL,
+    models: [
+      { id: "openai/gpt-5.6-sol" },
+      { id: "openai/gpt-5.3-codex-spark" },
+      { id: "openai/gpt-5.5" },
+      { id: "openai/gpt-5.5-fast" },
+      { id: "openai/gpt-5.6-luna" },
+      { id: "openai/gpt-5.6-sol-fast" },
+      { id: "openai/gpt-5.6-terra" },
+    ],
+  },
+  {
+    instanceId: "claude-code",
+    driver: "claude_code",
+    displayName: "Claude Code",
+    version: "2.1.310",
+    ready: true,
+    auth: "authenticated",
+    isDefault: false,
+    defaultModel: "claude-sonnet-5",
+    models: [{ id: "claude-sonnet-5" }, { id: "claude-opus-5" }],
+  },
+];
+
+/** What the server would say an import runs on, resolved against `mockHarnesses`. */
+export const mockImporterModel = (): ImporterModelView => ({
+  instanceId: "opencode",
+  model: IMPORTER_MODEL,
+  origin: "preferred",
+  detail: `OpenCode offers ${IMPORTER_MODEL}`,
+});

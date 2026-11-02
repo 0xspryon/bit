@@ -51,7 +51,7 @@
    * there: it belongs to the target, not to the message being typed.
    */
   let importer = $derived(app.importer);
-  let sessionsShown = $derived(
+  let importerShown = $derived(
     app.screen === "target" && app.importerOpen && app.navItem === "assets",
   );
   let sessionName = $derived(
@@ -192,7 +192,13 @@
       {/snippet}
     </CrumbPicker>
 
-    {#if app.drawerHidden}
+    <!--
+      The section crumb, which is how A6 draws the way back from the Auto-load page
+      (`acme_corp › Assets › Auto-load`). It shows with the rail hidden, as it always has,
+      and on this page whatever the rail is doing: the page has no header of its own to
+      carry a "back" button, so its way out is where the design puts it.
+    -->
+    {#if app.drawerHidden || importerShown}
       <IconAngleRight class="sep" width="12" height="12" />
       <CrumbPicker
         label="Switch section"
@@ -306,9 +312,9 @@
 
     <!-- The Auto-load page is a sub-page of Assets, the way an open goal is of Goals, so
          it is one more crumb: where you are, with the target still the first. -->
-    {#if app.importerOpen && app.navItem === "assets"}
+    {#if importerShown}
       <IconAngleRight class="sep" width="12" height="12" />
-      <span class="crumb-leaf">Auto-load scope</span>
+      <span class="crumb-leaf">Auto-load</span>
     {/if}
   {:else if app.screen === "new-target"}
     <!--
@@ -332,12 +338,14 @@
   {/if}
 
   <div class="right">
-    {#if sessionsShown && importer.current !== undefined}
+    {#if importerShown && importer.current !== undefined}
       <CrumbPicker
         label="Importer sessions"
         placeholder="Find a session…"
-        width={360}
+        width={410}
         align="end"
+        chip
+        searchable={false}
         bind:open={importer.pickerOpen}
         bind:query={sessionQuery}
         onenter={() => {
@@ -348,6 +356,8 @@
         {#snippet trigger()}
           {#if importer.current?.working}
             <span class="working-dot" aria-hidden="true"></span>
+          {:else if importer.current?.tally.messages === 0}
+            <IconPlus width="11" height="11" />
           {/if}
           <span class="crumb-text">{sessionName}</span>
         {/snippet}
@@ -360,6 +370,9 @@
               aria-current={current}
               onclick={() => importer.open(session.id)}
             >
+              <span class="check" aria-hidden="true">
+                {#if current}<IconCheck width="13" height="13" />{/if}
+              </span>
               <span class="option-main">
                 <span class="option-name">
                   {sessionWhen(session.startedAt, Date.now())}
@@ -367,9 +380,6 @@
                 </span>
                 <span class="option-sub">{tallyLine(session.tally)}</span>
               </span>
-              {#if current}
-                <IconCheck class="option-end" width="14" height="14" />
-              {/if}
             </button>
           {:else}
             <p class="none">No session matches.</p>
@@ -523,12 +533,14 @@
     text-transform: uppercase;
   }
 
+  /* A6 D3: a dot with a ring, while the importer is working. Not a state colour. */
   .working-dot {
     flex: none;
-    width: 6px;
-    height: 6px;
+    width: 5px;
+    height: 5px;
     border-radius: 50%;
-    background: var(--state-fg-success);
+    background: var(--text-base);
+    box-shadow: 0 0 0 3px var(--overlay-pressed);
   }
   .group-label {
     margin: 0;
@@ -543,8 +555,17 @@
     color: var(--text-muted);
     font: 400 11px/15px var(--font-mono);
   }
+  .check {
+    display: inline-flex;
+    flex: none;
+    width: 14px;
+    color: var(--icon-base);
+  }
   .new-session {
     align-items: flex-start;
+  }
+  .new-session-text > span:first-child {
+    color: var(--text-base);
   }
   .new-session-text {
     display: flex;

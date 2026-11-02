@@ -117,6 +117,8 @@ export interface ImporterSession {
   readonly startedAt: number;
   /** `provider/model`, shown and not editable: changing harness starts a new session. */
   readonly model: string;
+  /** The harness it ran on, by display name: the avatar letter on its header is this one's. */
+  readonly harness: string;
   readonly history: ImporterHistory;
   readonly items: readonly LiveItem[];
   readonly working: boolean;

@@ -72,11 +72,25 @@ const headings = (): string[] =>
     (each) => each.textContent?.replace(/\s+/g, " ").trim() ?? "",
   );
 
-/** Every status chip on a tool-call row, in order. */
+/** What became of each write on screen, in order: the row's own `data-write`. */
 const chips = (): string[] =>
-  [...document.querySelectorAll(".item .chip")].map(
-    (each) => each.textContent?.trim() ?? "",
-  );
+  [...document.querySelectorAll(".block")]
+    .map((each) => each.getAttribute("data-write") ?? "")
+    .filter((state) => state !== "");
+
+/** What each row of the thread is, in order: a reply, a write, a read, a bare record. */
+const kinds = (): string[] =>
+  [
+    ...document.querySelectorAll('[role="log"] .prose, [role="log"] .block'),
+  ].map((row) => {
+    if (row.classList.contains("prose")) return "Reply";
+    const what = row.querySelector(".what")?.textContent?.trim();
+    if (what !== undefined && what !== "") return what;
+    const sig = row.querySelector(".sig")?.textContent?.trim() ?? "";
+    if (sig.startsWith("add_scope_entry(")) return "Scope entry";
+    if (sig.startsWith("record_imported_asset(")) return "Asset";
+    return "Tool call";
+  });
 
 describe("D2: a new session", () => {
   test("is an empty chat with a composer and two starters, and no form", async () => {
@@ -210,12 +224,8 @@ describe("D3: streaming", () => {
     expect(hasButton("Stop")).toBe(true);
     // Tool calls and the agent's prose are rows of the same list, through the same item.
     await show("importer-streaming");
-    const kinds = [...document.querySelectorAll(".item .kind")].map((each) =>
-      each.textContent?.trim(),
-    );
-    expect(kinds).toContain("Reply");
-    expect(kinds).toContain("Tool call");
-    expect(kinds).toContain("Scope entry");
+    expect(kinds()).toContain("Reply");
+    expect(kinds()).toContain("Scope entry");
   });
 });
 
@@ -229,13 +239,10 @@ describe("D4: multi-turn", () => {
     // 7 scope entries and 3 assets, each shown once as its record with the call folded in:
     // 10 rows chipped `recorded`, and no bare "Tool call" row for any write.
     expect(chips().filter((chip) => chip === "recorded")).toHaveLength(10);
-    const kinds = [...document.querySelectorAll(".item .kind")].map((each) =>
-      each.textContent?.trim(),
-    );
-    expect(kinds.filter((kind) => kind === "Scope entry")).toHaveLength(7);
-    expect(kinds.filter((kind) => kind === "Asset")).toHaveLength(3);
+    expect(kinds().filter((kind) => kind === "Scope entry")).toHaveLength(7);
+    expect(kinds().filter((kind) => kind === "Asset")).toHaveLength(3);
     // The one read, `read_scope`, is a call with no record to collapse into.
-    expect(kinds.filter((kind) => kind === "Tool call")).toHaveLength(1);
+    expect(kinds().filter((kind) => kind === "Tool call")).toHaveLength(1);
     // And no row for a tool the importer does not have: it reads pages with its harness's
     // own reader (D13), so reading is prose and never a page-fetch call.
     expect(text()).not.toContain("fetch_page");
@@ -244,13 +251,90 @@ describe("D4: multi-turn", () => {
   });
 });
 
-describe("the list's height", () => {
-  test("the importer's chat is the page, so it lifts Chat's 420px bound through the prop", async () => {
+describe("the page layout", () => {
+  test("is a thread, not a panel: no caption, no frame, the footnote under the composer", async () => {
     await show("importer-complete");
 
-    const style = document.querySelector('[role="log"]')?.getAttribute("style");
-    expect(style).toContain("max-height");
-    expect(style).toContain("100vh");
+    const chat = document.querySelector(
+      'section[aria-label^="Load the scope"]',
+    );
+    expect(chat?.classList.contains("thread")).toBe(true);
+    // The panel's caption strip is the planner's and the goal agent's.
+    expect(chat?.querySelector(".head")).toBeNull();
+    const composerRow = chat?.querySelector(".composer");
+    const footnote = chat?.querySelector(".footnote");
+    expect(composerRow).not.toBeNull();
+    expect(
+      composerRow!.compareDocumentPosition(footnote!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  test("an empty session leads with the heading and the composer, and the log is out of the way", async () => {
+    await show("importer-first");
+
+    const chat = document.querySelector(
+      'section[aria-label^="Load the scope"]',
+    );
+    expect(chat?.classList.contains("idle")).toBe(true);
+    expect(chat?.querySelector("h2")?.textContent).toBe(
+      "Load the scope for acme-corp",
+    );
+  });
+});
+
+describe("D6: the model chip is the picker the operator already has", () => {
+  const chip = (): HTMLButtonElement => {
+    const found = document.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="dialog"][aria-label^="Harness and model"]',
+    );
+    if (found === null) throw new Error("no model chip");
+    return found;
+  };
+
+  test("opens HarnessChoice over the composer, and choosing a model changes the chip", async () => {
+    const app = await show("importer-first");
+    expect(chip().textContent).toContain("openai/gpt-5.6-sol");
+
+    click(chip());
+    await settle();
+
+    // The real component's columns: harness rail, a model filter, the model list.
+    const dialog = document.querySelector(
+      '[role="dialog"][aria-label="Choose a harness and model"]',
+    );
+    expect(dialog).not.toBeNull();
+    expect(dialog?.textContent).toContain("OpenCode");
+    expect(dialog?.textContent).toContain("Claude Code");
+    expect(
+      dialog?.querySelector('input[placeholder="Filter models"]'),
+    ).not.toBeNull();
+    // The importer's own sentence about pinning, in sessions' words.
+    expect(dialog?.textContent).toContain(
+      "A session is pinned to the harness it starts on",
+    );
+
+    const other = [
+      ...(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? []),
+    ].find((each) => each.textContent?.trim() === "openai/gpt-5.5");
+    if (other === undefined) throw new Error("no gpt-5.5 row");
+    click(other);
+    await settle();
+
+    expect(app.pickedImportModel).toBe("openai/gpt-5.5");
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(chip().textContent).toContain("openai/gpt-5.5");
+    // Nothing was sent by choosing.
+    expect(app.importer.current?.tally.messages).toBe(0);
+  });
+
+  test("once a session has started its model is shown and not editable", async () => {
+    await show("importer-complete");
+
+    expect(
+      document.querySelector('button[aria-label^="Harness and model"]'),
+    ).toBeNull();
+    expect(text()).toContain("openai/gpt-5.6-sol");
   });
 });
 
@@ -263,7 +347,7 @@ describe("a session the harness no longer holds", () => {
     expect(document.querySelector('[role="log"] [role="alert"]')).toBeNull();
     expect(document.querySelector('[role="alert"]')).toBeNull();
     // 3 entries and 5 assets survive as records, with no words and no calls.
-    expect(document.querySelectorAll('[role="log"] .item')).toHaveLength(8);
+    expect(document.querySelectorAll('[role="log"] .block')).toHaveLength(8);
     expect(text()).toContain("You are reading an earlier session");
     // Still writeable: the first message resumes it.
     expect(composer().disabled).toBe(false);
@@ -282,9 +366,9 @@ describe("a session the harness no longer holds", () => {
     await show("importer-reloaded");
 
     expect(headings().map((each) => each.slice(0, 22))).toEqual([
-      "Earlier in this sessio",
-      "You Load the scope fro",
-      "You It does — shop.acm",
+      "earlier in this sessio",
+      "Load the scope from ht",
+      "It does — shop.acme.co",
     ]);
     expect(text()).toContain(
       "This is its copy, not ours, and it may delete it.",

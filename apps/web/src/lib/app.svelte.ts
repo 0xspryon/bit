@@ -83,6 +83,7 @@ import {
   ImporterSessions,
   type ImporterScenario,
 } from "./importerSessions.svelte";
+import { mockHarnesses, mockImporterModel } from "./mockImporter";
 
 /**
  * A cancellable one-shot timer.
@@ -5194,6 +5195,10 @@ export const scenarios: Scenario[] = [
       a.previewTarget("acme-corp");
       a.navItem = "assets";
       a.importerOpen = true;
+      // There is no server to ask which harnesses are ready or which model an import would
+      // run on, so the chip's picker is given declared ones.
+      a.harnesses = mockHarnesses();
+      a.importerModel = mockImporterModel();
       a.importer.load(state);
     },
   })),
