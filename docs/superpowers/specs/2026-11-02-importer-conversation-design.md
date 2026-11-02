@@ -36,6 +36,40 @@ defects record what shipped.
 1. **Narrow the importer session's tool set.** Recorded under Known defects. The three MCP tools are the only ones that can _write_, but the session also holds whatever else the harness gives it — a live run used `Bash` to `curl` a page. The gated directory is the control and always was; the sentence we showed the operator was what was wrong, and that is already corrected. The fix is `allowedTools` on `createSession`, done with a live import to verify against, because the live run reached for `curl` rather than `WebFetch`.
 2. **The end-to-end pass**, now possible on both drivers.
 
+## The end-to-end pass — 2 Nov 2026
+
+Driven through the browser and the API against `main`, on
+`zai-coding-plan/glm-5.3-flash`. **It found one defect, and it was one no test could have
+found**: `0031`'s entry below. The Agent sessions route answered `500` and startup reconciliation
+failed on every target, on a database that reported itself fully current, because a renumbered
+migration had never run. 1588 tests passed against a schema a real upgrade never produces — every
+migration test builds forward from a chain prefix, so none of them could see it.
+
+Confirmed working, in the browser unless noted:
+
+- The sessions list: three states, the recorded model, the derived tally, and a row click opening
+  the conversation.
+- **An importer session reads `live` while idle between turns** — slice 2's property, finally
+  visible rather than inferred.
+- Replay after a restart, showing the operator's own words with the server's framing trimmed, and
+  saying plainly that replayed messages carry no call ids, so a call and its result are not paired
+  as they are live.
+- Resume: same harness session, new import id, explained accurately on screen.
+- **The citable-pages rule**: a URL on its own line was added and named back to the operator
+  ("Added as a page this import may cite: …"); one buried in prose was silently excluded.
+- **A page that cannot be fetched produces no entries at all.** Given an unreachable URL _and_ the
+  same scope written in prose in the same message, the importer recorded nothing and reported why.
+  There was nothing it could honestly attribute, and it did not fall back on the operator's
+  say-so. D15's "every link failing is not an error state" is observed: the import settled
+  `finished` with the model's own account.
+- The write path end to end against a real page: three entries and three assets, each citing the
+  page it was permitted to cite, down to the bullet it came from.
+- Records on the feed with their D3 receipts, and the leading "earlier in this session" group
+  carrying its own explanation after a reload.
+
+Not exercised: a refused tool call, a retried asset call, and the `fresh`-session fallbacks — all
+test-only, as recorded below.
+
 ## What has been verified against live agents, and on which driver
 
 This matters because several claims in this document were wrong until someone ran them.
