@@ -45,10 +45,13 @@ import {
   Stream,
 } from "effect";
 
-import { SCOPE_IMPORT_MAX_LINKS } from "@bit/contracts";
+import {
+  SCOPE_IMPORT_MAX_LINKS,
+  type ModelOptionSelection,
+} from "@bit/contracts";
 
 import { ScopeImportProgress } from "./progress";
-import { ScopeImporter } from "./scopeImporter";
+import { ScopeImporter, type ScopeImportRequest } from "./scopeImporter";
 import type { AgentHarness, McpRegistration } from "../harness/agentHarness";
 import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
@@ -160,7 +163,11 @@ interface Script {
   readonly readable: Set<string>;
   readonly registrations: { url: string; bearer: string }[];
   /** Every `createSession`, with the flag that decides whether it outlives a turn. */
-  readonly created: { sessionId: string; multiTurn: boolean }[];
+  readonly created: {
+    sessionId: string;
+    multiTurn: boolean;
+    options: readonly ModelOptionSelection[] | undefined;
+  }[];
   /** Every registration taken back, by session. */
   readonly unregistered: string[];
   readonly prompts: string[];
@@ -227,6 +234,7 @@ const scriptedHarness = (script: Script) =>
             script.created.push({
               sessionId: id,
               multiTurn: input.multiTurn === true,
+              options: input.options,
             });
             return { id };
           }),
@@ -441,6 +449,8 @@ const importWith = async (
     readonly failPrompt?: boolean;
     /** The links pasted. Both pages unless a test says otherwise. */
     readonly links?: readonly string[];
+    /** The operator's pick, as `ImportModelDraft` carries it. */
+    readonly choice?: ScopeImportRequest["choice"];
   } = {},
 ) => {
   const built = world(readable);
@@ -464,6 +474,7 @@ const importWith = async (
         targetName: "Acme Corp",
         workspacePath: workspace,
         links: options.links ?? [PAGE_GOOD, PAGE_BAD],
+        ...(options.choice === undefined ? {} : { choice: options.choice }),
       });
       return started;
     }),
@@ -670,6 +681,68 @@ describe("the session index", () => {
     expect(typeof rows[0]?.session_created_at).toBe("number");
     expect(await sessionsOf(runtime)).toHaveLength(1);
     await runtime.dispose();
+  });
+});
+
+/**
+ * The model options an importer session is opened with (S3.5).
+ *
+ * The run path's cases (`supervisor.test.ts`, "the model options a run is dispatched
+ * with"), asked of the importer: the stub's `scripted/model` offers `effort` and
+ * `scripted/other` offers nothing, and every case is a selection meeting one of the two.
+ */
+describe("the model options an importer session is opened with", () => {
+  const opened = async (choice: ScopeImportRequest["choice"]) => {
+    const { built, runtime, view } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      choice,
+    });
+    expect(view?.status).toBe("finished");
+    await runtime.dispose();
+    expect(built.script.created).toHaveLength(1);
+    return built.script.created[0]?.options;
+  };
+
+  test("a choice the model offers reaches createSession", async () => {
+    expect(
+      await opened({
+        model: "scripted/model",
+        modelOptions: [{ id: "effort", value: "high" }],
+      }),
+    ).toEqual([{ id: "effort", value: "high" }]);
+  });
+
+  test("options alone are resolved against the model the server picked", async () => {
+    // No model named: D15's rule resolves the instance's default, and the options are
+    // resolved against *that* model's descriptors, not dropped for want of a model.
+    expect(
+      await opened({ modelOptions: [{ id: "effort", value: "low" }] }),
+    ).toEqual([{ id: "effort", value: "low" }]);
+  });
+
+  test("nothing chosen is absent rather than empty", async () => {
+    expect(await opened(undefined)).toBeUndefined();
+    expect(
+      await opened({ model: "scripted/model", modelOptions: [] }),
+    ).toBeUndefined();
+  });
+
+  test("an option this model does not offer is dropped, not forwarded", async () => {
+    expect(
+      await opened({
+        model: "scripted/other",
+        modelOptions: [{ id: "effort", value: "high" }],
+      }),
+    ).toBeUndefined();
+  });
+
+  test("a value outside the descriptor's choices falls back to its default", async () => {
+    expect(
+      await opened({
+        model: "scripted/model",
+        modelOptions: [{ id: "effort", value: "xhigh" }],
+      }),
+    ).toEqual([{ id: "effort", value: "default" }]);
   });
 });
 
@@ -950,7 +1023,7 @@ describe("a session that outlives its first turn", () => {
 
     // The difference: one session, still registered, its grant still live.
     expect(built.script.created).toEqual([
-      { sessionId: "ses_import", multiTurn: true },
+      { sessionId: "ses_import", multiTurn: true, options: undefined },
     ]);
     expect(built.script.unregistered).toEqual([]);
     const bearer = built.script.registrations[0]?.bearer ?? "";

@@ -47,6 +47,7 @@ import {
   type LiveFrame,
   type LiveItem,
   type LiveUsage,
+  type ModelOptionDescriptor,
   type ModelOptionSelection,
   type PlanRoundStarted,
   type PlanRoundView,
@@ -248,6 +249,35 @@ export const fromSummary = (summary: TargetSummary, now: number): Target => ({
   status: summary.available ? "ready" : "missing",
   detail: summary.detail,
 });
+
+/**
+ * One options store with one descriptor set, or taken off.
+ *
+ * The rule behind both {@link App.pickModelOption} and {@link App.pickImportModelOption},
+ * written once because it is a rule rather than plumbing: picking the choice the model
+ * marks as its default **removes** the entry instead of storing `"default"` as a value, and
+ * an id the model has no descriptor for is refused (`undefined`) rather than stored.
+ */
+const withModelOptionPicked = (
+  store: Record<string, readonly ModelOptionSelection[]>,
+  key: string,
+  descriptors: readonly ModelOptionDescriptor[],
+  descriptorId: string,
+  value: string,
+): Record<string, readonly ModelOptionSelection[]> | undefined => {
+  const descriptor = descriptors.find((entry) => entry.id === descriptorId);
+  if (descriptor === undefined) return undefined;
+  const kept = (store[key] ?? []).filter(
+    (selection) => selection.id !== descriptorId,
+  );
+  const isDefault =
+    descriptor.options.find((choice) => choice.id === value)?.isDefault ===
+    true;
+  return {
+    ...store,
+    [key]: isDefault ? kept : [...kept, { id: descriptorId, value }],
+  };
+};
 
 export class App {
   /**
@@ -1546,8 +1576,45 @@ export class App {
         : (this.importerModel?.model ?? ""),
   );
 
+  /**
+   * What the operator has set *of* the importer's model, kept per instance and model.
+   *
+   * {@link modelOptionsByModel}'s twin and keyed the same way, for the same transition
+   * rules — but a store of its own, because a run's model and an import's are picked
+   * separately and a reasoning level set for one should not quietly ride along on the
+   * other. Only what was *set* is stored; see {@link pickImportModelOption}.
+   */
+  importModelOptionsByModel = $state<
+    Record<string, readonly ModelOptionSelection[]>
+  >({});
+  /** The import model's catalogue entry, when its instance lists it. */
+  importModelView = $derived(
+    this.importInstance?.models.find(
+      (entry) => entry.id === this.effectiveImportModel,
+    ),
+  );
+  /** What the import model can be asked for beyond its name. Empty for most models. */
+  importModelDescriptors = $derived(
+    modelOptionDescriptors(this.importModelView),
+  );
+  /** {@link modelOptionKey}'s rule, over the import's resolved instance and model. */
+  importModelOptionKey = $derived(
+    `${this.importInstance?.instanceId ?? ""}\u0000${this.effectiveImportModel}`,
+  );
+  /** What the operator has set on the model an import would use. Nothing, usually. */
+  pickedImportModelOptions = $derived(
+    this.importModelOptionsByModel[this.importModelOptionKey] ?? [],
+  );
+  /** Choices the import model has no descriptor for, so they will not be sent. */
+  droppedImportModelOptions = $derived(
+    droppedModelOptionIds(
+      this.importModelDescriptors,
+      this.pickedImportModelOptions,
+    ),
+  );
+
   /*
-   * There is no `importModelOptions` here, and `modelQuery` has no sibling derivation
+   * There is no filtered model list here, and `modelQuery` has no sibling derivation
    * either: **the filter lives in `HarnessChoice`**, once, for both the composer's picker
    * and this screen's. It was written twice — identically, with nothing keeping the two
    * the same — and a filter that means two things in two places is the kind of drift an
@@ -3684,13 +3751,21 @@ export class App {
     if (targetId === "" || links.length === 0 || this.importStarting) return;
     this.importStarting = true;
     this.importStartDetail = "";
+    // Normalised against the descriptors this tab is holding and absent when nothing was
+    // set — the run composer's rule, and the function the server resolves with again.
+    const importOptions = explicitModelOptionSelections(
+      this.importModelDescriptors,
+      this.pickedImportModelOptions,
+    );
     const call = await this.client.startScopeImport(this.serverUrl, targetId, {
       programLinks: links,
       // Absent unless the operator actually overrode something, which is what lets the
       // server apply D15's rule to the catalogue it observed. Sending the model this page
       // is *showing* would make the browser the authority on a descriptor it only read,
       // and would pin an import to a model id that may have been retired since it loaded.
-      ...(this.pickedImportInstanceId !== "" || this.pickedImportModel !== ""
+      ...(this.pickedImportInstanceId !== "" ||
+      this.pickedImportModel !== "" ||
+      importOptions !== undefined
         ? {
             importModel: {
               ...(this.pickedImportInstanceId === ""
@@ -3699,6 +3774,9 @@ export class App {
               ...(this.pickedImportModel === ""
                 ? {}
                 : { model: this.pickedImportModel }),
+              ...(importOptions === undefined
+                ? {}
+                : { modelOptions: importOptions }),
             },
           }
         : {}),
@@ -3833,9 +3911,24 @@ export class App {
     this.importModelQuery = "";
   }
 
+  /**
+   * Picks the importer's model. **The popover stays open**, for {@link pickModel}'s reason:
+   * the Reasoning column beside the list is about the model just picked.
+   */
   pickImportModel(model: string) {
     this.pickedImportModel = model;
-    this.importPickerOpen = false;
+  }
+
+  /** {@link pickModelOption}, for the importer's model and the importer's store. */
+  pickImportModelOption(descriptorId: string, value: string) {
+    const next = withModelOptionPicked(
+      this.importModelOptionsByModel,
+      this.importModelOptionKey,
+      this.importModelDescriptors,
+      descriptorId,
+      value,
+    );
+    if (next !== undefined) this.importModelOptionsByModel = next;
   }
 
   /**
@@ -4434,22 +4527,14 @@ export class App {
    * report as dropped.
    */
   pickModelOption(descriptorId: string, value: string) {
-    const descriptor = this.modelDescriptors.find(
-      (entry) => entry.id === descriptorId,
+    const next = withModelOptionPicked(
+      this.modelOptionsByModel,
+      this.modelOptionKey,
+      this.modelDescriptors,
+      descriptorId,
+      value,
     );
-    if (descriptor === undefined) return;
-    const key = this.modelOptionKey;
-    const kept = (this.modelOptionsByModel[key] ?? []).filter(
-      (selection) => selection.id !== descriptorId,
-    );
-    const isDefault =
-      descriptor.options.find((choice) => choice.id === value)?.isDefault ===
-      true;
-    const next = isDefault ? kept : [...kept, { id: descriptorId, value }];
-    this.modelOptionsByModel = {
-      ...this.modelOptionsByModel,
-      [key]: next,
-    };
+    if (next !== undefined) this.modelOptionsByModel = next;
   }
 
   togglePicker() {
@@ -4964,6 +5049,7 @@ export class App {
     this.importModelDetail = "";
     this.pickedImportInstanceId = "";
     this.pickedImportModel = "";
+    this.importModelOptionsByModel = {};
     this.importPickerOpen = false;
     this.importModelQuery = "";
     this.stopWatchingImport();

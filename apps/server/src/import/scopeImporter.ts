@@ -106,7 +106,11 @@
  * {@link SCOPE_IMPORT_REPORT_MAX} characters, read once from `messages` rather than
  * streamed, and rendered as text by a browser that escapes it.
  */
-import { SCOPE_IMPORT_MAX_LINKS, type ScopeImportView } from "@bit/contracts";
+import {
+  SCOPE_IMPORT_MAX_LINKS,
+  type ModelOptionSelection,
+  type ScopeImportView,
+} from "@bit/contracts";
 import { Context, Effect, Fiber, Layer } from "effect";
 
 import { resolveImporterModel } from "./importerModel";
@@ -119,6 +123,7 @@ import {
   type LiveSessionCloseReason,
   type LiveSessionOpenFailure,
 } from "../harness/liveAgentSessions";
+import { resolveSessionModelOptions } from "../harness/modelOptions";
 import { HarnessResolver } from "../harness/resolver";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
@@ -175,17 +180,18 @@ export interface ScopeImportRequest {
   readonly workspacePath: string | null;
   readonly links: readonly string[];
   /**
-   * The operator's pick, when they touched the picker on the create-target screen.
+   * The operator's pick, when they touched the importer's picker: `ImportModelDraft` as it
+   * arrived.
    *
-   * Two fields and not three: there is no `modelOptions` here, and `ImportModelDraft`
-   * records why — the field, this one and the `options` argument they reached were plumbing
-   * with no caller, and reasoning depth on a single-turn extraction session is a control
-   * for nothing.
+   * `modelOptions` is what was set *of* the model, unresolved. It is resolved in `start`
+   * against the model the importer actually resolved — which may not be the one the browser
+   * was showing — and reaches `createSession` as `options`, absent when nothing survives.
    */
   readonly choice?:
     | {
         readonly instanceId?: string | undefined;
         readonly model?: string | undefined;
+        readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
       }
     | undefined;
 }
@@ -356,6 +362,7 @@ export class ScopeImporter extends Context.Service<
         readonly request: ScopeImportRequest;
         readonly harness: AgentHarness["Service"];
         readonly model: string;
+        readonly options: readonly ModelOptionSelection[] | undefined;
         readonly links: readonly string[];
         readonly sessionId: string;
       }) {
@@ -376,6 +383,9 @@ export class ScopeImporter extends Context.Service<
               targetId: input.request.targetId,
               harness,
               model: input.model,
+              ...(input.options === undefined
+                ? {}
+                : { options: input.options }),
               sessionId: input.sessionId,
               title: `bit scope importer: ${input.request.targetName}`,
               ensureDirectory: fleet.ensureImportDirectory(
@@ -561,6 +571,14 @@ export class ScopeImporter extends Context.Service<
         }
 
         const harness = resolved.success.harness;
+        // Against the model this import resolved to, not the one the browser was showing:
+        // the run path's resolver, so the two cannot disagree about what is forwarded.
+        const options = yield* resolveSessionModelOptions(
+          harness,
+          choice.model,
+          request.choice?.modelOptions,
+          "a scope import",
+        );
         const importId = newImportId();
         const sessionId = harness.newSessionId();
 
@@ -629,6 +647,7 @@ export class ScopeImporter extends Context.Service<
             request,
             harness,
             model: choice.model,
+            options,
             links,
             sessionId,
           }).pipe(Effect.ensuring(Effect.sync(() => turns.delete(importId)))),

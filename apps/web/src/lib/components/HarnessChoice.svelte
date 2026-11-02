@@ -33,9 +33,10 @@
    * same harness. Both are already computed on `App`, each beside the thing it is a rule
    * for, and passing one in is what lets this file have no opinion about it.
    *
-   * The options column is a snippet for the same reason: it is a setting *of a model*, the
-   * composer has one to offer and the importer has none, and a column rendered from the
-   * caller's own markup cannot drift from the caller's own state.
+   * The options column is a snippet for the same reason: it is a setting *of a model*, whose
+   * state is the caller's — a run's options and an import's are kept apart — and the
+   * Auto-load page has none to offer. The callers that do render `ModelOptionsColumn` into
+   * it from their own state, so the column is one component and the state stays theirs.
    *
    * ## Keyboard
    *

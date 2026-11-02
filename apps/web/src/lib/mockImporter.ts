@@ -691,7 +691,28 @@ export const mockHarnesses = (): HarnessInstanceView[] => [
     isDefault: true,
     defaultModel: IMPORTER_MODEL,
     models: [
-      { id: "openai/gpt-5.6-sol" },
+      // The `variant` descriptor `openCodeClient.ts` builds for a reasoning model: a Default
+      // row first, then the effort ladder under its labels. So the chip's Reasoning column
+      // has something to show while there is no server to ask.
+      {
+        id: "openai/gpt-5.6-sol",
+        optionDescriptors: [
+          {
+            id: "variant",
+            label: "Reasoning",
+            type: "select",
+            options: [
+              { id: "default", label: "Default", isDefault: true },
+              { id: "none", label: "None" },
+              { id: "low", label: "Low" },
+              { id: "medium", label: "Medium" },
+              { id: "high", label: "High" },
+              { id: "xhigh", label: "Extra high" },
+              { id: "max", label: "Maximum" },
+            ],
+          },
+        ],
+      },
       { id: "openai/gpt-5.3-codex-spark" },
       { id: "openai/gpt-5.5" },
       { id: "openai/gpt-5.5-fast" },

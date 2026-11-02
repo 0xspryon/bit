@@ -322,10 +322,53 @@ describe("D6: the model chip is the picker the operator already has", () => {
     await settle();
 
     expect(app.pickedImportModel).toBe("openai/gpt-5.5");
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    // Still open, as the composer's is: the Reasoning column is about the model just
+    // picked, so closing on the pick would mean reopening to use it.
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
     expect(chip().textContent).toContain("openai/gpt-5.5");
     // Nothing was sent by choosing.
     expect(app.importer.current?.tally.messages).toBe(0);
+  });
+
+  test("the Reasoning column is the composer's, and what is picked in it is kept", async () => {
+    const app = await show("importer-first");
+    click(chip());
+    await settle();
+
+    const dialog = document.querySelector('[role="dialog"]');
+    // D6's third column: the descriptor's label and its harness id, every choice, the
+    // default marked, and the sentence about what is sent.
+    expect(dialog?.textContent).toContain("Reasoning");
+    expect(dialog?.textContent).toContain("variant");
+    const rows = [
+      ...(dialog?.querySelectorAll<HTMLButtonElement>(".option-row") ?? []),
+    ];
+    expect(
+      rows.map((row) => row.textContent?.replace(/\s+/g, " ").trim()),
+    ).toEqual([
+      "Default default",
+      "None",
+      "Low",
+      "Medium",
+      "High",
+      "Extra high",
+      "Maximum",
+    ]);
+    // Nothing set, so the model's own default is the one shown as current.
+    expect(rows[0]?.getAttribute("aria-pressed")).toBe("true");
+    expect(dialog?.textContent).toContain("Only what you set here is sent.");
+
+    const high = rows.find((row) => row.textContent?.trim() === "High");
+    if (high === undefined) throw new Error("no High row");
+    click(high);
+    await settle();
+
+    expect(app.pickedImportModelOptions).toEqual([
+      { id: "variant", value: "high" },
+    ]);
+    expect(high.getAttribute("aria-pressed")).toBe("true");
+    // A run's options are a different store: the importer's pick does not touch them.
+    expect(app.pickedModelOptions).toEqual([]);
   });
 
   test("once a session has started its model is shown and not editable", async () => {

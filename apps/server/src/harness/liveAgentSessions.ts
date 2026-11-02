@@ -56,7 +56,7 @@
  * can observe a preambled entry that has not been preambled, and a reader that falls through
  * to the permit finds the entry either preambled or gone.
  */
-import { bitMcpServerName } from "@bit/contracts";
+import { bitMcpServerName, type ModelOptionSelection } from "@bit/contracts";
 import { Effect, Exit, Fiber, Redacted, Scope, Semaphore } from "effect";
 
 import {
@@ -100,6 +100,7 @@ const createGatedSession = (
     readonly model: string;
     readonly directory: GatedDirectory;
     readonly sessionId: string;
+    readonly options?: readonly ModelOptionSelection[] | undefined;
   },
 ) => harness.createSession({ ...input, multiTurn: true });
 
@@ -188,6 +189,11 @@ export interface OpenPlan<Meta> {
   readonly targetId: string;
   readonly harness: AgentHarness["Service"];
   readonly model: string;
+  /**
+   * `createSession`'s `options`: already resolved against {@link model}'s descriptors
+   * (`harness/modelOptions.ts`), and absent — never `[]` — when the operator set nothing.
+   */
+  readonly options?: readonly ModelOptionSelection[] | undefined;
   readonly sessionId: string;
   readonly title: string;
   /** Makes the role directory. Gated by the spine and by no other code path. */
@@ -419,6 +425,7 @@ export const makeLiveAgentSessions = <Meta>(
           model: plan.model,
           directory,
           sessionId: plan.sessionId,
+          ...(plan.options === undefined ? {} : { options: plan.options }),
         });
         if (plan.afterCreate !== undefined) yield* plan.afterCreate(created.id);
         return { created, directory };

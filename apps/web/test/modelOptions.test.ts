@@ -12,7 +12,8 @@
  * no test runner of its own to add one to without touching the lockfile.
  *
  * The server's half of the same rules — resolution against *its* catalogue, and what
- * reaches `createSession` — is `apps/server/src/run/supervisor.test.ts`.
+ * reaches `createSession` — is `apps/server/src/run/supervisor.test.ts`, and
+ * `apps/server/src/import/scopeImporter.test.ts` for an importer session.
  *
  * Like `app.test.ts`, nothing here renders a component: every assertion is about a field
  * the picker reads.
@@ -228,5 +229,92 @@ describe("what a run is dispatched with", () => {
     await app.startRun();
 
     expect(dispatchedOptions(fake)).toBeUndefined();
+  });
+});
+
+/**
+ * The importer's picker sends options too (S3.5), from a store of its own.
+ *
+ * The run's cases above, asked of `startScopeImport`: absent when nothing was set, only
+ * what was set, and nothing carried across a model change. The server resolves what arrives
+ * again against the model it actually picked.
+ */
+describe("what an import is dispatched with", () => {
+  const sentImportModel = (fake: FakeServer): unknown => {
+    const call = fake.calls.find(
+      (entry) => entry.method === "startScopeImport",
+    );
+    return (call?.args[2] as { importModel?: unknown } | undefined)
+      ?.importModel;
+  };
+
+  const readyToImport = async (): Promise<{ app: App; fake: FakeServer }> => {
+    const { app, fake } = await signedIn();
+    fake.onImporterModel = () =>
+      ok({
+        instanceId: "opencode",
+        model: "openai/one",
+        origin: "preferred",
+        detail: "OpenCode offers openai/one",
+      });
+    await app.openTarget("acme-corp");
+    app.toSection("assets");
+    app.openImporter();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    app.setProgramLink(
+      app.programLinks[0]?.id ?? 1,
+      "https://hackerone.com/acme/policy",
+    );
+    return { app, fake };
+  };
+
+  test("the server's resolved model offers its descriptors to the column", async () => {
+    const { app } = await readyToImport();
+    expect(app.effectiveImportModel).toBe("openai/one");
+    expect(app.importModelDescriptors.map((entry) => entry.id)).toEqual([
+      "effort",
+    ]);
+  });
+
+  test("nothing set sends no importModel at all", async () => {
+    const { app, fake } = await readyToImport();
+    await app.startScopeImport();
+    expect(fake.countOf("startScopeImport")).toBe(1);
+    expect(sentImportModel(fake)).toBeUndefined();
+  });
+
+  test("an option set on the resolved model is sent alone, for the server to resolve", async () => {
+    const { app, fake } = await readyToImport();
+    app.pickImportModelOption("effort", "high");
+    await app.startScopeImport();
+    // No model: the operator did not override it, so the server still applies D15's rule
+    // and resolves the option against whatever that answers.
+    expect(sentImportModel(fake)).toEqual({
+      modelOptions: [{ id: "effort", value: "high" }],
+    });
+  });
+
+  test("picking the default takes the setting off rather than sending it", async () => {
+    const { app, fake } = await readyToImport();
+    app.pickImportModelOption("effort", "high");
+    app.pickImportModelOption("effort", "default");
+    await app.startScopeImport();
+    expect(sentImportModel(fake)).toBeUndefined();
+  });
+
+  test("a choice made on another model is not sent with this one", async () => {
+    const { app, fake } = await readyToImport();
+    app.pickImportModelOption("effort", "high");
+    app.pickImportModel("openai/plain");
+    await app.startScopeImport();
+    expect(sentImportModel(fake)).toEqual({ model: "openai/plain" });
+  });
+
+  test("a run's options and an import's are kept apart", async () => {
+    const { app } = await readyToImport();
+    app.pickModelOption("effort", "low");
+    expect(app.pickedImportModelOptions).toEqual([]);
+    app.pickImportModelOption("effort", "high");
+    expect(app.pickedModelOptions).toEqual([{ id: "effort", value: "low" }]);
   });
 });

@@ -87,9 +87,6 @@
 import {
   RunRefused,
   bitMcpServerName,
-  droppedModelOptionIds,
-  explicitModelOptionSelections,
-  modelOptionDescriptors,
   type ModelOptionSelection,
   type RunStarted,
   type RunningAttempt,
@@ -110,6 +107,7 @@ import {
 } from "effect";
 
 import { AgentHarness, type TerminalOutcome } from "../harness/agentHarness";
+import { resolveSessionModelOptions } from "../harness/modelOptions";
 import {
   HarnessResolver,
   type HarnessNotReady,
@@ -981,24 +979,12 @@ const make = Effect.fnUntraced(function* (options?: {
     // model through a named provider of its own, Claude Code has one — and asked here
     // rather than taken from `createSession`'s answer because the row is written first.
     const provenance = harness.modelProvenance(model);
-    // Against *this* model's descriptors, from the catalogue this process observed. A
-    // model the catalogue does not list offers nothing as far as we can tell, so every
-    // selection for it is dropped — which is the honest answer rather than forwarding a
-    // value to a harness that never said it would take one.
-    const descriptors = modelOptionDescriptors(
-      harness.instance.models.find((entry) => entry.id === model),
-    );
-    const requestedOptions = input.modelOptions ?? [];
-    const dropped = droppedModelOptionIds(descriptors, requestedOptions);
-    if (dropped.length > 0) {
-      yield* Effect.logWarning(
-        "the run named model options this model does not offer; they were dropped rather than forwarded",
-        { model, dropped: dropped.join(", ") },
-      );
-    }
-    const modelOptions = explicitModelOptionSelections(
-      descriptors,
-      requestedOptions,
+    // Resolved against *this* model's descriptors; see `resolveSessionModelOptions`.
+    const modelOptions = yield* resolveSessionModelOptions(
+      harness,
+      model,
+      input.modelOptions,
+      "the run",
     );
 
     // The goal and the intent already exist — the claim in `start` proved it — so every

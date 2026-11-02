@@ -403,26 +403,26 @@ export class TargetUnavailable extends Schema.TaggedError<TargetUnavailable>()(
 /**
  * Which harness and model an import runs on, when the operator picked one (D15).
  *
- * **{@link RunDraft}'s first two fields, spelled the same way and meaning the same
- * things**, rather than a new shape: the picker on the create-target screen is the picker
- * in the composer, and a second vocabulary for "which model" would be a second resolution
- * path. Both are optional and so is the whole struct, so a draft that says nothing about
+ * **{@link RunDraft}'s instance, model and options fields, spelled the same way and meaning
+ * the same things**, rather than a new shape: the picker on the create-target screen is the
+ * picker in the composer, and a second vocabulary for "which model" would be a second
+ * resolution path. All are optional and so is the whole struct, so a draft that says nothing about
  * the model gets D15's rule applied to the live catalogue — which is the common case,
  * because the screen preselects what that rule already answered.
  *
- * **`modelOptions` is deliberately not here**, where `RunDraft` has it. It was, and
- * nothing ever set it: the field, `ScopeImportRequest.choice.modelOptions` and the
- * `options` argument it reached on `createSession` were an unbroken run of plumbing with
- * no caller, which is a worse thing for a contract to carry than a missing feature. What
- * it would have configured is reasoning depth, and the importer is a single-turn
- * extraction session reading a table out of a page — D15's own argument for giving it a
- * cheap model is the argument against paying a model to think harder about it. A later
- * change that wants it adds the field *and* the control in one go, which is the state this
- * now is.
+ * **`modelOptions` is `RunDraft`'s too, and means the same thing.** The importer is a
+ * conversation now (S2), so reasoning depth on it is a control for something: the session
+ * reads the program's pages and then takes the operator's follow-ups, and a second turn on
+ * a hard page is where thinking harder pays. The same {@link ModelOptionSelection}s, the
+ * same resolution rules in `modelOption.ts`, and the same load-bearing absence: a
+ * selection is here only if the operator *set* it, so an empty list would claim an opinion
+ * and stop the harness applying its own default. Options the resolved model does not offer
+ * are dropped on arrival, as a run's are.
  */
 export const ImportModelDraft = Schema.Struct({
   instanceId: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
+  modelOptions: Schema.optional(Schema.Array(ModelOptionSelection)),
 });
 export type ImportModelDraft = typeof ImportModelDraft.Type;
 

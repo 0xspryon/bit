@@ -20,15 +20,18 @@
    *   disabled control reads as "not yet", and this one is "not ever".
    * - **A session that is working**: the same, dimmed, with the composer's hint beside it.
    *
-   * ## What is not in it, and why
+   * ## The Reasoning column
    *
-   * The Reasoning column D6 draws is not here. `ScopeImportDraft` carries a model and no
-   * options, so a reasoning control would be a setting nothing sends. The composer's own
-   * picker has it because a run does carry `RunDraft`'s options.
+   * D6's third column, and the same one the composer's picker renders
+   * ({@link ModelOptionsColumn}). It is a real control because the draft carries it:
+   * `ImportModelDraft.modelOptions`, `RunDraft`'s field, which the server resolves against
+   * the model it actually picked and hands to `createSession`. The state behind it is the
+   * importer's own (`importModelOptionsByModel`), kept apart from a run's.
    */
   import type { App } from "../app.svelte";
   import { IconAngleDown } from "../icons";
   import HarnessChoice from "./HarnessChoice.svelte";
+  import ModelOptionsColumn from "./ModelOptionsColumn.svelte";
 
   let {
     app,
@@ -119,6 +122,20 @@
         {#snippet note()}
           A session is pinned to the harness it starts on. Changing harness
           starts a new session; it never moves this one.
+        {/snippet}
+
+        {#snippet options()}
+          <ModelOptionsColumn
+            instance={app.importInstance}
+            model={app.effectiveImportModel}
+            modelView={app.importModelView}
+            descriptors={app.importModelDescriptors}
+            selections={app.pickedImportModelOptions}
+            dropped={app.droppedImportModelOptions}
+            onPick={(descriptorId, value) =>
+              app.pickImportModelOption(descriptorId, value)}
+            subject="A session"
+          />
         {/snippet}
       </HarnessChoice>
     </div>
