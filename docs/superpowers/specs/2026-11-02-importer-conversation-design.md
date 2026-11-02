@@ -1280,7 +1280,82 @@ One edge, stated because it is a real inequality: `time_idle` is written as
 `max(event.created, time_idle + 1)` so every terminal advances the column even inside one
 millisecond. A turn that _started_ in the same millisecond its predecessor terminalised
 therefore reads `idle >= busy` and its predecessor's outcome is believed. The window is a
-millisecond or two and it errs towards under-continuing.
+millisecond or two and it errs towards under-continuing. The live run below left 23 ms
+between the two, which is the ordinary distance.
+
+##### The live reproduction, on a second turn
+
+`spike/secondTurnStatusProbe.ts`, run on 2 Nov 2026 against `opencode v2.2.5` and
+`zai-coding-plan/glm-5.3-flash`. `restartStatusProbe.ts` could not show this: it interrupts
+a **first** turn, so the row it leaves has no `idle_outcome` at all. This one sends a turn
+and lets it finish, sends a second, and closes the server's scope while the second is in
+flight — then asks the same session through four layers, and prints what each one _would_
+have said before the fix, computed from the same raw row:
+
+```
+status after turn one      {"activity":"idle","outcome":"succeeded", ...}
+turn two                   prompted
+status during turn two     {"activity":"running", ...}          # no outcome: S7a's half
+server A closed            gracefully, mid turn two
+
+-- the row server B holds, raw --
+time.idle                  1793646033881
+time.busy                  1793646033904      <- 23 ms later: turn two started
+outcome                    succeeded          <- turn one's, never cleared
+GET /api/session/active    {"data":{}}
+
+-- what sessionStatus answers --
+sessionStatus              {"activity":"idle", ...}             # no outcome field at all
+
+-- what recovery concludes --
+observed                   abandoned
+trigger                    owed
+
+-- and what each said before the fix --
+sessionStatus              {"activity":"idle","outcome":"succeeded"}
+observed                   succeeded
+trigger                    none
+
+-- and the conversation itself --
+sessionContinuation        resumable
+messages readable          6
+```
+
+`trigger` moving from `none` to `owed` is the whole claim: that is the decision S7b takes,
+and it is the one that had to move for the feature to widen past first-turn interruptions.
+The session is resumable and its six messages read back, so there is a conversation for the
+continuation to carry on.
+
+##### And Claude Code's half, live
+
+`spike/claudeAbandonedProbe.ts`, run the same day against `claude-sonnet-5`. No restart is
+needed on that driver and the probe says why: the live `Query` handles live in a `Map` built
+with the harness layer, so a _second_ harness layer in the same process holds none of the
+first one's sessions while the CLI's transcript stays on disk — the same state a restart
+leaves, reached without one.
+
+```
+status while held (A)      {"activity":"idle","outcome":"succeeded","cost":0.1233206, ...}
+harness A closed           its query map is gone; the transcript is not
+
+sessionStatus              {"activity":"idle"}
+observed                   abandoned
+detail                     session 60237c52-… exists, has no turn in flight, and has never
+                           recorded a terminal outcome; the process that started its last
+                           turn is gone, so no outcome is coming and none can be inferred
+trigger                    owed
+
+-- an id nobody has, for contrast --
+observed                   missing
+
+sessionContinuation        resumable
+messages readable          2
+```
+
+The contrast line is the distinction the fix had to keep: a session with a transcript is
+`abandoned`, an id nobody has is `missing`, and only the first asserts the conversation is
+still there. The held reading above it is the normal path, unmoved — a completed turn
+reports its real outcome with its cost and tokens.
 
 #### One limit, stated
 
