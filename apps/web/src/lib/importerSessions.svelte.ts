@@ -1,11 +1,20 @@
 /**
- * The Auto-load page's chat state, driven entirely by mock data.
+ * The Auto-load page's chat state: the server's session list, over a conversation that is
+ * still mock.
  *
- * **There is no importer API yet**, and this is the stand-in for the one thing the page will
- * need from it: a list of sessions on the open target, the one being read, and what typing
- * into it does. Everything here is local to the tab and gone on a reload. When a real source
- * exists, this class is what gets replaced; `ImporterChat.svelte` and `TitleBar.svelte`
- * read these fields and know nothing about where they came from.
+ * ## What is real and what is not
+ *
+ * **The list is real.** {@link begin} and {@link syncIndexed} put the target's indexed
+ * sessions (`GET .../importer-sessions`) in the picker, each with its model, time, running
+ * flag and tally. **Everything inside a session is still mock**: there is no way to read
+ * what was said in one, or to prompt one (the next slices), so an indexed session opens
+ * empty with a note saying why, and sending into it appends the stand-in reply below.
+ * `ImporterChat.svelte` and `TitleBar.svelte` read these fields and know nothing about which
+ * is which; {@link ImporterSession.indexed} is what tells them apart.
+ *
+ * The nine scenarios the state picker loads ({@link load}) never touch the server and are
+ * wholly declared (`mockImporter.ts`), which is what lets an operator inspect a state
+ * without reproducing it.
  *
  * ## What sending does, and the one fake in it
  *
@@ -110,13 +119,47 @@ export class ImporterSessions {
    *
    * A session nobody has said anything in is not a *previous* session; it is the empty one
    * the operator is looking at, and listing it would make "Start a new session" appear to
-   * have a twin.
+   * have a twin. An indexed session's count is unknown rather than zero, and it is listed:
+   * the server says it exists.
    */
   listed = $derived(
     this.sessions
-      .filter((session) => session.tally.messages > 0)
+      .filter((session) => session.tally.messages !== 0)
       .toSorted((left, right) => right.startedAt - left.startedAt),
   );
+
+  /**
+   * Opens the page on a target: an empty session to type into, beside the ones the server
+   * lists.
+   *
+   * Replaces everything, including whatever a scenario or an earlier visit left, because the
+   * sessions are the target's and a list that kept another visit's local ones would be
+   * showing one of them as if the server had it.
+   */
+  begin(indexed: readonly ImporterSession[]): void {
+    const fresh = mockNewSession(this.#now());
+    this.draft = "";
+    this.pickerOpen = false;
+    this.#sent = 0;
+    this.sessions = [fresh, ...indexed];
+    this.currentId = fresh.id;
+  }
+
+  /**
+   * Swaps the server's sessions for a newer reading of them, leaving the page's own alone.
+   *
+   * What the operator is looking at stays where it is: an indexed session that is still
+   * listed keeps its place, and so does the empty one they are typing into. Only an open
+   * session the server no longer lists falls back to the empty one, since there is nothing
+   * left to show for it.
+   */
+  syncIndexed(indexed: readonly ImporterSession[]): void {
+    const own = this.sessions.filter((session) => session.indexed !== true);
+    this.sessions = [...own, ...indexed];
+    if (!this.sessions.some((session) => session.id === this.currentId)) {
+      this.currentId = own[0]?.id ?? indexed[0]?.id ?? "";
+    }
+  }
 
   /** Puts the prototype into one of the states the brief shows. */
   load(scenario: ImporterScenario): void {
@@ -250,7 +293,13 @@ export class ImporterSessions {
           outcome: null,
         },
       ],
-      tally: { ...before.tally, messages: before.tally.messages + 2 },
+      tally: {
+        ...before.tally,
+        // An indexed session's count is unknown, and a stand-in exchange is not a reason
+        // to start printing one.
+        messages:
+          before.tally.messages === null ? null : before.tally.messages + 2,
+      },
     }));
   }
 

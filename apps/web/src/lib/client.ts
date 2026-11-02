@@ -808,6 +808,17 @@ export const server = {
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.importerModel())),
 
   /**
+   * The harness sessions this target's imports have run on, newest first, with what each
+   * wrote. An index of the harness's storage: nothing that was said in them.
+   */
+  importerSessions: (baseUrl: string, targetId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.importerSessions({ params: { targetId } }),
+      ),
+    ),
+
+  /**
    * Starts a scope import on a target that already exists.
    *
    * The Auto-load page's only write. It answers as soon as the session is going, with the

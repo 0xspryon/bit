@@ -77,3 +77,4 @@ export { default as IconBell } from "line-awesome/svg/bell-solid.svg?component";
 export { default as IconScroll } from "line-awesome/svg/scroll-solid.svg?component";
 export { default as IconCollapse } from "line-awesome/svg/angle-double-left-solid.svg?component";
 export { default as IconExpand } from "line-awesome/svg/angle-double-right-solid.svg?component";
+export { default as IconHistory } from "line-awesome/svg/history-solid.svg?component";

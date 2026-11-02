@@ -47,10 +47,12 @@
   import Button from "../components/Button.svelte";
   import ConfirmAction from "../components/ConfirmAction.svelte";
   import PageFrame from "../components/PageFrame.svelte";
+  import { lastSessionSentence, sessionWhen } from "../importerChat";
   import {
     IconClose,
     IconCube,
     IconDownload,
+    IconHistory,
     IconPlus,
     IconScroll,
     IconSearch,
@@ -524,6 +526,38 @@
                 </Button>
               </div>
             </div>
+            {#if app.lastImporterSession !== undefined}
+              {@const last = app.lastImporterSession}
+              <!--
+                A6 D1's strip. Sessions are sticky per target, so an abandoned one is named
+                here rather than left for the operator to start a second beside it. What it
+                says is about what the session did (running, wrote nothing, wrote this
+                much) and never about what was said: the server keeps none of that.
+
+                "Continue" selects the session and opens the page; it does not prompt it.
+              -->
+              <div
+                class="last-session"
+                role="group"
+                aria-label="Last importer session"
+              >
+                <IconHistory width="14" height="14" />
+                <span class="last-text"
+                  >Last importer session
+                  <span class="mono last-when"
+                    >{sessionWhen(last.openedAt, Date.now())}</span
+                  >
+                  {lastSessionSentence(last)}</span
+                >
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={() => app.openImporter(last.sessionId)}
+                >
+                  Continue that session
+                </Button>
+              </div>
+            {/if}
           {:else}
             {#each [{ effect: "in", heading: "In scope" }, { effect: "out", heading: "Out of scope" }] as section (section.effect)}
               {@const rows = scope.entries.filter(
@@ -1421,6 +1455,28 @@
   }
   .scope-empty:focus {
     outline: none;
+  }
+  /* D1's strip: a bordered bar under the empty state, text first and the button at the end. */
+  .last-session {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 13px;
+    box-sizing: border-box;
+    border: 1px solid var(--border-base);
+    border-radius: 7px;
+    background: var(--bg-deep);
+    color: var(--icon-muted);
+  }
+  .last-text {
+    flex: 1;
+    font: 400 12px/18px var(--font-sans);
+    color: var(--text-muted);
+    text-wrap: pretty;
+  }
+  .last-when {
+    color: var(--text-base);
   }
   .empty-actions {
     display: flex;

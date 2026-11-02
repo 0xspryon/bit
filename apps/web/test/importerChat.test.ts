@@ -26,9 +26,13 @@ import {
 import {
   NO_HISTORY,
   buildImporterChat,
+  indexedSession,
+  lastSessionSentence,
+  sessionLabel,
   tallyLine,
   type ImporterHistory,
 } from "../src/lib/importerChat";
+import { importerSessionView } from "./fakeServer";
 
 let order = 0;
 const AT = 1_700_000_000_000;
@@ -388,6 +392,81 @@ describe("the picker's second line", () => {
     expect(tallyLine({ in: 1, out: 0, assets: 1, messages: 1 })).toBe(
       "1 in · 0 out · 1 asset · 1 message",
     );
+  });
+});
+
+describe("a session the server lists", () => {
+  test("leaves the message count off rather than printing a number it does not have", () => {
+    // What the server indexes carries no prose, so it has no count of it. `null` is not
+    // zero: zero is the empty thread, and printing "0 messages" of a session that wrote
+    // fourteen assets would be a statement about the conversation nobody checked.
+    expect(tallyLine({ in: 7, out: 3, assets: 14, messages: null })).toBe(
+      "7 in · 3 out · 14 assets",
+    );
+    expect(tallyLine({ in: 0, out: 0, assets: 0, messages: null })).toBe(
+      "nothing written",
+    );
+  });
+
+  test("is held with the server's figures, its running flag, and no invented conversation", () => {
+    const held = indexedSession(
+      importerSessionView({
+        sessionId: "ses_x",
+        running: true,
+        tally: { entriesIn: 7, entriesOut: 3, assets: 14 },
+      }),
+      "OpenCode",
+    );
+    expect(held).toMatchObject({
+      id: "ses_x",
+      harness: "OpenCode",
+      working: true,
+      indexed: true,
+      reading: true,
+      tally: { in: 7, out: 3, assets: 14, messages: null },
+      items: [],
+    });
+    // It says why there is no conversation, rather than showing the empty thread.
+    expect(held.history.source).toBe("pending");
+    expect(held.history.note).toContain("does not read the session's messages");
+    // And an unknown count is not the empty session: it keeps a time label.
+    expect(sessionLabel(held)).toMatch(/^Session /);
+  });
+});
+
+describe("the Assets strip's sentence about the last session", () => {
+  test("says a session that is running is running", () => {
+    expect(
+      lastSessionSentence({
+        running: true,
+        tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+      }),
+    ).toBe("is still running.");
+  });
+
+  test("says a session that wrote nothing ended without writing anything", () => {
+    expect(
+      lastSessionSentence({
+        running: false,
+        tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+      }),
+    ).toBe("ended without writing anything.");
+  });
+
+  test("says what a session that wrote something wrote, and any one kind is something", () => {
+    expect(
+      lastSessionSentence({
+        running: false,
+        tally: { entriesIn: 7, entriesOut: 3, assets: 14 },
+      }),
+    ).toBe("wrote 7 in · 3 out · 14 assets.");
+    // Assets alone: the session wrote no entry, and "nothing" would be a lie.
+    expect(
+      lastSessionSentence({
+        running: false,
+        tally: { entriesIn: 0, entriesOut: 0, assets: 2 },
+      }),
+    ).toBe("wrote 0 in · 0 out · 2 assets.");
   });
 });
 

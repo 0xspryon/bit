@@ -42,6 +42,7 @@ import {
   type GoalView,
   type HarnessInstanceView,
   type ImporterModelView,
+  type ImporterSessionView,
   type IntentView,
   type LiveFrame,
   type LiveItem,
@@ -79,11 +80,16 @@ import {
   type SentTurn,
 } from "./chat";
 import { server, type ServerClient } from "./client";
+import { indexedSession } from "./importerChat";
 import {
   ImporterSessions,
   type ImporterScenario,
 } from "./importerSessions.svelte";
-import { mockHarnesses, mockImporterModel } from "./mockImporter";
+import {
+  mockHarnesses,
+  mockImporterIndex,
+  mockImporterModel,
+} from "./mockImporter";
 
 /**
  * A cancellable one-shot timer.
@@ -452,6 +458,29 @@ export class App {
   scopeTargetId = $state("");
   scopeState = $state<AssetsState>("idle");
   scopeDetail = $state("");
+
+  /**
+   * The open target's importer sessions as the server indexes them, newest first.
+   *
+   * What the Auto-load page's session list and the Scope tab's "last session" strip both
+   * read. **Kept on a failed read** rather than cleared: the strip and the list are
+   * conveniences for finding a session again, a stale pointer is still a pointer to the
+   * same target, and a transient failure that blanked them would make an operator think the
+   * sessions were gone. A change of target clears it (`#clearEstate`), which is the only
+   * time it could be someone else's.
+   */
+  importerIndex = $state<readonly ImporterSessionView[]>([]);
+  importerIndexTargetId = $state("");
+
+  /**
+   * The newest importer session on the open target, or `undefined` when there is none or
+   * the index has not been read for this target yet.
+   */
+  lastImporterSession = $derived(
+    this.importerIndexTargetId === this.viewTargetId
+      ? this.importerIndex[0]
+      : undefined,
+  );
 
   /** Which tab of the Assets screen is open. Estate first: it is what the hunt produced. */
   assetsTab = $state<AssetsTab>("estate");
@@ -1920,6 +1949,7 @@ export class App {
     if (id === "assets" && this.viewTargetId !== "") {
       void this.loadAssets(this.viewTargetId);
       void this.loadScope(this.viewTargetId);
+      void this.loadImporterSessions(this.viewTargetId);
     }
   }
 
@@ -1950,6 +1980,8 @@ export class App {
     this.scopeTargetId = "";
     this.scopeState = "idle";
     this.scopeDetail = "";
+    this.importerIndex = [];
+    this.importerIndexTargetId = "";
     this.assetsTab = "estate";
     this.estateFilter = "all";
     this.estateQuery = "";
@@ -2205,6 +2237,42 @@ export class App {
     }
     this.scope = call.value;
     this.scopeState = "ready";
+  }
+
+  /**
+   * Reads the open target's importer sessions, and brings the Auto-load page into line if
+   * it is open.
+   *
+   * A failed read is silent and keeps what the page already holds (see
+   * {@link importerIndex}): the index is how an operator finds a session again, and nothing
+   * about the Assets screen is wrong because it could not be listed.
+   */
+  async loadImporterSessions(id: string) {
+    if (this.viewTargetId !== id) return;
+    const call = await this.client.importerSessions(this.serverUrl, id);
+    if (this.viewTargetId !== id) return;
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") this.signOut("expired");
+      return;
+    }
+    if (call._tag === "Unreachable") return;
+    this.importerIndex = call.value.sessions;
+    this.importerIndexTargetId = id;
+    if (this.importerOpen) this.importer.syncIndexed(this.#indexedSessions());
+  }
+
+  /** The index as the Auto-load page holds sessions, harness names resolved. */
+  #indexedSessions() {
+    return this.importerIndex.map((view) =>
+      indexedSession(
+        view,
+        this.harnesses.find(
+          (entry) => entry.instanceId === view.harnessInstanceId,
+        )?.displayName ??
+          view.harnessInstanceId ??
+          "Unknown harness",
+      ),
+    );
   }
 
   /**
@@ -3544,17 +3612,24 @@ export class App {
    * is a second session writing into the same scope. A settled import is not resumed: the
    * operator comes back for another go, and gets a clean form.
    */
-  openImporter() {
+  openImporter(sessionId?: string) {
     const targetId = this.viewTargetId;
     if (targetId === "") return;
     this.importerOpen = true;
-    // Mock: a fresh session beside the earlier ones. A real source would resume the
-    // target's newest, which is what "sticky per target" means.
-    this.importer.load("default");
+    // The target's indexed sessions beside an empty one to type into. What the index held
+    // when the page was reached is shown at once and read again below, so the list is never
+    // blank for the length of a round trip.
+    this.importer.begin(
+      this.importerIndexTargetId === targetId ? this.#indexedSessions() : [],
+    );
+    // "Continue that session": select it. Prompting it is a later slice, so this only puts
+    // it on screen, read-only until the operator types.
+    if (sessionId !== undefined) this.importer.open(sessionId);
     this.importStartDetail = "";
     this.importStarting = false;
     void this.loadHarnesses();
     void this.loadImporterModel();
+    void this.loadImporterSessions(targetId);
 
     const running =
       this.scopeImportId !== "" &&
@@ -4284,6 +4359,8 @@ export class App {
     }
     if (call._tag === "Unreachable") return;
     this.harnesses = call.value.map((entry) => ({ ...entry }));
+    // The Auto-load page names each session's harness, and may be showing the id until now.
+    if (this.importerOpen) this.importer.syncIndexed(this.#indexedSessions());
     // A picked instance the server no longer configures is dropped back to the default
     // rather than kept and refused later: this runs on a fresh session, so the only way
     // to be holding a stale id is a server that was reconfigured under us.
@@ -4861,6 +4938,8 @@ export class App {
     // receipt, which is the one thing the state picker must not do.
     this.importerOpen = false;
     this.importer.load("default");
+    this.importerIndex = [];
+    this.importerIndexTargetId = "";
     this.importerPhase = "form";
     this.importStarting = false;
     this.importStartDetail = "";
@@ -5202,4 +5281,35 @@ export const scenarios: Scenario[] = [
       a.importer.load(state);
     },
   })),
+  {
+    id: "importer-strip",
+    // Its own group: the A6 Auto-load nine are the importer page's states, and each of those
+    // mounts the chat. This one is the Assets screen that leads to it.
+    group: "A6 Assets",
+    label: "D1 · Assets, an earlier session to continue",
+    apply: (a) => {
+      a.reset();
+      a.previewTarget("acme-corp");
+      a.navItem = "assets";
+      a.assetsTab = "scope";
+      // An empty scope, declared: the strip lives in its empty state.
+      a.scope = {
+        entries: [],
+        hostLabels: [],
+        assetLabels: [],
+        promptBlock: null,
+      };
+      a.scopeTargetId = "acme-corp";
+      a.scopeState = "ready";
+      // What `GET .../importer-sessions` would answer, so the strip can be inspected without
+      // a server that has run an import. "Continue that session" is only faithful against a
+      // real session: it opens the page, which reads the harness listing and the model like
+      // any other visit to it, and with no session to read them with the app signs out as it
+      // does for every scenario that makes a call. The state picker's nine do not make one.
+      a.importerIndex = mockImporterIndex(Date.now());
+      a.importerIndexTargetId = "acme-corp";
+      a.harnesses = mockHarnesses();
+      a.importerModel = mockImporterModel();
+    },
+  },
 ];

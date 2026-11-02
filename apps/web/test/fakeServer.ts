@@ -38,6 +38,7 @@ import type {
   IntentView,
   HarnessInstanceView,
   ImporterModelView,
+  ImporterSessionView,
   LiveCursor,
   LiveFrame,
   LiveItem,
@@ -200,6 +201,24 @@ export const importerModelView = (
   model: "opencode/glm-5.3-flash-free",
   origin: "preferred",
   detail: "OpenCode offers opencode/glm-5.3-flash-free",
+  ...over,
+});
+
+/**
+ * One indexed importer session as the route answers it.
+ *
+ * Wrote nothing and not running by default, which is the strip's plainest sentence; a test
+ * that wants a tally or a live session says so.
+ */
+export const importerSessionView = (
+  over: Partial<ImporterSessionView> = {},
+): ImporterSessionView => ({
+  sessionId: "ses_1",
+  harnessInstanceId: "opencode",
+  model: "openai/gpt-5.6-sol",
+  openedAt: AT,
+  running: false,
+  tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
   ...over,
 });
 
@@ -1095,6 +1114,10 @@ export class FakeServer implements ServerClient {
   onImporterModel: (baseUrl: string) => Answer<"importerModel"> = () =>
     ok(importerModelView());
 
+  onImporterSessions: (
+    ...args: Parameters<ServerClient["importerSessions"]>
+  ) => Answer<"importerSessions"> = () => ok({ sessions: [] });
+
   onStartScopeImport: (
     ...args: Parameters<ServerClient["startScopeImport"]>
   ) => Answer<"startScopeImport"> = () =>
@@ -1267,6 +1290,11 @@ export class FakeServer implements ServerClient {
   importerModel = (baseUrl: string) =>
     this.record("importerModel", [baseUrl], () =>
       this.onImporterModel(baseUrl),
+    );
+
+  importerSessions = (...args: Parameters<ServerClient["importerSessions"]>) =>
+    this.record("importerSessions", args, () =>
+      this.onImporterSessions(...args),
     );
 
   startScopeImport = (...args: Parameters<ServerClient["startScopeImport"]>) =>

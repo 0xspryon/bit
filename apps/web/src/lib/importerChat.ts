@@ -42,7 +42,11 @@
  * (`RoundNarration.note` for a round, `GoalConversationView.note` for a goal). There is no
  * importer endpoint, so they are written here, in the same register.
  */
-import type { GoalNarrationView, LiveItem } from "@bit/contracts";
+import type {
+  GoalNarrationView,
+  ImporterSessionView,
+  LiveItem,
+} from "@bit/contracts";
 
 import {
   OPERATOR_TURN_KIND,
@@ -104,13 +108,18 @@ export const NO_HISTORY: ImporterHistory = {
 };
 
 /**
- * One importer session as the prototype holds it.
+ * One importer session as the page holds it.
  *
- * **All of it is mock today** (`mock.ts`'s fixtures). The shape is what a real source would
- * have to supply: the harness's answer, the feed, whether it is mid-turn, and the figures
- * the picker prints. `tally` is the server's count of what the session wrote, kept apart
- * from `items` on purpose: a reloaded tab holds records but not the calls that made them,
- * so a figure derived from what is on screen would disagree with the Assets page.
+ * **Two kinds, told apart by {@link indexed}.** An *indexed* session is one the server
+ * lists (`GET .../importer-sessions`): its identity, model, harness, time, whether it is
+ * running and its tally are real, and its `items` are empty and its `history` says so,
+ * because nothing that was said in it is stored here. Every other session is the page's own
+ * — the empty one the operator types into, and the declared ones the state picker loads
+ * (`mockImporter.ts`) — and all of it is mock.
+ *
+ * `tally` is the server's count of what the session wrote, kept apart from `items` on
+ * purpose: a reloaded tab holds records but not the calls that made them, so a figure
+ * derived from what is on screen would disagree with the Assets page.
  */
 export interface ImporterSession {
   readonly id: string;
@@ -125,6 +134,8 @@ export interface ImporterSession {
   readonly tally: ImporterTally;
   /** Opened from the picker and not written to since: read-only until the operator types. */
   readonly reading: boolean;
+  /** True when the server lists this session. Absent on the page's own. */
+  readonly indexed?: boolean;
 }
 
 /** What a session is built from. */
@@ -326,12 +337,19 @@ export const buildImporterChat = (
   return groups;
 };
 
-/** What a session wrote, for the picker. Counts of its own, not derived from the feed. */
+/**
+ * What a session wrote, for the picker. Counts of its own, not derived from the feed.
+ *
+ * `messages` is `null` when it is not known, which is every indexed session today: what was
+ * said is the harness's and this server keeps none of it, so a count of it is something only
+ * a read of the harness could supply. `null` is not zero — zero is the empty session, and is
+ * what separates "a thread to type into" from "a session that exists".
+ */
 export interface ImporterTally {
   readonly in: number;
   readonly out: number;
   readonly assets: number;
-  readonly messages: number;
+  readonly messages: number | null;
 }
 
 /**
@@ -347,6 +365,8 @@ export const tallyLine = (tally: ImporterTally): string => {
       : `${String(tally.in)} in · ${String(tally.out)} out · ${String(tally.assets)} ${
           tally.assets === 1 ? "asset" : "assets"
         }`;
+  // An unknown count is left off rather than printed as a number it is not.
+  if (tally.messages === null) return wrote;
   return `${wrote} · ${String(tally.messages)} ${
     tally.messages === 1 ? "message" : "messages"
   }`;
@@ -389,3 +409,66 @@ export const sessionLabel = (
         minute: "2-digit",
         hour12: false,
       })}`;
+
+/**
+ * What the page says in place of a conversation it cannot read.
+ *
+ * The harness holds what was said in a session, and reading it back is a later slice's. So
+ * an indexed session opens with this, in the `pending` slot, rather than as the empty thread
+ * — which would say nothing was ever said — or as `forgotten`, which would claim the harness
+ * had been asked and had answered.
+ */
+export const INDEXED_HISTORY: ImporterHistory = {
+  source: "pending",
+  note: "This page does not read the session's messages yet; the harness holds them. What the session wrote is on the Scope tab and in the Estate, and its tally is in the session list.",
+  truncated: false,
+  messages: [],
+};
+
+/**
+ * A session the server lists, as the page holds it.
+ *
+ * `harness` is a display name the caller resolves from the harness listing, because the
+ * server's row carries the instance id and the avatar letter wants the name. `reading` is
+ * true: an indexed session is opened to be read, and the first message the operator types
+ * resumes it. `messages` is `null` — see {@link ImporterTally}.
+ */
+export const indexedSession = (
+  view: ImporterSessionView,
+  harness: string,
+): ImporterSession => ({
+  id: view.sessionId,
+  startedAt: view.openedAt,
+  model: view.model,
+  harness,
+  history: INDEXED_HISTORY,
+  items: [],
+  working: view.running,
+  tally: {
+    in: view.tally.entriesIn,
+    out: view.tally.entriesOut,
+    assets: view.tally.assets,
+    messages: null,
+  },
+  reading: true,
+  indexed: true,
+});
+
+/**
+ * The Assets screen's strip about the target's last importer session (A6 D1).
+ *
+ * Three sentences, all about what the session did and none about what it said: still
+ * running, wrote nothing, or wrote this much. "Ended" is only said of a session this server
+ * does not know to be running; a restart forgets that, so it can read "ended without writing
+ * anything" of a session the restart cut off, and the tally is the part that can be trusted.
+ */
+export const lastSessionSentence = (
+  view: Pick<ImporterSessionView, "running" | "tally">,
+): string => {
+  if (view.running) return "is still running.";
+  const { entriesIn, entriesOut, assets } = view.tally;
+  if (entriesIn === 0 && entriesOut === 0 && assets === 0) {
+    return "ended without writing anything.";
+  }
+  return `wrote ${tallyLine({ in: entriesIn, out: entriesOut, assets, messages: null })}.`;
+};

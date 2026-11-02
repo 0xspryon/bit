@@ -34,6 +34,7 @@ import {
   claudeCodeToolName,
   type HarnessInstanceView,
   type ImporterModelView,
+  type ImporterSessionView,
   type LiveItem,
   type ScopeImportTool,
 } from "@bit/contracts";
@@ -641,6 +642,33 @@ export const mockOpeningSession = (now: number): ImporterSession => ({
 export const mockEarlierSessions = (now: number): ImporterSession[] => [
   questionSession(now),
   mockForgottenSession(now),
+];
+
+/**
+ * What the server would list for a target with two earlier sessions, newest first.
+ *
+ * The state picker's D1 scenario loads these into `app.importerIndex`, so the Assets
+ * screen's "last session" strip and the picker's indexed rows can be inspected without a
+ * server that has run an import. They are the contract's own view, which is the point: the
+ * strip and the rows are rendered from exactly what the route answers.
+ */
+export const mockImporterIndex = (now: number): ImporterSessionView[] => [
+  {
+    sessionId: "ses_indexed_quiet",
+    harnessInstanceId: "claude-code",
+    model: "anthropic/claude-code",
+    openedAt: now - 9 * DAY,
+    running: false,
+    tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+  },
+  {
+    sessionId: "ses_indexed_wrote",
+    harnessInstanceId: "opencode",
+    model: "openai/gpt-5.5",
+    openedAt: now - 12 * DAY,
+    running: false,
+    tally: { entriesIn: 3, entriesOut: 0, assets: 5 },
+  },
 ];
 
 /**
