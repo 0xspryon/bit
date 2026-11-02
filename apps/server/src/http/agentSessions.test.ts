@@ -15,6 +15,7 @@ const GOAL = {
   goalName: "Billing auth",
   harnessSessionId: "ses_goal_1",
   harnessInstanceId: "claude-code",
+  model: null,
   openedAt: 100,
 };
 
@@ -44,9 +45,19 @@ describe("a goal conversation", () => {
     });
   });
 
-  test("not held is 'dormant' with no model, and is never 'ended'", () => {
+  test("not held is 'dormant', and is never 'ended'; a row with no model reads null, not a guess", () => {
     const [row] = unionAgentSessions(sources({ goals: [GOAL] })).sessions;
     expect(row).toMatchObject({ state: "dormant", model: null });
+  });
+
+  test("a dormant goal shows the model its row recorded", () => {
+    const [row] = unionAgentSessions(
+      sources({ goals: [{ ...GOAL, model: "anthropic/claude-sonnet-5" }] }),
+    ).sessions;
+    expect(row).toMatchObject({
+      state: "dormant",
+      model: "anthropic/claude-sonnet-5",
+    });
   });
 
   test("a held session that is not the one the index names is not reported live for that row", () => {
@@ -56,6 +67,7 @@ describe("a goal conversation", () => {
         goalLive: () => ({ sessionId: "ses_other", model: "x/y" }),
       }),
     ).sessions;
+    // Not the registry's model — that is another session's — and the row recorded none.
     expect(row).toMatchObject({ state: "dormant", model: null });
   });
 });

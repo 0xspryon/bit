@@ -582,6 +582,7 @@ const make = Effect.fnUntraced(function* () {
             targetId: entry.targetId,
             harnessSessionId: entry.sessionId,
             harnessInstanceId: entry.instanceId,
+            model: entry.model,
           }),
         ),
         Effect.scoped,

@@ -491,6 +491,7 @@ describe("the conversations a restart interrupted", () => {
             targetId: TARGET,
             harnessSessionId: SESSION,
             harnessInstanceId: "opencode",
+            model: "anthropic/claude-sonnet-5",
           });
         }).pipe(Effect.orDie),
       after: ({ dispatched }) => Effect.succeed(dispatched),
@@ -516,6 +517,7 @@ describe("the conversations a restart interrupted", () => {
             targetId: TARGET,
             harnessSessionId: SESSION,
             harnessInstanceId: "opencode",
+            model: "anthropic/claude-sonnet-5",
           });
           yield* store.endGoal(
             { callerScope: operatorScope(TARGET), targetId: TARGET },
@@ -577,6 +579,7 @@ describe("the conversations a restart interrupted", () => {
               targetId: TARGET,
               harnessSessionId: `ses_goal_${String(at)}`,
               harnessInstanceId: "opencode",
+              model: "anthropic/claude-sonnet-5",
             });
           }
         }).pipe(Effect.orDie),
@@ -785,6 +788,7 @@ describe("what a continued worker is handed", () => {
             targetId: TARGET,
             harnessSessionId: "ses_goal",
             harnessInstanceId: "opencode",
+            model: "anthropic/claude-sonnet-5",
           });
         }).pipe(Effect.orDie),
       after: ({ dispatched }) => Effect.succeed(dispatched),

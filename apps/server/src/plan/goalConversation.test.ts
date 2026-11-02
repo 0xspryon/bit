@@ -1034,6 +1034,8 @@ describe("the first message on a goal", () => {
 
     expect(recorded?.harnessSessionId).toBe(accepted.harnessSessionId);
     expect(recorded?.harnessInstanceId).toBe(accepted.instanceId);
+    // The model is written where the session row is, so a dormant goal can say what it ran on.
+    expect(recorded?.model).toBe(`${accepted.providerId}/${accepted.modelId}`);
 
     await first.runtime.dispose();
   });

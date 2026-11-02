@@ -493,6 +493,7 @@ describe("a database already at 0002", () => {
       "27_import_session_end_reason",
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -777,6 +778,7 @@ describe("a database already at 0005", () => {
       "27_import_session_end_reason",
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1505,6 +1507,7 @@ describe("a database already at 0015", () => {
       "27_import_session_end_reason",
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1655,6 +1658,7 @@ describe("a database already at 0016", () => {
       "27_import_session_end_reason",
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1834,6 +1838,7 @@ describe("a database already at 0017", () => {
       "27_import_session_end_reason",
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(
@@ -2067,6 +2072,7 @@ describe("0025 import session confirmation", () => {
       "27_import_session_end_reason",
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     expect(outcome.columns).toContain("session_created_at");
     // Not backfilled: nothing in a 0024 row says the harness ever held the session.
@@ -2108,6 +2114,7 @@ describe("0026 import session end", () => {
       "27_import_session_end_reason",
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     expect(outcome.columns).toContain("ended_at");
     // Not backfilled: a row from before the column says nothing about an ending.
@@ -2158,6 +2165,7 @@ describe("0027 import session end reason", () => {
       "27_import_session_end_reason",
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     expect(outcome.columns).toContain("ended_reason");
     // Not backfilled: nothing under 0026 recorded why a row ended.
@@ -2205,6 +2213,7 @@ describe("0028 and 0029: an import session's model options and pages", () => {
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
       "28_import_session_model_options",
       "29_import_session_pages",
+      "30_goal_session_model",
     ]);
     expect(outcome.columns).toContain("model_options");
     expect(outcome.columns).toContain("pages");
@@ -2216,5 +2225,43 @@ describe("0028 and 0029: an import session's model options and pages", () => {
         pages: '["https://hackerone.com/acme"]',
       },
     ]);
+  });
+});
+
+describe("0030: a goal conversation's model", () => {
+  test("a row written under 0029 upgrades with no model, and the column then takes one", async () => {
+    const path = newDatabasePath();
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* runMigrations({ loader: chainThrough(29) });
+        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
+          VALUES ('goal_old', 'acme-corp', 'objective', 1)`;
+        yield* sql`INSERT INTO goal_sessions (
+            goal_id, target_id, harness_session_id, harness_instance_id, opened_at
+          ) VALUES ('goal_old', 'acme-corp', 'ses_old', 'claude-code', 100)`;
+        const applied = yield* migrate;
+        const upgraded = yield* sql<{
+          model: string | null;
+        }>`SELECT model FROM goal_sessions`;
+        yield* sql`UPDATE goal_sessions SET model = 'anthropic/claude-sonnet-5'
+          WHERE goal_id = 'goal_old'`;
+        return {
+          applied,
+          upgraded,
+          columns: yield* columnsOf(sql, "goal_sessions"),
+          written: yield* sql<{
+            model: string | null;
+          }>`SELECT model FROM goal_sessions`,
+        };
+      }),
+    );
+
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
+      "30_goal_session_model",
+    ]);
+    expect(outcome.columns).toContain("model");
+    // Not backfilled: a 0021 row says nothing about what the conversation ran on.
+    expect(outcome.upgraded).toEqual([{ model: null }]);
+    expect(outcome.written).toEqual([{ model: "anthropic/claude-sonnet-5" }]);
   });
 });

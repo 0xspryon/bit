@@ -1658,6 +1658,26 @@ const addImportSessionPages = statements(
 );
 
 /**
+ * `0030` — which model a goal conversation ran on.
+ *
+ * `0021` recorded the session and the instance and no model, so a goal conversation this
+ * process no longer holds listed as "model not recorded": only a held one could say. An
+ * import session's index stores its model (`0024`) and the "Agent sessions" list reads it
+ * from there; this is the same column for the goal's index, for the same reader.
+ *
+ * `provider/model`, as `import_sessions.model` is and as the live registry reports it. It is
+ * **nullable, and `NULL` is the honest answer on every row written before this column** —
+ * there is nothing in a `0021` row from which a model could be recovered, and guessing one
+ * (the harness's current default is the obvious candidate) would put a model the
+ * conversation may never have run on beside a session id. Not backfilled, for `0015`'s
+ * reason. A row is also rewritten, model included, whenever the goal's conversation opens a
+ * new session, so a `NULL` ages out as goals are talked to again.
+ */
+const addGoalSessionModel = statements(
+  `ALTER TABLE goal_sessions ADD COLUMN model TEXT`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1704,6 +1724,7 @@ export const MIGRATIONS: Record<
   "0027_import_session_end_reason": addImportSessionEndReason,
   "0028_import_session_model_options": addImportSessionModelOptions,
   "0029_import_session_pages": addImportSessionPages,
+  "0030_goal_session_model": addGoalSessionModel,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

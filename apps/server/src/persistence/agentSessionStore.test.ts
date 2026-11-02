@@ -74,12 +74,14 @@ describe("the goal sessions of a target", () => {
           targetId: "target-1",
           harnessSessionId: "gses-a",
           harnessInstanceId: "claude-code",
+          model: "anthropic/claude-sonnet-5",
         });
         yield* store.recordGoalSession({
           goalId: "goal-elsewhere",
           targetId: "target-2",
           harnessSessionId: "gses-elsewhere",
           harnessInstanceId: null,
+          model: "anthropic/claude-sonnet-5",
         });
         return yield* store.goalSessionsForTarget("target-1");
       }),
@@ -91,7 +93,39 @@ describe("the goal sessions of a target", () => {
       goalName: "Objective a",
       harnessSessionId: "gses-a",
       harnessInstanceId: "claude-code",
+      model: "anthropic/claude-sonnet-5",
     });
+  });
+
+  test("re-recording a conversation replaces its model with the new session's", async () => {
+    const rows = await withStore((store) =>
+      Effect.gen(function* () {
+        yield* store.seedAttempt(seed("a"));
+        const base = {
+          goalId: "goal-a",
+          targetId: "target-1",
+          harnessInstanceId: "claude-code",
+        };
+        yield* store.recordGoalSession({
+          ...base,
+          harnessSessionId: "gses-1",
+          model: "anthropic/claude-sonnet-5",
+        });
+        yield* store.recordGoalSession({
+          ...base,
+          harnessSessionId: "gses-2",
+          model: "anthropic/claude-opus-5-5",
+        });
+        return {
+          list: yield* store.goalSessionsForTarget("target-1"),
+          one: yield* store.goalSession("goal-a"),
+        };
+      }),
+    );
+    expect(rows.list.map((r) => [r.harnessSessionId, r.model])).toEqual([
+      ["gses-2", "anthropic/claude-opus-5-5"],
+    ]);
+    expect(rows.one?.model).toBe("anthropic/claude-opus-5-5");
   });
 
   test("a goal nobody has talked to is not a session", async () => {

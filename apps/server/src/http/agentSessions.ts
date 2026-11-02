@@ -34,6 +34,8 @@ export interface AgentSessionSources {
     readonly goalName: string;
     readonly harnessSessionId: string;
     readonly harnessInstanceId: string | null;
+    /** What the conversation was recorded as running on, or null (`0030`; older rows). */
+    readonly model: string | null;
     readonly openedAt: number;
   }[];
   /** The goal conversation registry's answer for one goal, or `undefined` when not held. */
@@ -89,8 +91,9 @@ export const unionAgentSessions = (
       subject: goal.goalName,
       subjectId: goal.goalId,
       harnessInstanceId: goal.harnessInstanceId,
-      // Only a conversation this process holds can say; `goal_sessions` records no model.
-      model: live ? held.model : null,
+      // What the registry holds if it holds this session, else what the row recorded. Null is a
+      // row written before `0030`, which stored no model and is not backfilled with a guess.
+      model: live ? held.model : goal.model,
       startedAt: goal.openedAt,
       // A goal conversation has no ending of its own: the goal's status is its authority and
       // ending a goal interrupts nothing (`plan/goalConversation.ts`). So a goal row is live

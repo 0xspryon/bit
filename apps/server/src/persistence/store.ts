@@ -6448,10 +6448,11 @@ const makeStore = Effect.fnUntraced(function* () {
     Result: Schema.Struct({
       harness_session_id: Schema.String,
       harness_instance_id: Schema.NullOr(Schema.String),
+      model: Schema.NullOr(Schema.String),
       opened_at: Schema.Finite,
     }),
     execute: (goalId) =>
-      sql`SELECT harness_session_id, harness_instance_id, opened_at
+      sql`SELECT harness_session_id, harness_instance_id, model, opened_at
           FROM goal_sessions WHERE goal_id = ${goalId}`,
   });
 
@@ -6480,6 +6481,7 @@ const makeStore = Effect.fnUntraced(function* () {
       onSome: (value) => ({
         harnessSessionId: value.harness_session_id,
         harnessInstanceId: value.harness_instance_id,
+        model: value.model,
         openedAt: value.opened_at,
       }),
     });
@@ -6501,17 +6503,19 @@ const makeStore = Effect.fnUntraced(function* () {
       readonly targetId: string;
       readonly harnessSessionId: string;
       readonly harnessInstanceId: string | null;
+      readonly model: string;
     }) {
       const now = yield* Clock.currentTimeMillis;
       yield* sql`INSERT INTO goal_sessions (
-            goal_id, target_id, harness_session_id, harness_instance_id, opened_at
+            goal_id, target_id, harness_session_id, harness_instance_id, model, opened_at
           ) VALUES (
             ${input.goalId}, ${input.targetId}, ${input.harnessSessionId},
-            ${input.harnessInstanceId}, ${now}
+            ${input.harnessInstanceId}, ${input.model}, ${now}
           )
           ON CONFLICT(goal_id) DO UPDATE SET
             harness_session_id = excluded.harness_session_id,
             harness_instance_id = excluded.harness_instance_id,
+            model = excluded.model,
             opened_at = excluded.opened_at`.pipe(
         Effect.mapError(asDatabaseError("query")),
       );
@@ -6526,6 +6530,8 @@ const makeStore = Effect.fnUntraced(function* () {
     description: Schema.String,
     harness_session_id: Schema.String,
     harness_instance_id: Schema.NullOr(Schema.String),
+    /** `provider/model`, or `NULL` on a row written before `0030`. */
+    model: Schema.NullOr(Schema.String),
     opened_at: Schema.Finite,
     /**
      * The goal's own status, read along the join this already makes (S7).
@@ -6546,6 +6552,7 @@ const makeStore = Effect.fnUntraced(function* () {
       sql`SELECT s.goal_id AS goal_id, g.name AS name, g.description AS description,
                  s.harness_session_id AS harness_session_id,
                  s.harness_instance_id AS harness_instance_id,
+                 s.model AS model,
                  s.opened_at AS opened_at, g.status AS status
           FROM goal_sessions s
           JOIN goals g ON g.id = s.goal_id
@@ -6558,9 +6565,8 @@ const makeStore = Effect.fnUntraced(function* () {
    * `goal_sessions` keeps the latest session only.
    *
    * **An index of the harness's storage, as {@link goalSession} is.** A row says a
-   * conversation was opened on that goal, never that one is live, and it holds no model:
-   * `0021` recorded the session and the instance and nothing else, so the model of a goal
-   * conversation this process no longer holds is not known here.
+   * conversation was opened on that goal, never that one is live. Its model is recorded
+   * (`0030`); a row written before that holds none, and reads `null` rather than a guess.
    */
   const goalSessionsForTarget = Effect.fn(
     "ObservationStore.goalSessionsForTarget",
@@ -6574,6 +6580,7 @@ const makeStore = Effect.fnUntraced(function* () {
       goalName: row.name === "" ? row.description : row.name,
       harnessSessionId: row.harness_session_id,
       harnessInstanceId: row.harness_instance_id,
+      model: row.model,
       openedAt: row.opened_at,
       goalStatus: row.status,
     }));
@@ -9226,6 +9233,8 @@ export class ObservationStore extends Context.Service<
       | {
           readonly harnessSessionId: string;
           readonly harnessInstanceId: string | null;
+          /** `null` on a row written before `0030`; never a guess. */
+          readonly model: string | null;
           readonly openedAt: number;
         }
       | undefined,
@@ -9237,10 +9246,13 @@ export class ObservationStore extends Context.Service<
       readonly targetId: string;
       readonly harnessSessionId: string;
       readonly harnessInstanceId: string | null;
+      /** `provider/model`, as the live registry reports it. */
+      readonly model: string;
     }) => Effect.Effect<void, DatabaseError>;
     /**
      * The goal conversations a target has opened, newest first (S8). Records of opening, not
-     * of liveness, and without a model: `goal_sessions` holds none.
+     * of liveness. `model` is what the conversation ran on, or `null` for a row written before
+     * `0030`, which recorded none.
      */
     readonly goalSessionsForTarget: (targetId: string) => Effect.Effect<
       readonly {
@@ -9248,6 +9260,7 @@ export class ObservationStore extends Context.Service<
         readonly goalName: string;
         readonly harnessSessionId: string;
         readonly harnessInstanceId: string | null;
+        readonly model: string | null;
         readonly openedAt: number;
         /** The goal's status, for the restart sweep. See {@link GoalSessionListRow}. */
         readonly goalStatus: string;

@@ -73,8 +73,9 @@ export const AgentSessionView = Schema.Struct({
   harnessInstanceId: Schema.NullOr(Schema.String),
   /**
    * The model as `provider/model`, or null when it is not known. Null is a goal conversation
-   * this process does not hold: `goal_sessions` (`0021`) records the session and the instance
-   * and no model, so only a live one can say.
+   * whose row was written before `0030` (`goal_sessions` recorded the session and the
+   * instance and no model until then) and which this process does not hold; those are not
+   * backfilled with a guess.
    */
   model: Schema.NullOr(Schema.String),
   /** When the session was opened, in epoch milliseconds. */
