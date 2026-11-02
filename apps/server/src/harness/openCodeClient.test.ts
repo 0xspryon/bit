@@ -21,6 +21,8 @@ import { FetchHttpClient } from "effect/http";
 
 import {
   AgentHarness,
+  lastAssistantText,
+  type MessageEntry,
   NARRATION_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
 } from "./agentHarness";
@@ -1316,5 +1318,216 @@ describe("the context limit the picker reads", () => {
     // And no threshold either, for the same reason: both come out of the entry that could
     // not be read, and a mark drawn at a made-up number is worse than no mark.
     expect(instance.models[0]?.compactionAt).toBeUndefined();
+  });
+});
+
+/**
+ * `messages` against a fake that pages the way OpenCode's `message.list` does.
+ *
+ * The fake reimplements the three behaviours of `packages/server/src/handlers/message.ts`
+ * that this seam has to survive, because a stub that simply answered "the whole list" would
+ * have passed against the code that shipped the defect:
+ *
+ * - **No `order` means newest first**, and no `limit` means 50.
+ * - **The order rides in the cursor**, and a request that names both a cursor and an order
+ *   is refused (`InvalidCursorError`, 400).
+ * - **`cursor.next` is present on every non-empty page**, including the last, so the end of
+ *   the list is an empty page rather than a missing cursor.
+ *
+ * Captured shapes are from a live `opencode` 2.2.5 (2026-11-02).
+ */
+describe("reading a session's messages", () => {
+  /** Ids sort like the server's own: a fixed prefix, then a counter in a sortable form. */
+  const messageId = (at: number): string =>
+    `msg_${at.toString(16).padStart(12, "0")}${"A".repeat(14)}`;
+
+  type Said = { readonly role: "user" | "assistant"; readonly text: string };
+
+  const wire = (said: Said, at: number): Record<string, unknown> =>
+    said.role === "user"
+      ? {
+          id: messageId(at),
+          time: { created: 1_793_577_000_000 + at },
+          text: said.text,
+          type: "user",
+        }
+      : {
+          id: messageId(at),
+          time: {
+            created: 1_793_577_000_000 + at,
+            completed: 1_793_577_000_001 + at,
+          },
+          type: "assistant",
+          agent: "build",
+          model: { id: "big-pickle", providerID: "opencode" },
+          content: [{ type: "text", text: said.text }],
+          finish: "stop",
+          rawFinish: "stop",
+          cost: 0,
+          tokens: {
+            input: 1,
+            output: 1,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        };
+
+  interface PagingOptions {
+    /** The most the server will return per page, whatever `limit` asked for. */
+    readonly serverCap?: number;
+    /** Hand back a cursor whose page is never empty, as a broken server would. */
+    readonly neverEnds?: boolean;
+  }
+
+  /** Builds the fake: oldest-first `said`, answered the way `message.list` answers. */
+  const pagingServer = (said: readonly Said[], options: PagingOptions = {}) => {
+    const stored = said.map((entry, at) => wire(entry, at));
+    const encode = (at: number, order: string, direction: string) =>
+      Buffer.from(
+        JSON.stringify({ id: messageId(at), order, direction }),
+      ).toString("base64url");
+    const requests: URL[] = [];
+    const stub = (url: string): Promise<Response> => {
+      if (!url.includes("/message")) return json({ data: [] });
+      const query = new URL(url);
+      requests.push(query);
+      const cursor = query.searchParams.get("cursor");
+      const askedOrder = query.searchParams.get("order");
+      if (cursor !== null && askedOrder !== null) {
+        return json(
+          {
+            _tag: "InvalidCursorError",
+            message: "Cursor cannot be combined with order",
+          },
+          400,
+        );
+      }
+      const decoded = cursor
+        ? (JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as {
+            id: string;
+            order: string;
+          })
+        : undefined;
+      const order = decoded?.order ?? askedOrder ?? "desc";
+      const limit = Math.min(
+        Number(query.searchParams.get("limit") ?? 50),
+        options.serverCap ?? Number.POSITIVE_INFINITY,
+      );
+      const indexes = stored.map((_, at) => at);
+      const ordered = order === "asc" ? indexes : indexes.reverse();
+      const from =
+        decoded === undefined
+          ? 0
+          : ordered.findIndex((at) => messageId(at) === decoded.id) + 1;
+      const page = options.neverEnds
+        ? [ordered[0] ?? 0]
+        : ordered.slice(from, from + limit);
+      const last = page.at(-1);
+      return json({
+        data: page.map((at) => stored[at]),
+        cursor: {
+          previous:
+            page[0] === undefined ? null : encode(page[0], order, "previous"),
+          next: last === undefined ? null : encode(last, order, "next"),
+        },
+      });
+    };
+    return { stub, requests };
+  };
+
+  const read = (
+    server: ReturnType<typeof pagingServer>,
+  ): Promise<readonly MessageEntry[]> => {
+    const { layer } = clientWith((url) => server.stub(url));
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (client) => client.messages("ses_1")),
+          layer,
+        ),
+      ),
+    );
+  };
+
+  /** 450 messages: more than the server's 50 default and more than two 200-row pages. */
+  const longSession = (): Said[] => [
+    { role: "user", text: "begin" },
+    { role: "assistant", text: "FIRST reply" },
+    ...Array.from({ length: 445 }, (_, at): Said => ({
+      role: "user",
+      text: `filler ${String(at)}`,
+    })),
+    { role: "assistant", text: "SECOND to last reply" },
+    { role: "user", text: "and now the report" },
+    { role: "assistant", text: "FINAL report" },
+  ];
+
+  test("a session past one page comes back oldest first and complete", async () => {
+    const said = longSession();
+    const server = pagingServer(said);
+    const entries = await read(server);
+    // Every message, in the order it was said. Against the bare call this is the newest 50
+    // reversed; against a first page only it is 200.
+    expect(entries.map((entry) => entry.text)).toEqual(
+      said.map((entry) => entry.text),
+    );
+    expect(entries.map((entry) => entry.type)).toEqual(
+      said.map((entry) => entry.role),
+    );
+  });
+
+  test("the first page names the order and the later pages carry only the cursor", async () => {
+    const server = pagingServer(longSession());
+    await read(server);
+    const [first, ...rest] = server.requests;
+    expect(first?.searchParams.get("order")).toBe("asc");
+    expect(first?.searchParams.get("cursor")).toBeNull();
+    // 450 rows at 200 a page is three full-or-part pages, and one empty page to say so.
+    expect(rest.length).toBe(3);
+    for (const page of rest) {
+      expect(page.searchParams.get("cursor")).not.toBeNull();
+      // The server refuses both together, so this is also what keeps the walk alive.
+      expect(page.searchParams.get("order")).toBeNull();
+    }
+    // The server's own maximum, not its default of 50.
+    for (const page of server.requests) {
+      expect(page.searchParams.get("limit")).toBe("200");
+    }
+  });
+
+  test("a page shorter than the limit is not taken for the last one", async () => {
+    // A server may cap `limit` below what was asked. Reading a short page as the end would
+    // stop at 120 of 450 and say nothing.
+    const said = longSession();
+    const entries = await read(pagingServer(said, { serverCap: 120 }));
+    expect(entries).toHaveLength(said.length);
+    expect(entries.at(-1)?.text).toBe("FINAL report");
+  });
+
+  test("the last thing the assistant said is found, not the oldest it said inside the window", async () => {
+    const entries = await read(pagingServer(longSession()));
+    // Newest-first, the newest 50 hold two replies and a scan from the end lands on the
+    // earlier of them; truncated to the oldest 50 it would land on FIRST.
+    expect(lastAssistantText(entries)).toBe("FINAL report");
+  });
+
+  test("a cursor that never runs out fails rather than returning a truncated list", async () => {
+    const { layer } = clientWith((url) =>
+      pagingServer(longSession(), { neverEnds: true }).stub(url),
+    );
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (client) => client.messages("ses_1")),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(result.failure._tag).toBe("HarnessDecodeError");
+    }
   });
 });

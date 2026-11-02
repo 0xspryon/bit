@@ -611,6 +611,15 @@ const flatten = (entry: unknown): MessageEntry => {
 };
 
 /**
+ * Messages asked for per `message.list` page: the server's own maximum
+ * (`SessionMessagesQuery`: `limit` is 1..200), so a long session costs the fewest requests.
+ */
+const MESSAGE_PAGE_SIZE = 200;
+
+/** Pages walked before `messages` gives up loudly. See that function for why it fails. */
+const MESSAGE_PAGE_CEILING = 500;
+
+/**
  * Per-operation request bounds.
  *
  * These bound *our* transport, nothing else. `wait` is deliberately absent from the
@@ -1120,15 +1129,70 @@ export const openCodeHarness = (
         };
       });
 
+      /**
+       * The session's messages, oldest first, all of them.
+       *
+       * ## Why this asks for an order and walks the cursor
+       *
+       * `message.list` with no arguments answers **the newest 50, newest first**
+       * (`packages/server/src/handlers/message.ts`: `order ?? "desc"`, `limit ?? 50`).
+       * This used to call it bare and map the one page it got back, so for any session
+       * past 50 messages the seam returned a silently truncated, reversed list - and
+       * `lastAssistantText`, which scans from the end, read the *oldest* reply it was
+       * given. Confirmed against a live `opencode` 2.2.5 on 2026-11-02: a session of 246
+       * messages answered 50, newest first, and the scope importer's helper named an
+       * earlier reply than the last one.
+       *
+       * - **`order: "asc"` is sent, not assumed.** The default has already changed once
+       *   (commit `fe0c4f8c74`, 2026-06-06), and a default is not a promise.
+       * - **The cursor is followed to the end, inside this function.** The seam promises
+       *   `readonly MessageEntry[]`, and every caller - the transcript, both narrations,
+       *   the importer's report - reads that as the whole log. Putting the cursor on the
+       *   seam would make each of them page, and Claude Code has no cursor to offer. The
+       *   cost of doing it here is that a very long session is buffered whole before any
+       *   caller sees a byte, which `run/transcript.ts` already states as true of the
+       *   fetch, and which each caller bounds on its own side.
+       * - **Only the first page carries `order`.** The server refuses a request that has
+       *   both a `cursor` and an `order` (`InvalidCursorError`): the order is encoded in
+       *   the cursor, so every later page inherits it.
+       * - **The end is an empty page, not a short one.** A server is free to cap `limit`
+       *   below what was asked, and a short page would then be mistaken for the last. It
+       *   costs one extra request.
+       * - **A ceiling that fails, rather than a cap that truncates.** A cursor that never
+       *   runs dry would otherwise loop for ever. Past {@link MESSAGE_PAGE_CEILING} pages
+       *   this reports a decode failure, because a silent stop is exactly the defect this
+       *   replaces.
+       *
+       * Each page is bounded by the control timeout on its own; a caller that wants the
+       * whole walk bounded wraps the call, as the transcript and narration paths do.
+       */
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(
         "openCodeHarness.messages",
       )(function* (sessionId) {
-        const listed = yield* bounded(
-          "message.list",
-          timeouts.control,
-          api.message.list({ sessionID: sessionId as Session.ID }),
-        );
-        return listed.data.map(flatten);
+        const entries: MessageEntry[] = [];
+        let cursor: string | undefined;
+        for (let page = 0; page < MESSAGE_PAGE_CEILING; page += 1) {
+          const listed = yield* bounded(
+            "message.list",
+            timeouts.control,
+            api.message.list({
+              sessionID: sessionId as Session.ID,
+              limit: MESSAGE_PAGE_SIZE,
+              ...(cursor === undefined ? { order: "asc" } : { cursor }),
+            }),
+          );
+          if (listed.data.length === 0) return entries;
+          for (const entry of listed.data) entries.push(flatten(entry));
+          const next = listed.cursor.next;
+          if (typeof next !== "string") return entries;
+          cursor = next;
+        }
+        return yield* new HarnessDecodeError({
+          operation: "message.list",
+          status: undefined,
+          detail: `the cursor did not run out in ${String(MESSAGE_PAGE_CEILING)} pages of ${String(MESSAGE_PAGE_SIZE)}; stopped rather than return a truncated list`,
+          cause: undefined,
+        });
       });
 
       const interruptSession: AgentHarness["Service"]["interruptSession"] =
