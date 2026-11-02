@@ -30,6 +30,7 @@ import {
   openCodeToolName,
 } from "@bit/contracts";
 import type {
+  AgentSessionView,
   AssetView,
   AttemptTranscript,
   FolderListing,
@@ -224,6 +225,24 @@ export const importerSessionView = (
   endedReason: null,
   importId: "imp_1",
   tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+  ...over,
+});
+
+/** One row of the Agent sessions list: a dormant goal conversation unless a test says otherwise. */
+export const agentSessionView = (
+  over: Partial<AgentSessionView> = {},
+): AgentSessionView => ({
+  kind: "goal",
+  key: "goal:goal_1",
+  sessionId: "ses_goal_1",
+  subject: "Find auth bypasses",
+  subjectId: "goal_1",
+  harnessInstanceId: "opencode",
+  model: null,
+  startedAt: AT,
+  state: "dormant",
+  detail: null,
+  tally: null,
   ...over,
 });
 
@@ -1166,6 +1185,10 @@ export class FakeServer implements ServerClient {
   onImporterModel: (baseUrl: string) => Answer<"importerModel"> = () =>
     ok(importerModelView());
 
+  onAgentSessions: (
+    ...args: Parameters<ServerClient["agentSessions"]>
+  ) => Answer<"agentSessions"> = () => ok({ sessions: [], workersOmitted: 0 });
+
   onImporterSessions: (
     ...args: Parameters<ServerClient["importerSessions"]>
   ) => Answer<"importerSessions"> = () => ok({ sessions: [] });
@@ -1358,6 +1381,9 @@ export class FakeServer implements ServerClient {
     this.record("importerModel", [baseUrl], () =>
       this.onImporterModel(baseUrl),
     );
+
+  agentSessions = (...args: Parameters<ServerClient["agentSessions"]>) =>
+    this.record("agentSessions", args, () => this.onAgentSessions(...args));
 
   importerSessions = (...args: Parameters<ServerClient["importerSessions"]>) =>
     this.record("importerSessions", args, () =>

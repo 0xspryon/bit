@@ -6479,6 +6479,129 @@ const makeStore = Effect.fnUntraced(function* () {
     },
   );
 
+  /* ── Two more kinds of session, listed for "Agent sessions" (S8) ───────────── */
+
+  const GoalSessionListRow = Schema.Struct({
+    goal_id: Schema.String,
+    name: Schema.String,
+    description: Schema.String,
+    harness_session_id: Schema.String,
+    harness_instance_id: Schema.NullOr(Schema.String),
+    opened_at: Schema.Finite,
+  });
+
+  const selectGoalSessionsForTarget = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: GoalSessionListRow,
+    execute: (targetId) =>
+      sql`SELECT s.goal_id AS goal_id, g.name AS name, g.description AS description,
+                 s.harness_session_id AS harness_session_id,
+                 s.harness_instance_id AS harness_instance_id,
+                 s.opened_at AS opened_at
+          FROM goal_sessions s
+          JOIN goals g ON g.id = s.goal_id
+          WHERE s.target_id = ${targetId}
+          ORDER BY s.opened_at DESC, s.goal_id DESC`,
+  });
+
+  /**
+   * The goal conversations a target has opened, newest first: one per goal, because
+   * `goal_sessions` keeps the latest session only.
+   *
+   * **An index of the harness's storage, as {@link goalSession} is.** A row says a
+   * conversation was opened on that goal, never that one is live, and it holds no model:
+   * `0021` recorded the session and the instance and nothing else, so the model of a goal
+   * conversation this process no longer holds is not known here.
+   */
+  const goalSessionsForTarget = Effect.fn(
+    "ObservationStore.goalSessionsForTarget",
+  )(function* (targetId: string) {
+    const rows = yield* selectGoalSessionsForTarget(targetId).pipe(
+      Effect.mapError(lift("goal_sessions", targetId)),
+    );
+    return rows.map((row) => ({
+      goalId: row.goal_id,
+      // A goal minted before `0013` is unnamed, and its objective is what it is called.
+      goalName: row.name === "" ? row.description : row.name,
+      harnessSessionId: row.harness_session_id,
+      harnessInstanceId: row.harness_instance_id,
+      openedAt: row.opened_at,
+    }));
+  });
+
+  const WorkerSessionListRow = Schema.Struct({
+    attempt_id: Schema.String,
+    question: Schema.String,
+    worker_id: Schema.String,
+    harness_session_id: Schema.String,
+    harness_instance_id: Schema.NullOr(Schema.String),
+    provider_id: Schema.String,
+    model_id: Schema.String,
+    status: Schema.String,
+    started_at: Schema.Finite,
+    ended_at: Schema.NullOr(Schema.Finite),
+  });
+
+  const selectWorkerSessionsForTarget = SqlSchema.findAll({
+    Request: Schema.Struct({ targetId: Schema.String, limit: Schema.Int }),
+    Result: WorkerSessionListRow,
+    execute: ({ targetId, limit }) =>
+      sql`SELECT a.id AS attempt_id, i.question AS question, a.worker_id AS worker_id,
+                 a.harness_session_id AS harness_session_id,
+                 a.harness_instance_id AS harness_instance_id,
+                 a.provider_id AS provider_id, a.model_id AS model_id,
+                 a.status AS status, a.started_at AS started_at, a.ended_at AS ended_at
+          FROM attempts a
+          JOIN intents i ON i.id = a.intent_id
+          WHERE a.target_id = ${targetId} AND a.harness_session_id IS NOT NULL
+          ORDER BY a.started_at DESC, a.id DESC
+          LIMIT ${limit}`,
+  });
+
+  const selectWorkerSessionCount = SqlSchema.findOne({
+    Request: Schema.String,
+    Result: Schema.Struct({ total: Schema.Finite }),
+    execute: (targetId) =>
+      sql`SELECT COUNT(*) AS total FROM attempts
+          WHERE target_id = ${targetId} AND harness_session_id IS NOT NULL`,
+  });
+
+  /**
+   * The harness sessions a target's worker attempts have run on, newest first, at most
+   * `limit` of them, with how many more there are.
+   *
+   * **A worker session is an attempt, one for one**: an attempt is prompted once on a session
+   * it created, and records which (`harness_session_id`, null until the session exists —
+   * those rows are not sessions yet and are not listed). It is the one kind whose rows
+   * accumulate with every intent the dispatcher runs, which is why this is bounded and the
+   * goal and import reads are not: they grow by an operator's action, this grows by the
+   * hunt's.
+   */
+  const workerSessionsForTarget = Effect.fn(
+    "ObservationStore.workerSessionsForTarget",
+  )(function* (targetId: string, limit: number) {
+    const rows = yield* selectWorkerSessionsForTarget({ targetId, limit }).pipe(
+      Effect.mapError(lift("attempts", targetId)),
+    );
+    const counted = yield* selectWorkerSessionCount(targetId).pipe(
+      Effect.mapError(lift("attempts", targetId)),
+    );
+    return {
+      sessions: rows.map((row) => ({
+        attemptId: row.attempt_id,
+        question: row.question,
+        workerId: row.worker_id,
+        harnessSessionId: row.harness_session_id,
+        harnessInstanceId: row.harness_instance_id,
+        model: `${row.provider_id}/${row.model_id}`,
+        status: row.status,
+        startedAt: row.started_at,
+        endedAt: row.ended_at,
+      })),
+      total: counted.total,
+    };
+  });
+
   /* ── The scope importer's sessions ─────────────────────────────────────────── */
 
   const ImportSessionRow = Schema.Struct({
@@ -8188,6 +8311,8 @@ const makeStore = Effect.fnUntraced(function* () {
     steerReceipt,
     goalSession,
     recordGoalSession,
+    goalSessionsForTarget,
+    workerSessionsForTarget,
     importSessions,
     recordImportSession,
     recordImportPages,
@@ -8794,6 +8919,45 @@ export class ObservationStore extends Context.Service<
       readonly harnessSessionId: string;
       readonly harnessInstanceId: string | null;
     }) => Effect.Effect<void, DatabaseError>;
+    /**
+     * The goal conversations a target has opened, newest first (S8). Records of opening, not
+     * of liveness, and without a model: `goal_sessions` holds none.
+     */
+    readonly goalSessionsForTarget: (targetId: string) => Effect.Effect<
+      readonly {
+        readonly goalId: string;
+        readonly goalName: string;
+        readonly harnessSessionId: string;
+        readonly harnessInstanceId: string | null;
+        readonly openedAt: number;
+      }[],
+      DatabaseError | StoredRowError
+    >;
+    /**
+     * The harness sessions a target's worker attempts ran on, newest first and bounded by
+     * `limit`, with the number of such sessions in all (S8). An attempt with no session yet
+     * is not one.
+     */
+    readonly workerSessionsForTarget: (
+      targetId: string,
+      limit: number,
+    ) => Effect.Effect<
+      {
+        readonly sessions: readonly {
+          readonly attemptId: string;
+          readonly question: string;
+          readonly workerId: string;
+          readonly harnessSessionId: string;
+          readonly harnessInstanceId: string | null;
+          readonly model: string;
+          readonly status: string;
+          readonly startedAt: number;
+          readonly endedAt: number | null;
+        }[];
+        readonly total: number;
+      },
+      DatabaseError | StoredRowError
+    >;
     /**
      * The harness sessions this target's scope imports have run on **and the harness confirmed
      * creating**, newest first, each with what it wrote.

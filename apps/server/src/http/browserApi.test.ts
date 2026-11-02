@@ -5190,3 +5190,240 @@ describe("a target's assets", () => {
     });
   });
 });
+
+/**
+ * The agent-sessions route: every long-running agent session on a target, of every kind that
+ * has an index, folded into one list at read time (importer-conversation design, S8).
+ *
+ * Seeded with `bun:sqlite` rows because what is under test is the union — that three indexes
+ * with different subjects and different evidence of liveness come out as one ordered list,
+ * scoped to one target, with `live` read from this process's registries and from nothing
+ * stored. `persistence/agentSessionStore.test.ts` runs the two new reads' SQL against the
+ * real schema.
+ */
+describe("a target's agent sessions", () => {
+  const mixed = "agents-mixed";
+  const quiet = "agents-none";
+  const other = "agents-other";
+
+  const register = async (name: string) => {
+    mkdirSync(join(workspaceRoot, name), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: {
+          workspacePath: join(workspaceRoot, name),
+          name,
+          scopeNote: "",
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+  };
+
+  const seedMixed = (targetId: string, tag: string, base: number) => {
+    const database = new Database(
+      join(fleetRoot, "targets", targetId, HUNT_FILE),
+    );
+    try {
+      // An import session whose run this process holds as running (`LIVE_IMPORT_ID`) is
+      // only seeded on the target that owns it; the other target's import is ended.
+      database.run(
+        `INSERT INTO import_sessions (
+           import_id, target_id, harness_session_id, harness_instance_id, model,
+           caller_scope, opened_at, session_created_at, ended_at, ended_reason
+         ) VALUES (?, ?, ?, 'opencode', 'openai/gpt-5.6-sol', ?, ?, ?, ?, ?)`,
+        tag === "main"
+          ? [
+              LIVE_IMPORT_ID,
+              targetId,
+              `ses_import_${tag}`,
+              `${targetId}/import/${LIVE_IMPORT_ID}`,
+              base + 10,
+              base + 11,
+              null,
+              null,
+            ]
+          : [
+              `imp_${tag}`,
+              targetId,
+              `ses_import_${tag}`,
+              `${targetId}/import/imp_${tag}`,
+              base + 10,
+              base + 11,
+              base + 50,
+              "operator",
+            ],
+      );
+      database.run(
+        `INSERT INTO goals (id, target_id, description, created_at, name, status)
+         VALUES (?, ?, 'Find auth bypasses in the billing API', ?, ?, 'active')`,
+        [`goal_${tag}`, targetId, base, `Billing auth ${tag}`],
+      );
+      database.run(
+        `INSERT INTO goal_sessions (
+           goal_id, target_id, harness_session_id, harness_instance_id, opened_at
+         ) VALUES (?, ?, ?, 'claude-code', ?)`,
+        [`goal_${tag}`, targetId, `ses_goal_${tag}`, base + 20],
+      );
+      database.run(
+        `INSERT INTO intents (id, goal_id, target_id, question, created_at)
+         VALUES (?, ?, ?, 'Does /invoices accept another tenant id?', ?)`,
+        [`intent_${tag}`, `goal_${tag}`, targetId, base + 25],
+      );
+      const attempt = (
+        id: string,
+        session: string | null,
+        status: string,
+        startedAt: number,
+      ) =>
+        database.run(
+          `INSERT INTO attempts (
+             id, intent_id, target_id, worker_id, harness_session_id, provider_id,
+             model_id, status, started_at, ended_at
+           ) VALUES (?, ?, ?, 'worker_1', ?, 'anthropic', 'sonnet-5', ?, ?, ?)`,
+          [
+            id,
+            `intent_${tag}`,
+            targetId,
+            session,
+            status,
+            startedAt,
+            status === "running" ? null : startedAt + 5,
+          ],
+        );
+      attempt(`att_run_${tag}`, `ses_worker_run_${tag}`, "running", base + 30);
+      attempt(`att_done_${tag}`, `ses_worker_done_${tag}`, "failed", base + 28);
+      // Claimed before its session existed: a row, but not yet a session.
+      attempt(`att_early_${tag}`, null, "running", base + 40);
+    } finally {
+      database.close();
+    }
+  };
+
+  beforeAll(async () => {
+    await register(mixed);
+    await register(quiet);
+    await register(other);
+    seedMixed(mixed, "main", 1_000);
+    seedMixed(other, "elsewhere", 9_000);
+  });
+
+  test("unions the goal, importer and worker sessions into one list, newest first", async () => {
+    const response = await read(
+      await signedIn(`/targets/${mixed}/agent-sessions`),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      workersOmitted: 0,
+      sessions: [
+        {
+          kind: "worker",
+          key: "worker:att_run_main",
+          sessionId: "ses_worker_run_main",
+          subject: "Does /invoices accept another tenant id?",
+          subjectId: "att_run_main",
+          harnessInstanceId: null,
+          model: "anthropic/sonnet-5",
+          startedAt: 1_030,
+          state: "live",
+          detail: "running",
+          tally: null,
+        },
+        {
+          kind: "worker",
+          key: "worker:att_done_main",
+          sessionId: "ses_worker_done_main",
+          subject: "Does /invoices accept another tenant id?",
+          subjectId: "att_done_main",
+          harnessInstanceId: null,
+          model: "anthropic/sonnet-5",
+          startedAt: 1_028,
+          state: "ended",
+          detail: "failed",
+          tally: null,
+        },
+        {
+          // `GoalConversations.unavailable` holds nothing: a recorded conversation this
+          // process cannot reach reads dormant, and its model is not known.
+          kind: "goal",
+          key: "goal:goal_main",
+          sessionId: "ses_goal_main",
+          subject: "Billing auth main",
+          subjectId: "goal_main",
+          harnessInstanceId: "claude-code",
+          model: null,
+          startedAt: 1_020,
+          state: "dormant",
+          detail: null,
+          tally: null,
+        },
+        {
+          kind: "importer",
+          key: `importer:${LIVE_IMPORT_ID}`,
+          sessionId: "ses_import_main",
+          subject: "Scope import",
+          subjectId: LIVE_IMPORT_ID,
+          harnessInstanceId: "opencode",
+          model: "openai/gpt-5.6-sol",
+          startedAt: 1_010,
+          // This process holds LIVE_IMPORT_ID as running, and nothing stored says so.
+          state: "live",
+          detail: null,
+          tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+        },
+      ],
+    });
+  });
+
+  test("an attempt that has no session yet is not listed as one", async () => {
+    const response = await read(
+      await signedIn(`/targets/${mixed}/agent-sessions`),
+    );
+    expect(JSON.stringify(response.body)).not.toContain("att_early_main");
+  });
+
+  test("an ended import reads ended, with the reason beside it", async () => {
+    const response = await read(
+      await signedIn(`/targets/${other}/agent-sessions`),
+    );
+    expect(response.status).toBe(200);
+    const sessions = response.body["sessions"] as readonly {
+      readonly kind: string;
+      readonly state: string;
+      readonly detail: string | null;
+    }[];
+    expect(sessions.find((s) => s.kind === "importer")).toMatchObject({
+      state: "ended",
+      detail: "operator",
+    });
+  });
+
+  test("another target's sessions are not in it", async () => {
+    const response = await read(
+      await signedIn(`/targets/${mixed}/agent-sessions`),
+    );
+    expect(JSON.stringify(response.body)).not.toContain("elsewhere");
+  });
+
+  test("a target with no sessions answers with an empty list", async () => {
+    const response = await read(
+      await signedIn(`/targets/${quiet}/agent-sessions`),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ sessions: [], workersOmitted: 0 });
+  });
+
+  test("an unknown target is refused rather than answered empty", async () => {
+    const response = await read(
+      await signedIn("/targets/not-a-target/agent-sessions"),
+    );
+    expect(response.status).toBe(404);
+    expect(response.body["_tag"]).toBe("TargetNotFound");
+  });
+
+  test("it needs a session, like every other fleet route", async () => {
+    const response = await call(`/targets/${mixed}/agent-sessions`);
+    expect(response.status).toBe(401);
+  });
+});

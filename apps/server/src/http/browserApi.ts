@@ -88,6 +88,7 @@ import {
   listFolder,
 } from "./folders";
 import { BrowserSessions } from "./browserSessions";
+import { unionAgentSessions, WORKER_SESSIONS_LISTED } from "./agentSessions";
 import {
   DEFAULT_GOAL_BRIEFING_MAX_CHARS,
   buildGoalBriefing,
@@ -1612,6 +1613,46 @@ const fleetHandlers = HttpApiBuilder.group(
           })),
           truncated: read.truncated,
         } satisfies AttemptTranscript;
+      }),
+
+      /**
+       * Every long-running agent session on this target, of every kind that has an index.
+       *
+       * **A read-time union** (`http/agentSessions.ts`): the goal, importer and worker indexes
+       * are read from this target's own file and folded into one shape, and what this process
+       * holds is asked of its own registries — the goal conversations' and the importer's —
+       * because liveness is stored nowhere. All three ids a registry is asked about were read
+       * off this target's rows, so no other target's session can be answered for.
+       */
+      agentSessions: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const read = yield* withTargetStore(stores, row.targetId, (store) =>
+          Effect.all({
+            goals: store.goalSessionsForTarget(row.targetId),
+            importers: store.importSessions(row.targetId),
+            workers: store.workerSessionsForTarget(
+              row.targetId,
+              WORKER_SESSIONS_LISTED,
+            ),
+          }),
+        ).pipe(Effect.orDie);
+        const importers = yield* Effect.forEach(read.importers, (session) =>
+          Effect.map(
+            Effect.forEach(session.importIds, (importId) =>
+              importer.view(importId),
+            ),
+            (views) => ({
+              ...session,
+              running: views.some((view) => view?.status === "running"),
+            }),
+          ),
+        );
+        return unionAgentSessions({
+          goals: read.goals,
+          goalLive: conversations.live,
+          importers,
+          workers: read.workers,
+        });
       }),
 
       /**

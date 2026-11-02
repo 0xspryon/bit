@@ -263,6 +263,17 @@ export class GoalConversations extends Context.Service<
       readonly fetchTimeout?: Duration.Input | undefined;
     }) => Effect.Effect<GoalConversationView>;
     /**
+     * The session this process holds for a goal's conversation right now, or `undefined`.
+     *
+     * Synchronous and read-only: it looks at the registry and opens, prompts and closes
+     * nothing. It is what lets a list say "live" about a conversation without asking the
+     * harness, and it is the one place a goal conversation's model is known — `goal_sessions`
+     * does not record it. An entry still being opened is reported: it holds a credential.
+     */
+    readonly live: (
+      goalId: string,
+    ) => { readonly sessionId: string; readonly model: string } | undefined;
+    /**
      * Gives up on one goal's conversation: interrupts its narration, closes its scope and
      * revokes its credential. Idempotent, and safe for a goal with no live conversation.
      *
@@ -360,6 +371,7 @@ export class GoalConversations extends Context.Service<
               }),
             ),
           ),
+        live: () => undefined,
         close: () => Effect.void,
         /*
          * No harness, so no gate installer, so no directory an agent may be given files in.
@@ -1165,6 +1177,12 @@ const make = Effect.fnUntraced(function* () {
     // The surface's intentional close. The goal surface records no ending of its own (the
     // goal's status is its authority), so the reason reaches nothing yet.
     close: (goalId) => sessions.close(goalId, "operator"),
+    live: (goalId) => {
+      const held = sessions.get(goalId);
+      return held === undefined
+        ? undefined
+        : { sessionId: held.sessionId, model: held.model };
+    },
     attach,
   });
 });

@@ -67,6 +67,7 @@ import {
   RoundNotFound,
   RunningRound,
 } from "./plan";
+import { AgentSessionsView } from "./agentSessions";
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
 import {
@@ -1491,6 +1492,17 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         error: [TargetNotFound, TargetUnavailable],
       },
     ),
+    /**
+     * Every long-running agent session this target has, of any kind, newest first.
+     *
+     * **A read-time union** of the goal, importer and worker indexes; there is no table behind
+     * it. See {@link AgentSessionsView}.
+     */
+    HttpApiEndpoint.get("agentSessions", "/targets/:targetId/agent-sessions", {
+      params: { targetId: Schema.String },
+      success: AgentSessionsView,
+      error: [TargetNotFound, TargetUnavailable],
+    }),
     /**
      * Opens a conversation with the importer: a new session, the operator's message its
      * first turn. Answers once the session has the message, with the new import's id.

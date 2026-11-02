@@ -814,6 +814,17 @@ export const server = {
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.importerModel())),
 
   /**
+   * Every long-running agent session on this target, of any kind, newest first. A read-time
+   * union on the server: there is no table of "agent sessions" behind it.
+   */
+  agentSessions: (baseUrl: string, targetId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.agentSessions({ params: { targetId } }),
+      ),
+    ),
+
+  /**
    * The harness sessions this target's imports have run on, newest first, with what each
    * wrote. An index of the harness's storage: nothing that was said in them.
    */

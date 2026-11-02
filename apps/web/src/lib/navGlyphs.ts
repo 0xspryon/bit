@@ -11,6 +11,7 @@ import {
   IconEye,
   IconGoal,
   IconList,
+  IconRobot,
   IconSearch,
   IconUser,
 } from "./icons";
@@ -24,4 +25,5 @@ export const navGlyphs: Record<string, typeof IconGoal> = {
   workers: IconUser,
   blockers: IconBlocked,
   events: IconList,
+  "agent-sessions": IconRobot,
 };

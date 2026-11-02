@@ -40,6 +40,7 @@ import {
   type GoalObservationView,
   type GoalUploadView,
   type GoalView,
+  type AgentSessionView,
   type HarnessInstanceView,
   type ImporterModelView,
   type ImporterSessionView,
@@ -459,6 +460,26 @@ export class App {
   goalsDetail = $state("");
   /** The goal being looked at, or `""` for the list. */
   openGoalId = $state("");
+
+  /* ── The Agent sessions list (importer conversation design, S8) ───────────── */
+
+  /**
+   * Every long-running agent session on the open target, of every kind, as the server
+   * unions them. One target's at a time: {@link agentSessionsTargetId} says whose, and the
+   * screen draws nothing that disagrees with {@link viewTargetId}.
+   */
+  agentSessions = $state<readonly AgentSessionView[]>([]);
+  /** Worker sessions the server held back to bound the list; the screen says so. */
+  agentSessionsWorkersOmitted = $state(0);
+  agentSessionsTargetId = $state("");
+  agentSessionsState = $state<AssetsState>("idle");
+  agentSessionsDetail = $state("");
+  /**
+   * Why the last click on a row went nowhere, or `""`. The one case is an importer session
+   * the importer's own index no longer lists, which `openImporter` would otherwise answer
+   * by opening an empty page.
+   */
+  agentSessionsNote = $state("");
 
   /* ── The estate, and the scope that frames it ──────────────────────────────── */
 
@@ -2043,6 +2064,12 @@ export class App {
       void this.loadScope(this.viewTargetId);
       void this.loadImporterSessions(this.viewTargetId);
     }
+    // Read on every visit: "what is running right now" is the one question this list answers.
+    if (id === "agent-sessions" && this.viewTargetId !== "") {
+      this.agentSessionsNote = "";
+      void this.loadHarnesses();
+      void this.loadAgentSessions(this.viewTargetId);
+    }
   }
 
   /** Back above target scope, to every target. */
@@ -2715,6 +2742,85 @@ export class App {
     // so a reloaded tab knows at once whether a round is in flight rather than finding out
     // when the button is refused.
     void this.loadRunningRounds();
+  }
+
+  /**
+   * Reads the open target's agent sessions.
+   *
+   * `loadAssets`' discipline: another target's sessions are dropped before the read goes out
+   * and a late answer for a target we have left is ignored. A failed read keeps nothing from
+   * the last one, because unlike the importer's index this list *is* the answer to "what is
+   * running", and a stale one would be a wrong answer rather than a stale pointer.
+   */
+  async loadAgentSessions(id: string) {
+    if (this.viewTargetId !== id) return;
+    if (this.agentSessionsTargetId !== id) {
+      this.agentSessions = [];
+      this.agentSessionsWorkersOmitted = 0;
+      this.agentSessionsTargetId = id;
+    }
+    this.agentSessionsState = "loading";
+    this.agentSessionsDetail = "";
+
+    const call = await this.client.agentSessions(this.serverUrl, id);
+    if (this.viewTargetId !== id) return;
+
+    if (call._tag === "Unreachable") {
+      this.agentSessionsState = "failed";
+      this.agentSessionsDetail = "No server answered at this address.";
+      return;
+    }
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+        return;
+      }
+      this.agentSessionsState = "failed";
+      this.agentSessionsDetail = this.#refusalText(
+        call.error,
+        "This target's agent sessions could not be read.",
+      );
+      return;
+    }
+    this.agentSessions = call.value.sessions;
+    this.agentSessionsWorkersOmitted = call.value.workersOmitted;
+    this.agentSessionsState = "ready";
+  }
+
+  /**
+   * Opens the importer on one session, from the Agent sessions list. `false` when it could
+   * not, with {@link agentSessionsNote} saying so.
+   *
+   * **In-memory navigation, and a stopgap**: see `AgentSessions.svelte` on the deep link this
+   * stands in for. `openImporter(sessionId)` selects a session only if the importer's own
+   * index already holds it and otherwise opens the page on an empty one, so the index is read
+   * first when it does not hold the session, and the click goes nowhere rather than land on
+   * the wrong thing if it still does not.
+   */
+  async openImporterSession(sessionId: string): Promise<boolean> {
+    const targetId = this.viewTargetId;
+    if (targetId === "") return false;
+    const held = () =>
+      this.importerIndexTargetId === targetId &&
+      this.importerIndex.some((view) => view.sessionId === sessionId);
+    if (!held()) await this.loadImporterSessions(targetId);
+    if (this.viewTargetId !== targetId) return false;
+    if (!held()) {
+      this.agentSessionsNote =
+        "That importer session is no longer in the importer's own list, so there is nothing to open it on.";
+      return false;
+    }
+    this.agentSessionsNote = "";
+    this.toSection("assets");
+    this.openImporter(sessionId);
+    return true;
+  }
+
+  /** Opens a goal's page, where its conversation is. In-memory navigation, as above. */
+  openGoalConversation(goalId: string) {
+    this.agentSessionsNote = "";
+    this.toSection("goals");
+    this.openGoal(goalId);
   }
 
   closeGoal() {

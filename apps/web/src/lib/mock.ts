@@ -185,6 +185,7 @@ export const navGroups: ReadonlyArray<{
         attention: true,
       },
       { id: "events", label: "Event log", icon: "events" },
+      { id: "agent-sessions", label: "Agent sessions", icon: "agent-sessions" },
     ],
   },
 ];

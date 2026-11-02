@@ -33,6 +33,7 @@
   import Button from "../components/Button.svelte";
   import ComposeBox from "../components/ComposeBox.svelte";
   import Goal from "./Goal.svelte";
+  import AgentSessions from "./AgentSessions.svelte";
   import Assets from "./Assets.svelte";
   import AutoLoad from "./AutoLoad.svelte";
   import Goals from "./Goals.svelte";
@@ -86,6 +87,8 @@
       {:else}
         <Assets {app} />
       {/if}
+    {:else if app.navItem === "agent-sessions"}
+      <AgentSessions {app} />
     {:else}
       <PageFrame
         title={label}
