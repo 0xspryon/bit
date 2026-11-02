@@ -1124,6 +1124,7 @@ const continueInterrupted = (swept: readonly SweptTarget[]) =>
     let queued = 0;
     let sent = 0;
     let refused = 0;
+    let switchedOff = 0;
 
     for (const target of swept) {
       const row = yield* Effect.result(registry.target(target.targetId));
@@ -1139,6 +1140,7 @@ const continueInterrupted = (swept: readonly SweptTarget[]) =>
         targetId: target.targetId,
       });
       if (policy._tag === "off") {
+        switchedOff += 1;
         console.log(
           `startup continuation: ${target.targetId} — ${policy.detail}`,
         );
@@ -1267,10 +1269,19 @@ const continueInterrupted = (swept: readonly SweptTarget[]) =>
         );
       }
     }
+    /*
+     * Three sentences and not one, because "nothing was continued" has three different
+     * meanings and only one of them is the quiet success. A target this server was told not
+     * to continue may well have had work interrupted — saying nothing was interrupted there
+     * would be a claim this pass never established, which is the class of thing the whole
+     * slice is about.
+     */
     console.log(
-      queued === 0 && sent === 0 && refused === 0
-        ? "startup continuation: nothing was interrupted by the loss of a process, so nothing was continued"
-        : `startup continuation: ${String(queued)} queued, ${String(sent)} dispatched, ${String(refused)} not sent`,
+      queued > 0 || sent > 0 || refused > 0
+        ? `startup continuation: ${String(queued)} queued, ${String(sent)} dispatched, ${String(refused)} not sent`
+        : switchedOff > 0
+          ? `startup continuation: switched off for ${String(switchedOff)} target(s), so nothing was asked about or continued on ${switchedOff === 1 ? "it" : "them"}`
+          : "startup continuation: nothing was interrupted by the loss of a process, so nothing was continued",
     );
   });
 

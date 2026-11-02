@@ -773,6 +773,139 @@ Two things the continuation half inherits from it:
   definite answer can refine it. A continuation must therefore key off the _attempt_ being
   non-running, not off the row having been read once.
 
+### S7.6 — The second half, shipped: the turn that gets dispatched afterwards
+
+Done on 2 Nov 2026, on top of S7.5. The four open questions, each answered with the reason
+rather than a preference, and then the two things the live demonstration found.
+
+**How the summary is made: mechanically, from the harness, non-fatally.** A model call is
+wrong here for three reasons that compound — it spends money on the one path that runs when
+something has already gone wrong, possibly in a loop; it needs a harness, a model, a
+credential, a timeout and a cap of its own, which is the machinery this slice exists not to
+need twice; and it would **paraphrase evidence**, where a paraphrase that drops the one fact
+that mattered is indistinguishable to the reader from a transcript that never held it. So
+`summariseTranscript` counts the messages, quotes the dead attempt's last words bounded at
+1 200 characters with the cut marked, and carries the first error recorded against the
+session. It is worse prose than a model would write, which S7.4 predicted; what makes the
+trade sound is that the summary is **advisory and is not the record** — what the interrupted
+attempt established is in its observations, and the block says so in as many words.
+`readTranscriptSummary` answers `undefined` for every failure, and the block then says the
+transcript could not be read rather than going quiet.
+
+**The bound: three per chain in five minutes, counted off the queue.** T3 Code's number,
+taken as instructed. The chain is the thing that survives being continued, and it differs by
+surface: an intent for a worker (the attempt id changes by design, so counting attempts
+would never reach the cap), the goal id for a goal, and — honestly — the **target** for an
+importer conversation, because an import id names one authority period and the harness
+session id changes when a resume fails, so there is nothing else that persists. Two importer
+conversations on one target therefore share one cap; the thing being bounded is unattended
+spending on one engagement, so it fails in the safe direction.
+
+**Where the dispatcher lives: on the `0013` outbox, in two passes.** The sweep terminalizes
+and commits; `enqueueContinuations` writes an `agent.continuation.requested` event and an
+`agent.continue` row; `dispatchContinuations` sends the turns. The split is what makes
+S7.1's ordering structural rather than a matter of statement order — the second pass takes
+the sweep's own conclusions as its argument, so it cannot be called about an attempt nothing
+terminalized, and `openReplacementAttempt` refuses a `running` predecessor as the durable
+backstop. `agent.continue` is `reconcile_first` and that policy is implemented rather than
+declared: a row left `in_flight` by a dead dispatcher is **failed, never re-sent**, because
+whether the turn arrived is genuinely unknown and the next sweep re-asks the harness instead.
+
+**The switch: on by default, global and per target, in `control.sqlite`'s `settings`.**
+`CONTINUATION=0|1` stores it, as `BIT_PASSWORD` stores the browser password. The value is
+decoded against the closed pair `on`/`off`, so `"true"`, `"1"`, `"yes"` and a typo are all
+refusals — and so is a setting that could not be read at all, which is the last done
+criterion: a server that cannot tell what it was told does not prompt a model.
+`CONTINUE_ON_START=0` skips the pass for one boot without storing anything.
+
+Nothing added here reads `report.narrated`. The continuation decision is taken from
+`HarnessSessionStatus.of` — rank 1 — and the `settlement.ts` defect S7a recorded one rank
+down is neither touched nor relied on.
+
+#### The live demonstration
+
+A real import conversation on `zai-coding-plan/glm-5.3-flash`, a graceful restart **mid
+turn**, and the continuation dispatched and answered. The whole cycle, from the boot log of
+the second process:
+
+```
+startup reconciliation: no attempt or planner round was left unsettled across 1 target(s)
+  acme: importer conversation imp_1a19d4afb52…  session=ses_e62b504adffe…  continuation=queued as out_000001
+        the harness knows this session, is running no turn on it and recorded no outcome, so its last
+        turn was interrupted by the loss of the process that owned it — …
+  acme: out_000001  importer conversation imp_1a19d4afb52…  outcome=succeeded
+        import imp_1a19d4bdd29… (resumed) on session ses_e62b504adffe…
+startup continuation: 1 queued, 1 dispatched, 0 not sent
+```
+
+The durable trace behind those two lines, read out of the file: one `outbox` row
+(`agent.continue`, `reconcile_first`, `succeeded`, `attempts: 1`) whose `caused_by_event_id`
+is the `agent.continuation.requested` event, and two `import_sessions` rows on **one**
+`harness_session_id` — the second with no ending, which is the new authority period.
+
+What the agent did with it is the part worth quoting, because it is the property S7.1 is
+about. Its interrupted reply was cut off at `1. **Does`; after the continuation it answered:
+
+> Scope state checked: **0 entries** — nothing was recorded before the restart, which
+> matches where we were … the cut-off turn was mid-way through this written answer, not
+> mid-recording. Carrying on from the beginning, since only the first heading of item 1 had
+> appeared.
+
+It read `read_scope` before writing, as the synthetic message asks, and it knew what had and
+had not happened. The operator's switch was then exercised on the same database: with
+`CONTINUATION=0` the boot logged `startup continuation: acme — continuation is switched off
+by the setting 'continuation'` and queued nothing at all, and with `CONTINUATION=1` the
+next boot read the setting back and carried on.
+
+`spike/continuationSummaryProbe.ts` is the summary half against the same real transcript, for
+a session the probe's own process never opened: ten messages, four of them the agent's, the
+last reply quoted and cut at the cap, and OpenCode's own `Step interrupted` carried as the
+error — plus the `undefined` path, where the block says the transcript could not be read.
+
+**The worker handoff was not demonstrated live**, and the reason is the API rather than the
+code: nothing creates an intent over HTTP (the planner and the goal agent do), so a live
+worker continuation needs a planner round first. It is covered against real SQLite instead —
+`run/supervisor.test.ts` asserts the new identity, the `replaces_attempt_id` link, the
+untouched predecessor, the claim moving to the replacement, the summary above the question
+and the question still last, plus both refusals — and `recovery/continuationDispatcher.test.ts`
+drives sweep → queue → dispatch over a real file.
+
+#### What the demonstration found, and neither of these is fixed here
+
+**1. On Claude Code nothing is continued after a restart.** `claudeCodeClient.sessionStatus`
+_fails_ for any session this process does not hold — the SDK's live query dies with the
+process that spawned it and there is no re-attach — so `harnessStatus.ts` answers `missing`
+or `unreachable`, and both are refusals. The conversation is still there (
+`sessionContinuation` answers `resumable` off the transcript, which is what S6 shipped), so
+what is missing is only the _liveness_ half. The fix is for that driver to answer
+`{ activity: "idle", outcome: undefined }` for a transcript it still holds, which is honest
+now that `activity` exists and was not expressible before it; it is a driver change with its
+own tests and it is named here rather than smuggled into this slice.
+
+**2. OpenCode's stale `idle_outcome` means a conversation past its first completed turn is
+not continued either.** Found by running the demonstration a second time on the same
+session. `Execution.Started` updates `time_busy` and **never clears `idle_outcome`**, which
+S7a's own notes record; its fix was to drop the outcome while `activity` is `running`, and
+after a restart nothing is running — so turn one's `succeeded` is believed about turn two.
+The row, read live after a restart that interrupted a second turn:
+
+```
+time_idle    1793640432141     <- turn one went idle here
+time_busy    1793640472326     <- turn two started here, after it
+idle_outcome succeeded         <- turn one's, never cleared
+```
+
+`sessionStatus` therefore answers `succeeded`, `continuationTrigger` says "the harness
+stated how this session's last turn ended", and the interrupted second turn is left alone.
+It fails in the safe direction — under-continuing rather than prompting a model about work
+that may have finished — but it narrows S7 to conversations interrupted on their **first**
+turn, which is not what this slice assumed. Two candidate fixes, neither taken here because
+both change what rank 1 answers and so what an attempt or a round _settles_ to, which this
+slice was told not to touch: have `openCodeClient` suppress a recorded outcome when
+`time.busy > time.idle` (an unknown-field read — the live server exposes `time.busy` and the
+pinned `@opencode/schema@2.1.0` does not, which is why S7a warned against building on those
+timestamps), or widen the seam so `SessionStatus` says _which turn_ its outcome belongs to.
+
 ### Done criteria
 
 - [x] On boot, every non-terminal run is terminalized with a reason naming the restart,
@@ -780,16 +913,28 @@ Two things the continuation half inherits from it:
       `attempt_recoveries` row (and in the `plan.round.settled` payload for a round),
       alongside `observed: "abandoned"`. _Pending permission requests do not apply: bit's
       policy gate decides allow/deny synchronously and holds no pending request to mark._
-- [ ] The importer and the goal conversation continue by resuming their session; a test covers
-      each.
-- [ ] A worker attempt continues by ending the old attempt and opening a new one; the new
+      The ordering is now asserted where it can be wrong: the dispatcher's test reads the
+      attempt row **at the moment the continuation is handed over** and requires it to have
+      left `running`.
+- [x] The importer and the goal conversation continue by resuming their session; a test covers
+      each. One resume and not two: S6's decision was extracted to
+      `harness/sessionReopen.ts`, the goal path asks it too — with the same directory check,
+      because the gate lives in the directory a session runs in — and the continuation goes
+      through each surface's ordinary `send`.
+- [x] A worker attempt continues by ending the old attempt and opening a new one; the new
       attempt's prompt carries a summary of the old one's transcript; a test covers the
-      end-to-new handoff.
-- [ ] The summary is read from the harness, not from a transcript we persist, and a failure to
-      produce it does not stop the continuation.
-- [ ] A chained-continuation cap exists and is tested against a crash loop.
-- [ ] The dispatcher rides the `0013` outbox.
-- [ ] Nothing continues on a guess: an unreadable setting means no continuation.
+      end-to-new handoff. `RunSupervisor.continueAttempt`, through
+      `openReplacementAttempt`, which refuses a predecessor that is still `running`.
+- [x] The summary is read from the harness, not from a transcript we persist, and a failure to
+      produce it does not stop the continuation. Verified live against a real transcript and
+      against both failure paths; the transcript writer §8 removed is not reinstated.
+- [x] A chained-continuation cap exists and is tested against a crash loop: four boots inside
+      the window, three dispatched and the fourth `cancelled` with the cap in its sentence.
+- [x] The dispatcher rides the `0013` outbox, and is the first thing that moves a row off
+      `pending`: lease, `attempts`, `status` and `last_error` all carry their stated meaning.
+- [x] Nothing continues on a guess: an unreadable setting means no continuation — and so does
+      an unreadable queued payload, an instance this server does not configure, and a harness
+      that could not be asked.
 
 ---
 
@@ -1007,6 +1152,19 @@ Left alone deliberately — this slice was not to change how an attempt or a rou
 beyond making its _recovery_ status honest. The fix would be to clear `report.narrated` when
 a steer is accepted, in both supervisors, which is a settlement change with its own tests to
 write.
+
+#### And the half of the stale outcome the `activity` field did not close
+
+**Found on 2 Nov 2026 by running S7's own live demonstration twice**, and recorded in full
+under S7.6. The fix above drops a recorded outcome while `activity` is `running`; after a
+restart nothing is running, so a multi-turn session reports **turn one's** outcome about
+turn two — `Execution.Started` updates `time_busy` and never clears `idle_outcome`. The
+consequence lands on the continuation rather than on recovery: such a session reads
+`succeeded`, so nothing was left half-finished as far as this seam can tell, and the
+interrupted turn is not carried on. It fails in the safe direction and it narrows S7 to
+conversations interrupted on their first turn. Left alone here for the same reason as the
+`narrated` defect above: both candidate fixes change what rank 1 answers, and therefore what
+an attempt or a round settles to.
 
 #### One limit, stated
 
