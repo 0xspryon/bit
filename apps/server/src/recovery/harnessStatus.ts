@@ -40,8 +40,15 @@ import { HarnessResolver } from "../harness/resolver";
  *   a reply we cannot decode, an attempt that ran on a harness instance this process
  *   does not configure, or one whose instance *is* configured and did not come up. The
  *   last two are why this takes an instance id at all; see {@link HarnessSessionStatus.of}.
+ * - `abandoned` — we asked, the harness knows the session, and it is running no turn on
+ *   it and has recorded no outcome for it. **This is the answer a restart produces**, and
+ *   it is the one the vocabulary was missing: the process that started the last turn is
+ *   gone, so nobody will ever write an outcome, and nothing here is entitled to say which
+ *   one it would have been. Distinct from `missing` because the conversation is still
+ *   there — it can be read, and on both drivers it can be carried on — and distinct from
+ *   `running` because it is not.
  *
- * All three of ours mean *uncertain*. They are kept apart because the operator reading
+ * All four of ours mean *uncertain*. They are kept apart because the operator reading
  * the recovery record needs to know which one it was.
  */
 export type HarnessObservedStatus =
@@ -51,7 +58,8 @@ export type HarnessObservedStatus =
   | "interrupted"
   | "unbound"
   | "missing"
-  | "unreachable";
+  | "unreachable"
+  | "abandoned";
 
 export interface HarnessSessionReport {
   readonly observed: HarnessObservedStatus;
@@ -89,10 +97,27 @@ export class HarnessSessionStatus extends Context.Service<
   /**
    * The live adapter over whichever harnesses this process configures.
    *
-   * Note what the branches mean. A session that exists but reports no outcome is
-   * genuinely still running, and is left alone. A session the harness has never heard of
-   * is `missing` — which after a restart is the expected answer, because a new harness
-   * process is not guaranteed to know an old process's sessions. An attempt whose instance
+   * Note what the branches mean. **A session that exists and reports no outcome is not
+   * assumed to be running**, and that sentence is the correction this function needed: it
+   * used to map "no outcome" straight onto `running`, which after a restart left the
+   * attempt row `running`, the write fence unmoved and the round untouched — the pile of
+   * stuck `running` rows this whole file exists to prevent, reached by believing a column
+   * that only a live process ever fills in. The harness now answers
+   * `SessionStatus.activity` separately from the outcome, and only `activity: "running"`
+   * is read as running; "idle with nothing recorded" is `abandoned`.
+   *
+   * **The order of the branches is part of that.** `activity` is checked first, so an
+   * outcome reported beside `running` is ignored rather than believed: on both drivers
+   * that outcome belongs to an earlier turn (OpenCode's `Execution.Started` never clears
+   * `idle_outcome`; Claude Code's pump overwrites `record.outcome` per `result`), and both
+   * drivers already drop it. Checking here as well means a third harness that forgets
+   * cannot report turn one's answer about turn two through this seam.
+   *
+   * A session the harness has never heard of is `missing`. The two drivers reach a restart
+   * from opposite sides and both end at `uncertain`: Claude Code *fails* for any session it
+   * does not hold, because the SDK's live query dies with the process that spawned it, so a
+   * restart there is `missing` or `unreachable`; OpenCode finds the row by primary key in
+   * the user's own SQLite file, so a restart there is `abandoned`. An attempt whose instance
    * this process cannot give a harness for is `unreachable` without anything being asked.
    * Anything else is `unreachable` too, including a decode failure: being unable to
    * understand the answer is not the same as being told nothing happened.
@@ -149,11 +174,17 @@ export class HarnessSessionStatus extends Context.Service<
               resolved.success.harness.sessionStatus(harnessSessionId),
             );
             if (result._tag === "Success") {
-              const outcome = result.success.outcome;
+              const { activity, outcome } = result.success;
+              if (activity === "running") {
+                return {
+                  observed: "running",
+                  detail: `session ${harnessSessionId} has a turn in flight in the harness process that holds it${outcome === undefined ? "" : `, so its recorded outcome '${outcome}' belongs to an earlier turn and was not read`}`,
+                } satisfies HarnessSessionReport;
+              }
               return outcome === undefined
                 ? ({
-                    observed: "running",
-                    detail: `session ${harnessSessionId} exists and has not reported a terminal outcome`,
+                    observed: "abandoned",
+                    detail: `session ${harnessSessionId} exists, has no turn in flight, and has never recorded a terminal outcome; the process that started its last turn is gone, so no outcome is coming and none can be inferred`,
                   } satisfies HarnessSessionReport)
                 : ({
                     observed: outcome,
@@ -187,6 +218,12 @@ export class HarnessSessionStatus extends Context.Service<
    * no way to ask a real server to be unreachable at a chosen moment). A session id with
    * no entry answers `missing`, which is what a real harness does with an id it has
    * never seen.
+   *
+   * It scripts {@link HarnessObservedStatus} and not the harness's own `SessionStatus`, so
+   * it bypasses the activity/outcome mapping entirely. That is deliberate — the mapping has its own
+   * tests against the live layer — but it means a sweep driven from here cannot be used to
+   * show what the drivers answer. `recovery/reconcile.test.ts` covers that against
+   * `HarnessSessionStatus.layer`.
    */
   static readonly fromAnswers = (
     answers: Readonly<Record<string, HarnessObservedStatus>>,

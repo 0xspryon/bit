@@ -131,7 +131,18 @@ export const stubHarness = (
     // a steer has to be able to say "that id had already been sent".
     prompt: () => Effect.succeed({ delivered: true }),
     waitForIdle: () => Effect.void,
-    sessionStatus: () => Effect.succeed({} satisfies SessionStatus),
+    /*
+     * Idle, with nothing recorded — which `recovery/harnessStatus.ts` reads as `abandoned`
+     * and so as `uncertain`.
+     *
+     * This used to be `{}`, and `{}` meant `running` because `activity` did not exist.
+     * `idle` is the dull answer *and* the safe one: a suite that does not script a status
+     * gets "we cannot say how this ended", never "it is still going" — which is the
+     * assumption that left real `running` rows behind. A test about a live turn says
+     * `activity: "running"`.
+     */
+    sessionStatus: () =>
+      Effect.succeed({ activity: "idle" } satisfies SessionStatus),
     /*
      * Resumable, with no directory stated.
      *

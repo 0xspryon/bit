@@ -699,11 +699,40 @@ removed the transcript writer at settlement (DECISIONS §8) and this does not br
   no dispatcher. This is what it is for.
 - **Whether the operator can turn it off**, per target or globally. T3 makes it a project
   setting defaulting on.
+- ~~**Whether `serve --stdio` attaches OpenCode's own `resumeSuspendedSessions` sweep.**~~
+  Settled: it does not. See "OpenCode sessions survive a restart" under Known defects.
+
+### S7.5 — The first half, shipped: terminalize-first actually terminalizes
+
+Done on 2 Nov 2026, as the half S7's continuation has to stand on. **No continuation was
+built**: no synthetic turn, no dispatcher, no cap.
+
+The property S7.1 asks for — nothing half-finished is ever presented as still running — was
+not true, because the sweep could not tell a restart from a live turn. Both drivers now
+answer "is a turn in flight" (`SessionStatus.activity`) separately from "how did the last
+turn end", `harnessStatus.ts` has a fourth answer of its own (`abandoned`) for a session
+that exists with nothing running it, and both the attempt and round vocabularies map that to
+`uncertain` — which moves the row, bumps the fence and revokes the credential. Reproduced
+live against a real restart mid-turn and covered by a real-SQLite sweep test. The full
+reasoning, the reproduction and the `serve --stdio` answer are under Known defects.
+
+Two things the continuation half inherits from it:
+
+- **`abandoned` is not `missing`.** The conversation is still there — the live probe read its
+  messages back and `sessionContinuation` answered `resumable` — which is exactly what the
+  importer and goal paths will resume. Keeping the two answers apart is what makes a
+  continuation decidable from a recovery record.
+- **`uncertain` is still swept.** It is an open question the sweep re-asks, so a later
+  definite answer can refine it. A continuation must therefore key off the _attempt_ being
+  non-running, not off the row having been read once.
 
 ### Done criteria
 
-- [ ] On boot, every non-terminal run is terminalized with a reason naming the restart, and
-      pending permission requests are marked not-resumable, **before** anything is continued.
+- [x] On boot, every non-terminal run is terminalized with a reason naming the restart,
+      **before** anything is continued. The reason is the harness's own sentence on the
+      `attempt_recoveries` row (and in the `plan.round.settled` payload for a round),
+      alongside `observed: "abandoned"`. _Pending permission requests do not apply: bit's
+      policy gate decides allow/deny synchronously and holds no pending request to mark._
 - [ ] The importer and the goal conversation continue by resuming their session; a test covers
       each.
 - [ ] A worker attempt continues by ending the old attempt and opening a new one; the new
@@ -809,49 +838,136 @@ restricting without checking which read path actually works would break imports;
 question applies to the planner, goal and worker sessions, which were never audited for it
 either. Do it with a live import to verify against, not blind.
 
-### OpenCode sessions survive a restart, and recovery assumes they do not
+### OpenCode sessions survive a restart — fixed in S7's first half
 
-**Confirmed against OpenCode's source during S2's review. Pre-existing, in worker and round
-recovery, and deliberately untouched by S2.**
+**Found during S2's review, confirmed against OpenCode's source during S3's, surfaced from
+the UI by S8, and reproduced live and fixed on 2 Nov 2026.** Kept here rather than deleted
+because the reasoning is what the continuation half of S7 rests on.
 
-`openCodeClient.ts`'s `sessionStatus` reads `session.outcome`, which OpenCode fills from
+`openCodeClient.ts`'s `sessionStatus` read `session.outcome`, which OpenCode fills from
 `session_v2.idle_outcome` — written only on a terminal execution event. Two paths therefore
-leave a session that exists with no outcome after a restart:
+left a session that exists with no outcome after a restart:
 
 - an unclean death, where no terminal event is ever written; and
-- a **graceful** shutdown, where the interrupt is tagged `reason: "shutdown"` and the projector
-  returns early without setting the outcome, deliberately, to support restart continuity.
+- a **graceful** shutdown, where `projectIdle` returns early for an
+  `Execution.Interrupted` whose `reason` is `"shutdown"`, writing neither `idle_outcome`
+  nor `time_idle`. `coordinator.interrupt`'s reason defaults to `"shutdown"`
+  (`core/src/session/execution.ts`, `terminal`'s `reason ?? "shutdown"`), so a server
+  tearing its own executions down records nothing — deliberately, to support OpenCode's own
+  restart continuity. An interrupt through the HTTP API is tagged `"user"` and does record.
 
-`harnessStatus.ts:152` maps "no outcome" to `running`, and reconciliation then records
-`still_running`: the attempt row stays `running`, the fence is not bumped, and a round is left
-alone. **That is the pile of stuck `running` rows recovery exists to prevent** — the same
-failure the Claude Code branch of that function carries a comment about, reached from the
-other side.
+`harnessStatus.ts` mapped "no outcome" to `running`, and reconciliation then recorded
+`still_running`: the attempt row stayed `running`, the fence was not bumped, and a round was
+left alone — so `openRound` refused every later round on that goal for ever. S8 put that row
+on a screen, where a stale `running` attempt read **Live**
+(`http/agentSessions.ts`: `attempt.status === "running" ? "live" : "ended"`).
 
-The reason it was invisible is the comment beside it, now corrected: it asserted that a
-restarted `opencode serve` has never heard of the old session. It has. Sessions are rows in one
-SQLite file under the user's XDG data dir, and a fresh server finds them by primary key.
+**The fix is a second question, not a cleverer reading of the first.** `SessionStatus` now
+carries a required `activity: "running" | "idle"` beside the optional `outcome`, and a
+caller may believe the outcome only while `activity` is `idle`. On OpenCode it comes from
+`GET /api/session/active` — _"foreground Session drains currently owned by this OpenCode
+process; sessions absent from the result are inactive"_, backed by `SessionExecution.active`
+— which is the server's own answer rather than an inference off `time_busy`/`time_idle`.
+The active set is read **before** the session row, so a turn that terminalises between the
+two reads is reported as still running rather than as abandoned: erring towards "ask again"
+is recoverable, erring towards "abandoned" fences a live attempt. On Claude Code it comes
+from the pump's `accepted`/`completed` pair, which `waitForIdle` already settles on.
+`harnessStatus.ts` grew a fourth answer of its own, `abandoned` — the session is there,
+nothing is running it, nothing ever recorded an outcome — which maps to `uncertain` for both
+attempts and rounds. It is deliberately not `interrupted`: that is a terminal answer a
+harness states, and nothing stated it.
 
-There is a worse possibility in the same area that is **not established**: OpenCode's own
-`resumeSuspendedSessions` sweep would continue a worker turn under a dead credential — the
-auto-continuation S7 explicitly rejects for workers. `process.ts` gates that sweep on a
-lifecycle and we spawn `serve --stdio`, which should not attach one, but `fetch.ts:49` forks it
-unconditionally, and which path `--stdio` takes was not established. **Settle this before S7.**
+**The smaller defect alongside it is fixed by the same field.** `Execution.Started` updates
+`time_busy` and never clears `idle_outcome`, so a multi-turn OpenCode session mid-turn-two
+reported turn one's outcome; Claude Code's pump overwrites `record.outcome` on each `result`
+and had the identical problem from the other side. Both drivers now drop the outcome while a
+turn is in flight, and `harnessStatus.ts` ignores one reported beside `activity: "running"`
+as well, so a third harness that forgets cannot answer about the wrong turn through that
+seam. It had not bitten because nothing read `sessionStatus` for importer or goal sessions
+— S6 shipped without reading it, deliberately, and added `AgentHarness.sessionContinuation`
+beside it instead — but worker attempts can be steered, so it was reachable.
 
-A second, smaller defect alongside it: `Execution.Started` updates `time_busy` but never clears
-`idle_outcome`, so a multi-turn OpenCode session mid-turn-two reports turn one's outcome.
-Nothing reads `sessionStatus` for importer or goal sessions today. **S6 shipped without
-reading it, deliberately**: "how did this session's last turn end" and "is this conversation
-still there to talk to" are two questions, the first is the one both drivers answer badly for a
-session from a dead process, and only the second is S6's. So S6 added
-`AgentHarness.sessionContinuation` beside `sessionStatus` rather than leaning on it — Claude
-Code answers it from the transcript's own metadata, OpenCode from `session.get`'s
-`location.directory` — and nothing in the importer's replay or reopen path reads an outcome.
-The defect is untouched and no wider. S7 is still where it is fixed.
+#### The live reproduction
 
-Suggested direction, not a decision: treat "no outcome while not busy in this process" as
-uncertain rather than `running`, deriving it from `time_busy`/`time_idle` and the execution
-claim.
+`spike/restartStatusProbe.ts`, run on 2 Nov 2026 against `opencode v2.2.5` and
+`zai-coding-plan/glm-5.3-flash`. One session, one real turn, server A closed gracefully
+**mid-turn**, server B spawned over the same database:
+
+```
+status while live (A)   {"activity":"running", ...}
+server A closed         gracefully, mid-turn
+GET /api/session/:id    {"data":{... "time":{"created":…,"updated":…,"busy":1793627661384} …}}
+GET /api/session/active {"data":{}}
+sessionStatus           {"activity":"idle", ...}            # no outcome field at all
+before this slice       running    -> attempt stays 'running', fence unmoved, still_running
+after this slice        abandoned  -> uncertain, fence bumped, credential revoked
+sessionContinuation     resumable
+messages still readable 2
+```
+
+And the same abandoned session, swept end to end through `spike/recoveryDemo.ts` — the
+real startup sweep over a real database with a freshly spawned server — before the fix and
+after it:
+
+```
+before   harness=running     status=running->running     disposition=still_running  fence=0->0
+after    harness=abandoned   status=running->uncertain   disposition=uncertain      fence=0->1
+```
+
+The row is the projector's signature exactly: `time.busy` set, `time.idle` **absent**, and
+no `outcome` key. The same session reported `activity: "running"` while its turn was in
+flight, which is the distinction that did not exist before. Note also that the live server
+exposes `time.busy` while the pinned `@opencode/schema@2.1.0` does not — another reason not
+to build the answer on those timestamps.
+
+#### `serve --stdio` does not attach OpenCode's own sweep — settled
+
+The open question S7 was told to settle before building on this. **It does not attach it**,
+and the gate is a `lifecycle`, not the mode:
+
+- `server/src/process.ts` calls `installRestartContinuity` — the one `forkScoped` of
+  `resumeSuspendedSessions` — inside `if (lifecycle)`.
+- `cli/src/server-process.ts` passes a `lifecycle` only when `serviceOptions !== undefined`,
+  and `serviceOptions` is read only for `options.mode === "service"`. All three modes
+  (`default`, `service`, `stdio`) otherwise share one `start`.
+- `server/src/fetch.ts:49` does fork it unconditionally, but that is `ServerFetch.make`, the
+  entry for embedders that hand requests in (workerd, Deno, `Bun.serve`, a test harness).
+  The CLI's `serve` never goes through it.
+
+We spawn `serve --stdio`, so OpenCode is **not** resuming our worker turns, and the
+auto-continuation S7 rejects for workers is not already happening behind us. The live probe
+agrees: server B's `/api/session/active` was `{}` with an unfinished turn sitting in the
+database.
+
+The corollary matters for the fix: because nothing resumes, "absent from `active`" really
+does mean "no turn of this session is running", and that is why the active set is a sound
+basis for the answer. If an upgrade ever attached that sweep under `--stdio`, `active` would
+start reporting our abandoned sessions as running again — which would be _honest_ (something
+would indeed be running them) and would make the credential problem the real one to solve.
+
+#### What this did _not_ fix: `narrated` has the same staleness one rank down
+
+`run/settlement.ts` ranks the harness's answer first and the **narration's** terminal event
+second. Both supervisors keep `narrated` as the last terminal `session.execution.*` the
+stream carried, and that is per-_stream_, not per-turn — so a round whose first turn
+terminalised and was then steered holds turn one's event in `narrated` while turn two runs.
+Suppressing the stale outcome at rank 1 therefore narrows the window rather than closing it:
+when narration is present it carries the same stale value, and the practical difference
+appears only when the stream dropped, where settlement now reaches `interrupted` (for a stop)
+or `uncertain` instead of asserting turn one's answer about turn two.
+
+Left alone deliberately — this slice was not to change how an attempt or a round settles
+beyond making its _recovery_ status honest. The fix would be to clear `report.narrated` when
+a steer is accepted, in both supervisors, which is a settlement change with its own tests to
+write.
+
+#### One limit, stated
+
+`session.active` reports drains owned by _this_ OpenCode process. The sessions live in one
+SQLite file under the user's XDG data directory, so a different `opencode` could in
+principle be executing a session of ours and our server would not see it. The answer would
+then be `abandoned` → `uncertain`: our authority revoked over work that may continue. That is
+the same disposition as an unreachable harness and the right direction to fail in.
 
 ## Deferred
 

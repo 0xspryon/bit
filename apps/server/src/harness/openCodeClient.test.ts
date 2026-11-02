@@ -143,6 +143,35 @@ const json = (body: unknown, status = 200) =>
     }),
   );
 
+/**
+ * `GET /api/session/active`'s answer: the sessions this OpenCode process is executing.
+ *
+ * The server's shape is a record keyed by session id whose only value is
+ * `{ type: "running" }`, and *absence is the answer* — "sessions absent from the result are
+ * inactive". So `activeSessions()` with no ids is a server running nothing, which is what a
+ * freshly spawned one is.
+ */
+const activeSessions = (...ids: readonly string[]) => ({
+  data: Object.fromEntries(ids.map((id) => [id, { type: "running" }])),
+});
+
+/**
+ * A transport for `sessionStatus`, which asks two questions and so needs two answers.
+ *
+ * Routed on the URL rather than answered uniformly, because the two reads decode different
+ * shapes: a `Session.Info` handed to the active-sessions decoder is a decode failure, which
+ * would make every test here fail for the wrong reason.
+ */
+const statusStub =
+  (answers: {
+    readonly active?: readonly string[];
+    readonly session?: Record<string, unknown>;
+  }) =>
+  (url: string) =>
+    url.includes("/api/session/active")
+      ? json(activeSessions(...(answers.active ?? [])))
+      : json(sessionInfo(answers.session));
+
 describe("session lineage", () => {
   /**
    * A planner round opened inside an existing lineage sends that session as its parent.
@@ -330,8 +359,8 @@ describe("typed decoding", () => {
   });
 
   test("a malformed outcome value in a status body is rejected", async () => {
-    const { layer } = clientWith(() =>
-      json(sessionInfo({ outcome: "probably fine" })),
+    const { layer } = clientWith(
+      statusStub({ session: { outcome: "probably fine" } }),
     );
     const result = await Effect.runPromise(
       Effect.scoped(
@@ -509,7 +538,7 @@ describe("requests", () => {
   });
 
   test("a session id with URL-significant characters is encoded", async () => {
-    const { layer, recorded } = clientWith(() => json(sessionInfo()));
+    const { layer, recorded } = clientWith(statusStub({}));
     await Effect.runPromise(
       Effect.scoped(
         Effect.provide(
@@ -522,7 +551,195 @@ describe("requests", () => {
         ),
       ),
     );
-    expect(recorded.urls[0]).toContain("ses%2F..%2Fadmin");
+    // `sessionStatus` reads the active set first and the session second; the id only ever
+    // reaches a path in the second, and that is the one that has to be encoded.
+    expect(recorded.urls).toHaveLength(2);
+    expect(recorded.urls[0]).toContain("/api/session/active");
+    expect(recorded.urls[0]).not.toContain("admin");
+    expect(recorded.urls[1]).toContain("ses%2F..%2Fadmin");
+  });
+});
+
+/* ── What became of a session ────────────────────────────────────────────────── */
+
+/**
+ * `sessionStatus`, and the recovery defect it used to carry.
+ *
+ * ## The two states `idle_outcome` cannot tell apart
+ *
+ * `session.get`'s `outcome` is `session_v2.idle_outcome`, written by OpenCode's projector
+ * (`core/src/session/projector.ts`) and only on a terminal execution event. Verified
+ * against that source:
+ *
+ * - `projectIdle` **returns early** for `Execution.Interrupted` when
+ *   `event.data.reason === "shutdown"`, writing neither `idle_outcome` nor `time_idle`.
+ *   `coordinator.interrupt`'s reason defaults to `"shutdown"`, so a server tearing its
+ *   executions down — which is every clean restart of the one we spawn — records nothing.
+ *   An interrupt through the HTTP API passes `"user"` and does record.
+ * - `Execution.Started` sets `time_busy` and leaves `idle_outcome` alone, so a session in
+ *   its second turn still reports the first turn's outcome.
+ *
+ * So "no outcome" covered both "a turn is running" and "a turn's process is gone", and
+ * this seam used to answer the first for both. `recovery/harnessStatus.ts` then recorded
+ * `still_running`: the attempt row stayed `running`, the write fence never moved, and
+ * nothing would look again.
+ *
+ * The fix is `GET /api/session/active` — *"foreground Session drains currently owned by
+ * this OpenCode process; sessions absent from the result are inactive"* — which is the
+ * server's own answer rather than an inference off timestamps.
+ */
+describe("what became of an opencode session", () => {
+  const statusOf = (
+    answers: {
+      readonly active?: readonly string[];
+      readonly session?: Record<string, unknown>;
+    },
+    sessionId = "ses_1",
+  ) => {
+    const { layer, recorded } = clientWith(statusStub(answers));
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.map(
+            Effect.flatMap(AgentHarness, (client) =>
+              client.sessionStatus(sessionId),
+            ),
+            (status) => ({ status, recorded }),
+          ),
+          layer,
+        ),
+      ),
+    );
+  };
+
+  /**
+   * The regression. This is exactly what a restarted server answers for a session whose
+   * turn it never finished: the row is found by primary key out of the one SQLite file
+   * under the user's data directory, and nothing is executing it.
+   */
+  test("a session that exists with no outcome after a restart is idle, not running", async () => {
+    const { status } = await statusOf({ active: [] });
+    expect(status.activity).toBe("idle");
+    expect(status.outcome).toBeUndefined();
+  });
+
+  test("a session the server is executing is running", async () => {
+    const { status } = await statusOf({ active: ["ses_1"] });
+    expect(status.activity).toBe("running");
+  });
+
+  /**
+   * Another session being busy says nothing about this one, which is the whole point of
+   * reading a record keyed by session id rather than a process-wide busy flag.
+   */
+  test("another session's turn does not make this one running", async () => {
+    const { status } = await statusOf({ active: ["ses_other"] });
+    expect(status.activity).toBe("idle");
+  });
+
+  /** `Execution.Started` never clears the column, so turn two holds turn one's answer. */
+  test("a live turn's status does not report the previous turn's outcome", async () => {
+    const { status } = await statusOf({
+      active: ["ses_1"],
+      session: { outcome: "succeeded" },
+    });
+    expect(status.activity).toBe("running");
+    expect(status.outcome).toBeUndefined();
+  });
+
+  test("an outcome on an idle session is reported, with its cost and tokens", async () => {
+    const { status } = await statusOf({
+      active: [],
+      session: {
+        outcome: "failed",
+        cost: 0.25,
+        tokens: {
+          input: 3,
+          output: 4,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+      },
+    });
+    expect(status.activity).toBe("idle");
+    expect(status.outcome).toBe("failed");
+    expect(status.cost).toBe(0.25);
+    expect(status.tokens).toMatchObject({ input: 3, output: 4 });
+  });
+
+  /**
+   * The order is load-bearing and is asserted, not assumed.
+   *
+   * Reading `active` *after* `get` would mean a turn that terminalises between the two
+   * reads is seen as "no outcome, nothing running it" — `abandoned`, which fences a live
+   * attempt. This way round the same race reads as still running, and recovery asks again.
+   */
+  test("the active set is read before the session row", async () => {
+    const { recorded } = await statusOf({ active: [] });
+    expect(recorded.urls).toHaveLength(2);
+    expect(recorded.urls[0]).toContain("/api/session/active");
+    expect(recorded.urls[1]).toContain("/api/session/ses_1");
+  });
+
+  /**
+   * A session the server does not have is still a `SessionNotFoundError` on the *second*
+   * read, and that has to survive the first one: `harnessStatus.ts` tells `missing` from
+   * `unreachable` by that tag, and a 404 swallowed into the active read would have made
+   * every forgotten session merely unreachable.
+   */
+  test("a 404 on the session row is still a SessionNotFoundError", async () => {
+    const { layer } = clientWith((url) =>
+      url.includes("/api/session/active")
+        ? json(activeSessions())
+        : json(
+            { _tag: "SessionNotFoundError", message: "no such session" },
+            404,
+          ),
+    );
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (client) =>
+              client.sessionStatus("ses_1"),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(result.failure._tag).toBe("HarnessTransportError");
+      if (result.failure._tag === "HarnessTransportError") {
+        expect(result.failure.status).toBe(404);
+      }
+    }
+  });
+
+  /** "We could not read the active set" must not read as "nothing is running". */
+  test("an unreadable active set fails rather than answering idle", async () => {
+    const { layer } = clientWith((url) =>
+      url.includes("/api/session/active")
+        ? json({ error: "boom" }, 503)
+        : json(sessionInfo()),
+    );
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (client) =>
+              client.sessionStatus("ses_1"),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(result.failure.operation).toBe("session.active");
+    }
   });
 });
 

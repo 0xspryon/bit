@@ -1623,8 +1623,26 @@ export const claudeCodeHarness = (
       )(function* (sessionId) {
         const record = sessions.get(sessionId);
         if (record !== undefined) {
+          /*
+           * A turn is in flight exactly when a message this session accepted has not
+           * produced its `result` yet, which is the pair `waitForIdle` already settles on
+           * (DECISIONS.md §24.1, consequence 4) rather than a second notion of liveness.
+           *
+           * **`record.outcome` is the *last completed* turn's**, set by the pump on every
+           * `result`, so a steered session in its second turn holds the first turn's
+           * answer while the second one runs. Suppressed here for that reason — the same
+           * defect `Execution.Started` leaves on the OpenCode driver, reached from this
+           * side by a mutable field rather than a column nobody clears. Nothing read this
+           * across turns before worker attempts could be steered, which is why it had not
+           * bitten.
+           *
+           * `closed` is checked too: a query that ended with messages still unanswered is
+           * not running, and `accepted > completed` alone would say it was for ever.
+           */
+          const running = !record.closed && record.completed < record.accepted;
           return {
-            outcome: record.outcome,
+            activity: running ? "running" : "idle",
+            outcome: running ? undefined : record.outcome,
             cost: record.cost,
             tokens: record.tokens,
           };

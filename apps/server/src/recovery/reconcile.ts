@@ -73,9 +73,16 @@ import {
  * The status one harness answer proposes for an attempt.
  *
  * The store decides what actually happens to the row — it applies the no-regression
- * rules — so this is a proposal, not a verdict. Three of the seven answers map onto
+ * rules — so this is a proposal, not a verdict. Four of the eight answers map onto
  * `uncertain`, and that is the point of the mapping: there is no path from "we do not
  * know" to a definite execution status.
+ *
+ * `abandoned` is the fourth and the newest: the harness knows the session, is running no
+ * turn on it and recorded no outcome. It is emphatically **not** `interrupted` — that is a
+ * terminal answer a harness states, and nothing stated it here. `uncertain` with the
+ * harness's own sentence beside it is what is actually in evidence, and unlike the
+ * `running` this used to propose, it moves the row, bumps the fence and revokes the
+ * credential.
  */
 export const mapObserved = (
   observed: HarnessObservedStatus,
@@ -92,6 +99,7 @@ export const mapObserved = (
     case "unbound":
     case "missing":
     case "unreachable":
+    case "abandoned":
       return "uncertain";
   }
 };
@@ -163,8 +171,12 @@ export const reconcileAttempt = Effect.fn("reconcileAttempt")(function* (
  *
  * - `running` + the harness still reports it live → left alone (`still_running`). This
  *   is the whole reason the sweep does not simply mark what it finds as interrupted.
+ *   "Live" is now the harness saying a turn is **in flight** (`SessionStatus.activity`),
+ *   not merely the absence of an outcome: an absent outcome is what a restart leaves, and
+ *   reading it as live was what left rows here for ever.
  * - `running` + a definite answer → settled, authority revoked.
- * - `running` + no answer → `uncertain`, authority revoked anyway.
+ * - `running` + no answer → `uncertain`, authority revoked anyway. This covers the
+ *   restart case (`abandoned`): the session is still there and nothing is running it.
  * - `uncertain` + a definite answer → `refined`. This is the case the previous
  *   running-only sweep could not reach.
  * - `uncertain` + the harness reporting it live → `unresumable`, and nothing is
@@ -235,9 +247,15 @@ export const releaseOrphanedClaims = Effect.fn("releaseOrphanedClaims")(
  *
  * `undefined` for `running`, which is the one answer that is **not** a proposal: the
  * harness says the session is still going, so there is nothing to record and the row is
- * left exactly as it is. The other six all end the round, and three of them end it
+ * left exactly as it is. The other seven all end the round, and four of them end it
  * `uncertain` — which is the point of the mapping: there is no path from "we do not know"
  * to a definite status.
+ *
+ * `abandoned` is one of those four, and it is the one that matters most here: before the
+ * harness answered `SessionStatus.activity`, a round whose server had restarted came back
+ * `running`, this returned `undefined`, and the round stayed `running` for ever — which
+ * means `openRound` refused every later round on that goal for ever. The round sweep's
+ * whole reason for existing was defeated by the one answer a restart actually produces.
  */
 export const mapObservedRound = (
   observed: HarnessObservedStatus,
@@ -256,6 +274,7 @@ export const mapObservedRound = (
     case "unbound":
     case "missing":
     case "unreachable":
+    case "abandoned":
       return "uncertain";
   }
 };

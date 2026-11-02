@@ -1133,9 +1133,74 @@ export const openCodeHarness = (
         );
       });
 
+      /**
+       * Whether a turn is in flight, and how the last completed one ended.
+       *
+       * ## Why this asks twice, and why `session.active` is asked first
+       *
+       * `session.get`'s `outcome` is `session_v2.idle_outcome`, and **two different
+       * states leave it unset or stale**, both verified against OpenCode's own projector
+       * (`core/src/session/projector.ts`):
+       *
+       * - `projectIdle` returns early for `Execution.Interrupted` with
+       *   `reason === "shutdown"`, writing neither the outcome nor `time_idle`. That is the
+       *   *graceful* path: `coordinator.interrupt` defaults its reason to `"shutdown"`, so
+       *   a server whose scope closes — ours, on every clean restart — tears its executions
+       *   down and records nothing. (An interrupt through the API is tagged `"user"` and
+       *   does write an outcome.) An unclean death writes nothing either, for the duller
+       *   reason that no event is ever published.
+       * - `Execution.Started` sets `time_busy` and **does not clear `idle_outcome`**, so a
+       *   session in its second turn reports the first turn's outcome.
+       *
+       * Reading `outcome` alone therefore answers "running" for a session nothing is
+       * running, and answers turn one for turn two. This used to do exactly that, and
+       * `recovery/harnessStatus.ts` turned the first of those into a `still_running`
+       * attempt row that nothing would ever settle.
+       *
+       * `GET /api/session/active` is the fix and it is the server's own answer rather than
+       * an inference: *"foreground Session drains currently owned by this OpenCode
+       * process. Sessions absent from the result are inactive"*, backed by
+       * `SessionExecution.active`, which snapshots the coordinator's live executions. A
+       * session the server is not executing is not running, whatever its row says — and a
+       * restarted server is executing nothing, because the sweep that would resume
+       * suspended sessions is attached only under `--service` (`server/src/process.ts`
+       * gates `installRestartContinuity` on a `lifecycle`, and `cli/src/server-process.ts`
+       * passes one only in service mode). We spawn `serve --stdio`.
+       *
+       * **The order is load-bearing.** `active` is read *before* `get`, so a turn that
+       * terminalises between the two reads is reported as still running rather than as a
+       * session with no outcome and nothing running it. That errs towards "ask again",
+       * which recovery is built for; the other order errs towards "abandoned", which
+       * fences a live attempt. The normal settle path is unaffected either way:
+       * `waitForIdle` is `session.wait`, which resolves on `awaitIdle` — "resolves once
+       * this process owns no active execution" — so by the time the supervisor asks, the
+       * session has already left `active` and the outcome it reads is the real one.
+       *
+       * Both reads are bounded on their own; a caller that wants the pair bounded wraps
+       * the call, as `run/supervisor.ts`'s settle does.
+       *
+       * One limit, stated because it is the honest reading of "owned by this OpenCode
+       * process": the sessions live in one SQLite file under the user's data directory, so
+       * a *different* opencode process could in principle be executing a session of ours
+       * and this server would not see it in `active`. The answer would then be "idle with
+       * no outcome", which reaches `uncertain` — our authority revoked over work that may
+       * continue. That is the same disposition as an unreachable harness and the right
+       * direction to fail in; the opposite assumption is the defect above.
+       */
       const sessionStatus: AgentHarness["Service"]["sessionStatus"] = Effect.fn(
         "openCodeHarness.sessionStatus",
       )(function* (sessionId) {
+        const active = yield* bounded(
+          "session.active",
+          timeouts.control,
+          api.session.active(),
+        );
+        // `Object.hasOwn` and not a property read: the answer is a record keyed by session
+        // id, and a decoded object still inherits `Object.prototype`, so a plain lookup
+        // would answer for a key like `constructor`. Session ids are `ses_`-prefixed and
+        // cannot collide today — this is the check that does not depend on that staying
+        // true. Presence *is* the answer: "sessions absent from the result are inactive".
+        const running = Object.hasOwn(active, sessionId);
         const session = yield* bounded(
           "session.get",
           timeouts.control,
@@ -1143,7 +1208,14 @@ export const openCodeHarness = (
         );
         const outcome = (session as { outcome?: unknown }).outcome;
         return {
-          outcome: Schema.is(TerminalOutcome)(outcome) ? outcome : undefined,
+          activity: running ? "running" : "idle",
+          // Dropped while a turn is in flight, because of `Execution.Started`: whatever is
+          // in the column belongs to a turn that has already finished, and reporting it
+          // would answer about the wrong turn.
+          outcome:
+            running || !Schema.is(TerminalOutcome)(outcome)
+              ? undefined
+              : outcome,
           cost: session.cost,
           tokens: session.tokens as Record<string, unknown> | undefined,
         };
@@ -1152,12 +1224,15 @@ export const openCodeHarness = (
       /**
        * Whether the server still has this session to prompt, and the directory it runs in.
        *
-       * **`session.get`, reading `location.directory` and deliberately not `outcome`.** The
-       * outcome field is the one the known OpenCode recovery defect turns on — a restarted
-       * server answers no outcome for a session that is not running, and `harnessStatus.ts`
-       * maps that to `running` — and nothing here touches it. The question asked is only
-       * whether the row is there, which is the question `session.prompt` will put to the
-       * same server a moment later.
+       * **`session.get`, reading `location.directory` and deliberately not `outcome`.**
+       * Nothing here touches the outcome, and that separation is still the right one even
+       * now that {@link sessionStatus} reads it honestly: "how did this session's last turn
+       * end" and "is this conversation still there to talk to" are two questions, and this
+       * one needs no active-sessions read at all. The question asked is only whether the row
+       * is there, which is the question `session.prompt` will put to the same server a
+       * moment later. (It used to be the *only* safe question, because `sessionStatus`
+       * answered "running" for a restarted server's idle session; that is fixed, and this
+       * is unchanged by the fix.)
        *
        * The directory is reported because it is the one thing that can make a resume fail
        * after the lookup succeeds: OpenCode resolves a prompt through the session's *stored*

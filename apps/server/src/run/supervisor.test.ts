@@ -265,7 +265,13 @@ const fakeClient = (
         return script.statusUnreachable === true
           ? Effect.fail(transport("session.get", "the harness is unreachable"))
           : Effect.succeed(
-              script.status === undefined ? {} : { outcome: script.status },
+              // `idle` either way: a supervisor asks this at settlement, after
+              // `waitForIdle` has returned, so the session it asks about is never mid-turn.
+              // A script with no status is a harness that stated no outcome, which is the
+              // `uncertain` path — not a live turn.
+              script.status === undefined
+                ? { activity: "idle" as const }
+                : { activity: "idle" as const, outcome: script.status },
             );
       },
       messages: () => Effect.succeed([]),

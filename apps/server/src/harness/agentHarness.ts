@@ -129,12 +129,48 @@ export const TerminalOutcome = Schema.Literals([
 export type TerminalOutcome = typeof TerminalOutcome.Type;
 
 /**
+ * Whether a turn is in flight on a session, in the process that would be running it.
+ *
+ * **This is the field that stops "no outcome" being read as "still running", and that
+ * mistake is why it exists.** `idle_outcome` on OpenCode and the pump's `outcome` on
+ * Claude Code are both written only when a turn reaches a terminal event, so an absent
+ * outcome covers two states that could not be more different: a turn that is running, and
+ * a turn whose process died without ever writing one. `recovery/harnessStatus.ts` used to
+ * collapse them into `running`, which left the attempt row `running`, the write fence
+ * unmoved and the round untouched — exactly the pile of stuck `running` rows recovery
+ * exists to prevent.
+ *
+ * So the two questions are asked separately. This one is "is a turn in flight", answered
+ * by whichever process holds the execution; {@link SessionStatus.outcome} is "how did the
+ * last completed turn end". A caller may only believe the outcome while this says `idle`.
+ *
+ * - `running` — a turn is in flight. The outcome, if any, belongs to an *earlier* turn and
+ *   must not be read; both drivers suppress it for that reason.
+ * - `idle` — no turn is in flight. An outcome here is the last turn's and is current; no
+ *   outcome here means no turn ever recorded one, which is **not** a terminal answer.
+ *
+ * **There is no third member for "cannot tell", deliberately.** A harness that cannot tell
+ * answers `idle`, which reaches `uncertain` through `harnessStatus.ts` — not `running`.
+ * Failing towards "we do not know" is recoverable; failing towards "still going" is the
+ * defect above.
+ */
+export type SessionActivity = "running" | "idle";
+
+/**
  * What the harness currently says about one session.
  *
- * Three fields, all optional, because every one of them is something a harness may simply
- * not know. `outcome` absent means "still running, or nothing definite" — never "failed".
+ * `activity` is **required** and the other three are optional, and that split is the
+ * point: cost, tokens and the outcome are each something a harness may simply not know,
+ * while "is a turn in flight" is the one thing the process holding the execution always
+ * knows and a reader can never infer. A third harness that forgets it does not compile,
+ * which is the only guard that would have caught {@link SessionActivity}'s defect.
+ *
+ * `outcome` absent means "no turn has recorded one" — never "failed", and never "still
+ * running" either: that is `activity`'s to say. An `outcome` reported alongside
+ * `activity: "running"` is a *stale* outcome from an earlier turn and callers ignore it.
  */
 export interface SessionStatus {
+  readonly activity: SessionActivity;
   readonly outcome?: TerminalOutcome | undefined;
   readonly cost?: number | undefined;
   readonly tokens?: Record<string, unknown> | undefined;
@@ -708,6 +744,19 @@ export class AgentHarness extends Context.Service<
     readonly waitForIdle: (
       sessionId: string,
     ) => Effect.Effect<void, HarnessFailure>;
+    /**
+     * Whether a turn is in flight on one session, and how the last completed one ended.
+     *
+     * **Two answers and not one**, which is {@link SessionActivity}'s whole reason for
+     * existing: an implementation establishes "is a turn in flight" from the execution it
+     * owns, and reports an outcome only when the answer is `idle`. Reporting an outcome
+     * beside `activity: "running"` is reporting an earlier turn's answer about the current
+     * one, and callers ignore it rather than trust it.
+     *
+     * An implementation that cannot answer at all fails, and `recovery/harnessStatus.ts`
+     * maps the failure to `missing` or `unreachable` — both `uncertain`. It must not
+     * invent `activity: "running"` to stand in for not knowing.
+     */
     readonly sessionStatus: (
       sessionId: string,
     ) => Effect.Effect<SessionStatus, HarnessFailure>;

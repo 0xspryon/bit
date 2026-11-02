@@ -33,7 +33,7 @@ import { join } from "node:path";
 
 import { Effect, Layer, Redacted } from "effect";
 
-import { AgentHarness } from "../harness/agentHarness";
+import { AgentHarness, type SessionStatus } from "../harness/agentHarness";
 import { HarnessResolver } from "../harness/resolver";
 import { stubHarness, STUB_INSTANCE } from "../harness/stubHarness";
 import {
@@ -1315,10 +1315,7 @@ const OPENCODE_INSTANCE = defaultInstanceIdForDriver(OPENCODE_DRIVER);
 describe("the live harness adapter's own mapping", () => {
   /** A client that answers one way, so the adapter's branches are the thing under test. */
   const clientLayer = (
-    answer: Effect.Effect<
-      { readonly outcome?: "succeeded" | "failed" | "interrupted" | undefined },
-      HarnessTransportError
-    >,
+    answer: Effect.Effect<SessionStatus, HarnessTransportError>,
   ) =>
     Layer.succeed(
       AgentHarness,
@@ -1331,10 +1328,7 @@ describe("the live harness adapter's own mapping", () => {
     );
 
   const observe = (
-    answer: Effect.Effect<
-      { readonly outcome?: "succeeded" | "failed" | "interrupted" | undefined },
-      HarnessTransportError
-    >,
+    answer: Effect.Effect<SessionStatus, HarnessTransportError>,
   ) =>
     Effect.runPromise(
       Effect.scoped(
@@ -1354,13 +1348,64 @@ describe("the live harness adapter's own mapping", () => {
       ),
     );
 
-  test("a session with no terminal outcome is still running", async () => {
-    const report = await observe(Effect.succeed({ outcome: undefined }));
+  /**
+   * The regression this whole slice is about, at the seam where it was wrong.
+   *
+   * This test used to read "a session with no terminal outcome is still running", and it
+   * passed, and it was the defect written down as an assertion. The answer below is
+   * exactly what OpenCode gives for a session whose server has been restarted: the row is
+   * there, nothing is executing it, and `idle_outcome` was never written — because
+   * `projectIdle` returns early for an interrupt tagged `reason: "shutdown"`, which is
+   * what a closing server's own teardown produces, and because an unclean death publishes
+   * no terminal event at all.
+   *
+   * Read as `running` it left the attempt row `running`, the write fence unmoved and the
+   * credential ungated, with nothing that would ever look again.
+   */
+  test("a session that exists with no outcome and nothing running it is abandoned, not running", async () => {
+    const report = await observe(
+      Effect.succeed({ activity: "idle", outcome: undefined }),
+    );
+    expect(report.observed).toBe("abandoned");
+    expect(report.observed).not.toBe("running");
+    // And it is `uncertain` in both vocabularies, never a definite status: nothing stated
+    // an outcome, so nothing here may propose one.
+    expect(mapObserved(report.observed)).toBe("uncertain");
+    expect(mapObservedRound(report.observed)).toBe("uncertain");
+    // The operator reading the recovery row has to be able to tell this from `missing`.
+    expect(report.detail).toContain("no turn in flight");
+  });
+
+  test("a turn in flight is running, and is left alone", async () => {
+    const report = await observe(Effect.succeed({ activity: "running" }));
     expect(report.observed).toBe("running");
+    expect(mapObserved(report.observed)).toBe("running");
+    // A round whose session is live is the one answer that writes nothing.
+    expect(mapObservedRound(report.observed)).toBeUndefined();
+  });
+
+  /**
+   * The second defect, defended at this seam as well as in each driver.
+   *
+   * OpenCode's `Execution.Started` sets `time_busy` and never clears `idle_outcome`, and
+   * Claude Code's pump overwrites `record.outcome` on each `result`, so on both drivers a
+   * session in its second turn *holds* the first turn's outcome. Both drivers now drop it,
+   * but this mapping must not depend on them remembering to: an outcome beside a turn in
+   * flight is an answer about a turn that is over, and recovery would settle the attempt
+   * on it.
+   */
+  test("an outcome reported beside a live turn is not read as that turn's outcome", async () => {
+    const report = await observe(
+      Effect.succeed({ activity: "running", outcome: "succeeded" }),
+    );
+    expect(report.observed).toBe("running");
+    expect(report.detail).toContain("belongs to an earlier turn");
   });
 
   test("a reported outcome is carried through verbatim", async () => {
-    const report = await observe(Effect.succeed({ outcome: "interrupted" }));
+    const report = await observe(
+      Effect.succeed({ activity: "idle", outcome: "interrupted" }),
+    );
     expect(report.observed).toBe("interrupted");
   });
 
@@ -1618,7 +1663,7 @@ describe("a planner round a process left running", () => {
   });
 
   /** Pure, so the whole state space is enumerable without a connection. */
-  test("the mapping has no `failed` in it, and three answers mean uncertain", () => {
+  test("the mapping has no `failed` in it, and four answers mean uncertain", () => {
     // `running` is the one answer that is not a proposal at all: nothing is recorded.
     expect(mapObservedRound("running")).toBeUndefined();
     // Both definite non-interrupted answers mean the same thing about a round, because a
@@ -1629,6 +1674,9 @@ describe("a planner round a process left running", () => {
     expect(mapObservedRound("unbound")).toBe("uncertain");
     expect(mapObservedRound("missing")).toBe("uncertain");
     expect(mapObservedRound("unreachable")).toBe("uncertain");
+    // The restart answer, and the one that matters most for a round: left `running`, the
+    // goal takes no further rounds for ever, because `openRound` refuses a second one.
+    expect(mapObservedRound("abandoned")).toBe("uncertain");
   });
 
   test("sweeps to uncertain when the harness cannot answer, and the goal takes a round again", async () => {
@@ -1860,5 +1908,192 @@ describe("a planner round a process left running", () => {
     expect(outcome.swept[0]?.revokedGrants).toBe(1);
     expect(outcome.resolved).toBeUndefined();
     expect(outcome.refused._tag).toBe("Failure");
+  });
+});
+
+/* ── S7.1: terminalize first, and the answer a restart actually gives ────────── */
+
+/**
+ * The property S7 is built on, stated as a sweep over real rows: **after the sweep, no
+ * attempt and no round whose owning process is gone is left `running`.**
+ *
+ * This is the test that would have caught the OpenCode recovery defect, and it is driven
+ * through `HarnessSessionStatus.layer` rather than `fromAnswers` for exactly that reason.
+ * The scripted layer takes a `HarnessObservedStatus`, so it starts *after* the mapping that
+ * was wrong; the live layer starts from what a driver answers. The answer below —
+ * `{ activity: "idle" }` with no outcome — is what OpenCode gives for a session whose
+ * server has restarted, verified against its own source:
+ *
+ * - the session row is still there, because sessions live in one SQLite file under the
+ *   user's XDG data directory and a freshly spawned server finds them by primary key;
+ * - nothing is executing it, because `/api/session/active` reports only drains this
+ *   process owns and a new process owns none — the sweep that would resume them
+ *   (`SessionRestart.resumeSuspendedSessions`) is attached only under `--service`, and we
+ *   spawn `serve --stdio`;
+ * - and `idle_outcome` was never written, because `projectIdle` returns early for an
+ *   interrupt tagged `reason: "shutdown"`, which is what a closing server's own teardown
+ *   produces, and because an unclean death publishes no terminal event at all.
+ *
+ * Before the fix this reached `mapObserved` as `running`, so the attempt row stayed
+ * `running` with `still_running` filed against it, the write fence never moved, the
+ * credential was never revoked, and the round was left alone — which also meant
+ * `openRound` refused every later round on that goal for ever. Nothing in the system would
+ * have looked again. S8 then put that row on a screen, where it read "Live".
+ */
+describe("a restart leaves nothing reading as running", () => {
+  const HOST = { callerScope: operatorScope(TARGET), targetId: TARGET };
+
+  /**
+   * The whole recovery path over one real database file, with the drivers' own mapping in
+   * the loop.
+   *
+   * `HarnessResolver.single` because the rows name `opencode` and one configured instance
+   * is what makes the mapping — rather than the foreign-instance branch — the thing under
+   * test; that branch has its own coverage in `harness/resolver.test.ts`.
+   */
+  const sweptWith = <A, E>(
+    path: string,
+    status: SessionStatus,
+    use: (
+      store: ObservationStore["Service"],
+    ) => Effect.Effect<
+      A,
+      E,
+      ObservationStore | HarnessSessionStatus | McpCredentials
+    >,
+  ): Promise<A> =>
+    Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(ObservationStore, use).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ObservationStore.layer(path),
+              HarnessSessionStatus.layer.pipe(
+                Layer.provide(HarnessResolver.single),
+                Layer.provide(
+                  Layer.succeed(
+                    AgentHarness,
+                    stubHarness({
+                      instance: {
+                        ...STUB_INSTANCE,
+                        instanceId: defaultInstanceIdForDriver(OPENCODE_DRIVER),
+                      },
+                      sessionStatus: () => Effect.succeed(status),
+                    }),
+                  ),
+                ),
+              ),
+              McpCredentials.layer,
+            ),
+          ),
+        ),
+      ),
+    );
+
+  const RESTARTED: SessionStatus = { activity: "idle", outcome: undefined };
+
+  test("an attempt whose session has no outcome after a restart leaves running, fence bumped", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      seed(store, "attempt-1").pipe(Effect.asVoid),
+    );
+
+    const outcome = await sweptWith(path, RESTARTED, (store) =>
+      Effect.gen(function* () {
+        const swept = yield* reconcileUnsettledAttempts();
+        return { swept, unsettled: yield* store.unsettledAttempts() };
+      }),
+    );
+
+    const entry = outcome.swept[0];
+    // The answer the sweep got, which is the half that used to be `running`.
+    expect(entry?.observed).toBe("abandoned");
+    // The property: the row does not stay `running`.
+    expect(entry?.outcome.status).toBe("uncertain");
+    expect(entry?.outcome.status).not.toBe("running");
+    expect(entry?.outcome.disposition).not.toBe("still_running");
+    // And authority is gone, durably: leaving `running` is the one transition that bumps
+    // the fence, so a credential minted by the dead process cannot write after this.
+    expect(entry?.outcome.fenceAfter).toBeGreaterThan(
+      entry?.outcome.fenceBefore ?? 0,
+    );
+    // `uncertain` is still an open question and is swept again, which is what lets a later
+    // definite answer refine it. It is not a *running* question.
+    expect(outcome.unsettled.map((row) => row.status)).toEqual(["uncertain"]);
+  });
+
+  test("a round whose session has no outcome after a restart is settled, and the goal is free", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      Effect.gen(function* () {
+        yield* seed(store, "attempt-1");
+        yield* store.openRound(HOST, {
+          goalId: "goal-1",
+          roundId: "rnd-1",
+          budget: 5,
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt-5.6-sol",
+          harnessSessionId: "ses_round_abandoned",
+        });
+      }),
+    );
+
+    const outcome = await sweptWith(path, RESTARTED, (store) =>
+      Effect.gen(function* () {
+        const swept = yield* reconcileRunningRounds();
+        // The goal has to take another round, which is the consequence that matters: a
+        // round left `running` blocks every later one on that goal.
+        const reopened = yield* Effect.result(
+          store.openRound(HOST, {
+            goalId: "goal-1",
+            roundId: "rnd-2",
+            budget: 5,
+            harnessInstanceId: "opencode",
+            providerId: "openai",
+            modelId: "gpt-5.6-sol",
+            harnessSessionId: "ses_round_2",
+          }),
+        );
+        return { swept, reopened, left: yield* store.roundsLeftRunning() };
+      }),
+    );
+
+    expect(outcome.swept[0]?.observed).toBe("abandoned");
+    expect(outcome.swept[0]?.settlement?.effective).toBe("uncertain");
+    // Not left alone, which is what `mapObservedRound("running")` returning `undefined`
+    // did with this answer before.
+    expect(outcome.swept[0]?.settlement?.changed).toBe(true);
+    expect(outcome.swept[0]?.fenceAfter).toBeDefined();
+    expect(outcome.reopened._tag).toBe("Success");
+    // `rnd-1` is gone from the running set; only the one just opened is there.
+    expect(outcome.left.map((round) => round.roundId)).toEqual(["rnd-2"]);
+  });
+
+  /**
+   * The other side of the property, so it cannot be satisfied by sweeping everything.
+   *
+   * A harness that says a turn **is** in flight still leaves the row alone with its
+   * authority intact. That is the whole reason recovery asks rather than assuming, and a
+   * fix that terminalised unconditionally would have broken a live attempt in a process
+   * that is also serving.
+   */
+  test("a session with a turn in flight is still left running, authority intact", async () => {
+    const path = newDatabasePath();
+    await withRecovery(path, {}, (store) =>
+      seed(store, "attempt-1").pipe(Effect.asVoid),
+    );
+
+    const outcome = await sweptWith(path, { activity: "running" }, () =>
+      reconcileUnsettledAttempts(),
+    );
+
+    expect(outcome[0]?.observed).toBe("running");
+    expect(outcome[0]?.outcome.status).toBe("running");
+    expect(outcome[0]?.outcome.disposition).toBe("still_running");
+    expect(outcome[0]?.outcome.fenceAfter).toBe(
+      outcome[0]?.outcome.fenceBefore,
+    );
+    expect(outcome[0]?.revokedGrants).toBe(0);
   });
 });

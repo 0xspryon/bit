@@ -1427,6 +1427,58 @@ describe("a second accepted message, and what settlement means after one", () =>
     expect(answer.earlyWait).toBeUndefined();
   });
 
+  /**
+   * The same two turns, asked the other question: what does `sessionStatus` say *during*
+   * turn two?
+   *
+   * `record.outcome` is overwritten by the pump on every `result`, so after turn one's
+   * result it holds `succeeded` — turn one's answer — while turn two is still running.
+   * This used to be reported verbatim, which is a terminal answer about a turn that has
+   * not happened yet. A supervisor settling on it would have closed the round and revoked
+   * the credential while the directive's own turn was mid-flight.
+   *
+   * The counterpart defect on the other driver is OpenCode's `Execution.Started`, which
+   * sets `time_busy` and never clears `idle_outcome`. Both are answered the same way: the
+   * outcome is only reported while no turn is in flight.
+   */
+  test("mid-second-turn, the status reports a live turn and not the first turn's outcome", async () => {
+    const answer = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "round",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+        });
+        yield* harness.prompt(SESSION, "the round's briefing");
+        yield* Effect.promise(() => driver.pulled(1));
+        yield* harness.prompt(SESSION, "a directive", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: "aaaaaaaabbbbbbbbccccccccdddddddd",
+        });
+        yield* Effect.promise(() => driver.pulled(2));
+
+        // Turn one ends; `record.outcome` is now `succeeded` and turn two is still live.
+        driver.emitResult();
+        yield* Effect.sleep("40 millis");
+        const duringTurnTwo = yield* harness.sessionStatus(SESSION);
+
+        driver.emitResult();
+        yield* harness.waitForIdle(SESSION);
+        const afterBoth = yield* harness.sessionStatus(SESSION);
+        return { duringTurnTwo, afterBoth };
+      }),
+    );
+
+    expect(answer.duringTurnTwo.activity).toBe("running");
+    // The half that used to be wrong: turn one's answer, reported about turn two.
+    expect(answer.duringTurnTwo.outcome).toBeUndefined();
+    // And once everything accepted has been answered, the outcome is current and reported.
+    expect(answer.afterBoth.activity).toBe("idle");
+    expect(answer.afterBoth.outcome).toBe("succeeded");
+  });
+
   test("the steer carries the driver's own id and its own timing", async () => {
     const seen = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
