@@ -558,15 +558,4 @@
     line-height: var(--lh-compact);
     color: var(--state-fg-danger);
   }
-  .visually-hidden {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    margin: -1px;
-    padding: 0;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-    border: 0;
-  }
 </style>

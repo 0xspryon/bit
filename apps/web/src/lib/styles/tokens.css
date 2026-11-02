@@ -201,8 +201,28 @@ body {
   font-family: var(--font-mono);
 }
 
+/**
+ * Said to a screen reader, drawn to nobody.
+ *
+ * **`top`/`left` are not decoration, and leaving them off scrolled the whole
+ * application.** Absolute with no offsets puts the box at its *static* position, and
+ * with no positioned ancestor the box it is positioned in is the initial containing
+ * block — the document. So a hidden span a thousand pixels down a chat thread was laid
+ * out a thousand pixels down the *document*: 1px tall, clipped, invisible, and counted
+ * in the document's scrollable overflow all the same. The scroller it was written
+ * inside could not clip it, because a scroller only clips what it is the containing
+ * block of, and `overflow` alone does not make it one.
+ *
+ * The shell is pinned to the viewport and every region that scrolls has its own
+ * `overflow` — so the document should never scroll, and what made it scroll anyway was
+ * thirteen of these in a long importer thread. Anchoring them to the origin of whatever
+ * box they are positioned in costs nothing (they are 1px and clipped wherever they land)
+ * and means this utility can never extend anything's scrollable area again.
+ */
 .visually-hidden {
   position: absolute;
+  top: 0;
+  left: 0;
   width: 1px;
   height: 1px;
   margin: -1px;
@@ -210,6 +230,7 @@ body {
   overflow: hidden;
   clip-path: inset(50%);
   white-space: nowrap;
+  border: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {
