@@ -23,7 +23,8 @@
  * 4. **{@link LiveAgentSessions.closeSession}**: narrator interrupted first, so nothing is
  *    published for a session whose credential is about to go; then the scope; then a
  *    belt-and-braces revoke whose expected answer is zero and whose non-zero answer is a
- *    logged bug rather than a handled condition.
+ *    logged bug rather than a handled condition. Anything keyed by the id — the map entry,
+ *    the id-wide revoke, `afterClose` — is touched only while the id is still this entry's.
  * 5. **The layer finalizer**, closing every session still open, which is what makes "no
  *    longer than the process" true.
  *
@@ -223,6 +224,9 @@ export interface LiveAgentSessions<Meta> {
    * Gives up on one session: narration first, then its scope, then the belt-and-braces
    * revoke. See this module's header for why the order matters and why a non-zero revoke
    * is logged as a bug.
+   *
+   * Safe to call with a stale entry: if the map no longer holds this exact entry, only the
+   * entry's own narrator and scope are closed, and nothing keyed by its id is touched.
    */
   readonly closeSession: (entry: LiveAgentSession<Meta>) => Effect.Effect<void>;
   /** {@link closeSession} by id. Idempotent, and safe for an id with nothing live. */
@@ -278,19 +282,66 @@ export const makeLiveAgentSessions = <Meta>(
       sessionId: entry.sessionId,
     });
 
+    /**
+     * How many times an open has started building for each id.
+     *
+     * Read by {@link closeSession} and nothing else, to tell whether a newer session for the
+     * same id began acquiring while this close was suspended — see there.
+     */
+    const builds = new Map<string, number>();
+
+    /*
+     * **Only the entry the map still holds is the id's to close.** A close can be stale: two
+     * messages took the fast path into one session and both prompts failed; the first failure
+     * closed it, a third message opened a fresh session under the same id, and the second
+     * failure then arrives holding the *old* entry. Deleting by id there would drop the new
+     * session from the map — its scope then in no map, its registration and narrator alive
+     * until process death — and the belt-and-braces revoke, which works by id, would kill the
+     * new session's credential and log it as a stray. So the map and the id-wide revoke are
+     * touched only when the map still holds this exact entry, compared by its `Scope` (the
+     * preambled replacement is a different object over the same scope). The entry's own
+     * narrator and scope are closed either way: they are this entry's, and must go.
+     *
+     * The check is made before the first suspension, so nothing can interleave between
+     * reading the map and deleting from it.
+     *
+     * **The same revoke can also hit a session that is not yet in any map.** Once this close
+     * has deleted the entry, a message that arrives while the scope is still closing (an
+     * unregister is a round trip to the harness) finds nothing live, takes the permit, and
+     * mints a credential for the same id. So the revoke runs only if no open has started
+     * building for this id since the close began; if one has, the revoke is skipped, which
+     * gives up the bug detector for that one close rather than revoking a credential this
+     * close does not own.
+     */
     const closeSession = Effect.fnUntraced(function* (
       entry: LiveAgentSession<Meta>,
     ) {
-      live.delete(entry.id);
+      const current = live.get(entry.id)?.scope === entry.scope;
+      if (current) live.delete(entry.id);
+      const buildsAtClose = builds.get(entry.id) ?? 0;
       if (entry.narrator !== undefined) yield* Fiber.interrupt(entry.narrator);
       yield* Scope.close(entry.scope, Exit.void);
-      const stray = yield* role.revokeStray(entry.id);
-      if (stray > 0) {
-        yield* Effect.logError(role.words.strayCredential, {
-          [role.words.idKey]: entry.id,
-          sessionId: entry.sessionId,
-          revoked: stray,
-        });
+      if (!current) {
+        yield* Effect.logDebug(
+          "a stale close found a newer session, or none, under the same id; only its own scope was closed",
+          annotate(entry),
+        );
+        return;
+      }
+      if ((builds.get(entry.id) ?? 0) === buildsAtClose) {
+        const stray = yield* role.revokeStray(entry.id);
+        if (stray > 0) {
+          yield* Effect.logError(role.words.strayCredential, {
+            [role.words.idKey]: entry.id,
+            sessionId: entry.sessionId,
+            revoked: stray,
+          });
+        }
+      } else {
+        yield* Effect.logInfo(
+          "a newer session for the same id began opening while this one was closing, so the belt-and-braces revoke was skipped rather than run against its credential",
+          annotate(entry),
+        );
       }
       if (role.afterClose !== undefined) yield* role.afterClose(entry);
       yield* Effect.logInfo(role.words.closed, annotate(entry));
@@ -391,6 +442,8 @@ export const makeLiveAgentSessions = <Meta>(
           // the prompt, so an entry reachable from in here is preambled or already gone.
           const raced = live.get(input.id);
           if (raced !== undefined) return yield* input.joined(raced);
+          // Before anything is acquired, so a close already in flight for this id sees it.
+          builds.set(input.id, (builds.get(input.id) ?? 0) + 1);
 
           const plan = yield* input.prepare;
           const urls = yield* endpoints.urls;

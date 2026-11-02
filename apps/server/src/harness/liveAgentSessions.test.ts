@@ -57,8 +57,10 @@ interface Recorder {
 /**
  * A harness with three places an opener can be parked: inside `createSession`; inside
  * `registerMcpServer`, with a credential minted and nothing yet published; and inside the
- * opening prompt, after the entry is published and before it is preambled. Every other step is `Effect.sync`, so without a suspension point
- * two openers would never interleave and the permit would be tested by nothing.
+ * opening prompt, after the entry is published and before it is preambled. Every other step
+ * is `Effect.sync`, so without a suspension point two openers would never interleave and
+ * the permit would be tested by nothing. A fourth, inside `unregisterMcpServer`, parks a
+ * *close* halfway through its scope.
  */
 const gatedHarness = (
   recorder: Recorder,
@@ -69,6 +71,8 @@ const gatedHarness = (
     readonly registerGate?: Deferred.Deferred<void>;
     readonly promptEntered?: Deferred.Deferred<void>;
     readonly promptGate?: Deferred.Deferred<void>;
+    readonly unregisterEntered?: Deferred.Deferred<void>;
+    readonly unregisterGate?: Deferred.Deferred<void>;
   },
 ): AgentHarness["Service"] => {
   let minted = 0;
@@ -110,7 +114,13 @@ const gatedHarness = (
         });
       }),
     unregisterMcpServer: (sessionId) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
+        if (gates.unregisterEntered !== undefined) {
+          yield* Deferred.succeed(gates.unregisterEntered, undefined);
+        }
+        if (gates.unregisterGate !== undefined) {
+          yield* Deferred.await(gates.unregisterGate);
+        }
         recorder.unregistrations.push(sessionId);
       }),
     prompt: (sessionId, _text, delivery = { _tag: "open" as const }) =>
@@ -356,5 +366,92 @@ describe("opening an import session", () => {
     expect(outcome.result.live).toBeUndefined();
     expect(recorder.unregistrations).toEqual(["ses_1"]);
     expect(outcome.ended).toEqual([IMPORT]);
+  });
+});
+
+const freshRecorder = (): Recorder => ({
+  created: [],
+  registrations: [],
+  unregistrations: [],
+  prompts: [],
+});
+
+describe("closing an import session that is no longer the id's", () => {
+  test("a stale close leaves the newer session under the same id alone", async () => {
+    // The goal path's sequence, which S3's `deliverInto` makes reachable here too: two
+    // messages delivered into one session whose prompts both fail. The first failure closes
+    // it, a third message opens a fresh session under the same id, and only then does the
+    // second failure close the session it was holding.
+    const recorder = freshRecorder();
+    const harness = gatedHarness(recorder, {});
+
+    const outcome = await withImporterSessions(
+      harness,
+      ({ sessions, plan, credentials }) =>
+        Effect.gen(function* () {
+          yield* opening(sessions, plan);
+          const first = sessions.get(IMPORT);
+          if (first === undefined) return yield* Effect.die("no first session");
+          yield* sessions.closeSession(first);
+          yield* opening(sessions, { ...plan, sessionId: "ses_second" });
+          // The stale close, holding the first entry.
+          yield* sessions.closeSession(first);
+          return {
+            live: sessions.get(IMPORT)?.sessionId,
+            grants: yield* credentials.size,
+            unregistered: [...recorder.unregistrations],
+          };
+        }),
+    );
+
+    // The second session is still the id's, still holds its credential, and its
+    // registration was not touched.
+    expect(outcome.result.live).toBe("ses_second");
+    expect(outcome.result.grants).toBe(1);
+    expect(outcome.result.unregistered).toEqual(["ses_1"]);
+    // One end for the first close and one for the finalizer's: the stale close records none.
+    expect(outcome.ended).toEqual([IMPORT, IMPORT]);
+    expect(outcome.afterRelease).toBe(0);
+  });
+
+  test("a close still taking its scope down does not revoke the credential of a session opened meanwhile", async () => {
+    const recorder = freshRecorder();
+    const unregisterEntered = Effect.runSync(Deferred.make<void>());
+    const unregisterGate = Effect.runSync(Deferred.make<void>());
+    const harness = gatedHarness(recorder, {
+      unregisterEntered,
+      unregisterGate,
+    });
+
+    const outcome = await withImporterSessions(
+      harness,
+      ({ sessions, plan, credentials }) =>
+        Effect.gen(function* () {
+          yield* opening(sessions, plan);
+          const first = sessions.get(IMPORT);
+          if (first === undefined) return yield* Effect.die("no first session");
+          // The close deletes the entry, then parks in the unregister round trip...
+          const closing = yield* Effect.forkChild(sessions.closeSession(first));
+          yield* Deferred.await(unregisterEntered);
+          // ...and a message that arrives now finds nothing live and opens a new one.
+          const reopened = yield* opening(sessions, {
+            ...plan,
+            sessionId: "ses_second",
+          });
+          yield* Deferred.succeed(unregisterGate, undefined);
+          yield* Fiber.join(closing);
+          return {
+            reopened,
+            live: sessions.get(IMPORT)?.sessionId,
+            grants: yield* credentials.size,
+          };
+        }),
+    );
+
+    expect(outcome.result.reopened).toBe("opened");
+    expect(outcome.result.live).toBe("ses_second");
+    // The first credential went with its scope; the second's is untouched.
+    expect(outcome.result.grants).toBe(1);
+    expect(outcome.afterRelease).toBe(0);
   });
 });
