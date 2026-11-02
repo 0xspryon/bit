@@ -191,6 +191,7 @@ describe("a fresh database", () => {
       "goal_sessions",
       "goals",
       "host_scope_labels",
+      "import_sessions",
       "intent_anchors",
       "intents",
       "observation_dimension_links",
@@ -486,6 +487,7 @@ describe("a database already at 0002", () => {
       "21_goal_sessions",
       "22_target_scope",
       "23_asset_imports",
+      "24_import_sessions",
     ]);
     expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
     expect(outcome.columns).toContain("record_format");
@@ -764,6 +766,7 @@ describe("a database already at 0005", () => {
       "21_goal_sessions",
       "22_target_scope",
       "23_asset_imports",
+      "24_import_sessions",
     ]);
     expect(outcome.key).toEqual([
       "attempt_id",
@@ -1486,6 +1489,7 @@ describe("a database already at 0015", () => {
       "21_goal_sessions",
       "22_target_scope",
       "23_asset_imports",
+      "24_import_sessions",
     ]);
     // The old columns are untouched; the new ones took the defaults the migration
     // documents: an open goal, no name, and no ending recorded.
@@ -1630,6 +1634,7 @@ describe("a database already at 0016", () => {
       "21_goal_sessions",
       "22_target_scope",
       "23_asset_imports",
+      "24_import_sessions",
     ]);
     const unchanged = {
       claimed_by_attempt_id: null,
@@ -1803,6 +1808,7 @@ describe("a database already at 0017", () => {
       "21_goal_sessions",
       "22_target_scope",
       "23_asset_imports",
+      "24_import_sessions",
     ]);
     expect(outcome.key).toEqual(["goal_id"]);
     expect(outcome.columns).toEqual(

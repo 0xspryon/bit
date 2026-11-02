@@ -48,6 +48,7 @@ import { SCOPE_IMPORT_MAX_LINKS } from "@bit/contracts";
 import { ScopeImportProgress } from "./progress";
 import { ScopeImporter } from "./scopeImporter";
 import type { McpRegistration } from "../harness/agentHarness";
+import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
 import { STUB_INSTANCE, stubHarness } from "../harness/stubHarness";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
@@ -162,6 +163,8 @@ interface Script {
   readonly subscribed: string[];
   /** Resolves once the scripted session has finished making its calls. */
   done: Promise<void>;
+  /** Makes `createSession` fail, for a session that never opens. */
+  failCreate: boolean;
 }
 
 const newScript = (readable: readonly string[]): Script => ({
@@ -171,6 +174,7 @@ const newScript = (readable: readonly string[]): Script => ({
   interrupted: [],
   subscribed: [],
   done: Promise.resolve(),
+  failCreate: false,
 });
 
 /**
@@ -186,7 +190,17 @@ const scriptedHarness = (script: Script) =>
     newSessionId: () => "ses_import",
     installGate: () => Effect.void,
     createSession: (input) =>
-      Effect.succeed({ id: input.sessionId ?? "ses_x" }),
+      script.failCreate
+        ? Effect.fail(
+            new HarnessTransportError({
+              operation: "createSession",
+              status: 503,
+              tag: undefined,
+              detail: "the scripted harness would not open a session",
+              cause: undefined,
+            }),
+          )
+        : Effect.succeed({ id: input.sessionId ?? "ses_x" }),
     registerMcpServer: (_sessionId, _name, config: McpRegistration) =>
       Effect.sync(() => {
         script.registrations.push({
@@ -356,8 +370,12 @@ const world = (readable: readonly string[]) => {
  * importer rather than the HTTP shape — `browserApi` has its own suite. The row and the
  * migrated file are the same ones `createTarget` would have produced.
  */
-const importWith = async (readable: readonly string[]) => {
+const importWith = async (
+  readable: readonly string[],
+  options: { readonly failCreate?: boolean } = {},
+) => {
   const built = world(readable);
+  built.script.failCreate = options.failCreate === true;
   const runtime = ManagedRuntime.make(built.layer);
   const outcome = await runtime.runPromise(
     Effect.gen(function* () {
@@ -492,6 +510,68 @@ describe("every link failing is not an error state", () => {
 
     const scope = await scopeOf(runtime);
     expect(scope.entries).toEqual([]);
+    await runtime.dispose();
+  });
+});
+
+/**
+ * The importer's session index (`0024`).
+ *
+ * The store's own suite proves the tally is counted correctly **given** the scope the
+ * writes are filed under. What only an importer run can prove is that the scope the real
+ * tools file them under, over the real endpoint and credential, is the one the index
+ * joined on — a mismatch between the two spellings would count zero for every session and
+ * pass every store test.
+ */
+describe("the session index", () => {
+  const sessionsOf = (
+    runtime: ManagedRuntime.ManagedRuntime<TargetStores, DatabaseError>,
+  ) =>
+    runtime.runPromise(
+      Effect.flatMap(TargetStores, (stores) =>
+        withTargetStore(stores, TARGET, (store) =>
+          store.importSessions(TARGET),
+        ),
+      ).pipe(Effect.orDie),
+    );
+
+  test("a finished import is indexed with what it actually wrote", async () => {
+    const { runtime, started, view } = await importWith([PAGE_GOOD, PAGE_BAD]);
+    expect(view?.status).toBe("finished");
+
+    const sessions = await sessionsOf(runtime);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({
+      // The id the harness was asked to create the session under, not one read back.
+      harnessSessionId: "ses_import",
+      harnessInstanceId: STUB_INSTANCE.instanceId,
+      model: started._tag === "started" ? started.model : "",
+      importIds: [started._tag === "started" ? started.importId : ""],
+      // Two pages, each with an in entry, an out entry and an asset.
+      entriesIn: 2,
+      entriesOut: 2,
+      assets: 2,
+    });
+    await runtime.dispose();
+  });
+
+  test("a session that never opened is indexed too, and wrote nothing", async () => {
+    const { runtime, view } = await importWith([PAGE_GOOD], {
+      failCreate: true,
+    });
+    expect(view?.status).toBe("failed");
+
+    // The row is written before the session exists (the attempt rows' arrangement), so a
+    // crash between creating a session and recording it cannot lose one. The price is this:
+    // an entry for a session the harness never had, which reads as one that wrote nothing.
+    const sessions = await sessionsOf(runtime);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({
+      harnessSessionId: "ses_import",
+      entriesIn: 0,
+      entriesOut: 0,
+      assets: 0,
+    });
     await runtime.dispose();
   });
 });

@@ -69,7 +69,12 @@ import {
 } from "./plan";
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
-import { ImporterModelView, ProgramLink, ScopeImportView } from "./scopeImport";
+import {
+  ImporterModelView,
+  ImporterSessionsView,
+  ProgramLink,
+  ScopeImportView,
+} from "./scopeImport";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
@@ -1446,6 +1451,25 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         params: { targetId: Schema.String, importId: Schema.String },
         success: ScopeImportView,
         error: [ScopeImportNotFound],
+      },
+    ),
+    /**
+     * The harness sessions this target's scope imports have run on, newest first, each with
+     * what it wrote.
+     *
+     * **An index and not a history.** Nothing said in a session is stored or returned here;
+     * a row is the harness's id for a session this server opened, with the figures counted
+     * from what that session left on the target. Reading the conversation is the harness's
+     * to answer. The figures are counted on read rather than kept, so they cannot be wrong
+     * about a session that is still writing.
+     */
+    HttpApiEndpoint.get(
+      "importerSessions",
+      "/targets/:targetId/importer-sessions",
+      {
+        params: { targetId: Schema.String },
+        success: ImporterSessionsView,
+        error: [TargetNotFound, TargetUnavailable],
       },
     ),
     /**

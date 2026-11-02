@@ -40,6 +40,7 @@ import {
   type LiveFrame,
   type LiveItem,
   type RunningAttempt,
+  type ScopeImportView,
 } from "@bit/contracts";
 import {
   Context,
@@ -198,6 +199,38 @@ const supervisorHolding: Layer.Layer<RunSupervisor> = Layer.succeed(
 );
 
 /**
+ * The import this suite's importer reports as running.
+ *
+ * `ScopeImporter.unavailable` knows no import, so a route that reads "is this session going
+ * right now" could only ever see `false`. This is the one live import the double below
+ * admits to, and the importer-sessions tests seed a session whose run it is.
+ */
+const LIVE_IMPORT_ID = "imp_live_in_this_suite";
+
+/**
+ * `unavailable` in every respect but one: it holds a single running import.
+ *
+ * Starts are still refused by name, so the creation and start tests above are unchanged.
+ * `view` is cast because a test double for a route that reads one field (`status`) should
+ * not have to rebuild a whole panel's worth of the rest.
+ */
+const importerHoldingOne = Layer.effect(
+  ScopeImporter,
+  Effect.gen(function* () {
+    const base = yield* ScopeImporter;
+    return ScopeImporter.of({
+      ...base,
+      view: (importId) =>
+        Effect.succeed(
+          importId === LIVE_IMPORT_ID
+            ? ({ importId, status: "running" } as ScopeImportView)
+            : undefined,
+        ),
+    });
+  }),
+).pipe(Layer.provide(ScopeImporter.unavailable));
+
+/**
  * The browser API's routes, with the narration bus handed in rather than rebuilt.
  *
  * `Layer.unwrap` over `Effect.context` is the same move `main.ts` makes and it is here for
@@ -224,7 +257,7 @@ const endpoint = Layer.unwrap(
         // `createTarget` on one code path, since D15 makes a failed import a value rather
         // than a failed creation. `importerTools.test.ts` and `scopeImporter.test.ts` drive
         // the real thing.
-        Layer.provide(ScopeImporter.unavailable),
+        Layer.provide(importerHoldingOne),
         // The same resolver the server builds, over the same registry: the route under test is
         // the one that opens a target's own file, so a stub here would test the stub.
         Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
@@ -4125,6 +4158,175 @@ describe("a live connection that has nothing to say", () => {
     // And the client's patience is longer than the heartbeat, or a healthy quiet connection
     // would be read as dead. See `LIVE_SILENCE_LIMIT_SECONDS`.
     expect(LIVE_SILENCE_LIMIT_SECONDS).toBeGreaterThan(LIVE_HEARTBEAT_SECONDS);
+  });
+});
+
+/**
+ * The importer-sessions route: which harness sessions a target's imports ran on.
+ *
+ * Seeded with `bun:sqlite` for the assets route's reason: the figures are counted from rows
+ * other writes leave, and `persistence/importSessionStore.test.ts` proves the count against
+ * the real write path. What is asserted here is the route in front of it — that the store's
+ * answer reaches the wire in the right shape, in the right order, scoped to the right target,
+ * with `running` coming from this process's own registry and from nothing stored.
+ */
+describe("a target's importer sessions", () => {
+  const withSessions = "sessions-some";
+  const quiet = "sessions-none";
+  const other = "sessions-other";
+
+  const register = async (name: string) => {
+    mkdirSync(join(workspaceRoot, name), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: {
+          workspacePath: join(workspaceRoot, name),
+          name,
+          scopeNote: "",
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+  };
+
+  const run = (
+    targetId: string,
+    importId: string,
+    session: string,
+    openedAt: number,
+  ) => ({
+    importId,
+    targetId,
+    session,
+    openedAt,
+    scope: `${targetId}/import/${importId}`,
+  });
+
+  /** Rows for `runs`, and a tally under the first run's scope: two in, one out, one asset. */
+  const seed = (targetId: string, runs: ReturnType<typeof run>[]) => {
+    const database = new Database(
+      join(fleetRoot, "targets", targetId, HUNT_FILE),
+    );
+    try {
+      for (const r of runs) {
+        database.run(
+          `INSERT INTO import_sessions (
+             import_id, target_id, harness_session_id, harness_instance_id, model,
+             caller_scope, opened_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            r.importId,
+            r.targetId,
+            r.session,
+            "opencode",
+            "openai/gpt-5.6-sol",
+            r.scope,
+            r.openedAt,
+          ],
+        );
+      }
+      const first = runs[0];
+      if (first === undefined) return;
+      for (const [index, effect] of ["in", "in", "out"].entries()) {
+        database.run(
+          `INSERT INTO events (
+             id, sequence, target_id, kind, payload, caller_scope, operation,
+             subject_id, recorded_at
+           ) VALUES (?, ?, ?, 'scope.entry.added', ?, ?, 'add_scope_entry', ?, ?)`,
+          [
+            `evt_${targetId}_${String(index)}`,
+            index + 1,
+            targetId,
+            JSON.stringify({ effect }),
+            first.scope,
+            `scope_${String(index)}`,
+            first.openedAt + 1,
+          ],
+        );
+      }
+      database.run(
+        `INSERT INTO assets (id, target_id, kind, identity, host, port, first_seen_at)
+         VALUES (?, ?, 'host', 'app.acme.test:443', 'app.acme.test', 443, ?)`,
+        [`asset_${targetId}`, targetId, first.openedAt + 2],
+      );
+      database.run(
+        `INSERT INTO asset_imports (
+           asset_id, operation_id, caller_scope, source_url, imported_as, note,
+           imported_at
+         ) VALUES (?, 'op-1', ?, 'https://hackerone.test/acme', 'app.acme.test', 'row 1', ?)`,
+        [`asset_${targetId}`, first.scope, first.openedAt + 2],
+      );
+    } finally {
+      database.close();
+    }
+  };
+
+  beforeAll(async () => {
+    await register(withSessions);
+    await register(quiet);
+    await register(other);
+    seed(withSessions, [
+      run(withSessions, "imp_old", "ses_old", 1_000),
+      run(withSessions, LIVE_IMPORT_ID, "ses_new", 2_000),
+    ]);
+    seed(other, [run(other, "imp_elsewhere", "ses_elsewhere", 9_000)]);
+  });
+
+  test("lists the sessions newest first, each with what it wrote", async () => {
+    const response = await read(
+      await signedIn(`/targets/${withSessions}/importer-sessions`),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      sessions: [
+        {
+          sessionId: "ses_new",
+          harnessInstanceId: "opencode",
+          model: "openai/gpt-5.6-sol",
+          openedAt: 2_000,
+          // This process holds LIVE_IMPORT_ID as running, and nothing stored says so.
+          running: true,
+          tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+        },
+        {
+          sessionId: "ses_old",
+          harnessInstanceId: "opencode",
+          model: "openai/gpt-5.6-sol",
+          openedAt: 1_000,
+          running: false,
+          tally: { entriesIn: 2, entriesOut: 1, assets: 1 },
+        },
+      ],
+    });
+  });
+
+  test("another target's sessions are not in it", async () => {
+    const response = await read(
+      await signedIn(`/targets/${withSessions}/importer-sessions`),
+    );
+    expect(JSON.stringify(response.body)).not.toContain("ses_elsewhere");
+  });
+
+  test("a target that has never imported answers with an empty list", async () => {
+    const response = await read(
+      await signedIn(`/targets/${quiet}/importer-sessions`),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ sessions: [] });
+  });
+
+  test("an unknown target is refused rather than answered empty", async () => {
+    const response = await read(
+      await signedIn("/targets/not-a-target/importer-sessions"),
+    );
+    expect(response.status).toBe(404);
+    expect(response.body["_tag"]).toBe("TargetNotFound");
+  });
+
+  test("it needs a session, like every other fleet route", async () => {
+    const response = await call(`/targets/${withSessions}/importer-sessions`);
+    expect(response.status).toBe(401);
   });
 });
 

@@ -240,6 +240,63 @@ export const ImporterModelView = Schema.Struct({
 export type ImporterModelView = typeof ImporterModelView.Type;
 
 /**
+ * What one importer session wrote, counted from the rows it left (`0024`).
+ *
+ * Three numbers and no `messages`: what was *said* in a session is the harness's, and this
+ * server persists no prose (`DECISIONS.md` §8). A picker that wants a message count has to
+ * ask the harness, and does not get one from here.
+ *
+ * They are what the session **wrote**, not what is still there: an entry the operator has
+ * since removed was still written by the session.
+ */
+export const ImporterSessionTally = Schema.Struct({
+  entriesIn: Schema.Int,
+  entriesOut: Schema.Int,
+  /** Distinct assets, so a host two runs of one session both recorded is counted once. */
+  assets: Schema.Int,
+});
+export type ImporterSessionTally = typeof ImporterSessionTally.Type;
+
+/**
+ * One harness session the scope importer ran on, as the session picker and the Assets
+ * screen's "last session" strip read it.
+ *
+ * **A pointer, not a conversation.** `sessionId` is the harness's own id, the thing to ask
+ * the harness with; nothing about what was said is on this view, and a row here never means
+ * the harness still holds the session. Several import runs on one session are one view.
+ */
+export const ImporterSessionView = Schema.Struct({
+  /** The harness's session id. Unique within the list. */
+  sessionId: Schema.String,
+  /**
+   * The harness instance that minted it, or null for a row written before instances were
+   * recorded. A session recorded against an instance this server does not run must not be
+   * asked about — the harness we do have would answer "no such session" for a session that
+   * may be alive elsewhere.
+   */
+  harnessInstanceId: Schema.NullOr(Schema.String),
+  /** The model it ran on, as `provider/model`. */
+  model: Schema.String,
+  /** When the session was opened, in epoch milliseconds. */
+  openedAt: Schema.Int,
+  /**
+   * Whether an import run on this session is going **right now, in this server process**.
+   *
+   * Read from the live registry and not stored: a restart forgets it, so `false` is "not
+   * known to be running" and a session that was running when the server died reads `false`.
+   */
+  running: Schema.Boolean,
+  tally: ImporterSessionTally,
+});
+export type ImporterSessionView = typeof ImporterSessionView.Type;
+
+export const ImporterSessionsView = Schema.Struct({
+  /** Newest first. */
+  sessions: Schema.Array(ImporterSessionView),
+});
+export type ImporterSessionsView = typeof ImporterSessionsView.Type;
+
+/**
  * One program page, reduced to a key two spellings of it can be compared by.
  *
  * **The importer retypes the URL it was given, so an exact string match is the wrong

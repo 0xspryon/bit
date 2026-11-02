@@ -6444,6 +6444,150 @@ const makeStore = Effect.fnUntraced(function* () {
     },
   );
 
+  /* ── The scope importer's sessions ─────────────────────────────────────────── */
+
+  const ImportSessionRow = Schema.Struct({
+    harness_session_id: Schema.String,
+    harness_instance_id: Schema.NullOr(Schema.String),
+    model: Schema.String,
+    opened_at: Schema.Finite,
+    import_ids: Schema.String,
+    entries_in: Schema.Finite,
+    entries_out: Schema.Finite,
+    assets: Schema.Finite,
+  });
+
+  /**
+   * One row per harness session on a target, newest first, with what each wrote.
+   *
+   * **The three figures are counted here, from the rows the writes themselves left, and are
+   * stored nowhere** — `0024`'s commentary has the argument. `scope.entry.added` events
+   * carry the entry's `effect` in their payload and the scope they were written under;
+   * `asset_imports` rows carry the scope too. Both are inserted in the same transaction as
+   * the entry or asset they describe, so they cannot disagree with it, and a figure that
+   * is read from them cannot go stale.
+   *
+   * **The session is the unit, and a session may have had several runs.** `import_sessions`
+   * is keyed by import id, so a continuation that mints a fresh id is a second row naming
+   * the same `harness_session_id`. Every count therefore ranges over *every* scope any run
+   * of the session wrote under (the `IN` subquery), and the outer query keeps one row per
+   * session — the one that opened it, with the earliest `opened_at` and the lower import id
+   * on a tie. The assets are `DISTINCT` for the same reason: two runs of one session that
+   * both recorded a host are one asset, and summing per-run counts would put a figure on the
+   * picker that the Assets page disagrees with.
+   *
+   * `import_ids` is a comma-joined list because an import id is minted (`imp_` and a
+   * timestamp-ordered identifier) and never contains one, and because the route needs them
+   * to ask the in-memory registry whether any run is still going.
+   */
+  const selectImportSessions = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: ImportSessionRow,
+    execute: (targetId) =>
+      sql`SELECT
+            s.harness_session_id AS harness_session_id,
+            s.harness_instance_id AS harness_instance_id,
+            s.model AS model,
+            s.opened_at AS opened_at,
+            (SELECT group_concat(r.import_id) FROM import_sessions r
+              WHERE r.target_id = s.target_id
+                AND r.harness_session_id = s.harness_session_id) AS import_ids,
+            (SELECT count(*) FROM events e
+              WHERE e.kind = 'scope.entry.added'
+                AND json_extract(e.payload, '$.effect') = 'in'
+                AND e.caller_scope IN (
+                  SELECT r.caller_scope FROM import_sessions r
+                  WHERE r.target_id = s.target_id
+                    AND r.harness_session_id = s.harness_session_id)) AS entries_in,
+            (SELECT count(*) FROM events e
+              WHERE e.kind = 'scope.entry.added'
+                AND json_extract(e.payload, '$.effect') = 'out'
+                AND e.caller_scope IN (
+                  SELECT r.caller_scope FROM import_sessions r
+                  WHERE r.target_id = s.target_id
+                    AND r.harness_session_id = s.harness_session_id)) AS entries_out,
+            (SELECT count(DISTINCT a.asset_id) FROM asset_imports a
+              WHERE a.caller_scope IN (
+                SELECT r.caller_scope FROM import_sessions r
+                WHERE r.target_id = s.target_id
+                  AND r.harness_session_id = s.harness_session_id)) AS assets
+          FROM import_sessions s
+          WHERE s.target_id = ${targetId}
+            AND NOT EXISTS (
+              SELECT 1 FROM import_sessions o
+              WHERE o.target_id = s.target_id
+                AND o.harness_session_id = s.harness_session_id
+                AND (o.opened_at < s.opened_at
+                  OR (o.opened_at = s.opened_at AND o.import_id < s.import_id)))
+          ORDER BY s.opened_at DESC, s.import_id DESC`,
+  });
+
+  /**
+   * Every harness session a target's scope imports have run on, newest first, each with what
+   * it wrote.
+   *
+   * **An index of somebody else's storage, as {@link goalSession} is**: a row says the
+   * harness minted this id for an import, never that the harness still holds it. What was
+   * said in it is the harness's to answer and is not read here.
+   */
+  const importSessions = Effect.fn("ObservationStore.importSessions")(
+    function* (targetId: string) {
+      const rows = yield* selectImportSessions(targetId).pipe(
+        Effect.mapError(lift("import_sessions", targetId)),
+      );
+      return rows.map((row) => ({
+        harnessSessionId: row.harness_session_id,
+        harnessInstanceId: row.harness_instance_id,
+        model: row.model,
+        openedAt: row.opened_at,
+        importIds: row.import_ids.split(","),
+        entriesIn: row.entries_in,
+        entriesOut: row.entries_out,
+        assets: row.assets,
+      }));
+    },
+  );
+
+  /**
+   * Records that an import run is on a harness session.
+   *
+   * **Called with the session id before the session exists**, which is the attempt rows'
+   * arrangement (`AgentHarness.newSessionId`): the row names the session first, so a crash
+   * between creating it and writing this leaves no live session nobody can find. The cost is
+   * the one that arrangement already accepts — an id for a session that was never created —
+   * and an index that is asked about it gets the harness's honest "no such session".
+   *
+   * The caller scope is {@link callerScopeOf}'s, computed here and stored, so the tallies
+   * join on the exact string the importer's writes are filed under. `DO NOTHING` on the
+   * import id: ids are minted, so a conflict is a retry of this very write.
+   */
+  const recordImportSession = Effect.fn("ObservationStore.recordImportSession")(
+    function* (input: {
+      readonly importId: string;
+      readonly targetId: string;
+      readonly harnessSessionId: string;
+      readonly harnessInstanceId: string | null;
+      readonly model: string;
+    }) {
+      const openedAt = yield* Clock.currentTimeMillis;
+      const callerScope = callerScopeOf({
+        _tag: "importer",
+        targetId: input.targetId,
+        importId: input.importId,
+      });
+      yield* sql`INSERT INTO import_sessions (
+            import_id, target_id, harness_session_id, harness_instance_id, model,
+            caller_scope, opened_at
+          ) VALUES (
+            ${input.importId}, ${input.targetId}, ${input.harnessSessionId},
+            ${input.harnessInstanceId}, ${input.model}, ${callerScope}, ${openedAt}
+          )
+          ON CONFLICT(import_id) DO NOTHING`.pipe(
+        Effect.mapError(asDatabaseError("query")),
+      );
+    },
+  );
+
   /** What a recorded steer answers with, and what a retry of one replays. */
   const SteerResult = Schema.Struct({
     roundId: Schema.String,
@@ -7761,6 +7905,8 @@ const makeStore = Effect.fnUntraced(function* () {
     steerReceipt,
     goalSession,
     recordGoalSession,
+    importSessions,
+    recordImportSession,
     endGoalAsAgent,
     attemptsForGoal,
   });
@@ -8359,6 +8505,35 @@ export class ObservationStore extends Context.Service<
       readonly targetId: string;
       readonly harnessSessionId: string;
       readonly harnessInstanceId: string | null;
+    }) => Effect.Effect<void, DatabaseError>;
+    /**
+     * The harness sessions this target's scope imports have run on, newest first, each with
+     * what it wrote.
+     *
+     * An index of the harness's storage and never a claim the harness still holds a session.
+     * The figures are counted from the rows the writes left (`0024`), so they cannot go stale.
+     */
+    readonly importSessions: (targetId: string) => Effect.Effect<
+      readonly {
+        readonly harnessSessionId: string;
+        readonly harnessInstanceId: string | null;
+        readonly model: string;
+        readonly openedAt: number;
+        /** Every import run on this session, so a caller can ask which are still live. */
+        readonly importIds: readonly string[];
+        readonly entriesIn: number;
+        readonly entriesOut: number;
+        readonly assets: number;
+      }[],
+      DatabaseError | StoredRowError
+    >;
+    /** Records that an import run is on a harness session. See `0024`. */
+    readonly recordImportSession: (input: {
+      readonly importId: string;
+      readonly targetId: string;
+      readonly harnessSessionId: string;
+      readonly harnessInstanceId: string | null;
+      readonly model: string;
     }) => Effect.Effect<void, DatabaseError>;
     /**
      * Ends the caller's own goal, recorded as `endedBy: "goal_agent"`.

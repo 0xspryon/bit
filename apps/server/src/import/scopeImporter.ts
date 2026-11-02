@@ -85,6 +85,7 @@ import { HarnessResolver } from "../harness/resolver";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { newImportId } from "../persistence/identifier";
+import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { gatedRoleDirectory, POLICY_AUDIT_FILE } from "../policy/install";
 import { WorkerEndpoints } from "../run/supervisor";
 
@@ -203,6 +204,7 @@ export class ScopeImporter extends Context.Service<
     | McpCredentials
     | WorkerEndpoints
     | ScopeImportProgress
+    | TargetStores
   > = Layer.effect(
     ScopeImporter,
     Effect.gen(function* () {
@@ -211,6 +213,7 @@ export class ScopeImporter extends Context.Service<
       const credentials = yield* McpCredentials;
       const endpoints = yield* WorkerEndpoints;
       const progress = yield* ScopeImportProgress;
+      const stores = yield* TargetStores;
       // This layer's own scope, which every import's fiber is forked into. Shutting the
       // server down closes it, which interrupts any import still reading and — through
       // each import's own inner scope — revokes its credential and takes back its MCP
@@ -475,6 +478,44 @@ export class ScopeImporter extends Context.Service<
         const harness = resolved.success.harness;
         const importId = newImportId();
         const sessionId = harness.newSessionId();
+
+        /*
+         * The index entry, written before the session exists.
+         *
+         * That is the attempt rows' arrangement and for their reason: the harness holds
+         * every session of every project and cannot be asked which were ours, so the
+         * index is the only way an operator finds this one again, and an id recorded first
+         * cannot be lost to a crash between creating the session and writing the row. The
+         * price is an entry for a session that never opened (a gate that would not
+         * install), which reads as a session that wrote nothing and, asked about, as one
+         * the harness does not have. Both are true.
+         *
+         * **A failure to write it does not refuse the import.** The index is a way of
+         * finding a session and is advisory in the way `ScopeImportView` is: the import's
+         * work is its entries and assets, and they land whether or not this row does. It is
+         * logged with the id, which is what recovers it by hand.
+         */
+        yield* withTargetStore(stores, request.targetId, (store) =>
+          store.recordImportSession({
+            importId,
+            targetId: request.targetId,
+            harnessSessionId: sessionId,
+            harnessInstanceId: harness.instance.instanceId,
+            model: choice.model,
+          }),
+        ).pipe(
+          Effect.catch((failure) =>
+            Effect.logWarning(
+              "a scope import's session could not be indexed; the import runs regardless, and the session will not appear in the target's list",
+              {
+                targetId: request.targetId,
+                importId,
+                sessionId,
+                detail: failure.message,
+              },
+            ),
+          ),
+        );
 
         // Opened before the fiber starts, so the panel's first poll finds an import with
         // every link `waiting` rather than a `404` for the first moment of its life.

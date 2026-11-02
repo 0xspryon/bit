@@ -1442,6 +1442,69 @@ const addAssetImports = statements(
 );
 
 /**
+ * `0024` — which harness session each scope import ran on, so the operator can find it
+ * again.
+ *
+ * **A pointer, not a record of the conversation.** `DECISIONS.md` §8 is explicit that this
+ * build persists no prose and reads it from the harness, and nothing here changes that. What
+ * a harness cannot tell us is *which of its sessions were ours*: it holds every session of
+ * every project, and a page that wants "the importer sessions on this target" has nothing to
+ * ask it with. This table is that index. It is `0021`'s sibling and shaped on it, with the
+ * one difference that a goal has one current session and a target has a history of them.
+ *
+ * ## One row per import run, many runs per session
+ *
+ * `import_id` is the key and `harness_session_id` is **deliberately not unique.** Today an
+ * import is one run on one session and the two are 1:1. A session that is continued later
+ * (a second prompt on the same harness session) writes under a credential, and a credential
+ * is bound to an import id, so a continuation is either the same id again or a new one — and
+ * this table is the same shape either way. If it is a new one, the continuation inserts a
+ * second row naming the same session, and the reader groups by session. Making the session
+ * the key instead would have forced a second migration at exactly that point, and a second
+ * key is the one change here that cannot be made without rebuilding the table.
+ *
+ * ## There are no tallies on the row, and that is the decision
+ *
+ * The picker prints what a session wrote (`7 in · 3 out · 14 assets`). Storing those three
+ * numbers here would mean keeping them current: bumped by every importer write, by something
+ * other than the transaction that made the write, and bumped again by every write a
+ * continued session makes. A crash between the write and the bump leaves a count that is
+ * wrong for good, and nothing detects it.
+ *
+ * They are **derived** instead, from rows that already say who wrote them and are written
+ * in the same transaction as the thing they describe: `scope.entry.added` events (the
+ * entry's `effect` is in the payload) and `asset_imports` rows, both carrying
+ * `caller_scope`. `caller_scope` here is that exact string, recorded rather than rebuilt in
+ * SQL, so the join is on the value the writes were made under and not on a second spelling
+ * of `callerScopeOf`'s format. A continued session's tally keeps up because its writes land
+ * under a scope this table already names.
+ *
+ * What the derivation counts is what the session **wrote**, not what is still there: an
+ * entry the operator later removes was still written by the session, and the event log it is
+ * counted from is append-only.
+ *
+ * `harness_instance_id` is nullable and `model` is not, for `goal_sessions`' and the
+ * picker's reasons: the instance is what says which harness may be asked about the session,
+ * and the model is shown on every row. Neither can be recovered from the harness cheaply.
+ *
+ * No foreign key from `target_id` (the file *is* the target, §3). The one index is the one
+ * read: a target's sessions, newest first.
+ */
+const addImportSessions = statements(
+  `CREATE TABLE import_sessions (
+    import_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    harness_session_id TEXT NOT NULL,
+    harness_instance_id TEXT,
+    model TEXT NOT NULL,
+    caller_scope TEXT NOT NULL,
+    opened_at INTEGER NOT NULL,
+    CHECK (length(harness_session_id) > 0)
+  )`,
+  `CREATE INDEX import_sessions_target_idx ON import_sessions(target_id, opened_at)`,
+);
+
+/**
  * The ordered chain. Append only; never edit an entry that has shipped.
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1482,6 +1545,7 @@ export const MIGRATIONS: Record<
   "0021_goal_sessions": addGoalSessions,
   "0022_target_scope": addTargetScope,
   "0023_asset_imports": addAssetImports,
+  "0024_import_sessions": addImportSessions,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

@@ -1407,6 +1407,46 @@ const fleetHandlers = HttpApiBuilder.group(
       }),
 
       /**
+       * The harness sessions this target's imports have run on, newest first.
+       *
+       * The tallies come from the target's own file, counted on read (`0024`); `running` is
+       * the one field this process answers itself, from the live registry. A session counts
+       * as running if **any** of its runs is: the figure is for the session, and a session
+       * continued under a fresh import id is still one session.
+       *
+       * The registry is keyed by import id and `readImport` checks an id against its target
+       * before answering. This does not need that check: the ids it asks about were read off
+       * this target's own rows, so they cannot belong to another.
+       */
+      importerSessions: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const sessions = yield* withTargetStore(stores, row.targetId, (store) =>
+          store.importSessions(row.targetId),
+        ).pipe(Effect.orDie);
+        return {
+          sessions: yield* Effect.forEach(sessions, (session) =>
+            Effect.map(
+              Effect.forEach(session.importIds, (importId) =>
+                importer.view(importId),
+              ),
+              (views) => ({
+                sessionId: session.harnessSessionId,
+                harnessInstanceId: session.harnessInstanceId,
+                model: session.model,
+                openedAt: session.openedAt,
+                running: views.some((view) => view?.status === "running"),
+                tally: {
+                  entriesIn: session.entriesIn,
+                  entriesOut: session.entriesOut,
+                  assets: session.assets,
+                },
+              }),
+            ),
+          ),
+        };
+      }),
+
+      /**
        * Stops one import, keeping everything it has already written.
        *
        * The same target check, and the same refusal for an import of another target: a
