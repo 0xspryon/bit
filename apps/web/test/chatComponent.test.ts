@@ -118,6 +118,7 @@ const committed = (): LiveItem => ({
   attemptId: null,
   roundId: "rnd_1",
   goalId: null,
+  importId: null,
   headline: "Intent added",
   body: "intent int_real was added",
   tool: null,
@@ -316,6 +317,7 @@ describe("the context meter", () => {
     attemptId: null,
     roundId: "rnd_1",
     goalId: null,
+    importId: null,
     at: AT,
     ...over,
   });
@@ -645,6 +647,7 @@ describe("the planner's own half of the chat", () => {
       attemptId: null,
       roundId: "rnd_1",
       goalId: null,
+      importId: null,
       at: AT,
     });
     await settle();
@@ -691,6 +694,7 @@ describe("the planner's own half of the chat", () => {
       attemptId: null,
       roundId: "rnd_1",
       goalId: null,
+      importId: null,
       at: AT,
     });
     await settle();
@@ -924,6 +928,7 @@ describe("the goal agent's own half of the chat", () => {
       attemptId: null,
       roundId: null,
       goalId: "goal_1",
+      importId: null,
       at: AT,
     });
     await settle();

@@ -355,6 +355,25 @@ export const LiveItem = Schema.Struct({
    * `null` for everything else, including every record a round or a worker wrote.
    */
   goalId: Schema.NullOr(Schema.String),
+  /**
+   * The scope import this item belongs to, when it is part of an importer **conversation**.
+   *
+   * The fourth sibling, and the importer chat's filter: an importer session is keyed by
+   * import id (one authority period, `0027`), so that is the only id that can say which of a
+   * target's importer chats an entry belongs in. None of the other three can: an importer
+   * session is not an attempt, a round or a goal's agent, so all three are null on
+   * everything it says.
+   *
+   * It is set exactly one way: **the importer's own narration**, published under the import
+   * whose session the importer opened, exactly as a goal agent's is published under its
+   * goal.
+   *
+   * `null` for everything else — including, for now, every record the importer wrote. Its
+   * `scope.entry.added` and `asset.imported` events are not projected onto this feed at all
+   * yet (the importer conversation design, S5), and attributing them here is that slice's
+   * work, from the event's caller scope, rather than a guess made from this one.
+   */
+  importId: Schema.NullOr(Schema.String),
   /** A short label: the tool's name, `Denied`, `Observation recorded`. */
   headline: Schema.String,
   /** A sentence for the operator. The gate's reason, the store's claim, the reply's text. */
@@ -602,13 +621,14 @@ export const LiveUsage = Schema.Struct({
   /**
    * Whose session this call belongs to, exactly as {@link LiveItem} carries it.
    *
-   * One of the three is set. A page showing a planner round and a goal conversation side by
+   * One of the four is set. A page showing a planner round and a goal conversation side by
    * side has two meters on it, and nothing but this says which figure is which — the two
    * agents have their own sessions, their own models and their own windows.
    */
   attemptId: Schema.NullOr(Schema.String),
   roundId: Schema.NullOr(Schema.String),
   goalId: Schema.NullOr(Schema.String),
+  importId: Schema.NullOr(Schema.String),
   /** When the harness said it, in epoch milliseconds. Not an ordering key. */
   at: EpochMillis,
 });

@@ -10,18 +10,29 @@
  *
  * **This does not do that, and the difference is not stylistic.** The calls below are
  * recorded by the importer's own toolkit, at the moment each one crosses our MCP boundary
- * and after the write it describes has landed. Nothing in this process subscribes to the
- * importer's narration at all. Three things follow, and the first is the one that matters:
+ * and after the write it describes has landed. This registry does not read the importer's
+ * narration, and the panel is built from this registry alone. Three things follow:
  *
- * - **Narration cannot be rendered, because it is never captured.** A filter is a line of
- *   code somebody can relax; not reading the stream is a thing somebody would have to go
- *   and build. D16's "no narration, no reasoning" is therefore a property of the wiring.
+ * - **Narration does not reach the panel, because the panel's source does not carry it.**
+ *   It is not a filter over a stream that also holds prose — that would be one relaxed
+ *   predicate away from showing reasoning. The panel's rows come from a different source
+ *   altogether.
  * - **A recorded call is a write that happened.** The toolkit records *after* the store
  *   returns, so the panel cannot show an entry that was refused, and an operator reading
  *   it as a receipt is reading it correctly. A narration-derived panel would show the call
  *   the model attempted, which is a different and much weaker claim.
  * - **It costs nothing extra.** The calls are already crossing this boundary. Nothing is
  *   captured, streamed or stored to render the panel, which is what D16 promises.
+ *
+ * **What this header used to say, and why it stopped being true.** It said narration
+ * *cannot* be rendered because nothing in the process captures it, and called that a
+ * property of the wiring. The importer conversation design's S4 changed the wiring: the
+ * importer's session is a conversation now, and its narration is drained onto the
+ * in-process bus (`run/narration.ts`, under an `import` subject) so the Auto-load page's
+ * chat can show what the agent says. D16 is amended to match (the target-scope design):
+ * the **panel** keeps its call list and nothing else, and the **chat** shows prose. What
+ * keeps the two apart is no longer that the prose does not exist; it is that this
+ * registry, which is all the panel reads, never subscribes to it.
  *
  * The harness's own page fetches do not appear here, per D13: they are not our tool calls,
  * and nothing we own observes them.
@@ -31,7 +42,9 @@
  * message *after* it has settled and settles the import with it, so an import that wrote
  * nothing can say why it wrote nothing. That is one status line, written once, by the same
  * `settle` call that records the status — not a stream, not the call list, and nothing this
- * registry subscribes to.
+ * registry subscribes to. It is read that way rather than off the bus because the
+ * create-target path, which is the one that shows this panel, still has no browser
+ * attached to any stream, and the bus keeps nothing for a reader who is not there.
  *
  * ## In memory, for the life of the process, and deliberately
  *

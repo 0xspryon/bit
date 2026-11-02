@@ -69,6 +69,8 @@ import { FleetStore, HUNT_FILE } from "../persistence/fleet";
 import type { DatabaseError } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
+import { projectNarration } from "../run/liveTranscript";
+import { RunNarrations, type RunNarration } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 
 const base = mkdtempSync(join(tmpdir(), "bit-scope-importer-"));
@@ -180,8 +182,16 @@ interface Script {
   /** How each prompt was delivered, in the same order as `prompts`. */
   readonly deliveries: PromptDelivery[];
   readonly interrupted: string[];
-  /** Sessions whose narration stream was subscribed to. Expected to stay empty. */
+  /** Sessions whose narration stream was subscribed to: one per opened session (S4). */
   readonly subscribed: string[];
+  /**
+   * Each narration stream that stopped, with how many registrations had been taken back at
+   * that moment. The spine interrupts the narrator **before** it closes the scope, so on a
+   * close that count is still what it was before the close began.
+   */
+  readonly streamsEnded: { sessionId: string; unregisteredAt: number }[];
+  /** Makes the narration stream fail once it has said its lines, as a dropped stream does. */
+  failEvents: boolean;
   /** Resolves once the scripted session has finished making its calls. */
   done: Promise<void>;
   /** Makes `createSession` fail, for a session that never opens. */
@@ -233,6 +243,8 @@ const newScript = (readable: readonly string[]): Script => ({
   deliveries: [],
   interrupted: [],
   subscribed: [],
+  streamsEnded: [],
+  failEvents: false,
   done: Promise.resolve(),
   failCreate: false,
   failPrompt: false,
@@ -404,7 +416,11 @@ const scriptedHarness = (script: Script) => {
      * `Stream.never` made the D16 claim unfalsifiable: nothing could reach the panel from
      * a stream that yields nothing, so a server that *did* subscribe would have passed.
      * This one yields two reasoning lines and then stays open like a live session's, so
-     * "no narration reaches the view" is a fact about the wiring.
+     * "no narration reaches the view" is a fact about the wiring — now that the chat does
+     * subscribe (S4), a fact about which source the panel reads.
+     *
+     * With `failEvents` it fails after its lines instead of staying open: the stream a
+     * harness drops mid-conversation, which must not end the conversation.
      */
     sessionEvents: (sessionId) =>
       Stream.concat(
@@ -417,11 +433,31 @@ const scriptedHarness = (script: Script) => {
             detail: { _tag: "reply" as const, text },
           })),
         ),
-        Stream.never,
+        Stream.suspend(() =>
+          script.failEvents
+            ? Stream.fail(
+                new HarnessTransportError({
+                  operation: "sessionEvents",
+                  status: undefined,
+                  tag: undefined,
+                  detail: "the scripted harness dropped the event stream",
+                  cause: undefined,
+                }),
+              )
+            : Stream.never,
+        ),
       ).pipe(
         Stream.onStart(
           Effect.sync(() => {
             script.subscribed.push(sessionId);
+          }),
+        ),
+        Stream.ensuring(
+          Effect.sync(() => {
+            script.streamsEnded.push({
+              sessionId,
+              unregisteredAt: script.unregistered.length,
+            });
           }),
         ),
       ),
@@ -455,6 +491,8 @@ const world = (readable: readonly string[]) => {
     McpCredentials.layer,
     McpCallCounter.layer,
     PolicyDecisions.layer,
+    // The one narration bus, so a test can subscribe to what the importer publishes (S4).
+    RunNarrations.layer,
   );
 
   const withStores = TargetStores.layer.pipe(Layer.provideMerge(base));
@@ -528,12 +566,23 @@ const importWith = async (
     readonly links?: readonly string[];
     /** The operator's pick, as `ImportModelDraft` carries it. */
     readonly choice?: ScopeImportRequest["choice"];
+    /** Makes the narration stream fail after its lines. See `Script.failEvents`. */
+    readonly failEvents?: boolean;
+    /**
+     * Runs once the runtime exists and before the import starts: where a test subscribes
+     * to the narration bus, which replays nothing to a late subscriber.
+     */
+    readonly beforeStart?: (
+      runtime: ManagedRuntime.ManagedRuntime<RunNarrations, unknown>,
+    ) => Promise<void>;
   } = {},
 ) => {
   const built = world(readable);
   built.script.failCreate = options.failCreate === true;
   built.script.failPrompt = options.failPrompt === true;
+  built.script.failEvents = options.failEvents === true;
   const runtime = ManagedRuntime.make(built.layer);
+  if (options.beforeStart !== undefined) await options.beforeStart(runtime);
   const outcome = await runtime.runPromise(
     Effect.gen(function* () {
       const fleet = yield* FleetStore;
@@ -881,8 +930,9 @@ describe("nothing is started but the import", () => {
  * `messages` after the session settles and becomes the import's status line, because an
  * import that wrote nothing has to be able to say why — and that is the common case, since
  * a client-rendered program page answers `200` with no scope in it. The **narration** is on
- * `sessionEvents`, which nothing here subscribes to, so it reaches the call list, the view
- * and the panel not at all.
+ * `sessionEvents`, which the importer now drains onto the narration bus for the chat (S4,
+ * and D16 as amended) — and which reaches the call list, the view and the panel not at all,
+ * because none of them reads the bus.
  */
 describe("the session's closing report, and nothing else it said", () => {
   test("an import that wrote nothing says why, in the session's own words", async () => {
@@ -907,14 +957,16 @@ describe("the session's closing report, and nothing else it said", () => {
     await runtime.dispose();
   });
 
-  test("nothing subscribes to the narration stream, so none of it is anywhere in the view", async () => {
+  test("the narration stream is drained for the chat, and none of it is anywhere in the view", async () => {
     const { built, runtime, view } = await importWith([PAGE_GOOD, PAGE_BAD]);
     expect(view?.status).toBe("finished");
 
-    // The scripted harness narrates two reasoning lines and keeps the stream open, so
-    // this is a claim about the wiring rather than about the contract's shape: a server
-    // that subscribed would have something to show, and has nowhere to put it.
-    expect(built.script.subscribed).toEqual([]);
+    // The scripted harness narrates two reasoning lines and keeps the stream open, and the
+    // importer **does** subscribe now — once, for its one session (S4). So this is a claim
+    // about which source the panel reads rather than about the contract's shape: the
+    // narration exists in this process, and the view still has nowhere it could have come
+    // from.
+    expect(built.script.subscribed).toEqual(["ses_import"]);
 
     // The whole view, serialised: calls, link rows, totals, detail. If a later change adds
     // a narration field and fills it, this is the line that fails.
@@ -941,6 +993,148 @@ describe("the session's closing report, and nothing else it said", () => {
     const prompt = built.script.prompts[0] ?? "";
     expect(prompt).toContain("no scope table");
     expect(prompt).toContain("naming the page and");
+    await runtime.dispose();
+  });
+});
+
+/**
+ * Takes the first `count` narration entries this target's importer publishes, subscribing
+ * before the import starts and waiting until the subscription is established — the bus
+ * replays nothing, so a test that started first would be testing its own luck.
+ */
+const collectNarration = (count: number) => {
+  let taken: Promise<readonly RunNarration[]> | undefined;
+  const beforeStart = async (
+    runtime: ManagedRuntime.ManagedRuntime<RunNarrations, unknown>,
+  ) => {
+    const before = await runtime.runPromise(
+      Effect.flatMap(RunNarrations, (bus) => bus.subscriberCount),
+    );
+    taken = runtime.runPromise(
+      Effect.flatMap(RunNarrations, (bus) =>
+        bus
+          .subscribe({ targetId: TARGET })
+          .pipe(Stream.take(count), Stream.runCollect),
+      ),
+    );
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const now = await runtime.runPromise(
+        Effect.flatMap(RunNarrations, (bus) => bus.subscriberCount),
+      );
+      if (now > before) return;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    throw new Error("the narration subscription was never established");
+  };
+  return {
+    beforeStart,
+    taken: () => {
+      if (taken === undefined) throw new Error("nothing was subscribed");
+      return taken;
+    },
+  };
+};
+
+/**
+ * Live narration (the importer conversation design, S4).
+ *
+ * The goal conversation's narrator, on the importer's sessions: forked by the spine into the
+ * session's scope, publishing under an `import` subject, interrupted first on close, and
+ * logged rather than fatal when the stream ends.
+ */
+describe("the importer narrates to the chat", () => {
+  test("what the session says is published under its import, and projects with that import on it", async () => {
+    const narration = collectNarration(NARRATION.length);
+    const { runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      beforeStart: narration.beforeStart,
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const items = await narration.taken();
+
+    expect(items.map((item) => item.subject)).toEqual(
+      NARRATION.map(() => ({ _tag: "import", importId: started.importId })),
+    );
+    expect(items.map((item) => item.harnessSessionId)).toEqual(
+      NARRATION.map(() => "ses_import"),
+    );
+    expect(
+      items.map((item) =>
+        item.entry.detail._tag === "reply" ? item.entry.detail.text : "",
+      ),
+    ).toEqual([...NARRATION]);
+
+    // And on the wire: the import is the item's one subject id, so the chat can file it
+    // and no attempt, round or goal chat can claim it.
+    const frame = projectNarration(items[0] as RunNarration);
+    expect(frame).toMatchObject({
+      _tag: "item",
+      kind: "turn.reply",
+      body: NARRATION[0],
+      importId: started.importId,
+      attemptId: null,
+      roundId: null,
+      goalId: null,
+    });
+    await runtime.dispose();
+  });
+
+  test("stopping the session interrupts its narrator before the scope takes the registration back", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    // Open, and still narrating: a session that outlives its turn keeps its stream.
+    expect(built.script.streamsEnded).toEqual([]);
+
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.stop(started.importId),
+      ),
+    );
+    // Ended, and ended while nothing had been unregistered yet: the spine interrupts the
+    // narrator first, so nothing is published for a session whose credential is going.
+    expect(built.script.streamsEnded).toEqual([
+      { sessionId: "ses_import", unregisteredAt: 0 },
+    ]);
+    expect(built.script.unregistered).toEqual(["ses_import"]);
+    await runtime.dispose();
+  });
+
+  test("the layer's shutdown ends the narrator too, with no lifecycle of its own", async () => {
+    const { built, runtime } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    await runtime.dispose();
+    expect(built.script.streamsEnded).toEqual([
+      { sessionId: "ses_import", unregisteredAt: 0 },
+    ]);
+  });
+
+  test("a stream that ends does not end the conversation: the next message still reaches the session", async () => {
+    const { built, runtime, started, view } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      failEvents: true,
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    expect(view?.status).toBe("finished");
+    // The stream is gone and the session is not: nothing was unregistered and the grant
+    // is still live.
+    expect(built.script.streamsEnded).toEqual([
+      { sessionId: "ses_import", unregisteredAt: 0 },
+    ]);
+    expect(built.script.unregistered).toEqual([]);
+    const bearer = built.script.registrations[0]?.bearer ?? "";
+    expect((await authorityOf(runtime, bearer)).size).toBe(1);
+
+    const sent = await sendTo(runtime, started.importId, "Anything else?");
+    expect(sent._tag).toBe("Success");
+    if (sent._tag !== "Success") return;
+    expect(sent.success.conversation).toBe("continued");
+    expect(built.script.prompts[1]).toBe("Anything else?");
+    expect(built.script.deliveries[1]?._tag).toBe("steer");
+    // Still the one session: a dropped stream is not a reason to open another.
+    expect(built.script.created).toHaveLength(1);
     await runtime.dispose();
   });
 });

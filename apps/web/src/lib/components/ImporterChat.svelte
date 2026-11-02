@@ -2,10 +2,12 @@
   /**
    * The scope importer's conversation (A6 D2–D5): an ordinary chat, pointed at one job.
    *
-   * **Driven by mock data.** Every field it reads is on `app.importer`
-   * (`importerSessions.svelte.ts`), which holds declared sessions; nothing here reaches a
-   * server. See that file for the one fake in the interface (the stand-in reply to a sent
-   * message) and `mockImporter.ts` for the content, whose narration is invented.
+   * Every field it reads is on `app.importer` (`importerSessions.svelte.ts`). On a real
+   * target that is the server's: the session list (S1), the composer (S3) and — since S4 —
+   * the importer's own replies and thinking, live, from the target's narration feed. In the
+   * state picker it is declared: see that file for the one fake in the interface (the
+   * stand-in reply to a sent message) and `mockImporter.ts` for the content, whose narration
+   * is invented. Tool rows are still declared-only (S5).
    *
    * ## It is {@link Chat}, laid out as a page
    *
@@ -61,6 +63,7 @@
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import Chat from "./Chat.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
+  import StreamCursor from "./StreamCursor.svelte";
 
   let { app }: { app: App } = $props();
 
@@ -194,6 +197,18 @@
       {/if}
     {/snippet}
 
+    {#snippet tail(group)}
+      <!--
+        D3's streaming cursor: the importer is still on this message. Drawn while the turn is
+        in flight — from the server accepting it until the server says the import is no
+        longer running — and not while a pending write already draws its own, so a turn
+        never blinks twice. The heading's status line says the same thing in words.
+      -->
+      {#if group.subject.working && !group.rows.some((row) => row.write === "pending")}
+        <div class="streaming"><StreamCursor /></div>
+      {/if}
+    {/snippet}
+
     {#snippet footnote()}
       A call marked <strong>recorded</strong> is a committed event and stays on the
       Assets page. A dashed call, the importer's words and your messages are narration:
@@ -307,6 +322,10 @@
     min-height: 0;
     flex-direction: column;
     padding: 0 32px;
+  }
+
+  .streaming {
+    padding: 4px 0 0;
   }
 
   /* ── The separator: the operator's bubble, then the importer's header ──────── */

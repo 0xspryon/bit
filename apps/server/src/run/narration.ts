@@ -64,7 +64,8 @@ import type { HarnessNarration } from "../harness/agentHarness";
 export const NARRATION_BUFFER = 256;
 
 /**
- * Whose session is narrating: a worker's attempt, or a planner round.
+ * Whose session is narrating: a worker's attempt, a planner round, a goal's agent, or a
+ * scope importer.
  *
  * **Tagged rather than two nullable id fields, for the reason `CallerContext` is tagged.**
  * Exactly one of the two is ever set, and a pair of nullable fields makes "neither" and
@@ -92,7 +93,24 @@ export type NarrationSubject =
    * turn — and the chat groups by the conversation rather than by the turn for the same
    * reason: there is no durable record of a turn boundary to corroborate one.
    */
-  | { readonly _tag: "goal"; readonly goalId: string };
+  | { readonly _tag: "goal"; readonly goalId: string }
+  /**
+   * A scope importer's session: the conversation an operator has on a target's Auto-load
+   * page.
+   *
+   * The fourth case, and a conversation in the way the third is — many turns, one stream,
+   * keyed by subject rather than by turn. Keyed by **import id** rather than by target,
+   * because a target can have several importer sessions over its life and the chat shows
+   * one of them; and rather than by harness session id, because the import id is the
+   * authority period the importer's credential and its writes are filed under, so it is the
+   * same key everything else about the session already uses.
+   *
+   * It exists because the importer stopped being a batch job. While it was one prompt with
+   * nobody on the other end, its narration was deliberately never drained (D16 in the
+   * target-scope design, which the importer conversation design's S4 amends): there was no
+   * screen to narrate to. A chat is one.
+   */
+  | { readonly _tag: "import"; readonly importId: string };
 
 /**
  * One entry of narration as a supervisor hands it over, with the things that say whose it
@@ -137,16 +155,17 @@ export interface RunNarration extends RunNarrationInput {
 /**
  * Which narration a subscriber wants. Absent means every target, or every subject.
  *
- * `attemptId` and `roundId` are both here and both optional, and that is **not** the shape
+ * The subject ids are all here and all optional, and that is **not** the shape
  * {@link NarrationSubject} refused. A filter is a question and may legitimately name
- * neither — the live transcript asks for a whole target — or name one of them. What it
- * cannot do is name both, which is a question with no answers and reads as one.
+ * none — the live transcript asks for a whole target — or name one of them. What it
+ * cannot do is name two, which is a question with no answers and reads as one.
  */
 export interface NarrationFilter {
   readonly targetId?: string | undefined;
   readonly attemptId?: string | undefined;
   readonly roundId?: string | undefined;
   readonly goalId?: string | undefined;
+  readonly importId?: string | undefined;
 }
 
 const subjectMatches = (
@@ -158,7 +177,9 @@ const subjectMatches = (
   (filter.roundId === undefined ||
     (subject._tag === "round" && subject.roundId === filter.roundId)) &&
   (filter.goalId === undefined ||
-    (subject._tag === "goal" && subject.goalId === filter.goalId));
+    (subject._tag === "goal" && subject.goalId === filter.goalId)) &&
+  (filter.importId === undefined ||
+    (subject._tag === "import" && subject.importId === filter.importId));
 
 const matches = (filter: NarrationFilter, item: RunNarration): boolean =>
   (filter.targetId === undefined || filter.targetId === item.targetId) &&

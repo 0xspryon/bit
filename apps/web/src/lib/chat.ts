@@ -873,6 +873,7 @@ export const operatorTurn = (turn: SentTurn): LiveItem => ({
   attemptId: null,
   roundId: null,
   goalId: null,
+  importId: null,
   headline: "You",
   body: turn.text,
   tool: null,
@@ -1123,7 +1124,7 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
 /**
  * Which session a {@link LiveUsage} frame measures, as one map key.
  *
- * The frame carries the same three nullable ids a {@link LiveItem} does and exactly one of
+ * The frame carries the same four nullable ids a {@link LiveItem} does and exactly one of
  * them is set, so this is the join between "a measurement arrived" and "which pane it
  * belongs to". A page showing a planner round above a goal conversation has **two** meters
  * on it: two agents, two sessions, two models, two windows, and nothing but this key says
@@ -1135,10 +1136,13 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
  * trusted at a glance.
  */
 export const usageScope = (
-  usage: Pick<LiveUsage, "attemptId" | "roundId" | "goalId">,
+  usage: Pick<LiveUsage, "attemptId" | "roundId" | "goalId" | "importId">,
 ): string | undefined => {
   if (usage.roundId !== null) return `round:${usage.roundId}`;
   if (usage.goalId !== null) return `goal:${usage.goalId}`;
+  // Kept, though no importer pane draws a meter yet: dropping the frame would make the
+  // importer's model calls the one agent on a page whose figures vanish unexplained.
+  if (usage.importId !== null) return `import:${usage.importId}`;
   if (usage.attemptId !== null) return `attempt:${usage.attemptId}`;
   return undefined;
 };

@@ -82,12 +82,20 @@
  * install, an MCP registration the harness refused. Those are the operator's to fix and
  * are reported with the refusing component's own sentence.
  *
- * ## The session's narration is never read, and its final report is (D16)
+ * ## The chat reads the session's narration; the panel reads its calls (D16, amended)
  *
- * There is no `sessionEvents` subscription here, and its absence is D16's implementation
- * of the *call list*. The panel lists tool calls, which the importer's own toolkit records
- * as they cross our MCP boundary (`import/progress.ts`). Narration is not filtered out of
- * that list — it is never captured, so putting it there would mean building something new.
+ * The session's `sessionEvents` are drained onto the in-process narration bus under an
+ * `import` subject, by a narrator the spine forks into the session's scope, and the
+ * Auto-load page's chat subscribes through the target's live transcript. That reverses
+ * half of D16 on purpose (the importer conversation design, S4): D16 was written for a
+ * single-turn batch job with nobody on the other end, which has nothing to narrate to, and
+ * a conversation does.
+ *
+ * **The other half stands.** The progress panel lists tool calls, which the importer's own
+ * toolkit records as they cross our MCP boundary (`import/progress.ts`), and nothing else.
+ * Narration is not on the panel and is not filtered *out* of it either: the two are
+ * separate readers of separate sources, the panel a receipt of writes and the chat a
+ * conversation.
  *
  * **One message is read, after the session has settled: the last thing it said.** The
  * prompt asks for it explicitly — "stop and report in a few lines: which pages you could
@@ -123,6 +131,7 @@ import {
   Fiber,
   Layer,
   Semaphore,
+  Stream,
 } from "effect";
 
 import { resolveImporterModel } from "./importerModel";
@@ -145,6 +154,7 @@ import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { newImportId } from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
+import { RunNarrations } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 
 /**
@@ -409,6 +419,7 @@ export class ScopeImporter extends Context.Service<
     | WorkerEndpoints
     | ScopeImportProgress
     | TargetStores
+    | RunNarrations
   > = Layer.effect(
     ScopeImporter,
     Effect.gen(function* () {
@@ -418,6 +429,7 @@ export class ScopeImporter extends Context.Service<
       const endpoints = yield* WorkerEndpoints;
       const progress = yield* ScopeImportProgress;
       const stores = yield* TargetStores;
+      const narrations = yield* RunNarrations;
       // This layer's own scope, which every import's first turn is forked into. Shutting
       // the server down closes it, which interrupts any turn still reading; the session
       // registry's finalizer then revokes each credential and takes back each MCP
@@ -544,6 +556,59 @@ export class ScopeImporter extends Context.Service<
       const successors = new Map<string, string>();
 
       /**
+       * Publishes one import session's narration under its import, for as long as the
+       * session lives.
+       *
+       * `plan/goalConversation.ts`'s `narrate`, with the subject changed and nothing else: an
+       * importer conversation has no terminal outcome to read off the stream either, because
+       * it does not settle — a turn settles, and that is read from `waitForIdle`, not from
+       * here. The spine forks this into the session's own scope and interrupts it **first**
+       * on every close (`harness/liveAgentSessions.ts`, `closeSession`), so it needs no
+       * lifecycle of its own: the operator's stop, a refused prompt, a failed open and the
+       * layer's finalizer all end it, before the credential goes.
+       *
+       * **A stream that ends does not end the conversation.** It is logged and nothing more:
+       * the stream breaking says nothing about the session, and the next message still
+       * reaches it through `deliverTurn`, which does not look at this fiber at all. What is
+       * lost is what the chat would have shown until a reload replays from the harness.
+       *
+       * **Publishing is not persisting.** With nobody on the Auto-load page — which is
+       * always the case for an import started from the create-target form — every entry is
+       * published to no subscriber and kept nowhere (`run/narration.ts`'s header). That path's
+       * closing report is still read from `messages` after `waitForIdle`; see
+       * {@link settleTurn}.
+       */
+      const narrate = Effect.fnUntraced(function* (input: {
+        readonly harness: AgentHarness["Service"];
+        readonly targetId: string;
+        readonly importId: string;
+        readonly sessionId: string;
+      }) {
+        const outcome = yield* Effect.result(
+          Stream.runForEach(
+            input.harness.sessionEvents(input.sessionId),
+            (entry) =>
+              narrations.publish({
+                targetId: input.targetId,
+                subject: { _tag: "import", importId: input.importId },
+                harnessSessionId: input.sessionId,
+                entry,
+              }),
+          ),
+        );
+        if (outcome._tag === "Failure") {
+          yield* Effect.logWarning(
+            "a scope import's narration stream ended; this says nothing about the session, and the next message still reaches it",
+            {
+              importId: input.importId,
+              sessionId: input.sessionId,
+              detail: outcome.failure.message,
+            },
+          );
+        }
+      });
+
+      /**
        * The first turn of one import: open the session, let it work, settle the view.
        *
        * The acquire order is the spine's, and each step rules out the next step's
@@ -627,8 +692,15 @@ export class ScopeImporter extends Context.Service<
                     ),
                   ),
                 ),
-              // No narrator. D16: the importer's narration is never captured, and S4 is
-              // the slice that changes that.
+              // The narrator, forked by the spine into this session's scope. D16 as
+              // amended: the panel keeps its call list, and the chat shows this.
+              narrate: (sessionId: string) =>
+                narrate({
+                  harness,
+                  targetId: input.request.targetId,
+                  importId: input.importId,
+                  sessionId,
+                }),
               openingPrompt: () =>
                 assembleImporterPrompt({
                   targetName: input.request.targetName,
@@ -737,10 +809,12 @@ export class ScopeImporter extends Context.Service<
          * with no scope in it, so every step here succeeds, nothing is written, and
          * without this the operator is told "nothing could be read" and no more.
          *
-         * `messages` rather than `sessionEvents`, and that distinction is D16's: this is
-         * one message, pulled after the fact, not a stream subscribed to while the session
-         * talks. No narration is captured, nothing intermediate is kept, and the call list
-         * is untouched — what this produces is a single status line.
+         * `messages` rather than the narration bus, and that distinction is D16's: this is
+         * one message, pulled after the fact, for a panel and a toast that have no browser
+         * subscribed to anything — the create-target path, where an import is still a batch
+         * job. The session's narration *is* drained now (`narrate`), but onto a bus that
+         * keeps nothing for a reader who is not there, so it cannot stand in for this. The
+         * call list is untouched; what this produces is a single status line.
          *
          * A failure to read it is not a failure of the import. The entries are written and
          * are the operator's to review; the report is an explanation, and an explanation

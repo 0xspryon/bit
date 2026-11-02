@@ -3604,6 +3604,7 @@ describe("the context meter", () => {
     attemptId: null,
     roundId: "rnd_1",
     goalId: null,
+    importId: null,
     at: AT,
     ...over,
   });

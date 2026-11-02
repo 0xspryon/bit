@@ -1484,15 +1484,24 @@ export class App {
    * ({@link openImporter}) and left by going anywhere else — `toSection` and `openTarget`
    * both close it, and stop watching an import on the way out.
    *
-   * It is a chat with the importer (A6 D2–D5), **driven by mock data**: there is no importer
-   * API yet, so {@link importer} holds a declared list of sessions and nothing on this page
-   * reaches the server. The form, the model picker and the polled progress panel it used to
-   * carry are still here as state ({@link importerPhase}, {@link programLinks},
-   * {@link startScopeImport}) and no longer on screen; they go when the chat has a source.
+   * It is a chat with the importer (A6 D2–D5). On a real target its session list, its
+   * composer and the importer's live words are the server's (the importer conversation
+   * design, S1–S4); the state picker's scenarios are declared. The form, the model picker
+   * and the polled progress panel it used to carry are still here as state
+   * ({@link importerPhase}, {@link programLinks}, {@link startScopeImport}) and no longer on
+   * screen; they go when the chat has replaced them everywhere.
    */
   importerOpen = $state(false);
-  /** The Auto-load chat's sessions, the one on screen and its composer. Mock. */
-  importer = new ImporterSessions();
+  /**
+   * The Auto-load chat's sessions, the one on screen and its composer.
+   *
+   * Handed the target's live feed as a function, so the chat's groups read it where they
+   * are derived and an arriving entry moves them. Guarded by target, for
+   * {@link liveTargetId}'s reason: one target's feed never shows under another.
+   */
+  importer = new ImporterSessions(undefined, () =>
+    this.liveTargetId === this.viewTargetId ? this.liveItems : [],
+  );
   /**
    * Which half of the Auto-load page is showing: the links and the model, or the import's
    * progress. `importing` once an import has started on this target in this tab.
@@ -2427,6 +2436,55 @@ export class App {
       harnessName: (instanceId) =>
         this.harnesses.find((entry) => entry.instanceId === instanceId)
           ?.displayName ?? instanceId,
+      highWater: () => this.#activityHighWater() ?? 0,
+      watchTurn: (importId, idle) =>
+        this.#watchImporterTurn(targetId, importId, idle),
+    };
+  }
+
+  /**
+   * Polls one import until its turn is over, then calls `idle` once.
+   *
+   * {@link watchImport}'s loop — rescheduled after each answer, one request in flight — and
+   * separate from it because it watches a different thing for a different reader: that one
+   * settles the progress panel, this one only clears a chat's cursor, and the two must not
+   * stop each other.
+   *
+   * **Anything but `running` is the end of the turn**: settled, stopped, failed, forgotten
+   * by a restarted server, or no server answering. Each of those means nothing more is
+   * coming for this turn that this tab could see, and a cursor left blinking over a
+   * conversation that has stopped would be a claim the chat cannot back.
+   */
+  #watchImporterTurn(
+    targetId: string,
+    importId: string,
+    idle: () => void,
+  ): () => void {
+    let stopped = false;
+    let cancelNext: (() => void) | undefined;
+    const loop = async (): Promise<void> => {
+      if (stopped) return;
+      const call = await this.client.scopeImport(
+        this.serverUrl,
+        targetId,
+        importId,
+      );
+      if (stopped) return;
+      if (call._tag === "Ok" && call.value.status === "running") {
+        cancelNext = this.countdown.after(IMPORT_POLL_MS, () => void loop());
+        return;
+      }
+      if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+        this.signOut("expired");
+      }
+      stopped = true;
+      idle();
+    };
+    void loop();
+    return () => {
+      stopped = true;
+      cancelNext?.();
+      cancelNext = undefined;
     };
   }
 

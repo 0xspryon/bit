@@ -120,7 +120,11 @@ import {
 
 import { goalIdFromScope, roundIdFromScope } from "../persistence/store";
 import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
-import type { RunNarration, RunNarrations } from "./narration";
+import type {
+  NarrationSubject,
+  RunNarration,
+  RunNarrations,
+} from "./narration";
 
 /**
  * How long a caught-up reader waits before reading the event log again.
@@ -309,6 +313,13 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
      * thing that says so.
      */
     goalId: goalIdFromScope(event.callerScope) ?? null,
+    /**
+     * Null on every record, for now. The importer's records are not on this feed yet —
+     * `scope.entry.added` and `asset.imported` are not in `LIVE_ITEM_KINDS` — and placing
+     * them under an import is the importer conversation design's S5, read from the caller
+     * scope as `goalId` is above. Only the importer's narration carries one today.
+     */
+    importId: null,
     tool: null,
     // Null together with `tool`, always: a committed event is not a tool call, and the
     // record channel never names one.
@@ -516,6 +527,20 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
 
 /* ── Projecting live activity ────────────────────────────────────────────────── */
 
+/** The one id a narration subject carries, whichever kind it is. */
+const subjectKey = (subject: NarrationSubject): string => {
+  switch (subject._tag) {
+    case "attempt":
+      return subject.attemptId;
+    case "round":
+      return subject.roundId;
+    case "goal":
+      return subject.goalId;
+    case "import":
+      return subject.importId;
+  }
+};
+
 /**
  * One narration entry as one live frame, or nothing.
  *
@@ -542,7 +567,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
     /**
      * Whose session narrated this, projected from the bus's tagged subject.
      *
-     * Exactly one of the two is set, which is what the tag buys: an attempt's narration
+     * Exactly one of the four is set, which is what the tag buys: an attempt's narration
      * has no round and a round's has no attempt, and neither is a field left unfilled.
      * The supervisor publishes under the identity whose session it opened, so this is not
      * a guess at attribution.
@@ -550,23 +575,19 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
     attemptId: item.subject._tag === "attempt" ? item.subject.attemptId : null,
     roundId: item.subject._tag === "round" ? item.subject.roundId : null,
     goalId: item.subject._tag === "goal" ? item.subject.goalId : null,
+    importId: item.subject._tag === "import" ? item.subject.importId : null,
   };
   /**
    * The registration whose prefix this subject's tool names carry.
    *
    * Derived from the subject rather than searched for, which is what makes the reduction
-   * below exact: the server was registered as `bit-<attemptId>` or `bit-<roundId>` by the
-   * supervisor that opened this session, so the only prefix stripped is the one this
-   * application chose. A harness's own `bash` is untouched. `mcpToolName.ts` carries the
-   * two observed wire forms and the evidence for each.
+   * below exact: the server was registered as `bit-<id>` — attempt, round, goal or import —
+   * by whatever opened this session (`harness/liveAgentSessions.ts` for the last two), so
+   * the only prefix stripped is the one this application chose. A harness's own `bash` is
+   * untouched. `mcpToolName.ts` carries the two observed wire forms and the evidence for
+   * each.
    */
-  const serverName = bitMcpServerName(
-    item.subject._tag === "attempt"
-      ? item.subject.attemptId
-      : item.subject._tag === "round"
-        ? item.subject.roundId
-        : item.subject.goalId,
-  );
+  const serverName = bitMcpServerName(subjectKey(item.subject));
   const detail = item.entry.detail;
   switch (detail._tag) {
     case "reply":
@@ -676,6 +697,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
         attemptId: base.attemptId,
         roundId: base.roundId,
         goalId: base.goalId,
+        importId: base.importId,
         at: base.at,
       };
     case "opaque":
@@ -713,8 +735,10 @@ export const projectDecision = (
     at: decision.at,
     attemptId,
     // Null for the reason `roundId` below is null: the hook sends a harness session id and
-    // nothing else, so there is nothing here that names a goal conversation either.
+    // nothing else, so there is nothing here that names a goal conversation either — nor an
+    // importer's, whose sessions are not in the attempt map this denial was placed against.
     goalId: null,
+    importId: null,
     /**
      * Null, and that is a gap worth naming rather than papering over.
      *

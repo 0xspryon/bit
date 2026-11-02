@@ -21,8 +21,9 @@
  *   turn opens at each `user` entry. Reduced, so no tool calls: the agent's words are all
  *   there is. Replayed prose, labelled as the harness's, which it may have deleted.
  * - **The live feed** (`items`), where the operator's own message is a minted
- *   `turn.operator` row (see {@link operatorTurn}) and a turn opens at each of those. Tool
- *   calls, their results and the records they produced are all here.
+ *   `turn.operator` row (see {@link operatorTurn}) and a turn opens at each of those. The
+ *   importer's replies and thinking arrive here, filed by import id ({@link importerFeed});
+ *   tool calls, their results and the records they produced will (S5).
  *
  * Replayed turns come first, then live ones; the caller owns the floor between them (the
  * same job `buildGoalConversation`'s `narrationFloor` does), so nothing is shown from both.
@@ -50,6 +51,7 @@ import type {
 
 import {
   OPERATOR_TURN_KIND,
+  activityOrder,
   rowsFor,
   type ChatGroup,
   type RoundProse,
@@ -129,7 +131,23 @@ export interface ImporterSession {
   /** The harness it ran on, by display name: the avatar letter on its header is this one's. */
   readonly harness: string;
   readonly history: ImporterHistory;
+  /**
+   * What this page holds of the session itself, oldest first: the operator's own rows
+   * (minted here, see `operatorTurn`), and in the state picker's declared sessions every
+   * row. **Not** what the importer said on a real target — that is the target's live feed,
+   * filed by {@link importId} and merged in by {@link importerFeed}, so an entry is held in
+   * one place and never copied into a session.
+   */
   readonly items: readonly LiveItem[];
+  /**
+   * The activity publish order this tab had seen when each of the operator's rows in
+   * {@link items} was sent, keyed by the row's id.
+   *
+   * What places the importer's words under the message they answer: `SentTurn.after` on
+   * the goal path, and the same join. Absent on a row the page did not send against a
+   * server — the declared sessions' — which then sorts before every live entry.
+   */
+  readonly floors?: Readonly<Record<string, number>>;
   readonly working: boolean;
   readonly tally: ImporterTally;
   /** Opened from the picker and not written to since: read-only until the operator types. */
@@ -199,6 +217,66 @@ export const ENDED_NOTE =
  */
 export const strandedNote = (instanceId: string): string =>
   `This session ran on "${instanceId}", which this server does not run. It may still exist there, and asking another harness about it would only be told there is no such session, so it cannot be continued from here. What it wrote is on the Scope tab and in the Estate.`;
+
+/**
+ * One session's rows: its own, with the importer's narration from the target's live feed
+ * placed among them (the importer conversation design, S4).
+ *
+ * **Filed by `importId` and nothing else.** That is the one id the server sets on an
+ * importer's narration and on nothing else's (`LiveItem.importId`), so a goal agent's or a
+ * worker's words on the same target cannot land here, and a session with no import yet —
+ * the empty one the operator is typing into — takes nothing.
+ *
+ * **Placed by publish order, not by time.** An entry goes after the latest operator row that
+ * was sent before it was published: the row's floor ({@link ImporterSession.floors}) against
+ * the entry's own `activity:<n>`. That is `buildGoalConversation`'s join, and for its reason:
+ * the browser's clock and the server's are different clocks, and the importer can start
+ * answering before the browser has been told the message was accepted — so arrival order
+ * against the row, which is minted on acceptance, would put the start of a reply above the
+ * message it answers.
+ */
+export const importerFeed = (input: {
+  readonly own: readonly LiveItem[];
+  readonly floors: Readonly<Record<string, number>> | undefined;
+  readonly live: readonly LiveItem[];
+  readonly importId: string | undefined;
+}): readonly LiveItem[] => {
+  const { importId } = input;
+  if (importId === undefined) return input.own;
+  const mine = input.live.filter((item) => item.importId === importId);
+  if (mine.length === 0) return input.own;
+
+  // The page's own rows in runs, each opened by an operator row and carrying its floor.
+  const runs: { floor: number; items: LiveItem[] }[] = [];
+  for (const item of input.own) {
+    if (item.kind === OPERATOR_TURN_KIND || runs.length === 0) {
+      runs.push({
+        floor:
+          item.kind === OPERATOR_TURN_KIND
+            ? (input.floors?.[item.id] ?? -1)
+            : -1,
+        items: [],
+      });
+    }
+    runs.at(-1)?.items.push(item);
+  }
+
+  const merged: LiveItem[] = [];
+  let next = 0;
+  for (const item of mine) {
+    const order = activityOrder(item);
+    if (order !== undefined) {
+      while (next < runs.length && (runs[next]?.floor ?? -1) < order) {
+        merged.push(...(runs[next]?.items ?? []));
+        next += 1;
+      }
+    }
+    merged.push(item);
+  }
+  for (; next < runs.length; next += 1)
+    merged.push(...(runs[next]?.items ?? []));
+  return merged;
+};
 
 /** What a session is built from. */
 export interface ImporterChatInput {

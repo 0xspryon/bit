@@ -823,6 +823,34 @@ The boundary, stated so the next change knows which side it is on:
 A later change that wanted to show reasoning would still have to build a capture path.
 This one did not.
 
+**Amended 2026-11-02: the chat shows prose, and the panel still does not** (the importer
+conversation design, `2026-11-02-importer-conversation-design.md`, S4). The importer stopped
+being a batch job: its session outlives its first turn, the operator talks to it on the
+Auto-load page, and a conversation in which only one side's words appear is not one. So the
+capture path the paragraph above says a later change would have to build has been built,
+and this decision is amended rather than quietly broken:
+
+- **Now read**: `sessionEvents`. A narrator per importer session, forked into the session's
+  own scope by `harness/liveAgentSessions.ts` and interrupted first on every close, drains
+  it onto the in-process narration bus (`run/narration.ts`) under an `import` subject. The
+  target's live transcript carries it with `importId` set, and the Auto-load chat shows the
+  agent's replies, and its thinking collapsed and labelled, as they are produced. Like every
+  other narration in this build it is not stored: an entry published with nobody listening
+  is gone.
+- **Unchanged**: the progress panel. It is still built from the importer toolkit's own
+  record of the calls that crossed our MCP boundary, it still lists those calls and nothing
+  else, and `ScopeImportView` still has no field narration could go in. The argument above
+  for why the panel must not show reasoning — it is a receipt, read by someone about to
+  trust its output — holds exactly as it did; it was always about **the panel**, and the
+  chat is not the panel.
+- **Unchanged**: the closing report. It is still pulled from `messages` after `waitForIdle`
+  on every turn, because the create-target path that shows the panel has no browser
+  subscribed to anything, and the bus keeps nothing for a reader who is not there.
+
+What no longer holds is the claim that "no narration" is a property of the wiring. It is
+now a property of **which source each screen reads**: the panel reads the progress registry,
+which never subscribes to the bus, and the chat reads the bus.
+
 ## Build order
 
 Each slice ends with the gates green: `typecheck`, `test`, `test:persistence`, `build`,
@@ -867,6 +895,8 @@ reader will otherwise meet the difference and assume a mistake:
   namespace_ — which is what keeps an imported `scope.entry.added` distinguishable in the
   log from one the operator typed, and that distinction is what D13's review step reads.
 - **D16 is implemented by not capturing narration at all**, rather than by filtering it.
+  _(Superseded in part on 2026-11-02 — narration is now captured for the importer chat, and
+  the panel still does not read it; see D16's amendment.)_
   The importer's own toolkit records each call as it crosses our MCP boundary, after the
   write lands; nothing in the server subscribes to the importer session's `sessionEvents`.
   So the panel cannot show reasoning, and `ScopeImportView` has no field one could go in.

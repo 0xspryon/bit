@@ -64,6 +64,7 @@ const base = (
   attemptId: null,
   roundId: null,
   goalId: null,
+  importId: null,
   headline: "",
   body: "",
   tool: null,

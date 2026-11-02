@@ -6,9 +6,9 @@
  *
  * **The list is real.** {@link begin} and {@link syncIndexed} put the target's indexed
  * sessions (`GET .../importer-sessions`) in the picker, each with its model, time, running
- * flag and tally. **Everything inside a session is still mock**: there is no way to read
- * what was said in one, or to prompt one (the next slices), so an indexed session opens
- * empty with a note saying why, and sending into it appends the stand-in reply below.
+ * flag and tally. **What was said before this page opened is not**: there is no way to read
+ * a session's history yet (S6), so an indexed session opens empty with a note saying why.
+ * Sending into one posts, and what the importer says back is live (below).
  * `ImporterChat.svelte` and `TitleBar.svelte` read these fields and know nothing about which
  * is which; {@link ImporterSession.indexed} is what tells them apart.
  *
@@ -27,8 +27,19 @@
  * What comes back decides where the turn lands. `continued` appends to the session on
  * screen. `opened` is a **new harness session** — the first message of a conversation, or a
  * message to an import the server no longer held, which it reopened under a new import id —
- * so the page moves to it, keeping the operator's words on it. What the importer then says
- * is not shown yet: that is live narration, a later slice.
+ * so the page moves to it, keeping the operator's words on it.
+ *
+ * ## What the importer says, live (the importer conversation design, S4)
+ *
+ * The importer's replies and thinking arrive on the **target's** live feed, which the app
+ * already holds, with `importId` set; {@link groups} reads that feed and files each entry
+ * under the session whose import it names (`importerFeed`). Nothing is copied into a
+ * session, so an entry is in one place and a re-read of the index cannot lose it.
+ *
+ * While a turn is in flight its session is `working`, which is what draws the streaming
+ * cursor. It is set when the server accepts a message and cleared when the server says the
+ * import is no longer running ({@link ImporterServer.watchTurn}) — not when the agent goes
+ * quiet, because an agent reading a page can be quiet for a long time and is still working.
  *
  * ## What sending does without a server, and the one fake in it
  *
@@ -44,12 +55,13 @@
  * `pending` for ever. The same is true of Stop, which is what lets the prototype show that
  * state at all.
  */
-import type { ImporterTurnAccepted } from "@bit/contracts";
+import type { ImporterTurnAccepted, LiveItem } from "@bit/contracts";
 
 import { operatorTurn } from "./chat";
 import {
   NO_HISTORY,
   buildImporterChat,
+  importerFeed,
   type ImporterGroup,
   type ImporterSession,
   acceptedNotice,
@@ -128,6 +140,23 @@ export interface ImporterServer {
   readonly reread: () => void;
   /** A harness instance's display name, for the avatar on the session's header. */
   readonly harnessName: (instanceId: string) => string;
+  /**
+   * The highest activity publish order this tab has seen, or `0` for none. Read when a
+   * message is sent, so the importer's answer sorts after it: see
+   * `ImporterSession.floors`.
+   */
+  readonly highWater: () => number;
+  /**
+   * Watches one import until its turn is over, then calls `idle` once.
+   *
+   * **Asked, because the narration cannot say it.** The bus carries what the agent says and
+   * nothing about when it has stopped — a harness's stream has no "idle" entry, and an
+   * agent can be silent for a minute while it reads a page. The server does know: the
+   * import is `running` from the moment a message is accepted until `waitForIdle` returns
+   * for it (`progress.resume`, then `settle`). So the turn's cursor is cleared by that
+   * answer and by nothing guessed from the feed. Returns a function that stops watching.
+   */
+  readonly watchTurn: (importId: string, idle: () => void) => () => void;
 }
 
 /** What a stand-in reply says, so no one reads it as the importer's own words. */
@@ -136,7 +165,17 @@ export const STAND_IN_REPLY =
 
 export class ImporterSessions {
   readonly #now: () => number;
+  /**
+   * The target's live feed, read inside {@link groups} so an arrival moves the chat.
+   * Initialised here and replaced in the constructor: a field initialiser runs before the
+   * constructor body, and {@link groups} is one.
+   */
+  #live: () => readonly LiveItem[] = () => [];
   #sent = 0;
+  /** Stops watching the turn in flight, if one is being watched. */
+  #unwatch: (() => void) | undefined = undefined;
+  /** The import {@link #unwatch} is for. */
+  #watching: string | undefined = undefined;
 
   /** Every session on the target, in no particular order. */
   sessions = $state.raw<readonly ImporterSession[]>([]);
@@ -157,8 +196,12 @@ export class ImporterSessions {
   refused = $state(false);
   #server: ImporterServer | undefined = undefined;
 
-  constructor(now: () => number = () => Date.now()) {
+  constructor(
+    now: () => number = () => Date.now(),
+    live: () => readonly LiveItem[] = () => [],
+  ) {
     this.#now = now;
+    this.#live = live;
     this.load("default");
   }
 
@@ -172,7 +215,12 @@ export class ImporterSessions {
       ? []
       : buildImporterChat({
           history: this.current.history,
-          items: this.current.items,
+          items: importerFeed({
+            own: this.current.items,
+            floors: this.current.floors,
+            live: this.#live(),
+            importId: this.current.importId,
+          }),
           working: this.current.working,
         }),
   );
@@ -201,6 +249,7 @@ export class ImporterSessions {
    */
   begin(indexed: readonly ImporterSession[], server?: ImporterServer): void {
     const fresh = mockNewSession(this.#now());
+    this.#stopWatching();
     this.#server = server;
     this.draft = "";
     this.notice = "";
@@ -244,6 +293,7 @@ export class ImporterSessions {
             ...session,
             history: kept.history,
             items: kept.items,
+            ...(kept.floors === undefined ? {} : { floors: kept.floors }),
             reading: kept.reading,
           };
     });
@@ -254,12 +304,23 @@ export class ImporterSessions {
     if (!this.sessions.some((session) => session.id === this.currentId)) {
       this.currentId = own[0]?.id ?? refreshed[0]?.id ?? "";
     }
+    // `working` is the server's figure here, so a session it says is running — a turn sent
+    // from another tab, say — is watched to its end like one sent from this one.
+    const current = this.current;
+    if (
+      current?.working === true &&
+      current.importId !== undefined &&
+      this.#watching !== current.importId
+    ) {
+      this.#watch(current.importId);
+    }
   }
 
   /** Puts the prototype into one of the states the brief shows. */
   load(scenario: ImporterScenario): void {
     const now = this.#now();
     const earlier = mockEarlierSessions(now);
+    this.#stopWatching();
     this.#server = undefined;
     this.notice = "";
     this.refused = false;
@@ -329,10 +390,46 @@ export class ImporterSessions {
     this.pickerOpen = false;
     this.notice = "";
     this.refused = false;
-    if (this.sessions.some((session) => session.id === id)) {
+    const opened = this.sessions.find((session) => session.id === id);
+    if (opened !== undefined) {
       this.currentId = id;
       this.draft = "";
+      // A session the server says is running is watched to its end, so its cursor clears
+      // here too rather than only in the tab that sent the message.
+      if (opened.working && opened.importId !== undefined) {
+        this.#watch(opened.importId);
+      }
     }
+  }
+
+  /**
+   * Watches one import's turn and marks its session idle once the server says it is.
+   * One at a time: a later turn, or another session's, replaces the watch.
+   */
+  #watch(importId: string): void {
+    const server = this.#server;
+    if (server === undefined) return;
+    this.#stopWatching();
+    const stop = server.watchTurn(importId, () => {
+      if (this.#unwatch !== stop) return;
+      this.#unwatch = undefined;
+      this.#watching = undefined;
+      this.sessions = this.sessions.map((session) =>
+        session.importId === importId
+          ? { ...session, working: false }
+          : session,
+      );
+      // The turn wrote what it wrote: the list's tally is the server's to restate.
+      server.reread();
+    });
+    this.#unwatch = stop;
+    this.#watching = importId;
+  }
+
+  #stopWatching(): void {
+    this.#unwatch?.();
+    this.#unwatch = undefined;
+    this.#watching = undefined;
   }
 
   /**
@@ -396,6 +493,7 @@ export class ImporterSessions {
           attemptId: null,
           roundId: null,
           goalId: null,
+          importId: null,
           headline: "Importer",
           body: STAND_IN_REPLY,
           tool: null,
@@ -428,6 +526,9 @@ export class ImporterSessions {
     this.sending = true;
     this.notice = "";
     this.refused = false;
+    // Taken before the message goes, so whatever the importer says in answer sorts after
+    // it — including what it says before this request has been answered.
+    const after = server.highWater();
     const answer =
       session.importId === undefined
         ? await server.open(text)
@@ -449,6 +550,7 @@ export class ImporterSessions {
       const index = before.items.filter(
         (item) => item.kind === "turn.operator",
       ).length;
+      const row = operatorTurn({ index: index + 1, text, at, after });
       return {
         ...before,
         id: turn.harnessSessionId,
@@ -458,10 +560,8 @@ export class ImporterSessions {
         indexed: true,
         reading: false,
         working: true,
-        items: [
-          ...before.items,
-          operatorTurn({ index: index + 1, text, at, after: 0 }),
-        ],
+        items: [...before.items, row],
+        floors: { ...before.floors, [row.id]: after },
         tally: { ...before.tally, messages: null },
       };
     };
@@ -471,24 +571,26 @@ export class ImporterSessions {
       // opened for it: one thread, under the server's id from here on.
       const before =
         this.sessions.find((each) => each.id === session.id) ?? session;
-      const after = landed(before);
+      const next = landed(before);
       this.sessions = stillThere
-        ? this.sessions.map((each) => (each.id === session.id ? after : each))
-        : [...this.sessions, after];
-      if (this.currentId === session.id) this.currentId = after.id;
+        ? this.sessions.map((each) => (each.id === session.id ? next : each))
+        : [...this.sessions, next];
+      if (this.currentId === session.id) this.currentId = next.id;
     } else {
       // A fresh session opened in place of one the server no longer held: a new thread,
       // and the old one stays in the list as what it was.
-      const after = landed({
+      const fresh = landed({
         ...session,
         startedAt: at,
         history: NO_HISTORY,
         items: [],
+        floors: {},
         tally: { in: 0, out: 0, assets: 0, messages: null },
       });
-      this.sessions = [...this.sessions, after];
-      if (this.currentId === session.id) this.currentId = after.id;
+      this.sessions = [...this.sessions, fresh];
+      if (this.currentId === session.id) this.currentId = fresh.id;
     }
+    this.#watch(turn.importId);
     server.reread();
   }
 

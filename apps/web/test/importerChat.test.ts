@@ -27,6 +27,7 @@ import {
   INDEXED_HISTORY,
   NO_HISTORY,
   buildImporterChat,
+  importerFeed,
   indexedSession,
   lastSessionSentence,
   sessionLabel,
@@ -50,6 +51,7 @@ const item = (over: Partial<LiveItem> & Pick<LiveItem, "kind">): LiveItem => {
     attemptId: null,
     roundId: null,
     goalId: null,
+    importId: null,
     headline: "",
     body: "",
     tool: null,
@@ -606,5 +608,86 @@ describe("what the composer says under an accepted message", () => {
     expect(notice).toEndWith(
       "Not added, because this import already holds as many pages as one session reads: https://a.test/9.",
     );
+  });
+});
+
+/**
+ * The importer's narration, filed and placed (the importer conversation design, S4).
+ *
+ * The page's own rows are the operator's messages; the importer's words come from the
+ * target's live feed. These are the two rules that join them.
+ */
+describe("the importer's words from the live feed", () => {
+  const said = (n: number, body: string, importId: string | null = "imp_1") =>
+    ({
+      ...item({ kind: "turn.reply", body }),
+      id: `activity:${String(n)}`,
+      importId,
+    }) satisfies LiveItem;
+  const first = operatorTurn({
+    index: 1,
+    text: "Read the page",
+    at: AT,
+    after: 0,
+  });
+  const second = operatorTurn({
+    index: 2,
+    text: "And staging",
+    at: AT,
+    after: 0,
+  });
+  const floors = { [first.id]: 10, [second.id]: 20 };
+
+  test("are filed by import id and nothing else", () => {
+    const feed = importerFeed({
+      own: [first],
+      floors,
+      live: [
+        said(11, "mine"),
+        said(12, "another import's", "imp_2"),
+        { ...said(13, "a goal agent's", null), goalId: "goal_1" },
+      ],
+      importId: "imp_1",
+    });
+    expect(feed.map((each) => each.body)).toEqual(["Read the page", "mine"]);
+  });
+
+  test("a session with no import yet takes nothing", () => {
+    const feed = importerFeed({
+      own: [first],
+      floors,
+      live: [said(11, "mine")],
+      importId: undefined,
+    });
+    expect(feed).toEqual([first]);
+  });
+
+  test("are placed under the message sent before they were published, whatever order they arrived in", () => {
+    const groups = buildImporterChat({
+      history: NO_HISTORY,
+      items: importerFeed({
+        own: [first, second],
+        floors,
+        live: [
+          said(5, "before either message"),
+          said(15, "answering the first"),
+          said(25, "answering the second"),
+        ],
+        importId: "imp_1",
+      }),
+      working: true,
+    });
+    expect(
+      groups.map((group) => [
+        group.subject.message,
+        group.rows.map((row) => row.item.body),
+      ]),
+    ).toEqual([
+      [null, ["before either message"]],
+      ["Read the page", ["answering the first"]],
+      ["And staging", ["answering the second"]],
+    ]);
+    // The latest turn is live: something has been said in it.
+    expect(groups.at(-1)?.prose._tag).toBe("live");
   });
 });

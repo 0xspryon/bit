@@ -49,6 +49,7 @@
     splitCode,
     type WriteState,
   } from "../chat";
+  import StreamCursor from "./StreamCursor.svelte";
 
   let {
     item,
@@ -202,8 +203,7 @@
         </div>
       {:else if write === "pending"}
         <div class="ret writing mono">
-          <span class="caret" aria-hidden="true"></span>
-          <span>writing…</span>
+          <StreamCursor label="writing…" />
         </div>
       {:else if write === "recorded"}
         <div class="ret mono">
@@ -677,29 +677,10 @@
     font: 400 11px/16px var(--font-sans);
     white-space: normal;
   }
+  /* A6 D3's "writing…", drawn by `StreamCursor`: a mark that a write is in flight. */
   .writing {
     display: flex;
     align-items: center;
-    gap: 9px;
-    color: var(--text-muted);
-  }
-  /* The block cursor of A6 D3's "writing…": a mark that a write is in flight. */
-  .caret {
-    flex: none;
-    width: 7px;
-    height: 14px;
-    background: var(--text-base);
-    animation: blink 1.1s steps(2, start) infinite;
-  }
-  @keyframes blink {
-    to {
-      visibility: hidden;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .caret {
-      animation: none;
-    }
   }
   .raw {
     margin-top: 4px;

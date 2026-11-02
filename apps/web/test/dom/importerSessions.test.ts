@@ -23,7 +23,7 @@ import {
   type ScopeEntryView,
 } from "@bit/contracts";
 
-import { App, scenarios } from "../../src/lib/app.svelte";
+import { App, IMPORT_POLL_MS, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
@@ -32,8 +32,11 @@ import {
   emptyScope,
   importerSessionView,
   importerTurnAccepted,
+  liveActivity,
+  liveOpened,
   ok,
   refused,
+  scopeImportView,
   unreachable,
 } from "../fakeServer";
 import { click, mountInto, press, settle, type Mounted } from "./dom";
@@ -751,5 +754,157 @@ describe("the composer posts to the server", () => {
     );
     expect(text()).toContain("Not added");
     expect(text()).toContain("https://hackerone.com/acme/ninth");
+  });
+});
+
+/**
+ * What the importer says, live (the importer conversation design, S4).
+ *
+ * The server publishes the importer's narration on the target's live feed with `importId`
+ * set, and the chat files it under the session whose import that is. Driven through the
+ * real composer against a fake server: the message is posted, then frames arrive on the
+ * feed exactly as the SSE route would deliver them.
+ */
+describe("the importer's words, as they are produced", () => {
+  const send = async (value: string): Promise<void> => {
+    const box = composer();
+    typeInto(box, value);
+    box.focus();
+    press("Enter");
+    await settle();
+  };
+
+  const said = (
+    over: Partial<Parameters<typeof liveActivity>[0]> & { id: string },
+  ) =>
+    liveActivity({
+      attemptId: null,
+      importId: "imp_newest",
+      kind: "turn.reply",
+      headline: "Reply",
+      outcome: null,
+      ...over,
+    });
+
+  const cursor = (): Element | null =>
+    document.querySelector(".importer .streaming .stream-cursor");
+
+  test("a reply and a thought reach the chat under the message, and the cursor runs until the turn is over", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    // Somebody else's agent on the same target: not the importer's, so not in its chat.
+    fake.watch.send(
+      liveActivity({
+        id: "activity:1",
+        attemptId: null,
+        goalId: "goal_1",
+        kind: "turn.reply",
+        body: "the goal agent, talking",
+      }),
+    );
+    await settle();
+    // The turn is in flight from acceptance until the server says otherwise, and the
+    // server says so in both places: the import's progress and the session list.
+    const running = (yes: boolean) => {
+      fake.onScopeImport = (_baseUrl, targetId, importId) =>
+        ok(
+          scopeImportView({
+            targetId,
+            importId,
+            status: yes ? "running" : "finished",
+          }),
+        );
+      fake.onImporterSessions = () =>
+        ok({
+          sessions: SESSIONS.map((each) =>
+            each.importId === "imp_newest" ? { ...each, running: yes } : each,
+          ),
+        });
+    };
+    running(true);
+    await send("Also load the staging hosts");
+    expect(cursor()).not.toBeNull();
+
+    fake.watch.send(
+      said({
+        id: "activity:2",
+        kind: "turn.thinking",
+        headline: "Thinking",
+        body: "the staging table is on the second page",
+      }),
+    );
+    fake.watch.send(
+      said({ id: "activity:3", body: "Reading the second page." }),
+    );
+    await settle();
+
+    const thread = document.querySelector(".importer");
+    const words = (thread?.textContent ?? "").replace(/\s+/g, " ");
+    expect(words).toContain("Also load the staging hosts");
+    expect(words).toContain("Reading the second page.");
+    expect(words).not.toContain("the goal agent, talking");
+    // After the operator's message, not above it.
+    expect(words.indexOf("Reading the second page.")).toBeGreaterThan(
+      words.indexOf("Also load the staging hosts"),
+    );
+    // Thinking is collapsed and labelled, as the transcript renders it.
+    const thought = [...document.querySelectorAll(".importer details")].find(
+      (each) =>
+        each.textContent?.includes("the staging table is on the second page"),
+    ) as HTMLDetailsElement | undefined;
+    expect(thought).toBeDefined();
+    expect(thought?.open).toBe(false);
+    expect(thought?.querySelector("summary")?.textContent).toContain(
+      "What it considered",
+    );
+    // Still going while the server says the import is running.
+    expect(cursor()).not.toBeNull();
+
+    // The turn ends: the next poll is told so, and the cursor goes.
+    running(false);
+    // The poll's own timer, by its delay: the live feed's watchdog is armed beside it.
+    const poll = (app.countdown as FakeCountdown).live.filter(
+      (armed) => armed.ms === IMPORT_POLL_MS,
+    );
+    expect(poll).toHaveLength(1);
+    poll[0]?.fire();
+    await settle();
+    expect(cursor()).toBeNull();
+    expect(app.importer.current?.working).toBe(false);
+    // And the words stay.
+    expect(document.querySelector(".importer")?.textContent).toContain(
+      "Reading the second page.",
+    );
+  });
+
+  test("words published before the message was accepted still go under it", async () => {
+    const { fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(said({ id: "activity:4", body: "From an earlier turn." }));
+    await settle();
+    // The importer can start answering before the browser hears the message was accepted:
+    // the frame lands while the request is still out.
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) => {
+      fake.watch.send(said({ id: "activity:5", body: "Starting on it." }));
+      return ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_newest",
+          harnessInstanceId: "claude-code",
+        }),
+      );
+    };
+    await send("Load the staging hosts");
+    const words = (
+      document.querySelector(".importer")?.textContent ?? ""
+    ).replace(/\s+/g, " ");
+    const message = words.indexOf("Load the staging hosts");
+    expect(words.indexOf("From an earlier turn.")).toBeLessThan(message);
+    expect(words.indexOf("Starting on it.")).toBeGreaterThan(message);
   });
 });

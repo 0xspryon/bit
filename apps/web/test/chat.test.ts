@@ -79,6 +79,7 @@ const activity = (over: Partial<LiveItem> = {}): LiveItem => ({
   attemptId: null,
   roundId: ROUND,
   goalId: null,
+  importId: null,
   headline: "Reply",
   body: "thinking",
   tool: null,
@@ -104,6 +105,7 @@ const record = (over: Partial<LiveItem> = {}): LiveItem => {
     attemptId: null,
     roundId: ROUND,
     goalId: null,
+    importId: null,
     headline: "Intent",
     body: "intent int_real was added",
     tool: null,
@@ -1164,6 +1166,7 @@ describe("the context meter", () => {
     attemptId: null,
     roundId: ROUND,
     goalId: null,
+    importId: null,
     at: AT,
     ...over,
   });

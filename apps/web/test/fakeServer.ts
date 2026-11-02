@@ -645,6 +645,7 @@ export const liveItem = (over: Partial<LiveItem> = {}): LiveItem => ({
   attemptId: "attempt-1",
   roundId: null,
   goalId: null,
+  importId: null,
   headline: "Observation recorded",
   body: "the endpoint did not rate limit",
   tool: null,

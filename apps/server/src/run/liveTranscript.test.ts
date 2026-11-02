@@ -824,6 +824,37 @@ describe("projecting live activity", () => {
     expect(fromAttempt?.roundId).toBeNull();
   });
 
+  test("an importer's narration carries its import and nothing else, and its tools are reduced", () => {
+    // The fourth subject (the importer conversation design, S4). The chat files an entry by
+    // this id alone, so none of the other three may be set — a goal or round chat on the
+    // same page would otherwise claim the importer's words.
+    const importId = "imp_live";
+    const reply = projectedItem(
+      narration(
+        { _tag: "reply", text: "Reading the policy page." },
+        { subject: { _tag: "import", importId } },
+      ),
+    );
+    expect(reply?.importId).toBe(importId);
+    expect(reply?.attemptId).toBeNull();
+    expect(reply?.roundId).toBeNull();
+    expect(reply?.goalId).toBeNull();
+
+    // The registration is `bit-<importId>`, so the same reduction applies.
+    const call = projectedItem(
+      narration(
+        {
+          _tag: "toolCall",
+          callId: "c1",
+          tool: openCodeToolName(bitMcpServerName(importId), "add_scope_entry"),
+          input: "{}",
+        },
+        { subject: { _tag: "import", importId } },
+      ),
+    );
+    expect(call?.toolName).toBe("add_scope_entry");
+  });
+
   test("a reply reads as a turn, with no sequence", () => {
     const item = projectedItem(
       narration({ _tag: "reply", text: "I will probe the limiter." }),
@@ -1053,6 +1084,7 @@ describe("projecting live activity", () => {
       attemptId: null,
       roundId: "rnd_7",
       goalId: null,
+      importId: null,
       at: 1_700_000_000_000,
     });
   });

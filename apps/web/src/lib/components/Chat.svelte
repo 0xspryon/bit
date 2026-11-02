@@ -54,6 +54,7 @@
     label,
     groups,
     separator,
+    tail,
     readonly,
     count = "",
     note = "",
@@ -77,6 +78,14 @@
      * this component's header.
      */
     separator: Snippet<[ChatGroup<Subject>]>;
+    /**
+     * What follows one group's rows, rendered by the caller from the caller's own subject.
+     *
+     * The importer's streaming cursor (A6 D3) is the one use: it marks a turn the agent is
+     * still producing, and only the caller knows whether its subject is in flight — the
+     * same reason {@link separator} is the caller's. Absent renders nothing.
+     */
+    tail?: Snippet<[ChatGroup<Subject>]>;
     /**
      * Whether the operator may write into this conversation.
      *
@@ -301,6 +310,10 @@
               />
             {/each}
           </ol>
+        {/if}
+
+        {#if tail !== undefined}
+          {@render tail(group)}
         {/if}
       </li>
     {/each}
