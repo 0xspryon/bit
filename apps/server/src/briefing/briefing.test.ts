@@ -18,7 +18,7 @@ import {
   SUMMARY_CONDITIONS,
   SUMMARY_OBSERVATION_ID,
   multiCaseInput,
-  writeFirstSliceDatabase,
+  writeSummaryFormatDatabase,
 } from "../persistence/fixtures";
 import { ObservationStore, type AttemptCaller } from "../persistence/store";
 import {
@@ -452,14 +452,14 @@ describe("buildBriefing", () => {
   });
 });
 
-describe("briefings over an upgraded database", () => {
-  const upgraded = <A, E>(
+describe("briefings over a summary-format observation", () => {
+  const seeded = <A, E>(
     use: (
       store: ObservationStore["Service"],
     ) => Effect.Effect<A, E, ObservationStore>,
   ) => {
     const path = newDatabasePath();
-    return writeFirstSliceDatabase(path).then(() =>
+    return writeSummaryFormatDatabase(path).then(() =>
       Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
@@ -472,7 +472,7 @@ describe("briefings over an upgraded database", () => {
   };
 
   test("a summary observation is rendered, labelled, and not dressed up as cases", async () => {
-    const rendered = await upgraded(() =>
+    const rendered = await seeded(() =>
       Effect.map(buildBriefing("intent-per-client-limiter"), renderBriefing),
     );
 
@@ -492,11 +492,11 @@ describe("briefings over an upgraded database", () => {
   });
 
   test("both record formats appear side by side, each in its own shape", async () => {
-    const rendered = await upgraded((store) =>
+    const rendered = await seeded((store) =>
       Effect.gen(function* () {
         yield* store.recordObservation(
           {
-            // The adopted database's running attempt: a settled one has no authority.
+            // The fixture's running attempt: a settled one has no authority.
             _tag: "attempt",
             callerScope: `fixture-local/${RUNNING_ATTEMPT_ID}`,
             targetId: "fixture-local",
@@ -506,7 +506,7 @@ describe("briefings over an upgraded database", () => {
             workerId: "worker-1",
             attemptFence: 0,
           },
-          input({ operationId: "op-after-upgrade" }),
+          input({ operationId: "op-after-summary" }),
         );
         return yield* Effect.map(
           buildBriefing("intent-per-client-limiter"),
@@ -520,8 +520,8 @@ describe("briefings over an upgraded database", () => {
     );
     expect(rendered).toContain("RECORD FORMAT: summary");
     expect(rendered).toContain("cases (2)");
-    // Oldest first, so the summary-format row this database was adopted with leads and
-    // the case-based one recorded after the upgrade follows it.
+    // Oldest first, so the summary-format row the fixture seeded leads and
+    // the case-based one recorded afterwards follows it.
     expect(rendered.indexOf("RECORD FORMAT: summary")).toBeLessThan(
       rendered.indexOf("cases (2)"),
     );

@@ -3,15 +3,20 @@
  * the running server imports this.
  *
  * It lives in one place because the same observation has to be expressible three ways —
- * as a domain value, as a snake_case tool payload, and as rows in a pre-change database
- * — and a drifting copy of it in each suite is how you end up testing three different
- * things while believing you tested one.
+ * as a domain value, as a snake_case tool payload, and as rows in a database — and a
+ * drifting copy of it in each suite is how you end up testing three different things
+ * while believing you tested one.
  *
  * The strings here deliberately contain single and double quotes. Every value reaches
  * SQLite as a bound parameter, and a test that only ever stores well-behaved text cannot
  * tell a parameterised statement from a concatenated one.
  */
 import type { RecordObservationInput } from "@bit/contracts";
+import { Effect } from "effect";
+import { SqlClient } from "effect/sql";
+
+import { migrate } from "./migrations";
+import { sqliteLayer } from "./sql";
 
 /** Text that breaks a concatenated statement and is harmless as a bound parameter. */
 export const AWKWARD_TEXT = `the operator said "it's fine"); DROP TABLE observations; --" and meant it`;
@@ -176,15 +181,22 @@ export const multiCaseWireArgs = (
 });
 
 /**
- * A database in the first-slice shape: the original tables, real rows, and no journal.
+ * A database holding one **summary-format** observation, at the current schema.
  *
- * This is what the superseded bootstrap left behind — it ran `CREATE TABLE IF NOT EXISTS`
- * on every start and never recorded what it had applied — so it is the exact starting
- * state the adoption path has to cope with. The observation row's `conditions` is copied
- * in spirit from `apps/server/.runtime/hunt.sqlite`: one `clientIdentity` string naming
- * several identities in sequence, and one `requestCount` totalling all of them. That is
- * why it cannot be rewritten as cases without inventing an allocation, and why it reads
- * back as a summary-format observation.
+ * Both observation formats are formats of contract version 1 and neither supersedes the
+ * other (`OBSERVATION_CONTRACT_VERSION`), so a suite that only ever stores case-based rows
+ * tests half the contract. This is the other half, and it is the only summary row anywhere
+ * in the tests: the store reads it back, the briefing renders it, and both have to do so
+ * without dressing one prose record up as cases.
+ *
+ * The `conditions` object is copied in spirit from a real development file: one
+ * `clientIdentity` string naming several identities in sequence, and one `requestCount`
+ * totalling all of them. That is why it cannot be expressed as cases without inventing an
+ * allocation — which is exactly what `summary` exists to refuse (DECISIONS.md §21).
+ *
+ * The schema comes from {@link migrate}, not from DDL written out here. A fixture that
+ * declared its own tables would be a second description of the schema, free to drift from
+ * the baseline the moment either changed.
  */
 export const SUMMARY_CONDITIONS = {
   endpoint: "http://127.0.0.1:41317/login",
@@ -199,175 +211,109 @@ export const SUMMARY_CONDITIONS = {
 };
 
 export const SUMMARY_OBSERVATION_ID = "obs_000001_attempt-summary";
-/** An attempt the first-slice database left running, as the real one was found. */
+/**
+ * An attempt this database leaves running, as a real one was found.
+ *
+ * Needed for two reasons. Write authority is checked against the attempt's status, so a
+ * test that records a *new* observation here needs a live attempt to record it under —
+ * `attempt-summary` is settled, and settled is exactly what must be refused. And
+ * reconciliation needs a real `running` row to reconcile.
+ */
 export const RUNNING_ATTEMPT_ID = "attempt-abandoned";
 export const RUNNING_ATTEMPT_SESSION = "ses_abandoned";
 export const SUMMARY_RECEIPT_KEY =
   "fixture-local/attempt-summary:record_observation:summary-op-1";
 
-/** Creates the first-slice database at `filename`, with one observation and its receipt. */
-export const writeFirstSliceDatabase = async (
-  filename: string,
-): Promise<void> => {
-  const { Database } = await import("bun:sqlite");
-  const database = new Database(filename, { create: true, strict: true });
-  try {
-    database.exec("PRAGMA foreign_keys = ON");
-    for (const statement of [
-      `CREATE TABLE IF NOT EXISTS goals (
-        id TEXT PRIMARY KEY, target_id TEXT NOT NULL, description TEXT NOT NULL,
-        created_at INTEGER NOT NULL)`,
-      `CREATE TABLE IF NOT EXISTS intents (
-        id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id),
-        target_id TEXT NOT NULL, question TEXT NOT NULL, created_at INTEGER NOT NULL)`,
-      `CREATE INDEX IF NOT EXISTS intents_goal_idx ON intents(goal_id)`,
-      `CREATE TABLE IF NOT EXISTS attempts (
-        id TEXT PRIMARY KEY, intent_id TEXT NOT NULL REFERENCES intents(id),
-        target_id TEXT NOT NULL, worker_id TEXT NOT NULL, harness_session_id TEXT,
-        provider_id TEXT NOT NULL, model_id TEXT NOT NULL, status TEXT NOT NULL,
-        started_at INTEGER NOT NULL, ended_at INTEGER)`,
-      `CREATE INDEX IF NOT EXISTS attempts_intent_idx ON attempts(intent_id)`,
-      `CREATE TABLE IF NOT EXISTS observations (
-        id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, target_id TEXT NOT NULL,
-        intent_id TEXT NOT NULL REFERENCES intents(id),
-        attempt_id TEXT NOT NULL REFERENCES attempts(id),
-        harness_session_id TEXT NOT NULL, worker_id TEXT NOT NULL,
-        tested_claim TEXT NOT NULL, outcome TEXT NOT NULL, conditions TEXT NOT NULL,
-        observed_behavior TEXT NOT NULL, interpretation TEXT NOT NULL,
-        evidence_refs TEXT NOT NULL, limitations TEXT NOT NULL,
-        untested_dimensions TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
-      `CREATE UNIQUE INDEX IF NOT EXISTS observations_sequence_idx ON observations(sequence)`,
-      `CREATE INDEX IF NOT EXISTS observations_intent_idx ON observations(intent_id)`,
-      `CREATE TABLE IF NOT EXISTS command_receipts (
-        key TEXT PRIMARY KEY, caller_scope TEXT NOT NULL, operation TEXT NOT NULL,
-        operation_id TEXT NOT NULL, request_hash TEXT NOT NULL, result TEXT NOT NULL,
-        created_at INTEGER NOT NULL)`,
-      `CREATE INDEX IF NOT EXISTS command_receipts_scope_idx ON command_receipts(caller_scope)`,
-      `CREATE TABLE IF NOT EXISTS sequence_cursor (
-        name TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0)`,
-    ]) {
-      database.run(statement);
-    }
+const SUMMARY_RECORDED_AT = 1_792_395_958_800;
 
-    database.run(
-      `INSERT INTO goals (id, target_id, description, created_at) VALUES (?, ?, ?, ?)`,
-      [
-        "goal-ratelimit",
-        "fixture-local",
-        "Can auth rate limits be bypassed?",
-        1,
-      ],
-    );
-    database.run(
-      `INSERT INTO intents (id, goal_id, target_id, question, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [
-        "intent-per-client-limiter",
-        "goal-ratelimit",
-        "fixture-local",
-        "Probe the per-client limiter on POST /login.",
-        1,
-      ],
-    );
-    database.run(
-      `INSERT INTO attempts (id, intent_id, target_id, worker_id, harness_session_id,
-         provider_id, model_id, status, started_at, ended_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        "attempt-summary",
-        "intent-per-client-limiter",
-        "fixture-local",
-        "worker-1",
-        "ses_summary",
-        "openai",
-        "gpt-5.6-sol",
-        "succeeded",
-        1,
-        2,
-      ],
-    );
-    /**
-     * A second attempt, still running.
-     *
-     * The first-slice database has to carry one, for two reasons. Write authority is
-     * now checked against the attempt's status, so a test that records a *new*
-     * observation against an adopted database needs a live attempt to record it under —
-     * `attempt-summary` is settled, and settled is exactly what must be refused. And
-     * reconciliation needs a real adopted `running` row to reconcile, which is the
-     * state the development database was actually found in.
-     */
-    database.run(
-      `INSERT INTO attempts (id, intent_id, target_id, worker_id, harness_session_id,
-         provider_id, model_id, status, started_at, ended_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        RUNNING_ATTEMPT_ID,
-        "intent-per-client-limiter",
-        "fixture-local",
-        "worker-1",
-        RUNNING_ATTEMPT_SESSION,
-        "openai",
-        "gpt-5.6-sol",
-        "running",
-        3,
-        null,
-      ],
-    );
-    database.run(
-      `INSERT INTO observations (id, sequence, target_id, intent_id, attempt_id,
-         harness_session_id, worker_id, tested_claim, outcome, conditions,
-         observed_behavior, interpretation, evidence_refs, limitations,
-         untested_dimensions, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        SUMMARY_OBSERVATION_ID,
-        1,
-        "fixture-local",
-        "intent-per-client-limiter",
-        "attempt-summary",
-        "ses_summary",
-        "worker-1",
-        "Sending a different X-Client-Id header value evades the per-client request limit.",
-        "positive",
-        JSON.stringify(SUMMARY_CONDITIONS),
-        "Requests 1-10 returned 401; request 11 returned 429; three rotated identities then returned 401.",
-        "The limiter keys on the header value.",
-        JSON.stringify(["transcript://summary-run"]),
-        JSON.stringify([`Tested one short window; ${AWKWARD_TEXT}`]),
-        JSON.stringify(["Per-account limiting was out of scope."]),
-        1_792_395_958_800,
-      ],
-    );
-    database.run(
-      `INSERT INTO command_receipts (key, caller_scope, operation, operation_id,
-         request_hash, result, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        SUMMARY_RECEIPT_KEY,
-        "fixture-local/attempt-summary",
-        "record_observation",
-        "summary-op-1",
-        "a-hash-from-the-old-build",
-        JSON.stringify({
-          observationId: SUMMARY_OBSERVATION_ID,
-          sequence: 1,
-          replayed: false,
-          provenance: {
-            targetId: "fixture-local",
-            intentId: "intent-per-client-limiter",
-            attemptId: "attempt-summary",
-            harnessSessionId: "ses_summary",
-            workerId: "worker-1",
-            recordedAt: 1_792_395_958_800,
-          },
-        }),
-        1_792_395_958_800,
-      ],
-    );
-    database.run(
-      `INSERT INTO sequence_cursor (name, value) VALUES ('observations', 1)`,
-    );
-  } finally {
-    database.close();
-  }
-};
+/**
+ * The one untested dimension this observation raised, and the row's id.
+ *
+ * The id is opaque on purpose: a dimension's identity must not encode where it sits in
+ * the submitted list, or a later edit to that list would silently re-point every address.
+ * `<observationId>#u0` survives as the **wire alias** a briefing prints.
+ */
+export const SUMMARY_UNTESTED_DIMENSION =
+  "Per-account limiting was out of scope.";
+const SUMMARY_DIMENSION_ID = "dim_4f1c9a2e7b6d48f0a35c81e9d07b2f6a";
+
+/**
+ * Migrates `filename` and writes the summary observation, its receipt and its cursor.
+ *
+ * The receipt's `request_hash` is deliberately not one this build would compute. A retry of
+ * `summary-op-1` therefore has to come back as a **conflict** — same key, different content
+ * — rather than replaying, which is the behaviour `store.test.ts` pins.
+ */
+export const writeSummaryFormatDatabase = (filename: string): Promise<void> =>
+  Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* migrate;
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
+          VALUES ('goal-ratelimit', 'fixture-local',
+                  'Can auth rate limits be bypassed?', 1)`;
+        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
+          VALUES ('intent-per-client-limiter', 'goal-ratelimit', 'fixture-local',
+                  'Probe the per-client limiter on POST /login.', 1)`;
+        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
+            harness_session_id, provider_id, model_id, status, started_at, ended_at)
+          VALUES ('attempt-summary', 'intent-per-client-limiter', 'fixture-local',
+                  'worker-1', 'ses_summary', 'openai', 'gpt-5.6-sol', 'succeeded', 1, 2)`;
+        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
+            harness_session_id, provider_id, model_id, status, started_at)
+          VALUES (${RUNNING_ATTEMPT_ID}, 'intent-per-client-limiter', 'fixture-local',
+                  'worker-1', ${RUNNING_ATTEMPT_SESSION}, 'openai', 'gpt-5.6-sol',
+                  'running', 3)`;
+        yield* sql`INSERT INTO observations (
+            id, sequence, record_format, target_id, intent_id, attempt_id,
+            harness_session_id, worker_id, tested_claim, outcome, interpretation,
+            limitations, untested_dimensions, recorded_at,
+            summary_conditions, summary_observed_behavior, summary_evidence_refs
+          ) VALUES (
+            ${SUMMARY_OBSERVATION_ID}, 1, 'summary', 'fixture-local',
+            'intent-per-client-limiter', 'attempt-summary', 'ses_summary', 'worker-1',
+            'Sending a different X-Client-Id header value evades the per-client request limit.',
+            'positive', 'The limiter keys on the header value.',
+            ${JSON.stringify([`Tested one short window; ${AWKWARD_TEXT}`])},
+            ${JSON.stringify([SUMMARY_UNTESTED_DIMENSION])},
+            ${SUMMARY_RECORDED_AT},
+            ${JSON.stringify(SUMMARY_CONDITIONS)},
+            'Requests 1-10 returned 401; request 11 returned 429; three rotated identities then returned 401.',
+            ${JSON.stringify(["transcript://summary-run"])}
+          )`;
+        // The untested dimension, as a row as well as in the observation's JSON. The
+        // column is the submission and the row is what anything reads by: a briefing's
+        // open questions come from `observation_dimensions`, and an id that encoded the
+        // position would make position the identity again.
+        yield* sql`INSERT INTO observation_dimensions (id, observation_id, position,
+            text, created_at)
+          VALUES (${SUMMARY_DIMENSION_ID}, ${SUMMARY_OBSERVATION_ID}, 0,
+                  ${SUMMARY_UNTESTED_DIMENSION}, ${SUMMARY_RECORDED_AT})`;
+        yield* sql`INSERT INTO command_receipts (key, caller_scope, operation,
+            operation_id, request_hash, result, created_at)
+          VALUES (
+            ${SUMMARY_RECEIPT_KEY}, 'fixture-local/attempt-summary',
+            'record_observation', 'summary-op-1', 'a-hash-from-another-build',
+            ${JSON.stringify({
+              observationId: SUMMARY_OBSERVATION_ID,
+              sequence: 1,
+              replayed: false,
+              provenance: {
+                targetId: "fixture-local",
+                intentId: "intent-per-client-limiter",
+                attemptId: "attempt-summary",
+                harnessSessionId: "ses_summary",
+                workerId: "worker-1",
+                recordedAt: SUMMARY_RECORDED_AT,
+              },
+            })},
+            ${SUMMARY_RECORDED_AT}
+          )`;
+        // The cursor the observation above consumed. A write that ignored it would reuse
+        // sequence 1, and the unique index would refuse the row.
+        yield* sql`INSERT INTO sequence_cursor (name, value)
+          VALUES ('observations', 1)`;
+      }).pipe(Effect.provide(sqliteLayer(filename))),
+    ),
+  ).then(() => undefined);

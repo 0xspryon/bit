@@ -1,0 +1,36 @@
+## table effect_sql_migrations (on effect_sql_migrations)
+CREATE TABLE "effect_sql_migrations" ( migration_id integer PRIMARY KEY NOT NULL, created_at datetime NOT NULL DEFAULT current_timestamp, name VARCHAR(255) NOT NULL )
+## table settings (on settings)
+CREATE TABLE settings ( key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL )
+## table target_schema_state (on target_schema_state)
+CREATE TABLE target_schema_state ( target_id TEXT PRIMARY KEY REFERENCES targets(id), state TEXT NOT NULL, applied_through INTEGER, detail TEXT NOT NULL, checked_at INTEGER NOT NULL, CHECK (state IN ('ready', 'unavailable')) )
+## table targets (on targets)
+CREATE TABLE targets ( id TEXT PRIMARY KEY, name TEXT NOT NULL, scope_note TEXT NOT NULL, created_at INTEGER NOT NULL, archived_at INTEGER, workspace_path TEXT )
+## columns effect_sql_migrations
+  created_at datetime notnull=1 default=current_timestamp pk=0
+  migration_id INTEGER notnull=1 default=- pk=1
+  name VARCHAR(255) notnull=1 default=- pk=0
+## columns settings
+  key TEXT notnull=0 default=- pk=1
+  updated_at INTEGER notnull=1 default=- pk=0
+  value TEXT notnull=1 default=- pk=0
+## columns target_schema_state
+  applied_through INTEGER notnull=0 default=- pk=0
+  checked_at INTEGER notnull=1 default=- pk=0
+  detail TEXT notnull=1 default=- pk=0
+  state TEXT notnull=1 default=- pk=0
+  target_id TEXT notnull=0 default=- pk=1
+## columns targets
+  archived_at INTEGER notnull=0 default=- pk=0
+  created_at INTEGER notnull=1 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  name TEXT notnull=1 default=- pk=0
+  scope_note TEXT notnull=1 default=- pk=0
+  workspace_path TEXT notnull=0 default=- pk=0
+## structure settings
+  index sqlite_autoindex_settings_1 unique=1 origin=pk partial=0 cols=key/asc/BINARY/key|rowid/asc/BINARY/incl
+## structure target_schema_state
+  index sqlite_autoindex_target_schema_state_1 unique=1 origin=pk partial=0 cols=target_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk target_id -> targets.id update=NO ACTION delete=NO ACTION match=NONE
+## structure targets
+  index sqlite_autoindex_targets_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl

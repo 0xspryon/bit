@@ -37,7 +37,7 @@ import {
   SUMMARY_CONDITIONS,
   SUMMARY_OBSERVATION_ID,
   multiCaseInput,
-  writeFirstSliceDatabase,
+  writeSummaryFormatDatabase,
 } from "./fixtures";
 import * as identifier from "./identifier";
 import {
@@ -682,9 +682,9 @@ describe("contract validation", () => {
 });
 
 describe("summary-format observations", () => {
-  test("a first-slice row reads back as summary, unrewritten and labelled", async () => {
+  test("a stored summary row reads back as summary, unrewritten and labelled", async () => {
     const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
+    await writeSummaryFormatDatabase(path);
 
     const stored = await withStore(path, (store) =>
       store.observationsForIntent("intent-per-client-limiter"),
@@ -704,15 +704,15 @@ describe("summary-format observations", () => {
     expect(observation.limitations[0]).toContain(AWKWARD_TEXT);
   });
 
-  test("new writes against an upgraded database are case-based, and both formats coexist", async () => {
+  test("new writes beside a summary row are case-based, and both formats coexist", async () => {
     const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
+    await writeSummaryFormatDatabase(path);
 
     const stored = await withStore(path, (store) =>
       Effect.gen(function* () {
         yield* store.recordObservation(
           {
-            // The adopted database's *running* attempt. `attempt-summary` is settled,
+            // The fixture's *running* attempt. `attempt-summary` is settled,
             // and a settled attempt is exactly what the authority check must refuse.
             _tag: "attempt",
             callerScope: `fixture-local/${RUNNING_ATTEMPT_ID}`,
@@ -723,7 +723,7 @@ describe("summary-format observations", () => {
             workerId: "worker-1",
             attemptFence: 0,
           },
-          multiCaseInput({ operationId: "op-after-upgrade" }),
+          multiCaseInput({ operationId: "op-after-summary" }),
         );
         return yield* store.observationsForIntent("intent-per-client-limiter");
       }),
@@ -734,11 +734,11 @@ describe("summary-format observations", () => {
     expect(stored.map((item) => item.sequence)).toEqual([1, 2]);
   });
 
-  test("the original receipt still replays after the upgrade, so no duplicate is written", async () => {
+  test("a stored receipt from another build conflicts rather than writing a duplicate", async () => {
     // The receipt's stored result names the summary observation. A retry of that
     // operation must replay it rather than write a second row under a reused ID.
     const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
+    await writeSummaryFormatDatabase(path);
 
     const outcome = await withStore(path, (store) =>
       Effect.gen(function* () {

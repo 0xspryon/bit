@@ -1,27 +1,40 @@
 /**
- * Tests every migration path against real SQLite files.
+ * Tests both migration chains against real SQLite files.
  *
- * The chain has to hold up five ways, and all five are exercised here rather than
- * reasoned about:
+ * Nothing here checks SQL identifiers or placeholders at compile time, so every statement
+ * has to be executed. Each chain has to hold up four ways:
  *
- * 1. A fresh database replays the whole chain and ends up with the current schema.
- * 2. Running it again applies nothing — which is what stops the table rebuilds in `0002`
- *    and `0003` from happening twice.
- * 3. A database created by the first-slice bootstrap — original tables, real rows and
- *    receipts, no journal — upgrades with its data intact.
- * 4. A database already at `0002`, which is the state of the development file, reaches
- *    the renamed schema through `0003` with every row, receipt and cursor preserved.
- * 5. A database already at `0005`, holding recovery records written under the original
- *    three-column key, reaches the state-keyed table through `0006` with every row,
- *    `times` count and timestamp intact and a `prior_status` derived from what the row
- *    already recorded.
- * 6. A migration that fails leaves neither its schema change nor its journal row, and
- *    the database is still usable afterwards.
+ * 1. A fresh database replays the chain and ends up with **exactly** the schema committed
+ *    in `expectedSchema.hunt.txt` / `expectedSchema.control.txt` — every object, column,
+ *    index and foreign key.
+ * 2. Running it again applies nothing.
+ * 3. The constraints the schema carries are constraints the database enforces, not
+ *    properties of the statements we happen to have written.
+ * 4. A migration that fails leaves neither its schema change nor its journal row, and the
+ *    database is still usable afterwards.
+ *
+ * ## Why (1) exists, and what its absence cost
+ *
+ * Until the chains were collapsed to baselines there was no such test, and the gap was not
+ * theoretical: `0014_attempt_harness_instance` had been inserted into the middle of the old
+ * list after databases had recorded id 14 as something else, so the migrator — which skips
+ * every entry at or below the highest applied id — never ran it on those files.
+ * `attempts.harness_instance_id` was simply missing on a database whose journal reported
+ * itself current. 1588 passing tests did not see it, because every one of them either built
+ * a fresh file (where the column appears) or asserted a *subset* of the schema. The route
+ * that eventually selected the column answered `500`.
+ *
+ * A full-schema equality check catches that class on the first run, and it catches the
+ * ordinary version too: an appended migration whose effect nobody wrote down.
+ *
+ * **To update an expectation after appending a migration**, run the suite with
+ * `BIT_UPDATE_SCHEMA_EXPECTATION=1`; the files are rewritten and the change shows up as a
+ * reviewable diff. Never hand-edit them.
  *
  * Nothing here touches `apps/server/.runtime/`. Every test gets a fresh temporary file.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -29,13 +42,7 @@ import { Effect } from "effect";
 import { SqlClient } from "effect/sql";
 import { SqliteMigrator } from "@effect/sql-sqlite-bun";
 
-import {
-  RUNNING_ATTEMPT_ID,
-  SUMMARY_CONDITIONS,
-  SUMMARY_OBSERVATION_ID,
-  SUMMARY_RECEIPT_KEY,
-  writeFirstSliceDatabase,
-} from "./fixtures";
+import { CONTROL_MIGRATIONS, migrateControl } from "./controlMigrations";
 import { MIGRATIONS, migrate, runMigrations } from "./migrations";
 import { DatabaseError, sqliteLayer } from "./sql";
 
@@ -92,71 +99,193 @@ const columnsOf = (sql: SqlClient.SqlClient, table: string) =>
     (rows) => rows.map((row) => row.name).sort(),
   );
 
-/**
- * The primary key a table actually carries, in declaration order.
- *
- * Read from `PRAGMA table_info`'s `pk` column rather than from the migration text,
- * because the question is what the rebuilt table ended up with.
- */
-const primaryKeyOf = (sql: SqlClient.SqlClient, table: string) =>
-  Effect.map(
-    sql.unsafe<{ name: string; pk: number }>(`PRAGMA table_info(${table})`),
-    (rows) =>
-      rows
-        .filter((row) => row.pk > 0)
-        .sort((a, b) => a.pk - b.pk)
-        .map((row) => row.name),
-  );
-
-/**
- * The ids the chain declares, in order, as `[id, name]` and as plain numbers.
- *
- * Derived from {@link MIGRATIONS} rather than written out, so appending an entry does
- * not mean editing every full-chain assertion. Assertions about a *subset* — which
- * entries one upgrade applied — are still written out, because that is the part a
- * derived list could not check.
- */
-const CHAIN = Object.keys(MIGRATIONS).map((key) => {
-  const match = /^(\d+)_(.+)$/.exec(key);
-  if (match === null) throw new Error(`migration key ${key} has no id`);
-  return [Number(match[1]), match[2] ?? ""] as const;
-});
-const CHAIN_IDS = CHAIN.map(([id]) => id);
-const CHAIN_LABELS = CHAIN.map(([id, name]) => `${String(id)}_${name}`);
-
-/**
- * An id far above the chain, for the deliberately broken entries.
- *
- * It has to be above every real id or the migrator would skip it (it applies only ids
- * greater than the highest applied), and it must not collide with an id the chain may
- * grow into, which is why it is 99 rather than "one more than the last one".
- */
-const BROKEN_ID = "0099";
-
-/**
- * The real chain truncated at one id, as a loader.
- *
- * Needed because the migrator applies only ids *above* the highest applied one: a loader
- * built by removing one entry from the middle of {@link MIGRATIONS} would apply
- * everything after it and then never be able to apply the hole. Every "a database
- * already at NNNN" test therefore takes a file to that id and migrates forward from
- * there, which is also what a real upgrade does.
- */
-const chainThrough = (highestId: number): SqliteMigrator.Loader =>
-  SqliteMigrator.fromRecord(
-    Object.fromEntries(
-      Object.entries(MIGRATIONS).filter(
-        ([key]) => Number(key.slice(0, key.indexOf("_"))) <= highestId,
-      ),
-    ),
-  );
-
 const tablesOf = (sql: SqlClient.SqlClient) =>
   Effect.map(
     sql<{ name: string }>`SELECT name FROM sqlite_master WHERE type = 'table'
       ORDER BY name`,
     (rows) => rows.map((row) => row.name),
   );
+
+/**
+ * The ids a chain declares, as `[id, name]`, derived rather than written out.
+ *
+ * Appending an entry therefore does not mean editing a full-chain assertion — the one
+ * thing a derived list cannot check is the *effect* of the entries, which is what the
+ * schema expectation below is for.
+ */
+const chainOf = (migrations: Record<string, unknown>) =>
+  Object.keys(migrations).map((key) => {
+    const match = /^(\d+)_(.+)$/.exec(key);
+    if (match === null) throw new Error(`migration key ${key} has no id`);
+    return [Number(match[1]), match[2] ?? ""] as const;
+  });
+
+const HUNT_CHAIN = chainOf(MIGRATIONS);
+const CONTROL_CHAIN = chainOf(CONTROL_MIGRATIONS);
+const labelsOf = (chain: ReadonlyArray<readonly [number, string]>) =>
+  chain.map(([id, name]) => `${String(id)}_${name}`);
+
+/**
+ * An id far above either chain, for the deliberately broken entries.
+ *
+ * It has to be above every real id or the migrator would skip it (it applies only ids
+ * greater than the highest applied), and it must not collide with an id a chain may grow
+ * into, which is why it is 99 rather than "one more than the last one".
+ */
+const BROKEN_ID = "0099";
+
+// ---------------------------------------------------------------------------
+// The schema the chain produces, dumped whole and compared to a committed file
+// ---------------------------------------------------------------------------
+
+/**
+ * Every schema object, column, index column list and foreign key in one text block.
+ *
+ * Three deliberate choices about what does and does not register as a difference:
+ *
+ * - `sqlite_master.sql` is normalised to single spaces and compared as text, because a
+ *   `CHECK` constraint exists **only** in that text — no pragma reports one — and losing
+ *   one silently is exactly what this test must refuse.
+ * - Columns are listed **sorted by name**, with type, nullability, default and
+ *   primary-key position. Declaration order is not semantically meaningful in SQLite and
+ *   is already pinned by the `CREATE TABLE` text above.
+ * - Indexes are listed by `pragma_index_xinfo` and foreign keys by
+ *   `pragma_foreign_key_list`, so uniqueness, partiality, collation, direction, and the
+ *   on-update/on-delete actions are checked structurally rather than through the SQL text
+ *   they happen to be spelled in.
+ */
+const dumpSchema = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const objects = yield* sql<{
+    type: string;
+    name: string;
+    tbl_name: string;
+    sql: string | null;
+  }>`SELECT type, name, tbl_name, sql FROM sqlite_master
+       WHERE name NOT LIKE 'sqlite_%'
+       ORDER BY type, name`;
+  const out: string[] = [];
+  for (const object of objects) {
+    out.push(`## ${object.type} ${object.name} (on ${object.tbl_name})`);
+    out.push((object.sql ?? "").replace(/\s+/g, " ").trim());
+  }
+  const tables = objects
+    .filter((object) => object.type === "table")
+    .map((object) => object.name)
+    .sort();
+  for (const table of tables) {
+    const columns = yield* sql<{
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+      pk: number;
+    }>`SELECT name, type, "notnull", dflt_value, pk
+         FROM pragma_table_info(${table}) ORDER BY name`;
+    out.push(`## columns ${table}`);
+    for (const column of columns) {
+      out.push(
+        `  ${column.name} ${column.type} notnull=${String(column.notnull)}` +
+          ` default=${column.dflt_value ?? "-"} pk=${String(column.pk)}`,
+      );
+    }
+  }
+  for (const table of tables) {
+    const indexes = yield* sql<{
+      name: string;
+      unique: number;
+      origin: string;
+      partial: number;
+    }>`SELECT name, "unique", origin, partial
+         FROM pragma_index_list(${table}) ORDER BY name`;
+    const foreignKeys = yield* sql<{
+      table: string;
+      from: string;
+      to: string | null;
+      on_update: string;
+      on_delete: string;
+      match: string;
+    }>`SELECT "table", "from", "to", on_update, on_delete, "match"
+         FROM pragma_foreign_key_list(${table})
+         ORDER BY "table", "from", "to"`;
+    if (indexes.length === 0 && foreignKeys.length === 0) continue;
+    out.push(`## structure ${table}`);
+    for (const index of indexes) {
+      const columns = yield* sql<{
+        name: string | null;
+        desc: number;
+        coll: string;
+        key: number;
+      }>`SELECT name, desc, coll, key FROM pragma_index_xinfo(${index.name})
+           ORDER BY seqno`;
+      out.push(
+        `  index ${index.name} unique=${String(index.unique)}` +
+          ` origin=${index.origin} partial=${String(index.partial)} cols=` +
+          columns
+            .map(
+              (column) =>
+                `${column.name ?? "rowid"}/${column.desc === 1 ? "desc" : "asc"}` +
+                `/${column.coll}/${column.key === 1 ? "key" : "incl"}`,
+            )
+            .join("|"),
+      );
+    }
+    for (const key of foreignKeys) {
+      out.push(
+        `  fk ${key.from} -> ${key.table}.${key.to ?? "rowid"}` +
+          ` update=${key.on_update} delete=${key.on_delete} match=${key.match}`,
+      );
+    }
+  }
+  return `${out.join("\n")}\n`;
+});
+
+const expectationPath = (name: string) =>
+  join(import.meta.dir, `expectedSchema.${name}.txt`);
+
+/**
+ * Replays one chain into a fresh file and compares its whole schema to the committed dump.
+ *
+ * The migrator's journal table is part of the dump — its *shape* is, not its rows, which
+ * are the one thing about a collapsed chain that is deliberately different from what the
+ * old one left behind.
+ */
+const expectSchemaMatches = async (
+  name: string,
+  chain: Effect.Effect<unknown, DatabaseError, SqlClient.SqlClient>,
+) => {
+  const actual = await withSql(newDatabasePath(), () =>
+    Effect.flatMap(chain, () => dumpSchema),
+  );
+  if (process.env["BIT_UPDATE_SCHEMA_EXPECTATION"] === "1") {
+    writeFileSync(expectationPath(name), actual);
+  }
+  expect(actual).toBe(readFileSync(expectationPath(name), "utf8"));
+};
+
+describe("the schema a fresh replay produces", () => {
+  test("the hunt chain matches the committed expectation exactly", async () => {
+    await expectSchemaMatches("hunt", migrate);
+  });
+
+  test("the control chain matches the committed expectation exactly", async () => {
+    await expectSchemaMatches("control", migrateControl);
+  });
+
+  test("a second replay changes nothing about the schema", async () => {
+    // The property the equality test above cannot see on its own: it builds one file and
+    // migrates once. A migration that is not idempotent across runs — a bare `ALTER TABLE`
+    // the migrator did get round to skipping, say — would show up here and nowhere else.
+    const path = newDatabasePath();
+    const first = await withSql(path, () =>
+      Effect.flatMap(migrate, () => dumpSchema),
+    );
+    const second = await withSql(path, () =>
+      Effect.flatMap(migrate, () => dumpSchema),
+    );
+    expect(second).toBe(first);
+  });
+});
 
 describe("a fresh database", () => {
   test("replays the whole chain and reports what it applied", async () => {
@@ -167,17 +296,19 @@ describe("a fresh database", () => {
           applied,
           journal: yield* journalOf(sql),
           tables: yield* tablesOf(sql),
-          observations: yield* columnsOf(sql, "observations"),
-          recoveries: yield* columnsOf(sql, "attempt_recoveries"),
-          recoveryKey: yield* primaryKeyOf(sql, "attempt_recoveries"),
         };
       }),
     );
 
     expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual(
-      CHAIN_LABELS,
+      labelsOf(HUNT_CHAIN),
     );
-    expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
+    // Guards against a key being added to the record but never reaching the loader, and
+    // against the loader silently skipping a malformed key.
+    expect(outcome.journal.map((row) => row.migration_id)).toEqual(
+      HUNT_CHAIN.map(([id]) => id),
+    );
+    expect(outcome.journal).toHaveLength(Object.keys(MIGRATIONS).length);
     expect(outcome.tables).toEqual([
       "asset_discoveries",
       "asset_imports",
@@ -203,86 +334,52 @@ describe("a fresh database", () => {
       "scope_entries",
       "sequence_cursor",
     ]);
-    // The table `0003` left behind, not the one `0001` created or the one `0002` did.
-    expect(outcome.observations).toContain("record_format");
-    expect(outcome.observations).toContain("cases");
-    expect(outcome.observations).toContain("summary_conditions");
-    expect(outcome.observations).not.toContain("conditions");
-    expect(outcome.observations).not.toContain("schema_version");
-    // `0006` rebuilt this one, and a fresh replay has to end up with the rebuilt shape
-    // rather than `0004`'s: the table keeps its name, so only the key and the extra
-    // column distinguish them.
-    expect(outcome.recoveries).toContain("prior_status");
-    expect(outcome.recoveryKey).toEqual([
-      "attempt_id",
-      "observed_status",
-      "prior_status",
-      "resulting_status",
-      "disposition",
-      "fence_before",
-      "fence_after",
-    ]);
   });
 
-  test("the journal records one row per migration in {@link MIGRATIONS}", async () => {
-    // Guards against a key being added to the record but never reaching the loader,
-    // and against the loader silently skipping a malformed key.
-    const journal = await withSql(newDatabasePath(), (sql) =>
-      Effect.flatMap(migrate, () => journalOf(sql)),
-    );
-    expect(journal).toHaveLength(Object.keys(MIGRATIONS).length);
-  });
-
-  test("the rebuilt table's CHECK refuses a row that claims both formats", async () => {
-    // This constraint is the only thing standing between a hand-rolled insert and a row
-    // that is a case-based and a summary observation at once.
-    const refused = await withSql(newDatabasePath(), (sql) =>
+  test("the control chain builds the registry and nothing of the graph", async () => {
+    const outcome = await withSql(newDatabasePath(), (sql) =>
       Effect.gen(function* () {
-        yield* migrate;
-        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
-          VALUES ('g', 't', 'g', 1)`;
-        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
-          VALUES ('i', 'g', 't', 'q', 1)`;
-        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
-            provider_id, model_id, status, started_at)
-          VALUES ('a', 'i', 't', 'w', 'p', 'm', 'running', 1)`;
-        return yield* Effect.result(
-          sql`INSERT INTO observations (
-              id, sequence, record_format, target_id, intent_id, attempt_id,
-              harness_session_id, worker_id, tested_claim, outcome, interpretation,
-              limitations, untested_dimensions, recorded_at, setup, cases,
-              summary_conditions, summary_observed_behavior, summary_evidence_refs
-            ) VALUES ('o', 1, 'case_based', 't', 'i', 'a', 's', 'w', 'c', 'positive',
-              'i', '[]', '[]', 1, 'setup', '[]', '{}', 'behaviour', '[]')`,
-        );
+        const applied = yield* migrateControl;
+        return { applied, tables: yield* tablesOf(sql) };
       }),
     );
 
-    expect(refused._tag).toBe("Failure");
-    if (refused._tag === "Failure") {
-      expect(refused.failure.reason._tag).toBe("ConstraintError");
-    }
+    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual(
+      labelsOf(CONTROL_CHAIN),
+    );
+    // The two chains must never meet in one file: this one assumes the registry and the
+    // other assumes the graph, and a file holding both would be a third thing.
+    expect(outcome.tables).toEqual([
+      "effect_sql_migrations",
+      "settings",
+      "target_schema_state",
+      "targets",
+    ]);
   });
 });
 
 describe("a database that is already current", () => {
-  test("re-running the chain applies nothing", async () => {
-    const path = newDatabasePath();
-    const first = await withSql(path, () => migrate);
-    const second = await withSql(path, () => migrate);
-    const third = await withSql(path, (sql) =>
+  test("re-running either chain applies nothing", async () => {
+    const hunt = newDatabasePath();
+    const first = await withSql(hunt, () => migrate);
+    const second = await withSql(hunt, () => migrate);
+    const third = await withSql(hunt, (sql) =>
       Effect.gen(function* () {
         const applied = yield* migrate;
         return { applied, journal: yield* journalOf(sql) };
       }),
     );
+    const control = newDatabasePath();
+    await withSql(control, () => migrateControl);
+    const controlAgain = await withSql(control, () => migrateControl);
 
     expect(first).toHaveLength(Object.keys(MIGRATIONS).length);
-    // Empty, not "re-applied". `0002` and `0003` each drop and rebuild a table; a second
-    // run of either would destroy every observation written since the first.
     expect(second).toEqual([]);
     expect(third.applied).toEqual([]);
-    expect(third.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
+    expect(third.journal.map((row) => row.migration_id)).toEqual(
+      HUNT_CHAIN.map(([id]) => id),
+    );
+    expect(controlAgain).toEqual([]);
   });
 
   test("rows written after migrating survive a later migrate call", async () => {
@@ -305,990 +402,173 @@ describe("a database that is already current", () => {
   });
 });
 
-describe("adopting a first-slice database", () => {
-  test("original tables with no journal upgrade, and every row is preserved", async () => {
-    // The superseded bootstrap ran `CREATE TABLE IF NOT EXISTS` on every start and
-    // recorded nothing, so this is the state `.runtime/hunt.sqlite` started from.
-    const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
+/**
+ * The constraints the baseline carries, each checked for what it *refuses*.
+ *
+ * A `CHECK`, a `UNIQUE` or a trigger is only worth declaring if the database enforces it
+ * against a hand-rolled statement that never went through the store. That is the whole
+ * point of putting them in the schema rather than in a handler, so it is what is asserted.
+ */
+describe("what the schema refuses", () => {
+  /** A goal, an intent and a running attempt, which most inserts below hang off. */
+  const seedGraph = (sql: SqlClient.SqlClient) =>
+    Effect.gen(function* () {
+      yield* sql`INSERT INTO goals (id, target_id, description, created_at)
+        VALUES ('g', 't', 'g', 1)`;
+      yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
+        VALUES ('i', 'g', 't', 'q', 1)`;
+      yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
+          provider_id, model_id, status, started_at)
+        VALUES ('a', 'i', 't', 'w', 'p', 'm', 'running', 1)`;
+    });
 
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const applied = yield* migrate;
-        return {
-          applied,
-          journal: yield* journalOf(sql),
-          observations: yield* sql<{
-            id: string;
-            record_format: string;
-            sequence: number;
-            outcome: string;
-            setup: string | null;
-            cases: string | null;
-            summary_conditions: string | null;
-            summary_observed_behavior: string | null;
-            summary_evidence_refs: string | null;
-          }>`SELECT id, record_format, sequence, outcome, setup, cases,
-                summary_conditions, summary_observed_behavior, summary_evidence_refs
-             FROM observations`,
-          receipts: yield* sql<{
-            key: string;
-            result: string;
-          }>`SELECT key, result FROM command_receipts`,
-          cursor: yield* sql<{
-            value: number;
-          }>`SELECT value FROM sequence_cursor WHERE name = 'observations'`,
-          attempts: yield* sql<{ id: string; status: string }>`
-            SELECT id, status FROM attempts`,
-        };
-      }),
-    );
-
-    // `0001` is a no-op against the existing tables; the later entries do the work.
-    // Every entry is journalled, so a database created from scratch ends up identical.
-    expect(outcome.applied.map(([id]) => id)).toEqual(CHAIN_IDS);
-    expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
-
-    const observation = outcome.observations[0];
-    expect(outcome.observations).toHaveLength(1);
-    expect(observation?.id).toBe(SUMMARY_OBSERVATION_ID);
-    expect(observation?.sequence).toBe(1);
-    expect(observation?.outcome).toBe("positive");
-    // Labelled by format and left in its original shape, not rewritten as cases.
-    expect(observation?.record_format).toBe("summary");
-    expect(observation?.setup).toBeNull();
-    expect(observation?.cases).toBeNull();
-    expect(JSON.parse(observation?.summary_conditions ?? "null")).toEqual(
-      SUMMARY_CONDITIONS,
-    );
-    expect(observation?.summary_observed_behavior).toContain(
-      "request 11 returned 429",
-    );
-    expect(JSON.parse(observation?.summary_evidence_refs ?? "null")).toEqual([
-      "transcript://summary-run",
-    ]);
-
-    // Receipts, the sequence cursor and the attempt row are untouched, so a retry of
-    // the original operation still replays rather than writing a second observation.
-    expect(outcome.receipts.map((row) => row.key)).toEqual([
-      SUMMARY_RECEIPT_KEY,
-    ]);
-    expect(
-      (
-        JSON.parse(outcome.receipts[0]?.result ?? "{}") as {
-          observationId: string;
-        }
-      ).observationId,
-    ).toBe(SUMMARY_OBSERVATION_ID);
-    expect(outcome.cursor[0]?.value).toBe(1);
-    // Both adopted attempts keep their status, including the one left running: nothing
-    // in a migration settles an attempt, and only reconciliation may.
-    expect(outcome.attempts).toEqual([
-      { id: "attempt-summary", status: "succeeded" },
-      { id: RUNNING_ATTEMPT_ID, status: "running" },
-    ]);
-  });
-
-  test("an upgraded database reaches the same schema as a fresh one", async () => {
-    const upgradedPath = newDatabasePath();
-    await writeFirstSliceDatabase(upgradedPath);
-    const upgraded = await withSql(upgradedPath, (sql) =>
-      Effect.flatMap(migrate, () => columnsOf(sql, "observations")),
-    );
-    const fresh = await withSql(newDatabasePath(), (sql) =>
-      Effect.flatMap(migrate, () => columnsOf(sql, "observations")),
-    );
-
-    expect(upgraded).toEqual(fresh);
-  });
-
-  test("adopting is idempotent: a second start applies nothing", async () => {
-    const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
-    await withSql(path, () => migrate);
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const applied = yield* migrate;
-        const rows = yield* sql<{ id: string }>`SELECT id FROM observations`;
-        return { applied, rows };
-      }),
-    );
-
-    expect(outcome.applied).toEqual([]);
-    // The rebuild did not run a second time, so the row is still there.
-    expect(outcome.rows.map((row) => row.id)).toEqual([SUMMARY_OBSERVATION_ID]);
-  });
-});
-
-describe("a database already at 0002", () => {
-  /** Applies only the first two entries, which is the state the development file is in. */
-  const upToObservationCases = SqliteMigrator.fromRecord({
-    "0001_delegation_memory_slice": MIGRATIONS["0001_delegation_memory_slice"]!,
-    "0002_observation_cases": MIGRATIONS["0002_observation_cases"]!,
-  });
-
-  test("0003 renames the schema and carries every row, receipt and cursor across", async () => {
-    const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
-    const partial = await withSql(path, () =>
-      runMigrations({ loader: upToObservationCases }),
-    );
-    expect(partial.map(([id]) => id)).toEqual([1, 2]);
-
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const applied = yield* migrate;
-        return {
-          applied,
-          journal: yield* journalOf(sql),
-          columns: yield* columnsOf(sql, "observations"),
-          observations: yield* sql<{
-            id: string;
-            record_format: string;
-            sequence: number;
-            summary_conditions: string | null;
-            summary_observed_behavior: string | null;
-            summary_evidence_refs: string | null;
-          }>`SELECT id, record_format, sequence, summary_conditions,
-                summary_observed_behavior, summary_evidence_refs
-             FROM observations`,
-          receipts: yield* sql<{
-            key: string;
-            result: string;
-          }>`SELECT key, result FROM command_receipts`,
-          cursor: yield* sql<{
-            value: number;
-          }>`SELECT value FROM sequence_cursor WHERE name = 'observations'`,
-        };
-      }),
-    );
-
-    // The two applied entries are not replayed, so the rows they carried are not
-    // rebuilt a second time; everything after them is outstanding and runs in order.
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "3_observation_record_format",
-      "4_attempt_recovery",
-      "5_dimension_followups",
-      "6_recovery_state_key",
-      "7_planner_lineage",
-      "8_observation_dimensions",
-      "9_intent_dimension_provenance",
-      "10_assets",
-      "11_intent_anchors",
-      "12_event_log",
-      "13_outbox",
-      "14_attempt_harness_instance",
-      "15_attempt_model_options",
-      "16_goal_lifecycle",
-      "17_intent_lifecycle",
-      "18_planner_rounds",
-      "19_planner_lineage_by_goal",
-      "20_round_disposition_rationale",
-      "21_goal_sessions",
-      "22_target_scope",
-      "23_asset_imports",
-      "24_import_sessions",
-      "25_import_session_confirmation",
-      "26_import_session_end",
-      "27_import_session_end_reason",
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    expect(outcome.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
-    expect(outcome.columns).toContain("record_format");
-    expect(outcome.columns).not.toContain("schema_version");
-
-    // `schema_version = 1` became the `summary` format, with the columns intact.
-    const observation = outcome.observations[0];
-    expect(outcome.observations).toHaveLength(1);
-    expect(observation?.id).toBe(SUMMARY_OBSERVATION_ID);
-    expect(observation?.sequence).toBe(1);
-    expect(observation?.record_format).toBe("summary");
-    expect(JSON.parse(observation?.summary_conditions ?? "null")).toEqual(
-      SUMMARY_CONDITIONS,
-    );
-    expect(observation?.summary_observed_behavior).toContain(
-      "request 11 returned 429",
-    );
-    expect(JSON.parse(observation?.summary_evidence_refs ?? "null")).toEqual([
-      "transcript://summary-run",
-    ]);
-
-    // The idempotency receipt and the sequence cursor are the two things a rebuild
-    // could quietly lose, and losing either would let a replayed call write twice.
-    expect(outcome.receipts.map((row) => row.key)).toEqual([
-      SUMMARY_RECEIPT_KEY,
-    ]);
-    expect(
-      (
-        JSON.parse(outcome.receipts[0]?.result ?? "{}") as {
-          observationId: string;
-        }
-      ).observationId,
-    ).toBe(SUMMARY_OBSERVATION_ID);
-    expect(outcome.cursor[0]?.value).toBe(1);
-  });
-
-  test("a case-based row written at 0002 keeps its cases through the rename", async () => {
-    const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
-    await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: upToObservationCases });
-        // Written in `0002`'s vocabulary on purpose: this is the row shape the
-        // development file already holds, and `0003` has to map it, not drop it.
-        yield* sql`INSERT INTO observations (
-            id, sequence, schema_version, target_id, intent_id, attempt_id,
-            harness_session_id, worker_id, tested_claim, outcome, interpretation,
-            limitations, untested_dimensions, recorded_at, setup, cases,
-            legacy_conditions, legacy_observed_behavior, legacy_evidence_refs
-          ) VALUES ('obs_000002_attempt-summary', 2, 2, 'fixture-local',
-            'intent-per-client-limiter', 'attempt-summary', 'ses_summary', 'worker-1',
-            'a claim', 'negative', 'a reading', '[]', '[]', 2, 'the setup',
-            '[{"id":"case-a"}]', NULL, NULL, NULL)`;
-      }),
-    );
-
-    const rows = await withSql(path, (sql) =>
-      Effect.flatMap(
-        migrate,
-        () => sql<{
-          id: string;
-          record_format: string;
-          setup: string | null;
-          cases: string | null;
-        }>`SELECT id, record_format, setup, cases FROM observations
-             ORDER BY sequence`,
-      ),
-    );
-
-    expect(rows.map((row) => [row.id, row.record_format])).toEqual([
-      [SUMMARY_OBSERVATION_ID, "summary"],
-      ["obs_000002_attempt-summary", "case_based"],
-    ]);
-    expect(rows[1]?.setup).toBe("the setup");
-    expect(rows[1]?.cases).toBe('[{"id":"case-a"}]');
-  });
-});
-
-describe("a database already at 0005", () => {
-  /**
-   * Applies everything up to the recovery table as `0004` created it.
-   *
-   * This is the state of any database that ran the previous chain, the development file
-   * included, and it is the only way to exercise `0006` against rows written under the
-   * three-column key it replaces.
-   */
-  const upToDimensionFollowUps = SqliteMigrator.fromRecord({
-    "0001_delegation_memory_slice": MIGRATIONS["0001_delegation_memory_slice"]!,
-    "0002_observation_cases": MIGRATIONS["0002_observation_cases"]!,
-    "0003_observation_record_format":
-      MIGRATIONS["0003_observation_record_format"]!,
-    "0004_attempt_recovery": MIGRATIONS["0004_attempt_recovery"]!,
-    "0005_dimension_followups": MIGRATIONS["0005_dimension_followups"]!,
-  });
-
-  interface OldRecovery {
-    readonly attempt: string;
-    readonly observed: string;
-    readonly resulting: string;
-    readonly disposition: string;
-    readonly fenceBefore: number;
-    readonly fenceAfter: number;
-    readonly times: number;
-  }
-
-  /**
-   * Rows in `0004`'s vocabulary: no `prior_status`, because the column did not exist.
-   *
-   * One of each disposition, plus the two cases that make the derivation interesting —
-   * a `uncertain` pass that moved the fence (so it came from `running`) and one that did
-   * not (so the attempt was already `uncertain`) — plus a disposition nothing writes, to
-   * pin what happens to a value this codebase does not recognise.
-   */
-  const OLD_ROWS: readonly OldRecovery[] = [
-    {
-      attempt: "attempt-settled",
-      observed: "succeeded",
-      resulting: "succeeded",
-      disposition: "settled",
-      fenceBefore: 0,
-      fenceAfter: 1,
-      // The conflated row the old key produced: the second pass was really
-      // `already_final` and overwrote nothing but the detail and this counter.
-      times: 2,
-    },
-    {
-      attempt: "attempt-settled",
-      observed: "running",
-      resulting: "running",
-      disposition: "still_running",
-      fenceBefore: 0,
-      fenceAfter: 0,
-      times: 3,
-    },
-    {
-      attempt: "attempt-uncertain",
-      observed: "unreachable",
-      resulting: "uncertain",
-      disposition: "uncertain",
-      fenceBefore: 0,
-      fenceAfter: 1,
-      times: 1,
-    },
-    {
-      attempt: "attempt-uncertain",
-      observed: "missing",
-      resulting: "uncertain",
-      disposition: "uncertain",
-      fenceBefore: 1,
-      fenceAfter: 1,
-      times: 4,
-    },
-    {
-      attempt: "attempt-uncertain",
-      observed: "running",
-      resulting: "uncertain",
-      disposition: "unresumable",
-      fenceBefore: 1,
-      fenceAfter: 1,
-      times: 1,
-    },
-    {
-      attempt: "attempt-uncertain",
-      observed: "interrupted",
-      resulting: "interrupted",
-      disposition: "refined",
-      fenceBefore: 1,
-      fenceAfter: 1,
-      times: 1,
-    },
-    {
-      attempt: "attempt-final",
-      observed: "failed",
-      resulting: "succeeded",
-      disposition: "already_final",
-      fenceBefore: 1,
-      fenceAfter: 1,
-      times: 2,
-    },
-    {
-      attempt: "attempt-final",
-      observed: "missing",
-      resulting: "succeeded",
-      disposition: "not_a_disposition",
-      fenceBefore: 1,
-      fenceAfter: 1,
-      times: 1,
-    },
-  ];
-
-  /** Writes the attempts those records hang off, then the records themselves. */
-  const seedAtZeroFive = (path: string) =>
-    withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: upToDimensionFollowUps });
-        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
-          VALUES ('g', 't', 'the goal', 1)`;
-        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
-          VALUES ('i', 'g', 't', 'the question', 1)`;
-        for (const [attempt, status] of [
-          ["attempt-settled", "succeeded"],
-          ["attempt-uncertain", "uncertain"],
-          ["attempt-final", "succeeded"],
-        ] as const) {
-          yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
-              provider_id, model_id, status, started_at, write_fence)
-            VALUES (${attempt}, 'i', 't', 'w', 'p', 'm', ${status}, 1, 1)`;
-        }
-        let at = 100;
-        for (const row of OLD_ROWS) {
-          at += 10;
-          yield* sql`INSERT INTO attempt_recoveries (
-              attempt_id, observed_status, resulting_status, disposition, detail,
-              harness_session_id, fence_before, fence_after,
-              observations_at_recovery, first_reconciled_at, last_reconciled_at, times
-            ) VALUES (
-              ${row.attempt}, ${row.observed}, ${row.resulting}, ${row.disposition},
-              ${`${row.disposition} detail`}, 'ses_old', ${row.fenceBefore},
-              ${row.fenceAfter}, 0, ${at}, ${at + 1}, ${row.times}
-            )`;
-        }
-      }),
-    );
-
-  interface NewRecovery {
-    readonly attempt_id: string;
-    readonly observed_status: string;
-    readonly prior_status: string;
-    readonly resulting_status: string;
-    readonly disposition: string;
-    readonly detail: string;
-    readonly fence_before: number;
-    readonly fence_after: number;
-    readonly first_reconciled_at: number;
-    readonly last_reconciled_at: number;
-    readonly times: number;
-  }
-
-  const recoveriesIn = (sql: SqlClient.SqlClient) =>
-    sql<NewRecovery>`SELECT attempt_id, observed_status, prior_status,
-        resulting_status, disposition, detail, fence_before, fence_after,
-        first_reconciled_at, last_reconciled_at, times
-      FROM attempt_recoveries ORDER BY rowid`;
-
-  test("0006 rebuilds the key and carries every record, count and timestamp across", async () => {
-    const path = newDatabasePath();
-    await seedAtZeroFive(path);
-
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const applied = yield* migrate;
-        return {
-          applied,
-          key: yield* primaryKeyOf(sql, "attempt_recoveries"),
-          rows: yield* recoveriesIn(sql),
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "6_recovery_state_key",
-      "7_planner_lineage",
-      "8_observation_dimensions",
-      "9_intent_dimension_provenance",
-      "10_assets",
-      "11_intent_anchors",
-      "12_event_log",
-      "13_outbox",
-      "14_attempt_harness_instance",
-      "15_attempt_model_options",
-      "16_goal_lifecycle",
-      "17_intent_lifecycle",
-      "18_planner_rounds",
-      "19_planner_lineage_by_goal",
-      "20_round_disposition_rationale",
-      "21_goal_sessions",
-      "22_target_scope",
-      "23_asset_imports",
-      "24_import_sessions",
-      "25_import_session_confirmation",
-      "26_import_session_end",
-      "27_import_session_end_reason",
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    expect(outcome.key).toEqual([
-      "attempt_id",
-      "observed_status",
-      "prior_status",
-      "resulting_status",
-      "disposition",
-      "fence_before",
-      "fence_after",
-    ]);
-
-    // Nothing dropped, nothing merged, and insertion order preserved — which is what
-    // `recoveriesForAttempt` reads as "in the order first seen".
-    expect(outcome.rows).toHaveLength(OLD_ROWS.length);
-    expect(
-      outcome.rows.map((row) => [
-        row.attempt_id,
-        row.observed_status,
-        row.prior_status,
-        row.resulting_status,
-        row.disposition,
-      ]),
-    ).toEqual([
-      // `settled` is only reachable from `running`.
-      ["attempt-settled", "succeeded", "running", "succeeded", "settled"],
-      ["attempt-settled", "running", "running", "running", "still_running"],
-      // The fence moved, so this `uncertain` pass left `running`.
-      ["attempt-uncertain", "unreachable", "running", "uncertain", "uncertain"],
-      // The fence did not, so the attempt was already `uncertain`.
-      ["attempt-uncertain", "missing", "uncertain", "uncertain", "uncertain"],
-      ["attempt-uncertain", "running", "uncertain", "uncertain", "unresumable"],
-      [
-        "attempt-uncertain",
-        "interrupted",
-        "uncertain",
-        "interrupted",
-        "refined",
-      ],
-      // `already_final` keeps whatever it was already in.
-      ["attempt-final", "failed", "succeeded", "succeeded", "already_final"],
-      // Not a disposition anything writes: marked, not filed under a guess.
-      [
-        "attempt-final",
-        "missing",
-        "unrecorded",
-        "succeeded",
-        "not_a_disposition",
-      ],
-    ]);
-
-    // Every count, timestamp, fence and detail string is the one that was written.
-    expect(outcome.rows.map((row) => row.times)).toEqual(
-      OLD_ROWS.map((row) => row.times),
-    );
-    expect(
-      outcome.rows.map((row) => [row.fence_before, row.fence_after]),
-    ).toEqual(OLD_ROWS.map((row) => [row.fenceBefore, row.fenceAfter]));
-    expect(
-      outcome.rows.map((row) => [
-        row.first_reconciled_at,
-        row.last_reconciled_at,
-      ]),
-    ).toEqual([
-      [110, 111],
-      [120, 121],
-      [130, 131],
-      [140, 141],
-      [150, 151],
-      [160, 161],
-      [170, 171],
-      [180, 181],
-    ]);
-    expect(outcome.rows.map((row) => row.detail)).toEqual(
-      OLD_ROWS.map((row) => `${row.disposition} detail`),
-    );
-  });
-
-  test("the rebuilt key separates two passes the old one collapsed", async () => {
-    const path = newDatabasePath();
-    await seedAtZeroFive(path);
-
-    const outcome = await withSql(path, (sql) =>
+  test("an observation cannot claim both record formats at once", async () => {
+    // The only thing standing between a hand-rolled insert and a row that is a case-based
+    // and a summary observation at the same time.
+    const refused = await withSql(newDatabasePath(), (sql) =>
       Effect.gen(function* () {
         yield* migrate;
-        // The pass the old key could not hold: same attempt, same observed status, same
-        // resulting status as the `settled` row above, and a different decision.
-        const alongside = yield* Effect.result(
-          sql`INSERT INTO attempt_recoveries (
-              attempt_id, observed_status, prior_status, resulting_status, disposition,
-              detail, harness_session_id, fence_before, fence_after,
-              observations_at_recovery, first_reconciled_at, last_reconciled_at, times
-            ) VALUES ('attempt-settled', 'succeeded', 'succeeded', 'succeeded',
-              'already_final', 'asked again', 'ses_old', 1, 1, 0, 200, 200, 1)`,
+        yield* seedGraph(sql);
+        return yield* Effect.result(
+          sql`INSERT INTO observations (
+              id, sequence, record_format, target_id, intent_id, attempt_id,
+              harness_session_id, worker_id, tested_claim, outcome, interpretation,
+              limitations, untested_dimensions, recorded_at, setup, cases,
+              summary_conditions, summary_observed_behavior, summary_evidence_refs
+            ) VALUES ('o', 1, 'case_based', 't', 'i', 'a', 's', 'w', 'c', 'positive',
+              'i', '[]', '[]', 1, 'setup', '[]', '{}', 'behaviour', '[]')`,
         );
-        // And the identity still has to be an identity: the same state twice is refused
-        // by the constraint rather than becoming a second row.
-        const duplicate = yield* Effect.result(
-          sql`INSERT INTO attempt_recoveries (
-              attempt_id, observed_status, prior_status, resulting_status, disposition,
-              detail, harness_session_id, fence_before, fence_after,
-              observations_at_recovery, first_reconciled_at, last_reconciled_at, times
-            ) VALUES ('attempt-settled', 'succeeded', 'running', 'succeeded',
-              'settled', 'again', 'ses_old', 0, 1, 0, 300, 300, 1)`,
+      }),
+    );
+
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure.reason._tag).toBe("ConstraintError");
+    }
+  });
+
+  test("an intent cannot declare a dimension no row holds", async () => {
+    // `intents.addresses_dimension` is a **forward reference** in the baseline:
+    // `observation_dimensions` is created after `intents`, because it references
+    // `observations`, which references `intents`. SQLite resolves a foreign key at DML
+    // time, so this is what proves the cycle left a live constraint rather than a dead
+    // clause nothing checks.
+    const outcome = await withSql(newDatabasePath(), (sql) =>
+      Effect.gen(function* () {
+        yield* migrate;
+        yield* seedGraph(sql);
+        const refused = yield* Effect.result(
+          sql`INSERT INTO intents (id, goal_id, target_id, question, created_at,
+                addresses_dimension)
+              VALUES ('i2', 'g', 't', 'q', 2, 'dim_nope')`,
         );
+        const accepted = yield* Effect.result(
+          sql`INSERT INTO intents (id, goal_id, target_id, question, created_at,
+                addresses_dimension)
+              VALUES ('i3', 'g', 't', 'q', 3, NULL)`,
+        );
+        return { refused: refused._tag, accepted: accepted._tag };
+      }),
+    );
+
+    // Null is the ordinary case and means only that the intent did not say.
+    expect(outcome.accepted).toBe("Success");
+    expect(outcome.refused).toBe("Failure");
+  });
+
+  test("a planner lineage takes a goal that exists and refuses one that does not", async () => {
+    // `goal_id` is a real foreign key where a target id would have been a bare column,
+    // because a goal is ours and a target folder is not.
+    const outcome = await withSql(newDatabasePath(), (sql) =>
+      Effect.gen(function* () {
+        yield* migrate;
+        yield* seedGraph(sql);
+        const accepted = yield* Effect.result(
+          sql`INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
+            VALUES ('g', 'ses_lineage', 200)`,
+        );
+        const refused = yield* Effect.result(
+          sql`INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
+            VALUES ('goal_absent', 'ses_orphan', 201)`,
+        );
+        return { accepted: accepted._tag, refused: refused._tag };
+      }),
+    );
+
+    expect(outcome.accepted).toBe("Success");
+    expect(outcome.refused).toBe("Failure");
+  });
+
+  test("a recovery record is identified by its whole reconciliation state", async () => {
+    // The key is `(attempt_id, observed_status, prior_status, resulting_status,
+    // disposition, fence_before, fence_after)`. A narrower one conflates dispositions: a
+    // pass that settles a running attempt and a later pass that finds it already final
+    // agree on the observed and the resulting status while deciding different things.
+    const insert = (
+      sql: SqlClient.SqlClient,
+      prior: string,
+      disposition: string,
+      fenceBefore: number,
+      at: number,
+    ) =>
+      Effect.result(
+        sql`INSERT INTO attempt_recoveries (
+            attempt_id, observed_status, prior_status, resulting_status, disposition,
+            detail, harness_session_id, fence_before, fence_after,
+            observations_at_recovery, first_reconciled_at, last_reconciled_at, times
+          ) VALUES ('a', 'succeeded', ${prior}, 'succeeded', ${disposition},
+            ${`${disposition} detail`}, 'ses', ${fenceBefore}, 1, 0, ${at}, ${at}, 1)`,
+      );
+
+    const outcome = await withSql(newDatabasePath(), (sql) =>
+      Effect.gen(function* () {
+        yield* migrate;
+        yield* seedGraph(sql);
+        const settled = yield* insert(sql, "running", "settled", 0, 100);
+        // Same attempt, same observed status, same resulting status, different decision:
+        // this is the row a three-column key would have landed on top of the first.
+        const alongside = yield* insert(
+          sql,
+          "succeeded",
+          "already_final",
+          1,
+          200,
+        );
+        // And the identity still has to be an identity.
+        const duplicate = yield* insert(sql, "running", "settled", 0, 300);
         return {
-          alongside,
+          settled: settled._tag,
+          alongside: alongside._tag,
           duplicate,
-          rows: yield* recoveriesIn(sql),
+          // `rowid` order is "the order first seen", which is what
+          // `recoveriesForAttempt` reads: two reconciliations in the same millisecond
+          // are ordinary and a timestamp cannot order them.
+          rows: yield* sql<{
+            prior_status: string;
+            disposition: string;
+          }>`SELECT prior_status, disposition FROM attempt_recoveries ORDER BY rowid`,
         };
       }),
     );
 
-    expect(outcome.alongside._tag).toBe("Success");
+    expect(outcome.settled).toBe("Success");
+    expect(outcome.alongside).toBe("Success");
     expect(outcome.duplicate._tag).toBe("Failure");
     if (outcome.duplicate._tag === "Failure") {
       expect(outcome.duplicate.failure.reason._tag).toBe("ConstraintError");
     }
     expect(
-      outcome.rows
-        .filter((row) => row.attempt_id === "attempt-settled")
-        .map((row) => [row.prior_status, row.disposition]),
+      outcome.rows.map((row) => [row.prior_status, row.disposition]),
     ).toEqual([
       ["running", "settled"],
-      ["running", "still_running"],
       ["succeeded", "already_final"],
     ]);
   });
 
-  /** The real chain plus one entry that fails, appended past the last real entry. */
-  const brokenAfterRebuild = SqliteMigrator.fromRecord({
-    ...MIGRATIONS,
-    [`${BROKEN_ID}_broken_after_rebuild`]: Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      yield* sql`SELECT * FROM attempt_recoveires`;
-    }),
-  });
-
-  test("a migration that fails after 0006 leaves the rebuilt table and its rows", async () => {
-    const path = newDatabasePath();
-    await seedAtZeroFive(path);
-    await withSql(path, () => migrate);
-
-    const failure = await runChain(path, brokenAfterRebuild);
-    expect(failure._tag).toBe("Failure");
-
-    const after = await withSql(path, (sql) =>
+  test("an asset whose columns contradict its kind is refused, and identity is per target", async () => {
+    const outcome = await withSql(newDatabasePath(), (sql) =>
       Effect.gen(function* () {
-        return {
-          journal: yield* journalOf(sql),
-          key: yield* primaryKeyOf(sql, "attempt_recoveries"),
-          rows: yield* recoveriesIn(sql),
-        };
-      }),
-    );
-
-    // The rollback takes the pending migration with it and nothing else: `0006` is
-    // still journalled and the rebuilt table still holds every row.
-    expect(after.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
-    expect(after.key).toContain("prior_status");
-    expect(after.rows).toHaveLength(OLD_ROWS.length);
-    expect(after.rows.map((row) => row.times)).toEqual(
-      OLD_ROWS.map((row) => row.times),
-    );
-  });
-});
-
-describe("a database already at 0006", () => {
-  const runThrough = (path: string, highestId: number) =>
-    Effect.runPromise(
-      Effect.scoped(
-        runMigrations({ loader: chainThrough(highestId) }).pipe(
-          Effect.provide(sqliteLayer(path)),
-        ),
-      ),
-    );
-
-  test("0007 adds the lineage table and touches nothing else", async () => {
-    const path = newDatabasePath();
-    await runThrough(path, 6);
-
-    const before = await withSql(path, (sql) => tablesOf(sql));
-    expect(before).not.toContain("planner_lineages");
-
-    const applied = await runThrough(path, 7);
-    expect(applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "7_planner_lineage",
-    ]);
-
-    const after = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        return {
-          tables: yield* tablesOf(sql),
-          columns: yield* columnsOf(sql, "planner_lineages"),
-          key: yield* primaryKeyOf(sql, "planner_lineages"),
-          rows: yield* sql<{
-            count: number;
-          }>`SELECT COUNT(*) AS count FROM planner_lineages`,
-        };
-      }),
-    );
-
-    expect(after.columns).toEqual([
-      "created_at",
-      "harness_session_id",
-      "target_id",
-    ]);
-    // One current lineage per target, so the target is the key and a later round
-    // replaces rather than appends.
-    expect(after.key).toEqual(["target_id"]);
-    // It arrives empty: a lineage is recorded by the first planner round that opens
-    // one, never by the migration.
-    expect(after.rows[0]?.count).toBe(0);
-    // Every other table is exactly as `0006` left it.
-    expect(after.tables.filter((name) => name !== "planner_lineages")).toEqual(
-      before,
-    );
-  });
-});
-
-/**
- * The pre-`0008` backfill, against a file the real migration bodies took to `0007`.
- *
- * This is the path a development database actually walks: it holds observations whose
- * untested dimensions are a JSON array inside the row, and follow-up links keyed by
- * `(address, dimension_index)`. Nothing about it can be checked against a fresh database,
- * because a fresh one has no rows to unnest — so every assertion here is about data that
- * existed before the migration ran.
- */
-describe("a database already at 0007", () => {
-  const runThrough = (path: string, highestId: number) =>
-    Effect.runPromise(
-      Effect.scoped(
-        runMigrations({ loader: chainThrough(highestId) }).pipe(
-          Effect.provide(sqliteLayer(path)),
-        ),
-      ),
-    );
-
-  const RAISER = "obs_000001_attempt-a";
-  const ADDRESSER = "obs_000002_attempt-b";
-  /** Three dimensions, including one whose text would break a concatenated statement. */
-  const RAISED = [
-    "the per-account limit was never approached",
-    `a second tenant was never tried; the operator said "it's fine"); DROP TABLE x; --`,
-    "no window rollover was measured",
-  ];
-
-  /** Takes a file to `0007` and fills it with the shapes `0008` has to carry across. */
-  const seedAtZeroSeven = async (path: string) => {
-    await runThrough(path, 7);
-    await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
-          VALUES ('goal-1', 'fixture-local', 'Can rate limits be bypassed?', 1)`;
-        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
-          VALUES ('intent-1', 'goal-1', 'fixture-local', 'Probe the limiter.', 1)`;
-        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
-            harness_session_id, provider_id, model_id, status, started_at, write_fence)
-          VALUES ('attempt-a', 'intent-1', 'fixture-local', 'worker-1', 'ses_a',
-                  'openai', 'gpt-5.6-sol', 'succeeded', 1, 1)`;
-        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
-            harness_session_id, provider_id, model_id, status, started_at, write_fence)
-          VALUES ('attempt-b', 'intent-1', 'fixture-local', 'worker-1', 'ses_b',
-                  'openai', 'gpt-5.6-sol', 'succeeded', 2, 1)`;
-        // The raiser carries three dimensions; the addresser carries none, so the
-        // backfill has to cope with an empty array as well as a populated one.
-        yield* sql`INSERT INTO observations (
-            id, sequence, record_format, target_id, intent_id, attempt_id,
-            harness_session_id, worker_id, tested_claim, outcome, interpretation,
-            limitations, untested_dimensions, recorded_at,
-            summary_conditions, summary_observed_behavior, summary_evidence_refs
-          ) VALUES (
-            ${RAISER}, 1, 'summary', 'fixture-local', 'intent-1', 'attempt-a',
-            'ses_a', 'worker-1', 'Header rotation evades the limit.', 'positive',
-            'Keys on the header value.', '[]', ${JSON.stringify(RAISED)}, 1000,
-            '{}', 'seen', '[]'
-          )`;
-        yield* sql`INSERT INTO observations (
-            id, sequence, record_format, target_id, intent_id, attempt_id,
-            harness_session_id, worker_id, tested_claim, outcome, interpretation,
-            limitations, untested_dimensions, recorded_at,
-            summary_conditions, summary_observed_behavior, summary_evidence_refs
-          ) VALUES (
-            ${ADDRESSER}, 2, 'summary', 'fixture-local', 'intent-1', 'attempt-b',
-            'ses_b', 'worker-1', 'The account limit is 100.', 'negative',
-            'Not reproduced.', '[]', '[]', 2000, '{}', 'seen', '[]'
-          )`;
-        // A link in `0005`'s shape: keyed by the printed address and the parsed index.
-        yield* sql`INSERT INTO observation_dimension_links (
-            observation_id, address, source_observation_id, dimension_index, created_at
-          ) VALUES (${ADDRESSER}, ${`${RAISER}#u0`}, ${RAISER}, 0, 2000)`;
-      }),
-    );
-  };
-
-  test("0008 unnests every dimension in position order, with the raiser's own clock", async () => {
-    const path = newDatabasePath();
-    await seedAtZeroSeven(path);
-
-    const applied = await runThrough(path, 8);
-    expect(applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "8_observation_dimensions",
-    ]);
-
-    const after = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        return {
-          dimensions: yield* sql<{
-            id: string;
-            observation_id: string;
-            position: number;
-            text: string;
-            created_at: number;
-          }>`SELECT id, observation_id, position, text, created_at
-             FROM observation_dimensions ORDER BY observation_id, position`,
-          key: yield* primaryKeyOf(sql, "observation_dimension_links"),
-          links: yield* sql<{
-            observation_id: string;
-            dimension_id: string;
-            address: string;
-            created_at: number;
-          }>`SELECT observation_id, dimension_id, address, created_at
-             FROM observation_dimension_links`,
-          columns: yield* columnsOf(sql, "observation_dimension_links"),
-        };
-      }),
-    );
-
-    // One row per element, in position order, with the text byte for byte.
-    expect(
-      after.dimensions.map((row) => [row.position, row.text] as const),
-    ).toEqual(RAISED.map((text, index) => [index, text] as const));
-    expect(after.dimensions.every((row) => row.observation_id === RAISER)).toBe(
-      true,
-    );
-    // The addresser recorded an empty array, so it contributes nothing: `json_each` over
-    // `[]` yields no rows rather than one null row.
-    expect(after.dimensions).toHaveLength(RAISED.length);
-    // Stamped with the raising observation's `recorded_at`, not the migration's clock.
-    expect(after.dimensions.map((row) => row.created_at)).toEqual([
-      1000, 1000, 1000,
-    ]);
-    // Ids are opaque: not the alias, and not anything containing the position.
-    for (const row of after.dimensions) {
-      expect(row.id).toMatch(/^dim_[0-9a-f]{32}$/);
-      expect(row.id).not.toContain(RAISER);
-      expect(row.id).not.toContain("#u");
-    }
-    expect(new Set(after.dimensions.map((row) => row.id)).size).toBe(
-      RAISED.length,
-    );
-
-    // The link is repointed onto the dimension's id, keeps its address verbatim and its
-    // own timestamp, and the parsed-position columns are gone.
-    const dimensionZero = after.dimensions.find((row) => row.position === 0);
-    expect(after.links).toEqual([
-      {
-        observation_id: ADDRESSER,
-        dimension_id: dimensionZero?.id ?? "missing",
-        address: `${RAISER}#u0`,
-        created_at: 2000,
-      },
-    ]);
-    expect(after.key).toEqual(["observation_id", "dimension_id"]);
-    expect(after.columns).not.toContain("source_observation_id");
-    expect(after.columns).not.toContain("dimension_index");
-  });
-
-  test("0009 adds a nullable dimension reference to intents and nothing else", async () => {
-    const path = newDatabasePath();
-    await seedAtZeroSeven(path);
-    await runThrough(path, 8);
-
-    const before = await withSql(path, (sql) => columnsOf(sql, "intents"));
-    expect(before).not.toContain("addresses_dimension");
-
-    const applied = await runThrough(path, 9);
-    expect(applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "9_intent_dimension_provenance",
-    ]);
-
-    const after = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const asMigrated = yield* sql<{
-          addresses_dimension: string | null;
-        }>`SELECT addresses_dimension FROM intents WHERE id = 'intent-1'`;
-        const dimension = yield* sql<{
-          id: string;
-        }>`SELECT id FROM observation_dimensions WHERE position = 1`;
-        const id = dimension[0]?.id ?? "missing";
-        yield* sql`UPDATE intents SET addresses_dimension = ${id}
-          WHERE id = 'intent-1'`;
-        const refused = yield* Effect.result(
-          sql`INSERT INTO intents (id, goal_id, target_id, question, created_at,
-                addresses_dimension)
-              VALUES ('intent-2', 'goal-1', 'fixture-local', 'q', 3, 'dim_nope')`,
-        );
-        return {
-          columns: yield* columnsOf(sql, "intents"),
-          declared: yield* sql<{
-            addresses_dimension: string | null;
-          }>`SELECT addresses_dimension FROM intents WHERE id = 'intent-1'`,
-          refused: refused._tag,
-          asMigrated:
-            asMigrated[0] === undefined
-              ? "row missing"
-              : asMigrated[0].addresses_dimension,
-          existing: yield* sql<{
-            count: number;
-          }>`SELECT COUNT(*) AS count FROM intents`,
-          dimensionId: id,
-        };
-      }),
-    );
-
-    expect(after.columns).toContain("addresses_dimension");
-    // The migration invented no provenance: the existing intent arrived null, and the
-    // value read back here is the one this test then declared on it.
-    expect(after.asMigrated).toBeNull();
-    expect(after.declared[0]?.addresses_dimension).toBe(after.dimensionId);
-    // The reference is a real foreign key, so an id no dimension holds is refused.
-    expect(after.refused).toBe("Failure");
-    expect(after.existing[0]?.count).toBe(1);
-  });
-
-  test("0008 refuses to drop a link whose dimension does not exist", async () => {
-    const path = newDatabasePath();
-    await seedAtZeroSeven(path);
-    // An index past the end of the stored list. `0005`'s write boundary made this
-    // impossible, so this is a guard against what we have not thought of — and an
-    // INNER JOIN would have dropped the row silently instead of failing.
-    await withSql(
-      path,
-      (sql) =>
-        sql`INSERT INTO observation_dimension_links (
-          observation_id, address, source_observation_id, dimension_index, created_at
-        ) VALUES (${ADDRESSER}, ${`${RAISER}#u9`}, ${RAISER}, 9, 2000)`,
-    );
-
-    const failure = await runChain(path, chainThrough(8));
-    expect(failure._tag).toBe("Failure");
-    if (failure._tag === "Failure") {
-      expect((failure.failure as DatabaseError).reason).toContain(
-        "8_observation_dimensions",
-      );
-    }
-
-    // Rolled back whole: no dimensions table, the old link columns intact, both links
-    // still there, and the journal unchanged.
-    const after = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        return {
-          tables: yield* tablesOf(sql),
-          columns: yield* columnsOf(sql, "observation_dimension_links"),
-          links: yield* sql<{
-            count: number;
-          }>`SELECT COUNT(*) AS count FROM observation_dimension_links`,
-          journal: yield* journalOf(sql),
-        };
-      }),
-    );
-    expect(after.tables).not.toContain("observation_dimensions");
-    expect(after.columns).toContain("dimension_index");
-    expect(after.links[0]?.count).toBe(2);
-    expect(after.journal.map((row) => row.migration_id)).toEqual([
-      1, 2, 3, 4, 5, 6, 7,
-    ]);
-  });
-
-  test("0008 refuses an untested_dimensions column that is not a JSON array", async () => {
-    const path = newDatabasePath();
-    await seedAtZeroSeven(path);
-    await withSql(
-      path,
-      (sql) =>
-        sql`UPDATE observations SET untested_dimensions = '"not an array"'
-        WHERE id = ${ADDRESSER}`,
-    );
-
-    const failure = await runChain(path, chainThrough(8));
-    expect(failure._tag).toBe("Failure");
-
-    const after = await withSql(path, (sql) => tablesOf(sql));
-    expect(after).not.toContain("observation_dimensions");
-  });
-});
-
-/**
- * The tables Day 2 adds, each checked for what it enforces rather than for existing.
- */
-describe("a database already at 0009", () => {
-  const runThrough = (path: string, highestId: number) =>
-    Effect.runPromise(
-      Effect.scoped(
-        runMigrations({ loader: chainThrough(highestId) }).pipe(
-          Effect.provide(sqliteLayer(path)),
-        ),
-      ),
-    );
-
-  test("0010 refuses an asset whose columns contradict its kind", async () => {
-    const path = newDatabasePath();
-    await runThrough(path, 9);
-    const applied = await runThrough(path, 10);
-    expect(applied.map(([id, name]) => `${id}_${name}`)).toEqual(["10_assets"]);
-
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
+        yield* migrate;
         const insert = (
           id: string,
           kind: string,
@@ -1330,8 +610,8 @@ describe("a database already at 0009", () => {
 
     expect(outcome.hostOk).toBe("Success");
     expect(outcome.endpointOk).toBe("Success");
-    // The `CHECK` is what stops a row claiming to be a host with a method, or an
-    // endpoint without one, whatever a handler believes it is writing.
+    // The `CHECK` is what stops a row claiming to be a host with a method, or an endpoint
+    // without one, whatever a handler believes it is writing.
     expect(outcome.hostWithMethod).toBe("Failure");
     expect(outcome.endpointWithoutMethod).toBe("Failure");
     // Identity is unique within a target and kind, which is where the domain merge
@@ -1340,12 +620,10 @@ describe("a database already at 0009", () => {
     expect(outcome.otherTargetSameIdentity).toBe("Success");
   });
 
-  test("0012 makes a recorded event immutable and undeletable in the database", async () => {
-    const path = newDatabasePath();
-    await runThrough(path, 12);
-
-    const outcome = await withSql(path, (sql) =>
+  test("a recorded event is immutable and undeletable in the database", async () => {
+    const outcome = await withSql(newDatabasePath(), (sql) =>
       Effect.gen(function* () {
+        yield* migrate;
         yield* sql`INSERT INTO events (id, sequence, target_id, kind, payload,
             operation, subject_id, recorded_at)
           VALUES ('evt_000001', 1, 't', 'asset.recorded', '{}', 'record_asset',
@@ -1383,12 +661,10 @@ describe("a database already at 0009", () => {
     ]);
   });
 
-  test("0013 refuses an unknown status, an unknown policy and an orphan request", async () => {
-    const path = newDatabasePath();
-    await runThrough(path, 13);
-
-    const outcome = await withSql(path, (sql) =>
+  test("the outbox refuses an unknown status, an unknown policy and an orphan request", async () => {
+    const outcome = await withSql(newDatabasePath(), (sql) =>
       Effect.gen(function* () {
+        yield* migrate;
         yield* sql`INSERT INTO events (id, sequence, target_id, kind, payload,
             operation, subject_id, recorded_at)
           VALUES ('evt_000001', 1, 't', 'asset.recorded', '{}', 'record_asset',
@@ -1445,467 +721,94 @@ describe("a database already at 0009", () => {
     // An obligation with no event behind it is an obligation nobody can explain.
     expect(outcome.orphan).toBe("Failure");
   });
-});
 
-describe("a database already at 0015", () => {
-  /**
-   * Goals as `seedAttempt` minted them before goals had a lifecycle, in a file at `0015`.
-   *
-   * Inserted with a plain `INSERT` that names only the four columns that existed then, so
-   * the rows are what the old code wrote and the defaults are what has to supply the rest.
-   * Two targets, so "every existing goal becomes active" is not satisfied by one row.
-   */
-  const seedGoalsAtZeroFifteen = (path: string) =>
-    withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: chainThrough(15) });
-        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
-          VALUES ('goal_old_a', 'acme-corp', 'find auth bypasses', 100)`;
-        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
-          VALUES ('goal_old_b', 'internal-api', 'probe tenant isolation', 200)`;
-        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
-          VALUES ('intent_old', 'goal_old_a', 'acme-corp', 'does login rate-limit?', 101)`;
-      }),
-    );
-
-  test("leaves existing goals readable, active and unnamed", async () => {
-    const path = newDatabasePath();
-    await seedGoalsAtZeroFifteen(path);
-
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        return {
-          applied: yield* migrate,
-          goals: yield* sql<{
-            id: string;
-            description: string;
-            created_at: number;
-            name: string;
-            status: string;
-            ended_at: number | null;
-            ended_by: string | null;
-            end_reason: string | null;
-          }>`SELECT id, description, created_at, name, status, ended_at, ended_by,
-                    end_reason
-             FROM goals ORDER BY id`,
-          intents: yield* sql<{ goal_id: string }>`SELECT goal_id FROM intents`,
-        };
-      }),
-    );
-
-    // Everything above 0015 is outstanding.
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "16_goal_lifecycle",
-      "17_intent_lifecycle",
-      "18_planner_rounds",
-      "19_planner_lineage_by_goal",
-      "20_round_disposition_rationale",
-      "21_goal_sessions",
-      "22_target_scope",
-      "23_asset_imports",
-      "24_import_sessions",
-      "25_import_session_confirmation",
-      "26_import_session_end",
-      "27_import_session_end_reason",
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    // The old columns are untouched; the new ones took the defaults the migration
-    // documents: an open goal, no name, and no ending recorded.
-    expect(outcome.goals).toEqual([
-      {
-        id: "goal_old_a",
-        description: "find auth bypasses",
-        created_at: 100,
-        name: "",
-        status: "active",
-        ended_at: null,
-        ended_by: null,
-        end_reason: null,
-      },
-      {
-        id: "goal_old_b",
-        description: "probe tenant isolation",
-        created_at: 200,
-        name: "",
-        status: "active",
-        ended_at: null,
-        ended_by: null,
-        end_reason: null,
-      },
-    ]);
-    // The goal-to-intent link is the thing a rebuilt table would lose.
-    expect(outcome.intents).toEqual([{ goal_id: "goal_old_a" }]);
-  });
-
-  test("adds the index a target's goal list reads through", async () => {
-    const path = newDatabasePath();
-    await withSql(path, () => migrate);
-
-    const index = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const rows = yield* sql.unsafe<{ name: string }>(
-          `PRAGMA index_list(goals)`,
-        );
-        const columns = yield* sql.unsafe<{ seqno: number; name: string }>(
-          `PRAGMA index_info(goals_target_status_idx)`,
-        );
-        return {
-          present: rows.map((row) => row.name),
-          columns: [...columns]
-            .sort((a, b) => a.seqno - b.seqno)
-            .map((column) => column.name),
-        };
-      }),
-    );
-
-    expect(index.present).toContain("goals_target_status_idx");
-    expect(index.columns).toEqual(["target_id", "status"]);
-  });
-
-  test("a fresh database has the same goal columns as an upgraded one", async () => {
-    const upgraded = newDatabasePath();
-    await seedGoalsAtZeroFifteen(upgraded);
-    await withSql(upgraded, () => migrate);
-    const fresh = newDatabasePath();
-    await withSql(fresh, () => migrate);
-
-    const [fromUpgrade, fromScratch] = await Promise.all([
-      withSql(upgraded, (sql) => columnsOf(sql, "goals")),
-      withSql(fresh, (sql) => columnsOf(sql, "goals")),
-    ]);
-
-    expect(fromScratch).toEqual(fromUpgrade);
-    expect(fromScratch).toEqual(
-      [
-        "id",
-        "target_id",
-        "description",
-        "created_at",
-        "name",
-        "status",
-        "ended_at",
-        "ended_by",
-        "end_reason",
-      ].sort(),
-    );
-  });
-});
-
-describe("a database already at 0016", () => {
-  /**
-   * Intents as the old minting path wrote them, in a file at `0016`.
-   *
-   * Plain `INSERT`s naming only the columns that existed then, so the defaults are what
-   * has to supply the rest. One intent has an attempt, so "the attempt link survives" is
-   * not satisfied by an intent nothing hangs off.
-   */
-  const seedIntentsAtZeroSixteen = (path: string) =>
-    withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: chainThrough(16) });
-        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
-          VALUES ('goal_old', 'acme-corp', 'find auth bypasses', 100)`;
-        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
-          VALUES ('intent_old_a', 'goal_old', 'acme-corp', 'does login rate-limit?', 101)`;
-        yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
-          VALUES ('intent_old_b', 'goal_old', 'acme-corp', 'is the token rotated?', 102)`;
-        yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
-            provider_id, model_id, status, started_at, write_fence)
-          VALUES ('att_old', 'intent_old_a', 'acme-corp', 'wk_old', 'p', 'm',
-                  'succeeded', 103, 0)`;
-      }),
-    );
-
-  test("existing intents become open, unclaimed and unsuggested", async () => {
-    const path = newDatabasePath();
-    await seedIntentsAtZeroSixteen(path);
-
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        return {
-          applied: yield* migrate,
-          intents: yield* sql<{
-            id: string;
-            goal_id: string;
-            question: string;
-            created_at: number;
-            status: string;
-            claimed_by_attempt_id: string | null;
-            suggested_instance_id: string | null;
-            suggested_model: string | null;
-            suggested_model_options: string | null;
-          }>`SELECT id, goal_id, question, created_at, status, claimed_by_attempt_id,
-                    suggested_instance_id, suggested_model, suggested_model_options
-             FROM intents ORDER BY id`,
-          attempts: yield* sql<{
-            intent_id: string;
-          }>`SELECT intent_id FROM attempts`,
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "17_intent_lifecycle",
-      "18_planner_rounds",
-      "19_planner_lineage_by_goal",
-      "20_round_disposition_rationale",
-      "21_goal_sessions",
-      "22_target_scope",
-      "23_asset_imports",
-      "24_import_sessions",
-      "25_import_session_confirmation",
-      "26_import_session_end",
-      "27_import_session_end_reason",
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    const unchanged = {
-      claimed_by_attempt_id: null,
-      suggested_instance_id: null,
-    };
-    expect(outcome.intents).toEqual([
-      {
-        id: "intent_old_a",
-        goal_id: "goal_old",
-        question: "does login rate-limit?",
-        created_at: 101,
-        status: "open",
-        ...unchanged,
-        suggested_model: null,
-        suggested_model_options: null,
-      },
-      {
-        id: "intent_old_b",
-        goal_id: "goal_old",
-        question: "is the token rotated?",
-        created_at: 102,
-        status: "open",
-        ...unchanged,
-        suggested_model: null,
-        suggested_model_options: null,
-      },
-    ]);
-    // Not back-filled to `answered`, even though its attempt succeeded: the settlement
-    // rule judges at the moment of settling and is not applied to rows it never saw.
-    expect(outcome.attempts).toEqual([{ intent_id: "intent_old_a" }]);
-  });
-
-  test("adds the index a goal's intent list reads through", async () => {
-    const path = newDatabasePath();
-    await withSql(path, () => migrate);
-
-    const index = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const rows = yield* sql.unsafe<{ name: string }>(
-          `PRAGMA index_list(intents)`,
-        );
-        const columns = yield* sql.unsafe<{ seqno: number; name: string }>(
-          `PRAGMA index_info(intents_goal_status_idx)`,
-        );
-        return {
-          present: rows.map((row) => row.name),
-          columns: [...columns]
-            .sort((a, b) => a.seqno - b.seqno)
-            .map((column) => column.name),
-        };
-      }),
-    );
-
-    expect(index.present).toContain("intents_goal_status_idx");
-    expect(index.columns).toEqual(["goal_id", "status"]);
-  });
-
-  test("a fresh database has the same intent columns as an upgraded one", async () => {
-    const upgraded = newDatabasePath();
-    await seedIntentsAtZeroSixteen(upgraded);
-    await withSql(upgraded, () => migrate);
-    const fresh = newDatabasePath();
-    await withSql(fresh, () => migrate);
-
-    const [fromUpgrade, fromScratch] = await Promise.all([
-      withSql(upgraded, (sql) => columnsOf(sql, "intents")),
-      withSql(fresh, (sql) => columnsOf(sql, "intents")),
-    ]);
-
-    expect(fromScratch).toEqual(fromUpgrade);
-    expect(fromScratch).toContain("status");
-    expect(fromScratch).toContain("claimed_by_attempt_id");
-    expect(fromScratch).toContain("suggested_instance_id");
-    expect(fromScratch).toContain("suggested_model");
-    expect(fromScratch).toContain("suggested_model_options");
-  });
-});
-
-describe("a database already at 0017", () => {
-  /**
-   * A file at `0017`, with a planner lineage keyed by target and two goals under it.
-   *
-   * This is the state `0019` has to re-key from, and the rows are what the migration's
-   * comment makes a claim about: a target-keyed lineage cannot be re-keyed to a goal
-   * without inventing which goal it belonged to, so it is dropped.
-   */
-  const seedLineageAtZeroSeventeen = (path: string) =>
-    withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: chainThrough(17) });
-        yield* sql`INSERT INTO goals (id, target_id, description, created_at, name, status)
-          VALUES ('goal_old', 'acme-corp', 'find auth bypasses', 100, '', 'active')`;
-        yield* sql`INSERT INTO planner_lineages (target_id, harness_session_id, created_at)
-          VALUES ('acme-corp', 'ses_old_lineage', 101)`;
-      }),
-    );
-
-  test("0018 adds the round table with its own index, and nothing else moves", async () => {
-    const path = newDatabasePath();
-    await seedLineageAtZeroSeventeen(path);
-
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const applied = yield* runMigrations({ loader: chainThrough(18) });
-        return {
-          applied,
-          rounds: yield* columnsOf(sql, "planner_rounds"),
-          key: yield* primaryKeyOf(sql, "planner_rounds"),
-          indexes: yield* sql<{ name: string }>`SELECT name FROM sqlite_master
-            WHERE type = 'index' AND tbl_name = 'planner_rounds' ORDER BY name`,
-          // The lineage is still target-keyed at 0018: one migration, one change.
-          lineageColumns: yield* columnsOf(sql, "planner_lineages"),
-          goals: yield* sql<{ id: string }>`SELECT id FROM goals ORDER BY id`,
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "18_planner_rounds",
-    ]);
-    expect(outcome.rounds).toEqual(
-      [
-        "id",
-        "goal_id",
-        "target_id",
-        "status",
-        "write_fence",
-        "harness_session_id",
-        "harness_instance_id",
-        "provider_id",
-        "model_id",
-        "started_at_sequence",
-        "budget",
-        "disposition",
-        "started_at",
-        "ended_at",
-      ].sort(),
-    );
-    expect(outcome.key).toEqual(["id"]);
-    expect(outcome.indexes.map((row) => row.name)).toContain(
-      "planner_rounds_goal_idx",
-    );
-    expect(outcome.lineageColumns).toContain("target_id");
-    expect(outcome.goals.map((row) => row.id)).toEqual(["goal_old"]);
-  });
-
-  test("0019 re-keys the lineage to the goal over an existing database, dropping the rows it cannot re-key", async () => {
-    const path = newDatabasePath();
-    await seedLineageAtZeroSeventeen(path);
-
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        const applied = yield* migrate;
-        return {
-          applied,
-          columns: yield* columnsOf(sql, "planner_lineages"),
-          key: yield* primaryKeyOf(sql, "planner_lineages"),
-          rows: yield* sql<{
-            goal_id: string;
-          }>`SELECT goal_id FROM planner_lineages`,
-          // Everything the lineage is *not* about is untouched by the rebuild.
-          goals: yield* sql<{ id: string }>`SELECT id FROM goals ORDER BY id`,
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "18_planner_rounds",
-      "19_planner_lineage_by_goal",
-      "20_round_disposition_rationale",
-      "21_goal_sessions",
-      "22_target_scope",
-      "23_asset_imports",
-      "24_import_sessions",
-      "25_import_session_confirmation",
-      "26_import_session_end",
-      "27_import_session_end_reason",
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    expect(outcome.key).toEqual(["goal_id"]);
-    expect(outcome.columns).toEqual(
-      ["goal_id", "harness_session_id", "created_at"].sort(),
-    );
-    // The migration's own comment says these go, and why: a target-keyed row names no
-    // goal, and the table holds only a prompt-cache hint. Asserted rather than described.
-    expect(outcome.rows).toEqual([]);
-    expect(outcome.goals.map((row) => row.id)).toEqual(["goal_old"]);
-  });
-
-  test("the re-keyed lineage takes a goal that exists and refuses one that does not", async () => {
-    // The foreign key is new in `0019`: `target_id` was a bare column and `goal_id` is a
-    // reference, because a goal is ours and a target folder is not.
-    const path = newDatabasePath();
-    await seedLineageAtZeroSeventeen(path);
-
-    const outcome = await withSql(path, (sql) =>
+  test("an import session takes only the four end reasons, and null", async () => {
+    const outcome = await withSql(newDatabasePath(), (sql) =>
       Effect.gen(function* () {
         yield* migrate;
-        const accepted = yield* Effect.result(
-          sql`INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
-            VALUES ('goal_old', 'ses_new_lineage', 200)`,
+        yield* sql`INSERT INTO import_sessions (
+            import_id, target_id, harness_session_id, harness_instance_id, model,
+            caller_scope, opened_at, session_created_at, ended_at, ended_reason
+          ) VALUES ('imp_1', 'acme-corp', 'ses_1', 'opencode', 'p/m',
+                    'acme-corp/import/imp_1', 100, 150, 300, 'shutdown')`;
+        // Null passes the `CHECK`, which is the open row.
+        const open = yield* Effect.result(
+          sql`INSERT INTO import_sessions (
+              import_id, target_id, harness_session_id, model, caller_scope, opened_at
+            ) VALUES ('imp_2', 'acme-corp', 'ses_2', 'p/m',
+                      'acme-corp/import/imp_2', 400)`,
         );
-        const refused = yield* Effect.result(
-          sql`INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
-            VALUES ('goal_absent', 'ses_orphan', 201)`,
+        const unknown = yield* Effect.result(
+          sql`UPDATE import_sessions SET ended_reason = 'crashed'
+            WHERE import_id = 'imp_1'`,
         );
-        return { accepted, refused };
+        // The row is written before the session exists, so an empty session id would be
+        // a row naming nothing.
+        const emptySession = yield* Effect.result(
+          sql`INSERT INTO import_sessions (
+              import_id, target_id, harness_session_id, model, caller_scope, opened_at
+            ) VALUES ('imp_3', 'acme-corp', '', 'p/m',
+                      'acme-corp/import/imp_3', 500)`,
+        );
+        return {
+          open: open._tag,
+          unknown: unknown._tag,
+          emptySession: emptySession._tag,
+          rows: yield* sql<{
+            import_id: string;
+            ended_reason: string | null;
+          }>`SELECT import_id, ended_reason FROM import_sessions
+               ORDER BY import_id`,
+        };
       }),
     );
 
-    expect(outcome.accepted._tag).toBe("Success");
-    expect(outcome.refused._tag).toBe("Failure");
+    expect(outcome.open).toBe("Success");
+    expect(outcome.unknown).toBe("Failure");
+    expect(outcome.emptySession).toBe("Failure");
+    expect(outcome.rows).toEqual([
+      { import_id: "imp_1", ended_reason: "shutdown" },
+      { import_id: "imp_2", ended_reason: null },
+    ]);
   });
 
-  test("the upgraded lineage table matches a fresh replay exactly", async () => {
-    const upgraded = newDatabasePath();
-    await seedLineageAtZeroSeventeen(upgraded);
-    await withSql(upgraded, () => migrate);
+  test("the control registry holds its per-target state to two values", async () => {
+    const outcome = await withSql(newDatabasePath(), (sql) =>
+      Effect.gen(function* () {
+        yield* migrateControl;
+        yield* sql`INSERT INTO targets (id, name, scope_note, created_at)
+          VALUES ('acme-corp', 'Acme', 'a note', 1)`;
+        const ready = yield* Effect.result(
+          sql`INSERT INTO target_schema_state (target_id, state, applied_through,
+                detail, checked_at)
+              VALUES ('acme-corp', 'ready', 1, '', 2)`,
+        );
+        const nonsense = yield* Effect.result(
+          sql`UPDATE target_schema_state SET state = 'probably_fine'
+            WHERE target_id = 'acme-corp'`,
+        );
+        const orphan = yield* Effect.result(
+          sql`INSERT INTO target_schema_state (target_id, state, applied_through,
+                detail, checked_at)
+              VALUES ('no-such-target', 'ready', 1, '', 2)`,
+        );
+        return {
+          ready: ready._tag,
+          nonsense: nonsense._tag,
+          orphan: orphan._tag,
+          // Nullable, and null is the honest state of a target with no operator-chosen
+          // folder — including the one `main.ts` registers to serve a fixture.
+          workspace: yield* sql<{
+            workspace_path: string | null;
+          }>`SELECT workspace_path FROM targets`,
+        };
+      }),
+    );
 
-    const fresh = newDatabasePath();
-    await withSql(fresh, () => migrate);
-
-    const [fromUpgrade, fromScratch] = await Promise.all([
-      withSql(upgraded, (sql) =>
-        Effect.all({
-          lineage: columnsOf(sql, "planner_lineages"),
-          lineageKey: primaryKeyOf(sql, "planner_lineages"),
-          rounds: columnsOf(sql, "planner_rounds"),
-        }),
-      ),
-      withSql(fresh, (sql) =>
-        Effect.all({
-          lineage: columnsOf(sql, "planner_lineages"),
-          lineageKey: primaryKeyOf(sql, "planner_lineages"),
-          rounds: columnsOf(sql, "planner_rounds"),
-        }),
-      ),
-    ]);
-
-    expect(fromUpgrade).toEqual(fromScratch);
+    expect(outcome.ready).toBe("Success");
+    expect(outcome.nonsense).toBe("Failure");
+    expect(outcome.orphan).toBe("Failure");
+    expect(outcome.workspace).toEqual([{ workspace_path: null }]);
   });
 });
 
@@ -1932,6 +835,25 @@ describe("a failing migration", () => {
     }),
   });
 
+  /** A goal and one observation, so a rollback has rows it could have destroyed. */
+  const seedRows = (sql: SqlClient.SqlClient) =>
+    Effect.gen(function* () {
+      yield* sql`INSERT INTO goals (id, target_id, description, created_at)
+        VALUES ('g', 't', 'the goal', 1)`;
+      yield* sql`INSERT INTO intents (id, goal_id, target_id, question, created_at)
+        VALUES ('i', 'g', 't', 'q', 1)`;
+      yield* sql`INSERT INTO attempts (id, intent_id, target_id, worker_id,
+          provider_id, model_id, status, started_at)
+        VALUES ('a', 'i', 't', 'w', 'p', 'm', 'running', 1)`;
+      yield* sql`INSERT INTO observations (
+          id, sequence, record_format, target_id, intent_id, attempt_id,
+          harness_session_id, worker_id, tested_claim, outcome, interpretation,
+          limitations, untested_dimensions, recorded_at,
+          summary_conditions, summary_observed_behavior, summary_evidence_refs
+        ) VALUES ('obs_1', 1, 'summary', 't', 'i', 'a', 's', 'w', 'c', 'positive',
+          'r', '[]', '[]', 1, '{}', 'seen', '[]')`;
+    });
+
   test("names the migration that failed, in a typed error", async () => {
     const path = newDatabasePath();
     await withSql(path, () => migrate);
@@ -1950,9 +872,7 @@ describe("a failing migration", () => {
 
   test("rolls back only the pending migration when earlier ones are already applied", async () => {
     const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
-    const applied = await withSql(path, () => migrate);
-    expect(applied.map(([id]) => id)).toEqual(CHAIN_IDS);
+    await withSql(path, (sql) => Effect.flatMap(migrate, () => seedRows(sql)));
 
     await runChain(path, brokenLoader);
 
@@ -1967,18 +887,21 @@ describe("a failing migration", () => {
     );
 
     // No journal row for the broken entry, and no half-applied column.
-    expect(after.journal.map((row) => row.migration_id)).toEqual(CHAIN_IDS);
+    expect(after.journal.map((row) => row.migration_id)).toEqual(
+      HUNT_CHAIN.map(([id]) => id),
+    );
     expect(after.columns).not.toContain("half_applied");
-    // The migrations that had already succeeded are untouched, data included.
+    // The migration that had already succeeded is untouched, data included.
     expect(after.columns).toContain("record_format");
-    expect(after.rows.map((row) => row.id)).toEqual([SUMMARY_OBSERVATION_ID]);
+    expect(after.rows.map((row) => row.id)).toEqual(["obs_1"]);
   });
 
   test("rolls back the whole run when the failing migration is in the first batch", async () => {
-    // Worth stating explicitly, because it is not what a per-migration transaction
-    // would do: the migrator wraps the *entire* run in one transaction
+    // Worth stating explicitly, because it is not what a per-migration transaction would
+    // do: the migrator wraps the *entire* run in one transaction
     // (`effect/src/sql/Migrator.ts:321`), so a fresh database whose first migrate call
-    // hits a bad migration is left completely empty rather than half-built.
+    // hits a bad migration is left completely empty rather than half-built. With one
+    // baseline entry that is also the only shape a failure can take on a fresh file.
     const path = newDatabasePath();
     const failure = await runChain(path, brokenLoader);
     expect(failure._tag).toBe("Failure");
@@ -1998,8 +921,7 @@ describe("a failing migration", () => {
 
   test("the database recovers once the migration is corrected", async () => {
     const path = newDatabasePath();
-    await writeFirstSliceDatabase(path);
-    await withSql(path, () => migrate);
+    await withSql(path, (sql) => Effect.flatMap(migrate, () => seedRows(sql)));
     await runChain(path, brokenLoader);
 
     const recovered = await Effect.runPromise(
@@ -2017,16 +939,16 @@ describe("a failing migration", () => {
       ),
     );
 
-    // Only the corrected migration is outstanding; the real chain is not re-applied.
+    // Only the corrected migration is outstanding; the baseline is not re-applied, which
+    // matters more here than it did under a long chain: re-running it would try to create
+    // every table a second time.
     expect(recovered.applied.map(([id]) => id)).toEqual([Number(BROKEN_ID)]);
     expect(recovered.journal.map((row) => row.migration_id)).toEqual([
-      ...CHAIN_IDS,
+      ...HUNT_CHAIN.map(([id]) => id),
       Number(BROKEN_ID),
     ]);
     expect(recovered.columns).toContain("half_applied");
-    expect(recovered.rows.map((row) => row.id)).toEqual([
-      SUMMARY_OBSERVATION_ID,
-    ]);
+    expect(recovered.rows.map((row) => row.id)).toEqual(["obs_1"]);
   });
 
   test("a duplicate migration id is refused rather than half-applied", async () => {
@@ -2040,298 +962,5 @@ describe("a failing migration", () => {
     if (failure._tag === "Failure") {
       expect((failure.failure as DatabaseError).reason).toContain("Duplicates");
     }
-  });
-});
-
-describe("0025 import session confirmation", () => {
-  test("a row written under 0024 upgrades unconfirmed, and can then be confirmed", async () => {
-    const path = newDatabasePath();
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: chainThrough(24) });
-        yield* sql`INSERT INTO import_sessions (
-            import_id, target_id, harness_session_id, harness_instance_id, model,
-            caller_scope, opened_at
-          ) VALUES ('imp_old', 'acme-corp', 'ses_old', 'opencode', 'p/m',
-                    'acme-corp/import/imp_old', 100)`;
-        const applied = yield* migrate;
-        const upgraded = yield* sql<{
-          session_created_at: number | null;
-        }>`SELECT session_created_at FROM import_sessions`;
-        yield* sql`UPDATE import_sessions SET session_created_at = 200
-          WHERE import_id = 'imp_old'`;
-        return {
-          applied,
-          upgraded,
-          columns: yield* columnsOf(sql, "import_sessions"),
-          confirmed: yield* sql<{
-            session_created_at: number | null;
-          }>`SELECT session_created_at FROM import_sessions`,
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "25_import_session_confirmation",
-      "26_import_session_end",
-      "27_import_session_end_reason",
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    expect(outcome.columns).toContain("session_created_at");
-    // Not backfilled: nothing in a 0024 row says the harness ever held the session.
-    expect(outcome.upgraded).toEqual([{ session_created_at: null }]);
-    expect(outcome.confirmed).toEqual([{ session_created_at: 200 }]);
-  });
-});
-
-describe("0026 import session end", () => {
-  test("a row written under 0025 upgrades not-ended, and can then be ended", async () => {
-    const path = newDatabasePath();
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: chainThrough(25) });
-        yield* sql`INSERT INTO import_sessions (
-            import_id, target_id, harness_session_id, harness_instance_id, model,
-            caller_scope, opened_at, session_created_at
-          ) VALUES ('imp_old', 'acme-corp', 'ses_old', 'opencode', 'p/m',
-                    'acme-corp/import/imp_old', 100, 150)`;
-        const applied = yield* migrate;
-        const upgraded = yield* sql<{
-          ended_at: number | null;
-        }>`SELECT ended_at FROM import_sessions`;
-        yield* sql`UPDATE import_sessions SET ended_at = 300
-          WHERE import_id = 'imp_old'`;
-        return {
-          applied,
-          upgraded,
-          columns: yield* columnsOf(sql, "import_sessions"),
-          ended: yield* sql<{
-            ended_at: number | null;
-          }>`SELECT ended_at FROM import_sessions`,
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "26_import_session_end",
-      "27_import_session_end_reason",
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    expect(outcome.columns).toContain("ended_at");
-    // Not backfilled: a row from before the column says nothing about an ending.
-    expect(outcome.upgraded).toEqual([{ ended_at: null }]);
-    expect(outcome.ended).toEqual([{ ended_at: 300 }]);
-  });
-});
-
-describe("0027 import session end reason", () => {
-  test("a row ended under 0026 upgrades with no reason, and the column takes only the four reasons", async () => {
-    const path = newDatabasePath();
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: chainThrough(26) });
-        yield* sql`INSERT INTO import_sessions (
-            import_id, target_id, harness_session_id, harness_instance_id, model,
-            caller_scope, opened_at, session_created_at, ended_at
-          ) VALUES ('imp_old', 'acme-corp', 'ses_old', 'opencode', 'p/m',
-                    'acme-corp/import/imp_old', 100, 150, 300)`;
-        const applied = yield* migrate;
-        const upgraded = yield* sql<{
-          ended_at: number | null;
-          ended_reason: string | null;
-        }>`SELECT ended_at, ended_reason FROM import_sessions`;
-        yield* sql`INSERT INTO import_sessions (
-            import_id, target_id, harness_session_id, harness_instance_id, model,
-            caller_scope, opened_at, session_created_at, ended_at, ended_reason
-          ) VALUES ('imp_new', 'acme-corp', 'ses_new', 'opencode', 'p/m',
-                    'acme-corp/import/imp_new', 400, 450, 500, 'shutdown')`;
-        const unknown = yield* Effect.exit(
-          sql`UPDATE import_sessions SET ended_reason = 'crashed'
-            WHERE import_id = 'imp_new'`,
-        );
-        return {
-          applied,
-          upgraded,
-          unknownRefused: unknown._tag === "Failure",
-          columns: yield* columnsOf(sql, "import_sessions"),
-          reasons: yield* sql<{
-            import_id: string;
-            ended_reason: string | null;
-          }>`SELECT import_id, ended_reason FROM import_sessions ORDER BY import_id`,
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "27_import_session_end_reason",
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    expect(outcome.columns).toContain("ended_reason");
-    // Not backfilled: nothing under 0026 recorded why a row ended.
-    expect(outcome.upgraded).toEqual([{ ended_at: 300, ended_reason: null }]);
-    expect(outcome.unknownRefused).toBe(true);
-    expect(outcome.reasons).toEqual([
-      { import_id: "imp_new", ended_reason: "shutdown" },
-      { import_id: "imp_old", ended_reason: null },
-    ]);
-  });
-});
-
-describe("0028 and 0029: an import session's model options and pages", () => {
-  test("a row written under 0027 upgrades with neither recorded, and both then take JSON", async () => {
-    const path = newDatabasePath();
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: chainThrough(27) });
-        yield* sql`INSERT INTO import_sessions (
-            import_id, target_id, harness_session_id, harness_instance_id, model,
-            caller_scope, opened_at, session_created_at
-          ) VALUES ('imp_old', 'acme-corp', 'ses_old', 'opencode', 'p/m',
-                    'acme-corp/import/imp_old', 100, 150)`;
-        const applied = yield* migrate;
-        const upgraded = yield* sql<{
-          model_options: string | null;
-          pages: string | null;
-        }>`SELECT model_options, pages FROM import_sessions`;
-        yield* sql`UPDATE import_sessions
-          SET model_options = '[{"id":"effort","value":"high"}]',
-              pages = '["https://hackerone.com/acme"]'
-          WHERE import_id = 'imp_old'`;
-        return {
-          applied,
-          upgraded,
-          columns: yield* columnsOf(sql, "import_sessions"),
-          written: yield* sql<{
-            model_options: string | null;
-            pages: string | null;
-          }>`SELECT model_options, pages FROM import_sessions`,
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "28_import_session_model_options",
-      "29_import_session_pages",
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    expect(outcome.columns).toContain("model_options");
-    expect(outcome.columns).toContain("pages");
-    // Not backfilled: nothing under 0027 recorded either.
-    expect(outcome.upgraded).toEqual([{ model_options: null, pages: null }]);
-    expect(outcome.written).toEqual([
-      {
-        model_options: '[{"id":"effort","value":"high"}]',
-        pages: '["https://hackerone.com/acme"]',
-      },
-    ]);
-  });
-});
-
-describe("0030: a goal conversation's model", () => {
-  test("a row written under 0029 upgrades with no model, and the column then takes one", async () => {
-    const path = newDatabasePath();
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* runMigrations({ loader: chainThrough(29) });
-        yield* sql`INSERT INTO goals (id, target_id, description, created_at)
-          VALUES ('goal_old', 'acme-corp', 'objective', 1)`;
-        yield* sql`INSERT INTO goal_sessions (
-            goal_id, target_id, harness_session_id, harness_instance_id, opened_at
-          ) VALUES ('goal_old', 'acme-corp', 'ses_old', 'claude-code', 100)`;
-        const applied = yield* migrate;
-        const upgraded = yield* sql<{
-          model: string | null;
-        }>`SELECT model FROM goal_sessions`;
-        yield* sql`UPDATE goal_sessions SET model = 'anthropic/claude-sonnet-5'
-          WHERE goal_id = 'goal_old'`;
-        return {
-          applied,
-          upgraded,
-          columns: yield* columnsOf(sql, "goal_sessions"),
-          written: yield* sql<{
-            model: string | null;
-          }>`SELECT model FROM goal_sessions`,
-        };
-      }),
-    );
-
-    expect(outcome.applied.map(([id, name]) => `${id}_${name}`)).toEqual([
-      "30_goal_session_model",
-      "31_attempt_harness_instance_repair",
-    ]);
-    expect(outcome.columns).toContain("model");
-    // Not backfilled: a 0021 row says nothing about what the conversation ran on.
-    expect(outcome.upgraded).toEqual([{ model: null }]);
-    expect(outcome.written).toEqual([{ model: "anthropic/claude-sonnet-5" }]);
-  });
-
-  test("0031 repairs attempts.harness_instance_id on a database that skipped 0014", async () => {
-    /*
-     * The failure this exists for, found by driving the app rather than by a test.
-     *
-     * `0014_attempt_harness_instance` was inserted into the middle of the list after
-     * databases already existed, so those databases recorded id 14 as `outbox` and the
-     * migrator — which skips every entry at or below the highest applied id — never ran it.
-     * `attempts` kept no `harness_instance_id`, and nothing noticed until the Agent sessions
-     * list selected it: the route answered 500 and startup reconciliation logged
-     * `query failed` on every target.
-     *
-     * Simulated the way a real upgrade is: take a file forward through the chain, drop the
-     * column to put it in the state the renumber left, then migrate the rest of the way.
-     */
-    const path = newDatabasePath();
-    await runChain(path, chainThrough(30));
-
-    const outcome = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        // The closest reachable state to the one the skipped migration left. The index goes
-        // first: SQLite refuses to drop a column an index depends on.
-        yield* sql.unsafe(`DROP INDEX IF EXISTS attempts_harness_instance_idx`);
-        yield* sql.unsafe(
-          `ALTER TABLE attempts DROP COLUMN harness_instance_id`,
-        );
-        const before = yield* columnsOf(sql, "attempts");
-        const applied = yield* Effect.scoped(
-          runMigrations({ loader: SqliteMigrator.fromRecord(MIGRATIONS) }).pipe(
-            Effect.provide(sqliteLayer(path)),
-          ),
-        );
-        return {
-          before,
-          applied,
-          after: yield* columnsOf(sql, "attempts"),
-        };
-      }),
-    );
-
-    expect(outcome.before).not.toContain("harness_instance_id");
-    expect(outcome.after).toContain("harness_instance_id");
-  });
-
-  test("0031 is a no-op on a database that already has the column", async () => {
-    const path = newDatabasePath();
-    await runChain(path, chainThrough(31));
-    // Running the whole chain again must not fail on a bare ALTER TABLE.
-    const columns = await withSql(path, (sql) =>
-      Effect.gen(function* () {
-        yield* Effect.scoped(
-          runMigrations({ loader: SqliteMigrator.fromRecord(MIGRATIONS) }).pipe(
-            Effect.provide(sqliteLayer(path)),
-          ),
-        );
-        return yield* columnsOf(sql, "attempts");
-      }),
-    );
-    expect(columns).toContain("harness_instance_id");
   });
 });

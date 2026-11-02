@@ -1,0 +1,415 @@
+## index asset_discoveries_intent_idx (on asset_discoveries)
+CREATE INDEX asset_discoveries_intent_idx ON asset_discoveries(intent_id)
+## index asset_imports_source_idx (on asset_imports)
+CREATE INDEX asset_imports_source_idx ON asset_imports(source_url)
+## index attempt_recoveries_attempt_idx (on attempt_recoveries)
+CREATE INDEX attempt_recoveries_attempt_idx ON attempt_recoveries(attempt_id)
+## index attempts_harness_instance_idx (on attempts)
+CREATE INDEX attempts_harness_instance_idx ON attempts(harness_instance_id) WHERE harness_instance_id IS NOT NULL
+## index attempts_intent_idx (on attempts)
+CREATE INDEX attempts_intent_idx ON attempts(intent_id)
+## index attempts_status_idx (on attempts)
+CREATE INDEX attempts_status_idx ON attempts(status)
+## index command_receipts_scope_idx (on command_receipts)
+CREATE INDEX command_receipts_scope_idx ON command_receipts(caller_scope)
+## index events_kind_idx (on events)
+CREATE INDEX events_kind_idx ON events(kind)
+## index events_sequence_idx (on events)
+CREATE UNIQUE INDEX events_sequence_idx ON events(sequence)
+## index goals_target_status_idx (on goals)
+CREATE INDEX goals_target_status_idx ON goals(target_id, status)
+## index import_sessions_target_idx (on import_sessions)
+CREATE INDEX import_sessions_target_idx ON import_sessions(target_id, opened_at)
+## index intent_anchors_observation_idx (on intent_anchors)
+CREATE INDEX intent_anchors_observation_idx ON intent_anchors(observation_id)
+## index intents_addresses_dimension_idx (on intents)
+CREATE INDEX intents_addresses_dimension_idx ON intents(addresses_dimension)
+## index intents_goal_idx (on intents)
+CREATE INDEX intents_goal_idx ON intents(goal_id)
+## index intents_goal_status_idx (on intents)
+CREATE INDEX intents_goal_status_idx ON intents(goal_id, status)
+## index observation_dimension_links_dimension_idx (on observation_dimension_links)
+CREATE INDEX observation_dimension_links_dimension_idx ON observation_dimension_links(dimension_id)
+## index observations_intent_idx (on observations)
+CREATE INDEX observations_intent_idx ON observations(intent_id)
+## index observations_record_format_idx (on observations)
+CREATE INDEX observations_record_format_idx ON observations(record_format)
+## index observations_sequence_idx (on observations)
+CREATE UNIQUE INDEX observations_sequence_idx ON observations(sequence)
+## index outbox_event_idx (on outbox)
+CREATE INDEX outbox_event_idx ON outbox(caused_by_event_id)
+## index outbox_pending_idx (on outbox)
+CREATE INDEX outbox_pending_idx ON outbox(status, sequence) WHERE status = 'pending'
+## index outbox_sequence_idx (on outbox)
+CREATE UNIQUE INDEX outbox_sequence_idx ON outbox(sequence)
+## index planner_rounds_goal_idx (on planner_rounds)
+CREATE INDEX planner_rounds_goal_idx ON planner_rounds(goal_id, status)
+## index scope_entries_target_idx (on scope_entries)
+CREATE INDEX scope_entries_target_idx ON scope_entries(target_id)
+## table asset_discoveries (on asset_discoveries)
+CREATE TABLE asset_discoveries ( asset_id TEXT NOT NULL REFERENCES assets(id), operation_id TEXT NOT NULL, caller_scope TEXT NOT NULL, intent_id TEXT NOT NULL REFERENCES intents(id), attempt_id TEXT NOT NULL REFERENCES attempts(id), discovered_as TEXT NOT NULL, note TEXT NOT NULL, discovered_at INTEGER NOT NULL, PRIMARY KEY (asset_id, operation_id) )
+## table asset_imports (on asset_imports)
+CREATE TABLE asset_imports ( asset_id TEXT NOT NULL REFERENCES assets(id), operation_id TEXT NOT NULL, caller_scope TEXT NOT NULL, source_url TEXT NOT NULL, imported_as TEXT NOT NULL, note TEXT NOT NULL, imported_at INTEGER NOT NULL, PRIMARY KEY (asset_id, operation_id), CHECK (length(source_url) > 0) )
+## table asset_scope_labels (on asset_scope_labels)
+CREATE TABLE asset_scope_labels ( asset_id TEXT PRIMARY KEY REFERENCES assets(id), state TEXT NOT NULL, reason TEXT, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, CHECK (state IN ('in', 'out')) )
+## table assets (on assets)
+CREATE TABLE assets ( id TEXT PRIMARY KEY, target_id TEXT NOT NULL, kind TEXT NOT NULL, identity TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, scheme TEXT, method TEXT, path TEXT, first_seen_at INTEGER NOT NULL, UNIQUE (target_id, kind, identity), CHECK ( (kind = 'host' AND scheme IS NULL AND method IS NULL AND path IS NULL) OR (kind = 'endpoint' AND scheme IS NOT NULL AND method IS NOT NULL AND path IS NOT NULL) ) )
+## table attempt_recoveries (on attempt_recoveries)
+CREATE TABLE attempt_recoveries ( attempt_id TEXT NOT NULL REFERENCES attempts(id), observed_status TEXT NOT NULL, prior_status TEXT NOT NULL, resulting_status TEXT NOT NULL, disposition TEXT NOT NULL, detail TEXT NOT NULL, harness_session_id TEXT, fence_before INTEGER NOT NULL, fence_after INTEGER NOT NULL, observations_at_recovery INTEGER NOT NULL, first_reconciled_at INTEGER NOT NULL, last_reconciled_at INTEGER NOT NULL, times INTEGER NOT NULL, PRIMARY KEY (attempt_id, observed_status, prior_status, resulting_status, disposition, fence_before, fence_after) )
+## table attempts (on attempts)
+CREATE TABLE attempts ( id TEXT PRIMARY KEY, intent_id TEXT NOT NULL REFERENCES intents(id), target_id TEXT NOT NULL, worker_id TEXT NOT NULL, harness_session_id TEXT, provider_id TEXT NOT NULL, model_id TEXT NOT NULL, status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, write_fence INTEGER NOT NULL DEFAULT 0, recovery_disposition TEXT, recovered_at INTEGER, replaces_attempt_id TEXT REFERENCES attempts(id), harness_instance_id TEXT, model_options TEXT )
+## table command_receipts (on command_receipts)
+CREATE TABLE command_receipts ( key TEXT PRIMARY KEY, caller_scope TEXT NOT NULL, operation TEXT NOT NULL, operation_id TEXT NOT NULL, request_hash TEXT NOT NULL, result TEXT NOT NULL, created_at INTEGER NOT NULL )
+## table effect_sql_migrations (on effect_sql_migrations)
+CREATE TABLE "effect_sql_migrations" ( migration_id integer PRIMARY KEY NOT NULL, created_at datetime NOT NULL DEFAULT current_timestamp, name VARCHAR(255) NOT NULL )
+## table events (on events)
+CREATE TABLE events ( id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, target_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, caller_scope TEXT, intent_id TEXT REFERENCES intents(id), attempt_id TEXT REFERENCES attempts(id), operation TEXT NOT NULL, operation_id TEXT, subject_id TEXT NOT NULL, recorded_at INTEGER NOT NULL )
+## table goal_sessions (on goal_sessions)
+CREATE TABLE goal_sessions ( goal_id TEXT PRIMARY KEY REFERENCES goals(id), target_id TEXT NOT NULL, harness_session_id TEXT NOT NULL, harness_instance_id TEXT, opened_at INTEGER NOT NULL, model TEXT )
+## table goals (on goals)
+CREATE TABLE goals ( id TEXT PRIMARY KEY, target_id TEXT NOT NULL, description TEXT NOT NULL, created_at INTEGER NOT NULL, name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active', ended_at INTEGER, ended_by TEXT, end_reason TEXT )
+## table host_scope_labels (on host_scope_labels)
+CREATE TABLE host_scope_labels ( target_id TEXT NOT NULL, host TEXT NOT NULL, state TEXT NOT NULL, reason TEXT, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, PRIMARY KEY (target_id, host), CHECK (state IN ('in', 'out')), CHECK (length(host) > 0) )
+## table import_sessions (on import_sessions)
+CREATE TABLE import_sessions ( import_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, harness_session_id TEXT NOT NULL, harness_instance_id TEXT, model TEXT NOT NULL, caller_scope TEXT NOT NULL, opened_at INTEGER NOT NULL, session_created_at INTEGER, ended_at INTEGER, ended_reason TEXT CHECK (ended_reason IN ('operator', 'shutdown', 'refused', 'open_failed')), model_options TEXT, pages TEXT, CHECK (length(harness_session_id) > 0) )
+## table intent_anchors (on intent_anchors)
+CREATE TABLE intent_anchors ( intent_id TEXT NOT NULL REFERENCES intents(id), observation_id TEXT NOT NULL REFERENCES observations(id), position INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (intent_id, observation_id), CHECK (position >= 0) )
+## table intents (on intents)
+CREATE TABLE intents ( id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id), target_id TEXT NOT NULL, question TEXT NOT NULL, created_at INTEGER NOT NULL, addresses_dimension TEXT REFERENCES observation_dimensions(id), status TEXT NOT NULL DEFAULT 'open', claimed_by_attempt_id TEXT, suggested_instance_id TEXT, suggested_model TEXT, suggested_model_options TEXT )
+## table observation_dimension_links (on observation_dimension_links)
+CREATE TABLE observation_dimension_links ( observation_id TEXT NOT NULL REFERENCES observations(id), dimension_id TEXT NOT NULL REFERENCES observation_dimensions(id), address TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (observation_id, dimension_id) )
+## table observation_dimensions (on observation_dimensions)
+CREATE TABLE observation_dimensions ( id TEXT PRIMARY KEY, observation_id TEXT NOT NULL REFERENCES observations(id), position INTEGER NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE (observation_id, position), CHECK (position >= 0) )
+## table observations (on observations)
+CREATE TABLE observations ( id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, record_format TEXT NOT NULL, target_id TEXT NOT NULL, intent_id TEXT NOT NULL REFERENCES intents(id), attempt_id TEXT NOT NULL REFERENCES attempts(id), harness_session_id TEXT NOT NULL, worker_id TEXT NOT NULL, tested_claim TEXT NOT NULL, outcome TEXT NOT NULL, interpretation TEXT NOT NULL, limitations TEXT NOT NULL, untested_dimensions TEXT NOT NULL, recorded_at INTEGER NOT NULL, setup TEXT, cases TEXT, summary_conditions TEXT, summary_observed_behavior TEXT, summary_evidence_refs TEXT, CHECK ( (record_format = 'case_based' AND setup IS NOT NULL AND cases IS NOT NULL AND summary_conditions IS NULL AND summary_observed_behavior IS NULL AND summary_evidence_refs IS NULL) OR (record_format = 'summary' AND setup IS NULL AND cases IS NULL AND summary_conditions IS NOT NULL AND summary_observed_behavior IS NOT NULL AND summary_evidence_refs IS NOT NULL) ) )
+## table outbox (on outbox)
+CREATE TABLE outbox ( id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, target_id TEXT NOT NULL, request_type TEXT NOT NULL, payload TEXT NOT NULL, recovery_policy TEXT NOT NULL, caused_by_event_id TEXT NOT NULL REFERENCES events(id), status TEXT NOT NULL, attempts INTEGER NOT NULL, lease_owner TEXT, lease_expires_at INTEGER, next_attempt_at INTEGER, last_error TEXT, enqueued_at INTEGER NOT NULL, completed_at INTEGER, CHECK (status IN ('pending', 'in_flight', 'succeeded', 'failed', 'cancelled')), CHECK (recovery_policy IN ('safe_to_retry', 'idempotency_key', 'reconcile_first', 'do_not_repeat')), CHECK (attempts >= 0) )
+## table planner_lineages (on planner_lineages)
+CREATE TABLE planner_lineages ( goal_id TEXT PRIMARY KEY REFERENCES goals(id), harness_session_id TEXT NOT NULL, created_at INTEGER NOT NULL )
+## table planner_rounds (on planner_rounds)
+CREATE TABLE planner_rounds ( id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id), target_id TEXT NOT NULL, status TEXT NOT NULL, write_fence INTEGER NOT NULL DEFAULT 0, harness_session_id TEXT, harness_instance_id TEXT, provider_id TEXT, model_id TEXT, started_at_sequence INTEGER NOT NULL, budget INTEGER NOT NULL, disposition TEXT, started_at INTEGER NOT NULL, ended_at INTEGER, disposition_rationale TEXT )
+## table scope_entries (on scope_entries)
+CREATE TABLE scope_entries ( id TEXT PRIMARY KEY, target_id TEXT NOT NULL, effect TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, source TEXT NOT NULL, note TEXT, created_at INTEGER NOT NULL, UNIQUE (target_id, effect, kind, value), CHECK (effect IN ('in', 'out')), CHECK (kind IN ('subtree', 'host', 'cidr')), CHECK (source IN ('operator', 'imported')), CHECK (length(value) > 0) )
+## table sequence_cursor (on sequence_cursor)
+CREATE TABLE sequence_cursor ( name TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0 )
+## trigger events_are_append_only (on events)
+CREATE TRIGGER events_are_append_only BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only: a recorded event is never deleted'); END
+## trigger events_are_immutable (on events)
+CREATE TRIGGER events_are_immutable BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are immutable: record a new event instead'); END
+## columns asset_discoveries
+  asset_id TEXT notnull=1 default=- pk=1
+  attempt_id TEXT notnull=1 default=- pk=0
+  caller_scope TEXT notnull=1 default=- pk=0
+  discovered_as TEXT notnull=1 default=- pk=0
+  discovered_at INTEGER notnull=1 default=- pk=0
+  intent_id TEXT notnull=1 default=- pk=0
+  note TEXT notnull=1 default=- pk=0
+  operation_id TEXT notnull=1 default=- pk=2
+## columns asset_imports
+  asset_id TEXT notnull=1 default=- pk=1
+  caller_scope TEXT notnull=1 default=- pk=0
+  imported_as TEXT notnull=1 default=- pk=0
+  imported_at INTEGER notnull=1 default=- pk=0
+  note TEXT notnull=1 default=- pk=0
+  operation_id TEXT notnull=1 default=- pk=2
+  source_url TEXT notnull=1 default=- pk=0
+## columns asset_scope_labels
+  asset_id TEXT notnull=0 default=- pk=1
+  reason TEXT notnull=0 default=- pk=0
+  set_at INTEGER notnull=1 default=- pk=0
+  set_by TEXT notnull=1 default=- pk=0
+  state TEXT notnull=1 default=- pk=0
+## columns assets
+  first_seen_at INTEGER notnull=1 default=- pk=0
+  host TEXT notnull=1 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  identity TEXT notnull=1 default=- pk=0
+  kind TEXT notnull=1 default=- pk=0
+  method TEXT notnull=0 default=- pk=0
+  path TEXT notnull=0 default=- pk=0
+  port INTEGER notnull=1 default=- pk=0
+  scheme TEXT notnull=0 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+## columns attempt_recoveries
+  attempt_id TEXT notnull=1 default=- pk=1
+  detail TEXT notnull=1 default=- pk=0
+  disposition TEXT notnull=1 default=- pk=5
+  fence_after INTEGER notnull=1 default=- pk=7
+  fence_before INTEGER notnull=1 default=- pk=6
+  first_reconciled_at INTEGER notnull=1 default=- pk=0
+  harness_session_id TEXT notnull=0 default=- pk=0
+  last_reconciled_at INTEGER notnull=1 default=- pk=0
+  observations_at_recovery INTEGER notnull=1 default=- pk=0
+  observed_status TEXT notnull=1 default=- pk=2
+  prior_status TEXT notnull=1 default=- pk=3
+  resulting_status TEXT notnull=1 default=- pk=4
+  times INTEGER notnull=1 default=- pk=0
+## columns attempts
+  ended_at INTEGER notnull=0 default=- pk=0
+  harness_instance_id TEXT notnull=0 default=- pk=0
+  harness_session_id TEXT notnull=0 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  intent_id TEXT notnull=1 default=- pk=0
+  model_id TEXT notnull=1 default=- pk=0
+  model_options TEXT notnull=0 default=- pk=0
+  provider_id TEXT notnull=1 default=- pk=0
+  recovered_at INTEGER notnull=0 default=- pk=0
+  recovery_disposition TEXT notnull=0 default=- pk=0
+  replaces_attempt_id TEXT notnull=0 default=- pk=0
+  started_at INTEGER notnull=1 default=- pk=0
+  status TEXT notnull=1 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+  worker_id TEXT notnull=1 default=- pk=0
+  write_fence INTEGER notnull=1 default=0 pk=0
+## columns command_receipts
+  caller_scope TEXT notnull=1 default=- pk=0
+  created_at INTEGER notnull=1 default=- pk=0
+  key TEXT notnull=0 default=- pk=1
+  operation TEXT notnull=1 default=- pk=0
+  operation_id TEXT notnull=1 default=- pk=0
+  request_hash TEXT notnull=1 default=- pk=0
+  result TEXT notnull=1 default=- pk=0
+## columns effect_sql_migrations
+  created_at datetime notnull=1 default=current_timestamp pk=0
+  migration_id INTEGER notnull=1 default=- pk=1
+  name VARCHAR(255) notnull=1 default=- pk=0
+## columns events
+  attempt_id TEXT notnull=0 default=- pk=0
+  caller_scope TEXT notnull=0 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  intent_id TEXT notnull=0 default=- pk=0
+  kind TEXT notnull=1 default=- pk=0
+  operation TEXT notnull=1 default=- pk=0
+  operation_id TEXT notnull=0 default=- pk=0
+  payload TEXT notnull=1 default=- pk=0
+  recorded_at INTEGER notnull=1 default=- pk=0
+  sequence INTEGER notnull=1 default=- pk=0
+  subject_id TEXT notnull=1 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+## columns goal_sessions
+  goal_id TEXT notnull=0 default=- pk=1
+  harness_instance_id TEXT notnull=0 default=- pk=0
+  harness_session_id TEXT notnull=1 default=- pk=0
+  model TEXT notnull=0 default=- pk=0
+  opened_at INTEGER notnull=1 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+## columns goals
+  created_at INTEGER notnull=1 default=- pk=0
+  description TEXT notnull=1 default=- pk=0
+  end_reason TEXT notnull=0 default=- pk=0
+  ended_at INTEGER notnull=0 default=- pk=0
+  ended_by TEXT notnull=0 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  name TEXT notnull=1 default='' pk=0
+  status TEXT notnull=1 default='active' pk=0
+  target_id TEXT notnull=1 default=- pk=0
+## columns host_scope_labels
+  host TEXT notnull=1 default=- pk=2
+  reason TEXT notnull=0 default=- pk=0
+  set_at INTEGER notnull=1 default=- pk=0
+  set_by TEXT notnull=1 default=- pk=0
+  state TEXT notnull=1 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=1
+## columns import_sessions
+  caller_scope TEXT notnull=1 default=- pk=0
+  ended_at INTEGER notnull=0 default=- pk=0
+  ended_reason TEXT notnull=0 default=- pk=0
+  harness_instance_id TEXT notnull=0 default=- pk=0
+  harness_session_id TEXT notnull=1 default=- pk=0
+  import_id TEXT notnull=0 default=- pk=1
+  model TEXT notnull=1 default=- pk=0
+  model_options TEXT notnull=0 default=- pk=0
+  opened_at INTEGER notnull=1 default=- pk=0
+  pages TEXT notnull=0 default=- pk=0
+  session_created_at INTEGER notnull=0 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+## columns intent_anchors
+  created_at INTEGER notnull=1 default=- pk=0
+  intent_id TEXT notnull=1 default=- pk=1
+  observation_id TEXT notnull=1 default=- pk=2
+  position INTEGER notnull=1 default=- pk=0
+## columns intents
+  addresses_dimension TEXT notnull=0 default=- pk=0
+  claimed_by_attempt_id TEXT notnull=0 default=- pk=0
+  created_at INTEGER notnull=1 default=- pk=0
+  goal_id TEXT notnull=1 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  question TEXT notnull=1 default=- pk=0
+  status TEXT notnull=1 default='open' pk=0
+  suggested_instance_id TEXT notnull=0 default=- pk=0
+  suggested_model TEXT notnull=0 default=- pk=0
+  suggested_model_options TEXT notnull=0 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+## columns observation_dimension_links
+  address TEXT notnull=1 default=- pk=0
+  created_at INTEGER notnull=1 default=- pk=0
+  dimension_id TEXT notnull=1 default=- pk=2
+  observation_id TEXT notnull=1 default=- pk=1
+## columns observation_dimensions
+  created_at INTEGER notnull=1 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  observation_id TEXT notnull=1 default=- pk=0
+  position INTEGER notnull=1 default=- pk=0
+  text TEXT notnull=1 default=- pk=0
+## columns observations
+  attempt_id TEXT notnull=1 default=- pk=0
+  cases TEXT notnull=0 default=- pk=0
+  harness_session_id TEXT notnull=1 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  intent_id TEXT notnull=1 default=- pk=0
+  interpretation TEXT notnull=1 default=- pk=0
+  limitations TEXT notnull=1 default=- pk=0
+  outcome TEXT notnull=1 default=- pk=0
+  record_format TEXT notnull=1 default=- pk=0
+  recorded_at INTEGER notnull=1 default=- pk=0
+  sequence INTEGER notnull=1 default=- pk=0
+  setup TEXT notnull=0 default=- pk=0
+  summary_conditions TEXT notnull=0 default=- pk=0
+  summary_evidence_refs TEXT notnull=0 default=- pk=0
+  summary_observed_behavior TEXT notnull=0 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+  tested_claim TEXT notnull=1 default=- pk=0
+  untested_dimensions TEXT notnull=1 default=- pk=0
+  worker_id TEXT notnull=1 default=- pk=0
+## columns outbox
+  attempts INTEGER notnull=1 default=- pk=0
+  caused_by_event_id TEXT notnull=1 default=- pk=0
+  completed_at INTEGER notnull=0 default=- pk=0
+  enqueued_at INTEGER notnull=1 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  last_error TEXT notnull=0 default=- pk=0
+  lease_expires_at INTEGER notnull=0 default=- pk=0
+  lease_owner TEXT notnull=0 default=- pk=0
+  next_attempt_at INTEGER notnull=0 default=- pk=0
+  payload TEXT notnull=1 default=- pk=0
+  recovery_policy TEXT notnull=1 default=- pk=0
+  request_type TEXT notnull=1 default=- pk=0
+  sequence INTEGER notnull=1 default=- pk=0
+  status TEXT notnull=1 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+## columns planner_lineages
+  created_at INTEGER notnull=1 default=- pk=0
+  goal_id TEXT notnull=0 default=- pk=1
+  harness_session_id TEXT notnull=1 default=- pk=0
+## columns planner_rounds
+  budget INTEGER notnull=1 default=- pk=0
+  disposition TEXT notnull=0 default=- pk=0
+  disposition_rationale TEXT notnull=0 default=- pk=0
+  ended_at INTEGER notnull=0 default=- pk=0
+  goal_id TEXT notnull=1 default=- pk=0
+  harness_instance_id TEXT notnull=0 default=- pk=0
+  harness_session_id TEXT notnull=0 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  model_id TEXT notnull=0 default=- pk=0
+  provider_id TEXT notnull=0 default=- pk=0
+  started_at INTEGER notnull=1 default=- pk=0
+  started_at_sequence INTEGER notnull=1 default=- pk=0
+  status TEXT notnull=1 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+  write_fence INTEGER notnull=1 default=0 pk=0
+## columns scope_entries
+  created_at INTEGER notnull=1 default=- pk=0
+  effect TEXT notnull=1 default=- pk=0
+  id TEXT notnull=0 default=- pk=1
+  kind TEXT notnull=1 default=- pk=0
+  note TEXT notnull=0 default=- pk=0
+  source TEXT notnull=1 default=- pk=0
+  target_id TEXT notnull=1 default=- pk=0
+  value TEXT notnull=1 default=- pk=0
+## columns sequence_cursor
+  name TEXT notnull=0 default=- pk=1
+  value INTEGER notnull=1 default=0 pk=0
+## structure asset_discoveries
+  index asset_discoveries_intent_idx unique=0 origin=c partial=0 cols=intent_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_asset_discoveries_1 unique=1 origin=pk partial=0 cols=asset_id/asc/BINARY/key|operation_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk asset_id -> assets.id update=NO ACTION delete=NO ACTION match=NONE
+  fk attempt_id -> attempts.id update=NO ACTION delete=NO ACTION match=NONE
+  fk intent_id -> intents.id update=NO ACTION delete=NO ACTION match=NONE
+## structure asset_imports
+  index asset_imports_source_idx unique=0 origin=c partial=0 cols=source_url/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_asset_imports_1 unique=1 origin=pk partial=0 cols=asset_id/asc/BINARY/key|operation_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk asset_id -> assets.id update=NO ACTION delete=NO ACTION match=NONE
+## structure asset_scope_labels
+  index sqlite_autoindex_asset_scope_labels_1 unique=1 origin=pk partial=0 cols=asset_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk asset_id -> assets.id update=NO ACTION delete=NO ACTION match=NONE
+## structure assets
+  index sqlite_autoindex_assets_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_assets_2 unique=1 origin=u partial=0 cols=target_id/asc/BINARY/key|kind/asc/BINARY/key|identity/asc/BINARY/key|rowid/asc/BINARY/incl
+## structure attempt_recoveries
+  index attempt_recoveries_attempt_idx unique=0 origin=c partial=0 cols=attempt_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_attempt_recoveries_1 unique=1 origin=pk partial=0 cols=attempt_id/asc/BINARY/key|observed_status/asc/BINARY/key|prior_status/asc/BINARY/key|resulting_status/asc/BINARY/key|disposition/asc/BINARY/key|fence_before/asc/BINARY/key|fence_after/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk attempt_id -> attempts.id update=NO ACTION delete=NO ACTION match=NONE
+## structure attempts
+  index attempts_harness_instance_idx unique=0 origin=c partial=1 cols=harness_instance_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index attempts_intent_idx unique=0 origin=c partial=0 cols=intent_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index attempts_status_idx unique=0 origin=c partial=0 cols=status/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_attempts_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk replaces_attempt_id -> attempts.id update=NO ACTION delete=NO ACTION match=NONE
+  fk intent_id -> intents.id update=NO ACTION delete=NO ACTION match=NONE
+## structure command_receipts
+  index command_receipts_scope_idx unique=0 origin=c partial=0 cols=caller_scope/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_command_receipts_1 unique=1 origin=pk partial=0 cols=key/asc/BINARY/key|rowid/asc/BINARY/incl
+## structure events
+  index events_kind_idx unique=0 origin=c partial=0 cols=kind/asc/BINARY/key|rowid/asc/BINARY/incl
+  index events_sequence_idx unique=1 origin=c partial=0 cols=sequence/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_events_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk attempt_id -> attempts.id update=NO ACTION delete=NO ACTION match=NONE
+  fk intent_id -> intents.id update=NO ACTION delete=NO ACTION match=NONE
+## structure goal_sessions
+  index sqlite_autoindex_goal_sessions_1 unique=1 origin=pk partial=0 cols=goal_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk goal_id -> goals.id update=NO ACTION delete=NO ACTION match=NONE
+## structure goals
+  index goals_target_status_idx unique=0 origin=c partial=0 cols=target_id/asc/BINARY/key|status/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_goals_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+## structure host_scope_labels
+  index sqlite_autoindex_host_scope_labels_1 unique=1 origin=pk partial=0 cols=target_id/asc/BINARY/key|host/asc/BINARY/key|rowid/asc/BINARY/incl
+## structure import_sessions
+  index import_sessions_target_idx unique=0 origin=c partial=0 cols=target_id/asc/BINARY/key|opened_at/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_import_sessions_1 unique=1 origin=pk partial=0 cols=import_id/asc/BINARY/key|rowid/asc/BINARY/incl
+## structure intent_anchors
+  index intent_anchors_observation_idx unique=0 origin=c partial=0 cols=observation_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_intent_anchors_1 unique=1 origin=pk partial=0 cols=intent_id/asc/BINARY/key|observation_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk intent_id -> intents.id update=NO ACTION delete=NO ACTION match=NONE
+  fk observation_id -> observations.id update=NO ACTION delete=NO ACTION match=NONE
+## structure intents
+  index intents_addresses_dimension_idx unique=0 origin=c partial=0 cols=addresses_dimension/asc/BINARY/key|rowid/asc/BINARY/incl
+  index intents_goal_idx unique=0 origin=c partial=0 cols=goal_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index intents_goal_status_idx unique=0 origin=c partial=0 cols=goal_id/asc/BINARY/key|status/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_intents_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk goal_id -> goals.id update=NO ACTION delete=NO ACTION match=NONE
+  fk addresses_dimension -> observation_dimensions.id update=NO ACTION delete=NO ACTION match=NONE
+## structure observation_dimension_links
+  index observation_dimension_links_dimension_idx unique=0 origin=c partial=0 cols=dimension_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_observation_dimension_links_1 unique=1 origin=pk partial=0 cols=observation_id/asc/BINARY/key|dimension_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk dimension_id -> observation_dimensions.id update=NO ACTION delete=NO ACTION match=NONE
+  fk observation_id -> observations.id update=NO ACTION delete=NO ACTION match=NONE
+## structure observation_dimensions
+  index sqlite_autoindex_observation_dimensions_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_observation_dimensions_2 unique=1 origin=u partial=0 cols=observation_id/asc/BINARY/key|position/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk observation_id -> observations.id update=NO ACTION delete=NO ACTION match=NONE
+## structure observations
+  index observations_intent_idx unique=0 origin=c partial=0 cols=intent_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index observations_record_format_idx unique=0 origin=c partial=0 cols=record_format/asc/BINARY/key|rowid/asc/BINARY/incl
+  index observations_sequence_idx unique=1 origin=c partial=0 cols=sequence/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_observations_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk attempt_id -> attempts.id update=NO ACTION delete=NO ACTION match=NONE
+  fk intent_id -> intents.id update=NO ACTION delete=NO ACTION match=NONE
+## structure outbox
+  index outbox_event_idx unique=0 origin=c partial=0 cols=caused_by_event_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index outbox_pending_idx unique=0 origin=c partial=1 cols=status/asc/BINARY/key|sequence/asc/BINARY/key|rowid/asc/BINARY/incl
+  index outbox_sequence_idx unique=1 origin=c partial=0 cols=sequence/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_outbox_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk caused_by_event_id -> events.id update=NO ACTION delete=NO ACTION match=NONE
+## structure planner_lineages
+  index sqlite_autoindex_planner_lineages_1 unique=1 origin=pk partial=0 cols=goal_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk goal_id -> goals.id update=NO ACTION delete=NO ACTION match=NONE
+## structure planner_rounds
+  index planner_rounds_goal_idx unique=0 origin=c partial=0 cols=goal_id/asc/BINARY/key|status/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_planner_rounds_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  fk goal_id -> goals.id update=NO ACTION delete=NO ACTION match=NONE
+## structure scope_entries
+  index scope_entries_target_idx unique=0 origin=c partial=0 cols=target_id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_scope_entries_1 unique=1 origin=pk partial=0 cols=id/asc/BINARY/key|rowid/asc/BINARY/incl
+  index sqlite_autoindex_scope_entries_2 unique=1 origin=u partial=0 cols=target_id/asc/BINARY/key|effect/asc/BINARY/key|kind/asc/BINARY/key|value/asc/BINARY/key|rowid/asc/BINARY/incl
+## structure sequence_cursor
+  index sqlite_autoindex_sequence_cursor_1 unique=1 origin=pk partial=0 cols=name/asc/BINARY/key|rowid/asc/BINARY/incl

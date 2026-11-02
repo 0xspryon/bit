@@ -33,7 +33,6 @@ import { join } from "node:path";
 import { Clock, Effect } from "effect";
 import { SqlClient } from "effect/sql";
 
-import { migrate } from "./migrations";
 import { sqliteLayer } from "./sql";
 import {
   MutationError,
@@ -665,13 +664,9 @@ describe("asset_discoveries", () => {
     expect(duplicate._tag).toBe("Failure");
   });
 
-  /** The migration applies to a file the previous chain already brought up. */
-  test("the chain is current after the import table is added", async () => {
-    const path = newDatabasePath();
-    const applied = await withSql(path, () => migrate);
-    const again = await withSql(path, () => migrate);
-
-    expect(applied.map(([, name]) => name)).toContain("asset_imports");
-    expect(again).toEqual([]);
-  });
+  // There was a third test here, asserting that the applied migration labels contained
+  // `asset_imports` and that a second `migrate` applied nothing. Both moved: the chain is
+  // one baseline entry, so there is no per-table label to assert, and
+  // `migrations.test.ts` pins the whole schema against a committed dump — this table and
+  // its key included — and asserts the re-run applies nothing.
 });
