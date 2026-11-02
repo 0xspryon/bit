@@ -350,6 +350,88 @@ const DISPOSITIONS: ReadonlySet<string> = new Set([
   "objective_met",
 ]);
 
+/**
+ * A tool call as one line of a transcript: `add_scope_entry(effect="in", value="acme.com")`.
+ *
+ * What the narrated layout prints in place of a ledger row's "Arguments" disclosure, so a
+ * call reads in the stream the way the agent would say it. **It rearranges what the call
+ * carried and adds nothing**: the arguments are the call's own JSON, a `null` argument is
+ * left out as the absence it is, and the verbatim text is still one disclosure away on the
+ * row. Arguments are capped by the server with a marker appended, so a large call arrives as
+ * invalid JSON; that prints as `name(…)` and never as a guess at the missing half.
+ */
+export const callSignature = (
+  call: Pick<LiveItem, "toolName" | "tool" | "headline" | "input">,
+): string => {
+  const name = call.toolName ?? call.tool ?? call.headline;
+  if (call.input === null) return `${name}()`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(call.input);
+  } catch {
+    return `${name}(…)`;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return `${name}(${call.input})`;
+  }
+  const args = Object.entries(parsed as Record<string, unknown>)
+    .filter(([, value]) => value !== null && value !== undefined)
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`);
+  return `${name}(${args.join(", ")})`;
+};
+
+/** How much of a result's own text a transcript line shows before it says "…". */
+const RESULT_LINE_MAX = 160;
+
+/**
+ * The one line that answers a call, or `null` when nothing has.
+ *
+ * **The server's sentence when it wrote one.** A `tool.result` carries a `body`, "a sentence
+ * for the operator", precisely so a browser does not have to word what a payload means; that
+ * is used whenever it is there. Without one the result's own output is shown as itself —
+ * minified if it is JSON, cut at {@link RESULT_LINE_MAX} with a mark that it was cut. The
+ * rest is in the row's disclosure; nothing is summarised in between.
+ */
+export const resultLine = (result: LiveItem | null): string | null => {
+  if (result === null) return null;
+  const failed = result.outcome === "failed" ? "failed: " : "";
+  if (result.body !== "") return `${failed}${result.body}`;
+  if (result.output === null) return null;
+  const raw = result.output;
+  const text = ((): string => {
+    try {
+      return JSON.stringify(JSON.parse(raw));
+    } catch {
+      return raw.split("\n")[0] ?? "";
+    }
+  })();
+  return `${failed}${
+    text.length > RESULT_LINE_MAX ? `${text.slice(0, RESULT_LINE_MAX)}…` : text
+  }`;
+};
+
+/**
+ * Prose cut into plain and `code` runs, at backticks.
+ *
+ * An agent writes `acme.com` meaning a host and not a sentence, and A6 sets those in the
+ * mono face. Returned as data and rendered as text nodes, so nothing the agent wrote is ever
+ * interpreted as markup. An unmatched backtick is left in the text as typed.
+ */
+export const splitCode = (
+  text: string,
+): readonly { readonly code: boolean; readonly text: string }[] => {
+  const parts: { code: boolean; text: string }[] = [];
+  let last = 0;
+  for (const match of text.matchAll(/`([^`\n]+)`/g)) {
+    const at = match.index;
+    if (at > last) parts.push({ code: false, text: text.slice(last, at) });
+    parts.push({ code: true, text: match[1] ?? "" });
+    last = at + match[0].length;
+  }
+  if (last < text.length) parts.push({ code: false, text: text.slice(last) });
+  return parts;
+};
+
 /** One row of a round's conversation. */
 export interface ChatRow {
   /** Stable key for `{#each}`. The rendered item's own id, which is already stable. */

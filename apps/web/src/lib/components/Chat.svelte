@@ -18,6 +18,12 @@
    * caller renders its own heading through the `separator` snippet. {@link PlannerChat} is
    * the planner's; slice 9 writes its own and changes nothing here.
    *
+   * **A third axis, and a small one: `layout`.** The planner's and the goal agent's chats are
+   * panels on a page; the scope importer's (A6) is the page. `layout="thread"` arranges the
+   * same groups as an 800px reading column with no frame, a lead when empty, the composer
+   * pinned beneath and rows read as a transcript. It changes where things are put and how
+   * a row reads, not what any of it means — the rules below are the same for both.
+   *
    * What stays shared is everything that is genuinely about watching an agent work: the
    * grouping, the record-versus-activity distinction on every row ({@link ChatItem}), the
    * folding of a tool result into the call it answers, the pending-until-recorded merge
@@ -57,7 +63,7 @@
     meter,
     detail = "",
     empty,
-    maxHeight,
+    layout = "panel",
   }: {
     /** The heading, and the list's accessible name. */
     label: string;
@@ -114,12 +120,18 @@
     /** What to say when there is no conversation at all. */
     empty: string;
     /**
-     * How tall the list may grow before it scrolls, as a CSS length. Omitted keeps the 420px
-     * the planner and goal panels want, "because the page under them has other things to
-     * reach". A caller whose chat *is* the page (the importer's) passes a larger bound
-     * instead of reaching into this component's class from outside.
+     * How the conversation is arranged. `panel` (the default) is the planner's and the goal
+     * agent's: a captioned, bordered, 420px-tall list among other things on a page.
+     * `thread` is a chat that **is** the page: a reading column of 800px, no frame, the
+     * newest turn at the bottom of the space the page has and the composer pinned under it.
+     *
+     * It is a layout and nothing else. Both arrange the same groups and run the same rules;
+     * `thread` differs in that the heading, the empty sentence and the footnote are placed
+     * for a page rather than a panel, a group's rows read as a transcript
+     * ({@link ChatItem}'s `narrated`) rather than as a ledger, and nothing is boxed. See
+     * the style block for what each does.
      */
-    maxHeight?: string;
+    layout?: "panel" | "thread";
   } = $props();
 
   /**
@@ -169,22 +181,37 @@
   });
 
   let anything = $derived(groups.length > 0);
+  let thread = $derived(layout === "thread");
 </script>
 
-<section class="chat" aria-label={label}>
-  <div class="head">
-    <span class="title">{label}</span>
-    {#if count !== ""}
-      <span class="count">{count}</span>
-    {/if}
+<section
+  class={["chat", thread && "thread", thread && !anything && "idle"]}
+  aria-label={label}
+>
+  {#if !thread}
+    <div class="head">
+      <span class="title">{label}</span>
+      {#if count !== ""}
+        <span class="count">{count}</span>
+      {/if}
+      <!--
+        The context indicator, at the top of the pane. Last in the strip and pushed to the
+        end, so the heading and the count stay where a reader's eye starts.
+      -->
+      {#if meter !== undefined}
+        <div class="meter">{@render meter()}</div>
+      {/if}
+    </div>
+  {:else if !anything}
     <!--
-      The context indicator, at the top of the pane. Last in the strip and pushed to the
-      end, so the heading and the count stay where a reader's eye starts.
+      A page's empty state is its lead: the label as the heading and the sentence under it,
+      with the composer directly beneath, rather than a caption over an empty frame.
     -->
-    {#if meter !== undefined}
-      <div class="meter">{@render meter()}</div>
-    {/if}
-  </div>
+    <div class="hero">
+      <h2 class="hero-title">{label}</h2>
+      <p class="hero-text">{empty}</p>
+    </div>
+  {/if}
 
   {#if note !== ""}
     <p class="note">{note}</p>
@@ -204,7 +231,6 @@
     bind:this={list}
     onscroll={trackPinned}
     class={["groups", !anything && "hollow"]}
-    style:max-height={maxHeight}
     role="log"
     aria-label="{label}, oldest first"
   >
@@ -271,6 +297,7 @@
                 result={row.result}
                 write={row.write}
                 summary={row.summary}
+                narrated={thread}
               />
             {/each}
           </ol>
@@ -279,11 +306,18 @@
     {/each}
   </ol>
 
-  {#if !anything}
+  {#if !anything && !thread}
     <p class="empty" role="status">{empty}</p>
   {/if}
 
-  <p class="footnote">{@render footnote()}</p>
+  <!--
+    Under the composer on a page, where it reads as a footnote to the whole thread; above it
+    in a panel, where the composer is the last thing. The same sentence either way, and
+    required either way.
+  -->
+  {#if !thread}
+    <p class="footnote">{@render footnote()}</p>
+  {/if}
 
   {#if controls !== undefined}
     <div class="controls">{@render controls()}</div>
@@ -291,6 +325,10 @@
 
   {#if !readonly && composer !== undefined}
     <div class="composer">{@render composer()}</div>
+  {/if}
+
+  {#if thread}
+    <p class="footnote">{@render footnote()}</p>
   {/if}
 </section>
 
@@ -443,5 +481,91 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
+  }
+
+  /*
+   * ── The thread layout ───────────────────────────────────────────────────────
+   *
+   * A chat that is the page. A6's panels D2–D4 are the spec: an 800px column, centred, the
+   * log filling the height and scrolling inside it, the composer pinned beneath, and no
+   * frame anywhere — a turn is told apart by what it holds and the space around it, not by
+   * a rule. Everything below is under `.thread`, so the panel layout above is untouched.
+   */
+  .thread {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    max-width: 800px;
+    margin: 0 auto;
+    gap: 10px;
+    padding-top: 28px;
+  }
+  .thread .groups {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+    gap: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+  /* No conversation: the lead, the composer and what hangs off it, as one centred block. */
+  .thread.idle {
+    justify-content: center;
+    padding-top: 0;
+  }
+  .thread.idle .groups {
+    display: none;
+  }
+  .hero {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 18px;
+    text-align: center;
+  }
+  .hero-title {
+    margin: 0;
+    font: 530 24px/32px var(--font-sans);
+    letter-spacing: -0.01em;
+    color: var(--text-base);
+  }
+  .hero-text {
+    max-width: 620px;
+    margin: 0;
+    font: 400 13px/20px var(--font-sans);
+    color: var(--text-muted);
+    text-wrap: pretty;
+  }
+  /*
+   * One turn: the operator's message, then the importer's header and everything under it.
+   * The rule above a group is the panel's way of saying "new group"; here the operator's
+   * own bubble says it, and the column's spacing does the rest.
+   */
+  .thread .group {
+    gap: 12px;
+  }
+  .thread .sep {
+    padding-top: 0;
+    border-top: 0;
+  }
+  /* What the importer says sits under its header, indented past the avatar. */
+  .thread .group > :not(.sep) {
+    margin-left: 27px;
+  }
+  .thread .items {
+    gap: 12px;
+  }
+  .thread .controls {
+    justify-content: center;
+  }
+  .thread .composer {
+    padding: 0;
+  }
+  .thread .footnote {
+    text-align: center;
+    padding-bottom: 14px;
   }
 </style>

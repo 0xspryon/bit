@@ -25,6 +25,8 @@
     open = $bindable(false),
     width = 324,
     align = "start",
+    chip = false,
+    searchable = true,
     onenter,
     trigger,
     rows,
@@ -41,6 +43,16 @@
      * right-hand side, where a popover opening rightwards would run off the window.
      */
     align?: "start" | "end";
+    /**
+     * Draw the trigger as a bordered, monospaced chip rather than a quiet crumb: how A6 sets
+     * the importer's session control, which is a value (`Session 18:02`) and not a place.
+     */
+    chip?: boolean;
+    /**
+     * Whether the list has a filter field. On by default; a short list that is not a
+     * catalogue (A6 draws three sessions) is not worth one.
+     */
+    searchable?: boolean;
     /** Enter in the search field: usually, take the first match. */
     onenter?: () => void;
     trigger: Snippet;
@@ -80,7 +92,7 @@
 <div class="crumb-picker" bind:this={root}>
   <button
     bind:this={button}
-    class={["crumb", open && "open"]}
+    class={["crumb", open && "open", chip && "chip"]}
     aria-haspopup="dialog"
     aria-expanded={open}
     onclick={() => (open ? close(false) : (open = true))}
@@ -96,7 +108,7 @@
       aria-label={label}
       style:width="{width}px"
     >
-      <label class="search">
+      <label class={["search", !searchable && "off"]}>
         <IconSearch width="14" height="14" />
         <input
           bind:this={search}
@@ -143,6 +155,11 @@
     border-color: var(--border-base);
     background: var(--overlay-hover);
   }
+  .crumb.chip {
+    padding: 0 9px;
+    border-color: var(--border-base);
+    font: 400 12px/16px var(--font-mono);
+  }
   .crumb.open {
     border-color: var(--border-strong);
     background: var(--bg-layer-02);
@@ -183,6 +200,9 @@
     padding: 0 8px;
     border-bottom: 1px solid var(--border-muted);
     color: var(--icon-muted);
+  }
+  .search.off {
+    display: none;
   }
   .search input {
     flex: 1;

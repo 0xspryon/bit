@@ -42,8 +42,11 @@
 
   import {
     THINKING_KIND,
+    callSignature,
     kindLabel,
     outcomeTint,
+    resultLine,
+    splitCode,
     type WriteState,
   } from "../chat";
 
@@ -53,12 +56,20 @@
     result = null,
     write = null,
     summary = null,
+    narrated = false,
   }: {
     item: LiveItem;
     proposedBy?: LiveItem | null;
     result?: LiveItem | null;
     write?: WriteState | null;
     summary?: string | null;
+    /**
+     * Read the row as a transcript rather than as a ledger entry: prose as prose, a call as
+     * a mono block. The importer chat's (A6), where the page is one conversation and a row
+     * with a kind column, a time and a call id beside every line would bury it. Every fact
+     * the ledger row carries is still on it; see the narrated markup.
+     */
+    narrated?: boolean;
   } = $props();
 
   /**
@@ -120,23 +131,132 @@
   );
 </script>
 
-<!--
+{#if narrated}
+  <!--
+    The transcript reading of a row, for a chat that is a page (A6 D3/D4): the agent's own
+    prose as prose, and a tool call as the mono block it would be if the agent had said it —
+    the call on one line and what answered it under an arrow. **The same facts as the ledger
+    row below, arranged differently**: the record/activity distinction (a solid border for
+    what is committed, a dashed one for what is only narrated), the write state in words, the
+    verbatim payload one disclosure away, and the call id — all still here, only quieter.
+  -->
+  {#if item.kind === "turn.reply"}
+    <li class="prose" data-origin={item.origin}>
+      <span class="visually-hidden">{item.origin}</span>
+      <p>
+        {#each splitCode(item.body) as part, position (position)}
+          {#if part.code}<code>{part.text}</code>{:else}{part.text}{/if}
+        {/each}
+      </p>
+    </li>
+  {:else if thinking}
+    <li class="prose" data-origin={item.origin}>
+      <span class="visually-hidden">{item.origin}</span>
+      <details class="raw">
+        <summary>What it considered</summary>
+        <p class="thought">{item.body}</p>
+        <p class="aside">
+          What the agent was considering, not what it did — and not stored: this
+          is gone on a reload.
+        </p>
+      </details>
+    </li>
+  {:else}
+    <!--
+      A call (live, or collapsed into the record it produced), a result with no call to
+      fold into, a record with no call, or an event this build has no better word for. All
+      of them are a block: they are the "what it did" half of the thread.
+    -->
+    {@const call = proposedBy ?? (item.kind === "tool.call" ? item : null)}
+    {@const answer = resultLine(
+      result ?? (item.kind === "tool.result" ? item : null),
+    )}
+    <li
+      class="block"
+      data-origin={item.origin}
+      data-write={write ?? ""}
+      title={call?.callId == null ? undefined : `call ${call.callId}`}
+    >
+      <span class="visually-hidden">{item.origin}</span>
+      <div class="sig mono">
+        {#if call !== null}
+          {callSignature(call)}
+        {:else if item.kind === "tool.result"}
+          {item.toolName ?? item.headline}
+        {:else}
+          <span class="what">{kindLabel(item.kind)}</span>
+          {item.headline}
+        {/if}
+      </div>
+      {#if call === null && item.kind !== "tool.result" && item.body !== ""}
+        <div class="ret mono">{item.body}</div>
+      {/if}
+      {#if answer !== null}
+        <div class="ret mono" data-failed={result?.outcome === "failed"}>
+          → {answer}
+          {#if write === "recorded"}
+            <span class="chip" data-tint="success" title={item.id}
+              >recorded</span
+            >
+          {/if}
+        </div>
+      {:else if write === "pending"}
+        <div class="ret writing mono">
+          <span class="caret" aria-hidden="true"></span>
+          <span>writing…</span>
+        </div>
+      {:else if write === "recorded"}
+        <div class="ret mono">
+          → <span class="chip" data-tint="success" title={item.id}
+            >recorded</span
+          >
+          {item.body}
+        </div>
+      {/if}
+      {#if write === "unresolved" || write === "refused"}
+        <div
+          class="ret mono"
+          data-failed={write === "refused"}
+          data-unresolved={write === "unresolved"}
+          role={write === "unresolved" ? "status" : undefined}
+        >
+          → {write === "unresolved" ? "unresolved" : "refused"}
+          <span class="state-note">{WRITE_NOTES[write]}</span>
+        </div>
+      {/if}
+      {#if call?.input != null || item.output !== null || (result !== null && result.output !== null)}
+        <details class="raw">
+          <summary>Full call</summary>
+          {#if call?.input != null}
+            <pre class="mono">{call.input}</pre>
+          {/if}
+          {#if result !== null && result.output !== null}
+            <pre class="mono">{result.output}</pre>
+          {:else if item.output !== null}
+            <pre class="mono">{item.output}</pre>
+          {/if}
+        </details>
+      {/if}
+    </li>
+  {/if}
+{:else}
+  <!--
   The origin is the row's left edge: a solid rule for a committed record, a dashed rule and
   italics for in-process activity. The word is still here for a screen reader and in the
   row's title, because an edge nobody can read cannot say "this one is not part of the
   record" (`live.ts` §9) — it just no longer costs a second badge on every row.
 -->
-<li
-  class="item"
-  data-origin={item.origin}
-  title={item.origin === "record"
-    ? "Record: a committed event, in the order the store assigned it."
-    : "Activity: live and in-process. Not part of the record; can be dropped under load."}
->
-  <div class="row">
-    <span class="kind mono">{kindLabel(item.kind)}</span>
-    <span class="visually-hidden">{item.origin}</span>
-    <!--
+  <li
+    class="item"
+    data-origin={item.origin}
+    title={item.origin === "record"
+      ? "Record: a committed event, in the order the store assigned it."
+      : "Activity: live and in-process. Not part of the record; can be dropped under load."}
+  >
+    <div class="row">
+      <span class="kind mono">{kindLabel(item.kind)}</span>
+      <span class="visually-hidden">{item.origin}</span>
+      <!--
       The call id, on the items that have one.
 
       **It is the only thing that can pair a `tool.result` with its `tool.call`.** Both
@@ -146,15 +266,15 @@
       the row carries no tag: falling back to the tool name would attribute one command's
       output to a different command.
     -->
-    {#if item.callId !== null}
-      <span
-        class="call mono"
-        title="The harness's own id for this tool call. A result and the call it answers carry the same id; this is the only thing that pairs them."
-      >
-        call {item.callId}
-      </span>
-    {:else if proposedBy !== null && proposedBy.callId !== null}
-      <!--
+      {#if item.callId !== null}
+        <span
+          class="call mono"
+          title="The harness's own id for this tool call. A result and the call it answers carry the same id; this is the only thing that pairs them."
+        >
+          call {item.callId}
+        </span>
+      {:else if proposedBy !== null && proposedBy.callId !== null}
+        <!--
         A collapsed pair, which renders **two** ids because they are two different kinds of
         thing and the row's own sentence distinguishes them.
 
@@ -165,117 +285,118 @@
         below — the harness's local, non-durable call id — which told an operator the
         opposite of the distinction the sentence exists to draw.
       -->
-      <span
-        class="call mono"
-        data-kind="record"
-        title="The store's own event id for this committed record. Stable across connections and across a restart; this is the durable identity."
-      >
-        {item.id}
-      </span>
-      <span
-        class="call mono"
-        title="The harness's own id for the tool call this record came from. Local to that harness session and not durable."
-      >
-        call {proposedBy.callId}
-      </span>
-    {/if}
-    <span class="headline">{item.headline}</span>
-    {#if write !== null}
-      <span
-        class="chip outcome"
-        data-tint={writeTint}
-        title={WRITE_NOTES[write]}
-      >
-        {WRITE_LABELS[write]}
-      </span>
-    {/if}
-    {#if item.outcome !== null}
-      <span class="chip outcome" data-tint={outcomeTint(item.outcome)}>
-        {item.outcome}
-      </span>
-    {/if}
-    <span class="time mono">{time}</span>
-  </div>
+        <span
+          class="call mono"
+          data-kind="record"
+          title="The store's own event id for this committed record. Stable across connections and across a restart; this is the durable identity."
+        >
+          {item.id}
+        </span>
+        <span
+          class="call mono"
+          title="The harness's own id for the tool call this record came from. Local to that harness session and not durable."
+        >
+          call {proposedBy.callId}
+        </span>
+      {/if}
+      <span class="headline">{item.headline}</span>
+      {#if write !== null}
+        <span
+          class="chip outcome"
+          data-tint={writeTint}
+          title={WRITE_NOTES[write]}
+        >
+          {WRITE_LABELS[write]}
+        </span>
+      {/if}
+      {#if item.outcome !== null}
+        <span class="chip outcome" data-tint={outcomeTint(item.outcome)}>
+          {item.outcome}
+        </span>
+      {/if}
+      <span class="time mono">{time}</span>
+    </div>
 
-  {#if thinking && item.body !== ""}
-    <!--
+    {#if thinking && item.body !== ""}
+      <!--
       Collapsed, like a tool's arguments and for one more reason than they are: the text
       runs to paragraphs, it arrives a block at a time while the operator is reading
       something else, and it is the one thing on this surface that is not a claim about
       what happened. Shut, it is out of the accessibility tree, so a reader is not narrated
       a model's deliberation on every arrival.
     -->
-    <details class="io">
-      <summary class="io-label">What it considered</summary>
-      <p class="thought">{item.body}</p>
-      <p class="note">
-        What the agent was considering, not what it did — and not stored: this
-        is gone on a reload. What it actually did is the reply or the tool call
-        beside this.
-      </p>
-    </details>
-  {:else if item.body !== ""}
-    <p class="body">{item.body}</p>
-  {:else if summary !== null}
-    <!--
+      <details class="io">
+        <summary class="io-label">What it considered</summary>
+        <p class="thought">{item.body}</p>
+        <p class="note">
+          What the agent was considering, not what it did — and not stored: this
+          is gone on a reload. What it actually did is the reply or the tool
+          call beside this.
+        </p>
+      </details>
+    {:else if item.body !== ""}
+      <p class="body">{item.body}</p>
+    {:else if summary !== null}
+      <!--
       The one-line domain summary, in place of the body a tool call does not have. The
       `{:else if}` is the rule rather than a convenience: a committed record *has* a body —
       the server's own sentence about what was written — and showing a paraphrase of the
       request beneath it would be the same fact twice.
     -->
-    <p class="body">{summary}</p>
-  {/if}
+      <p class="body">{summary}</p>
+    {/if}
 
-  <!--
+    <!--
     The write's state in words as well as in the chip, because the chip is one word and
     three of the four states need a sentence to be actionable. `role="status"` only on
     `unresolved`: it is the one an operator must not miss, and announcing every pending
     tool call would make the region useless.
   -->
-  {#if write !== null}
-    <p
-      class={["note", write === "unresolved" && "loud"]}
-      role={write === "unresolved" ? "status" : undefined}
-    >
-      {WRITE_NOTES[write]}
-    </p>
-  {/if}
+    {#if write !== null}
+      <p
+        class={["note", write === "unresolved" && "loud"]}
+        role={write === "unresolved" ? "status" : undefined}
+      >
+        {WRITE_NOTES[write]}
+      </p>
+    {/if}
 
-  <!--
+    <!--
     Collapsed by default, and the `<summary>` says what is inside while it is shut, so the
     row stays readable and the payload stays out of both the accessibility tree and the box
     until a reader asks for it.
   -->
-  {#if item.input !== null}
-    <details class="io">
-      <summary class="io-label">Arguments</summary>
-      <pre class="io-text mono">{item.input}</pre>
-    </details>
-  {:else if proposedBy !== null && proposedBy.input !== null}
-    <details class="io">
-      <summary class="io-label">Arguments the round asked with</summary>
-      <pre class="io-text mono">{proposedBy.input}</pre>
-    </details>
-  {/if}
+    {#if item.input !== null}
+      <details class="io">
+        <summary class="io-label">Arguments</summary>
+        <pre class="io-text mono">{item.input}</pre>
+      </details>
+    {:else if proposedBy !== null && proposedBy.input !== null}
+      <details class="io">
+        <summary class="io-label">Arguments the round asked with</summary>
+        <pre class="io-text mono">{proposedBy.input}</pre>
+      </details>
+    {/if}
 
-  {#if item.output !== null}
-    <details class="io">
-      <summary class="io-label">Result</summary>
-      <pre class="io-text mono">{item.output}</pre>
-    </details>
-  {/if}
+    {#if item.output !== null}
+      <details class="io">
+        <summary class="io-label">Result</summary>
+        <pre class="io-text mono">{item.output}</pre>
+      </details>
+    {/if}
 
-  {#if result !== null && result.output !== null}
-    <details class="io">
-      <summary class="io-label">
-        Result{result.outcome === "failed"
-          ? " (the harness reported a failure)"
-          : ""}
-      </summary>
-      <pre class="io-text mono">{result.output}</pre>
-    </details>
-  {/if}
-</li>
+    {#if result !== null && result.output !== null}
+      <details class="io">
+        <summary class="io-label">
+          Result{result.outcome === "failed"
+            ? " (the harness reported a failure)"
+            : ""}
+        </summary>
+        <pre class="io-text mono">{result.output}</pre>
+      </details>
+    {/if}
+  </li>
+{/if}
 
 <style>
   .item {
@@ -465,6 +586,135 @@
     color: var(--text-muted);
     font-size: 11px;
     line-height: var(--lh-compact);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  /*
+   * ── The narrated reading (`narrated`) ───────────────────────────────────────
+   *
+   * A6 D3/D4: prose at 13px/21px in the base colour, and a tool call as a mono block in the
+   * deep background with a hairline border. Consecutive blocks are one block — three writes
+   * in a row read as one fenced span of calls, which is what they are — by overlapping each
+   * pair's borders and squaring the joined corners.
+   */
+  .prose {
+    list-style: none;
+  }
+  .prose p {
+    margin: 0;
+    color: var(--text-base);
+    font: 400 13px/21px var(--font-sans);
+    text-wrap: pretty;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+  .prose code {
+    font-family: var(--font-mono);
+    font-size: 13px;
+  }
+  .prose .thought {
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: var(--lh-compact);
+  }
+  .prose .aside {
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: var(--lh-compact);
+  }
+  .block {
+    display: flex;
+    flex-direction: column;
+    padding: 9px 12px;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-md);
+    background: var(--bg-deep);
+    color: var(--text-muted);
+    font: 400 12px/20px var(--font-mono);
+    list-style: none;
+  }
+  /* Not committed: narration only, which can be dropped and is gone on a reload. */
+  .block[data-origin="activity"] {
+    border-style: dashed;
+    border-color: var(--border-base);
+  }
+  .block + :global(.block) {
+    margin-top: -13px;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+  }
+  .block:has(+ :global(.block)) {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .sig,
+  .ret {
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+  .what {
+    margin-right: 6px;
+    color: var(--text-faint);
+    font: 600 10px/20px var(--font-sans);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .block .chip {
+    margin-left: 6px;
+    vertical-align: 1px;
+  }
+  .ret[data-failed="true"] {
+    color: var(--state-fg-danger);
+  }
+  .ret[data-unresolved="true"] {
+    color: var(--state-fg-warning);
+  }
+  .state-note {
+    display: block;
+    color: var(--text-muted);
+    font: 400 11px/16px var(--font-sans);
+    white-space: normal;
+  }
+  .writing {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--text-muted);
+  }
+  /* The block cursor of A6 D3's "writing…": a mark that a write is in flight. */
+  .caret {
+    flex: none;
+    width: 7px;
+    height: 14px;
+    background: var(--text-base);
+    animation: blink 1.1s steps(2, start) infinite;
+  }
+  @keyframes blink {
+    to {
+      visibility: hidden;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .caret {
+      animation: none;
+    }
+  }
+  .raw {
+    margin-top: 4px;
+  }
+  .raw summary {
+    color: var(--text-muted);
+    font: 400 11px/16px var(--font-sans);
+    cursor: pointer;
+  }
+  .raw pre {
+    margin: 4px 0 0;
+    overflow-x: auto;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 16px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
