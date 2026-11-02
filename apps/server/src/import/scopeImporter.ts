@@ -441,6 +441,21 @@ export class ScopeImporter extends Context.Service<
       readonly limit?: number | undefined;
       readonly fetchTimeout?: Duration.Input | undefined;
     }) => Effect.Effect<ImporterConversationView>;
+    /**
+     * Whether **this process holds** the session under this import id: its scope, credential
+     * and MCP registration are live.
+     *
+     * The honest answer to "is this importer live", which "is a run in flight" never was — a
+     * session outlives its turn (S2), so an idle conversation between messages is held and a
+     * run-in-flight test calls it "not running". Read-only by design: it asks the registry
+     * `sessions.get` does and exposes nothing that could open or close a session. `get`
+     * rather than `ready`, so an entry that is published and not yet preambled counts, as it
+     * does for {@link replay}'s `live`. A session still *opening*, before it is published, is
+     * not held yet; the list is a lower bound there, for a moment, and never an upper one.
+     * Asked of an import id, not a session id: a conversation continued under a fresh id is
+     * held under the fresh one, which is why the caller asks about each id a session has had.
+     */
+    readonly holds: (importId: string) => Effect.Effect<boolean>;
   }
 >()("bit/import/ScopeImporter") {
   /**
@@ -1589,6 +1604,8 @@ export class ScopeImporter extends Context.Service<
         converse,
         send,
         replay,
+        holds: (importId) =>
+          Effect.sync(() => sessions.get(importId) !== undefined),
       });
     }),
   );
@@ -1622,6 +1639,7 @@ export class ScopeImporter extends Context.Service<
         ),
       stop: () => Effect.succeed(undefined),
       view: () => Effect.succeed(undefined),
+      holds: () => Effect.succeed(false),
       converse: () => Effect.fail(noHarness),
       send: () => Effect.fail(noHarness),
       replay: (input) =>

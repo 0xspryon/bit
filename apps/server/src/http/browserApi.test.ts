@@ -219,6 +219,13 @@ const supervisorHolding: Layer.Layer<RunSupervisor> = Layer.succeed(
 const LIVE_IMPORT_ID = "imp_live_in_this_suite";
 
 /**
+ * An import this suite's importer **holds** with no run in flight: a conversation open between
+ * turns. `view` knows nothing of it, so only a route that asks the registry — rather than
+ * inferring liveness from a running view — can read it as live.
+ */
+const IDLE_HELD_IMPORT_ID = "imp_idle_held_in_this_suite";
+
+/**
  * `unavailable` in every respect but one: it holds a single running import.
  *
  * Starts are still refused by name, so the creation and start tests above are unchanged.
@@ -236,6 +243,12 @@ const importerHoldingOne = Layer.effect(
           importId === LIVE_IMPORT_ID
             ? ({ importId, status: "running" } as ScopeImportView)
             : undefined,
+        ),
+      // Held, as the real importer's registry would say of a session open between turns —
+      // with no run in flight, which `view` above does not report for this id's twin.
+      holds: (importId) =>
+        Effect.succeed(
+          importId === LIVE_IMPORT_ID || importId === IDLE_HELD_IMPORT_ID,
         ),
     });
   }),
@@ -5215,6 +5228,7 @@ describe("a target's agent sessions", () => {
   const mixed = "agents-mixed";
   const quiet = "agents-none";
   const other = "agents-other";
+  const idle = "agents-idle";
 
   const register = async (name: string) => {
     mkdirSync(join(workspaceRoot, name), { recursive: true });
@@ -5317,6 +5331,20 @@ describe("a target's agent sessions", () => {
     await register(other);
     seedMixed(mixed, "main", 1_000);
     seedMixed(other, "elsewhere", 9_000);
+    await register(idle);
+    const database = new Database(join(fleetRoot, "targets", idle, HUNT_FILE));
+    try {
+      // An open session with no ending recorded, that this process holds with nothing running.
+      database.run(
+        `INSERT INTO import_sessions (
+           import_id, target_id, harness_session_id, harness_instance_id, model,
+           caller_scope, opened_at, session_created_at
+         ) VALUES (?, ?, 'ses_idle', 'opencode', 'openai/gpt-5.6-sol', ?, 100, 101)`,
+        [IDLE_HELD_IMPORT_ID, idle, `${idle}/import/${IDLE_HELD_IMPORT_ID}`],
+      );
+    } finally {
+      database.close();
+    }
   });
 
   test("unions the goal, importer and worker sessions into one list, newest first", async () => {
@@ -5383,6 +5411,24 @@ describe("a target's agent sessions", () => {
           tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
         },
       ],
+    });
+  });
+
+  test("an importer conversation held open between turns reads live, with no run in flight", async () => {
+    const response = await read(
+      await signedIn(`/targets/${idle}/agent-sessions`),
+    );
+    expect(response.status).toBe(200);
+    const sessions = response.body["sessions"] as readonly {
+      readonly kind: string;
+      readonly state: string;
+      readonly detail: string | null;
+    }[];
+    // The importer double's `view` knows nothing of this import, so "a run is in flight"
+    // would say dormant; only the registry's answer to "do you hold it" says live.
+    expect(sessions.find((s) => s.kind === "importer")).toMatchObject({
+      state: "live",
+      detail: null,
     });
   });
 

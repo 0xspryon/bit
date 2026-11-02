@@ -1621,8 +1621,10 @@ const fleetHandlers = HttpApiBuilder.group(
        * **A read-time union** (`http/agentSessions.ts`): the goal, importer and worker indexes
        * are read from this target's own file and folded into one shape, and what this process
        * holds is asked of its own registries — the goal conversations' and the importer's —
-       * because liveness is stored nowhere. All three ids a registry is asked about were read
-       * off this target's rows, so no other target's session can be answered for.
+       * because liveness is stored nowhere. An importer session is live when this process
+       * **holds** it, between turns as well as during one. All three ids a registry is asked
+       * about were read off this target's rows, so no other target's session can be answered
+       * for.
        */
       agentSessions: Effect.fn(function* ({ params }) {
         const row = yield* openableTarget(fleet, params.targetId);
@@ -1636,15 +1638,14 @@ const fleetHandlers = HttpApiBuilder.group(
             ),
           }),
         ).pipe(Effect.orDie);
+        // "Held", not "a run is in flight": a session is open between turns (S2), and the
+        // registry is the only thing that knows. Asked of every import id the session has had.
         const importers = yield* Effect.forEach(read.importers, (session) =>
           Effect.map(
             Effect.forEach(session.importIds, (importId) =>
-              importer.view(importId),
+              importer.holds(importId),
             ),
-            (views) => ({
-              ...session,
-              held: views.some((view) => view?.status === "running"),
-            }),
+            (holds) => ({ ...session, held: holds.some(Boolean) }),
           ),
         );
         return unionAgentSessions({
