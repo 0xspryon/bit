@@ -435,6 +435,24 @@ the chat shows prose.
 The closing-report read (`messages` after `waitForIdle`) stays as it is on the create-target
 path, because that path still has no browser attached.
 
+### S4.4 — Narrated tool rows stay, and that shrinks S5
+
+Tool calls and their results arrive on the **same narration stream** as prose, so turning the
+narrator on put them in the chat whether or not anyone asked. They stay: the goal chat shows
+them the same way, and building a filter to hide information the operator wants — then deleting
+that filter one slice later — is work in both directions for nothing.
+
+So **S5's remit narrows** to what narration genuinely cannot give: the durable _records_
+(`scope.entry.added`, `asset.imported`) and the pairing of a record with the call that wrote it.
+
+### S4.5 — The cursor clears on the server's status, because the stream has no idle signal
+
+S4's done criteria said the cursor "clears when it idles", which assumed the narration stream
+could say when a turn was over. It cannot. The page polls the import's own `running` status
+instead, so the cursor can stay on for up to one poll interval (~900ms) after the agent's last
+word. Treating silence on the stream as idle would be a guess, and a cursor that vanishes
+mid-sentence is worse than one that lingers.
+
 ### Done criteria
 
 - [ ] A narrator fiber per session, forked into the session's scope, interrupted before the
