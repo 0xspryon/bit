@@ -2098,6 +2098,25 @@ export class App {
    *
    * Choosing Goals from inside one goal means the list, not the same page, so it closes
    * the goal as well.
+   *
+   * **A read transcript is closed for the same reason, and that is not a second rule.** A
+   * transcript is a record showing inside a section, exactly as an open goal is, so leaving
+   * the section puts it away. The symmetry was missing: `transcriptAttemptId` used to be
+   * cleared only by {@link reset}, so a transcript read on Goals went on being the
+   * *addressable place* of the Workers section for the rest of the visit — `placeOf` reads
+   * the pair `navItem === "workers" && transcriptAttemptId !== ""` — and the URL kept
+   * claiming `/t/<id>/attempts/<id>` over a section that had no attempt in hand.
+   *
+   * S4 made that visible and unacceptable. With history navigation, traversing onto a plain
+   * `/t/<id>/workers` entry applied the section, `placeOf` answered with the stale attempt,
+   * and the reflection pushed the attempt path straight back — so Back could not pass that
+   * entry at all. Clearing here is what makes `placeOf` honest, and honest is what Back
+   * needs: a section the operator chose names no attempt, and the Workers transcript panel
+   * goes back to being what its own comment says it is, the attempt a *link* named.
+   *
+   * The attempt itself is not forgotten — {@link lastAttempts} is untouched, so the Goals
+   * panel still offers "Read transcript" for the attempt this tab started. What is dropped
+   * is the reading, not the handle.
    */
   toSection(id: string) {
     // Going to a section — Assets included — leaves the Auto-load page, and stops watching
@@ -2108,6 +2127,10 @@ export class App {
     }
     this.navItem = id;
     if (id === "goals") this.closeGoal();
+    // Before any of the reads below, and before `applyPlace`'s attempt case calls
+    // `loadTranscript` — which sets the id synchronously, so that one case gets its
+    // transcript back on the same tick and nothing flickers.
+    this.#closeTranscript();
     /*
      * The estate is read when the operator goes to look at it.
      *
@@ -5287,6 +5310,26 @@ export class App {
   }
 
   /**
+   * Puts the read transcript away, with the refusal and the loading flag that belong to it.
+   *
+   * {@link lastAttempts} is deliberately not touched: that is the *handle* on an attempt
+   * this tab started, which outlives any one look at it, and clearing it would take the
+   * Goals panel's offer away rather than close what the panel was showing.
+   *
+   * Called by {@link toSection}, for the reason its comment gives, and by {@link reset}.
+   * A read in flight is dropped by the same guard that drops an overtaken one —
+   * {@link loadTranscript} re-checks {@link transcriptAttemptId} after its await — so
+   * leaving a section mid-read cannot land a transcript on a screen that no longer asked
+   * for it.
+   */
+  #closeTranscript() {
+    this.transcript = undefined;
+    this.transcriptAttemptId = "";
+    this.transcriptLoading = false;
+    this.transcriptDetail = "";
+  }
+
+  /**
    * Reads one attempt's transcript: ours if the server kept one, the harness's if not.
    *
    * **An absent transcript is a success, not a failure.** The server answers `200` with
@@ -5436,10 +5479,9 @@ export class App {
     this.pickerOpen = false;
     this.modelQuery = "";
     this.modelOptionsByModel = {};
-    this.transcript = undefined;
-    this.transcriptAttemptId = "";
-    this.transcriptLoading = false;
-    this.transcriptDetail = "";
+    this.#closeTranscript();
+    // And the handle as well, which `#closeTranscript` leaves alone: a scenario or a
+    // sign-out starts a tab that has run nothing, so there is no attempt to offer.
     this.lastAttempts = {};
   }
 }

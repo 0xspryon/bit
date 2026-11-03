@@ -26,6 +26,7 @@ import { historyWrite } from "../src/lib/placeHistory";
 import { FakeCountdown } from "./fakeCountdown";
 import {
   FakeServer,
+  attemptTranscript,
   goalView,
   importerSessionView,
   ok,
@@ -356,6 +357,64 @@ describe("a place that is reached across a round trip", () => {
     expect(app.navItem).toBe("assets");
     expect(app.importerOpen).toBe(true);
     expect(pathOf(placeOf(app))).toBe("/t/alpha/assets/chat/ses_1");
+  });
+});
+
+describe("a section entry with a transcript read behind it", () => {
+  test("Back passes through /t/<id>/workers instead of bouncing off it", async () => {
+    /*
+     * The regression guard for the defect S4 found. `transcriptAttemptId` used to be
+     * cleared only by `reset()`, and `placeOf` reads the pair `navItem === "workers" &&
+     * transcriptAttemptId !== ""` — so once a transcript had been read, *every* arrival on
+     * Workers answered with the attempt. Traversing onto a plain `/t/alpha/workers` entry
+     * applied the section, `placeOf` returned the stale attempt, and the reflection pushed
+     * the attempt path straight back: Back could not pass that entry, in either direction,
+     * for the rest of the visit.
+     *
+     * `toSection` now closes the transcript, as it already closed an open goal. The stack
+     * below is built with a direct `loadTranscript` because that is the minimal way to
+     * reach the state; in the app it arrives by reading a transcript on Goals — which
+     * changes no place and so writes nothing — and then choosing Workers.
+     */
+    const { app, history, act, traverse } = await signedIn(
+      served((fake) => {
+        fake.onTranscript = () => ok(attemptTranscript({ targetId: "alpha" }));
+      }),
+    );
+    await act(() => {
+      app.openTarget("alpha");
+    });
+    await act(() => {
+      app.toSection("workers");
+    });
+    await act(() => {
+      void app.loadTranscript("alpha", "att_7");
+    });
+
+    expect(history.entries).toEqual([
+      "/",
+      "/t/alpha",
+      "/t/alpha/workers",
+      "/t/alpha/attempts/att_7",
+    ]);
+
+    await traverse(-1);
+
+    // The entry is reached and stays reached: no attempt in hand, so no attempt in the URL.
+    expect(history.here).toBe("/t/alpha/workers");
+    expect(history.index).toBe(2);
+    expect(history.length).toBe(4);
+    expect(app.transcriptAttemptId).toBe("");
+
+    // And Back goes on working, which is the whole point.
+    await traverse(-1);
+    expect(history.here).toBe("/t/alpha");
+    expect(history.length).toBe(4);
+
+    // Forward still reads the transcript the path names, so nothing was lost by closing it.
+    await traverse(+2);
+    expect(history.here).toBe("/t/alpha/attempts/att_7");
+    expect(app.transcriptAttemptId).toBe("att_7");
   });
 });
 

@@ -80,6 +80,65 @@ describe("a link to an attempt transcript", () => {
     expect(pathOf(placeOf(app))).toBe(LINK);
   });
 
+  test("does not follow the operator to the next section, or back", async () => {
+    /*
+     * The symmetry `toSection` was missing, and the defect S4 found by needing it.
+     *
+     * `transcriptAttemptId` used to be cleared only by `reset()`, so a transcript read
+     * here went on being the *addressable place* of the Workers section for the rest of
+     * the visit — `placeOf` reads `navItem === "workers" && transcriptAttemptId !== ""`.
+     * The URL therefore claimed `/t/acme-corp/attempts/att_7` over a section holding no
+     * attempt, and with history navigation that was worse than untidy: traversing onto a
+     * plain `/t/acme-corp/workers` entry reflected the stale attempt straight back, so
+     * Back could not pass that entry.
+     *
+     * A transcript is a record showing inside a section, exactly as an open goal is, so
+     * leaving the section puts it away.
+     */
+    const app = await arrived();
+    expect(text()).toContain("read the login form");
+
+    app.toSection("findings");
+    await settle();
+    expect(app.transcriptAttemptId).toBe("");
+    expect(
+      document.querySelector("[aria-label='Attempt transcript']"),
+    ).toBeNull();
+
+    app.toSection("workers");
+    await settle();
+
+    // The section the operator chose names no attempt, so there is no panel and the path
+    // is the section's own. This is the assertion Back depends on.
+    expect(
+      document.querySelector("[aria-label='Attempt transcript']"),
+    ).toBeNull();
+    expect(pathOf(placeOf(app))).toBe("/t/acme-corp/workers");
+  });
+
+  test("but the attempt this tab started is still offered on Goals", async () => {
+    /*
+     * What the clear must *not* cost. `readableAttemptId` is derived from `lastAttempts`,
+     * the handle on an attempt this tab ran, and that outlives any one look at it — so the
+     * Goals panel still draws and still offers the read. What is dropped is the reading,
+     * not the handle: the button says "Read transcript" rather than "Reload transcript",
+     * because nothing is loaded any more.
+     */
+    const app = await arrived();
+    app.lastAttempts = { [T]: ATTEMPT };
+
+    app.toSection("goals");
+    await settle();
+
+    expect(app.readableAttemptId).toBe(ATTEMPT);
+    expect(
+      document.querySelector("[aria-label='Attempt transcript']"),
+    ).not.toBeNull();
+    expect(text()).toContain(ATTEMPT);
+    expect(text()).toContain("Read transcript");
+    expect(text()).not.toContain("Reload transcript");
+  });
+
   test("an attempt nobody linked to draws no panel on Workers", async () => {
     // The usual case: the section is a placeholder and nothing has read a transcript, so
     // there is nothing to show and nothing is drawn.
