@@ -75,7 +75,14 @@ Responses providers, and a smaller window can fire OpenCode's auto-compaction on
 step. T3 applies every in-session switch on the _next turn_, never mid-turn, so Claude Code
 mid-turn behaviour is genuinely unmeasured.
 
-**F4 — Model switch for a running conversation (M), F3 → F4.** An endpoint for importer
+**F4 — Model switch for a running conversation (M), F3 → F4.** From F3 and its review: the live-session
+registry keeps its own copy of the model besides the row, so update both; a Claude Code
+`switchModel` refused with `SESSION_NOT_FOUND_TAG`/404 means "not live — update the row, the
+next resume uses it"; OpenCode's switch 404 has no tag (check the status); `switchModel`
+requires a catalogue model id — OpenCode's `modelOf`/`openCodeVariantOf` decode with
+`decodeUnknownSync` and **throw** on a malformed id, so validate catalogue membership and
+resolve options before calling (or map the decode failure to a typed error); the stub's
+`recordModelSwitches()` is there for the tests. An endpoint for importer
 and goal conversations: refuse a different harness, re-resolve options against the new
 model (`explicitModelOptionSelections`, report `droppedModelOptionIds`), call
 `switchModel`, and only then update `model` / `model_options` on the row. A failure leaves
