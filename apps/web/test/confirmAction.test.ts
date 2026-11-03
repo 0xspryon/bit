@@ -49,6 +49,16 @@ describe("ConfirmAction's confirm button, as B6 draws it", () => {
     expect(stylesheet).not.toMatch(/:focus/);
   });
 
+  test("no control in it is autofocused", () => {
+    // The Enter that opened the dialog must not be able to finish it. The mounted tests
+    // read the `autofocus` property; this catches the attribute before it is compiled.
+    const markup = source.slice(
+      source.indexOf("</script>"),
+      source.indexOf("<style>"),
+    );
+    expect(markup).not.toMatch(/autofocus/i);
+  });
+
   test("working is dimmed and shows no pointer", () => {
     const working = rule('.confirm[aria-disabled="true"]');
     expect(working).toContain("opacity: 0.5");

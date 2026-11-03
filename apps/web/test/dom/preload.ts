@@ -33,6 +33,33 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { installComponents, installIcons, installRunes } from "../transforms";
 
 GlobalRegistrator.register({ width: 1024, height: 768 });
+
+/*
+ * A failing assertion prints a node as a short tag, not as its object graph.
+ *
+ * `bun test` prints a happy-dom node by walking it, and a node reaches its whole `window`:
+ * a failing `toBe` between two bare elements printed 248 056 lines, and inside a mounted
+ * app one ran the process out of memory before it reported anything — which took the
+ * machine's memory with it and killed the shell running the suite. With this, the same
+ * failure reads `Expected: <div>` / `Received: <button.confirm.danger>`.
+ *
+ * **It does not cover `toEqual`'s diff**, which walks the structure itself and ignores the
+ * hook. So never `toEqual` a node or an array of nodes: map them to strings first
+ * (`outerHTML`, `textContent`, an attribute), as every such assertion here does.
+ */
+Object.defineProperty(
+  Node.prototype,
+  Symbol.for("nodejs.util.inspect.custom"),
+  {
+    configurable: true,
+    value(this: Node): string {
+      if (!(this instanceof Element)) return `#${this.nodeName.toLowerCase()}`;
+      const id = this.id === "" ? "" : `#${this.id}`;
+      const classes = [...this.classList].map((each) => `.${each}`).join("");
+      return `<${this.tagName.toLowerCase()}${id}${classes}>`;
+    },
+  },
+);
 installRunes();
 installComponents("client");
 installIcons("client");

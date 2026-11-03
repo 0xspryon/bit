@@ -63,8 +63,9 @@ describe("ConfirmAction", () => {
     expect(panel.textContent).toContain("Something the caller wrote.");
     expect(label(button(panel, "confirm"))).toBe("Archive");
     expect(label(button(panel, "cancel"))).toBe("Leave it");
-    // The component carries no wording of its own beyond a default for Cancel.
-    expect(panel.textContent).not.toMatch(/entry|scope|asset|host/i);
+    // The component carries no wording of its own beyond a default for Cancel — not in
+    // its text, and not in an `aria-label` or `title` either, so the whole markup is read.
+    expect(panel.outerHTML).not.toMatch(/entry|scope|asset|host/i);
   });
 
   test("Cancel is called Cancel unless the caller says otherwise", async () => {
@@ -89,7 +90,15 @@ describe("ConfirmAction", () => {
 
   test("it opens with nothing focused by the markup", async () => {
     const panel = await draw();
-    expect(panel.querySelector("[autofocus]")).toBeNull();
+    // Svelte's client build sets `autofocus` as a property and queues a focus; it is never
+    // reflected as an attribute here, so `[autofocus]` would match nothing either way.
+    // Compared as markup, never as elements: a failing `toEqual` on a happy-dom element
+    // prints its whole window, which runs this test process out of memory.
+    expect(
+      [...panel.querySelectorAll<HTMLElement>("*")]
+        .filter((each) => each.autofocus)
+        .map((each) => each.outerHTML),
+    ).toEqual([]);
     // Focus is on the panel itself, so Enter presses nothing until Tab reaches a button.
     expect(document.activeElement).toBe(panel);
   });

@@ -309,8 +309,16 @@ describe("the delete question's words", () => {
   test("nothing in it is autofocused, and Delete is not disabled until it is working", async () => {
     const { panel } = await ask("acme.test");
     // Enter does nothing until the operator tabs to Delete. `autofocus` is the one
-    // way the markup itself could make it do something.
-    expect(panel.querySelector("[autofocus]")).toBeNull();
+    // way the markup itself could make it do something. Svelte sets it as a property, not
+    // an attribute, so the property is what is read.
+    // Compared as markup, never as elements: a failing `toEqual` on a happy-dom element
+    // prints its whole window, which runs this test process out of memory.
+    expect(
+      [...panel.querySelectorAll<HTMLElement>("*")]
+        .filter((each) => each.autofocus)
+        .map((each) => each.outerHTML),
+    ).toEqual([]);
+    expect(document.activeElement).toBe(panel);
     expect(button(panel, "Delete entry").getAttribute("aria-disabled")).toBe(
       "false",
     );
