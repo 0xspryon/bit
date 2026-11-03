@@ -200,18 +200,24 @@ export const placeOf = (app: App): Place => {
    * read off the pair the design's decision 1 names: the rail on Workers, and an attempt
    * being read.
    *
-   * **Today nothing in the app reaches this**, and that is worth knowing rather than
-   * discovering in a later slice. `TranscriptPanel` renders on the *Goals* section — see
-   * `Target.svelte` — and only for `readableAttemptId`, the one attempt this tab started
-   * here, "the only handle a browser has on a settled attempt until Flow B lists them".
-   * So a transcript read by clicking still shows the target's path until Workers lists
-   * attempts. {@link applyPlace} does reach it, which is what makes a link work in the
-   * direction the operator asked for.
+   * **The design called this guard unreachable, and it was not**, before this slice or
+   * after it: `loadTranscript` is what the Goals transcript panel calls for the attempt
+   * this tab started, `transcriptAttemptId` is cleared only by `reset()`, and clicking
+   * Workers afterwards satisfies both halves of the condition. What S3 changed is that
+   * the emission is now coherent rather than accidental — `Target.svelte` renders the
+   * transcript panel on Workers for the attempt in hand, so this path is written exactly
+   * when an attempt's transcript is the thing on screen there, which is what a reflected
+   * URL is supposed to mean.
    *
-   * `transcriptAttemptId` is also never cleared except by `reset()`, so leaving Workers
-   * and coming back would name the last attempt read. Harmless while nothing on Workers
-   * can read one; whichever slice puts the attempt list there owns closing it, and the
-   * narrow condition here is what keeps the staleness inside that one section.
+   * Still true, and the part the design was right about: nothing *produces* this link by
+   * clicking. There is no attempt to click on — Workers lists none until Flow B does — so
+   * a link to an attempt is written by hand or by a bookmark, and {@link applyPlace} is
+   * the end that matters.
+   *
+   * `transcriptAttemptId` is never cleared except by `reset()`, so leaving Workers and
+   * coming back shows the last transcript read, with the URL agreeing about it. The
+   * design noted that staleness while it was invisible; it is now visible, and whichever
+   * slice puts the attempt list on Workers still owns closing it.
    */
   if (app.navItem === "workers" && app.transcriptAttemptId !== "") {
     return { kind: "attempt", targetId, attemptId: app.transcriptAttemptId };
@@ -424,9 +430,11 @@ export const applyPlace = (app: App, place: Place): void => {
        * open on its empty session. This method is the one that reads the index first,
        * re-checks, and goes to Assets itself.
        *
-       * It is the method this slice was written for. Its own comment calls it "a stopgap:
-       * see `AgentSessions.svelte` on the deep link this stands in for", and that file says
-       * the destination of a row is a deep link this build cannot make. This is the link.
+       * It is the method this grammar was written for, and since S3 it is no longer a
+       * stopgap for a link that could not be made: the Agent sessions row is an `<a href>`
+       * carrying this very path, and its click applies this place through this function. One
+       * description of where a chat row leads, whether it is followed here or cold-loaded in
+       * a second tab.
        *
        * It reads `viewTargetId`, which `openTarget` above has already set, so the order
        * still holds. Fire-and-forget like the rest: the page arrives and the conversation
@@ -440,7 +448,12 @@ export const applyPlace = (app: App, place: Place): void => {
       void app.openImporterSession(place.sessionId);
       return;
     case "attempt":
-      // The rail goes to Workers, which the path does not say — decision 1's consequence.
+      /*
+       * The rail goes to Workers, which the path does not say — decision 1's consequence.
+       * The transcript panel is mounted on that section for exactly this arrival
+       * (`Target.svelte`): the read alone would put a transcript in state that no screen
+       * displayed, which is what this case did before S3.
+       */
       app.toSection("workers");
       void app.loadTranscript(targetId, place.attemptId);
       return;

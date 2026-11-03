@@ -28,7 +28,9 @@
    * {@link TranscriptPanel} remains the different thing beside it: what a *settled*
    * attempt left behind, read from the harness (the server keeps no copy), labelled as the
    * thing that may be gone, and told apart from a transcript that is gone and from a
-   * harness that could not be asked.
+   * harness that could not be asked. It is mounted twice, on the two sections that can have
+   * an attempt to read — Goals for the one this tab started, Workers for the one a link
+   * named — and each passes the id it knows about.
    */
   import Button from "../components/Button.svelte";
   import ComposeBox from "../components/ComposeBox.svelte";
@@ -163,12 +165,27 @@
       under every section would make it look like a control for Findings and Assets too.
 
       The settled transcript sits above it for the same reason, and renders nothing until
-      this tab has started a run here — the only handle a browser has on a settled attempt
-      until Flow B lists them.
+      this tab has started a run here — the handle a browser has on a settled attempt when
+      it was not given one, until Flow B lists them.
     -->
     {#if app.navItem === "goals"}
-      <TranscriptPanel {app} />
+      <TranscriptPanel {app} attemptId={app.readableAttemptId} />
       <ComposeBox {app} />
+    {/if}
+
+    <!--
+      The other way to have an attempt in hand: a link that named one.
+
+      `/t/<targetId>/attempts/<attemptId>` replays onto this section and reads that
+      transcript (`place.ts`, design decision 1 — the resource is named, not the rail it is
+      reached through), so the panel has to be on the section the path lands on or the link
+      would read a transcript nothing could show. It is one panel for the one attempt the URL
+      asked about and **not** the attempt list: Workers lists nothing, which is Flow B's, and
+      nothing in the app produces a link to an attempt. Inbound only, and this is the inbound
+      end of it.
+    -->
+    {#if app.navItem === "workers"}
+      <TranscriptPanel {app} attemptId={app.transcriptAttemptId} />
     {/if}
 
     <!-- Last, so it is the foot of the window: one line until it is opened. -->

@@ -59,14 +59,32 @@ export const mountInto = <Props extends Record<string, unknown>>(
  * happened calls `element.focus()` first, which is what the person's hand did.
  */
 export const click = (element: Element): void => {
-  element.dispatchEvent(
-    new MouseEvent("click", {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-    }),
-  );
+  clickOn(element);
+};
+
+/**
+ * The same click, with whatever a hand was holding down, and the event itself back.
+ *
+ * Two things {@link click} cannot express, both of which a link needs. A modifier key or a
+ * non-primary button is the browser's own vocabulary — new tab, new window, save — and a
+ * test about a link has to be able to send one. And whether the app called
+ * `preventDefault` is the whole question for an `<a href>`: it is the difference between
+ * routing in place and letting the document reload, and the only witness to it is the
+ * event, so it is returned rather than dropped.
+ */
+export const clickOn = (
+  element: Element,
+  init: MouseEventInit = {},
+): MouseEvent => {
+  const event = new MouseEvent("click", {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    ...init,
+  });
+  element.dispatchEvent(event);
   flushSync();
+  return event;
 };
 
 /**

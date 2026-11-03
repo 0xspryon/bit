@@ -21,38 +21,34 @@
    * A session whose harness this server no longer runs is **marked, not hidden**: the harness
    * may still hold it, and an operator looking for a session should find the row that says so.
    *
-   * ## Row click, and the part that waits for URL routing
+   * ## A row is a link
    *
-   * **The destination of a row is a deep link, and this build cannot make one.** "Open the
-   * importer on this session" and "open this goal's conversation" are addresses, and the app
-   * has no URL routing: navigation is in-memory state (`App.navItem`, `openGoalId`,
-   * `importerOpen`). A half-built router inside this slice would be a second routing
-   * convention nothing else follows, so none is invented here.
+   * The destination of a row is an **address**, and now it is written as one. "The importer,
+   * on this session" is `/t/<targetId>/assets/chat/<sessionId>`; "this goal's conversation"
+   * is `/t/<targetId>/goals/<goalId>` — the grammar in `lib/place.ts`, which
+   * `placeOfSession` turns a row into. So a row is an `<a href>` carrying that path:
+   * copyable, middle-clickable, openable in a second tab, which is what the operator asked
+   * for and what a button could not be however it was styled.
    *
-   * What a click does today is call the in-memory openers the Assets strip and the Goals list
-   * already use — `App.openImporterSession` (which goes to Assets and selects the session on
-   * the importer page) and `App.openGoalConversation` (which goes to Goals and opens the
-   * goal, where its conversation is). Those are honest destinations, but they are state, not
-   * addresses: they do not survive a reload, cannot be copied, and "back" does not know about
-   * them. A worker row has **no** destination — there is no attempt screen to open, and the
-   * Workers page is a placeholder — so it is inert rather than half-working.
+   * The ordinary click is still handled here rather than followed by the browser, because
+   * following the href would reload the document and throw the running app away — the
+   * session, the live feed, every read in hand — to move one section. `routedInApp` decides
+   * which clicks belong to the app, and `lib/placeLink.ts` says why every modified click is
+   * left to the browser instead. A click that is the app's applies the place through
+   * `applyPlace`, the same function the route uses to replay a link that cold-loaded, so a
+   * row followed in place and the same row opened in a new tab go through one description of
+   * where it leads. Nothing here writes the URL: state writes it, and the one writer is
+   * `routes/[...place]/+page.svelte`.
    *
-   * When real routing lands, each row becomes a plain `<a href>` and both shims are deleted:
-   *
-   *   importer  → /targets/:targetId/importer/:sessionId    (the importer page, selecting that session)
-   *   goal      → /targets/:targetId/goals/:subjectId       (the goal page; the conversation is its compose area)
-   *   worker    → /targets/:targetId/attempts/:subjectId    (once an attempt has a screen)
-   *
-   * Every id those need is already on the view (`sessionId`, `subjectId`), which is why the
-   * route returns them. A link also fixes the one thing the shim cannot: opening an importer
-   * session the importer's own index does not list yet (see `openImporterSession`'s reread).
+   * A worker row still has no destination — see `placeOfSession` — so it stays inert markup
+   * rather than a link to a section that cannot show an attempt.
    */
   import type { AgentSessionView } from "@bit/contracts";
 
   import {
-    destinationOf,
     harnessOf,
     KIND_LABEL,
+    placeOfSession,
     stateLabel,
     stateTitle,
     tallySentence,
@@ -63,6 +59,8 @@
   import PageFrame from "../components/PageFrame.svelte";
   import { sessionWhen } from "../importerChat";
   import { IconRobot } from "../icons";
+  import { applyPlace, pathOf, type Place } from "../place";
+  import { routedInApp } from "../placeLink";
 
   let { app }: { app: App } = $props();
 
@@ -71,17 +69,19 @@
   let mine = $derived(app.agentSessionsTargetId === app.viewTargetId);
   let rows = $derived(mine ? app.agentSessions : []);
 
-  const go = (session: AgentSessionView) => {
-    switch (destinationOf(session.kind)) {
-      case "importer":
-        void app.openImporterSession(session.sessionId);
-        return;
-      case "goal":
-        app.openGoalConversation(session.subjectId);
-        return;
-      case null:
-        return;
-    }
+  /**
+   * Follows a row's link in this tab, for the clicks that are this app's to follow.
+   *
+   * A click the browser has its own meaning for — a new tab, a new window, a download — is
+   * left alone with its href intact, and lands through the cold-load path a bookmark takes.
+   */
+  const follow = (place: Place, event: MouseEvent) => {
+    if (!routedInApp(event)) return;
+    event.preventDefault();
+    // A refusal is about the row it was raised for — a chat session the importer no longer
+    // lists — so following any row retires it before the next answer arrives.
+    app.agentSessionsNote = "";
+    applyPlace(app, place);
   };
 </script>
 
@@ -144,11 +144,21 @@
       {/if}
       <ul class="rows" aria-label="Agent sessions">
         {#each rows as session (session.key)}
+          {@const place = placeOfSession(session, app.viewTargetId)}
           <li>
-            {#if destinationOf(session.kind) !== null}
-              <button class="row go" onclick={() => go(session)}>
+            {#if place !== null}
+              <!--
+                A real href, so the operator can copy it, middle-click it, or open it beside
+                what they are reading. The handler is what keeps an ordinary click from
+                reloading the document; see `routedInApp`.
+              -->
+              <a
+                class="row go"
+                href={pathOf(place)}
+                onclick={(event) => follow(place, event)}
+              >
                 {@render content(session)}
-              </button>
+              </a>
             {:else}
               <!-- Inert: there is no screen for a worker attempt to open yet. -->
               <div class="row">{@render content(session)}</div>
@@ -193,6 +203,11 @@
   .row.go {
     cursor: pointer;
     transition: background var(--dur-hover) ease-out;
+    /* A link, so the browser would underline it and paint it the accent colour. The row is
+       the hit area and the hover tint is how it says so, as it did when it was a button:
+       eleven rows of underlined blue would be a different list. */
+    text-decoration: none;
+    color: var(--text-base);
   }
   .row.go:hover {
     background: var(--overlay-hover);

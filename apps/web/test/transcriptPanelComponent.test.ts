@@ -41,10 +41,23 @@ const panelAfter = async (
   await settle();
   app.lastAttempts = { [TARGET]: ATTEMPT };
   await app.loadTranscript(TARGET, ATTEMPT);
-  return render(TranscriptPanel, { props: { app } }).body;
+  // The section that mounts the panel names the attempt: Goals the one this tab started,
+  // Workers the one a link asked for. This is the Goals case.
+  return render(TranscriptPanel, { props: { app, attemptId: ATTEMPT } }).body;
 };
 
 describe("the transcript panel", () => {
+  test("names no attempt and draws nothing at all", () => {
+    // The absent form of the prop, and the usual state of both sections that mount this:
+    // no run started in this tab, and no link naming an attempt.
+    const app = new App(new FakeServer(), new FakeCountdown());
+    const html = render(TranscriptPanel, {
+      props: { app, attemptId: "" },
+    }).body;
+    expect(html).not.toContain("Read transcript");
+    expect(html).not.toContain("Attempt transcript");
+  });
+
   test("a transcript the harness has is shown, labelled as one that may be gone", async () => {
     const html = await panelAfter({
       source: "harness",

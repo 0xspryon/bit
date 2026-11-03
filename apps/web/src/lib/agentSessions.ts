@@ -3,13 +3,16 @@
  *
  * Kept out of the component so the words are testable and so the component stays a layout:
  * the one decision in here that is not wording is {@link harnessOf}, which is where a session
- * whose harness this server no longer runs is *marked rather than hidden*.
+ * whose harness this server no longer runs is *marked rather than hidden*, and
+ * {@link placeOfSession}, which is where a row's destination became an address.
  */
 import type {
   AgentSessionKind,
   AgentSessionView,
   HarnessInstanceView,
 } from "@bit/contracts";
+
+import type { Place } from "./place";
 
 export const KIND_LABEL: Record<AgentSessionKind, string> = {
   goal: "Goal",
@@ -87,12 +90,32 @@ export const tallySentence = (
     : `${String(tally.entriesIn)} in · ${String(tally.entriesOut)} out · ${String(tally.assets)} ${tally.assets === 1 ? "asset" : "assets"}`;
 
 /**
- * Which in-memory destination a row has today, or `null` where it has none.
+ * The place a row leads to, or `null` for a row that leads nowhere.
  *
- * A worker attempt has no screen of its own to open (the Workers page is a placeholder), so
- * its row is inert rather than leading somewhere that is not about it.
+ * One function rather than a destination name the component then turns into an address: the
+ * href a row carries and the place a click applies are the same answer, and two functions
+ * could disagree about which id a kind is addressed by. They are different ids —
+ * `sessionId` for an importer session, because the chat is addressed by the conversation;
+ * `subjectId` for a goal, because the session is about a goal and the goal is the resource —
+ * which is precisely the sort of thing that goes wrong twice if it is decided twice.
+ *
+ * **A worker attempt leads nowhere, and that is not an oversight.** The grammar has a path
+ * for one, `/t/<targetId>/attempts/<attemptId>`, and following it opens that transcript. But
+ * the Workers section lists nothing yet, so a row here is the only place an attempt could be
+ * clicked from, and the design keeps that row inert rather than let this list become half of
+ * the attempt list Flow B owns. The path stays inbound-only: a link to an attempt works, and
+ * nothing in the app writes one.
  */
-export const destinationOf = (
-  kind: AgentSessionKind,
-): "importer" | "goal" | null =>
-  kind === "importer" ? "importer" : kind === "goal" ? "goal" : null;
+export const placeOfSession = (
+  session: Pick<AgentSessionView, "kind" | "sessionId" | "subjectId">,
+  targetId: string,
+): Place | null => {
+  switch (session.kind) {
+    case "importer":
+      return { kind: "chat", targetId, sessionId: session.sessionId };
+    case "goal":
+      return { kind: "goal", targetId, goalId: session.subjectId };
+    case "worker":
+      return null;
+  }
+};

@@ -22,14 +22,22 @@
    *   a failure to ask, which a retry can change.
    *
    * The server says why in its own `note` rather than this component guessing at a reason.
+   *
+   * ## The attempt is named by whoever mounts this
+   *
+   * `attemptId` is a prop and not a read of `App`, because there are two different ways to
+   * have an attempt worth reading and each belongs to the section that has it. On **Goals**
+   * it is `readableAttemptId`, the one attempt this tab started on this target — the only
+   * handle a browser had on a settled attempt before there were URLs. On **Workers** it is
+   * `transcriptAttemptId`, the attempt a link named: `/t/<targetId>/attempts/<attemptId>`
+   * replays onto that section (`place.ts`, design decision 1), and without this panel there
+   * the link would read a transcript into state that no screen could show. Empty means there
+   * is nothing to ask about and nothing is drawn, which is the usual case on both.
    */
   import Button from "./Button.svelte";
   import type { App } from "../app.svelte";
 
-  let { app }: { app: App } = $props();
-
-  /** The attempt there is something to ask about: the last this tab started here. */
-  let attemptId = $derived(app.readableAttemptId);
+  let { app, attemptId }: { app: App; attemptId: string } = $props();
   /** Whether what is on screen is about that attempt, rather than a previous read. */
   let current = $derived(
     app.transcript !== undefined && app.transcriptAttemptId === attemptId,

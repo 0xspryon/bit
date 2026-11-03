@@ -2845,14 +2845,20 @@ export class App {
   }
 
   /**
-   * Opens the importer on one session, from the Agent sessions list. `false` when it could
-   * not, with {@link agentSessionsNote} saying so.
+   * Opens the importer on one session, by id alone. `false` when it could not, with
+   * {@link agentSessionsNote} saying so.
    *
-   * **In-memory navigation, and a stopgap**: see `AgentSessions.svelte` on the deep link this
-   * stands in for. `openImporter(sessionId)` selects a session only if the importer's own
-   * index already holds it and otherwise opens the page on an empty one, so the index is read
-   * first when it does not hold the session, and the click goes nowhere rather than land on
-   * the wrong thing if it still does not.
+   * **This is what a link to a chat needs**, and the reason it exists rather than the two
+   * calls it looks like. `openImporter(sessionId)` selects a session only if the importer's
+   * own index already holds it, and silently opens the page on a fresh empty one if it does
+   * not — which on a cold load is always, because the index arrives a round trip after the
+   * Assets section is entered. So the index is read first when it does not hold the session,
+   * and a session that is still not there is refused rather than landing on the wrong
+   * conversation.
+   *
+   * Both ways to a chat come through here: the row on the Agent sessions list, which is an
+   * `<a href>` whose click applies the place, and `place.ts`'s replay of that same path on a
+   * cold load. One method, so a link followed in two ways cannot behave two ways.
    */
   async openImporterSession(sessionId: string): Promise<boolean> {
     const targetId = this.viewTargetId;
@@ -2873,12 +2879,14 @@ export class App {
     return true;
   }
 
-  /** Opens a goal's page, where its conversation is. In-memory navigation, as above. */
-  openGoalConversation(goalId: string) {
-    this.agentSessionsNote = "";
-    this.toSection("goals");
-    this.openGoal(goalId);
-  }
+  /*
+   * `openGoalConversation(goalId)` was here: the goal half of the same stopgap, which went
+   * to Goals and opened the goal because a row could not be a link. A goal's conversation is
+   * on its own page and that page has an address — `/t/<targetId>/goals/<goalId>` — so the
+   * row carries it and `applyPlace` is what opens it, by the two calls this method wrapped.
+   * Deleted rather than kept as an alias: a second way to reach a place is a second place for
+   * the two to drift apart.
+   */
 
   closeGoal() {
     this.openGoalId = "";

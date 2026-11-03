@@ -4,9 +4,15 @@
  * `agentSessions.test.ts` (the pure one) owns the sentences; what it cannot see is that the
  * tab is in the rail under Operations, that a row says what the server said and nothing it
  * did not, that a target with none says so instead of drawing an empty frame, that a session
- * on a harness this server no longer runs is *marked rather than dropped*, and that a click
- * goes to the surface's own screen where one exists and nowhere where it does not. Each is
+ * on a harness this server no longer runs is *marked rather than dropped*, and that a row
+ * leads to the surface's own screen where one exists and nowhere where it does not. Each is
  * driven through `Target` the way a person reaches it: open the target, choose the tab.
+ *
+ * Since S3 a row is an `<a href>` rather than a button, which adds two claims only a
+ * rendered row can carry: the href is the path of the place the row leads to — the link an
+ * operator copies — and an ordinary click routes in the app while every modified click is
+ * left to the browser with the href intact. `placeLink.test.ts` holds the rule those last
+ * two follow from; this is the rule applied to a real row.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 
@@ -23,7 +29,7 @@ import {
   ok,
   unreachable,
 } from "../fakeServer";
-import { click, mountInto, settle, type Mounted } from "./dom";
+import { click, clickOn, mountInto, settle, type Mounted } from "./dom";
 
 let mounted: Mounted[] = [];
 afterEach(() => {
@@ -238,8 +244,33 @@ describe("the Agent sessions list", () => {
   });
 });
 
+describe("a row that leads somewhere", () => {
+  test("is a link carrying the path of the place it leads to", async () => {
+    // The row the whole routing design exists for: an operator can read this href out of
+    // the status bar, copy it, and send it to themselves for later review.
+    await openList([IMPORTER, GOAL]);
+    const links = [...document.querySelectorAll<HTMLAnchorElement>("a.row.go")];
+    expect(links.map((each) => each.getAttribute("href"))).toEqual([
+      "/t/acme-corp/assets/chat/ses_import_1",
+      "/t/acme-corp/goals/goal_1",
+    ]);
+  });
+
+  test("a worker row is inert: not a link, and a click changes nothing", async () => {
+    // There is a path for an attempt, and nothing to click it from until Workers lists
+    // attempts. A row that linked there would lead to a section that shows the operator
+    // their own transcript and nothing else.
+    const { app } = await openList([WORKER]);
+    expect(document.querySelector(".rows .row.go")).toBeNull();
+    expect(document.querySelector(".rows a")).toBeNull();
+    click(document.querySelector(".rows .row") as Element);
+    await settle();
+    expect(app.navItem).toBe("agent-sessions");
+  });
+});
+
 describe("clicking a row", () => {
-  test("an importer row opens the importer on that session", async () => {
+  test("an importer row opens the importer on that session, without following the href", async () => {
     const { app, fake } = await openList([IMPORTER]);
     fake.onImporterSessions = () =>
       ok({
@@ -251,11 +282,14 @@ describe("clicking a row", () => {
         ],
       });
 
-    const row = document.querySelector<HTMLButtonElement>(".rows .row.go");
+    const row = document.querySelector<HTMLAnchorElement>("a.row.go");
     expect(row).not.toBeNull();
-    click(row as HTMLButtonElement);
+    const event = clickOn(row as HTMLAnchorElement);
     await settle();
 
+    // `preventDefault` ran, so the browser never navigated: the app is still the app it
+    // was, with the session open in it.
+    expect(event.defaultPrevented).toBe(true);
     expect(app.navItem).toBe("assets");
     expect(app.importerOpen).toBe(true);
     expect(app.importer.current?.id).toBe("ses_import_1");
@@ -264,9 +298,7 @@ describe("clicking a row", () => {
   test("an importer row whose session the importer's own index lacks goes nowhere, and says so", async () => {
     const { app } = await openList([IMPORTER]);
     // The importer index answers empty (the fake's default).
-    click(
-      document.querySelector<HTMLButtonElement>(".rows .row.go") as Element,
-    );
+    clickOn(document.querySelector("a.row.go") as Element);
     await settle();
 
     expect(app.importerOpen).toBe(false);
@@ -276,20 +308,66 @@ describe("clicking a row", () => {
 
   test("a goal row opens the goal", async () => {
     const { app } = await openList([GOAL]);
-    click(
-      document.querySelector<HTMLButtonElement>(".rows .row.go") as Element,
-    );
+    clickOn(document.querySelector("a.row.go") as Element);
     await settle();
 
     expect(app.navItem).toBe("goals");
     expect(app.openGoalId).toBe("goal_1");
   });
 
-  test("a worker row is inert: it is not a button, and a click changes nothing", async () => {
-    const { app } = await openList([WORKER]);
-    expect(document.querySelector(".rows .row.go")).toBeNull();
-    click(document.querySelector(".rows .row") as Element);
+  test("and following another row retires a refusal the last one left", async () => {
+    const { app } = await openList([IMPORTER, GOAL]);
+    const links = [...document.querySelectorAll<HTMLAnchorElement>("a.row.go")];
+    // The chat row first, whose session the index does not list: it refuses, on screen.
+    clickOn(links[0] as HTMLAnchorElement);
     await settle();
-    expect(app.navItem).toBe("agent-sessions");
+    expect(text()).toContain("no longer in the importer's own list");
+
+    // Then the goal row. The refusal was about the row before it, not about the list.
+    clickOn(links[1] as HTMLAnchorElement);
+    await settle();
+    expect(app.agentSessionsNote).toBe("");
+  });
+});
+
+describe("a modified click on a row", () => {
+  /*
+   * The half that makes a row worth being a link. Ctrl, Cmd, Shift and Alt are the
+   * browser's own vocabulary for "open this somewhere else", and an app that calls
+   * `preventDefault` on every click swallows all four: the operator asks for a second tab
+   * and gets nothing, with no error to explain it.
+   *
+   * What is asserted is what this app does — nothing. The event is left unprevented and no
+   * state moves, so the href stands and the browser is free to act on it. The new tab
+   * itself is the browser's, and happy-dom does not open one.
+   */
+  test("ctrl or cmd is left to the browser, and the app does not move", async () => {
+    const { app } = await openList([IMPORTER]);
+    const row = document.querySelector("a.row.go") as Element;
+
+    for (const modifier of [{ ctrlKey: true }, { metaKey: true }]) {
+      const event = clickOn(row, modifier);
+      await settle();
+      expect(event.defaultPrevented).toBe(false);
+      expect(app.navItem).toBe("agent-sessions");
+      expect(app.importerOpen).toBe(false);
+    }
+  });
+
+  test("so are shift and alt, and a middle button", async () => {
+    const { app } = await openList([GOAL]);
+    const row = document.querySelector("a.row.go") as Element;
+
+    for (const modifier of [
+      { shiftKey: true },
+      { altKey: true },
+      { button: 1 },
+    ]) {
+      const event = clickOn(row, modifier);
+      await settle();
+      expect(event.defaultPrevented).toBe(false);
+      expect(app.openGoalId).toBe("");
+      expect(app.navItem).toBe("agent-sessions");
+    }
   });
 });
