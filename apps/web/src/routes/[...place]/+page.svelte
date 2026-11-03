@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * Flow A shell.
+   * Flow A shell, on the route that answers every path.
    *
    * The three screens from `docs/design/flow-a-getting-in.md`, against the real control
    * plane: Connect exchanges the server password for a session, the target rail reads
@@ -9,29 +9,46 @@
    * conditions that cause them.
    *
    * **It also owns the URL**, which is the one piece of state that is not in `App`. The
-   * open target is reflected into `?target=<id>` and read back out of it on load, so a
-   * link to a target opens that target — and so does a reload, which is the same thing
+   * place on screen — which target, which section, which record, in the grammar of
+   * `lib/place.ts` — is reflected into the path, and the path is read back at mount, so a
+   * link to a resource opens that resource and so does a reload, which is the same thing
    * from the operator's side. It stays in this file because `$app/navigation` is
    * SvelteKit's, and `App` is a plain class that a test or a second shell can construct
-   * without a router.
+   * without a router. `App` does not see the grammar either: the only thing it holds for
+   * the URL's sake is an opaque path string, and `App.requestedPath` says why.
+   *
+   * **Why a catch-all, `[...place]`.** A path has to resolve in development as well as in
+   * the build: the `adapter-static` fallback covers the built app only, and SvelteKit's
+   * dev server still routes from files, so `/t/acme-corp` answered 404 before this
+   * directory existed. It is needed for the reflection below too, not only for a cold
+   * load — a shallow `goto` resolves its intent against the route table like any other,
+   * so a path with no route would be refused on the way out as well as on the way in.
+   *
+   * One catch-all, and nothing beside it: a rest parameter matches zero segments, so this
+   * file answers `/` as well. A `+page.svelte` left at the root would have claimed `/`
+   * ahead of it and the app would mount through one of two routes depending on the URL it
+   * was opened with — two nodes rendering one shell, for no gain, since the shell reads
+   * the URL from `location` and never from `params`. The parameter is named for what it
+   * carries and is never read.
    */
+  import { untrack } from "svelte";
+
   import { goto } from "$app/navigation";
 
-  import ScenarioBar from "../lib/components/ScenarioBar.svelte";
-  import TitleBar from "../lib/components/TitleBar.svelte";
-  import Connect from "../lib/screens/Connect.svelte";
-  import NewTarget from "../lib/screens/NewTarget.svelte";
-  import Target from "../lib/screens/Target.svelte";
-  import Welcome from "../lib/screens/Welcome.svelte";
-  import { App } from "../lib/app.svelte";
+  import ScenarioBar from "../../lib/components/ScenarioBar.svelte";
+  import TitleBar from "../../lib/components/TitleBar.svelte";
+  import Connect from "../../lib/screens/Connect.svelte";
+  import NewTarget from "../../lib/screens/NewTarget.svelte";
+  import Target from "../../lib/screens/Target.svelte";
+  import Welcome from "../../lib/screens/Welcome.svelte";
+  import { App } from "../../lib/app.svelte";
+  import { placeArrivedAt } from "../../lib/arrival";
+  import { applyPlace, parsePath, pathOf, placeOf } from "../../lib/place";
 
   const app = new App();
 
-  /** The query parameter a deep link to a target carries. */
-  const TARGET_PARAM = "target";
-
   /**
-   * One attempt to resume a session a reload left behind, and the target the URL asked
+   * One attempt to resume a session a reload left behind, and the place the URL asked
    * for.
    *
    * `$effect` with no reactive reads, so it runs once after mount and never again. It
@@ -40,39 +57,81 @@
    * without asking. Until it answers the Connect screen is what is shown, which is the
    * correct thing to show when the app does not yet know whether it is signed in.
    *
-   * The requested target is read *before* `restore()` and acted on by it: a deep link may
-   * well arrive with no session at all, in which case it waits behind the Connect screen
-   * and opens once there is one. `location` rather than `page.url` because this runs once
-   * at mount and the answer wanted is the URL the tab was opened with.
+   * The place is read *before* `restore()` and released by it: a deep link may well
+   * arrive with no session at all, in which case it waits behind the Connect screen and
+   * is replayed below once there is one. `location` rather than `page.url` because this
+   * runs once at mount and the answer wanted is the URL the tab was opened with.
+   *
+   * What is held is `pathOf` of the place, not the text that arrived, and that is where an
+   * old `?target=<id>` bookmark is translated — once, here, by `placeArrivedAt`. Past this
+   * line the app knows one spelling of a place, and the reflection below writes it into
+   * the address bar. The target list is not held: there is nothing for a link to the root
+   * to restore, and holding it would suppress the reflection for ever.
    */
   $effect(() => {
-    const requested = new URLSearchParams(location.search).get(TARGET_PARAM);
-    if (requested !== null && requested !== "") app.requestTarget(requested);
+    const place = placeArrivedAt(location.pathname, location.search);
+    if (place.kind !== "targets") {
+      app.requestPlace(place.targetId, pathOf(place));
+    }
     void app.restore();
   });
 
   /**
-   * The open target, reflected into the URL.
+   * The held place, replayed at the moment `App` says it can be.
+   *
+   * `App` carries the path across Connect and releases it once the target list is in
+   * hand, by either way in — a fresh sign-in or a resumed session — because a link should
+   * land in the same place either way. This is the half that knows what the path says.
+   * Taking it empties it, so a place is replayed once and not on every later change.
+   *
+   * `untrack` around the replay, because `applyPlace` reads much of the state it then
+   * writes — `screen`, `viewTargetId` — and tracking those would re-run this effect on
+   * every screen change for nothing. The read that must stay tracked is the one in
+   * `takeReplayPath`, which is what wakes it.
+   *
+   * Declared before the reflection so that within one flush the place lands before the
+   * URL is written. The other order would reflect the target list first and the place
+   * second, replacing an address bar nobody had read yet.
+   */
+  $effect(() => {
+    const path = app.takeReplayPath();
+    if (path === "") return;
+    untrack(() => {
+      applyPlace(app, parsePath(path));
+    });
+  });
+
+  /**
+   * The place on screen, reflected into the path.
    *
    * One direction only: state is the source of truth and the URL follows it. Reading the
    * URL back on every change would mean two writers for one fact and a race between them
-   * on every click; the URL is read once, at mount, above.
+   * on every click; the URL is read at discrete moments only — at mount, above, and on
+   * `popstate` when S4 adds it.
    *
-   * `shallow: true` so this updates the address bar without running a navigation —
-   * there is one route and nothing to load — and `replace: true` so opening three targets
-   * does not leave three history entries on the way back out. The `catch` is not
-   * decoration: a rejected navigation must not take the screen down with it, and an
-   * address bar that lags is a far smaller problem than an app that crashes on it.
+   * **Nothing is written while a place is held.** Connect is a gate rather than a place,
+   * so `placeOf` reads the target list while it is up, and writing that would throw away
+   * the link the tab was opened with: a reload on the Connect screen would then land on
+   * the list instead of on the bookmark. The suppression lifts when `App` releases the
+   * place, which is the same moment there is something true to write.
+   *
+   * `shallow: true` so this updates the address bar without running a navigation — there
+   * is one route and nothing to load — and `replace: true` so opening three targets does
+   * not leave three history entries on the way back out. S4 owns the push-or-replace
+   * distinction that makes Back walk through places; until then every change replaces.
+   * The `catch` is not decoration: a rejected navigation must not take the screen down
+   * with it, and an address bar that lags is a far smaller problem than an app that
+   * crashes on it.
    */
   $effect(() => {
-    const open = app.screen === "target" ? app.selectedId : "";
-    const url = new URL(location.href);
-    if (open === "") url.searchParams.delete(TARGET_PARAM);
-    else url.searchParams.set(TARGET_PARAM, open);
-    if (url.href === location.href) return;
+    if (app.requestedPath !== "" || app.replayPath !== "") return;
+    const url = new URL(pathOf(placeOf(app)), location.href);
+    if (url.pathname === location.pathname && url.search === location.search) {
+      return;
+    }
     void goto(url, { shallow: true, replace: true, state: {} }).catch(
       (cause: unknown) => {
-        console.warn("could not reflect the open target into the URL", cause);
+        console.warn("could not reflect the place into the URL", cause);
       },
     );
   });

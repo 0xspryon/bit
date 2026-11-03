@@ -324,9 +324,9 @@ export type TargetCounts = typeof TargetCounts.Type;
  * One opened target: the row the rail already had, plus what its own file holds.
  *
  * The summary is repeated rather than referenced so a deep link works on a cold start.
- * Opening `?target=<id>` in a fresh tab has no rail to read a name and a scope note out
- * of, and a header that waited for the list before it could render would show an empty
- * frame first. One request answers the whole header.
+ * Opening `/t/<id>` in a fresh tab has no rail to read a name and a scope note out of, and
+ * a header that waited for the list before it could render would show an empty frame
+ * first. One request answers the whole header.
  */
 export const TargetView = Schema.Struct({
   target: TargetSummary,

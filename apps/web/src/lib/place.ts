@@ -164,8 +164,9 @@ const TARGETS: Place = { kind: "targets" };
  * Reads the place out of the state.
  *
  * Only ever reads. The URL follows the state and never the other way about, which is the
- * discipline `+page.svelte` already keeps for `?target=` and the reason it gives: two
- * writers for one fact race each other on every click.
+ * discipline the route keeps — `routes/[...place]/+page.svelte`, where this function is
+ * what the address bar is written from — and the reason it gives: two writers for one fact
+ * race each other on every click.
  *
  * Connect, the target rail and the New target page are all the target list here. Connect is
  * a gate rather than a place — it is what is shown while the app does not yet know whether

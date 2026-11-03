@@ -370,14 +370,41 @@ export class App {
   /** The server's own words for a refusal, shown instead of the counts. */
   viewDetail = $state("");
   /**
-   * A target named in the URL that could not be opened yet.
+   * The target named by a URL that could not be opened yet.
    *
-   * A deep link arrives before there is a session, so the id is parked here and acted on
-   * once the target list is in hand. Cleared whether or not it resolves — a link to a
-   * target that no longer exists should leave the operator on the list, once, rather than
-   * re-asking on every refresh of it.
+   * A deep link arrives before there is a session, so the place it names is parked here
+   * and acted on once the target list is in hand. Cleared whether or not it resolves — a
+   * link to a target that no longer exists should leave the operator on the list, once,
+   * rather than re-asking on every refresh of it.
+   *
+   * This is the only part of the held place `App` reads, because it is the only part `App`
+   * can judge: whether this server has such a target. See {@link requestedPath}.
    */
   requestedTargetId = $state("");
+  /**
+   * The rest of that held place, as the path it arrived as.
+   *
+   * A path and not a `Place`, because `place.ts` imports `App` — so `App` importing
+   * `place.ts` back would be a runtime cycle between the state and its own grammar. The
+   * string is opaque here: `App` holds it across the Connect screen and hands it back
+   * through {@link replayPath}, and the route, which owns the grammar, is what reads it.
+   *
+   * Holding the whole place rather than the target alone is what makes a link opened
+   * before there is a session land where it pointed. The browser session registry is in
+   * memory, so a server restart invalidates it and a bookmark opened the next morning is
+   * the common case, not an edge one: `/t/x/assets/scope` has to arrive at Scope after
+   * Connect, not merely at the target's Goals page.
+   */
+  requestedPath = $state("");
+  /**
+   * The held path, released at the one moment it can be replayed, or `""`.
+   *
+   * The handshake that keeps the grammar out of `App`. `App` knows *when* a held link can
+   * be opened — the list has arrived, by whichever way in — and nothing about *what* the
+   * link says; the route knows the grammar and cannot see the moment. So this field is
+   * `App` saying "now", and {@link takeReplayPath} is the route taking the answer.
+   */
+  replayPath = $state("");
   /**
    * Whether the target's rail is put away.
    *
@@ -1735,7 +1762,7 @@ export class App {
       // Once per session, with the target list: the harness configuration does not move
       // while a server runs, and the composer on every open target reads the same answer.
       await this.loadHarnesses();
-      this.openRequested();
+      this.releaseRequestedPlace();
     } finally {
       this.connecting = false;
     }
@@ -1765,9 +1792,9 @@ export class App {
       this.screen = "welcome";
       await this.loadTargets();
       await this.loadHarnesses();
-      // A deep link resumes into the target it named, which is the whole point of the
-      // URL carrying one: reloading the tab must not drop you back on the list.
-      this.openRequested();
+      // A deep link resumes into the place it named, which is the whole point of the URL
+      // carrying one: reloading the tab must not drop you back on the list.
+      this.releaseRequestedPlace();
       return;
     }
     if (call._tag === "Refused") {
@@ -2010,26 +2037,56 @@ export class App {
     this.goalsState = "ready";
   }
 
-  /** Remembers a target named in the URL, to open once there is a session. */
-  requestTarget(id: string) {
-    this.requestedTargetId = id;
+  /**
+   * Remembers the place a URL asked for, to land on once there is a session.
+   *
+   * Two strings, split along what `App` can read: `targetId` is the part it can check
+   * against the registry, `path` is text it only carries. See {@link requestedPath} for
+   * why the place does not arrive here parsed.
+   */
+  requestPlace(targetId: string, path: string) {
+    this.requestedTargetId = targetId;
+    this.requestedPath = path;
   }
 
   /**
-   * Opens the target a URL asked for, if it is one this server has.
+   * Releases the place a URL asked for, if its target is one this server has.
    *
    * Called after the list is loaded, by both ways in — a fresh sign-in and a resumed
-   * session — because a link should land in the same place either way. An id the registry
-   * does not hold is dropped silently *here* and reported by the route if the operator
-   * tries again: the list is already on screen, and it is the honest answer to "that
-   * target is not on this server".
+   * session — because a link should land in the same place either way.
+   *
+   * A target the registry does not hold is dropped silently *here*, before anything is
+   * opened: the list is already on screen, and it is the honest answer to "that target is
+   * not on this server". The check is in `App` rather than in the route because it is the
+   * one question about a held link that `App` is the authority on. Design D5 will give the
+   * refusal a sentence on the surface the arrival can see; S5 owns that, and this stays
+   * the place that knows the answer.
+   *
+   * The release happens whether or not anything is listening. A second shell, or a test,
+   * can hold a place, reach this moment and simply never replay it — no screen moves and
+   * nothing is left pending, which is the correct behaviour for a harness with no router.
    */
-  openRequested() {
+  releaseRequestedPlace() {
     const id = this.requestedTargetId;
+    const path = this.requestedPath;
     this.requestedTargetId = "";
-    if (id === "") return;
+    this.requestedPath = "";
+    if (id === "" || path === "") return;
     if (!this.targets.some((target) => target.id === id)) return;
-    this.openTarget(id);
+    this.replayPath = path;
+  }
+
+  /**
+   * Takes the released path, and leaves nothing behind.
+   *
+   * Once, because a place is replayed once. The route reads this from an effect, and an
+   * effect re-runs: a path that stayed put would replay the link again the next time
+   * anything that effect reads moved, pulling the operator back to a page they had left.
+   */
+  takeReplayPath(): string {
+    const path = this.replayPath;
+    this.replayPath = "";
+    return path;
   }
 
   toSettings() {
@@ -5343,6 +5400,8 @@ export class App {
     this.viewState = "empty";
     this.viewDetail = "";
     this.requestedTargetId = "";
+    this.requestedPath = "";
+    this.replayPath = "";
     this.runs = [];
     this.runIntentId = "";
     this.runFallback = null;

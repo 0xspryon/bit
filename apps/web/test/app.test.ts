@@ -2281,70 +2281,118 @@ describe("reading a transcript leaves the running list alone", () => {
   });
 });
 
-/* ── Deep links ──────────────────────────────────────────────────────────────── */
+/* ── Deep links ──────────────────────────────────────────────── */
 
 /**
- * `?target=<id>` is read out of the URL by the route and handed here as
- * {@link App.requestTarget}; what the route does with the URL afterwards is the route's,
- * and is not asserted below because that needs a DOM. What *is* here is the half that
- * decides whether the link works: the id is parked until there is a session, acted on
- * once the rail is in hand, and cleared either way.
+ * The half of a deep link `App` owns: a place it cannot read, held across the Connect
+ * screen and released at the one moment it can be opened.
+ *
+ * It is held as text because the grammar that reads a path imports `App` itself
+ * (`lib/place.ts`), and a runtime cycle between the state and its own grammar is not worth
+ * a typed field — see {@link App.requestedPath}. So `App` knows *when* a held link can be
+ * opened and nothing about *what* it says, and these tests assert exactly that much: held,
+ * released once by either way in, dropped for a target this server does not have, cleared
+ * either way. Where a link lands is the route's half, and `deepLink.test.ts` puts the two
+ * together the way the route does.
  */
 describe("deep links", () => {
-  test("a link to a target opens that target once there is a session", async () => {
+  test("a place is held across Connect and released once there is a session", async () => {
     const { app, fake } = open();
     fake.onTargets = () =>
       ok([
         targetSummary({ id: "acme-corp" }),
         targetSummary({ id: "scratch" }),
       ]);
-    fake.onTarget = (_baseUrl, targetId) =>
-      ok(targetView(targetSummary({ id: targetId, name: targetId })));
 
     // Arrives before there is a session, which is the case that matters.
-    app.requestTarget("scratch");
+    app.requestPlace("scratch", "/t/scratch/assets/scope");
     expect(app.screen).toBe("connect");
+    expect(app.replayPath).toBe("");
 
     await signIn(app);
     await settle();
 
-    expect(app.screen).toBe("target");
-    expect(app.viewTargetId).toBe("scratch");
-    expect(app.selectedId).toBe("scratch");
-    expect(app.viewState).toBe("ready");
+    expect(app.replayPath).toBe("/t/scratch/assets/scope");
     expect(app.requestedTargetId).toBe("");
+    expect(app.requestedPath).toBe("");
+    /*
+     * Nothing has been opened here, not even the target. A path names a whole place and
+     * only the route can read one, so opening the target eagerly would land the operator
+     * on Goals and then move them — two screens for one link. The target waits with the
+     * rest of it.
+     */
+    expect(app.screen).toBe("welcome");
+    expect(app.viewTargetId).toBe("");
+    expect(fake.countOf("target")).toBe(0);
   });
 
-  test("a link resumed from a reload opens the same target", async () => {
+  test("a place held through a reload is released by the resume", async () => {
+    // The second way in. A link should land in the same place whether the session was
+    // opened by hand or resumed, and the browser session registry is in memory — so the
+    // morning after a server restart is the common case, not the odd one.
     const { app, fake } = open();
     fake.stored = "token-from-a-reload";
     fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
 
-    app.requestTarget("acme-corp");
+    app.requestPlace("acme-corp", "/t/acme-corp/findings");
     await app.restore();
     await settle();
 
-    expect(app.screen).toBe("target");
-    expect(app.viewTargetId).toBe("acme-corp");
+    expect(app.replayPath).toBe("/t/acme-corp/findings");
   });
 
   /**
    * Dropped here and not retried. The list is already on screen and is the honest answer
    * to "that target is not on this server"; re-asking on every refresh would be the link
    * following the operator around.
+   *
+   * The check is `App`'s because the registry is, and it is the one question about a held
+   * path that `App` can answer without reading it. Design D5 owes this a sentence the
+   * operator can see, which is S5's.
    */
-  test("a link to a target this server does not have lands on the list", async () => {
+  test("a link to a target this server does not have is dropped on the list", async () => {
     const { app, fake } = open();
     fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
 
-    app.requestTarget("a-target-from-another-server");
+    app.requestPlace(
+      "a-target-from-another-server",
+      "/t/a-target-from-another-server/goals/goal_1",
+    );
     await signIn(app);
 
     expect(app.screen).toBe("welcome");
     expect(app.viewTargetId).toBe("");
-    // Cleared, so the next `openRequested()` does not try it again.
+    expect(app.replayPath).toBe("");
+    // Cleared, so the next way in does not try it again.
     expect(app.requestedTargetId).toBe("");
+    expect(app.requestedPath).toBe("");
     expect(fake.countOf("target")).toBe(0);
+  });
+
+  test("a released place is taken once", async () => {
+    // The route reads it from an effect, and an effect re-runs. A path that stayed put
+    // would replay the link again later and pull the operator back to a page they had
+    // left.
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+
+    app.requestPlace("acme-corp", "/t/acme-corp");
+    await signIn(app);
+
+    expect(app.takeReplayPath()).toBe("/t/acme-corp");
+    expect(app.takeReplayPath()).toBe("");
+    expect(app.replayPath).toBe("");
+  });
+
+  test("a scenario reset drops a held place", () => {
+    // `reset()` is the picker's way back to a fresh load, and a link the last visit was
+    // holding would otherwise fire during the next one.
+    const { app } = open();
+    app.requestPlace("acme-corp", "/t/acme-corp/assets/scope");
+    app.reset();
+    expect(app.requestedTargetId).toBe("");
+    expect(app.requestedPath).toBe("");
+    expect(app.replayPath).toBe("");
   });
 });
 
