@@ -143,7 +143,13 @@ with entries, **Auto-load…** moves into the Scope tab header.
 **U2 — D2 new session (S), F1 → U2.** Heading, lead, composer, and the two suggestion chips
 as pre-written first messages. Composer chips read "Importer on <model>".
 
-**U3 — D6 harness modal wording and in-session switching (S), F4 → U3.** Footer: "This
+**U3 — D6 harness modal wording and in-session switching (S), F4 → U3.** From F4's review: a message
+already running finishes on the old model — `applied: "live"` means _from the next model
+call_, so word the confirmation that way (measured: a turn sent before the switch still
+answered on the old model). A message sent behind an in-flight switch can wait up to ~90 s
+in the worst case (successor open, then `setModel`, context-limit read and
+`applyFlagSettings`, each bounded by the control timeout) — show that it is waiting.
+Refusals are `ConversationModelRefused` (409, with a sentence) → the F2 `ErrorDialog`. Footer: "This
 session stays on <harness> — picking another harness opens a new one. Models and reasoning
 inside it can change at any time, including mid-run." Choosing a model in an open session
 calls F4; choosing another harness opens a new session.
