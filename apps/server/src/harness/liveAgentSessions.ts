@@ -697,6 +697,16 @@ export const makeLiveAgentSessions = <Meta>(
         }),
       );
 
+    /*
+     * V2(chat): follow-ups are queued *in the harness*, not here. Each one goes straight to
+     * the session as a `queued` steer (OpenCode `delivery: "queue"`, Claude Code
+     * `priority: "later"`), so once sent it cannot be edited, cancelled or reordered; a
+     * Claude Code message queued but not yet run lives in this process's input stream and is
+     * lost if bit restarts (OpenCode keeps its queue in its own database); and what an
+     * interrupt does to messages still in either harness's queue is unmeasured. Proper V2:
+     * an app-owned queue (T3's model) that the operator can edit, cancel and reorder, that
+     * survives a restart, and from which a message can be promoted to an immediate steer.
+     */
     const deliver: LiveAgentSessions<Meta>["deliver"] = (entry, prompt) =>
       Effect.gen(function* () {
         const accepted = yield* Effect.result(

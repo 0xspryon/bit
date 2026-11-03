@@ -1540,6 +1540,14 @@ export class ScopeImporter extends Context.Service<
               // The same harness and model the earlier session ran on, so the conversation
               // does not quietly change models under the operator. A row from before
               // instances were recorded has nothing to pin, and D15's rule applies.
+              //
+              // V2(chat): the row holds only the session's *current* model and options.
+              // V1 model switching (within the pinned harness) overwrites them in place and
+              // records no history of when a switch happened, so a reload knows the model a
+              // session ended on and nothing about the turns before. Proper V2: an
+              // append-only switch log keyed by session, so the transcript can mark each
+              // switch, plus cross-harness handoff that carries the graph, the agent
+              // definition and a summary of the conversation into a new harness session.
               ...(row.harnessInstanceId === null
                 ? {}
                 : {

@@ -301,6 +301,13 @@ const OPENCODE_RESERVE_MIN = 16_000;
  * Exported for its test, which is the honest reason: the two constants above and the
  * `input`-before-`context` precedence are exactly what an `opencode` upgrade breaks
  * silently, and a direct test is what notices.
+ *
+ * V2(chat): compaction is left to each harness's own automatic default. Both compact by
+ * default and bit disables neither, but nothing detects a configuration that turns it off
+ * (an `opencode.json` in an ancestor directory, the user's Claude Code settings), and
+ * nothing warns when a model switch lands on a model whose window the current context
+ * will not fit. Proper V2: read the effective compaction policy per session, and warn —
+ * or refuse — a switch to a smaller window before it is made.
  */
 export const openCodeCompactionAt = (
   limit: OpenCodeModelLimit,

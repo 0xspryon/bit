@@ -1250,6 +1250,16 @@ export const claudeCodeHarness = (
                    * conversation as two rows again. `resumeSessionAt` truncates a resume to
                    * a chosen point, which is a rewind and is nobody's intent here.
                    *
+                   * V2(chat): rewinding a conversation to an earlier message is not offered.
+                   * Both harnesses could: `resumeSessionAt` here (same session id, a new
+                   * branch in the transcript) and OpenCode's `session.revert.stage`/`commit`.
+                   * What neither undoes is what the agent wrote into bit through MCP after
+                   * that message, so a rewind would leave the agent believing it had not
+                   * written entries the Scope tab still shows. Proper V2: tie each MCP write
+                   * to the turn that made it, then rewind conversation and writes together
+                   * (or tell the agent what survived), as an in-place rewind so the session
+                   * keeps one id and one row.
+                   *
                    * **A resume cannot raise a dialog on this transport**, which is worth
                    * stating because the dialog is the caveat S2.5 carries. The CLI emits a
                    * `request_user_dialog` only for a `dialog_kind` the client declared in
