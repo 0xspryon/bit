@@ -491,7 +491,12 @@ interface SessionRecord {
    * `prompt` rather than on this field: a review found a `yield* Deferred.isDone(...)`
    * between the read and the `accepted += 1`, which is a fiber suspension point and left
    * the window open. `prompt` now uses `Deferred.isDoneUnsafe` and carries the reasoning at
-   * the line. Nothing but those two places touches this.
+   * the line.
+   *
+   * Written by the pump only: when it decides a single-turn session is done, before its
+   * `break`, and on every exit from its `for await`, before it completes {@link ended}.
+   * Read by `prompt`, to refuse a steer, and by `switchModel`'s `gone()`, to answer a
+   * switch that lost its query as not found rather than uncertain.
    */
   settling: boolean;
   /** The application message ids this session has accepted, so a retry delivers once. */
@@ -1641,9 +1646,9 @@ export const claudeCodeHarness = (
          * ending marks the record first and closes the query after, but a stream that
          * fails, or ends because the CLI exited, is closed by the SDK, which rejects the
          * pending requests before the pump sees the stream end: this fiber wakes while the
-         * pump has not yet set `settling`. So a failed request waits, up to `STREAM_END_GRACE`, for the pump
-         * to say the stream ended before `gone()` is read. A timeout does not wait; see
-         * `STREAM_END_GRACE`.
+         * pump has not yet set `settling`. So a failed request waits, up to
+         * `STREAM_END_GRACE`, for the pump to say the stream ended before `gone()` is read.
+         * A timeout does not wait; see `STREAM_END_GRACE`.
          */
         const send = (
           operation: string,
