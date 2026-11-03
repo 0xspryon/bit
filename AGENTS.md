@@ -56,6 +56,16 @@
   repository statement and every migration path has to be executed against a real
   file. Run build, lint, and format checks before handing off changes.
   `sprint-roadmap.html` fails `format:check` already; leave it alone.
+- Run every test command under a 1 GB memory limit, as
+  `systemd-run --user --scope -q -p MemoryMax=1G -p MemorySwapMax=0 timeout 900 <command>`
+  (e.g. `… bun run test`). The operator's machine has little memory to spare, and a test
+  that runs away takes the machine and every agent on it down; under the limit only that
+  test process dies. The whole of `bun run test` fits (measured peak: server suite 386 MB,
+  web DOM suite 294 MB), so a run killed at 1 GB is a bug to investigate, not a reason to
+  raise the limit. A failing assertion on happy-dom nodes is the known cause: never
+  `toEqual` a node or an array of nodes — compare strings (`outerHTML`, `textContent`).
+  When a test mutates a file to prove it can fail, copy the file first and restore from
+  the copy; a killed run never reaches a cleanup step after it.
 - When in doubt about how to implement a functionality or how EffectV4 works, look
   the EffectV4, OpenCode/ T3Code better-agent repositories and gain inspiration
   from that about how how such a functionality should be implemented.
