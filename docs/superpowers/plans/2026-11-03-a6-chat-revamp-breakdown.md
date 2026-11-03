@@ -72,7 +72,7 @@ the switch until idle and says so. Known already (OpenCode source, read by an ea
 thread): `switchModel` takes effect at the next step boundary, the new model is sent the
 full stored history, reasoning from a different model is dropped on Anthropic and OpenAI
 Responses providers, and a smaller window can fire OpenCode's auto-compaction on the next
-step. T3 applies every in-session switch on the *next turn*, never mid-turn, so Claude Code
+step. T3 applies every in-session switch on the _next turn_, never mid-turn, so Claude Code
 mid-turn behaviour is genuinely unmeasured.
 
 **F4 — Model switch for a running conversation (M), F3 → F4.** An endpoint for importer
@@ -165,7 +165,7 @@ their own block within the 800 px measure.
 Shiki to the Oniguruma WASM engine because the JS regex engine can hang.
 
 **U12 — D8 flow figures (S), U10 → U12. Decided: T3's approach.** Agents write
-```` ```mermaid ```` fences, rendered with **`pele`** (T3 `^1.8.0`; OpenCode pins `1.7.0`),
+` ```mermaid ` fences, rendered with **`pele`** (T3 `^1.8.0`; OpenCode pins `1.7.0`),
 not mermaid.js. The fence leaves the sanitised markdown pipeline as plain code; a Svelte
 component for `language-mermaid` draws it client-side. Lazy `import("pele/lazy")`, cached,
 with per-diagram-type loads (T3 `apps/web/src/components/chat/MermaidDiagram.tsx:11-42`).
