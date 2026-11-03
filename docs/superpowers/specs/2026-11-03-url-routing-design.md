@@ -5,8 +5,8 @@
 
 ## What this is for
 
-One sentence, the operator's: *"I want to bookmark and share deeplinks with myself for
-later review."* The example given is the one that stings today — there is no way to link
+One sentence, the operator's: _"I want to bookmark and share deeplinks with myself for
+later review."_ The example given is the one that stings today — there is no way to link
 to a specific AI asset chat. The comparison offered is Gmail: a resource id in the
 address bar of a single-page app.
 
@@ -26,28 +26,39 @@ has to be undone to get path URLs.
 
 **The pattern already exists, for exactly one resource.** `+page.svelte:30-78` reflects the
 open target into `?target=<id>` and reads it back at mount. It is one-way on purpose, and
-the comment says why: *"state is the source of truth and the URL follows it. Reading the
+the comment says why: _"state is the source of truth and the URL follows it. Reading the
 URL back on every change would mean two writers for one fact and a race between them on
-every click."* It also already handles the hard case — a deep link arriving with no
+every click."_ It also already handles the hard case — a deep link arriving with no
 session waits behind Connect and opens once there is one. This work generalises that; it
 does not replace it.
 
-**`App` is already shaped for replay.** Every way into a resource is a method that takes
-an id and loads everything from it: `openTarget(id)`, `toSection(id)`,
-`toAssetsTab(tab)`, `openGoal(goalId)`, `openImporter(sessionId?)`,
-`loadTranscript(targetId, attemptId)`. A route handler does not need new data loading. It
-needs to call the methods that are there, outermost first. `openTarget` resets `navItem`
-to `"goals"`, so the order is not incidental.
+**`App` is already shaped for replay** — with one exception, found during S1 and
+corrected here. Every way into a resource is a method that takes an id and loads from it:
+`openTarget(id)`, `toSection(id)`, `toAssetsTab(tab)`, `openGoal(goalId)`,
+`loadTranscript(targetId, attemptId)`. A route handler calls the methods that are there,
+outermost first; `openTarget` resets `navItem` to `"goals"`, so the order is not
+incidental.
+
+The exception is the chat, which is the row this whole document exists for.
+`openImporter(sessionId)` delegates to `ImporterSessions.open`, which **silently does
+nothing** for an id the index does not already hold — and on a cold load the index arrives
+a round trip after the Assets section is entered, so the requested id is simply lost and
+the page opens on an empty session. The remedy is not new machinery:
+`App.openImporterSession(sessionId)` already reads the index, re-checks, reports a session
+that is gone, and opens the one that is there. Its own comment calls it _"a stopgap: see
+`AgentSessions.svelte` on the deep link this stands in for"_, and `AgentSessions.svelte`
+says _"The destination of a row is a deep link, and this build cannot make one."_ Two
+comments in the codebase were already waiting for this work. Replay uses that method.
 
 **Paths 404 in development.** `curl /t/acme-corp` returns 404 against `bun run dev`. The
-static fallback applies to the *built* app; SvelteKit's dev server still routes from
+static fallback applies to the _built_ app; SvelteKit's dev server still routes from
 files. Path URLs therefore need a route file, which is the one piece of new plumbing here.
 
 ## The constraint to protect
 
-`+page.svelte` says it keeps the URL out of `App` because *"`$app/navigation` is
+`+page.svelte` says it keeps the URL out of `App` because _"`$app/navigation` is
 SvelteKit's, and `App` is a plain class that a test or a second shell can construct
-without a router."* That property is load-bearing: 455 web tests and 84 DOM tests mount
+without a router."_ That property is load-bearing: 455 web tests and 84 DOM tests mount
 screens against a bare `new App()`. Nothing in this design may put a SvelteKit import
 inside `App` or require a router to construct one.
 
@@ -63,7 +74,7 @@ distinction this design draws:
 - **View** — how you have arranged your look at it. Filters, search text, which picker is
   open, scroll offset, whether the live dock is expanded. Stays out.
 
-The test is the operator's own words: *for later review*. A link is worth saving when it
+The test is the operator's own words: _for later review_. A link is worth saving when it
 names a thing you will come back and read.
 
 The line is not absolute, and the operator moved it: **the estate filter is in** (decision
@@ -141,13 +152,21 @@ through them. Toggling a picker leaves none, because it is not in the URL at all
 
 A bookmark outlives the thing it names: a goal gets ended, a target gets removed, an
 importer session falls out of the harness. `openRequested()` today drops an unknown target
-*silently*, which is defensible for a stale tab and wrong for a bookmark — the operator
+_silently_, which is defensible for a stale tab and wrong for a bookmark — the operator
 asked for something specific and deserves an answer.
 
 The rule: **fall back to the nearest place that does exist, and say what was missing.**
 A dead goal id lands on that target's goal list with "that goal no longer exists"; a dead
 target lands on the target list with the same courtesy. Never a blank screen, never a
 spinner that does not end, and never silence.
+
+A dead **chat session** is the case most likely to happen, because a harness can let a
+session go while the index still remembers it. `openImporterSession` already produces the
+sentence for it — "That importer session is no longer in the importer's own list, so there
+is nothing to open it on." What it does not yet get right is _where_ that sentence appears:
+it writes `agentSessionsNote`, which is the Agent sessions screen's banner, and an operator
+arriving from a bookmark is not on that screen. S5 owns moving it to a surface the arrival
+can see.
 
 ### D6 — A deep link that arrives signed out is held, not lost
 
@@ -156,21 +175,21 @@ pending `Place`: parse at mount, hold it, replay the whole thing after Connect s
 by either way in, a fresh sign-in or a resumed session, because a link should land in the
 same place either way. This matters more than it sounds: the browser session registry is
 in memory, so a server restart invalidates it, and a bookmark opened the next morning is
-*the* common case rather than an edge one.
+_the_ common case rather than an edge one.
 
 ## The addressable inventory
 
-| Place | Path |
-| --- | --- |
-| Target list | `/` |
-| A target (lands on Goals) | `/t/<targetId>` |
-| A section | `/t/<targetId>/<section>` |
-| A goal | `/t/<targetId>/goals/<goalId>` |
-| Assets, one tab | `/t/<targetId>/assets/estate` · `/t/<targetId>/assets/scope` |
-| The estate, filtered | `/t/<targetId>/assets/estate?filter=uncovered` |
-| **An AI asset chat** | `/t/<targetId>/assets/chat/<sessionId>` |
-| An attempt transcript | `/t/<targetId>/attempts/<attemptId>` |
-| Settings | `/t/<targetId>/settings` |
+| Place                     | Path                                                                                       |
+| ------------------------- | ------------------------------------------------------------------------------------------ |
+| Target list               | `/`                                                                                        |
+| A target (lands on Goals) | `/t/<targetId>`                                                                            |
+| A section                 | `/t/<targetId>/<section>`                                                                  |
+| A goal                    | `/t/<targetId>/goals/<goalId>`                                                             |
+| Assets, one tab           | `/t/<targetId>/assets/estate` · `/t/<targetId>/assets/scope`                               |
+| The estate, filtered      | `/t/<targetId>/assets/estate?filter=uncovered`                                             |
+| **An AI asset chat**      | `/t/<targetId>/assets/chat/<sessionId>`                                                    |
+| An attempt transcript     | `/t/<targetId>/attempts/<attemptId>` — inbound only, see decision 1                        |
+| Settings                  | `/t/<targetId>/settings` — a `navItem` the rail's footer sets, so a section like any other |
 
 `<section>` is a nav id from `navGroups`: `goals`, `findings`, `observations`, `assets`,
 `evidence`, `workers`, `blockers`, `events`, `agent-sessions`. `attempts` is the one
@@ -189,7 +208,7 @@ Each slice ends on `main`, with gates green and the UI driven in a browser.
 `place.ts` alone: the `Place` union, `pathOf`, `parsePath`, `placeOf`, `applyPlace`. No
 wiring, nothing imports it yet.
 
-*Done when:* every row of the inventory round-trips `parsePath(pathOf(p)) === p`;
+_Done when:_ every row of the inventory round-trips `parsePath(pathOf(p)) === p`;
 `parsePath` is total over garbage input (unknown section, missing id, trailing slash,
 percent-encoding, an id with a slash in it, `attempts` with no id) and returns the nearest
 valid place rather than throwing; an absent, misspelled or impossible `?filter` yields the
@@ -201,27 +220,29 @@ Move `+page.svelte` under a catch-all route. Reflect `placeOf` into the path on 
 change. Read the path at mount. Retire the `?target=` special case — and keep old links
 working by translating `?target=<id>` into the path form once, on arrival.
 
-*Done when:* `/t/<id>` and `/t/<id>/<section>` open that place from a cold load;
+_Done when:_ `/t/<id>` and `/t/<id>/<section>` open that place from a cold load;
 navigating by clicking updates the address bar; a reload holds the place; an existing
 `?target=acme-corp` bookmark still lands on that target; the 455 + 84 web tests still
 construct `App` without a router.
 
 ### S3 — Records by id
 
-`openGoal`, `openImporter(sessionId)`, `loadTranscript` reachable from a path. This is the
-slice that answers the original complaint.
+`openGoal`, `openImporterSession(sessionId)` and `loadTranscript` reachable from a path.
+This is the slice that answers the original complaint, and the slice that retires the two
+in-memory stopgaps in `AgentSessions.svelte` and `openImporterSession`.
 
-*Done when:* a link to an AI asset chat opens that session, read-only until typed into,
+_Done when:_ a link to an AI asset chat opens that session, read-only until typed into,
 from a cold load; a link to a goal opens it with its briefing, intents and plan rounds
-read; a link to an attempt transcript opens it at `/t/<id>/attempts/<attemptId>`, with the
-rail on Workers; `?filter=uncovered` opens the estate filtered; each of those updates the
-address bar when reached by clicking instead.
+read; a link to an attempt transcript opens it at `/t/<id>/attempts/<attemptId>`;
+`?filter=uncovered` opens the estate filtered; the goal and the chat each update the
+address bar when reached by clicking instead — the attempt does not, and cannot, for the
+reason in decision 1.
 
 ### S4 — Back and forward
 
 `popstate` applies the place. Resource navigation pushes, incidental state replaces.
 
-*Done when:* opening three targets and pressing Back three times walks back through them
+_Done when:_ opening three targets and pressing Back three times walks back through them
 without a page load; Back out of a goal lands on the goal list, not the previous target;
 Forward returns; no history entry is created by opening a picker, switching theme, or
 expanding the live dock.
@@ -231,7 +252,7 @@ expanding the live dock.
 D5 and D6: the nearest-valid-place fallback with a message, and the held place replayed
 after Connect.
 
-*Done when:* a path naming a deleted goal lands on that target's goal list and says the
+_Done when:_ a path naming a deleted goal lands on that target's goal list and says the
 goal is gone; a path naming an unknown target lands on the target list and says so; a deep
 link opened with no browser session shows Connect, then lands on the full place — record
 and all — after signing in; the same holds for a resumed session.
@@ -248,6 +269,26 @@ uniform: `attempts` is a **resource collection, not a nav section**. `parsePath`
 the difference, and replaying `/t/x/attempts/<id>` sets `navItem` to `workers` while the
 path never says so. Every other second segment is a section id. One exception, documented,
 rather than a path that misnames what it points at.
+
+**And this row is inbound only, which S1 established and I had wrong.** A transcript has no
+page of its own. `TranscriptPanel` renders on the **Goals** section, and only for
+`readableAttemptId` — the one attempt this tab started on this target, _"the only handle a
+browser has on a settled attempt until Flow B lists them"_. So a link to an attempt opens
+its transcript, but reading a transcript by clicking never produces that link, because
+there is nowhere to click from. S3's criterion that every record "updates the address bar
+when reached by clicking" cannot be met for attempts without building the Workers attempt
+list, which is Flow B and not a routing slice.
+
+Two alternatives were weighed and rejected. Deleting the case loses a grammar that is
+already correct and will be needed. Reflecting the transcript from the Goals page, where it
+actually renders, **breaks on a lifecycle bug**: `transcriptAttemptId` is cleared only by
+`reset()`, so the URL would stick on `attempts/<id>` for the rest of the visit.
+
+So: the path parses and replays, `placeOf` never emits it, and the guard that would emit it
+is `navItem === "workers" && transcriptAttemptId !== ""` — unreachable today, correct
+unchanged the day Workers lists attempts. Whichever slice builds that list owns clearing
+`transcriptAttemptId`; until then the narrow guard confines the staleness to a section that
+cannot read a transcript at all.
 
 **2. The estate filter is addressable**, as `?filter=<all|in|out|uncovered>` on
 `/t/<targetId>/assets/estate`. See D2 for why it is a query parameter and not a path
