@@ -6,3 +6,4 @@ build
 .turbo
 .agents/skills/
 .claude/worktrees/
+docs/superpowers/design/

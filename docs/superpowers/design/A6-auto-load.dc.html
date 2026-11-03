@@ -1,0 +1,840 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root,[data-theme="dark"]{--background-bg-base:#242424;--background-bg-deep:#161616;--background-bg-layer-01:#2e2e2e;--background-bg-layer-02:#3a3a3a;--background-bg-layer-03:#5c5c5c;--background-bg-inverse:#fafafa;--text-text-base:#f2f2f2;--text-text-muted:#aeaeae;--text-text-faint:#808080;--icon-icon-base:#dbdbdb;--icon-icon-muted:#808080;--icon-icon-faint:#5c5c5c;--border-border-muted:#ffffff14;--border-border-base:#ffffff1a;--border-border-strong:#ffffff33;--border-border-focus:#f2f2f2;--state-bg-danger:#461516;--state-fg-danger:#f17471;--state-border-danger:#97252b;--state-bg-warning:#4b4025;--state-fg-warning:#f2cf76;--state-border-warning:#ac8833;--overlay-hover:#ffffff0f;--overlay-pressed:#ffffff1a}
+[data-theme="light"]{--background-bg-base:#ffffff;--background-bg-deep:#fafafa;--background-bg-layer-01:#fafafa;--background-bg-layer-02:#f2f2f2;--background-bg-layer-03:#eeeeee;--background-bg-inverse:#161616;--text-text-base:#161616;--text-text-muted:#5c5c5c;--text-text-faint:#808080;--icon-icon-base:#3a3a3a;--icon-icon-muted:#808080;--icon-icon-faint:#aeaeae;--border-border-muted:#00000014;--border-border-base:#0000001a;--border-border-strong:#00000033;--border-border-focus:#161616;--state-bg-danger:#fcecebff;--state-fg-danger:#b82d35;--state-border-danger:#f2bbb7;--state-bg-warning:#fefaec;--state-fg-warning:#cb9f34;--state-border-warning:#f7e5b5;--overlay-hover:#0000000a;--overlay-pressed:#00000014}
+body{margin:0;background:#0c0c0c;font-family:Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:#f2f2f2;text-decoration:underline}a:hover{color:#aeaeae}
+:focus-visible{outline:2px solid var(--border-border-focus);outline-offset:2px}
+@keyframes dc-shimmer{0%{background-position:160% 0}100%{background-position:-60% 0}}
+</style>
+</helmet>
+<section data-screen-label="Auto-load importer" style="padding:96px;display:flex;flex-direction:column;gap:56px;width:3200px">
+  <div style="display:flex;flex-direction:column;gap:8px;max-width:1080px">
+    <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#808080">A6 · Auto-load</div>
+    <div style="font:530 48px/56px Inter;color:#f2f2f2;letter-spacing:-0.02em">The importer is a conversation, not a machine</div>
+    <div style="font:400 18px/28px Inter;color:#aeaeae;text-wrap:pretty">Scope no longer arrives through a field on the create form. A target is created empty, and the operator loads its scope from the Assets page by talking to an importer agent — one chat, multi-turn, told to narrate every tool call it makes. There is no separate panel of tool activity: the narration <em>is</em> the transcript, and the transcript is the audit trail. Sessions are sticky per target, so the thread you corrected last week is still there to continue.</div>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:96px;align-items:flex-start">
+
+    <div id="d1" style="display:flex;flex-direction:column;gap:20px;width:1440px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#161616;background:#f2f2f2;padding:2px 8px;border-radius:4px">D1</div>
+        <div style="font:530 24px/32px Inter;color:#f2f2f2">Assets · where the flow starts</div>
+      </div>
+      <div data-theme="{{ theme }}" style="width:1440px;height:720px;background:var(--background-bg-base);display:flex;flex-direction:column;overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px #ffffff1a">
+        <div style="flex:none;height:38px;display:flex;align-items:center;gap:4px;padding:0 4px 0 10px;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <span style="flex:none;width:16px;height:16px;border-radius:4px;background:var(--background-bg-inverse);color:var(--background-bg-deep);font:600 9px/16px Inter;text-align:center">A</span>
+            <span style="font:500 12px/16px Inter;color:var(--text-text-base)">acme_corp</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <span style="font:500 12px/16px Inter;color:var(--text-text-base)">Assets</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <div style="flex:1"></div>
+          <div style="flex:none;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border-radius:5px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Theme"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"></circle><path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none"></path></svg></div>
+        </div>
+        <div style="flex:1;min-height:0;display:flex;flex-direction:column;padding:28px 32px;gap:20px">
+          <div style="display:flex;flex-direction:column;gap:6px;max-width:680px">
+            <div style="font:530 26px/32px Inter;color:var(--text-text-base);letter-spacing:-0.01em">Assets</div>
+            <div style="font:400 13px/19px Inter;color:var(--text-text-muted);text-wrap:pretty">The client's estate, as you authored it. These entries are only ever written with your say-so.</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;padding:3px;border-radius:7px;background:var(--background-bg-deep);align-self:flex-start;box-sizing:border-box;border:1px solid var(--border-border-muted)">
+            <div style="padding:5px 12px;border-radius:5px;font:400 12px/16px Inter;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">Estate</div>
+            <div style="padding:5px 12px;border-radius:5px;background:var(--background-bg-layer-02);font:500 12px/16px Inter;color:var(--text-text-base)">Scope</div>
+          </div>
+          <div style="flex:1;min-height:0;display:flex;align-items:center;justify-content:center">
+            <div style="display:flex;flex-direction:column;align-items:center;gap:14px;max-width:560px;text-align:center">
+              <svg style="color:var(--icon-icon-faint)" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25"><path d="M12 3 3 7.5v9L12 21l9-4.5v-9L12 3Z"></path><path d="M3 7.5 12 12l9-4.5M12 12v9"></path></svg>
+              <div style="font:530 20px/28px Inter;color:var(--text-text-base)">No scope authored for this target</div>
+              <div style="font:400 13px/20px Inter;color:var(--text-text-muted);text-wrap:pretty">Hand the program's pages to the importer and it drafts the in and out entries with you, or type the first entry yourself.</div>
+              <div style="display:flex;align-items:center;gap:10px;margin-top:4px">
+                <div style="display:flex;align-items:center;gap:8px;height:34px;padding:0 14px;border-radius:6px;box-sizing:border-box;background:var(--background-bg-inverse);color:var(--background-bg-base);font:500 13px/34px Inter" style-hover="box-shadow:inset 0 0 0 999px #0000001f">
+                  <svg style="flex:none" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M7 10l5 5 5-5M12 15V3"></path></svg>
+                  <span>Auto-load scope…</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;height:34px;padding:0 14px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-strong);color:var(--text-text-base);font:500 13px/32px Inter" style-hover="background:var(--overlay-hover)">
+                  <svg style="flex:none" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>
+                  <span>Add an entry by hand</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style="flex:none;display:flex;align-items:center;gap:10px;padding:11px 13px;border-radius:7px;box-sizing:border-box;border:1px solid var(--border-border-base);background:var(--background-bg-deep)">
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 10h8M8 14h5"></path><path d="M21 12a9 9 0 1 1-3.2-6.9L21 4v8h-8"></path></svg>
+            <span style="flex:1;font:400 12px/18px Inter;color:var(--text-text-muted);text-wrap:pretty">Last importer session <span style="font-family:'IBM Plex Mono',monospace;color:var(--text-text-base)">Oct 24, 21:38</span> ended without writing anything.</span>
+            <div style="flex:none;height:26px;padding:0 11px;border-radius:5px;box-sizing:border-box;border:1px solid var(--border-border-strong);font:500 12px/24px Inter;color:var(--text-text-base)" style-hover="background:var(--overlay-pressed)">Continue that session</div>
+          </div>
+        </div>
+      </div>
+      <div style="width:1440px;display:flex;flex-direction:column;gap:10px;padding-top:12px">
+        <div style="font:500 13px/18px Inter;color:#f2f2f2">One button, and the thread it left behind</div>
+        <div style="font:400 13px/20px Inter;color:#aeaeae;max-width:1000px;text-wrap:pretty">Auto-load is a page, not a dialog — it opens a full importer session with the target already in hand. Because sessions are sticky per target, an abandoned one does not vanish: the strip at the bottom names it and offers to continue rather than silently starting a fourth empty thread. On a target that already has entries this strip is the only thing that changes; the primary button moves into the Scope tab's header as <span style="font-family:'IBM Plex Mono',monospace">Auto-load…</span>.</div>
+      </div>
+    </div>
+
+    <div id="d2" style="display:flex;flex-direction:column;gap:20px;width:1440px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#161616;background:#f2f2f2;padding:2px 8px;border-radius:4px">D2</div>
+        <div style="font:530 24px/32px Inter;color:#f2f2f2">Importer · new session</div>
+      </div>
+      <div data-theme="{{ theme }}" style="width:1440px;height:820px;background:var(--background-bg-base);display:flex;flex-direction:column;overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px #ffffff1a">
+        <div style="flex:none;height:38px;display:flex;align-items:center;gap:4px;padding:0 4px 0 10px;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <span style="flex:none;width:16px;height:16px;border-radius:4px;background:var(--background-bg-inverse);color:var(--background-bg-deep);font:600 9px/16px Inter;text-align:center">A</span>
+            <span style="font:500 12px/16px Inter;color:var(--text-text-base)">acme_corp</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <span style="font:400 12px/16px Inter;color:var(--text-text-muted)">Assets</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <span style="font:500 12px/16px Inter;color:var(--text-text-base);padding:0 6px">Auto-load</span>
+          <div style="flex:1"></div>
+          <div title="Toggle session context · no tokens used yet" style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="var(--border-border-strong)" stroke-width="3"></circle></svg>
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">0</span>
+          </div>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12a9 9 0 1 1-3.2-6.9L21 4v8h-8"></path></svg>
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">New session</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <div style="flex:none;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border-radius:5px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Theme"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"></circle><path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none"></path></svg></div>
+        </div>
+
+        <div style="flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 32px;gap:28px">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:12px;max-width:620px;text-align:center">
+            <div style="font:530 24px/32px Inter;color:var(--text-text-base);letter-spacing:-0.01em">Load the scope for acme_corp</div>
+            <div style="font:400 13px/20px Inter;color:var(--text-text-muted);text-wrap:pretty">Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread.</div>
+          </div>
+          <div style="width:100%;max-width:760px;display:flex;flex-direction:column;gap:10px">
+            <div style="display:flex;flex-direction:column;gap:10px;padding:14px;border-radius:10px;box-sizing:border-box;border:1px solid var(--border-border-strong);background:var(--background-bg-layer-01)">
+              <div style="display:flex;align-items:flex-start;min-height:46px">
+                <span style="font:400 13px/20px Inter;color:var(--text-text-faint);text-wrap:pretty">Paste a policy or scope URL, or say what is in and out of scope…</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px">
+                <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Attach"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 5v14M5 12h14"></path></svg></div>
+                <div style="flex:none;display:flex;align-items:center;gap:7px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M7 10l5 5 5-5M12 15V3"></path></svg>
+                  <span style="font:500 12px/16px Inter;color:var(--text-text-base)">Importer</span>
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+                </div>
+                <div style="flex:none;display:flex;align-items:center;gap:8px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                  <span style="flex:none;width:15px;height:15px;border-radius:4px;background:var(--background-bg-layer-03);color:var(--text-text-base);font:500 9px/15px 'IBM Plex Mono',monospace;text-align:center">o</span>
+                  <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">openai/gpt-5.6-sol</span>
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+                </div>
+                <div style="flex:1"></div>
+                <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--background-bg-layer-02);color:var(--text-text-faint)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 19V5M5 12l7-7 7 7"></path></svg></div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <div style="display:flex;align-items:center;gap:7px;height:28px;padding:0 10px;border-radius:14px;box-sizing:border-box;border:1px dashed var(--border-border-strong);font:400 12px/26px Inter;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover);color:var(--text-text-base)">
+                <svg style="flex:none" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"></path><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"></path></svg>
+                <span>Read a HackerOne or Bugcrowd program page</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:7px;height:28px;padding:0 10px;border-radius:14px;box-sizing:border-box;border:1px dashed var(--border-border-strong);font:400 12px/26px Inter;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover);color:var(--text-text-base)">
+                <svg style="flex:none" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="3" width="16" height="18" rx="2"></rect><path d="M8 8h8M8 12h8M8 16h5"></path></svg>
+                <span>Paste a statement of work</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="width:1440px;display:flex;flex-direction:column;gap:10px;padding-top:12px">
+        <div style="font:500 13px/18px Inter;color:#f2f2f2">An ordinary chat, pointed at one job</div>
+        <div style="font:400 13px/20px Inter;color:#aeaeae;max-width:1000px;text-wrap:pretty">No form, no link list, no run button — a composer and two suggestions that are really just pre-written first messages. The model chip sits in the composer exactly where it sits everywhere else in the product, so the harness and reasoning picker is the one the operator already knows. The session control lives in the crumb bar because it belongs to the target, not to the message being typed.</div>
+      </div>
+    </div>
+
+    <div id="d3" style="display:flex;flex-direction:column;gap:20px;width:1440px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#161616;background:#f2f2f2;padding:2px 8px;border-radius:4px">D3</div>
+        <div style="font:530 24px/32px Inter;color:#f2f2f2">Streaming · prose full width, tool calls collapsed</div>
+      </div>
+      <div data-theme="{{ theme }}" style="width:1440px;height:900px;background:var(--background-bg-base);display:flex;flex-direction:column;overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px #ffffff1a">
+        <div style="flex:none;height:38px;display:flex;align-items:center;gap:4px;padding:0 4px 0 10px;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <span style="flex:none;width:16px;height:16px;border-radius:4px;background:var(--background-bg-inverse);color:var(--background-bg-deep);font:600 9px/16px Inter;text-align:center">A</span>
+            <span style="font:500 12px/16px Inter;color:var(--text-text-base)">acme_corp</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <span style="font:400 12px/16px Inter;color:var(--text-text-muted)">Assets</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <span style="font:500 12px/16px Inter;color:var(--text-text-base);padding:0 6px">Auto-load</span>
+          <div style="flex:1"></div>
+          <div title="Toggle session context · 24,106 of 200,000 tokens" style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="var(--border-border-strong)" stroke-width="3"></circle><circle cx="12" cy="12" r="9" fill="none" stroke="var(--icon-icon-base)" stroke-width="3" stroke-linecap="round" stroke-dasharray="6.8 49.7" transform="rotate(-90 12 12)"></circle></svg>
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">24,106</span>
+          </div>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+            <span style="flex:none;width:5px;height:5px;border-radius:50%;background:var(--text-text-base);box-shadow:0 0 0 3px var(--overlay-pressed)"></span>
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">Full policy sweep</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <div style="flex:none;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border-radius:5px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Theme"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"></circle><path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none"></path></svg></div>
+        </div>
+
+        <div style="flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;overflow:hidden;padding:28px 32px 0">
+          <div style="width:100%;max-width:800px;display:flex;flex-direction:column;gap:26px">
+
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:7px">
+              <div style="max-width:560px;padding:11px 14px;border-radius:10px;box-sizing:border-box;background:var(--background-bg-layer-02);font:400 13px/20px Inter;color:var(--text-text-base);text-wrap:pretty">Load the scope from <span style="font-family:'IBM Plex Mono',monospace">https://hackerone.com/acme/policy</span> — and the SOW says the partner portal is in too.</div>
+              <div style="display:flex;align-items:center;gap:9px;color:var(--icon-icon-faint)">
+                <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">You · 18:02</span>
+                <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style-hover="color:var(--icon-icon-base)"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:18px">
+              <div style="display:flex;align-items:center;gap:10px" style-hover="opacity:0.85">
+                <svg style="flex:none;color:var(--icon-icon-faint)" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>
+                <span style="flex:1;min-width:0;font:400 13px/20px Inter;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background-image:linear-gradient(90deg,var(--text-text-faint) 30%,var(--text-text-base) 50%,var(--text-text-faint) 70%);background-size:220% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;animation:dc-shimmer 2.6s linear infinite">The program page is the authoritative list and the SOW only adds to it, so I read the policy first…</span>
+                <svg style="flex:none;color:var(--icon-icon-faint)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+              </div>
+              <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">Fetching the policy page.</div>
+              <div style="display:flex;align-items:center;gap:10px" style-hover="opacity:0.8">
+                <span style="flex:none;font:500 12px/16px 'IBM Plex Mono',monospace;color:var(--icon-icon-faint)">&gt;_</span>
+                <span style="font:400 12px/16px Inter;color:var(--text-text-muted)">Ran 1 command</span>
+                <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">fetch_page</span>
+              </div>
+              <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">The table has nine rows. Six are in scope — <span style="font-family:'IBM Plex Mono',monospace">acme.com</span> and <span style="font-family:'IBM Plex Mono',monospace">acmelabs.io</span> are written with wildcards, so I am taking them as the host and every subdomain. Writing them now.</div>
+              <div style="display:flex;align-items:center;gap:10px" style-hover="opacity:0.8">
+                <span style="flex:none;font:500 12px/16px 'IBM Plex Mono',monospace;color:var(--icon-icon-faint)">&gt;_</span>
+                <span style="font:400 12px/16px Inter;color:var(--text-text-muted)">Ran 3 commands</span>
+                <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">write_scope_entry</span>
+              </div>
+              <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">Row seven reads "no WordPress properties", which is prose rather than a host. The only WordPress property the page names is <span style="font-family:'IBM Plex Mono',monospace">blog.acme.com</span>, so I am writing that one host out and leaving the rule itself for you —</div>
+              <div style="display:flex;align-items:center;gap:9px">
+                <span style="width:7px;height:14px;background:var(--text-text-base);display:inline-block"></span>
+                <span style="font:400 12px/16px Inter;color:var(--text-text-faint)">writing…</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="flex:none;display:flex;justify-content:center;padding:16px 32px 20px">
+          <div style="width:100%;max-width:800px;display:flex;flex-direction:column;gap:10px">
+            <div style="align-self:center;display:flex;align-items:center;gap:8px;height:28px;padding:0 12px;border-radius:14px;box-sizing:border-box;border:1px solid var(--border-border-strong);background:var(--background-bg-layer-01);font:500 12px/26px Inter;color:var(--text-text-base)" style-hover="background:var(--overlay-pressed)">
+              <svg style="flex:none" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"></rect></svg>
+              <span>Stop</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:10px;padding:14px;border-radius:10px;box-sizing:border-box;border:1px solid var(--border-border-base);background:var(--background-bg-layer-01)">
+              <div style="display:flex;align-items:flex-start;min-height:22px">
+                <span style="font:400 13px/20px Inter;color:var(--text-text-faint)">Correct it, or add what the pages do not say…</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px">
+                <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Attach"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 5v14M5 12h14"></path></svg></div>
+                <div style="flex:none;display:flex;align-items:center;gap:7px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M7 10l5 5 5-5M12 15V3"></path></svg>
+                  <span style="font:500 12px/16px Inter;color:var(--text-text-base)">Importer</span>
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+                </div>
+                <div style="flex:none;display:flex;align-items:center;gap:8px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                  <span style="flex:none;width:15px;height:15px;border-radius:4px;background:var(--background-bg-layer-03);color:var(--text-text-base);font:500 9px/15px 'IBM Plex Mono',monospace;text-align:center">o</span>
+                  <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">openai/gpt-5.6-sol</span>
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+                </div>
+                <span style="font:400 11px/16px Inter;color:var(--text-text-faint)">OpenCode for this session · any of its models</span>
+                <div style="flex:1"></div>
+                <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--background-bg-layer-02);color:var(--text-text-faint)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 19V5M5 12l7-7 7 7"></path></svg></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="width:1440px;display:flex;flex-direction:column;gap:10px;padding-top:12px">
+        <div style="font:500 13px/18px Inter;color:#f2f2f2">The narration is the receipt</div>
+        <div style="font:400 13px/20px Inter;color:#aeaeae;max-width:1000px;text-wrap:pretty">There is no tool-call panel to keep in sync with the transcript. The agent's prose runs full width with no avatar and no bubble — it is the page's own voice, and only the operator's turns are boxed. A tool call collapses to one muted line naming how many commands ran and which tool ran them; the parameters and the output are one click away, not in your face. Reasoning collapses the same way, to a single truncated line. Progress is read off the stream itself — each write lands as a line as it happens — so there is no counter strip to keep honest, and nothing that can disagree with the Assets page. The one number in the chrome is the context meter in the crumb bar: a ring and a token count, there because a long import is the thing most likely to run the window out, and clickable to see what is holding the window.</div>
+      </div>
+    </div>
+
+    <div id="d4" style="display:flex;flex-direction:column;gap:20px;width:1440px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#161616;background:#f2f2f2;padding:2px 8px;border-radius:4px">D4</div>
+        <div style="font:530 24px/32px Inter;color:#f2f2f2">Multi-turn · correcting it in the thread</div>
+      </div>
+      <div data-theme="{{ theme }}" style="width:1440px;height:900px;background:var(--background-bg-base);display:flex;flex-direction:column;overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px #ffffff1a">
+        <div style="flex:none;height:38px;display:flex;align-items:center;gap:4px;padding:0 4px 0 10px;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <span style="flex:none;width:16px;height:16px;border-radius:4px;background:var(--background-bg-inverse);color:var(--background-bg-deep);font:600 9px/16px Inter;text-align:center">A</span>
+            <span style="font:500 12px/16px Inter;color:var(--text-text-base)">acme_corp</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <span style="font:400 12px/16px Inter;color:var(--text-text-muted)">Assets</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <span style="font:500 12px/16px Inter;color:var(--text-text-base);padding:0 6px">Auto-load</span>
+          <div style="flex:1"></div>
+          <div title="Toggle session context · 71,398 of 200,000 tokens" style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="var(--border-border-strong)" stroke-width="3"></circle><circle cx="12" cy="12" r="9" fill="none" stroke="var(--icon-icon-base)" stroke-width="3" stroke-linecap="round" stroke-dasharray="20.2 36.3" transform="rotate(-90 12 12)"></circle></svg>
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">71,398</span>
+          </div>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">Full policy sweep</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <div style="flex:none;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border-radius:5px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Theme"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"></circle><path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none"></path></svg></div>
+        </div>
+
+        <div style="flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;overflow:hidden;padding:20px 32px 0">
+          <div style="width:100%;max-width:800px;display:flex;flex-direction:column;gap:24px">
+
+            <div style="display:flex;align-items:center;gap:12px;opacity:0.5">
+              <span style="flex:1;height:1px;background:var(--border-border-base)"></span>
+              <span style="font:400 11px/16px Inter;color:var(--text-text-faint)">earlier in this session</span>
+              <span style="flex:1;height:1px;background:var(--border-border-base)"></span>
+            </div>
+
+            <div style="opacity:0.55;font:400 13px/21px Inter;color:var(--text-text-muted);text-wrap:pretty">…that is the whole table. I wrote 6 in-scope entries, 2 out, and recorded 9 hosts as assets. One row I could not turn into an entry: "no WordPress properties" — I excluded <span style="font-family:'IBM Plex Mono',monospace">blog.acme.com</span> because the page names it, but the rule may reach further.</div>
+
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:7px">
+              <div style="max-width:560px;padding:11px 14px;border-radius:10px;box-sizing:border-box;background:var(--background-bg-layer-02);font:400 13px/20px Inter;color:var(--text-text-base);text-wrap:pretty">It does — <span style="font-family:'IBM Plex Mono',monospace">shop.acme.com</span> is WordPress too. Put it out, and the partner portal <span style="font-family:'IBM Plex Mono',monospace">app.partner.com</span> is in, host only, no subdomains.</div>
+              <div style="display:flex;align-items:center;gap:9px;color:var(--icon-icon-faint)">
+                <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">You · 18:11</span>
+                <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style-hover="color:var(--icon-icon-base)"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:18px">
+              <div style="display:flex;align-items:center;gap:10px" style-hover="opacity:0.8">
+                <span style="flex:none;font:500 12px/16px 'IBM Plex Mono',monospace;color:var(--icon-icon-faint)">&gt;_</span>
+                <span style="font:400 12px/16px Inter;color:var(--text-text-muted)">Ran 3 commands</span>
+                <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">write_scope_entry, record_asset</span>
+              </div>
+              <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. <span style="font-family:'IBM Plex Mono',monospace">shop.acme.com</span> was already recorded as an asset, so it keeps its history and is relabelled excluded rather than written twice.</div>
+              <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">The scope now reads 7 in, 3 out. Anything else from the SOW that the program page would not know about?</div>
+              <div style="display:flex;align-items:center;gap:9px;color:var(--icon-icon-faint)">
+                <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style-hover="color:var(--icon-icon-base)"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg>
+                <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">Importer · openai/gpt-5.6-sol · 41s</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="flex:none;display:flex;justify-content:center;padding:16px 32px 20px">
+          <div style="width:100%;max-width:800px;display:flex;flex-direction:column;gap:10px;padding:14px;border-radius:10px;box-sizing:border-box;border:1px solid var(--border-border-strong);background:var(--background-bg-layer-01)">
+            <div style="display:flex;align-items:flex-start;min-height:22px">
+              <span style="font:400 13px/20px Inter;color:var(--text-text-base)">The engagement window is Nov 3 to Nov 21</span>
+              <span style="width:1px;height:18px;background:var(--text-text-base);margin-left:1px"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Attach"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 5v14M5 12h14"></path></svg></div>
+                <div style="flex:none;display:flex;align-items:center;gap:7px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M7 10l5 5 5-5M12 15V3"></path></svg>
+                  <span style="font:500 12px/16px Inter;color:var(--text-text-base)">Importer</span>
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+                </div>
+              <div style="flex:none;display:flex;align-items:center;gap:8px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                <span style="flex:none;width:15px;height:15px;border-radius:4px;background:var(--background-bg-layer-03);color:var(--text-text-base);font:500 9px/15px 'IBM Plex Mono',monospace;text-align:center">o</span>
+                <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">openai/gpt-5.6-sol</span>
+                <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+              </div>
+              <div style="flex:1"></div>
+              <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--background-bg-inverse);color:var(--background-bg-base)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 19V5M5 12l7-7 7 7"></path></svg></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="width:1440px;display:flex;flex-direction:column;gap:10px;padding-top:12px">
+        <div style="font:500 13px/18px Inter;color:#f2f2f2">Corrections are messages, not forms</div>
+        <div style="font:400 13px/20px Inter;color:#aeaeae;max-width:1000px;text-wrap:pretty">The operator's second turn does what the Assets page would otherwise take four clicks to do, and it lands in the same transcript as the reason for it — <span style="font-family:'IBM Plex Mono',monospace">source="operator"</span> is the provenance the entry carries forever. The agent ends every turn either with a question or with nothing left to ask, which is what makes it safe to leave the thread open: there is no run that has to be finished.</div>
+      </div>
+    </div>
+
+    <div id="d5" style="display:flex;flex-direction:column;gap:20px;width:1040px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#161616;background:#f2f2f2;padding:2px 8px;border-radius:4px">D5</div>
+        <div style="font:530 24px/32px Inter;color:#f2f2f2">Sessions · sticky per target</div>
+      </div>
+      <div data-theme="{{ theme }}" style="position:relative;width:1040px;height:560px;background:var(--background-bg-base);overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px #ffffff1a">
+        <div style="height:38px;display:flex;align-items:center;gap:4px;padding:0 4px 0 10px;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box">
+            <span style="flex:none;width:16px;height:16px;border-radius:4px;background:var(--background-bg-inverse);color:var(--background-bg-deep);font:600 9px/16px Inter;text-align:center">A</span>
+            <span style="font:500 12px/16px Inter;color:var(--text-text-base)">acme_corp</span>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <span style="font:400 12px/16px Inter;color:var(--text-text-muted);padding:0 6px">Assets</span>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <span style="font:500 12px/16px Inter;color:var(--text-text-base);padding:0 6px">Auto-load</span>
+          <div style="flex:1"></div>
+          <div title="Toggle session context · 71,398 of 200,000 tokens" style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid transparent">
+            <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="var(--border-border-strong)" stroke-width="3"></circle><circle cx="12" cy="12" r="9" fill="none" stroke="var(--icon-icon-base)" stroke-width="3" stroke-linecap="round" stroke-dasharray="20.2 36.3" transform="rotate(-90 12 12)"></circle></svg>
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">71,398</span>
+          </div>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid var(--border-border-strong);background:var(--overlay-pressed)">
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">Full policy sweep</span>
+            <svg style="flex:none;color:var(--icon-icon-base)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"></path></svg>
+          </div>
+          <div style="flex:none;width:30px;height:30px"></div>
+        </div>
+
+        <div style="position:absolute;right:46px;top:44px;width:412px;display:flex;flex-direction:column;gap:6px;padding:6px;box-sizing:border-box;border-radius:8px;background:var(--background-bg-layer-01);border:1px solid var(--border-border-strong);box-shadow:0 18px 48px #00000070">
+          <div style="padding:8px 8px 6px;font:600 10px/14px Inter;color:var(--text-text-faint);letter-spacing:0.08em;text-transform:uppercase">Importer sessions · acme_corp</div>
+          <div title="Full policy sweep — read hackerone.com/acme/policy end to end, then took the partner portal and the WordPress exclusion from the operator" style="display:flex;align-items:flex-start;gap:10px;padding:9px 8px;border-radius:5px;background:var(--overlay-hover)">
+            <svg style="flex:none;margin-top:3px;color:var(--icon-icon-base)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25"><path d="m20 6-11 11-5-5"></path></svg>
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:baseline;gap:8px;min-width:0">
+                <span style="font:500 13px/18px Inter;color:var(--text-text-base);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Full policy sweep</span>
+                <span style="flex:none;font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">openai/gpt-5.6-sol</span>
+              </div>
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
+                <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">7 in · 3 out · 14 assets</span>
+                <span style="flex:none;font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">Today 18:02</span>
+              </div>
+            </div>
+          </div>
+          <div title="Aborted SOW paste — no tool calls, nothing written to the target" style="display:flex;align-items:flex-start;gap:10px;padding:9px 8px;border-radius:5px" style-hover="background:var(--overlay-hover)">
+            <span style="flex:none;width:13px;margin-top:3px"></span>
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:baseline;gap:8px;min-width:0">
+                <span style="font:400 13px/18px Inter;color:var(--text-text-base);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Aborted SOW paste</span>
+                <span style="flex:none;font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">anthropic/claude-code</span>
+              </div>
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
+                <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">nothing written</span>
+                <span style="flex:none;font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">Oct 24, 21:38</span>
+              </div>
+            </div>
+          </div>
+          <div title="First pass from the SOW — three in-scope entries written before the program page was available; superseded by the sweep above" style="display:flex;align-items:flex-start;gap:10px;padding:9px 8px;border-radius:5px" style-hover="background:var(--overlay-hover)">
+            <span style="flex:none;width:13px;margin-top:3px"></span>
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:baseline;gap:8px;min-width:0">
+                <span style="font:400 13px/18px Inter;color:var(--text-text-base);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">First pass from the SOW</span>
+                <span style="flex:none;font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">openai/gpt-5.5</span>
+              </div>
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
+                <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">3 in · 0 out · 5 assets</span>
+                <span style="flex:none;font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">Oct 21, 09:14</span>
+              </div>
+            </div>
+          </div>
+          <div style="height:1px;background:var(--border-border-muted);margin:0 2px"></div>
+          <div style="display:flex;align-items:flex-start;gap:10px;padding:9px 8px;border-radius:5px" style-hover="background:var(--overlay-hover)">
+            <svg style="flex:none;margin-top:2px;color:var(--icon-icon-base)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 5v14M5 12h14"></path></svg>
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+              <div style="font:400 13px/18px Inter;color:var(--text-text-base)">Start a new session</div>
+              <div style="font:400 11px/16px Inter;color:var(--text-text-muted);text-wrap:pretty">Empty thread, same target. What it writes adds to the scope that is already there.</div>
+            </div>
+          </div>
+        </div>
+
+        <div style="position:absolute;left:32px;bottom:28px;width:520px;display:flex;flex-direction:column;gap:8px">
+          <div style="font:500 13px/18px Inter;color:var(--text-text-base)">Named, not timestamped</div>
+          <div style="font:400 12px/19px Inter;color:var(--text-text-muted);text-wrap:pretty">Each session carries a name the agent proposes from its first turn, and a line saying what it actually wrote — so "the one where I got it right" is findable without opening three threads. The date sits where you scan last; the full summary is on hover. The model shown is the one the session ended on, not a fixed property of it.</div>
+        </div>
+      </div>
+      <div style="width:1040px;display:flex;flex-direction:column;gap:10px;padding-top:12px">
+        <div style="font:400 13px/20px Inter;color:#aeaeae;max-width:1000px;text-wrap:pretty">Opening an older session shows its transcript read-only until the operator types — the first new message resumes it, with the scope as it stands now, not as it stood then.</div>
+      </div>
+    </div>
+
+    <div id="d6" style="display:flex;flex-direction:column;gap:20px;width:1040px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#161616;background:#f2f2f2;padding:2px 8px;border-radius:4px">D6</div>
+        <div style="font:530 24px/32px Inter;color:#f2f2f2">Harness and model · a modal, not a menu</div>
+      </div>
+      <div data-theme="{{ theme }}" style="position:relative;width:1040px;height:560px;background:var(--background-bg-base);overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px #ffffff1a;display:flex;flex-direction:column;justify-content:flex-end;padding:0 32px 20px">
+
+        <div style="position:absolute;inset:0;z-index:2;background:#00000099;display:flex;align-items:center;justify-content:center;padding:32px;box-sizing:border-box">
+          <div style="width:100%;max-width:820px;display:flex;flex-direction:column;box-sizing:border-box;border-radius:10px;background:var(--background-bg-layer-01);border:1px solid var(--border-border-strong);box-shadow:0 28px 72px #00000085;overflow:hidden">
+            <div style="flex:none;display:flex;align-items:center;gap:12px;padding:13px 14px;border-bottom:1px solid var(--border-border-base)">
+              <span style="flex:1;font:530 14px/20px Inter;color:var(--text-text-base)">Harness, model and reasoning</span>
+              <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">Full policy sweep</span>
+              <div style="flex:none;width:26px;height:26px;display:flex;align-items:center;justify-content:center;border-radius:5px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Close"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M18 6 6 18M6 6l12 12"></path></svg></div>
+            </div>
+            <div style="display:flex;align-items:stretch;gap:0;padding:6px">
+              <div style="flex:none;width:224px;display:flex;flex-direction:column;gap:2px;padding:4px 6px 6px;border-right:1px solid var(--border-border-muted)">
+                <div style="padding:6px 8px;font:600 10px/14px Inter;color:var(--text-text-faint);letter-spacing:0.08em;text-transform:uppercase">Harness</div>
+                <div style="display:flex;align-items:center;gap:9px;padding:7px 8px;border-radius:5px;background:var(--overlay-hover)">
+                  <span style="flex:none;width:18px;height:18px;border-radius:5px;background:var(--background-bg-layer-03);color:var(--text-text-base);font:500 10px/18px 'IBM Plex Mono',monospace;text-align:center">o</span>
+                  <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+                    <div style="display:flex;align-items:baseline;gap:7px">
+                      <span style="font:500 13px/18px Inter;color:var(--text-text-base)">OpenCode</span>
+                      <span style="font:400 10px/14px Inter;color:var(--text-text-faint);letter-spacing:0.04em;text-transform:uppercase">default</span>
+                    </div>
+                    <span style="font:400 11px/15px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">2.1.2</span>
+                  </div>
+                </div>
+                <div style="display:flex;align-items:center;gap:9px;padding:7px 8px;border-radius:5px" style-hover="background:var(--overlay-hover)">
+                  <span style="flex:none;width:18px;height:18px;border-radius:5px;background:var(--background-bg-layer-02);color:var(--text-text-muted);font:500 10px/18px 'IBM Plex Mono',monospace;text-align:center">c</span>
+                  <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+                    <span style="font:400 13px/18px Inter;color:var(--text-text-base)">Claude Code</span>
+                    <span style="font:400 11px/15px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">2.1.310</span>
+                  </div>
+                </div>
+              </div>
+
+              <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;padding:4px 6px 6px;border-right:1px solid var(--border-border-muted)">
+                <div style="display:flex;align-items:center;gap:8px;height:28px;margin:4px 2px 4px;padding:0 10px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-strong);background:var(--background-bg-base)">
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m21 21-4.3-4.3"></path><circle cx="11" cy="11" r="7"></circle></svg>
+                  <span style="font:400 12px/16px Inter;color:var(--text-text-faint)">Filter models</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:5px;background:var(--overlay-hover)">
+                  <span style="flex:1;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">openai/gpt-5.6-sol</span>
+                  <span style="font:400 10px/14px Inter;color:var(--text-text-faint);letter-spacing:0.04em;text-transform:uppercase">default</span>
+                </div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">openai/gpt-5.3-codex-spark</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">openai/gpt-5.5</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">openai/gpt-5.5-fast</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">openai/gpt-5.6-luna</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">openai/gpt-5.6-sol-fast</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">openai/gpt-5.6-terra</div>
+              </div>
+
+              <div style="flex:none;width:208px;display:flex;flex-direction:column;gap:2px;padding:4px 6px 6px">
+                <div style="padding:6px 8px;font:600 10px/14px Inter;color:var(--text-text-faint);letter-spacing:0.08em;text-transform:uppercase">Reasoning</div>
+                <div style="display:flex;align-items:baseline;justify-content:space-between;padding:2px 8px 4px">
+                  <span style="font:400 12px/16px Inter;color:var(--text-text-muted)">Reasoning</span>
+                  <span style="font:400 11px/16px Inter;color:var(--text-text-faint)">variant</span>
+                </div>
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:5px 8px;border-radius:5px;background:var(--overlay-hover)">
+                  <span style="font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">Default</span>
+                  <span style="font:400 10px/14px Inter;color:var(--text-text-faint);letter-spacing:0.04em;text-transform:uppercase">default</span>
+                </div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">None</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">Low</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">Medium</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">High</div>
+                <div style="padding:5px 8px;border-radius:5px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover)">Maximum</div>
+                <div style="padding:8px;font:400 11px/16px Inter;color:var(--text-text-muted);text-wrap:pretty">Only what you set here is sent. A model left on its default is sent nothing, so the harness applies its own.</div>
+              </div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:10px;padding:12px 14px;border-top:1px solid var(--border-border-base);background:var(--background-bg-base)">
+              <span style="flex:1;font:400 11px/16px Inter;color:var(--text-text-muted);text-wrap:pretty">This session stays on OpenCode — picking another harness opens a new one. Models and reasoning inside it can change at any time, including mid-run.</span>
+              <div style="flex:none;height:30px;padding:0 13px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-strong);font:500 12px/28px Inter;color:var(--text-text-base)" style-hover="background:var(--overlay-hover)">Cancel</div>
+              <div style="flex:none;height:30px;padding:0 15px;border-radius:6px;box-sizing:border-box;background:var(--background-bg-inverse);color:var(--background-bg-base);font:500 12px/30px Inter" style-hover="box-shadow:inset 0 0 0 999px #0000001f">Use for this session</div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:center">
+          <div style="width:100%;max-width:800px;display:flex;flex-direction:column;gap:10px;padding:14px;border-radius:10px;box-sizing:border-box;border:1px solid var(--border-border-base);background:var(--background-bg-layer-01)">
+            <div style="display:flex;align-items:flex-start;min-height:22px">
+              <span style="font:400 13px/20px Inter;color:var(--text-text-faint)">Paste a policy or scope URL, or say what is in and out of scope…</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--icon-icon-muted)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 5v14M5 12h14"></path></svg></div>
+                <div style="flex:none;display:flex;align-items:center;gap:7px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M7 10l5 5 5-5M12 15V3"></path></svg>
+                  <span style="font:500 12px/16px Inter;color:var(--text-text-base)">Importer</span>
+                  <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+                </div>
+              <div style="flex:none;display:flex;align-items:center;gap:8px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-strong);background:var(--overlay-pressed)">
+                <span style="flex:none;width:15px;height:15px;border-radius:4px;background:var(--background-bg-layer-03);color:var(--text-text-base);font:500 9px/15px 'IBM Plex Mono',monospace;text-align:center">o</span>
+                <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">openai/gpt-5.6-sol</span>
+                <svg style="flex:none;color:var(--icon-icon-base)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"></path></svg>
+              </div>
+              <div style="flex:1"></div>
+              <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--background-bg-layer-02);color:var(--text-text-faint)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 19V5M5 12l7-7 7 7"></path></svg></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="width:1040px;display:flex;flex-direction:column;gap:10px;padding-top:12px">
+        <div style="font:500 13px/18px Inter;color:#f2f2f2">Lifted whole, framed as a decision</div>
+        <div style="font:400 13px/20px Inter;color:#aeaeae;max-width:1000px;text-wrap:pretty">The harness / model / reasoning picker is lifted as-is, but opens as a modal rather than a popover hanging off the chip — three columns is more decision than a menu should hold next to a half-typed message, and the choice is one a session is pinned to. The backdrop also makes the obvious thing true: nothing else is actionable until it is answered or dismissed. Its one importer-specific wording is the footer note, which talks about sessions rather than attempts.</div>
+      </div>
+    </div>
+
+    <div id="d7" style="display:flex;flex-direction:column;gap:20px;width:1040px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#161616;background:#f2f2f2;padding:2px 8px;border-radius:4px">D7</div>
+        <div style="font:530 24px/32px Inter;color:#f2f2f2">Agent selector · who the message goes to</div>
+      </div>
+      <div data-theme="{{ theme }}" style="position:relative;width:1040px;height:560px;background:var(--background-bg-base);overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px #ffffff1a;display:flex;flex-direction:column;justify-content:flex-end;padding:0 32px 20px">
+
+        <div style="position:absolute;left:170px;bottom:112px;width:440px">
+          <div style="width:100%;display:flex;flex-direction:column;padding:6px;box-sizing:border-box;border-radius:8px;background:var(--background-bg-layer-01);border:1px solid var(--border-border-strong);box-shadow:0 18px 48px #00000070">
+            <div style="padding:8px 8px 6px;font:600 10px/14px Inter;color:var(--text-text-faint);letter-spacing:0.08em;text-transform:uppercase">Agent</div>
+            <div style="display:flex;align-items:flex-start;gap:10px;padding:8px;border-radius:5px;background:var(--overlay-hover)">
+              <svg style="flex:none;margin-top:2px;color:var(--icon-icon-base)" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M7 10l5 5 5-5M12 15V3"></path></svg>
+              <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+                <div style="display:flex;align-items:baseline;gap:8px">
+                  <span style="font:500 13px/18px Inter;color:var(--text-text-base)">Importer</span>
+                  <span style="font:400 10px/14px Inter;color:var(--text-text-faint);letter-spacing:0.04em;text-transform:uppercase">only agent</span>
+                </div>
+                <div style="font:400 11px/16px Inter;color:var(--text-text-muted);text-wrap:pretty">Reads program pages and statements of work, writes scope entries and assets.</div>
+              </div>
+              <svg style="flex:none;margin-top:3px;color:var(--icon-icon-base)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25"><path d="m20 6-11 11-5-5"></path></svg>
+            </div>
+            <div style="display:flex;gap:9px;padding:9px 8px 6px;margin-top:5px;border-top:1px solid var(--border-border-muted)">
+              <svg style="flex:none;margin-top:1px;color:var(--icon-icon-faint)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5M12 8h.01"></path></svg>
+              <span style="flex:1;font:400 11px/16px Inter;color:var(--text-text-muted);text-wrap:pretty">Importer is the only agent for now. When others land, switching applies to the next message — the thread stays, and the agent you switch to reads everything said before it.</span>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:center">
+          <div style="width:100%;max-width:800px;display:flex;flex-direction:column;gap:10px;padding:14px;border-radius:10px;box-sizing:border-box;border:1px solid var(--border-border-base);background:var(--background-bg-layer-01)">
+            <div style="display:flex;align-items:flex-start;min-height:22px">
+              <span style="font:400 13px/20px Inter;color:var(--text-text-faint)">Correct it, or add what the pages do not say…</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--icon-icon-muted)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 5v14M5 12h14"></path></svg></div>
+              <div style="flex:none;display:flex;align-items:center;gap:7px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-strong);background:var(--overlay-pressed)">
+                <svg style="flex:none;color:var(--icon-icon-base)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M7 10l5 5 5-5M12 15V3"></path></svg>
+                <span style="font:500 12px/16px Inter;color:var(--text-text-base)">Importer</span>
+                <svg style="flex:none;color:var(--icon-icon-base)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"></path></svg>
+              </div>
+              <div style="flex:none;display:flex;align-items:center;gap:8px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                <span style="flex:none;width:15px;height:15px;border-radius:4px;background:var(--background-bg-layer-03);color:var(--text-text-base);font:500 9px/15px 'IBM Plex Mono',monospace;text-align:center">o</span>
+                <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">openai/gpt-5.6-sol</span>
+                <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+              </div>
+              <div style="flex:1"></div>
+              <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--background-bg-layer-02);color:var(--text-text-faint)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 19V5M5 12l7-7 7 7"></path></svg></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="width:1040px;display:flex;flex-direction:column;gap:10px;padding-top:12px">
+        <div style="font:500 13px/18px Inter;color:#f2f2f2">Agent first, then model</div>
+        <div style="font:400 13px/20px Inter;color:#aeaeae;max-width:1000px;text-wrap:pretty">Two chips, read left to right as one sentence: <span style="font-family:'IBM Plex Mono',monospace">Importer</span> on <span style="font-family:'IBM Plex Mono',monospace">openai/gpt-5.6-sol</span>. The agent is what the message is for and carries its own tools and permissions, so it leads; the model is how it thinks. The list names what the agent can write, because that is the only difference an operator needs before sending. Importer is the sole agent for now — the chip stays because the slot is real, and because agent is per-message rather than per-session: swapping it mid-thread will be a normal move, and the new agent inherits the transcript rather than starting blind.</div>
+      </div>
+    </div>
+
+    <div id="d8" style="display:flex;flex-direction:column;gap:20px;width:1440px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="font:500 14px/20px 'IBM Plex Mono',monospace;color:#161616;background:#f2f2f2;padding:2px 8px;border-radius:4px">D8</div>
+        <div style="font:530 24px/32px Inter;color:#f2f2f2">What the transcript can render</div>
+      </div>
+      <div data-theme="{{ theme }}" style="width:1440px;height:1566px;background:var(--background-bg-base);display:flex;flex-direction:column;overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px #ffffff1a">
+        <div style="flex:none;height:38px;display:flex;align-items:center;gap:4px;padding:0 4px 0 10px;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 8px;border-radius:5px;box-sizing:border-box">
+            <span style="flex:none;width:16px;height:16px;border-radius:4px;background:var(--background-bg-inverse);color:var(--background-bg-deep);font:600 9px/16px Inter;text-align:center">A</span>
+            <span style="font:500 12px/16px Inter;color:var(--text-text-base)">acme_corp</span>
+          </div>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <span style="font:400 12px/16px Inter;color:var(--text-text-muted);padding:0 6px">Assets</span>
+          <svg style="flex:none;color:var(--icon-icon-faint)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="m10 6 6 6-6 6"></path></svg>
+          <span style="font:500 12px/16px Inter;color:var(--text-text-base);padding:0 6px">Auto-load</span>
+          <div style="flex:1"></div>
+          <div title="Toggle session context · 118,204 of 200,000 tokens" style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid transparent" style-hover="background:var(--overlay-hover);border-color:var(--border-border-base)">
+            <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="var(--border-border-strong)" stroke-width="3"></circle><circle cx="12" cy="12" r="9" fill="none" stroke="var(--icon-icon-base)" stroke-width="3" stroke-linecap="round" stroke-dasharray="33.4 23.1" transform="rotate(-90 12 12)"></circle></svg>
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">118,204</span>
+          </div>
+          <div style="flex:none;display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:5px;box-sizing:border-box;border:1px solid var(--border-border-base)">
+            <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">Full policy sweep</span>
+            <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+          </div>
+          <div style="flex:none;width:30px;height:30px"></div>
+        </div>
+
+        <div style="flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;overflow:hidden;padding:28px 32px 0">
+          <div style="width:100%;max-width:800px;display:flex;flex-direction:column;gap:26px">
+
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:7px">
+              <div style="max-width:560px;padding:11px 14px;border-radius:10px;box-sizing:border-box;background:var(--background-bg-layer-02);font:400 13px/20px Inter;color:var(--text-text-base);text-wrap:pretty">Write up everything you did on this target — the scope as a table, the raw rule you could not parse, and the entry JSON for the partner portal.</div>
+              <div style="display:flex;align-items:center;gap:9px;color:var(--icon-icon-faint)">
+                <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">You · 18:24</span>
+                <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style-hover="color:var(--icon-icon-base)"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg>
+              </div>
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:20px">
+              <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">Here is the whole session. <strong style="font-weight:600">Six rows parsed cleanly</strong>, <em>one did not</em>, and <span style="text-decoration:line-through;color:var(--text-text-muted)">two rows I first read as hosts</span> turned out to be CIDR ranges. Provenance is on every entry as <span style="font:400 12px/20px 'IBM Plex Mono',monospace;background:var(--background-bg-layer-02);border-radius:4px;padding:1px 5px">source</span>, pointing at <a href="#d8">the policy page line</a> it came from.</div>
+
+              <div style="font:530 15px/22px Inter;color:var(--text-text-base);padding-top:4px">Scope as written</div>
+
+              <div style="display:flex;flex-direction:column;border-radius:7px;overflow:hidden;box-sizing:border-box;border:1px solid var(--border-border-base)">
+                <div style="display:grid;grid-template-columns:1.6fr 0.7fr 1fr 1.4fr;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+                  <div style="padding:9px 12px;font:500 11px/16px Inter;color:var(--text-text-muted);letter-spacing:0.04em;text-transform:uppercase">Host</div>
+                  <div style="padding:9px 12px;font:500 11px/16px Inter;color:var(--text-text-muted);letter-spacing:0.04em;text-transform:uppercase">Dir</div>
+                  <div style="padding:9px 12px;font:500 11px/16px Inter;color:var(--text-text-muted);letter-spacing:0.04em;text-transform:uppercase">Source</div>
+                  <div style="padding:9px 12px;font:500 11px/16px Inter;color:var(--text-text-muted);letter-spacing:0.04em;text-transform:uppercase">Note</div>
+                </div>
+                <div style="display:grid;grid-template-columns:1.6fr 0.7fr 1fr 1.4fr;border-bottom:1px solid var(--border-border-muted)">
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">*.acme.com</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-base)">in</div>
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">policy:212</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-muted)">host + subdomains</div>
+                </div>
+                <div style="display:grid;grid-template-columns:1.6fr 0.7fr 1fr 1.4fr;border-bottom:1px solid var(--border-border-muted)">
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">*.acmelabs.io</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-base)">in</div>
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">policy:213</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-muted)">host + subdomains</div>
+                </div>
+                <div style="display:grid;grid-template-columns:1.6fr 0.7fr 1fr 1.4fr;border-bottom:1px solid var(--border-border-muted)">
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">203.0.113.0/24</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-base)">in</div>
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">policy:216</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-muted)">CIDR, 256 addresses</div>
+                </div>
+                <div style="display:grid;grid-template-columns:1.6fr 0.7fr 1fr 1.4fr;border-bottom:1px solid var(--border-border-muted)">
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">app.partner.com</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-base)">in</div>
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">operator</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-muted)">host only</div>
+                </div>
+                <div style="display:grid;grid-template-columns:1.6fr 0.7fr 1fr 1.4fr">
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">blog.acme.com</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-base)">out</div>
+                  <div style="padding:9px 12px;font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">policy:219</div>
+                  <div style="padding:9px 12px;font:400 12px/18px Inter;color:var(--text-text-muted)">WordPress rule</div>
+                </div>
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div style="font:400 13px/21px Inter;color:var(--text-text-base)">Still open after this session:</div>
+                <div style="display:flex;flex-direction:column;gap:7px;padding-left:4px">
+                  <div style="display:flex;align-items:flex-start;gap:10px">
+                    <span style="flex:none;width:4px;height:4px;border-radius:50%;background:var(--icon-icon-muted);margin-top:8px"></span>
+                    <span style="flex:1;font:400 13px/20px Inter;color:var(--text-text-base);text-wrap:pretty">The WordPress rule — prose, not a host.</span>
+                  </div>
+                  <div style="display:flex;align-items:flex-start;gap:10px;padding-left:22px">
+                    <span style="flex:none;width:4px;height:4px;border-radius:50%;background:var(--icon-icon-faint);margin-top:8px"></span>
+                    <span style="flex:1;font:400 13px/20px Inter;color:var(--text-text-muted);text-wrap:pretty">Nested: I only excluded the one host the page names.</span>
+                  </div>
+                  <div style="display:flex;align-items:flex-start;gap:10px">
+                    <span style="flex:none;width:4px;height:4px;border-radius:50%;background:var(--icon-icon-muted);margin-top:8px"></span>
+                    <span style="flex:1;font:400 13px/20px Inter;color:var(--text-text-base);text-wrap:pretty">Two staging hosts the SOW mentions but the program page does not.</span>
+                  </div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:8px;padding-top:6px">
+                  <div style="display:flex;align-items:center;gap:10px">
+                    <span style="flex:none;width:15px;height:15px;border-radius:3px;display:flex;align-items:center;justify-content:center;background:var(--background-bg-inverse);color:var(--background-bg-base)"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="m20 6-11 11-5-5"></path></svg></span>
+                    <span style="font:400 13px/20px Inter;color:var(--text-text-muted);text-decoration:line-through">Read the program policy page</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:10px">
+                    <span style="flex:none;width:15px;height:15px;border-radius:3px;box-sizing:border-box;border:1px solid var(--border-border-strong)"></span>
+                    <span style="font:400 13px/20px Inter;color:var(--text-text-base)">Confirm the WordPress rule's reach with the client</span>
+                  </div>
+                </div>
+              </div>
+
+              <div style="display:flex;gap:14px;padding-left:2px">
+                <span style="flex:none;width:2px;background:var(--border-border-strong);border-radius:1px"></span>
+                <div style="flex:1;display:flex;flex-direction:column;gap:8px">
+                  <div style="font:400 13px/21px Inter;color:var(--text-text-muted);text-wrap:pretty">"Testing is permitted against any Acme-owned property except WordPress properties, which are managed by a third party and are out of scope for this program."</div>
+                  <div style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">hackerone.com/acme/policy · line 219</div>
+                </div>
+              </div>
+
+              <div style="display:flex;flex-direction:column;border-radius:7px;overflow:hidden;box-sizing:border-box;border:1px solid var(--border-border-base)">
+                <div style="display:flex;align-items:center;gap:8px;padding:7px 10px 7px 12px;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+                  <span style="flex:1;font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">entry-10.json</span>
+                  <div style="flex:none;display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:5px;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover);color:var(--text-text-base)">
+                    <svg style="flex:none" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg>
+                    <span style="font:400 11px/16px Inter">Copy</span>
+                  </div>
+                </div>
+                <div style="padding:12px 14px;background:var(--background-bg-deep);font:400 12px/20px 'IBM Plex Mono',monospace;color:var(--text-text-muted);white-space:pre">{
+  <span style="color:var(--text-text-base);font-weight:500">"host"</span>:       <span style="color:var(--text-text-base)">"app.partner.com"</span>,
+  <span style="color:var(--text-text-base);font-weight:500">"subdomains"</span>: <span style="color:var(--text-text-base)">false</span>,
+  <span style="color:var(--text-text-base);font-weight:500">"direction"</span>:  <span style="color:var(--text-text-base)">"in"</span>,
+  <span style="color:var(--text-text-base);font-weight:500">"source"</span>:     <span style="color:var(--text-text-base)">"operator"</span>,
+  <span style="color:var(--text-text-base);font-weight:500">"written_at"</span>: <span style="color:var(--text-text-base)">"2026-11-03T18:07:41Z"</span>
+}</div>
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">Inline, an expression reads <span style="font:400 12px/20px 'IBM Plex Mono',monospace;background:var(--background-bg-layer-02);border-radius:4px;padding:1px 5px">var=expres() + yield * expres2()</span> — fenced, it keeps its own frame:</div>
+                <div style="display:flex;flex-direction:column;border-radius:7px;overflow:hidden;box-sizing:border-box;border:1px solid var(--border-border-base)">
+                  <div style="display:flex;align-items:center;gap:8px;padding:7px 10px 7px 12px;background:var(--background-bg-deep);border-bottom:1px solid var(--border-border-base)">
+                    <span style="flex:1;font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">js</span>
+                    <div style="flex:none;display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:5px;color:var(--text-text-muted)" style-hover="background:var(--overlay-hover);color:var(--text-text-base)">
+                      <svg style="flex:none" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg>
+                      <span style="font:400 11px/16px Inter">Copy</span>
+                    </div>
+                  </div>
+                  <div style="padding:12px 14px;background:var(--background-bg-deep);font:400 12px/20px 'IBM Plex Mono',monospace;color:var(--text-text-muted);white-space:pre"><span style="color:var(--text-text-base);font-weight:500">var</span>=<span style="color:var(--text-text-base)">expres</span>() + <span style="color:var(--text-text-base);font-weight:500">yield</span> * <span style="color:var(--text-text-base)">expres2</span>()</div>
+                </div>
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">The one row I could not split is long enough to need its own gutter — it scrolls rather than widening the thread:</div>
+                <div style="padding:10px 12px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-muted);background:var(--background-bg-deep);overflow-x:auto">
+                  <span style="display:block;white-space:nowrap;font:400 12px/20px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">https://acme.com/legacy/partner/handoff?redirect=https%3A%2F%2Fapp.partner.com%2Fsso%2Fcallback&amp;tenant=acme-corp-emea-production&amp;sig=9f2c1ab7e4d05583c1f0</span>
+                </div>
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:10px">
+                <div style="font:400 13px/21px Inter;color:var(--text-text-base)">How the partner portal sits relative to what is in scope:</div>
+                <div style="display:flex;align-items:center;gap:14px;padding:16px;border-radius:7px;box-sizing:border-box;border:1px solid var(--border-border-base);background:var(--background-bg-deep)">
+                  <div style="flex:none;padding:8px 12px;border-radius:5px;box-sizing:border-box;border:1px solid var(--border-border-strong);font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">*.acme.com</div>
+                  <svg style="flex:none;color:var(--icon-icon-faint)" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 12h15M14 7l5 5-5 5"></path></svg>
+                  <div style="flex:none;padding:8px 12px;border-radius:5px;box-sizing:border-box;border:1px solid var(--border-border-strong);font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-base)">/legacy/partner/handoff</div>
+                  <svg style="flex:none;color:var(--icon-icon-faint)" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 12h15M14 7l5 5-5 5"></path></svg>
+                  <div style="flex:none;padding:8px 12px;border-radius:5px;box-sizing:border-box;border:1px dashed var(--border-border-strong);font:400 12px/18px 'IBM Plex Mono',monospace;color:var(--text-text-muted)">app.partner.com</div>
+                </div>
+              </div>
+
+
+              <div style="font:400 13px/21px Inter;color:var(--text-text-base);text-wrap:pretty">Want me to record the two staging hosts as assets, or leave them until the client answers?</div>
+              <div style="display:flex;align-items:center;gap:9px;color:var(--icon-icon-faint)">
+                <svg style="flex:none" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style-hover="color:var(--icon-icon-base)"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg>
+                <span style="font:400 11px/16px 'IBM Plex Mono',monospace;color:var(--text-text-faint)">Importer · openai/gpt-5.6-sol · 2m 27s</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="flex:none;display:flex;justify-content:center;padding:16px 32px 20px">
+          <div style="width:100%;max-width:800px;display:flex;flex-direction:column;gap:10px;padding:14px;border-radius:10px;box-sizing:border-box;border:1px solid var(--border-border-base);background:var(--background-bg-layer-01)">
+            <div style="display:flex;align-items:flex-start;min-height:22px">
+              <span style="font:400 13px/20px Inter;color:var(--text-text-faint)">Correct it, or add what the pages do not say…</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--icon-icon-muted)" style-hover="background:var(--overlay-hover);color:var(--icon-icon-base)" aria-label="Attach"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 5v14M5 12h14"></path></svg></div>
+              <div style="flex:none;display:flex;align-items:center;gap:7px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                <svg style="flex:none;color:var(--icon-icon-muted)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M7 10l5 5 5-5M12 15V3"></path></svg>
+                <span style="font:500 12px/16px Inter;color:var(--text-text-base)">Importer</span>
+                <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+              </div>
+              <div style="flex:none;display:flex;align-items:center;gap:8px;height:28px;padding:0 9px;border-radius:6px;box-sizing:border-box;border:1px solid var(--border-border-base)" style-hover="background:var(--overlay-hover)">
+                <span style="flex:none;width:15px;height:15px;border-radius:4px;background:var(--background-bg-layer-03);color:var(--text-text-base);font:500 9px/15px 'IBM Plex Mono',monospace;text-align:center">o</span>
+                <span style="font:400 12px/16px 'IBM Plex Mono',monospace;color:var(--text-text-base)">openai/gpt-5.6-sol</span>
+                <svg style="flex:none;color:var(--icon-icon-muted)" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+              </div>
+              <div style="flex:1"></div>
+              <div style="flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--background-bg-layer-02);color:var(--text-text-faint)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 19V5M5 12l7-7 7 7"></path></svg></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="width:1440px;display:flex;flex-direction:column;gap:10px;padding-top:12px">
+        <div style="font:500 13px/18px Inter;color:#f2f2f2">Rich content, same ink</div>
+        <div style="font:400 13px/20px Inter;color:#aeaeae;max-width:1000px;text-wrap:pretty">Everything the agent can emit renders in the thread's own vocabulary: inline bold, italic, strikethrough, links and code; headings, nested and task lists; blockquotes with the line they came from; tables that fill the thread width rather than scrolling; code blocks framed with a filename and a copy affordance; and small flow figures for relationships. Syntax highlighting is carried by weight and tone, not colour — the palette stays monochrome. Anything that cannot wrap — a long URL, a token, a header dump — scrolls inside its own block so the 800px measure never breaks.</div>
+      </div>
+    </div>
+
+  </div>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;default&quot;:&quot;dark&quot;,&quot;tsType&quot;:&quot;string&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme ?? "dark" };
+  }
+}
+</script>
+</body>
+</html>
