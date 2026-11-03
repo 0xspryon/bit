@@ -1372,6 +1372,8 @@ const turnDrivenSdk = () => {
   let sessionId = "";
   /** Set by {@link failStream}: what the stream throws once it has been woken. */
   let streamFailure: Error | undefined;
+  /** Set by {@link endStream}: the stream returns once it has been woken. */
+  let streamEnded = false;
   const push = (message: SDKMessage): void => {
     pending.push(message);
     const waiting = wake;
@@ -1434,6 +1436,7 @@ const turnDrivenSdk = () => {
               if (next !== undefined) yield next;
             }
             if (streamFailure !== undefined) throw streamFailure;
+            if (streamEnded) return;
             await new Promise<void>((resolve) => {
               wake = resolve;
             });
@@ -1451,15 +1454,33 @@ const turnDrivenSdk = () => {
     push(result(sessionId, "success"));
   };
   /**
-   * Kills the query with an error, **in the order SDK 0.3.310's `Query.performCleanup`
-   * does it**: every pending control request is rejected first, and only then is the
-   * input stream errored. So a switch waiting on `setModel` wakes before the pump has
-   * seen the stream fail, which is the order a fix has to survive.
+   * Kills the query with an error, **in the order the pump sees it under SDK 0.3.310**:
+   * `Query.readMessages` errors the message stream and calls `cleanup(e)`, which rejects
+   * every pending control request at once, but the pump's iterator only throws once
+   * `readSdkMessages`' `finally` has awaited that cleanup. So a switch waiting on
+   * `setModel` wakes before the pump has seen the stream fail, which is the order a fix
+   * has to survive.
    */
   const failStream = (cause: Error): void => {
     for (const reject of hanging) reject(cause);
     hanging.clear();
     streamFailure = cause;
+    const waiting = wake;
+    wake = undefined;
+    waiting?.();
+  };
+  /**
+   * Ends the query **cleanly**, as SDK 0.3.310 does when the CLI exits with code 0:
+   * `readMessages` finishes the message stream and calls `cleanup()`, which rejects every
+   * pending control request with "Query closed before response received"; the pump's
+   * iterator then returns, without an error, after that cleanup has run.
+   */
+  const endStream = (): void => {
+    for (const reject of hanging) {
+      reject(new Error("Query closed before response received"));
+    }
+    hanging.clear();
+    streamEnded = true;
     const waiting = wake;
     wake = undefined;
     waiting?.();
@@ -1471,7 +1492,7 @@ const turnDrivenSdk = () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   };
-  return { sdk, seen, controls, emitResult, failStream, pulled };
+  return { sdk, seen, controls, emitResult, failStream, endStream, pulled };
 };
 
 const withTurnDriven = <A>(
@@ -2219,6 +2240,39 @@ describe("switching a Claude Code session's model", () => {
           yield* Effect.sleep("5 millis");
         }
         driver.failStream(new Error("the CLI exited with code 1"));
+        const failure = yield* Fiber.join(switching);
+        return { failure, switches: [...driver.seen.switches] };
+      }),
+    );
+    expect(outcome.switches).toEqual(["model:claude-opus-5"]);
+    expect(outcome.failure._tag).toBe("HarnessTransportError");
+    if (outcome.failure._tag === "HarnessTransportError") {
+      expect(outcome.failure.operation).toBe("session.switchModel");
+      expect(outcome.failure.tag).toBe(SESSION_NOT_FOUND_TAG);
+      expect(outcome.failure.status).toBe(404);
+    }
+  });
+
+  test("a switch whose stream ends cleanly while it waits is refused as not found", async () => {
+    /*
+     * The CLI exiting with code 0 under a conversation: no error anywhere, the pump's
+     * `for await` simply finishes. The SDK still rejects the pending `setModel` first, and
+     * the switch is resumed by `ended` on the pump's own call stack, before `closeSession`
+     * has marked the record closed. Unless the pump marked it as going before that, the
+     * switch reads a live session and reports a plain, "uncertain", failure.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        driver.controls.hang = "setModel";
+        const switching = yield* Effect.forkChild(
+          Effect.flip(harness.switchModel(LIVE, "claude-opus-5")),
+        );
+        for (let tries = 0; driver.seen.switches.length === 0; tries += 1) {
+          if (tries > 200) throw new Error("setModel was never sent");
+          yield* Effect.sleep("5 millis");
+        }
+        driver.endStream();
         const failure = yield* Fiber.join(switching);
         return { failure, switches: [...driver.seen.switches] };
       }),
