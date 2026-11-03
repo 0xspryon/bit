@@ -12,6 +12,7 @@ export * from "./asset";
 export * from "./scope";
 export * from "./scopeImport";
 export * from "./agentSessions";
+export * from "./agents";
 export * from "./intent";
 export * from "./goal";
 export * from "./plan";

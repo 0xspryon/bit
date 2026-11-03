@@ -225,6 +225,7 @@ export const importerSessionView = (
   endedAt: null,
   endedReason: null,
   importId: "imp_1",
+  agentId: "importer",
   tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
   ...over,
 });
@@ -1186,6 +1187,19 @@ export class FakeServer implements ServerClient {
   onImporterModel: (baseUrl: string) => Answer<"importerModel"> = () =>
     ok(importerModelView());
 
+  /** The server's registry as it stands: the importer, and nothing else. */
+  onAgents: (baseUrl: string) => Answer<"agents"> = () =>
+    ok({
+      agents: [
+        {
+          id: "importer",
+          label: "Importer",
+          writes:
+            "Scope entries and the hosts they name, from the program pages you give it",
+        },
+      ],
+    });
+
   onAgentSessions: (
     ...args: Parameters<ServerClient["agentSessions"]>
   ) => Answer<"agentSessions"> = () => ok({ sessions: [], workersOmitted: 0 });
@@ -1382,6 +1396,9 @@ export class FakeServer implements ServerClient {
     this.record("importerModel", [baseUrl], () =>
       this.onImporterModel(baseUrl),
     );
+
+  agents = (baseUrl: string) =>
+    this.record("agents", [baseUrl], () => this.onAgents(baseUrl));
 
   agentSessions = (...args: Parameters<ServerClient["agentSessions"]>) =>
     this.record("agentSessions", args, () => this.onAgentSessions(...args));

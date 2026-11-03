@@ -6673,6 +6673,7 @@ const makeStore = Effect.fnUntraced(function* () {
     ended_at: Schema.NullOr(Schema.Finite),
     latest_import_id: Schema.String,
     ended_reason: Schema.NullOr(ImportSessionEndReason),
+    agent_id: Schema.String,
   });
 
   /**
@@ -6729,6 +6730,7 @@ const makeStore = Effect.fnUntraced(function* () {
             s.harness_instance_id AS harness_instance_id,
             s.model AS model,
             s.opened_at AS opened_at,
+            s.agent_id AS agent_id,
             (SELECT group_concat(r.import_id) FROM import_sessions r
               WHERE r.target_id = s.target_id
                 AND r.harness_session_id = s.harness_session_id) AS import_ids,
@@ -6814,6 +6816,7 @@ const makeStore = Effect.fnUntraced(function* () {
         endedAt: row.ended_at,
         endedReason: row.ended_at === null ? null : row.ended_reason,
         latestImportId: row.latest_import_id,
+        agentId: row.agent_id,
       }));
     },
   );
@@ -6841,6 +6844,7 @@ const makeStore = Effect.fnUntraced(function* () {
       readonly model: string;
       readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
       readonly pages?: readonly string[] | undefined;
+      readonly agentId: string;
     }) {
       const openedAt = yield* Clock.currentTimeMillis;
       // `0015`'s encoding, so the two columns compare byte for byte.
@@ -6852,13 +6856,13 @@ const makeStore = Effect.fnUntraced(function* () {
       });
       yield* sql`INSERT INTO import_sessions (
             import_id, target_id, harness_session_id, harness_instance_id, model,
-            model_options, pages, caller_scope, opened_at
+            model_options, pages, caller_scope, opened_at, agent_id
           ) VALUES (
             ${input.importId}, ${input.targetId}, ${input.harnessSessionId},
             ${input.harnessInstanceId}, ${input.model},
             ${modelOptions === null ? null : JSON.stringify(modelOptions)},
             ${input.pages === undefined ? null : JSON.stringify(input.pages)},
-            ${callerScope}, ${openedAt}
+            ${callerScope}, ${openedAt}, ${input.agentId}
           )
           ON CONFLICT(import_id) DO NOTHING`.pipe(
         Effect.mapError(asDatabaseError("query")),
@@ -6972,10 +6976,12 @@ const makeStore = Effect.fnUntraced(function* () {
       ended_at: Schema.NullOr(Schema.Finite),
       ended_reason: Schema.NullOr(ImportSessionEndReason),
       session_created_at: Schema.NullOr(Schema.Finite),
+      agent_id: Schema.String,
     }),
     execute: (importId) =>
       sql`SELECT target_id, harness_session_id, harness_instance_id, model,
-                 model_options, pages, ended_at, ended_reason, session_created_at
+                 model_options, pages, ended_at, ended_reason, session_created_at,
+                 agent_id
             FROM import_sessions
             WHERE import_id = ${importId}`,
   });
@@ -7005,6 +7011,7 @@ const makeStore = Effect.fnUntraced(function* () {
         endedAt: value.ended_at,
         endedReason: value.ended_reason,
         confirmedAt: value.session_created_at,
+        agentId: value.agent_id,
       }),
     });
   });
@@ -9316,6 +9323,8 @@ export class ObservationStore extends Context.Service<
         readonly endedReason: ImportSessionEndReason | null;
         /** The newest run, which a message to the session is addressed to. */
         readonly latestImportId: string;
+        /** The agent the session runs as (`0002`), from the run that opened it. */
+        readonly agentId: string;
       }[],
       DatabaseError | StoredRowError
     >;
@@ -9365,6 +9374,12 @@ export class ObservationStore extends Context.Service<
            * message had been lost.
            */
           readonly confirmedAt: number | null;
+          /**
+           * The agent this run's session runs as (`0002`): pinned when the session's first
+           * message was sent, and what a reopen opens its successor as. `importer` on a row
+           * written before the column existed.
+           */
+          readonly agentId: string;
         }
       | undefined,
       DatabaseError | StoredRowError
@@ -9387,6 +9402,11 @@ export class ObservationStore extends Context.Service<
       readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
       /** The pages its entries may cite, as the import starts. See `0029`. */
       readonly pages?: readonly string[] | undefined;
+      /**
+       * The agent the session runs as (`0002`). Required rather than defaulted: the opener
+       * is the one place that knows which agent it opened, and a row is written once.
+       */
+      readonly agentId: string;
     }) => Effect.Effect<void, DatabaseError>;
     /** Rewrites the pages an import's entries may cite, once a message widened them (`0029`). */
     readonly recordImportPages: (

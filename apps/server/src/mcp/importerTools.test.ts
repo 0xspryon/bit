@@ -38,6 +38,7 @@ import { join } from "node:path";
 
 import { Context, Effect, Layer, ManagedRuntime, Redacted } from "effect";
 
+import { IMPORTER_AGENT } from "../agent/registry";
 import { ScopeImportProgress } from "../import/progress";
 import {
   ObservationStore,
@@ -189,6 +190,7 @@ class Seeded extends Context.Service<
         harnessSessionId: "ses_ended",
         harnessInstanceId: "opencode",
         model: "opencode/glm-5.3-flash-free",
+        agentId: "importer",
       });
       yield* store.confirmImportSession(IMPORT_ENDED);
       yield* store.endImportSession(IMPORT_ENDED, "operator");
@@ -217,6 +219,7 @@ class Seeded extends Context.Service<
           harnessSessionId: `ses_${reason}`,
           harnessInstanceId: "opencode",
           model: "opencode/glm-5.3-flash-free",
+          agentId: "importer",
         });
         yield* store.confirmImportSession(importId);
         yield* store.endImportSession(importId, reason);
@@ -426,6 +429,8 @@ const IMPORTER_TOOLS = [
 describe("the importer's three tools exist here and nowhere else", () => {
   test("the importer is offered exactly the three", async () => {
     expect(await toolNames(importerUrl, importerToken)).toEqual(IMPORTER_TOOLS);
+    // And the importer agent's declared authority is what the endpoint serves.
+    expect([...IMPORTER_AGENT.authority.tools].sort()).toEqual(IMPORTER_TOOLS);
   });
 
   test("a worker attempt is offered none of them", async () => {

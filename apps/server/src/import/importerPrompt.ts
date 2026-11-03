@@ -16,6 +16,16 @@
  * whatever happens to the next page, because they were written when that page was read
  * rather than batched to the end.
  *
+ * ## Reached through the agent registry
+ *
+ * These assemblers are the importer agent's prompts (`agent/registry.ts`'s `IMPORTER_AGENT`),
+ * and the importer service sends them only through that entry: the opener and the resume
+ * note through the session's recorded agent, a later message through the agent pinned on
+ * the live session. The text lives here rather than in the registry because it is code, not
+ * a template — it branches on how many pages there are and on whether an earlier session
+ * gave any — and moving it would change nothing it says. Its output is pinned in
+ * `agent/registry.test.ts`.
+ *
  * ## The page content is data, never instruction
  *
  * `SCOPE_IMPORT_DATA_NOT_INSTRUCTIONS` carries that, and lives in contracts because the

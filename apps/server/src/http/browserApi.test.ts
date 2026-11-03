@@ -1536,6 +1536,29 @@ describe("the harness listing", () => {
   });
 });
 
+describe("the agent registry", () => {
+  test("lists the importer with its label and what it writes, and nothing of its prompt or grant", async () => {
+    const listed = await read(await signedIn("/agents"));
+    expect(listed.status).toBe(200);
+    expect(listed.body).toEqual({
+      agents: [
+        {
+          id: "importer",
+          label: "Importer",
+          writes:
+            "Scope entries and the hosts they name, from the program pages you give it",
+        },
+      ],
+    });
+  });
+
+  test("the listing needs a session like everything else", async () => {
+    const refused = await read(await call("/agents"));
+    expect(refused.status).toBe(401);
+    expect(refused.body["_tag"]).toBe("Unauthenticated");
+  });
+});
+
 describe("reading an attempt's transcript", () => {
   const targetId = "transcripts";
   const attemptId = "at_no_transcript";
@@ -4323,6 +4346,8 @@ describe("a target's importer sessions", () => {
           endedReason: null,
           // The run a message to this session is addressed to.
           importId: LIVE_IMPORT_ID,
+          // Seeded with no agent, as a row from before `0002`: it reads as the importer.
+          agentId: "importer",
           tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
         },
         {
@@ -4337,6 +4362,7 @@ describe("a target's importer sessions", () => {
           // Seeded with no reason, as a row ended before `0027` has none.
           endedReason: null,
           importId: "imp_old",
+          agentId: "importer",
           tally: { entriesIn: 2, entriesOut: 1, assets: 1 },
         },
       ],

@@ -814,6 +814,14 @@ export const server = {
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.importerModel())),
 
   /**
+   * The agents a conversation can run as, for the agent chip: each one's name and what it
+   * can write. The server's registry, asked rather than compiled into this bundle, so the
+   * chip never offers an agent the server no longer defines.
+   */
+  agents: (baseUrl: string) =>
+    run(Effect.flatMap(client(baseUrl), (api) => api.fleet.agents())),
+
+  /**
    * Every long-running agent session on this target, of any kind, newest first. A read-time
    * union on the server: there is no table of "agent sessions" behind it.
    */

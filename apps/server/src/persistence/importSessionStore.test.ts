@@ -28,7 +28,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Effect } from "effect";
+import { SqlClient } from "effect/sql";
+import { SqliteMigrator } from "@effect/sql-sqlite-bun";
 
+import { MIGRATIONS, runMigrations } from "./migrations";
+import { sqliteLayer } from "./sql";
 import {
   callerScopeOf,
   ObservationStore,
@@ -97,6 +101,7 @@ const open = (
       harnessSessionId: over.session ?? `ses_${importId}`,
       harnessInstanceId: "opencode",
       model: "openai/gpt-5.6-sol",
+      agentId: "importer",
     });
     if (over.confirmed !== false) yield* store.confirmImportSession(importId);
   });
@@ -429,6 +434,7 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
           harnessSessionId: "ses_effort",
           harnessInstanceId: "claude",
           model: "anthropic/claude-sonnet-5",
+          agentId: "importer",
           // Out of order on purpose: the row holds `0015`'s sorted encoding.
           modelOptions: [
             { id: "thinking", value: "on" },
@@ -442,6 +448,7 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
           harnessSessionId: "ses_default",
           harnessInstanceId: "claude",
           model: "anthropic/claude-sonnet-5",
+          agentId: "importer",
           modelOptions: [],
         });
         return {
@@ -472,6 +479,7 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
           harnessSessionId: "ses_pages",
           harnessInstanceId: "opencode",
           model: "openai/gpt-5.6-sol",
+          agentId: "importer",
           pages: [PAGE],
         });
         yield* store.recordImportPages("imp_pages", [PAGE, later]);
@@ -497,6 +505,7 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
             harnessSessionId: `ses_${importId}`,
             harnessInstanceId: "opencode",
             model: "openai/gpt-5.6-sol",
+            agentId: "importer",
           });
         }
         yield* store.confirmImportSession("imp_opened");
@@ -515,5 +524,72 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
      * "I no longer hold that session", which would tell an operator their message was lost.
      */
     expect(outcome.never?.confirmedAt).toBeNull();
+  });
+});
+
+describe("the agent a session runs as (0002)", () => {
+  test("is stored as written and read back by both reads, from the run that opened it", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        // An id the registry does not define, so a default could not pass for a write.
+        yield* store.recordImportSession({
+          importId: "imp_pinned",
+          targetId: TARGET,
+          harnessSessionId: "ses_pinned",
+          harnessInstanceId: "opencode",
+          model: "openai/gpt-5.6-sol",
+          agentId: "retired_agent",
+        });
+        yield* store.confirmImportSession("imp_pinned");
+        return {
+          row: yield* store.importSession("imp_pinned"),
+          index: yield* store.importSessions(TARGET),
+        };
+      }),
+    );
+    expect(outcome.row?.agentId).toBe("retired_agent");
+    expect(outcome.index.map((session) => session.agentId)).toEqual([
+      "retired_agent",
+    ]);
+  });
+
+  test("a row written before the column existed reads as the importer", async () => {
+    const path = newDatabasePath();
+    const baseline = MIGRATIONS["0001_baseline"];
+    if (baseline === undefined) throw new Error("the baseline is missing");
+    // The file as a build before `0002` left it: the baseline only, and a row on it.
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* runMigrations({
+            loader: SqliteMigrator.fromRecord({ "0001_baseline": baseline }),
+          });
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`INSERT INTO import_sessions (
+              import_id, target_id, harness_session_id, harness_instance_id, model,
+              caller_scope, opened_at, session_created_at
+            ) VALUES (
+              'imp_old', ${TARGET}, 'ses_old', 'opencode', 'openai/gpt-5.6-sol',
+              ${callerScopeOf({ _tag: "importer", targetId: TARGET, importId: "imp_old" })},
+              1, 2
+            )`;
+        }).pipe(Effect.provide(sqliteLayer(path))),
+      ),
+    );
+
+    // Opening the store migrates the rest of the chain over it.
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        return {
+          row: yield* store.importSession("imp_old"),
+          index: yield* store.importSessions(TARGET),
+        };
+      }),
+    );
+    expect(outcome.row?.agentId).toBe("importer");
+    expect(outcome.index.map((session) => session.agentId)).toEqual([
+      "importer",
+    ]);
   });
 });

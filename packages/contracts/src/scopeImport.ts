@@ -352,6 +352,13 @@ export const ImporterSessionView = Schema.Struct({
    * closed and opened again would carry more than one — and a message goes to the latest.
    */
   importId: Schema.String,
+  /**
+   * The agent this session runs as (`AgentView.id`), pinned when its first message was sent.
+   *
+   * Every run of a session carries the same one: a reopen reads it back off the row rather
+   * than choosing again, so a conversation never changes agent under the operator.
+   */
+  agentId: Schema.String,
   tally: ImporterSessionTally,
 });
 export type ImporterSessionView = typeof ImporterSessionView.Type;
@@ -740,6 +747,9 @@ export type ImporterTurnAccepted = typeof ImporterTurnAccepted.Type;
  *   or the pre-execution policy gate would not install into it. Refused rather than run
  *   ungated, as a worker and a goal conversation are.
  * - `target_unavailable`, `store_unavailable` — the target's database.
+ * - `agent_unavailable` — the session runs as an agent this server does not define (or one
+ *   an import session cannot be opened as), so it cannot be continued: an agent is pinned to
+ *   its conversation, and opening it as another would be a substitution nobody chose.
  *
  * `409`, for `GoalConversationRefused`'s reason. An import id this target does not hold is
  * `ScopeImportNotFound` instead, a `404`.
@@ -756,6 +766,7 @@ export class ImporterConversationRefused extends Schema.TaggedError<ImporterConv
       "import_ungated",
       "target_unavailable",
       "store_unavailable",
+      "agent_unavailable",
     ]),
     detail: Schema.String,
   },

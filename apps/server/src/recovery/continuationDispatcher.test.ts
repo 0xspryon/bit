@@ -416,6 +416,7 @@ describe("the conversations a restart interrupted", () => {
         harnessSessionId: SESSION,
         harnessInstanceId: "opencode",
         model: "zai/glm",
+        agentId: "importer",
       });
       yield* store.confirmImportSession("imp_1");
       if (options?.ended !== undefined) {

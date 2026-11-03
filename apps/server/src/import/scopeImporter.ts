@@ -142,14 +142,14 @@ import {
   type RecordedImportSession,
 } from "./importerHistory";
 import { resolveImporterModel } from "./importerModel";
-import {
-  assembleImporterFollowUpPrompt,
-  assembleImporterPrompt,
-  assembleImporterResumePrompt,
-  operatorPages,
-} from "./importerPrompt";
+import { operatorPages, type ImporterPromptInput } from "./importerPrompt";
 import { importerSessionTitle } from "./importerTitle";
 import { ScopeImportProgress, widenPages } from "./progress";
+import {
+  agentById,
+  IMPORTER_AGENT,
+  type AgentDefinition,
+} from "../agent/registry";
 import { lastAssistantText, type AgentHarness } from "../harness/agentHarness";
 import {
   makeLiveAgentSessions,
@@ -219,9 +219,32 @@ export const importReport = (text: string): string | null => {
   return `${(space > SCOPE_IMPORT_REPORT_MAX / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 };
 
+/**
+ * What an import session's live entry carries beyond the spine's own fields: the agent it
+ * runs as, so a later message is framed by the same agent that opened it.
+ */
+interface ImportSessionMeta {
+  readonly agent: AgentDefinition<ImporterPromptInput>;
+}
+
+/**
+ * The agent an import session may run as, by the id a row recorded, or `undefined`.
+ *
+ * `undefined` for an id this server does not define, and for an agent whose authority is
+ * not the importer's: this service mints importer credentials and registers them at the
+ * importer endpoint and nowhere else, so an agent granted any other role could not be given
+ * its tools here — opening it would hand it the importer's instead.
+ */
+export const importSessionAgent = (
+  id: string,
+): AgentDefinition<ImporterPromptInput> | undefined => {
+  const agent = agentById(id);
+  return agent?.authority.role === "importer" ? agent : undefined;
+};
+
 /** Where an import's first turn says how its open went, for a caller that waits on it. */
 type Opening = Deferred.Deferred<
-  LiveAgentSession<undefined>,
+  LiveAgentSession<ImportSessionMeta>,
   ImporterConversationRefused
 >;
 
@@ -357,6 +380,16 @@ export interface ScopeImportRequest {
    * dropped with the session that carried it; already resolved, it resolves to itself.
    */
   readonly choice?: ImportModelDraft | undefined;
+  /**
+   * The agent the session runs as: its prompts and the grant its credential carries.
+   *
+   * Absent for a new conversation, which opens as {@link IMPORTER_AGENT} — the only agent
+   * there is. A reopen passes the one the predecessor's row recorded (`0002`), because the
+   * agent is pinned once the first message is sent: a successor session, resumed or fresh,
+   * is the same conversation and runs as the same agent. Resolved by the caller rather than
+   * named by id here, so an id this server does not define is refused where it was read.
+   */
+  readonly agent?: AgentDefinition<ImporterPromptInput> | undefined;
 }
 
 /**
@@ -536,7 +569,7 @@ export class ScopeImporter extends Context.Service<
        * credential with no clock, `revokeImport` as the belt-and-braces check, and `ended_at`
        * with its reason recorded once the session is closed.
        */
-      const sessions = yield* makeLiveAgentSessions<undefined>(
+      const sessions = yield* makeLiveAgentSessions<ImportSessionMeta>(
         { fleet, endpoints },
         {
           // The **importer** endpoint. The path selects the toolkit and the grant decides
@@ -689,6 +722,8 @@ export class ScopeImporter extends Context.Service<
       const run = Effect.fnUntraced(function* (input: {
         readonly importId: string;
         readonly request: ScopeImportRequest;
+        /** The agent the session runs as, as `startWith` recorded it on the row. */
+        readonly agent: AgentDefinition<ImporterPromptInput>;
         readonly harness: AgentHarness["Service"];
         readonly model: string;
         readonly options: readonly ModelOptionSelection[] | undefined;
@@ -715,7 +750,7 @@ export class ScopeImporter extends Context.Service<
         const harness = input.harness;
         const opened = yield* Effect.result(
           sessions.open<
-            LiveAgentSession<undefined> | undefined,
+            LiveAgentSession<ImportSessionMeta> | undefined,
             LiveSessionOpenFailure,
             never
           >({
@@ -784,16 +819,20 @@ export class ScopeImporter extends Context.Service<
                   importId: input.importId,
                   sessionId,
                 }),
+              // The agent's own prompts, and only through it: the agent is what decides what a
+              // conversation is told, and this is the one place an opener is written.
               openingPrompt: () =>
                 resume !== undefined && input.message !== undefined
-                  ? assembleImporterResumePrompt({ message: input.message })
-                  : assembleImporterPrompt({
+                  ? input.agent.prompt.resume({ message: input.message })
+                  : input.agent.prompt.opening({
                       targetName: input.request.targetName,
                       links: input.links,
                       message: input.message,
                       earlierPages: input.earlierPages,
                     }),
-              meta: undefined,
+              // Pinned to the entry, so every later message into this session is framed by
+              // the agent that opened it (`deliverTurn`).
+              meta: { agent: input.agent },
             }),
             opened: (entry) => Effect.succeed(entry),
           }),
@@ -1013,6 +1052,9 @@ export class ScopeImporter extends Context.Service<
           pickedOptions,
           "a scope import",
         );
+        // Pinned from here: the row records it, the opener is its, and a reopen of this
+        // conversation reads it back from the row rather than choosing again (`0002`).
+        const agent = request.agent ?? IMPORTER_AGENT;
         const importId = newImportId();
         // A resume names the session it continues: minting a fresh id would start a second
         // conversation and leave the session index showing one as two (S3.3).
@@ -1081,6 +1123,7 @@ export class ScopeImporter extends Context.Service<
               model: choice.model,
               modelOptions: dispatchedOptions,
               pages: given.pages,
+              agentId: agent.id,
             }),
           ).pipe(
             Effect.catch((failure) =>
@@ -1120,6 +1163,7 @@ export class ScopeImporter extends Context.Service<
             run({
               importId,
               request,
+              agent,
               harness,
               model: choice.model,
               options: dispatchedOptions,
@@ -1255,7 +1299,7 @@ export class ScopeImporter extends Context.Service<
 
       /** What an accepted message answers with. */
       const accepted = (
-        entry: LiveAgentSession<undefined>,
+        entry: LiveAgentSession<ImportSessionMeta>,
         conversation: ImporterTurnAccepted["conversation"],
         note: string,
         pages: {
@@ -1291,7 +1335,7 @@ export class ScopeImporter extends Context.Service<
        * fiber is already waiting, which will.
        */
       const deliverTurn = Effect.fnUntraced(function* (
-        entry: LiveAgentSession<undefined>,
+        entry: LiveAgentSession<ImportSessionMeta>,
         text: string,
       ) {
         const widened = yield* progress.addLinks(entry.id, operatorPages(text));
@@ -1313,7 +1357,7 @@ export class ScopeImporter extends Context.Service<
         const delivered = yield* Effect.result(
           sessions.deliver(
             entry,
-            assembleImporterFollowUpPrompt({ message: text }),
+            entry.meta.agent.prompt.followUp({ message: text }),
           ),
         );
         if (delivered._tag === "Failure") {
@@ -1347,7 +1391,7 @@ export class ScopeImporter extends Context.Service<
         request: ScopeImportRequest,
       ) {
         const opening: Opening = yield* Deferred.make<
-          LiveAgentSession<undefined>,
+          LiveAgentSession<ImportSessionMeta>,
           ImporterConversationRefused
         >();
         const started = yield* startWith(request, opening);
@@ -1494,6 +1538,19 @@ export class ScopeImporter extends Context.Service<
               });
             }
             /*
+             * The agent the conversation runs as, from the row: pinned when its first message
+             * was sent, so the successor — resumed or fresh — runs as the same one. Refused
+             * rather than defaulted when this server does not define it, because opening the
+             * conversation as some other agent is a substitution nobody chose.
+             */
+            const agent = importSessionAgent(row.agentId);
+            if (agent === undefined) {
+              return yield* new ImporterConversationRefused({
+                reason: "agent_unavailable",
+                detail: `import ${input.importId}'s session runs as the agent '${row.agentId}', which this server does not define as an importer, so it cannot be continued. Start a new session to carry on.`,
+              });
+            }
+            /*
              * The earlier session's pages, carried forward: they were the operator's, and
              * this is the same conversation. From memory when this process still holds the
              * old import's list (a refused prompt), and from the row (`0029`) when it does
@@ -1529,6 +1586,7 @@ export class ScopeImporter extends Context.Service<
               message: input.text,
               earlierPages,
               predecessor: input.importId,
+              agent,
               ...(reopen._tag === "resume"
                 ? {
                     resume: {

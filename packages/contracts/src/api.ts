@@ -38,6 +38,7 @@ import {
   HttpApiSecurity,
 } from "effect/http-api";
 
+import { AgentsView } from "./agents";
 import { AssetView } from "./asset";
 import { ScopeEntryDraft, ScopeLabelDraft, ScopeView } from "./scope";
 import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
@@ -98,6 +99,8 @@ export const FOLDERS_PATH = apiPath("folders");
 export const HARNESSES_PATH = apiPath("harnesses");
 /** Which model the scope importer will run on, resolved against the live catalogue. */
 export const IMPORTER_MODEL_PATH = apiPath("importer-model");
+/** The agents a conversation can run as: the registry, as a chip lists it. */
+export const AGENTS_PATH = apiPath("agents");
 
 /* ── Session ─────────────────────────────────────────────────────────────────── */
 
@@ -1589,6 +1592,17 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
     HttpApiEndpoint.get("importerModel", "/importer-model", {
       success: ImporterModelView,
       error: [ImporterModelUnavailable],
+    }),
+    /**
+     * The agents a conversation can run as, for the agent chip.
+     *
+     * A request rather than a list in the browser bundle, for `importerModel`'s reason: the
+     * registry is the server's, and a list compiled into the screen would go on offering an
+     * agent after the server stopped defining it. Each entry is its label and what it can
+     * write; its prompt and its grant stay on the server, which applies them.
+     */
+    HttpApiEndpoint.get("agents", "/agents", {
+      success: AgentsView,
     }),
     HttpApiEndpoint.get("folders", "/folders", {
       query: { path: Schema.optional(Schema.String) },

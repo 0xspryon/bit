@@ -52,6 +52,7 @@ import {
   type ModelOptionSelection,
 } from "@bit/contracts";
 
+import { IMPORTER_AGENT } from "../agent/registry";
 import { operatorTextOf } from "./importerPrompt";
 import { ScopeImportProgress } from "./progress";
 import { continuationMessage } from "../recovery/continuation";
@@ -1866,6 +1867,35 @@ const viewOf = (
     Effect.flatMap(ScopeImporter, (importer) => importer.view(importId)),
   );
 
+/** Every `import_sessions` row's agent, read straight off the file. */
+const agentsOf = (root: string) => {
+  const database = new Database(join(root, "targets", TARGET, HUNT_FILE), {
+    readonly: true,
+  });
+  try {
+    return database
+      .query("SELECT import_id, agent_id FROM import_sessions")
+      .all() as { import_id: string; agent_id: string }[];
+  } finally {
+    database.close();
+  }
+};
+
+/**
+ * Rewrites one row's agent on the file, as a row written by a build that defined an agent
+ * this one does not would read. Done with no runtime open over the file.
+ */
+const recordAgent = (root: string, importId: string, agentId: string) => {
+  const database = new Database(join(root, "targets", TARGET, HUNT_FILE));
+  try {
+    database
+      .query("UPDATE import_sessions SET agent_id = ? WHERE import_id = ?")
+      .run(agentId, importId);
+  } finally {
+    database.close();
+  }
+};
+
 /** Every `import_sessions` row's pages and model options, read straight off the file. */
 const carriedOf = (root: string) => {
   const database = new Database(join(root, "targets", TARGET, HUNT_FILE), {
@@ -2333,6 +2363,82 @@ describe("a reopen that resumes", () => {
     expect(operatorTextOf(prompt)?.startsWith("[bit] ")).toBe(true);
     expect(prompt).toContain("read_scope");
 
+    await restarted.dispose();
+  });
+
+  test("runs as the agent the row recorded, and the successor records the same one", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    built.script.holds.set(
+      "ses_import",
+      directoryOf(built.root, started.importId),
+    );
+    // Pinned on the first message: the opener's row names the agent before any reopen.
+    expect(agentsOf(built.root)).toEqual([
+      { import_id: started.importId, agent_id: "importer" },
+    ]);
+    // And the opener is that agent's, byte for byte.
+    expect(built.script.prompts[0]).toBe(
+      IMPORTER_AGENT.prompt.opening({
+        targetName: "Acme Corp",
+        links: [PAGE_GOOD],
+        message: undefined,
+        earlierPages: [],
+      }),
+    );
+    await runtime.dispose();
+
+    const restarted = ManagedRuntime.make(built.layer);
+    const reopened = await sendTo(restarted, started.importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+    expect(reopened.success.conversation).toBe("resumed");
+
+    // The resume note is the recorded agent's, not one chosen afresh.
+    expect(built.script.prompts.at(-1)).toBe(
+      IMPORTER_AGENT.prompt.resume({ message: "Continue." }),
+    );
+    // The successor's row names the same agent, so a second reopen reads it again.
+    const successor = agentsOf(built.root).find(
+      (each) => each.import_id === reopened.success.importId,
+    );
+    expect(successor?.agent_id).toBe("importer");
+    // And the session index carries it for the chip.
+    const index = await indexOf(restarted);
+    expect(index.map((each) => each.agentId)).toEqual(["importer"]);
+    await restarted.dispose();
+  });
+
+  test("a row naming an agent this server does not define is refused, not reopened as another", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    built.script.holds.set(
+      "ses_import",
+      directoryOf(built.root, started.importId),
+    );
+    const prompted = built.script.prompts.length;
+    await runtime.dispose();
+    recordAgent(built.root, started.importId, "retired_agent");
+
+    const restarted = ManagedRuntime.make(built.layer);
+    const sent = await sendTo(restarted, started.importId, "Continue.");
+    expect(sent._tag).toBe("Failure");
+    if (sent._tag !== "Failure") return;
+    expect(sent.failure).toMatchObject({
+      _tag: "ImporterConversationRefused",
+      reason: "agent_unavailable",
+    });
+    expect(String((sent.failure as { detail: string }).detail)).toContain(
+      "'retired_agent'",
+    );
+    // Nothing was said to the session, and no successor was opened under the default.
+    expect(built.script.prompts).toHaveLength(prompted);
+    expect(agentsOf(built.root)).toHaveLength(1);
     await restarted.dispose();
   });
 

@@ -71,7 +71,7 @@ CREATE TABLE goals ( id TEXT PRIMARY KEY, target_id TEXT NOT NULL, description T
 ## table host_scope_labels (on host_scope_labels)
 CREATE TABLE host_scope_labels ( target_id TEXT NOT NULL, host TEXT NOT NULL, state TEXT NOT NULL, reason TEXT, set_by TEXT NOT NULL, set_at INTEGER NOT NULL, PRIMARY KEY (target_id, host), CHECK (state IN ('in', 'out')), CHECK (length(host) > 0) )
 ## table import_sessions (on import_sessions)
-CREATE TABLE import_sessions ( import_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, harness_session_id TEXT NOT NULL, harness_instance_id TEXT, model TEXT NOT NULL, caller_scope TEXT NOT NULL, opened_at INTEGER NOT NULL, session_created_at INTEGER, ended_at INTEGER, ended_reason TEXT CHECK (ended_reason IN ('operator', 'shutdown', 'refused', 'open_failed')), model_options TEXT, pages TEXT, CHECK (length(harness_session_id) > 0) )
+CREATE TABLE import_sessions ( import_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, harness_session_id TEXT NOT NULL, harness_instance_id TEXT, model TEXT NOT NULL, caller_scope TEXT NOT NULL, opened_at INTEGER NOT NULL, session_created_at INTEGER, ended_at INTEGER, ended_reason TEXT CHECK (ended_reason IN ('operator', 'shutdown', 'refused', 'open_failed')), model_options TEXT, pages TEXT, agent_id TEXT NOT NULL DEFAULT 'importer' CHECK (length(agent_id) > 0), CHECK (length(harness_session_id) > 0) )
 ## table intent_anchors (on intent_anchors)
 CREATE TABLE intent_anchors ( intent_id TEXT NOT NULL REFERENCES intents(id), observation_id TEXT NOT NULL REFERENCES observations(id), position INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (intent_id, observation_id), CHECK (position >= 0) )
 ## table intents (on intents)
@@ -211,6 +211,7 @@ CREATE TRIGGER events_are_immutable BEFORE UPDATE ON events BEGIN SELECT RAISE(A
   state TEXT notnull=1 default=- pk=0
   target_id TEXT notnull=1 default=- pk=1
 ## columns import_sessions
+  agent_id TEXT notnull=1 default='importer' pk=0
   caller_scope TEXT notnull=1 default=- pk=0
   ended_at INTEGER notnull=0 default=- pk=0
   ended_reason TEXT notnull=0 default=- pk=0

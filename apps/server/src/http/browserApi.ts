@@ -113,6 +113,7 @@ import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { renderScopeBlock } from "../scope/scopePrompt";
 import { isWithin, POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
+import { AGENTS, agentView } from "../agent/registry";
 import { chooseImporterModel } from "../import/importerModel";
 import { importerSessionTitles } from "../import/importerTitle";
 import { ScopeImporter } from "../import/scopeImporter";
@@ -1332,6 +1333,12 @@ const fleetHandlers = HttpApiBuilder.group(
        * which is also what keeps the screen and the import from disagreeing about what the
        * default is.
        */
+      /**
+       * The agents a conversation can run as: the registry, as the chip lists it. Never
+       * fails — the registry is this build's own, and it always has the importer.
+       */
+      agents: () => Effect.succeed({ agents: AGENTS.map(agentView) }),
+
       importerModel: () => {
         const choice = chooseImporterModel(harnesses.instances);
         return choice === undefined
@@ -1448,6 +1455,7 @@ const fleetHandlers = HttpApiBuilder.group(
                 endedAt: session.endedAt,
                 endedReason: session.endedReason,
                 importId: session.latestImportId,
+                agentId: session.agentId,
                 tally: {
                   entriesIn: session.entriesIn,
                   entriesOut: session.entriesOut,

@@ -1106,6 +1106,29 @@ const baseline = statements(
 );
 
 /**
+ * `0002` — which agent an import session runs as (`agent/registry.ts`).
+ *
+ * The agent decides the prompt a conversation is opened with and the MCP grant its
+ * credential carries, and it is **pinned when the first message is sent**: every later run of
+ * the same harness session — a follow-up, a resume after a restart, a fresh session opened
+ * in its place — runs as the agent this row names, read back from here rather than chosen
+ * again. So the column is written once, by the insert, and nothing updates it.
+ *
+ * - **`NOT NULL DEFAULT 'importer'`**, which is also what every row written before this
+ *   column reads as. Until it existed the importer was the only thing an import session
+ *   could be, so the default is a fact about those rows rather than a guess.
+ * - **No `CHECK` naming the ids.** The registry is the list, and it is meant to grow by
+ *   adding a definition: a constraint here would make every new agent a migration too. A row
+ *   naming an agent this build does not define is refused where it is read, by the reopen,
+ *   with the id in the sentence.
+ */
+const importSessionAgent = statements(
+  `ALTER TABLE import_sessions
+     ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'importer'
+       CHECK (length(agent_id) > 0)`,
+);
+
+/**
  * The ordered chain. **Append only; never edit an applied entry.**
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1125,6 +1148,7 @@ export const MIGRATIONS: Record<
   Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient>
 > = {
   "0001_baseline": baseline,
+  "0002_import_session_agent": importSessionAgent,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */
