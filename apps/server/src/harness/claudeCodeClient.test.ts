@@ -1537,7 +1537,14 @@ const turnDrivenSdk = () => {
     refuse: "setModel" | "applyFlagSettings" | undefined;
     hang: "setModel" | "applyFlagSettings" | undefined;
     hangOn: string | undefined;
-  } = { refuse: undefined, hang: undefined, hangOn: undefined };
+    /** Rejects `interrupt()`, as a CLI that will not acknowledge one does. */
+    refuseInterrupt: boolean;
+  } = {
+    refuse: undefined,
+    hang: undefined,
+    hangOn: undefined,
+    refuseInterrupt: false,
+  };
   const hanging = new Set<(cause: Error) => void>();
   const answer = async (
     request: "setModel" | "applyFlagSettings",
@@ -1587,6 +1594,9 @@ const turnDrivenSdk = () => {
         setMcpServers: async () => ({}),
         interrupt: async () => {
           seen.interrupts += 1;
+          if (controls.refuseInterrupt) {
+            throw new Error("the CLI did not acknowledge the interrupt");
+          }
           return undefined;
         },
         // The window this account gets for this model, which is the only place a Claude
@@ -2130,6 +2140,133 @@ describe("what Claude Code calls a session", () => {
   });
 });
 
+/* ── Stopping a conversation's turn ──────────────────────────────────────────── */
+
+describe("stopping a conversation's turn (A6 F5)", () => {
+  const TALK = "44444444-0000-4000-8000-000000000001";
+
+  /** A multi-turn session with its opening turn running. */
+  const talking = (
+    harness: AgentHarness["Service"],
+    driver: ReturnType<typeof turnDrivenSdk>,
+  ) =>
+    Effect.gen(function* () {
+      yield* harness.createSession({
+        title: "conversation",
+        model: "claude-sonnet-5",
+        directory: "/tmp/goal",
+        sessionId: TALK,
+        multiTurn: true,
+      });
+      yield* harness.prompt(TALK, "go");
+      yield* Effect.promise(() => driver.pulled(1));
+    });
+
+  const steer = (harness: AgentHarness["Service"], id: string) =>
+    harness.prompt(TALK, `message ${id}`, {
+      _tag: "steer",
+      urgency: "queued",
+      messageId: id.padEnd(32, "0"),
+    });
+
+  test("an interrupted turn ends interrupted, the query stays open, and the next message is answered as an ordinary turn", async () => {
+    /*
+     * Measured on 2.1.310 (`AgentHarness.interruptSession`): the CLI keeps a streaming
+     * query open across an interrupt. This used to close it, so Stop ended the
+     * conversation and the operator's next message was refused.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        const stopped = yield* harness.interruptSession(TALK);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        const afterStop = yield* harness.sessionStatus(TALK);
+        const next = yield* steer(harness, "aa");
+        yield* Effect.promise(() => driver.pulled(2));
+        const runningAgain = yield* harness.sessionStatus(TALK);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        const afterNext = yield* harness.sessionStatus(TALK);
+        return {
+          stopped,
+          afterStop,
+          next,
+          runningAgain,
+          afterNext,
+          closes: driver.seen.closes,
+          interrupts: driver.seen.interrupts,
+        };
+      }),
+    );
+    expect(outcome.stopped).toBe(true);
+    expect(outcome.interrupts).toBe(1);
+    expect(outcome.closes).toBe(0);
+    expect(outcome.afterStop.activity).toBe("idle");
+    expect(outcome.afterStop.outcome).toBe("interrupted");
+    expect(outcome.next.delivered).toBe(true);
+    expect(outcome.runningAgain.activity).toBe("running");
+    // The interrupt was for the turn it stopped, not for every turn after it.
+    expect(outcome.afterNext.outcome).toBe("succeeded");
+  });
+
+  test("a message queued behind the stopped turn runs after it, and the session is idle only once it has", async () => {
+    // The measured Claude Code behaviour: the queued message is a turn of its own, run at
+    // once. `accepted`/`completed` stay paired, so `waitForIdle` waits for it.
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        yield* steer(harness, "bb");
+        yield* Effect.promise(() => driver.pulled(2));
+        const stopped = yield* harness.interruptSession(TALK);
+        driver.emitResult();
+        yield* Effect.sleep("40 millis");
+        const between = yield* harness.sessionStatus(TALK);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        const after = yield* harness.sessionStatus(TALK);
+        return { stopped, between, after, closes: driver.seen.closes };
+      }),
+    );
+    expect(outcome.stopped).toBe(true);
+    expect(outcome.between.activity).toBe("running");
+    expect(outcome.after.activity).toBe("idle");
+    expect(outcome.after.outcome).toBe("succeeded");
+    expect(outcome.closes).toBe(0);
+  });
+
+  test("a conversation between turns has nothing to interrupt, and the CLI is not asked", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        const stopped = yield* harness.interruptSession(TALK);
+        return { stopped, interrupts: driver.seen.interrupts };
+      }),
+    );
+    expect(outcome.stopped).toBe(false);
+    expect(outcome.interrupts).toBe(0);
+  });
+
+  test("an interrupt the CLI will not acknowledge fails, and the query is closed", async () => {
+    // `false` would say nothing was running, which is the one thing this does not know.
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.controls.refuseInterrupt = true;
+        const failure = yield* Effect.flip(harness.interruptSession(TALK));
+        const status = yield* harness.sessionStatus(TALK);
+        return { failure, status, closes: driver.seen.closes };
+      }),
+    );
+    expect(outcome.failure._tag).toBe("HarnessTransportError");
+    expect(outcome.failure.message).toContain("would not acknowledge");
+    expect(outcome.closes).toBe(1);
+    expect(outcome.status.activity).toBe("idle");
+  });
+});
+
 /* ── Switching a session's model ─────────────────────────────────────────────── */
 
 describe("switching a Claude Code session's model", () => {
@@ -2372,16 +2509,27 @@ describe("switching a Claude Code session's model", () => {
   test("a switch whose query closes while it waits is refused as not found, not left uncertain", async () => {
     /*
      * `setModel` takes about a second to be answered (the probe measured 1.0–1.2 s), and
-     * the query can close inside that second: an interrupt, a stream failure, or a
-     * single-turn session's turn ending. The SDK then rejects every pending control
-     * request. A plain transport failure there reads as "uncertain", so the caller keeps
-     * the row on the old model — and the next resume, which reads the row, starts on the
-     * model the operator just switched away from. The query is gone; the answer is the
-     * same one a switch arriving a moment later gets: not found, update the row.
+     * the query can close inside that second: an interrupt of a single-turn session, a
+     * stream failure, or a single-turn session's turn ending. The SDK then rejects every
+     * pending control request. A plain transport failure there reads as "uncertain", so
+     * the caller keeps the row on the old model — and the next resume, which reads the
+     * row, starts on the model the operator just switched away from. The query is gone;
+     * the answer is the same one a switch arriving a moment later gets: not found, update
+     * the row.
+     *
+     * Single-turn, because only there does an interrupt close the query: a conversation's
+     * stays open across one (A6 F5, the tests under "stopping a conversation's turn").
      */
     const outcome = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
-        yield* opened(harness, driver);
+        yield* harness.createSession({
+          title: "round",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: LIVE,
+        });
+        yield* harness.prompt(LIVE, "go");
+        yield* Effect.promise(() => driver.pulled(1));
         driver.controls.hang = "setModel";
         const switching = yield* Effect.forkChild(
           Effect.flip(harness.switchModel(LIVE, "claude-opus-5")),

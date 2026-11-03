@@ -3832,6 +3832,29 @@ describe("attaching files to a goal, on the wire", () => {
     expect(empty.status).toBe(400);
   });
 
+  test("a goal's Stop with no conversation held is a 200 that says so, and a goal this target lacks is a 404 (A6 F5)", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+    const stopped = await read(
+      await signedIn(`/targets/${targetId}/goals/${goalId}/conversation/stop`, {
+        method: "POST",
+      }),
+    );
+    expect(stopped.status).toBe(200);
+    expect(stopped.body).toMatchObject({
+      conversationId: goalId,
+      outcome: "not_live",
+      working: false,
+    });
+    const unknown = await read(
+      await signedIn(
+        `/targets/${targetId}/goals/goal_not_here/conversation/stop`,
+        { method: "POST" },
+      ),
+    );
+    expect(unknown.status).toBe(404);
+  });
+
   test("the browser names no path: there is nowhere in the request to put one", async () => {
     // Asserted the way the planner route's "there is no payload" test is: a request
     // carrying extra fields that look like a destination gets the *same* answer as one
@@ -4495,6 +4518,46 @@ describe("a target's importer sessions", () => {
       await signedIn("/targets/not-a-target/importer-sessions/imp_old/model", {
         method: "POST",
         body: { model: "scripted/other" },
+      }),
+    );
+    expect(elsewhere.status).toBe(404);
+  });
+
+  test("a message's urgency is decoded: a known one reaches the importer, any other is refused (A6 F5)", async () => {
+    const preemptive = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/messages`,
+        { method: "POST", body: { text: "now", urgency: "preemptive" } },
+      ),
+    );
+    // Through the decoder to the importer, which on this server has no harness.
+    expect(preemptive.status).toBe(409);
+    expect(preemptive.body).toMatchObject({ reason: "no_harness" });
+    const unknown = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/messages`,
+        { method: "POST", body: { text: "now", urgency: "immediately" } },
+      ),
+    );
+    expect(unknown.status).toBe(400);
+  });
+
+  test("a Stop with nothing held is a 200 that says so, and an unknown target is a 404 (A6 F5)", async () => {
+    const stopped = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/stop`,
+        { method: "POST" },
+      ),
+    );
+    expect(stopped.status).toBe(200);
+    expect(stopped.body).toMatchObject({
+      conversationId: "imp_old",
+      outcome: "not_live",
+      working: false,
+    });
+    const elsewhere = await read(
+      await signedIn("/targets/not-a-target/importer-sessions/imp_old/stop", {
+        method: "POST",
       }),
     );
     expect(elsewhere.status).toBe(404);

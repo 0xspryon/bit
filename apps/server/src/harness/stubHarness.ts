@@ -30,6 +30,7 @@ import {
   AgentHarness,
   type HarnessNarration,
   type MessageEntry,
+  type PromptDelivery,
   type SessionContinuation,
   type SessionStatus,
   type SessionTitle,
@@ -124,6 +125,36 @@ export const recordModelSwitches = (): {
     switchModel: (sessionId, model, options) =>
       Effect.sync(() => {
         switches.push({ sessionId, model, options });
+      }),
+  };
+};
+
+/** One `prompt` call, as the stub received it. */
+export interface RecordedPrompt {
+  readonly sessionId: string;
+  readonly text: string;
+  /** Verbatim, `undefined` included: an omitted delivery is the seam's `open` default. */
+  readonly delivery: PromptDelivery | undefined;
+}
+
+/**
+ * A `prompt` that remembers every call, for a test about what was delivered and how.
+ *
+ * {@link recordModelSwitches}'s shape and reason: accepted and reported as delivered, like
+ * the default, and the calls kept where a test can read them — a steer's `urgency` is the
+ * usual thing asked.
+ */
+export const recordPrompts = (): {
+  readonly prompts: readonly RecordedPrompt[];
+  readonly prompt: StubHarness["prompt"];
+} => {
+  const prompts: RecordedPrompt[] = [];
+  return {
+    prompts,
+    prompt: (sessionId, text, delivery) =>
+      Effect.sync(() => {
+        prompts.push({ sessionId, text, delivery });
+        return { delivered: true };
       }),
   };
 };

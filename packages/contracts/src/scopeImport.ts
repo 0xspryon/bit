@@ -37,6 +37,8 @@
  */
 import { Schema } from "effect";
 
+import { SteerUrgency } from "./conversationTurn";
+
 /**
  * The three tools the importer has, and the only three values this can ever hold.
  *
@@ -651,9 +653,10 @@ export const IMPORTER_MESSAGE_MAX_CHARS = 32_000;
 /**
  * What a browser sends to say something to an importer session.
  *
- * The operator's words and nothing else, for `GoalMessageDraft`'s reason: the session is the
- * server's, and a browser that could name its harness, directory or credential would be
- * choosing where an agent runs and what it may reach. Trimmed and never empty, so an empty
+ * The operator's words, and how urgently they should land, and nothing else, for
+ * `GoalMessageDraft`'s reason: the session is the server's, and a browser that could name its
+ * harness, directory or credential would be choosing where an agent runs and what it may
+ * reach. Trimmed and never empty, so an empty
  * composer submit is refused by the decoder before a session is opened for it.
  */
 export const ImporterMessageDraft = Schema.Struct({
@@ -663,6 +666,12 @@ export const ImporterMessageDraft = Schema.Struct({
   ).annotate({
     description: `What to say to the importer. Trimmed, never empty, and at most ${String(IMPORTER_MESSAGE_MAX_CHARS)} characters.`,
   }),
+  /**
+   * How a message sent while a turn runs should land: `queued` (the default, when absent)
+   * or `preemptive` ("send now"). See {@link SteerUrgency}. It says nothing about the
+   * session the message goes to, which stays the server's.
+   */
+  urgency: Schema.optional(SteerUrgency),
 });
 export type ImporterMessageDraft = typeof ImporterMessageDraft.Type;
 

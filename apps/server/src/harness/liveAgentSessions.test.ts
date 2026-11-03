@@ -19,12 +19,13 @@ import { join } from "node:path";
 import { Deferred, Effect, Exit, Fiber, Layer, Redacted, Scope } from "effect";
 
 import type { AgentHarness, McpRegistration } from "./agentHarness";
+import { HarnessTransportError } from "./errors";
 import {
   makeLiveAgentSessions,
   type LiveAgentSessions,
   type OpenPlan,
 } from "./liveAgentSessions";
-import { recordModelSwitches, stubHarness } from "./stubHarness";
+import { recordModelSwitches, recordPrompts, stubHarness } from "./stubHarness";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import type { WorkerUrls } from "../run/supervisor";
@@ -630,5 +631,171 @@ describe("a model switch", () => {
     ]);
     expect(row.model).toBe("stub/other");
     expect(outcome.result.registry).toBe("stub/other");
+  });
+});
+
+describe("a later message and a Stop (A6 F5)", () => {
+  /** Opens the import's session on `harness` and returns its entry. */
+  const opened = (
+    sessions: LiveAgentSessions<undefined>,
+    plan: OpenPlan<undefined>,
+  ) =>
+    Effect.gen(function* () {
+      yield* opening(sessions, plan);
+      const entry = sessions.ready(IMPORT);
+      if (entry === undefined) throw new Error("the session did not open");
+      return entry;
+    });
+
+  test("deliver passes the operator's urgency through to the harness as a steer", async () => {
+    const recorded = recordPrompts();
+    const harness = stubHarness({ prompt: recorded.prompt });
+    await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        const entry = yield* opened(sessions, plan);
+        yield* sessions.deliver(entry, "carry on", "queued");
+        yield* sessions.deliver(entry, "now, please", "preemptive");
+      }),
+    );
+    const steers = recorded.prompts.flatMap((each) =>
+      each.delivery?._tag === "steer"
+        ? [{ text: each.text, urgency: each.delivery.urgency }]
+        : [],
+    );
+    expect(steers).toEqual([
+      { text: "carry on", urgency: "queued" },
+      { text: "now, please", urgency: "preemptive" },
+    ]);
+  });
+
+  test("a Stop of a running turn interrupts the harness and keeps the session, credential and all", async () => {
+    const interrupted: string[] = [];
+    const harness = stubHarness({
+      interruptSession: (sessionId) =>
+        Effect.sync(() => {
+          interrupted.push(sessionId);
+          return true;
+        }),
+    });
+    const outcome = await withImporterSessions(
+      harness,
+      ({ sessions, plan, credentials }) =>
+        Effect.gen(function* () {
+          const entry = yield* opened(sessions, plan);
+          const found = yield* sessions.interrupt(IMPORT);
+          return {
+            found: found._tag,
+            working: found._tag === "interrupted" ? found.working : undefined,
+            stillHeld: sessions.ready(IMPORT)?.scope === entry.scope,
+            grants: yield* credentials.size,
+          };
+        }),
+    );
+    expect(interrupted).toEqual(["ses_stub_1"]);
+    expect(outcome.result).toEqual({
+      found: "interrupted",
+      working: false,
+      stillHeld: true,
+      grants: 1,
+    });
+    // Closed by the layer's finalizer and nothing else: the Stop closed nothing.
+    expect(outcome.reasons).toEqual(["shutdown"]);
+  });
+
+  test("a turn that does not go idle after the interrupt is reported still working", async () => {
+    // Claude Code runs a message queued behind the stopped turn at once: the session is
+    // busy again by the time the Stop is answered.
+    const harness = stubHarness({
+      interruptSession: () => Effect.succeed(true),
+      waitForIdle: () => Effect.never,
+    });
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        yield* opened(sessions, plan);
+        return yield* sessions.interrupt(IMPORT);
+      }),
+    );
+    expect(outcome.result._tag).toBe("interrupted");
+    if (outcome.result._tag === "interrupted") {
+      expect(outcome.result.working).toBe(true);
+    }
+  }, 10_000);
+
+  test("a Stop with nothing running is idle, and with nothing held is not live", async () => {
+    const outcome = await withImporterSessions(
+      stubHarness(),
+      ({ sessions, plan }) =>
+        Effect.gen(function* () {
+          const before = yield* sessions.interrupt(IMPORT);
+          yield* opened(sessions, plan);
+          const after = yield* sessions.interrupt(IMPORT);
+          return { before: before._tag, after: after._tag };
+        }),
+    );
+    expect(outcome.result).toEqual({ before: "not_live", after: "idle" });
+  });
+
+  test("a harness that will not acknowledge the Stop fails it, and the session is let go as refused", async () => {
+    const harness = stubHarness({
+      interruptSession: () =>
+        Effect.fail(
+          new HarnessTransportError({
+            operation: "session.interrupt",
+            status: undefined,
+            tag: undefined,
+            detail: "no answer",
+            cause: undefined,
+          }),
+        ),
+    });
+    const outcome = await withImporterSessions(
+      harness,
+      ({ sessions, plan, credentials }) =>
+        Effect.gen(function* () {
+          yield* opened(sessions, plan);
+          const failure = yield* Effect.flip(sessions.interrupt(IMPORT));
+          return {
+            failure: failure._tag,
+            held: sessions.get(IMPORT) !== undefined,
+            grants: yield* credentials.size,
+          };
+        }),
+    );
+    expect(outcome.result).toEqual({
+      failure: "HarnessTransportError",
+      held: false,
+      grants: 0,
+    });
+    expect(outcome.reasons).toEqual(["refused"]);
+  });
+
+  test("a Stop while the opening prompt is in flight waits for it, then stops that turn", async () => {
+    const recorder = freshRecorder();
+    const promptEntered = Effect.runSync(Deferred.make<void>());
+    const promptGate = Effect.runSync(Deferred.make<void>());
+    const interrupted: string[] = [];
+    const harness: AgentHarness["Service"] = {
+      ...gatedHarness(recorder, { promptEntered, promptGate }),
+      interruptSession: (sessionId) =>
+        Effect.sync(() => {
+          interrupted.push(sessionId);
+          return true;
+        }),
+    };
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        const opener = yield* Effect.forkChild(opening(sessions, plan));
+        yield* Deferred.await(promptEntered);
+        const stopper = yield* Effect.forkChild(sessions.interrupt(IMPORT));
+        for (let turn = 0; turn < 10; turn += 1) yield* Effect.yieldNow;
+        const askedEarly = interrupted.length;
+        yield* Deferred.succeed(promptGate, undefined);
+        yield* Fiber.join(opener);
+        const found = yield* Fiber.join(stopper);
+        return { askedEarly, found: found._tag };
+      }),
+    );
+    expect(outcome.result).toEqual({ askedEarly: 0, found: "interrupted" });
+    expect(interrupted).toEqual(["ses_1"]);
   });
 });

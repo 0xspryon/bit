@@ -7081,13 +7081,22 @@ const makeStore = Effect.fnUntraced(function* () {
       ended_reason: Schema.NullOr(ImportSessionEndReason),
       session_created_at: Schema.NullOr(Schema.Finite),
       agent_id: Schema.String,
+      latest_import_id: Schema.NullOr(Schema.String),
     }),
+    // `latest_import_id` is `selectImportSessions`' subquery, correlated to this row: the
+    // newest confirmed run of the same harness session on the same target.
     execute: (importId) =>
-      sql`SELECT target_id, harness_session_id, harness_instance_id, model,
-                 model_options, pages, ended_at, ended_reason, session_created_at,
-                 agent_id
-            FROM import_sessions
-            WHERE import_id = ${importId}`,
+      sql`SELECT s.target_id, s.harness_session_id, s.harness_instance_id, s.model,
+                 s.model_options, s.pages, s.ended_at, s.ended_reason,
+                 s.session_created_at, s.agent_id,
+                 (SELECT r.import_id FROM import_sessions r
+                   WHERE r.target_id = s.target_id
+                     AND r.harness_session_id = s.harness_session_id
+                     AND r.session_created_at IS NOT NULL
+                   ORDER BY r.opened_at DESC, r.import_id DESC
+                   LIMIT 1) AS latest_import_id
+            FROM import_sessions s
+            WHERE s.import_id = ${importId}`,
   });
 
   /**
@@ -7116,6 +7125,7 @@ const makeStore = Effect.fnUntraced(function* () {
         endedReason: value.ended_reason,
         confirmedAt: value.session_created_at,
         agentId: value.agent_id,
+        latestImportId: value.latest_import_id,
       }),
     });
   });
@@ -9501,6 +9511,14 @@ export class ObservationStore extends Context.Service<
            * written before the column existed.
            */
           readonly agentId: string;
+          /**
+           * The newest confirmed run of this row's harness session on its target — the one
+           * {@link importSessions} lists as `latestImportId` and a message to the session is
+           * addressed to. Equal to this run's own id when it is that run; another id when a
+           * later run carried the session on (a reopen chain, A6 F4/F5); `null` when no run
+           * of the session was ever confirmed.
+           */
+          readonly latestImportId: string | null;
         }
       | undefined,
       DatabaseError | StoredRowError

@@ -189,6 +189,9 @@ const fakeHarness = (
      * model it no longer offers. Nothing is refused unless a test says.
      */
     readonly refuseModels?: ReadonlySet<string> | undefined;
+    /** What `interruptSession` answers (A6 F5). The stub's `false` unless a test says. */
+    readonly interrupt?:
+      Effect.Effect<boolean, HarnessTransportError> | undefined;
   },
 ): AgentHarness["Service"] =>
   stubHarness({
@@ -282,6 +285,9 @@ const fakeHarness = (
         ).map((entry) => ({ ...entry, error: undefined })),
       ),
     sessionEvents: () => Stream.never,
+    ...(options?.interrupt === undefined
+      ? {}
+      : { interruptSession: () => options.interrupt ?? Effect.succeed(false) }),
     ...(options?.continuation === undefined
       ? {}
       : {
@@ -307,6 +313,8 @@ const world = (options?: {
   readonly switchAnswer?:
     Effect.Effect<void, HarnessTransportError> | undefined;
   readonly refuseModels?: ReadonlySet<string> | undefined;
+  readonly interrupt?:
+    Effect.Effect<boolean, HarnessTransportError> | undefined;
 }) => {
   const scratch = newScratch();
   const root = join(scratch, "fleet");
@@ -1977,5 +1985,103 @@ describe("switching a goal conversation's model", () => {
     expect(second.recorder.created).toEqual([]);
     expect((await rowOf(second.runtime))?.model).toBe("scripted/retired");
     await second.runtime.dispose();
+  });
+});
+
+/* ── A6 F5: urgency and Stop ─────────────────────────────────────────────────── */
+
+const stopping = (runtime: ChatRuntime) =>
+  runtime.runPromise(
+    Effect.result(
+      Effect.flatMap(GoalConversations, (conversations) =>
+        conversations.stopTurn({ targetId: TARGET, goalId: GOAL }),
+      ),
+    ),
+  );
+
+describe("a goal conversation's urgency and Stop (A6 F5)", () => {
+  test("a preemptive message reaches the harness as a preemptive steer", async () => {
+    const { first, ready } = world();
+    await ready;
+    await sending(first.runtime, "what is happening?");
+    await first.runtime.runPromise(
+      Effect.flatMap(GoalConversations, (conversations) =>
+        conversations.send({
+          targetId: TARGET,
+          goalId: GOAL,
+          text: "drop that and look at the login form",
+          urgency: "preemptive",
+        }),
+      ).pipe(Effect.orDie),
+    );
+    expect(first.recorder.prompts[1]?.delivery).toBe("steer");
+    expect(first.recorder.prompts[1]?.urgency).toBe("preemptive");
+    await first.runtime.dispose();
+  });
+
+  test("Stop interrupts a running turn and keeps the conversation: the next message continues it", async () => {
+    const { first, ready } = world({ interrupt: Effect.succeed(true) });
+    await ready;
+    const opened = await sending(first.runtime, "what is happening?");
+    const stopped = await stopping(first.runtime);
+    expect(stopped._tag).toBe("Success");
+    if (stopped._tag === "Success") {
+      expect(stopped.success).toMatchObject({
+        conversationId: GOAL,
+        outcome: "interrupted",
+        working: false,
+      });
+    }
+    expect(first.recorder.unregistrations).toEqual([]);
+    const next = await sending(first.runtime, "carry on");
+    expect(next.conversation).toBe("continued");
+    expect(next.harnessSessionId).toBe(opened.harnessSessionId);
+    expect(first.recorder.created).toHaveLength(1);
+    await first.runtime.dispose();
+  });
+
+  test("Stop with nothing running is idle, and with no conversation held is not live", async () => {
+    const { first, ready } = world();
+    await ready;
+    const before = await stopping(first.runtime);
+    await sending(first.runtime, "what is happening?");
+    const after = await stopping(first.runtime);
+    expect(before._tag === "Success" ? before.success.outcome : before).toBe(
+      "not_live",
+    );
+    expect(after._tag === "Success" ? after.success.outcome : after).toBe(
+      "idle",
+    );
+    await first.runtime.dispose();
+  });
+
+  test("a harness that will not acknowledge Stop is refused, and the conversation is let go", async () => {
+    const { first, ready } = world({
+      interrupt: Effect.fail(
+        new HarnessTransportError({
+          operation: "session.interrupt",
+          status: undefined,
+          tag: undefined,
+          detail: "no answer",
+          cause: undefined,
+        }),
+      ),
+    });
+    await ready;
+    await sending(first.runtime, "what is happening?");
+    const stopped = await stopping(first.runtime);
+    expect(stopped._tag).toBe("Failure");
+    if (stopped._tag === "Failure") {
+      expect(stopped.failure._tag).toBe("ConversationStopRefused");
+      expect(stopped.failure.reason).toBe("harness_unreachable");
+    }
+    expect(first.recorder.unregistrations).toHaveLength(1);
+    const live = await first.runtime.runPromise(
+      Effect.map(GoalConversations, (conversations) =>
+        conversations.live(GOAL),
+      ),
+    );
+    expect(live).toBeUndefined();
+    await first.runtime.dispose();
   });
 });

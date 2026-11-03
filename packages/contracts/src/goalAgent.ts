@@ -23,6 +23,8 @@
  */
 import { Schema } from "effect";
 
+import { SteerUrgency } from "./conversationTurn";
+
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
   description: "Epoch milliseconds.",
@@ -31,9 +33,9 @@ const EpochMillis = Schema.Finite.annotate({
 /**
  * What a browser sends to say something to a goal's agent.
  *
- * One field, and it is the operator's own words. There is no model, no harness, no session
- * id and no directory here, for {@link PlanRefused}'s reason: the session the message goes
- * to is the server's — it lives in `targets/<id>/goal/<goalId>/` and holds a credential
+ * The operator's own words, and how urgently they should land. There is no model, no
+ * harness, no session id and no directory here, for {@link PlanRefused}'s reason: the
+ * session the message goes to is the server's — it lives in `targets/<id>/goal/<goalId>/` and holds a credential
  * minted before it was created — and a browser that could name any of that would be
  * choosing where an agent runs and what it may reach.
  *
@@ -45,6 +47,12 @@ export const GoalMessageDraft = Schema.Struct({
   text: Schema.Trim.check(Schema.isNonEmpty()).annotate({
     description: "What to say to this goal's agent. Trimmed, and never empty.",
   }),
+  /**
+   * How a message sent while a turn runs should land: `queued` (the default, when absent)
+   * or `preemptive` ("send now"). See {@link SteerUrgency}. Timing, not authority: it names
+   * nothing about where the agent runs.
+   */
+  urgency: Schema.optional(SteerUrgency),
 });
 export type GoalMessageDraft = typeof GoalMessageDraft.Type;
 

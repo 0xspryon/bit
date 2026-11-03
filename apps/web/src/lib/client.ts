@@ -48,6 +48,7 @@ import {
   type ScopeEntryDraft,
   type ScopeImportDraft,
   type ScopeLabelDraft,
+  type SteerUrgency,
   type TargetDraft,
 } from "@bit/contracts";
 import { Effect, Fiber, Layer, Result, Stream } from "effect";
@@ -283,6 +284,11 @@ export const REFUSAL_TAGS = new Set([
   // the F2 error modal prints with its one dismiss action. As transport trouble it would
   // say "No server answered" while the picker kept showing a model the session is not on.
   "ConversationModelRefused",
+  // Stopping a conversation's turn (A6 F5), importer or goal. A harness that would not
+  // acknowledge the stop, so whether the turn stopped is uncertain and the server let go of
+  // the session: a sentence the error modal prints. As transport trouble it would say "No
+  // server answered" about a stop the server tried and could not confirm.
+  "ConversationStopRefused",
 ]);
 
 /**
@@ -727,13 +733,28 @@ export const server = {
     targetId: string,
     goalId: string,
     text: string,
+    /** `queued` when absent, which is what the server defaults to as well. */
+    urgency?: SteerUrgency,
   ) =>
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.sendGoalMessage({
           params: { targetId, goalId },
-          payload: { text },
+          payload: { text, ...(urgency === undefined ? {} : { urgency }) },
         }),
+      ),
+    ),
+
+  /**
+   * Stops the turn running in one goal's conversation, and keeps the conversation (A6 F5).
+   *
+   * A conversation with nothing running, or none held by the server, is a success that
+   * says so (`outcome`); a harness that would not acknowledge the stop is a refusal.
+   */
+  stopGoalTurn: (baseUrl: string, targetId: string, goalId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.stopGoalTurn({ params: { targetId, goalId } }),
       ),
     ),
 
@@ -899,13 +920,29 @@ export const server = {
     targetId: string,
     importId: string,
     text: string,
+    /** `queued` when absent, which is what the server defaults to as well. */
+    urgency?: SteerUrgency,
   ) =>
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.sendImporterMessage({
           params: { targetId, importId },
-          payload: { text },
+          payload: { text, ...(urgency === undefined ? {} : { urgency }) },
         }),
+      ),
+    ),
+
+  /**
+   * Stops the turn running in one import's session, and keeps the conversation (A6 F5).
+   *
+   * **Not {@link stopScopeImport}**, which ends the import for good. The answer's
+   * `conversationId` is the import the stop landed on and `working` whether the session is
+   * still busy — on Claude Code, with a message queued behind the stopped turn.
+   */
+  stopImporterTurn: (baseUrl: string, targetId: string, importId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.stopImporterTurn({ params: { targetId, importId } }),
       ),
     ),
 

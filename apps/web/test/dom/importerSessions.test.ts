@@ -17,6 +17,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import {
+  ConversationStopRefused,
   ImporterConversationRefused,
   ImporterModelUnavailable,
   type ImporterSessionView,
@@ -1078,5 +1079,114 @@ describe("a session this server no longer holds", () => {
     // refusal is the one that counts, and this page has not had one.
     expect(text()).not.toContain("no longer holds");
     expect(composer().disabled).toBe(false);
+  });
+});
+
+describe("the Stop pill (A6 F5)", () => {
+  const cursor = (): Element | null =>
+    document.querySelector(".importer .streaming .stream-cursor");
+  const stopPill = (): HTMLButtonElement | null =>
+    document.querySelector<HTMLButtonElement>(".importer button.stop");
+  const dialog = (): HTMLElement | null =>
+    document.querySelector<HTMLElement>('[role="alertdialog"]');
+
+  /** A listed session with a turn the server says is running. */
+  const working = async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    await settle();
+    // Running in both places the server says it: the import's progress and the list.
+    fake.onScopeImport = (_baseUrl, targetId, importId) =>
+      ok(scopeImportView({ targetId, importId, status: "running" }));
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: SESSIONS.map((each) =>
+          each.importId === "imp_newest" ? { ...each, running: true } : each,
+        ),
+      });
+    const box = composer();
+    typeInto(box, "Also load the staging hosts");
+    box.focus();
+    press("Enter");
+    await settle();
+    expect(cursor()).not.toBeNull();
+    return { app, fake };
+  };
+
+  test("asks the server to stop the turn, and the cursor clears on the server's answer, not on the press", async () => {
+    const { app, fake } = await working();
+    const release = fake.hold("stopImporterTurn");
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill while the turn runs");
+    click(pill);
+    await settle();
+
+    const calls = fake.calls
+      .filter((call) => call.method === "stopImporterTurn")
+      .map((call) => call.args.slice(1));
+    expect(calls).toEqual([["acme-corp", "imp_newest"]]);
+    // Asked, not answered: still working, and the pill says it is stopping.
+    expect(cursor()).not.toBeNull();
+    expect(stopPill()?.textContent?.trim()).toBe("Stopping…");
+    expect(stopPill()?.getAttribute("aria-disabled")).toBe("true");
+
+    release();
+    await settle();
+    expect(cursor()).toBeNull();
+    expect(app.importer.current?.working).toBe(false);
+    expect(stopPill()).toBeNull();
+    expect(
+      document.querySelector(".importer .notice")?.textContent?.trim(),
+    ).toBe("Stopped the turn import imp_newest was taking.");
+  });
+
+  test("a turn the server says is still working keeps its cursor", async () => {
+    // Claude Code runs a message queued behind the stopped turn at once.
+    const { app, fake } = await working();
+    fake.onStopImporterTurn = (_baseUrl, _targetId, importId) =>
+      ok({
+        conversationId: importId,
+        outcome: "interrupted",
+        working: true,
+        detail: "Its harness went straight on to a message you sent.",
+      });
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill while the turn runs");
+    click(pill);
+    await settle();
+    expect(cursor()).not.toBeNull();
+    expect(app.importer.current?.working).toBe(true);
+    expect(stopPill()?.textContent?.trim()).toBe("Stop");
+  });
+
+  test("a refusal opens the error dialog with the server's sentence, and the turn is left as it was", async () => {
+    const { fake } = await working();
+    fake.onStopImporterTurn = () =>
+      refused(
+        new ConversationStopRefused({
+          reason: "harness_unreachable",
+          detail: "The harness did not acknowledge the stop.",
+        }),
+      );
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill while the turn runs");
+    click(pill);
+    await settle();
+    const shown = dialog();
+    expect(shown).not.toBeNull();
+    expect(shown?.textContent).toContain("Turn not stopped");
+    expect(shown?.textContent).toContain(
+      "The harness did not acknowledge the stop.",
+    );
+    expect(cursor()).not.toBeNull();
+    const close = [...(shown?.querySelectorAll("button") ?? [])].find(
+      (each) => each.textContent?.trim() === "Close",
+    );
+    if (close === undefined) throw new Error("no Close button");
+    click(close);
+    await settle();
+    expect(dialog()).toBeNull();
   });
 });

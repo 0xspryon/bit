@@ -1501,6 +1501,24 @@ const fleetHandlers = HttpApiBuilder.group(
           targetId: row.targetId,
           importId: params.importId,
           text: payload.text,
+          ...(payload.urgency === undefined
+            ? {}
+            : { urgency: payload.urgency }),
+        });
+      }),
+
+      /**
+       * Stops the turn running in one import's session, and keeps the conversation (A6 F5).
+       *
+       * The target is checked here and the import inside the importer, against this target's
+       * own file, as a message is: an id of another target is a `404`, never stopped. Not
+       * `stopScopeImport`, which ends the import's authority; this leaves it open.
+       */
+      stopImporterTurn: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.stopTurn({
+          targetId: row.targetId,
+          importId: params.importId,
         });
       }),
 
@@ -2494,6 +2512,24 @@ const fleetHandlers = HttpApiBuilder.group(
           targetId: row.targetId,
           goalId: params.goalId,
           text: payload.text,
+          ...(payload.urgency === undefined
+            ? {}
+            : { urgency: payload.urgency }),
+        });
+      }),
+
+      /**
+       * Stops the turn running in one goal's conversation, and keeps it (A6 F5).
+       *
+       * A goal this target does not hold is a `404` before anything is asked; the rest is
+       * {@link GoalConversations.stopTurn}'s.
+       */
+      stopGoalTurn: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        yield* ownedGoal(stores, row.targetId, params.goalId);
+        return yield* conversations.stopTurn({
+          targetId: row.targetId,
+          goalId: params.goalId,
         });
       }),
 

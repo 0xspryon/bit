@@ -2717,6 +2717,31 @@ export class App {
           ),
         ),
       /**
+       * Stops one import's turn and keeps the conversation (A6 F5). An expired session signs
+       * out, as every call here does; anything else refused, or no server answering, is a
+       * sentence for the error dialog.
+       */
+      stop: async (importId) => {
+        const call = await this.client.stopImporterTurn(
+          this.serverUrl,
+          targetId,
+          importId,
+        );
+        if (call._tag === "Ok") return { _tag: "stopped", stopped: call.value };
+        if (call._tag === "Refused") {
+          if (call.error._tag === "Unauthenticated") this.signOut("expired");
+          return {
+            _tag: "refused",
+            detail: this.#refusalText(call.error, "The turn was not stopped."),
+          };
+        }
+        return {
+          _tag: "refused",
+          detail:
+            "No server answered at this address, so the turn may still be running.",
+        };
+      },
+      /**
        * One session's conversation, with the floor the live tail is joined at (S6).
        *
        * **The floor is taken before the request leaves**, like every other join on this

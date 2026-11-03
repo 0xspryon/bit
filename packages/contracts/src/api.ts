@@ -44,6 +44,10 @@ import {
   ConversationModelRefused,
   ConversationModelSwitched,
 } from "./conversationModel";
+import {
+  ConversationStopped,
+  ConversationStopRefused,
+} from "./conversationTurn";
 import { AssetView } from "./asset";
 import { ScopeEntryDraft, ScopeLabelDraft, ScopeView } from "./scope";
 import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
@@ -1532,8 +1536,10 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
     /**
      * Says something to one import's session, and answers without waiting for the turn.
      *
-     * A live session is given the message as a queued steer: work in flight finishes, then
-     * the message runs (DECISIONS.md §24.1). An import the operator ended is refused, because
+     * A live session is given the message as a steer at the draft's `urgency`: `queued` by
+     * default — work in flight finishes, then the message runs — or `preemptive`, which lands
+     * it at the harness's next step boundary and throws away the rest of the work in flight
+     * (DECISIONS.md §24.1). An import the operator ended is refused, because
      * its authority is over. An import whose session this server no longer holds — closed
      * after a refused prompt, or lost to a restart — gets a fresh session under a **new
      * import id**, which the answer carries and says so. An id this target does not hold is a
@@ -1548,6 +1554,34 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         success: ImporterTurnAccepted.pipe(HttpApiSchema.status(202)),
         error: [
           ImporterConversationRefused,
+          ScopeImportNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
+     * Stops the turn running in one import's session, and keeps the conversation (A6 F5).
+     *
+     * **Not {@link stopScopeImport}**, which ends the import and its authority for good. This
+     * interrupts the harness's turn and nothing else: the session stays open in this server,
+     * its credential stays live, and the next message continues it under the same import.
+     * What was written before the stop stays written.
+     *
+     * Addressed by import id and applied to the import that holds the session now, as a
+     * message is. A session this server does not hold, or one with nothing running, is a
+     * `200` that says so ({@link ConversationStopped.outcome}), not a refusal. A harness that
+     * would not acknowledge the stop is {@link ConversationStopRefused}. An id this target
+     * does not hold is a `404`.
+     */
+    HttpApiEndpoint.post(
+      "stopImporterTurn",
+      "/targets/:targetId/importer-sessions/:importId/stop",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        success: ConversationStopped,
+        error: [
+          ConversationStopRefused,
           ScopeImportNotFound,
           TargetNotFound,
           TargetUnavailable,
@@ -2090,7 +2124,7 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
      * **The first message creates the session**, in `targets/<id>/goal/<goalId>/` under a
      * credential with no clock expiry, with the goal toolkit registered on it — and a
      * later message is delivered into that same session, queued behind whatever it is
-     * doing rather than cutting it off. {@link GoalTurnAccepted.conversation} says which
+     * doing rather than cutting it off unless the draft's `urgency` is `preemptive`. {@link GoalTurnAccepted.conversation} says which
      * of the two happened, and `priorUnavailable` is how a first message *after a restart*
      * is told from a first message ever.
      *
@@ -2106,6 +2140,28 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         success: GoalTurnAccepted.pipe(HttpApiSchema.status(202)),
         error: [
           GoalConversationRefused,
+          GoalNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
+     * Stops the turn running in one goal's conversation, and keeps the conversation (A6 F5).
+     *
+     * {@link stopImporterTurn} for a goal: the harness's turn is interrupted, the session
+     * stays open with its credential, and the next message continues it. A goal whose
+     * conversation this server does not hold, or holds idle, is a `200` that says so. A
+     * goal this target does not hold is a `404`.
+     */
+    HttpApiEndpoint.post(
+      "stopGoalTurn",
+      "/targets/:targetId/goals/:goalId/conversation/stop",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        success: ConversationStopped,
+        error: [
+          ConversationStopRefused,
           GoalNotFound,
           TargetNotFound,
           TargetUnavailable,

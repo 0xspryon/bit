@@ -30,6 +30,9 @@
  * 6. **{@link LiveAgentSessions.switchModel}**: one model switch at a time per id, under the
  *    opening permit, and the registry's copy of the model kept in step with the harness.
  *    The row is the surface's; the order — harness, then registry, then row — is here.
+ * 7. **{@link LiveAgentSessions.interrupt}**: Stop. The turn ends and the session does not,
+ *    so a conversation can be stopped and carried on; a harness that will not acknowledge
+ *    the stop has the session closed rather than left holding authority nobody can steer.
  *
  * ## What it does not own
  *
@@ -60,13 +63,23 @@
  * to the permit finds the entry either preambled or gone.
  */
 import { bitMcpServerName, type ModelOptionSelection } from "@bit/contracts";
-import { Effect, Exit, Fiber, Redacted, Scope, Semaphore } from "effect";
+import {
+  type Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  Redacted,
+  Scope,
+  Semaphore,
+} from "effect";
 
 import {
   OPEN_PROMPT,
   SESSION_NOT_FOUND_TAG,
   type AgentHarness,
   type HarnessFailure,
+  type SteerUrgency,
 } from "./agentHarness";
 import type { HarnessNotReady } from "./resolver";
 import type { CredentialRefused, IssuedCredential } from "../mcp/credentials";
@@ -331,6 +344,33 @@ const switchFoundNoSession = (failure: HarnessFailure): boolean =>
   failure._tag === "HarnessTransportError" &&
   (failure.tag === SESSION_NOT_FOUND_TAG || failure.status === 404);
 
+/**
+ * What {@link LiveAgentSessions.interrupt} found.
+ *
+ * - `not_live` — no session is held under the id, so nothing of it runs in this process.
+ * - `idle` — a session is held and the harness said nothing was running in it.
+ * - `interrupted` — the harness stopped a running turn. `working` is whether the session
+ *   was still busy once {@link INTERRUPT_SETTLE} had passed.
+ */
+export type LiveInterrupt<Meta> =
+  | { readonly _tag: "not_live" }
+  | { readonly _tag: "idle"; readonly entry: LiveAgentSession<Meta> }
+  | {
+      readonly _tag: "interrupted";
+      readonly entry: LiveAgentSession<Meta>;
+      readonly working: boolean;
+    };
+
+/**
+ * How long an interrupted turn is given to go idle before a Stop is answered.
+ *
+ * Measured at ~10 ms (Claude Code, the `result` after the acknowledgement) and ~50 ms
+ * (OpenCode, `idle` after `session.interrupt`) on the interrupt probe, so two seconds is
+ * generous for the turn that was stopped and short of any turn that runs after it — which
+ * is the case `working: true` reports.
+ */
+export const INTERRUPT_SETTLE: Duration.Input = "2 seconds";
+
 export interface LiveAgentSessions<Meta> {
   /** The entry for one id, preambled or not. For reads that only need the session id. */
   readonly get: (id: string) => LiveAgentSession<Meta> | undefined;
@@ -374,12 +414,13 @@ export interface LiveAgentSessions<Meta> {
   /**
    * Gives one later message to a session that has had its opening prompt.
    *
-   * **A `steer` at `queued` urgency, and the spine decides that rather than each surface**
-   * (DECISIONS.md §24.1): the work in flight finishes, then the message runs. `preemptive`
-   * would cut off whatever the agent was in the middle of — including a tool call it was
-   * about to report on — and an operator sending a second message has not asked for that.
-   * Two conversations deciding delivery timing separately is the drift this module exists
-   * to prevent.
+   * **A `steer`, at the urgency the operator asked for** (DECISIONS.md §24.1). `queued` is
+   * every surface's default: the work in flight finishes, then the message runs.
+   * `preemptive` is "send now", and only ever an explicit choice — it cuts off whatever the
+   * agent was in the middle of, and an operator who merely sent a second message has not
+   * asked for that. The urgency is passed straight through; the spine owns what each one
+   * means on the harness (see the V2 notes at the implementation), so two
+   * conversations cannot drift apart on delivery timing.
    *
    * **A refusal closes the session, as `refused`**, which is the third item on the list of
    * things that close one: the session has been prompted-and-failed, this seam never
@@ -400,7 +441,30 @@ export interface LiveAgentSessions<Meta> {
   readonly deliver: (
     entry: LiveAgentSession<Meta>,
     prompt: string,
+    urgency: SteerUrgency,
   ) => Effect.Effect<void, HarnessFailure>;
+  /**
+   * Stops the turn running in one id's session, and keeps the session (A6 F5).
+   *
+   * The harness's `interruptSession` and nothing more: the entry stays in the map, its
+   * scope, credential and registration stay live, and the next {@link deliver} continues
+   * the same session — both harnesses keep a multi-turn session promptable after an
+   * interrupt (measured; `AgentHarness.interruptSession`). A session still being opened is
+   * waited for under the opening permit, so its opening turn is the one stopped.
+   *
+   * An interrupted turn is then given {@link INTERRUPT_SETTLE} to go idle, which it does in
+   * tens of milliseconds on both harnesses. `working: true` means it did not: on Claude Code
+   * that is a message queued behind the stopped turn, which the harness runs at once.
+   *
+   * **A harness that will not acknowledge the interrupt has the session closed, as
+   * `refused`**, and the failure returned. Whether its turn stopped is uncertain, and a
+   * session this process cannot steer is one whose authority should not outlive the doubt —
+   * the run and round supervisors revoke on the same uncertainty. The next message then
+   * carries the conversation on in a session this process holds again.
+   */
+  readonly interrupt: (
+    id: string,
+  ) => Effect.Effect<LiveInterrupt<Meta>, HarnessFailure>;
   /** {@link closeSession} by id. Idempotent, and safe for an id with nothing live. */
   readonly close: (
     id: string,
@@ -813,18 +877,33 @@ export const makeLiveAgentSessions = <Meta>(
      * V2(chat): follow-ups are queued *in the harness*, not here. Each one goes straight to
      * the session as a `queued` steer (OpenCode `delivery: "queue"`, Claude Code
      * `priority: "later"`), so once sent it cannot be edited, cancelled or reordered; a
-     * Claude Code message queued but not yet run lives in this process's input stream and is
-     * lost if bit restarts (OpenCode keeps its queue in its own database); and what an
-     * interrupt does to messages still in either harness's queue is unmeasured. Proper V2:
-     * an app-owned queue (T3's model) that the operator can edit, cancel and reorder, that
-     * survives a restart, and from which a message can be promoted to an immediate steer.
+     * Claude Code message queued but not yet run lives in the CLI's input stream and is lost
+     * if bit restarts (OpenCode keeps its queue in its own database). And a Stop treats it
+     * differently on each harness (measured 2026-11-04, `AgentHarness.interruptSession`):
+     * Claude Code runs a message queued behind the interrupted turn at once, as a turn of its
+     * own, so the conversation answers it straight after the Stop; OpenCode holds it in the
+     * session's inbox, out of the transcript, and runs it ahead of the operator's next
+     * message in the same execution. Proper V2: an app-owned queue (T3's model) that the
+     * operator can edit, cancel and reorder, that survives a restart, that a Stop holds back
+     * on both harnesses alike, and from which a message can be promoted to an immediate steer.
      */
-    const deliver: LiveAgentSessions<Meta>["deliver"] = (entry, prompt) =>
+    const deliver: LiveAgentSessions<Meta>["deliver"] = (
+      entry,
+      prompt,
+      urgency,
+    ) =>
       Effect.gen(function* () {
         const accepted = yield* Effect.result(
           entry.harness.prompt(entry.sessionId, prompt, {
             _tag: "steer",
-            urgency: "queued",
+            /*
+             * V2(chat): "send now" is a preemptive steer — it lands at the harness's next
+             * step boundary, so a tool call already running finishes first and the rest of
+             * the work in flight is discarded. Proper V2: a combined "stop and send" that
+             * interrupts the turn and then opens the next one, once interrupt-with-queued-
+             * messages behaviour is measured.
+             */
+            urgency,
             messageId: crypto.randomUUID().replaceAll("-", ""),
           }),
         );
@@ -832,6 +911,36 @@ export const makeLiveAgentSessions = <Meta>(
           yield* closeSession(entry, "refused");
           return yield* Effect.fail(accepted.failure);
         }
+      });
+
+    const interrupt: LiveAgentSessions<Meta>["interrupt"] = (id) =>
+      Effect.gen(function* () {
+        // Published and not yet preambled: its opener holds the permit until the opening
+        // prompt has landed, so waiting for the permit is waiting for the turn to exist.
+        if (ready(id) === undefined && live.get(id) !== undefined) {
+          yield* Semaphore.withPermit(openingLock(id))(Effect.void);
+        }
+        const entry = ready(id);
+        if (entry === undefined) return { _tag: "not_live" } as const;
+        const asked = yield* Effect.result(
+          entry.harness.interruptSession(entry.sessionId),
+        );
+        if (asked._tag === "Failure") {
+          yield* closeSession(entry, "refused");
+          return yield* Effect.fail(asked.failure);
+        }
+        if (!asked.success) return { _tag: "idle", entry } as const;
+        // A wait that fails is a stream that ended, which is not a session still working.
+        const settled = yield* Effect.result(
+          entry.harness
+            .waitForIdle(entry.sessionId)
+            .pipe(Effect.timeoutOption(INTERRUPT_SETTLE)),
+        );
+        return {
+          _tag: "interrupted",
+          entry,
+          working: settled._tag === "Success" && Option.isNone(settled.success),
+        } as const;
       });
 
     /**
@@ -939,6 +1048,7 @@ export const makeLiveAgentSessions = <Meta>(
       open,
       closeSession,
       deliver,
+      interrupt,
       switchModel,
       close: (id, reason) => {
         const entry = live.get(id);

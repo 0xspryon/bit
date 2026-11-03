@@ -1013,8 +1013,40 @@ export class AgentHarness extends Context.Service<
      *
      * Reports whether the harness says it interrupted something: `false` for a session
      * that was already idle, which is not a failure and is worth being able to tell apart.
-     * Resuming is deliberately not on this interface — carrying work on after an
-     * interruption means a new attempt identity (DECISIONS.md §15).
+     * A failure means the harness did not acknowledge the interrupt, so whether the turn
+     * stopped is uncertain. For a worker attempt or a planner round, carrying work on after
+     * an interruption means a new attempt identity (DECISIONS.md §15), and both supervisors
+     * revoke the authority whatever this answers.
+     *
+     * **A `multiTurn` session stays open and promptable after an interrupt** (A6 F5): the
+     * turn in flight ends `interrupted`, and the conversation's next message is an ordinary
+     * steer into the same session. A single-turn session is over, as it always was.
+     *
+     * ## What an interrupt does, measured (2026-11-04, `spike/interruptProbe.ts`)
+     *
+     * One long turn, a `queued` steer sent while it ran, an interrupt half a second later,
+     * thirty seconds of quiet, then a third message.
+     *
+     * - **Claude Code 2.1.310 (Agent SDK 0.3.310), `claude-haiku-4-5`.** `Query.interrupt()`
+     *   is acknowledged in ~15 ms; the CLI writes a `[Request interrupted by user]` user
+     *   entry and the turn's `result` arrives ~10 ms later as `error_during_execution`
+     *   (`outcomeOf` reads it as `interrupted`). **The queued message then runs at once, on
+     *   its own**, as a turn of its own with its own `result` — the operator who queued it
+     *   and pressed Stop sees the conversation answer it. The query stays open: the third
+     *   message, thirty seconds later, was answered normally. So `accepted`/`completed` stay
+     *   true across an interrupt, and the implementation only has to keep the query open
+     *   rather than close it (it used to close it, which made Stop end the conversation).
+     * - **OpenCode 2.2.5, `zai-coding-plan/glm-5.3-flash`.** `session.interrupt` answers
+     *   `interrupted: true` in ~20 ms and the session is idle with `outcome: "interrupted"`
+     *   ~50 ms after. **The queued message does not run**: OpenCode's run coordinator claims
+     *   the interrupted execution's pending wakes, so the message stays in the session's
+     *   inbox — not in its transcript — until something wakes the session again. The third
+     *   message did, and both then ran in one execution: the queued message first, then the
+     *   new one, one `idle` at the end. The session is promptable throughout.
+     *
+     * The two harnesses disagree about a queued follow-up, and the seam does not hide it:
+     * there is no app-owned queue to hold such a message back (`V2(chat):` at
+     * `LiveAgentSessions.deliver`).
      */
     readonly interruptSession: (
       sessionId: string,

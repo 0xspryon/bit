@@ -1246,6 +1246,27 @@ export class FakeServer implements ServerClient {
   ) => Answer<"stopScopeImport"> = (_baseUrl, targetId, importId) =>
     ok(scopeImportView({ targetId, importId, status: "stopped" }));
 
+  /** A turn the harness stopped, settled: the dull answer to a Stop (A6 F5). */
+  onStopImporterTurn: (
+    ...args: Parameters<ServerClient["stopImporterTurn"]>
+  ) => Answer<"stopImporterTurn"> = (_baseUrl, _targetId, importId) =>
+    ok({
+      conversationId: importId,
+      outcome: "interrupted",
+      working: false,
+      detail: `Stopped the turn import ${importId} was taking.`,
+    });
+
+  onStopGoalTurn: (
+    ...args: Parameters<ServerClient["stopGoalTurn"]>
+  ) => Answer<"stopGoalTurn"> = (_baseUrl, _targetId, goalId) =>
+    ok({
+      conversationId: goalId,
+      outcome: "interrupted",
+      working: false,
+      detail: `Stopped the turn goal ${goalId}'s conversation was taking.`,
+    });
+
   onTranscript: (
     baseUrl: string,
     targetId: string,
@@ -1438,6 +1459,14 @@ export class FakeServer implements ServerClient {
 
   stopScopeImport = (...args: Parameters<ServerClient["stopScopeImport"]>) =>
     this.record("stopScopeImport", args, () => this.onStopScopeImport(...args));
+
+  stopImporterTurn = (...args: Parameters<ServerClient["stopImporterTurn"]>) =>
+    this.record("stopImporterTurn", args, () =>
+      this.onStopImporterTurn(...args),
+    );
+
+  stopGoalTurn = (...args: Parameters<ServerClient["stopGoalTurn"]>) =>
+    this.record("stopGoalTurn", args, () => this.onStopGoalTurn(...args));
 
   transcript = (baseUrl: string, targetId: string, attemptId: string) =>
     this.record("transcript", [baseUrl, targetId, attemptId], () =>

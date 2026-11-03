@@ -234,6 +234,8 @@ interface Script {
   failPrompt: boolean;
   /** Makes a later (steered) prompt fail, for a session that refuses a second message. */
   failSteer: boolean;
+  /** Makes `interruptSession` fail, for a harness that will not acknowledge a Stop. */
+  failInterrupt: boolean;
   /**
    * What the scripted agent does with a later message, given the message and the
    * credential of the session it landed in. Nothing, unless a test says.
@@ -299,6 +301,7 @@ const newScript = (readable: readonly string[]): Script => {
     failCreate: false,
     failPrompt: false,
     failSteer: false,
+    failInterrupt: false,
     onSteer: undefined,
     holdPrompt: undefined,
     holdRegister: undefined,
@@ -486,10 +489,20 @@ const scriptedHarness = (script: Script) => {
             }),
     waitForIdle: () => Effect.promise(() => script.done),
     interruptSession: (sessionId) =>
-      Effect.sync(() => {
-        script.interrupted.push(sessionId);
-        return true;
-      }),
+      script.failInterrupt
+        ? Effect.fail(
+            new HarnessTransportError({
+              operation: "session.interrupt",
+              status: undefined,
+              tag: undefined,
+              detail: "the scripted harness did not acknowledge the interrupt",
+              cause: undefined,
+            }),
+          )
+        : Effect.sync(() => {
+            script.interrupted.push(sessionId);
+            return true;
+          }),
     // The transcript, in the order `AgentHarness.messages` promises - oldest first, which
     // each real driver has its own test for: the narration the session produced along the
     // way, and its closing report last. `lastAssistantText` has to find
@@ -3251,5 +3264,221 @@ describe("switching an import's model", () => {
     }
     expect(rowOf(built.root, importId)?.model).toBe("scripted/model");
     await restarted.dispose();
+  });
+});
+
+/* ── A6 F5: urgency, Stop, and an older run's id ─────────────────────────────── */
+
+const stopOf = (
+  runtime: ManagedRuntime.ManagedRuntime<ScopeImporter, unknown>,
+  importId: string,
+) =>
+  runtime.runPromise(
+    Effect.result(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.stopTurn({ targetId: TARGET, importId }),
+      ),
+    ),
+  );
+
+/** A live, settled import of one link, its session still held. */
+const liveOne = async () => {
+  const opened = await importWith([PAGE_GOOD], { links: [PAGE_GOOD] });
+  if (opened.started._tag !== "started") {
+    throw new Error("the import did not start");
+  }
+  return { ...opened, importId: opened.started.importId };
+};
+
+/** Where the harness resolves the session it created for one import. */
+const importDirectoryOf = (root: string, importId: string) =>
+  join(root, "targets", TARGET, "import", importId);
+
+describe("a message's urgency (A6 F5)", () => {
+  test("a preemptive message reaches the harness as a preemptive steer, and one that names none stays queued", async () => {
+    const { built, runtime, importId } = await liveOne();
+    const now = await runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.send({
+            targetId: TARGET,
+            importId,
+            text: "Stop reading that page; read this one.",
+            urgency: "preemptive",
+          }),
+        ),
+      ),
+    );
+    expect(now._tag).toBe("Success");
+    const later = await sendTo(runtime, importId, "And then the API hosts.");
+    expect(later._tag).toBe("Success");
+    const urgencies = built.script.deliveries.flatMap((delivery) =>
+      delivery._tag === "steer" ? [delivery.urgency] : [],
+    );
+    expect(urgencies).toEqual(["preemptive", "queued"]);
+    await runtime.dispose();
+  });
+});
+
+describe("stopping an import's turn (A6 F5)", () => {
+  test("interrupts the live session's turn and keeps the conversation: the next message continues it under the same import", async () => {
+    const { built, runtime, importId } = await liveOne();
+    const stopped = await stopOf(runtime, importId);
+    expect(stopped._tag).toBe("Success");
+    if (stopped._tag !== "Success") return;
+    expect(stopped.success).toMatchObject({
+      conversationId: importId,
+      outcome: "interrupted",
+      working: false,
+    });
+    expect(stopped.success.detail).toContain("next message carries");
+    expect(built.script.interrupted).toEqual(["ses_import"]);
+    // Not the import's end: nothing was taken back, and the session is still held.
+    expect(built.script.unregistered).toEqual([]);
+    expect(endings(built.root)).toEqual([
+      { import_id: importId, ended_at: null, ended_reason: null },
+    ]);
+
+    const next = await sendTo(runtime, importId, "Carry on with the API.");
+    expect(next._tag).toBe("Success");
+    if (next._tag === "Success") {
+      expect(next.success.conversation).toBe("continued");
+      expect(next.success.importId).toBe(importId);
+    }
+    expect(built.script.created).toHaveLength(1);
+    await runtime.dispose();
+  });
+
+  test("an import this server does not hold is not live, and an id this target does not hold is not found", async () => {
+    const { built, runtime, importId } = await liveOne();
+    await runtime.dispose();
+    const restarted = ManagedRuntime.make(built.layer);
+    const stopped = await stopOf(restarted, importId);
+    expect(stopped._tag).toBe("Success");
+    if (stopped._tag === "Success") {
+      expect(stopped.success.outcome).toBe("not_live");
+      expect(stopped.success.working).toBe(false);
+    }
+    const unknown = await stopOf(restarted, "imp_nobody");
+    expect(unknown._tag).toBe("Failure");
+    if (unknown._tag === "Failure") {
+      expect(unknown.failure._tag).toBe("ScopeImportNotFound");
+    }
+    expect(built.script.interrupted).toEqual([]);
+    await restarted.dispose();
+  });
+
+  test("a harness that will not acknowledge it is refused with a sentence, and the next message carries the conversation on", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.failInterrupt = true;
+    built.script.holds.set(
+      "ses_import",
+      importDirectoryOf(built.root, importId),
+    );
+    const stopped = await stopOf(runtime, importId);
+    expect(stopped._tag).toBe("Failure");
+    if (stopped._tag !== "Failure") return;
+    expect(stopped.failure._tag).toBe("ConversationStopRefused");
+    if (stopped.failure._tag === "ConversationStopRefused") {
+      expect(stopped.failure.reason).toBe("harness_unreachable");
+      expect(stopped.failure.detail).toContain("uncertain");
+    }
+    // Let go of: the registration is taken back with the credential.
+    expect(built.script.unregistered).toEqual(["ses_import"]);
+
+    const next = await sendTo(runtime, importId, "Are you still there?");
+    expect(next._tag).toBe("Success");
+    if (next._tag === "Success") {
+      expect(next.success.conversation).toBe("resumed");
+      expect(next.success.harnessSessionId).toBe("ses_import");
+    }
+    await runtime.dispose();
+  });
+
+  test("addressed to a predecessor, it stops the successor this server opened", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.holds.set(
+      "ses_import",
+      importDirectoryOf(built.root, importId),
+    );
+    await runtime.dispose();
+    const restarted = ManagedRuntime.make(built.layer);
+    const reopened = await sendTo(restarted, importId, "Continue.");
+    if (reopened._tag !== "Success") throw new Error("the reopen failed");
+    await built.script.done;
+    const stopped = await stopOf(restarted, importId);
+    expect(stopped._tag).toBe("Success");
+    if (stopped._tag === "Success") {
+      expect(stopped.success.outcome).toBe("interrupted");
+      expect(stopped.success.conversationId).toBe(reopened.success.importId);
+    }
+    expect(built.script.interrupted).toEqual(["ses_import"]);
+    await restarted.dispose();
+  });
+});
+
+describe("an older run's id after a restart (A6 F5, from F4's review)", () => {
+  /**
+   * I1 opened, I2 resumed it after one restart, I3 after another: three rows naming one
+   * harness session, with I3 live in the last process and that process knowing only
+   * I2 → I3. An old tab still holding I1 must reach I3, not resume the session a second
+   * time beside it.
+   */
+  const chain = async () => {
+    const { built, runtime, importId: first } = await liveOne();
+    built.script.holds.set("ses_import", importDirectoryOf(built.root, first));
+    await runtime.dispose();
+    const second = ManagedRuntime.make(built.layer);
+    const two = await sendTo(second, first, "Continue.");
+    if (two._tag !== "Success") throw new Error("the first reopen failed");
+    await built.script.done;
+    await second.dispose();
+    const third = ManagedRuntime.make(built.layer);
+    const three = await sendTo(third, two.success.importId, "Continue again.");
+    if (three._tag !== "Success") throw new Error("the second reopen failed");
+    await built.script.done;
+    return {
+      built,
+      runtime: third,
+      first,
+      latest: three.success.importId,
+    };
+  };
+
+  test("a message to the oldest run is delivered into the newest, and no second resume is opened", async () => {
+    const { built, runtime, first, latest } = await chain();
+    const created = built.script.created.length;
+    const sent = await sendTo(runtime, first, "Also the staging hosts.");
+    expect(sent._tag).toBe("Success");
+    if (sent._tag === "Success") {
+      expect(sent.success.conversation).toBe("continued");
+      expect(sent.success.importId).toBe(latest);
+    }
+    expect(built.script.created).toHaveLength(created);
+    await runtime.dispose();
+  });
+
+  test("a model switch addressed to the oldest run lands on the newest, live", async () => {
+    const { built, runtime, first, latest } = await chain();
+    const switched = await runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.switchModel({
+            targetId: TARGET,
+            importId: first,
+            model: "scripted/other",
+          }),
+        ),
+      ),
+    );
+    expect(switched._tag).toBe("Success");
+    if (switched._tag === "Success") {
+      expect(switched.success.conversationId).toBe(latest);
+      expect(switched.success.applied).toBe("live");
+    }
+    expect(built.script.switches).toEqual([
+      { sessionId: "ses_import", model: "scripted/other", options: undefined },
+    ]);
+    await runtime.dispose();
   });
 });

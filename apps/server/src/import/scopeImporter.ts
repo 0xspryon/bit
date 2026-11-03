@@ -116,16 +116,19 @@
  */
 import {
   ConversationModelRefused,
+  ConversationStopRefused,
   ImporterConversationRefused,
   SCOPE_IMPORT_MAX_LINKS,
   ScopeImportNotFound,
   type ConversationModelDraft,
   type ConversationModelSwitched,
+  type ConversationStopped,
   type ImporterConversationView,
   type ImporterTurnAccepted,
   type ImportModelDraft,
   type ModelOptionSelection,
   type ScopeImportView,
+  type SteerUrgency,
 } from "@bit/contracts";
 import {
   Context,
@@ -169,6 +172,7 @@ import {
   sameModelChoice,
 } from "../harness/modelSwitch";
 import { HarnessResolver } from "../harness/resolver";
+import { turnStopped, turnStopRefusal } from "../harness/turnStop";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { newImportId } from "../persistence/identifier";
@@ -439,16 +443,23 @@ export class ScopeImporter extends Context.Service<
     /**
      * Gives one operator message to an import (S3).
      *
-     * Live in this process: delivered into its session as a queued steer, under the **same**
-     * import id, so its writes count toward the same tally. Ended by the operator: refused.
-     * Anything else — closed after a refused prompt, lost to a restart — opens a fresh
-     * session under a **new** import id, because an import id names one authority period
-     * and an ended one is never revived (`0027`).
+     * Live in this process: delivered into its session as a steer at `urgency` (`queued`
+     * unless said otherwise), under the **same** import id, so its writes count toward the
+     * same tally. Ended by the operator: refused. Anything else — closed after a refused
+     * prompt, lost to a restart — opens a fresh session under a **new** import id, because
+     * an import id names one authority period and an ended one is never revived (`0027`).
+     *
+     * **Addressed to an older run, it goes to the newest** (A6 F5): an import id that is not
+     * its session's newest confirmed run (`latest_import_id`) — an old tab's, after a reopen
+     * — is followed to that run, as an in-memory successor is. Reopening from the old row
+     * instead would open the same Claude Code session a second time while the newest run
+     * holds it.
      */
     readonly send: (input: {
       readonly targetId: string;
       readonly importId: string;
       readonly text: string;
+      readonly urgency?: SteerUrgency | undefined;
     }) => Effect.Effect<
       ImporterTurnAccepted,
       ImporterConversationRefused | ScopeImportNotFound
@@ -488,6 +499,26 @@ export class ScopeImporter extends Context.Service<
      * held under the fresh one, which is why the caller asks about each id a session has had.
      */
     readonly holds: (importId: string) => Effect.Effect<boolean>;
+    /**
+     * Stops the turn running in one import's session, and keeps the conversation (A6 F5).
+     *
+     * **Not {@link stop}**, which ends the import's authority for good. This is the spine's
+     * `interrupt`: the harness's turn ends, the session stays held with its credential, and
+     * the next message continues it under the same import id. Addressed by import id and
+     * applied to the import that holds the session now — the newest run, then any successor
+     * this process opened — so an old tab's Stop reaches the session that is running.
+     *
+     * The turn's settle fiber is left alone: the interrupt makes the session idle, and that
+     * fiber settles the import's view from `waitForIdle` exactly as a turn that ended by
+     * itself would.
+     */
+    readonly stopTurn: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+    }) => Effect.Effect<
+      ConversationStopped,
+      ConversationStopRefused | ScopeImportNotFound
+    >;
     /**
      * Moves one import's session onto another model of its harness, or other options of its
      * model (A6 F4). The harness is the row's and is never changed here.
@@ -1360,9 +1391,9 @@ export class ScopeImporter extends Context.Service<
       /**
        * Gives one message to an import whose session is live and preambled.
        *
-       * Delivery is the spine's (`LiveAgentSessions.deliver`): a `steer` at `queued` urgency,
-       * the goal conversation's seam and reasoning (DECISIONS.md §24.1), and a refusal closes
-       * the session as `refused`. **The import id does not change**: this is the same
+       * Delivery is the spine's (`LiveAgentSessions.deliver`): a `steer` at the operator's
+       * urgency, `queued` by default — the goal conversation's seam and reasoning
+       * (DECISIONS.md §24.1) — and a refusal closes the session as `refused`. **The import id does not change**: this is the same
        * authority period, so the writes this turn makes are filed under the same
        * `caller_scope` and the session's tally keeps counting (S3.3).
        *
@@ -1375,6 +1406,7 @@ export class ScopeImporter extends Context.Service<
       const deliverTurn = Effect.fnUntraced(function* (
         entry: LiveAgentSession<ImportSessionMeta>,
         text: string,
+        urgency: SteerUrgency,
       ) {
         const widened = yield* progress.addLinks(entry.id, operatorPages(text));
         // The durable copy (`0029`), so a session reopened after a restart can carry these
@@ -1396,6 +1428,7 @@ export class ScopeImporter extends Context.Service<
           sessions.deliver(
             entry,
             entry.meta.agent.prompt.followUp({ message: text }),
+            urgency,
           ),
         );
         if (delivered._tag === "Failure") {
@@ -1518,13 +1551,35 @@ export class ScopeImporter extends Context.Service<
           return row;
         });
 
+      /**
+       * The run a message or a switch addressed to `importId` belongs to instead, when that is
+       * not `importId` itself: its harness session's newest confirmed run (A6 F5, from F4's
+       * review).
+       *
+       * In-process, {@link successors} already follows a reopen to the import it minted. A
+       * restart forgets that map and the rows do not: I1 → I2 → I3 is three rows naming one
+       * harness session, and an old tab still holding I1 would otherwise reopen from I1's
+       * row — resuming the same Claude Code session a second time while I3 holds it — or
+       * switch a model on a row nothing reads. `latest_import_id` is the session list's own
+       * answer to "which run is the conversation now", so following it agrees with the
+       * picker. `undefined` when the row is the newest, or when no run was ever confirmed.
+       */
+      const newerRun = (
+        importId: string,
+        row: { readonly latestImportId: string | null },
+      ): string | undefined =>
+        row.latestImportId !== null && row.latestImportId !== importId
+          ? row.latestImportId
+          : undefined;
+
       const send: ScopeImporter["Service"]["send"] = Effect.fn(
         "ScopeImporter.send",
       )(function* (input) {
+        const urgency = input.urgency ?? "queued";
         // The fast path: live, preambled, and this target's.
         const live = sessions.ready(input.importId);
         if (live !== undefined && live.targetId === input.targetId) {
-          return yield* deliverTurn(live, input.text);
+          return yield* deliverTurn(live, input.text, urgency);
         }
 
         /*
@@ -1542,7 +1597,11 @@ export class ScopeImporter extends Context.Service<
           return yield* send(input);
         }
 
-        yield* recordedImport(input);
+        const addressed = yield* recordedImport(input);
+        const newest = newerRun(input.importId, addressed);
+        if (newest !== undefined) {
+          return yield* send({ ...input, importId: newest });
+        }
 
         /*
          * Published but not yet preambled: join it, under the spine's permit. `prepare`
@@ -1559,7 +1618,7 @@ export class ScopeImporter extends Context.Service<
               never
             >({
               id: input.importId,
-              joined: (entry) => deliverTurn(entry, input.text),
+              joined: (entry) => deliverTurn(entry, input.text, urgency),
               prepare: Effect.fail(NOT_LIVE),
               refuse: refusal,
               opened: () => Effect.fail(NOT_LIVE),
@@ -1589,6 +1648,12 @@ export class ScopeImporter extends Context.Service<
              * switch that landed while this message waited for the permit.
              */
             const row = yield* recordedImport(input);
+            // Again inside the permit, for the reason the row is read again: a reopen under
+            // another id's permit can have made a newer run since the read above.
+            const newer = newerRun(input.importId, row);
+            if (newer !== undefined) {
+              return yield* send({ ...input, importId: newer });
+            }
             const target = yield* fleet
               .target(input.targetId)
               .pipe(Effect.mapError(refusal));
@@ -1782,6 +1847,29 @@ export class ScopeImporter extends Context.Service<
                         return yield* switchFrom(successor, input);
                       }
                     }
+                    // The newest run after a restart, which `successors` no longer knows
+                    // (`newerRun`). A row of another target, or none, is `switchOne`'s to
+                    // refuse as not found.
+                    const row = yield* withTargetStore(
+                      stores,
+                      input.targetId,
+                      (store) => store.importSession(importId),
+                    ).pipe(
+                      Effect.mapError(
+                        (failure) =>
+                          new ConversationModelRefused({
+                            reason: "store_unavailable",
+                            detail: `import ${importId}'s record could not be read (${failure.message}), so nothing was switched.`,
+                          }),
+                      ),
+                    );
+                    const newer =
+                      row === undefined || row.targetId !== input.targetId
+                        ? undefined
+                        : newerRun(importId, row);
+                    if (newer !== undefined) {
+                      return yield* switchFrom(newer, input);
+                    }
                     return yield* switchOne(importId, input);
                   }),
                 )
@@ -1962,6 +2050,49 @@ export class ScopeImporter extends Context.Service<
         });
       });
 
+      const stopTurn: ScopeImporter["Service"]["stopTurn"] = Effect.fn(
+        "ScopeImporter.stopTurn",
+      )(function* (input) {
+        const row = yield* withTargetStore(stores, input.targetId, (store) =>
+          store.importSession(input.importId),
+        ).pipe(
+          Effect.mapError(
+            (failure) =>
+              new ConversationStopRefused({
+                reason: "store_unavailable",
+                detail: `import ${input.importId}'s record could not be read (${failure.message}), so nothing was stopped.`,
+              }),
+          ),
+        );
+        if (row === undefined || row.targetId !== input.targetId) {
+          return yield* new ScopeImportNotFound({
+            reason: "unknown_import",
+            importId: input.importId,
+            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no turn to stop`,
+          });
+        }
+        /*
+         * The import holding the session now: the newest run the rows know of, then whatever
+         * this process has opened after it. An open still in flight is waited for, so a Stop
+         * pressed as a reopen lands reaches the session it opened rather than finding none.
+         * The chain only ever runs forward (a successor is minted after its predecessor), so
+         * this ends.
+         */
+        let importId = newerRun(input.importId, row) ?? input.importId;
+        for (;;) {
+          const opening = inFlight.get(importId);
+          if (opening !== undefined) yield* Deferred.await(opening.known);
+          const next = successors.get(importId);
+          if (next === undefined) break;
+          importId = next;
+        }
+        const what = `import ${importId}`;
+        const found = yield* sessions
+          .interrupt(importId)
+          .pipe(Effect.mapError((failure) => turnStopRefusal(failure, what)));
+        return turnStopped({ found, conversationId: importId, what });
+      });
+
       return ScopeImporter.of({
         start,
         stop,
@@ -1970,6 +2101,7 @@ export class ScopeImporter extends Context.Service<
         send,
         replay,
         switchModel,
+        stopTurn,
         holds: (importId) =>
           Effect.sync(() => sessions.get(importId) !== undefined),
       });
@@ -2008,6 +2140,15 @@ export class ScopeImporter extends Context.Service<
       holds: () => Effect.succeed(false),
       converse: () => Effect.fail(noHarness),
       send: () => Effect.fail(noHarness),
+      // No harness, so no session this server could hold: nothing of any import runs here.
+      stopTurn: (input) =>
+        Effect.succeed(
+          turnStopped({
+            found: { _tag: "not_live" },
+            conversationId: input.importId,
+            what: `import ${input.importId}`,
+          }),
+        ),
       switchModel: () =>
         Effect.fail(
           new ConversationModelRefused({

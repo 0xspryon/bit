@@ -59,10 +59,13 @@
  * state at all.
  */
 import type {
+  ConversationStopped,
   ImporterConversationView,
   ImporterTurnAccepted,
   LiveItem,
 } from "@bit/contracts";
+
+import type { ErrorNotice } from "./components/ErrorDialog.svelte";
 
 import { operatorTurn } from "./chat";
 import {
@@ -129,6 +132,11 @@ export type ImporterSent =
       readonly ended?: boolean;
     };
 
+/** What the server answered a Stop with, as the page needs it. */
+export type ImporterStopAnswer =
+  | { readonly _tag: "stopped"; readonly stopped: ConversationStopped }
+  | { readonly _tag: "refused"; readonly detail: string };
+
 /**
  * The page's way to the server, handed in by the app when the page is a real target's.
  *
@@ -140,6 +148,11 @@ export interface ImporterServer {
   readonly open: (text: string) => Promise<ImporterSent>;
   /** Says `text` to one import's session. */
   readonly send: (importId: string, text: string) => Promise<ImporterSent>;
+  /**
+   * Stops the turn running in one import's session, keeping the conversation (A6 F5): the
+   * harness is interrupted and the session stays open for the next message.
+   */
+  readonly stop: (importId: string) => Promise<ImporterStopAnswer>;
   /**
    * Reads one import's conversation back from the harness (S6), with the activity publish
    * order the read is to be joined at.
@@ -229,6 +242,13 @@ export class ImporterSessions {
   notice = $state("");
   /** Whether {@link notice} is a refusal, which the composer shows as one. */
   refused = $state(false);
+  /** True while a Stop is with the server and not yet answered. */
+  stopping = $state(false);
+  /**
+   * A Stop the server could not carry out, for the error dialog; `undefined` when there is
+   * none. Not {@link notice}: that line is about the draft beneath it, and a Stop is not.
+   */
+  stopFailure = $state<ErrorNotice | undefined>(undefined);
   #server: ImporterServer | undefined = undefined;
 
   constructor(
@@ -294,6 +314,8 @@ export class ImporterSessions {
     this.notice = "";
     this.refused = false;
     this.sending = false;
+    this.stopping = false;
+    this.stopFailure = undefined;
     this.pickerOpen = false;
     this.#sent = 0;
     this.sessions = [fresh, ...indexed];
@@ -379,6 +401,8 @@ export class ImporterSessions {
     this.notice = "";
     this.refused = false;
     this.sending = false;
+    this.stopping = false;
+    this.stopFailure = undefined;
     this.draft = "";
     this.pickerOpen = false;
     this.#sent = 0;
@@ -706,10 +730,53 @@ export class ImporterSessions {
     server.reread();
   }
 
-  /** Stops the importer mid-turn. Whatever it had not finished stays visibly unfinished. */
-  stop(): void {
+  /**
+   * Stops the importer mid-turn, and keeps the conversation (A6 F5).
+   *
+   * **With a server, the harness is really interrupted**, and the session's working state
+   * follows the server's answer rather than the button: it clears when the server says the
+   * turn is over (or that nothing was running), and stays when the server says the
+   * conversation is still busy — on Claude Code, a message queued behind the stopped turn
+   * runs at once. The turn watch is left running either way, so the list is re-read when
+   * the import settles. The server's sentence goes in {@link notice}; a refusal goes to the
+   * error dialog ({@link stopFailure}), since it is about the turn and not the draft.
+   *
+   * Without one — the state picker's scenarios — there is nothing to interrupt, and the
+   * prototype shows the stopped state: whatever it had not finished stays visibly
+   * unfinished.
+   */
+  async stop(): Promise<void> {
     const session = this.current;
     if (session === undefined) return;
-    this.#replace(session.id, (before) => ({ ...before, working: false }));
+    const server = this.#server;
+    const importId = session.importId;
+    if (server === undefined || importId === undefined) {
+      this.#replace(session.id, (before) => ({ ...before, working: false }));
+      return;
+    }
+    if (this.stopping) return;
+    this.stopping = true;
+    const answer = await server.stop(importId);
+    this.stopping = false;
+    // The page was left or reset meanwhile: nothing here is the answer's to change.
+    if (this.#server !== server) return;
+    if (answer._tag === "refused") {
+      this.stopFailure = { title: "Turn not stopped", sentence: answer.detail };
+      return;
+    }
+    const stopped = answer.stopped;
+    this.notice = stopped.detail;
+    this.refused = false;
+    if (stopped.working) return;
+    this.sessions = this.sessions.map((each) =>
+      each.importId === importId || each.importId === stopped.conversationId
+        ? { ...each, working: false }
+        : each,
+    );
+  }
+
+  /** Closes the error dialog a refused Stop opened. */
+  dismissStopFailure(): void {
+    this.stopFailure = undefined;
   }
 }

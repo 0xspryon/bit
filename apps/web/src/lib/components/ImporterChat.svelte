@@ -69,6 +69,7 @@
   import { ENDED_NOTE, strandedNote } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import Chat from "./Chat.svelte";
+  import ErrorDialog from "./ErrorDialog.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
   import StreamCursor from "./StreamCursor.svelte";
 
@@ -129,6 +130,8 @@
       : { harness: session.harness, model: session.model },
   );
   let box = $state<HTMLTextAreaElement | undefined>(undefined);
+  /** The Stop pill, which focus returns to when a refused Stop's dialog closes. */
+  let stopButton = $state<HTMLButtonElement | undefined>(undefined);
 
   function submit(event: Event): void {
     event.preventDefault();
@@ -288,9 +291,22 @@
 
     {#snippet controls()}
       {#if working}
-        <button class="stop" type="button" onclick={() => importer.stop()}>
+        <!--
+          Stop interrupts the harness's turn and keeps the conversation (A6 F5). The cursor
+          clears on the server's answer, not on the press. While the answer is coming the pill
+          is aria-disabled rather than disabled, so focus stays on it.
+        -->
+        <button
+          bind:this={stopButton}
+          class="stop"
+          type="button"
+          aria-disabled={importer.stopping}
+          onclick={() => {
+            if (!importer.stopping) void importer.stop();
+          }}
+        >
           <span class="stop-mark" aria-hidden="true"></span>
-          <span>Stop</span>
+          <span>{importer.stopping ? "Stopping…" : "Stop"}</span>
         </button>
       {/if}
     {/snippet}
@@ -386,6 +402,14 @@
   </Chat>
 </div>
 
+{#if importer.stopFailure !== undefined}
+  <ErrorDialog
+    {...importer.stopFailure}
+    opener={stopButton ?? null}
+    ondismiss={() => importer.dismissStopFailure()}
+  />
+{/if}
+
 <style>
   .importer {
     display: flex;
@@ -467,6 +491,10 @@
   }
   .stop:hover {
     background: var(--overlay-pressed);
+  }
+  .stop[aria-disabled="true"] {
+    color: var(--text-muted);
+    cursor: progress;
   }
   .stop:focus-visible {
     outline: 2px solid var(--border-focus);

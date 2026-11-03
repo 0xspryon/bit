@@ -64,11 +64,14 @@ import {
   GoalUploadRefused,
   type ConversationModelDraft,
   type ConversationModelSwitched,
+  type ConversationStopRefused,
+  type ConversationStopped,
   type ModelOptionSelection,
   type GoalConversationView,
   type GoalTurnAccepted,
   type GoalUploadView,
   type GoalUploadsAccepted,
+  type SteerUrgency,
 } from "@bit/contracts";
 import { Context, Effect, Layer, Stream, type Duration } from "effect";
 
@@ -97,6 +100,7 @@ import {
   type CheckedModelSwitch,
 } from "../harness/modelSwitch";
 import { HarnessResolver } from "../harness/resolver";
+import { turnStopped, turnStopRefusal } from "../harness/turnStop";
 import {
   roleDirectoryMatcher,
   sessionReopen,
@@ -265,13 +269,16 @@ export class GoalConversations extends Context.Service<
      * policy gate in it, resolves a harness, creates a session, mints a credential with no
      * clock expiry, registers the goal MCP endpoint under it, subscribes to narration,
      * records the session id and sends the prompt. Message two is a `prompt` into the same
-     * session, queued behind whatever it is doing.
+     * session, queued behind whatever it is doing — or, at `preemptive` urgency, landed at
+     * its next step boundary.
      */
     readonly send: (input: {
       readonly targetId: string;
       readonly goalId: string;
       /** The operator's words, trimmed by the payload decoder and otherwise untouched. */
       readonly text: string;
+      /** How a message into a running turn lands. `queued` when absent. */
+      readonly urgency?: SteerUrgency | undefined;
     }) => Effect.Effect<GoalTurnAccepted, GoalConversationRefused>;
     /**
      * One goal's conversation as a reloaded tab replays it, from the harness.
@@ -306,6 +313,18 @@ export class GoalConversations extends Context.Service<
      * able to make.
      */
     readonly close: (goalId: string) => Effect.Effect<void>;
+    /**
+     * Stops the turn running in one goal's conversation, and keeps the conversation (A6 F5).
+     *
+     * The spine's `interrupt`, and **not {@link close}**: the session stays held with its
+     * credential and the next message continues it. A goal with no conversation held here,
+     * or one idle, is answered as such rather than refused. A goal's id names its
+     * conversation across every session it has had, so there is no successor to follow.
+     */
+    readonly stopTurn: (input: {
+      readonly targetId: string;
+      readonly goalId: string;
+    }) => Effect.Effect<ConversationStopped, ConversationStopRefused>;
     /**
      * Moves one goal's conversation onto another model of its harness, or other options of
      * its model (A6 F4).
@@ -415,6 +434,15 @@ export class GoalConversations extends Context.Service<
           ),
         live: () => undefined,
         close: () => Effect.void,
+        // No harness, so no session this server could hold.
+        stopTurn: (input) =>
+          Effect.succeed(
+            turnStopped({
+              found: { _tag: "not_live" },
+              conversationId: input.goalId,
+              what: `goal ${input.goalId}'s conversation`,
+            }),
+          ),
         switchModel: () =>
           Effect.fail(
             new ConversationModelRefused({
@@ -530,14 +558,15 @@ const make = Effect.fnUntraced(function* () {
    * the conversation it was about to create had been created by somebody else. A second
    * copy of this would be a second decision about delivery timing.
    *
-   * The delivery itself is the spine's {@link LiveAgentSessions.deliver}: a `steer` at
-   * `queued` urgency with a minted message id, and a refusal closes the session as
+   * The delivery itself is the spine's {@link LiveAgentSessions.deliver}: a `steer` at the
+   * operator's urgency (`queued` by default) with a minted message id, and a refusal closes the session as
    * `refused` so the next message opens a fresh one. The scope importer's conversation
    * delivers through the same call, which is why it is there rather than here.
    */
   const deliverInto = Effect.fnUntraced(function* (
     entry: LiveConversation,
     text: string,
+    urgency: SteerUrgency,
   ) {
     /*
      * The operator's words, verbatim — unless this goal has files attached, in which case
@@ -549,7 +578,9 @@ const make = Effect.fnUntraced(function* () {
       attachments: attachmentsFor(fleet.paths, entry.targetId, entry.id),
       message: text,
     });
-    const accepted = yield* Effect.result(sessions.deliver(entry, prompt));
+    const accepted = yield* Effect.result(
+      sessions.deliver(entry, prompt, urgency),
+    );
     if (accepted._tag === "Failure") return yield* refuse(accepted.failure);
     return {
       targetId: entry.targetId,
@@ -774,7 +805,11 @@ const make = Effect.fnUntraced(function* () {
      */
     const existing = sessions.ready(input.goalId);
     if (existing !== undefined) {
-      return yield* deliverInto(existing, input.text);
+      return yield* deliverInto(
+        existing,
+        input.text,
+        input.urgency ?? "queued",
+      );
     }
 
     /*
@@ -813,7 +848,8 @@ const make = Effect.fnUntraced(function* () {
       never
     >({
       id: input.goalId,
-      joined: (raced) => deliverInto(raced, input.text),
+      joined: (raced) =>
+        deliverInto(raced, input.text, input.urgency ?? "queued"),
       refuse,
       prepare: Effect.gen(function* () {
         const row = yield* Effect.result(fleet.target(input.targetId));
@@ -1566,10 +1602,23 @@ const make = Effect.fnUntraced(function* () {
     });
   });
 
+  const stopTurn: GoalConversations["Service"]["stopTurn"] = Effect.fn(
+    "GoalConversations.stopTurn",
+  )(function* (input) {
+    const what = `goal ${input.goalId}'s conversation`;
+    const found = yield* sessions
+      .interrupt(input.goalId)
+      .pipe(Effect.mapError((failure) => turnStopRefusal(failure, what)));
+    // The route has checked the goal is this target's; a live entry of another target
+    // cannot exist under a goal id, which names one goal of one target.
+    return turnStopped({ found, conversationId: input.goalId, what });
+  });
+
   return GoalConversations.of({
     send,
     replay,
     switchModel,
+    stopTurn,
     // The surface's intentional close. The goal surface records no ending of its own (the
     // goal's status is its authority), so the reason reaches nothing yet.
     close: (goalId) => sessions.close(goalId, "operator"),

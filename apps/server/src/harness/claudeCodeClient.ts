@@ -536,7 +536,10 @@ interface SessionRecord {
    * `assistant` frame states no usage rather than inventing a call to hang it on.
    */
   lastCallId: string | undefined;
-  /** Set by {@link interruptSession}, so the outcome is `interrupted` and not `failed`. */
+  /**
+   * Set by {@link interruptSession}, so the outcome is `interrupted` and not `failed`.
+   * Cleared at the next `result` on a multi-turn session, whose query outlives the turn.
+   */
   interrupted: boolean;
   /** The query has been closed; nothing more will arrive. */
   closed: boolean;
@@ -1238,6 +1241,10 @@ export const claudeCodeHarness = (
                   const outcome = outcomeOf(message, record.interrupted);
                   if (message.type === "result") {
                     record.outcome = outcome;
+                    // The interrupt was for this turn. A conversation's query outlives it, and
+                    // the next turn — a queued message running straight after, say — has not
+                    // been interrupted by anyone.
+                    if (record.multiTurn) record.interrupted = false;
                     record.cost = message.total_cost_usd;
                     record.tokens = message.usage as unknown as Record<
                       string,
@@ -2232,8 +2239,15 @@ export const claudeCodeHarness = (
           ) {
             return false;
           }
+          // A conversation between turns has nothing running, and asking anyway would mark
+          // the *next* turn's `result` as interrupted. A single-turn session is never
+          // between turns while its query is open, so it is asked as it always was.
+          if (record.multiTurn && record.completed >= record.accepted) {
+            return false;
+          }
           // Set before asking, so a `result` arriving mid-interrupt is read as
-          // `interrupted` rather than as the `error_during_execution` the SDK reports.
+          // `interrupted` rather than as the `error_during_execution` the SDK reports. A
+          // multi-turn session's pump clears it again at that `result`.
           record.interrupted = true;
           const live = record.query;
           const asked = yield* Effect.result(
@@ -2249,16 +2263,35 @@ export const claudeCodeHarness = (
               controlTimeout,
             ),
           );
-          // Closed either way: the attempt is over, and a CLI subprocess left behind by a
-          // refused interrupt is the one leak worth paying a forced close for.
-          yield* closeSession(record);
           if (asked._tag === "Failure") {
+            // Closed: a CLI that will not acknowledge an interrupt is one this process can
+            // no longer steer, and a subprocess left behind by it is the one leak worth
+            // paying a forced close for. Reported as the failure it is — `false` would say
+            // nothing was running, which is the one thing this does not know.
+            yield* closeSession(record);
             yield* Effect.logWarning(
               "a Claude Code session would not acknowledge an interrupt; its query was closed anyway",
               { sessionId, detail: String(asked.failure) },
             );
-            return false;
+            return yield* transport(
+              "session.interrupt",
+              asked.failure._tag === "TimeoutError"
+                ? "the session would not acknowledge an interrupt within the control timeout, so its query was closed"
+                : `${asked.failure.detail}; its query was closed`,
+            );
           }
+          /*
+           * A single-turn session is over: its attempt or round ends here, so the query is
+           * closed rather than left for the pump's `result`.
+           *
+           * **A conversation's query is kept open** (A6 F5), which is what lets the operator
+           * stop a turn and carry on talking. Measured on 2.1.310 (`AgentHarness.
+           * interruptSession`): the interrupted turn ends with its own `result`, a message
+           * already queued behind it then runs as a turn of its own, and a later message is
+           * answered normally. So `accepted` and `completed` stay paired across the interrupt
+           * and nothing else here has to change.
+           */
+          if (!record.multiTurn) yield* closeSession(record);
           return true;
         });
 
