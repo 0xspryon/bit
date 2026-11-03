@@ -68,7 +68,12 @@ variant on the ref. Claude Code: `query.setModel(model)` and
 the new model applies at its next resume (`record.model`). Stub harness too. Include a short
 probe (in `spike/`, like `steeringProbe.ts`) that switches **mid-turn** on both harnesses
 and records when the change takes effect; if a harness refuses mid-turn, that harness holds
-the switch until idle and says so.
+the switch until idle and says so. Known already (OpenCode source, read by an earlier
+thread): `switchModel` takes effect at the next step boundary, the new model is sent the
+full stored history, reasoning from a different model is dropped on Anthropic and OpenAI
+Responses providers, and a smaller window can fire OpenCode's auto-compaction on the next
+step. T3 applies every in-session switch on the *next turn*, never mid-turn, so Claude Code
+mid-turn behaviour is genuinely unmeasured.
 
 **F4 — Model switch for a running conversation (M), F3 → F4.** An endpoint for importer
 and goal conversations: refuse a different harness, re-resolve options against the new
@@ -142,7 +147,9 @@ away; reasoning collapses to one truncated line (markdown); turn footer
 **U7 — D7 agent chip (S), F1 → U7.** Chip and list from the registry ("only agent", what
 it can write); locked once the conversation has started.
 
-**U8 — D5 sessions list (M).** Spec S9: session named from the harness title (with its five
+**U8 — D5 sessions list (M).** The server half of S9 is done (`d0d82a2`:
+`AgentHarness.sessionTitle`, `import/importerTitle.ts`, nullable `title` in the
+contract); this task is the web half. Spec S9: session named from the harness title (with its five
 constraints), the write summary ("7 in · 3 out · 14 assets"), the model it ended on, the
 date, **Start a new session**; an older session read-only until the operator types.
 
@@ -157,17 +164,32 @@ their own block within the 800 px measure.
 **U11 — D8 syntax highlighting (S).** Monochrome, by weight and tone. New dependency; T3 pins
 Shiki to the Oniguruma WASM engine because the JS regex engine can hang.
 
-**U12 — D8 flow figures (S, decide first).** "Small flow figures for relationships" needs a
-renderer choice (a diagram dependency, or a constrained format of our own) before
-planning.
+**U12 — D8 flow figures (S), U10 → U12. Decided: T3's approach.** Agents write
+```` ```mermaid ```` fences, rendered with **`pele`** (T3 `^1.8.0`; OpenCode pins `1.7.0`),
+not mermaid.js. The fence leaves the sanitised markdown pipeline as plain code; a Svelte
+component for `language-mermaid` draws it client-side. Lazy `import("pele/lazy")`, cached,
+with per-diagram-type loads (T3 `apps/web/src/components/chat/MermaidDiagram.tsx:11-42`).
+Mount with `links: false, images: false, zoom: false`; **re-sanitise the SVG** with a
+private DOMPurify (`USE_PROFILES: { svg, svgFilters }`, `FORBID_TAGS: a, image,
+foreignObject, style`, `FORBID_ATTR: href, xlink:href, src, srcset`; T3 `:154-167`) —
+OpenCode skips this pass and bit must not, because importer text is attacker-controlled.
+While streaming, show the code until the fence is closed (T3 `isClosedCodeFence`,
+`MarkdownCodeBlock.logic.ts:44-66`), then draw once. Theme through `--pele-*` CSS
+variables mapped to bit's tokens, so light/dark flips without redrawing. Errors: "Unable
+to render diagram" with the source, a Show code / Show diagram toggle, Copy copies the
+source. `overflow-x: auto`, SVG `max-width: 100%`. Out of V1: KaTeX labels and the expand
+dialog. New dependencies: `pele`, `dompurify`.
 
 **U13 — Uploads in the composer (M), F2 + F9 → U13.** Paste, drop and the `+` picker;
 thumbnails for images, name and size for files, remove, refusal through F2; the attachment
 chip with copy-path in operator turns, live and on reload.
 
-## Suggested order
+## Order
 
-1. F1, F2, F3, F6, F10, U1, U10 — independent, can run in parallel.
-2. F4, F5, F7, F8, F9, U2, U7, U9, U11.
-3. U3, U4, U8, U13.
-4. U5, U6, then U12 once decided.
+Slices run **one at a time** on branch `a6-chat-revamp`, each committed by its implementer.
+After each, a separate reviewer agent reviews the code against its brief and the design,
+and checks the UI in a real browser (headless Chrome over CDP on the dev server) at tablet
+width and up. Fixes go back to the implementer; the next slice starts after review passes.
+
+F1, F2, F3, F4, F5, F6, F7, F8, F10, F9, U1, U10, U12, U11, U2, U7, U3, U4, U5, U6, U9, U8,
+U13.
