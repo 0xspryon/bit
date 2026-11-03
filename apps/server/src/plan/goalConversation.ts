@@ -884,6 +884,13 @@ const make = Effect.fnUntraced(function* () {
          * the importer's compromise (see its reopen in `import/scopeImporter.ts`). Proper
          * V2: the same append-only switch log keyed by session, so a replay can mark each
          * switch and give each turn its model.
+         *
+         * **Not checked against the catalogue, on purpose**, as the importer's reopen does
+         * not check it either. The row's model is one the operator chose, and bit does not
+         * silently put another in its place: a model this instance's catalogue no longer
+         * lists goes to the harness as recorded, and the harness refuses it in its own
+         * sentence, which this open answers with. Opening on the default instead would be a
+         * substitution nobody chose, reported as the conversation carrying on.
          */
         const pinned =
           recorded !== undefined &&

@@ -184,6 +184,11 @@ const fakeHarness = (
     /** What a model switch answers once recorded. Accepted unless a test says otherwise. */
     readonly switchAnswer?:
       Effect.Effect<void, HarnessTransportError> | undefined;
+    /**
+     * Models `createSession` refuses, in the harness's own words, as a real one refuses a
+     * model it no longer offers. Nothing is refused unless a test says.
+     */
+    readonly refuseModels?: ReadonlySet<string> | undefined;
   },
 ): AgentHarness["Service"] =>
   stubHarness({
@@ -199,6 +204,15 @@ const fakeHarness = (
         }
         if (options?.createGate !== undefined) {
           yield* Deferred.await(options.createGate);
+        }
+        if (options?.refuseModels?.has(input.model) === true) {
+          return yield* new HarnessTransportError({
+            operation: "createSession",
+            status: undefined,
+            tag: undefined,
+            detail: `There's an issue with the selected model (${input.model}). It may not exist or you may not have access to it.`,
+            cause: undefined,
+          });
         }
         // `resume` first, as the seam says: a continued session keeps its own id, and
         // `sessionId` is ignored beside it.
@@ -292,6 +306,7 @@ const world = (options?: {
   readonly continuation?: SessionContinuation | undefined;
   readonly switchAnswer?:
     Effect.Effect<void, HarnessTransportError> | undefined;
+  readonly refuseModels?: ReadonlySet<string> | undefined;
 }) => {
   const scratch = newScratch();
   const root = join(scratch, "fleet");
@@ -1905,5 +1920,62 @@ describe("switching a goal conversation's model", () => {
       modelOptions: [{ id: "effort", value: "low" }],
     });
     await third.runtime.dispose();
+  });
+
+  /**
+   * A row whose model the catalogue no longer lists — retired since the switch, say — is
+   * opened on as recorded, and the harness's refusal is the answer. Opening on the default
+   * instead would carry the conversation on under a model nobody chose.
+   */
+  test("a reopen on a recorded model the catalogue no longer lists answers the harness's refusal, not the default", async () => {
+    const { first, make, ready, root } = world({
+      refuseModels: new Set(["scripted/retired"]),
+    });
+    await ready;
+    const before = await sending(first.runtime, "hello");
+    // Written through the store, which records whatever it is given: the catalogue check
+    // is the switch's, and this row stands for one that passed it when it was made.
+    await first.runtime.runPromise(
+      Effect.flatMap(TargetStores, (stores) =>
+        withTargetStore(stores, TARGET, (store) =>
+          store.recordGoalSessionModel({
+            goalId: GOAL,
+            harnessSessionId: before.harnessSessionId,
+            model: "scripted/retired",
+            modelOptions: undefined,
+          }),
+        ),
+      ).pipe(Effect.orDie),
+    );
+    await first.runtime.dispose();
+
+    const second = make({
+      continuation: {
+        _tag: "resumable",
+        directory: join(root, "targets", TARGET, "goal", GOAL),
+        detail: "the transcript is still on disk",
+      },
+    });
+    const refused = await second.runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(GoalConversations, (conversations) =>
+          conversations.send({
+            targetId: TARGET,
+            goalId: GOAL,
+            text: "are you still there?",
+          }),
+        ),
+      ),
+    );
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure.message).toContain(
+        "There's an issue with the selected model (scripted/retired)",
+      );
+    }
+    // Nothing opened, on the default or anything else.
+    expect(second.recorder.created).toEqual([]);
+    expect((await rowOf(second.runtime))?.model).toBe("scripted/retired");
+    await second.runtime.dispose();
   });
 });

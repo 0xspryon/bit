@@ -1489,6 +1489,35 @@ export class ScopeImporter extends Context.Service<
         return made;
       };
 
+      /**
+       * The index row a message to an import acts on, refused when there is nothing to say
+       * it to: unknown on this target, or ended by the operator.
+       */
+      const recordedImport = (input: {
+        readonly targetId: string;
+        readonly importId: string;
+      }) =>
+        Effect.gen(function* () {
+          const row = yield* withTargetStore(stores, input.targetId, (store) =>
+            store.importSession(input.importId),
+          ).pipe(Effect.mapError(refusal));
+          if (row === undefined || row.targetId !== input.targetId) {
+            return yield* new ScopeImportNotFound({
+              reason: "unknown_import",
+              importId: input.importId,
+              detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no session to say this to`,
+            });
+          }
+          // The one end that is final, and the one the importer's tools refuse writes on.
+          if (row.endedReason === "operator") {
+            return yield* new ImporterConversationRefused({
+              reason: "import_ended",
+              detail: `import ${input.importId} was ended by the operator, so its session's authority has ended with it and its tools refuse every write. An ended import is not reopened; start a new session to carry on.`,
+            });
+          }
+          return row;
+        });
+
       const send: ScopeImporter["Service"]["send"] = Effect.fn(
         "ScopeImporter.send",
       )(function* (input) {
@@ -1513,23 +1542,7 @@ export class ScopeImporter extends Context.Service<
           return yield* send(input);
         }
 
-        const row = yield* withTargetStore(stores, input.targetId, (store) =>
-          store.importSession(input.importId),
-        ).pipe(Effect.mapError(refusal));
-        if (row === undefined || row.targetId !== input.targetId) {
-          return yield* new ScopeImportNotFound({
-            reason: "unknown_import",
-            importId: input.importId,
-            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no session to say this to`,
-          });
-        }
-        // The one end that is final, and the one the importer's tools refuse writes on.
-        if (row.endedReason === "operator") {
-          return yield* new ImporterConversationRefused({
-            reason: "import_ended",
-            detail: `import ${input.importId} was ended by the operator, so its session's authority has ended with it and its tools refuse every write. An ended import is not reopened; start a new session to carry on.`,
-          });
-        }
+        yield* recordedImport(input);
 
         /*
          * Published but not yet preambled: join it, under the spine's permit. `prepare`
@@ -1569,6 +1582,13 @@ export class ScopeImporter extends Context.Service<
             if (successor !== undefined) {
               return yield* send({ ...input, importId: successor });
             }
+            /*
+             * The row again, inside the permit. A model switch to this import writes the row
+             * under this same permit (`switchModel`), so the model the successor opens on
+             * below is the one the last switch left — never the one read above, before a
+             * switch that landed while this message waited for the permit.
+             */
+            const row = yield* recordedImport(input);
             const target = yield* fleet
               .target(input.targetId)
               .pipe(Effect.mapError(refusal));
@@ -1709,25 +1729,91 @@ export class ScopeImporter extends Context.Service<
         });
       });
 
+      /** The import ids a switch has claimed (`switchFrom`). */
+      const switchingImports = new Set<string>();
+
       /**
-       * The import a switch addressed to `importId` lands on: the end of its successor chain
-       * in this process. Bounded, though a chain cannot loop — each successor is a freshly
-       * minted id — because a bound costs nothing and a loop here would hang a request.
+       * The import a switch addressed to `importId` lands on, decided under that id's reopen
+       * permit.
+       *
+       * **The permit is the point.** A message to an import that is not live reopens it
+       * under this permit, reading the row's model and opening a successor on it — under
+       * the successor's opening permit, not this id's, so the spine's claim does not cover
+       * it. A switch that wrote this row while the message held the permit would answer
+       * success and be lost: the successor would open on the model read before it. So a
+       * switch takes the same permit, and the reopen re-reads the row inside it (`send`).
+       * Lock order is reopen → opening, as `send`'s; along a chain, predecessor before
+       * successor, as `send` follows it.
+       *
+       * Inside the permit no successor can be added to this id — only a reopen under it
+       * mints one — but one can be taken back, when its open fails. So a successor still
+       * opening is waited on, and followed only if it is still the successor once its open
+       * is known; taken back, the next message reopens from this id's row, which is the one
+       * to switch.
        */
-      const currentImport = (importId: string): string => {
-        let current = importId;
-        for (let hop = 0; hop < 64; hop += 1) {
-          const next = successors.get(current);
-          if (next === undefined) return current;
-          current = next;
-        }
-        return current;
-      };
+      const switchFrom = (
+        importId: string,
+        input: Parameters<ScopeImporter["Service"]["switchModel"]>[0],
+      ): ReturnType<ScopeImporter["Service"]["switchModel"]> =>
+        /*
+         * Claimed before the permit, and refused when another switch holds it: the permit
+         * makes a switch wait for a reopen, and must not make it queue behind another
+         * switch, which the spine refuses rather than queues (`LiveAgentSessions.switchModel`
+         * says why). Claimed on every id along the chain, so a switch addressed to the
+         * predecessor and one addressed to its successor meet on the successor's claim.
+         */
+        Effect.acquireUseRelease(
+          Effect.sync(() => {
+            if (switchingImports.has(importId)) return false;
+            switchingImports.add(importId);
+            return true;
+          }),
+          (claimed) =>
+            claimed
+              ? Semaphore.withPermit(reopenLock(importId))(
+                  Effect.gen(function* () {
+                    const successor = successors.get(importId);
+                    if (successor !== undefined) {
+                      const following = inFlight.get(successor);
+                      if (following !== undefined) {
+                        yield* Deferred.await(following.known);
+                      }
+                      if (successors.get(importId) === successor) {
+                        return yield* switchFrom(successor, input);
+                      }
+                    }
+                    return yield* switchOne(importId, input);
+                  }),
+                )
+              : Effect.fail(
+                  modelSwitchRefusal(
+                    { _tag: "ModelSwitchInFlight" },
+                    {
+                      what: `import ${importId}`,
+                      model: input.model,
+                      previous: null,
+                    },
+                  ),
+                ),
+          (claimed) =>
+            claimed
+              ? Effect.sync(() => {
+                  switchingImports.delete(importId);
+                })
+              : Effect.void,
+        );
 
       const switchModel: ScopeImporter["Service"]["switchModel"] = Effect.fn(
         "ScopeImporter.switchModel",
       )(function* (input) {
-        const importId = currentImport(input.importId);
+        return yield* switchFrom(input.importId, input);
+      });
+
+      /** One import's switch, once {@link switchFrom} has decided it is this one. */
+      const switchOne = Effect.fn("ScopeImporter.switchOne")(function* (
+        importId: string,
+        input: Parameters<ScopeImporter["Service"]["switchModel"]>[0],
+      ) {
         /*
          * Still opening: wait until the open is known (`inFlight`), as a message does. The
          * opener wrote the row with the model it is opening on and does not read it again,
@@ -1825,6 +1911,20 @@ export class ScopeImporter extends Context.Service<
                           harnessMoved: entry !== undefined,
                           detail: failure.message,
                         }),
+                      ),
+                      // Nothing written is not a switch recorded: the row `prepare` read is
+                      // gone from this target's file, so a reopen would not open on it.
+                      Effect.flatMap((written) =>
+                        written
+                          ? Effect.void
+                          : Effect.fail(
+                              recordRefusal({
+                                what,
+                                model: checked.model,
+                                harnessMoved: entry !== undefined,
+                                detail: `this target's file no longer holds ${what}'s record`,
+                              }),
+                            ),
                       ),
                     );
                   }),

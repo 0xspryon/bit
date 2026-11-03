@@ -983,6 +983,42 @@ const outcomeOf = (
 };
 
 /** Reduces one stored transcript entry to the three fields a caller uses. */
+/**
+ * The wrappers the CLI writes into a transcript for a local slash command, each the whole
+ * of one user entry. Measured on 2.1.310 transcripts after `Query.setModel` (A6 F4), which
+ * the CLI records as though `/model` had been typed: a `<local-command-caveat>` (meta), then
+ * `<command-name>/model</command-name>` with its `<command-message>` and `<command-args>`,
+ * then `<local-command-stdout>Set model to …</local-command-stdout>`. `stderr` is the same
+ * wrapper for a command that failed.
+ *
+ * Anchored at both ends and matched against the entry's whole text, so only an entry that
+ * *is* one of these is dropped. An operator's message that quotes one is never such an
+ * entry: every message this server sends is framed by its own prompt around the operator's
+ * words, so it never consists of a wrapper and nothing else.
+ */
+const LOCAL_COMMAND_ENTRY = [
+  /^<local-command-caveat>[^<]*<\/local-command-caveat>$/,
+  /^<command-name>\/[^<\s]+<\/command-name>\s*<command-message>[^<]*<\/command-message>\s*<command-args>[^<]*<\/command-args>$/,
+  /^<local-command-(stdout|stderr)>[^<]*<\/local-command-\1>$/,
+] as const;
+
+/**
+ * Whether a stored entry is the CLI's own record of a local command rather than anything
+ * said in the conversation — which a replay would otherwise show as an operator message
+ * the harness holds and never answered.
+ *
+ * V2(chat): dropped, not shown. The transcript work marks where a model switch happened;
+ * these entries are not that marker and are not turned into one here.
+ */
+const isLocalCommandEntry = (entry: SessionMessage): boolean => {
+  if (entry.type !== "user") return false;
+  const content = (entry.message as { content?: unknown } | null | undefined)
+    ?.content;
+  if (typeof content !== "string") return false;
+  const text = content.trim();
+  return LOCAL_COMMAND_ENTRY.some((pattern) => pattern.test(text));
+};
+
 const flatten = (entry: SessionMessage): MessageEntry => {
   const message = (entry.message ?? {}) as {
     content?: unknown;
@@ -2178,7 +2214,9 @@ export const claudeCodeHarness = (
               `could not read session ${sessionId}'s transcript: ${String(cause)}`,
             ),
         });
-        return entries.map(flatten);
+        return entries
+          .filter((entry) => !isLocalCommandEntry(entry))
+          .map(flatten);
       });
 
       const interruptSession: AgentHarness["Service"]["interruptSession"] =

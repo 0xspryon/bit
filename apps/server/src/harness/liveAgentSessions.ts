@@ -836,8 +836,8 @@ export const makeLiveAgentSessions = <Meta>(
 
     /**
      * The ids with a model switch in flight. A set rather than a permit, because the second
-     * switch is refused rather than made to wait; added and checked with no suspension in
-     * between, so two switches cannot both see it free.
+     * switch is refused rather than made to wait; checked and added in one synchronous step,
+     * so two switches cannot both see it free.
      */
     const switching = new Set<string>();
 
@@ -845,35 +845,49 @@ export const makeLiveAgentSessions = <Meta>(
       readonly id: string;
       readonly prepare: Effect.Effect<ModelSwitchPlan<Meta, E, R>, E, R>;
     }): Effect.Effect<ModelSwitchApplied, E | ModelSwitchFailure, R> =>
-      Effect.suspend(() => {
-        if (switching.has(input.id)) {
-          return Effect.fail<ModelSwitchFailure>({
-            _tag: "ModelSwitchInFlight",
-          });
-        }
-        switching.add(input.id);
-        return Semaphore.withPermit(openingLock(input.id))(
-          Effect.gen(function* () {
-            const plan = yield* input.prepare;
-            // Inside the permit an entry is preambled or gone (this module's header), so
-            // `get` and `ready` agree here.
-            const entry = live.get(input.id);
-            if (entry === undefined) {
-              yield* plan.record(undefined);
-              return "recorded" as const;
-            }
-            if (entry.instanceId !== plan.instanceId) {
-              return yield* Effect.fail<ModelSwitchFailure>({
-                _tag: "ModelSwitchStale",
-                liveInstanceId: entry.instanceId,
-              });
-            }
-            return yield* Effect.uninterruptible(
-              switchLive(input.id, entry, plan),
-            );
-          }),
-        ).pipe(Effect.ensuring(Effect.sync(() => switching.delete(input.id))));
-      });
+      /*
+       * The claim is an acquire and its release is attached by the same operator, so there
+       * is no instant between the id entering `switching` and its release being owed: an
+       * interrupt that lands anywhere after the claim still takes the id back out, and the
+       * conversation is never left refusing every switch as `switch_in_flight`.
+       */
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          if (switching.has(input.id)) return false;
+          switching.add(input.id);
+          return true;
+        }),
+        (claimed) =>
+          claimed
+            ? Semaphore.withPermit(openingLock(input.id))(
+                Effect.gen(function* () {
+                  const plan = yield* input.prepare;
+                  // Inside the permit an entry is preambled or gone (this module's
+                  // header), so `get` and `ready` agree here.
+                  const entry = live.get(input.id);
+                  if (entry === undefined) {
+                    yield* plan.record(undefined);
+                    return "recorded" as const;
+                  }
+                  if (entry.instanceId !== plan.instanceId) {
+                    return yield* Effect.fail<ModelSwitchFailure>({
+                      _tag: "ModelSwitchStale",
+                      liveInstanceId: entry.instanceId,
+                    });
+                  }
+                  return yield* Effect.uninterruptible(
+                    switchLive(input.id, entry, plan),
+                  );
+                }),
+              )
+            : Effect.fail<ModelSwitchFailure>({ _tag: "ModelSwitchInFlight" }),
+        (claimed) =>
+          claimed
+            ? Effect.sync(() => {
+                switching.delete(input.id);
+              })
+            : Effect.void,
+      );
 
     /*
      * The harness call and the row write, **uninterruptible together**: a caller that goes

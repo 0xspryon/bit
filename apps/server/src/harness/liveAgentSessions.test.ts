@@ -24,7 +24,7 @@ import {
   type LiveAgentSessions,
   type OpenPlan,
 } from "./liveAgentSessions";
-import { stubHarness } from "./stubHarness";
+import { recordModelSwitches, stubHarness } from "./stubHarness";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import type { WorkerUrls } from "../run/supervisor";
@@ -542,5 +542,93 @@ describe("an opener that dies", () => {
     expect(recorder.unregistrations[0]).toBe("ses_1");
     // The died opener's close, then the finalizer's for the second session.
     expect(outcome.reasons).toEqual(["open_failed", "shutdown"]);
+  });
+});
+
+describe("a model switch", () => {
+  /**
+   * The spine's claim that a switch never interleaves with an open. The open writes the row
+   * with the model it opens on before its opening prompt, as the goal path's `beforePrompt`
+   * does, and publishes its entry with that model; a switch that ran while the open was
+   * parked in the prompt would be overwritten on one side or the other — the open's final
+   * `live.set` puts back the entry it captured, on the old model, while the row says the
+   * new one. Under the opening permit the switch waits, then finds the session live.
+   */
+  test("waits for an open in flight, and the row and the registry agree afterwards", async () => {
+    const recorder = freshRecorder();
+    const promptEntered = Effect.runSync(Deferred.make<void>());
+    const promptGate = Effect.runSync(Deferred.make<void>());
+    const recorded = recordModelSwitches();
+    const harness: AgentHarness["Service"] = {
+      ...gatedHarness(recorder, { promptEntered, promptGate }),
+      switchModel: recorded.switchModel,
+    };
+    const row = { model: "" };
+
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        const opener = yield* Effect.forkChild(
+          sessions.open<"opened" | "joined", unknown, never>({
+            id: IMPORT,
+            joined: () => Effect.succeed("joined" as const),
+            refuse: (failure) => failure,
+            prepare: Effect.succeed({
+              ...plan,
+              beforePrompt: (entry) =>
+                Effect.sync(() => {
+                  row.model = entry.model;
+                }),
+            }),
+            opened: () => Effect.succeed("opened" as const),
+          }),
+        );
+        yield* Deferred.await(promptEntered);
+        const switcher = yield* Effect.forkChild(
+          sessions.switchModel({
+            id: IMPORT,
+            prepare: Effect.succeed({
+              instanceId: harness.instance.instanceId,
+              model: "stub/other",
+              options: undefined,
+              meta: (meta: undefined) => meta,
+              record: () =>
+                Effect.sync(() => {
+                  row.model = "stub/other";
+                }),
+            }),
+          }),
+        );
+        // Every step a switch takes without the permit is synchronous, so a few yields are
+        // enough for one that does not wait to have run to the end.
+        for (let turn = 0; turn < 10; turn += 1) yield* Effect.yieldNow;
+        const during = {
+          switches: recorded.switches.length,
+          row: row.model,
+          switched: switcher.pollUnsafe() !== undefined,
+        };
+        yield* Deferred.succeed(promptGate, undefined);
+        const opened = yield* Fiber.join(opener);
+        const applied = yield* Fiber.join(switcher);
+        return {
+          during,
+          opened,
+          applied,
+          registry: sessions.get(IMPORT)?.model,
+        };
+      }),
+    );
+
+    expect(outcome.result.during).toEqual({
+      switches: 0,
+      row: "stub/model",
+      switched: false,
+    });
+    expect(outcome.result.opened).toBe("opened");
+    expect(outcome.result.applied).toBe("live");
+    expect(recorded.switches).toEqual([
+      { sessionId: "ses_1", model: "stub/other", options: undefined },
+    ]);
+    expect(row.model).toBe("stub/other");
+    expect(outcome.result.registry).toBe("stub/other");
   });
 });

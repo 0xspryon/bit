@@ -6549,14 +6549,29 @@ const makeStore = Effect.fnUntraced(function* () {
     readonly model: string;
     readonly modelOptions: readonly ModelOptionSelection[] | undefined;
   }) {
-    const modelOptions = canonicalModelOptions(input.modelOptions ?? null);
-    const rows = yield* sql<{ readonly goal_id: string }>`UPDATE goal_sessions
-          SET model = ${input.model},
-              model_options = ${modelOptions === null ? null : JSON.stringify(modelOptions)}
-          WHERE goal_id = ${input.goalId}
-            AND harness_session_id = ${input.harnessSessionId}
-          RETURNING goal_id`.pipe(Effect.mapError(asDatabaseError("query")));
+    const rows = yield* updateGoalSessionModel(input).pipe(
+      Effect.mapError(lift("goal_sessions", input.goalId)),
+    );
     return rows.length > 0;
+  });
+
+  const updateGoalSessionModel = SqlSchema.findAll({
+    Request: Schema.Struct({
+      goalId: Schema.String,
+      harnessSessionId: Schema.String,
+      model: Schema.String,
+      modelOptions: Schema.UndefinedOr(Schema.Array(ModelOptionSelection)),
+    }),
+    Result: Schema.Struct({ goal_id: Schema.String }),
+    execute: (request) => {
+      const modelOptions = canonicalModelOptions(request.modelOptions ?? null);
+      return sql`UPDATE goal_sessions
+          SET model = ${request.model},
+              model_options = ${modelOptions === null ? null : JSON.stringify(modelOptions)}
+          WHERE goal_id = ${request.goalId}
+            AND harness_session_id = ${request.harnessSessionId}
+          RETURNING goal_id`;
+    },
   });
 
   /* ── Two more kinds of session, listed for "Agent sessions" (S8) ───────────── */
@@ -6939,15 +6954,27 @@ const makeStore = Effect.fnUntraced(function* () {
     readonly model: string;
     readonly modelOptions: readonly ModelOptionSelection[] | undefined;
   }) {
-    const modelOptions = canonicalModelOptions(input.modelOptions ?? null);
-    const rows = yield* sql<{
-      readonly import_id: string;
-    }>`UPDATE import_sessions
-          SET model = ${input.model},
-              model_options = ${modelOptions === null ? null : JSON.stringify(modelOptions)}
-          WHERE import_id = ${input.importId}
-          RETURNING import_id`.pipe(Effect.mapError(asDatabaseError("query")));
+    const rows = yield* updateImportSessionModel(input).pipe(
+      Effect.mapError(lift("import_sessions", input.importId)),
+    );
     return rows.length > 0;
+  });
+
+  const updateImportSessionModel = SqlSchema.findAll({
+    Request: Schema.Struct({
+      importId: Schema.String,
+      model: Schema.String,
+      modelOptions: Schema.UndefinedOr(Schema.Array(ModelOptionSelection)),
+    }),
+    Result: Schema.Struct({ import_id: Schema.String }),
+    execute: (request) => {
+      const modelOptions = canonicalModelOptions(request.modelOptions ?? null);
+      return sql`UPDATE import_sessions
+          SET model = ${request.model},
+              model_options = ${modelOptions === null ? null : JSON.stringify(modelOptions)}
+          WHERE import_id = ${request.importId}
+          RETURNING import_id`;
+    },
   });
 
   /**
@@ -9335,7 +9362,7 @@ export class ObservationStore extends Context.Service<
       readonly harnessSessionId: string;
       readonly model: string;
       readonly modelOptions: readonly ModelOptionSelection[] | undefined;
-    }) => Effect.Effect<boolean, DatabaseError>;
+    }) => Effect.Effect<boolean, DatabaseError | StoredRowError>;
     /**
      * The goal conversations a target has opened, newest first (S8). Records of opening, not
      * of liveness. `model` is what the conversation ran on, or `null` for a row written before
@@ -9501,7 +9528,7 @@ export class ObservationStore extends Context.Service<
       readonly importId: string;
       readonly model: string;
       readonly modelOptions: readonly ModelOptionSelection[] | undefined;
-    }) => Effect.Effect<boolean, DatabaseError>;
+    }) => Effect.Effect<boolean, DatabaseError | StoredRowError>;
     /**
      * Ends the caller's own goal, recorded as `endedBy: "goal_agent"`.
      *

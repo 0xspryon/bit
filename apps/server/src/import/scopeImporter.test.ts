@@ -266,6 +266,16 @@ interface Script {
         readonly gate: Deferred.Deferred<void>;
       }
     | undefined;
+  /**
+   * Parks `sessionContinuation` until `gate` opens, signalling `entered` on the way in: a
+   * message reopening an import, holding its reopen permit, and not yet opening anything.
+   */
+  holdContinuation:
+    | {
+        readonly entered: Deferred.Deferred<void>;
+        readonly gate: Deferred.Deferred<void>;
+      }
+    | undefined;
 }
 
 const newScript = (readable: readonly string[]): Script => {
@@ -292,6 +302,7 @@ const newScript = (readable: readonly string[]): Script => {
     onSteer: undefined,
     holdPrompt: undefined,
     holdRegister: undefined,
+    holdContinuation: undefined,
   };
 };
 
@@ -320,17 +331,27 @@ const scriptedHarness = (script: Script) => {
      */
     sessionContinuation: (sessionId) => {
       const directory = script.holds.get(sessionId);
-      return Effect.succeed(
-        directory === undefined
-          ? {
-              _tag: "unresumable",
-              detail: `the scripted harness holds no transcript for ${sessionId}`,
-            }
-          : {
-              _tag: "resumable",
-              directory,
-              detail: `the scripted harness still holds ${sessionId}`,
-            },
+      const held = script.holdContinuation;
+      const parked =
+        held === undefined
+          ? Effect.void
+          : Deferred.succeed(held.entered, undefined).pipe(
+              Effect.andThen(Deferred.await(held.gate)),
+            );
+      return Effect.andThen(
+        parked,
+        Effect.succeed(
+          directory === undefined
+            ? ({
+                _tag: "unresumable",
+                detail: `the scripted harness holds no transcript for ${sessionId}`,
+              } as const)
+            : ({
+                _tag: "resumable",
+                directory,
+                detail: `the scripted harness still holds ${sessionId}`,
+              } as const),
+        ),
       );
     },
     createSession: (input) =>
@@ -3060,5 +3081,175 @@ describe("switching an import's model", () => {
     }
     expect(built.script.switches).toEqual([]);
     await runtime.dispose();
+  });
+
+  /** A gate, and the signal that something reached it. */
+  const gate = () => ({
+    entered: Effect.runSync(Deferred.make<void>()),
+    gate: Effect.runSync(Deferred.make<void>()),
+  });
+
+  /** Long enough for a switch that does not wait to have answered: it is all local I/O. */
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 100));
+
+  test("a switch that lands while a message is reopening the import waits for it, and ends on the successor", async () => {
+    const { built, runtime, importId } = await liveImport();
+    built.script.holds.set(
+      "ses_import",
+      join(built.root, "targets", TARGET, "import", importId),
+    );
+    await runtime.dispose();
+
+    // A new process: nothing live, so a message reopens, and it is parked on the harness's
+    // answer about what it still holds — inside the reopen permit, before any successor.
+    const restarted = ManagedRuntime.make(built.layer);
+    const held = gate();
+    built.script.holdContinuation = held;
+    const message = restarted.runFork(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.send({ targetId: TARGET, importId, text: "Continue." }),
+      ),
+    );
+    await Effect.runPromise(Deferred.await(held.entered));
+
+    const switching = restarted.runFork(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.switchModel({
+          targetId: TARGET,
+          importId,
+          model: "scripted/other",
+        }),
+      ),
+    );
+    await settle();
+    // It waits rather than writing a row the message has already read.
+    expect(switching.pollUnsafe()).toBeUndefined();
+    expect(rowOf(built.root, importId)?.model).toBe("scripted/model");
+
+    built.script.holdContinuation = undefined;
+    await Effect.runPromise(Deferred.succeed(held.gate, undefined));
+    const reopened = await restarted.runPromise(Fiber.join(message));
+    await built.script.done;
+    const successor = reopened.importId;
+    expect(successor).not.toBe(importId);
+    const switched = await restarted.runPromise(Fiber.join(switching));
+
+    // The switch lands on the successor the message opened, and on its live session.
+    expect(switched).toMatchObject({
+      conversationId: successor,
+      model: "scripted/other",
+      applied: "live",
+      changed: true,
+    });
+    expect(built.script.switches).toEqual([
+      { sessionId: "ses_import", model: "scripted/other", options: undefined },
+    ]);
+    // The row, the registry and the next message agree.
+    expect(rowOf(built.root, successor)?.model).toBe("scripted/other");
+    const next = await sendTo(restarted, importId, "And now?");
+    expect(next._tag).toBe("Success");
+    if (next._tag === "Success") {
+      expect(next.success.importId).toBe(successor);
+      expect(next.success.model).toBe("scripted/other");
+    }
+    await restarted.dispose();
+  });
+
+  test("a switch that followed a successor whose open then failed lands on the import the next message reopens from", async () => {
+    const { built, runtime, importId } = await liveImport();
+    await runtime.dispose();
+
+    // A new process; the message's fresh session is parked in its opening prompt, which
+    // will be refused, and the request waiting on it goes away — so the reopen permit is
+    // free while the successor is still opening.
+    const restarted = ManagedRuntime.make(built.layer);
+    const held = gate();
+    built.script.holdPrompt = held;
+    // Read when the prompt is made, so set before it is: the parked prompt is refused.
+    built.script.failPrompt = true;
+    const dropped = restarted.runFork(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.send({ targetId: TARGET, importId, text: "Continue." }),
+      ),
+    );
+    await Effect.runPromise(Deferred.await(held.entered));
+    await restarted.runPromise(Fiber.interrupt(dropped));
+    // The parked prompt was made refusing; the next session's will not be.
+    built.script.failPrompt = false;
+    const opened = built.script.created.length;
+
+    const switching = restarted.runFork(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.switchModel({
+          targetId: TARGET,
+          importId,
+          model: "scripted/other",
+        }),
+      ),
+    );
+    await settle();
+    expect(switching.pollUnsafe()).toBeUndefined();
+
+    // A message now: it reads the row, still on the old model, and waits for the reopen
+    // permit the switch holds while it waits for the successor's open.
+    const message = restarted.runFork(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.send({ targetId: TARGET, importId, text: "Continue." }),
+      ),
+    );
+    await settle();
+    expect(message.pollUnsafe()).toBeUndefined();
+
+    built.script.holdPrompt = undefined;
+    await Effect.runPromise(Deferred.succeed(held.gate, undefined));
+    const switched = await restarted.runPromise(Fiber.join(switching));
+    // Not the successor that never opened: the import the operator knows.
+    expect(switched).toMatchObject({
+      conversationId: importId,
+      model: "scripted/other",
+      applied: "recorded",
+      changed: true,
+    });
+    expect(rowOf(built.root, importId)?.model).toBe("scripted/other");
+
+    // And the message reopens from that row as the switch left it, not as it first read it.
+    const reopened = await restarted.runPromise(Fiber.join(message));
+    await built.script.done;
+    expect(reopened.model).toBe("scripted/other");
+    expect(built.script.created).toHaveLength(opened + 1);
+    expect(built.script.created.at(-1)?.model).toBe("scripted/other");
+    expect(rowOf(built.root, reopened.importId)?.model).toBe("scripted/other");
+    await restarted.dispose();
+  });
+
+  test("a switch the file writes nothing for answers that nothing was recorded", async () => {
+    const { built, runtime, importId } = await liveImport();
+    await runtime.dispose();
+    // The row `prepare` read, and an update that touches no row: a trigger standing in for
+    // the record having gone from the file between the read and the write.
+    const database = new Database(
+      join(built.root, "targets", TARGET, HUNT_FILE),
+    );
+    try {
+      database.run(
+        `CREATE TRIGGER switch_lands_nowhere BEFORE UPDATE OF model ON import_sessions
+         BEGIN SELECT RAISE(IGNORE); END`,
+      );
+    } finally {
+      database.close();
+    }
+
+    const restarted = ManagedRuntime.make(built.layer);
+    const refused = await switchTo(restarted, importId, "scripted/other");
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure).toMatchObject({
+        _tag: "ConversationModelRefused",
+        reason: "store_unavailable",
+      });
+      expect(refused.failure.message).toContain("nothing was switched");
+    }
+    expect(rowOf(built.root, importId)?.model).toBe("scripted/model");
+    await restarted.dispose();
   });
 });

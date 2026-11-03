@@ -1305,6 +1305,59 @@ describe("a session this process does not hold", () => {
     ]);
     expect(lastAssistantText(entries)).toBe("closing report");
   });
+
+  /**
+   * What `Query.setModel` leaves in the transcript (A6 F4): the CLI records the switch as
+   * though `/model` had been typed. The three entries below are copied from a 2.1.310
+   * transcript written by the model-switch probe, string content and all.
+   */
+  test("the CLI's own record of a /model switch is not a message, and an operator's quote of one is", async () => {
+    const SESSION = "11111111-0000-4000-8000-000000000005";
+    const user = (uuid: string, content: string): SessionMessage => ({
+      type: "user",
+      uuid,
+      session_id: SESSION,
+      message: { role: "user", content },
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+    });
+    const quoted =
+      "Why does my log say <local-command-stdout>Set model to `claude-sonnet-4-5`</local-command-stdout>?";
+    const entries = await withHarness(
+      {
+        transcript: [
+          user("a", "start"),
+          {
+            type: "assistant",
+            uuid: "b",
+            session_id: SESSION,
+            message: { content: [{ type: "text", text: "first reply" }] },
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+          },
+          user(
+            "c",
+            "<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>",
+          ),
+          user(
+            "d",
+            "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>claude-sonnet-4-5</command-args>",
+          ),
+          user(
+            "e",
+            "<local-command-stdout>Set model to `claude-sonnet-4-5`</local-command-stdout>",
+          ),
+          user("f", quoted),
+        ],
+      },
+      (harness) => harness.messages(SESSION),
+    );
+    expect(entries.map((entry) => entry.text)).toEqual([
+      "start",
+      "first reply",
+      quoted,
+    ]);
+  });
 });
 
 /* ── Steering, and what `waitForIdle` means once a session can take two messages ── */

@@ -277,6 +277,12 @@ export const REFUSAL_TAGS = new Set([
   // closed, no harness is ready — that the composer prints beside itself. As transport
   // trouble it would read "No server answered" about a server that answered precisely.
   "ImporterConversationRefused",
+  // Switching a running conversation's model (A6 F4), importer or goal. A `409` carrying a
+  // sentence — a model outside the pinned harness's catalogue, a switch already in flight,
+  // an uncertain harness answer that names the model the session may still be on — which
+  // the F2 error modal prints with its one dismiss action. As transport trouble it would
+  // say "No server answered" while the picker kept showing a model the session is not on.
+  "ConversationModelRefused",
 ]);
 
 /**
