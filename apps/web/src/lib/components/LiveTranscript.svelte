@@ -455,7 +455,7 @@
   .body {
     display: flex;
     min-height: 0;
-    max-height: min(360px, 45vh);
+    max-height: min(360px, 45dvh);
   }
   .body[hidden] {
     display: none;

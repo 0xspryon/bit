@@ -156,7 +156,13 @@
   .app {
     display: flex;
     flex-direction: column;
-    height: 100vh;
+    /* `dvh`, not `vh`: on a tablet whose browser toolbar retracts, `100vh` is the
+       *large* viewport, so the shell stands taller than the room it has and the
+       document scrolls the whole app — header, rail and composer included. The
+       shell is the only full-height box here, so it is the only one that can
+       cause that; the panels below clamp with `dvh` for the narrower reason that
+       a popover sized against the large viewport overhangs the visible one. */
+    height: 100dvh;
     background: var(--bg-base);
     color: var(--text-base);
   }

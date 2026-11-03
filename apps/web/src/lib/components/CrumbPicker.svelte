@@ -179,7 +179,7 @@
     z-index: 20;
     display: flex;
     flex-direction: column;
-    max-height: min(520px, calc(100vh - 80px));
+    max-height: min(520px, calc(100dvh - 80px));
     padding: 6px;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-lg);

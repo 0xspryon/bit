@@ -194,7 +194,7 @@
     caret browsing, but it is not in the tab order.
   */
   .rendered {
-    max-height: 60vh;
+    max-height: 60dvh;
     overflow: auto;
     margin: 0;
     padding: 12px 14px;

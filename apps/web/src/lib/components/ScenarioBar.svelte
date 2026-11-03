@@ -66,7 +66,7 @@
     z-index: 60;
     display: flex;
     flex-direction: column;
-    max-height: calc(100vh - 28px);
+    max-height: calc(100dvh - 28px);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-lg);
     background: var(--bg-deep);
