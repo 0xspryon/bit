@@ -17,7 +17,15 @@ import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import { FakeServer } from "../fakeServer";
-import { click, mountInto, press, settle, type Mounted } from "./dom";
+import {
+  click,
+  focused,
+  mountInto,
+  press,
+  pressEnterIn,
+  settle,
+  type Mounted,
+} from "./dom";
 
 let mounted: Mounted[] = [];
 afterEach(() => {
@@ -365,7 +373,7 @@ describe("D6: the model chip is the picker the operator already has", () => {
     return found;
   };
 
-  test("opens HarnessChoice over the composer, and choosing a model changes the chip", async () => {
+  test("opens HarnessChoice in a modal, and choosing a model changes the chip", async () => {
     const app = await show("importer-first");
     expect(chip().textContent).toContain("openai/gpt-5.6-sol");
 
@@ -450,7 +458,206 @@ describe("D6: the model chip is the picker the operator already has", () => {
     expect(
       document.querySelector('button[aria-label^="Harness and model"]'),
     ).toBeNull();
-    expect(text()).toContain("openai/gpt-5.6-sol");
+    // A span, not a disabled button: "not ever" rather than "not yet".
+    const held = document.querySelector(".chip.held");
+    expect(held?.tagName).toBe("SPAN");
+    expect(held?.textContent).toContain("openai/gpt-5.6-sol");
+  });
+});
+
+describe("S5: the model picker is a modal", () => {
+  const chip = (): HTMLButtonElement => {
+    const found = document.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="dialog"][aria-label^="Harness and model"]',
+    );
+    if (found === null) throw new Error("no model chip");
+    return found;
+  };
+  const dialog = (): HTMLElement | null =>
+    document.querySelector<HTMLElement>(
+      '[role="dialog"][aria-label="Choose a harness and model"]',
+    );
+
+  /** Opened the way a hand opens it: focus on the chip, then the click. */
+  const open = async (): Promise<HTMLElement> => {
+    await show("importer-first");
+    chip().focus();
+    click(chip());
+    await settle();
+    const found = dialog();
+    if (found === null) throw new Error("the picker did not open");
+    return found;
+  };
+
+  test("says it is modal, and starts with focus in the filter", async () => {
+    const panel = await open();
+
+    expect(panel.getAttribute("aria-modal")).toBe("true");
+    expect(chip().getAttribute("aria-expanded")).toBe("true");
+    expect(
+      document.activeElement ===
+        panel.querySelector('input[aria-label="Filter models"]'),
+      `focus is on ${focused()}`,
+    ).toBe(true);
+  });
+
+  test("Escape closes it and puts focus back on the chip", async () => {
+    await open();
+
+    press("Escape");
+    await settle();
+
+    expect(dialog()).toBeNull();
+    expect(chip().getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(chip());
+  });
+
+  test("a click outside the panel closes it and puts focus back on the chip", async () => {
+    const panel = await open();
+
+    // Inside the panel is not outside: a rail row is picked and the dialog stays.
+    const row = panel.querySelector<HTMLButtonElement>(".rail-row");
+    if (row === null) throw new Error("no rail row");
+    click(row);
+    await settle();
+    expect(dialog()).not.toBeNull();
+
+    // happy-dom does no hit-testing, so "outside" is the scrim's own control, which is
+    // what a click anywhere off the panel lands on in a browser.
+    const scrim = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Close the harness picker"]',
+    );
+    if (scrim === null) throw new Error("no scrim");
+    expect(panel.contains(scrim)).toBe(false);
+    click(scrim);
+    await settle();
+
+    expect(dialog()).toBeNull();
+    expect(document.activeElement).toBe(chip());
+  });
+
+  test("focus returns to the chip even when the click that opened it did not focus it", async () => {
+    // Safari's case: a button clicked is not focused, so the dialog opens over `<body>`.
+    await show("importer-first");
+    (document.activeElement as HTMLElement | null)?.blur();
+    click(chip());
+    await settle();
+    expect(dialog()).not.toBeNull();
+
+    press("Escape");
+    await settle();
+
+    expect(document.activeElement).toBe(chip());
+  });
+
+  test("Tab and Shift+Tab wrap inside the panel and never reach the page behind it", async () => {
+    const panel = await open();
+    const focusable = [
+      ...panel.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ),
+    ];
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (first === undefined || last === undefined || first === last) {
+      throw new Error("the panel has too few controls to wrap");
+    }
+
+    last.focus();
+    press("Tab");
+    expect(document.activeElement).toBe(first);
+
+    press("Tab", { shiftKey: true });
+    expect(document.activeElement).toBe(last);
+
+    // Still open, and the chip — the page behind it — never had focus.
+    expect(dialog()).not.toBeNull();
+    expect(panel.contains(document.activeElement)).toBe(true);
+  });
+});
+
+describe("S5: the picker is not part of the composer it opens from", () => {
+  const chip = (): HTMLButtonElement => {
+    const found = document.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="dialog"][aria-label^="Harness and model"]',
+    );
+    if (found === null) throw new Error("no model chip");
+    return found;
+  };
+  const dialog = (): HTMLElement | null =>
+    document.querySelector<HTMLElement>(
+      '[role="dialog"][aria-label="Choose a harness and model"]',
+    );
+  const filter = (): HTMLInputElement => {
+    const found = dialog()?.querySelector<HTMLInputElement>(
+      'input[aria-label="Filter models"]',
+    );
+    if (found === undefined || found === null) throw new Error("no filter");
+    return found;
+  };
+
+  test("Enter in the filter does not send the draft in the composer behind it", async () => {
+    const app = await show("importer-first");
+    type(composer(), "Read https://bugcrowd.com/acme and load it");
+    click(chip());
+    await settle();
+
+    const field = filter();
+    field.value = "gpt";
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    pressEnterIn(field);
+    await settle();
+
+    // The modal is not in the composer's form, so its fields have no form owner at all.
+    expect(field.form).toBeNull();
+    expect(dialog()?.closest("form")).toBeNull();
+    // Nothing sent and no turn started: the draft is still the operator's, in the box.
+    expect(app.importer.current?.tally.messages).toBe(0);
+    expect(headings()).toEqual([]);
+    expect(composer().value).toBe("Read https://bugcrowd.com/acme and load it");
+    // And the picker the operator was typing in is still open.
+    expect(dialog()).not.toBeNull();
+  });
+
+  test("a picker left open when its branch goes does not reopen when the branch comes back", async () => {
+    const app = await show("importer-first");
+    click(chip());
+    await settle();
+    expect(dialog()).not.toBeNull();
+
+    // A session gaining messages under an open picker: the chip's branch goes, dialog and
+    // all, without anything closing the dialog first. (Enter in the filter was how; it no
+    // longer is, so the send is made directly.)
+    app.importer.draft = "Read https://bugcrowd.com/acme and load it";
+    app.importer.send();
+    await settle();
+    expect(headings()).toHaveLength(1);
+    expect(document.querySelector(".chip.held")).not.toBeNull();
+    expect(dialog()).toBeNull();
+    expect(app.importPickerOpen).toBe(false);
+
+    // The next new session renders the chip again, and the picker stays shut until asked.
+    app.importer.start();
+    await settle();
+    expect(chip().getAttribute("aria-expanded")).toBe("false");
+    expect(dialog()).toBeNull();
+  });
+
+  test("a picker left open when the importer is left does not reopen on return", async () => {
+    const app = await show("importer-first");
+    click(chip());
+    await settle();
+    expect(dialog()).not.toBeNull();
+
+    // The whole page goes, as it does when the operator navigates away, and comes back.
+    for (const each of mounted) each.destroy();
+    mounted = [];
+    expect(dialog()).toBeNull();
+    mounted.push(mountInto(TitleBar, { app }), mountInto(Target, { app }));
+    await settle();
+
+    expect(chip().getAttribute("aria-expanded")).toBe("false");
+    expect(dialog()).toBeNull();
   });
 });
 

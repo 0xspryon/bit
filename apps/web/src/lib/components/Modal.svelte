@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
+  import { holdFocus, wrapTab } from "../dialogFocus";
   import { IconClose } from "../icons";
 
   let {
@@ -17,50 +18,14 @@
   let panel = $state<HTMLElement | null>(null);
 
   /*
-   * Focus goes *into* the dialog when it opens, onto the panel itself and no control.
-   *
-   * Without this, focus stays on whatever opened the dialog — behind the scrim — so Tab
-   * walks the page underneath, and Enter re-activates the opener. Landing on the panel
-   * rather than a button is deliberate: a dialog that focuses its confirm button turns
-   * the Enter that opened it into the Enter that confirms it. The first Tab reaches the
-   * first control.
-   *
-   * ## Where focus goes back to
-   *
-   * To the opener, if it still exists. The dialogs that matter most are the ones that
-   * *delete the thing that opened them* — the `×` on an entry row is gone once the entry
-   * is — and an opener that is no longer in the document cannot take focus, which leaves
-   * it on `<body>` and the next Tab at the first control on the page, nowhere near where
-   * the operator was.
-   *
-   * So a page that opens a dialog from something deletable marks a survivor with
-   * `data-focus-fallback` (and `tabindex="-1"`, so it can take focus without becoming a
-   * tab stop). The nearest marked ancestor of the opener is remembered when the dialog
-   * opens, because by the time it closes the opener has no ancestors left to ask. If the
-   * opener is gone, that ancestor gets focus instead; if there is none, behaviour is what
-   * it was.
-   *
-   * **The marked ancestor can go too.** Deleting the last scope entry replaces both lists
-   * with the empty state, so the list that was marked is as gone as the `×` was. The
-   * dialog was opened from something marked, so the page has said it keeps a survivor
-   * somewhere: the first one still in the document gets focus, which on that page is the
-   * empty state, and is better than `<body>`.
+   * Focus goes into the dialog when it opens, onto the panel itself and no control, and
+   * back to the opener — or to a marked survivor when the opener was deleted — when it
+   * closes. Both rules, and why each is the way it is, are `dialogFocus`'s, shared with the
+   * harness picker's dialog so the two cannot drift.
    */
   $effect(() => {
     if (panel === null) return;
-    const opener = document.activeElement;
-    const fallback =
-      opener instanceof Element
-        ? opener.closest<HTMLElement>("[data-focus-fallback]")
-        : null;
-    if (!panel.contains(opener)) panel.focus();
-    return () => {
-      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
-      else if (fallback !== null && fallback.isConnected) fallback.focus();
-      else if (fallback !== null) {
-        document.querySelector<HTMLElement>("[data-focus-fallback]")?.focus();
-      }
-    };
+    return holdFocus(panel);
   });
 
   function onkeydown(event: KeyboardEvent) {
@@ -68,23 +33,7 @@
       onclose();
       return;
     }
-    if (event.key !== "Tab" || panel === null) return;
-    const focusable = panel.querySelectorAll<HTMLElement>(
-      'button:not(:disabled), [href], input:not(:disabled), select, textarea, [tabindex]:not([tabindex="-1"])',
-    );
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (first === undefined || last === undefined) return;
-    if (
-      event.shiftKey &&
-      (document.activeElement === first || document.activeElement === panel)
-    ) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
+    if (panel !== null) wrapTab(event, panel);
   }
 </script>
 

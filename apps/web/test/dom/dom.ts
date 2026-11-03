@@ -108,6 +108,38 @@ export const press = (key: string, options: KeyboardEventInit = {}): void => {
   flushSync();
 };
 
+/**
+ * Enter in a text field, and what a browser does next that happy-dom does not.
+ *
+ * A browser that sees an uncancelled Enter in a text field with a form owner performs
+ * *implicit submission*: it clicks that form's default button — its first submit button in
+ * tree order — if there is one and it is enabled. happy-dom dispatches the event and stops,
+ * so `press("Enter")` in a field cannot show whether Enter there submits anything. This
+ * takes the browser's step for it, from the field's real form owner: a field that is not in
+ * a form submits nothing, which is what a test about that question needs to be able to see.
+ */
+export const pressEnterIn = (field: HTMLInputElement): void => {
+  field.focus();
+  const event = new KeyboardEvent("keydown", {
+    key: "Enter",
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+  });
+  field.dispatchEvent(event);
+  const form = field.form;
+  if (!event.defaultPrevented && form !== null) {
+    const submitter = [...form.elements].find(
+      (each): each is HTMLButtonElement | HTMLInputElement =>
+        (each instanceof HTMLButtonElement && each.type === "submit") ||
+        (each instanceof HTMLInputElement &&
+          (each.type === "submit" || each.type === "image")),
+    );
+    if (submitter !== undefined && !submitter.disabled) submitter.click();
+  }
+  flushSync();
+};
+
 /** The element a person would call "the one with focus", described the way a failure reads. */
 export const focused = (): string => {
   const element = document.activeElement;

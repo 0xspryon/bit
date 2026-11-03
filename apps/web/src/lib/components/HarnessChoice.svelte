@@ -523,14 +523,17 @@
     holds them (§3.5). 920px is where three columns stop fitting beside the composer's
     trigger; the inline block stacks at the width its own form does.
 
-    Only the rail moves. Stacking all three into a 340px panel — the cap that keeps the
-    importer's panel on screen when its composer sits mid-page — left each a third of it:
-    the rail scrolled with its second harness under the fold and missed by a click, and
-    the model list showed under two rows. So the rail becomes a strip with the harnesses
-    side by side, and it never shrinks — every harness stays on screen and clickable,
-    whatever the lists below need — and the model list and the options column keep
-    sharing a row under it, each scrolling in what is left. Both popovers are at least
-    ~450px wide here, which is room for the two of them.
+    Only the rail moves. Stacking all three into a 340px panel — the height both floating
+    shells cap theirs at, the composer's popover and the importer's dialog — left each a
+    third of it: the rail scrolled with its second harness under the fold and missed by a
+    click, and the model list showed under two rows. So the rail becomes a strip with the
+    harnesses side by side, and it never shrinks — every harness stays on screen and
+    clickable, whatever the lists below need — and the model list and the options column
+    keep sharing a row under it, each scrolling in what is left. Both shells are at least
+    ~450px wide here from tablet width up, which is room for the two of them.
+
+    `layout="popover"` is the name of the three-column shape, and the importer's dialog
+    uses it too: what it says is "floating, three columns wide", not "anchored".
   */
   @media (max-width: 920px) {
     .choice.popover {

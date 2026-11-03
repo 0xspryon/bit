@@ -4543,7 +4543,7 @@ export class App {
   }
 
   /**
-   * Picks the importer's model. **The popover stays open**, for {@link pickModel}'s reason:
+   * Picks the importer's model. **The picker stays open**, for {@link pickModel}'s reason:
    * the Reasoning column beside the list is about the model just picked.
    */
   pickImportModel(model: string) {

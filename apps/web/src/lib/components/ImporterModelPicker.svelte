@@ -3,13 +3,19 @@
    * The model chip on the importer's composer, and the picker it opens (A6 D2, D6).
    *
    * **The picker the operator already has.** D6 is explicit that the harness and model
-   * picker is "lifted as-is and anchored to the composer chip — the importer is just another
-   * place a model runs, and nothing about it earns a second picker". So the columns are
-   * {@link HarnessChoice}, the same component the run composer's popover and the old
-   * Auto-load form used, and the state behind it is the importer's own that already existed
-   * (`pickedImportInstanceId`, `pickedImportModel`, `importPickerOpen`, `importModelQuery`).
-   * Its one importer-specific line is the pinning note, which talks about sessions where the
-   * composer's talks about attempts.
+   * picker is "lifted as-is" — the importer is just another place a model runs, and nothing
+   * about it earns a second picker. So the columns are {@link HarnessChoice}, the same
+   * component the run composer's popover and the old Auto-load form used, and the state
+   * behind it is the importer's own that already existed (`pickedImportInstanceId`,
+   * `pickedImportModel`, `importPickerOpen`, `importModelQuery`). Its one importer-specific
+   * line is the pinning note, which talks about sessions where the composer's talks about
+   * attempts.
+   *
+   * **A modal, where D6 anchored it to the chip.** The operator asked for it on 2026-11-03
+   * with the design otherwise unchanged, so the columns are untouched and only their shell
+   * moved: {@link HarnessDialog} centres them over a scrim, rendered out of the composer's
+   * form so that Enter in its filter is not a submission of the draft. The run composer's
+   * picker is still a popover; that was not asked for.
    *
    * ## Three states, because a session's model is not always the operator's to change
    *
@@ -28,9 +34,12 @@
    * the model it actually picked and hands to `createSession`. The state behind it is the
    * importer's own (`importModelOptionsByModel`), kept apart from a run's.
    */
+  import type { Attachment } from "svelte/attachments";
+
   import type { App } from "../app.svelte";
   import { IconAngleDown } from "../icons";
   import HarnessChoice from "./HarnessChoice.svelte";
+  import HarnessDialog from "./HarnessDialog.svelte";
   import ModelOptionsColumn from "./ModelOptionsColumn.svelte";
 
   let {
@@ -48,55 +57,38 @@
     dimmed?: boolean;
   } = $props();
 
-  let panel = $state<HTMLElement | null>(null);
-  /** The chip, so a picker closed by keyboard can hand focus back to what opened it. */
+  /** The chip, which the dialog hands focus back to when it closes. */
   let trigger = $state<HTMLButtonElement | null>(null);
 
   /**
-   * Closes the picker and puts focus back on the chip that opened it.
+   * Closes the picker whenever the branch that renders it goes, however it goes.
    *
-   * `Modal`'s rule, for the reason its tests state: a dialog dismissed by keyboard leaves
-   * the keyboard nowhere, and `body` is nowhere. Escape reaches this through
-   * {@link HarnessChoice}'s `onDismiss`; the scrim's click reaches it directly.
+   * **The invariant: `importPickerOpen` may not stay true across a teardown of that
+   * branch.** The flag is on `App` and outlives this markup, so a flag left true is an
+   * instruction to reopen the dialog the next time the branch renders — with no operator
+   * action, its old filter query, and focus taken into it. The branch goes when the session
+   * gains messages (`pinned` is no longer `null`) and when the importer is left altogether,
+   * and the next "Start a new session" or visit renders it again.
+   *
+   * On the branch rather than at each way of reaching it: `importer.start()`, navigating
+   * away, a session opened from the crumb bar and whatever comes next would each need
+   * remembering, and the one forgotten is the one that reopens it. The chip's own button
+   * does not need this: it lives in the same branch as the dialog, so the dialog's opener
+   * cannot be gone while the dialog is open.
    */
-  function closeToTrigger(): void {
+  const closesWithBranch: Attachment = () => () => {
     app.importPickerOpen = false;
-    trigger?.focus();
-  }
+  };
 
   let harness = $derived(
     pinned?.harness ?? app.importInstance?.displayName ?? "",
   );
   let model = $derived(pinned?.model ?? app.effectiveImportModel);
   let letter = $derived((harness.slice(0, 1) || "?").toLowerCase());
-
-  /**
-   * Tab wraps inside the panel, as the composer's picker does and for its reason: a popover
-   * that let focus out while open would leave the keyboard somewhere the operator cannot
-   * see. Escape and the row walking are `HarnessChoice`'s.
-   */
-  function onkeydown(event: KeyboardEvent) {
-    if (!app.importPickerOpen || event.key !== "Tab" || panel === null) return;
-    const focusable = panel.querySelectorAll<HTMLElement>(
-      'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
-    );
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (first === undefined || last === undefined) return;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
 </script>
 
-<svelte:window {onkeydown} />
-
 {#if pinned === null}
-  <div class="picker">
+  <div class="picker" {@attach closesWithBranch}>
     <button
       class="chip"
       type="button"
@@ -112,19 +104,9 @@
     </button>
 
     {#if app.importPickerOpen}
-      <!-- Transparent, under the panel, only to catch the click that closes it. -->
-      <button
-        class="dismiss"
-        type="button"
-        tabindex="-1"
-        aria-label="Close the harness picker"
-        onclick={() => closeToTrigger()}
-      ></button>
-      <div
-        class="panel"
-        role="dialog"
-        aria-label="Choose a harness and model"
-        bind:this={panel}
+      <HarnessDialog
+        opener={trigger}
+        onclose={() => (app.importPickerOpen = false)}
       >
         <HarnessChoice
           instances={app.harnesses}
@@ -133,7 +115,6 @@
           bind:query={app.importModelQuery}
           onPickInstance={(instanceId) => app.pickImportInstance(instanceId)}
           onPickModel={(modelId) => app.pickImportModel(modelId)}
-          onDismiss={closeToTrigger}
         >
           {#snippet note()}
             A session is pinned to the harness it starts on. Changing harness
@@ -154,7 +135,7 @@
             />
           {/snippet}
         </HarnessChoice>
-      </div>
+      </HarnessDialog>
     {/if}
   </div>
 {:else}
@@ -223,72 +204,15 @@
     flex: none;
     color: var(--icon-muted);
   }
-  .dismiss {
-    position: fixed;
-    inset: 0;
-    border: 0;
-    background: transparent;
-    cursor: default;
-  }
   /*
-   * The chip's own wrapper, so the panel below hangs off the chip rather than off the
-   * composer's box: `position: relative` here is what `left`/`right` resolve against.
-   * One flex item on the strip, exactly as the chip alone was, so wrapping it moves
-   * nothing.
+   * The chip's own wrapper, which once anchored a popover and now only keeps the chip one
+   * flex item on the strip, exactly as the chip alone was. The dialog is not in it:
+   * `HarnessDialog` leaves only an empty, `hidden` origin here and renders at the end of
+   * `<body>`, out of the composer's form.
    */
   .picker {
-    position: relative;
     display: flex;
     /* Gives way before the send button does, as every control on this strip does. */
     min-width: 0;
-  }
-  /*
-   * The floating panel: `HarnessPicker`'s approach on this side of the composer too —
-   * absolutely positioned out of a relative trigger, so opening it moves no pixel of
-   * the composer's layout, and sized by the columns it holds rather than by the width
-   * of whatever is under it.
-   *
-   * Opens leftwards from the chip, where the run composer's opens rightwards from its
-   * trigger for the same reason: that is where this trigger's room is. This chip is
-   * the third control on its strip, ~410px in from the left even on a 768px window,
-   * so a panel lined up with the chip's *left* edge runs past the window's right edge
-   * (410 + 622 > 1024); lined up with its right edge, 622px ends ~45px inside even at
-   * 1024 and ~218px in at 1440.
-   */
-  .panel {
-    position: absolute;
-    right: 0;
-    bottom: calc(100% + 6px);
-    z-index: 2;
-    display: flex;
-    /* 196 + 240 + 184, plus the two 1px dividers between them. */
-    width: 622px;
-    /*
-     * 340 is the cap the columns resolve their scrolling against, and the composer
-     * picker's number. The second arm is the importer's own case, and the reason a
-     * taller panel was reverted once: the picker only opens on a *new* session, whose
-     * composer sits at the vertical centre of the page rather than at the bottom, and
-     * the chip then holds only about half the window above it (measured: chip top ≈
-     * 50vh + 34), so a 340px panel runs off the top of any window shorter than ~700px.
-     * `50dvh` keeps the panel inside the room the chip actually has, and stops binding
-     * — leaving the full 340 — wherever the window is tall enough to give it.
-     */
-    max-height: min(340px, calc(50dvh + 12px));
-    overflow: hidden;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--elevation-floating);
-    background: var(--bg-layer-01);
-  }
-  /*
-     Narrow viewports: the composer picker's own numbers, because `HarnessChoice`
-     stacks the same way for both popovers and its stacked layout was measured against
-     this width. Right-aligned to the chip, the 470px cap ends well inside the window:
-     the chip's right edge is ~100px in from the window's right at 768px.
-   */
-  @media (max-width: 920px) {
-    .panel {
-      width: min(92vw, clamp(360px, calc(100vw - 310px), 470px));
-    }
   }
 </style>
