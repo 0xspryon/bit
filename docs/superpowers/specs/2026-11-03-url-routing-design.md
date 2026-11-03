@@ -190,17 +190,17 @@ _the_ common case rather than an edge one.
 
 ## The addressable inventory
 
-| Place                     | Path                                                                                       |
-| ------------------------- | ------------------------------------------------------------------------------------------ |
-| Target list               | `/`                                                                                        |
-| A target (lands on Goals) | `/t/<targetId>`                                                                            |
-| A section                 | `/t/<targetId>/<section>`                                                                  |
-| A goal                    | `/t/<targetId>/goals/<goalId>`                                                             |
-| Assets, one tab           | `/t/<targetId>/assets/estate` · `/t/<targetId>/assets/scope`                               |
-| The estate, filtered      | `/t/<targetId>/assets/estate?filter=uncovered`                                             |
-| **An AI asset chat**      | `/t/<targetId>/assets/chat/<sessionId>`                                                    |
-| An attempt transcript     | `/t/<targetId>/attempts/<attemptId>` — inbound only, see decision 1                        |
-| Settings                  | `/t/<targetId>/settings` — a `navItem` the rail's footer sets, so a section like any other |
+| Place                     | Path                                                                                                                                                                                                           |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Target list               | `/`                                                                                                                                                                                                            |
+| A target (lands on Goals) | `/t/<targetId>`                                                                                                                                                                                                |
+| A section                 | `/t/<targetId>/<section>`                                                                                                                                                                                      |
+| A goal                    | `/t/<targetId>/goals/<goalId>`                                                                                                                                                                                 |
+| Assets, one tab           | `/t/<targetId>/assets/estate` · `/t/<targetId>/assets/scope`                                                                                                                                                   |
+| The estate, filtered      | `/t/<targetId>/assets/estate?filter=uncovered`                                                                                                                                                                 |
+| **An AI asset chat**      | `/t/<targetId>/assets/chat/<sessionId>` — the **harness** session id (`ses_…`), which is what `AgentSessionView.sessionId` carries (`browserApi.ts`: `sessionId: session.harnessSessionId`), not the import id |
+| An attempt transcript     | `/t/<targetId>/attempts/<attemptId>` — inbound only, see decision 1                                                                                                                                            |
+| Settings                  | `/t/<targetId>/settings` — a `navItem` the rail's footer sets, so a section like any other                                                                                                                     |
 
 `<section>` is a nav id from `navGroups`: `goals`, `findings`, `observations`, `assets`,
 `evidence`, `workers`, `blockers`, `events`, `agent-sessions`. `attempts` is the one
@@ -310,11 +310,32 @@ already correct and will be needed. Reflecting the transcript from the Goals pag
 actually renders, **breaks on a lifecycle bug**: `transcriptAttemptId` is cleared only by
 `reset()`, so the URL would stick on `attempts/<id>` for the rest of the visit.
 
-So: the path parses and replays, `placeOf` never emits it, and the guard that would emit it
-is `navItem === "workers" && transcriptAttemptId !== ""` — unreachable today, correct
-unchanged the day Workers lists attempts. Whichever slice builds that list owns clearing
-`transcriptAttemptId`; until then the narrow guard confines the staleness to a section that
-cannot read a transcript at all.
+So: the path parses and replays, and the guard that emits it is
+`navItem === "workers" && transcriptAttemptId !== ""`.
+
+**Two claims in the paragraph above were wrong, and S3 found both.** They are corrected
+here rather than quietly rewritten, because the way they were wrong is the useful part.
+
+_"A link to an attempt opens its transcript"_ was not true when written. `applyPlace` set
+the rail to Workers and read the transcript, but `TranscriptPanel` rendered only under
+`{#if app.navItem === "goals"}` — so the link loaded a transcript into state that no screen
+displayed, and the operator got "Workers · Placeholder content". S3 mounts the panel on
+Workers too, with the attempt id passed in, so each section names the attempt it has. That
+is one panel for the one attempt a URL named, not the Workers attempt list.
+
+_"Unreachable today"_ was wrong in the other direction, and worse, because it described a
+defect on `main` rather than a missing feature. `TranscriptPanel` has a "Read transcript"
+button that sets `transcriptAttemptId`, and only `reset()` clears it — so reading a
+transcript on Goals and then clicking Workers already satisfied the guard, and the address
+bar already claimed `/t/<id>/attempts/<id>` over a placeholder page. The URL was lying
+before anyone noticed it could. Mounting the panel on Workers is what makes that emission
+truthful: the path is written exactly when an attempt's transcript is what is on screen.
+
+What remains deferred is only that **nothing in the app produces such a link.** A worker row
+in the Agent sessions list is the one place one could be offered, and S3 deliberately left
+that row inert rather than let the list become half of the attempt list Flow B owns. So the
+path works inbound, and reading a transcript reflects honestly; what is missing is somewhere
+to click.
 
 **2. The estate filter is addressable**, as `?filter=<all|in|out|uncovered>` on
 `/t/<targetId>/assets/estate`. See D2 for why it is a query parameter and not a path
