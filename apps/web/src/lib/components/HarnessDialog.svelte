@@ -54,6 +54,10 @@
    *   before this component's attachment does. So nothing is in the layer until it is in
    *   `<body>`.
    *
+   * The move is `dialogLayer`'s `toBody`, which `Modal` uses too — so a dialog opened from
+   * inside this one (a refusal of a pick, while the picker stays open) is later in `<body>`
+   * and drawn on top of it, and only the dialog on top answers Escape and Tab.
+   *
    * Nothing else about the dialog depends on where it is: Svelte also listens for its
    * delegated events on `document` for exactly this case, the design tokens are on
    * `:root`, the focus trap is the panel's own, and focus goes back to the named opener
@@ -67,8 +71,8 @@
    * this element.
    */
   import { untrack, type Snippet } from "svelte";
-  import type { Attachment } from "svelte/attachments";
-  import { holdFocus, wrapTab } from "../dialogFocus";
+  import { holdFocus } from "../dialogFocus";
+  import { dialogKeydown, enterLayer, toBody } from "../dialogLayer";
 
   let {
     onclose,
@@ -87,37 +91,33 @@
   let moved = $state(false);
 
   /** Moves the layer to the end of `<body>`, and takes it away with the dialog. */
-  const toBody: Attachment<HTMLDivElement> = (layer) => {
-    document.body.append(layer);
-    moved = true;
-    return () => layer.remove();
-  };
+  const toBodyThenRender = toBody(() => (moved = true));
 
   // Only the panel mounting is a reason to run this: re-running it would restore focus
-  // to the opener and take it back again while the dialog was still open.
+  // to the opener and take it back again while the dialog was still open. It is on top of
+  // the open dialogs from here until it closes; see `dialogLayer`.
   $effect(() => {
     if (panel === null) return;
     const mounted = panel;
-    return untrack(() => holdFocus(mounted, opener));
+    return untrack(() => {
+      const leave = enterLayer(mounted);
+      const restore = holdFocus(mounted, opener);
+      return () => {
+        leave();
+        restore();
+      };
+    });
   });
-
-  function onkeydown(event: KeyboardEvent) {
-    if (event.key === "Escape") {
-      onclose();
-      return;
-    }
-    if (panel !== null) wrapTab(event, panel);
-  }
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window onkeydown={(event) => dialogKeydown(event, panel, onclose)} />
 
 <!--
   The origin stays where the caller wrote the dialog and is empty once the layer has moved:
   see "It renders at the end of `<body>`" above.
 -->
 <div class="origin" hidden>
-  <div class="layer" {@attach toBody}>
+  <div class="layer" {@attach toBodyThenRender}>
     {#if moved}
       <div class="scrim">
         <!--
@@ -168,6 +168,8 @@
     inset: 0;
     z-index: 50;
     display: grid;
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 24px;
     background: var(--overlay-scrim);

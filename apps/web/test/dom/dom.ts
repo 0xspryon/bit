@@ -93,19 +93,26 @@ export const clickOn = (
  * `Modal` listens on the window, so the event is sent from the focused element and left to
  * bubble — which is the path a real key takes — rather than dispatched at the window
  * directly, where a listener on the element in between would never be asked.
+ *
+ * **It does not move focus.** A browser moves focus on an uncancelled Tab; happy-dom does
+ * not. So the event is returned: whether the app cancelled it is what says a trap took the
+ * key, and where focus is afterwards is then only what the app itself moved it to.
  */
-export const press = (key: string, options: KeyboardEventInit = {}): void => {
+export const press = (
+  key: string,
+  options: KeyboardEventInit = {},
+): KeyboardEvent => {
   const from = document.activeElement ?? document.body;
-  from.dispatchEvent(
-    new KeyboardEvent("keydown", {
-      key,
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      ...options,
-    }),
-  );
+  const event = new KeyboardEvent("keydown", {
+    key,
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    ...options,
+  });
+  from.dispatchEvent(event);
   flushSync();
+  return event;
 };
 
 /**

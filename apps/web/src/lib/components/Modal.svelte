@@ -4,12 +4,17 @@
    * padded body and a footer of actions. It owns the Escape key and the Tab trap, and takes
    * its focus rules from `dialogFocus`.
    *
+   * It renders at the end of `<body>`, not where it is written, and answers keys only while
+   * it is the dialog on top: both are `dialogLayer`'s, shared with `HarnessDialog`, so a
+   * dialog opened from inside another is drawn over it and one Escape closes only it.
+   *
    * The options below exist for {@link ErrorDialog}, which is this card saying "the server
    * refused that" rather than asking anything. Every one defaults to what the form and
    * question dialogs already had, so they are unchanged by it.
    */
   import { untrack, type Snippet } from "svelte";
-  import { holdFocus, wrapTab } from "../dialogFocus";
+  import { holdFocus } from "../dialogFocus";
+  import { dialogKeydown, enterLayer, toBody } from "../dialogLayer";
   import { IconClose } from "../icons";
 
   let {
@@ -60,68 +65,94 @@
    * Focus goes into the dialog when it opens, onto the panel itself and no control, and
    * back to the opener — or to a marked survivor when the opener was deleted — when it
    * closes. Both rules, and why each is the way it is, are `dialogFocus`'s, shared with the
-   * harness picker's dialog so the two cannot drift.
+   * harness picker's dialog so the two cannot drift. It goes on top of the open dialogs
+   * as it mounts and comes off as it closes, before focus goes back.
    */
   $effect(() => {
     if (panel === null) return;
     const mounted = panel;
     // Only the panel mounting is a reason to run this; a new `opener` is not.
-    return untrack(() => holdFocus(mounted, opener));
+    return untrack(() => {
+      const leave = enterLayer(mounted);
+      const restore = holdFocus(mounted, opener);
+      return () => {
+        leave();
+        restore();
+      };
+    });
   });
-
-  function onkeydown(event: KeyboardEvent) {
-    if (event.key === "Escape") {
-      onclose();
-      return;
-    }
-    if (panel !== null) wrapTab(event, panel);
-  }
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window onkeydown={(event) => dialogKeydown(event, panel, onclose)} />
 
-<div class="scrim">
-  {#if scrimCloses}
-    <!--
+<!--
+  The origin stays where the caller wrote the dialog; the layer inside it moves to the end
+  of `<body>` as it mounts. See `dialogLayer`.
+-->
+<div class="origin" hidden>
+  <div class="layer" {@attach toBody()}>
+    <div class="scrim">
+      {#if scrimCloses}
+        <!--
       The outside of the panel, as a control, as `HarnessDialog` draws it: out of the tab
       order, because Escape is the keyboard's way out.
     -->
-    <button
-      class="dismiss"
-      type="button"
-      tabindex="-1"
-      aria-label="Close"
-      onclick={onclose}
-    ></button>
-  {/if}
-  <div
-    class="panel"
-    {role}
-    aria-modal="true"
-    aria-label={title}
-    aria-describedby={describedby}
-    tabindex="-1"
-    style:--modal-width={`${width}px`}
-    bind:this={panel}
-  >
-    <header>
-      <h2>{title}</h2>
-      {#if closeButton}
-        <button class="x" type="button" onclick={onclose} aria-label="Close">
-          <IconClose width="12" height="12" />
-        </button>
+        <button
+          class="dismiss"
+          type="button"
+          tabindex="-1"
+          aria-label="Close"
+          onclick={onclose}
+        ></button>
       {/if}
-    </header>
-    <div class="body">{@render body()}</div>
-    <footer>{@render footer()}</footer>
+      <div
+        class="panel"
+        {role}
+        aria-modal="true"
+        aria-label={title}
+        aria-describedby={describedby}
+        tabindex="-1"
+        style:--modal-width={`${width}px`}
+        bind:this={panel}
+      >
+        <header>
+          <h2>{title}</h2>
+          {#if closeButton}
+            <button
+              class="x"
+              type="button"
+              onclick={onclose}
+              aria-label="Close"
+            >
+              <IconClose width="12" height="12" />
+            </button>
+          {/if}
+        </header>
+        <div class="body">{@render body()}</div>
+        <footer>{@render footer()}</footer>
+      </div>
+    </div>
   </div>
 </div>
 
 <style>
+  /* In `<body>` it is one more child of a block box; it should not be a box at all. */
+  .layer {
+    display: contents;
+  }
+  /*
+   * One row, as tall as the window less the padding, and no taller: a grid row otherwise
+   * grows to its content, and then the panel's `max-height: 100%` is a percentage of a
+   * panel-sized row and never binds — a long body pushed the footer, and its one way out,
+   * off the bottom of the window. `minmax(0, …)` lets the row be shorter than the panel's
+   * content, so the panel is the one that gives, and its body scrolls.
+   */
   .scrim {
     position: fixed;
     inset: 0;
     display: grid;
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 24px;
     background: var(--overlay-scrim);
