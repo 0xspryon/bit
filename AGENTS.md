@@ -62,10 +62,12 @@
   that runs away takes the machine and every agent on it down; under the limit only that
   test process dies. The whole of `bun run test` fits (measured peak: server suite 386 MB,
   web DOM suite 294 MB), so a run killed at 1 GB is a bug to investigate, not a reason to
-  raise the limit. `bun run typecheck` runs under the same limit only one package at a
-  time with Node's heap sized to it:
-  `… NODE_OPTIONS=--max-old-space-size=900 bun run typecheck --concurrency=1` (in
-  parallel, `tsc` and `svelte-check` together exceed 1 GB and are killed). A failing assertion on happy-dom nodes is the known cause: never
+  raise the limit. Typecheck, build and install are not tests and do not fit in 1 GB
+  (measured: the server's `tsc` alone peaks at 1.12 GB, `vite build` at 1.1 GB), so run
+  them one package at a time under a 2 GB limit instead:
+  `systemd-run --user --scope -q -p MemoryMax=2G -p MemorySwapMax=0 timeout 900 bun run typecheck --concurrency=1`,
+  and the same for `bun run build --concurrency=1` and `bun install --frozen-lockfile`.
+  `NODE_OPTIONS` does not help: turbo's strict env mode drops it. A failing assertion on happy-dom nodes is the known cause: never
   `toEqual` a node or an array of nodes — compare strings (`outerHTML`, `textContent`).
   When a test mutates a file to prove it can fail, copy the file first and restore from
   the copy; a killed run never reaches a cleanup step after it.
