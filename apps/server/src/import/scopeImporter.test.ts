@@ -65,7 +65,13 @@ import type {
 } from "../harness/agentHarness";
 import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
-import { STUB_INSTANCE, stubHarness } from "../harness/stubHarness";
+import {
+  STUB_INSTANCE,
+  recordModelSwitches,
+  stubHarness,
+  type RecordedModelSwitch,
+} from "../harness/stubHarness";
+import { SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
@@ -191,8 +197,19 @@ interface Script {
     resume: string | undefined;
     /** Where the session runs, which is where the gate went. */
     directory: string;
+    /** The model the session is opened on: a reopen after a switch opens on the new one. */
+    model: string;
     options: readonly ModelOptionSelection[] | undefined;
   }[];
+  /** Every `switchModel`, as the stub's `recordModelSwitches` records it (A6 F4). */
+  readonly switches: readonly RecordedModelSwitch[];
+  /** `switchModel` as the stub records it; {@link switchAnswer} decides what it answers. */
+  readonly recordSwitch: AgentHarness["Service"]["switchModel"];
+  /**
+   * What a switch answers once it is recorded: accepted unless a test says otherwise — a
+   * refusal, or a gate to hold the switch in flight.
+   */
+  switchAnswer: Effect.Effect<void, HarnessTransportError> | undefined;
   /** Every registration taken back, by session. */
   readonly unregistered: string[];
   readonly prompts: string[];
@@ -251,26 +268,32 @@ interface Script {
     | undefined;
 }
 
-const newScript = (readable: readonly string[]): Script => ({
-  readable: new Set(readable),
-  holds: new Map<string, string>(),
-  registrations: [],
-  created: [],
-  unregistered: [],
-  prompts: [],
-  deliveries: [],
-  interrupted: [],
-  subscribed: [],
-  streamsEnded: [],
-  failEvents: false,
-  done: Promise.resolve(),
-  failCreate: false,
-  failPrompt: false,
-  failSteer: false,
-  onSteer: undefined,
-  holdPrompt: undefined,
-  holdRegister: undefined,
-});
+const newScript = (readable: readonly string[]): Script => {
+  const recorded = recordModelSwitches();
+  return {
+    readable: new Set(readable),
+    holds: new Map<string, string>(),
+    registrations: [],
+    created: [],
+    switches: recorded.switches,
+    recordSwitch: recorded.switchModel,
+    switchAnswer: undefined,
+    unregistered: [],
+    prompts: [],
+    deliveries: [],
+    interrupted: [],
+    subscribed: [],
+    streamsEnded: [],
+    failEvents: false,
+    done: Promise.resolve(),
+    failCreate: false,
+    failPrompt: false,
+    failSteer: false,
+    onSteer: undefined,
+    holdPrompt: undefined,
+    holdRegister: undefined,
+  };
+};
 
 /**
  * A harness whose `prompt` is the importer agent, scripted.
@@ -330,10 +353,19 @@ const scriptedHarness = (script: Script) => {
               multiTurn: input.multiTurn === true,
               resume: input.resume,
               directory: input.directory,
+              model: input.model,
               options: input.options,
             });
             return { id };
           }),
+    switchModel: (sessionId, model, options) =>
+      script
+        .recordSwitch(sessionId, model, options)
+        .pipe(
+          Effect.andThen(
+            Effect.suspend(() => script.switchAnswer ?? Effect.void),
+          ),
+        ),
     unregisterMcpServer: (sessionId) =>
       Effect.sync(() => {
         script.unregistered.push(sessionId);
@@ -2687,6 +2719,346 @@ describe("an agent granted another authority", () => {
     expect(built.script.prompts).toHaveLength(0);
     expect(agentsOf(built.root)).toHaveLength(0);
     expect((await authorityOf(runtime, "")).size).toBe(0);
+    await runtime.dispose();
+  });
+});
+
+/**
+ * Switching a running conversation's model within its pinned harness (A6 F4).
+ *
+ * The scripted harness records every `switchModel` through the stub's own
+ * `recordModelSwitches`, and answers whatever `script.switchAnswer` says — accepted by
+ * default, a refusal or a gate when a test needs one. The row is read straight from the file,
+ * so what is asserted is what a reopen after a restart would read.
+ */
+describe("switching an import's model", () => {
+  const switchTo = (
+    runtime: ManagedRuntime.ManagedRuntime<ScopeImporter, unknown>,
+    importId: string,
+    model: string,
+    modelOptions?: readonly ModelOptionSelection[],
+  ) =>
+    runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.switchModel({
+            targetId: TARGET,
+            importId,
+            model,
+            ...(modelOptions === undefined ? {} : { modelOptions }),
+          }),
+        ),
+      ),
+    );
+
+  const rowOf = (root: string, importId: string) => {
+    const database = new Database(join(root, "targets", TARGET, HUNT_FILE), {
+      readonly: true,
+    });
+    try {
+      return database
+        .query(
+          "SELECT model, model_options, harness_instance_id FROM import_sessions WHERE import_id = ?",
+        )
+        .get(importId) as {
+        model: string;
+        model_options: string | null;
+        harness_instance_id: string | null;
+      } | null;
+    } finally {
+      database.close();
+    }
+  };
+
+  /** A live import: one link read, settled, and its session still held. */
+  const liveImport = async (choice?: ScopeImportRequest["choice"]) => {
+    const opened = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      ...(choice === undefined ? {} : { choice }),
+    });
+    if (opened.started._tag !== "started") {
+      throw new Error("the import did not start");
+    }
+    return { ...opened, importId: opened.started.importId };
+  };
+
+  const notFound = (tag: string | undefined) =>
+    new HarnessTransportError({
+      operation: "session.switchModel",
+      status: 404,
+      tag,
+      detail: "no such running session",
+      cause: undefined,
+    });
+
+  test("a live session is switched at once, and the row, the registry and the panel follow", async () => {
+    const { built, runtime, importId } = await liveImport();
+
+    const switched = await switchTo(runtime, importId, "scripted/other");
+    expect(switched._tag).toBe("Success");
+    if (switched._tag !== "Success") return;
+    expect(switched.success).toEqual({
+      conversationId: importId,
+      harnessInstanceId: STUB_INSTANCE.instanceId,
+      model: "scripted/other",
+      modelOptions: [],
+      droppedModelOptionIds: [],
+      applied: "live",
+      changed: true,
+    });
+    expect(built.script.switches).toEqual([
+      { sessionId: "ses_import", model: "scripted/other", options: undefined },
+    ]);
+    expect(rowOf(built.root, importId)).toEqual({
+      model: "scripted/other",
+      model_options: null,
+      harness_instance_id: STUB_INSTANCE.instanceId,
+    });
+    // The registry's own copy: what the next accepted message reports.
+    const next = await sendTo(runtime, importId, "And the API?");
+    expect(next._tag).toBe("Success");
+    if (next._tag === "Success") {
+      expect(next.success.conversation).toBe("continued");
+      expect(next.success.model).toBe("scripted/other");
+    }
+    const view = await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) => importer.view(importId)),
+    );
+    expect(view?.model).toBe("scripted/other");
+    await runtime.dispose();
+  });
+
+  test("options are resolved against the new model, and the ones it does not offer are reported", async () => {
+    const { built, runtime, importId } = await liveImport();
+
+    const kept = await switchTo(runtime, importId, "scripted/model", [
+      { id: "thinking", value: "on" },
+      { id: "effort", value: "high" },
+    ]);
+    expect(kept._tag).toBe("Success");
+    if (kept._tag !== "Success") return;
+    expect(kept.success.modelOptions).toEqual([
+      { id: "effort", value: "high" },
+    ]);
+    expect(kept.success.droppedModelOptionIds).toEqual(["thinking"]);
+    expect(
+      JSON.parse(rowOf(built.root, importId)?.model_options ?? "null"),
+    ).toEqual([{ id: "effort", value: "high" }]);
+
+    // A model that offers nothing: the reasoning level is not carried across.
+    const dropped = await switchTo(runtime, importId, "scripted/other", [
+      { id: "effort", value: "high" },
+    ]);
+    expect(dropped._tag).toBe("Success");
+    if (dropped._tag !== "Success") return;
+    expect(dropped.success.modelOptions).toEqual([]);
+    expect(dropped.success.droppedModelOptionIds).toEqual(["effort"]);
+    expect(built.script.switches.map((each) => each.options)).toEqual([
+      [{ id: "effort", value: "high" }],
+      // Absent, never `[]`: nothing chosen for the new model.
+      undefined,
+    ]);
+    expect(rowOf(built.root, importId)?.model_options).toBeNull();
+    await runtime.dispose();
+  });
+
+  test("a model outside the pinned harness's catalogue is refused before the harness is asked", async () => {
+    const { built, runtime, importId } = await liveImport();
+
+    const refused = await switchTo(
+      runtime,
+      importId,
+      "anthropic/claude-opus-5-5",
+    );
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag !== "Failure") return;
+    expect(refused.failure).toMatchObject({
+      _tag: "ConversationModelRefused",
+      reason: "model_unavailable",
+    });
+    expect(refused.failure.message).toContain("scripted/other");
+    expect(built.script.switches).toEqual([]);
+    expect(rowOf(built.root, importId)?.model).toBe("scripted/model");
+    await runtime.dispose();
+  });
+
+  test("a second switch while one is in flight is refused, not queued", async () => {
+    const { built, runtime, importId } = await liveImport();
+    const entered = Deferred.makeUnsafe<void>();
+    const gate = Deferred.makeUnsafe<void>();
+    built.script.switchAnswer = Deferred.succeed(entered, undefined).pipe(
+      Effect.andThen(Deferred.await(gate)),
+    );
+
+    const first = runtime.runFork(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.switchModel({
+          targetId: TARGET,
+          importId,
+          model: "scripted/other",
+        }),
+      ),
+    );
+    await runtime.runPromise(Deferred.await(entered));
+
+    const second = await switchTo(runtime, importId, "scripted/model", [
+      { id: "effort", value: "low" },
+    ]);
+    expect(second._tag).toBe("Failure");
+    if (second._tag === "Failure") {
+      expect(second.failure).toMatchObject({
+        _tag: "ConversationModelRefused",
+        reason: "switch_in_flight",
+      });
+    }
+
+    await runtime.runPromise(Deferred.succeed(gate, undefined));
+    const settled = await runtime.runPromise(Fiber.join(first));
+    expect(settled.applied).toBe("live");
+    // The refused one never reached the harness, and the row is the first one's.
+    expect(built.script.switches).toHaveLength(1);
+    expect(rowOf(built.root, importId)?.model).toBe("scripted/other");
+
+    // And once it has answered, the next switch is taken.
+    built.script.switchAnswer = undefined;
+    const third = await switchTo(runtime, importId, "scripted/model");
+    expect(third._tag).toBe("Success");
+    await runtime.dispose();
+  });
+
+  test("a session the harness no longer runs has only its row switched, whichever way the 404 is said", async () => {
+    // Claude Code's tag with its 404, then OpenCode's bare 404.
+    for (const tag of [SESSION_NOT_FOUND_TAG, undefined]) {
+      const { built, runtime, importId } = await liveImport();
+      built.script.switchAnswer = Effect.fail(notFound(tag));
+
+      const switched = await switchTo(runtime, importId, "scripted/other");
+      expect(switched._tag).toBe("Success");
+      if (switched._tag !== "Success") return;
+      expect(switched.success.applied).toBe("recorded");
+      expect(switched.success.changed).toBe(true);
+      expect(built.script.switches).toHaveLength(1);
+      expect(rowOf(built.root, importId)?.model).toBe("scripted/other");
+      await runtime.dispose();
+    }
+  });
+
+  test("an uncertain answer leaves the row and the registry as they were, with the harness's sentence", async () => {
+    const { built, runtime, importId } = await liveImport();
+    built.script.switchAnswer = Effect.fail(
+      new HarnessTransportError({
+        operation: "session.switchModel",
+        status: undefined,
+        tag: undefined,
+        detail: "the control request timed out",
+        cause: undefined,
+      }),
+    );
+
+    const refused = await switchTo(runtime, importId, "scripted/other");
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag !== "Failure") return;
+    expect(refused.failure).toMatchObject({
+      _tag: "ConversationModelRefused",
+      reason: "harness_unreachable",
+    });
+    expect(refused.failure.message).toContain("the control request timed out");
+    expect(refused.failure.message).toContain("'scripted/model'");
+    expect(rowOf(built.root, importId)?.model).toBe("scripted/model");
+    const next = await sendTo(runtime, importId, "Still there?");
+    if (next._tag === "Success")
+      expect(next.success.model).toBe("scripted/model");
+    await runtime.dispose();
+  });
+
+  test("the same model and options again is a success that changes nothing", async () => {
+    const { built, runtime, importId } = await liveImport({
+      model: "scripted/model",
+      modelOptions: [{ id: "effort", value: "high" }],
+    });
+    const before = rowOf(built.root, importId);
+
+    const again = await switchTo(runtime, importId, "scripted/model", [
+      { id: "effort", value: "high" },
+    ]);
+    expect(again._tag).toBe("Success");
+    if (again._tag !== "Success") return;
+    expect(again.success.changed).toBe(false);
+    expect(again.success.applied).toBe("live");
+    expect(rowOf(built.root, importId)).toEqual(before);
+    // The live session is still told, harmlessly: a repeat is how an uncertain switch is
+    // settled, and both harnesses treat it as a no-op.
+    expect(built.script.switches).toEqual([
+      {
+        sessionId: "ses_import",
+        model: "scripted/model",
+        options: [{ id: "effort", value: "high" }],
+      },
+    ]);
+    await runtime.dispose();
+  });
+
+  test("after a restart, a switched import resumes on the new model and options", async () => {
+    const { built, runtime, importId } = await liveImport({
+      model: "scripted/other",
+    });
+    built.script.holds.set(
+      "ses_import",
+      join(built.root, "targets", TARGET, "import", importId),
+    );
+    await runtime.dispose();
+
+    // Nothing is live in the new process, so only the row changes and the harness is not
+    // asked.
+    const restarted = ManagedRuntime.make(built.layer);
+    const switched = await switchTo(restarted, importId, "scripted/model", [
+      { id: "effort", value: "low" },
+    ]);
+    expect(switched._tag).toBe("Success");
+    if (switched._tag !== "Success") return;
+    expect(switched.success.applied).toBe("recorded");
+    expect(built.script.switches).toEqual([]);
+
+    const reopened = await sendTo(restarted, importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+    expect(reopened.success.conversation).toBe("resumed");
+    expect(reopened.success.model).toBe("scripted/model");
+    const resumed = built.script.created.at(-1);
+    expect(resumed?.resume).toBe("ses_import");
+    expect(resumed?.model).toBe("scripted/model");
+    expect(resumed?.options).toEqual([{ id: "effort", value: "low" }]);
+    // And the successor's own row carries it, so a second restart keeps it too.
+    expect(rowOf(built.root, reopened.success.importId)?.model).toBe(
+      "scripted/model",
+    );
+    await restarted.dispose();
+  });
+
+  test("an import the operator ended is refused, and an id this target does not hold is not found", async () => {
+    const { built, runtime, importId } = await liveImport();
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) => importer.stop(importId)),
+    );
+
+    const ended = await switchTo(runtime, importId, "scripted/other");
+    expect(ended._tag).toBe("Failure");
+    if (ended._tag === "Failure") {
+      expect(ended.failure).toMatchObject({
+        _tag: "ConversationModelRefused",
+        reason: "conversation_ended",
+      });
+    }
+    const unknown = await switchTo(runtime, "imp_not_here", "scripted/other");
+    expect(unknown._tag).toBe("Failure");
+    if (unknown._tag === "Failure") {
+      expect(unknown.failure).toMatchObject({
+        _tag: "ScopeImportNotFound",
+        reason: "unknown_import",
+      });
+    }
+    expect(built.script.switches).toEqual([]);
     await runtime.dispose();
   });
 });

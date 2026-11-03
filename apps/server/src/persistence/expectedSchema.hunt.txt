@@ -65,7 +65,7 @@ CREATE TABLE "effect_sql_migrations" ( migration_id integer PRIMARY KEY NOT NULL
 ## table events (on events)
 CREATE TABLE events ( id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, target_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, caller_scope TEXT, intent_id TEXT REFERENCES intents(id), attempt_id TEXT REFERENCES attempts(id), operation TEXT NOT NULL, operation_id TEXT, subject_id TEXT NOT NULL, recorded_at INTEGER NOT NULL )
 ## table goal_sessions (on goal_sessions)
-CREATE TABLE goal_sessions ( goal_id TEXT PRIMARY KEY REFERENCES goals(id), target_id TEXT NOT NULL, harness_session_id TEXT NOT NULL, harness_instance_id TEXT, opened_at INTEGER NOT NULL, model TEXT )
+CREATE TABLE goal_sessions ( goal_id TEXT PRIMARY KEY REFERENCES goals(id), target_id TEXT NOT NULL, harness_session_id TEXT NOT NULL, harness_instance_id TEXT, opened_at INTEGER NOT NULL, model TEXT , model_options TEXT)
 ## table goals (on goals)
 CREATE TABLE goals ( id TEXT PRIMARY KEY, target_id TEXT NOT NULL, description TEXT NOT NULL, created_at INTEGER NOT NULL, name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active', ended_at INTEGER, ended_by TEXT, end_reason TEXT )
 ## table host_scope_labels (on host_scope_labels)
@@ -191,6 +191,7 @@ CREATE TRIGGER events_are_immutable BEFORE UPDATE ON events BEGIN SELECT RAISE(A
   harness_instance_id TEXT notnull=0 default=- pk=0
   harness_session_id TEXT notnull=1 default=- pk=0
   model TEXT notnull=0 default=- pk=0
+  model_options TEXT notnull=0 default=- pk=0
   opened_at INTEGER notnull=1 default=- pk=0
   target_id TEXT notnull=1 default=- pk=0
 ## columns goals

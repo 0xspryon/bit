@@ -59,8 +59,12 @@
  * clock, and it is not needed yet.
  */
 import {
+  ConversationModelRefused,
   GoalConversationRefused,
   GoalUploadRefused,
+  type ConversationModelDraft,
+  type ConversationModelSwitched,
+  type ModelOptionSelection,
   type GoalConversationView,
   type GoalTurnAccepted,
   type GoalUploadView,
@@ -83,6 +87,15 @@ import {
   makeLiveAgentSessions,
   type LiveAgentSession,
 } from "../harness/liveAgentSessions";
+import { resolveSessionModelOptions } from "../harness/modelOptions";
+import {
+  checkModelSwitch,
+  modelSwitched,
+  modelSwitchRefusal,
+  recordRefusal,
+  sameModelChoice,
+  type CheckedModelSwitch,
+} from "../harness/modelSwitch";
 import { HarnessResolver } from "../harness/resolver";
 import {
   roleDirectoryMatcher,
@@ -294,6 +307,25 @@ export class GoalConversations extends Context.Service<
      */
     readonly close: (goalId: string) => Effect.Effect<void>;
     /**
+     * Moves one goal's conversation onto another model of its harness, or other options of
+     * its model (A6 F4).
+     *
+     * `ScopeImporter.switchModel` for a goal: the harness is the one `goal_sessions` records
+     * and is never changed here; the model is checked against that instance's catalogue and
+     * the options resolved against the new model; a live session is switched under the
+     * spine's one-at-a-time claim and opening permit, then the registry and the row follow.
+     * A session not held here has only its row changed, and the next message — resumed or
+     * fresh, on that same instance — opens on it. A goal nobody has talked to has no
+     * harness yet and is refused as `no_session`; a goal that is not active is refused as
+     * `conversation_ended`, for `send`'s reason.
+     */
+    readonly switchModel: (
+      input: {
+        readonly targetId: string;
+        readonly goalId: string;
+      } & ConversationModelDraft,
+    ) => Effect.Effect<ConversationModelSwitched, ConversationModelRefused>;
+    /**
      * Puts files where this goal's agent can read them, and tells nobody yet.
      *
      * **It does not open a conversation and does not prompt anything.** The files land on
@@ -383,6 +415,14 @@ export class GoalConversations extends Context.Service<
           ),
         live: () => undefined,
         close: () => Effect.void,
+        switchModel: () =>
+          Effect.fail(
+            new ConversationModelRefused({
+              reason: "harness_not_ready",
+              detail:
+                "this server has no agent harness, so no goal conversation's model can be switched.",
+            }),
+          ),
         /*
          * No harness, so no gate installer, so no directory an agent may be given files in.
          *
@@ -573,7 +613,10 @@ const make = Effect.fnUntraced(function* () {
    * will report this conversation as absent — and the next message that opens a session
    * will try the row again.
    */
-  const recordRow = Effect.fnUntraced(function* (entry: LiveConversation) {
+  const recordRow = Effect.fnUntraced(function* (
+    entry: LiveConversation,
+    options: readonly ModelOptionSelection[] | undefined,
+  ) {
     const recorded = yield* Effect.result(
       stores.open(entry.targetId).pipe(
         Effect.flatMap((store) =>
@@ -583,6 +626,7 @@ const make = Effect.fnUntraced(function* () {
             harnessSessionId: entry.sessionId,
             harnessInstanceId: entry.instanceId,
             model: entry.model,
+            modelOptions: options,
           }),
         ),
         Effect.scoped,
@@ -794,13 +838,27 @@ const make = Effect.fnUntraced(function* () {
          * a fresh one takes this server's default. Asked inside the permit, which is where
          * `prepare` runs, and it acquires nothing — it is one read of the harness.
          */
+        /*
+         * The row again, inside the permit. A model switch writes it under this same permit
+         * (`LiveAgentSessions.switchModel`), so the model this open reads below is the one
+         * the last switch left, never one a switch is about to replace; the read outside the
+         * permit only decided whether there was a conversation at all.
+         */
+        const current = yield* Effect.result(
+          stores.open(input.targetId).pipe(
+            Effect.flatMap((store) => store.goalSession(input.goalId)),
+            Effect.scoped,
+          ),
+        );
+        if (current._tag === "Failure") return yield* refuse(current.failure);
+        const recorded = current.success ?? priorSession;
         const reopen =
-          priorSession === undefined
+          recorded === undefined
             ? undefined
             : yield* goalReopen({
                 targetId: input.targetId,
                 goalId: input.goalId,
-                session: priorSession,
+                session: recorded,
               });
         resumed = reopen?.reopen;
         const chosen =
@@ -812,7 +870,37 @@ const make = Effect.fnUntraced(function* () {
             : yield* Effect.result(resolver.resolve(undefined));
         if (chosen._tag === "Failure") return yield* refuse(chosen.failure);
         const harness = chosen.success.harness;
-        const model = harness.instance.defaultModel;
+        /*
+         * The model the conversation is on, when this open runs on the instance its row
+         * names: the model and options the operator last switched it to (A6 F4), or the one
+         * it was opened on. Resumed or fresh — a fresh session on the same harness is the
+         * same conversation as far as the picker goes, as the importer's reopen keeps its
+         * row's model. Another instance (a fresh open after the recorded one went away)
+         * knows nothing of that row's catalogue, so it takes its own default, as a first
+         * message does. A row from before `0030` recorded no model and gets the default.
+         *
+         * V2(chat): `goal_sessions` holds only the conversation's *current* model and
+         * options, overwritten in place by a switch, with no record of when one happened —
+         * the importer's compromise (see its reopen in `import/scopeImporter.ts`). Proper
+         * V2: the same append-only switch log keyed by session, so a replay can mark each
+         * switch and give each turn its model.
+         */
+        const pinned =
+          recorded !== undefined &&
+          recorded.model !== null &&
+          recorded.harnessInstanceId === harness.instance.instanceId
+            ? recorded
+            : undefined;
+        const model = pinned?.model ?? harness.instance.defaultModel;
+        const options =
+          pinned === undefined
+            ? undefined
+            : yield* resolveSessionModelOptions(
+                harness,
+                model,
+                pinned.modelOptions ?? undefined,
+                "a goal conversation's recorded model",
+              );
         const provenance = harness.modelProvenance(model);
         const resume =
           reopen?.reopen._tag === "resume"
@@ -822,6 +910,7 @@ const make = Effect.fnUntraced(function* () {
           targetId: input.targetId,
           harness,
           model,
+          ...(options === undefined ? {} : { options }),
           // Ignored beside `resume`, and minted anyway rather than conditionally: the spine
           // takes one or the other and says so once, so a surface does not have to.
           sessionId: harness.newSessionId(),
@@ -851,7 +940,7 @@ const make = Effect.fnUntraced(function* () {
            * one permit no interleaving can leave the map naming one session while the row
            * names another.
            */
-          beforePrompt: (entry: LiveConversation) => recordRow(entry),
+          beforePrompt: (entry: LiveConversation) => recordRow(entry, options),
           /*
            * Three situations and two assemblers, which is the split S3.1 argues for: a
            * session this process created gets the whole preamble, and one it **resumed**
@@ -1325,9 +1414,155 @@ const make = Effect.fnUntraced(function* () {
     } satisfies GoalUploadsAccepted;
   });
 
+  const switchModel: GoalConversations["Service"]["switchModel"] = Effect.fn(
+    "GoalConversations.switchModel",
+  )(function* (input) {
+    const what = `goal ${input.goalId}'s conversation`;
+    // Read inside the claim, for the answer and for the uncertain answer's sentence. A
+    // holder rather than two `let`s, which narrowing would read as never assigned.
+    const decided: {
+      previous: string | null;
+      answer:
+        | { readonly checked: CheckedModelSwitch; readonly changed: boolean }
+        | undefined;
+    } = { previous: null, answer: undefined };
+    const unreadable = (failure: { readonly message: string }) =>
+      new ConversationModelRefused({
+        reason: "store_unavailable",
+        detail: `${what}'s record could not be read (${failure.message}), so nothing was switched.`,
+      });
+    const applied = yield* Effect.result(
+      sessions.switchModel({
+        id: input.goalId,
+        prepare: Effect.gen(function* () {
+          const read = yield* stores.open(input.targetId).pipe(
+            Effect.flatMap((store) =>
+              Effect.all({
+                goal: store.loadGoal(input.goalId),
+                session: store.goalSession(input.goalId),
+              }),
+            ),
+            Effect.scoped,
+            Effect.mapError(unreadable),
+          );
+          const goal = read.goal;
+          if (goal === undefined || goal.targetId !== input.targetId) {
+            return yield* new ConversationModelRefused({
+              reason: "no_session",
+              detail: `no goal ${input.goalId} is recorded in target ${input.targetId}, so there is no conversation to switch`,
+            });
+          }
+          // `send`'s rule: an ended goal takes no further turn, so nothing would run on it.
+          if (goal.status !== "active") {
+            return yield* new ConversationModelRefused({
+              reason: "conversation_ended",
+              detail: `goal ${input.goalId} is ${goal.status}, so its conversation takes no further turn and there is no model to switch.`,
+            });
+          }
+          const session = read.session;
+          if (session === undefined || session.harnessInstanceId === null) {
+            return yield* new ConversationModelRefused({
+              reason: "no_session",
+              detail:
+                session === undefined
+                  ? `nobody has talked to goal ${input.goalId} yet, so its conversation has no harness to switch within. The first message opens it on the default harness and its default model.`
+                  : `${what} was recorded before its harness instance was, so there is no pinned harness to switch within.`,
+            });
+          }
+          decided.previous = session.model;
+          const checked = yield* checkModelSwitch({
+            resolver,
+            instanceId: session.harnessInstanceId,
+            model: input.model,
+            requested: input.modelOptions,
+            what,
+          });
+          const changed = !sameModelChoice(session, checked);
+          decided.answer = { checked, changed };
+          const provenance = checked.harness.modelProvenance(checked.model);
+          return {
+            instanceId: checked.instanceId,
+            model: checked.model,
+            options: checked.options,
+            // `GoalTurnAccepted` reports the provenance of the model the session is on.
+            meta: () => ({
+              providerId: provenance.providerId,
+              modelId: provenance.modelId,
+            }),
+            record: (entry: LiveConversation | undefined) =>
+              changed
+                ? stores.open(input.targetId).pipe(
+                    Effect.flatMap((store) =>
+                      // The session the row named when this switch was decided, which under
+                      // the permit is the one any live entry was recorded on.
+                      store.recordGoalSessionModel({
+                        goalId: input.goalId,
+                        harnessSessionId: session.harnessSessionId,
+                        model: checked.model,
+                        modelOptions: checked.options,
+                      }),
+                    ),
+                    Effect.scoped,
+                    Effect.mapError((failure) =>
+                      recordRefusal({
+                        what,
+                        model: checked.model,
+                        harnessMoved: entry !== undefined,
+                        detail: failure.message,
+                      }),
+                    ),
+                    Effect.flatMap((written) =>
+                      written
+                        ? Effect.void
+                        : Effect.fail(
+                            recordRefusal({
+                              what,
+                              model: checked.model,
+                              harnessMoved: entry !== undefined,
+                              detail: `the record no longer names session ${session.harnessSessionId}`,
+                            }),
+                          ),
+                    ),
+                  )
+                : Effect.void,
+          };
+        }),
+      }),
+    );
+    if (applied._tag === "Failure") {
+      const failure = applied.failure;
+      return yield* failure._tag === "ModelSwitchInFlight" ||
+      failure._tag === "ModelSwitchUncertain" ||
+      failure._tag === "ModelSwitchStale"
+        ? Effect.fail(
+            modelSwitchRefusal(failure, {
+              what,
+              model: input.model,
+              previous: decided.previous,
+            }),
+          )
+        : Effect.fail(failure);
+    }
+    const answer = decided.answer;
+    if (answer === undefined) {
+      // Unreachable: a switch that succeeded ran `prepare`.
+      return yield* new ConversationModelRefused({
+        reason: "store_unavailable",
+        detail: `${what}'s switch answered without a plan, so nothing is known to have changed.`,
+      });
+    }
+    return modelSwitched({
+      conversationId: input.goalId,
+      checked: answer.checked,
+      applied: applied.success,
+      changed: answer.changed,
+    });
+  });
+
   return GoalConversations.of({
     send,
     replay,
+    switchModel,
     // The surface's intentional close. The goal surface records no ending of its own (the
     // goal's status is its authority), so the reason reaches nothing yet.
     close: (goalId) => sessions.close(goalId, "operator"),

@@ -3788,6 +3788,50 @@ describe("attaching files to a goal, on the wire", () => {
     expect(String(response.body["detail"])).toContain("HARNESS");
   });
 
+  test("a goal's model switch reaches the service, and a goal this target lacks is a 404 first (A6 F4)", async () => {
+    const targetId = await freshTarget();
+    const goalId = await newGoal(targetId);
+
+    // A server with no harness has no catalogue to check a model against.
+    const switched = await read(
+      await signedIn(
+        `/targets/${targetId}/goals/${goalId}/conversation/model`,
+        {
+          method: "POST",
+          body: { model: "scripted/other", modelOptions: [] },
+        },
+      ),
+    );
+    expect(switched.status).toBe(409);
+    expect(switched.body).toMatchObject({
+      _tag: "ConversationModelRefused",
+      reason: "harness_not_ready",
+    });
+
+    const unknown = await read(
+      await signedIn(
+        `/targets/${targetId}/goals/goal_not_here/conversation/model`,
+        {
+          method: "POST",
+          body: { model: "scripted/other" },
+        },
+      ),
+    );
+    expect(unknown.status).toBe(404);
+
+    // No model is a malformed request, refused by the decoder.
+    const empty = await read(
+      await signedIn(
+        `/targets/${targetId}/goals/${goalId}/conversation/model`,
+        {
+          method: "POST",
+          body: { model: "  " },
+        },
+      ),
+    );
+    expect(empty.status).toBe(400);
+  });
+
   test("the browser names no path: there is nowhere in the request to put one", async () => {
     // Asserted the way the planner route's "there is no payload" test is: a request
     // carrying extra fields that look like a destination gets the *same* answer as one
@@ -4418,6 +4462,42 @@ describe("a target's importer sessions", () => {
       ),
     );
     expect(response.status).toBe(400);
+  });
+
+  test("a model switch reaches the importer, and is refused by name on a server with no harness (A6 F4)", async () => {
+    const switched = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/model`,
+        {
+          method: "POST",
+          body: {
+            model: "scripted/other",
+            modelOptions: [{ id: "effort", value: "high" }],
+          },
+        },
+      ),
+    );
+    expect(switched.status).toBe(409);
+    expect(switched.body).toMatchObject({
+      _tag: "ConversationModelRefused",
+      reason: "harness_not_ready",
+    });
+
+    const empty = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/model`,
+        { method: "POST", body: { model: "" } },
+      ),
+    );
+    expect(empty.status).toBe(400);
+
+    const elsewhere = await read(
+      await signedIn("/targets/not-a-target/importer-sessions/imp_old/model", {
+        method: "POST",
+        body: { model: "scripted/other" },
+      }),
+    );
+    expect(elsewhere.status).toBe(404);
   });
 
   test("a message to an unknown target is a 404 before the importer is asked", async () => {

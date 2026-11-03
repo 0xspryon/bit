@@ -38,16 +38,38 @@ export const resolveSessionModelOptions = (
   what: string,
 ): Effect.Effect<readonly ModelOptionSelection[] | undefined> =>
   Effect.gen(function* () {
-    const descriptors = modelOptionDescriptors(
-      harness.instance.models.find((entry) => entry.id === model),
-    );
-    const selections = requested ?? [];
-    const dropped = droppedModelOptionIds(descriptors, selections);
+    const { options, dropped } = modelOptionsFor(harness, model, requested);
     if (dropped.length > 0) {
       yield* Effect.logWarning(
         `${what} named model options this model does not offer; they were dropped rather than forwarded`,
         { model, dropped: dropped.join(", ") },
       );
     }
-    return explicitModelOptionSelections(descriptors, selections);
+    return options;
   });
+
+/**
+ * {@link resolveSessionModelOptions} without the log, answering what was dropped as well.
+ *
+ * For a caller that tells the operator rather than the log: a model switch answers
+ * `droppedModelOptionIds` so the picker can say what the new model does not offer
+ * (`harness/modelSwitch.ts`). The same resolution, so a switch and an open cannot disagree
+ * about what a selection becomes.
+ */
+export const modelOptionsFor = (
+  harness: AgentHarness["Service"],
+  model: string,
+  requested: readonly ModelOptionSelection[] | undefined,
+): {
+  readonly options: readonly ModelOptionSelection[] | undefined;
+  readonly dropped: readonly string[];
+} => {
+  const descriptors = modelOptionDescriptors(
+    harness.instance.models.find((entry) => entry.id === model),
+  );
+  const selections = requested ?? [];
+  return {
+    options: explicitModelOptionSelections(descriptors, selections),
+    dropped: droppedModelOptionIds(descriptors, selections),
+  };
+};

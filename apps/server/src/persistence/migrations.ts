@@ -1129,6 +1129,25 @@ const importSessionAgent = statements(
 );
 
 /**
+ * `0003` — what a goal conversation's model is set to, beside the model (A6 F4).
+ *
+ * `import_sessions.model_options` for a goal's session, in the same encoding and for the
+ * same reason, which a model switch made sharper: the operator may now change a running
+ * conversation's model and reasoning, and a goal conversation the next message reopens —
+ * resumed or fresh, on the same harness instance — opens on what this row holds. Without
+ * the column a reasoning level the operator chose would be dropped by every reopen.
+ *
+ * Nullable with no default: `NULL` is "nothing chosen", which is also what every row
+ * written before this column means — a goal conversation was always opened on its
+ * harness's default model with no options, so that is a fact about those rows, not a
+ * guess. Written by every open (`recordGoalSession`) and by a model switch
+ * (`recordGoalSessionModel`), both alongside `model`.
+ */
+const goalSessionModelOptions = statements(
+  `ALTER TABLE goal_sessions ADD COLUMN model_options TEXT`,
+);
+
+/**
  * The ordered chain. **Append only; never edit an applied entry.**
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1149,6 +1168,7 @@ export const MIGRATIONS: Record<
 > = {
   "0001_baseline": baseline,
   "0002_import_session_agent": importSessionAgent,
+  "0003_goal_session_model_options": goalSessionModelOptions,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

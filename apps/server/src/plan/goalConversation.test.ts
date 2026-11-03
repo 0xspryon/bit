@@ -46,13 +46,22 @@ import {
   Stream,
 } from "effect";
 
+import type { ModelOptionSelection } from "@bit/contracts";
+
 import {
   AgentHarness,
+  SESSION_NOT_FOUND_TAG,
   type McpRegistration,
   type SessionContinuation,
 } from "../harness/agentHarness";
 import { HarnessResolver } from "../harness/resolver";
-import { STUB_INSTANCE, stubHarness } from "../harness/stubHarness";
+import { HarnessTransportError } from "../harness/errors";
+import {
+  STUB_INSTANCE,
+  recordModelSwitches,
+  stubHarness,
+  type RecordedModelSwitch,
+} from "../harness/stubHarness";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { operatorScope } from "../persistence/store";
@@ -91,7 +100,13 @@ interface Recorder {
     multiTurn: boolean;
     /** The session this create **continued** rather than made, if any (S7). */
     resumed: string | undefined;
+    /** What the session was opened on: a reopen after a switch opens on the new model. */
+    model: string;
+    options: readonly ModelOptionSelection[] | undefined;
   }[];
+  /** Every `switchModel`, as the stub's `recordModelSwitches` records it (A6 F4). */
+  readonly switches: readonly RecordedModelSwitch[];
+  readonly recordSwitch: AgentHarness["Service"]["switchModel"];
   readonly gated: string[];
   readonly registrations: { name: string; url: string; bearer: string }[];
   readonly unregistrations: { sessionId: string; name: string }[];
@@ -103,13 +118,18 @@ interface Recorder {
   }[];
 }
 
-const emptyRecorder = (): Recorder => ({
-  created: [],
-  gated: [],
-  registrations: [],
-  unregistrations: [],
-  prompts: [],
-});
+const emptyRecorder = (): Recorder => {
+  const recorded = recordModelSwitches();
+  return {
+    created: [],
+    switches: recorded.switches,
+    recordSwitch: recorded.switchModel,
+    gated: [],
+    registrations: [],
+    unregistrations: [],
+    prompts: [],
+  };
+};
 
 /**
  * A harness that records what it is handed and succeeds at everything.
@@ -161,6 +181,9 @@ const fakeHarness = (
      * because the directory is the half of the decision that is about authority.
      */
     readonly continuation?: SessionContinuation | undefined;
+    /** What a model switch answers once recorded. Accepted unless a test says otherwise. */
+    readonly switchAnswer?:
+      Effect.Effect<void, HarnessTransportError> | undefined;
   },
 ): AgentHarness["Service"] =>
   stubHarness({
@@ -185,9 +208,15 @@ const fakeHarness = (
           directory: input.directory,
           multiTurn: input.multiTurn === true,
           resumed: input.resume,
+          model: input.model,
+          options: input.options,
         });
         return { id };
       }),
+    switchModel: (sessionId, model, modelOptions) =>
+      recorder
+        .recordSwitch(sessionId, model, modelOptions)
+        .pipe(Effect.andThen(options?.switchAnswer ?? Effect.void)),
     registerMcpServer: (_sessionId, name, config: McpRegistration) =>
       Effect.sync(() => {
         recorder.registrations.push({
@@ -261,6 +290,8 @@ const world = (options?: {
   readonly openPromptGate?: Deferred.Deferred<void> | undefined;
   readonly openPromptEntered?: Deferred.Deferred<void> | undefined;
   readonly continuation?: SessionContinuation | undefined;
+  readonly switchAnswer?:
+    Effect.Effect<void, HarnessTransportError> | undefined;
 }) => {
   const scratch = newScratch();
   const root = join(scratch, "fleet");
@@ -288,6 +319,8 @@ const world = (options?: {
   const make = (over?: {
     readonly messages?: readonly { type: string; text: string }[];
     readonly continuation?: SessionContinuation | undefined;
+    readonly switchAnswer?:
+      Effect.Effect<void, HarnessTransportError> | undefined;
   }) => {
     const recorder = emptyRecorder();
     const settings = { ...options, ...over };
@@ -1652,5 +1685,225 @@ describe("when a conversation may not be had", () => {
 
     expect(await Effect.runPromise(credentials.size)).toBe(0);
     expect(first.recorder.unregistrations).toHaveLength(1);
+  });
+});
+
+/**
+ * Switching a goal conversation's model within its pinned harness (A6 F4).
+ *
+ * The importer's suite covers the spine's one-at-a-time claim and the repeat; these are what
+ * is the goal's own: its row is `goal_sessions`, its live entry carries the provenance a
+ * `GoalTurnAccepted` reports, and its open — resumed or fresh — reads the row's model.
+ */
+describe("switching a goal conversation's model", () => {
+  const switching = (
+    runtime: ChatRuntime,
+    model: string,
+    modelOptions?: readonly ModelOptionSelection[],
+  ) =>
+    runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(GoalConversations, (conversations) =>
+          conversations.switchModel({
+            targetId: TARGET,
+            goalId: GOAL,
+            model,
+            ...(modelOptions === undefined ? {} : { modelOptions }),
+          }),
+        ),
+      ),
+    );
+
+  const rowOf = (runtime: ChatRuntime) =>
+    runtime.runPromise(
+      Effect.flatMap(TargetStores, (stores) =>
+        withTargetStore(stores, TARGET, (store) => store.goalSession(GOAL)),
+      ).pipe(Effect.orDie),
+    );
+
+  test("a goal nobody has talked to has no harness to switch within", async () => {
+    const { first, ready } = world();
+    await ready;
+    const refused = await switching(first.runtime, "scripted/other");
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure.reason).toBe("no_session");
+    }
+    expect(first.recorder.switches).toEqual([]);
+    await first.runtime.dispose();
+  });
+
+  test("a live conversation is switched at once; the row, the registry and the provenance follow", async () => {
+    const { first, ready } = world();
+    await ready;
+    const opened = await sending(first.runtime, "hello");
+    expect(first.recorder.created[0]?.model).toBe("scripted/model");
+
+    const switched = await switching(first.runtime, "scripted/model", [
+      { id: "effort", value: "high" },
+      { id: "thinking", value: "on" },
+    ]);
+    expect(switched._tag).toBe("Success");
+    if (switched._tag !== "Success") return;
+    expect(switched.success).toMatchObject({
+      conversationId: GOAL,
+      applied: "live",
+      changed: true,
+      modelOptions: [{ id: "effort", value: "high" }],
+      droppedModelOptionIds: ["thinking"],
+    });
+
+    const other = await switching(first.runtime, "scripted/other");
+    expect(other._tag).toBe("Success");
+    expect(first.recorder.switches).toEqual([
+      {
+        sessionId: opened.harnessSessionId,
+        model: "scripted/model",
+        options: [{ id: "effort", value: "high" }],
+      },
+      {
+        sessionId: opened.harnessSessionId,
+        model: "scripted/other",
+        options: undefined,
+      },
+    ]);
+    const row = await rowOf(first.runtime);
+    expect(row).toMatchObject({
+      harnessSessionId: opened.harnessSessionId,
+      model: "scripted/other",
+      modelOptions: null,
+    });
+    const live = await first.runtime.runPromise(
+      Effect.map(GoalConversations, (conversations) =>
+        conversations.live(GOAL),
+      ),
+    );
+    expect(live?.model).toBe("scripted/other");
+    // The next turn reports the model the session is on now.
+    const next = await sending(first.runtime, "and now?");
+    expect(next.conversation).toBe("continued");
+    expect(next.modelId).toBe("other");
+    await first.runtime.dispose();
+  });
+
+  test("a model outside the pinned harness's catalogue is refused and nothing is asked", async () => {
+    const { first, ready } = world();
+    await ready;
+    await sending(first.runtime, "hello");
+    const refused = await switching(first.runtime, "openai/gpt-5.6-sol");
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure.reason).toBe("model_unavailable");
+    }
+    expect(first.recorder.switches).toEqual([]);
+    expect((await rowOf(first.runtime))?.model).toBe("scripted/model");
+    await first.runtime.dispose();
+  });
+
+  test("an uncertain answer leaves the row and the registry as they were", async () => {
+    const { first, ready } = world({
+      switchAnswer: Effect.fail(
+        new HarnessTransportError({
+          operation: "session.switchModel",
+          status: 503,
+          tag: undefined,
+          detail: "the harness went away mid-request",
+          cause: undefined,
+        }),
+      ),
+    });
+    await ready;
+    await sending(first.runtime, "hello");
+    const refused = await switching(first.runtime, "scripted/other");
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure.reason).toBe("harness_unreachable");
+      expect(refused.failure.detail).toContain(
+        "the harness went away mid-request",
+      );
+    }
+    expect((await rowOf(first.runtime))?.model).toBe("scripted/model");
+    const live = await first.runtime.runPromise(
+      Effect.map(GoalConversations, (conversations) =>
+        conversations.live(GOAL),
+      ),
+    );
+    expect(live?.model).toBe("scripted/model");
+    await first.runtime.dispose();
+  });
+
+  test("a session the harness no longer runs has only its row switched", async () => {
+    const { first, ready } = world({
+      switchAnswer: Effect.fail(
+        new HarnessTransportError({
+          operation: "session.switchModel",
+          status: 404,
+          tag: SESSION_NOT_FOUND_TAG,
+          detail: "that session's query has closed",
+          cause: undefined,
+        }),
+      ),
+    });
+    await ready;
+    await sending(first.runtime, "hello");
+    const switched = await switching(first.runtime, "scripted/other");
+    expect(switched._tag).toBe("Success");
+    if (switched._tag === "Success") {
+      expect(switched.success.applied).toBe("recorded");
+    }
+    expect((await rowOf(first.runtime))?.model).toBe("scripted/other");
+    await first.runtime.dispose();
+  });
+
+  test("after a restart, the switch is recorded and the resumed conversation opens on it", async () => {
+    const { first, make, ready, root } = world();
+    await ready;
+    const before = await sending(first.runtime, "hello");
+    await first.runtime.dispose();
+
+    const held = {
+      continuation: {
+        _tag: "resumable",
+        directory: join(root, "targets", TARGET, "goal", GOAL),
+        detail: "the transcript is still on disk",
+      },
+    } as const;
+    // Not the harness's default, so an open that ignored the row would show.
+    const second = make(held);
+    const switched = await switching(second.runtime, "scripted/other");
+    expect(switched._tag).toBe("Success");
+    if (switched._tag !== "Success") return;
+    // Not held in this process, so the harness is not asked; the row is what changes.
+    expect(switched.success.applied).toBe("recorded");
+    expect(second.recorder.switches).toEqual([]);
+
+    const after = await sending(second.runtime, "are you still there?");
+    expect(after.conversation).toBe("resumed");
+    expect(after.modelId).toBe("other");
+    expect(second.recorder.created[0]).toMatchObject({
+      resumed: before.harnessSessionId,
+      model: "scripted/other",
+      options: undefined,
+    });
+    await second.runtime.dispose();
+
+    // And the options, the same way: switched while nothing is held, opened on by a resume.
+    const third = make(held);
+    const back = await switching(third.runtime, "scripted/model", [
+      { id: "effort", value: "low" },
+    ]);
+    expect(back._tag).toBe("Success");
+    await sending(third.runtime, "one more");
+    expect(third.recorder.created[0]).toMatchObject({
+      resumed: before.harnessSessionId,
+      model: "scripted/model",
+      options: [{ id: "effort", value: "low" }],
+    });
+    // The open re-records the row with what it opened on, options included.
+    expect(await rowOf(third.runtime)).toMatchObject({
+      model: "scripted/model",
+      modelOptions: [{ id: "effort", value: "low" }],
+    });
+    await third.runtime.dispose();
   });
 });

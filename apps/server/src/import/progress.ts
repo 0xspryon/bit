@@ -128,7 +128,8 @@ interface Entry {
   /** How many of the links the operator gave are not in {@link urls}. Usually 0. */
   readonly droppedLinks: number;
   readonly harnessInstanceId: string;
-  readonly model: string;
+  /** The session's current model: a switch (A6 F4) changes it. See `switchModel`. */
+  model: string;
   readonly startedAt: number;
   status: ScopeImportStatus;
   detail: string | null;
@@ -296,6 +297,15 @@ export class ScopeImportProgress extends Context.Service<
      * nothing.
      */
     readonly resume: (importId: string) => Effect.Effect<boolean>;
+    /**
+     * Records that the import's session is on another model of its harness now (A6 F4), so
+     * the panel names the model the session is running rather than the one it opened on.
+     * Nothing for an import this process does not know.
+     */
+    readonly switchModel: (
+      importId: string,
+      model: string,
+    ) => Effect.Effect<void>;
   }
 >()("bit/import/ScopeImportProgress") {
   static readonly layer = Layer.sync(ScopeImportProgress, () => {
@@ -414,6 +424,12 @@ export class ScopeImportProgress extends Context.Service<
           entry.finishedAt = null;
           return true;
         }),
+
+      switchModel: (importId, model) =>
+        Effect.sync(() => {
+          const entry = entries.get(importId);
+          if (entry !== undefined) entry.model = model;
+        }),
     });
   });
 
@@ -439,6 +455,7 @@ export class ScopeImportProgress extends Context.Service<
         stopped: () => Effect.succeed(false),
         addLinks: () => Effect.succeed(undefined),
         resume: () => Effect.succeed(false),
+        switchModel: () => Effect.void,
       }),
   );
 }

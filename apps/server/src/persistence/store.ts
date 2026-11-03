@@ -6449,10 +6449,11 @@ const makeStore = Effect.fnUntraced(function* () {
       harness_session_id: Schema.String,
       harness_instance_id: Schema.NullOr(Schema.String),
       model: Schema.NullOr(Schema.String),
+      model_options: Schema.NullOr(jsonModelOptions),
       opened_at: Schema.Finite,
     }),
     execute: (goalId) =>
-      sql`SELECT harness_session_id, harness_instance_id, model, opened_at
+      sql`SELECT harness_session_id, harness_instance_id, model, model_options, opened_at
           FROM goal_sessions WHERE goal_id = ${goalId}`,
   });
 
@@ -6482,6 +6483,7 @@ const makeStore = Effect.fnUntraced(function* () {
         harnessSessionId: value.harness_session_id,
         harnessInstanceId: value.harness_instance_id,
         model: value.model,
+        modelOptions: value.model_options,
         openedAt: value.opened_at,
       }),
     });
@@ -6504,23 +6506,58 @@ const makeStore = Effect.fnUntraced(function* () {
       readonly harnessSessionId: string;
       readonly harnessInstanceId: string | null;
       readonly model: string;
+      readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
     }) {
       const now = yield* Clock.currentTimeMillis;
+      // `0015`'s encoding, so this column and `import_sessions.model_options` compare byte
+      // for byte.
+      const modelOptions = canonicalModelOptions(input.modelOptions ?? null);
       yield* sql`INSERT INTO goal_sessions (
-            goal_id, target_id, harness_session_id, harness_instance_id, model, opened_at
+            goal_id, target_id, harness_session_id, harness_instance_id, model,
+            model_options, opened_at
           ) VALUES (
             ${input.goalId}, ${input.targetId}, ${input.harnessSessionId},
-            ${input.harnessInstanceId}, ${input.model}, ${now}
+            ${input.harnessInstanceId}, ${input.model},
+            ${modelOptions === null ? null : JSON.stringify(modelOptions)}, ${now}
           )
           ON CONFLICT(goal_id) DO UPDATE SET
             harness_session_id = excluded.harness_session_id,
             harness_instance_id = excluded.harness_instance_id,
             model = excluded.model,
+            model_options = excluded.model_options,
             opened_at = excluded.opened_at`.pipe(
         Effect.mapError(asDatabaseError("query")),
       );
     },
   );
+
+  /**
+   * Records that a goal's conversation was switched to another model of its harness (A6
+   * F4), answering whether the row named that session.
+   *
+   * Only the model and its options: the harness instance is pinned to the conversation and
+   * the session is the one the switch was made on. **Guarded by the session id**, so a
+   * switch that was decided against one session cannot rewrite the row of another that an
+   * open recorded since — `false` says nothing was written. One statement, so one implicit
+   * transaction; the harness has already been asked by the time this runs, never inside it.
+   */
+  const recordGoalSessionModel = Effect.fn(
+    "ObservationStore.recordGoalSessionModel",
+  )(function* (input: {
+    readonly goalId: string;
+    readonly harnessSessionId: string;
+    readonly model: string;
+    readonly modelOptions: readonly ModelOptionSelection[] | undefined;
+  }) {
+    const modelOptions = canonicalModelOptions(input.modelOptions ?? null);
+    const rows = yield* sql<{ readonly goal_id: string }>`UPDATE goal_sessions
+          SET model = ${input.model},
+              model_options = ${modelOptions === null ? null : JSON.stringify(modelOptions)}
+          WHERE goal_id = ${input.goalId}
+            AND harness_session_id = ${input.harnessSessionId}
+          RETURNING goal_id`.pipe(Effect.mapError(asDatabaseError("query")));
+    return rows.length > 0;
+  });
 
   /* ── Two more kinds of session, listed for "Agent sessions" (S8) ───────────── */
 
@@ -6885,6 +6922,33 @@ const makeStore = Effect.fnUntraced(function* () {
       );
     },
   );
+
+  /**
+   * Records that an import run's session was switched to another model of its harness (A6
+   * F4), answering whether the row exists.
+   *
+   * `import_sessions.model` and `model_options` hold the session's **current** model only,
+   * which is what a reopen opens its successor on; no history of switches is kept (see the
+   * compromise noted at the reopen in `import/scopeImporter.ts`). One statement, so one
+   * implicit transaction, written after the harness answered and never around it.
+   */
+  const recordImportSessionModel = Effect.fn(
+    "ObservationStore.recordImportSessionModel",
+  )(function* (input: {
+    readonly importId: string;
+    readonly model: string;
+    readonly modelOptions: readonly ModelOptionSelection[] | undefined;
+  }) {
+    const modelOptions = canonicalModelOptions(input.modelOptions ?? null);
+    const rows = yield* sql<{
+      readonly import_id: string;
+    }>`UPDATE import_sessions
+          SET model = ${input.model},
+              model_options = ${modelOptions === null ? null : JSON.stringify(modelOptions)}
+          WHERE import_id = ${input.importId}
+          RETURNING import_id`.pipe(Effect.mapError(asDatabaseError("query")));
+    return rows.length > 0;
+  });
 
   /**
    * Records that the harness created the session an import run's row names.
@@ -8597,11 +8661,13 @@ const makeStore = Effect.fnUntraced(function* () {
     steerReceipt,
     goalSession,
     recordGoalSession,
+    recordGoalSessionModel,
     goalSessionsForTarget,
     workerSessionsForTarget,
     importSessions,
     recordImportSession,
     recordImportPages,
+    recordImportSessionModel,
     confirmImportSession,
     endImportSession,
     importSessionEnd,
@@ -9242,6 +9308,8 @@ export class ObservationStore extends Context.Service<
           readonly harnessInstanceId: string | null;
           /** `null` on a row written before `0030`; never a guess. */
           readonly model: string | null;
+          /** What the model is set to (`0003`); `null` for nothing chosen. */
+          readonly modelOptions: readonly ModelOptionSelection[] | null;
           readonly openedAt: number;
         }
       | undefined,
@@ -9255,7 +9323,19 @@ export class ObservationStore extends Context.Service<
       readonly harnessInstanceId: string | null;
       /** `provider/model`, as the live registry reports it. */
       readonly model: string;
+      /** The resolved selections the session is opened with. See `0003`. */
+      readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
     }) => Effect.Effect<void, DatabaseError>;
+    /**
+     * Records a goal conversation's switch to another model of its harness (A6 F4), for the
+     * session the switch was made on. `false` when the row names no such session.
+     */
+    readonly recordGoalSessionModel: (input: {
+      readonly goalId: string;
+      readonly harnessSessionId: string;
+      readonly model: string;
+      readonly modelOptions: readonly ModelOptionSelection[] | undefined;
+    }) => Effect.Effect<boolean, DatabaseError>;
     /**
      * The goal conversations a target has opened, newest first (S8). Records of opening, not
      * of liveness. `model` is what the conversation ran on, or `null` for a row written before
@@ -9413,6 +9493,15 @@ export class ObservationStore extends Context.Service<
       importId: string,
       pages: readonly string[],
     ) => Effect.Effect<void, DatabaseError>;
+    /**
+     * Records an import session's switch to another model of its harness (A6 F4). `false`
+     * when this file holds no such import.
+     */
+    readonly recordImportSessionModel: (input: {
+      readonly importId: string;
+      readonly model: string;
+      readonly modelOptions: readonly ModelOptionSelection[] | undefined;
+    }) => Effect.Effect<boolean, DatabaseError>;
     /**
      * Ends the caller's own goal, recorded as `endedBy: "goal_agent"`.
      *

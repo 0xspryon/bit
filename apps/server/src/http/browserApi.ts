@@ -1522,6 +1522,26 @@ const fleetHandlers = HttpApiBuilder.group(
        * is an import whose session was never created, which is a different fact from a
        * conversation whose words are gone.
        */
+      /**
+       * Moves one import's session onto another model of its harness (A6 F4).
+       *
+       * The target is checked here and everything else in the importer, which reads the
+       * import's row from this target's own file: an id of another target is a `404`, and a
+       * model outside the row's harness instance's catalogue is refused before the harness
+       * is asked anything.
+       */
+      switchImporterModel: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.switchModel({
+          targetId: row.targetId,
+          importId: params.importId,
+          model: payload.model,
+          ...(payload.modelOptions === undefined
+            ? {}
+            : { modelOptions: payload.modelOptions }),
+        });
+      }),
+
       importerMessages: Effect.fn(function* ({ params }) {
         const row = yield* openableTarget(fleet, params.targetId);
         /*
@@ -2474,6 +2494,26 @@ const fleetHandlers = HttpApiBuilder.group(
           targetId: row.targetId,
           goalId: params.goalId,
           text: payload.text,
+        });
+      }),
+
+      /**
+       * Moves one goal's conversation onto another model of its harness (A6 F4).
+       *
+       * A goal this target does not hold is a `404` before anything is read; the rest —
+       * the pinned harness, the catalogue, the live session, the row — is
+       * {@link GoalConversations.switchModel}'s.
+       */
+      switchGoalModel: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        yield* ownedGoal(stores, row.targetId, params.goalId);
+        return yield* conversations.switchModel({
+          targetId: row.targetId,
+          goalId: params.goalId,
+          model: payload.model,
+          ...(payload.modelOptions === undefined
+            ? {}
+            : { modelOptions: payload.modelOptions }),
         });
       }),
 

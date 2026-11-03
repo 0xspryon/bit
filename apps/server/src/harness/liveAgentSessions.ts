@@ -27,6 +27,9 @@
  *    the id-wide revoke, `afterClose` — is touched only while the id is still this entry's.
  * 5. **The layer finalizer**, closing every session still open, which is what makes "no
  *    longer than the process" true.
+ * 6. **{@link LiveAgentSessions.switchModel}**: one model switch at a time per id, under the
+ *    opening permit, and the registry's copy of the model kept in step with the harness.
+ *    The row is the surface's; the order — harness, then registry, then row — is here.
  *
  * ## What it does not own
  *
@@ -61,6 +64,7 @@ import { Effect, Exit, Fiber, Redacted, Scope, Semaphore } from "effect";
 
 import {
   OPEN_PROMPT,
+  SESSION_NOT_FOUND_TAG,
   type AgentHarness,
   type HarnessFailure,
 } from "./agentHarness";
@@ -254,6 +258,79 @@ export interface OpenPlan<Meta> {
   readonly meta: Meta;
 }
 
+/**
+ * What a surface has decided a model switch is, once it has read its row and checked the
+ * request. Built inside {@link LiveAgentSessions.switchModel}'s claim and permit, so nothing
+ * it read can change under it.
+ */
+export interface ModelSwitchPlan<Meta, E, R> {
+  /**
+   * The conversation's pinned harness instance, which the model was checked against. A
+   * live entry on any other instance is not switched: see {@link ModelSwitchStale}.
+   */
+  readonly instanceId: string;
+  /** A name in that instance's catalogue: a malformed id throws in OpenCode's decoder. */
+  readonly model: string;
+  /** Already resolved against {@link model}'s descriptors; absent for nothing chosen. */
+  readonly options: readonly ModelOptionSelection[] | undefined;
+  /** The entry's meta once it is on {@link model}: the goal path's provenance, say. */
+  readonly meta: (meta: Meta) => Meta;
+  /**
+   * The row write. **A plain write and nothing else**: it runs after the harness has
+   * answered, never around it, so no transaction is held across a harness call. A surface
+   * whose row already says this passes a no-op.
+   */
+  readonly record: (
+    entry: LiveAgentSession<Meta> | undefined,
+  ) => Effect.Effect<void, E, R>;
+}
+
+/** A second switch of one id while the first has not answered. Refused, never queued. */
+export interface ModelSwitchInFlight {
+  readonly _tag: "ModelSwitchInFlight";
+}
+
+/**
+ * The harness was asked and did not clearly answer, so the session's model is uncertain.
+ * The row is left as it was; asking again settles it, because a switch is idempotent.
+ */
+export interface ModelSwitchUncertain {
+  readonly _tag: "ModelSwitchUncertain";
+  readonly failure: HarnessFailure;
+}
+
+/**
+ * The live entry is on another harness instance than the one the plan checked the model
+ * against. Unreachable while a surface reads its row inside the permit — the row and the
+ * entry are written by the same open — and refused rather than sent, because a model from
+ * one catalogue is not a valid id on another.
+ */
+export interface ModelSwitchStale {
+  readonly _tag: "ModelSwitchStale";
+  readonly liveInstanceId: string;
+}
+
+export type ModelSwitchFailure =
+  ModelSwitchInFlight | ModelSwitchUncertain | ModelSwitchStale;
+
+/**
+ * Where a switch took effect: `live`, the harness took it; `recorded`, there was no live
+ * session to tell — this process holds none, or the harness no longer has it — so only the
+ * row changed, and the next resume opens on it.
+ */
+export type ModelSwitchApplied = "live" | "recorded";
+
+/**
+ * Whether a harness's refusal of a switch means "that session is not running here".
+ *
+ * Claude Code says so with {@link SESSION_NOT_FOUND_TAG} (and 404) for a query that is gone
+ * or going; OpenCode's `session.switchModel` 404 carries no tag, so the status is the test,
+ * as every other not-found reader on the seam already does.
+ */
+const switchFoundNoSession = (failure: HarnessFailure): boolean =>
+  failure._tag === "HarnessTransportError" &&
+  (failure.tag === SESSION_NOT_FOUND_TAG || failure.status === 404);
+
 export interface LiveAgentSessions<Meta> {
   /** The entry for one id, preambled or not. For reads that only need the session id. */
   readonly get: (id: string) => LiveAgentSession<Meta> | undefined;
@@ -329,6 +406,41 @@ export interface LiveAgentSessions<Meta> {
     id: string,
     reason: LiveSessionCloseReason,
   ) => Effect.Effect<void>;
+  /**
+   * Moves one id's session onto another model of its harness, and keeps the registry's copy
+   * of the model in step (A6 F4).
+   *
+   * **One switch at a time per id, refused rather than queued.** A second switch while one
+   * is in flight fails with {@link ModelSwitchInFlight} at once. Two concurrent OpenCode
+   * switches are two HTTP calls that can reach the server in one order and complete in the
+   * other, so a row written on each completion could disagree with the server; and a
+   * Claude Code switch waits on a control response with no bound of its own beyond the
+   * control timeout, so a queue behind a hung CLI would time out one entry after another.
+   *
+   * **Under the id's opening permit**, so a switch never interleaves with an open: an open
+   * reads the row's model and writes the row, and a switch that landed between the two
+   * would be overwritten by an open that never saw it. A switch that arrives while an open
+   * is in flight waits for it, and then finds the session live. Delivery does not take the
+   * permit, so messages to a live session are not held up by a switch.
+   *
+   * Inside both, in order:
+   *
+   * 1. `prepare` — the surface reads its row and checks the request. It may refuse.
+   * 2. Live entry: the harness's `switchModel`. Accepted — the registry's copy is updated
+   *    (if the map still holds this entry), then the row is written: `live`. A refusal that
+   *    means "no such running session" ({@link switchFoundNoSession}) — the row only:
+   *    `recorded`, and the next resume opens on it. Anything else — the row is not written
+   *    and the failure is {@link ModelSwitchUncertain}.
+   * 3. No live entry: the row only, `recorded`.
+   *
+   * The registry is updated before the row is written because it mirrors the harness, which
+   * has already moved: a row write that then fails leaves the record behind and says so,
+   * and asking again — a no-op on the harness — writes it.
+   */
+  readonly switchModel: <E, R>(input: {
+    readonly id: string;
+    readonly prepare: Effect.Effect<ModelSwitchPlan<Meta, E, R>, E, R>;
+  }) => Effect.Effect<ModelSwitchApplied, E | ModelSwitchFailure, R>;
 }
 
 /**
@@ -722,12 +834,98 @@ export const makeLiveAgentSessions = <Meta>(
         }
       });
 
+    /**
+     * The ids with a model switch in flight. A set rather than a permit, because the second
+     * switch is refused rather than made to wait; added and checked with no suspension in
+     * between, so two switches cannot both see it free.
+     */
+    const switching = new Set<string>();
+
+    const switchModel: LiveAgentSessions<Meta>["switchModel"] = <E, R>(input: {
+      readonly id: string;
+      readonly prepare: Effect.Effect<ModelSwitchPlan<Meta, E, R>, E, R>;
+    }): Effect.Effect<ModelSwitchApplied, E | ModelSwitchFailure, R> =>
+      Effect.suspend(() => {
+        if (switching.has(input.id)) {
+          return Effect.fail<ModelSwitchFailure>({
+            _tag: "ModelSwitchInFlight",
+          });
+        }
+        switching.add(input.id);
+        return Semaphore.withPermit(openingLock(input.id))(
+          Effect.gen(function* () {
+            const plan = yield* input.prepare;
+            // Inside the permit an entry is preambled or gone (this module's header), so
+            // `get` and `ready` agree here.
+            const entry = live.get(input.id);
+            if (entry === undefined) {
+              yield* plan.record(undefined);
+              return "recorded" as const;
+            }
+            if (entry.instanceId !== plan.instanceId) {
+              return yield* Effect.fail<ModelSwitchFailure>({
+                _tag: "ModelSwitchStale",
+                liveInstanceId: entry.instanceId,
+              });
+            }
+            return yield* Effect.uninterruptible(
+              switchLive(input.id, entry, plan),
+            );
+          }),
+        ).pipe(Effect.ensuring(Effect.sync(() => switching.delete(input.id))));
+      });
+
+    /*
+     * The harness call and the row write, **uninterruptible together**: a caller that goes
+     * away (an HTTP client that disconnected) must not leave a harness that has moved and a
+     * row that was never told. Both ends are bounded — the harness call by its control
+     * timeout, the write by SQLite — so this cannot hang a fiber that is being interrupted.
+     */
+    const switchLive = <E, R>(
+      id: string,
+      entry: LiveAgentSession<Meta>,
+      plan: ModelSwitchPlan<Meta, E, R>,
+    ): Effect.Effect<ModelSwitchApplied, E | ModelSwitchFailure, R> =>
+      Effect.gen(function* () {
+        const switched = yield* Effect.result(
+          entry.harness.switchModel(entry.sessionId, plan.model, plan.options),
+        );
+        if (switched._tag === "Failure") {
+          if (!switchFoundNoSession(switched.failure)) {
+            return yield* Effect.fail<ModelSwitchFailure>({
+              _tag: "ModelSwitchUncertain",
+              failure: switched.failure,
+            });
+          }
+          // Not running in the harness: the entry is a handle on a session that is
+          // gone or going, and the next message closes it as `refused` and reopens
+          // from the row. So the row is what changes, and the entry keeps the model
+          // its dead session was on.
+          yield* plan.record(undefined);
+          return "recorded" as const;
+        }
+        // Only the entry the map still holds, compared by scope as `closeSession` does:
+        // a session closed and reopened under the same id while this waited is not the
+        // one that was switched.
+        const current = live.get(id);
+        if (current !== undefined && current.scope === entry.scope) {
+          live.set(id, {
+            ...current,
+            model: plan.model,
+            meta: plan.meta(current.meta),
+          });
+        }
+        yield* plan.record(entry);
+        return "live" as const;
+      });
+
     return {
       get: (id) => live.get(id),
       ready,
       open,
       closeSession,
       deliver,
+      switchModel,
       close: (id, reason) => {
         const entry = live.get(id);
         return entry === undefined ? Effect.void : closeSession(entry, reason);

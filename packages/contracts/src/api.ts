@@ -39,6 +39,11 @@ import {
 } from "effect/http-api";
 
 import { AgentsView } from "./agents";
+import {
+  ConversationModelDraft,
+  ConversationModelRefused,
+  ConversationModelSwitched,
+} from "./conversationModel";
 import { AssetView } from "./asset";
 import { ScopeEntryDraft, ScopeLabelDraft, ScopeView } from "./scope";
 import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
@@ -1577,6 +1582,33 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       },
     ),
     /**
+     * Moves one import's session onto another model of its harness, or other options of
+     * its model (A6 F4).
+     *
+     * The harness is the import's own, read from its row: a model that instance's catalogue
+     * does not list is refused, so a model of another harness always is. A live session is
+     * switched at once and takes it from its next model call; one this server does not hold
+     * has only its record changed, and the next message reopens it on the new model. The
+     * record changes only after the harness accepted — an uncertain answer leaves it as it
+     * was. One switch at a time per import; a second while one is in flight is refused, not
+     * queued. An id this target does not hold is a `404`.
+     */
+    HttpApiEndpoint.post(
+      "switchImporterModel",
+      "/targets/:targetId/importer-sessions/:importId/model",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        payload: ConversationModelDraft,
+        success: ConversationModelSwitched,
+        error: [
+          ConversationModelRefused,
+          ScopeImportNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
      * Which model an import would run on right now (D15).
      *
      * **A request rather than a constant in the browser bundle**, and `modelOption.ts`'s
@@ -2074,6 +2106,31 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         success: GoalTurnAccepted.pipe(HttpApiSchema.status(202)),
         error: [
           GoalConversationRefused,
+          GoalNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
+     * Moves one goal's conversation onto another model of its harness, or other options of
+     * its model (A6 F4).
+     *
+     * `switchImporterModel` for a goal, with the same rules: the harness is the one the
+     * conversation's row records and is never changed here, a model outside its catalogue
+     * is refused, a live session is switched at once, and one this server does not hold has
+     * its record changed for the next message to reopen on. A goal nobody has talked to has
+     * no harness yet and is refused as `no_session`.
+     */
+    HttpApiEndpoint.post(
+      "switchGoalModel",
+      "/targets/:targetId/goals/:goalId/conversation/model",
+      {
+        params: { targetId: Schema.String, goalId: Schema.String },
+        payload: ConversationModelDraft,
+        success: ConversationModelSwitched,
+        error: [
+          ConversationModelRefused,
           GoalNotFound,
           TargetNotFound,
           TargetUnavailable,

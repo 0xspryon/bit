@@ -494,6 +494,77 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
     expect(outcome.missing).toBeUndefined();
   });
 
+  test("a model switch rewrites the model and its options in place, and only on that row (A6 F4)", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const base = {
+          targetId: TARGET,
+          harnessInstanceId: "claude",
+          model: "anthropic/claude-sonnet-5",
+          agentId: "importer",
+          modelOptions: [{ id: "effort", value: "low" }],
+        };
+        yield* store.recordImportSession({
+          ...base,
+          importId: "imp_switch",
+          harnessSessionId: "ses_switch",
+        });
+        yield* store.recordImportSession({
+          ...base,
+          importId: "imp_beside",
+          harnessSessionId: "ses_beside",
+        });
+        const switched = yield* store.recordImportSessionModel({
+          importId: "imp_switch",
+          model: "anthropic/claude-opus-5-5",
+          // Out of order on purpose: the same canonical encoding as the insert.
+          modelOptions: [
+            { id: "thinking", value: "on" },
+            { id: "effort", value: "high" },
+          ],
+        });
+        const afterSwitch = yield* store.importSession("imp_switch");
+        // Nothing chosen for the new model is `null`, never `[]`.
+        const cleared = yield* store.recordImportSessionModel({
+          importId: "imp_switch",
+          model: "anthropic/claude-haiku-4-5",
+          modelOptions: undefined,
+        });
+        const missing = yield* store.recordImportSessionModel({
+          importId: "imp_not_there",
+          model: "anthropic/claude-opus-5-5",
+          modelOptions: undefined,
+        });
+        return {
+          switched,
+          afterSwitch,
+          cleared,
+          afterClear: yield* store.importSession("imp_switch"),
+          beside: yield* store.importSession("imp_beside"),
+          missing,
+        };
+      }),
+    );
+    expect(outcome.switched).toBe(true);
+    expect(outcome.afterSwitch?.model).toBe("anthropic/claude-opus-5-5");
+    expect(outcome.afterSwitch?.modelOptions).toEqual([
+      { id: "effort", value: "high" },
+      { id: "thinking", value: "on" },
+    ]);
+    expect(outcome.cleared).toBe(true);
+    expect(outcome.afterClear?.model).toBe("anthropic/claude-haiku-4-5");
+    expect(outcome.afterClear?.modelOptions).toBeNull();
+    // The harness instance and the session are pinned; a switch never touches them.
+    expect(outcome.afterClear?.harnessInstanceId).toBe("claude");
+    expect(outcome.afterClear?.harnessSessionId).toBe("ses_switch");
+    expect(outcome.beside?.model).toBe("anthropic/claude-sonnet-5");
+    expect(outcome.beside?.modelOptions).toEqual([
+      { id: "effort", value: "low" },
+    ]);
+    expect(outcome.missing).toBe(false);
+  });
+
   test("the row says whether its session was ever created, which is what a replay needs (S6)", async () => {
     const path = newDatabasePath();
     const outcome = await withStore(path, (store) =>

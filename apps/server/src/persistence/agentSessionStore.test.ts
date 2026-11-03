@@ -128,6 +128,94 @@ describe("the goal sessions of a target", () => {
     expect(rows.one?.model).toBe("anthropic/claude-opus-5-5");
   });
 
+  test("records what the model is set to beside it, and a model switch rewrites both for that session only (0003, A6 F4)", async () => {
+    const outcome = await withStore((store) =>
+      Effect.gen(function* () {
+        yield* store.seedAttempt(seed("a"));
+        yield* store.recordGoalSession({
+          goalId: "goal-a",
+          targetId: "target-1",
+          harnessSessionId: "gses-1",
+          harnessInstanceId: "claude-code",
+          model: "anthropic/claude-sonnet-5",
+          // Out of order on purpose: the row holds the sorted encoding.
+          modelOptions: [
+            { id: "thinking", value: "on" },
+            { id: "effort", value: "low" },
+          ],
+        });
+        const opened = yield* store.goalSession("goal-a");
+        const switched = yield* store.recordGoalSessionModel({
+          goalId: "goal-a",
+          harnessSessionId: "gses-1",
+          model: "anthropic/claude-opus-5-5",
+          modelOptions: [{ id: "effort", value: "high" }],
+        });
+        const afterSwitch = yield* store.goalSession("goal-a");
+        // Decided against a session the row no longer names: nothing is written.
+        const stale = yield* store.recordGoalSessionModel({
+          goalId: "goal-a",
+          harnessSessionId: "gses-0",
+          model: "anthropic/claude-haiku-4-5",
+          modelOptions: undefined,
+        });
+        const cleared = yield* store.recordGoalSessionModel({
+          goalId: "goal-a",
+          harnessSessionId: "gses-1",
+          model: "anthropic/claude-haiku-4-5",
+          modelOptions: undefined,
+        });
+        const afterClear = yield* store.goalSession("goal-a");
+        // A later open on the same goal replaces the options with its own, none included.
+        yield* store.recordGoalSession({
+          goalId: "goal-a",
+          targetId: "target-1",
+          harnessSessionId: "gses-2",
+          harnessInstanceId: "claude-code",
+          model: "anthropic/claude-sonnet-5",
+          modelOptions: [{ id: "effort", value: "low" }],
+        });
+        yield* store.recordGoalSession({
+          goalId: "goal-a",
+          targetId: "target-1",
+          harnessSessionId: "gses-3",
+          harnessInstanceId: "claude-code",
+          model: "anthropic/claude-sonnet-5",
+        });
+        return {
+          opened,
+          switched,
+          afterSwitch,
+          stale,
+          cleared,
+          afterClear,
+          reopened: yield* store.goalSession("goal-a"),
+          list: yield* store.goalSessionsForTarget("target-1"),
+        };
+      }),
+    );
+    expect(outcome.opened?.modelOptions).toEqual([
+      { id: "effort", value: "low" },
+      { id: "thinking", value: "on" },
+    ]);
+    expect(outcome.switched).toBe(true);
+    expect(outcome.afterSwitch).toMatchObject({
+      harnessSessionId: "gses-1",
+      harnessInstanceId: "claude-code",
+      model: "anthropic/claude-opus-5-5",
+      modelOptions: [{ id: "effort", value: "high" }],
+    });
+    expect(outcome.stale).toBe(false);
+    expect(outcome.cleared).toBe(true);
+    expect(outcome.afterClear?.model).toBe("anthropic/claude-haiku-4-5");
+    expect(outcome.afterClear?.modelOptions).toBeNull();
+    expect(outcome.reopened?.harnessSessionId).toBe("gses-3");
+    expect(outcome.reopened?.modelOptions).toBeNull();
+    expect(outcome.list.map((row) => row.model)).toEqual([
+      "anthropic/claude-sonnet-5",
+    ]);
+  });
+
   test("a goal nobody has talked to is not a session", async () => {
     const rows = await withStore((store) =>
       Effect.gen(function* () {

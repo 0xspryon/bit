@@ -115,9 +115,12 @@
  * streamed, and rendered as text by a browser that escapes it.
  */
 import {
+  ConversationModelRefused,
   ImporterConversationRefused,
   SCOPE_IMPORT_MAX_LINKS,
   ScopeImportNotFound,
+  type ConversationModelDraft,
+  type ConversationModelSwitched,
   type ImporterConversationView,
   type ImporterTurnAccepted,
   type ImportModelDraft,
@@ -157,6 +160,14 @@ import {
   type LiveSessionOpenFailure,
 } from "../harness/liveAgentSessions";
 import { resolveSessionModelOptions } from "../harness/modelOptions";
+import {
+  checkModelSwitch,
+  type CheckedModelSwitch,
+  modelSwitched,
+  modelSwitchRefusal,
+  recordRefusal,
+  sameModelChoice,
+} from "../harness/modelSwitch";
 import { HarnessResolver } from "../harness/resolver";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
@@ -477,6 +488,28 @@ export class ScopeImporter extends Context.Service<
      * held under the fresh one, which is why the caller asks about each id a session has had.
      */
     readonly holds: (importId: string) => Effect.Effect<boolean>;
+    /**
+     * Moves one import's session onto another model of its harness, or other options of its
+     * model (A6 F4). The harness is the row's and is never changed here.
+     *
+     * Addressed by import id and applied to the import that **is** the conversation now: an
+     * import this process has since reopened under a successor is followed to it, as a
+     * message is, and one still opening is waited for. Then, under the spine's one-at-a-time
+     * claim and opening permit: the row is read, the model checked against the row's harness
+     * instance's catalogue, the options resolved against the new model; a live session is
+     * switched and its registry entry and the panel follow, and the row is written only after
+     * the harness accepted. A session the harness no longer runs, or none held here, has only
+     * its row changed, which is what the next reopen opens on (`send`).
+     */
+    readonly switchModel: (
+      input: {
+        readonly targetId: string;
+        readonly importId: string;
+      } & ConversationModelDraft,
+    ) => Effect.Effect<
+      ConversationModelSwitched,
+      ConversationModelRefused | ScopeImportNotFound
+    >;
   }
 >()("bit/import/ScopeImporter") {
   /**
@@ -1605,7 +1638,8 @@ export class ScopeImporter extends Context.Service<
                     },
                   }
                 : {}),
-              // The same harness and model the earlier session ran on, so the conversation
+              // The same harness the earlier session ran on, and the model it is on now —
+              // the last `switchModel`'s, or the one it opened with — so the conversation
               // does not quietly change models under the operator. A row from before
               // instances were recorded has nothing to pin, and D15's rule applies.
               //
@@ -1675,6 +1709,159 @@ export class ScopeImporter extends Context.Service<
         });
       });
 
+      /**
+       * The import a switch addressed to `importId` lands on: the end of its successor chain
+       * in this process. Bounded, though a chain cannot loop — each successor is a freshly
+       * minted id — because a bound costs nothing and a loop here would hang a request.
+       */
+      const currentImport = (importId: string): string => {
+        let current = importId;
+        for (let hop = 0; hop < 64; hop += 1) {
+          const next = successors.get(current);
+          if (next === undefined) return current;
+          current = next;
+        }
+        return current;
+      };
+
+      const switchModel: ScopeImporter["Service"]["switchModel"] = Effect.fn(
+        "ScopeImporter.switchModel",
+      )(function* (input) {
+        const importId = currentImport(input.importId);
+        /*
+         * Still opening: wait until the open is known (`inFlight`), as a message does. The
+         * opener wrote the row with the model it is opening on and does not read it again,
+         * so a row switched in that window would be a change the session never saw.
+         */
+        const opening = inFlight.get(importId);
+        if (opening !== undefined && opening.targetId === input.targetId) {
+          yield* Deferred.await(opening.known);
+        }
+        const what = `import ${importId}`;
+        // Read inside the claim, for the answer and for the uncertain answer's sentence. A
+        // holder rather than two `let`s, which narrowing would read as never assigned.
+        const decided: {
+          previous: string | null;
+          answer:
+            | {
+                readonly checked: CheckedModelSwitch;
+                readonly changed: boolean;
+              }
+            | undefined;
+        } = { previous: null, answer: undefined };
+        const applied = yield* Effect.result(
+          sessions.switchModel({
+            id: importId,
+            prepare: Effect.gen(function* () {
+              const row = yield* withTargetStore(
+                stores,
+                input.targetId,
+                (store) => store.importSession(importId),
+              ).pipe(
+                Effect.mapError(
+                  (failure) =>
+                    new ConversationModelRefused({
+                      reason: "store_unavailable",
+                      detail: `${what}'s record could not be read (${failure.message}), so nothing was switched.`,
+                    }),
+                ),
+              );
+              if (row === undefined || row.targetId !== input.targetId) {
+                return yield* new ScopeImportNotFound({
+                  reason: "unknown_import",
+                  importId: input.importId,
+                  detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no session to switch`,
+                });
+              }
+              if (row.endedReason === "operator") {
+                return yield* new ConversationModelRefused({
+                  reason: "conversation_ended",
+                  detail: `${what} was ended by the operator, so nothing will run on it again and there is no model to switch. Start a new session to carry on.`,
+                });
+              }
+              if (row.harnessInstanceId === null) {
+                return yield* new ConversationModelRefused({
+                  reason: "no_session",
+                  detail: `${what} was recorded before its harness instance was, so there is no pinned harness to switch within.`,
+                });
+              }
+              decided.previous = row.model;
+              const checked = yield* checkModelSwitch({
+                resolver,
+                instanceId: row.harnessInstanceId,
+                model: input.model,
+                requested: input.modelOptions,
+                what,
+              });
+              const changed = !sameModelChoice(row, checked);
+              decided.answer = { checked, changed };
+              return {
+                instanceId: checked.instanceId,
+                model: checked.model,
+                options: checked.options,
+                // The importer's meta is the agent it runs as, which a switch does not touch.
+                meta: (meta: ImportSessionMeta) => meta,
+                record: (
+                  entry: LiveAgentSession<ImportSessionMeta> | undefined,
+                ) =>
+                  Effect.gen(function* () {
+                    // The panel names the model the session runs, so it follows a live
+                    // switch; with no live session it already shows the one it ran on.
+                    if (entry !== undefined) {
+                      yield* progress.switchModel(importId, checked.model);
+                    }
+                    if (!changed) return;
+                    yield* withTargetStore(stores, input.targetId, (store) =>
+                      store.recordImportSessionModel({
+                        importId,
+                        model: checked.model,
+                        modelOptions: checked.options,
+                      }),
+                    ).pipe(
+                      Effect.mapError((failure) =>
+                        recordRefusal({
+                          what,
+                          model: checked.model,
+                          harnessMoved: entry !== undefined,
+                          detail: failure.message,
+                        }),
+                      ),
+                    );
+                  }),
+              };
+            }),
+          }),
+        );
+        if (applied._tag === "Failure") {
+          const failure = applied.failure;
+          return yield* failure._tag === "ModelSwitchInFlight" ||
+          failure._tag === "ModelSwitchUncertain" ||
+          failure._tag === "ModelSwitchStale"
+            ? Effect.fail(
+                modelSwitchRefusal(failure, {
+                  what,
+                  model: input.model,
+                  previous: decided.previous,
+                }),
+              )
+            : Effect.fail(failure);
+        }
+        const answer = decided.answer;
+        if (answer === undefined) {
+          // Unreachable: a switch that succeeded ran `prepare`.
+          return yield* new ConversationModelRefused({
+            reason: "store_unavailable",
+            detail: `${what}'s switch answered without a plan, so nothing is known to have changed.`,
+          });
+        }
+        return modelSwitched({
+          conversationId: importId,
+          checked: answer.checked,
+          applied: applied.success,
+          changed: answer.changed,
+        });
+      });
+
       return ScopeImporter.of({
         start,
         stop,
@@ -1682,6 +1869,7 @@ export class ScopeImporter extends Context.Service<
         converse,
         send,
         replay,
+        switchModel,
         holds: (importId) =>
           Effect.sync(() => sessions.get(importId) !== undefined),
       });
@@ -1720,6 +1908,14 @@ export class ScopeImporter extends Context.Service<
       holds: () => Effect.succeed(false),
       converse: () => Effect.fail(noHarness),
       send: () => Effect.fail(noHarness),
+      switchModel: () =>
+        Effect.fail(
+          new ConversationModelRefused({
+            reason: "harness_not_ready",
+            detail:
+              "this server is configured with no agent harness, so no importer session's model can be switched.",
+          }),
+        ),
       replay: (input) =>
         importerConversation({
           resolver: undefined,
