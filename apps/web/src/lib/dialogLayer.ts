@@ -27,55 +27,125 @@
  *
  * Each dialog listens for Escape and Tab on the window, because focus can be on the panel
  * itself or anywhere in it. With two up, both hear one key: one Escape closed both, and
- * the lower one's Tab trap pulled focus out of the upper one. So the dialogs that are open
- * are kept in the order they opened, and only the last answers; and an Escape it answered
- * is marked handled, so a dialog that becomes the last one *during* that same key — the
- * upper one closed synchronously, before the lower one's listener ran — still leaves it.
+ * the lower one's Tab trap pulled focus out of the upper one. So only the dialog on top
+ * answers; and an Escape it answered is marked handled, so a dialog that becomes the top
+ * one *during* that same key — the upper one closed synchronously, before the lower one's
+ * listener ran — still leaves it.
+ *
+ * "On top" is the order the layers went into `<body>`, which is what is drawn: they are
+ * kept in a list as `toBody` appends them, so the list and the screen cannot disagree. It
+ * was once the order the dialogs' effects ran in, and those are not the same order. When
+ * a dialog renders inside another in the same update — the picker opening with a refusal
+ * already set — Svelte runs the inner one's effects first, a child's before its parent's,
+ * while the outer one's layer is in `<body>` first. The error was drawn on top and the
+ * picker had the keyboard.
+ *
+ * ## Focus goes in from the bottom up
+ *
+ * The same child-first order sent focus the wrong way: the error's effect focused it, and
+ * the picker's, after, took focus back to the panel behind. So a dialog does not take
+ * focus until every layer under it has: one whose layer is in `<body>` but whose effect
+ * has not run yet holds the ones over it back, and they go in after it, in `<body>` order.
+ * That is the order they would have taken focus in had they opened one after the other —
+ * so the error's opener is in the picker, and closing the error puts focus back there.
  */
 import type { Attachment } from "svelte/attachments";
 import { wrapTab } from "./dialogFocus";
 
-/** Every open dialog's panel, in the order they opened: the last is on top. */
-const open: HTMLElement[] = [];
+/**
+ * A dialog's layer in `<body>`, from the moment it is appended.
+ *
+ * - `mounting`: in `<body>`, its effect not run yet. Every layer over it waits for it.
+ * - `waiting`: its effect has run, and it takes focus with `enter` once nothing under it
+ *   is still mounting.
+ * - `entered`: it has taken focus, and `restore` gives it back.
+ * - `left`: its effect is torn down, and it holds nothing back while its layer goes.
+ */
+interface Layer {
+  readonly element: HTMLElement;
+  status: "mounting" | "waiting" | "entered" | "left";
+  enter: (() => () => void) | null;
+  restore: (() => void) | null;
+}
+
+/** Every dialog's layer, in `<body>` order: the last is on top. */
+const open: Layer[] = [];
+
+/** Lets every waiting layer take focus, bottom up, as far as the first still mounting. */
+const advance = (): void => {
+  for (const layer of open) {
+    if (layer.status === "mounting") return;
+    if (layer.status === "waiting" && layer.enter !== null) {
+      layer.status = "entered";
+      layer.restore = layer.enter();
+      layer.enter = null;
+    }
+  }
+};
 
 /**
- * Moves the element it is attached to to the end of `<body>`, and removes it with the
- * dialog. `onMoved` runs once it is there, for a dialog that renders its panel only after
- * the move (`HarnessDialog`).
+ * Moves the element it is attached to to the end of `<body>`, which puts it on top of the
+ * open dialogs, and removes it with the dialog. `onMoved` runs once it is there, for a
+ * dialog that renders its panel only after the move (`HarnessDialog`).
  *
  * Moving a node that holds focus blurs it. A body whose own effect focused a field before
  * the attachment ran would lose that, so whatever inside had focus has it again after.
  */
 export const toBody =
   (onMoved?: () => void): Attachment<HTMLElement> =>
-  (layer) => {
+  (element) => {
     const held = document.activeElement;
-    document.body.append(layer);
+    document.body.append(element);
+    const layer: Layer = {
+      element,
+      status: "mounting",
+      enter: null,
+      restore: null,
+    };
+    open.push(layer);
     if (
       held instanceof HTMLElement &&
       held !== document.activeElement &&
-      layer.contains(held)
+      element.contains(held)
     ) {
       held.focus();
     }
     onMoved?.();
-    return () => layer.remove();
+    return () => {
+      const at = open.indexOf(layer);
+      if (at !== -1) open.splice(at, 1);
+      element.remove();
+      // It may have gone without its effect ever running; nothing over it waits on it now.
+      advance();
+    };
   };
 
 /**
- * Puts `panel` on top of the open dialogs, and returns what takes it off. Call it from the
- * effect that sees the panel mount, beside `holdFocus`.
+ * Takes focus into `panel` with `holdFocus` once every dialog under it has, and returns
+ * what gives it back. Call it from the effect that sees the panel mount, after `toBody`
+ * has moved its layer.
  */
-export function enterLayer(panel: HTMLElement): () => void {
-  open.push(panel);
+export function enterLayer(
+  panel: HTMLElement,
+  holdFocus: () => () => void,
+): () => void {
+  const layer = open.find((each) => each.element.contains(panel));
+  if (layer === undefined) return holdFocus();
+  layer.status = "waiting";
+  layer.enter = holdFocus;
+  advance();
   return () => {
-    const at = open.lastIndexOf(panel);
-    if (at !== -1) open.splice(at, 1);
+    const { restore } = layer;
+    layer.status = "left";
+    layer.enter = null;
+    layer.restore = null;
+    restore?.();
   };
 }
 
-/** Whether `panel` is the dialog on top, which is the one keys are for. */
-export const isTopmost = (panel: HTMLElement): boolean => open.at(-1) === panel;
+/** Whether `panel` is in the dialog on top, which is the one keys are for. */
+export const isTopmost = (panel: HTMLElement): boolean =>
+  open.at(-1)?.element.contains(panel) ?? false;
 
 /**
  * A dialog's window `keydown`: Escape closes it, Tab stays in it — if it is the dialog on

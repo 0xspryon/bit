@@ -335,3 +335,65 @@ describe("opened from inside the harness picker", () => {
     expect(document.activeElement, focused()).toBe(pick);
   });
 });
+
+/**
+ * The picker opening with the refusal already set, so both mount in one update. Svelte
+ * runs the error's effects before the picker's — a child's before its parent's — while the
+ * error is moved to `<body>` after the picker and drawn over it; the keyboard has to follow
+ * what is drawn, not the order the effects ran in.
+ */
+describe("mounted in the same update as the picker", () => {
+  const picker = (): HTMLElement | null =>
+    document.querySelector<HTMLElement>(
+      '[role="dialog"][aria-label="Choose a harness and model"]',
+    );
+
+  const openTogether = async () => {
+    mounted.push(mountInto(NestedDialogs, { refusedAtOpen: true }));
+    await settle();
+    const error = dialog();
+    const lower = picker();
+    if (error === null || lower === null)
+      throw new Error("both should be open");
+    return { error, lower };
+  };
+
+  test("focus starts in the error, which is drawn on top", async () => {
+    const { error, lower } = await openTogether();
+    const errorLayer = error.closest(".layer");
+    const pickerLayer = lower.closest(".layer");
+    expect(
+      (pickerLayer?.compareDocumentPosition(errorLayer as Node) ?? 0) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(document.activeElement, focused()).toBe(error);
+  });
+
+  test("Tab stays in the error", async () => {
+    const { error } = await openTogether();
+    const close = error.querySelector<HTMLElement>("button");
+    if (close === null) throw new Error("no Close");
+    // From the panel, where focus starts, to its one control and no further.
+    press("Tab", { shiftKey: true });
+    expect(document.activeElement, focused()).toBe(close);
+    press("Tab");
+    expect(document.activeElement, focused()).toBe(close);
+  });
+
+  test("the first Escape closes only the error, into the picker; the second, the picker", async () => {
+    await openTogether();
+    press("Escape");
+    await settle();
+    expect(dialog()).toBeNull();
+    const lower = picker();
+    expect(lower).not.toBeNull();
+    expect(lower?.contains(document.activeElement), focused()).toBe(true);
+
+    press("Escape");
+    await settle();
+    expect(picker()).toBeNull();
+    expect(document.activeElement, focused()).toBe(
+      document.querySelector(".trigger"),
+    );
+  });
+});

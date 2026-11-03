@@ -65,21 +65,14 @@
    * Focus goes into the dialog when it opens, onto the panel itself and no control, and
    * back to the opener — or to a marked survivor when the opener was deleted — when it
    * closes. Both rules, and why each is the way it is, are `dialogFocus`'s, shared with the
-   * harness picker's dialog so the two cannot drift. It goes on top of the open dialogs
-   * as it mounts and comes off as it closes, before focus goes back.
+   * harness picker's dialog so the two cannot drift. Focus goes in only once every dialog
+   * drawn under this one has taken it, which `dialogLayer` orders.
    */
   $effect(() => {
     if (panel === null) return;
     const mounted = panel;
     // Only the panel mounting is a reason to run this; a new `opener` is not.
-    return untrack(() => {
-      const leave = enterLayer(mounted);
-      const restore = holdFocus(mounted, opener);
-      return () => {
-        leave();
-        restore();
-      };
-    });
+    return untrack(() => enterLayer(mounted, () => holdFocus(mounted, opener)));
   });
 </script>
 

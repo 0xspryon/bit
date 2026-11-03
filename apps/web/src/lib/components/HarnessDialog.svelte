@@ -94,19 +94,12 @@
   const toBodyThenRender = toBody(() => (moved = true));
 
   // Only the panel mounting is a reason to run this: re-running it would restore focus
-  // to the opener and take it back again while the dialog was still open. It is on top of
-  // the open dialogs from here until it closes; see `dialogLayer`.
+  // to the opener and take it back again while the dialog was still open. A dialog drawn
+  // over this one waits for it to take focus first; see `dialogLayer`.
   $effect(() => {
     if (panel === null) return;
     const mounted = panel;
-    return untrack(() => {
-      const leave = enterLayer(mounted);
-      const restore = holdFocus(mounted, opener);
-      return () => {
-        leave();
-        restore();
-      };
-    });
+    return untrack(() => enterLayer(mounted, () => holdFocus(mounted, opener)));
   });
 </script>
 
