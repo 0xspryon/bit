@@ -452,6 +452,20 @@ interface SessionRecord {
    */
   idle: Deferred.Deferred<void, HarnessFailure>;
   /**
+   * Completed once, by the pump, the moment its `for await` over the query exits — an
+   * error, a `break` or the iterator finishing — and by `closeSession`. Never failed.
+   *
+   * **Not {@link idle}**, which a multi-turn session completes at the end of every turn
+   * while its query stays open. This one says the query's stream is over, and the record
+   * has been marked {@link settling} by the time it completes.
+   *
+   * What `switchModel` waits on when a control request fails: SDK 0.3.310's
+   * `Query.performCleanup` rejects every pending control request *before* it errors the
+   * stream, so the request's failure can be seen while the pump still thinks the session
+   * is live. See `STREAM_END_GRACE`.
+   */
+  readonly ended: Deferred.Deferred<void>;
+  /**
    * How many messages this session has accepted, and how many have completed.
    *
    * The pair is what makes `waitForIdle` mean "idle after the last accepted message"
@@ -540,6 +554,22 @@ export interface ClaudeCodeHarnessOptions {
 }
 
 const DEFAULT_CONTROL_TIMEOUT: Duration.Input = "30 seconds";
+
+/**
+ * How long `switchModel` waits, after a control request **failed** (not timed out), for
+ * the pump to report that the query's stream ended, before deciding whether the failure
+ * was the session going away.
+ *
+ * The SDK rejects pending control requests and errors the stream in one synchronous step
+ * (0.3.310's `Query.performCleanup`), so on a real close the pump sees the error a few
+ * microtasks and a fiber hop later: milliseconds. The bound only has to cover that hop,
+ * with room for a loaded event loop. It is paid in full only by a request the CLI refused
+ * on a session that stays live, which is reported this much later — beside a `setModel`
+ * round trip of about a second (the probe's 1.0–1.2 s), not something a caller notices. A
+ * timeout does not wait: the control bound has already been spent, and a session that
+ * does not answer for that long is not one that closed a microtask ago.
+ */
+const STREAM_END_GRACE: Duration.Input = "250 millis";
 
 /**
  * Which Claude Code build this harness will actually run.
@@ -1096,6 +1126,7 @@ export const claudeCodeHarness = (
         Effect.sync(() => {
           if (record.closed) return;
           record.closed = true;
+          Deferred.doneUnsafe(record.ended, Effect.void);
           record.release?.();
           // Wakes the input iterable, which may be parked on an empty queue: it checks
           // `closed` when it wakes and returns, which ends the generator. Without this the
@@ -1215,6 +1246,8 @@ export const claudeCodeHarness = (
           // A stream that died takes the session with it, conversation or not: there is no
           // query left to prompt, and `idle` must not be left uncompleted.
           if (drained._tag === "Failure") record.settling = true;
+          // After `settling`, so a switch woken by this reads the session as going.
+          Deferred.doneUnsafe(record.ended, Effect.void);
           yield* drained._tag === "Failure"
             ? Deferred.fail(record.idle, drained.failure)
             : Deferred.succeed(record.idle, undefined);
@@ -1485,6 +1518,7 @@ export const claudeCodeHarness = (
           multiTurn: input.multiTurn === true,
           resumed: input.resume !== undefined,
           idle,
+          ended: yield* Deferred.make<void>(),
           accepted: 0,
           completed: 0,
           settling: false,
@@ -1584,12 +1618,20 @@ export const claudeCodeHarness = (
         /*
          * A request that fails *because the query went away* is the same answer as a
          * switch that arrived a moment later, not an uncertain one. The SDK rejects every
-         * pending control request when a query closes (0.3.310's `Query.cleanup`), and
-         * `setModel` is answered in about a second, so an interrupt, a stream failure or a
-         * single-turn session ending inside that second is not rare. Reported as a plain
-         * transport failure, the caller would keep the row on the old model and the next
-         * resume — which reads the row — would start on it. Whatever the CLI did with the
-         * request, that query is not coming back.
+         * pending control request when a query closes (0.3.310's `Query.performCleanup`),
+         * and `setModel` is answered in about a second, so an interrupt, a stream failure
+         * or a single-turn session ending inside that second is not rare. Reported as a
+         * plain transport failure, the caller would keep the row on the old model and the
+         * next resume — which reads the row — would start on it. Whatever the CLI did with
+         * the request, that query is not coming back.
+         *
+         * **The rejection can arrive before the record says so.** An interrupt or a turn
+         * ending marks the record first and closes the query after, but a stream that
+         * *fails* is closed by the SDK, which rejects the pending requests and only then
+         * errors the stream: this fiber wakes while the pump has not yet seen the error or
+         * set `settling`. So a failed request waits, up to `STREAM_END_GRACE`, for the pump
+         * to say the stream ended before `gone()` is read. A timeout does not wait; see
+         * `STREAM_END_GRACE`.
          */
         const send = (
           operation: string,
@@ -1597,12 +1639,28 @@ export const claudeCodeHarness = (
           refused: string,
         ): Effect.Effect<void, HarnessTransportError> =>
           control(operation, run, refused).pipe(
-            Effect.mapError((failure) =>
-              gone()
-                ? notLive(
-                    `session ${sessionId}'s query closed while ${operation} was waiting on its answer`,
+            Effect.catch((failure) =>
+              (failure.tag === "TimeoutError"
+                ? Effect.void
+                : Effect.asVoid(
+                    Effect.timeoutOption(
+                      Deferred.await(record.ended),
+                      STREAM_END_GRACE,
+                    ),
                   )
-                : failure,
+              ).pipe(
+                Effect.andThen(
+                  Effect.suspend(() =>
+                    Effect.fail(
+                      gone()
+                        ? notLive(
+                            `session ${sessionId}'s query closed while ${operation} was waiting on its answer`,
+                          )
+                        : failure,
+                    ),
+                  ),
+                ),
+              ),
             ),
           );
         // Read and written only under the permit: see `SessionRecord.switching`. The checks

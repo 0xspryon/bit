@@ -771,9 +771,12 @@ export class AgentHarness extends Context.Service<
      *   going: a single-turn session that has finished or is finishing, an interrupted one,
      *   or one from a process that has since exited. There is nothing to send a control
      *   request to. **The same answer comes back when the query closes while a switch is
-     *   waiting on its control response** — `setModel` takes about a second, so a Stop
-     *   inside that second is ordinary — rather than an uncertain transport failure: the
-     *   query is gone whatever it did with the request. That is not a lost switch. A resume opens a *new* query through {@link createSession}, which takes its
+     *   waiting on its control response** — `setModel` takes about a second, so a Stop,
+     *   a stream failure or a single-turn session ending inside that second is ordinary —
+     *   rather than an uncertain transport failure: the query is gone whatever it did with
+     *   the request. A failed stream is the case that needs waiting for, because the SDK
+     *   rejects the request before it errors the stream; the harness gives the stream a
+     *   short bound to end before it decides. That is not a lost switch. A resume opens a *new* query through {@link createSession}, which takes its
      *   model and options from the caller — that is, from the session row — so a caller
      *   that sees this tag updates the row and the next resume runs on the new model.
      *   Writing it onto a dead record instead would be a change nothing ever reads.

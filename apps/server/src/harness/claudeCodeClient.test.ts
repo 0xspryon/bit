@@ -1370,6 +1370,8 @@ const turnDrivenSdk = () => {
   const pending: SDKMessage[] = [];
   let wake: (() => void) | undefined;
   let sessionId = "";
+  /** Set by {@link failStream}: what the stream throws once it has been woken. */
+  let streamFailure: Error | undefined;
   const push = (message: SDKMessage): void => {
     pending.push(message);
     const waiting = wake;
@@ -1431,6 +1433,7 @@ const turnDrivenSdk = () => {
               const next = pending.shift();
               if (next !== undefined) yield next;
             }
+            if (streamFailure !== undefined) throw streamFailure;
             await new Promise<void>((resolve) => {
               wake = resolve;
             });
@@ -1447,6 +1450,20 @@ const turnDrivenSdk = () => {
   const emitResult = (): void => {
     push(result(sessionId, "success"));
   };
+  /**
+   * Kills the query with an error, **in the order SDK 0.3.310's `Query.performCleanup`
+   * does it**: every pending control request is rejected first, and only then is the
+   * input stream errored. So a switch waiting on `setModel` wakes before the pump has
+   * seen the stream fail, which is the order a fix has to survive.
+   */
+  const failStream = (cause: Error): void => {
+    for (const reject of hanging) reject(cause);
+    hanging.clear();
+    streamFailure = cause;
+    const waiting = wake;
+    wake = undefined;
+    waiting?.();
+  };
   /** Waits until the SDK has pulled `count` messages off the input iterable. */
   const pulled = async (count: number): Promise<void> => {
     for (let index = 0; index < 400; index += 1) {
@@ -1454,7 +1471,7 @@ const turnDrivenSdk = () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   };
-  return { sdk, seen, controls, emitResult, pulled };
+  return { sdk, seen, controls, emitResult, failStream, pulled };
 };
 
 const withTurnDriven = <A>(
@@ -2173,6 +2190,39 @@ describe("switching a Claude Code session's model", () => {
       }),
     );
     expect(outcome.stopped).toBe(true);
+    expect(outcome.switches).toEqual(["model:claude-opus-5"]);
+    expect(outcome.failure._tag).toBe("HarnessTransportError");
+    if (outcome.failure._tag === "HarnessTransportError") {
+      expect(outcome.failure.operation).toBe("session.switchModel");
+      expect(outcome.failure.tag).toBe(SESSION_NOT_FOUND_TAG);
+      expect(outcome.failure.status).toBe(404);
+    }
+  });
+
+  test("a switch whose stream fails while it waits is refused as not found, though the SDK rejects the request first", async () => {
+    /*
+     * The same answer as the interrupt above, reached in the order that makes it hard: the
+     * SDK rejects the pending `setModel` *before* it errors the stream, so the switch's
+     * failure arrives while the pump has not yet seen the stream end and the record does
+     * not yet say the session is going. Read then, it is a plain transport failure — an
+     * "uncertain" switch on a query that no longer exists.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        driver.controls.hang = "setModel";
+        const switching = yield* Effect.forkChild(
+          Effect.flip(harness.switchModel(LIVE, "claude-opus-5")),
+        );
+        for (let tries = 0; driver.seen.switches.length === 0; tries += 1) {
+          if (tries > 200) throw new Error("setModel was never sent");
+          yield* Effect.sleep("5 millis");
+        }
+        driver.failStream(new Error("the CLI exited with code 1"));
+        const failure = yield* Fiber.join(switching);
+        return { failure, switches: [...driver.seen.switches] };
+      }),
+    );
     expect(outcome.switches).toEqual(["model:claude-opus-5"]);
     expect(outcome.failure._tag).toBe("HarnessTransportError");
     if (outcome.failure._tag === "HarnessTransportError") {
