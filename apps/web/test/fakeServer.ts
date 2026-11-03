@@ -282,6 +282,7 @@ export const importerConversationView = (
   live: false,
   source: "harness",
   continuation: "resume",
+  refusal: null,
   ephemeral: true,
   note: "From the harness, which may delete it.",
   messages: [

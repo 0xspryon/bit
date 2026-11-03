@@ -381,6 +381,10 @@ describe("an import the operator ended", () => {
     expect(view.messages).toHaveLength(1);
     expect(view.continuation).toBe("refused");
     expect(view.note).toContain("refuse every write");
+    // Said as an end in its own field, so a screen words it as one and not by guessing
+    // from `refused`, which a session nobody ended can answer too.
+    expect(view.refusal?.reason).toBe("import_ended");
+    expect(view.refusal?.detail).toContain("You ended this import");
   });
 
   test("is not asked about: the harness is never consulted for a session nothing will be sent to", async () => {
@@ -420,6 +424,7 @@ describe("an import the operator ended", () => {
         },
       });
       expect(view.continuation).toBe("resume");
+      expect(view.refusal).toBeNull();
     }
   });
 });
@@ -447,6 +452,12 @@ describe("a row naming an agent this server does not define", () => {
       agentUnavailableDetail(IMPORT, "retired_agent"),
     );
     expect(view.note).not.toContain("Your next message");
+    // Not an end, and said so in the field the screen words the composer from: nobody
+    // ended this session, and the sentence is the send's own.
+    expect(view.refusal).toEqual({
+      reason: "agent_unavailable",
+      detail: agentUnavailableDetail(IMPORT, "retired_agent"),
+    });
   });
 
   test("is refused when nothing was ever said in it too", async () => {
@@ -457,6 +468,7 @@ describe("a row naming an agent this server does not define", () => {
     expect(view.note).toContain(
       agentUnavailableDetail(IMPORT, "retired_agent"),
     );
+    expect(view.refusal?.reason).toBe("agent_unavailable");
   });
 
   test("the operator's end is said first, as the send checks it first", async () => {
@@ -467,11 +479,13 @@ describe("a row naming an agent this server does not define", () => {
     expect(view.continuation).toBe("refused");
     expect(view.note).toContain("You ended this import");
     expect(view.note).not.toContain("'retired_agent'");
+    expect(view.refusal?.reason).toBe("import_ended");
   });
 
   test("the importer is not refused", async () => {
     const view = await read({ messages: [], continuation: still });
     expect(view.continuation).toBe("resume");
+    expect(view.refusal).toBeNull();
   });
 });
 

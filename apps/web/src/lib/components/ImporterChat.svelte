@@ -40,8 +40,9 @@
    *
    * **Every state that disables it is the server's**, never a guess from here: no harness
    * (the server answered `no_harness` to which model an import would run on), a stranded
-   * session (its harness is not one the server lists), and a session the operator ended
-   * (`endedReason` on the server's row, or `continuation: "refused"` on its replay). A
+   * session (its harness is not one the server lists), a session the operator ended
+   * (`endedReason` on the server's row, or an `import_ended` refusal on its replay), and a
+   * session the replay refuses for any other reason, worded in the server's sentence. A
    * session the *server* let go of is not disabled — a message to it either takes the
    * conversation back over or opens a fresh one, and `ImporterHistory.continuation` is which
    * of the two, so the note above the thread says what the next message will do rather than
@@ -79,16 +80,29 @@
   let target = $derived(app.selected?.name ?? app.viewTargetId);
   /** Set when the session's harness is one this server does not run: see `strandedNote`. */
   let stranded = $derived(session?.strandedOn);
+  /** The replay's refusal, when it answered `refused`: which one, and the server's sentence. */
+  let refusal = $derived(session?.history.refusal);
   /**
    * The operator ended it: the server refuses a message to it.
    *
-   * From the index row's `endedReason`, and from the replay's `continuation` once that has
-   * answered — the same fact from two reads, and either is enough. The second matters
-   * because a row read before the operator ended the session in another tab says nothing
-   * about it, and a composer offered on that row is a message that will be refused.
+   * From the index row's `endedReason`, and from the replay's `import_ended` refusal once
+   * that has answered — the same fact from two reads, and either is enough. The second
+   * matters because a row read before the operator ended the session in another tab says
+   * nothing about it, and a composer offered on that row is a message that will be refused.
+   *
+   * **Not every `refused`.** A session whose recorded agent this server does not define is
+   * refused too, and nobody ended it; saying "ended" over it would tell the operator they
+   * did something they did not. That one is {@link refusedBecause}.
    */
   let ended = $derived(
-    session?.ended === true || session?.history.continuation === "refused",
+    session?.ended === true || refusal?.reason === "import_ended",
+  );
+  /**
+   * The server's sentence for a refusal that is not the operator's end, shown as it stands:
+   * the reason is the server's to give, so this page words nothing of its own over it.
+   */
+  let refusedBecause = $derived(
+    !ended && refusal !== undefined ? refusal.detail : undefined,
   );
   /**
    * Which model an import would run on could not be had, so there is nothing to talk to. Only
@@ -101,7 +115,9 @@
     app.importerModel === undefined && app.importModelDetail !== "",
   );
   let noHarness = $derived(noModel && app.importModelNoHarness);
-  let blocked = $derived(stranded !== undefined || ended || noModel);
+  let blocked = $derived(
+    stranded !== undefined || ended || refusedBecause !== undefined || noModel,
+  );
   let canSend = $derived(
     importer.draft.trim() !== "" && !blocked && !importer.sending,
   );
@@ -167,13 +183,15 @@
       ? "This session's harness is not on this server, so it cannot be continued."
       : ended
         ? "This session was ended, so it cannot be continued."
-        : noHarness
-          ? "No agent harness on this server is ready, so there is no importer to talk to."
-          : noModel
-            ? "The server could not be asked which model the importer would run on, so there is nothing to send to yet."
-            : groups.length === 0
-              ? "Paste a policy or scope URL, or say what is in and out of scope…"
-              : "Correct it, or add what the pages do not say…",
+        : refusedBecause !== undefined
+          ? refusedBecause
+          : noHarness
+            ? "No agent harness on this server is ready, so there is no importer to talk to."
+            : noModel
+              ? "The server could not be asked which model the importer would run on, so there is nothing to send to yet."
+              : groups.length === 0
+                ? "Paste a policy or scope URL, or say what is in and out of scope…"
+                : "Correct it, or add what the pages do not say…",
   );
 </script>
 
@@ -187,11 +205,13 @@
       ? strandedNote(stranded)
       : ended
         ? ENDED_NOTE
-        : noModel
-          ? app.importModelDetail
-          : session?.reading
-            ? readingNote
-            : ""}
+        : refusedBecause !== undefined
+          ? refusedBecause
+          : noModel
+            ? app.importModelDetail
+            : session?.reading
+              ? readingNote
+              : ""}
     empty="Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread."
   >
     {#snippet separator(group)}

@@ -828,8 +828,9 @@ export type ImporterConversationSource = typeof ImporterConversationSource.Type;
  *   session**: the harness has swept the transcript, or it holds a session that was killed
  *   before its first prompt was saved — which can be neither continued nor recreated. The
  *   note says which, and what is carried forward.
- * - `refused` — the operator ended this import. Its authority is over, the importer's tools
- *   refuse every write under it, and no message is accepted. A new session is the way on.
+ * - `refused` — no message is accepted, and a new session is the way on. **Not only the
+ *   operator's end**: {@link ImporterConversationView.refusal} says which refusal it is,
+ *   and a screen must word it from that rather than read every `refused` as an end.
  */
 export const ImporterContinuation = Schema.Literals([
   "live",
@@ -838,6 +839,27 @@ export const ImporterContinuation = Schema.Literals([
   "refused",
 ]);
 export type ImporterContinuation = typeof ImporterContinuation.Type;
+
+/**
+ * Why a replay answered `refused`, in the send's own vocabulary and with its sentence.
+ *
+ * The two {@link ImporterConversationRefused} reasons a message to a session this process
+ * does not hold is refused on before any harness is asked, so the replay can promise them:
+ *
+ * - `import_ended` — the operator ended this import. Its authority is over.
+ * - `agent_unavailable` — the session runs as an agent this server does not define as an
+ *   importer. Nobody ended it; it cannot be reopened as the agent it was opened as.
+ *
+ * `detail` is the server's sentence for it, to be shown as it stands. For
+ * `agent_unavailable` it is word for word the one a message to the same import is refused
+ * with, so what the screen says before a send and what the send answers cannot differ.
+ */
+export const ImporterContinuationRefusal = Schema.Struct({
+  reason: Schema.Literals(["import_ended", "agent_unavailable"]),
+  detail: Schema.String,
+});
+export type ImporterContinuationRefusal =
+  typeof ImporterContinuationRefusal.Type;
 
 /**
  * One replayed message of an importer conversation.
@@ -891,6 +913,14 @@ export const ImporterConversationView = Schema.Struct({
   live: Schema.Boolean,
   source: ImporterConversationSource,
   continuation: ImporterContinuation,
+  /**
+   * Which refusal a `refused` {@link continuation} is, and the server's sentence for it.
+   *
+   * Non-null exactly when `continuation` is `refused`, and null otherwise. A reader must
+   * not take `refused` alone as "the operator ended it": a session whose recorded agent this
+   * build does not define is refused too, and nobody ended it.
+   */
+  refusal: Schema.NullOr(ImporterContinuationRefusal),
   /** True only for `harness`: what is shown can disappear. */
   ephemeral: Schema.Boolean,
   /** A sentence for the operator, set on every source including a successful read. */

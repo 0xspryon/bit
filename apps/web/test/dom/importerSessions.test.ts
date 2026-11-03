@@ -25,6 +25,7 @@ import {
 
 import { App, IMPORT_POLL_MS, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
+import { ENDED_NOTE } from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import {
@@ -345,6 +346,10 @@ const composer = (): HTMLTextAreaElement => {
   if (box === null) throw new Error("no composer");
   return box;
 };
+
+/** The sentence the page sets above the thread, which is `Chat`'s first note. */
+const notice = (): string =>
+  document.querySelector(".importer .note")?.textContent?.trim() ?? "";
 
 const typeInto = (box: HTMLTextAreaElement, value: string): void => {
   box.value = value;
@@ -1018,6 +1023,11 @@ describe("a session this server no longer holds", () => {
           importId,
           source: "harness",
           continuation: "refused",
+          refusal: {
+            reason: "import_ended",
+            detail:
+              "You ended this import, so its authority has ended with it.",
+          },
           note: "You ended this import, so its authority has ended with it.",
         }),
       );
@@ -1026,7 +1036,37 @@ describe("a session this server no longer holds", () => {
     // The row the index answered says nothing about an end — this is the replay's answer
     // alone, which is what makes a session ended in another tab safe to look at here.
     expect(composer().disabled).toBe(true);
-    expect(text()).toContain("ended");
+    expect(notice()).toBe(ENDED_NOTE);
+    expect(composer().placeholder).toBe(
+      "This session was ended, so it cannot be continued.",
+    );
+  });
+
+  test("one refused for a reason that is not an end says the server's reason, not that it was ended", async () => {
+    // What a session opened as an agent a later build no longer defines answers after a
+    // restart. Nobody ended it, so "This session was ended" would be a claim about something
+    // the operator never did.
+    const reason =
+      "Import imp_newest's session runs as the agent 'retired_agent', which this server does not define as an importer, so it cannot be continued. Start a new session to carry on.";
+    const fake = new FakeServer();
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        replayed({
+          targetId,
+          importId,
+          source: "harness",
+          continuation: "refused",
+          refusal: { reason: "agent_unavailable", detail: reason },
+          note: `From the harness, which may delete it. ${reason}`,
+        }),
+      );
+    await continueWith(fake);
+
+    expect(composer().disabled).toBe(true);
+    expect(composer().placeholder).toBe(reason);
+    expect(notice()).toBe(reason);
+    expect(text()).not.toContain("This session was ended");
+    expect(composer().placeholder).not.toContain("was ended");
   });
 
   test("a replay that does not answer leaves the thread alone rather than claiming silence", async () => {

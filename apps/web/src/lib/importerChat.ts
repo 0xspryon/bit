@@ -69,6 +69,7 @@
 import type {
   GoalNarrationView,
   ImporterContinuation,
+  ImporterContinuationRefusal,
   ImporterConversationView,
   ImporterSessionView,
   LiveItem,
@@ -143,6 +144,15 @@ export interface ImporterHistory {
    * that counts.
    */
   readonly continuation?: ImporterContinuation;
+  /**
+   * Which refusal a `refused` {@link continuation} is, and the server's sentence for it.
+   *
+   * Present exactly when `continuation` is `refused`. The page words an end from
+   * `import_ended` and shows the server's sentence for any other refusal, and never reads
+   * `refused` alone as an end: a session whose agent this server does not define is refused
+   * too, and nobody ended it.
+   */
+  readonly refusal?: ImporterContinuationRefusal;
 }
 
 export const NO_HISTORY: ImporterHistory = {
@@ -166,6 +176,7 @@ export const historyOf = (view: ImporterConversationView): ImporterHistory => ({
   truncated: view.truncated,
   messages: view.messages,
   continuation: view.continuation,
+  ...(view.refusal === null ? {} : { refusal: view.refusal }),
 });
 
 /**

@@ -72,6 +72,7 @@
  */
 import {
   type ImporterContinuation,
+  type ImporterContinuationRefusal,
   type ImporterConversationMessage,
   type ImporterConversationView,
   type ImporterSessionEndReason,
@@ -271,6 +272,7 @@ const empty = (input: {
   readonly harnessSessionId: string | null;
   readonly live: boolean;
   readonly continuation: ImporterContinuation;
+  readonly refusal: ImporterContinuationRefusal | null;
   readonly source: "pending" | "forgotten" | "none" | "absent";
   readonly note: string;
 }): ImporterConversationView => ({
@@ -280,6 +282,7 @@ const empty = (input: {
   live: input.live,
   source: input.source,
   continuation: input.continuation,
+  refusal: input.refusal,
   ephemeral: false,
   note: input.note,
   messages: [],
@@ -314,7 +317,7 @@ const FRAMING_NOTE =
  * over. The composer is disabled on it rather than offered.
  */
 const ENDED_NOTE =
-  " You ended this import, so its authority has ended with it: the importer's tools refuse every write under it and no message is accepted. Start a new session to carry on.";
+  "You ended this import, so its authority has ended with it: the importer's tools refuse every write under it and no message is accepted. Start a new session to carry on.";
 
 /**
  * One importer session's conversation, as the harness still has it.
@@ -362,12 +365,25 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
    * A row naming an agent this build does not define is refused by the send, so the
    * composer is disabled on it here, with the send's own sentence.
    */
-  const refusal: string | undefined = ended
-    ? ENDED_NOTE
+  const refusalOf: ImporterContinuationRefusal | null = ended
+    ? { reason: "import_ended", detail: ENDED_NOTE }
     : live || importSessionAgent(input.recorded.agentId) !== undefined
-      ? undefined
-      : ` ${agentUnavailableDetail(input.importId, input.recorded.agentId)}`;
-  const refused = refusal !== undefined;
+      ? null
+      : {
+          reason: "agent_unavailable",
+          detail: agentUnavailableDetail(
+            input.importId,
+            input.recorded.agentId,
+          ),
+        };
+  const refused = refusalOf !== null;
+  /*
+   * The refusal's sentence as the tail of a note, and as the view's own field. Both,
+   * because the note is the replay's whole account and the field is what the screen words
+   * the composer and the banner from — and must not read every `refused` as an end.
+   */
+  const refusal: string | undefined =
+    refusalOf === null ? undefined : ` ${refusalOf.detail}`;
 
   /*
    * Nothing has ever been said here: the row exists and the session does not.
@@ -381,6 +397,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       harnessSessionId: null,
       live: false,
       continuation: refused ? "refused" : "fresh",
+      refusal: refusalOf,
       source: "absent",
       note: refused
         ? `Nothing was ever said in import ${input.importId}: its session was never created.${refusal}`
@@ -394,6 +411,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       harnessSessionId: sessionId,
       live,
       continuation: refused ? "refused" : "fresh",
+      refusal: refusalOf,
       source: "forgotten",
       note: `This server has no agent harness configured, so session ${sessionId} cannot be asked about and no message can be sent to it.${refusal ?? ""}`,
     });
@@ -408,6 +426,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       harnessSessionId: sessionId,
       live,
       continuation: refused ? "refused" : "fresh",
+      refusal: refusalOf,
       source: "forgotten",
       note: `${resolved.failure.message} This conversation's words can only come from the harness, so they are unavailable here. What this import wrote is unaffected: its entries are on the Scope tab and its assets in the Estate.${refusal ?? ""}`,
     });
@@ -427,6 +446,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       harnessSessionId: sessionId,
       live,
       continuation: refused ? "refused" : "fresh",
+      refusal: refusalOf,
       source: "forgotten",
       note: `This session ran on harness instance '${input.recorded.harnessInstanceId}', which this server does not configure, so its words cannot be asked for here and it cannot be continued from here.${refusal ?? ""}`,
     });
@@ -486,6 +506,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       harnessSessionId: sessionId,
       live,
       continuation,
+      refusal: refusalOf,
       source: "forgotten",
       note:
         (deleted
@@ -501,6 +522,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       harnessSessionId: sessionId,
       live,
       continuation,
+      refusal: refusalOf,
       source: live ? "pending" : "none",
       note: live
         ? `${displayName} holds nothing for this session yet. What the importer says will appear here as it says it.`
@@ -552,6 +574,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       // at all".
       source: "harness",
       continuation,
+      refusal: refusalOf,
       ephemeral: true,
       note:
         `From ${displayName}, which may delete it. Nothing here is words: everything the harness holds for this session is ` +
@@ -584,6 +607,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
     live,
     source: "harness",
     continuation,
+    refusal: refusalOf,
     ephemeral: true,
     note:
       `From ${displayName}, which may delete it: this build stores no part of a conversation, so what is here lasts exactly as long as the harness keeps it. What the importer *wrote* is durable and is on the Scope tab and in the Estate.` +

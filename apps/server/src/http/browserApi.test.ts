@@ -4463,6 +4463,8 @@ describe("a target's importer sessions", () => {
         // No harness to continue it with, so the composer is told a new session — never a
         // resume it would then be refused.
         continuation: "fresh",
+        // Not refused, so no refusal on the wire: null, not absent.
+        refusal: null,
         messages: [],
         truncated: false,
       });
