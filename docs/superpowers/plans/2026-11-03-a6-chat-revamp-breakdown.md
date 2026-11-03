@@ -115,7 +115,10 @@ HEIC; V2 is T3's signed, size-pinned two-step upload with sniffing and compressi
 `V2(chat):` at the Claude Code delivery — non-image files reach it as a path only; V2
 inlines `text/plain` and PDF as document blocks.
 
-**F10 — One renderer for live and replay (M).** Spec S6: replay produces the same
+**F10 — One renderer for live and replay (M). While reshaping the conversation view, make
+`ImporterConversationView` a union keyed on `continuation` so `refusal` exists only on
+`refused` (F1 review: today the invariant holds by convention, and a `refused` without a
+refusal would leave the composer enabled).** Spec S6: replay produces the same
 normalised items as live, through `ChatItem`, including per-turn model and timestamps from
 the harness transcript (needed by U4's turn footer). Blocks U4–U6.
 
@@ -145,7 +148,11 @@ away; reasoning collapses to one truncated line (markdown); turn footer
 **U6 — D3 Stop pill and Send now (S), F5 + U4 → U6.**
 
 **U7 — D7 agent chip (S), F1 → U7.** Chip and list from the registry ("only agent", what
-it can write); locked once the conversation has started.
+it can write); locked once the conversation has started. Today the chip is hardcoded text "Importer"
+(`ImporterChat.svelte`, `agent-chip`): read the session's `agentId` instead, and decide what
+it shows for a session whose agent this build no longer defines (the composer is already
+refused with the server's sentence, F1 `609da09`). Also from F1's review: `startWith` checks
+the agent's authority role on every open path — keep that when the chip can choose.
 
 **U8 — D5 sessions list (M).** The server half of S9 is done (`d0d82a2`:
 `AgentHarness.sessionTitle`, `import/importerTitle.ts`, nullable `title` in the
