@@ -82,7 +82,12 @@ next resume uses it"; OpenCode's switch 404 has no tag (check the status); `swit
 requires a catalogue model id — OpenCode's `modelOf`/`openCodeVariantOf` decode with
 `decodeUnknownSync` and **throw** on a malformed id, so validate catalogue membership and
 resolve options before calling (or map the decode failure to a typed error); the stub's
-`recordModelSwitches()` is there for the tests. An endpoint for importer
+`recordModelSwitches()` is there for the tests. From F3's second review: run switches **one at a time per
+conversation** in F4 — two concurrent OpenCode HTTP switches can reach the server in one
+order and complete in the other, so a row written on each completion could disagree with
+the server; and a queued switch's wait has no bound of its own on Claude Code (a hung CLI
+makes a burst time out one after another), so refuse or coalesce a switch while one is in
+flight. An endpoint for importer
 and goal conversations: refuse a different harness, re-resolve options against the new
 model (`explicitModelOptionSelections`, report `droppedModelOptionIds`), call
 `switchModel`, and only then update `model` / `model_options` on the row. A failure leaves
