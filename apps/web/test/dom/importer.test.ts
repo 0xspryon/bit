@@ -72,6 +72,26 @@ const headings = (): string[] =>
     (each) => each.textContent?.replace(/\s+/g, " ").trim() ?? "",
   );
 
+/** Each group's own text, separator and all. */
+const groupText = (index: number): string =>
+  (
+    document.querySelectorAll('[role="log"] > .group')[index]?.textContent ?? ""
+  ).replace(/\s+/g, " ");
+
+/**
+ * Each group's footer, in order, as the element its footer sits inside and the footer's
+ * words: `null` for a group with none.
+ */
+const footers = (): ({ in: Element | null; says: string } | null)[] =>
+  [...document.querySelectorAll('[role="log"] > .group')].map((group) => {
+    const foot = group.querySelector(".foot");
+    if (foot === null) return null;
+    return {
+      in: foot.closest("li.prose, li.replayed"),
+      says: foot.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    };
+  });
+
 /** What became of each write on screen, in order: the row's own `data-write`. */
 const chips = (): string[] =>
   [...document.querySelectorAll(".block")]
@@ -184,14 +204,17 @@ describe("sending a message", () => {
 });
 
 describe("D3: streaming", () => {
-  test("a write in flight is pending, the heading says the importer is working, and Stop is offered", async () => {
+  test("a write in flight is pending, the turn says the importer is working, and Stop is offered", async () => {
     await show("importer-streaming");
 
     expect(headings()).toHaveLength(1);
     expect(headings()[0]).toContain(
       "Load the scope from https://hackerone.com/acme/policy",
     );
-    expect(headings()[0]).toContain("working");
+    // Said in the turn, for a reader who cannot see the cursor — not in the separator, which
+    // is the operator's bubble and nothing else since the header over the reply went (S3).
+    expect(headings()[0]).not.toContain("working");
+    expect(groupText(0)).toContain("The importer is working");
     // Three entries landed; the fourth is asked for and not confirmed.
     expect(chips().filter((chip) => chip === "recorded")).toHaveLength(3);
     expect(chips().filter((chip) => chip === "pending")).toHaveLength(1);
@@ -211,7 +234,7 @@ describe("D3: streaming", () => {
     expect(chips().filter((chip) => chip === "pending")).toHaveLength(0);
     expect(chips().filter((chip) => chip === "unresolved")).toHaveLength(1);
     expect(hasButton("Stop")).toBe(false);
-    expect(headings()[0]).not.toContain("working");
+    expect(groupText(0)).not.toContain("The importer is working");
     expect(text()).toContain(
       "this call produced neither a record nor a stated failure",
     );
@@ -248,6 +271,56 @@ describe("D4: multi-turn", () => {
     expect(text()).not.toContain("fetch_page");
     expect(text()).not.toContain("write_scope_entry");
     expect(chips().filter((chip) => chip === "unresolved")).toHaveLength(0);
+  });
+});
+
+describe("S3: nothing labels what the importer says", () => {
+  test("no header over a reply: the separator is the operator's words, and nothing else", async () => {
+    await show("importer-complete");
+
+    const seps = [...document.querySelectorAll('[role="log"] > .group > .sep')];
+    expect(seps).toHaveLength(2);
+    for (const sep of seps) {
+      const bubble = sep.querySelector(".bubble")?.textContent?.trim() ?? "";
+      expect(bubble).not.toBe("");
+      expect(sep.textContent?.trim()).toBe(bubble);
+    }
+  });
+
+  test("a finished turn carries the model in a footer under its last reply", async () => {
+    const app = await show("importer-complete");
+    const model = app.importer.current?.model ?? "";
+    expect(model).not.toBe("");
+
+    const each = footers();
+    expect(each).toHaveLength(2);
+    for (const footer of each) {
+      expect(footer?.says).toBe(`Model: ${model}`);
+      expect(footer?.in?.classList.contains("prose")).toBe(true);
+    }
+  });
+
+  test("a turn still in flight has the cursor and no footer yet", async () => {
+    await show("importer-streaming");
+
+    expect(footers()).toEqual([null]);
+    // The pending write draws the cursor here, as `writing…`.
+    expect(chips()).toContain("pending");
+  });
+
+  test("a replayed reply is unlabelled, and its footer is under the harness's copy", async () => {
+    const app = await show("importer-reloaded");
+
+    const labels = [
+      ...document.querySelectorAll('[role="log"] .replay-type'),
+    ].map((each) => each.textContent);
+    expect(labels).not.toContain("assistant");
+    const replayedFooters = footers().filter((each) => each !== null);
+    expect(replayedFooters.length).toBeGreaterThan(0);
+    for (const footer of replayedFooters) {
+      expect(footer.in?.classList.contains("replayed")).toBe(true);
+      expect(footer.says).toBe(`Model: ${app.importer.current?.model ?? ""}`);
+    }
   });
 });
 
@@ -416,7 +489,11 @@ describe("a session the harness no longer holds", () => {
     expect(text()).toContain(
       "This is its copy, not ours, and it may delete it.",
     );
-    expect(text()).toContain("The table has five rows.");
+    expect(text()).toContain("The table has five rows:");
+    // S4: the harness's copy is markdown too, so its table is a table and not pipes.
+    expect(
+      document.querySelectorAll("li.replayed .table-wrap > table"),
+    ).toHaveLength(1);
     // The records are up in 'earlier', with the reason they are not under a message.
     expect(text()).toContain("Nothing on the record says which message");
   });

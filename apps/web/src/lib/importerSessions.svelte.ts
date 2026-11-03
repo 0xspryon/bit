@@ -162,7 +162,7 @@ export interface ImporterServer {
    * session the operator ended reads as ended and the composer stops offering it.
    */
   readonly reread: () => void;
-  /** A harness instance's display name, for the avatar on the session's header. */
+  /** A harness instance's display name, for the glyph on the composer's model chip. */
   readonly harnessName: (instanceId: string) => string;
   /**
    * The highest activity publish order this tab has seen, or `0` for none. Read when a

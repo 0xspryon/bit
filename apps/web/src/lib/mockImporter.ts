@@ -274,7 +274,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
     ),
     f.reply("Reading the policy page.", 2),
     f.reply(
-      "The scope table is at line 212 and has five rows. Three are in scope — `acme.com` and `acmelabs.io` are written with wildcards, so I am taking them as the apex and every subdomain. Writing them now.",
+      "The scope table is at line 212 and has five rows:\n\n| # | Asset | Written as | Reading |\n| --- | --- | --- | --- |\n| 1 | `acme.com` | `*.acme.com` | in, apex and every subdomain |\n| 2 | `acmelabs.io` | `*.acmelabs.io` | in, apex and every subdomain |\n| 3 | `203.0.113.0/24` | address block | in |\n| 4 | — | “No WordPress properties” | out, but prose rather than a host |\n| 5 | `status.acme.com` | third-party status page | out |\n\nThree are in scope — `acme.com` and `acmelabs.io` are written with wildcards, so I am taking them as the apex and every subdomain. Writing them now.",
       8,
     ),
   );
@@ -434,7 +434,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
   );
   items.push(
     f.reply(
-      "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. `shop.acme.com` was already recorded as an asset and will now read as out. The scope now reads 4 in, 3 out. Anything else from the SOW that the program page would not know about?",
+      "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. `shop.acme.com` was already recorded as an asset and will now read as out. The scope now reads 4 in, 3 out:\n\n```text\nin\n├── acme.com          subtree\n├── acmelabs.io       subtree\n├── 203.0.113.0/24    cidr\n└── app.partner.com   host only\nout\n├── blog.acme.com     WordPress, named\n├── shop.acme.com     WordPress, from you\n└── status.acme.com   third party\n```\n\nAnything else from the SOW that the program page would not know about?",
       198,
     ),
   );
@@ -483,7 +483,7 @@ export const mockReloadedSession = (now: number): ImporterSession => ({
       {
         index: 1,
         type: "assistant",
-        text: "The table has five rows. Three are in scope — acme.com and acmelabs.io are written with wildcards, so I am taking them as the host and every subdomain.",
+        text: "The table has five rows:\n\n| # | Asset | Written as | Reading |\n| --- | --- | --- | --- |\n| 1 | `acme.com` | `*.acme.com` | in, apex and every subdomain |\n| 2 | `acmelabs.io` | `*.acmelabs.io` | in, apex and every subdomain |\n| 3 | `203.0.113.0/24` | address block | in |\n| 4 | — | “No WordPress properties” | out, but prose rather than a host |\n| 5 | `status.acme.com` | third-party status page | out |\n\nThree are in scope — **`acme.com`** and **`acmelabs.io`** are written with wildcards, so I am taking them as the host and every subdomain.",
       },
       {
         index: 2,
@@ -498,7 +498,7 @@ export const mockReloadedSession = (now: number): ImporterSession => ({
       {
         index: 4,
         type: "assistant",
-        text: "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. The scope now reads 4 in, 3 out. Anything else from the SOW that the program page would not know about?",
+        text: "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. The scope now reads 4 in, 3 out:\n\n```text\nin\n├── acme.com          subtree\n├── acmelabs.io       subtree\n├── 203.0.113.0/24    cidr\n└── app.partner.com   host only\nout\n├── blog.acme.com     WordPress, named\n├── shop.acme.com     WordPress, from you\n└── status.acme.com   third party\n```\n\nAnything else from the SOW that the program page would not know about?",
       },
     ],
   },

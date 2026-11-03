@@ -19,10 +19,13 @@
    * {@link ChatItem} too, `narrated`: prose as prose and a call as a mono block, with the
    * same record/activity distinction and write states as the ledger reading.
    *
-   * One group per operator message. The separator is the operator's bubble and, under it,
-   * the importer's header (the harness's letter, "Importer", the model); what the importer
-   * said and called follows as rows. The five prose states are `Chat`'s and are all
-   * reachable from here: `live`, `pending`, `replayed`, `forgotten`, `loading` and `none`.
+   * One group per operator message. The separator is the operator's bubble and nothing
+   * else; what the importer said and called follows as rows, with **no label over it** —
+   * OpenCode's reading (S3), where the bubble being on the right is what says who spoke.
+   * The model the reply ran on is a quiet footer under the finished reply instead, and the
+   * harness is the glyph on the composer's model chip, which a session never changes. The
+   * five prose states are `Chat`'s and are all reachable from here: `live`, `pending`,
+   * `replayed`, `forgotten`, `loading` and `none`.
    *
    * ## The composer is enabled, unlike the planner's
    *
@@ -109,9 +112,6 @@
       ? null
       : { harness: session.harness, model: session.model },
   );
-  /** The importer's header in a group names the session's own harness and model. */
-  let letter = $derived((session?.harness.slice(0, 1) || "?").toLowerCase());
-
   let box = $state<HTMLTextAreaElement | undefined>(undefined);
 
   function submit(event: Event): void {
@@ -204,25 +204,13 @@
       {:else}
         <!--
           The operator's message is the heading of the stretch of work it asked for, set as
-          D3 draws it: right-aligned in a bubble, with the importer's header beneath. It is
-          the one part of a group that survives anything — it is in the harness's copy as a
-          `user` entry and in this tab's feed as a minted row — so a group whose words and
-          calls have both gone is still legible as "this is what you asked".
+          D3 draws it: right-aligned in a bubble. It is the one part of a group that
+          survives anything — it is in the harness's copy as a `user` entry and in this
+          tab's feed as a minted row — so a group whose words and calls have both gone is
+          still legible as "this is what you asked".
         -->
-        <div class="turn">
-          <div class="you">
-            <div class="bubble">{group.subject.message}</div>
-          </div>
-          <div class="agent">
-            <span class="avatar" aria-hidden="true">{letter}</span>
-            <span class="who">Importer</span>
-            <span class="model">{session?.model ?? ""}</span>
-            {#if group.subject.working}
-              <span class="visually-hidden" role="status"
-                >The importer is working.</span
-              >
-            {/if}
-          </div>
+        <div class="you">
+          <div class="bubble">{group.subject.message}</div>
         </div>
       {/if}
     {/snippet}
@@ -232,10 +220,43 @@
         D3's streaming cursor: the importer is still on this message. Drawn while the turn is
         in flight — from the server accepting it until the server says the import is no
         longer running — and not while a pending write already draws its own, so a turn
-        never blinks twice. The heading's status line says the same thing in words.
+        never blinks twice.
+
+        The status line is the cursor's counterpart in words, for a reader who cannot see
+        either cursor, so it follows the turn and not the cursor: it is said whichever of the
+        two is drawn. It lived in the header over the reply until that header went (S3);
+        here it is still inside the group it is about, and still after the operator's words.
       -->
-      {#if group.subject.working && !group.rows.some((row) => row.write === "pending")}
-        <div class="streaming"><StreamCursor /></div>
+      {#if group.subject.working}
+        <span class="visually-hidden" role="status"
+          >The importer is working.</span
+        >
+        {#if !group.rows.some((row) => row.write === "pending")}
+          <div class="streaming"><StreamCursor /></div>
+        {/if}
+      {/if}
+    {/snippet}
+
+    {#snippet footer(group)}
+      <!--
+        Under the finished reply, in OpenCode's manner: the model it ran on, small and muted.
+        Not while the turn is in flight, as OpenCode's is not — the cursor is what is under a
+        reply still being written, and a caption that appeared mid-stream would then move
+        down with every row that landed above it.
+
+        **The model and no duration.** OpenCode's `2m 27s` is two times off one clock, the
+        operator's message's and the reply's, both stored by its server. Nothing here has
+        such a pair: a replayed turn carries no time at all (`ImporterTurn.at`), and a live
+        one's start is this tab's clock while every reply's `at` is the server's — not one
+        clock, and `LiveItem.at` is documented as no ordering key. The end of a turn is
+        known only from a poll that also ends on any failure to answer. A figure built from
+        those would look like a measurement and not be one.
+      -->
+      {#if !group.subject.working && session !== undefined && session.model !== ""}
+        <p class="foot">
+          <!-- An expression, because Svelte trims the space off the end of an element's text. -->
+          <span class="visually-hidden">{"Model: "}</span>{session.model}
+        </p>
       {/if}
     {/snippet}
 
@@ -351,24 +372,25 @@
     flex: 1;
     min-height: 0;
     flex-direction: column;
-    padding: 0 32px;
   }
 
   .streaming {
     padding: 4px 0 0;
   }
 
-  /* ── The separator: the operator's bubble, then the importer's header ──────── */
-  .turn {
+  /*
+    ── The separator: the operator's bubble ─────────────────────────────────────
+    Across the whole row, so the bubble can be pushed to its right end. The space under it
+    is the gap the importer's header used to fill: with the header gone the reply would
+    otherwise sit 12px under the question, closer than turns sit to each other, and the
+    question would read as the caption of the answer.
+  */
+  .you {
     display: flex;
     flex: 1 1 100%;
     min-width: 0;
-    flex-direction: column;
-    gap: 26px;
-  }
-  .you {
-    display: flex;
     justify-content: flex-end;
+    padding-bottom: 8px;
   }
   .bubble {
     max-width: 560px;
@@ -382,32 +404,15 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  .agent {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-  }
-  .avatar {
-    display: inline-flex;
-    flex: none;
-    align-items: center;
-    justify-content: center;
-    width: 18px;
-    height: 18px;
-    border-radius: 5px;
-    background: var(--bg-layer-03);
-    color: var(--text-base);
-    font: 500 10px/18px var(--font-mono);
-  }
-  .who {
-    font: 500 12px/16px var(--font-sans);
-    color: var(--text-muted);
-  }
-  .model {
+  /*
+    The turn's footer. Muted and not faint: faint is below AA at 11px, and this is now the
+    only place on the turn the model is said, not decoration beside a label that said it.
+  */
+  .foot {
+    margin: 8px 0 0;
     font: 400 11px/16px var(--font-mono);
-    /* Faint is below AA at this size; this is decoration beside "Importer", which says it. */
     color: var(--text-muted);
-    opacity: 0.8;
+    overflow-wrap: anywhere;
   }
   .earlier {
     display: flex;
@@ -492,10 +497,13 @@
   textarea::placeholder {
     color: var(--text-faint);
   }
+  /*
+    No focus style while typing, as in OpenCode's composer: for a text field the caret is
+    the indicator, and the box keeps its own border. `none` rather than no rule, because
+    the global `:focus-visible` ring in tokens.css matches a textarea on click as well.
+  */
   textarea:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 4px;
-    border-radius: 2px;
+    outline: none;
   }
   .strip {
     display: flex;

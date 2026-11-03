@@ -231,6 +231,17 @@ export const assembleImporterPrompt = (input: ImporterPromptInput): string => {
     `- A page that 404s, needs a login, or has no scope you can read is not a problem.`,
     `  Say so and move to the next one. Nothing you have already written is lost.`,
     "",
+    // The conversation renders what the session says as markdown, where `*.acme.com` loses
+    // its asterisk to italics and a subtree reads as a single host. Backticks are the one
+    // markup that shows a value exactly as written there; the closing report is also the
+    // import's status line, which is plain text, where the backticks show literally and the
+    // value is still exact. Hence "may": the sentence is true of both. The entries
+    // themselves are tool calls and are not affected; this is about the prose the operator
+    // checks them against.
+    `What you write to the operator may be shown as markdown, which reads the asterisk in`,
+    `a wildcard as emphasis. Put every host, wildcard and scope value you mention in`,
+    `backticks, such as \`*.acme.com\`, so it shows exactly as written.`,
+    "",
     `When you have ${none ? "done what the operator asked" : `been through ${many ? "every page" : "the page"}`}, stop and report in a`,
     `few lines: which pages you could read, what you recorded, and anything you were`,
     `unsure about or that the pages disagreed on. Do not test anything. Do not fetch`,

@@ -47,7 +47,8 @@
   import type { Snippet } from "svelte";
 
   import ChatItem from "./ChatItem.svelte";
-  import type { ChatGroup } from "../chat";
+  import Markdown from "./Markdown.svelte";
+  import { ASSISTANT_ENTRY, lastProse, type ChatGroup } from "../chat";
   import { atBottom } from "../scroll";
 
   let {
@@ -55,6 +56,7 @@
     groups,
     separator,
     tail,
+    footer,
     readonly,
     count = "",
     note = "",
@@ -86,6 +88,21 @@
      * same reason {@link separator} is the caller's. Absent renders nothing.
      */
     tail?: Snippet<[ChatGroup<Subject>]>;
+    /**
+     * A turn's footer, rendered by the caller and placed here: under the group's last
+     * piece of the agent's prose ({@link lastProse}), inside that row.
+     *
+     * OpenCode's arrangement, and the importer's (S3): no label above what the agent says —
+     * the operator's bubble being on the other side is what says who spoke — and the facts
+     * a label carried, the model, in a quiet line under the finished reply instead. The
+     * caller decides what it says and **whether it says anything yet**, because only the
+     * caller knows if its subject is finished; this decides only where it goes. A group with
+     * no prose gets none, since a caption needs words to sit under.
+     *
+     * Thread layout only. The panel's ledger rows carry their own kind, time and id, and a
+     * caption under one of them would be a second header on a row that already has one.
+     */
+    footer?: Snippet<[ChatGroup<Subject>]>;
     /**
      * Whether the operator may write into this conversation.
      *
@@ -244,7 +261,11 @@
     aria-label="{label}, oldest first"
   >
     {#each groups as group (group.key)}
+      {@const place = thread && footer !== undefined ? lastProse(group) : null}
       <li class="group">
+        {#snippet closing()}
+          {@render footer?.(group)}
+        {/snippet}
         <!--
           The caller's own heading. Every part of it that survives a reload does so because
           it comes from a row rather than from narration; this component makes no claim
@@ -264,17 +285,48 @@
             That is the cost decision 14 accepted, said rather than hidden.
           -->
           <p class="note">{group.prose.note}</p>
+          <!--
+            The entry's own word is its label in a panel, always. In a thread the agent's
+            entry goes unlabelled, as OpenCode's does, and **only** the agent's: anything
+            else the harness lists — a `shell` command's output, a `synthetic` injection, a
+            word this build has never seen — keeps it, or it would read as the agent having
+            said it. See `ASSISTANT_ENTRY`.
+          -->
           <ol class="replay">
             {#each group.replayed as message (message.index)}
-              <li class="replayed">
-                <span class="replay-type mono">{message.type}</span>
-                {#if message.text !== ""}
-                  <p class="replay-text">{message.text}</p>
-                {/if}
-                {#if message.error !== undefined}
-                  <p class="replay-error">{message.error}</p>
-                {/if}
-              </li>
+              <!--
+                An agent entry with no words and no error says nothing, and drawn it would be
+                an empty item: 0px tall, still taking a list gap, and announced as a blank to
+                a screen reader. The server already drops these and counts them in
+                `omittedBlank` (`importerHistory.ts`, `goalNarration.ts`); this is here so
+                the rendering does not depend on that filter staying in place. It cannot
+                strand the footer: `lastProse` never places it on a blank entry.
+              -->
+              {#if message.type !== ASSISTANT_ENTRY || message.text.trim() !== "" || message.error !== undefined}
+                <li class="replayed">
+                  {#if !thread || message.type !== ASSISTANT_ENTRY}
+                    <span class="replay-type mono">{message.type}</span>
+                  {/if}
+                  {#if message.text.trim() !== ""}
+                    <!--
+                      Markdown, as the importer's live row is: the same reply read back after
+                      a reload should not lose its table to pipes. In `layout="panel"` the
+                      live row is still `ChatItem`'s plain-text ledger row, so there the two
+                      differ until S6 unifies them. See `Markdown.svelte` for why this is
+                      safe on text quoted from a program page.
+                    -->
+                    <div class="replay-text">
+                      <Markdown text={message.text} />
+                    </div>
+                  {/if}
+                  {#if message.error !== undefined}
+                    <p class="replay-error">{message.error}</p>
+                  {/if}
+                  {#if place?._tag === "replayed" && place.index === message.index}
+                    {@render closing()}
+                  {/if}
+                </li>
+              {/if}
             {/each}
           </ol>
           {#if group.prose.truncated}
@@ -307,6 +359,9 @@
                 write={row.write}
                 summary={row.summary}
                 narrated={thread}
+                footer={place?._tag === "row" && place.key === row.key
+                  ? closing
+                  : undefined}
               />
             {/each}
           </ol>
@@ -473,13 +528,12 @@
     letter-spacing: 0.04em;
     color: var(--text-muted);
   }
+  /* The type a replayed reply's markdown inherits; it draws its own blocks. */
   .replay-text {
-    margin: 0;
+    min-width: 0;
     font-size: 12px;
     line-height: var(--lh-compact);
     color: var(--text-base);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
   }
   .replay-error {
     margin: 0;
@@ -503,22 +557,50 @@
    * log filling the height and scrolling inside it, the composer pinned beneath, and no
    * frame anywhere — a turn is told apart by what it holds and the space around it, not by
    * a rule. Everything below is under `.thread`, so the panel layout above is untouched.
+   *
+   * **The column is drawn, not boxed.** A scroll container's bar sits at its own edge, so
+   * when the 800px box was the thing that scrolled, the bar was drawn beside the text in
+   * the middle of the window. So the section spans the page, the log scrolls across all of
+   * it, and the column is drawn by padding inside the log — its bar on the window's edge —
+   * and by a width on every other child, which do not scroll. The page's side margin is
+   * here too rather than on the caller: padding on an ancestor of the log would put the
+   * bar 32px in from the edge it is meant to be on.
+   *
+   * `--column` and `--gutter` are variables because the log and its siblings compute the
+   * one column in two different ways and must never disagree, which is `PageFrame`'s
+   * `--edge` lesson. Below 864px both come to the page less a 32px gutter each side.
    */
   .thread {
+    --column: 800px;
+    --gutter: 32px;
     flex: 1;
     min-height: 0;
     width: 100%;
-    max-width: 800px;
-    margin: 0 auto;
     gap: 10px;
     padding-top: 28px;
   }
+  .thread > :not(.groups) {
+    width: min(var(--column), calc(100% - 2 * var(--gutter)));
+    margin-inline: auto;
+    box-sizing: border-box;
+  }
+  /*
+   * Padding rather than an 800px wrapper inside the log, so the `<ol>` stays both the
+   * scroller `list` is bound to and the live region its rows are appended to — a wrapper
+   * would split those into two elements and put the region one level down from the
+   * children it announces. A percentage padding resolves against the section, which is
+   * the log's own width.
+   *
+   * The column's left edge is the composer's to the pixel. A classic scrollbar takes its
+   * width out of the content on the right, so the right edge falls short of the
+   * composer's by that much; an overlay scrollbar (a tablet's) takes nothing.
+   */
   .thread .groups {
     flex: 1 1 auto;
     min-height: 0;
     max-height: none;
     gap: 26px;
-    padding: 0;
+    padding: 0 max(var(--gutter), calc((100% - var(--column)) / 2));
     border: 0;
     border-radius: 0;
     background: transparent;
@@ -553,9 +635,14 @@
     text-wrap: pretty;
   }
   /*
-   * One turn: the operator's message, then the importer's header and everything under it.
-   * The rule above a group is the panel's way of saying "new group"; here the operator's
-   * own bubble says it, and the column's spacing does the rest.
+   * One turn: the operator's message, then what the agent said and did in reply. The rule
+   * above a group is the panel's way of saying "new group"; here the operator's own bubble
+   * says it, and the column's spacing does the rest.
+   *
+   * There is no header over the reply and so no indent under one. The agent's prose starts
+   * at the column's left edge and the operator's bubble ends at its right, as in OpenCode:
+   * which side a line is on is what says who spoke, and an offset measured from an avatar
+   * that is no longer drawn would be a margin with nothing to line up with.
    */
   .thread .group {
     gap: 12px;
@@ -563,10 +650,6 @@
   .thread .sep {
     padding-top: 0;
     border-top: 0;
-  }
-  /* What the importer says sits under its header, indented past the avatar. */
-  .thread .group > :not(.sep) {
-    margin-left: 27px;
   }
   .thread .items {
     gap: 12px;

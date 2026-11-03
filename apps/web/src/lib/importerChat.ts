@@ -187,7 +187,7 @@ export interface ImporterSession {
   readonly startedAt: number;
   /** `provider/model`, shown and not editable: changing harness starts a new session. */
   readonly model: string;
-  /** The harness it ran on, by display name: the avatar letter on its header is this one's. */
+  /** The harness it ran on, by display name: the glyph on the composer's model chip. */
   readonly harness: string;
   readonly history: ImporterHistory;
   /**
@@ -691,7 +691,7 @@ export const LOADING_HISTORY: ImporterHistory = {
  * A session the server lists, as the page holds it.
  *
  * `harness` is a display name the caller resolves from the harness listing, because the
- * server's row carries the instance id and the avatar letter wants the name. `reading` is
+ * server's row carries the instance id and the model chip's glyph wants the name. `reading` is
  * true: an indexed session is opened to be read, and the first message the operator types
  * carries it on. `messages` is `null` — see {@link ImporterTally}. `strandedOn` is the
  * caller's to work out from the harness listing, and is set only for a harness this server

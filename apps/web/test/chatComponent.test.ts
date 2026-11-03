@@ -505,6 +505,232 @@ describe("the separator, which the caller owns", () => {
     expect(html).toContain("Shortened");
   });
 
+  /*
+   * S3: a thread drops the label over the agent's own words, and only those. The replayed
+   * shape passes each harness's word through unmapped, and OpenCode's list carries `shell`
+   * and `synthetic` entries a `user`-cut files among the replies — which must not read as
+   * the agent having said them.
+   */
+  const mixed = (): ChatRound =>
+    chatRound({
+      prose: {
+        _tag: "replayed",
+        note: "From OpenCode, which may delete it.",
+        ephemeral: true,
+        truncated: false,
+      },
+      replayed: [
+        { index: 0, type: "assistant", text: "reading the policy page" },
+        { index: 1, type: "shell", text: "$ curl -sI https://acme.com" },
+        { index: 2, type: "synthetic", text: "injected by the harness" },
+        { index: 3, type: "assistant", text: "three entries are in scope" },
+        { index: 4, type: "assistant", text: "", error: "the model stopped" },
+      ],
+    });
+  const labels = (html: string): string[] =>
+    [...html.matchAll(/class="replay-type[^"]*"[^>]*>([^<]*)</g)].map(
+      (match) => match[1] ?? "",
+    );
+
+  test("a thread labels every replayed entry but the agent's own", () => {
+    const html = body({ groups: [mixed()], readonly: true, layout: "thread" });
+    expect(labels(html)).toEqual(["shell", "synthetic"]);
+    expect(html).toContain("three entries are in scope");
+  });
+
+  test("a panel keeps the label on every replayed entry, the agent's included", () => {
+    const html = body({ groups: [mixed()], readonly: true });
+    expect(labels(html)).toEqual([
+      "assistant",
+      "shell",
+      "synthetic",
+      "assistant",
+      "assistant",
+    ]);
+  });
+
+  /*
+   * S4: both rows that carry the agent's words render them as markdown. What markdown does
+   * to the text — and what it refuses to do with HTML in it — is `test/dom/markdown.test.ts`;
+   * this is only that both paths go through it.
+   */
+  test("the agent's words are markdown on both paths, live and replayed", () => {
+    const reply: LiveItem = {
+      ...committed(),
+      id: "activity:1",
+      origin: "activity",
+      sequence: null,
+      kind: "turn.reply",
+      headline: "Reply",
+      body: "Layout:\n\n```text\nsrc/\n  lib/\n```",
+    };
+    const html = body({
+      groups: [
+        chatRound({
+          prose: {
+            _tag: "replayed",
+            note: "From OpenCode, which may delete it.",
+            ephemeral: true,
+            truncated: false,
+          },
+          replayed: [
+            {
+              index: 0,
+              type: "assistant",
+              text: "| Asset | In |\n| --- | --- |\n| `acme.com` | yes |",
+            },
+          ],
+        }),
+        chatRound({
+          key: "rnd_2",
+          prose: { _tag: "live" },
+          rows: [
+            {
+              key: reply.id,
+              item: reply,
+              proposedBy: null,
+              result: null,
+              write: null,
+              summary: null,
+            },
+          ],
+        }),
+      ],
+      readonly: true,
+      layout: "thread",
+    });
+    // Replayed: a table in its scroller, not a row of pipes.
+    expect(html).toContain(`<div class="table-wrap"><table>`);
+    expect(html).toContain("<td><code>acme.com</code></td>");
+    expect(html).not.toContain("| Asset |");
+    // Live: a fence, its indentation intact, and no backticks left.
+    expect(html).toContain(
+      `<pre data-language="text"><code class="language-text">src/\n  lib/\n</code></pre>`,
+    );
+    expect(html).not.toContain("```");
+  });
+
+  test("a replayed agent entry with no words and no error draws no item", () => {
+    const html = body({
+      groups: [
+        chatRound({
+          prose: {
+            _tag: "replayed",
+            note: "From OpenCode, which may delete it.",
+            ephemeral: true,
+            truncated: false,
+          },
+          replayed: [
+            { index: 0, type: "assistant", text: "reading the policy page" },
+            // The server drops both of these first; the client does not rely on it.
+            { index: 1, type: "assistant", text: "" },
+            { index: 2, type: "assistant", text: "  \n " },
+            // An error is something to show, and a non-agent entry keeps its label.
+            {
+              index: 3,
+              type: "assistant",
+              text: "",
+              error: "the model stopped",
+            },
+            { index: 4, type: "idle", text: "" },
+          ],
+        }),
+      ],
+      readonly: true,
+      layout: "thread",
+    });
+    expect(html.match(/<li class="replayed/g)).toHaveLength(3);
+    expect(html).toContain("the model stopped");
+    expect(labels(html)).toEqual(["idle"]);
+  });
+
+  const foot = createRawSnippet<[ChatRound]>((group) => ({
+    render: () => `<span data-probe="foot">${group().key}</span>`,
+  }));
+  /** The text of the element the footer probe was rendered inside. */
+  const captioned = (html: string): string | undefined => {
+    const at = html.indexOf(`data-probe="foot"`);
+    if (at === -1) return undefined;
+    const open = html.lastIndexOf("<li", at);
+    return html.slice(open, at);
+  };
+
+  test("a thread's footer sits inside the last entry the agent said words in", () => {
+    const html = body({
+      groups: [mixed()],
+      readonly: true,
+      layout: "thread",
+      footer: foot,
+    });
+    expect(html.match(/data-probe="foot"/g)).toHaveLength(1);
+    // Not the error-only entry after it, and not the `shell` or `synthetic` ones.
+    expect(captioned(html)).toContain("three entries are in scope");
+  });
+
+  test("a live reply takes the footer over the replayed copy, and a call after it does not", () => {
+    const reply = (id: string, text: string): LiveItem => ({
+      ...committed(),
+      id,
+      origin: "activity",
+      sequence: null,
+      kind: "turn.reply",
+      headline: "Reply",
+      body: text,
+    });
+    const rows = [
+      reply("activity:1", "first words"),
+      reply("activity:2", "I will add the intent now"),
+      reply("activity:3", "   "),
+    ].map((item) => ({
+      key: item.id,
+      item,
+      proposedBy: null,
+      result: null,
+      write: null,
+      summary: null,
+    }));
+    const html = body({
+      groups: [
+        chatRound({
+          prose: { _tag: "live" },
+          rows: [
+            ...rows,
+            {
+              key: "record:evt-real",
+              item: committed(),
+              proposedBy: proposed(),
+              result: null,
+              write: "recorded",
+              summary: null,
+            },
+          ],
+        }),
+      ],
+      readonly: true,
+      layout: "thread",
+      footer: foot,
+    });
+    expect(html.match(/data-probe="foot"/g)).toHaveLength(1);
+    expect(captioned(html)).toContain("I will add the intent now");
+  });
+
+  test("no footer on a group with no words, nor in a panel", () => {
+    const silent = chatRound({
+      prose: { _tag: "none", note: "The importer wrote nothing." },
+    });
+    expect(
+      body({
+        groups: [silent],
+        readonly: true,
+        layout: "thread",
+        footer: foot,
+      }),
+    ).not.toContain(`data-probe="foot"`);
+    expect(
+      body({ groups: [mixed()], readonly: true, footer: foot }),
+    ).not.toContain(`data-probe="foot"`);
+  });
+
   test("an empty chat says what would fill it, and a failed read is an alert", () => {
     expect(body({ groups: [], readonly: true })).toContain("Nothing yet.");
     const failed = body({
@@ -841,6 +1067,9 @@ describe("the goal agent's own half of the chat", () => {
     // The operator's own half of it comes back from the harness as a `user` entry, which is
     // the only reason a reload is not one-sided.
     expect(html).toContain("what is happening?");
+    // A panel, so the entries keep the harness's own word as their label: the importer's
+    // thread dropped it over the agent's prose (S3), and this surface did not ask to.
+    expect(html).toMatch(/class="replay-type[^"]*"[^>]*>assistant</);
   });
 
   test("a conversation this process no longer holds is marked, not silently shown", async () => {

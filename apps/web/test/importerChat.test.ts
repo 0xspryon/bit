@@ -17,12 +17,7 @@ import {
   type ScopeImportTool,
 } from "@bit/contracts";
 
-import {
-  callSignature,
-  operatorTurn,
-  resultLine,
-  splitCode,
-} from "../src/lib/chat";
+import { callSignature, operatorTurn, resultLine } from "../src/lib/chat";
 import {
   LOADING_HISTORY,
   NO_HISTORY,
@@ -712,24 +707,6 @@ describe("a call as one line of the thread", () => {
     expect(resultLine(answer({ body: "refused", outcome: "failed" }))).toBe(
       "failed: refused",
     );
-  });
-});
-
-describe("prose with code in it", () => {
-  test("splits at backticks into runs, as data, so nothing the agent wrote is read as markup", () => {
-    expect(
-      splitCode("Three are in scope — `acme.com` and `<b>x</b>`."),
-    ).toEqual([
-      { code: false, text: "Three are in scope — " },
-      { code: true, text: "acme.com" },
-      { code: false, text: " and " },
-      { code: true, text: "<b>x</b>" },
-      { code: false, text: "." },
-    ]);
-  });
-
-  test("leaves an unmatched backtick as typed", () => {
-    expect(splitCode("a ` b")).toEqual([{ code: false, text: "a ` b" }]);
   });
 });
 

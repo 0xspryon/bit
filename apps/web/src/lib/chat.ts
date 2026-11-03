@@ -107,6 +107,15 @@ const KIND_LABELS: Record<string, string | undefined> = {
  */
 export const THINKING_KIND = "turn.thinking";
 
+/**
+ * The kind an agent's own prose carries: the server's string (`live.ts`'s `turn.reply`).
+ *
+ * Named once because two things must agree on it — {@link ChatItem}'s branch that renders
+ * a row as prose, and {@link lastProse}, which places a turn's footer under that row. A
+ * footer hung on a row that was not drawn as prose would be a caption on the wrong thing.
+ */
+export const REPLY_KIND = "turn.reply";
+
 /** The kind as words, or the kind itself when this build has never heard of it. */
 export const kindLabel = (kind: string): string => KIND_LABELS[kind] ?? kind;
 
@@ -401,28 +410,6 @@ export const resultLine = (result: LiveItem | null): string | null => {
   }`;
 };
 
-/**
- * Prose cut into plain and `code` runs, at backticks.
- *
- * An agent writes `acme.com` meaning a host and not a sentence, and A6 sets those in the
- * mono face. Returned as data and rendered as text nodes, so nothing the agent wrote is ever
- * interpreted as markup. An unmatched backtick is left in the text as typed.
- */
-export const splitCode = (
-  text: string,
-): readonly { readonly code: boolean; readonly text: string }[] => {
-  const parts: { code: boolean; text: string }[] = [];
-  let last = 0;
-  for (const match of text.matchAll(/`([^`\n]+)`/g)) {
-    const at = match.index;
-    if (at > last) parts.push({ code: false, text: text.slice(last, at) });
-    parts.push({ code: true, text: match[1] ?? "" });
-    last = at + match[0].length;
-  }
-  if (last < text.length) parts.push({ code: false, text: text.slice(last) });
-  return parts;
-};
-
 /** One row of a round's conversation. */
 export interface ChatRow {
   /** Stable key for `{#each}`. The rendered item's own id, which is already stable. */
@@ -520,6 +507,48 @@ export interface ChatGroup<Subject> {
   /** The live conversation, in arrival order. */
   readonly rows: readonly ChatRow[];
 }
+
+/**
+ * The harness's word for a replayed entry that is **the agent speaking**.
+ *
+ * Not "anything but `user`". `AgentHarness.messages` passes each harness's own vocabulary
+ * through unmapped, and OpenCode's list carries `shell`, `synthetic`, `idle` and more beside
+ * `user` and `assistant`; a caller that cuts turns at `user` (the importer's `cutReplay`)
+ * files all of those among the replies. A `shell` entry is a command's output and a
+ * `synthetic` one is text the harness injected — neither is the agent saying it — so only
+ * this word is read as the agent's prose, and every other word, including one this build
+ * has never seen, keeps its label. Both drivers spell the agent's entry this way.
+ */
+export const ASSISTANT_ENTRY = "assistant";
+
+/**
+ * Where a turn's last piece of the agent's prose is drawn, or `null` when it has none.
+ *
+ * A live row when one of them is prose, else a replayed entry: the rows are drawn after the
+ * replayed list, so a group holding both ends on its rows. Prose means words, not a row
+ * kind — a reply with an empty body draws nothing, and an `assistant` entry carrying only
+ * an error is a failure rather than something said.
+ *
+ * It is what {@link Chat} hangs a turn's footer on, as OpenCode does (`copyContentID`: the
+ * finished turn's last non-empty text part), rather than on the group's last row: a turn
+ * that says what it will write and then writes it is still captioned under its words.
+ */
+export type ProsePlace =
+  | { readonly _tag: "row"; readonly key: string }
+  | { readonly _tag: "replayed"; readonly index: number };
+
+export const lastProse = (
+  group: Pick<ChatGroup<unknown>, "rows" | "replayed">,
+): ProsePlace | null => {
+  const row = group.rows.findLast(
+    (each) => each.item.kind === REPLY_KIND && each.item.body.trim() !== "",
+  );
+  if (row !== undefined) return { _tag: "row", key: row.key };
+  const entry = group.replayed.findLast(
+    (each) => each.type === ASSISTANT_ENTRY && each.text.trim() !== "",
+  );
+  return entry === undefined ? null : { _tag: "replayed", index: entry.index };
+};
 
 /** What a planner round's separator needs, and the whole of what the chat is given. */
 export interface PlannerSubject {

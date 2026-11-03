@@ -39,16 +39,18 @@
    *   call cannot rely on.
    */
   import type { LiveItem } from "@bit/contracts";
+  import type { Snippet } from "svelte";
 
   import {
+    REPLY_KIND,
     THINKING_KIND,
     callSignature,
     kindLabel,
     outcomeTint,
     resultLine,
-    splitCode,
     type WriteState,
   } from "../chat";
+  import Markdown from "./Markdown.svelte";
   import StreamCursor from "./StreamCursor.svelte";
 
   let {
@@ -58,6 +60,7 @@
     write = null,
     summary = null,
     narrated = false,
+    footer,
   }: {
     item: LiveItem;
     proposedBy?: LiveItem | null;
@@ -71,6 +74,13 @@
      * the ledger row carries is still on it; see the narrated markup.
      */
     narrated?: boolean;
+    /**
+     * A line under this row's prose, inside the row: the turn's footer, when {@link Chat}
+     * has placed it here. Inside rather than after, because it is a caption on these words
+     * and a list item between two rows would be a row of its own. Drawn only on a narrated
+     * reply — the one reading where a row is prose — and ignored on anything else.
+     */
+    footer?: Snippet | undefined;
   } = $props();
 
   /**
@@ -141,14 +151,11 @@
     what is committed, a dashed one for what is only narrated), the write state in words, the
     verbatim payload one disclosure away, and the call id — all still here, only quieter.
   -->
-  {#if item.kind === "turn.reply"}
+  {#if item.kind === REPLY_KIND}
     <li class="prose" data-origin={item.origin}>
       <span class="visually-hidden">{item.origin}</span>
-      <p>
-        {#each splitCode(item.body) as part, position (position)}
-          {#if part.code}<code>{part.text}</code>{:else}{part.text}{/if}
-        {/each}
-      </p>
+      <div class="reply"><Markdown text={item.body} /></div>
+      {@render footer?.()}
     </li>
   {:else if thinking}
     <li class="prose" data-origin={item.origin}>
@@ -600,6 +607,15 @@
   .prose {
     list-style: none;
   }
+  /*
+   * The reply is markdown (`Markdown.svelte`), which draws its own blocks; this sets the
+   * type they inherit. No `white-space: pre-wrap` any more — see that component.
+   */
+  .prose .reply {
+    color: var(--text-base);
+    font: 400 13px/21px var(--font-sans);
+    text-wrap: pretty;
+  }
   .prose p {
     margin: 0;
     color: var(--text-base);
@@ -607,10 +623,6 @@
     text-wrap: pretty;
     overflow-wrap: anywhere;
     white-space: pre-wrap;
-  }
-  .prose code {
-    font-family: var(--font-mono);
-    font-size: 13px;
   }
   .prose .thought {
     margin-top: 4px;
