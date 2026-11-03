@@ -131,24 +131,68 @@ type Place = … // a discriminated union, one case per addressable resource
 placeOf(app: App): Place        // read the place out of the state
 pathOf(place: Place): string    // format
 parsePath(path: string): Place  // parse, total — never throws
-applyPlace(app: App, place: Place): void  // replay, by calling App's own open* methods
+applyPlace(app: App, place: Place): Promise<void>  // replay, by calling App's own open* methods
 ```
 
 The shell keeps owning `goto` and `popstate`; `App` keeps knowing nothing about either.
 `place.ts` is unit-testable without a router or a DOM, which is where the round-trip
 property tests go.
 
+**`applyPlace` was specified as `void` here, and that was wrong.** S4 found it, and the
+slice order hid it: while reflection replaced unconditionally, nothing needed to know when
+a place had finished landing. Two of the eight places are reached across a round trip — a
+chat reads the importer's index before it can select a session, an attempt reads its
+transcript — so between the call and the answer the app stands on the page _above_ the
+place that was asked for. Reflecting that was an invisible flicker when every write
+replaced. Under D4's push rule it is a junk history entry per deep link, and a second one
+when the real place arrives. So the replay is awaitable, and reflection is suppressed while
+it runs.
+
 ### D4 — One-way, except on history navigation
 
 The existing discipline holds: state writes the URL continuously, the URL is read only at
 discrete moments. Those moments become two rather than one — at mount, and on `popstate`.
 A `popstate` is a discrete event, not a continuous read, so it does not reintroduce the
-race the current comment warns about.
+race the current comment warns about. That argument is true and **not sufficient**:
+discreteness stops the race, it does not stop the ratchet — an apply that reflects can
+still leave one new history entry per traversal for ever. What stops that is the rule
+below, named here because S4 had to invent it: **a write that would not change the address
+bar is skipped.** Since `parsePath` and `pathOf` are inverses over every `Place`, a
+traversal that applies successfully ends in exactly that equality, so the cycle has no
+first step. Stated as two halves, neither of them a convention anyone has to remember:
+the browser fires `popstate` for a traversal and never for the `pushState` a write
+performs, so the writer cannot wake the reader; and skip-when-equal means the reader
+cannot wake the writer.
 
 This is also what makes Back work, which a deeplinking app is expected to do. The
 granularity: **opening a resource pushes a history entry; everything else replaces.**
 Opening three targets in a row leaves three entries, because you may want to go back
-through them. Toggling a picker leaves none, because it is not in the URL at all.
+through them — **by the target crumb picker**, which is the route that walks target to
+target; going out to the list and in again interleaves a `/` entry each time, correctly,
+because the list is a place you really did visit. Toggling a picker leaves no entry at
+all, because it is not in the URL.
+
+The rule in the end needed no second axis over the grammar, because **it is** the grammar:
+a change of _path_ pushes, a change of _query_ replaces. D2 put the resource in the path
+and the view modifier in the query for exactly this reason. One extra case, which is not
+obvious until a bookmark proves it: re-spelling the same place — `/t/x/goals` onto `/t/x`,
+or an old `?target=x` onto `/t/x` — replaces, because pushing a re-spelling leaves an entry
+whose Back lands on the same page under its old name, and with a saved `?target=` bookmark
+it would do that once per attempt to leave the page.
+
+**Three SvelteKit mechanisms for reading a traversal cannot work, and one fact kills all
+three.** A shallow `goto` never advances `page.url`: `update_page` is called with the new
+URL only under `shallow`, and every history entry is stamped `pageUrl: page.url.href` —
+the URL the _document was loaded with_. So `page.url` is the load URL while the address
+bar has moved on, and on a traversal the router sets it back to that stale value.
+`afterNavigate` sees the same thing, because the popstate handler navigates to
+`new URL(history_metadata.pageUrl ?? location.href)` rather than to the entry the browser
+traversed to. And `page.shallow.url` _is_ correct on a traversal, but it is also written by
+our own `goto`, which readmits the two-writers race through a side door. What is left is a
+bare `window.addEventListener("popstate", …)`, whose contract is precisely "a traversal
+happened, and `location` is now the truth". Verified against the installed SvelteKit
+3.1.0 source, not from memory — this project has already been wrong once by reasoning from
+SvelteKit 2.
 
 **And nothing is written while a place is held** — the rule S2 had to invent, because D4
 and D6 contradict each other without it. Connect is a gate rather than a place, so
