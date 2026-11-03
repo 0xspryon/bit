@@ -22,3 +22,7 @@ secrets/
 
 # Visual brainstorming scratch
 .superpowers/
+
+# Agent worktrees. Checkouts of this same repo, each with its own branch:
+# tracked by git as worktrees, never as content, and not this checkout to format.
+.claude/worktrees/
