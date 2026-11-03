@@ -93,7 +93,12 @@ model (`explicitModelOptionSelections`, report `droppedModelOptionIds`), call
 `switchModel`, and only then update `model` / `model_options` on the row. A failure leaves
 the row unchanged and is shown through F2.
 
-**F5 — Real Stop and Send now (M).** Stop calls `interruptSession` for the importer and goal
+**F5 — Real Stop and Send now (M).** Also, from F4's last review: after a restart, a message or a
+switch addressed to an _older_ import id in a reopen chain (I1 when I3 is the newest run)
+is not followed to the newest run — `send` would reopen the same Claude Code session a
+second time while I3 holds it, and a switch reports success on a row nothing reads. Refuse
+(or redirect) an import id that is not its session's newest confirmed run in both `send`
+and `switchFrom`, using the `latest_import_id` subquery. Stop calls `interruptSession` for the importer and goal
 conversations (today `importerSessions.svelte.ts:710` only flips a browser flag). The
 message endpoint takes `urgency: "queued" | "preemptive"`; the composer shows **Send now**
 beside Send while a turn runs. Record what an interrupt does to messages still in each
@@ -154,7 +159,9 @@ session stays on <harness> — picking another harness opens a new one. Models a
 inside it can change at any time, including mid-run." Choosing a model in an open session
 calls F4; choosing another harness opens a new session.
 
-**U4 — D3/D4 transcript layout (M), F10 → U4.** Agent prose full width, no bubble; operator
+**U4 — D3/D4 transcript layout (M), F10 → U4.** The turn footer's model must come from the transcript, not
+the session row: after a switch every replayed turn is labelled with the current model
+(`ImporterChat.svelte:275`), but each assistant entry records the model that answered it. Agent prose full width, no bubble; operator
 turns boxed with "You · 18:02"; consecutive tool calls collapse to one muted line
 ("Ran 3 commands · write_scope_entry, record_asset") with parameters and output one click
 away; reasoning collapses to one truncated line (markdown); turn footer
@@ -218,3 +225,9 @@ width and up. Fixes go back to the implementer; the next slice starts after revi
 
 F1, F2, F3, F4, F5, F6, F7, F8, F10, F9, U1, U10, U12, U11, U2, U7, U3, U4, U5, U6, U9, U8,
 U13.
+
+## Known issues found along the way (not in any slice)
+
+- The **built** server (`bun dist/main.js`) cannot open Claude Code sessions: it refuses
+  `import_ungated` because it resolves the policy hook at `apps/plugins/claudeCodeGate.ts`,
+  which does not exist; `bun src/main.ts` works. Predates this work (found in F4's review).
