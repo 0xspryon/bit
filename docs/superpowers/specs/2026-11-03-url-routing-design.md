@@ -205,23 +205,52 @@ suppressed past the gate.
 
 ### D5 — A link to something that is gone says so
 
-A bookmark outlives the thing it names: a goal gets ended, a target gets removed, an
-importer session falls out of the harness. `openRequested()` today drops an unknown target
+A bookmark outlives the thing it names. `releaseRequestedPlace` dropped an unknown target
 _silently_, which is defensible for a stale tab and wrong for a bookmark — the operator
 asked for something specific and deserves an answer.
 
 The rule: **fall back to the nearest place that does exist, and say what was missing.**
-A dead goal id lands on that target's goal list with "that goal no longer exists"; a dead
-target lands on the target list with the same courtesy. Never a blank screen, never a
-spinner that does not end, and never silence.
+Never a blank screen, never a spinner that does not end, and never silence.
 
-A dead **chat session** is the case most likely to happen, because a harness can let a
-session go while the index still remembers it. `openImporterSession` already produces the
-sentence for it — "That importer session is no longer in the importer's own list, so there
-is nothing to open it on." What it does not yet get right is _where_ that sentence appears:
-it writes `agentSessionsNote`, which is the Agent sessions screen's banner, and an operator
-arriving from a bookmark is not on that screen. S5 owns moving it to a surface the arrival
-can see.
+**Five things this section got wrong, found by implementing it.** They are corrected here
+rather than rewritten away.
+
+_"A goal gets ended."_ Ending is one-way and an ended goal **stays in the list** with
+status `met` or `abandoned`; nothing in this build deletes a goal, and a link to an ended
+one opens fine. What actually produces `GoalNotFound` on a link is a goal id belonging to a
+_different_ target — the contract says so itself: "a goal that exists in another target's
+file is not found here" — or a typo. So "that goal no longer exists", which this section
+prescribed, is a claim the app has no grounds for. The sentence has to say what the server
+actually reported, and point at the likeliest cause.
+
+_One dead-target path, where there are two._ This section describes only the **cold** one,
+a link held across Connect. A path pasted into a live signed-in tab, or traversed onto,
+goes through `refreshTarget`'s `TargetNotFound` — and that same branch fires on a stale
+rail-row click, which is not a link at all. Implementing D5 as written would have left the
+warm case silent, which is to say would have left its own done criterion failing.
+
+_The chat case is not only about the surface._ `openImporterSession` also left the operator
+wherever `openTarget` had landed, which is the target's Goals page: not "the nearest place
+that does exist" in any useful sense, just where they happened to be. The fallback had to be
+chosen as well as the surface. It is the target's **Agent sessions** list — further along
+the path than `/t/<id>/assets`, but the list of this target's conversations is what the link
+was asking about, and for a click on a stale row it is no move at all.
+
+_"Never a spinner that does not end"_ was already broken by the goal case, in prose rather
+than as a spinner: `Goal.svelte` with no goal in the list renders "This goal is not in the
+open target's list. It may belong to another target, or the list has not been read yet." —
+for ever.
+
+_And D4 contradicts this section._ A fallback is a change of path by construction, so
+"a change of path pushes" applied to it: a bookmark to a dead target bounced to `/` and
+**pushed** it over `/t/<gone>`, leaving the dead URL one Back away — and pressing Back
+applied it, bounced, and pushed again. One entry per press, and no way off the target list.
+D4's safety argument is explicitly conditioned on a traversal that _applies successfully_,
+and this is the case that does not; the doc wrote its own escape clause and never came back
+to it. The rule that closes it: **a reflection written while an arrival note stands corrects
+the entry the dead link is on** rather than adding one. The note's own lifetime bounds it —
+the operator's next navigation retires the note, and the next write pushes again — so it
+cannot leak into the ordinary case.
 
 ### D6 — A deep link that arrives signed out is held, not lost
 
@@ -320,12 +349,23 @@ expanding the live dock.
 D5 alone. D6's held place shipped in S2; what is left is what a link does when the
 resource it names is gone, and the surface it says so on.
 
-_Done when:_ a path naming a deleted goal lands on that target's goal list and says the
-goal is gone; a path naming an unknown target lands on the target list and says so rather
-than tidying the address bar in silence, which is what S2 left it doing; a path naming a
-chat session the importer no longer lists says so **on the page the link landed on** —
-today `openImporterSession` writes that sentence to `agentSessionsNote`, the Agent sessions
-screen's banner, which an operator arriving from a bookmark is not looking at.
+_Done when:_ a path naming a goal this target does not have lands on its goal list and says
+what the server reported; a path naming an unknown target lands on the target list and says
+so, cold and warm alike; a path naming a chat session the importer no longer lists says so
+**on the page the link landed on**. No failed arrival leaves a history entry it can bounce
+off.
+
+The sentence lives in **one banner in the shell**, above whatever screen the fallback landed
+on, because the three fallbacks land on three different pages — the target list, a target's
+goal list, a target's Agent sessions list. A banner owned by any one screen is missing from
+the other two, which is the exact bug D5 names: the chat sentence existed and only the Agent
+sessions list rendered it. One site above the screen means every page a fallback can reach
+has the surface by construction, and a fourth fallback inherits it instead of needing one.
+
+Not the toast: `app.toast` is `role="alert"` and danger-toned, for an import that read
+nothing. Nothing has failed when a bookmark gets old — time passed. This is `role="status"`,
+`tone="info"`, dismissible, and it never times out, because it is the answer to a question
+the operator asked by following a link.
 
 ## Decisions taken
 
@@ -389,3 +429,54 @@ The estate's search text (`estateQuery`) stays out for now. It is not a principl
 exclusion so much as an unproven one: free text is the kind of thing that reads as noise
 in a bookmark until you have wanted it once. D2 leaves it a home — `&q=` — so adding it
 later costs nothing and breaks no saved link.
+
+## What the five slices did not do
+
+All five are on `main` and the goal is met: a resource has a URL, the URL survives a
+bookmark, a reload and the Connect gate, Back and Forward move the app, and a link to
+something gone says so. This is the honest remainder, written down because a clean list
+would be a false one.
+
+**An attempt that does not exist has no fallback.** D5 names three resources; the inventory
+has four records. `/t/<id>/attempts/<att_gone>` sets `transcriptAttemptId`, the read is
+refused, and the panel shows the server's own sentence on Workers — so it is not silent,
+which is why S5 did not stretch to it. But there is no fallback, and `placeOf` goes on
+emitting the path, so the address bar keeps naming an attempt that is not there. D5's own
+list was one short.
+
+**Nothing in the app produces a link to an attempt.** Decision 1's deferral, still standing.
+A worker row in the Agent sessions list is the one place one could be offered; S3 left it
+inert rather than make that list half of the attempt list Flow B owns. The operator has the
+call, and it is roughly one line.
+
+**A dead-goal arrival spends requests it never shows.** `openGoal` fires seven reads before
+the fallback, against an id that does not exist, and `confirmOpenGoal` asks a question
+`refreshGoal` already asked. Removable by giving `refreshGoal` a return value; the duplicate
+was chosen for reviewability and is documented at the method.
+
+**A warm dead-target click leaves a duplicate `/` entry.** The push for `/t/<id>` has
+already happened by the time the registry answers, so the correction lands on it. Bounded
+and ratchet-free — the traversal back onto it was tested — but not free. Removing it means
+suppressing reflection until a target's counts land, which would delay the address bar for
+every ordinary target open.
+
+**`arrivalNote` retirement is nine call sites, not an invariant.** A tenth navigation that
+forgets to retire the note leaves a stale sentence _and_ turns one push into a replace.
+`App` cannot compute "the place changed" because it must not import `place.ts`; the route
+could, but that means the route writing `App` state. Left explicit and documented rather
+than clever.
+
+**The dead-chat fallback can land on a list that still shows the dead row.** The server
+unions the harness's sessions; the importer's index is a different reader of the same world.
+So the operator can click the same row and get the same note. Reconciling two indexes is a
+harness question, not a routing one.
+
+**Nothing renders the banner in a test.** The route needs a DOM and `$app/navigation` to
+mount, so `deepLink.test.ts` and `history.test.ts` write its rules out by hand. The state
+and the rules are covered; the banner's existence is proved only by a browser run. That gap
+is S2's, and it now carries one more thing.
+
+**The estate's search text is still out**, with `&q=` reserved for it (decision 2), and
+`.app` now sizes with `dvh` so a tablet's retracting toolbar cannot scroll the shell away —
+unrelated to routing, but it landed the same day and the two were often confused in
+conversation.
