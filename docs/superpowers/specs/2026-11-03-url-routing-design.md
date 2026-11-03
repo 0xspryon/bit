@@ -231,6 +231,12 @@ construct `App` without a router.
 This is the slice that answers the original complaint, and the slice that retires the two
 in-memory stopgaps in `AgentSessions.svelte` and `openImporterSession`.
 
+`AgentSessions.svelte` lines 44-48 sketch the paths that shim was expected to become —
+`/targets/:targetId/importer/:sessionId` and `/targets/:targetId/goals/:subjectId` — which
+is not the grammar that was approved. That comment is helpful today and misleading the
+moment the shim goes, so this slice deletes or corrects it rather than leaving a second
+spelling of the URL scheme in the tree.
+
 _Done when:_ a link to an AI asset chat opens that session, read-only until typed into,
 from a cold load; a link to a goal opens it with its briefing, intents and plan rounds
 read; a link to an attempt transcript opens it at `/t/<id>/attempts/<attemptId>`;
