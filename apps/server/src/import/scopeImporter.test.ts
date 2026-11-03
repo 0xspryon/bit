@@ -52,8 +52,9 @@ import {
   type ModelOptionSelection,
 } from "@bit/contracts";
 
-import { IMPORTER_AGENT } from "../agent/registry";
-import { operatorTextOf } from "./importerPrompt";
+import { IMPORTER_AGENT, type AgentDefinition } from "../agent/registry";
+import { agentUnavailableDetail } from "./importerHistory";
+import { operatorTextOf, type ImporterPromptInput } from "./importerPrompt";
 import { ScopeImportProgress } from "./progress";
 import { continuationMessage } from "../recovery/continuation";
 import { ScopeImporter, type ScopeImportRequest } from "./scopeImporter";
@@ -607,6 +608,8 @@ const importWith = async (
     readonly links?: readonly string[];
     /** The operator's pick, as `ImportModelDraft` carries it. */
     readonly choice?: ScopeImportRequest["choice"];
+    /** The agent the session is asked to run as. The importer unless a test says otherwise. */
+    readonly agent?: ScopeImportRequest["agent"];
     /** Makes the narration stream fail after its lines. See `Script.failEvents`. */
     readonly failEvents?: boolean;
     /**
@@ -642,6 +645,7 @@ const importWith = async (
         workspacePath: workspace,
         links: options.links ?? [PAGE_GOOD, PAGE_BAD],
         ...(options.choice === undefined ? {} : { choice: options.choice }),
+        ...(options.agent === undefined ? {} : { agent: options.agent }),
       });
       return started;
     }),
@@ -1569,6 +1573,7 @@ const replayOf = (
           harnessInstanceId: row.harnessInstanceId,
           endedReason: row.endedReason,
           confirmedAt: row.confirmedAt,
+          agentId: row.agentId,
         },
       });
     }),
@@ -2442,6 +2447,39 @@ describe("a reopen that resumes", () => {
     await restarted.dispose();
   });
 
+  test("the replay and the send agree on a row naming an agent this server does not define", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    // The harness still holds the session, so only the agent stands between it and a resume.
+    built.script.holds.set(
+      "ses_import",
+      directoryOf(built.root, started.importId),
+    );
+    await runtime.dispose();
+    recordAgent(built.root, started.importId, "retired_agent");
+    const sentence = agentUnavailableDetail(started.importId, "retired_agent");
+
+    const restarted = ManagedRuntime.make(built.layer);
+    // The composer is disabled, with the sentence the send refuses with — not offered a
+    // resume or a fresh session the send would then refuse.
+    const replayed = await replayOf(restarted, started.importId);
+    expect(replayed.continuation).toBe("refused");
+    expect(replayed.note).toContain(sentence);
+    expect(replayed.note).not.toContain("Your next message");
+
+    const sent = await sendTo(restarted, started.importId, "Continue.");
+    expect(sent._tag).toBe("Failure");
+    if (sent._tag !== "Failure") return;
+    expect(sent.failure).toMatchObject({
+      _tag: "ImporterConversationRefused",
+      reason: "agent_unavailable",
+      detail: sentence,
+    });
+    await restarted.dispose();
+  });
+
   test("the resumed session is not told the rules again: its history already has them", async () => {
     const { built, runtime, started } = await importWith([PAGE_GOOD], {
       links: [PAGE_GOOD],
@@ -2582,5 +2620,73 @@ describe("a reopen that resumes", () => {
     expect(after.live).toBe(true);
     expect(after.continuation).toBe("live");
     await restarted.dispose();
+  });
+});
+
+/**
+ * An agent's authority is the credential its session is minted with, and this service mints
+ * only an importer's. `startWith` is where every open passes — a new import, a conversation
+ * opened from the composer, a reopen — so the check is there and not only at the reopen.
+ */
+describe("an agent granted another authority", () => {
+  // A worker's round authority: what a hunting agent's credential grants.
+  const ROUND_GRANTED: AgentDefinition<ImporterPromptInput> = {
+    ...IMPORTER_AGENT,
+    id: "round_granted",
+    authority: { role: "round", tools: [] },
+  };
+
+  test("is refused by a start, before anything is minted, written or said", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      agent: ROUND_GRANTED,
+    });
+    expect(started).toMatchObject({
+      _tag: "refused",
+      reason: "agent_unavailable",
+    });
+    if (started._tag !== "refused") return;
+    expect(started.detail).toContain("'round_granted'");
+    expect(started.detail).toContain("'round'");
+    expect(built.script.prompts).toHaveLength(0);
+    expect(agentsOf(built.root)).toHaveLength(0);
+    expect((await authorityOf(runtime, "")).size).toBe(0);
+    await runtime.dispose();
+  });
+
+  test("is refused by a conversation opened from the composer", async () => {
+    const built = world([PAGE_GOOD]);
+    const runtime = ManagedRuntime.make(built.layer);
+    const opened = await runtime.runPromise(
+      Effect.gen(function* () {
+        const fleet = yield* FleetStore;
+        yield* fleet.register({
+          targetId: TARGET,
+          name: "Acme Corp",
+          scopeNote: "",
+          workspacePath: workspace,
+        });
+        yield* fleet.migrateTarget(TARGET);
+        return yield* Effect.result(
+          (yield* ScopeImporter).converse({
+            targetId: TARGET,
+            targetName: "Acme Corp",
+            workspacePath: workspace,
+            text: "Load the scope.",
+            agent: ROUND_GRANTED,
+          }),
+        );
+      }),
+    );
+    expect(opened._tag).toBe("Failure");
+    if (opened._tag !== "Failure") return;
+    expect(opened.failure).toMatchObject({
+      _tag: "ImporterConversationRefused",
+      reason: "agent_unavailable",
+    });
+    expect(built.script.prompts).toHaveLength(0);
+    expect(agentsOf(built.root)).toHaveLength(0);
+    expect((await authorityOf(runtime, "")).size).toBe(0);
+    await runtime.dispose();
   });
 });

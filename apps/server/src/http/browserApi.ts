@@ -1333,12 +1333,6 @@ const fleetHandlers = HttpApiBuilder.group(
        * which is also what keeps the screen and the import from disagreeing about what the
        * default is.
        */
-      /**
-       * The agents a conversation can run as: the registry, as the chip lists it. Never
-       * fails — the registry is this build's own, and it always has the importer.
-       */
-      agents: () => Effect.succeed({ agents: AGENTS.map(agentView) }),
-
       importerModel: () => {
         const choice = chooseImporterModel(harnesses.instances);
         return choice === undefined
@@ -1351,6 +1345,12 @@ const fleetHandlers = HttpApiBuilder.group(
             )
           : Effect.succeed(choice);
       },
+
+      /**
+       * The agents a conversation can run as: the registry, as the chip lists it. Never
+       * fails — the registry is this build's own, and it always has the importer.
+       */
+      agents: () => Effect.succeed({ agents: AGENTS.map(agentView) }),
 
       /**
        * Starts one import against a target that already exists.
@@ -1553,6 +1553,7 @@ const fleetHandlers = HttpApiBuilder.group(
             harnessInstanceId: session.harnessInstanceId,
             endedReason: session.endedReason,
             confirmedAt: session.confirmedAt,
+            agentId: session.agentId,
           },
         });
       }),

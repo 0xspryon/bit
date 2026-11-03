@@ -19,7 +19,7 @@ import {
   assembleImporterPrompt,
   assembleImporterResumePrompt,
 } from "../import/importerPrompt";
-import { importSessionAgent } from "../import/scopeImporter";
+import { importSessionAgent } from "../import/importerHistory";
 import { ImporterToolkit } from "../mcp/importerTools";
 import {
   AGENTS,

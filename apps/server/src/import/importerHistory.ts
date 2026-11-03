@@ -78,7 +78,8 @@ import {
 } from "@bit/contracts";
 import { Effect, type Duration } from "effect";
 
-import { operatorTextOf } from "./importerPrompt";
+import { operatorTextOf, type ImporterPromptInput } from "./importerPrompt";
+import { agentById, type AgentDefinition } from "../agent/registry";
 import {
   SESSION_NOT_FOUND_TAG,
   type AgentHarness,
@@ -86,6 +87,7 @@ import {
 import type { HarnessResolver } from "../harness/resolver";
 import { roleDirectoryMatcher, sessionReopen } from "../harness/sessionReopen";
 import { isRoleDirectoryId } from "../persistence/fleet";
+import type { CallerContext } from "../persistence/store";
 
 /** How long the harness is given to answer about one conversation. */
 export const IMPORTER_HISTORY_FETCH_TIMEOUT: Duration.Input = "5 seconds";
@@ -100,7 +102,45 @@ export interface RecordedImportSession {
   readonly endedReason: ImporterSessionEndReason | null;
   /** `null` while the harness never confirmed creating the session. See the header. */
   readonly confirmedAt: number | null;
+  /** The agent the session runs as (`0002`). See {@link importSessionAgent}. */
+  readonly agentId: string;
 }
+
+/**
+ * The caller kind every import session's credential is minted as.
+ *
+ * The scope importer registers its sessions at the importer endpoint and nowhere else, and
+ * that endpoint admits this kind and refuses every other. So it is the one authority an
+ * import session can carry, and an agent granted any other cannot be opened here: it would
+ * be handed the importer's tools instead of its own.
+ */
+export const IMPORT_SESSION_ROLE =
+  "importer" as const satisfies CallerContext["_tag"];
+
+/**
+ * The agent an import session may run as, by the id a row recorded, or `undefined`.
+ *
+ * `undefined` for an id this server does not define, and for an agent whose authority is
+ * not {@link IMPORT_SESSION_ROLE}.
+ *
+ * **One decision for the replay and the send.** The replay answers `refused` on it, with
+ * {@link agentUnavailableDetail} as its sentence, and a message to the same row is refused
+ * on it with the same sentence — so a composer is never offered for a session the send
+ * will not reopen.
+ */
+export const importSessionAgent = (
+  id: string,
+): AgentDefinition<ImporterPromptInput> | undefined => {
+  const agent = agentById(id);
+  return agent?.authority.role === IMPORT_SESSION_ROLE ? agent : undefined;
+};
+
+/** Why a session whose recorded agent {@link importSessionAgent} refuses is not continued. */
+export const agentUnavailableDetail = (
+  importId: string,
+  agentId: string,
+): string =>
+  `Import ${importId}'s session runs as the agent '${agentId}', which this server does not define as an importer, so it cannot be continued. Start a new session to carry on.`;
 
 /**
  * What a message to an import this process does not hold will do.
@@ -316,6 +356,18 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
    * authority is over — but the continuation is `refused` whatever the harness answers.
    */
   const ended = input.recorded.endedReason === "operator";
+  /*
+   * The other refusal, and in `send`'s order: an operator's end first, then a session this
+   * process holds (which was opened here, so its agent is defined), then the recorded agent.
+   * A row naming an agent this build does not define is refused by the send, so the
+   * composer is disabled on it here, with the send's own sentence.
+   */
+  const refusal: string | undefined = ended
+    ? ENDED_NOTE
+    : live || importSessionAgent(input.recorded.agentId) !== undefined
+      ? undefined
+      : ` ${agentUnavailableDetail(input.importId, input.recorded.agentId)}`;
+  const refused = refusal !== undefined;
 
   /*
    * Nothing has ever been said here: the row exists and the session does not.
@@ -328,10 +380,10 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       ...base,
       harnessSessionId: null,
       live: false,
-      continuation: ended ? "refused" : "fresh",
+      continuation: refused ? "refused" : "fresh",
       source: "absent",
-      note: ended
-        ? `Nothing was ever said in import ${input.importId}: its session was never created.${ENDED_NOTE}`
+      note: refused
+        ? `Nothing was ever said in import ${input.importId}: its session was never created.${refusal}`
         : `Nothing was ever said in import ${input.importId}. Its index entry was written before its session existed, and the session was never created — so there is no conversation here rather than no words. Your next message opens one.`,
     });
   }
@@ -341,9 +393,9 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       ...base,
       harnessSessionId: sessionId,
       live,
-      continuation: ended ? "refused" : "fresh",
+      continuation: refused ? "refused" : "fresh",
       source: "forgotten",
-      note: `This server has no agent harness configured, so session ${sessionId} cannot be asked about and no message can be sent to it.${ended ? ENDED_NOTE : ""}`,
+      note: `This server has no agent harness configured, so session ${sessionId} cannot be asked about and no message can be sent to it.${refusal ?? ""}`,
     });
   }
 
@@ -355,9 +407,9 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       ...base,
       harnessSessionId: sessionId,
       live,
-      continuation: ended ? "refused" : "fresh",
+      continuation: refused ? "refused" : "fresh",
       source: "forgotten",
-      note: `${resolved.failure.message} This conversation's words can only come from the harness, so they are unavailable here. What this import wrote is unaffected: its entries are on the Scope tab and its assets in the Estate.${ended ? ENDED_NOTE : ""}`,
+      note: `${resolved.failure.message} This conversation's words can only come from the harness, so they are unavailable here. What this import wrote is unaffected: its entries are on the Scope tab and its assets in the Estate.${refusal ?? ""}`,
     });
   }
   /*
@@ -374,9 +426,9 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       ...base,
       harnessSessionId: sessionId,
       live,
-      continuation: ended ? "refused" : "fresh",
+      continuation: refused ? "refused" : "fresh",
       source: "forgotten",
-      note: `This session ran on harness instance '${input.recorded.harnessInstanceId}', which this server does not configure, so its words cannot be asked for here and it cannot be continued from here.${ended ? ENDED_NOTE : ""}`,
+      note: `This session ran on harness instance '${input.recorded.harnessInstanceId}', which this server does not configure, so its words cannot be asked for here and it cannot be continued from here.${refusal ?? ""}`,
     });
   }
 
@@ -387,10 +439,10 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
    *
    * Only for a session this process does not hold: a live one is continued by delivering
    * into it, which needs no harness round trip and is the registry's answer rather than the
-   * harness's. Not asked for an ended import either — nothing will be sent to it.
+   * harness's. Not asked for a refused one either — nothing will be sent to it.
    */
   const reopen: ImporterReopen | undefined =
-    live || ended
+    live || refused
       ? undefined
       : yield* importerReopen({
           harness,
@@ -398,17 +450,18 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
           sessionId,
           importDirectory: input.importDirectory,
         });
-  const continuation: ImporterContinuation = ended
+  const continuation: ImporterContinuation = refused
     ? "refused"
     : live
       ? "live"
       : (reopen?._tag ?? "fresh");
   /** Appended to every note, because it is the same fact whether the prose came back or not. */
-  const standing = ended
-    ? ENDED_NOTE
-    : reopen === undefined
-      ? ""
-      : continuationNote(reopen);
+  const standing =
+    refusal !== undefined
+      ? refusal
+      : reopen === undefined
+        ? ""
+        : continuationNote(reopen);
 
   const fetched = yield* Effect.result(
     Effect.timeout(

@@ -32,6 +32,7 @@ import type {
 } from "../harness/agentHarness";
 
 import {
+  agentUnavailableDetail,
   importerConversation,
   importerReopen,
   type RecordedImportSession,
@@ -56,6 +57,7 @@ const recorded = (
   harnessInstanceId: STUB_INSTANCE.instanceId,
   endedReason: null,
   confirmedAt: 1_700_000_000_000,
+  agentId: "importer",
   ...over,
 });
 
@@ -419,6 +421,57 @@ describe("an import the operator ended", () => {
       });
       expect(view.continuation).toBe("resume");
     }
+  });
+});
+
+/**
+ * The other refusal `send` makes, answered here with `send`'s own sentence, so a composer is
+ * never offered for a session the message would be refused on.
+ */
+describe("a row naming an agent this server does not define", () => {
+  const still = {
+    _tag: "resumable",
+    directory: importDirectory(TARGET, IMPORT),
+    detail: "still held",
+  } as const;
+
+  test("is refused, in the send's words, even when the harness could resume it", async () => {
+    const view = await read({
+      recorded: recorded({ agentId: "retired_agent" }),
+      messages: [entry({ text: "two in, one out" })],
+      continuation: still,
+    });
+    expect(view.continuation).toBe("refused");
+    expect(view.messages).toHaveLength(1);
+    expect(view.note).toContain(
+      agentUnavailableDetail(IMPORT, "retired_agent"),
+    );
+    expect(view.note).not.toContain("Your next message");
+  });
+
+  test("is refused when nothing was ever said in it too", async () => {
+    const view = await read({
+      recorded: recorded({ agentId: "retired_agent", confirmedAt: null }),
+    });
+    expect(view.continuation).toBe("refused");
+    expect(view.note).toContain(
+      agentUnavailableDetail(IMPORT, "retired_agent"),
+    );
+  });
+
+  test("the operator's end is said first, as the send checks it first", async () => {
+    const view = await read({
+      recorded: recorded({ agentId: "retired_agent", endedReason: "operator" }),
+      messages: [],
+    });
+    expect(view.continuation).toBe("refused");
+    expect(view.note).toContain("You ended this import");
+    expect(view.note).not.toContain("'retired_agent'");
+  });
+
+  test("the importer is not refused", async () => {
+    const view = await read({ messages: [], continuation: still });
+    expect(view.continuation).toBe("resume");
   });
 });
 

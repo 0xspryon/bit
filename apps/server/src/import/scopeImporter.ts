@@ -137,19 +137,18 @@ import {
 } from "effect";
 
 import {
+  agentUnavailableDetail,
+  IMPORT_SESSION_ROLE,
   importerConversation,
   importerReopenFor,
+  importSessionAgent,
   type RecordedImportSession,
 } from "./importerHistory";
 import { resolveImporterModel } from "./importerModel";
 import { operatorPages, type ImporterPromptInput } from "./importerPrompt";
 import { importerSessionTitle } from "./importerTitle";
 import { ScopeImportProgress, widenPages } from "./progress";
-import {
-  agentById,
-  IMPORTER_AGENT,
-  type AgentDefinition,
-} from "../agent/registry";
+import { IMPORTER_AGENT, type AgentDefinition } from "../agent/registry";
 import { lastAssistantText, type AgentHarness } from "../harness/agentHarness";
 import {
   makeLiveAgentSessions,
@@ -191,8 +190,11 @@ export type ScopeImportStarted =
   /** Links were given and this server cannot read them. The target is created regardless. */
   | {
       readonly _tag: "refused";
-      /** Which of the two: no harness at all, or the chosen one cannot take a session. */
-      readonly reason: "no_harness" | "harness_not_ready";
+      /**
+       * No harness at all, the chosen one cannot take a session, or the agent asked for is
+       * granted an authority this service does not mint (see `startWith`).
+       */
+      readonly reason: "no_harness" | "harness_not_ready" | "agent_unavailable";
       readonly detail: string;
     };
 
@@ -226,21 +228,6 @@ export const importReport = (text: string): string | null => {
 interface ImportSessionMeta {
   readonly agent: AgentDefinition<ImporterPromptInput>;
 }
-
-/**
- * The agent an import session may run as, by the id a row recorded, or `undefined`.
- *
- * `undefined` for an id this server does not define, and for an agent whose authority is
- * not the importer's: this service mints importer credentials and registers them at the
- * importer endpoint and nowhere else, so an agent granted any other role could not be given
- * its tools here — opening it would hand it the importer's instead.
- */
-export const importSessionAgent = (
-  id: string,
-): AgentDefinition<ImporterPromptInput> | undefined => {
-  const agent = agentById(id);
-  return agent?.authority.role === "importer" ? agent : undefined;
-};
 
 /** Where an import's first turn says how its open went, for a caller that waits on it. */
 type Opening = Deferred.Deferred<
@@ -585,7 +572,7 @@ export class ScopeImporter extends Context.Service<
           // toolkit reads before every write.
           issue: (input) =>
             credentials.issueWithoutExpiry({
-              _tag: "importer",
+              _tag: IMPORT_SESSION_ROLE,
               targetId: input.targetId,
               importId: input.id,
             }),
@@ -978,6 +965,27 @@ export class ScopeImporter extends Context.Service<
             : "";
 
         /*
+         * The agent, and whether a session can be opened as it at all — **here, where every
+         * open passes**, before anything is resolved, minted or written.
+         *
+         * Its authority is what its credential grants, and this service mints exactly one
+         * kind: `issue` below writes `IMPORT_SESSION_ROLE` and registers it at the importer
+         * endpoint. An agent granted any other role would be opened with the importer's
+         * tools, so it is refused rather than opened under a grant that is not its own —
+         * whichever caller built the request (a new conversation, a reopen, a test).
+         * Pinned from here: the row records it, the opener is its, and a reopen of this
+         * conversation reads it back from the row rather than choosing again (`0002`).
+         */
+        const agent = request.agent ?? IMPORTER_AGENT;
+        if (agent.authority.role !== IMPORT_SESSION_ROLE) {
+          return {
+            _tag: "refused",
+            reason: "agent_unavailable",
+            detail: `the agent '${agent.id}' is granted the '${agent.authority.role}' authority, and an import session's credential is only ever an importer's, so no session can be opened as it.${consequence}`,
+          } as const;
+        }
+
+        /*
          * Bounded here rather than refused in the contract.
          *
          * One session reads every link (D15), so they share one context window, and a
@@ -1052,9 +1060,6 @@ export class ScopeImporter extends Context.Service<
           pickedOptions,
           "a scope import",
         );
-        // Pinned from here: the row records it, the opener is its, and a reopen of this
-        // conversation reads it back from the row rather than choosing again (`0002`).
-        const agent = request.agent ?? IMPORTER_AGENT;
         const importId = newImportId();
         // A resume names the session it continues: minting a fresh id would start a second
         // conversation and leave the session index showing one as two (S3.3).
@@ -1422,6 +1427,9 @@ export class ScopeImporter extends Context.Service<
           links: [],
           message: input.text,
           ...(input.choice === undefined ? {} : { choice: input.choice }),
+          // Passed on rather than dropped: an agent asked for and not honoured would be a
+          // substitution, and `startWith` is where its authority is checked.
+          ...(input.agent === undefined ? {} : { agent: input.agent }),
         });
         return accepted(
           entry,
@@ -1547,7 +1555,9 @@ export class ScopeImporter extends Context.Service<
             if (agent === undefined) {
               return yield* new ImporterConversationRefused({
                 reason: "agent_unavailable",
-                detail: `import ${input.importId}'s session runs as the agent '${row.agentId}', which this server does not define as an importer, so it cannot be continued. Start a new session to carry on.`,
+                // The replay's sentence for the same row (`importerHistory.ts`), so the
+                // composer was already disabled on it with these words.
+                detail: agentUnavailableDetail(input.importId, row.agentId),
               });
             }
             /*
