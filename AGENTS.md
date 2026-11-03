@@ -67,8 +67,9 @@
   them one package at a time under a 2 GB limit instead:
   `systemd-run --user --scope -q -p MemoryMax=2G -p MemorySwapMax=0 timeout 900 bun run typecheck --concurrency=1`,
   and the same for `bun run build --concurrency=1` and `bun install --frozen-lockfile`.
-  `NODE_OPTIONS` does not help: turbo's strict env mode drops it. A failing assertion on happy-dom nodes is the known cause: never
-  `toEqual` a node or an array of nodes — compare strings (`outerHTML`, `textContent`).
+  `NODE_OPTIONS` does not help: turbo's strict env mode drops it. The known cause of a
+  runaway test is a failing assertion on happy-dom nodes: never `toEqual` a node or an
+  array of nodes — compare strings (`outerHTML`, `textContent`).
   When a test mutates a file to prove it can fail, copy the file first and restore from
   the copy; a killed run never reaches a cleanup step after it.
 - When in doubt about how to implement a functionality or how EffectV4 works, look
