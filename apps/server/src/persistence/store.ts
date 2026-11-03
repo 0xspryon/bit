@@ -6772,6 +6772,14 @@ const makeStore = Effect.fnUntraced(function* () {
    * session is addressed to, because an import id names one authority period and only the
    * latest can still hold one — and `ended_reason` is that run's (`0027`), read only once
    * the session as a whole has ended, so it is `NULL` exactly when `ended_at` is.
+   *
+   * **`model` is that latest run's too, not the opening row's.** A model switch (A6 F4)
+   * rewrites only the run it was made on, and a reopen opens its successor on the latest
+   * run's model, so the rows of one session can name different models and only the latest
+   * says what the conversation is on now and will reopen on. The other columns read from the
+   * opening row cannot differ along a session: `opened_at` is meant to be the opening's,
+   * `agent_id` is pinned once the first message is sent, and a switch stays within the
+   * pinned `harness_instance_id`.
    */
   const selectImportSessions = SqlSchema.findAll({
     Request: Schema.String,
@@ -6780,7 +6788,12 @@ const makeStore = Effect.fnUntraced(function* () {
       sql`SELECT
             s.harness_session_id AS harness_session_id,
             s.harness_instance_id AS harness_instance_id,
-            s.model AS model,
+            (SELECT r.model FROM import_sessions r
+              WHERE r.target_id = s.target_id
+                AND r.harness_session_id = s.harness_session_id
+                AND r.session_created_at IS NOT NULL
+              ORDER BY r.opened_at DESC, r.import_id DESC
+              LIMIT 1) AS model,
             s.opened_at AS opened_at,
             s.agent_id AS agent_id,
             (SELECT group_concat(r.import_id) FROM import_sessions r
@@ -9417,6 +9430,7 @@ export class ObservationStore extends Context.Service<
       readonly {
         readonly harnessSessionId: string;
         readonly harnessInstanceId: string | null;
+        /** The model of its latest run, which a switch may have changed (A6 F4). */
         readonly model: string;
         readonly openedAt: number;
         /** Every import run on this session, so a caller can ask which are still live. */

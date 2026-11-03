@@ -565,6 +565,49 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
     expect(outcome.missing).toBe(false);
   });
 
+  test("the session list names the model of the run a reopen continues, not the run that opened it (A6 F4)", async () => {
+    const path = newDatabasePath();
+    const listed = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* open(store, "imp_opened", { session: "ses_chain" });
+        yield* Effect.sleep("5 millis");
+        // The reopen, opened on its predecessor's model, then switched.
+        yield* open(store, "imp_reopened", { session: "ses_chain" });
+        yield* store.recordImportSessionModel({
+          importId: "imp_reopened",
+          model: "anthropic/claude-haiku-4-5",
+          modelOptions: undefined,
+        });
+        const afterSwitch = yield* store.importSessions(TARGET);
+        yield* Effect.sleep("5 millis");
+        // A later run the harness never confirmed is not the session's latest run, so its
+        // model is not the session's either — the same rule as `latestImportId`.
+        yield* store.recordImportSession({
+          importId: "imp_unconfirmed",
+          targetId: TARGET,
+          harnessSessionId: "ses_chain",
+          harnessInstanceId: "opencode",
+          model: "anthropic/claude-opus-5-5",
+          agentId: "importer",
+        });
+        return {
+          afterSwitch,
+          afterUnconfirmed: yield* store.importSessions(TARGET),
+        };
+      }),
+    );
+    expect(listed.afterSwitch).toHaveLength(1);
+    expect(listed.afterSwitch[0]).toMatchObject({
+      harnessSessionId: "ses_chain",
+      latestImportId: "imp_reopened",
+      model: "anthropic/claude-haiku-4-5",
+    });
+    expect(listed.afterUnconfirmed[0]).toMatchObject({
+      latestImportId: "imp_reopened",
+      model: "anthropic/claude-haiku-4-5",
+    });
+  });
+
   test("the row says whether its session was ever created, which is what a replay needs (S6)", async () => {
     const path = newDatabasePath();
     const outcome = await withStore(path, (store) =>

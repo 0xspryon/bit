@@ -26,6 +26,10 @@
  * What is **not** here: a real Claude Code turn. That needs a login and a model, and is
  * exercised live; see the report.
  */
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, test } from "bun:test";
 import type {
   McpServerConfig,
@@ -52,6 +56,7 @@ import {
 } from "../import/importerPrompt";
 import {
   claudeCodeHarness,
+  liveClaudeCodeSdk,
   newClaudeCodeSessionId,
   type ClaudeCodeSdk,
   type HarnessQuery,
@@ -1308,21 +1313,32 @@ describe("a session this process does not hold", () => {
 
   /**
    * What `Query.setModel` leaves in the transcript (A6 F4): the CLI records the switch as
-   * though `/model` had been typed. The three entries below are copied from a 2.1.310
-   * transcript written by the model-switch probe, string content and all.
+   * though `/model` had been typed. The entries below are what SDK 0.3.310's
+   * `getSessionMessages` returned for a 2.1.310 transcript the model-switch probe wrote —
+   * keys, flag and string content as read: the `isMeta` caveat that heads the run on disk is
+   * already gone, and the two entries after it carry `isCompletedLocalCommand: true`.
    */
-  test("the CLI's own record of a /model switch is not a message, and an operator's quote of one is", async () => {
+  test("the CLI's own record of a /model switch is not a message, and an operator's message that is one wrapper is", async () => {
     const SESSION = "11111111-0000-4000-8000-000000000005";
-    const user = (uuid: string, content: string): SessionMessage => ({
-      type: "user",
-      uuid,
-      session_id: SESSION,
-      message: { role: "user", content },
-      parent_tool_use_id: null,
-      parent_agent_id: null,
-    });
-    const quoted =
-      "Why does my log say <local-command-stdout>Set model to `claude-sonnet-4-5`</local-command-stdout>?";
+    const user = (
+      uuid: string,
+      content: string,
+      localCommand = false,
+    ): SessionMessage =>
+      ({
+        type: "user",
+        uuid,
+        session_id: SESSION,
+        message: { role: "user", content },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        ...(localCommand ? { isCompletedLocalCommand: true } : {}),
+      }) as SessionMessage;
+    const stdout =
+      "<local-command-stdout>Set model to `claude-sonnet-4-5`</local-command-stdout>";
+    const commandName =
+      "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>claude-sonnet-4-5</command-args>";
+    const quoted = `Why does my log say ${stdout}?`;
     const entries = await withHarness(
       {
         transcript: [
@@ -1335,19 +1351,14 @@ describe("a session this process does not hold", () => {
             parent_tool_use_id: null,
             parent_agent_id: null,
           },
-          user(
-            "c",
-            "<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>",
-          ),
-          user(
-            "d",
-            "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>claude-sonnet-4-5</command-args>",
-          ),
-          user(
-            "e",
-            "<local-command-stdout>Set model to `claude-sonnet-4-5`</local-command-stdout>",
-          ),
+          user("d", commandName, true),
+          user("e", stdout, true),
           user("f", quoted),
+          // An operator's paste sent verbatim — an importer follow-up is the operator's
+          // words unchanged — whose whole text is one wrapper. No caveat precedes it, so
+          // the SDK does not mark it, and it is the operator's message.
+          user("g", stdout),
+          user("h", commandName),
         ],
       },
       (harness) => harness.messages(SESSION),
@@ -1356,7 +1367,128 @@ describe("a session this process does not hold", () => {
       "start",
       "first reply",
       quoted,
+      stdout,
+      commandName,
     ]);
+  });
+
+  /**
+   * The same claim against the **real** `getSessionMessages`, because the flag the filter
+   * reads is SDK 0.3.310's own derivation and is not in its published types: a later SDK
+   * that stopped setting it, or set it wider, fails here rather than in a replay.
+   *
+   * The transcript is written to a temporary `CLAUDE_CONFIG_DIR` in the CLI's on-disk form,
+   * each entry trimmed to the fields the SDK reads from the probe's 2.1.310 transcripts: the
+   * `/model` run is the meta caveat, the command record and its stdout, and the operator
+   * prompts carry `promptSource: "sdk"` as every message this server sends does. The hard
+   * case is the last prompt — an operator's paste that is exactly one stdout wrapper, sent
+   * directly after a `/model` run, where a filter that looked at the text or the position
+   * alone would take it for the run's output.
+   */
+  test("the real SDK marks only the CLI's /model run, not an operator's paste of its output that follows it", async () => {
+    const SESSION = "11111111-0000-4000-8000-000000000006";
+    const WORKSPACE = "/tmp/bit-local-command-ws";
+    const root = await mkdtemp(join(tmpdir(), "bit-local-command-"));
+    const previous = process.env["CLAUDE_CONFIG_DIR"];
+    const stdout =
+      "<local-command-stdout>Set model to `claude-sonnet-4-5`</local-command-stdout>";
+    let at = Date.parse("2026-11-03T20:49:06.000Z");
+    let parent: string | null = null;
+    const line = (
+      uuid: string,
+      type: "user" | "assistant",
+      content: unknown,
+      extra: Record<string, unknown> = {},
+    ) => {
+      const entry = {
+        parentUuid: parent,
+        isSidechain: false,
+        type,
+        message:
+          type === "user"
+            ? { role: "user", content }
+            : { role: "assistant", content, model: "claude-sonnet-4-5" },
+        uuid,
+        timestamp: new Date((at += 1000)).toISOString(),
+        sessionId: SESSION,
+        version: "2.1.310",
+        ...extra,
+      };
+      parent = uuid;
+      return JSON.stringify(entry);
+    };
+    const prompt = { promptSource: "sdk" } as const;
+    const reply = (text: string) => [{ type: "text", text }];
+    const transcript = [
+      line("00000000-0000-4000-8000-000000000001", "user", "start", prompt),
+      line(
+        "00000000-0000-4000-8000-000000000002",
+        "assistant",
+        reply("first reply"),
+      ),
+      line(
+        "00000000-0000-4000-8000-000000000003",
+        "user",
+        "<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>",
+        { isMeta: true },
+      ),
+      line(
+        "00000000-0000-4000-8000-000000000004",
+        "user",
+        "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>claude-sonnet-4-5</command-args>",
+      ),
+      line("00000000-0000-4000-8000-000000000005", "user", stdout),
+      line("00000000-0000-4000-8000-000000000006", "user", stdout, prompt),
+      line(
+        "00000000-0000-4000-8000-000000000007",
+        "assistant",
+        reply("second reply"),
+      ),
+    ];
+    try {
+      const project = join(
+        root,
+        "projects",
+        WORKSPACE.replace(/[^a-zA-Z0-9]/g, "-"),
+      );
+      await mkdir(project, { recursive: true });
+      await writeFile(
+        join(project, `${SESSION}.jsonl`),
+        `${transcript.join("\n")}\n`,
+      );
+      process.env["CLAUDE_CONFIG_DIR"] = root;
+      const { sdk } = scriptedSdk();
+      const entries = await Effect.runPromise(
+        Effect.scoped(
+          // No session is registered, so `messages` passes no `dir` and the SDK searches
+          // every project under the temporary config directory — this one only.
+          Effect.flatMap(AgentHarness, (harness) =>
+            harness.messages(SESSION),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                sdk: {
+                  ...sdk,
+                  sessionMessages: liveClaudeCodeSdk.sessionMessages,
+                },
+                controlTimeout: "2 seconds",
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+      expect(entries.map((entry) => entry.text)).toEqual([
+        "start",
+        "first reply",
+        stdout,
+        "second reply",
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

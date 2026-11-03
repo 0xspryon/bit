@@ -982,43 +982,43 @@ const outcomeOf = (
   return message.subtype === "success" ? "succeeded" : "failed";
 };
 
-/** Reduces one stored transcript entry to the three fields a caller uses. */
 /**
- * The wrappers the CLI writes into a transcript for a local slash command, each the whole
- * of one user entry. Measured on 2.1.310 transcripts after `Query.setModel` (A6 F4), which
- * the CLI records as though `/model` had been typed: a `<local-command-caveat>` (meta), then
- * `<command-name>/model</command-name>` with its `<command-message>` and `<command-args>`,
- * then `<local-command-stdout>Set model to …</local-command-stdout>`. `stderr` is the same
- * wrapper for a command that failed.
+ * Whether a stored entry is the CLI's own record of a local slash command rather than
+ * anything said in the conversation — which a replay would otherwise show as an operator
+ * message the harness holds and never answered.
  *
- * Anchored at both ends and matched against the entry's whole text, so only an entry that
- * *is* one of these is dropped. An operator's message that quotes one is never such an
- * entry: every message this server sends is framed by its own prompt around the operator's
- * words, so it never consists of a wrapper and nothing else.
- */
-const LOCAL_COMMAND_ENTRY = [
-  /^<local-command-caveat>[^<]*<\/local-command-caveat>$/,
-  /^<command-name>\/[^<\s]+<\/command-name>\s*<command-message>[^<]*<\/command-message>\s*<command-args>[^<]*<\/command-args>$/,
-  /^<local-command-(stdout|stderr)>[^<]*<\/local-command-\1>$/,
-] as const;
-
-/**
- * Whether a stored entry is the CLI's own record of a local command rather than anything
- * said in the conversation — which a replay would otherwise show as an operator message
- * the harness holds and never answered.
+ * `Query.setModel` is recorded in the transcript as though `/model` had been typed (A6 F4).
+ * Measured on the model-switch probe's 2.1.310 transcripts, each switch is a run of three
+ * user entries: a `<local-command-caveat>` carrying `isMeta: true` — the only entry of the
+ * run that does — then `<command-name>/model</command-name>` with its `<command-message>`
+ * and `<command-args>`, then `<local-command-stdout>Set model to …</local-command-stdout>`
+ * (`stderr` for a command that failed).
+ *
+ * **The run is recognised by where it sits, not by what its text looks like.** SDK 0.3.310's
+ * `getSessionMessages` drops the `isMeta` caveat itself and marks the entries that follow it
+ * as that same command — the first non-meta `<command-name>` record after the caveat, then
+ * the stdout/stderr outputs after that record, stopping at anything else — with
+ * `isCompletedLocalCommand: true`. That flag is what is read here, and only that. A
+ * message this server sent is not part of such a run even when its whole text is one of the
+ * wrappers: an importer follow-up is the operator's words unchanged
+ * (`assembleImporterFollowUpPrompt`), and so is a goal follow-up without attachments, so an
+ * operator who pastes `<local-command-stdout>…</local-command-stdout>` sends exactly that —
+ * and the CLI stores it with `promptSource: "sdk"`, which the SDK never counts as part of a
+ * run, so it is kept even when it lands directly after a `/model` run's output.
+ *
+ * The flag is not in the SDK's published `SessionMessage` type, so it is read through a cast
+ * — the same honest form as the steer's `uuid` and `priority` below. Should a later SDK stop
+ * setting it, these entries reappear in the replay; no operator message can vanish.
  *
  * V2(chat): dropped, not shown. The transcript work marks where a model switch happened;
  * these entries are not that marker and are not turned into one here.
  */
-const isLocalCommandEntry = (entry: SessionMessage): boolean => {
-  if (entry.type !== "user") return false;
-  const content = (entry.message as { content?: unknown } | null | undefined)
-    ?.content;
-  if (typeof content !== "string") return false;
-  const text = content.trim();
-  return LOCAL_COMMAND_ENTRY.some((pattern) => pattern.test(text));
-};
+const isLocalCommandEntry = (entry: SessionMessage): boolean =>
+  entry.type === "user" &&
+  (entry as { readonly isCompletedLocalCommand?: unknown })
+    .isCompletedLocalCommand === true;
 
+/** Reduces one stored transcript entry to the three fields a caller uses. */
 const flatten = (entry: SessionMessage): MessageEntry => {
   const message = (entry.message ?? {}) as {
     content?: unknown;
