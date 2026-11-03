@@ -4313,6 +4313,10 @@ describe("a target's importer sessions", () => {
           harnessInstanceId: "opencode",
           model: "openai/gpt-5.6-sol",
           openedAt: 2_000,
+          // Null, and the list answered all the same: the rows name an `opencode` instance
+          // this test server does not run, so the harness is not asked at all (S9). The
+          // titled path is `import/importerTitle.test.ts`'s.
+          title: null,
           // This process holds LIVE_IMPORT_ID as running, and nothing stored says so.
           running: true,
           endedAt: null,
@@ -4326,6 +4330,7 @@ describe("a target's importer sessions", () => {
           harnessInstanceId: "opencode",
           model: "openai/gpt-5.6-sol",
           openedAt: 1_000,
+          title: null,
           running: false,
           // Stored (`0026`), so it survives the process that ended it.
           endedAt: 1_500,

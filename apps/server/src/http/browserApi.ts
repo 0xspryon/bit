@@ -114,6 +114,7 @@ import { renderScopeBlock } from "../scope/scopePrompt";
 import { isWithin, POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
 import { chooseImporterModel } from "../import/importerModel";
+import { importerSessionTitles } from "../import/importerTitle";
 import { ScopeImporter } from "../import/scopeImporter";
 import { GoalConversations } from "../plan/goalConversation";
 import {
@@ -1424,6 +1425,13 @@ const fleetHandlers = HttpApiBuilder.group(
         const sessions = yield* withTargetStore(stores, row.targetId, (store) =>
           store.importSessions(row.targetId),
         ).pipe(Effect.orDie);
+        // Asked of the harness, after the rows and never instead of them: this never fails
+        // and is held to a short budget, so a harness that is down costs the list its
+        // titles and nothing else. `import/importerTitle.ts` says why the list waits at all.
+        const titles = yield* importerSessionTitles({
+          resolver: harnesses,
+          sessions,
+        });
         return {
           sessions: yield* Effect.forEach(sessions, (session) =>
             Effect.map(
@@ -1435,6 +1443,7 @@ const fleetHandlers = HttpApiBuilder.group(
                 harnessInstanceId: session.harnessInstanceId,
                 model: session.model,
                 openedAt: session.openedAt,
+                title: titles.get(session.harnessSessionId) ?? null,
                 running: views.some((view) => view?.status === "running"),
                 endedAt: session.endedAt,
                 endedReason: session.endedReason,

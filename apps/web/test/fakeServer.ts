@@ -220,6 +220,7 @@ export const importerSessionView = (
   harnessInstanceId: "opencode",
   model: "openai/gpt-5.6-sol",
   openedAt: AT,
+  title: null,
   running: false,
   endedAt: null,
   endedReason: null,

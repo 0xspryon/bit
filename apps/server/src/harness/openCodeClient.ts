@@ -96,6 +96,7 @@ import {
   type HarnessNarration,
   type MessageEntry,
   type NarrationDetail,
+  type SessionTitle,
   type SessionWindow,
 } from "./agentHarness";
 import { openCodeMessageId } from "./messageId";
@@ -709,6 +710,16 @@ export const DEFAULT_TIMEOUTS: ClientTimeouts = {
   control: "30 seconds",
   wait: "30 minutes",
 };
+
+/**
+ * OpenCode's stand-in for a session that has no title yet: its kind and creation time.
+ *
+ * Copied from `@opencode/util`'s `session-title-fallback.ts`, which is how OpenCode itself
+ * recognises one, rather than imported: the package is not a dependency of this server, and
+ * a placeholder is the one title `openCodeHarness.sessionTitle` must not report as a name.
+ */
+export const OPENCODE_PLACEHOLDER_TITLE =
+  /^(New session|Child session) - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 /**
  * A session id this application mints, in OpenCode's own format.
@@ -1420,6 +1431,54 @@ export const openCodeHarness = (
         });
 
       /**
+       * What OpenCode calls a session: the row's `title`, read by `session.get`.
+       *
+       * One bounded read per id, not `session.list`: that endpoint pages over every session
+       * the server holds, newest first, and is not a lookup — see the seam.
+       *
+       * A `404` is `forgotten`, as in {@link sessionContinuation}, and any other failure is
+       * a failure. An absent or blank `title` is `untitled`, and so is **OpenCode's own
+       * placeholder**: a session created without a title is shown as `New session - <ISO
+       * time>` (`Child session - …` under a parent) until its first turn earns a generated
+       * one. That string is OpenCode's date, not a name, and `@opencode/util`'s
+       * `session-title-fallback.ts` recognises it with exactly this pattern.
+       *
+       * **What this does not filter is the title the caller gave the session.** OpenCode
+       * keeps a `title` passed to `session.create` and only generates one for a session that
+       * has none (`SessionTitle.isUntitled` in `packages/core/src/session/runner/llm.ts`), so
+       * a session this server named answers with that name for ever. It is reported as
+       * `titled` because it *is* the session's title; recognising it as the caller's own
+       * words is the caller's business, and `import/importerTitle.ts` does it for the
+       * importer.
+       */
+      const sessionTitle: AgentHarness["Service"]["sessionTitle"] = Effect.fn(
+        "openCodeHarness.sessionTitle",
+      )(function* (sessionId) {
+        const asked = yield* Effect.result(
+          bounded(
+            "session.get",
+            timeouts.control,
+            api.session.get({ sessionID: sessionId as Session.ID }),
+          ),
+        );
+        if (asked._tag === "Failure") {
+          if (asked.failure.status === 404) {
+            return {
+              _tag: "forgotten",
+              detail: `this OpenCode server holds no session ${sessionId}`,
+            } satisfies SessionTitle;
+          }
+          return yield* Effect.fail(asked.failure);
+        }
+        const title = asked.success.title;
+        return title === undefined ||
+          title.trim() === "" ||
+          OPENCODE_PLACEHOLDER_TITLE.test(title)
+          ? ({ _tag: "untitled" } satisfies SessionTitle)
+          : ({ _tag: "titled", title } satisfies SessionTitle);
+      });
+
+      /**
        * The session's messages, oldest first, all of them.
        *
        * ## Why this asks for an order and walks the cursor
@@ -1572,6 +1631,7 @@ export const openCodeHarness = (
         waitForIdle,
         sessionStatus,
         sessionContinuation,
+        sessionTitle,
         messages,
         interruptSession,
         sessionEvents,

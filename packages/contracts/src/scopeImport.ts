@@ -294,8 +294,32 @@ export const ImporterSessionView = Schema.Struct({
   harnessInstanceId: Schema.NullOr(Schema.String),
   /** The model it ran on, as `provider/model`. */
   model: Schema.String,
-  /** When the session was opened, in epoch milliseconds. */
+  /**
+   * When the session was opened, in epoch milliseconds.
+   *
+   * From bit's own durable row, so it is always here — including for a session the harness
+   * has since deleted. It is what identifies a session when {@link title} cannot, and what
+   * tells two sessions apart that the harness named alike. {@link title} sits beside it and
+   * never replaces it.
+   */
   openedAt: Schema.Int,
+  /**
+   * What the harness calls this session, as one line of at most 120 characters, or null.
+   *
+   * Read from the harness on every list and never stored: both harnesses retitle a
+   * conversation as it develops, and a title is as perishable as the conversation's words
+   * (DECISIONS.md §8). It is agent- or person-authored text, so it is a plain label — never
+   * markup.
+   *
+   * **Null means there is no name to show, and the screen labels the session by
+   * {@link openedAt}.** It covers every reason at once, because each is drawn the same way:
+   * the harness has deleted the session, holds it with no title yet (both title a
+   * conversation after its first turn), could not be asked within the list's short budget, or
+   * answered with a name this server gave it rather than one it earned — OpenCode keeps the
+   * `bit scope importer: <target>` a session was opened under. A null here can become a title
+   * on the next read.
+   */
+  title: Schema.NullOr(Schema.String),
   /**
    * Whether an import run on this session is going **right now, in this server process**.
    *

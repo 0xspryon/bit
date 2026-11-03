@@ -33,7 +33,8 @@
  *    {@link AgentHarness.messages} — settle, stop, read back. And
  *    {@link AgentHarness.sessionContinuation} beside them, which asks the one thing a
  *    conversation needs and a run does not: whether a session this process no longer holds
- *    can be talked to again.
+ *    can be talked to again. {@link AgentHarness.sessionTitle} is the third question of that
+ *    kind, and the only one a screen asks rather than a run: what the harness calls it.
  * 10. {@link AgentHarness.unregisterMcpServer} — take the registration away again when
  *    the credential it carried is revoked.
  *
@@ -214,6 +215,76 @@ export type SessionContinuation =
       /** The harness's own sentence about why not: swept, never saved, unknown. */
       readonly detail: string;
     };
+
+/**
+ * What a harness calls one session, asked of the harness (S9).
+ *
+ * **Three answers, because they are three facts and a screen draws each differently.**
+ * `forgotten` is the harness no longer holding the session at all — Claude Code sweeps
+ * transcripts on `cleanupPeriodDays`, and for anything old enough that is the ordinary
+ * answer. `untitled` is a harness that still holds it and has no name for it *yet*: both
+ * harnesses title a conversation after its first turn, so this is a session that has said
+ * little or nothing, and it may have a title on the next read. `titled` is the name. A fourth
+ * fact — "we could not ask" — is the failure channel, as on every other operation here: a
+ * harness that did not answer has said nothing about the session.
+ *
+ * Collapsing `untitled` and `forgotten` into an empty string would lose exactly the
+ * distinction the replay keeps between `none` and `forgotten` (`import/importerHistory.ts`):
+ * one is a session that is there and quiet, the other is one whose words are gone.
+ *
+ * **A title is the harness's or a person's name for the session, never a prompt the harness
+ * fell back to.** That is the half each implementation has to make true rather than inherit:
+ * the Claude Agent SDK's `summary` falls back to the session's prompts when nothing better
+ * exists, and those prompts are this server's framing. See `claudeCodeHarness.sessionTitle`.
+ *
+ * `title` is the harness's text verbatim — not trimmed beyond "is it blank", not capped.
+ * Uncapped on purpose: a caller that recognises its own words in a title needs the whole
+ * string to do it, and a cut made here could remove the very marker it would look for. The
+ * caller caps with {@link capSessionTitle} before the text reaches any screen.
+ */
+export type SessionTitle =
+  | { readonly _tag: "titled"; readonly title: string }
+  | { readonly _tag: "untitled" }
+  | {
+      readonly _tag: "forgotten";
+      /** The harness's own sentence about why it has nothing for this id. */
+      readonly detail: string;
+    };
+
+/**
+ * The most characters a session title carries to a screen.
+ *
+ * **A label, not a field of a transcript, so it is capped on different terms from
+ * {@link NARRATION_FIELD_MAX}.** That cap is 4 000 characters and marks its cut with
+ * {@link NARRATION_TRUNCATED_MARK}, a new line and a sentence, because a narration field is
+ * read in a scrolling transcript where an operator must not mistake a shortened tool argument
+ * for the whole one. A title sits on one line of chrome — a crumb, a picker row — where a
+ * new line would break the line it sits on and a sentence would be longer than most titles.
+ * So this is 120 characters, whitespace collapsed to single spaces, and a single `…` where it
+ * cut.
+ *
+ * 120 is above what either harness writes on its own: OpenCode cuts generated titles at 100
+ * (`packages/core/src/session/title.ts`, `MAX_LENGTH`), and the Claude Code `ai-title`s
+ * observed on this machine's importer transcripts are four to six words. So it bites on a
+ * name nobody's generator wrote — a rename, or a third harness — which is the agent- or
+ * person-authored text the cap is for.
+ */
+export const SESSION_TITLE_MAX = 120;
+
+/**
+ * One title as a single line of at most {@link SESSION_TITLE_MAX} characters, or
+ * `undefined` when nothing but whitespace was there.
+ *
+ * Applied by the caller *after* it has recognised any of its own words in the title; see
+ * {@link SessionTitle} on why the seam hands it over uncapped.
+ */
+export const capSessionTitle = (value: string): string | undefined => {
+  const line = value.replace(/\s+/g, " ").trim();
+  if (line === "") return undefined;
+  return line.length <= SESSION_TITLE_MAX
+    ? line
+    : `${line.slice(0, SESSION_TITLE_MAX - 1).trimEnd()}…`;
+};
 
 /** One entry of a session's message log, reduced to what this application reads. */
 export interface MessageEntry {
@@ -777,6 +848,30 @@ export class AgentHarness extends Context.Service<
     readonly sessionContinuation: (
       sessionId: string,
     ) => Effect.Effect<SessionContinuation, HarnessFailure>;
+    /**
+     * What the harness currently calls one session (S9). See {@link SessionTitle}.
+     *
+     * **One session per call, on both drivers, and that is the cost shape a caller plans
+     * around.** It looks as though OpenCode could answer a whole list at once — `session.list`
+     * carries `title` — but that endpoint is a newest-first page over *every* session the
+     * server holds, not a lookup by id, so finding a handful of named sessions in it means
+     * paging until they turn up. `session.get` is one bounded round trip per id. Claude Code's
+     * `getSessionInfo` is one file read per id, and its `listSessions` is per project
+     * directory, which for the importer is one per import. So neither driver is cheaper in
+     * bulk for the question callers ask, and the seam does not pretend otherwise: a caller
+     * listing N sessions makes N calls, concurrently and under its own deadline.
+     *
+     * **Bounded**, like everything here but {@link sessionEvents}: an implementation holds
+     * each call to its control timeout. A caller drawing a list should bound the whole
+     * fan-out more tightly than that, because a title is decoration and the list is not.
+     *
+     * Read-through and never stored: both harnesses retitle a conversation as it develops,
+     * so a copy kept by this application would be a second copy of the harness's data with
+     * no way to know it had gone stale (DECISIONS.md §8).
+     */
+    readonly sessionTitle: (
+      sessionId: string,
+    ) => Effect.Effect<SessionTitle, HarnessFailure>;
     /**
      * One session's messages, as the harness retains them: **oldest first, and all of
      * them.**

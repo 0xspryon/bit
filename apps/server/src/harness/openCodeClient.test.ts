@@ -1953,3 +1953,80 @@ describe("reading a session's messages", () => {
     }
   });
 });
+
+describe("what OpenCode calls a session", () => {
+  const titleOf = (respond: (url: string) => Promise<Response>) => {
+    const { layer, recorded } = clientWith(respond);
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.map(
+            Effect.result(
+              Effect.flatMap(AgentHarness, (client) =>
+                client.sessionTitle("ses_1"),
+              ),
+            ),
+            (answer) => ({ answer, recorded }),
+          ),
+          layer,
+        ),
+      ),
+    );
+  };
+
+  test("the session row's title is the title, read by one session.get", async () => {
+    const { answer, recorded } = await titleOf(() =>
+      json(sessionInfo({ title: "Acme scope: staging and API hosts" })),
+    );
+    expect(answer).toMatchObject({
+      _tag: "Success",
+      success: { _tag: "titled", title: "Acme scope: staging and API hosts" },
+    });
+    // One id-addressed read and nothing else: not `session.list`, which pages over every
+    // session the server holds.
+    expect(recorded.urls).toHaveLength(1);
+    expect(recorded.urls[0]).toContain("/api/session/ses_1");
+  });
+
+  /**
+   * Reported as the session's title, deliberately: it *is* the title. Recognising it as this
+   * server's own name is the importer's business (`import/importerTitle.ts`), not the
+   * driver's, and the driver must not guess which callers named their sessions how.
+   */
+  test("the name a session was created under comes back as its title", async () => {
+    const { answer } = await titleOf(() =>
+      json(sessionInfo({ title: "bit scope importer: Acme" })),
+    );
+    expect(answer).toMatchObject({
+      success: { _tag: "titled", title: "bit scope importer: Acme" },
+    });
+  });
+
+  test("no title, or OpenCode's own dated placeholder, is untitled", async () => {
+    for (const title of [
+      undefined,
+      "  ",
+      "New session - 2026-11-03T18:02:11.123Z",
+      "Child session - 2026-11-03T18:02:11.123Z",
+    ]) {
+      const { answer } = await titleOf(() =>
+        json(
+          sessionInfo(title === undefined ? { title: undefined } : { title }),
+        ),
+      );
+      expect(answer).toMatchObject({ success: { _tag: "untitled" } });
+    }
+  });
+
+  test("a 404 is a forgotten session, any other failure is a failure", async () => {
+    const gone = await titleOf(() =>
+      json({ _tag: "SessionNotFoundError", message: "no such session" }, 404),
+    );
+    expect(gone.answer).toMatchObject({
+      _tag: "Success",
+      success: { _tag: "forgotten" },
+    });
+    const down = await titleOf(() => json({ message: "boom" }, 500));
+    expect(down.answer._tag).toBe("Failure");
+  });
+});

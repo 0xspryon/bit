@@ -9,8 +9,8 @@
  * harness cannot answer" states a test could not produce on demand.
  *
  * It lives in `src/` rather than in one of those files for a reason that only appeared with
- * the second harness: {@link AgentHarness} has fourteen members, and three hand-written
- * copies of a fourteen-member object is three places to forget the fifteenth. `persistence/
+ * the second harness: {@link AgentHarness} has fifteen members, and three hand-written
+ * copies of a fifteen-member object is three places to forget the sixteenth. `persistence/
  * fixtures.ts` is here on the same grounds.
  *
  * **Every member is overridable and the defaults are the dullest possible answers**: a
@@ -31,6 +31,7 @@ import {
   type MessageEntry,
   type SessionContinuation,
   type SessionStatus,
+  type SessionTitle,
 } from "./agentHarness";
 import {
   DriverKind,
@@ -157,6 +158,15 @@ export const stubHarness = (
         directory: undefined,
         detail: "the scripted harness still holds this session",
       } satisfies SessionContinuation),
+    /*
+     * Untitled: the harness holds the session and has no name for it.
+     *
+     * The dull answer, and the one that keeps a list drawn over a stub labelled by its own
+     * dates — which is what a screen has to fall back on anyway. A test about a name states
+     * it.
+     */
+    sessionTitle: () =>
+      Effect.succeed({ _tag: "untitled" } satisfies SessionTitle),
     messages: () => Effect.succeed([] as readonly MessageEntry[]),
     interruptSession: () => Effect.succeed(false),
     // Empty rather than open: a suite that wants a stream which stays up until it is

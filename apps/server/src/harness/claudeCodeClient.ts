@@ -130,6 +130,7 @@ import {
   type NarrationDetail,
   type PromptDelivery,
   type SessionStatus,
+  type SessionTitle,
   type TerminalOutcome,
 } from "./agentHarness";
 import { HarnessProcessError, HarnessTransportError } from "./errors";
@@ -1784,6 +1785,80 @@ export const claudeCodeHarness = (
           },
         );
 
+      /**
+       * What Claude Code calls a session: `customTitle`, and **never `summary`**.
+       *
+       * `SDKSessionInfo.summary` is documented as "custom title, auto-generated summary, or
+       * first prompt", and the SDK builds it as a chain (`sdk.mjs`, 0.3.310): a `/rename`,
+       * then the CLI's own `ai-title`, then the transcript's `last-prompt`, then a `summary`
+       * entry, then the first prompt. `customTitle` is the first two of those — the SDK
+       * folds `aiTitle` into it — and everything after them is a **prompt**. For every
+       * session this server opens, a prompt is this server's framing: the importer's opener is
+       * `assembleImporterPrompt`'s three kilobytes of rules with the operator's sentence at
+       * the bottom, and a reconnected session's is `assembleImporterResumePrompt`'s.
+       *
+       * **And the framing cannot be trimmed back to the operator's words here**, which is the
+       * reason this ignores the fallback rather than splitting it the way the replay does.
+       * The SDK flattens every new line to a space and cuts the prompt at 200 characters
+       * (`firstPrompt`); the CLI's `last-prompt` entry is cut at about 160. On this machine's
+       * real importer transcripts it reads "You are reading the published scope of a bug
+       * bounty program so that an operator can review it before any testing begins. The
+       * engagement is called Acme Corp.  Th" — the delimiter `operatorTextOf` splits at is
+       * two kilobytes further on and has been cut off, and its new lines would no longer
+       * match if it had not. A `last-prompt` that *is* an operator's follow-up arrives the
+       * same way, with nothing on it to tell it from framing. So the chain past
+       * `customTitle` is unusable as a name, and a session without one is `untitled`.
+       *
+       * That costs little in practice: the CLI writes an `ai-title` after a session's first
+       * turn in SDK mode too — every importer transcript on this machine has one ("Acme Corp
+       * bug bounty scope review") — so `untitled` is a session that has barely spoken.
+       *
+       * `undefined` from the SDK is `forgotten`, for the reason {@link sessionContinuation}
+       * gives. The SDK also answers `undefined` for a transcript with nothing to summarise,
+       * which is a session with no conversation in it; it has no title either way.
+       *
+       * The directory is passed when this process holds the session, so the SDK reads one
+       * project's folder rather than searching all of them; otherwise it searches.
+       */
+      const sessionTitle: AgentHarness["Service"]["sessionTitle"] = Effect.fn(
+        "claudeCodeHarness.sessionTitle",
+      )(function* (sessionId) {
+        const directory = sessions.get(sessionId)?.directory;
+        const info = yield* Effect.tryPromise({
+          try: () =>
+            sdk.sessionInfo(
+              sessionId,
+              directory === undefined ? {} : { dir: directory },
+            ),
+          catch: (cause) =>
+            transport(
+              "session.get",
+              `could not read the Claude Code session store: ${String(cause)}`,
+            ),
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: controlTimeout,
+            orElse: () =>
+              Effect.fail(
+                transport(
+                  "session.get",
+                  `the Claude Code session store did not answer about session ${sessionId} in time`,
+                ),
+              ),
+          }),
+        );
+        if (info === undefined) {
+          return {
+            _tag: "forgotten",
+            detail: `the Claude Code session store holds no transcript for session ${sessionId}`,
+          } satisfies SessionTitle;
+        }
+        const title = info.customTitle;
+        return title === undefined || title.trim() === ""
+          ? ({ _tag: "untitled" } satisfies SessionTitle)
+          : ({ _tag: "titled", title } satisfies SessionTitle);
+      });
+
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(
         "claudeCodeHarness.messages",
       )(function* (sessionId) {
@@ -1867,6 +1942,7 @@ export const claudeCodeHarness = (
         waitForIdle,
         sessionStatus,
         sessionContinuation,
+        sessionTitle,
         messages,
         interruptSession,
         sessionEvents,

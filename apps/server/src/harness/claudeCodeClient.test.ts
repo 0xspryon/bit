@@ -47,6 +47,10 @@ import {
   SESSION_NOT_FOUND_TAG,
 } from "./agentHarness";
 import {
+  assembleImporterPrompt,
+  assembleImporterResumePrompt,
+} from "../import/importerPrompt";
+import {
   claudeCodeHarness,
   newClaudeCodeSessionId,
   type ClaudeCodeSdk,
@@ -85,6 +89,11 @@ interface Script {
   readonly stored?: readonly string[];
   /** What `getSessionMessages` answers, oldest first as the SDK documents it. */
   readonly transcript?: readonly SessionMessage[];
+  /**
+   * What `getSessionInfo` answers for a stored session, beyond its id. A function so a test
+   * can make the read itself throw, as a busy or unreadable store does.
+   */
+  readonly info?: () => Partial<SDKSessionInfo>;
 }
 
 const result = (
@@ -202,6 +211,7 @@ const scriptedSdk = (script: Script = {}) => {
               sessionId,
               summary: "s",
               lastModified: 1,
+              ...script.info?.(),
             } satisfies SDKSessionInfo)
           : undefined,
       ),
@@ -1720,5 +1730,117 @@ describe("a second accepted message, and what settlement means after one", () =>
     expect(answer.closedAfterTurnOne).toBe(0);
     expect(answer.second.delivered).toBe(true);
     expect(answer.prompts).toHaveLength(2);
+  });
+});
+
+/* ── What a session is called ────────────────────────────────────────────────── */
+
+describe("what Claude Code calls a session", () => {
+  const STORED = "11111111-0000-4000-8000-0000000000a1";
+
+  const titleOf = (info?: () => Partial<SDKSessionInfo>, stored = [STORED]) =>
+    withHarness(
+      { stored, ...(info === undefined ? {} : { info }) },
+      (harness) => harness.sessionTitle(STORED),
+    );
+
+  /**
+   * What the SDK does to a prompt before it reports one, so the fixtures below are what it
+   * actually hands back rather than a tidier stand-in.
+   *
+   * `sdk.mjs` (0.3.310): every new line becomes a space, the result is trimmed, and anything
+   * over 200 characters is cut to 200 and given a `…`. That is `firstPrompt`; the CLI's
+   * `last-prompt` entry, which `summary` prefers, is the same text cut shorter.
+   */
+  const asTheSdkReportsIt = (prompt: string): string => {
+    const line = prompt.replaceAll("\n", " ").trim();
+    return line.length > 200 ? `${line.slice(0, 200).trim()}…` : line;
+  };
+
+  /** A real opener: the importer's whole framing, with an operator's sentence below it. */
+  const OPENER = assembleImporterPrompt({
+    targetName: "Acme Corp",
+    links: [],
+    message: "Load the staging hosts from the policy page",
+  });
+
+  test("the CLI's ai-title, which the SDK reports as customTitle, is the title", async () => {
+    // As observed on this machine's real importer transcripts: the SDK folds `aiTitle` into
+    // `customTitle`, and `summary` repeats it.
+    const answer = await titleOf(() => ({
+      customTitle: "Acme Corp bug bounty scope review",
+      summary: "Acme Corp bug bounty scope review",
+      firstPrompt: asTheSdkReportsIt(OPENER),
+    }));
+    expect(answer).toEqual({
+      _tag: "titled",
+      title: "Acme Corp bug bounty scope review",
+    });
+  });
+
+  /**
+   * The leak this operation exists to refuse. With no title earned yet, the SDK's `summary`
+   * falls through to the prompt — and the prompt is this server's three kilobytes of rules,
+   * flattened and cut so that the delimiter the replay splits at is gone.
+   */
+  test("a summary that is only the opener's framing is untitled, never the title", async () => {
+    expect(OPENER.length).toBeGreaterThan(2_000);
+    const reported = asTheSdkReportsIt(OPENER);
+    // The premise, checked rather than assumed: the SDK's version has lost the operator's
+    // words entirely, so there is nothing below a delimiter to trim back to.
+    expect(reported).toStartWith("You are reading the published scope");
+    expect(reported).not.toContain("Load the staging hosts");
+    const answer = await titleOf(() => ({
+      summary: reported,
+      firstPrompt: reported,
+    }));
+    expect(answer).toEqual({ _tag: "untitled" });
+  });
+
+  test("a summary that is a reconnected session's framing is untitled too", async () => {
+    const resumed = asTheSdkReportsIt(
+      assembleImporterResumePrompt({
+        message: "carry on with the second page",
+      }),
+    );
+    const answer = await titleOf(() => ({
+      summary: resumed,
+      firstPrompt: asTheSdkReportsIt(OPENER),
+    }));
+    expect(answer).toEqual({ _tag: "untitled" });
+  });
+
+  /**
+   * Not the SDK's behaviour today, and the reason it is pinned anyway: if a release stopped
+   * cutting the prompt, `summary` would carry the whole opener, and a driver that had started
+   * trusting `summary` would put every word of the framing in the operator's chrome.
+   */
+  test("even a summary carrying the whole opener verbatim is not a title", async () => {
+    const answer = await titleOf(() => ({ summary: OPENER }));
+    expect(answer).toEqual({ _tag: "untitled" });
+  });
+
+  test("a blank customTitle is untitled, not an empty name", async () => {
+    const answer = await titleOf(() => ({ customTitle: "   ", summary: "x" }));
+    expect(answer).toEqual({ _tag: "untitled" });
+  });
+
+  test("a session the store does not hold is forgotten, with the store's sentence", async () => {
+    const answer = await titleOf(undefined, []);
+    expect(answer._tag).toBe("forgotten");
+    if (answer._tag === "forgotten") expect(answer.detail).toContain(STORED);
+  });
+
+  test("a store that cannot be read is a failure, not a forgotten session", async () => {
+    const result = await withHarness(
+      {
+        stored: [STORED],
+        info: () => {
+          throw new Error("EBUSY");
+        },
+      },
+      (harness) => Effect.result(harness.sessionTitle(STORED)),
+    );
+    expect(result._tag).toBe("Failure");
   });
 });

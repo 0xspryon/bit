@@ -148,6 +148,7 @@ import {
   assembleImporterResumePrompt,
   operatorPages,
 } from "./importerPrompt";
+import { importerSessionTitle } from "./importerTitle";
 import { ScopeImportProgress, widenPages } from "./progress";
 import { lastAssistantText, type AgentHarness } from "../harness/agentHarness";
 import {
@@ -732,7 +733,8 @@ export class ScopeImporter extends Context.Service<
                 ? {}
                 : { options: input.options }),
               sessionId: input.sessionId,
-              title: `bit scope importer: ${input.request.targetName}`,
+              // `importerTitle.ts` recognises this name when a harness hands it back.
+              title: importerSessionTitle(input.request.targetName),
               ...(resume === undefined ? {} : { resume: resume.sessionId }),
               /*
                * The session's directory, which on a resume is **not** this import's.
