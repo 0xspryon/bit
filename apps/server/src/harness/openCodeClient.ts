@@ -1051,15 +1051,20 @@ export const openCodeHarness = (
        *
        * The catalogue states a limit per *model* and the narration states usage per
        * *session*, so something has to join them, and this is the smallest thing that can:
-       * the model is known exactly once, at `createSession`, and is not on any event
-       * afterwards. Reading it back off `GET /api/session/:id` per usage event would be a
-       * request per model call to learn a constant.
+       * the model is known at `createSession` and at every `switchModel`, and is not on any
+       * event in between. Reading it back off `GET /api/session/:id` per usage event would be a
+       * request per model call to learn something that changes only when we change it.
        *
        * Per session and unbounded for the life of the process, like {@link delivered} and
-       * for the same reason: one number per session this process has opened, bounded by the
-       * work actually done. A session this process did not open is simply absent, and its
-       * narration carries no limit — which is the honest answer rather than the default
-       * model's window applied to somebody else's session.
+       * for the same reason: one number per session this process has opened or switched,
+       * bounded by the work actually done. A session this process did neither to is simply
+       * absent, and its narration carries no limit — which is the honest answer rather than
+       * the default model's window applied to somebody else's session.
+       *
+       * A switch made mid-step replaces the entry at once, while the step already running
+       * finishes on the old model; that one step's usage is drawn against the new window.
+       * Accepted: the meter is a picture of the session from now on, and the step after it
+       * is the new model's.
        */
       const contextLimits = new Map<string, SessionWindow>();
 
@@ -1128,6 +1133,49 @@ export const openCodeHarness = (
           });
         }
         return { id: session.id };
+      });
+
+      /**
+       * Moves the session's stored model reference, variant and all.
+       *
+       * `session.switchModel` is the one other way into the reference `session.create` set,
+       * and a prompt carries no model, so this is the whole of a switch on this driver: no
+       * live state of ours to update but the context window below. OpenCode reads the
+       * reference at each step, so the switch reaches a turn already running at its next
+       * model call — see `AgentHarness.switchModel` for what was measured.
+       *
+       * **The variant is replaced, never kept.** `Model.Ref.variant` is optional and the
+       * whole reference is sent, so a switch that names no variant (nothing chosen, or the
+       * default) leaves the session on the new model with no variant at all — not on the old
+       * model's variant, which may not exist on the new one.
+       *
+       * Idempotent on the server's own terms: the reference is set, not toggled, so the
+       * same request twice leaves the session where the first one put it. Nothing is
+       * remembered here to skip a repeat, because this process is not the only writer —
+       * OpenCode's own UI can move the reference too — and skipping on a stale memory would
+       * be the one way to make a retry not apply.
+       */
+      const switchModel: AgentHarness["Service"]["switchModel"] = Effect.fn(
+        "openCodeHarness.switchModel",
+      )(function* (sessionId, model, options) {
+        yield* bounded(
+          "session.switchModel",
+          timeouts.control,
+          api.session.switchModel({
+            sessionID: sessionId as Session.ID,
+            model: { ...modelOf(model), ...openCodeVariantOf(options) },
+          }),
+        );
+        // After the server took it, never before: a refused switch leaves the session on
+        // its old model, and the meter must not move to a window it is not running in.
+        const view = models.find((entry) => entry.id === model);
+        if (view?.contextLimit === undefined) contextLimits.delete(sessionId);
+        else {
+          contextLimits.set(sessionId, {
+            contextLimit: view.contextLimit,
+            compactionAt: view.compactionAt,
+          });
+        }
       });
 
       /**
@@ -1608,22 +1656,26 @@ export const openCodeHarness = (
          * call succeeds or fails, which bounds this by the calls in flight.
          */
         const names = new Map<string, string>();
-        // Read once per stream rather than per event: it is the model's window and the
-        // model of a live session does not change under this build — nothing calls
-        // `session.switchModel`.
-        const window = contextLimits.get(sessionId);
-        return api.event
-          .subscribe()
-          .pipe(
-            Stream.mapError(fail("event.subscribe")),
-            Stream.filterMap(
-              Filter.make((event: unknown) =>
-                sessionOf(event) === sessionId
-                  ? Result.succeed(openCodeNarration(event, names, window))
-                  : Result.fail(event),
-              ),
+        return api.event.subscribe().pipe(
+          Stream.mapError(fail("event.subscribe")),
+          Stream.filterMap(
+            Filter.make((event: unknown) =>
+              sessionOf(event) === sessionId
+                ? Result.succeed(
+                    // Read per event rather than once per stream: `switchModel` can
+                    // move a live session onto a model with another window, and a
+                    // stream opened before the switch would otherwise draw every later
+                    // call against the old model's limit. One map lookup per event.
+                    openCodeNarration(
+                      event,
+                      names,
+                      contextLimits.get(sessionId),
+                    ),
+                  )
+                : Result.fail(event),
             ),
-          );
+          ),
+        );
       };
 
       return AgentHarness.of({
@@ -1634,6 +1686,7 @@ export const openCodeHarness = (
         registerMcpServer,
         unregisterMcpServer,
         createSession,
+        switchModel,
         prompt,
         waitForIdle,
         sessionStatus,

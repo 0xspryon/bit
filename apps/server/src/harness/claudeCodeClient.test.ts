@@ -76,6 +76,8 @@ interface Launched {
   readonly order: string[];
   readonly registered: Record<string, McpServerConfig>[];
   readonly prompts: string[];
+  /** `setModel` and `applyFlagSettings` calls, as `model:<id>` and `effort:<level|null>`. */
+  readonly switches: string[];
   interrupts: number;
   closes: number;
 }
@@ -142,6 +144,7 @@ const scriptedSdk = (script: Script = {}) => {
         order: [],
         registered: [],
         prompts: [],
+        switches: [],
         interrupts: 0,
         closes: 0,
       };
@@ -179,6 +182,12 @@ const scriptedSdk = (script: Script = {}) => {
         // Code limit can come from: it is session-time, not catalogue-time. See
         // `HarnessQuery.getContextUsage`.
         getContextUsage: async () => ({ maxTokens: CONTEXT_WINDOW }),
+        setModel: async (model) => {
+          seen.switches.push(`model:${String(model)}`);
+        },
+        applyFlagSettings: async (settings) => {
+          seen.switches.push(`effort:${String(settings.effortLevel)}`);
+        },
         close: () => {
           seen.closes += 1;
         },
@@ -1319,8 +1328,31 @@ const turnDrivenSdk = () => {
     prompts: [] as string[],
     uuids: [] as (string | undefined)[],
     priorities: [] as (string | undefined)[],
+    /** `setModel` and `applyFlagSettings` calls, as `model:<id>` and `effort:<level|null>`. */
+    switches: [] as string[],
+    /** How many times the context window was asked for. */
+    contextReads: 0,
     closes: 0,
     interrupts: 0,
+  };
+  /**
+   * How the session answers a model switch, changeable mid-test so a retry can succeed.
+   *
+   * `refuse` rejects that one control request; `hang` never answers it, which is the case
+   * the control bound exists for. Either way the call is still recorded, because a request
+   * the CLI refused was still sent.
+   */
+  const controls: {
+    refuse: "setModel" | "applyFlagSettings" | undefined;
+    hang: "setModel" | "applyFlagSettings" | undefined;
+  } = { refuse: undefined, hang: undefined };
+  const answer = async (
+    request: "setModel" | "applyFlagSettings",
+  ): Promise<void> => {
+    if (controls.hang === request) await new Promise<never>(() => {});
+    if (controls.refuse === request) {
+      throw new Error(`the CLI refused ${request}`);
+    }
   };
   const pending: SDKMessage[] = [];
   let wake: (() => void) | undefined;
@@ -1358,7 +1390,18 @@ const turnDrivenSdk = () => {
         // The window this account gets for this model, which is the only place a Claude
         // Code limit can come from: it is session-time, not catalogue-time. See
         // `HarnessQuery.getContextUsage`.
-        getContextUsage: async () => ({ maxTokens: CONTEXT_WINDOW }),
+        getContextUsage: async () => {
+          seen.contextReads += 1;
+          return { maxTokens: CONTEXT_WINDOW };
+        },
+        setModel: async (model) => {
+          seen.switches.push(`model:${String(model)}`);
+          await answer("setModel");
+        },
+        applyFlagSettings: async (settings) => {
+          seen.switches.push(`effort:${String(settings.effortLevel)}`);
+          await answer("applyFlagSettings");
+        },
         close: () => {
           seen.closes += 1;
         },
@@ -1392,7 +1435,7 @@ const turnDrivenSdk = () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   };
-  return { sdk, seen, emitResult, pulled };
+  return { sdk, seen, controls, emitResult, pulled };
 };
 
 const withTurnDriven = <A>(
@@ -1842,5 +1885,287 @@ describe("what Claude Code calls a session", () => {
       (harness) => Effect.result(harness.sessionTitle(STORED)),
     );
     expect(result._tag).toBe("Failure");
+  });
+});
+
+/* ── Switching a session's model ─────────────────────────────────────────────── */
+
+describe("switching a Claude Code session's model", () => {
+  const LIVE = "33333333-0000-4000-8000-000000000001";
+
+  /** A multi-turn session whose query is running, ready to be switched. */
+  const opened = (
+    harness: AgentHarness["Service"],
+    driver: ReturnType<typeof turnDrivenSdk>,
+  ) =>
+    Effect.gen(function* () {
+      yield* harness.createSession({
+        title: "conversation",
+        model: "claude-sonnet-5",
+        directory: "/tmp/goal",
+        sessionId: LIVE,
+        multiTurn: true,
+        options: [{ id: "effort", value: "low" }],
+      });
+      yield* harness.prompt(LIVE, "go");
+      yield* Effect.promise(() => driver.pulled(1));
+    });
+
+  test("before the first prompt, the switch is what the query starts with, and nothing is sent", async () => {
+    const sessionId = newClaudeCodeSessionId();
+    const seen = await withHarness({}, (harness, launched) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId,
+          options: [{ id: "effort", value: "low" }],
+        });
+        yield* harness.switchModel(sessionId, "claude-opus-5", [
+          { id: "effort", value: "max" },
+        ]);
+        yield* harness.prompt(sessionId, "go");
+        return launched[0];
+      }),
+    );
+    expect(seen?.options.model).toBe("claude-opus-5");
+    expect(seen?.options.effort).toBe("max");
+    // There was no query to send a control request to, and the launch carried it all.
+    expect(seen?.switches).toEqual([]);
+  });
+
+  test("a live session is moved with setModel, then given its level", async () => {
+    const switches = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        yield* harness.switchModel(LIVE, "claude-opus-5", [
+          { id: "effort", value: "high" },
+        ]);
+        return [...driver.seen.switches];
+      }),
+    );
+    // Model first, so the level is applied to the model it was chosen for.
+    expect(switches).toEqual(["model:claude-opus-5", "effort:high"]);
+  });
+
+  test("the default level, and no level at all, are sent as null rather than left out", async () => {
+    /*
+     * `null` is the SDK's "the model's default effort" (`applyFlagSettings`), and the probe
+     * measured it doing that: `low`, then `null` on the same model, read back Sonnet 5's
+     * default. Leaving the key out instead would keep the previous model's level on the
+     * new one — which is a level nobody chose for it.
+     */
+    const switches = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        yield* harness.switchModel(LIVE, "claude-opus-5", [
+          { id: "effort", value: "default" },
+        ]);
+        yield* harness.switchModel(LIVE, "claude-haiku-4-5");
+        return [...driver.seen.switches];
+      }),
+    );
+    expect(switches).toEqual([
+      "model:claude-opus-5",
+      "effort:null",
+      "model:claude-haiku-4-5",
+      "effort:null",
+    ]);
+  });
+
+  test("the same switch twice sends nothing the second time, and a level alone sends only the level", async () => {
+    const switches = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        // What the session was opened with: nothing to send.
+        yield* harness.switchModel(LIVE, "claude-sonnet-5", [
+          { id: "effort", value: "low" },
+        ]);
+        const afterNoOp = [...driver.seen.switches];
+        yield* harness.switchModel(LIVE, "claude-sonnet-5", [
+          { id: "effort", value: "high" },
+        ]);
+        yield* harness.switchModel(LIVE, "claude-sonnet-5", [
+          { id: "effort", value: "high" },
+        ]);
+        return { afterNoOp, all: [...driver.seen.switches] };
+      }),
+    );
+    expect(switches.afterNoOp).toEqual([]);
+    expect(switches.all).toEqual(["effort:high"]);
+  });
+
+  test("a model change asks for the session's context window again", async () => {
+    const reads = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        // The launch's own read is forked; let it land before counting.
+        yield* Effect.sleep("20 millis");
+        const atLaunch = driver.seen.contextReads;
+        yield* harness.switchModel(LIVE, "claude-sonnet-5", [
+          { id: "effort", value: "high" },
+        ]);
+        yield* Effect.sleep("20 millis");
+        const afterLevelOnly = driver.seen.contextReads;
+        yield* harness.switchModel(LIVE, "claude-opus-5");
+        yield* Effect.sleep("20 millis");
+        return {
+          atLaunch,
+          afterLevelOnly,
+          afterModel: driver.seen.contextReads,
+        };
+      }),
+    );
+    expect(reads.atLaunch).toBe(1);
+    // The window is the model's: a level changes nothing about it.
+    expect(reads.afterLevelOnly).toBe(1);
+    expect(reads.afterModel).toBe(2);
+  });
+
+  test("a refused setModel fails, and the retry sends it again", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        driver.controls.refuse = "setModel";
+        const refused = yield* Effect.flip(
+          harness.switchModel(LIVE, "claude-opus-5"),
+        );
+        driver.controls.refuse = undefined;
+        yield* harness.switchModel(LIVE, "claude-opus-5");
+        return { refused, switches: [...driver.seen.switches] };
+      }),
+    );
+    expect(outcome.refused._tag).toBe("HarnessTransportError");
+    if (outcome.refused._tag === "HarnessTransportError") {
+      expect(outcome.refused.operation).toBe("query.setModel");
+      expect(outcome.refused.detail).toContain("the CLI refused setModel");
+    }
+    expect(outcome.switches).toEqual([
+      "model:claude-opus-5",
+      "model:claude-opus-5",
+      "effort:null",
+    ]);
+  });
+
+  test("after a switch that timed out, going back to the old model is still sent", async () => {
+    /*
+     * A `setModel` that never answered may have been taken anyway — a timeout says nothing
+     * about what the CLI did — so the session is on the old model or the new one and
+     * nobody knows which. The record still says the old one. A switch *back* to it is the
+     * retry a record-only comparison gets wrong: model and level both "already match", it
+     * would send nothing, and the session could stay on the model the operator just
+     * backed out of. Both requests must go.
+     */
+    const switches = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        driver.controls.hang = "setModel";
+        yield* Effect.flip(
+          harness.switchModel(LIVE, "claude-opus-5", [
+            { id: "effort", value: "high" },
+          ]),
+        );
+        driver.controls.hang = undefined;
+        yield* harness.switchModel(LIVE, "claude-sonnet-5", [
+          { id: "effort", value: "low" },
+        ]);
+        // Settled now: the same switch again sends nothing.
+        yield* harness.switchModel(LIVE, "claude-sonnet-5", [
+          { id: "effort", value: "low" },
+        ]);
+        return [...driver.seen.switches];
+      }),
+    );
+    expect(switches).toEqual([
+      "model:claude-opus-5",
+      "model:claude-sonnet-5",
+      "effort:low",
+    ]);
+  }, 20_000);
+
+  test("a level that was refused after the model moved is sent again by the same switch", async () => {
+    const switches = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        driver.controls.refuse = "applyFlagSettings";
+        yield* Effect.flip(
+          harness.switchModel(LIVE, "claude-opus-5", [
+            { id: "effort", value: "high" },
+          ]),
+        );
+        driver.controls.refuse = undefined;
+        yield* harness.switchModel(LIVE, "claude-opus-5", [
+          { id: "effort", value: "high" },
+        ]);
+        return [...driver.seen.switches];
+      }),
+    );
+    // The retry sends both, not just the level: an unfinished switch makes the record no
+    // evidence of either, and a second `setModel` to the model the CLI is on is harmless.
+    expect(switches).toEqual([
+      "model:claude-opus-5",
+      "effort:high",
+      "model:claude-opus-5",
+      "effort:high",
+    ]);
+  });
+
+  test("a control request that never answers fails on the control bound", async () => {
+    const failure = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        driver.controls.hang = "setModel";
+        return yield* Effect.flip(harness.switchModel(LIVE, "claude-opus-5"));
+      }),
+    );
+    expect(failure._tag).toBe("HarnessTransportError");
+    if (failure._tag === "HarnessTransportError") {
+      expect(failure.operation).toBe("query.setModel");
+      expect(failure.tag).toBe("TimeoutError");
+      expect(failure.detail).toContain("whether it took the change is unknown");
+    }
+  }, 20_000);
+
+  test("a session this process does not hold live is refused as not found, and nothing is sent", async () => {
+    /*
+     * Two ways of not holding one: never having had it (another process opened it, or
+     * this one restarted), and a single-turn session whose query closed when its turn
+     * ended. Neither has a query to send a control request to; a resume opens a new query
+     * on whatever model its caller passes, which is the session row's.
+     */
+    const sessionId = newClaudeCodeSessionId();
+    const outcome = await withHarness(
+      { messages: [assistant(sessionId), result(sessionId, "success")] },
+      (harness, launched) =>
+        Effect.gen(function* () {
+          const unknown = yield* Effect.flip(
+            harness.switchModel(
+              "44444444-0000-4000-8000-000000000001",
+              "claude-opus-5",
+            ),
+          );
+          yield* harness.createSession({
+            title: "bit: round",
+            model: "claude-sonnet-5",
+            directory: "/tmp/ws",
+            sessionId,
+          });
+          yield* harness.prompt(sessionId, "go");
+          yield* harness.waitForIdle(sessionId);
+          const closed = yield* Effect.flip(
+            harness.switchModel(sessionId, "claude-opus-5"),
+          );
+          return { unknown, closed, switches: launched[0]?.switches };
+        }),
+    );
+    for (const failure of [outcome.unknown, outcome.closed]) {
+      expect(failure._tag).toBe("HarnessTransportError");
+      if (failure._tag === "HarnessTransportError") {
+        expect(failure.tag).toBe(SESSION_NOT_FOUND_TAG);
+        expect(failure.status).toBe(404);
+      }
+    }
+    expect(outcome.switches).toEqual([]);
   });
 });

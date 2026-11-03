@@ -16,7 +16,7 @@
  * asserted below.
  */
 import { describe, expect, test } from "bun:test";
-import { Effect, Fiber, Layer, Redacted } from "effect";
+import { Effect, Fiber, Layer, Redacted, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import {
@@ -2028,5 +2028,244 @@ describe("what OpenCode calls a session", () => {
     });
     const down = await titleOf(() => json({ message: "boom" }, 500));
     expect(down.answer._tag).toBe("Failure");
+  });
+});
+
+/* ── Switching a session's model ─────────────────────────────────────────────── */
+
+describe("switching an opencode session's model", () => {
+  /**
+   * A transport that answers the catalogue with two models whose windows differ, a 204 to
+   * every switch, a session to every create, and whatever `rest` says to anything else.
+   *
+   * Two windows, because the one consequence of a switch this client owns beyond the
+   * request is which window the meter is drawn against afterwards.
+   */
+  const switchStub =
+    (rest: (url: string) => Promise<Response> = () => json(sessionInfo())) =>
+    (url: string, init: RequestInit | undefined) => {
+      if (url.includes("/api/model")) {
+        return json({
+          location: { directory: "/tmp" },
+          data: [catalogueEntry, defaultCatalogueEntry],
+        });
+      }
+      if (url.endsWith("/model") && init?.method === "POST") {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      return rest(url);
+    };
+
+  const switching = <A, E>(
+    stub: Parameters<typeof clientWith>[0],
+    use: (harness: AgentHarness["Service"]) => Effect.Effect<A, E>,
+  ) => {
+    const { layer, recorded } = clientWith(stub);
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(Effect.result(Effect.flatMap(AgentHarness, use)), layer),
+      ),
+    ).then((answer) => ({ answer, recorded }));
+  };
+
+  /** The `model` reference of each request body sent to the switch route, in order. */
+  const switchBodies = (recorded: {
+    readonly urls: readonly string[];
+    readonly bodies: readonly string[];
+    readonly methods: readonly string[];
+  }) =>
+    recorded.urls.flatMap((url, at) =>
+      url.endsWith("/model") && recorded.methods[at] === "POST"
+        ? [
+            (
+              JSON.parse(recorded.bodies[at] ?? "{}") as {
+                model?: Record<string, unknown>;
+              }
+            ).model,
+          ]
+        : [],
+    );
+
+  test("the variant rides on the model reference sent to the session's model route", async () => {
+    const { answer, recorded } = await switching(switchStub(), (harness) =>
+      harness.switchModel("ses_1", "opencode/glm-5.3-flash-free", [
+        { id: "variant", value: "high" },
+      ]),
+    );
+    expect(answer._tag).toBe("Success");
+    expect(recorded.urls).toEqual([
+      "http://127.0.0.1:9/api/session/ses_1/model",
+    ]);
+    expect(recorded.methods).toEqual(["POST"]);
+    expect(switchBodies(recorded)).toEqual([
+      { providerID: "opencode", id: "glm-5.3-flash-free", variant: "high" },
+    ]);
+  });
+
+  test("the default choice, and no choice at all, send a reference with no variant", async () => {
+    /*
+     * Not `variant: "default"`, which OpenCode would accept: a switch replaces the whole
+     * reference, so naming no variant is what moves the session off the old model's
+     * variant. And it is the honest spelling of "the operator did not pin one", as at
+     * `createSession`.
+     */
+    const { recorded } = await switching(switchStub(), (harness) =>
+      Effect.gen(function* () {
+        yield* harness.switchModel("ses_1", "openai/gpt-5.6-sol", [
+          { id: "variant", value: "default" },
+        ]);
+        yield* harness.switchModel("ses_1", "openai/gpt-5.6-sol");
+      }),
+    );
+    const bodies = switchBodies(recorded);
+    expect(bodies).toHaveLength(2);
+    for (const body of bodies) {
+      expect(body).toMatchObject({ providerID: "openai", id: "gpt-5.6-sol" });
+      expect(body?.["variant"] ?? undefined).toBeUndefined();
+    }
+  });
+
+  test("the same switch twice is sent twice and succeeds twice", async () => {
+    // Nothing is remembered to skip a repeat: this process is not the only writer of the
+    // session's model, so a skip on a stale memory would be a retry that did not apply.
+    // The server's own answer to a repeat is a no-op (spike/modelSwitchProbe.ts).
+    const { answer, recorded } = await switching(switchStub(), (harness) =>
+      Effect.gen(function* () {
+        yield* harness.switchModel("ses_1", "opencode/glm-5.3-flash-free", [
+          { id: "variant", value: "low" },
+        ]);
+        yield* harness.switchModel("ses_1", "opencode/glm-5.3-flash-free", [
+          { id: "variant", value: "low" },
+        ]);
+      }),
+    );
+    expect(answer._tag).toBe("Success");
+    const bodies = switchBodies(recorded);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toEqual(bodies[1]);
+  });
+
+  test("a session OpenCode does not have fails as not found, with its 404", async () => {
+    // The generated client reports this route's 404 as a bare status rather than with the
+    // `SessionNotFoundError` tag, so the status is the evidence — and it is what every
+    // not-found reader on this seam already accepts (`tag === SESSION_NOT_FOUND_TAG ||
+    // status === 404`, in `recovery/harnessStatus.ts` and `run/transcript.ts`).
+    const { answer } = await switching(
+      () =>
+        json({ _tag: "SessionNotFoundError", message: "no such session" }, 404),
+      (harness) => harness.switchModel("ses_gone", "openai/gpt-5.6-sol"),
+    );
+    expect(answer._tag).toBe("Failure");
+    if (answer._tag === "Failure") {
+      expect(answer.failure._tag).toBe("HarnessTransportError");
+      if (answer.failure._tag === "HarnessTransportError") {
+        expect(answer.failure.operation).toBe("session.switchModel");
+        expect(answer.failure.status).toBe(404);
+      }
+    }
+  });
+
+  test("a switch that hangs fails on the control bound and says it proves nothing", async () => {
+    const { answer } = await switching(
+      (url) =>
+        url.includes("/api/model")
+          ? json({ location: { directory: "/tmp" }, data: [] })
+          : new Promise<Response>(() => {}),
+      (harness) => harness.switchModel("ses_1", "openai/gpt-5.6-sol"),
+    );
+    expect(answer._tag).toBe("Failure");
+    if (answer._tag === "Failure") {
+      expect(answer.failure._tag).toBe("HarnessTransportError");
+      if (answer.failure._tag === "HarnessTransportError") {
+        expect(answer.failure.operation).toBe("session.switchModel");
+        expect(answer.failure.tag).toBe("TimeoutError");
+      }
+    }
+  }, 20_000);
+
+  test("after a switch, a stream already open draws the next call against the new window", async () => {
+    /*
+     * The one piece of state this client keeps about a session's model, and the reason
+     * `sessionEvents` reads it per event rather than once per stream: a stream opened
+     * before a switch must not go on drawing every later call against the old window.
+     *
+     * The session is opened on the 200 000 model and its stream subscribed; one step ends
+     * and is read; the session is switched to the 400 000 model; a second step ends. The
+     * first carries 200 000 and the second 400 000 — on the same stream.
+     */
+    const stepEnded = (callId: string, seq: number): string =>
+      `data: ${JSON.stringify({
+        id: `evt_${callId}`,
+        type: "session.step.ended",
+        created: 1_793_347_011_894,
+        durable: { aggregateID: "ses_1", seq, version: 1 },
+        data: {
+          sessionID: "ses_1",
+          assistantMessageID: callId,
+          finish: "tool-calls",
+          tokens: {
+            input: 10,
+            output: 1,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+          cost: 0,
+        },
+      })}\n\n`;
+    let push: ((frame: string) => void) | undefined;
+    const events = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        push = (frame) => {
+          controller.enqueue(new TextEncoder().encode(frame));
+        };
+      },
+    });
+    const seen: unknown[] = [];
+    const until = (done: () => boolean) =>
+      Effect.gen(function* () {
+        for (let tries = 0; tries < 400 && !done(); tries += 1) {
+          yield* Effect.sleep("5 millis");
+        }
+      });
+    const { answer } = await switching(
+      switchStub((url) =>
+        url.includes("/api/event")
+          ? Promise.resolve(
+              new Response(events, {
+                headers: { "content-type": "text/event-stream" },
+              }),
+            )
+          : json(sessionInfo()),
+      ),
+      (harness) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "t",
+            model: "opencode/glm-5.3-flash-free",
+            directory: "/tmp",
+            sessionId: "ses_1",
+          });
+          const reading = yield* harness.sessionEvents("ses_1").pipe(
+            Stream.take(2),
+            Stream.runForEach((entry) =>
+              Effect.sync(() => {
+                seen.push(entry.detail);
+              }),
+            ),
+            Effect.forkChild,
+          );
+          yield* Effect.sleep("20 millis");
+          push?.(stepEnded("msg_before", 1));
+          yield* until(() => seen.length >= 1);
+          yield* harness.switchModel("ses_1", "openai/gpt-5.6-sol");
+          push?.(stepEnded("msg_after", 2));
+          yield* Fiber.join(reading);
+        }),
+    );
+    expect(answer._tag).toBe("Success");
+    expect(seen).toMatchObject([
+      { callId: "msg_before", contextLimit: 200_000, compactionAt: 170_000 },
+      { callId: "msg_after", contextLimit: 400_000, compactionAt: 231_200 },
+    ]);
   });
 });

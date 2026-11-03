@@ -307,6 +307,27 @@ export interface HarnessQuery extends AsyncIterable<SDKMessage> {
    * numerator comes from the stream; only the denominator comes from here.
    */
   getContextUsage(): Promise<{ readonly maxTokens?: number }>;
+  /**
+   * Moves the live session onto another model, from its next response.
+   *
+   * The SDK's own doc: "Change the model used for subsequent responses. Only available in
+   * streaming input mode" — which every query here is, because the input is the held-open
+   * iterable `launch` builds. See `AgentHarness.switchModel` for when "subsequent" turned
+   * out to be.
+   */
+  setModel(model?: string): Promise<void>;
+  /**
+   * Merges settings into the session's flag layer; narrowed to the one key sent.
+   *
+   * `effortLevel: null` is not "unset and fall back to a settings file": the SDK documents
+   * it as one of four keys that reset session state, and "`effortLevel` goes to the model's
+   * default effort". That is exactly the meaning of "nothing chosen" for the new model, so
+   * `switchModel` sends `null` rather than omitting the key, which would leave the old
+   * model's level in place.
+   */
+  applyFlagSettings(settings: {
+    readonly effortLevel: EffortLevel | null;
+  }): Promise<void>;
   close(): void;
 }
 
@@ -343,15 +364,34 @@ export const liveClaudeCodeSdk: ClaudeCodeSdk = {
 interface SessionRecord {
   readonly sessionId: string;
   readonly title: string;
-  readonly model: string;
+  /**
+   * The model this session runs on: what `launch` starts the query with, and, once it is
+   * running, what the last `switchModel` the session acknowledged put it on.
+   *
+   * Mutable for `switchModel` and nothing else. Changed only after the control request
+   * answered, so a refused switch leaves this naming the model the session is still on,
+   * and a retry sends the request again rather than finding it already "done".
+   */
+  model: string;
   /**
    * The reasoning level this session runs at, or nothing for the model's own.
    *
    * Held with the rest of the session's configuration rather than applied on creation,
    * because `createSession` here starts nothing: the SDK's `query()` is what takes it, and
-   * that call does not happen until the prompt arrives. Same reason `model` is here.
+   * that call does not happen until the prompt arrives. Same reason `model` is here, and
+   * mutable for the same reason too.
    */
-  readonly effort: EffortLevel | undefined;
+  effort: EffortLevel | undefined;
+  /**
+   * A model switch was started and has not been seen through: a control request failed or
+   * timed out after another had been sent, so the CLI may be on something {@link model}
+   * and {@link effort} do not say.
+   *
+   * While it is set, `switchModel` sends both requests whatever the record says, because
+   * the record is no longer evidence of what the session runs on. Cleared when a switch
+   * completes.
+   */
+  switchUnsettled: boolean;
   readonly directory: string;
   /** Per-attempt MCP registrations. One session's, never another's. */
   readonly mcpServers: Record<string, McpServerConfig>;
@@ -1168,6 +1208,55 @@ export const claudeCodeHarness = (
         });
 
       /**
+       * Reads the session's context window into its record, in the background.
+       *
+       * Bounded, its failure logged at debug and discarded, and `contextLimit` simply stays
+       * unset: a read that does not answer costs a percentage on a meter and nothing else.
+       * Into the layer's scope, like the pump, so it is not interrupted by the caller
+       * returning and is interrupted on shutdown.
+       *
+       * Asked at launch and again after every model switch, because the window is the
+       * *model's* as this session resolved it, and a switch can change it.
+       */
+      const readContextLimit = (
+        record: SessionRecord,
+        live: HarnessQuery,
+      ): Effect.Effect<void> =>
+        Effect.asVoid(
+          Effect.forkIn(
+            Effect.ignore(
+              Effect.timeout(
+                Effect.tap(
+                  Effect.tryPromise({
+                    try: () => live.getContextUsage(),
+                    catch: (cause) =>
+                      transport(
+                        "context_usage",
+                        `the session would not report its context window: ${String(cause)}`,
+                      ),
+                  }),
+                  (usage) =>
+                    Effect.sync(() => {
+                      const max = usage.maxTokens;
+                      record.contextLimit =
+                        max !== undefined && Number.isFinite(max)
+                          ? max
+                          : undefined;
+                    }),
+                ),
+                controlTimeout,
+              ),
+              {
+                log: "Debug",
+                message:
+                  "could not read this Claude Code session's context window; its meter will show tokens and no percentage",
+              },
+            ),
+            harnessScope,
+          ),
+        );
+
+      /**
        * Launches the query for one session, with the prompt held back.
        *
        * The gate is the point. `query()` starts with no MCP servers — see difference (2) in
@@ -1315,49 +1404,15 @@ export const claudeCodeHarness = (
           yield* Effect.forkIn(pump(record), harnessScope);
 
           /*
-           * The session's context window, read once, beside the run rather than in it.
+           * The session's context window, read beside the run rather than in it.
            *
            * Forked for two reasons. It is a control round trip to a subprocess that has
            * just started, so awaiting it here would delay the moment the prompt is accepted
            * — and the caller of this is the supervisor, which has a run to get going. And a
            * window is a *denominator*: a read that does not answer costs a percentage on a
-           * meter, which must never be allowed to cost a run. So it is bounded, its failure
-           * is logged at debug and discarded, and `contextLimit` simply stays unset.
-           *
-           * Into the layer's scope, like the pump above, so it is not interrupted by the
-           * caller returning and is interrupted on shutdown.
+           * meter, which must never be allowed to cost a run. See `readContextLimit`.
            */
-          yield* Effect.forkIn(
-            Effect.ignore(
-              Effect.timeout(
-                Effect.tap(
-                  Effect.tryPromise({
-                    try: () => started.getContextUsage(),
-                    catch: (cause) =>
-                      transport(
-                        "context_usage",
-                        `the session would not report its context window: ${String(cause)}`,
-                      ),
-                  }),
-                  (usage) =>
-                    Effect.sync(() => {
-                      const max = usage.maxTokens;
-                      record.contextLimit =
-                        max !== undefined && Number.isFinite(max)
-                          ? max
-                          : undefined;
-                    }),
-                ),
-                controlTimeout,
-              ),
-              {
-                log: "Debug",
-                message:
-                  "could not read this Claude Code session's context window; its meter will show tokens and no percentage",
-              },
-            ),
-            harnessScope,
-          );
+          yield* readContextLimit(record, started);
 
           if (Object.keys(record.mcpServers).length > 0) {
             const registered = yield* Effect.result(
@@ -1408,6 +1463,7 @@ export const claudeCodeHarness = (
           title: input.title,
           model: input.model,
           effort: claudeCodeEffortOf(input.options),
+          switchUnsettled: false,
           directory: input.directory,
           mcpServers: {},
           narration,
@@ -1433,6 +1489,100 @@ export const claudeCodeHarness = (
         // `parentSessionId` is ignored: Claude Code has no lineage concept to route prompt
         // caching through, and nothing in this application passes it for a worker session.
         return { id: sessionId };
+      });
+
+      /** One control request to a live query, bounded and mapped like the others here. */
+      const control = (
+        operation: string,
+        run: () => Promise<unknown>,
+        refused: string,
+      ): Effect.Effect<void, HarnessTransportError> =>
+        Effect.tryPromise({
+          try: run,
+          catch: (cause) =>
+            transport(operation, `${refused}: ${String(cause)}`),
+        }).pipe(
+          Effect.timeout(controlTimeout),
+          Effect.catchTag("TimeoutError", () =>
+            Effect.fail(
+              transport(
+                operation,
+                `${refused} within the control bound; whether it took the change is unknown`,
+                { tag: "TimeoutError" },
+              ),
+            ),
+          ),
+          Effect.asVoid,
+        );
+
+      /**
+       * Moves a session this process holds onto another model, or another effort.
+       *
+       * Three states of the record, three answers:
+       *
+       * - **Created, not yet prompted** — no query exists, so there is nothing to ask. The
+       *   record is changed and `launch` starts the query on the new model and effort.
+       * - **Live** — `setModel`, then `applyFlagSettings({ effortLevel })`. The model goes
+       *   first so the level is applied to the model it is meant for. The record changes
+       *   one field at a time, each only after its request answered, which is what makes a
+       *   retry after a partial failure send exactly what is still missing.
+       * - **Settling, closed, or never held** — refused with `SESSION_NOT_FOUND_TAG`. See
+       *   `AgentHarness.switchModel` on why that is a refusal and not a lost switch.
+       *
+       * **The level is always sent after a model change**, even when it equals the record's:
+       * the record says what *we* last set, and whether the CLI keeps a flag-layer effort
+       * across `setModel` is its business. Sending it costs one control request; not sending
+       * it could leave the new model at a level nobody chose for it. With no model change and
+       * the same level, nothing is sent at all, which is the idempotence the seam promises.
+       */
+      const switchModel: AgentHarness["Service"]["switchModel"] = Effect.fn(
+        "claudeCodeHarness.switchModel",
+      )(function* (sessionId, model, options) {
+        const record = sessions.get(sessionId);
+        // `settling` as well as `closed`, for the reason `prompt` refuses a steer on it: the
+        // pump has decided the session is over and `closeSession` is one Effect boundary
+        // away, so a query that still answers now is one nothing will prompt again.
+        if (record === undefined || record.settling || record.closed) {
+          return yield* transport(
+            "session.switchModel",
+            `this process holds no live session ${sessionId}, so there is no query to switch; ` +
+              "a resume starts on the model it is opened with",
+            { tag: SESSION_NOT_FOUND_TAG, status: 404 },
+          );
+        }
+        const effort = claudeCodeEffortOf(options);
+        const live = record.query;
+        if (live === undefined) {
+          record.model = model;
+          record.effort = effort;
+          return;
+        }
+        const unsettled = record.switchUnsettled;
+        const modelChanged = unsettled || record.model !== model;
+        if (!modelChanged && record.effort === effort) return;
+        // Set before the first request and cleared after the last, so any failure between
+        // them — including a timeout, where the CLI may have taken the change anyway —
+        // leaves the next call unable to skip on the strength of a stale record.
+        record.switchUnsettled = true;
+        if (modelChanged) {
+          yield* control(
+            "query.setModel",
+            () => live.setModel(model),
+            `the session would not move to model ${model}`,
+          );
+          record.model = model;
+          // The window is the model's; until the new one answers, the meter shows no
+          // percentage rather than the old model's.
+          record.contextLimit = undefined;
+          yield* readContextLimit(record, live);
+        }
+        yield* control(
+          "query.applyFlagSettings",
+          () => live.applyFlagSettings({ effortLevel: effort ?? null }),
+          `the session would not take reasoning level ${effort ?? "default"}`,
+        );
+        record.effort = effort;
+        record.switchUnsettled = false;
       });
 
       const registerMcpServer: AgentHarness["Service"]["registerMcpServer"] =
@@ -1946,6 +2096,7 @@ export const claudeCodeHarness = (
         modelProvenance: claudeCodeModelProvenance,
         installGate: installClaudeCodeGate,
         createSession,
+        switchModel,
         registerMcpServer,
         unregisterMcpServer,
         prompt,

@@ -38,6 +38,9 @@
  * 10. {@link AgentHarness.unregisterMcpServer} — take the registration away again when
  *    the credential it carried is revoked.
  *
+ * And one a run never calls and a conversation does: {@link AgentHarness.switchModel},
+ * which moves a session onto another model of the same harness, mid-turn or between turns.
+ *
  * Plus {@link AgentHarness.instance}: which configured harness this is, so an attempt can
  * be pinned to it.
  *
@@ -716,6 +719,102 @@ export class AgentHarness extends Context.Service<
        */
       readonly resume?: string | undefined;
     }) => Effect.Effect<SessionRef, HarnessFailure>;
+    /**
+     * Moves one session onto another model of **this same harness**, or onto other options
+     * of the model it already has.
+     *
+     * The harness is pinned to a conversation and the model is not: an operator may change
+     * model or reasoning at any time, including while a turn is running, and the change is
+     * applied at once — the harness takes it from its next model call. Nothing here changes
+     * the harness, and nothing here can: a session id belongs to one harness.
+     *
+     * `model` is a name this instance's catalogue knows, as for {@link createSession}, and
+     * `options` follows that operation's rules exactly. It is **already resolved against the
+     * new model's descriptors by the caller** (`harness/modelOptions.ts`), so every id here
+     * is one this harness reported for `model` and every value is one of that descriptor's
+     * choices. What each implementation owns is the translation — OpenCode puts the variant
+     * on the session's model reference, the Claude Agent SDK takes an `effortLevel` flag
+     * setting — and what to do with `MODEL_OPTION_DEFAULT_CHOICE`. **Absent options mean
+     * "nothing chosen" for the new model**: a reasoning level chosen for the old model is
+     * not carried across, because it was resolved against the old model's descriptors and
+     * the new one may not offer it.
+     *
+     * **Idempotent.** Switching a session to the model and options it already has succeeds
+     * and leaves it as it was, so a caller that lost the answer may simply ask again.
+     *
+     * **Not the record of the model.** This changes what the harness uses; which model a
+     * conversation is on is the session row's, and the caller updates the row only after
+     * this has succeeded. A failure leaves the harness on whatever it had — or, for a
+     * transport failure, on an *uncertain* model, which asking again settles.
+     *
+     * ## Per harness
+     *
+     * - **OpenCode** — `session.switchModel` with the variant on the `Model.Ref`, bounded
+     *   like every control call. The session's stored model reference is what changes, so
+     *   it applies whether or not this process (or any process) is running a turn on it, and
+     *   it outlives this process. A session OpenCode does not have fails with status 404.
+     *   The generated client does not put {@link SESSION_NOT_FOUND_TAG} on this route's
+     *   404, so a caller tests `tag === SESSION_NOT_FOUND_TAG || status === 404`, as every
+     *   other not-found reader on this seam already does.
+     * - **Claude Code** — `Query.setModel` and then `Query.applyFlagSettings({ effortLevel })`
+     *   on the live query, each bounded by the control timeout. The session's record is
+     *   updated after each answer, and it is what makes a repeat send nothing. It is not
+     *   what a resume reads: a resume rebuilds the record from {@link createSession}'s
+     *   input. The reasoning level is always sent, `null` when nothing (or the default) was chosen,
+     *   because the SDK reads `null` as "the model's own default" and leaving it out would
+     *   carry the old model's level across. A session that has been created and not yet
+     *   prompted has no query: the record is changed and the first prompt starts on it.
+     *
+     *   **A Claude Code session this process does not hold live is refused**, with
+     *   {@link SESSION_NOT_FOUND_TAG} and status 404. That is a session whose query is gone or
+     *   going: a single-turn session that has finished or is finishing, an interrupted one,
+     *   or one from a process that has since exited. There is nothing to send a control
+     *   request to. That is not a lost switch. A resume opens a *new* query through {@link createSession}, which takes its
+     *   model and options from the caller — that is, from the session row — so a caller
+     *   that sees this tag updates the row and the next resume runs on the new model.
+     *   Writing it onto a dead record instead would be a change nothing ever reads.
+     *
+     * ## Measured
+     *
+     * By `spike/modelSwitchProbe.ts` on 2026-11-03, through this seam's own implementations
+     * against the real harnesses. **Both take a switch at the next model call of the turn
+     * already running.** Neither holds it until the turn ends, so neither implementation
+     * defers anything or refuses mid-turn.
+     *
+     * - **OpenCode** — `opencode` 2.2.5 server, `@opencode/client` 2.1.0, Z.AI Coding Plan
+     *   `glm-5.3-flash` → `glm-5.3`. (The free `opencode/*-free` models were all answering
+     *   429 `provider.free-limit` that day, which is a quota and not a switch result.) One
+     *   long turn of seven model calls, switched after the first tool result: the switch
+     *   was acknowledged in 8 ms, the next step began 28 ms later on `glm-5.3`, and all six
+     *   remaining steps ran on it. The step before the switch stayed on `glm-5.3-flash`.
+     *   OpenCode writes a `model-switched` entry into the transcript (`model` and
+     *   `previous`), publishes `session.model.selected`, and re-sends its instruction
+     *   catalogue as a `system` entry before the next step. Sending the same switch again
+     *   was acknowledged and wrote **no** second `model-switched` entry. Between turns, the
+     *   next turn ran on the new model with variant `high` recorded on its assistant
+     *   message. A reference sent with no variant is recorded as `variant: "default"`.
+     * - **Claude Code** — CLI 2.1.310, `@anthropic-ai/claude-agent-sdk` 0.3.310,
+     *   `claude-haiku-4-5` → `claude-sonnet-4-5` mid-turn, `claude-sonnet-5` and back to
+     *   `claude-haiku-4-5` between turns. Three runs. `setModel` took 1.0–1.2 s to be
+     *   acknowledged. The model call already in flight when it was sent finished on Haiku
+     *   (`message.model`), and every later call of the same turn ran on Sonnet 4.5: five
+     *   later calls in two runs. In the third run Haiku ended the turn on the in-flight
+     *   call, so the switch first showed on the next turn. Between turns, the next turn's
+     *   `system/init` names the new model and its calls run on it. Effort was read back
+     *   through the `CLAUDE_EFFORT` the CLI exports to Bash. `low` read `low`. A following
+     *   `effortLevel: null` on the same model read `high`, Sonnet 5's default, so `null`
+     *   resets the level rather than keeping it. An effort-only change to `high` read
+     *   `high`, acknowledged in about 10 ms. Haiku 4.5 after `null` read `high`. A repeat of
+     *   the same switch sent nothing and returned in 0–1 ms.
+     *
+     * What the probe did not measure: an effort change mid-turn, and the context window
+     * after a switch. Both run on the same control channels as the model switch above.
+     */
+    readonly switchModel: (
+      sessionId: string,
+      model: string,
+      options?: readonly ModelOptionSelection[] | undefined,
+    ) => Effect.Effect<void, HarnessFailure>;
     /**
      * Makes our MCP endpoint reachable from one session, under one credential.
      *

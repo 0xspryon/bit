@@ -9,8 +9,8 @@
  * harness cannot answer" states a test could not produce on demand.
  *
  * It lives in `src/` rather than in one of those files for a reason that only appeared with
- * the second harness: {@link AgentHarness} has fifteen members, and three hand-written
- * copies of a fifteen-member object is three places to forget the sixteenth. `persistence/
+ * the second harness: {@link AgentHarness} has sixteen members, and three hand-written
+ * copies of a sixteen-member object is three places to forget the seventeenth. `persistence/
  * fixtures.ts` is here on the same grounds.
  *
  * **Every member is overridable and the defaults are the dullest possible answers**: a
@@ -23,6 +23,7 @@
  * own, `stub`, rather than claiming to be OpenCode. A test that wants an attempt row to
  * name a real instance says so.
  */
+import type { ModelOptionSelection } from "@bit/contracts";
 import { Effect, Stream } from "effect";
 
 import {
@@ -88,6 +89,45 @@ export const STUB_INSTANCE: HarnessInstance = {
 
 export type StubHarness = AgentHarness["Service"];
 
+/** One `switchModel` call, as the stub received it. */
+export interface RecordedModelSwitch {
+  readonly sessionId: string;
+  readonly model: string;
+  /** Verbatim, `undefined` included: "nothing chosen" is not the same as `[]`. */
+  readonly options: readonly ModelOptionSelection[] | undefined;
+}
+
+/**
+ * A `switchModel` that remembers every call, for a test about a model switch.
+ *
+ * Separate from {@link stubHarness} rather than built into it, because a stub's members
+ * are services and have nowhere to hang a list a test could read; and the default there
+ * succeeds without recording, like `registerMcpServer`. A test that cares passes this as
+ * the override and reads `switches` afterwards:
+ *
+ * ```ts
+ * const recorded = recordModelSwitches();
+ * const harness = stubHarness({ switchModel: recorded.switchModel });
+ * // … then expect(recorded.switches).toEqual([{ sessionId, model, options }])
+ * ```
+ *
+ * Every call is recorded, a repeat included: the seam promises a repeat is harmless, and
+ * a caller that sent one should be visible to the test that asks.
+ */
+export const recordModelSwitches = (): {
+  readonly switches: readonly RecordedModelSwitch[];
+  readonly switchModel: StubHarness["switchModel"];
+} => {
+  const switches: RecordedModelSwitch[] = [];
+  return {
+    switches,
+    switchModel: (sessionId, model, options) =>
+      Effect.sync(() => {
+        switches.push({ sessionId, model, options });
+      }),
+  };
+};
+
 /**
  * A scripted harness, with the members a test cares about replaced.
  *
@@ -123,6 +163,10 @@ export const stubHarness = (
       Effect.succeed({
         id: input.resume ?? input.sessionId ?? "ses_chosen_by_harness",
       }),
+    // Accepted, like every switch on a real harness that holds the session: a test that
+    // wants to see the switches uses `recordModelSwitches`, and one that wants a refusal
+    // overrides this with it.
+    switchModel: () => Effect.void,
     registerMcpServer: () => Effect.void,
     // Succeeds without recording anything, like the registration above: a test that cares
     // which registrations were taken away says so by overriding it.
