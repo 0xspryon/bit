@@ -282,6 +282,58 @@ const withModelOptionPicked = (
   };
 };
 
+/*
+ * ── What a link that outlived its resource says ──────────────────────────────────
+ *
+ * Design D5: a bookmark outlives the thing it names, and the app should say so instead of
+ * pretending. Three resources can go while a saved link still points at them — a target
+ * leaves the registry, a goal id turns out to be another target's, an importer session
+ * falls out of the harness's own index — and the rule for all three is the same: fall back
+ * to the nearest place that does exist, and say what was missing.
+ *
+ * The three sentences live together here, out of the methods that raise them, because they
+ * are one piece of writing and are easier to keep consistent side by side than three
+ * hundred lines apart. They share a shape, and the shape is the point:
+ *
+ * - **They name the id.** An operator looking at this is deciding whether their bookmark
+ *   has a typo in it or the thing really went, and the id is most of that answer.
+ * - **They say where the operator has been put**, because being moved without being told
+ *   is the failure mode D5 exists to end.
+ * - **They blame nobody.** Following your own saved link is not a mistake, and nothing has
+ *   gone wrong here that anyone could have avoided: time passed. So no "invalid", no
+ *   "error", no "failed" — just what is not there and what is.
+ *
+ * {@link App.arrivalNote} is where they are put and the shell is what renders them.
+ */
+
+/** A path naming a target this server's registry does not hold. */
+const targetGoneNote = (targetId: string): string =>
+  `This server has no target called "${targetId}", so there was nothing to open. These are the targets it does have.`;
+
+/**
+ * A path naming a goal the target it names does not hold.
+ *
+ * The second sentence is the useful half. A goal id is a handle into one target's evidence
+ * — the server's own `GoalNotFound` says so, and answers it for a goal that exists under a
+ * *different* target — so "wrong target" is the likeliest reason an operator is reading
+ * this, and a sentence that only said "no such goal" would leave them hunting for it.
+ */
+const goalGoneNote = (goalId: string): string =>
+  `This target has no goal under the id "${goalId}". A goal id belongs to one target, so it may be another target's — these are this target's goals.`;
+
+/**
+ * A path naming an importer session the importer's index no longer lists.
+ *
+ * The first sentence is the one that was already in the code before D5, written for the
+ * Agent sessions banner; it was right about *what* and wrong only about *where*, so it is
+ * kept word for word. The second says where the fallback landed.
+ *
+ * No id in this one, deliberately: a `ses_…` handle is the harness's and says nothing to an
+ * operator that the list beneath it does not say better.
+ */
+const chatGoneNote = (): string =>
+  "That importer session is no longer in the importer's own list, so there is nothing to open it on. The target's agent sessions are listed here.";
+
 export class App {
   /**
    * The control plane this instance talks to.
@@ -406,6 +458,54 @@ export class App {
    */
   replayPath = $state("");
   /**
+   * What a link that outlived the thing it names has to say, or `""`.
+   *
+   * The other half of a deep link, and the half design D5 is about: {@link requestedPath}
+   * carries a link to the moment it can be followed, and this is what is left when
+   * following it finds nothing there. A target the registry has dropped, a goal id that
+   * belongs to a different target, an importer session the harness has let go — each used
+   * to fail quietly, and each now lands on the nearest place that does exist with its
+   * reason here. The three sentences are above the class; this is where they are put.
+   *
+   * ## Why one field, read by the shell above every screen
+   *
+   * The three fallbacks land on three different pages — the target list, a target's goal
+   * list, its Agent sessions list — so a banner belonging to any one screen would be absent
+   * from the other two, which is precisely the bug D5 names: `openImporterSession` had the
+   * right sentence on a screen the arrival was not looking at. The route renders this
+   * between the crumb bar and the screen, so it is on every page a fallback can reach *by
+   * construction* rather than by three separate correct decisions, and a fourth fallback
+   * added later inherits the surface instead of needing one.
+   *
+   * ## Why not {@link toast}
+   *
+   * That one belongs to the import that read nothing: `role="alert"`, danger-toned,
+   * floating over the page. Nothing has failed here — time passed and a link got old — so
+   * putting the two on one surface would either dress this up as a failure or quieten that
+   * one down to a notice. One surface per severity, and these are two.
+   *
+   * ## Why it waits
+   *
+   * This sentence is the answer to a question the operator asked by following a link, and a
+   * link can take a while to be answered: a deep link may arrive before there is a session,
+   * sit behind Connect for as long as the password takes, and only then turn out to name
+   * something gone. A message that timed out would often be gone before the page it belongs
+   * to had rendered. So nothing expires it. It goes when the operator dismisses it, and
+   * when they navigate — every method below that moves the app clears it, because once they
+   * have chosen somewhere else the sentence is about where they were sent, not where they
+   * are.
+   *
+   * ## It is also a history rule
+   *
+   * The route reads this a second way, as `placeHistory.ts`'s `"fell-back"`: a reflection
+   * written while this stands **corrects** the address bar entry the dead link is on
+   * instead of adding one. Without that, a bookmark to a deleted target left a `/` entry
+   * pushed over `/t/<gone>`, and Back onto `/t/<gone>` bounced and pushed another — a Back
+   * button that could not leave the page. So the note is what makes a failed arrival cost
+   * no history entry.
+   */
+  arrivalNote = $state("");
+  /**
    * Whether the target's rail is put away.
    *
    * Hidden, not collapsed to icons: the crumb bar takes over the one job the rail did that
@@ -501,12 +601,17 @@ export class App {
   agentSessionsTargetId = $state("");
   agentSessionsState = $state<AssetsState>("idle");
   agentSessionsDetail = $state("");
-  /**
-   * Why the last click on a row went nowhere, or `""`. The one case is an importer session
-   * the importer's own index no longer lists, which `openImporter` would otherwise answer
-   * by opening an empty page.
+  /*
+   * `agentSessionsNote` was here: "why the last click on a row went nowhere", with the one
+   * case being an importer session the importer's index no longer lists.
+   *
+   * Deleted rather than kept beside {@link arrivalNote}, which now carries that sentence.
+   * The case it answered is design D5's, and D5's point is that the answer has to be on the
+   * page the link landed on — a banner that only the Agent sessions list rendered was right
+   * for the one arrival that came from a click on that list and silent for every arrival
+   * that came from a URL. Two surfaces for one event would have left the choice of which to
+   * write to whoever added the next fallback.
    */
-  agentSessionsNote = $state("");
 
   /* ── The estate, and the scope that frames it ──────────────────────────────── */
 
@@ -1813,6 +1918,9 @@ export class App {
     this.screen = "connect";
     this.password = "";
     this.connectError = reason;
+    // A note about a link followed in the session that just ended. The Connect screen does
+    // not render it, so leaving it would make it reappear behind a *later* sign-in.
+    this.#retireArrivalNote();
     this.targets = [];
     this.selectedId = "";
     this.viewTargetId = "";
@@ -1886,6 +1994,7 @@ export class App {
    * nobody had asked for — see {@link refreshTarget}.
    */
   openTarget(id: string) {
+    this.#retireArrivalNote();
     // A different target, or the same one reopened, is never the Auto-load page: and if its
     // panel was polling, that poll is about an import this screen is no longer showing.
     if (this.importerOpen) {
@@ -1987,12 +2096,7 @@ export class App {
         return;
       }
       if (error._tag === "TargetNotFound") {
-        this.viewState = "empty";
-        this.screen = "welcome";
-        // There is no target to watch any more. Forgotten rather than left running against
-        // a deep link to something the registry does not hold.
-        this.#forgetLive();
-        await this.loadTargets();
+        await this.#targetIsGone(id);
         return;
       }
       this.viewState = "unavailable";
@@ -2011,6 +2115,35 @@ export class App {
   }
 
   /**
+   * The fallback for a target this server's registry does not hold: the list, and a
+   * sentence saying so.
+   *
+   * Design D5's first case, and it arrives two ways that have to behave alike. A URL names
+   * a target that has gone, which is the bookmark the design is about; or the operator
+   * clicks a rail row for a target something else removed while this tab held the list.
+   * Both end up here through {@link refreshTarget}'s `TargetNotFound`, and the sentence is
+   * true of both without accusing either — it says what this server has, not what the
+   * operator did.
+   *
+   * There is also a third way in, {@link confirmOpenGoal}'s own `TargetNotFound`, which is
+   * why this is a method rather than a branch. A deep link to a goal on a target that has
+   * gone asks about both at once, and the two answers must not be two different screens.
+   *
+   * The note is set **before** the list is read, so the sentence is up while the read is in
+   * flight rather than arriving after it: the operator has just been moved, and that is the
+   * moment the explanation is worth having.
+   */
+  async #targetIsGone(id: string) {
+    this.viewState = "empty";
+    this.screen = "welcome";
+    // There is no target to watch any more. Forgotten rather than left running against a
+    // deep link to something the registry does not hold.
+    this.#forgetLive();
+    this.arrivalNote = targetGoneNote(id);
+    await this.loadTargets();
+  }
+
+  /**
    * Opens a target with the prototype's counts and goals and no request, for the state
    * picker.
    *
@@ -2020,6 +2153,7 @@ export class App {
    * shortcut `reset()` is: real where it can be, declared where it cannot.
    */
   previewTarget(id: string) {
+    this.#retireArrivalNote();
     this.select(id);
     this.screen = "target";
     this.detailOpen = false;
@@ -2044,6 +2178,33 @@ export class App {
    * against the registry, `path` is text it only carries. See {@link requestedPath} for
    * why the place does not arrive here parsed.
    */
+  /**
+   * Retires a standing arrival note, because the operator has gone somewhere of their own
+   * choosing.
+   *
+   * Called at the head of every method that moves the app: {@link openTarget},
+   * {@link toSection}, {@link toAllTargets}, {@link openGoal}, {@link toAssetsTab},
+   * {@link toSettings}, {@link openImporter}, {@link previewTarget}. The sentence is about
+   * where a link *sent* them, so the moment they pick a destination themselves it has
+   * stopped being about anything on screen.
+   *
+   * **At the head, and that is load-bearing.** Each of D5's three fallbacks navigates to
+   * the place it falls back to and *then* writes its note, so the clear has to happen on
+   * the way in or the fallback would erase its own sentence. A clear at the tail would have
+   * worked for two of the three and silently not for the one that matters.
+   *
+   * A method rather than nine assignments, so that the reason is written once and the next
+   * navigation someone adds has somewhere to find it.
+   */
+  #retireArrivalNote() {
+    this.arrivalNote = "";
+  }
+
+  /** Puts away a note the operator has read. The route's banner offers this. */
+  dismissArrivalNote() {
+    this.arrivalNote = "";
+  }
+
   requestPlace(targetId: string, path: string) {
     this.requestedTargetId = targetId;
     this.requestedPath = path;
@@ -2055,12 +2216,23 @@ export class App {
    * Called after the list is loaded, by both ways in — a fresh sign-in and a resumed
    * session — because a link should land in the same place either way.
    *
-   * A target the registry does not hold is dropped silently *here*, before anything is
-   * opened: the list is already on screen, and it is the honest answer to "that target is
-   * not on this server". The check is in `App` rather than in the route because it is the
-   * one question about a held link that `App` is the authority on. Design D5 will give the
-   * refusal a sentence on the surface the arrival can see; S5 owns that, and this stays
-   * the place that knows the answer.
+   * A target the registry does not hold is dropped *here*, before anything is opened: the
+   * list is already on screen, and it is the honest answer to "that target is not on this
+   * server". The check is in `App` rather than in the route because it is the one question
+   * about a held link that `App` is the authority on.
+   *
+   * **It is no longer dropped silently**, which is design D5 and the whole of S5. The
+   * operator asked for something specific by following a link, waited behind the Connect
+   * screen for it, and used to be left on a target list with nothing said and the address
+   * bar quietly tidied to `/`. {@link arrivalNote} gets the sentence instead, and the route
+   * is what puts it on screen. The target is *not* opened to find this out: the registry is
+   * already in hand, so the refusal costs no request and there is no flash of a target on
+   * its way to being refused.
+   *
+   * Only the target is checked, because only the target is a question `App` can answer
+   * without the grammar. A held path whose *goal* or *chat* has gone is replayed and
+   * answered by {@link confirmOpenGoal} and {@link openImporterSession} once the place is
+   * being applied.
    *
    * The release happens whether or not anything is listening. A second shell, or a test,
    * can hold a place, reach this moment and simply never replay it — no screen moves and
@@ -2072,7 +2244,10 @@ export class App {
     this.requestedTargetId = "";
     this.requestedPath = "";
     if (id === "" || path === "") return;
-    if (!this.targets.some((target) => target.id === id)) return;
+    if (!this.targets.some((target) => target.id === id)) {
+      this.arrivalNote = targetGoneNote(id);
+      return;
+    }
     this.replayPath = path;
   }
 
@@ -2090,6 +2265,7 @@ export class App {
   }
 
   toSettings() {
+    this.#retireArrivalNote();
     this.navItem = "settings";
   }
 
@@ -2119,6 +2295,7 @@ export class App {
    * is the reading, not the handle.
    */
   toSection(id: string) {
+    this.#retireArrivalNote();
     // Going to a section — Assets included — leaves the Auto-load page, and stops watching
     // the import its panel was showing. The import runs on: nothing here ever drove it.
     if (this.importerOpen) {
@@ -2146,7 +2323,6 @@ export class App {
     }
     // Read on every visit: "what is running right now" is the one question this list answers.
     if (id === "agent-sessions" && this.viewTargetId !== "") {
-      this.agentSessionsNote = "";
       void this.loadHarnesses();
       void this.loadAgentSessions(this.viewTargetId);
     }
@@ -2154,6 +2330,7 @@ export class App {
 
   /** Back above target scope, to every target. */
   toAllTargets() {
+    this.#retireArrivalNote();
     this.search = "";
     this.screen = "welcome";
   }
@@ -2783,6 +2960,7 @@ export class App {
 
   /** Switches tab. Clears a refusal, which belonged to the control the operator left. */
   toAssetsTab(tab: AssetsTab) {
+    this.#retireArrivalNote();
     this.assetsTab = tab;
     this.scopeRefusal = "";
     this.scopeRefusalContradiction = false;
@@ -2796,6 +2974,7 @@ export class App {
    * the list was loaded has changed the numbers under it.
    */
   openGoal(goalId: string) {
+    this.#retireArrivalNote();
     this.openGoalId = goalId;
     this.goalEndOpen = false;
     this.goalEndStatus = "met";
@@ -2822,6 +3001,69 @@ export class App {
     // so a reloaded tab knows at once whether a round is in flight rather than finding out
     // when the button is refused.
     void this.loadRunningRounds();
+  }
+
+  /**
+   * Confirms the open goal is one this target still holds, and falls back to its list if it
+   * is not.
+   *
+   * Design D5's second case. {@link openGoal} is optimistic by design — it shows the row it
+   * already has and lets the reads replace it — and for a click that is right, because the
+   * row was on screen a moment ago so the goal exists. For a link it is not enough: a path
+   * can name a goal id that is a year old, a typo, or another target's, and until something
+   * asks the server nobody knows which. So the link's replay calls this after
+   * {@link openGoal}, and this is the half that can say the goal is gone.
+   *
+   * **Optimistic first, confirmed second, and not the other way round.** Confirming before
+   * opening would hold every link to a goal behind a round trip and show the goal list on
+   * the way to a goal that exists, which is the common case paying for the rare one.
+   * Opening first means a dead link shows a goal page with nothing in it for one round trip
+   * before falling back — a flicker, in exchange for every live link being instant.
+   *
+   * **Why its own read rather than {@link refreshGoal}'s.** `openGoal` fires that read and
+   * forgets it, and `refreshGoal` is deliberately indiscriminate about failure: it keeps
+   * the row it has and says nothing, because an operator looking at a goal is not helped by
+   * it vanishing when a refresh fails. Reusing it would mean reading "the goal is gone" off
+   * an absent row, which is also what an unreachable server looks like — and "that goal no
+   * longer exists" is not a sentence to say on a guess. This asks, and acts only on the
+   * server's own `GoalNotFound`. The cost is one duplicate `GET` beside the seven reads
+   * `openGoal` already fires, and only on a link rather than on a click.
+   *
+   * The two guards after the await are {@link refreshGoal}'s, for its reason: an answer
+   * about a goal the operator has since left is dropped rather than acted on, so a slow
+   * refusal cannot close a goal they opened in the meantime or leave a note about a page
+   * they are no longer on.
+   */
+  async confirmOpenGoal(goalId: string): Promise<void> {
+    const targetId = this.viewTargetId;
+    if (targetId === "") return;
+    const call = await this.client.goal(this.serverUrl, targetId, goalId);
+    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
+
+    if (call._tag === "Ok") {
+      // The goal is real, and this is the answer `refreshGoal` would have placed: put it in
+      // the list so the page has its row even when the list read has not come back yet.
+      this.#placeGoal(call.value);
+      return;
+    }
+    // No server answered. The link may be perfectly good, so nothing is claimed about it;
+    // the goal page keeps saying it has no row, which is what is true.
+    if (call._tag === "Unreachable") return;
+    if (call.error._tag === "Unauthenticated") {
+      this.signOut("expired");
+      return;
+    }
+    if (call.error._tag === "TargetNotFound") {
+      // The link named a goal on a target that has gone. One sentence about the target, not
+      // two about both halves of the path, and it is the same one a stale rail row gets.
+      await this.#targetIsGone(targetId);
+      return;
+    }
+    if (call.error._tag !== "GoalNotFound") return;
+    // The goal list, which is one level out and the nearest place that does exist: the rail
+    // is already on Goals, so closing the goal *is* the fallback.
+    this.closeGoal();
+    this.arrivalNote = goalGoneNote(goalId);
   }
 
   /**
@@ -2869,7 +3111,7 @@ export class App {
 
   /**
    * Opens the importer on one session, by id alone. `false` when it could not, with
-   * {@link agentSessionsNote} saying so.
+   * {@link arrivalNote} saying so and the rail on the target's Agent sessions list.
    *
    * **This is what a link to a chat needs**, and the reason it exists rather than the two
    * calls it looks like. `openImporter(sessionId)` selects a session only if the importer's
@@ -2892,11 +3134,38 @@ export class App {
     if (!held()) await this.loadImporterSessions(targetId);
     if (this.viewTargetId !== targetId) return false;
     if (!held()) {
-      this.agentSessionsNote =
-        "That importer session is no longer in the importer's own list, so there is nothing to open it on.";
+      /*
+       * Design D5's third case, and the one it calls likeliest: a harness can let a session
+       * go while something else still remembers it. The sentence was already right before
+       * this slice and was written to `agentSessionsNote`, the Agent sessions list's own
+       * banner — so an operator who clicked a row there read it, and an operator who opened
+       * the same link in a second tab was told nothing at all. It goes to
+       * {@link arrivalNote} now, which the shell renders above whatever screen the arrival
+       * reached.
+       *
+       * **The fallback is the Agent sessions list, which is not the nearest page in the
+       * path.** `/t/<id>/assets` is; `parsePath` sends a chat path with no session there,
+       * and the Assets page is what the Auto-load page sits on. But it has nothing to say
+       * about conversations, and the question this link asked was which conversations this
+       * target has. The Agent sessions list is the page that answers it, so that is the
+       * nearest place that exists *in the sense D5 means* — somewhere the operator can
+       * carry on from rather than merely a page that renders.
+       *
+       * It is also the one fallback that is usually no move at all: a click on a stale row
+       * comes from this list, so the rail does not change, the address bar does not change,
+       * and the only difference the operator sees is the sentence. The cold arrival is the
+       * case that moves.
+       *
+       * One honest cost of landing here: the row may still be in the list. The server
+       * unions the harness's sessions and the importer's index is a different reader of the
+       * same world, so the session this note is about can still be on screen underneath it.
+       * That is the staleness the note names, and seeing which row it is beats not seeing
+       * it.
+       */
+      this.toSection("agent-sessions");
+      this.arrivalNote = chatGoneNote();
       return false;
     }
-    this.agentSessionsNote = "";
     this.toSection("assets");
     this.openImporter(sessionId);
     return true;
@@ -4052,6 +4321,7 @@ export class App {
   openImporter(sessionId?: string) {
     const targetId = this.viewTargetId;
     if (targetId === "") return;
+    this.#retireArrivalNote();
     this.importerOpen = true;
     // The target's indexed sessions beside an empty one to type into. What the index held
     // when the page was reached is shown at once and read again below, so the list is never
@@ -5440,6 +5710,7 @@ export class App {
     this.scopeImportTargetId = "";
     this.scopeImportDetail = "";
     this.toast = "";
+    this.#retireArrivalNote();
     this.navItem = "goals";
     this.#clearGoals();
     this.drawerHidden = false;

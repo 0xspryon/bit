@@ -18,6 +18,7 @@
  * records: a shared one makes the ordering depend on the order the tests run in.
  */
 import { describe, expect, test } from "bun:test";
+import { GoalNotFound } from "@bit/contracts";
 
 import { App } from "../src/lib/app.svelte";
 import { placeArrivedAt } from "../src/lib/arrival";
@@ -27,6 +28,7 @@ import {
   FakeServer,
   importerSessionView,
   ok,
+  refused,
   targetSummary,
 } from "./fakeServer";
 
@@ -147,12 +149,29 @@ describe("a link opened before there is a session", () => {
     expect(app.navItem).toBe("events");
   });
 
-  test("names a target this server does not have, and lands on the list", async () => {
+  test("names a target this server does not have, and lands on the list saying so", async () => {
+    /*
+     * Design D5, on the path the whole slice had to be driven along: the link arrives
+     * before there is a session, waits behind Connect for as long as the password takes,
+     * and only once the registry is in hand turns out to name nothing.
+     *
+     * **The sentence has to be there when the list renders**, which is why it is `App`'s
+     * and not raised by whatever screen was up at the time: it is written at the one moment
+     * the answer is known, which is after the gate has already dropped, and nothing between
+     * that moment and the first render of the target list clears it. A message raised while
+     * Connect was up and gone by the time the list arrived would be no message at all.
+     *
+     * Still no request spent on the target: the refusal is read off the list that just
+     * loaded, so there is no flash of a target on its way to being refused.
+     */
     const fake = served((f) => {
       f.onTargets = () => ok([targetSummary({ id: T, name: T })]);
     });
     const app = new App(fake, new FakeCountdown());
     arriveAt(app, "/t/from-another-server/goals/goal_1");
+
+    expect(app.screen).toBe("connect");
+    expect(app.arrivalNote).toBe("");
 
     app.password = "correct-horse";
     await app.connect();
@@ -162,6 +181,91 @@ describe("a link opened before there is a session", () => {
     expect(app.screen).toBe("welcome");
     expect(reflected(app)).toBe("/");
     expect(fake.countOf("target")).toBe(0);
+    expect(app.arrivalNote).toBe(
+      'This server has no target called "from-another-server", so there was nothing to open. These are the targets it does have.',
+    );
+  });
+
+  test("names a goal that has gone, and lands on that target's goal list saying so", async () => {
+    /*
+     * The second of D5's three, and the one that needs the server rather than the registry:
+     * `App` can tell a target it has never heard of from the list it already holds, and it
+     * cannot tell anything about a goal without asking. So this link is replayed in full,
+     * the goal page opens on the strength of the id, and the fallback happens a round trip
+     * later — one flicker in exchange for every live link opening at once.
+     */
+    const fake = served((f) => {
+      f.onGoal = (_url, targetId, goalId) =>
+        refused(
+          new GoalNotFound({
+            targetId,
+            goalId,
+            detail: `no goal '${goalId}' is recorded in this target`,
+          }),
+        );
+    });
+    const app = new App(fake, new FakeCountdown());
+    arriveAt(app, "/t/acme-corp/goals/goal_9");
+
+    app.password = "correct-horse";
+    await app.connect();
+    replay(app);
+    await settle();
+
+    // On the target the link named, on its goal list, which is one level out.
+    expect(app.viewTargetId).toBe(T);
+    expect(app.navItem).toBe("goals");
+    expect(app.openGoalId).toBe("");
+    expect(reflected(app)).toBe("/t/acme-corp");
+    expect(app.arrivalNote).toBe(
+      "This target has no goal under the id \"goal_9\". A goal id belongs to one target, so it may be another target's — these are this target's goals.",
+    );
+  });
+
+  test("names a chat session that has gone, and lands on the Agent sessions list saying so", async () => {
+    /*
+     * The third, and the one D5 calls likeliest, because a harness can let a session go
+     * while an index still remembers it. The sentence already existed before this slice and
+     * went to the Agent sessions list's own banner, which an operator arriving from a
+     * bookmark was not looking at — so what S5 changed is the surface, and this is the
+     * arrival that could not see the old one.
+     */
+    const fake = served((f) => {
+      f.onImporterSessions = () => ok({ sessions: [] });
+    });
+    const app = new App(fake, new FakeCountdown());
+    arriveAt(app, "/t/acme-corp/assets/chat/ses_1");
+
+    app.password = "correct-horse";
+    await app.connect();
+    replay(app);
+    await settle();
+
+    expect(app.importerOpen).toBe(false);
+    expect(app.navItem).toBe("agent-sessions");
+    expect(reflected(app)).toBe("/t/acme-corp/agent-sessions");
+    expect(app.arrivalNote).toBe(
+      "That importer session is no longer in the importer's own list, so there is nothing to open it on. The target's agent sessions are listed here.",
+    );
+  });
+
+  test("and the note goes when the operator navigates away from the fallback", async () => {
+    // It waits to be read and it does not outstay its welcome. The sentence is about where
+    // a link sent the operator, so once they pick somewhere themselves it is about nothing
+    // on screen — and the route's history rule depends on the same moment.
+    const fake = served((f) => {
+      f.onTargets = () => ok([targetSummary({ id: T, name: T })]);
+    });
+    const app = new App(fake, new FakeCountdown());
+    arriveAt(app, "/t/from-another-server");
+
+    app.password = "correct-horse";
+    await app.connect();
+    await settle();
+    expect(app.arrivalNote).not.toBe("");
+
+    app.openTarget(T);
+    expect(app.arrivalNote).toBe("");
   });
 });
 

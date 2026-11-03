@@ -78,9 +78,14 @@
   const follow = (place: Place, event: MouseEvent) => {
     if (!routedInApp(event)) return;
     event.preventDefault();
-    // A refusal is about the row it was raised for — a chat session the importer no longer
-    // lists — so following any row retires it before the next answer arrives.
-    app.agentSessionsNote = "";
+    /*
+     * Nothing is cleared here any more. This used to retire `agentSessionsNote` — the one
+     * refusal a row could raise, for an importer session the importer's index no longer
+     * lists — before the next answer arrived. That sentence is design D5's and moved to
+     * `App.arrivalNote`, which the shell renders above every screen, and `applyPlace`
+     * reaches it through the navigation methods that retire it. So the clear belongs to
+     * `App` now, beside the fallbacks that write it, rather than to one of the two ways in.
+     */
     void applyPlace(app, place);
   };
 </script>
@@ -139,9 +144,11 @@
         </p>
       </div>
     {:else}
-      {#if app.agentSessionsNote !== ""}
-        <p class="refusal" role="alert">{app.agentSessionsNote}</p>
-      {/if}
+      <!--
+        No banner of its own. A row whose session has gone is answered by the shell's
+        arrival banner, which is on this page and on every other page such a link can land
+        on; see `App.arrivalNote`.
+      -->
       <ul class="rows" aria-label="Agent sessions">
         {#each rows as session (session.key)}
           {@const place = placeOfSession(session, app.viewTargetId)}
@@ -271,17 +278,6 @@
     border-radius: var(--radius-sm);
     color: var(--text-base);
   }
-  .refusal {
-    margin: 0 0 12px;
-    padding: 9px 12px;
-    border: 1px solid var(--state-border-danger);
-    border-radius: var(--radius-md);
-    background: var(--state-bg-danger);
-    color: var(--state-fg-danger);
-    font-size: 12px;
-    line-height: 18px;
-  }
-
   .notice {
     display: flex;
     flex-direction: column;

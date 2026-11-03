@@ -296,6 +296,18 @@ describe("clicking a row", () => {
   });
 
   test("an importer row whose session the importer's own index lacks goes nowhere, and says so", async () => {
+    /*
+     * The sentence is no longer in *this* screen's DOM, and that is design D5's point. It
+     * used to be: a row that went nowhere wrote `agentSessionsNote` and this list rendered
+     * it, which told the operator who clicked a row and told the operator who opened the
+     * same link in a second tab nothing at all. It is `App.arrivalNote` now, which the
+     * shell renders above whatever screen the arrival reached — so the assertion is on the
+     * state, and the browser run is what shows the banner.
+     *
+     * The rail staying on Agent sessions is not an accident of this test: the fallback for
+     * a dead chat *is* this list, so a click from it moves nothing and a cold arrival from
+     * a URL ends up here.
+     */
     const { app } = await openList([IMPORTER]);
     // The importer index answers empty (the fake's default).
     clickOn(document.querySelector("a.row.go") as Element);
@@ -303,7 +315,7 @@ describe("clicking a row", () => {
 
     expect(app.importerOpen).toBe(false);
     expect(app.navItem).toBe("agent-sessions");
-    expect(text()).toContain("no longer in the importer's own list");
+    expect(app.arrivalNote).toContain("no longer in the importer's own list");
   });
 
   test("a goal row opens the goal", async () => {
@@ -315,18 +327,20 @@ describe("clicking a row", () => {
     expect(app.openGoalId).toBe("goal_1");
   });
 
-  test("and following another row retires a refusal the last one left", async () => {
+  test("and following another row retires a note the last one left", async () => {
     const { app } = await openList([IMPORTER, GOAL]);
     const links = [...document.querySelectorAll<HTMLAnchorElement>("a.row.go")];
-    // The chat row first, whose session the index does not list: it refuses, on screen.
+    // The chat row first, whose session the index does not list: it goes nowhere, and says so.
     clickOn(links[0] as HTMLAnchorElement);
     await settle();
-    expect(text()).toContain("no longer in the importer's own list");
+    expect(app.arrivalNote).toContain("no longer in the importer's own list");
 
-    // Then the goal row. The refusal was about the row before it, not about the list.
+    // Then the goal row, which lands. The note was about the row before it, and the
+    // navigation methods `applyPlace` calls are what retire it — so the operator is never
+    // left reading a sentence about a link they have already moved on from.
     clickOn(links[1] as HTMLAnchorElement);
     await settle();
-    expect(app.agentSessionsNote).toBe("");
+    expect(app.arrivalNote).toBe("");
   });
 });
 

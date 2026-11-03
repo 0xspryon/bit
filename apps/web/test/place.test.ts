@@ -509,11 +509,13 @@ describe("replaying a place", () => {
      * then goes nowhere rather than opening the Auto-load page on an empty conversation
      * that looks like the one that was asked for.
      *
-     * **The behaviour is right and the surface is not.** `agentSessionsNote` is the Agent
-     * sessions list's own line, and nothing on the Assets page or the goal list reads it,
-     * so an operator arriving by URL is told nothing. Design D5 wants a sentence on the
-     * page the link lands on; S5 owns moving it, and this assertion is here so that slice
-     * can see what it is replacing.
+     * **The surface is now the arrival's, which is S5.** The sentence used to go to
+     * `agentSessionsNote`, the Agent sessions list's own line, which nothing on the Assets
+     * page or the goal list reads — so the operator who clicked a row was told and the
+     * operator who opened the link cold was not. It goes to `arrivalNote`, which the shell
+     * renders above every screen, and the fallback goes to the target's Agent sessions
+     * list: the page that answers the question the link asked, which is what conversations
+     * this target has.
      */
     const app = await landed(
       { kind: "chat", targetId: T, sessionId: "ses_1" },
@@ -523,9 +525,15 @@ describe("replaying a place", () => {
     );
 
     expect(app.importerOpen).toBe(false);
-    expect(app.agentSessionsNote).not.toBe("");
-    // Still on the target it named, which is the nearest place that does exist.
-    expect(placeOf(app)).toEqual({ kind: "target", targetId: T });
+    expect(app.arrivalNote).toContain("no longer in the importer's own list");
+    // The target's Agent sessions list, which is the nearest place that exists *and* has
+    // something to say about conversations. `/t/<id>/assets` is nearer in the path and
+    // answers a different question.
+    expect(placeOf(app)).toEqual({
+      kind: "section",
+      targetId: T,
+      section: "agent-sessions",
+    });
   });
 
   test("an attempt reads the transcript, with the rail on Workers", async () => {

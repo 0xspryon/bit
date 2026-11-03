@@ -144,3 +144,52 @@ describe("the same place under another name", () => {
     expect(historyWrite(at("/t"), "/")).toBe("replace");
   });
 });
+
+describe("an arrival that fell back", () => {
+  test("replaces, whatever the two paths say about each other", () => {
+    /*
+     * Design D5's history rule. Every one of these would push under the rule above — a
+     * fallback lands on a *container* of the place the link named, which is a different
+     * path by construction — and pushing is wrong for all three. The entry the operator is
+     * standing on names nothing, so leaving it behind leaves a trap; and going Back onto it
+     * applies it, falls back again, and pushes again, which is a Back button that cannot
+     * leave the page.
+     */
+    expect(historyWrite(at("/t/acme-corp"), "/", "fell-back")).toBe("replace");
+    expect(
+      historyWrite(
+        at("/t/acme-corp/goals/goal_9"),
+        "/t/acme-corp",
+        "fell-back",
+      ),
+    ).toBe("replace");
+    expect(
+      historyWrite(
+        at("/t/acme-corp/assets/chat/ses_9"),
+        "/t/acme-corp/agent-sessions",
+        "fell-back",
+      ),
+    ).toBe("replace");
+  });
+
+  test("still skips a write that would change nothing", () => {
+    // The skip stays first, because it is what keeps the apply-then-reflect cycle from
+    // having a first step. A fallback that happens to land on the address already in the
+    // bar — a stale row clicked from the very list it falls back to — is not a correction
+    // of anything.
+    expect(
+      historyWrite(
+        at("/t/acme-corp/agent-sessions"),
+        "/t/acme-corp/agent-sessions",
+        "fell-back",
+      ),
+    ).toBe("skip");
+  });
+
+  test("and a landing is the ordinary rule, which is the default", () => {
+    // Stated so the default is pinned: an omitted third argument must mean "landed", so a
+    // caller that forgets it spends a history entry rather than silently eating one.
+    expect(historyWrite(at("/"), "/t/acme-corp", "landed")).toBe("push");
+    expect(historyWrite(at("/"), "/t/acme-corp")).toBe("push");
+  });
+});

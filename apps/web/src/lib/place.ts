@@ -39,8 +39,11 @@
  * the honest answer to a bad guess is the closest real page, not a stack trace.
  *
  * Whether the *resource* a well-formed path names still exists is a different question,
- * answered later by the `App` methods {@link applyPlace} calls (design D5). This module
- * only decides what a string means.
+ * answered by the `App` methods {@link applyPlace} calls (design D5): a target the registry
+ * does not hold, a goal id that is another target's, an importer session the harness has
+ * let go. Each falls back to the nearest place that does exist and leaves its reason in
+ * `App.arrivalNote`, which the shell renders. This module only decides what a string
+ * means, and has no opinion about whether the thing it names is still there.
  */
 import type { App, EstateFilter } from "./app.svelte";
 
@@ -400,14 +403,15 @@ const decodeSegment = (part: string): string => {
  * **Still fire-and-forget, and now it says when it has finished.** The screen arrives first
  * and the reads land behind it: every state write a place *implies* happens synchronously,
  * before this returns, so a caller that ignores the promise behaves exactly as it did
- * before. The promise is for the one caller that has to know — S4's history reader. Two
- * places are reached across a round trip rather than in one call (`openImporterSession`
- * reads the importer's index first, `loadTranscript` reads the transcript), so between the
- * call and the answer the app stands on the page *above* the place that was asked for. That
- * intermediate place is not somewhere the operator went, and the route must not write it
- * into the address bar: doing so used to be an invisible flicker, and once a write can push
- * it becomes a junk history entry per deep link. So the route suppresses reflection until
- * this settles, which is a bound the server sets rather than a timer.
+ * before. The promise is for the one caller that has to know — S4's history reader. Three
+ * places are reached across a round trip rather than in one call: `openImporterSession`
+ * reads the importer's index first, `loadTranscript` reads the transcript, and since S5 a
+ * goal is confirmed to exist after it is opened. So between the call and the answer the app
+ * stands either on the page *above* the place that was asked for, or on a page that may
+ * turn out not to exist. Neither is somewhere the operator went, and the route must not
+ * write either into the address bar: doing so used to be an invisible flicker, and once a
+ * write can push it becomes a junk history entry per deep link. So the route suppresses
+ * reflection until this settles, which is a bound the server sets rather than a timer.
  */
 export const applyPlace = (app: App, place: Place): Promise<void> => {
   if (place.kind === "targets") {
@@ -432,7 +436,19 @@ export const applyPlace = (app: App, place: Place): Promise<void> => {
     case "goal":
       app.toSection("goals");
       app.openGoal(place.goalId);
-      return SETTLED;
+      /*
+       * Opened at once and confirmed behind it (design D5). `openGoal` is optimistic — it
+       * shows the row it has and lets the reads replace it — which is right for a click,
+       * where the row was on screen a moment ago, and not enough for a link, where the id
+       * may be a year old or another target's. `confirmOpenGoal` asks the server and falls
+       * back to the goal list with a sentence if the answer is `GoalNotFound`.
+       *
+       * So this is the third place reached across a round trip, and the reason it matters is
+       * the route's: until the answer lands, the app is standing on a goal page that may
+       * turn out not to exist, and a reflection of *that* would push a history entry for a
+       * place the operator never reached. The promise is what the route waits out.
+       */
+      return app.confirmOpenGoal(place.goalId);
     case "estate":
       app.toSection("assets");
       app.toAssetsTab("estate");
@@ -466,10 +482,12 @@ export const applyPlace = (app: App, place: Place): Promise<void> => {
        * section is entered *after* the index comes back, so until then the app is on the
        * target's Goals page and not on this chat.
        *
-       * A session the index no longer lists leaves the operator on the target with
-       * `agentSessionsNote` set. The behaviour is right and the surface is not: that note
-       * belongs to the Agent sessions list, and a link that outlived its session deserves
-       * design D5's own sentence on the page it lands on. S5 owns moving it.
+       * A session the index no longer lists is design D5's third case, and the method
+       * answers it: the rail goes to the target's Agent sessions list — the page that says
+       * which conversations the target does have — and `App.arrivalNote` carries the
+       * sentence, which the shell renders above whatever screen the arrival reached. The
+       * note used to go to the Agent sessions banner alone, so an arrival by URL was told
+       * nothing; S5 moved it and this case needs no special handling for it.
        */
       return app.openImporterSession(place.sessionId).then(IGNORED);
     case "attempt":

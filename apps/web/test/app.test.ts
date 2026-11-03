@@ -2347,10 +2347,11 @@ describe("deep links", () => {
    * following the operator around.
    *
    * The check is `App`'s because the registry is, and it is the one question about a held
-   * path that `App` can answer without reading it. Design D5 owes this a sentence the
-   * operator can see, which is S5's.
+   * path that `App` can answer without reading it. Design D5's sentence goes with it: the
+   * operator asked for something specific by following a link and waited behind Connect for
+   * it, so being put on a list with nothing said is the one outcome S5 rules out.
    */
-  test("a link to a target this server does not have is dropped on the list", async () => {
+  test("a link to a target this server does not have is dropped on the list, with a reason", async () => {
     const { app, fake } = open();
     fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
 
@@ -2367,6 +2368,94 @@ describe("deep links", () => {
     expect(app.requestedTargetId).toBe("");
     expect(app.requestedPath).toBe("");
     expect(fake.countOf("target")).toBe(0);
+    expect(app.arrivalNote).toContain(
+      'This server has no target called "a-target-from-another-server"',
+    );
+  });
+
+  test("and a held place that does resolve leaves no note behind", async () => {
+    // The note is for the arrival that failed. A link that lands says nothing, because
+    // landing is what a link is supposed to do.
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+
+    app.requestPlace("acme-corp", "/t/acme-corp/findings");
+    await signIn(app);
+
+    expect(app.replayPath).toBe("/t/acme-corp/findings");
+    expect(app.arrivalNote).toBe("");
+  });
+
+  /*
+   * `confirmOpenGoal` is the half of design D5 that has to ask the server, so it is also
+   * the half that can be wrong about what the answer meant. "That goal no longer exists" is
+   * not a sentence to say on a guess — it sends the operator looking for a goal that is
+   * perfectly fine — so only the server's own `GoalNotFound` produces it.
+   */
+  test("a goal the server refuses by id falls back to the goal list", async () => {
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = () => ok({ goals: [goalView({ goalId: "goal_1" })] });
+    fake.onGoal = (_url, targetId, goalId) =>
+      refused(
+        new GoalNotFound({
+          targetId,
+          goalId,
+          detail: `no goal '${goalId}' is recorded in this target`,
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_9");
+    await app.confirmOpenGoal("goal_9");
+
+    expect(app.openGoalId).toBe("");
+    expect(app.arrivalNote).toContain('no goal under the id "goal_9"');
+  });
+
+  test("an unreachable server says nothing about whether the goal exists", async () => {
+    // The failure that looks identical from the goal page: no row, nothing read. The link
+    // may be perfectly good and the server merely away, so the goal stays open and the
+    // reads' own failure states are what the operator sees.
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoals = () => ok({ goals: [] });
+    fake.onGoal = () => unreachable("no server answered");
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_9");
+    await app.confirmOpenGoal("goal_9");
+
+    expect(app.openGoalId).toBe("goal_9");
+    expect(app.arrivalNote).toBe("");
+  });
+
+  test("a goal on a target that has gone says so about the target, once", async () => {
+    // Both halves of the path are dead and the operator gets one sentence, not two: the
+    // target is the outer fact, and a goal list for a target that is not there is not a
+    // page to put anybody on.
+    const { app, fake } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    fake.onGoal = (_url, targetId) =>
+      refused(
+        new TargetNotFound({
+          reason: "unknown_target",
+          targetId,
+          detail: `no target '${targetId}' is registered`,
+        }),
+      );
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    app.openGoal("goal_9");
+    await app.confirmOpenGoal("goal_9");
+
+    expect(app.screen).toBe("welcome");
+    expect(app.arrivalNote).toContain(
+      'This server has no target called "acme-corp"',
+    );
   });
 
   test("a released place is taken once", async () => {

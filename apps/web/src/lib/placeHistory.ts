@@ -40,6 +40,24 @@
  * nothing to write and the loop has no first step. The route's comment names this; the
  * `"skip"` case is where it is enforced.
  *
+ * ## Why a failed arrival replaces
+ *
+ * The third input is design D5's, and it is a history rule rather than a message one. When
+ * a link names something that has gone, the app falls back to the nearest place that does
+ * exist — a goal list for a dead goal, the target list for a dead target — and that
+ * fallback *is* a change of path, so the rule above would push. Pushing it is wrong twice
+ * over. The entry the operator is standing on names nothing, so leaving it behind to go
+ * Back to is leaving a trap; and going Back onto it applies it again, falls back again, and
+ * pushes again — a Back button that cannot leave the page, which is what a bookmark to a
+ * deleted target did on `main` before S5.
+ *
+ * So a fallback **corrects the entry the dead link is on** instead of adding one: the
+ * address bar stops lying, history keeps its length, and Back goes to wherever the operator
+ * was before they followed the link. The route knows an arrival fell back because
+ * `App.arrivalNote` is standing, and the note's own lifetime is what bounds this — it is
+ * cleared by the next navigation the operator chooses, so the very next write after that is
+ * an ordinary push again.
+ *
  * Pure, so the rule is testable without a DOM, a router or an `App` (`test/placeHistory.test.ts`).
  */
 import { placeArrivedAt } from "./arrival";
@@ -66,14 +84,36 @@ export interface Address {
 }
 
 /**
+ * Whether the place on screen is the one the URL asked for, or the nearest one that exists.
+ *
+ * `"fell-back"` is the arrival design D5 is about: the link named a resource that has gone
+ * and the app went one level out instead. The route reads it off a standing
+ * `App.arrivalNote`, which is set by exactly those three fallbacks and cleared by the next
+ * navigation the operator makes.
+ */
+export type Arrival = "landed" | "fell-back";
+
+/**
  * How to write `next` over `here`.
  *
  * `next` is {@link pathOf} of the place the state is in, so it is always canonical. `here`
  * is whatever the address bar happens to hold, which is canonical for every entry this app
  * wrote and may not be for the one the tab was opened with.
+ *
+ * `arrival` defaults to `"landed"`, which is the safe default in the direction that
+ * matters: a caller that forgets it gets the ordinary rule, so an omission costs a history
+ * entry rather than silently eating one the operator wanted.
  */
-export const historyWrite = (here: Address, next: string): HistoryWrite => {
+export const historyWrite = (
+  here: Address,
+  next: string,
+  arrival: Arrival = "landed",
+): HistoryWrite => {
   if (next === here.pathname + here.search) return "skip";
+  // Before the path comparison, because a fallback is a change of path by construction —
+  // the place it lands on is a *container* of the one the link named — so the rule below
+  // would always answer `"push"` for it.
+  if (arrival === "fell-back") return "replace";
   const held = pathOf(placeArrivedAt(here.pathname, here.search));
   return pathnameOf(held) === pathnameOf(next) ? "replace" : "push";
 };

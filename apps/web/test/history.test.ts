@@ -18,6 +18,7 @@
  * records.
  */
 import { describe, expect, test } from "bun:test";
+import { GoalNotFound, TargetNotFound } from "@bit/contracts";
 
 import { App } from "../src/lib/app.svelte";
 import { placeArrivedAt } from "../src/lib/arrival";
@@ -30,6 +31,7 @@ import {
   goalView,
   importerSessionView,
   ok,
+  refused,
   targetSummary,
 } from "./fakeServer";
 
@@ -92,7 +94,14 @@ const tab = (app: App, href: string) => {
   const reflect = () => {
     if (applying > 0) return;
     const next = pathOf(placeOf(app));
-    const write = historyWrite(history.address, next);
+    // The third input, S5's: a standing arrival note means the last apply fell back to the
+    // nearest place that exists, so the entry in the address bar names nothing and this
+    // write corrects it. The route reads it exactly this way.
+    const write = historyWrite(
+      history.address,
+      next,
+      app.arrivalNote === "" ? "landed" : "fell-back",
+    );
     if (write === "skip") return;
     if (write === "push") history.push(next);
     else history.replace(next);
@@ -440,5 +449,146 @@ describe("the link the shell used to write", () => {
     });
 
     expect(history.entries).toEqual(["/t/alpha"]);
+  });
+});
+
+describe("a link that outlived its resource", () => {
+  /*
+   * Design D5 read as arithmetic rather than as prose. A fallback is a change of path — the
+   * place it lands on is a container of the place the link named — so D4's rule would push
+   * it, and pushing it is wrong twice over: the entry left behind names nothing, and
+   * traversing back onto it falls back and pushes again. The second half is the one that
+   * ruins the app, because it is a Back button that cannot leave the page.
+   *
+   * These drive the route's three rules over a real `App`, so what is asserted is the stack
+   * the operator would be pressing Back against. The bookmark cases start the tab *on* the
+   * dead URL, because that is what a bookmark is.
+   */
+
+  /** A server that has `alpha` in its registry and refuses to open it. */
+  const withoutTheTarget = (): FakeServer =>
+    served((f) => {
+      f.onTarget = (_url, id) =>
+        refused(
+          new TargetNotFound({
+            reason: "unknown_target",
+            targetId: id,
+            detail: `no target '${id}' is registered`,
+          }),
+        );
+    });
+
+  const withoutTheGoal = (): FakeServer =>
+    served((f) => {
+      f.onGoal = (_url, targetId, goalId) =>
+        refused(
+          new GoalNotFound({
+            targetId,
+            goalId,
+            detail: `no goal '${goalId}' is recorded in this target`,
+          }),
+        );
+    });
+
+  test("a bookmark to a target that has gone leaves one entry, the list", async () => {
+    const app = new App(withoutTheTarget(), new FakeCountdown());
+    const { history, traverse } = tab(app, "/t/alpha");
+    app.password = "correct-horse";
+    await app.connect();
+    await settle();
+
+    await traverse(0);
+
+    /*
+     * The entry the bookmark opened is *corrected* to `/`, not left with a `/` pushed on
+     * top of it. That is the regression this slice closes, and it was live on `main`: the
+     * bounce pushed, so the dead URL sat one Back away, and pressing Back applied it,
+     * bounced again and pushed again. The stack grew by one entry per press and the
+     * operator could not get out of the target list.
+     */
+    expect(history.entries).toEqual(["/"]);
+    expect(app.screen).toBe("welcome");
+    expect(app.arrivalNote).toContain(
+      'This server has no target called "alpha"',
+    );
+
+    // Nothing to go back to, which is the truth: this tab has been on one page.
+    await traverse(0);
+    expect(history.length).toBe(1);
+    expect(history.here).toBe("/");
+  });
+
+  test("a rail row for a target that has gone costs its entry, not two", async () => {
+    // The other way into the same fallback, and the one that is not a link at all: the
+    // operator clicks a row for a target something else removed while this tab held the
+    // list. The push for `/t/alpha` has already happened by the time the registry answers,
+    // so the correction lands on it — one entry spent, and never a second.
+    const { app, history, act } = await signedIn(withoutTheTarget());
+
+    await act(() => {
+      app.openTarget("alpha");
+    });
+
+    expect(history.entries).toEqual(["/", "/"]);
+    expect(app.screen).toBe("welcome");
+    expect(app.arrivalNote).not.toBe("");
+  });
+
+  test("a bookmark to a goal that has gone leaves one entry, its goal list", async () => {
+    const app = new App(withoutTheGoal(), new FakeCountdown());
+    const { history, traverse } = tab(app, "/t/alpha/goals/goal_9");
+    app.password = "correct-horse";
+    await app.connect();
+    await settle();
+
+    await traverse(0);
+
+    expect(history.entries).toEqual(["/t/alpha"]);
+    expect(app.navItem).toBe("goals");
+    expect(app.openGoalId).toBe("");
+    expect(app.arrivalNote).toContain(
+      'This target has no goal under the id "goal_9"',
+    );
+  });
+
+  test("a bookmark to a chat that has gone leaves one entry, the Agent sessions list", async () => {
+    const fake = served((f) => {
+      f.onImporterSessions = () => ok({ sessions: [] });
+    });
+    const app = new App(fake, new FakeCountdown());
+    const { history, traverse } = tab(app, "/t/alpha/assets/chat/ses_1");
+    app.password = "correct-horse";
+    await app.connect();
+    await settle();
+
+    await traverse(0);
+
+    expect(history.entries).toEqual(["/t/alpha/agent-sessions"]);
+    expect(app.importerOpen).toBe(false);
+    expect(app.arrivalNote).toContain("no longer in the importer's own list");
+  });
+
+  test("and the next navigation the operator makes pushes again", async () => {
+    /*
+     * The note's lifetime is what bounds the replace rule, so it cannot leak into the
+     * ordinary case. One dead link corrects one entry; the moment the operator chooses
+     * somewhere themselves the note goes and pushing resumes — otherwise a single stale
+     * bookmark would quietly flatten the rest of the visit's history.
+     */
+    const app = new App(withoutTheGoal(), new FakeCountdown());
+    const { history, act, traverse } = tab(app, "/t/alpha/goals/goal_9");
+    app.password = "correct-horse";
+    await app.connect();
+    await settle();
+
+    await traverse(0);
+    expect(app.arrivalNote).not.toBe("");
+
+    await act(() => {
+      app.toSection("events");
+    });
+
+    expect(app.arrivalNote).toBe("");
+    expect(history.entries).toEqual(["/t/alpha", "/t/alpha/events"]);
   });
 });

@@ -36,6 +36,7 @@
 
   import { goto } from "$app/navigation";
 
+  import Banner from "../../lib/components/Banner.svelte";
   import ScenarioBar from "../../lib/components/ScenarioBar.svelte";
   import TitleBar from "../../lib/components/TitleBar.svelte";
   import Connect from "../../lib/screens/Connect.svelte";
@@ -59,9 +60,11 @@
    * How many places the URL has asked for that the app has not yet reached.
    *
    * Applying a place is not instant for all eight of them: `applyPlace` reaches a chat by
-   * reading the importer's index first and an attempt by reading its transcript, so between
-   * the call and the answer the app stands on the page *above* the place that was asked
-   * for. That page is not somewhere the operator went, and the reflection below is
+   * reading the importer's index first, an attempt by reading its transcript, and a goal by
+   * confirming after the fact that the goal exists. So between the call and the answer the
+   * app stands either on the page *above* the place that was asked for, or on a goal page
+   * that may turn out to be empty. Neither is somewhere the operator went, and the
+   * reflection below is
    * suppressed until this returns to zero, for the same reason it is suppressed while a
    * place is held across Connect: there is nothing true to write yet.
    *
@@ -248,6 +251,18 @@
    * no second hop to loop on and no entry to accumulate. That is the half this effect owns;
    * the reader above owns the other half.
    *
+   * **A failed arrival corrects its entry rather than adding one**, which is design D5's
+   * half of this effect and the third thing `historyWrite` is told. A standing
+   * `app.arrivalNote` means the last thing that happened was a link landing on the nearest
+   * place that exists instead of the place it named — so the entry in the address bar names
+   * nothing, and the write that follows is a correction of it. Reading the note here is
+   * also what *wakes* this effect for the fallbacks that answer a round trip late: the
+   * registry refusing a target comes back after `applying` has already returned to zero.
+   *
+   * The note is not cleared here. `App` clears it on the operator's next navigation, which
+   * is the moment the sentence stops being about anything on screen, and it is the same
+   * moment the next write goes back to pushing.
+   *
    * `shallow: true` so this updates the address bar without running a navigation: there is
    * one route and nothing to load. `replace` comes from `historyWrite`, which is D4's
    * "opening a resource pushes a history entry; everything else replaces" turned into a
@@ -260,7 +275,11 @@
       return;
     }
     const next = pathOf(placeOf(app));
-    const write = historyWrite(location, next);
+    const write = historyWrite(
+      location,
+      next,
+      app.arrivalNote === "" ? "landed" : "fell-back",
+    );
     if (write === "skip") return;
     void goto(new URL(next, location.href), {
       shallow: true,
@@ -292,23 +311,60 @@
   {#if app.screen === "connect"}
     <!-- Level 0: no chrome. There is nothing to navigate to yet. -->
     <Connect {app} />
-  {:else if app.screen === "welcome"}
-    <!-- Level 1: above target scope. One crumb, and the table of targets is the navigation. -->
-    <TitleBar {app} />
-    <Welcome {app} />
-  {:else if app.screen === "new-target"}
+  {:else}
     <!--
-      Level 1 as well: a page above target scope, because the target it is about does not
-      exist yet. A3 turns what was a dialog into this, and keeps only the folder browser
-      modal — which `NewTarget` mounts itself, since it is the one thing on that page
-      whose state nothing else reads.
+      The crumb bar, on every screen above the gate. Hoisted out of the three branches
+      below so that the arrival banner has one place to sit: under the chrome and above
+      whatever page a link landed on.
     -->
     <TitleBar {app} />
-    <NewTarget {app} />
-  {:else}
-    <!-- Level 2: the crumb bar plus the target's own rail. -->
-    <TitleBar {app} />
-    <Target {app} />
+
+    <!--
+      What a link that outlived its resource has to say (design D5).
+
+      **One site, three landing places.** A dead target lands on the target list, a dead
+      goal on that target's goal list, a dead chat session on its Agent sessions list — so
+      a banner owned by any one screen would be missing from the other two, which is the
+      bug D5 names: the sentence for a dead chat already existed and was written to the
+      Agent sessions list's own banner, where an operator arriving from a bookmark never
+      saw it. Rendering it here means every page a fallback can reach has it by
+      construction, and a fourth fallback added later inherits the surface.
+
+      **In the document flow, not floating.** It pushes the page down rather than covering
+      a row of it, and it reads as part of the page the link landed on rather than as a
+      system notification about one. The import's toast below is the other choice and the
+      right one for *that* message, which belongs to no screen at all.
+
+      `tone="info"` and `role="status"` from `Banner`: nothing has failed here. A bookmark
+      got old, which is a fact rather than an error, and dressing it in the danger tones
+      the import failure uses would say something untrue about the severity. It is
+      dismissible and it does not time out — see `App.arrivalNote` for why waiting is the
+      whole point.
+
+      Not rendered on the Connect screen, which has no chrome and nothing to be above;
+      `signOut` retires the note so one cannot wait behind the gate for a later session.
+    -->
+    {#if app.arrivalNote !== ""}
+      <Banner tone="info" ondismiss={() => app.dismissArrivalNote()}>
+        {app.arrivalNote}
+      </Banner>
+    {/if}
+
+    {#if app.screen === "welcome"}
+      <!-- Level 1: above target scope. The table of targets is the navigation. -->
+      <Welcome {app} />
+    {:else if app.screen === "new-target"}
+      <!--
+        Level 1 as well: a page above target scope, because the target it is about does not
+        exist yet. A3 turns what was a dialog into this, and keeps only the folder browser
+        modal — which `NewTarget` mounts itself, since it is the one thing on that page
+        whose state nothing else reads.
+      -->
+      <NewTarget {app} />
+    {:else}
+      <!-- Level 2: the target's own rail, under the crumb bar. -->
+      <Target {app} />
+    {/if}
   {/if}
 
   <!--
