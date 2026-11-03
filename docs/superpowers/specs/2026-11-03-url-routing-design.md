@@ -58,8 +58,10 @@ files. Path URLs therefore need a route file, which is the one piece of new plum
 
 `+page.svelte` says it keeps the URL out of `App` because _"`$app/navigation` is
 SvelteKit's, and `App` is a plain class that a test or a second shell can construct
-without a router."_ That property is load-bearing: 455 web tests and 84 DOM tests mount
-screens against a bare `new App()`. Nothing in this design may put a SvelteKit import
+without a router."_ That property is load-bearing: the web and DOM suites mount
+screens against a bare `new App()` — 455 and 84 of them when this was written, 549 and 84
+by the end of S2. A count in prose goes stale in a week; what must not change is that none
+of them needs a router. Nothing in this design may put a SvelteKit import
 inside `App` or require a router to construct one.
 
 ## Design
@@ -148,6 +150,15 @@ granularity: **opening a resource pushes a history entry; everything else replac
 Opening three targets in a row leaves three entries, because you may want to go back
 through them. Toggling a picker leaves none, because it is not in the URL at all.
 
+**And nothing is written while a place is held** — the rule S2 had to invent, because D4
+and D6 contradict each other without it. Connect is a gate rather than a place, so
+`placeOf` reads the target list for as long as it is up; reflecting that would erase the
+link the tab was opened with, and a reload at the gate would land on the list instead of
+the bookmark. So reflection is suppressed from the moment a place is held until `App`
+releases it, which is the same moment there is something true to write. Both ways in
+release it, and an unresolvable target is dropped before anything opens, so nothing stays
+suppressed past the gate.
+
 ### D5 — A link to something that is gone says so
 
 A bookmark outlives the thing it names: a goal gets ended, a target gets removed, an
@@ -220,9 +231,16 @@ Move `+page.svelte` under a catch-all route. Reflect `placeOf` into the path on 
 change. Read the path at mount. Retire the `?target=` special case — and keep old links
 working by translating `?target=<id>` into the path form once, on arrival.
 
-_Done when:_ `/t/<id>` and `/t/<id>/<section>` open that place from a cold load;
-navigating by clicking updates the address bar; a reload holds the place; an existing
-`?target=acme-corp` bookmark still lands on that target; the 455 + 84 web tests still
+**Scope note, decided during S1 — and this time actually written down.** This slice
+carries the _held place_ as well: the generalisation of `requestedTargetId` from a target
+id to the whole place, so a link opened before sign-in lands where it pointed rather than
+on that target's Goals page. It belongs here because S2's own criteria need it, and
+splitting it would leave a visibly half-working deep link on `main`. S5 keeps the
+dead-resource half only.
+
+_Done when:_ `/t/<id>` and `/t/<id>/<section>` open that place from a cold load, signed in
+or signed out; navigating by clicking updates the address bar; a reload holds the place; an
+existing `?target=acme-corp` bookmark still lands on that target; the web tests still
 construct `App` without a router.
 
 ### S3 — Records by id
@@ -253,15 +271,17 @@ without a page load; Back out of a goal lands on the goal list, not the previous
 Forward returns; no history entry is created by opening a picker, switching theme, or
 expanding the live dock.
 
-### S5 — Links that outlive their resource, and links that arrive early
+### S5 — Links that outlive their resource
 
-D5 and D6: the nearest-valid-place fallback with a message, and the held place replayed
-after Connect.
+D5 alone. D6's held place shipped in S2; what is left is what a link does when the
+resource it names is gone, and the surface it says so on.
 
 _Done when:_ a path naming a deleted goal lands on that target's goal list and says the
-goal is gone; a path naming an unknown target lands on the target list and says so; a deep
-link opened with no browser session shows Connect, then lands on the full place — record
-and all — after signing in; the same holds for a resumed session.
+goal is gone; a path naming an unknown target lands on the target list and says so rather
+than tidying the address bar in silence, which is what S2 left it doing; a path naming a
+chat session the importer no longer lists says so **on the page the link landed on** —
+today `openImporterSession` writes that sentence to `agentSessionsNote`, the Agent sessions
+screen's banner, which an operator arriving from a bookmark is not looking at.
 
 ## Decisions taken
 
