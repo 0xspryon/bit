@@ -1,5 +1,14 @@
 <script lang="ts">
-  import type { Snippet } from "svelte";
+  /**
+   * The titled card every form and question dialog is drawn in: a scrim, a heading, a
+   * padded body and a footer of actions. It owns the Escape key and the Tab trap, and takes
+   * its focus rules from `dialogFocus`.
+   *
+   * The options below exist for {@link ErrorDialog}, which is this card saying "the server
+   * refused that" rather than asking anything. Every one defaults to what the form and
+   * question dialogs already had, so they are unchanged by it.
+   */
+  import { untrack, type Snippet } from "svelte";
   import { holdFocus, wrapTab } from "../dialogFocus";
   import { IconClose } from "../icons";
 
@@ -8,11 +17,41 @@
     onclose,
     body,
     footer,
+    role = "dialog",
+    describedby,
+    scrimCloses = false,
+    closeButton = true,
+    width = 560,
+    opener = null,
   }: {
+    /** The heading, and the dialog's accessible name. */
     title: string;
     onclose: () => void;
     body: Snippet;
     footer: Snippet;
+    /**
+     * `alertdialog` for a dialog that interrupts to say something went wrong, so a screen
+     * reader announces it as urgent; `dialog` for everything that asks or collects.
+     */
+    role?: "dialog" | "alertdialog";
+    /** The id of the element in `body` that is the dialog's message, for `aria-describedby`. */
+    describedby?: string;
+    /**
+     * Whether a click on the scrim closes it. Off by default: a form or a question about
+     * deleting something should not be lost to a stray click. A dialog that holds nothing
+     * to lose — `HarnessDialog`, `ErrorDialog` — turns it on.
+     */
+    scrimCloses?: boolean;
+    /** The header's ×. A dialog whose footer is its one way out leaves it off. */
+    closeButton?: boolean;
+    /** The panel's width in px, before the window narrows it. */
+    width?: number;
+    /**
+     * The control that opened it, when the caller knows. Otherwise it is whatever has focus
+     * as the dialog mounts, which for a refusal that arrives after a request is not always
+     * the control that sent it: see `dialogFocus`, "The opener can be named".
+     */
+    opener?: HTMLElement | null;
   } = $props();
 
   let panel = $state<HTMLElement | null>(null);
@@ -25,7 +64,9 @@
    */
   $effect(() => {
     if (panel === null) return;
-    return holdFocus(panel);
+    const mounted = panel;
+    // Only the panel mounting is a reason to run this; a new `opener` is not.
+    return untrack(() => holdFocus(mounted, opener));
   });
 
   function onkeydown(event: KeyboardEvent) {
@@ -40,20 +81,36 @@
 <svelte:window {onkeydown} />
 
 <div class="scrim">
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  {#if scrimCloses}
+    <!--
+      The outside of the panel, as a control, as `HarnessDialog` draws it: out of the tab
+      order, because Escape is the keyboard's way out.
+    -->
+    <button
+      class="dismiss"
+      type="button"
+      tabindex="-1"
+      aria-label="Close"
+      onclick={onclose}
+    ></button>
+  {/if}
   <div
     class="panel"
-    role="dialog"
+    {role}
     aria-modal="true"
     aria-label={title}
+    aria-describedby={describedby}
     tabindex="-1"
+    style:--modal-width={`${width}px`}
     bind:this={panel}
   >
     <header>
       <h2>{title}</h2>
-      <button class="x" onclick={onclose} aria-label="Close">
-        <IconClose width="12" height="12" />
-      </button>
+      {#if closeButton}
+        <button class="x" type="button" onclick={onclose} aria-label="Close">
+          <IconClose width="12" height="12" />
+        </button>
+      {/if}
     </header>
     <div class="body">{@render body()}</div>
     <footer>{@render footer()}</footer>
@@ -71,8 +128,16 @@
     z-index: 50;
     animation: fade var(--dur-fade) ease-out;
   }
+  .dismiss {
+    position: absolute;
+    inset: 0;
+    border: 0;
+    background: transparent;
+    cursor: default;
+  }
   .panel {
-    width: min(100%, 560px);
+    position: relative;
+    width: min(100%, var(--modal-width));
     max-height: min(100%, 640px);
     display: flex;
     flex-direction: column;
