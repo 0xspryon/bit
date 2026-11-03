@@ -1339,17 +1339,30 @@ const turnDrivenSdk = () => {
    * How the session answers a model switch, changeable mid-test so a retry can succeed.
    *
    * `refuse` rejects that one control request; `hang` never answers it, which is the case
-   * the control bound exists for. Either way the call is still recorded, because a request
-   * the CLI refused was still sent.
+   * the control bound exists for. `hangOn` does the same for one call only, named as it
+   * is recorded in `seen.switches` (`effort:high`). Either way the call is still recorded,
+   * because a request the CLI refused was still sent.
+   *
+   * A request left hanging is **rejected when the query closes**, as SDK 0.3.310's
+   * `Query.cleanup` does to every pending control response ("Query closed before response
+   * received"). A fake that left it hanging would make a switch racing a close look like a
+   * timeout, which is not what the caller gets.
    */
   const controls: {
     refuse: "setModel" | "applyFlagSettings" | undefined;
     hang: "setModel" | "applyFlagSettings" | undefined;
-  } = { refuse: undefined, hang: undefined };
+    hangOn: string | undefined;
+  } = { refuse: undefined, hang: undefined, hangOn: undefined };
+  const hanging = new Set<(cause: Error) => void>();
   const answer = async (
     request: "setModel" | "applyFlagSettings",
+    label: string,
   ): Promise<void> => {
-    if (controls.hang === request) await new Promise<never>(() => {});
+    if (controls.hang === request || controls.hangOn === label) {
+      await new Promise<never>((_, reject) => {
+        hanging.add(reject);
+      });
+    }
     if (controls.refuse === request) {
       throw new Error(`the CLI refused ${request}`);
     }
@@ -1395,15 +1408,21 @@ const turnDrivenSdk = () => {
           return { maxTokens: CONTEXT_WINDOW };
         },
         setModel: async (model) => {
-          seen.switches.push(`model:${String(model)}`);
-          await answer("setModel");
+          const label = `model:${String(model)}`;
+          seen.switches.push(label);
+          await answer("setModel", label);
         },
         applyFlagSettings: async (settings) => {
-          seen.switches.push(`effort:${String(settings.effortLevel)}`);
-          await answer("applyFlagSettings");
+          const label = `effort:${String(settings.effortLevel)}`;
+          seen.switches.push(label);
+          await answer("applyFlagSettings", label);
         },
         close: () => {
           seen.closes += 1;
+          for (const reject of hanging) {
+            reject(new Error("Query closed before response received"));
+          }
+          hanging.clear();
         },
         [Symbol.asyncIterator]: async function* () {
           // Never ends on its own, like the real stream: it is closed, not completed.
@@ -2125,6 +2144,93 @@ describe("switching a Claude Code session's model", () => {
       expect(failure.tag).toBe("TimeoutError");
       expect(failure.detail).toContain("whether it took the change is unknown");
     }
+  }, 20_000);
+
+  test("a switch whose query closes while it waits is refused as not found, not left uncertain", async () => {
+    /*
+     * `setModel` takes about a second to be answered (the probe measured 1.0–1.2 s), and
+     * the query can close inside that second: an interrupt, a stream failure, or a
+     * single-turn session's turn ending. The SDK then rejects every pending control
+     * request. A plain transport failure there reads as "uncertain", so the caller keeps
+     * the row on the old model — and the next resume, which reads the row, starts on the
+     * model the operator just switched away from. The query is gone; the answer is the
+     * same one a switch arriving a moment later gets: not found, update the row.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        driver.controls.hang = "setModel";
+        const switching = yield* Effect.forkChild(
+          Effect.flip(harness.switchModel(LIVE, "claude-opus-5")),
+        );
+        for (let tries = 0; driver.seen.switches.length === 0; tries += 1) {
+          if (tries > 200) throw new Error("setModel was never sent");
+          yield* Effect.sleep("5 millis");
+        }
+        const stopped = yield* harness.interruptSession(LIVE);
+        const failure = yield* Fiber.join(switching);
+        return { stopped, failure, switches: [...driver.seen.switches] };
+      }),
+    );
+    expect(outcome.stopped).toBe(true);
+    expect(outcome.switches).toEqual(["model:claude-opus-5"]);
+    expect(outcome.failure._tag).toBe("HarnessTransportError");
+    if (outcome.failure._tag === "HarnessTransportError") {
+      expect(outcome.failure.operation).toBe("session.switchModel");
+      expect(outcome.failure.tag).toBe(SESSION_NOT_FOUND_TAG);
+      expect(outcome.failure.status).toBe(404);
+    }
+  });
+
+  test("two switches at once are taken one after the other, so the later one's timeout is not forgotten", async () => {
+    /*
+     * A goes to (opus, low) and B to (haiku, high), started together. Interleaved, A could
+     * finish while B's level was still unanswered and clear the flag that says the record
+     * is no evidence: B then times out, the record says haiku/low *settled* while the CLI
+     * may be at high, and a later (haiku, low) is skipped as a no-op. Taken in turn, B's
+     * timeout is the last word, and the later switch is sent.
+     */
+    const switches = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* opened(harness, driver);
+        driver.controls.hangOn = "effort:high";
+        const first = yield* Effect.forkChild(
+          harness.switchModel(LIVE, "claude-opus-5", [
+            { id: "effort", value: "low" },
+          ]),
+        );
+        const second = yield* Effect.forkChild(
+          Effect.flip(
+            harness.switchModel(LIVE, "claude-haiku-4-5", [
+              { id: "effort", value: "high" },
+            ]),
+          ),
+        );
+        yield* Fiber.join(first);
+        const timedOut = yield* Fiber.join(second);
+        driver.controls.hangOn = undefined;
+        yield* harness.switchModel(LIVE, "claude-haiku-4-5", [
+          { id: "effort", value: "low" },
+        ]);
+        return {
+          timedOut:
+            timedOut._tag === "HarnessTransportError"
+              ? timedOut.tag
+              : undefined,
+          all: [...driver.seen.switches],
+        };
+      }),
+    );
+    expect(switches.timedOut).toBe("TimeoutError");
+    expect(switches.all).toEqual([
+      "model:claude-opus-5",
+      "effort:low",
+      "model:claude-haiku-4-5",
+      "effort:high",
+      // The record is unsettled after B, so the switch back to `low` is sent in full.
+      "model:claude-haiku-4-5",
+      "effort:low",
+    ]);
   }, 20_000);
 
   test("a session this process does not hold live is refused as not found, and nothing is sent", async () => {

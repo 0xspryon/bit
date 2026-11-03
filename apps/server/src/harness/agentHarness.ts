@@ -764,12 +764,16 @@ export class AgentHarness extends Context.Service<
      *   because the SDK reads `null` as "the model's own default" and leaving it out would
      *   carry the old model's level across. A session that has been created and not yet
      *   prompted has no query: the record is changed and the first prompt starts on it.
+     *   Two switches on one session are taken one after the other, never interleaved.
      *
      *   **A Claude Code session this process does not hold live is refused**, with
      *   {@link SESSION_NOT_FOUND_TAG} and status 404. That is a session whose query is gone or
      *   going: a single-turn session that has finished or is finishing, an interrupted one,
      *   or one from a process that has since exited. There is nothing to send a control
-     *   request to. That is not a lost switch. A resume opens a *new* query through {@link createSession}, which takes its
+     *   request to. **The same answer comes back when the query closes while a switch is
+     *   waiting on its control response** — `setModel` takes about a second, so a Stop
+     *   inside that second is ordinary — rather than an uncertain transport failure: the
+     *   query is gone whatever it did with the request. That is not a lost switch. A resume opens a *new* query through {@link createSession}, which takes its
      *   model and options from the caller — that is, from the session row — so a caller
      *   that sees this tag updates the row and the next resume runs on the new model.
      *   Writing it onto a dead record instead would be a change nothing ever reads.

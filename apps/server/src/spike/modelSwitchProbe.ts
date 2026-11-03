@@ -375,8 +375,9 @@ interface Frame {
  *
  * The production options pass through untouched apart from `settingSources` (none, so the
  * operator's own hooks and permissions do not enter the measurement) and `allowedTools`
- * (`Read`, standing in for the gate's pre-approval, and `printenv` through `Bash`, which is
- * how a turn reads back the effort level it ran at). See the file header.
+ * (`Read`, standing in for the gate's pre-approval, and exactly `printenv CLAUDE_EFFORT`
+ * through `Bash`, which is how a turn reads back the effort level it ran at). See the file
+ * header.
  */
 const teeingSdk = (frames: Frame[], file: string): ClaudeCodeSdk => ({
   ...liveClaudeCodeSdk,
@@ -386,7 +387,10 @@ const teeingSdk = (frames: Frame[], file: string): ClaudeCodeSdk => ({
       options: {
         ...params.options,
         settingSources: [],
-        allowedTools: ["Read", "Bash(printenv:*)"],
+        // The exact command and nothing else. A rule with no wildcard matches only that
+        // command line; `Bash(printenv:*)` also pre-approved a bare `printenv`, which would
+        // dump the CLI's whole environment into the unredacted frames this probe writes.
+        allowedTools: ["Read", "Bash(printenv CLAUDE_EFFORT)"],
       },
     });
     const wrapped: HarnessQuery = {

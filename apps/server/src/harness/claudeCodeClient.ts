@@ -108,6 +108,7 @@ import {
   Layer,
   Queue,
   Redacted,
+  Semaphore,
   Stream,
   type Cause,
   type Duration,
@@ -390,8 +391,21 @@ interface SessionRecord {
    * While it is set, `switchModel` sends both requests whatever the record says, because
    * the record is no longer evidence of what the session runs on. Cleared when a switch
    * completes.
+   *
+   * Only true because switches on one session never overlap; see {@link switching}.
    */
   switchUnsettled: boolean;
+  /**
+   * One permit, held by `switchModel` for the whole of a switch.
+   *
+   * {@link model}, {@link effort} and {@link switchUnsettled} are written one request at a
+   * time, and two switches interleaving would write them in an order the CLI never saw: A
+   * finishing could clear `switchUnsettled` while B's level was still unanswered, B then
+   * timing out would leave the record claiming a settled level the CLI may not be at, and
+   * the next switch to that level would be skipped. Taken in turn, the record follows the
+   * order the requests reached the CLI, and the last one to fail is the last word.
+   */
+  readonly switching: Semaphore.Semaphore;
   readonly directory: string;
   /** Per-attempt MCP registrations. One session's, never another's. */
   readonly mcpServers: Record<string, McpServerConfig>;
@@ -1464,6 +1478,7 @@ export const claudeCodeHarness = (
           model: input.model,
           effort: claudeCodeEffortOf(input.options),
           switchUnsettled: false,
+          switching: yield* Semaphore.make(1),
           directory: input.directory,
           mcpServers: {},
           narration,
@@ -1527,7 +1542,14 @@ export const claudeCodeHarness = (
        *   one field at a time, each only after its request answered, which is what makes a
        *   retry after a partial failure send exactly what is still missing.
        * - **Settling, closed, or never held** — refused with `SESSION_NOT_FOUND_TAG`. See
-       *   `AgentHarness.switchModel` on why that is a refusal and not a lost switch.
+       *   `AgentHarness.switchModel` on why that is a refusal and not a lost switch. That
+       *   includes a query that closes **while a request is waiting**: a failure seen once
+       *   the record is settling, closed or replaced is reported as not found, whatever the
+       *   SDK said, because there is no live query left for the switch to be uncertain about.
+       *
+       * Switches on one session are taken one at a time, under the record's
+       * {@link SessionRecord.switching} permit, so the record's fields follow the order the
+       * CLI saw the requests in.
        *
        * **The level is always sent after a model change**, even when it equals the record's:
        * the record says what *we* last set, and whether the CLI keeps a flag-layer effort
@@ -1538,51 +1560,97 @@ export const claudeCodeHarness = (
       const switchModel: AgentHarness["Service"]["switchModel"] = Effect.fn(
         "claudeCodeHarness.switchModel",
       )(function* (sessionId, model, options) {
-        const record = sessions.get(sessionId);
-        // `settling` as well as `closed`, for the reason `prompt` refuses a steer on it: the
-        // pump has decided the session is over and `closeSession` is one Effect boundary
-        // away, so a query that still answers now is one nothing will prompt again.
-        if (record === undefined || record.settling || record.closed) {
-          return yield* transport(
+        const notLive = (detail: string) =>
+          transport(
             "session.switchModel",
-            `this process holds no live session ${sessionId}, so there is no query to switch; ` +
-              "a resume starts on the model it is opened with",
+            `${detail}; a resume starts on the model it is opened with`,
             { tag: SESSION_NOT_FOUND_TAG, status: 404 },
           );
-        }
-        const effort = claudeCodeEffortOf(options);
-        const live = record.query;
-        if (live === undefined) {
-          record.model = model;
-          record.effort = effort;
-          return;
-        }
-        const unsettled = record.switchUnsettled;
-        const modelChanged = unsettled || record.model !== model;
-        if (!modelChanged && record.effort === effort) return;
-        // Set before the first request and cleared after the last, so any failure between
-        // them — including a timeout, where the CLI may have taken the change anyway —
-        // leaves the next call unable to skip on the strength of a stale record.
-        record.switchUnsettled = true;
-        if (modelChanged) {
-          yield* control(
-            "query.setModel",
-            () => live.setModel(model),
-            `the session would not move to model ${model}`,
+        const record = sessions.get(sessionId);
+        if (record === undefined) {
+          return yield* notLive(
+            `this process holds no live session ${sessionId}, so there is no query to switch`,
           );
-          record.model = model;
-          // The window is the model's; until the new one answers, the meter shows no
-          // percentage rather than the old model's.
-          record.contextLimit = undefined;
-          yield* readContextLimit(record, live);
         }
-        yield* control(
-          "query.applyFlagSettings",
-          () => live.applyFlagSettings({ effortLevel: effort ?? null }),
-          `the session would not take reasoning level ${effort ?? "default"}`,
+        // `settling` as well as `closed`, for the reason `prompt` refuses a steer on it: the
+        // pump has decided the session is over and `closeSession` is one Effect boundary
+        // away, so a query that still answers now is one nothing will prompt again. And a
+        // record that is no longer the one held for this id was replaced by a resume, whose
+        // query took its model from its own `createSession`.
+        const gone = (): boolean =>
+          record.settling ||
+          record.closed ||
+          sessions.get(sessionId) !== record;
+        /*
+         * A request that fails *because the query went away* is the same answer as a
+         * switch that arrived a moment later, not an uncertain one. The SDK rejects every
+         * pending control request when a query closes (0.3.310's `Query.cleanup`), and
+         * `setModel` is answered in about a second, so an interrupt, a stream failure or a
+         * single-turn session ending inside that second is not rare. Reported as a plain
+         * transport failure, the caller would keep the row on the old model and the next
+         * resume — which reads the row — would start on it. Whatever the CLI did with the
+         * request, that query is not coming back.
+         */
+        const send = (
+          operation: string,
+          run: () => Promise<unknown>,
+          refused: string,
+        ): Effect.Effect<void, HarnessTransportError> =>
+          control(operation, run, refused).pipe(
+            Effect.mapError((failure) =>
+              gone()
+                ? notLive(
+                    `session ${sessionId}'s query closed while ${operation} was waiting on its answer`,
+                  )
+                : failure,
+            ),
+          );
+        // Read and written only under the permit: see `SessionRecord.switching`. The checks
+        // are inside it too, because a switch that waited may find the session closed, or
+        // launched, by the one it waited behind.
+        return yield* Semaphore.withPermit(
+          record.switching,
+          Effect.gen(function* () {
+            if (gone()) {
+              return yield* notLive(
+                `this process holds no live session ${sessionId}, so there is no query to switch`,
+              );
+            }
+            const effort = claudeCodeEffortOf(options);
+            const live = record.query;
+            if (live === undefined) {
+              record.model = model;
+              record.effort = effort;
+              return;
+            }
+            const unsettled = record.switchUnsettled;
+            const modelChanged = unsettled || record.model !== model;
+            if (!modelChanged && record.effort === effort) return;
+            // Set before the first request and cleared after the last, so any failure
+            // between them — including a timeout, where the CLI may have taken the change
+            // anyway — leaves the next call unable to skip on the strength of a stale record.
+            record.switchUnsettled = true;
+            if (modelChanged) {
+              yield* send(
+                "query.setModel",
+                () => live.setModel(model),
+                `the session would not move to model ${model}`,
+              );
+              record.model = model;
+              // The window is the model's; until the new one answers, the meter shows no
+              // percentage rather than the old model's.
+              record.contextLimit = undefined;
+              yield* readContextLimit(record, live);
+            }
+            yield* send(
+              "query.applyFlagSettings",
+              () => live.applyFlagSettings({ effortLevel: effort ?? null }),
+              `the session would not take reasoning level ${effort ?? "default"}`,
+            );
+            record.effort = effort;
+            record.switchUnsettled = false;
+          }),
         );
-        record.effort = effort;
-        record.switchUnsettled = false;
       });
 
       const registerMcpServer: AgentHarness["Service"]["registerMcpServer"] =
