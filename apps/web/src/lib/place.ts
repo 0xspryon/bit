@@ -161,6 +161,21 @@ const DEFAULT_FILTER: EstateFilter = "all";
 const TARGETS: Place = { kind: "targets" };
 
 /**
+ * What {@link applyPlace} answers for a place it reached without asking anything.
+ *
+ * One shared resolved promise rather than a fresh one per call: these cases are pure state
+ * writes, and the promise exists only so the caller has one shape to await. Written as an
+ * explicit return rather than by making {@link applyPlace} `async`, so that the guarantee
+ * the route depends on — every state write a place implies has already happened when the
+ * function returns — is visible in the body instead of resting on the reader knowing where
+ * an `async` function's first suspension is.
+ */
+const SETTLED: Promise<void> = Promise.resolve();
+
+/** Drops an answer the caller of {@link applyPlace} has no use for. */
+const IGNORED = (): void => undefined;
+
+/**
  * Reads the place out of the state.
  *
  * Only ever reads. The URL follows the state and never the other way about, which is the
@@ -376,19 +391,28 @@ const decodeSegment = (part: string): string => {
  * to `goals` and would undo a section set before it.
  *
  * **It is a transition from anywhere, not just from a cold start**, which is what history
- * navigation will need of it: each case sets everything its place implies rather than
- * trusting what the last place left behind. The one thing it does not redo is entering a
- * target it is already in — `openTarget` reopens the database, re-reads the counts and
- * reconnects the live feed, and pressing Back between two sections of one target is not a
- * reason to do any of that.
+ * navigation needs of it: each case sets everything its place implies rather than trusting
+ * what the last place left behind. The one thing it does not redo is entering a target it
+ * is already in — `openTarget` reopens the database, re-reads the counts and reconnects the
+ * live feed, and pressing Back between two sections of one target is not a reason to do any
+ * of that.
  *
- * Fire-and-forget, like the methods it calls: the screen arrives first and the reads land
- * behind it.
+ * **Still fire-and-forget, and now it says when it has finished.** The screen arrives first
+ * and the reads land behind it: every state write a place *implies* happens synchronously,
+ * before this returns, so a caller that ignores the promise behaves exactly as it did
+ * before. The promise is for the one caller that has to know — S4's history reader. Two
+ * places are reached across a round trip rather than in one call (`openImporterSession`
+ * reads the importer's index first, `loadTranscript` reads the transcript), so between the
+ * call and the answer the app stands on the page *above* the place that was asked for. That
+ * intermediate place is not somewhere the operator went, and the route must not write it
+ * into the address bar: doing so used to be an invisible flicker, and once a write can push
+ * it becomes a junk history entry per deep link. So the route suppresses reflection until
+ * this settles, which is a bound the server sets rather than a timer.
  */
-export const applyPlace = (app: App, place: Place): void => {
+export const applyPlace = (app: App, place: Place): Promise<void> => {
   if (place.kind === "targets") {
     app.toAllTargets();
-    return;
+    return SETTLED;
   }
 
   const { targetId } = place;
@@ -401,14 +425,14 @@ export const applyPlace = (app: App, place: Place): void => {
       // `openTarget` has already landed on Goals, but this is also the way *back* to the
       // goal list from a goal that is open, and `toSection` is what closes one.
       app.toSection("goals");
-      return;
+      return SETTLED;
     case "section":
       app.toSection(place.section);
-      return;
+      return SETTLED;
     case "goal":
       app.toSection("goals");
       app.openGoal(place.goalId);
-      return;
+      return SETTLED;
     case "estate":
       app.toSection("assets");
       app.toAssetsTab("estate");
@@ -416,11 +440,11 @@ export const applyPlace = (app: App, place: Place): void => {
       // assign it too. `openTarget` resets it; arriving from another place on the same
       // target does not, so a place that means "the whole estate" has to say so.
       app.estateFilter = place.filter;
-      return;
+      return SETTLED;
     case "scope":
       app.toSection("assets");
       app.toAssetsTab("scope");
-      return;
+      return SETTLED;
     case "chat":
       /*
        * `openImporterSession` rather than `toSection("assets")` and `openImporter`, which
@@ -437,16 +461,17 @@ export const applyPlace = (app: App, place: Place): void => {
        * a second tab.
        *
        * It reads `viewTargetId`, which `openTarget` above has already set, so the order
-       * still holds. Fire-and-forget like the rest: the page arrives and the conversation
-       * follows the read.
+       * still holds. The page arrives and the conversation follows the read — and this is
+       * one of the two cases whose answer the returned promise carries, because the Assets
+       * section is entered *after* the index comes back, so until then the app is on the
+       * target's Goals page and not on this chat.
        *
        * A session the index no longer lists leaves the operator on the target with
        * `agentSessionsNote` set. The behaviour is right and the surface is not: that note
        * belongs to the Agent sessions list, and a link that outlived its session deserves
        * design D5's own sentence on the page it lands on. S5 owns moving it.
        */
-      void app.openImporterSession(place.sessionId);
-      return;
+      return app.openImporterSession(place.sessionId).then(IGNORED);
     case "attempt":
       /*
        * The rail goes to Workers, which the path does not say — decision 1's consequence.
@@ -455,7 +480,9 @@ export const applyPlace = (app: App, place: Place): void => {
        * displayed, which is what this case did before S3.
        */
       app.toSection("workers");
-      void app.loadTranscript(targetId, place.attemptId);
-      return;
+      // The other case with an answer worth waiting for: the rail is on Workers at once,
+      // but the path says `attempts/<id>` only once `transcriptAttemptId` is set, which is
+      // after the read.
+      return app.loadTranscript(targetId, place.attemptId);
   }
 };

@@ -81,7 +81,7 @@
     // A refusal is about the row it was raised for — a chat session the importer no longer
     // lists — so following any row retires it before the next answer arrives.
     app.agentSessionsNote = "";
-    applyPlace(app, place);
+    void applyPlace(app, place);
   };
 </script>
 

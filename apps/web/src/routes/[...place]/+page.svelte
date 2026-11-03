@@ -10,9 +10,10 @@
    *
    * **It also owns the URL**, which is the one piece of state that is not in `App`. The
    * place on screen — which target, which section, which record, in the grammar of
-   * `lib/place.ts` — is reflected into the path, and the path is read back at mount, so a
-   * link to a resource opens that resource and so does a reload, which is the same thing
-   * from the operator's side. It stays in this file because `$app/navigation` is
+   * `lib/place.ts` — is reflected into the path, and the path is read back at the two
+   * moments a URL can arrive from outside: at mount, and on a `popstate`. So a link to a
+   * resource opens that resource, so does a reload, and so does Back — three spellings of
+   * one thing from the operator's side. It stays in this file because `$app/navigation` is
    * SvelteKit's, and `App` is a plain class that a test or a second shell can construct
    * without a router. `App` does not see the grammar either: the only thing it holds for
    * the URL's sake is an opaque path string, and `App.requestedPath` says why.
@@ -43,9 +44,59 @@
   import Welcome from "../../lib/screens/Welcome.svelte";
   import { App } from "../../lib/app.svelte";
   import { placeArrivedAt } from "../../lib/arrival";
-  import { applyPlace, parsePath, pathOf, placeOf } from "../../lib/place";
+  import {
+    applyPlace,
+    parsePath,
+    pathOf,
+    placeOf,
+    type Place,
+  } from "../../lib/place";
+  import { historyWrite } from "../../lib/placeHistory";
 
   const app = new App();
+
+  /**
+   * How many places the URL has asked for that the app has not yet reached.
+   *
+   * Applying a place is not instant for all eight of them: `applyPlace` reaches a chat by
+   * reading the importer's index first and an attempt by reading its transcript, so between
+   * the call and the answer the app stands on the page *above* the place that was asked
+   * for. That page is not somewhere the operator went, and the reflection below is
+   * suppressed until this returns to zero, for the same reason it is suppressed while a
+   * place is held across Connect: there is nothing true to write yet.
+   *
+   * This mattered less before S4 and matters now. Under a reflection that always replaced,
+   * writing the intermediate page was an invisible flicker of the address bar; under one
+   * that can push it is a junk history entry for every deep link to a chat or an attempt,
+   * and a second one when the real place lands.
+   *
+   * A counter rather than a flag, so that two traversals in flight at once cannot have the
+   * first to answer lift the suppression the second still needs.
+   */
+  let applying = $state(0);
+
+  /**
+   * Applies a place the URL asked for, and says so for as long as it takes.
+   *
+   * The one way into `applyPlace` from a URL — both discrete moments below go through here
+   * — and deliberately not the way a click goes. Following a chat row applies a place too
+   * (`AgentSessions.svelte`), and that is the operator moving the app, which is the event
+   * the reflection exists to write down rather than to wait out.
+   *
+   * The `catch` is for the shape rather than for a known thrower: `applyPlace` hands back
+   * whatever the `App` method it called hands back, and a rejection from a URL nobody is
+   * waiting on would otherwise be an unhandled one.
+   */
+  const applyFromUrl = (place: Place): void => {
+    applying += 1;
+    void applyPlace(app, place)
+      .catch((cause: unknown) => {
+        console.warn("could not open the place the URL asked for", cause);
+      })
+      .finally(() => {
+        applying -= 1;
+      });
+  };
 
   /**
    * One attempt to resume a session a reload left behind, and the place the URL asked
@@ -97,43 +148,127 @@
     const path = app.takeReplayPath();
     if (path === "") return;
     untrack(() => {
-      applyPlace(app, parsePath(path));
+      applyFromUrl(parsePath(path));
     });
+  });
+
+  /**
+   * Back and Forward: the second and last moment the URL is read.
+   *
+   * **A bare `popstate` listener, and not one of SvelteKit's three alternatives.** The
+   * reasons are specific to this version and were read out of `@sveltejs/kit@3.1.0`'s
+   * `src/runtime/client/client.js` rather than remembered, because the writes below are
+   * *shallow* and shallow routing is where that file keeps its surprises:
+   *
+   * - **`page.url` from `$app/state` is not the address bar here.** A shallow `goto` never
+   *   touches it — `update_state` updates `page.state` and `page.shallow` and nothing else
+   *   (`client.js:2953`) — so it still holds the URL the tab was loaded with, and on a
+   *   `popstate` the router sets it back to that same stale URL (`client.js:2173`). An
+   *   effect over it would read the bookmark the operator arrived on, for ever, rather than
+   *   where they have walked to.
+   * - **`afterNavigate` is stale for the same reason.** The entry a shallow write leaves
+   *   carries `pageUrl: page.url.href` (`client.js:2929`) — the load URL, not the one just
+   *   written — and that is the URL the popstate handler navigates to (`client.js:3323`).
+   *   So `navigation.to.url` is not the entry the browser traversed to either.
+   * - **`page.shallow.url` is correct and still wrong to use.** It is set from
+   *   `location.href` on a traversal (`client.js:3357`) and it is reactive — but it is also
+   *   set by our own `goto` (`client.js:2957`), so an effect over it would read back what
+   *   this component had just written. That is precisely the two-writers race the one-way
+   *   rule exists to prevent, re-admitted through a side door.
+   *
+   * What is left is the DOM's own event, and it is the better answer rather than the
+   * remaining one. `location` during a `popstate` is the entry the browser has already
+   * traversed to, with no router indirection between the fact and the read. And the browser
+   * fires `popstate` for a traversal and for nothing else — never for the `pushState` or
+   * `replaceState` a `goto` performs. So **the writer cannot wake the reader**: not by this
+   * file's good manners but by the event's definition, which is the first of the two things
+   * that make the feedback loop impossible rather than unlikely.
+   *
+   * SvelteKit's own listener runs too, and does that stale-URL navigation: our entries never
+   * satisfy its shallow test (`client.js:3329` compares the stored `pageUrl` against
+   * `location.href`, and they differ by construction). It is noise rather than a conflict —
+   * it writes no history entry, because a popped navigation skips both branches that would,
+   * and it does not touch `App`. The one thing it must not do is unmount this component,
+   * which would take the `App` above with it. It does not: the route node is the same
+   * catch-all and only the data is re-applied, which is what a marker left on `window`
+   * proved across three traversals when this slice was driven in a browser.
+   *
+   * **A traversal while the Connect gate is up is held, not applied.** Behind the gate there
+   * is no session, so opening a target would only be refused — the same situation a cold
+   * deep link is in, so it takes the same road: `App` carries the place and releases it once
+   * there is a session. Holding also keeps the reflection suppressed, so the URL the
+   * operator walked to survives until there is something true to say about it.
+   *
+   * `placeArrivedAt` rather than `parsePath`, so that the two readers of a URL cannot
+   * disagree about one. The only entry in this tab's history this app did not write is the
+   * one the tab was opened with, and that one may still be spelled `?target=<id>`; the first
+   * reflection replaces it, so Back does not reach it in practice, and reading it through
+   * the same translation the mount uses costs nothing.
+   */
+  $effect(() => {
+    const traversed = (): void => {
+      const place = placeArrivedAt(location.pathname, location.search);
+      if (app.screen === "connect") {
+        // The root holds nothing — there is no resource to restore, and a held root would
+        // suppress the reflection for the rest of the visit — so walking back to it at the
+        // gate drops what was held rather than replacing it.
+        if (place.kind === "targets") app.requestPlace("", "");
+        else app.requestPlace(place.targetId, pathOf(place));
+        return;
+      }
+      applyFromUrl(place);
+    };
+    window.addEventListener("popstate", traversed);
+    return () => {
+      window.removeEventListener("popstate", traversed);
+    };
   });
 
   /**
    * The place on screen, reflected into the path.
    *
-   * One direction only: state is the source of truth and the URL follows it. Reading the
-   * URL back on every change would mean two writers for one fact and a race between them
-   * on every click; the URL is read at discrete moments only — at mount, above, and on
-   * `popstate` when S4 adds it.
+   * One writer: state is the source of truth and the URL follows it. Reading the URL back
+   * on every change would mean two writers for one fact and a race between them on every
+   * click; the URL is read at discrete moments only — at mount, and on a traversal.
    *
-   * **Nothing is written while a place is held.** Connect is a gate rather than a place,
-   * so `placeOf` reads the target list while it is up, and writing that would throw away
-   * the link the tab was opened with: a reload on the Connect screen would then land on
-   * the list instead of on the bookmark. The suppression lifts when `App` releases the
-   * place, which is the same moment there is something true to write.
+   * **Nothing is written while the app is not yet where it has been asked to be.** Three
+   * conditions, one rule, and the rule is that a URL should say where the operator *is*
+   * rather than where they are on the way to. A place held across Connect: the gate is not
+   * a place, so `placeOf` reads the target list while it is up, and writing that would throw
+   * away the link the tab was opened with — a reload on the Connect screen would land on the
+   * list instead of on the bookmark. A place released and not yet replayed, which is the
+   * same instant seen from the other side. And a place being applied, which is `applying`
+   * above.
    *
-   * `shallow: true` so this updates the address bar without running a navigation — there
-   * is one route and nothing to load — and `replace: true` so opening three targets does
-   * not leave three history entries on the way back out. S4 owns the push-or-replace
-   * distinction that makes Back walk through places; until then every change replaces.
-   * The `catch` is not decoration: a rejected navigation must not take the screen down
-   * with it, and an address bar that lags is a far smaller problem than an app that
-   * crashes on it.
+   * **What makes the feedback loop impossible.** The URL is written only when it does not
+   * already say what the state says — `historyWrite` answers `"skip"` otherwise — and a
+   * traversal that is applied successfully ends in exactly that equality, because
+   * `parsePath` and `pathOf` are inverses over every place and `applyPlace` puts the app in
+   * the place it was handed. So the apply-then-reflect cycle has no first step: no write, so
+   * no second hop to loop on and no entry to accumulate. That is the half this effect owns;
+   * the reader above owns the other half.
+   *
+   * `shallow: true` so this updates the address bar without running a navigation: there is
+   * one route and nothing to load. `replace` comes from `historyWrite`, which is D4's
+   * "opening a resource pushes a history entry; everything else replaces" turned into a
+   * decision — a change of path pushes, a change of query or of spelling replaces. The
+   * `catch` is not decoration: a rejected navigation must not take the screen down with it,
+   * and an address bar that lags is a far smaller problem than an app that crashes on it.
    */
   $effect(() => {
-    if (app.requestedPath !== "" || app.replayPath !== "") return;
-    const url = new URL(pathOf(placeOf(app)), location.href);
-    if (url.pathname === location.pathname && url.search === location.search) {
+    if (app.requestedPath !== "" || app.replayPath !== "" || applying > 0) {
       return;
     }
-    void goto(url, { shallow: true, replace: true, state: {} }).catch(
-      (cause: unknown) => {
-        console.warn("could not reflect the place into the URL", cause);
-      },
-    );
+    const next = pathOf(placeOf(app));
+    const write = historyWrite(location, next);
+    if (write === "skip") return;
+    void goto(new URL(next, location.href), {
+      shallow: true,
+      replace: write === "replace",
+      state: {},
+    }).catch((cause: unknown) => {
+      console.warn("could not reflect the place into the URL", cause);
+    });
   });
 
   // The token sheet is scoped to :root, so the theme has to land on <html>.

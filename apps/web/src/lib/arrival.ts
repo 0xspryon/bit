@@ -11,6 +11,13 @@
  * The translation happens **once, on arrival**. The route holds `pathOf` of whatever this
  * returns, so from the first reflection onwards the address bar carries the path form and
  * nothing downstream of here has ever heard of the query parameter.
+ *
+ * "On arrival" has two readers rather than one, and S4 added the second: the mount, and a
+ * `popstate`. They are the same event seen twice — a URL the app did not write, arriving
+ * from outside — and the only such URL a tab's history can hold is the one it was opened
+ * with. The first reflection replaces that entry with the path form, so Back does not reach
+ * it in practice; both readers go through this function anyway, because two readers of one
+ * URL that disagreed about what it meant would be worse than a shim with one extra caller.
  */
 import { parsePath, type Place } from "./place";
 
