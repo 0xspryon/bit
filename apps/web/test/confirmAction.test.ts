@@ -1,89 +1,17 @@
 /**
- * What the generic confirmation dialog is, independent of any one thing it confirms.
+ * ConfirmAction's confirm button as B6 draws it, read off the component's own stylesheet.
  *
- * `assetsComponent.test.ts` covers the scope-entry wording that goes *through* it. This
- * file is about the part that must be true for every future caller: nothing in it is
- * specific to a scope entry, nothing in it is focused on open, and its confirm button is
- * the five states B6 draws.
- *
- * **Server output, so no click runs.** The behaviours that need a browser — Escape
- * cancelling, the focus landing on the panel and not a button, Tab reaching Delete third —
- * are checked in one, and are not claimed here. What is checked here is what the markup
- * and the stylesheet say.
+ * What the dialog says and which of its buttons are pressable is `test/dom/confirmAction`,
+ * which mounts it: `Modal` renders its panel only once its layer is at the end of `<body>`
+ * (see `dialogLayer`), so a server render of it is an empty layer and has no markup to
+ * read. `assetsComponent.test.ts` no longer covers the scope-entry wording either; that is
+ * `test/dom/scopeDelete`.
  */
 import { describe, expect, test } from "bun:test";
-import { createRawSnippet } from "svelte";
-import { render } from "svelte/server";
-
-import ConfirmAction from "../src/lib/components/ConfirmAction.svelte";
 
 const source = await Bun.file(
   new URL("../src/lib/components/ConfirmAction.svelte", import.meta.url),
 ).text();
-
-const body = createRawSnippet(() => ({
-  render: () => "<p>Something the caller wrote.</p>",
-}));
-
-const draw = (props: Record<string, unknown> = {}): string =>
-  render(ConfirmAction, {
-    props: {
-      title: "Archive the thing?",
-      body,
-      confirmLabel: "Archive",
-      workingLabel: "Archiving…",
-      onconfirm: () => {},
-      oncancel: () => {},
-      ...props,
-    },
-  }).body;
-
-describe("ConfirmAction", () => {
-  test("every word on it is the caller's, and none is a scope entry's", () => {
-    const html = draw({ cancelLabel: "Leave it" });
-    expect(html).toContain("Archive the thing?");
-    expect(html).toContain("Something the caller wrote.");
-    expect(html).toContain(">Archive<");
-    expect(html).toContain(">Leave it<");
-    // The component carries no wording of its own beyond a default for Cancel.
-    expect(html).not.toMatch(/entry|scope|asset|host/i);
-  });
-
-  test("Cancel is called Cancel unless the caller says otherwise", () => {
-    expect(draw()).toContain(">Cancel<");
-  });
-
-  test("the tone picks the fill, and the default is not the red one", () => {
-    expect(draw({ tone: "danger" })).toContain("action confirm danger");
-    expect(draw({ tone: "neutral" })).toContain("action confirm neutral");
-    // A confirmation is not automatically a destructive one: red is chosen, not defaulted
-    // to, because red is a severity signal.
-    expect(draw()).toContain("action confirm neutral");
-  });
-
-  test("it opens with nothing focused by the markup", () => {
-    expect(draw()).not.toContain("autofocus");
-  });
-
-  test("working swaps the label, withdraws Cancel and disables the confirm without dropping focus", () => {
-    const html = draw({ working: true });
-    expect(html).toContain("Archiving…");
-    expect(html).not.toContain(">Archive<");
-    // `aria-disabled`, not `disabled`: a disabled button is dropped from the tab order
-    // and, in a browser, loses focus to the page behind the scrim.
-    expect(html).toMatch(
-      /class="action confirm [^"]*"[^>]*aria-disabled="true"/,
-    );
-    expect(html).not.toMatch(/class="action confirm [^"]*"[^>]*[ ]disabled/);
-    expect(html).toMatch(/class="action cancel [^"]*"[^>]*disabled/);
-  });
-
-  test("at rest the confirm is pressable", () => {
-    expect(draw()).toMatch(
-      /class="action confirm [^"]*"[^>]*aria-disabled="false"/,
-    );
-  });
-});
 
 describe("ConfirmAction's confirm button, as B6 draws it", () => {
   /** One rule's declarations, from the component's own stylesheet. */

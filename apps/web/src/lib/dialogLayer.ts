@@ -19,6 +19,13 @@
  * So each dialog's layer is appended to `<body>` as it mounts. The one opened last is last
  * in `<body>`, so it is on top, whatever either caller is nested in.
  *
+ * That holds only if a dialog renders nothing into its layer until the layer has moved.
+ * Svelte runs a child's attachment before its parent's, so a dialog opened from inside
+ * another *in the same update* — a `Modal` whose body holds another `Modal` — would have
+ * its layer appended first, and the outer one drawn over it. Both `Modal` and
+ * `HarnessDialog` render their panel in `toBody`'s `onMoved`, so the inner dialog does not
+ * exist until the outer one's layer is in `<body>`, and can only follow it there.
+ *
  * The component keeps an empty, `hidden` origin where it was written and moves only a layer
  * inside it: Svelte removes a block by walking its nodes from first to last sibling, and a
  * moved root would send that walk off through whatever followed it in `<body>`.
@@ -85,8 +92,9 @@ const advance = (): void => {
 
 /**
  * Moves the element it is attached to to the end of `<body>`, which puts it on top of the
- * open dialogs, and removes it with the dialog. `onMoved` runs once it is there, for a
- * dialog that renders its panel only after the move (`HarnessDialog`).
+ * open dialogs, and removes it with the dialog. `onMoved` runs once it is there: both
+ * dialogs render their panel only then, so one opened from inside it follows it into
+ * `<body>` (see "At the end of `<body>`").
  *
  * Moving a node that holds focus blurs it. A body whose own effect focused a field before
  * the attachment ran would lose that, so whatever inside had focus has it again after.

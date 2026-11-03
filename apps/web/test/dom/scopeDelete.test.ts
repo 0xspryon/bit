@@ -19,6 +19,8 @@ import { App } from "../../src/lib/app.svelte";
 import Assets from "../../src/lib/screens/Assets.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import { FakeServer, emptyScope, ok } from "../fakeServer";
+import { flushSync } from "svelte";
+
 import { click, mountInto, press, settle, type Mounted } from "./dom";
 
 const entry = (value: string, effect: "in" | "out" = "in"): ScopeEntryView => ({
@@ -215,5 +217,121 @@ describe("the delete question", () => {
     expect(document.activeElement?.getAttribute("aria-label")).toBe(
       "No scope authored for this target",
     );
+  });
+});
+
+/**
+ * What the question says. These were server-rendered markup tests until `Modal` began
+ * rendering its panel only once its layer is in `<body>`, which a server render never
+ * reaches; they are the same claims, read off the mounted dialog.
+ */
+describe("the delete question's words", () => {
+  const entries = [
+    entry("acme.test"),
+    { ...entry("blog.acme.test", "out"), kind: "host" as const },
+  ];
+
+  /** The question about `value`, open, as the operator's click on its × leaves it. */
+  const ask = async (
+    value: string,
+  ): Promise<{ app: App; panel: HTMLElement }> => {
+    const opened = await openScopeWith(entries);
+    clickWithMouse(removeButton(value));
+    await settle();
+    const panel = dialog();
+    if (panel === null) throw new Error(`no question about ${value}`);
+    return { app: opened.app, panel };
+  };
+
+  /** The words of the dialog, with source line breaks folded to spaces. */
+  const words = (panel: HTMLElement): string =>
+    (panel.textContent ?? "").replace(/\s+/g, " ");
+
+  const button = (panel: HTMLElement, label: string): HTMLButtonElement => {
+    const found = [...panel.querySelectorAll<HTMLButtonElement>("button")].find(
+      (each) => each.textContent?.trim() === label,
+    );
+    if (found === undefined) throw new Error(`no ${label} button`);
+    return found;
+  };
+
+  test("no question is on screen until one is asked", async () => {
+    await openScopeWith(entries);
+    expect(dialog()).toBeNull();
+  });
+
+  test("an in-scope entry says what it removes, and what it leaves alone", async () => {
+    const { panel } = await ask("acme.test");
+    expect(panel.getAttribute("aria-label")).toBe(
+      "Delete the entry acme.test?",
+    );
+    const dialogWords = words(panel);
+    expect(dialogWords).toContain("acme.test and every subdomain");
+    expect(dialogWords).toContain("from the in-scope list");
+    // The delete path touches no asset and no label, and the sentence says so.
+    expect(dialogWords).toContain("Nothing the hunt found is deleted");
+    expect(dialogWords).toContain("Labels you set by hand are not touched");
+    expect(dialogWords).toContain("not covered");
+    expect(dialogWords).toContain("Delete entry");
+    expect(dialogWords).toContain("Cancel");
+    expect(dialogWords).not.toContain("Keep it out");
+  });
+
+  test("an out-of-scope entry warns that deleting ends the exclusion", async () => {
+    const dialogWords = words((await ask("blog.acme.test")).panel);
+    expect(dialogWords).toContain("from the out-of-scope list");
+    // Deleting an exclusion can make a host *in* scope, if an in-scope entry also
+    // covers it. That is the consequence an operator tidying the list would not guess.
+    expect(dialogWords).toContain("becomes");
+    expect(dialogWords).toContain("in scope");
+    expect(dialogWords).toContain("does not keep a host out of the hunt");
+    expect(dialogWords).toContain("Keep it out");
+  });
+
+  test("it promises no count, no undo and no alternative action", async () => {
+    /*
+     * B5 and B6 draw an asset count, an Undo and a "Move to out of scope instead"
+     * button. None has a server behind it: no contract carries a per-entry asset
+     * count, and nothing anywhere undoes a deletion. Copy that promised them would be
+     * a button that appears to work and does nothing.
+     */
+    for (const value of ["acme.test", "blog.acme.test"]) {
+      const dialogWords = words((await ask(value)).panel);
+      expect(dialogWords).not.toMatch(/\d+ assets?/);
+      expect(dialogWords).not.toContain("Undoable");
+      expect(dialogWords).not.toContain("Move to out of scope");
+      expect(dialogWords).toContain("There is no undo");
+      mounted?.destroy();
+      mounted = undefined;
+    }
+  });
+
+  test("nothing in it is autofocused, and Delete is not disabled until it is working", async () => {
+    const { panel } = await ask("acme.test");
+    // Enter does nothing until the operator tabs to Delete. `autofocus` is the one
+    // way the markup itself could make it do something.
+    expect(panel.querySelector("[autofocus]")).toBeNull();
+    expect(button(panel, "Delete entry").getAttribute("aria-disabled")).toBe(
+      "false",
+    );
+  });
+
+  test("while it works the button says so and cannot be pressed", async () => {
+    const { app, panel } = await ask("acme.test");
+    app.scopeBusy = true;
+    flushSync();
+    expect(words(panel)).not.toContain("Delete entry");
+    const confirm = button(panel, "Deleting…");
+    expect(confirm.classList.contains("danger")).toBe(true);
+    expect(confirm.getAttribute("aria-disabled")).toBe("true");
+    // Cancel is withdrawn too: the request is already on its way.
+    expect(button(panel, "Cancel").disabled).toBe(true);
+  });
+
+  test("an entry that is gone takes its question with it", async () => {
+    const { app } = await openScopeWith(entries);
+    app.askToRemoveScopeEntry("ent_already_deleted");
+    await settle();
+    expect(dialog()).toBeNull();
   });
 });

@@ -60,6 +60,15 @@
   } = $props();
 
   let panel = $state<HTMLElement | null>(null);
+  /**
+   * Whether the layer is in `<body>` yet, which is when the panel may render into it.
+   *
+   * A child's attachment runs before its parent's. Rendered at once, a dialog opened from
+   * inside this one in the same update would have its layer appended first, and be drawn
+   * under this one — which would have the keyboard, and close both on one Escape. Rendered
+   * after the move, as `HarnessDialog`'s is, it can only follow this one into `<body>`.
+   */
+  let moved = $state(false);
 
   /*
    * Focus goes into the dialog when it opens, onto the panel itself and no control, and
@@ -80,51 +89,53 @@
 
 <!--
   The origin stays where the caller wrote the dialog; the layer inside it moves to the end
-  of `<body>` as it mounts. See `dialogLayer`.
+  of `<body>` as it mounts, and the panel renders only once it is there. See `dialogLayer`.
 -->
 <div class="origin" hidden>
-  <div class="layer" {@attach toBody()}>
-    <div class="scrim">
-      {#if scrimCloses}
-        <!--
-      The outside of the panel, as a control, as `HarnessDialog` draws it: out of the tab
-      order, because Escape is the keyboard's way out.
-    -->
-        <button
-          class="dismiss"
-          type="button"
+  <div class="layer" {@attach toBody(() => (moved = true))}>
+    {#if moved}
+      <div class="scrim">
+        {#if scrimCloses}
+          <!--
+            The outside of the panel, as a control, as `HarnessDialog` draws it: out of the
+            tab order, because Escape is the keyboard's way out.
+          -->
+          <button
+            class="dismiss"
+            type="button"
+            tabindex="-1"
+            aria-label="Close"
+            onclick={onclose}
+          ></button>
+        {/if}
+        <div
+          class="panel"
+          {role}
+          aria-modal="true"
+          aria-label={title}
+          aria-describedby={describedby}
           tabindex="-1"
-          aria-label="Close"
-          onclick={onclose}
-        ></button>
-      {/if}
-      <div
-        class="panel"
-        {role}
-        aria-modal="true"
-        aria-label={title}
-        aria-describedby={describedby}
-        tabindex="-1"
-        style:--modal-width={`${width}px`}
-        bind:this={panel}
-      >
-        <header>
-          <h2>{title}</h2>
-          {#if closeButton}
-            <button
-              class="x"
-              type="button"
-              onclick={onclose}
-              aria-label="Close"
-            >
-              <IconClose width="12" height="12" />
-            </button>
-          {/if}
-        </header>
-        <div class="body">{@render body()}</div>
-        <footer>{@render footer()}</footer>
+          style:--modal-width={`${width}px`}
+          bind:this={panel}
+        >
+          <header>
+            <h2>{title}</h2>
+            {#if closeButton}
+              <button
+                class="x"
+                type="button"
+                onclick={onclose}
+                aria-label="Close"
+              >
+                <IconClose width="12" height="12" />
+              </button>
+            {/if}
+          </header>
+          <div class="body">{@render body()}</div>
+          <footer>{@render footer()}</footer>
+        </div>
       </div>
-    </div>
+    {/if}
   </div>
 </div>
 
