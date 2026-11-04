@@ -175,7 +175,12 @@ away; reasoning collapses to one truncated line (markdown); turn footer
 **U5 — Live streaming in the thread (S), F6 + U4 → U5.** From F6: request the live stream with `?partials=1`;
 replace by `blockId` and never add a partial's `id` to the shown-ids set; when the session
 goes idle, hide "writing…" for any partial with no finished block; on stream reopen, drop
-every partial (finished blocks replayed after a gap carry no `blockId`). Apply partial updates by item id,
+every partial (finished blocks replayed after a gap carry no `blockId`). From F7's live run (GLM 5.3): `session.reasoning.ended` arrives only at the
+step's end, so a thinking partial would show "writing…" for the whole reply — treat a
+thinking partial as done once a reply partial of the same message starts (the `blockId`
+prefix is the message id). A thinking block over the 4,000-character cap stops growing while
+the model keeps thinking (seen frozen ~30 s) — show it as truncated rather than as still
+writing. Apply partial updates by item id,
 "writing…" indicator, markdown over partial text with unclosed fences handled.
 
 **U6 — D3 Stop pill and Send now (S), F5 + U4 → U6.** Show Stop whenever the **server** says the
@@ -259,3 +264,7 @@ U13.
   detaches itself (its own session, `setsid`, a plugin's sync process) can still escape. A
   cgroup per CLI would contain everything it starts. The gate's list of ended sessions is
   in memory only, so a CLI orphaned by a hard server kill is allowed again after a restart.
+- **Operator decision pending:** an importer's OpenCode session listed a global `bit` MCP
+  server (`bit_ingest`, `bit_retrieve`) in its tool catalogue, most likely from the
+  operator's global OpenCode config — so an importer session could call tools outside what
+  bit grants it (F7 review). Same class as the Claude Code user-settings item above.
