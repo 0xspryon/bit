@@ -676,9 +676,10 @@ export interface ClaudeCodeHarnessOptions {
   /**
    * How long a control request to a live session may take.
    *
-   * Bounds *our* ask, not the worker. It covers `setMcpServers` and `interrupt`, both of
-   * which are round trips to a subprocess that may be wedged; neither ever decides an
-   * outcome.
+   * Bounds *our* ask, not the worker. It covers `setMcpServers` and the other control
+   * requests, round trips to a subprocess that may be wedged; none ever decides an outcome.
+   * A Stop's `interrupt()` and `stopTask` have shorter bounds of their own
+   * ({@link DEFAULT_INTERRUPT_TIMEOUT}, {@link DEFAULT_TASK_STOP_TIMEOUT}).
    */
   readonly controlTimeout?: Duration.Input;
   /**
@@ -696,6 +697,11 @@ export interface ClaudeCodeHarnessOptions {
    * {@link DEFAULT_TASK_STOP_TIMEOUT}; tests shorten it.
    */
   readonly taskStopTimeout?: Duration.Input;
+  /**
+   * How long a Stop waits for the CLI to acknowledge its `interrupt()`. Defaults to
+   * {@link DEFAULT_INTERRUPT_TIMEOUT}; tests shorten it.
+   */
+  readonly interruptTimeout?: Duration.Input;
 }
 
 const DEFAULT_CONTROL_TIMEOUT: Duration.Input = "30 seconds";
@@ -713,6 +719,23 @@ const DEFAULT_CONTROL_TIMEOUT: Duration.Input = "30 seconds";
 const DEFAULT_TASK_STOP_TIMEOUT: Duration.Input = "3 seconds";
 
 /**
+ * How long a Stop waits for the CLI to acknowledge its `interrupt()` before closing the
+ * query and stopping the CLI instead.
+ *
+ * Its own bound, not {@link DEFAULT_CONTROL_TIMEOUT}, for the reason
+ * {@link DEFAULT_TASK_STOP_TIMEOUT} has one: the worker and planner supervisors give the
+ * whole `interruptSession` 10 s (`SETTLEMENT_ASK_TIMEOUT`) and abandon it after that. Under
+ * the 30 s control timeout a CLI that never acknowledged was still being waited on when the
+ * supervisor gave up, so the forced close that follows a refused interrupt never ran and
+ * the CLI kept going. 3 s, then at most {@link DEFAULT_CLI_STOP_BOUNDS}' 2 s to end the
+ * CLI, fits inside those 10 s with room; and an acknowledged interrupt followed by
+ * `stopTask`s takes at most this plus {@link DEFAULT_TASK_STOP_TIMEOUT}, 6 s. 2.1.310
+ * acknowledges an interrupt in ~20 ms (measured, at `interruptSession`), so a CLI that
+ * takes 3 s is one this process can no longer steer.
+ */
+export const DEFAULT_INTERRUPT_TIMEOUT: Duration.Input = "3 seconds";
+
+/**
  * An ended CLI's bounds: a second after `SIGTERM`, a second after `SIGKILL`.
  *
  * Short, because `endSession` is on the close path of an operator's End and of shutdown,
@@ -725,7 +748,7 @@ const DEFAULT_TASK_STOP_TIMEOUT: Duration.Input = "3 seconds";
  * every CLI at once (A6 F5's fourth review). 25 ms still gives a tool started during the
  * grace dozens of looks to be found in.
  */
-const DEFAULT_CLI_STOP_BOUNDS: StopBounds = {
+export const DEFAULT_CLI_STOP_BOUNDS: StopBounds = {
   terminateGrace: 1_000,
   killGrace: 1_000,
   poll: 25,
@@ -1378,6 +1401,8 @@ export const claudeCodeHarness = (
       const cliTreeRefresh = options.cliTreeRefresh ?? DEFAULT_CLI_TREE_REFRESH;
       const taskStopTimeout =
         options.taskStopTimeout ?? DEFAULT_TASK_STOP_TIMEOUT;
+      const interruptTimeout =
+        options.interruptTimeout ?? DEFAULT_INTERRUPT_TIMEOUT;
 
       /** The layer's own scope, so the pump below outlives the fiber that started it. */
       const harnessScope = yield* Effect.scope;
@@ -2836,7 +2861,8 @@ export const claudeCodeHarness = (
                     `the session would not acknowledge an interrupt: ${String(cause)}`,
                   ),
               }),
-              controlTimeout,
+              // Its own bound, not `controlTimeout`: see DEFAULT_INTERRUPT_TIMEOUT.
+              interruptTimeout,
             ),
           );
           if (asked._tag === "Failure") {
@@ -2852,7 +2878,7 @@ export const claudeCodeHarness = (
             return yield* transport(
               "session.interrupt",
               asked.failure._tag === "TimeoutError"
-                ? "the session would not acknowledge an interrupt within the control timeout, so its query was closed"
+                ? "the session would not acknowledge an interrupt in time, so its query was closed"
                 : `${asked.failure.detail}; its query was closed`,
             );
           }

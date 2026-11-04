@@ -38,7 +38,7 @@ import type {
   SessionMessage,
   SDKSessionInfo,
 } from "@anthropic-ai/claude-agent-sdk";
-import { Effect, Fiber, Layer, Redacted, Stream } from "effect";
+import { Duration, Effect, Fiber, Layer, Redacted, Stream } from "effect";
 
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
 import { CLAUDE_CODE_MINIMUM, compareVersions } from "../policy/claudeCodeGate";
@@ -55,8 +55,11 @@ import {
   assembleImporterPrompt,
   assembleImporterResumePrompt,
 } from "../import/importerPrompt";
+import { SETTLEMENT_ASK_TIMEOUT } from "../run/settlement";
 import {
   claudeCodeHarness,
+  DEFAULT_CLI_STOP_BOUNDS,
+  DEFAULT_INTERRUPT_TIMEOUT,
   liveClaudeCodeSdk,
   newClaudeCodeSessionId,
   type ClaudeCodeHarnessOptions,
@@ -1546,6 +1549,8 @@ const turnDrivenSdk = () => {
     hangOn: string | undefined;
     /** Rejects `interrupt()`, as a CLI that will not acknowledge one does. */
     refuseInterrupt: boolean;
+    /** Never answers `interrupt()`, as a wedged CLI does; rejected when the query closes. */
+    hangInterrupt: boolean;
     /** Acknowledges `stopTask` and leaves the task running, for a task that will not stop. */
     ignoreStopTask: boolean;
     /** Never answers `stopTask` for these task ids, and leaves the task running. */
@@ -1555,6 +1560,7 @@ const turnDrivenSdk = () => {
     hang: undefined,
     hangOn: undefined,
     refuseInterrupt: false,
+    hangInterrupt: false,
     ignoreStopTask: false,
     hangStopTask: new Set(),
   };
@@ -1623,6 +1629,11 @@ const turnDrivenSdk = () => {
           seen.interrupts += 1;
           if (controls.refuseInterrupt) {
             throw new Error("the CLI did not acknowledge the interrupt");
+          }
+          if (controls.hangInterrupt) {
+            await new Promise<never>((_, reject) => {
+              hanging.add(reject);
+            });
           }
           // Measured on 2.1.310: an interrupt stops every subagent, and no shell.
           for (const [taskId, task] of openTasks) {
@@ -2715,6 +2726,22 @@ describe("stopping a conversation's turn (A6 F5)", () => {
     });
   });
 
+  test("a late task_started from an earlier run does not replace the run held", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.startTask("b9", "local_bash", { runId: "r2" });
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.startTask("b9", "local_bash", { runId: "r1" });
+        driver.lateNotification("b9", "r1");
+        yield* Effect.sleep("40 millis");
+        return { background: (yield* harness.sessionStatus(TALK)).background };
+      }),
+    );
+    expect(outcome).toEqual({ background: true });
+  });
+
   test("a stopTask that never answers delays neither the other tasks' nor the Stop past its own bound", async () => {
     /*
      * The tasks are asked at once, each bounded by `taskStopTimeout`, not one after the
@@ -2844,6 +2871,42 @@ describe("stopping a conversation's turn (A6 F5)", () => {
       outcome: "interrupted",
       waitedIdle: true,
     });
+  });
+
+  test("an interrupt the CLI never answers is given up on at its own bound, and the CLI closed", async () => {
+    /*
+     * The supervisors abandon a whole `interruptSession` after 10 s. Bounded only by the
+     * control timeout (30 s by default, here 30 s too) the interrupt was still waiting when
+     * they gave up, so the forced close never ran and the CLI went on. With the interrupt's
+     * own bound (here 200 ms) the close comes well inside the supervisors' wait.
+     */
+    const outcome = await withTurnDriven(
+      (harness, driver) =>
+        Effect.gen(function* () {
+          yield* talking(harness, driver);
+          driver.controls.hangInterrupt = true;
+          const started = Date.now();
+          const failure = yield* Effect.flip(harness.interruptSession(TALK));
+          const took = Date.now() - started;
+          const status = yield* harness.sessionStatus(TALK);
+          return { failure, took, status, closes: driver.seen.closes };
+        }),
+      { controlTimeout: "30 seconds", interruptTimeout: "200 millis" },
+    );
+    expect(outcome.failure._tag).toBe("HarnessTransportError");
+    expect(outcome.failure.message).toContain("would not acknowledge");
+    expect(outcome.took).toBeLessThan(5_000);
+    expect(outcome.closes).toBe(1);
+    expect(outcome.status.activity).toBe("idle");
+  });
+
+  test("by default a Stop gives up on the interrupt and ends the CLI inside the supervisors' wait", () => {
+    const forcedClose =
+      Duration.toMillis(DEFAULT_INTERRUPT_TIMEOUT) +
+      DEFAULT_CLI_STOP_BOUNDS.terminateGrace +
+      DEFAULT_CLI_STOP_BOUNDS.killGrace;
+    expect(forcedClose).toBeLessThanOrEqual(5_000 + 2_000);
+    expect(forcedClose).toBeLessThan(Duration.toMillis(SETTLEMENT_ASK_TIMEOUT));
   });
 
   test("an interrupt the CLI will not acknowledge fails, and the query is closed", async () => {
