@@ -231,3 +231,9 @@ U13.
 - The **built** server (`bun dist/main.js`) cannot open Claude Code sessions: it refuses
   `import_ungated` because it resolves the policy hook at `apps/plugins/claudeCodeGate.ts`,
   which does not exist; `bun src/main.ts` works. Predates this work (found in F4's review).
+- **Operator decision pending:** importer (and goal) Claude Code CLIs load the operator's
+  _user_ settings (`settingSources: ["user", …]`, `claudeCodeClient.ts:~1478`). Seen live in
+  F5's review: the operator's own hooks ran against the importer, the superpowers
+  SessionStart context was injected into it, and the operator's episodic-memory MCP server
+  ran as its child — so the importer agent could search the operator's past conversations.
+  The source comment justifies the setting only by the gate in `.claude/settings.local.json`.
