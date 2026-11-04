@@ -35,6 +35,7 @@ import {
   type SessionStatus,
   type SessionTitle,
 } from "./agentHarness";
+import type { MessageAttachment } from "./attachments";
 import {
   DriverKind,
   defaultInstanceIdForDriver,
@@ -135,6 +136,8 @@ export interface RecordedPrompt {
   readonly text: string;
   /** Verbatim, `undefined` included: an omitted delivery is the seam's `open` default. */
   readonly delivery: PromptDelivery | undefined;
+  /** The files it carried (A6 F9), `undefined` when the caller passed none. */
+  readonly attachments: readonly MessageAttachment[] | undefined;
 }
 
 /**
@@ -151,9 +154,9 @@ export const recordPrompts = (): {
   const prompts: RecordedPrompt[] = [];
   return {
     prompts,
-    prompt: (sessionId, text, delivery) =>
+    prompt: (sessionId, text, delivery, attachments) =>
       Effect.sync(() => {
-        prompts.push({ sessionId, text, delivery });
+        prompts.push({ sessionId, text, delivery, attachments });
         return { delivered: true };
       }),
   };

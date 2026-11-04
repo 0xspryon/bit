@@ -156,6 +156,9 @@ export type GoalUploadsAccepted = typeof GoalUploadsAccepted.Type;
  * - `too_many` — this request would put the goal over `UPLOAD_MAX_FILES`. Measured against
  *   the **directory** rather than the request, so a cap cannot be walked past ten files at
  *   a time; the sentence says how many are already there.
+ * - `too_much`, `unsupported_image` — the message uploads' reader's (A6 F9, shared with this
+ *   route): the request's files over `UPLOAD_MAX_TOTAL_BYTES` together, or a HEIC/HEIF image,
+ *   which is refused rather than converted. See `MessageUploadRefused`.
  * - `empty_file` — a zero-byte file. Refused rather than stored: an agent told to read a
  *   file that has nothing in it will report that the evidence says nothing, which is a
  *   false reading of an upload that went wrong.
@@ -186,6 +189,8 @@ export class GoalUploadRefused extends Schema.TaggedError<GoalUploadRefused>()(
       "no_files",
       "too_large",
       "too_many",
+      "too_much",
+      "unsupported_image",
       "empty_file",
       "unsafe_name",
       "write_failed",

@@ -271,6 +271,13 @@ export class ControlPlaneEndpoint extends Context.Service<
      * sixty seconds would be a sixty-second test. Nothing in the server passes this.
      */
     readonly idleTimeout?: number | undefined;
+    /**
+     * The largest request body the listener reads, in bytes (A6 F9). Bun's own default is
+     * 128 MiB; `main.ts` passes the upload total plus room for the message, so raising
+     * `UPLOAD_MAX_TOTAL_BYTES` past that is not answered by Bun with an empty `413` before
+     * the server's own sentence could be.
+     */
+    readonly maxRequestBodySize?: number | undefined;
   }) =>
     Layer.effect(
       ControlPlaneEndpoint,
@@ -328,6 +335,9 @@ export class ControlPlaneEndpoint extends Context.Service<
               // See `CONTROL_PLANE_IDLE_TIMEOUT`. Unset, Bun's ten-second default closes
               // every idle live-transcript connection before its heartbeat can fire.
               idleTimeout: options.idleTimeout ?? CONTROL_PLANE_IDLE_TIMEOUT,
+              ...(options.maxRequestBodySize === undefined
+                ? {}
+                : { maxRequestBodySize: options.maxRequestBodySize }),
               fetch: (request) => web.handler(request),
             }),
           ),

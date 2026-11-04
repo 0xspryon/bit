@@ -261,6 +261,10 @@ export const REFUSAL_TAGS = new Set([
   // difference between a rejected upload an operator can act on and one that says "failed",
   // and classifying them as transport trouble would throw all of them away.
   "GoalUploadRefused",
+  // A message's files (A6 F9), on the importer's and a goal's message endpoints: a HEIC
+  // image, a file over its cap, too many, too much together. Each names the file and the
+  // figure, and nothing was stored or sent — the F2 error modal prints it.
+  "MessageUploadRefused",
   // The scope import panel. An import this process has forgotten is a real answer and the
   // panel acts on it by sending the operator to Assets, where what the import *wrote* is —
   // the entries and the assets are durable rows, and only the receipt was ever in memory.

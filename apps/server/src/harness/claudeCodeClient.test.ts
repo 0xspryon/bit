@@ -90,6 +90,8 @@ interface Launched {
   readonly order: string[];
   readonly registered: Record<string, McpServerConfig>[];
   readonly prompts: string[];
+  /** Each prompt's `message.content` as the SDK was handed it (A6 F9: a list with images). */
+  readonly contents: unknown[];
   /** `setModel` and `applyFlagSettings` calls, as `model:<id>` and `effort:<level|null>`. */
   readonly switches: string[];
   interrupts: number;
@@ -158,6 +160,7 @@ const scriptedSdk = (script: Script = {}) => {
         order: [],
         registered: [],
         prompts: [],
+        contents: [],
         switches: [],
         interrupts: 0,
         closes: 0,
@@ -175,6 +178,7 @@ const scriptedSdk = (script: Script = {}) => {
             .message?.content;
           seen.order.push("prompt");
           seen.prompts.push(String(content));
+          seen.contents.push(content);
           deliver?.();
         }
       })();
@@ -5195,4 +5199,292 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
       "meta: a note the CLI keeps for itself",
     ]);
   });
+});
+
+/* ── A message's files (A6 F9) ───────────────────────────────────────────────── */
+
+describe("a message's files", () => {
+  test("an image goes as a base64 block before the words, and every file as a path line", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bit-cc-attach-"));
+    try {
+      const png = join(root, "uploads", "shot.png");
+      const notes = join(root, "uploads", "notes.txt");
+      await mkdir(join(root, "uploads"));
+      await writeFile(png, new Uint8Array([137, 80, 78, 71]));
+      await writeFile(notes, "a scope note");
+      const sessionId = newClaudeCodeSessionId();
+      const contents = await withHarness({}, (harness, seen) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "bit: t",
+            model: "claude-sonnet-5",
+            directory: root,
+            sessionId,
+          });
+          yield* harness.prompt(sessionId, "Describe it.", undefined, [
+            {
+              kind: "image",
+              name: "shot.png",
+              mimeType: "image/png",
+              path: png,
+              bytes: 4,
+            },
+            {
+              kind: "file",
+              name: "notes.txt",
+              mimeType: "text/plain",
+              path: notes,
+              bytes: 12,
+            },
+          ]);
+          yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)));
+          return seen[0]?.contents;
+        }),
+      );
+      expect(contents).toEqual([
+        [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: Buffer.from([137, 80, 78, 71]).toString("base64"),
+            },
+          },
+          {
+            type: "text",
+            text: `Describe it.\n\n[Attached image "shot.png" is saved at: ${png}]\n[Attached file "notes.txt" is saved at: ${notes}]`,
+          },
+        ],
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a message whose files are all path-only stays string content, with its lines", async () => {
+    const sessionId = newClaudeCodeSessionId();
+    const contents = await withHarness({}, (harness, seen) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId,
+        });
+        yield* harness.prompt(sessionId, "Read it.", undefined, [
+          {
+            kind: "file",
+            name: "policy.pdf",
+            mimeType: "application/pdf",
+            path: "/tmp/ws/uploads/policy.pdf",
+            bytes: 10,
+          },
+        ]);
+        yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)));
+        return seen[0]?.contents;
+      }),
+    );
+    expect(contents).toEqual([
+      'Read it.\n\n[Attached file "policy.pdf" is saved at: /tmp/ws/uploads/policy.pdf]',
+    ]);
+  });
+
+  test("an image that cannot be read sends nothing", async () => {
+    const sessionId = newClaudeCodeSessionId();
+    const outcome = await withHarness({}, (harness, seen) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId,
+        });
+        const sent = yield* Effect.result(
+          harness.prompt(sessionId, "Look.", undefined, [
+            {
+              kind: "image",
+              name: "gone.png",
+              mimeType: "image/png",
+              path: "/nonexistent/bit/uploads/gone.png",
+              bytes: 4,
+            },
+          ]),
+        );
+        return { sent: sent._tag, launched: seen.length };
+      }),
+    );
+    expect(outcome).toEqual({ sent: "Failure", launched: 0 });
+  });
+
+  /**
+   * The operator's message is a **list** once it carries an image, and must still replay as
+   * "You" — `cliMarker` keys on the SDK's markers, not on the shape — with its files read
+   * back from the path lines and the image block's type, and the lines out of its words.
+   */
+  test("a replayed message with files is the operator's, carrying them, and its path lines are not in its words", async () => {
+    const SESSION = "11111111-0000-4000-8000-0000000000f9";
+    const png = "/fleet/targets/t/import/imp_1/uploads/shot.png";
+    const notes = "/fleet/targets/t/import/imp_1/uploads/notes.txt";
+    const entries = await withHarness(
+      {
+        transcript: [
+          {
+            type: "user",
+            uuid: "u1",
+            session_id: SESSION,
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: "image/webp",
+                    data: "AA==",
+                  },
+                },
+                {
+                  type: "text",
+                  text: `What is in these?\n\n[Attached image "shot.png" is saved at: ${png}]\n[Attached file "notes.txt" is saved at: ${notes}]`,
+                },
+              ],
+            },
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+          } as SessionMessage,
+        ],
+      },
+      (harness) => harness.messages(SESSION),
+    );
+    expect(entries[0]?.marker).toBeUndefined();
+    expect(entries[0]?.text).toBe("What is in these?");
+    expect(entries[0]?.attachments).toEqual([
+      { kind: "image", name: "shot.png", mimeType: "image/webp", path: png },
+      { kind: "file", name: "notes.txt", mimeType: "text/plain", path: notes },
+    ]);
+    const [item] = projectReplay({
+      entries,
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: SESSION,
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    expect(item?.kind).toBe("turn.operator");
+    expect(item?.headline).toBe("You");
+    expect(item?.body).toBe("What is in these?");
+    expect(item?.attachments?.map((file) => file.path)).toEqual([png, notes]);
+  });
+});
+
+/**
+ * A real importer conversation with files, read back through the **real**
+ * `getSessionMessages` (A6 F9).
+ *
+ * `testdata/claude-code-transcript/attachments.cli.jsonl` was recorded 2026-11-04 by CLI
+ * 2.1.310 (`claude-haiku-4-5`) in an importer session opened with a PNG and a `.txt`
+ * through the multipart endpoint, then sent a follow-up steer with a second PNG. Sanitised:
+ * a fixed session id, a shortened temporary path, thinking signatures redacted, and each
+ * entry cut to the fields the SDK reads plus `promptSource` and `isMeta`, its `parentUuid`
+ * re-linked to the entry kept before it (the CLI's queue and attachment records between
+ * them are dropped, and the SDK walks the chain by that link). Both operator
+ * messages are **list** content (an image block, then the text with its path lines), and
+ * after each the CLI stores an `isMeta` user entry naming its own cached copy of the image
+ * (`[Image: source: /tmp/claude-…/images/1.png]`), which the SDK drops.
+ */
+test("a real transcript's messages with files replay as the operator's, carrying their files", async () => {
+  const SESSION = "00000000-0000-4000-8000-0000000000f9";
+  const root = await mkdtemp(join(tmpdir(), "bit-attachments-"));
+  const previous = process.env["CLAUDE_CONFIG_DIR"];
+  try {
+    const project = join(root, "projects", "-tmp-bit-attachments-ws");
+    await mkdir(project, { recursive: true });
+    await writeFile(
+      join(project, `${SESSION}.jsonl`),
+      await readFile(
+        join(
+          import.meta.dir,
+          "testdata",
+          "claude-code-transcript",
+          "attachments.cli.jsonl",
+        ),
+        "utf8",
+      ),
+    );
+    process.env["CLAUDE_CONFIG_DIR"] = root;
+    const { sdk } = scriptedSdk();
+    const entries = await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(AgentHarness, (harness) =>
+          harness.messages(SESSION),
+        ).pipe(
+          Effect.provide(
+            claudeCodeHarness({
+              sdk: {
+                ...sdk,
+                sessionMessages: liveClaudeCodeSdk.sessionMessages,
+              },
+              controlTimeout: "2 seconds",
+            }),
+          ),
+          Effect.orDie,
+        ),
+      ),
+    );
+    const folder =
+      "/tmp/bit-f9-live/hunt/targets/cc4/import/imp_1a1a5b22561001o6wMLGWxLmQz/uploads";
+    const operator = projectReplay({
+      entries,
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: SESSION,
+      users: "operator",
+      fallbackAt: 0,
+    }).items.filter((item) => item.kind === "turn.operator");
+    expect(
+      operator.map((item) => ({
+        headline: item.headline,
+        endsWithLine: item.body.includes("[Attached"),
+        attachments: item.attachments,
+      })),
+    ).toEqual([
+      {
+        headline: "You",
+        endsWithLine: false,
+        attachments: [
+          {
+            kind: "image",
+            name: "colours.png",
+            mimeType: "image/png",
+            path: `${folder}/colours.png`,
+          },
+          {
+            kind: "file",
+            name: "notes.txt",
+            mimeType: "text/plain",
+            path: `${folder}/notes.txt`,
+          },
+        ],
+      },
+      {
+        headline: "You",
+        endsWithLine: false,
+        attachments: [
+          {
+            kind: "image",
+            name: "colours (2).png",
+            mimeType: "image/png",
+            path: `${folder}/colours (2).png`,
+          },
+        ],
+      },
+    ]);
+    // The CLI's own note about its cached copy is not a message anybody sent.
+    expect(
+      entries.some((entry) => entry.text.startsWith("[Image: source:")),
+    ).toBe(false);
+  } finally {
+    if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+    else process.env["CLAUDE_CONFIG_DIR"] = previous;
+    await rm(root, { recursive: true, force: true });
+  }
 });

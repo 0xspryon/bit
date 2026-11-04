@@ -62,6 +62,7 @@ import {
   GoalUploadRefused,
   GoalUploadsAccepted,
 } from "./goalUpload";
+import { MessageUploadRefused, MessageWithFilesDraft } from "./messageUpload";
 import {
   GoalObservationView,
   IntentAbandonDraft,
@@ -1528,9 +1529,15 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       "/targets/:targetId/importer-sessions",
       {
         params: { targetId: Schema.String },
-        payload: ImporterConversationDraft,
+        // JSON, or the same JSON under `message` with files beside it (A6 F9).
+        payload: [ImporterConversationDraft, MessageWithFilesDraft],
         success: ImporterTurnAccepted.pipe(HttpApiSchema.status(202)),
-        error: [ImporterConversationRefused, TargetNotFound, TargetUnavailable],
+        error: [
+          ImporterConversationRefused,
+          MessageUploadRefused,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
       },
     ),
     /**
@@ -1544,16 +1551,24 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
      * after a refused prompt, or lost to a restart — gets a fresh session under a **new
      * import id**, which the answer carries and says so. An id this target does not hold is a
      * `404`.
+     *
+     * **Files travel in the same request** (A6 F9): a `multipart/form-data` body with this
+     * draft's JSON under `message` and each file under `files` ({@link MessageWithFilesDraft}).
+     * They are checked and stored in the session's own directory before the message is
+     * delivered, and a refusal ({@link MessageUploadRefused}) stores and delivers nothing.
+     * The first message ({@link openImporterConversation}) and a goal's take the same form.
      */
     HttpApiEndpoint.post(
       "sendImporterMessage",
       "/targets/:targetId/importer-sessions/:importId/messages",
       {
         params: { targetId: Schema.String, importId: Schema.String },
-        payload: ImporterMessageDraft,
+        // JSON, or the same JSON under `message` with files beside it (A6 F9).
+        payload: [ImporterMessageDraft, MessageWithFilesDraft],
         success: ImporterTurnAccepted.pipe(HttpApiSchema.status(202)),
         error: [
           ImporterConversationRefused,
+          MessageUploadRefused,
           ScopeImportNotFound,
           TargetNotFound,
           TargetUnavailable,
@@ -2136,10 +2151,12 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       "/targets/:targetId/goals/:goalId/conversation",
       {
         params: { targetId: Schema.String, goalId: Schema.String },
-        payload: GoalMessageDraft,
+        // JSON, or the same JSON under `message` with files beside it (A6 F9).
+        payload: [GoalMessageDraft, MessageWithFilesDraft],
         success: GoalTurnAccepted.pipe(HttpApiSchema.status(202)),
         error: [
           GoalConversationRefused,
+          MessageUploadRefused,
           GoalNotFound,
           TargetNotFound,
           TargetUnavailable,
@@ -2196,8 +2213,11 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
     /**
      * Attaches files to one goal's conversation, where its agent can read them.
      *
-     * **The only endpoint on this API that is not JSON.** The body is
-     * `multipart/form-data` and the payload declaration is what makes both halves of it:
+     * **The one endpoint on this API that takes only multipart** (the message endpoints
+     * take it beside JSON since A6 F9, with the files *in* the message — the mechanism a
+     * goal's composer is meant to move to, after which this route and its per-goal list can
+     * go). The body is `multipart/form-data` and the payload declaration is what makes both
+     * halves of it:
      * the server is handed the parser's stream of parts and consumes it itself, and
      * `HttpApiClient` takes a `FormData` — see {@link GoalUploadDraft} on why the streaming
      * shape and not the buffered one, which cannot work at this version, and why no parser
@@ -2213,8 +2233,10 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
      * `targets/<id>/goal/<goalId>/uploads/`, obtained through the same gating a goal
      * session's directory is, and never under the engagement folder a worker runs in.
      *
-     * Both caps — `UPLOAD_MAX_BYTES` per file and `UPLOAD_MAX_FILES` per goal — are
-     * enforced on the server, answered as {@link GoalUploadRefused} naming the figure, and
+     * Its caps are the message uploads' (`upload/uploads.ts`): `UPLOAD_MAX_BYTES` per file,
+     * `UPLOAD_MAX_IMAGE_BYTES` per image, `UPLOAD_MAX_TOTAL_BYTES` per request, and
+     * `UPLOAD_MAX_FILES` — here counted per goal. They are enforced on the server, answered
+     * as {@link GoalUploadRefused} naming the figure, and
      * are **not sent to the browser at all**: a client that knew them would be a second
      * copy to keep in step, and a client that did not would be refused by the same check.
      */

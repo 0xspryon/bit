@@ -118,6 +118,8 @@ interface Recorder {
     text: string;
     delivery: string;
     urgency?: string;
+    /** The files it carried (A6 F9), as `[kind, name, path]`. Absent when it carried none. */
+    attachments?: readonly (readonly [string, string, string])[];
   }[];
 }
 
@@ -256,7 +258,12 @@ const fakeHarness = (
       Effect.sync(() => {
         recorder.ended.push(sessionId);
       }),
-    prompt: (sessionId, text, delivery = { _tag: "open" as const }) =>
+    prompt: (
+      sessionId,
+      text,
+      delivery = { _tag: "open" as const },
+      attachments,
+    ) =>
       options?.promptFails === true
         ? Effect.fail(
             new (class {
@@ -280,6 +287,13 @@ const fakeHarness = (
               ...(delivery._tag === "steer"
                 ? { urgency: delivery.urgency }
                 : {}),
+              ...(attachments === undefined || attachments.length === 0
+                ? {}
+                : {
+                    attachments: attachments.map(
+                      (file) => [file.kind, file.name, file.path] as const,
+                    ),
+                  }),
             });
             return { delivered: true };
           }),
@@ -2104,6 +2118,54 @@ describe("a goal conversation's urgency and Stop (A6 F5)", () => {
       ),
     );
     expect(live).toBeUndefined();
+    await first.runtime.dispose();
+  });
+});
+
+describe("a message's files (A6 F9)", () => {
+  const file = (name: string, kind: "image" | "file", mimeType: string) => ({
+    sentName: name,
+    name,
+    contentType: mimeType,
+    kind,
+    mimeType,
+    bytes: new TextEncoder().encode(`bytes of ${name}`),
+  });
+
+  test("the opening message's and a follow-up's files land in the goal's own uploads/ and go with their prompts", async () => {
+    const { root, first, ready } = world();
+    await ready;
+    const uploads = join(root, "targets", TARGET, "goal", GOAL, "uploads");
+    await first.runtime.runPromise(
+      Effect.flatMap(GoalConversations, (conversations) =>
+        Effect.gen(function* () {
+          yield* conversations.send({
+            targetId: TARGET,
+            goalId: GOAL,
+            text: "Look at this.",
+            uploads: [file("shot.png", "image", "image/png")],
+          });
+          yield* conversations.send({
+            targetId: TARGET,
+            goalId: GOAL,
+            text: "And this.",
+            uploads: [file("notes.txt", "file", "text/plain")],
+          });
+        }),
+      ).pipe(Effect.orDie),
+    );
+    expect(
+      first.recorder.prompts.map((prompt) => [
+        prompt.delivery,
+        prompt.attachments,
+      ]),
+    ).toEqual([
+      ["open", [["image", "shot.png", join(uploads, "shot.png")]]],
+      ["steer", [["file", "notes.txt", join(uploads, "notes.txt")]]],
+    ]);
+    expect(readFileSync(join(uploads, "notes.txt"), "utf8")).toBe(
+      "bytes of notes.txt",
+    );
     await first.runtime.dispose();
   });
 });

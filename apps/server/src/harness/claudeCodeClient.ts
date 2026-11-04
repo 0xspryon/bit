@@ -84,6 +84,7 @@
  *   Claude Code 2.1.211+).
  */
 import { spawn as spawnChild, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 import {
   MODEL_OPTION_DEFAULT_CHOICE,
@@ -139,6 +140,11 @@ import {
   type SessionTitle,
   type TerminalOutcome,
 } from "./agentHarness";
+import {
+  splitAttachmentLines,
+  withAttachmentLines,
+  type MessageAttachment,
+} from "./attachments";
 import { HarnessProcessError, HarnessTransportError } from "./errors";
 import { claudeCodeMessageId } from "./messageId";
 import {
@@ -1540,10 +1546,35 @@ const flattenTranscript = (
             .map((part) => part.text)
             .join("\n");
     const marker = cliMarker(entry);
+    /*
+     * The files an operator's message carried (A6 F9): its trailing `[Attached …]` lines,
+     * taken out of the words, each image's type from its image block — the blocks precede
+     * the text in the order the lines name them (`userContent`).
+     */
+    const imageTypes = blocks.flatMap((part) => {
+      const block = part as {
+        type?: unknown;
+        source?: { media_type?: unknown };
+      };
+      return block.type === "image" &&
+        typeof block.source?.media_type === "string"
+        ? [block.source.media_type]
+        : [];
+    });
+    let nextImage = 0;
+    const split =
+      entry.type === "user" && marker === undefined
+        ? splitAttachmentLines(text, (_, kind) =>
+            kind === "image" ? imageTypes[nextImage++] : undefined,
+          )
+        : undefined;
     return {
       type: entry.type,
-      text,
+      text: split?.text ?? text,
       ...(marker === undefined ? {} : { marker }),
+      ...(split === undefined || split.attachments.length === 0
+        ? {}
+        : { attachments: split.attachments }),
       // The stored transcript carries no error channel of its own; a failure arrives as a
       // `result` message on the live stream and is settled from there. Reporting
       // `undefined` is the honest answer rather than scraping text for the word "error".
@@ -1565,6 +1596,67 @@ const flattenTranscript = (
 };
 
 /**
+ * A user message's content: the words alone, or image blocks and then the words (A6 F9).
+ *
+ * A string whenever the message carries no image, which is every message without files and
+ * every message whose files are path-only — so nothing about those changed. With images it
+ * is a list, and {@link cliMarker} still reads it as the operator's: it keys on the SDK's
+ * markers, never on the content's shape.
+ */
+type UserContent =
+  | string
+  | ReadonlyArray<
+      | {
+          readonly type: "image";
+          readonly source: {
+            readonly type: "base64";
+            readonly media_type: string;
+            readonly data: string;
+          };
+        }
+      | { readonly type: "text"; readonly text: string }
+    >;
+
+/**
+ * The content one prompt sends, its files read off disk for the image blocks.
+ *
+ * Every file gets its path line ({@link withAttachmentLines}); an image also goes inline, as
+ * a base64 block **before** the text, the order the Messages API documents for an image the
+ * text then talks about. A file that cannot be read fails the prompt before anything is sent.
+ *
+ * V2(chat): non-image files reach Claude Code as a path only; the agent reads them with its
+ * own tools if it decides to. Proper V2: inline text/plain and PDF as document blocks where
+ * the SDK accepts them, matching OpenCode.
+ */
+const userContent = (
+  text: string,
+  attachments: readonly MessageAttachment[],
+): Effect.Effect<UserContent, HarnessTransportError> =>
+  Effect.gen(function* () {
+    const words = withAttachmentLines(text, attachments);
+    const images = attachments.filter((file) => file.kind === "image");
+    if (images.length === 0) return words;
+    const blocks = yield* Effect.forEach(images, (image) =>
+      Effect.try({
+        try: () => ({
+          type: "image" as const,
+          source: {
+            type: "base64" as const,
+            media_type: image.mimeType,
+            data: readFileSync(image.path).toString("base64"),
+          },
+        }),
+        catch: (cause) =>
+          transport(
+            "session.prompt",
+            `the attached image ${image.path} could not be read (${cause instanceof Error ? cause.message : String(cause)}); nothing was sent`,
+          ),
+      }),
+    );
+    return [...blocks, { type: "text" as const, text: words }];
+  });
+
+/**
  * One message for the SDK's input iterable, with the two fields a steer needs.
  *
  * `uuid` and `priority` are **cast on**, exactly as DECISIONS.md §24.1's probe does: the
@@ -1580,13 +1672,13 @@ const flattenTranscript = (
  */
 const userMessage = (
   record: SessionRecord,
-  text: string,
+  content: UserContent,
   uuid: string,
   delivery: Extract<PromptDelivery, { _tag: "steer" }> | undefined,
 ): SDKUserMessage =>
   ({
     type: "user",
-    message: { role: "user", content: text },
+    message: { role: "user", content },
     parent_tool_use_id: null,
     session_id: record.sessionId,
     // Every message carries one, the opening prompt included, so the `result` that answers
@@ -2248,7 +2340,7 @@ export const claudeCodeHarness = (
        */
       const launch = (
         record: SessionRecord,
-        text: string,
+        content: UserContent,
       ): Effect.Effect<void, HarnessTransportError> =>
         Effect.gen(function* () {
           const released = Promise.withResolvers<void>();
@@ -2274,7 +2366,7 @@ export const claudeCodeHarness = (
           // that `unanswered` is true from the moment anything can be read from it.
           const opening = crypto.randomUUID();
           record.unanswered.add(opening);
-          record.offer(userMessage(record, text, opening, undefined));
+          record.offer(userMessage(record, content, opening, undefined));
 
           const input = async function* (): AsyncGenerator<SDKUserMessage> {
             await released.promise;
@@ -2802,8 +2894,10 @@ export const claudeCodeHarness = (
        */
       const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
         "claudeCodeHarness.prompt",
-      )(function* (sessionId, text, delivery = OPEN_PROMPT) {
+      )(function* (sessionId, text, delivery = OPEN_PROMPT, attachments = []) {
         const record = yield* recordFor("session.prompt", sessionId);
+        // Read before any state is touched, so an unreadable file sends nothing.
+        const content = yield* userContent(text, attachments);
         if (delivery._tag === "open") {
           // Ended before it was ever prompted: launching would start a CLI for a session
           // whose authority is already over.
@@ -2820,7 +2914,7 @@ export const claudeCodeHarness = (
               `session ${sessionId} has already been prompted; carrying work on means a new attempt identity`,
             );
           }
-          yield* launch(record, text);
+          yield* launch(record, content);
           return { delivered: true };
         }
         if (record.query === undefined) {
@@ -2871,7 +2965,7 @@ export const claudeCodeHarness = (
         record.deliveredIds.add(delivery.messageId);
         const uuid = claudeCodeMessageId(delivery.messageId);
         record.unanswered.add(uuid);
-        offer(userMessage(record, text, uuid, delivery));
+        offer(userMessage(record, content, uuid, delivery));
         return { delivered: true };
       });
 

@@ -293,13 +293,13 @@ describe("the figures a refusal has to carry", () => {
     // Both, never one: the readable form makes the sentence legible and the exact count is
     // what an operator checks against the cap they are about to change.
     expect(describeBytes(512)).toBe("512 bytes");
-    expect(describeBytes(DEFAULT_UPLOAD_MAX_BYTES)).toContain("10485760 bytes");
-    expect(describeBytes(DEFAULT_UPLOAD_MAX_BYTES)).toContain("10.0 MiB");
+    expect(describeBytes(DEFAULT_UPLOAD_MAX_BYTES)).toContain("52428800 bytes");
+    expect(describeBytes(DEFAULT_UPLOAD_MAX_BYTES)).toContain("50.0 MiB");
     expect(describeBytes(1536)).toBe("1536 bytes (1.5 KiB)");
   });
 
-  test("the shipped defaults are the ones the brief names", () => {
-    expect(DEFAULT_UPLOAD_MAX_BYTES).toBe(10_485_760);
-    expect(DEFAULT_UPLOAD_MAX_FILES).toBe(10);
+  test("the shipped defaults are the ones A6 decided (T3's: 50 MiB a file, 100 files)", () => {
+    expect(DEFAULT_UPLOAD_MAX_BYTES).toBe(52_428_800);
+    expect(DEFAULT_UPLOAD_MAX_FILES).toBe(100);
   });
 });

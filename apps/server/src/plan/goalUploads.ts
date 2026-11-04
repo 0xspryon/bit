@@ -30,29 +30,24 @@
 import { lstatSync, readdirSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
-import { GOAL_UPLOAD_FIELD, GoalUploadRefused } from "@bit/contracts";
-import { Effect, Stream } from "effect";
+import { GoalUploadRefused } from "@bit/contracts";
+import { Effect, type Stream } from "effect";
 import type { Multipart } from "effect/http";
 
-/**
- * The per-file ceiling when `UPLOAD_MAX_BYTES` is not set: 10 MiB.
- *
- * A starting point rather than a finding, like `DEFAULT_ROUND_BUDGET`. It is big enough
- * for the documents an operator actually attaches to an engagement — a scope letter, an
- * API specification, a capture summary — and small enough that a mis-picked video is
- * refused instead of filling the fleet root.
- */
-export const DEFAULT_UPLOAD_MAX_BYTES = 10_485_760;
+import { DEFAULT_UPLOAD_LIMITS, readUploadParts } from "../upload/uploads";
 
 /**
- * How many files one goal may hold when `UPLOAD_MAX_FILES` is not set: 10.
- *
- * **Per goal, not per request**, which is the only reading of a cap that cannot be walked
- * past: ten files at a time, repeated, would otherwise be unbounded. It is also the figure
- * the attachment list is bounded by, and that list goes into every prompt the agent is
- * sent — so this is a bound on the framing, not only on disk.
+ * The caps, shared with every message upload since A6 F9 (`upload/uploads.ts`, which says
+ * where each figure comes from and how the environment overrides it). `UPLOAD_MAX_BYTES` is
+ * now 50 MiB and `UPLOAD_MAX_FILES` 100 — they were 10 MiB and 10 when this route was the
+ * only one — and this route still counts `UPLOAD_MAX_FILES` against the whole goal, which is
+ * also a bound on the attachment list every prompt carries.
  */
-export const DEFAULT_UPLOAD_MAX_FILES = 10;
+export {
+  DEFAULT_UPLOAD_MAX_BYTES,
+  DEFAULT_UPLOAD_MAX_FILES,
+  describeBytes,
+} from "../upload/uploads";
 
 /** One file a goal holds, as the prompt and the caps need it. */
 export interface GoalAttachment {
@@ -216,14 +211,6 @@ export const unlistedEntries = (uploadsDirectory: string): number => {
   }
 };
 
-/**
- * A byte count as a person reads it, with the exact figure kept beside it.
- *
- * Both, always, and never one: the human form is what makes a sentence legible and the
- * exact count is what makes a refusal checkable against a cap an operator is about to
- * change. A refusal that said only "12.0 MiB" would not say whether raising the limit to
- * 12 MiB would be enough.
- */
 /** One file read off the wire, bytes and all, before anything has been written. */
 export interface CollectedUpload {
   readonly name: string;
@@ -234,98 +221,46 @@ export interface CollectedUpload {
 /**
  * Reads a multipart body into memory, refusing as soon as a cap is passed.
  *
- * **This is the parser's consumer, and it exists because the pinned server's buffered
- * multipart cannot run here** — `HttpServer.layerServices` provides `FileSystem.layerNoop`
- * and there is no real implementation in reach, so the only usable shape is
- * `asMultipartStream`, which hands the handler the parts and nothing else. The contract's
- * {@link GoalUploadDraft} records the measurement that settled that.
+ * **The message uploads' reader** (`upload/uploads.ts`'s `readUploadParts`), so this route
+ * and the message endpoints refuse the same files the same way — a HEIC image, an empty
+ * file, one over the image or file cap, a request over the total — and only the error is
+ * this route's own. The name is the one the browser sent, unsanitised:
+ * `GoalConversations.attach` refuses an unsafe one rather than storing it under another.
  *
- * **What the caps mean here, and it is not the same thing they mean in the service.** This
- * bounds *what is read*: the count stops the parser at `maxFiles + 1` parts and the byte
- * cap stops a part's content stream the moment it is exceeded, so a file ten times the
- * limit is refused after `maxBytes` of it rather than after all of it.
- * `GoalConversations.attach` then bounds *what is stored* — the same per-file cap again,
- * plus the count against the whole goal rather than this request. The duplication is
- * deliberate: this one is about memory and is only reachable with a parser, and that one is
- * about the goal and is reachable from a test without one.
- *
- * **The memory ceiling is `maxBytes × maxFiles`**, which with the shipped defaults is 100
- * MiB and is the honest price of an all-or-nothing attach: nothing is written until every
- * part has been read and every cap has held, so a refused request leaves no half-attached
- * file behind. An operator who raises both caps raises this with them.
- *
- * Non-file parts are ignored rather than refused. A browser's `FormData` can carry text
- * fields a framework added, and nothing here reads one — the field name a file travels
- * under is the contract's, and anything else is not an instruction to this server.
+ * `GoalConversations.attach` then bounds *what is stored* — the per-file cap again, and the
+ * count against the whole goal rather than this request.
  */
 export const collectUploads = (
   stream: Stream.Stream<Multipart.Part, Multipart.MultipartError>,
-  caps: { readonly maxBytes: number; readonly maxFiles: number },
+  caps: {
+    readonly maxBytes: number;
+    readonly maxFiles: number;
+    readonly maxImageBytes?: number | undefined;
+    readonly maxTotalBytes?: number | undefined;
+  },
 ): Effect.Effect<readonly CollectedUpload[], GoalUploadRefused> =>
-  Effect.gen(function* () {
-    const collected: CollectedUpload[] = [];
-    yield* Stream.runForEach(stream, (part) =>
-      Effect.gen(function* () {
-        if (part._tag !== "File") return;
-        if (collected.length >= caps.maxFiles) {
-          return yield* new GoalUploadRefused({
-            reason: "too_many",
-            detail: `that request carries more than ${String(caps.maxFiles)} files, which is this server's cap per goal, so the rest of it was not even read and nothing was attached. Attach fewer at a time, or raise UPLOAD_MAX_FILES on the server and restart it.`,
-          });
-        }
-        const chunks: Uint8Array[] = [];
-        let total = 0;
-        yield* Stream.runForEach(part.content, (chunk) =>
-          Effect.suspend(() => {
-            total += chunk.length;
-            if (total > caps.maxBytes) {
-              // Stopped here rather than after the whole file: the read is abandoned at the
-              // cap, so the sentence names "more than" instead of an exact size nobody
-              // waited to measure.
-              return Effect.fail(
-                new GoalUploadRefused({
-                  reason: "too_large",
-                  detail: `'${part.name}' is more than ${describeBytes(caps.maxBytes)}, which is this server's per-file cap, so reading it was abandoned and nothing in that request was attached. Attach a smaller file — an extract or a summary of the part that matters — or raise UPLOAD_MAX_BYTES on the server and restart it.`,
-                }),
-              );
-            }
-            chunks.push(chunk);
-            return Effect.void;
-          }),
-        );
-        const bytes = new Uint8Array(total);
-        let at = 0;
-        for (const chunk of chunks) {
-          bytes.set(chunk, at);
-          at += chunk.length;
-        }
-        collected.push({
-          name: part.name,
-          contentType: part.contentType,
-          bytes,
-        });
-      }),
-    ).pipe(
-      Effect.catchTag("MultipartError", (cause) =>
-        Effect.fail(
-          new GoalUploadRefused({
-            reason: "no_files",
-            detail: `that request's body could not be read as an upload (${cause.message}), so nothing was attached. It has to be a multipart/form-data body with each file under the '${GOAL_UPLOAD_FIELD}' field, which is what the composer sends.`,
-          }),
-        ),
-      ),
-    );
-    return collected;
-  });
-
-export const describeBytes = (bytes: number): string => {
-  if (bytes < 1024) return `${String(bytes)} bytes`;
-  const units = ["KiB", "MiB", "GiB", "TiB"];
-  let scaled = bytes / 1024;
-  let unit = 0;
-  while (scaled >= 1024 && unit < units.length - 1) {
-    scaled /= 1024;
-    unit += 1;
-  }
-  return `${String(bytes)} bytes (${scaled.toFixed(1)} ${String(units[unit])})`;
-};
+  readUploadParts(stream, {
+    maxFileBytes: caps.maxBytes,
+    maxFiles: caps.maxFiles,
+    maxImageBytes: caps.maxImageBytes ?? DEFAULT_UPLOAD_LIMITS.maxImageBytes,
+    maxTotalBytes: caps.maxTotalBytes ?? DEFAULT_UPLOAD_LIMITS.maxTotalBytes,
+  }).pipe(
+    Effect.map((read) =>
+      read.files.map((file) => ({
+        name: file.sentName,
+        contentType: file.contentType,
+        bytes: file.bytes,
+      })),
+    ),
+    Effect.mapError(
+      (refusal) =>
+        new GoalUploadRefused({
+          reason:
+            refusal.reason === "unreadable_body" ||
+            refusal.reason === "no_message"
+              ? "no_files"
+              : refusal.reason,
+          detail: refusal.detail,
+        }),
+    ),
+  );

@@ -814,8 +814,9 @@ export interface ReplayProjection {
  * conversation is the same items the watched one was, attributed to the same subject. What a
  * stored message has that the live stream does not is drawn too, each as what it is:
  *
- * - a `user` entry's words — the operator's in a conversation (`turn.operator`, `You`), a
- *   steer in a planner round (`turn.other`, labelled `user`). The caller trims its own
+ * - a `user` entry's words — the operator's in a conversation (`turn.operator`, `You`, with
+ *   the files the message carried as `attachments`), a steer in a planner round
+ *   (`turn.other`, labelled `user`). The caller trims its own
  *   framing off the text first, and drops an entry it never wants shown (a round's prompt).
  * - a `user` entry the harness wrote itself ({@link MessageEntry.marker}) — Claude Code's
  *   `[Request interrupted by user for tool use]` after a Stop, its `<task-notification>`
@@ -891,6 +892,11 @@ export const projectReplay = (input: {
             output: null,
             callId: null,
             outcome: null,
+            // The files the message carried (A6 F9), its path lines already out of `body`.
+            ...(entry.attachments === undefined ||
+            entry.attachments.length === 0
+              ? {}
+              : { attachments: entry.attachments }),
           });
         } else {
           note(at, "user", entry.text, false);

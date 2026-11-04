@@ -80,6 +80,8 @@
  */
 import { Schema } from "effect";
 
+import { MessageAttachmentView } from "./messageUpload";
+
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
   description: "Epoch milliseconds.",
@@ -556,6 +558,13 @@ export const LiveItem = Schema.Struct({
    * operator turn, a record, a block streamed before its step's model was seen.
    */
   model: Schema.optionalKey(Schema.String),
+  /**
+   * On a replayed `turn.operator` item, the files the operator's message carried (A6 F9),
+   * in the order they were sent: read from the harness's transcript, with the prompt's
+   * `[Attached …]` lines taken out of {@link body} so a path is not shown twice. Absent on
+   * a message that carried none, and on every other kind.
+   */
+  attachments: Schema.optionalKey(Schema.Array(MessageAttachmentView)),
   /**
    * On a record a write tool produced, the id the write that produced it is known by, so a
    * client can join the record to its call by content rather than by position (A6 F10

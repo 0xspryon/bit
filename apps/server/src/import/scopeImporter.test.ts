@@ -31,7 +31,14 @@
  */
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -64,6 +71,7 @@ import type {
   McpRegistration,
   PromptDelivery,
 } from "../harness/agentHarness";
+import type { MessageAttachment } from "../harness/attachments";
 import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
 import {
@@ -83,6 +91,7 @@ import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 import { projectNarration } from "../run/liveTranscript";
 import { RunNarrations, type RunNarration } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
+import type { ReadUpload } from "../upload/uploads";
 
 const base = mkdtempSync(join(tmpdir(), "bit-scope-importer-"));
 const fleetRoot = join(base, "fleet");
@@ -228,6 +237,8 @@ interface Script {
   readonly prompts: string[];
   /** How each prompt was delivered, in the same order as `prompts`. */
   readonly deliveries: PromptDelivery[];
+  /** The files each prompt carried (A6 F9), in the same order as `prompts`. */
+  readonly attachments: (readonly MessageAttachment[] | undefined)[];
   readonly interrupted: string[];
   /** Sessions the spine ended (`AgentHarness.endSession`), in order. */
   readonly ended: string[];
@@ -313,6 +324,7 @@ const newScript = (readable: readonly string[]): Script => {
     unregistered: [],
     prompts: [],
     deliveries: [],
+    attachments: [],
     interrupted: [],
     ended: [],
     subscribed: [],
@@ -433,7 +445,12 @@ const scriptedHarness = (script: Script) => {
             Effect.andThen(record),
           );
     },
-    prompt: (_sessionId, text, delivery = { _tag: "open" as const }) =>
+    prompt: (
+      _sessionId,
+      text,
+      delivery = { _tag: "open" as const },
+      attachments,
+    ) =>
       delivery._tag === "steer"
         ? script.failSteer
           ? Effect.fail(
@@ -448,6 +465,7 @@ const scriptedHarness = (script: Script) => {
           : Effect.sync(() => {
               script.prompts.push(text);
               script.deliveries.push(delivery);
+              script.attachments.push(attachments);
               const registration = script.registrations.at(-1);
               const onSteer = script.onSteer;
               if (registration !== undefined && onSteer !== undefined) {
@@ -472,6 +490,7 @@ const scriptedHarness = (script: Script) => {
           : Effect.sync(() => {
               script.prompts.push(text);
               script.deliveries.push(delivery);
+              script.attachments.push(attachments);
               const registration = script.registrations.at(-1);
               if (registration === undefined) return { delivered: true };
               const url = registration.url;
@@ -695,9 +714,9 @@ const heldOpening = (script: Script): AgentHarness["Service"] => {
   const harness = scriptedHarness(script);
   return {
     ...harness,
-    prompt: (sessionId, text, delivery) => {
+    prompt: (sessionId, text, delivery, attachments) => {
       const held = script.holdPrompt;
-      const sent = harness.prompt(sessionId, text, delivery);
+      const sent = harness.prompt(sessionId, text, delivery, attachments);
       return held === undefined
         ? sent
         : Deferred.succeed(held.entered, undefined).pipe(
@@ -3590,6 +3609,168 @@ describe("an older run's id after a restart (A6 F5, from F4's review)", () => {
     expect(built.script.switches).toEqual([
       { sessionId: "ses_import", model: "scripted/other", options: undefined },
     ]);
+    await runtime.dispose();
+  });
+});
+
+/** A file as the route hands it over: read off the wire and checked (A6 F9). */
+const upload = (
+  name: string,
+  body: string,
+  kind: "image" | "file",
+  mimeType: string,
+): ReadUpload => ({
+  sentName: name,
+  name,
+  contentType: mimeType,
+  kind,
+  mimeType,
+  bytes: new TextEncoder().encode(body),
+});
+
+describe("a message's files (A6 F9)", () => {
+  test("a follow-up's files are stored in the session's own directory and handed to the harness with the message", async () => {
+    const { built, runtime, importId } = await liveOne();
+    const files = [
+      upload("shot.png", "png bytes", "image", "image/png"),
+      upload("notes.txt", "a scope note", "file", "text/plain"),
+    ];
+    const sent = await runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.send({
+            targetId: TARGET,
+            importId,
+            text: "Read these.",
+            uploads: files,
+          }),
+        ),
+      ),
+    );
+    expect(sent._tag).toBe("Success");
+
+    // The words are the operator's, untouched: the path lines are the harness's to add.
+    expect(built.script.prompts[1]).toBe("Read these.");
+    const given = built.script.attachments[1] ?? [];
+    const folder = join(importDirectoryOf(built.root, importId), "uploads");
+    expect(given.map((file) => [file.kind, file.name, file.path])).toEqual([
+      ["image", "shot.png", join(folder, "shot.png")],
+      ["file", "notes.txt", join(folder, "notes.txt")],
+    ]);
+    expect(readFileSync(join(folder, "notes.txt"), "utf8")).toBe(
+      "a scope note",
+    );
+    // No temporary left behind, and nothing outside the folder.
+    expect(readdirSync(folder).sort()).toEqual(["notes.txt", "shot.png"]);
+    await runtime.dispose();
+  });
+
+  test("a second message's file of the same name is stored beside the first, never over it", async () => {
+    const { built, runtime, importId } = await liveOne();
+    const send = (body: string) =>
+      runtime.runPromise(
+        Effect.result(
+          Effect.flatMap(ScopeImporter, (importer) =>
+            importer.send({
+              targetId: TARGET,
+              importId,
+              text: "Another.",
+              uploads: [upload("image.png", body, "image", "image/png")],
+            }),
+          ),
+        ),
+      );
+    expect((await send("first"))._tag).toBe("Success");
+    expect((await send("second"))._tag).toBe("Success");
+    const folder = join(importDirectoryOf(built.root, importId), "uploads");
+    expect(readFileSync(join(folder, "image.png"), "utf8")).toBe("first");
+    expect(readFileSync(join(folder, "image (2).png"), "utf8")).toBe("second");
+    expect(built.script.attachments[2]?.[0]?.name).toBe("image (2).png");
+    await runtime.dispose();
+  });
+
+  test("files that cannot be stored are refused before the harness is asked, and the session is kept", async () => {
+    const { built, runtime, importId } = await liveOne();
+    // Something has put a link where the folder goes: the bytes would land wherever it
+    // points, so nothing is written and nothing is sent.
+    const outside = mkdtempSync(join(tmpdir(), "bit-upload-elsewhere-"));
+    symlinkSync(
+      outside,
+      join(importDirectoryOf(built.root, importId), "uploads"),
+    );
+    const sent = await runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.send({
+            targetId: TARGET,
+            importId,
+            text: "Read this.",
+            uploads: [upload("notes.txt", "x", "file", "text/plain")],
+          }),
+        ),
+      ),
+    );
+    expect(sent._tag).toBe("Failure");
+    if (sent._tag !== "Failure") return;
+    expect(sent.failure).toMatchObject({
+      _tag: "ImporterConversationRefused",
+      reason: "upload_unwritable",
+    });
+    expect(readdirSync(outside)).toEqual([]);
+    expect(built.script.prompts).toHaveLength(1);
+    // The session is still this process's: a plain message goes into it.
+    const after = await sendTo(runtime, importId, "Without the file, then.");
+    expect(after._tag).toBe("Success");
+    if (after._tag === "Success") {
+      expect(after.success.conversation).toBe("continued");
+    }
+    await runtime.dispose();
+  });
+
+  test("an opening message's files are stored once the directory is gated, and go with the opening prompt", async () => {
+    const built = world([PAGE_GOOD]);
+    const runtime = ManagedRuntime.make(built.layer);
+    const opened = await runtime.runPromise(
+      Effect.gen(function* () {
+        const fleet = yield* FleetStore;
+        yield* fleet.register({
+          targetId: TARGET,
+          name: "Acme Corp",
+          scopeNote: "",
+          workspacePath: workspace,
+        });
+        yield* fleet.migrateTarget(TARGET);
+        return yield* Effect.result(
+          (yield* ScopeImporter).converse({
+            targetId: TARGET,
+            targetName: "Acme Corp",
+            workspacePath: workspace,
+            text: `Load what this says:\n${PAGE_GOOD}`,
+            uploads: [
+              upload("policy.pdf", "%PDF-1.7", "file", "application/pdf"),
+            ],
+          }),
+        );
+      }),
+    );
+    expect(opened._tag).toBe("Success");
+    if (opened._tag !== "Success") return;
+    await built.script.done;
+    const folder = join(
+      importDirectoryOf(built.root, opened.success.importId),
+      "uploads",
+    );
+    expect(built.script.deliveries[0]?._tag).toBe("open");
+    expect(built.script.attachments[0]).toEqual([
+      {
+        kind: "file",
+        name: "policy.pdf",
+        mimeType: "application/pdf",
+        path: join(folder, "policy.pdf"),
+        bytes: 8,
+      },
+    ]);
+    expect(readFileSync(join(folder, "policy.pdf"), "utf8")).toBe("%PDF-1.7");
     await runtime.dispose();
   });
 });

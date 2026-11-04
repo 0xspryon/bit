@@ -105,7 +105,9 @@ import { browserApiRoutes } from "./http/browserApi";
 import {
   DEFAULT_UPLOAD_MAX_BYTES,
   DEFAULT_UPLOAD_MAX_FILES,
-} from "./plan/goalUploads";
+  DEFAULT_UPLOAD_MAX_IMAGE_BYTES,
+  DEFAULT_UPLOAD_MAX_TOTAL_BYTES,
+} from "./upload/uploads";
 import {
   BrowserSessions,
   PASSWORD_ENV_VAR,
@@ -317,33 +319,41 @@ const wholeNumberFromEnv = (
   return parsed;
 };
 
-/**
- * The per-file ceiling on a file attached to a goal conversation, from `UPLOAD_MAX_BYTES`.
+/*
+ * The upload caps (A6 F9), each from its variable or its default in `upload/uploads.ts`:
+ * the environment wins, nothing else is consulted. Enforced on the server and **nowhere
+ * else** — the browser is not told these figures, so there is no second copy to drift — and
+ * a file over one is refused with the figure in the sentence, so an operator can tell
+ * whether to send less or raise the number.
  *
- * **10 MiB by default** (`plan/goalUploads.ts`'s `DEFAULT_UPLOAD_MAX_BYTES`). Enforced on
- * the server and **nowhere else**: the browser is not told this figure, so there is no
- * second copy of it to drift, and a composer that pre-checked would be the one place the
- * cap could be out of date. A file over it is refused with its own size and this figure in
- * the sentence, so an operator can tell whether to split the file or raise the number.
+ * - `UPLOAD_MAX_IMAGE_BYTES`, 10 MiB: per image. An image is a file too, so the cap in
+ *   force is the smaller of this and `UPLOAD_MAX_BYTES`.
+ * - `UPLOAD_MAX_BYTES`, 50 MiB: per file. Was 10 MiB when the goal attach route was the
+ *   only upload; the variable is the same.
+ * - `UPLOAD_MAX_FILES`, 100: per message — and, on the goal attach route, per goal (it was
+ *   10), where it also bounds the attachment list every goal prompt carries.
+ * - `UPLOAD_MAX_TOTAL_BYTES`, 100 MiB: one request's files together, which is the memory a
+ *   request can hold while it is read. The listener's body ceiling follows it.
  */
 const UPLOAD_MAX_BYTES = wholeNumberFromEnv(
   "UPLOAD_MAX_BYTES",
   process.env["UPLOAD_MAX_BYTES"],
   DEFAULT_UPLOAD_MAX_BYTES,
 );
-
-/**
- * How many files one goal may hold, from `UPLOAD_MAX_FILES`.
- *
- * **Ten by default**, and counted against the goal rather than against one request — the
- * only reading of a count cap that cannot be walked past ten files at a time. It is a bound
- * on the prompt as much as on the disk: every attached file is named in every message this
- * goal's agent is sent.
- */
+const UPLOAD_MAX_IMAGE_BYTES = wholeNumberFromEnv(
+  "UPLOAD_MAX_IMAGE_BYTES",
+  process.env["UPLOAD_MAX_IMAGE_BYTES"],
+  DEFAULT_UPLOAD_MAX_IMAGE_BYTES,
+);
 const UPLOAD_MAX_FILES = wholeNumberFromEnv(
   "UPLOAD_MAX_FILES",
   process.env["UPLOAD_MAX_FILES"],
   DEFAULT_UPLOAD_MAX_FILES,
+);
+const UPLOAD_MAX_TOTAL_BYTES = wholeNumberFromEnv(
+  "UPLOAD_MAX_TOTAL_BYTES",
+  process.env["UPLOAD_MAX_TOTAL_BYTES"],
+  DEFAULT_UPLOAD_MAX_TOTAL_BYTES,
 );
 
 /**
@@ -856,6 +866,12 @@ const endpoint = Layer.unwrap(
       ControlPlaneEndpoint.layer({
         policy: PERMISSIVE_POLICY,
         port: PORT,
+        // Bun's 128 MiB, or the upload total and 8 MiB for the message and the form's own
+        // framing when an operator raised the total past it.
+        maxRequestBodySize: Math.max(
+          128 * 1024 * 1024,
+          UPLOAD_MAX_TOTAL_BYTES + 8 * 1024 * 1024,
+        ),
         // The planner's `list_harnesses`, as a list of values rather than as the resolver.
         // Read out of *this* graph's context and reduced by `plannerHarnessesOf`, which is
         // where the "no credential material reaches a planner" claim lives. Handing the
@@ -916,6 +932,8 @@ const endpoint = Layer.unwrap(
           goalBriefingMaxChars: GOAL_BRIEFING_MAX_CHARS,
           uploadMaxBytes: UPLOAD_MAX_BYTES,
           uploadMaxFiles: UPLOAD_MAX_FILES,
+          uploadMaxImageBytes: UPLOAD_MAX_IMAGE_BYTES,
+          uploadMaxTotalBytes: UPLOAD_MAX_TOTAL_BYTES,
         }).pipe(
           Layer.provide(
             CONFIGURED_PASSWORD === undefined

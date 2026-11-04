@@ -180,6 +180,7 @@ import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
 import { narrateCoalesced } from "../run/streamingCoalescer";
 import { WorkerEndpoints } from "../run/supervisor";
+import type { ReadUpload } from "../upload/uploads";
 
 /**
  * What became of the attempt to start an import.
@@ -291,6 +292,13 @@ const refusal = (failure: {
           failure.message ??
           "that harness instance is not usable on this server",
       });
+    case "UploadWriteFailed":
+      return new ImporterConversationRefused({
+        reason: "upload_unwritable",
+        detail:
+          failure.message ??
+          "the message's files could not be stored, so nothing was sent",
+      });
     default:
       return new ImporterConversationRefused({
         reason: "store_unavailable",
@@ -333,6 +341,11 @@ export interface ScopeImportRequest {
    * there were links to read. Absent for an import started from links alone.
    */
   readonly message?: string | undefined;
+  /**
+   * The files that first message carried, read and checked (A6 F9). Stored in the
+   * session's directory once the spine has gated it, before the opening prompt.
+   */
+  readonly uploads?: readonly ReadUpload[] | undefined;
   /**
    * Pages an earlier import of the same conversation could cite, carried forward when a
    * message to it opens a fresh session (finding 4 of the S3 review). They were the
@@ -437,8 +450,10 @@ export class ScopeImporter extends Context.Service<
      * be told whether it worked, not at a create-target form that must not wait.
      */
     readonly converse: (
-      input: Omit<ScopeImportRequest, "links" | "message"> & {
+      input: Omit<ScopeImportRequest, "links" | "message" | "uploads"> & {
         readonly text: string;
+        /** The files the message carried (A6 F9), read and checked by the route. */
+        readonly uploads?: readonly ReadUpload[] | undefined;
       },
     ) => Effect.Effect<ImporterTurnAccepted, ImporterConversationRefused>;
     /**
@@ -461,6 +476,8 @@ export class ScopeImporter extends Context.Service<
       readonly importId: string;
       readonly text: string;
       readonly urgency?: SteerUrgency | undefined;
+      /** The files the message carried (A6 F9), read and checked by the route. */
+      readonly uploads?: readonly ReadUpload[] | undefined;
     }) => Effect.Effect<
       ImporterTurnAccepted,
       ImporterConversationRefused | ScopeImportNotFound
@@ -888,6 +905,10 @@ export class ScopeImporter extends Context.Service<
               // Pinned to the entry, so every later message into this session is framed by
               // the agent that opened it (`deliverTurn`).
               meta: { agent: input.agent },
+              // The first message's files, stored by the spine in the gated directory.
+              ...(input.request.uploads === undefined
+                ? {}
+                : { uploads: input.request.uploads }),
             }),
             opened: (entry) => Effect.succeed(entry),
           }),
@@ -1402,6 +1423,7 @@ export class ScopeImporter extends Context.Service<
         entry: LiveAgentSession<ImportSessionMeta>,
         text: string,
         urgency: SteerUrgency,
+        uploads?: readonly ReadUpload[],
       ) {
         const widened = yield* progress.addLinks(entry.id, operatorPages(text));
         // The durable copy (`0029`), so a session reopened after a restart can carry these
@@ -1424,8 +1446,19 @@ export class ScopeImporter extends Context.Service<
             entry,
             entry.meta.agent.prompt.followUp({ message: text }),
             urgency,
+            uploads,
           ),
         );
+        if (
+          delivered._tag === "Failure" &&
+          delivered.failure._tag === "UploadWriteFailed"
+        ) {
+          // Nothing was asked of the harness, so the session is kept.
+          return yield* new ImporterConversationRefused({
+            reason: "upload_unwritable",
+            detail: `${delivered.failure.message}. The session is still open; send the message again.`,
+          });
+        }
         if (delivered._tag === "Failure") {
           return yield* new ImporterConversationRefused({
             reason: "harness_unreachable",
@@ -1487,6 +1520,7 @@ export class ScopeImporter extends Context.Service<
           workspacePath: input.workspacePath,
           links: [],
           message: input.text,
+          ...(input.uploads === undefined ? {} : { uploads: input.uploads }),
           ...(input.choice === undefined ? {} : { choice: input.choice }),
           // Passed on rather than dropped: an agent asked for and not honoured would be a
           // substitution, and `startWith` is where its authority is checked.
@@ -1574,7 +1608,7 @@ export class ScopeImporter extends Context.Service<
         // The fast path: live, preambled, and this target's.
         const live = sessions.ready(input.importId);
         if (live !== undefined && live.targetId === input.targetId) {
-          return yield* deliverTurn(live, input.text, urgency);
+          return yield* deliverTurn(live, input.text, urgency, input.uploads);
         }
 
         /*
@@ -1613,7 +1647,8 @@ export class ScopeImporter extends Context.Service<
               never
             >({
               id: input.importId,
-              joined: (entry) => deliverTurn(entry, input.text, urgency),
+              joined: (entry) =>
+                deliverTurn(entry, input.text, urgency, input.uploads),
               prepare: Effect.fail(NOT_LIVE),
               refuse: refusal,
               opened: () => Effect.fail(NOT_LIVE),
@@ -1707,6 +1742,9 @@ export class ScopeImporter extends Context.Service<
               workspacePath: target.workspacePath ?? null,
               links: [],
               message: input.text,
+              ...(input.uploads === undefined
+                ? {}
+                : { uploads: input.uploads }),
               earlierPages,
               predecessor: input.importId,
               agent,

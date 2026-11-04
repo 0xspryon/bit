@@ -97,6 +97,7 @@ import {
   type Stream,
 } from "effect";
 
+import type { MessageAttachment, ReplayedAttachment } from "./attachments";
 import type { HarnessDecodeError, HarnessTransportError } from "./errors";
 import type { HarnessInstance, ModelProvenance } from "./identity";
 import type { GateInstaller } from "../policy/install";
@@ -364,6 +365,13 @@ export interface MessageEntry {
    * content takes. {@link text} still holds the harness's words.
    */
   readonly marker?: string;
+  /**
+   * On a `user` entry whose message carried files (A6 F9), the files, read from the
+   * harness's own record of it: the prompt's `[Attached …]` lines, which are taken out of
+   * {@link text}, with the type the harness's image block or file part kept. Absent when the
+   * message carried none.
+   */
+  readonly attachments?: readonly ReplayedAttachment[];
 }
 
 /**
@@ -1038,6 +1046,15 @@ export class AgentHarness extends Context.Service<
       sessionId: string,
       text: string,
       delivery?: PromptDelivery,
+      /**
+       * The files this message carried, already stored in the session's own working
+       * directory (A6 F9). Every implementation appends one line per file to `text`
+       * (`withAttachmentLines`), and gives inline what its harness takes inline — Claude
+       * Code an image block per image, OpenCode a file part per image, `text/plain` or PDF
+       * (`harness/attachments.ts`). Absent or empty: the prompt is `text` alone, exactly as
+       * before.
+       */
+      attachments?: readonly MessageAttachment[],
     ) => Effect.Effect<PromptAccepted, HarnessFailure>;
     /**
      * Blocks until the session is no longer running.

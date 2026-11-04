@@ -151,6 +151,8 @@ export type GoalTurnAccepted = typeof GoalTurnAccepted.Type;
  *   install into it. The conversation is refused rather than run ungated, exactly as a
  *   worker and a round are.
  * - `target_unavailable`, `store_unavailable` — the target's database.
+ * - `upload_unwritable` — the message carried files and they could not be written into the
+ *   goal's `uploads/` folder (A6 F9). Nothing was said to the agent; a live session is kept.
  *
  * `409` for {@link PlanRefused}'s reason: every one of them is a conflict with the state
  * of the goal, the process or the installation rather than a malformed request.
@@ -167,6 +169,7 @@ export class GoalConversationRefused extends Schema.TaggedError<GoalConversation
       "goal_ungated",
       "target_unavailable",
       "store_unavailable",
+      "upload_unwritable",
     ]),
     detail: Schema.String,
   },

@@ -20,7 +20,9 @@
         "PLANNER_ROUND_BUDGET",
         "GOAL_BRIEFING_MAX_CHARS",
         "UPLOAD_MAX_BYTES",
-        "UPLOAD_MAX_FILES"
+        "UPLOAD_MAX_FILES",
+        "UPLOAD_MAX_IMAGE_BYTES",
+        "UPLOAD_MAX_TOTAL_BYTES"
       ]
     },
     "build": {

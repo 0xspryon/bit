@@ -760,6 +760,9 @@ export type ImporterTurnAccepted = typeof ImporterTurnAccepted.Type;
  * - `agent_unavailable` — the session runs as an agent this server does not define (or one
  *   an import session cannot be opened as), so it cannot be continued: an agent is pinned to
  *   its conversation, and opening it as another would be a substitution nobody chose.
+ * - `upload_unwritable` — the message carried files and they could not be written into the
+ *   session's `uploads/` folder (A6 F9). Nothing was said to the agent; a live session is
+ *   kept.
  *
  * `409`, for `GoalConversationRefused`'s reason. An import id this target does not hold is
  * `ScopeImportNotFound` instead, a `404`.
@@ -777,6 +780,7 @@ export class ImporterConversationRefused extends Schema.TaggedError<ImporterConv
       "target_unavailable",
       "store_unavailable",
       "agent_unavailable",
+      "upload_unwritable",
     ]),
     detail: Schema.String,
   },

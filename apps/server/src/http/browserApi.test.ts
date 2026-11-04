@@ -85,6 +85,7 @@ import { GoalConversations } from "../plan/goalConversation";
 import { PlanSupervisor } from "../plan/planSupervisor";
 import { RunSupervisor, type RunInput } from "../run/supervisor";
 import { PolicyDecisions, type PolicyConfig } from "../policy/service";
+import type { ReadUpload } from "../upload/uploads";
 
 const scratch = mkdtempSync(join(tmpdir(), "bit-browser-api-"));
 /** `realpath` because the OS temporary directory is itself a link on some systems. */
@@ -232,12 +233,50 @@ const IDLE_HELD_IMPORT_ID = "imp_idle_held_in_this_suite";
  * `view` is cast because a test double for a route that reads one field (`status`) should
  * not have to rebuild a whole panel's worth of the rest.
  */
+/**
+ * What the message routes handed the importer (A6 F9): the words and the files the route
+ * read off a multipart body, recorded before the double refuses `no_harness` as a server
+ * without one does.
+ */
+const handedToImporter: {
+  readonly route: "converse" | "send";
+  readonly text: string;
+  readonly urgency: string | undefined;
+  readonly uploads: readonly { name: string; kind: string; body: string }[];
+}[] = [];
+const recordUploads = (
+  uploads: readonly ReadUpload[] | undefined,
+): readonly { name: string; kind: string; body: string }[] =>
+  (uploads ?? []).map((file) => ({
+    name: file.name,
+    kind: file.kind,
+    body: new TextDecoder().decode(file.bytes),
+  }));
+
 const importerHoldingOne = Layer.effect(
   ScopeImporter,
   Effect.gen(function* () {
     const base = yield* ScopeImporter;
     return ScopeImporter.of({
       ...base,
+      converse: (input) => {
+        handedToImporter.push({
+          route: "converse",
+          text: input.text,
+          urgency: undefined,
+          uploads: recordUploads(input.uploads),
+        });
+        return base.converse(input);
+      },
+      send: (input) => {
+        handedToImporter.push({
+          route: "send",
+          text: input.text,
+          urgency: input.urgency,
+          uploads: recordUploads(input.uploads),
+        });
+        return base.send(input);
+      },
       view: (importId) =>
         Effect.succeed(
           importId === LIVE_IMPORT_ID
@@ -5719,5 +5758,213 @@ describe("a target's agent sessions", () => {
   test("it needs a session, like every other fleet route", async () => {
     const response = await call(`/targets/${mixed}/agent-sessions`);
     expect(response.status).toBe(401);
+  });
+});
+
+describe("a message's files, on the wire (A6 F9)", () => {
+  /** A message endpoint's multipart body as the composer sends it: the JSON under `message`. */
+  const withFiles = (
+    path: string,
+    message: unknown,
+    files: readonly { name: string; body: string; type: string }[],
+  ) => {
+    const form = new FormData();
+    if (message !== undefined) {
+      form.append(
+        "message",
+        typeof message === "string" ? message : JSON.stringify(message),
+      );
+    }
+    for (const file of files) {
+      form.append(
+        "files",
+        new File([file.body], file.name, { type: file.type }),
+      );
+    }
+    return fetch(`${api}${path}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: form,
+    });
+  };
+
+  // A target of this describe's own, so it runs alone as well as in the suite.
+  const TARGET = "files-a6";
+  beforeAll(async () => {
+    mkdirSync(join(workspaceRoot, TARGET), { recursive: true });
+    const created = await read(
+      await signedIn("/targets", {
+        method: "POST",
+        body: {
+          workspacePath: join(workspaceRoot, TARGET),
+          name: TARGET,
+          scopeNote: "",
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+  });
+
+  test("an importer message with files reaches the importer with its words, its urgency and each file", async () => {
+    handedToImporter.length = 0;
+    const response = await read(
+      await withFiles(
+        `/targets/${TARGET}/importer-sessions/imp_x/messages`,
+        { text: "  Describe these.  ", urgency: "preemptive" },
+        [
+          { name: "shot.png", body: "png", type: "image/png" },
+          { name: "../notes.txt", body: "words", type: "text/plain" },
+        ],
+      ),
+    );
+    // Past the parser and into the importer, which refuses as a server with no harness does.
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      _tag: "ImporterConversationRefused",
+      reason: "no_harness",
+    });
+    expect(handedToImporter).toEqual([
+      {
+        route: "send",
+        // Decoded by the JSON body's own schema, so trimmed exactly as a JSON message is.
+        text: "Describe these.",
+        urgency: "preemptive",
+        uploads: [
+          { name: "shot.png", kind: "image", body: "png" },
+          { name: "notes.txt", kind: "file", body: "words" },
+        ],
+      },
+    ]);
+  });
+
+  test("an importer conversation's first message takes files the same way", async () => {
+    handedToImporter.length = 0;
+    await withFiles(
+      `/targets/${TARGET}/importer-sessions`,
+      { text: "Start." },
+      [{ name: "policy.pdf", body: "%PDF", type: "application/pdf" }],
+    );
+    expect(handedToImporter).toEqual([
+      {
+        route: "converse",
+        text: "Start.",
+        urgency: undefined,
+        uploads: [{ name: "policy.pdf", kind: "file", body: "%PDF" }],
+      },
+    ]);
+  });
+
+  test("a JSON message is still a message, with no files", async () => {
+    handedToImporter.length = 0;
+    await signedIn(`/targets/${TARGET}/importer-sessions/imp_x/messages`, {
+      method: "POST",
+      body: { text: "No files." },
+    });
+    expect(handedToImporter).toEqual([
+      { route: "send", text: "No files.", urgency: undefined, uploads: [] },
+    ]);
+  });
+
+  test("each refusal is a typed 409 with a sentence, and nothing reaches the importer", async () => {
+    handedToImporter.length = 0;
+    const path = `/targets/${TARGET}/importer-sessions/imp_x/messages`;
+    const cases: readonly [
+      string,
+      unknown,
+      readonly { name: string; body: string; type: string }[],
+    ][] = [
+      [
+        "unsupported_image",
+        { text: "hi" },
+        [{ name: "IMG.HEIC", body: "x", type: "image/heic" }],
+      ],
+      [
+        "empty_file",
+        { text: "hi" },
+        [{ name: "e.txt", body: "", type: "text/plain" }],
+      ],
+      // The suite's caps: 64 bytes a file, two files.
+      [
+        "too_large",
+        { text: "hi" },
+        [{ name: "big.txt", body: "x".repeat(65), type: "text/plain" }],
+      ],
+      [
+        "too_many",
+        { text: "hi" },
+        ["a", "b", "c"].map((name) => ({
+          name: `${name}.txt`,
+          body: name,
+          type: "text/plain",
+        })),
+      ],
+      [
+        "no_message",
+        undefined,
+        [{ name: "a.txt", body: "a", type: "text/plain" }],
+      ],
+      [
+        "no_message",
+        "{not json",
+        [{ name: "a.txt", body: "a", type: "text/plain" }],
+      ],
+      [
+        "no_message",
+        { text: "   " },
+        [{ name: "a.txt", body: "a", type: "text/plain" }],
+      ],
+    ];
+    for (const [reason, message, files] of cases) {
+      const response = await read(await withFiles(path, message, files));
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({
+        _tag: "MessageUploadRefused",
+        reason,
+      });
+      expect(String(response.body["detail"]).length).toBeGreaterThan(20);
+    }
+    expect(handedToImporter).toEqual([]);
+  });
+
+  test("a target this server does not hold is a 404 before the body is read", async () => {
+    const response = await read(
+      await withFiles(
+        "/targets/nobody/importer-sessions/imp_x/messages",
+        { text: "hi" },
+        [{ name: "IMG.HEIC", body: "x", type: "image/heic" }],
+      ),
+    );
+    expect(response.status).toBe(404);
+  });
+
+  test("a goal message takes files the same way, and refuses them the same way", async () => {
+    const created = await read(
+      await signedIn(`/targets/${TARGET}/goals`, {
+        method: "POST",
+        body: { name: "Files", description: "Read what I send." },
+      }),
+    );
+    const goalId = String(created.body["goalId"]);
+    const path = `/targets/${TARGET}/goals/${goalId}/conversation`;
+    const accepted = await read(
+      await withFiles(path, { text: "Look." }, [
+        { name: "shot.png", body: "png", type: "image/png" },
+      ]),
+    );
+    // Through the parser to the conversation service, which has no harness in this suite.
+    expect(accepted.body).toMatchObject({
+      _tag: "GoalConversationRefused",
+      reason: "no_harness",
+    });
+    const refused = await read(
+      await withFiles(path, { text: "Look." }, [
+        { name: "IMG.heif", body: "x", type: "" },
+      ]),
+    );
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({
+      _tag: "MessageUploadRefused",
+      reason: "unsupported_image",
+    });
   });
 });

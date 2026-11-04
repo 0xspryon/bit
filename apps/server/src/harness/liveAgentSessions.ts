@@ -102,6 +102,11 @@ import {
   type PolicyHookNotInstalled,
 } from "../policy/install";
 import type { WorkerUrls } from "../run/supervisor";
+import {
+  storeUploads,
+  type ReadUpload,
+  type UploadWriteFailed,
+} from "../upload/uploads";
 
 /**
  * `AgentHarness.createSession`, narrowed so that the directory must be gated.
@@ -154,6 +159,11 @@ export interface LiveAgentSession<Meta> {
    * session under the same id, and ending by id would end that one.
    */
   readonly harnessSession: SessionRef;
+  /**
+   * The session's working directory, as the spine gated it: where the agent works, and
+   * where the files a message carries are stored, under `uploads/` (A6 F9).
+   */
+  readonly directory: string;
   readonly instanceId: string;
   readonly model: string;
   readonly harness: AgentHarness["Service"];
@@ -191,7 +201,8 @@ export type LiveSessionOpenFailure =
   | PolicyHookNotInstalled
   | HarnessFailure
   | HarnessNotReady
-  | CredentialRefused;
+  | CredentialRefused
+  | UploadWriteFailed;
 
 /**
  * What a surface is, as far as authority goes. Fixed per surface.
@@ -280,6 +291,13 @@ export interface OpenPlan<Meta> {
   ) => Effect.Effect<void>;
   /** The opening prompt, built at the moment it is sent rather than when the plan was. */
   readonly openingPrompt: (entry: LiveAgentSession<Meta>) => string;
+  /**
+   * The files the opening message carried, read and checked (A6 F9). Stored in the
+   * session's directory once it is gated, before anything is prompted, and handed to the
+   * harness with the opening prompt. A failure to store them fails the open, so a session
+   * is never prompted without the files its message named.
+   */
+  readonly uploads?: readonly ReadUpload[] | undefined;
   readonly meta: Meta;
 }
 
@@ -489,7 +507,14 @@ export interface LiveAgentSessions<Meta> {
     entry: LiveAgentSession<Meta>,
     prompt: string,
     urgency: SteerUrgency,
-  ) => Effect.Effect<void, HarnessFailure>;
+    /**
+     * The files this message carried, read and checked (A6 F9). Stored in the entry's
+     * directory first; a failure to store them is {@link UploadWriteFailed}, nothing is
+     * prompted, and — unlike a refused prompt — **the session is kept**, since the harness
+     * was never asked.
+     */
+    uploads?: readonly ReadUpload[],
+  ) => Effect.Effect<void, HarnessFailure | UploadWriteFailed>;
   /**
    * Stops the turn running in one id's session, and keeps the session (A6 F5).
    *
@@ -979,7 +1004,12 @@ export const makeLiveAgentSessions = <Meta>(
                         scope,
                       );
                       yield* register(plan, input.id, urls, created, directory);
-                      return created;
+                      // The opening message's files, into the directory now gated (A6 F9).
+                      const attachments =
+                        plan.uploads === undefined || plan.uploads.length === 0
+                          ? []
+                          : yield* storeUploads(directory, plan.uploads);
+                      return { created, directory, attachments };
                     }).pipe(Scope.provide(scope)),
                   );
                   if (opened._tag === "Failure") {
@@ -995,12 +1025,16 @@ export const makeLiveAgentSessions = <Meta>(
                   const narrator =
                     narrate === undefined
                       ? undefined
-                      : yield* Effect.forkIn(narrate(opened.success.id), scope);
+                      : yield* Effect.forkIn(
+                          narrate(opened.success.created.id),
+                          scope,
+                        );
                   const entry: LiveAgentSession<Meta> = {
                     id: input.id,
                     targetId: plan.targetId,
-                    sessionId: opened.success.id,
-                    harnessSession: opened.success,
+                    sessionId: opened.success.created.id,
+                    harnessSession: opened.success.created,
+                    directory: opened.success.directory,
                     instanceId: harness.instance.instanceId,
                     model: plan.model,
                     harness,
@@ -1025,6 +1059,7 @@ export const makeLiveAgentSessions = <Meta>(
                       entry.sessionId,
                       plan.openingPrompt(entry),
                       OPEN_PROMPT,
+                      opened.success.attachments,
                     ),
                   );
                   if (prompted._tag === "Failure") {
@@ -1089,21 +1124,32 @@ export const makeLiveAgentSessions = <Meta>(
       entry,
       prompt,
       urgency,
+      uploads,
     ) =>
       Effect.gen(function* () {
+        // Stored before the harness is asked, and a failure here closes nothing.
+        const attachments =
+          uploads === undefined || uploads.length === 0
+            ? []
+            : yield* storeUploads(entry.directory, uploads);
         const accepted = yield* Effect.result(
-          entry.harness.prompt(entry.sessionId, prompt, {
-            _tag: "steer",
-            /*
-             * V2(chat): "send now" is a preemptive steer — it lands at the harness's next
-             * step boundary, so a tool call already running finishes first and the rest of
-             * the work in flight is discarded. Proper V2: a combined "stop and send" that
-             * interrupts the turn and then opens the next one, once interrupt-with-queued-
-             * messages behaviour is measured.
-             */
-            urgency,
-            messageId: crypto.randomUUID().replaceAll("-", ""),
-          }),
+          entry.harness.prompt(
+            entry.sessionId,
+            prompt,
+            {
+              _tag: "steer",
+              /*
+               * V2(chat): "send now" is a preemptive steer — it lands at the harness's next
+               * step boundary, so a tool call already running finishes first and the rest of
+               * the work in flight is discarded. Proper V2: a combined "stop and send" that
+               * interrupts the turn and then opens the next one, once interrupt-with-queued-
+               * messages behaviour is measured.
+               */
+              urgency,
+              messageId: crypto.randomUUID().replaceAll("-", ""),
+            },
+            attachments,
+          ),
         );
         if (accepted._tag === "Failure") {
           yield* closeSession(entry, "refused");

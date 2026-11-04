@@ -1348,6 +1348,63 @@ describe("steering a live session", () => {
     expect(body).toContain('"id":null');
   });
 
+  test("a message's files: an image, text/plain and a PDF go as file parts, everything gets its path line (A6 F9)", async () => {
+    const files = [
+      { kind: "image", name: "shot.png", mimeType: "image/png" },
+      { kind: "file", name: "notes.txt", mimeType: "text/plain" },
+      { kind: "file", name: "policy.pdf", mimeType: "application/pdf" },
+      { kind: "file", name: "capture.har", mimeType: "application/json" },
+    ].map((file) => ({
+      ...file,
+      kind: file.kind as "image" | "file",
+      path: `/fleet/t/import/imp_1/uploads/${file.name}`,
+      bytes: 10,
+    }));
+    const huge = {
+      kind: "file" as const,
+      name: "big.txt",
+      mimeType: "text/plain",
+      path: "/fleet/t/import/imp_1/uploads/big.txt",
+      // Over what OpenCode reads inline: path-only, like any other file.
+      bytes: 21 * 1024 * 1024,
+    };
+    const { recorded } = await prompting(inbox("steer"), (harness) =>
+      harness.prompt("ses_1", "Read these.", undefined, [...files, huge]),
+    );
+    const body = JSON.parse(recorded.bodies[0] ?? "{}") as {
+      text?: string;
+      files?: readonly { uri: string; name?: string }[];
+    };
+    expect(body.files).toEqual(
+      ["shot.png", "notes.txt", "policy.pdf"].map((name) => ({
+        uri: `file:///fleet/t/import/imp_1/uploads/${name}`,
+        name,
+      })),
+    );
+    expect(body.text).toBe(
+      [
+        "Read these.",
+        "",
+        ...[...files, huge].map(
+          (file) =>
+            `[Attached ${file.kind} "${file.name}" is saved at: ${file.path}]`,
+        ),
+      ].join("\n"),
+    );
+  });
+
+  test("a message with no files sends no file parts", async () => {
+    const { recorded } = await prompting(inbox("steer"), (harness) =>
+      harness.prompt("ses_1", "just words"),
+    );
+    const body = JSON.parse(recorded.bodies[0] ?? "{}") as {
+      text?: string;
+      files?: unknown;
+    };
+    expect(body.text).toBe("just words");
+    expect(body.files ?? null).toBeNull();
+  });
+
   test("a queued steer sends delivery queue and a msg_-prefixed id", async () => {
     const { value, recorded } = await prompting(inbox("queue"), (harness) =>
       harness.prompt("ses_1", "focus on the lockout path", {
@@ -2788,5 +2845,70 @@ describe("a session's stored messages, as the live stream's parts (A6 F10)", () 
       ["tool.call", "zai-coding-plan/glm-5.3-flash"],
       ["tool.result", undefined],
     ]);
+  });
+});
+
+/* ── A message's files, replayed (A6 F9) ─────────────────────────────────────── */
+
+describe("a replayed message's files", () => {
+  test("an operator's message carries its files, typed from OpenCode's file parts, and its path lines are not in its words", async () => {
+    const png = "/fleet/targets/t/import/imp_1/uploads/shot.png";
+    const har = "/fleet/targets/t/import/imp_1/uploads/capture.har";
+    let pages = 0;
+    const { layer } = clientWith((url) => {
+      if (!url.includes("/message")) return json({ data: [] });
+      pages += 1;
+      return json({
+        data:
+          pages > 1
+            ? []
+            : [
+                {
+                  id: `msg_${"0".repeat(12)}${"A".repeat(14)}`,
+                  time: { created: 1_793_577_000_000 },
+                  type: "user",
+                  text: `What is in these?\n\n[Attached image "shot.png" is saved at: ${png}]\n[Attached file "capture.har" is saved at: ${har}]`,
+                  // Only the image went inline: a HAR is path-only.
+                  files: [
+                    {
+                      data: "AA==",
+                      mime: "image/png",
+                      source: { type: "uri", uri: `file://${png}` },
+                      name: "shot.png",
+                    },
+                  ],
+                },
+              ],
+        cursor: { previous: null, next: pages > 1 ? null : "x" },
+      });
+    });
+    const entries = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (client) => client.messages("ses_1")),
+          layer,
+        ),
+      ),
+    );
+    expect(entries[0]?.text).toBe("What is in these?");
+    expect(entries[0]?.attachments).toEqual([
+      { kind: "image", name: "shot.png", mimeType: "image/png", path: png },
+      {
+        kind: "file",
+        name: "capture.har",
+        mimeType: "application/json",
+        path: har,
+      },
+    ]);
+    const [item] = projectReplay({
+      entries,
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    expect(item?.headline).toBe("You");
+    expect(item?.body).toBe("What is in these?");
+    expect(item?.attachments?.length).toBe(2);
   });
 });

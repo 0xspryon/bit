@@ -37,10 +37,15 @@ import {
   dimensionsOf,
   GoalBriefingRefused,
   GoalNotFound,
+  GoalMessageDraft,
   GoalRefused,
+  ImporterConversationDraft,
+  ImporterMessageDraft,
   ImporterModelUnavailable,
   IntentNotFound,
   IntentRefused,
+  MESSAGE_FIELD,
+  MessageUploadRefused,
   RoundNotFound,
   RunRefused,
   ScopeImportNotFound,
@@ -74,10 +79,11 @@ import {
   Effect,
   Layer,
   Redacted,
+  Schema,
   Stream,
   type Duration,
 } from "effect";
-import { HttpServer } from "effect/http";
+import { HttpServer, type Multipart } from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
 
 import {
@@ -118,11 +124,7 @@ import { chooseImporterModel } from "../import/importerModel";
 import { importerSessionTitles } from "../import/importerTitle";
 import { ScopeImporter } from "../import/scopeImporter";
 import { GoalConversations } from "../plan/goalConversation";
-import {
-  DEFAULT_UPLOAD_MAX_BYTES,
-  DEFAULT_UPLOAD_MAX_FILES,
-  collectUploads,
-} from "../plan/goalUploads";
+import { collectUploads } from "../plan/goalUploads";
 import { PlanSupervisor } from "../plan/planSupervisor";
 import {
   GOAL_NARRATION_ROUND_LIMIT,
@@ -133,6 +135,12 @@ import { RunNarrations } from "../run/narration";
 import { RunSupervisor } from "../run/supervisor";
 import { readTranscript } from "../run/transcript";
 import { PolicyDecisions } from "../policy/service";
+import {
+  DEFAULT_UPLOAD_LIMITS,
+  readUploadParts,
+  type ReadUpload,
+  type UploadLimits,
+} from "../upload/uploads";
 
 /** What the browser API needs to know about this installation. */
 export interface BrowserApiConfig {
@@ -169,8 +177,9 @@ export interface BrowserApiConfig {
    */
   readonly goalBriefingMaxChars?: number | undefined;
   /**
-   * The per-file ceiling on an attachment, in bytes. Defaults to
-   * {@link DEFAULT_UPLOAD_MAX_BYTES}.
+   * The per-file ceiling on an attachment, in bytes. Defaults to 50 MiB
+   * (`upload/uploads.ts`'s `DEFAULT_UPLOAD_MAX_BYTES`), for a message's files and the goal
+   * attach route's alike.
    *
    * Real configuration, like {@link goalBriefingMaxChars}: `main.ts` reads
    * `UPLOAD_MAX_BYTES` and passes it, and the refusal above it names this number so an
@@ -181,14 +190,76 @@ export interface BrowserApiConfig {
    */
   readonly uploadMaxBytes?: number | undefined;
   /**
-   * How many files one goal may hold. Defaults to {@link DEFAULT_UPLOAD_MAX_FILES}.
+   * How many files one message may carry, and one goal hold through the attach route.
+   * Defaults to 100 (`DEFAULT_UPLOAD_MAX_FILES`).
    *
-   * Per goal rather than per request, which is the only reading that cannot be walked
-   * past — see the constant. It is also a bound on the prompt: every attached file is named
+   * On the attach route, per goal rather than per request, which is the only reading that
+   * cannot be walked past — and a bound on the prompt there: every attached file is named
    * in every message this goal's agent is sent.
    */
   readonly uploadMaxFiles?: number | undefined;
+  /** The per-image ceiling, in bytes. Defaults to 10 MiB; never above {@link uploadMaxBytes}. */
+  readonly uploadMaxImageBytes?: number | undefined;
+  /** The ceiling on one request's files together, in bytes. Defaults to 100 MiB. */
+  readonly uploadMaxTotalBytes?: number | undefined;
 }
+
+/** The upload caps in force, each the configured figure or its default (`upload/uploads.ts`). */
+const uploadLimitsOf = (config: BrowserApiConfig): UploadLimits => ({
+  maxImageBytes:
+    config.uploadMaxImageBytes ?? DEFAULT_UPLOAD_LIMITS.maxImageBytes,
+  maxFileBytes: config.uploadMaxBytes ?? DEFAULT_UPLOAD_LIMITS.maxFileBytes,
+  maxFiles: config.uploadMaxFiles ?? DEFAULT_UPLOAD_LIMITS.maxFiles,
+  maxTotalBytes:
+    config.uploadMaxTotalBytes ?? DEFAULT_UPLOAD_LIMITS.maxTotalBytes,
+});
+
+/**
+ * A message endpoint's payload as the draft and its files (A6 F9).
+ *
+ * A JSON body is the draft, with no files, exactly as before. A multipart body is read
+ * here, under every cap, and its `message` field decoded with **the same schema** the JSON
+ * body is — so a message with files is checked exactly as one without them, and nothing
+ * about the files can widen what the draft may say.
+ *
+ * V2(chat): uploads are one request with no lifecycle — no signed upload URLs, no pending
+ * state or sweep of abandoned files (they live as long as the session's directory), the
+ * browser's MIME type trusted after the allow-list, no image compression, HEIC/HEIF
+ * refused. Proper V2: T3's two-step upload (signed, size-pinned URL; claim on send;
+ * pending sweep), byte sniffing, compression to fit the limit, HEIC conversion if wanted.
+ */
+export const messageWithFiles = <A, I>(
+  payload: A | Stream.Stream<Multipart.Part, Multipart.MultipartError>,
+  draft: Schema.Codec<A, I>,
+  limits: UploadLimits,
+): Effect.Effect<
+  { readonly draft: A; readonly uploads: readonly ReadUpload[] },
+  MessageUploadRefused
+> =>
+  Stream.isStream(payload)
+    ? Effect.gen(function* () {
+        const read = yield* readUploadParts(payload, limits, [MESSAGE_FIELD]);
+        const field = read.fields.get(MESSAGE_FIELD);
+        if (field === undefined) {
+          return yield* new MessageUploadRefused({
+            reason: "no_message",
+            detail: `that request carries files but no '${MESSAGE_FIELD}' field, so there was no message to send them with and nothing was stored. A message with files is the message's JSON under '${MESSAGE_FIELD}' and each file under 'files'.`,
+          });
+        }
+        const decoded = yield* Schema.decodeUnknownEffect(
+          Schema.fromJsonString(draft),
+        )(field).pipe(
+          Effect.mapError(
+            (issue) =>
+              new MessageUploadRefused({
+                reason: "no_message",
+                detail: `that request's '${MESSAGE_FIELD}' field is not a message this endpoint takes (${issue.message}), so nothing was stored or sent.`,
+              }),
+          ),
+        );
+        return { draft: decoded, uploads: read.files };
+      })
+    : Effect.succeed({ draft: payload, uploads: [] });
 
 /**
  * The configuration the handlers read, as a service.
@@ -1477,14 +1548,22 @@ const fleetHandlers = HttpApiBuilder.group(
        */
       openImporterConversation: Effect.fn(function* ({ params, payload }) {
         const row = yield* openableTarget(fleet, params.targetId);
+        // The target first, so a request for one this server does not hold is a 404 before
+        // a byte of its body is read.
+        const { draft, uploads } = yield* messageWithFiles(
+          payload,
+          ImporterConversationDraft,
+          uploadLimitsOf(config),
+        );
         return yield* importer.converse({
           targetId: row.targetId,
           targetName: row.name,
           workspacePath: row.workspacePath ?? null,
-          text: payload.text,
-          ...(payload.importModel === undefined
+          text: draft.text,
+          ...(uploads.length === 0 ? {} : { uploads }),
+          ...(draft.importModel === undefined
             ? {}
-            : { choice: payload.importModel }),
+            : { choice: draft.importModel }),
         });
       }),
 
@@ -1497,13 +1576,17 @@ const fleetHandlers = HttpApiBuilder.group(
        */
       sendImporterMessage: Effect.fn(function* ({ params, payload }) {
         const row = yield* openableTarget(fleet, params.targetId);
+        const { draft, uploads } = yield* messageWithFiles(
+          payload,
+          ImporterMessageDraft,
+          uploadLimitsOf(config),
+        );
         return yield* importer.send({
           targetId: row.targetId,
           importId: params.importId,
-          text: payload.text,
-          ...(payload.urgency === undefined
-            ? {}
-            : { urgency: payload.urgency }),
+          text: draft.text,
+          ...(uploads.length === 0 ? {} : { uploads }),
+          ...(draft.urgency === undefined ? {} : { urgency: draft.urgency }),
         });
       }),
 
@@ -2508,13 +2591,17 @@ const fleetHandlers = HttpApiBuilder.group(
       sendGoalMessage: Effect.fn(function* ({ params, payload }) {
         const row = yield* openableTarget(fleet, params.targetId);
         yield* ownedGoal(stores, row.targetId, params.goalId);
+        const { draft, uploads } = yield* messageWithFiles(
+          payload,
+          GoalMessageDraft,
+          uploadLimitsOf(config),
+        );
         return yield* conversations.send({
           targetId: row.targetId,
           goalId: params.goalId,
-          text: payload.text,
-          ...(payload.urgency === undefined
-            ? {}
-            : { urgency: payload.urgency }),
+          text: draft.text,
+          ...(uploads.length === 0 ? {} : { uploads }),
+          ...(draft.urgency === undefined ? {} : { urgency: draft.urgency }),
         });
       }),
 
@@ -2594,8 +2681,9 @@ const fleetHandlers = HttpApiBuilder.group(
       uploadGoalFiles: Effect.fn(function* ({ params, payload }) {
         const row = yield* openableTarget(fleet, params.targetId);
         yield* ownedGoal(stores, row.targetId, params.goalId);
-        const maxBytes = config.uploadMaxBytes ?? DEFAULT_UPLOAD_MAX_BYTES;
-        const maxFiles = config.uploadMaxFiles ?? DEFAULT_UPLOAD_MAX_FILES;
+        const limits = uploadLimitsOf(config);
+        const maxBytes = limits.maxFileBytes;
+        const maxFiles = limits.maxFiles;
         /*
          * The body, read here and bounded while it is read.
          *
@@ -2603,7 +2691,12 @@ const fleetHandlers = HttpApiBuilder.group(
          * does not hold is a 404 before a byte of its body is consumed. Only then is the
          * parser's stream drained, with both caps applied as it goes.
          */
-        const files = yield* collectUploads(payload, { maxBytes, maxFiles });
+        const files = yield* collectUploads(payload, {
+          maxBytes,
+          maxFiles,
+          maxImageBytes: limits.maxImageBytes,
+          maxTotalBytes: limits.maxTotalBytes,
+        });
         return yield* conversations.attach({
           targetId: row.targetId,
           goalId: params.goalId,

@@ -138,6 +138,7 @@ import {
   uploadNameRefusal,
   type CollectedUpload,
 } from "./goalUploads";
+import type { ReadUpload } from "../upload/uploads";
 
 /**
  * One file as the HTTP layer hands it over: read off the wire, not yet anywhere on disk.
@@ -238,6 +239,15 @@ const refuse = (error: {
         detail:
           error.message ?? "that harness instance is not usable on this server",
       });
+    case "UploadWriteFailed":
+      // The message's files would not go to disk (A6 F9). Nothing was asked of the
+      // harness, and a live session is kept.
+      return new GoalConversationRefused({
+        reason: "upload_unwritable",
+        detail:
+          error.message ??
+          "the message's files could not be stored, so nothing was sent",
+      });
     case "CredentialRefused":
       // Unreachable through `issueWithoutExpiry`, whose parameter is a goal binding. Mapped
       // rather than died on, because a security boundary that refuses should be reported as
@@ -281,6 +291,12 @@ export class GoalConversations extends Context.Service<
       readonly text: string;
       /** How a message into a running turn lands. `queued` when absent. */
       readonly urgency?: SteerUrgency | undefined;
+      /**
+       * The files the message carried (A6 F9), read and checked by the route. Stored in
+       * `goal/<goalId>/uploads/` — the goal agent's own directory's, where the attach
+       * route's files are too — and given to the harness with this message.
+       */
+      readonly uploads?: readonly ReadUpload[] | undefined;
     }) => Effect.Effect<GoalTurnAccepted, GoalConversationRefused>;
     /**
      * One goal's conversation as a reloaded tab replays it, from the harness.
@@ -570,6 +586,7 @@ const make = Effect.fnUntraced(function* () {
     entry: LiveConversation,
     text: string,
     urgency: SteerUrgency,
+    uploads?: readonly ReadUpload[],
   ) {
     /*
      * The operator's words, verbatim — unless this goal has files attached, in which case
@@ -582,7 +599,7 @@ const make = Effect.fnUntraced(function* () {
       message: text,
     });
     const accepted = yield* Effect.result(
-      sessions.deliver(entry, prompt, urgency),
+      sessions.deliver(entry, prompt, urgency, uploads),
     );
     if (accepted._tag === "Failure") return yield* refuse(accepted.failure);
     return {
@@ -816,6 +833,7 @@ const make = Effect.fnUntraced(function* () {
         existing,
         input.text,
         input.urgency ?? "queued",
+        input.uploads,
       );
     }
 
@@ -856,7 +874,12 @@ const make = Effect.fnUntraced(function* () {
     >({
       id: input.goalId,
       joined: (raced) =>
-        deliverInto(raced, input.text, input.urgency ?? "queued"),
+        deliverInto(
+          raced,
+          input.text,
+          input.urgency ?? "queued",
+          input.uploads,
+        ),
       refuse,
       prepare: Effect.gen(function* () {
         const row = yield* Effect.result(fleet.target(input.targetId));
@@ -991,6 +1014,8 @@ const make = Effect.fnUntraced(function* () {
            * names another.
            */
           beforePrompt: (entry: LiveConversation) => recordRow(entry, options),
+          // The message's files, stored by the spine in the gated directory (A6 F9).
+          ...(input.uploads === undefined ? {} : { uploads: input.uploads }),
           /*
            * Three situations and two assemblers, which is the split S3.1 argues for: a
            * session this process created gets the whole preamble, and one it **resumed**

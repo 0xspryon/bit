@@ -53,6 +53,8 @@
  * environment the agent's own shell commands inherit (DECISIONS.md §6 "credentials off
  * argv").
  */
+import { fileURLToPath, pathToFileURL } from "node:url";
+
 import {
   MODEL_OPTION_DEFAULT_CHOICE,
   type HarnessModelView,
@@ -102,6 +104,11 @@ import {
   type SessionTitle,
   type SessionWindow,
 } from "./agentHarness";
+import {
+  inlinesOnOpenCode,
+  splitAttachmentLines,
+  withAttachmentLines,
+} from "./attachments";
 import { openCodeMessageId } from "./messageId";
 import { HarnessDecodeError, HarnessTransportError } from "./errors";
 import {
@@ -913,6 +920,10 @@ const flatten = (entry: unknown): MessageEntry => {
     time?: { created?: unknown } | undefined;
     error?: { message?: unknown } | undefined;
     content?: ReadonlyArray<{ type?: unknown; text?: unknown }> | undefined;
+    files?: ReadonlyArray<{
+      mime?: unknown;
+      source?: { type?: unknown; uri?: unknown };
+    }>;
   };
   const type = typeof record.type === "string" ? record.type : "unknown";
   const content = Array.isArray(record.content) ? record.content : [];
@@ -929,17 +940,40 @@ const flatten = (entry: unknown): MessageEntry => {
     record.description.trim() !== ""
       ? record.description
       : undefined;
+  const words =
+    summary !== undefined
+      ? summary
+      : typeof record.text === "string"
+        ? record.text
+        : content
+            .filter((part) => part.type === "text")
+            .map((part) => (typeof part.text === "string" ? part.text : ""))
+            .join("\n");
+  /*
+   * The files an operator's message carried (A6 F9): its trailing `[Attached …]` lines,
+   * taken out of the words, each file's type from the file part OpenCode stored for it
+   * (matched by its `file://` uri) when it was sent inline.
+   */
+  const fileTypes = new Map<string, string>();
+  for (const file of Array.isArray(record.files) ? record.files : []) {
+    const uri = file.source?.type === "uri" ? file.source.uri : undefined;
+    if (typeof uri !== "string" || typeof file.mime !== "string") continue;
+    try {
+      fileTypes.set(fileURLToPath(uri), file.mime);
+    } catch {
+      // Not a file uri: nothing of ours.
+    }
+  }
+  const split =
+    type === "user"
+      ? splitAttachmentLines(words, (path) => fileTypes.get(path))
+      : undefined;
   return {
     type,
-    text:
-      summary !== undefined
-        ? summary
-        : typeof record.text === "string"
-          ? record.text
-          : content
-              .filter((part) => part.type === "text")
-              .map((part) => (typeof part.text === "string" ? part.text : ""))
-              .join("\n"),
+    text: split?.text ?? words,
+    ...(split === undefined || split.attachments.length === 0
+      ? {}
+      : { attachments: split.attachments }),
     error:
       typeof record.error?.message === "string"
         ? record.error.message
@@ -1502,7 +1536,16 @@ export const openCodeHarness = (
        */
       const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
         "openCodeHarness.prompt",
-      )(function* (sessionId, text, delivery = OPEN_PROMPT) {
+      )(function* (sessionId, text, delivery = OPEN_PROMPT, attachments = []) {
+        /*
+         * The files (A6 F9): a path line each on the text, and an image, `text/plain` or PDF
+         * also as a file part, which OpenCode reads off disk itself (a `file://` uri, its
+         * own composer's form) and stores in the message with its type.
+         */
+        const files = attachments.filter(inlinesOnOpenCode).map((file) => ({
+          uri: pathToFileURL(file.path).href,
+          name: file.name,
+        }));
         if (delivery._tag === "steer") {
           const sent = delivered.get(sessionId) ?? new Set<string>();
           if (sent.has(delivery.messageId)) return { delivered: false };
@@ -1514,7 +1557,8 @@ export const openCodeHarness = (
           timeouts.control,
           api.session.prompt({
             sessionID: sessionId as Session.ID,
-            text,
+            text: withAttachmentLines(text, attachments),
+            ...(files.length === 0 ? {} : { files }),
             // Spread rather than passed as `undefined` for `parentID`'s reason: an absent
             // field is the server's own default, and the opening prompt deliberately takes
             // it. §24.1 reports that the server resolved an omitted `delivery` to `steer`
