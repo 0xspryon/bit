@@ -1413,26 +1413,59 @@ const isLocalCommandEntry = (entry: SessionMessage): boolean =>
     .isCompletedLocalCommand === true;
 
 /**
- * What a `user` entry's text blocks mark, for an entry the CLI wrote itself.
+ * What a `user` entry marks, for an entry the CLI wrote itself; `undefined` for one somebody
+ * sent.
  *
- * **Told by the content's shape, because nothing else survives the read.** Every message
- * this server sends is string content ({@link userMessage}), and the CLI stores it as a
- * string with `promptSource: "sdk"`; the CLI's own note in the user's role is a **list** of
- * `text` blocks with no `promptSource`. Measured on 2.1.310 after a Stop that cut a `Bash`
- * call: the `tool_result` refusing the call, then a separate `user` entry
- * `[{type: "text", text: "[Request interrupted by user for tool use]"}]`
- * (`testdata/claude-code-transcript/interrupted-tool.cli.jsonl`). SDK 0.3.310's
- * `getSessionMessages` drops `promptSource`, so the shape is the one discriminator left —
- * and a `tool_result` list has no top-level `text` block, so it never reaches here.
+ * **Told by the SDK's own markers, never by the content's shape.** Every message this server
+ * sends is string content today, but an attachment (U13) makes an operator's message a list
+ * of blocks, so "a list is the CLI's" would turn the operator's words into a note. What
+ * separates the two is what the CLI stamps on its own entries:
  *
- * The interrupt notes (`… for tool use`, and the plain one a cut reply gets) are
- * `interrupted`. Any other text the CLI stores there is labelled as the harness's, which is
- * all that can honestly be said of it: it is not the operator's.
+ * - **`origin`.** A `<task-notification>` — a background task that finished, or a
+ *   foreground `Bash` a Stop killed after it had run for a few seconds — is a `user` entry
+ *   with **string** content and `promptSource: "system"`; the killed one is stored as a
+ *   `queued_command` attachment that `getSessionMessages` surfaces as a user entry with
+ *   `isQueuedCommand: true`. SDK 0.3.310 keeps `origin: {kind: "task-notification"}` on
+ *   both (measured on 2.1.310, `testdata/claude-code-transcript/task-notifications.cli.jsonl`),
+ *   and no message this server sends carries an `origin` ({@link userMessage}). Not in the
+ *   published `SessionMessage` type, so read through a cast like `isCompletedLocalCommand`.
+ *   A task notification is `task`; any other kind but `human` is named by its kind.
+ * - **The interrupt note**, as a last resort, because nothing else marks it: after a Stop
+ *   the CLI writes `[Request interrupted by user for tool use]` (or `… by user]` for a cut
+ *   reply) as a `user` entry whose content is exactly one `text` block opening with that text,
+ *   with no `origin` and — once the SDK has read it — no `promptSource`
+ *   (`interrupted-tool.cli.jsonl`). It is `interrupted`. An operator's message carrying an
+ *   attachment has more than one block, and one sent as words is a string.
+ *
+ * Everything else in the user's role is the operator's (or, in a planner round, a steer).
+ * Should a later SDK stop passing `origin` through, a notification reads as the operator's
+ * again; no operator message can be hidden by this.
  */
-const cliMarker = (text: string): string =>
-  text.trimStart().startsWith("[Request interrupted by user")
+const cliMarker = (entry: SessionMessage): string | undefined => {
+  if (entry.type !== "user") return undefined;
+  const origin = (entry as { readonly origin?: unknown }).origin;
+  const kind =
+    typeof origin === "object" && origin !== null
+      ? (origin as { readonly kind?: unknown }).kind
+      : undefined;
+  if (typeof kind === "string" && kind !== "human") {
+    return kind === "task-notification" ? "task" : kind;
+  }
+  const content = (entry.message as { readonly content?: unknown } | undefined)
+    ?.content;
+  if (!Array.isArray(content) || content.length !== 1) return undefined;
+  const [only] = content as readonly unknown[];
+  const text =
+    typeof only === "object" &&
+    only !== null &&
+    (only as { type?: unknown }).type === "text"
+      ? (only as { text?: unknown }).text
+      : undefined;
+  return typeof text === "string" &&
+    text.trimStart().startsWith("[Request interrupted by user")
     ? "interrupted"
-    : "Claude Code";
+    : undefined;
+};
 
 /**
  * The stored transcript as {@link MessageEntry}s, each with its parts (A6 F10).
@@ -1441,9 +1474,9 @@ const cliMarker = (text: string): string =>
  * {@link assistantParts} and a `user` entry's `tool_result`s through {@link userParts},
  * the two functions {@link narrate} reads live frames with, so a replay is the live
  * conversation's own items. A `user` entry whose content is a string is the words sent —
- * the operator's, under whatever framing the caller trims — and has no parts. One whose
- * content is a list of `text` blocks is the CLI's own note, and carries a `marker`
- * ({@link cliMarker}).
+ * the operator's, under whatever framing the caller trims — and has no parts. One the CLI
+ * wrote itself — an interrupt note, a task notification — carries a `marker`
+ * ({@link cliMarker}), whatever its content's shape.
  *
  * **A finished block gets the `blockId` it streamed under**, when the transcript lets this
  * name it: the CLI writes one entry per content block of a call (the split the stream
@@ -1488,12 +1521,7 @@ const flattenTranscript = (
             )
             .map((part) => part.text)
             .join("\n");
-    const marker =
-      entry.type === "user" &&
-      typeof message.content !== "string" &&
-      text.trim() !== ""
-        ? cliMarker(text)
-        : undefined;
+    const marker = cliMarker(entry);
     return {
       type: entry.type,
       text,

@@ -4872,4 +4872,221 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  /**
+   * Both kinds of `<task-notification>`, read back through the **real** `getSessionMessages`.
+   *
+   * `testdata/claude-code-transcript/task-notifications.cli.jsonl` is in the CLI's on-disk
+   * form: recorded 2026-11-04 by CLI 2.1.310 (`claude-haiku-4-5`) in an importer session
+   * that was stopped twelve seconds into a 60 s foreground `Bash`, then asked for a
+   * background `Bash`. Sanitised: a fixed session id and workspace path, the opening
+   * prompt cut to the operator's own words (the importer's framing is the caller's to
+   * trim), thinking `signature`s read `sig-redacted`, and each entry keeps only the fields
+   * the SDK reads plus `promptSource` and `origin`; parent links skip the entries dropped.
+   *
+   * The killed task's note is a `queued_command` **attachment** the CLI delivered with the
+   * operator's follow-up — the SDK surfaces it as a string `user` entry with
+   * `isQueuedCommand: true`, directly after the follow-up — and the finished background
+   * task's is a string `user` entry with `promptSource: "system"` that opened a turn of the
+   * CLI's own. Both are string content, as an operator's message is; what tells them apart
+   * is the `origin` the SDK keeps on both.
+   */
+  test("a task notification replays as `task`, not as a message the operator sent, and opens no turn of theirs", async () => {
+    const NOTIFIED = "00000000-0000-4000-8000-0000000000f3";
+    const root = await mkdtemp(join(tmpdir(), "bit-notified-"));
+    const previous = process.env["CLAUDE_CONFIG_DIR"];
+    try {
+      const project = join(root, "projects", "-tmp-bit-notified-ws");
+      await mkdir(project, { recursive: true });
+      await writeFile(
+        join(project, `${NOTIFIED}.jsonl`),
+        await readFile(
+          join(
+            import.meta.dir,
+            "testdata",
+            "claude-code-transcript",
+            "task-notifications.cli.jsonl",
+          ),
+          "utf8",
+        ),
+      );
+      process.env["CLAUDE_CONFIG_DIR"] = root;
+      const { sdk } = scriptedSdk();
+      const entries = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            harness.messages(NOTIFIED),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                sdk: {
+                  ...sdk,
+                  sessionMessages: liveClaudeCodeSdk.sessionMessages,
+                },
+                controlTimeout: "2 seconds",
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+      expect(
+        entries
+          .filter((entry) => entry.type === "user")
+          .map((entry) => [
+            entry.marker ?? null,
+            entry.text.slice(0, 24).replace(/\n/g, " "),
+          ]),
+      ).toEqual([
+        [null, "Use your Bash tool once,"],
+        [null, ""],
+        ["interrupted", "[Request interrupted by "],
+        [null, "Now use your Bash tool o"],
+        ["task", "<task-notification> <tas"],
+        [null, ""],
+        ["task", "<task-notification> <tas"],
+      ]);
+      for (const subject of [
+        { _tag: "import", importId: "imp_1" },
+        { _tag: "goal", goalId: "goal_1" },
+      ] as const) {
+        const replayed = projectReplay({
+          entries,
+          subject,
+          harnessSessionId: NOTIFIED,
+          users: "operator",
+          fallbackAt: 0,
+        }).items;
+        expect(
+          replayed.map((item) =>
+            item.kind === "turn.other"
+              ? `${item.headline}: ${/<status>(\w+)<\/status>/.exec(item.body ?? "")?.[1] ?? item.body}`
+              : item.kind === "turn.reply"
+                ? `reply: ${item.body}`
+                : item.kind,
+          ),
+        ).toEqual([
+          "turn.operator",
+          "turn.thinking",
+          "tool.call",
+          "tool.result",
+          "interrupted: [Request interrupted by user for tool use]",
+          // The operator's follow-up keeps its own call and reply: the killed task's note
+          // sits inside its turn, and is no turn of the operator's.
+          "turn.operator",
+          "task: killed",
+          "turn.thinking",
+          "tool.call",
+          "tool.result",
+          "turn.thinking",
+          "reply: started",
+          "task: completed",
+          "turn.thinking",
+          "reply: Background command completed successfully.",
+        ]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The rule is the SDK's markers, not the content's shape (A6 F10 re-review). An
+   * attachment (U13) makes an operator's message a **list** of blocks, which a rule keyed on
+   * "a list is the CLI's" would turn into a harness note; and a `<task-notification>` is a
+   * **string**, which the same rule would hand to the operator. Each entry below is a shape
+   * `getSessionMessages` can return, with the field that decides it.
+   */
+  test("a user entry is the operator's whatever its content's shape, unless the SDK marks it as the CLI's", async () => {
+    const SESSION = "11111111-0000-4000-8000-000000000007";
+    const user = (
+      uuid: string,
+      content: unknown,
+      extra: Record<string, unknown> = {},
+    ): SessionMessage =>
+      ({
+        type: "user",
+        uuid,
+        session_id: SESSION,
+        message: { role: "user", content },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        ...extra,
+      }) as SessionMessage;
+    const notification =
+      "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>";
+    const entries = await withHarness(
+      {
+        transcript: [
+          // An operator's message as a list — words beside an attachment, and words alone.
+          user("a", [
+            { type: "text", text: "What does this screenshot show?" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "AA==" },
+            },
+          ]),
+          user("b", [{ type: "text", text: "Just the words, as a list." }]),
+          // An operator's paste of the CLI's note, beside an attachment: still theirs.
+          user("c", [
+            {
+              type: "text",
+              text: "[Request interrupted by user for tool use]",
+            },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "AA==" },
+            },
+          ]),
+          // An origin a host stamps on keyboard input is not the CLI's.
+          user("d", "typed", { origin: { kind: "human" } }),
+          user("e", notification, {
+            origin: { kind: "task-notification" },
+          }),
+          user("f", notification, {
+            origin: { kind: "task-notification" },
+            isQueuedCommand: true,
+          }),
+          user("g", [
+            {
+              type: "text",
+              text: "[Request interrupted by user for tool use]",
+            },
+          ]),
+          user("h", [{ type: "text", text: "[Request interrupted by user]" }]),
+        ],
+      },
+      (harness) => harness.messages(SESSION),
+    );
+    expect(entries.map((entry) => entry.marker ?? null)).toEqual([
+      null,
+      null,
+      null,
+      null,
+      "task",
+      "task",
+      "interrupted",
+      "interrupted",
+    ]);
+    expect(
+      projectReplay({
+        entries,
+        subject: { _tag: "import", importId: "imp_1" },
+        harnessSessionId: SESSION,
+        users: "operator",
+        fallbackAt: 0,
+      }).items.map((item) => `${item.headline}: ${item.body ?? ""}`),
+    ).toEqual([
+      "You: What does this screenshot show?",
+      "You: Just the words, as a list.",
+      "You: [Request interrupted by user for tool use]",
+      "You: typed",
+      `task: ${notification}`,
+      `task: ${notification}`,
+      "interrupted: [Request interrupted by user for tool use]",
+      "interrupted: [Request interrupted by user]",
+    ]);
+  });
 });

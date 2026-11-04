@@ -357,7 +357,10 @@ export interface MessageEntry {
    * Claude Code stores its own notes in the user's role. After a Stop that cut a tool call
    * the CLI writes `[Request interrupted by user for tool use]` as a `user` entry, and a
    * replay that read every `user` entry as the operator's words drew it as a message the
-   * operator sent. It is `interrupted`. {@link text} still holds the harness's words.
+   * operator sent. It is `interrupted`. A `<task-notification>` — a background task done, or
+   * a foreground `Bash` a Stop killed — is another, and is `task`. Set from the harness's
+   * own markers, never from the content's shape, so an operator's message is never one
+   * whatever form its content takes. {@link text} still holds the harness's words.
    */
   readonly marker?: string;
 }

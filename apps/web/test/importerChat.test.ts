@@ -1170,4 +1170,110 @@ describe("a reloaded write and its record, when the replay or the feed is cut", 
       "turn:1 app.acme.com (op_2) → app.acme.com via op_2 recorded",
     ]);
   });
+
+  test("in the uncut stretch, an asset call whose record is not on screen takes no other operation's", () => {
+    // Nothing is cut, so order pairing is allowed — but only for what carries no id. The
+    // call was sent with op_x and op_x's record is not here; op_y's is, and is unclaimed.
+    // Taking it would put one write's receipt on another's call.
+    const groups = buildImporterChat({
+      history: harness(
+        [
+          replayItem(0, "turn.operator", "record the host"),
+          replayItem(1, "tool.call", "", {
+            headline: "record_imported_asset",
+            toolName: "record_imported_asset",
+            callId: "call_op_x",
+            input: JSON.stringify({
+              url: "https://app.acme.com",
+              value: "app.acme.com (op_x)",
+              operation_id: "op_x",
+            }),
+          }),
+        ],
+        false,
+      ),
+      items: [
+        {
+          ...record("asset.imported", "app.acme.com via op_y"),
+          writeId: "op_y",
+        },
+      ],
+      working: false,
+    });
+    expect(writes(groups)).toEqual([
+      "turn:1 app.acme.com (op_x) → - unresolved",
+    ]);
+    // op_y's receipt is nobody's on this page, and stays on screen as such.
+    expect(groups[0]?.key).toBe("earlier");
+    expect(groups[0]?.rows.map((row) => row.item.headline)).toEqual([
+      "app.acme.com via op_y",
+    ]);
+  });
+
+  test("an entry added twice keeps each call on its own receipt when the replay lost the first", () => {
+    // a.com was added (created), then added again (found): two records under one entry id.
+    // The replay kept only the second call; the feed kept both records.
+    const found = (n: number): LiveItem[] => [
+      replayItem(4 * n, "turn.operator", "add a.com again"),
+      replayItem(4 * n + 1, "tool.call", "", {
+        headline: "add_scope_entry",
+        toolName: "add_scope_entry",
+        callId: "call_again",
+        input: JSON.stringify({ effect: "in", kind: "host", value: "a.com" }),
+      }),
+      replayItem(4 * n + 2, "tool.result", "", {
+        callId: "call_again",
+        outcome: "ok",
+        output: JSON.stringify({
+          entry_id: "ent_a.com",
+          value: "a.com",
+          created: false,
+        }),
+      }),
+    ];
+    const created = {
+      ...receipt("a.com"),
+      headline: "a.com (created)",
+      outcome: "new",
+    };
+    const again = {
+      ...receipt("a.com"),
+      headline: "a.com (found)",
+      body: "already in scope as entry ent_a.com · in · host · a.com · nothing changed",
+      outcome: "known",
+    };
+    const groups = buildImporterChat({
+      history: harness(found(1), true),
+      items: [created, again],
+      working: false,
+    });
+    expect(writes(groups)).toEqual(["turn:1 a.com → a.com (found) recorded"]);
+    // The first add's receipt is the cut call's, and is said as nobody's on this page.
+    expect(groups[0]?.key).toBe("earlier");
+    expect(groups[0]?.rows.map((row) => row.item.headline)).toEqual([
+      "a.com (created)",
+    ]);
+    // Uncut, both calls are on screen and each still takes its own.
+    const whole = buildImporterChat({
+      history: harness(
+        [
+          ...replayedTurn(0, "a.com", true).map((each) =>
+            each.kind === "tool.result"
+              ? { ...each, callId: "call_first" }
+              : each.kind === "tool.call"
+                ? { ...each, callId: "call_first" }
+                : each,
+          ),
+          ...found(1),
+        ],
+        false,
+      ),
+      items: [created, again],
+      working: false,
+    });
+    expect(writes(whole)).toEqual([
+      "turn:1 a.com → a.com (created) recorded",
+      "turn:2 a.com → a.com (found) recorded",
+    ]);
+  });
 });

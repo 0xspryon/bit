@@ -621,6 +621,37 @@ const callWriteId = (
   }
 };
 
+/**
+ * What a write call's result says its record will say — `new` or `known`, in the record's
+ * own `outcome` words — or `undefined` where it does not say.
+ *
+ * Only `add_scope_entry` needs it: its id is the **entry's**, so adding an entry that is
+ * already there writes a second record under the same id, `created: false`
+ * (`scope.entry.added`'s `known`). An asset's id is the operation's, one record each. Read
+ * from capped JSON like {@link callWriteId}, so a cut field reads as "does not say" and the
+ * call takes any record under its id, as it did before; so does a record with no `outcome`.
+ */
+const callWriteOutcome = (
+  call: LiveItem,
+  result: LiveItem | undefined,
+): "new" | "known" | undefined => {
+  if (
+    call.toolName !== "add_scope_entry" ||
+    result === undefined ||
+    result.output === null
+  ) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(result.output);
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const created = (parsed as Record<string, unknown>)["created"];
+    return created === true ? "new" : created === false ? "known" : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 /** A top-level string field of a JSON object's text, or `undefined` for anything else. */
 const stringField = (json: string | null, key: string): string | undefined => {
   if (json === null) return undefined;
@@ -641,7 +672,11 @@ const stringField = (json: string | null, key: string): string | undefined => {
  * **By id first.** A call whose id is known ({@link callWriteId}) takes the record carrying
  * the same `writeId`, and only that one: if that record is not in `items`, the call is
  * unpaired, which is the honest rendering of "its record is not on this page". It never
- * takes the next record in line, which would be another call's.
+ * takes the next record in line, which would be another call's. An entry added twice has
+ * two records under one id — `created`, then `found` — so a call whose result says which
+ * it was ({@link callWriteOutcome}) takes only a record that says the same: with the
+ * oldest call cut from a replay, the next one would otherwise take the `created` receipt
+ * and leave its own to drop into an earlier group.
  *
  * **By order for the rest**, as this function always paired: a round's writes are committed
  * in the order it made them, so the i-th unpaired `add_intent` call belongs with the i-th
@@ -709,9 +744,15 @@ const pairWrites = (
     if (result !== undefined && wroteNothing(result)) return;
     const id = callWriteId(item, result);
     if (id !== undefined) {
-      const record = byId
-        .get(keyOf(wanted, id))
-        ?.find((each) => !taken.has(each.id));
+      const outcome = callWriteOutcome(item, result);
+      const record = byId.get(keyOf(wanted, id))?.find(
+        (each) =>
+          !taken.has(each.id) &&
+          // A record that does not say either way is not ruled out by it.
+          (outcome === undefined ||
+            each.outcome === null ||
+            each.outcome === outcome),
+      );
       if (record !== undefined) {
         paired.set(item.id, record);
         taken.add(record.id);
