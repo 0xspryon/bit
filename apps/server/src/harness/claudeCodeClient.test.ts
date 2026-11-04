@@ -5001,7 +5001,12 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
    * null, `logicalParentUuid` the turn's reply), the summary as a string `user` entry with
    * `isCompactSummary` and `isVisibleInTranscriptOnly` and no `origin`, then an operator
    * follow-up and its reply. The summary's text is cut to a few lines and the boundary's
-   * `compactMetadata` to its counts; the trigger is `auto`, as it is in a session bit drives.
+   * `compactMetadata` to its counts. The trigger says `auto`, as it would in a session bit
+   * drives, but the layout is a manual `/compact`'s: a real auto compaction (2.1.308) also
+   * puts `session_context`, `date` and `instructions` attachments between the boundary and
+   * the summary, and the summary carries `turnOrigin`, `summarizedTurnPromptUuids` and
+   * `turnPosition`. The SDK drops the attachments and maps none of those fields to `origin`,
+   * so a real auto-compacted transcript reads back the same as this one.
    *
    * SDK 0.3.310 reads the chain back only to the boundary, so the turn before it is not in
    * the answer at all: the replay starts at the summary. The summary is the CLI's prose, not
