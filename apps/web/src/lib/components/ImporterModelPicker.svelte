@@ -109,7 +109,7 @@
    * cannot be gone while the dialog is open.
    *
    * A started session's dialog needs none of this: its open flag is this component's own
-   * ({@link sessionOpen}) and goes with it.
+   * ({@link sessionOpen}), goes with it, and closes when the session on screen changes.
    */
   const closesWithBranch: Attachment = () => () => {
     app.importPickerOpen = false;
@@ -134,7 +134,21 @@
         ? app.harnesses.find((each) => each.instanceId === pinned.instanceId)
         : app.harnesses.find((each) => each.displayName === pinned.harness),
   );
-  let sessionOpen = $state(false);
+  /** The session on screen, as a value: a new `pinned` for the same session is no change. */
+  let sessionKey = $derived(pinned?.sessionId);
+  /**
+   * Whether the started session's dialog is open: set by the chip and the dialog's buttons,
+   * and **back to closed whenever the session on screen changes**, however it changes. This
+   * component outlives the session — browser Back, a session opened from the crumb bar —
+   * and a dialog left open over the next session would be staging the last one's pick under
+   * the next one's chip, its "Use for this session" switching a session it was not opened
+   * for. The staged pick goes with it: {@link openSession} stages afresh from the session
+   * the dialog is opened for, so nothing staged for the last one is ever shown again.
+   */
+  let sessionOpen = $derived.by(() => {
+    void sessionKey;
+    return false;
+  });
   /**
    * Which opening of the dialog is on screen, counted. A switch's answer closes the dialog
    * only if it is still the opening that sent it: an operator who cancelled while it was
@@ -174,6 +188,8 @@
   );
   /** This session's switch with the server, if any: another session's is not this chip's. */
   let switching = $derived(app.importer.switchingOf(pinned?.sessionId));
+  /** This session's refused switch, not yet dismissed: another session's waits for it. */
+  let failure = $derived(app.importer.switchFailureOf(pinned?.sessionId));
 
   function openSession(): void {
     if (pinned === null || sessionInstance === undefined) return;
@@ -379,15 +395,16 @@
   </span>
 {/if}
 
-{#if app.importer.switchFailure !== undefined}
+{#if pinned !== null && failure !== undefined}
   <!--
-    A refused switch, over the picker while it is still open (it stays up while the call is
-    out), so closing it puts the operator back on the choice the server refused.
+    A refused switch of the session on screen, over its picker while that is still open (it
+    stays up while the call is out), so closing it puts the operator back on the choice the
+    server refused. Another session's refusal is not drawn here: it waits for its session.
   -->
   <ErrorDialog
-    {...app.importer.switchFailure}
+    {...failure}
     opener={sessionOpen ? confirmButton : trigger}
-    ondismiss={() => app.importer.dismissSwitchFailure()}
+    ondismiss={() => app.importer.dismissSwitchFailure(pinned.sessionId)}
   />
 {/if}
 

@@ -42,8 +42,22 @@
  * dialog opened by pointer there finds `<body>`. A caller that knows its trigger passes it.
  */
 
-const FOCUSABLE =
-  'button:not(:disabled), [href], input:not(:disabled), select, textarea, [tabindex]:not([tabindex="-1"])';
+/**
+ * The controls Tab stops on. `tabindex="-1"` takes any of them out of the order — a row of
+ * a roving-tabindex list (`HarnessChoice`'s models, D7's agents) is a button that only the
+ * arrows reach — so a trap that counted one as its "last" would wait for focus on a control
+ * Tab never lands on, and let it out past the one it does.
+ */
+const FOCUSABLE = [
+  "button:not(:disabled)",
+  "[href]",
+  "input:not(:disabled)",
+  "select",
+  "textarea",
+  "[tabindex]",
+]
+  .map((each) => `${each}:not([tabindex="-1"])`)
+  .join(", ");
 
 /**
  * Moves focus into `panel` and returns what puts it back. Call it from the `$effect` that

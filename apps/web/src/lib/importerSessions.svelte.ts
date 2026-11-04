@@ -194,6 +194,12 @@ export interface SwitchNotice {
   readonly onceIdle?: string;
 }
 
+/** A model switch of one session that the server refused, until the operator dismisses it. */
+export interface SwitchFailure {
+  readonly sessionId: string;
+  readonly notice: ErrorNotice;
+}
+
 /** What the server answered a Stop with, as the page needs it. */
 export type ImporterStopAnswer =
   | { readonly _tag: "stopped"; readonly stopped: ConversationStopped }
@@ -362,8 +368,15 @@ export class ImporterSessions {
    * ends, rather than going on saying the step "is on now" finishes on the old model.
    */
   switchNotice = $state<SwitchNotice | undefined>(undefined);
-  /** A switch the server refused, for the error dialog; `undefined` when there is none. */
-  switchFailure = $state<ErrorNotice | undefined>(undefined);
+  /**
+   * The switches the server refused and the operator has not yet dismissed, for the error
+   * dialog: **one per session at most, and shown only over its own session.** A refusal
+   * answers a pick made in one session's picker; drawn over whatever is on screen when it
+   * lands — another session's picker, after browser Back — it reads as a refusal of *that*
+   * session's pick. So it waits with its session, and opens when that session is on screen
+   * again. Read one session's with {@link switchFailureOf}.
+   */
+  switchFailures = $state.raw<readonly SwitchFailure[]>([]);
   /**
    * True while a message sent behind an in-flight switch is with the server (F4's review):
    * the server delivers it once the switch has answered, which can take up to ~90 s when
@@ -449,7 +462,7 @@ export class ImporterSessions {
     this.stopping = false;
     this.switches = [];
     this.switchNotice = undefined;
-    this.switchFailure = undefined;
+    this.switchFailures = [];
     this.waitingForSwitch = false;
     this.#switchedTo.clear();
     this.stopFailure = undefined;
@@ -603,7 +616,7 @@ export class ImporterSessions {
     this.stopping = false;
     this.switches = [];
     this.switchNotice = undefined;
-    this.switchFailure = undefined;
+    this.switchFailures = [];
     this.waitingForSwitch = false;
     this.#switchedTo.clear();
     this.stopFailure = undefined;
@@ -1132,10 +1145,17 @@ export class ImporterSessions {
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return false;
     if (answer._tag === "refused") {
-      this.switchFailure = {
-        title: "Model not switched",
-        sentence: sentenceCase(answer.detail),
-      };
+      // Kept with the session it refused, which is not necessarily the one on screen now.
+      this.switchFailures = [
+        ...this.switchFailures.filter((each) => each.sessionId !== session.id),
+        {
+          sessionId: session.id,
+          notice: {
+            title: "Model not switched",
+            sentence: sentenceCase(answer.detail),
+          },
+        },
+      ];
       // The record may have moved under this tab — another switch was in flight, or one the
       // harness answered uncertainly — so the chip is the server's row again, not this tab's.
       server.reread();
@@ -1177,9 +1197,17 @@ export class ImporterSessions {
     return true;
   }
 
-  /** Closes the error dialog a refused switch opened. */
-  dismissSwitchFailure(): void {
-    this.switchFailure = undefined;
+  /** A refused switch of one session, not yet dismissed, if there is one. */
+  switchFailureOf(sessionId: string | undefined): ErrorNotice | undefined {
+    return this.switchFailures.find((each) => each.sessionId === sessionId)
+      ?.notice;
+  }
+
+  /** Closes the error dialog a refused switch of `sessionId` opened. */
+  dismissSwitchFailure(sessionId: string): void {
+    this.switchFailures = this.switchFailures.filter(
+      (each) => each.sessionId !== sessionId,
+    );
   }
 
   /** Closes the error dialog a refused Stop opened. */

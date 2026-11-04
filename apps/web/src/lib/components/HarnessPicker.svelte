@@ -65,7 +65,9 @@
     if (!app.pickerOpen) return;
     if (event.key !== "Tab" || panel === null) return;
     const focusable = panel.querySelectorAll<HTMLElement>(
-      'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      // Not a `tabindex="-1"` control: the model rows are a roving tabindex, so all
+      // but one are buttons Tab never stops on, and the last of them is not the last stop.
+      'button:not(:disabled):not([tabindex="-1"]), input:not(:disabled):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])',
     );
     const first = focusable[0];
     const last = focusable[focusable.length - 1];

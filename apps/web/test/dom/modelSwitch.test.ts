@@ -22,6 +22,7 @@ import {
 import { App, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import { mockHarnesses } from "../../src/lib/mockImporter";
+import { applyPlace, parsePath } from "../../src/lib/place";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import {
@@ -708,6 +709,80 @@ describe("U3 review: the switch confirmation goes stale with what it described",
     expect(page()).not.toContain("is on now");
     expect(page()).toContain(ENDED);
   });
+
+  /*
+   * The turn's end reaches this tab three ways, and the test above has two of them at
+   * once — the watch, then the list read it asks for — so it passes with either call gone.
+   * Each of these has one alone: the watch is held on a running import throughout.
+   */
+  const midTurn = async (): Promise<{
+    app: App;
+    fake: FakeServer;
+    countdown: FakeCountdown;
+  }> => {
+    const opened = await openOn([
+      importerSessionView({ sessionId: "ses_old", model: SOL, running: true }),
+    ]);
+    opened.fake.onScopeImport = (_baseUrl, targetId, importId) =>
+      ok(scopeImportView({ targetId, importId, status: "running" }));
+    await switchTo(FIVE);
+    expect(page()).toContain(MID);
+    return opened;
+  };
+
+  test("mid-turn it is put in the past when only the turn watch says the turn ended", async () => {
+    const { app, fake, countdown } = await midTurn();
+    // The watch reads the import as finished; the list read it asks for has not answered
+    // yet, so the watch is the only one to have said so.
+    fake.onScopeImport = (_baseUrl, targetId, importId) =>
+      ok(scopeImportView({ targetId, importId, status: "finished" }));
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: [importerSessionView({ sessionId: "ses_old", model: FIVE })],
+      });
+    const reads = fake.countOf("importerSessions");
+    const release = fake.hold("importerSessions");
+    countdown.fire();
+    await settle();
+
+    expect(fake.countOf("importerSessions")).toBe(reads + 1);
+    expect(app.importer.current?.working).toBe(false);
+    expect(page()).not.toContain("is on now");
+    expect(page()).toContain(ENDED);
+    release();
+    await settle();
+  });
+
+  test("mid-turn it is put in the past when only a reading of the list says the turn ended", async () => {
+    const { app, fake } = await midTurn();
+    // The turn ended — from another tab's Stop, say — and the next reading of the list
+    // is the first this tab hears of it.
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: [importerSessionView({ sessionId: "ses_old", model: FIVE })],
+      });
+    await app.loadImporterSessions("acme-corp");
+    await settle();
+
+    expect(fake.countOf("stopImporterTurn")).toBe(0);
+    expect(app.importer.current?.working).toBe(false);
+    expect(page()).not.toContain("is on now");
+    expect(page()).toContain(ENDED);
+  });
+
+  test("mid-turn it is put in the past when only a Stop says the turn ended", async () => {
+    const { app, fake } = await midTurn();
+    const reads = fake.countOf("importerSessions");
+    // The server answers the Stop with the turn over; the list still says it is running.
+    await app.importer.stop();
+    await settle();
+
+    expect(fake.countOf("stopImporterTurn")).toBe(1);
+    expect(fake.countOf("importerSessions")).toBe(reads);
+    expect(app.importer.current?.working).toBe(false);
+    expect(page()).not.toContain("is on now");
+    expect(page()).toContain(ENDED);
+  });
 });
 
 describe("U3 review: a switch's answer and the dialog it was sent from", () => {
@@ -822,6 +897,115 @@ describe("U3 review: a switch in flight is its own session's", () => {
     expect(
       app.importer.sessions.find((each) => each.id === "ses_other")?.model,
     ).toBe("openai/gpt-5.6-terra");
+  });
+});
+
+describe("U3 review 2: a refusal and a picker belong to their own session", () => {
+  const TWO = [
+    importerSessionView({ sessionId: "ses_old", model: SOL }),
+    importerSessionView({
+      sessionId: "ses_other",
+      importId: "imp_2",
+      model: SOL,
+      openedAt: 1_700_000_100_000,
+    }),
+  ];
+  const REFUSED =
+    "Another model switch of import imp_1 has not answered yet. Switches are not queued: wait for it to finish, then pick again.";
+
+  /** What browser Back to a session's chat applies: the place its URL names. */
+  const backTo = async (app: App, sessionId: string): Promise<void> => {
+    await applyPlace(app, parsePath(`/t/acme-corp/assets/chat/${sessionId}`));
+    await settle();
+  };
+
+  test("a refusal of one session's switch does not open over another session's picker, and waits for its own", async () => {
+    const { app, fake } = await openOn(TWO);
+    fake.onSwitchImporterModel = () =>
+      refused(
+        new ConversationModelRefused({
+          reason: "switch_in_flight",
+          detail: REFUSED.replace(/^A/, "a"),
+        }),
+      );
+    const release = fake.hold("switchImporterModel");
+    await openPicker();
+    click(inPicker(FIVE));
+    await settle();
+    click(inPicker("Use for this session"));
+    await settle();
+    press("Escape");
+    await settle();
+
+    // The operator moves on to the other session and opens its picker; the first switch's
+    // refusal lands meanwhile.
+    app.importer.open("ses_other");
+    await settle();
+    await openPicker();
+    release();
+    await settle();
+    await settle();
+
+    expect(alert()).toBeNull();
+    expect(picker()).not.toBeNull();
+    expect(layers()).toEqual(["Choose a harness and model"]);
+    expect(page()).not.toContain("Model not switched");
+
+    press("Escape");
+    await settle();
+    expect(picker()).toBeNull();
+    expect(alert()).toBeNull();
+
+    // Back on the session it refused, the refusal is there, with the server's sentence.
+    app.importer.open("ses_old");
+    await settle();
+    const shown = alert();
+    expect(said(shown)).toContain("Model not switched");
+    expect(said(shown?.querySelector(".sentence"))).toBe(REFUSED);
+    expect(app.importer.current?.model).toBe(SOL);
+
+    // Dismissed, it is gone for good: not on the other session, not back here.
+    press("Escape");
+    await settle();
+    expect(alert()).toBeNull();
+    app.importer.open("ses_other");
+    await settle();
+    app.importer.open("ses_old");
+    await settle();
+    expect(alert()).toBeNull();
+  });
+
+  test("a picker left open through browser Back closes, and opens on the session it is then over", async () => {
+    const { app, fake } = await openOn(TWO);
+    await openPicker();
+    click(inPicker(FIVE));
+    await settle();
+    expect(inPicker(FIVE).classList.contains("selected")).toBe(true);
+
+    await backTo(app, "ses_other");
+    expect(app.importer.current?.id).toBe("ses_other");
+    expect(picker()).toBeNull();
+    expect(sessionChip().getAttribute("aria-expanded")).toBe("false");
+
+    // Opened again, it is the other session's, staged from that session and not the pick
+    // made over the first; confirming switches the session on screen.
+    await openPicker();
+    expect(inPicker(SOL).classList.contains("selected")).toBe(true);
+    expect(inPicker(FIVE).classList.contains("selected")).toBe(false);
+    click(inPicker("openai/gpt-5.6-terra"));
+    await settle();
+    click(inPicker("Use for this session"));
+    await settle();
+    await settle();
+    const switches = fake.calls.filter(
+      (each) => each.method === "switchImporterModel",
+    );
+    expect(switches.map((each) => each.args[2])).toEqual(["imp_2"]);
+
+    // And back on the first, its picker is closed too: nothing reopens it unasked.
+    await backTo(app, "ses_old");
+    expect(app.importer.current?.id).toBe("ses_old");
+    expect(picker()).toBeNull();
   });
 });
 

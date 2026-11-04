@@ -14,7 +14,7 @@ import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import { FakeServer } from "../fakeServer";
-import { click, mountInto, settle, type Mounted } from "./dom";
+import { click, mountInto, press, settle, type Mounted } from "./dom";
 
 let mounted: Mounted[] = [];
 afterEach(() => {
@@ -102,5 +102,68 @@ describe("the importer's picker", () => {
     await settle();
 
     expect(columns(dialog())).toEqual([["rail"], ["models", "options"]]);
+  });
+});
+
+/*
+ * The model list is a roving tabindex: every row but one is a `tabindex="-1"` button. A
+ * trap that counted those took the last row for its last stop, so with a picked model that
+ * has no Reasoning column and is not last in the list, Tab from its row — the real last
+ * stop — went past the trap: behind the scrim, or onto the composer under the popover.
+ * happy-dom does not move focus on Tab, so what is pinned is the trap's own move.
+ */
+describe("Tab from a picked model with no reasoning options wraps inside the picker", () => {
+  const PICKED = "openai/gpt-5.5";
+
+  /** The picked row, after picking it, with focus on it as the arrows would leave it. */
+  const onPickedRow = async (): Promise<HTMLButtonElement> => {
+    const row = [
+      ...dialog().querySelectorAll<HTMLButtonElement>(".model-row"),
+    ].find((each) => each.textContent.includes(PICKED));
+    if (row === undefined) throw new Error(`no ${PICKED} row`);
+    click(row);
+    await settle();
+    expect(dialog().querySelectorAll(".option-row")).toHaveLength(0);
+    // Not the last row: the rows after it are the ones Tab never reaches.
+    const rows = [...dialog().querySelectorAll(".model-row")];
+    expect(rows.indexOf(row)).toBeLessThan(rows.length - 1);
+    row.focus();
+    return row;
+  };
+
+  /** The first and last controls Tab stops on, in the panel's order. */
+  const stops = (): HTMLElement[] =>
+    [
+      ...dialog().querySelectorAll<HTMLElement>(
+        "button:not(:disabled), input:not(:disabled), [tabindex]",
+      ),
+    ].filter((each) => each.tabIndex >= 0);
+
+  const wrapsFrom = async (row: HTMLButtonElement): Promise<void> => {
+    const order = stops();
+    expect(order.at(-1)?.outerHTML).toBe(row.outerHTML);
+    const forward = press("Tab");
+    expect(forward.defaultPrevented).toBe(true);
+    expect(document.activeElement === order[0]).toBe(true);
+    const back = press("Tab", { shiftKey: true });
+    expect(back.defaultPrevented).toBe(true);
+    expect(document.activeElement === row).toBe(true);
+  };
+
+  test("in the new-session dialog", async () => {
+    await show("importer-first");
+    const chip = document.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="dialog"][aria-label^="Harness and model"]',
+    );
+    if (chip === null) throw new Error("no model chip");
+    click(chip);
+    await settle();
+    await wrapsFrom(await onPickedRow());
+  });
+
+  test("in the run composer's popover", async () => {
+    const app = await show("run-picker");
+    await wrapsFrom(await onPickedRow());
+    expect(app.pickerOpen).toBe(true);
   });
 });
