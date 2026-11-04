@@ -184,6 +184,7 @@ const scriptedSdk = (script: Script = {}) => {
           seen.interrupts += 1;
           return undefined;
         },
+        stopTask: async () => undefined,
         // The window this account gets for this model, which is the only place a Claude
         // Code limit can come from: it is session-time, not catalogue-time. See
         // `HarnessQuery.getContextUsage`.
@@ -1520,6 +1521,8 @@ const turnDrivenSdk = () => {
     contextReads: 0,
     closes: 0,
     interrupts: 0,
+    /** The task ids `stopTask` was called with, in order. */
+    stoppedTasks: [] as string[],
   };
   /**
    * How the session answers a model switch, changeable mid-test so a retry can succeed.
@@ -1540,12 +1543,17 @@ const turnDrivenSdk = () => {
     hangOn: string | undefined;
     /** Rejects `interrupt()`, as a CLI that will not acknowledge one does. */
     refuseInterrupt: boolean;
+    /** Acknowledges `stopTask` and leaves the task running, for a task that will not stop. */
+    ignoreStopTask: boolean;
   } = {
     refuse: undefined,
     hang: undefined,
     hangOn: undefined,
     refuseInterrupt: false,
+    ignoreStopTask: false,
   };
+  /** The tasks started and not yet over, by `task_id`, with their `task_type`. */
+  const openTasks = new Map<string, string>();
   const hanging = new Set<(cause: Error) => void>();
   const answer = async (
     request: "setModel" | "applyFlagSettings",
@@ -1604,7 +1612,17 @@ const turnDrivenSdk = () => {
           if (controls.refuseInterrupt) {
             throw new Error("the CLI did not acknowledge the interrupt");
           }
+          // Measured on 2.1.310: an interrupt stops every subagent, and no shell.
+          for (const [taskId, type] of openTasks) {
+            if (type === "local_agent") endTask(taskId, "stopped");
+          }
           return undefined;
+        },
+        stopTask: async (taskId) => {
+          seen.stoppedTasks.push(taskId);
+          if (!controls.ignoreStopTask && openTasks.has(taskId)) {
+            endTask(taskId, "stopped");
+          }
         },
         // The window this account gets for this model, which is the only place a Claude
         // Code limit can come from: it is session-time, not catalogue-time. See
@@ -1688,6 +1706,43 @@ const turnDrivenSdk = () => {
     } as unknown as SDKMessage);
     push(assistant(sessionId));
   };
+  /**
+   * Starts a task in the background, as 2.1.310 does for a `run_in_background` `Agent`
+   * (`local_agent`) or Bash (`local_bash`) call: `system/task_started`, and no turn.
+   */
+  const startTask = (
+    taskId: string,
+    type: "local_agent" | "local_bash",
+  ): void => {
+    openTasks.set(taskId, type);
+    push({
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      task_type: type,
+      description: `background ${type}`,
+      is_backgrounded: true,
+      session_id: sessionId,
+      uuid: crypto.randomUUID(),
+    } as unknown as SDKMessage);
+  };
+  /** Ends a task with its `system/task_notification`, which is all 2.1.310 says of it. */
+  const endTask = (
+    taskId: string,
+    status: "completed" | "failed" | "stopped",
+  ): void => {
+    openTasks.delete(taskId);
+    push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: taskId,
+      status,
+      output_file: `/tmp/${taskId}.out`,
+      summary: `task ${status}`,
+      session_id: sessionId,
+      uuid: crypto.randomUUID(),
+    } as unknown as SDKMessage);
+  };
   /** Ends the turn nobody sent, with a `result` that names no message, as 2.1.310's does. */
   const endUnrequestedTurn = (): void => {
     push(result(sessionId, "success"));
@@ -1770,6 +1825,8 @@ const turnDrivenSdk = () => {
     startUnrequestedTurn,
     endUnrequestedTurn,
     emitSubagentFrames,
+    startTask,
+    endTask,
     failStream,
     endStream,
     pulled,
@@ -2460,6 +2517,151 @@ describe("stopping a conversation's turn (A6 F5)", () => {
     expect(outcome.outcome).toBe("succeeded");
   });
 
+  test("a Stop with only a background agent running interrupts it, says so, and does not mark the next turn interrupted", async () => {
+    /*
+     * A6 F5's fifth review, seen live: after the parent turn's `result` a background
+     * `Agent` went on to run `sleep 30 && curl`, Stop answered "nothing was running", and
+     * the curl landed. Measured on 2.1.310: `interrupt()` stops the agent
+     * (`task_notification status=stopped`) and no `result` follows.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.startTask("a1", "local_agent");
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.emitSubagentFrames();
+        yield* Effect.sleep("40 millis");
+        const before = yield* harness.sessionStatus(TALK);
+        const stopped = yield* harness.interruptSession(TALK);
+        const after = yield* harness.sessionStatus(TALK);
+        yield* steer(harness, "gg");
+        yield* Effect.promise(() => driver.pulled(2));
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        const next = yield* harness.sessionStatus(TALK);
+        return {
+          before: [before.activity, before.background],
+          stopped,
+          after: [after.activity, after.background],
+          next: [next.activity, next.outcome],
+          interrupts: driver.seen.interrupts,
+          // A subagent is not asked again: `stopTask` would make the CLI open a turn.
+          stoppedTasks: driver.seen.stoppedTasks,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      before: ["idle", true],
+      stopped: "background",
+      after: ["idle", false],
+      next: ["idle", "succeeded"],
+      interrupts: 1,
+      stoppedTasks: [],
+    });
+  });
+
+  test("a Stop with only a background shell running stops it by its task id, which an interrupt does not reach", async () => {
+    // Measured on 2.1.310: `interrupt()` leaves a `run_in_background` Bash running to the
+    // end; `stopTask` stops it, and opens no turn.
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.startTask("b1", "local_bash");
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        const stopped = yield* harness.interruptSession(TALK);
+        const after = yield* harness.sessionStatus(TALK);
+        return {
+          stopped,
+          background: after.background,
+          outcome: after.outcome,
+          stoppedTasks: driver.seen.stoppedTasks,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      stopped: "background",
+      background: false,
+      // The last turn's own answer: stopping background work ends no turn.
+      outcome: "succeeded",
+      stoppedTasks: ["b1"],
+    });
+  });
+
+  test("a background task that will not stop is still reported running after the Stop", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.startTask("b2", "local_bash");
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.controls.ignoreStopTask = true;
+        const stopped = yield* harness.interruptSession(TALK);
+        const after = yield* harness.sessionStatus(TALK);
+        return { stopped, background: after.background };
+      }),
+    );
+    expect(outcome).toEqual({ stopped: "background", background: true });
+  }, 10_000);
+
+  test("a background task is over at its notification, completed or stopped, and Stop then finds nothing", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.startTask("a2", "local_agent");
+        driver.startTask("b3", "local_bash");
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        yield* Effect.sleep("40 millis");
+        const both = yield* harness.sessionStatus(TALK);
+        driver.endTask("a2", "completed");
+        yield* Effect.sleep("40 millis");
+        const one = yield* harness.sessionStatus(TALK);
+        driver.endTask("b3", "stopped");
+        yield* Effect.sleep("40 millis");
+        const none = yield* harness.sessionStatus(TALK);
+        const stopped = yield* harness.interruptSession(TALK);
+        return {
+          background: [both.background, one.background, none.background],
+          stopped,
+          interrupts: driver.seen.interrupts,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      background: [true, true, false],
+      stopped: false,
+      interrupts: 0,
+    });
+  });
+
+  test("a Stop during a turn with a background shell running stops both, and only the turn is interrupted", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.startTask("b4", "local_bash");
+        yield* Effect.sleep("40 millis");
+        const stopped = yield* harness.interruptSession(TALK);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        const after = yield* harness.sessionStatus(TALK);
+        return {
+          stopped,
+          outcome: after.outcome,
+          background: after.background,
+          stoppedTasks: driver.seen.stoppedTasks,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      stopped: true,
+      outcome: "interrupted",
+      background: false,
+      stoppedTasks: ["b4"],
+    });
+  });
+
   test("a background subagent's frames after a stopped foreground turn do not reopen it", async () => {
     const outcome = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
@@ -3090,6 +3292,7 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
         const query: HarnessQuery = {
           setMcpServers: async () => ({}),
           interrupt: async () => undefined,
+          stopTask: async () => undefined,
           getContextUsage: async () => ({}),
           setModel: async () => undefined,
           applyFlagSettings: async () => undefined,
@@ -3241,6 +3444,7 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
         const query: HarnessQuery = {
           setMcpServers: async () => ({}),
           interrupt: async () => undefined,
+          stopTask: async () => undefined,
           getContextUsage: async () => ({}),
           setModel: async () => undefined,
           applyFlagSettings: async () => undefined,
@@ -3362,6 +3566,109 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
       });
     } finally {
       // A tool this test failed to see stopped must not outlive it.
+      if (tool !== undefined && processIdentity(tool) !== undefined) {
+        try {
+          process.kill(tool, "SIGKILL");
+        } catch {
+          // Gone already.
+        }
+      }
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("an end that arrives while a crashed CLI's tools are being stopped waits for that stop, and no second one runs", async () => {
+    /*
+     * `stopCli` lets one stop of a CLI run at a time, and a second caller waits for it
+     * (A6 F5's fifth review: nothing failed when that wait was removed). The crash starts
+     * a stop at exit; the tool traps `SIGTERM`, writing a line each time one arrives, so it
+     * outlasts the `SIGTERM` leg and every stop that reaches it is counted. An end that
+     * returned without waiting would return with the tool still running; one that ran a
+     * stop of its own would signal it twice.
+     */
+    const scratch = await mkdtemp(join(tmpdir(), "bit-cli-one-stop-"));
+    const pidFile = join(scratch, "tool.pid");
+    const termFile = join(scratch, "terms");
+    const { sdk, seen } = spawningSdk(
+      `setsid sh -c 'trap "echo term >> ${termFile}" TERM; while :; do sleep 0.05; done' & echo $! > '${pidFile}'; sleep 0.4; kill -9 $$`,
+    );
+    const terms = async (): Promise<number> =>
+      (await readFile(termFile, "utf8").catch(() => ""))
+        .split("\n")
+        .filter((line) => line === "term").length;
+    let tool: number | undefined;
+    try {
+      const outcome = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              const ref = yield* harness.createSession({
+                title: "conversation",
+                model: "claude-sonnet-5",
+                directory: scratch,
+                sessionId: TALK,
+                multiTurn: true,
+              });
+              yield* harness.prompt(TALK, "go");
+              const before = yield* Effect.promise(async () => {
+                for (
+                  let tries = 0;
+                  tries < 200 && tool === undefined;
+                  tries += 1
+                ) {
+                  const text = await readFile(pidFile, "utf8").catch(() => "");
+                  if (text.trim() !== "") tool = Number(text.trim());
+                  else await new Promise((resolve) => setTimeout(resolve, 10));
+                }
+                const leader = seen.leader;
+                if (tool === undefined || leader === undefined) {
+                  throw new Error("the stand-in CLI never started its tool");
+                }
+                // Past the crash, and into the exit-time stop's `SIGTERM` leg.
+                for (let tries = 0; tries < 300; tries += 1) {
+                  if (
+                    processIdentity(leader) === undefined &&
+                    (await terms()) > 0
+                  ) {
+                    break;
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, 5));
+                }
+                return {
+                  leader: processIdentity(leader) !== undefined,
+                  tool: processIdentity(tool) !== undefined,
+                  terms: await terms(),
+                };
+              });
+              yield* harness.endSession(ref);
+              const toolAfter =
+                tool !== undefined && processIdentity(tool) !== undefined;
+              return {
+                before,
+                toolAfter,
+                terms: yield* Effect.promise(terms),
+              };
+            }),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                sdk,
+                controlTimeout: "2 seconds",
+                cliStopBounds: { terminateGrace: 600, killGrace: 500, poll: 5 },
+                cliTreeRefresh: 50,
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+      expect(outcome).toEqual({
+        // The CLI had crashed, its stop had signalled the tool once, and the tool was up.
+        before: { leader: false, tool: true, terms: 1 },
+        toolAfter: false,
+        terms: 1,
+      });
+    } finally {
       if (tool !== undefined && processIdentity(tool) !== undefined) {
         try {
           process.kill(tool, "SIGKILL");

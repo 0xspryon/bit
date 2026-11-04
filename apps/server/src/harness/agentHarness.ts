@@ -180,6 +180,16 @@ export interface SessionStatus {
   readonly outcome?: TerminalOutcome | undefined;
   readonly cost?: number | undefined;
   readonly tokens?: Record<string, unknown> | undefined;
+  /**
+   * Whether work the agent started in the background — a background subagent or shell,
+   * which a turn's end does not wait for — is still running (A6 F5's fifth review).
+   *
+   * **Beside {@link activity}, not part of it**: a turn is what `waitForIdle` and a run's
+   * settlement wait for, and a background task can outlive every turn, so folding it in
+   * would leave a conversation never idle. A screen that offers Stop reads both. Absent
+   * from a harness that does not report background work (OpenCode).
+   */
+  readonly background?: boolean | undefined;
 }
 
 /**
@@ -1026,6 +1036,10 @@ export class AgentHarness extends Context.Service<
      *
      * Reports whether the harness says it interrupted something: `false` for a session
      * that was already idle, which is not a failure and is worth being able to tell apart.
+     * `"background"` when no turn was running but background work was ({@link
+     * SessionStatus.background}), and that is what was stopped: no turn ends for it, so
+     * nothing is marked interrupted, and whether all of it stopped is `sessionStatus`'s to
+     * say afterwards. Only Claude Code answers it.
      * A failure means the harness did not acknowledge the interrupt, so whether the turn
      * stopped is uncertain. For a worker attempt or a planner round, carrying work on after
      * an interruption means a new attempt identity (DECISIONS.md §15), and both supervisors
@@ -1064,7 +1078,7 @@ export class AgentHarness extends Context.Service<
      */
     readonly interruptSession: (
       sessionId: string,
-    ) => Effect.Effect<boolean, HarnessFailure>;
+    ) => Effect.Effect<boolean | "background", HarnessFailure>;
     /**
      * What a `queued` steer still waiting behind a turn does when that turn is interrupted,
      * as measured above: `runs` — the harness runs it at once, as a turn of its own (Claude

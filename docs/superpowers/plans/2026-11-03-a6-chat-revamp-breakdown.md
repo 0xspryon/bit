@@ -174,7 +174,9 @@ away; reasoning collapses to one truncated line (markdown); turn footer
 conversation is running (`sessionStatus` / the live stream), not only while a message the
 operator sent is unanswered — today the web decides from accepted messages
 (`importerSessions.svelte.ts:~192`), so a turn the CLI starts itself (a background task's
-notification turn) cannot be stopped from the browser (F5 R4 review).
+notification turn) cannot be stopped from the browser (F5 R4 review). Background work counts too:
+`sessionStatus.background` is true while a background subagent or shell the agent started is
+still running, outside any turn, and a Stop then answers `background_stopped` (F5 R5 review).
 
 **U7 — D7 agent chip (S), F1 → U7.** Chip and list from the registry ("only agent", what
 it can write); locked once the conversation has started. Today the chip is hardcoded text "Importer"

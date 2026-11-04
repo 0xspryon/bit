@@ -49,6 +49,15 @@ export const turnStopped = <Meta>(input: {
         working: found.working,
         detail: interruptedDetail(found, what),
       };
+    case "background":
+      return {
+        conversationId,
+        outcome: "background_stopped",
+        working: found.working,
+        detail: found.working
+          ? `No turn was running in ${what}'s session, but work it had started in the background was. It was told to stop, and some of it had not stopped by the time this answered, so it may still be running; stop again to ask once more.`
+          : `No turn was running in ${what}'s session, but work it had started in the background was, and that is stopped now. Everything it wrote is kept, and your next message carries the conversation on in the same session.`,
+      };
   }
 };
 

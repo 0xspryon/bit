@@ -366,6 +366,9 @@ const switchFoundNoSession = (failure: HarnessFailure): boolean =>
  *   had been delivered behind the stopped turn — sent while the conversation was busy, and
  *   the conversation not idle since — which is the message a harness then either runs at
  *   once or holds (`AgentHarness.queuedOnInterrupt`).
+ * - `background` — no turn was running, but work the agent started in the background was,
+ *   and the harness was asked to stop it (`AgentHarness.interruptSession`). `working` is
+ *   whether the harness still reports some of it running afterwards.
  */
 export type LiveInterrupt<Meta> =
   | { readonly _tag: "not_live" }
@@ -375,6 +378,11 @@ export type LiveInterrupt<Meta> =
       readonly entry: LiveAgentSession<Meta>;
       readonly working: boolean;
       readonly followUp: boolean;
+    }
+  | {
+      readonly _tag: "background";
+      readonly entry: LiveAgentSession<Meta>;
+      readonly working: boolean;
     };
 
 /**
@@ -1125,6 +1133,23 @@ export const makeLiveAgentSessions = <Meta>(
           return yield* Effect.fail(asked.failure);
         }
         if (!asked.success) return { _tag: "idle", entry } as const;
+        if (asked.success === "background") {
+          /*
+           * No turn was stopped, so there is no idle to wait for and no follow-up to
+           * account for. The harness has already waited for its tasks to say they are over;
+           * whether any still runs is its status to report, and a status it cannot give is
+           * read as "may still be running", never as stopped.
+           */
+          const status = yield* Effect.result(
+            entry.harness.sessionStatus(entry.sessionId),
+          );
+          return {
+            _tag: "background",
+            entry,
+            working:
+              status._tag === "Failure" || status.success.background === true,
+          } as const;
+        }
         // Run at once or held, the message is no longer queued behind a turn: a second Stop
         // stops the turn it became, or finds the conversation idle.
         state.followUps = 0;

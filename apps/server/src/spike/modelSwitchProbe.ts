@@ -396,6 +396,7 @@ const teeingSdk = (frames: Frame[], file: string): ClaudeCodeSdk => ({
     const wrapped: HarnessQuery = {
       setMcpServers: (servers) => live.setMcpServers(servers),
       interrupt: () => live.interrupt(),
+      stopTask: (taskId) => live.stopTask(taskId),
       getContextUsage: () => live.getContextUsage(),
       setModel: (model) => live.setModel(model),
       applyFlagSettings: (settings) => live.applyFlagSettings(settings),

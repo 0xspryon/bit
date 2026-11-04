@@ -762,6 +762,39 @@ describe("a later message and a Stop (A6 F5)", () => {
     expect(outcome.result).toEqual({ before: "not_live", after: "idle" });
   });
 
+  test("a Stop that stopped only background work says so, and says when some of it may still run", async () => {
+    // A6 F5's fifth review: no turn was running, a background agent was, and the answer
+    // used to be "nothing was running" while it went on to act.
+    const answer = (background: boolean) =>
+      withImporterSessions(
+        stubHarness({
+          interruptSession: () => Effect.succeed("background" as const),
+          sessionStatus: () =>
+            Effect.succeed({ activity: "idle" as const, background }),
+        }),
+        ({ sessions, plan }) =>
+          Effect.gen(function* () {
+            yield* opened(sessions, plan);
+            const found = yield* sessions.interrupt(IMPORT);
+            return turnStopped({
+              found,
+              conversationId: IMPORT,
+              what: `import ${IMPORT}`,
+            });
+          }),
+      );
+    const stopped = (await answer(false)).result;
+    expect(stopped.outcome).toBe("background_stopped");
+    expect(stopped.working).toBe(false);
+    expect(stopped.detail).toContain("started in the background");
+    expect(stopped.detail).toContain("stopped now");
+    expect(stopped.detail).not.toContain("Nothing was running");
+    const lingering = (await answer(true)).result;
+    expect(lingering.outcome).toBe("background_stopped");
+    expect(lingering.working).toBe(true);
+    expect(lingering.detail).toContain("may still be running");
+  });
+
   test("a harness that will not acknowledge the Stop fails it, and the session is let go as refused", async () => {
     const harness = stubHarness({
       interruptSession: () =>

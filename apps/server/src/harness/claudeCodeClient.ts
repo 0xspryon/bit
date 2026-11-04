@@ -304,6 +304,12 @@ export interface HarnessQuery extends AsyncIterable<SDKMessage> {
   ): Promise<{ readonly errors?: unknown }>;
   interrupt(): Promise<unknown>;
   /**
+   * Stops one task the CLI is running — a background shell, say — by the `task_id` its
+   * `system/task_started` named. The CLI answers with that task's `task_notification`
+   * (`status: "stopped"`). What `interrupt()` does not reach: see `interruptSession`.
+   */
+  stopTask(taskId: string): Promise<void>;
+  /**
    * What this session's model takes, as a control request.
    *
    * **The only honest source of a Claude Code context limit, and it is session-time.**
@@ -580,6 +586,19 @@ interface SessionRecord {
    * operator's next turn interrupted (A6 F5's fourth review: a background subagent's).
    */
   interrupted: boolean;
+  /**
+   * The tasks the CLI has started and not yet said are over, by `task_id`, with their
+   * `task_type` (`local_agent`, `local_bash`, …): added at `system/task_started`, removed
+   * at that task's `system/task_notification`, whatever its status (A6 F5's fifth review).
+   *
+   * What makes background work visible. A `run_in_background` subagent or shell outlives
+   * the turn that started it, and no `result` covers it, so {@link turnOpen} cannot say it
+   * is running — a Stop then answered "nothing was running" while a background agent went
+   * on to act. Every task 2.1.310 starts is bracketed by the two frames (measured), so the
+   * pair is the whole of it. Ambient tasks (the CLI's own housekeeping, `ambient: true`)
+   * are not activity and are not kept.
+   */
+  readonly tasks: Map<string, string>;
   /** The query has been closed; nothing more will arrive. */
   closed: boolean;
   /**
@@ -1273,6 +1292,32 @@ const answer = (record: SessionRecord, message: SDKMessage): void => {
 const sessionRunning = (record: SessionRecord): boolean =>
   !record.closed && (record.turnOpen || record.unanswered.size > 0);
 
+/** Whether a task the CLI started is still running. See `SessionRecord.tasks`. */
+const backgroundRunning = (record: SessionRecord): boolean =>
+  !record.closed && record.tasks.size > 0;
+
+/**
+ * Keeps {@link SessionRecord.tasks} in step with one frame: a task starts at
+ * `system/task_started` and is over at its `system/task_notification`.
+ */
+const trackTask = (record: SessionRecord, message: SDKMessage): void => {
+  if (message.type !== "system") return;
+  if (message.subtype === "task_started") {
+    if (message.ambient === true) return;
+    record.tasks.set(message.task_id, message.task_type ?? "unknown");
+  } else if (message.subtype === "task_notification") {
+    record.tasks.delete(message.task_id);
+  }
+};
+
+/**
+ * How long a Stop waits for the tasks it stopped to say so, with their
+ * `task_notification`s. Measured at under 20 ms on 2.1.310 for both an `interrupt()` and a
+ * `stopTask`; a task still listed after this is reported as possibly running, never as
+ * stopped.
+ */
+const TASK_STOP_SETTLE_MILLIS = 2_000;
+
 export const claudeCodeHarness = (
   options: ClaudeCodeHarnessOptions = {},
 ): Layer.Layer<AgentHarness, HarnessProcessError> =>
@@ -1647,6 +1692,7 @@ export const claudeCodeHarness = (
               try: async () => {
                 for await (const message of live) {
                   const outcome = outcomeOf(message, record.interrupted);
+                  trackTask(record, message);
                   if (answeredUuids(message) !== undefined) {
                     record.stamped = true;
                   }
@@ -2023,6 +2069,7 @@ export const claudeCodeHarness = (
           contextLimit: undefined,
           lastCallId: undefined,
           interrupted: false,
+          tasks: new Map<string, string>(),
           closed: false,
           cli: undefined,
           stderrTail: "",
@@ -2441,6 +2488,8 @@ export const claudeCodeHarness = (
             outcome: running ? undefined : record.outcome,
             cost: record.cost,
             tokens: record.tokens,
+            // Beside `activity`, never in it: see `SessionStatus.background`.
+            background: backgroundRunning(record),
           };
         }
         /**
@@ -2687,18 +2736,46 @@ export const claudeCodeHarness = (
           ) {
             return false;
           }
-          // A conversation between turns has nothing running, and asking anyway would mark
-          // the *next* turn's `result` as interrupted. A single-turn session is never
-          // between turns while its query is open, so it is asked as it always was. A turn
-          // the CLI started itself — a background task's notification — is running, and
-          // is stopped like any other.
-          if (record.multiTurn && !sessionRunning(record)) {
-            return false;
-          }
+          /*
+           * What a Stop has to reach, and with what — measured on 2.1.310 (A6 F5's fifth
+           * review; bare SDK 0.3.310, `claude-haiku-4-5`, each task running
+           * `sleep 25 && curl <listener>`, the call made 3 s after the parent turn's
+           * `result`, so no turn was open):
+           *
+           * - A `run_in_background` **subagent**, `interrupt()`: `task_notification
+           *   status=stopped` ~20 ms after the acknowledgement, its Bash dies with it and
+           *   the curl never arrives. No `result` follows and no turn opens.
+           * - The same subagent, `stopTask(id)`: stopped too, its own Bash with it — and the
+           *   CLI then **opens a turn of its own** to tell the model so, which is more work
+           *   started by a Stop. A subagent is stopped with `interrupt()`.
+           * - A `run_in_background` **Bash shell**, `interrupt()`: acknowledged, and the
+           *   shell runs on. It finished 25 s later, the curl arrived, and the CLI opened a
+           *   turn for its notification. **`interrupt()` does not reach a shell.**
+           * - The same shell, `stopTask(id)`: `task_notification status=stopped` within
+           *   10 ms, no curl, no turn.
+           *
+           * So a Stop asks `interrupt()` — for the turn, if one runs, and every subagent —
+           * then `stopTask` for every other task still listed. Task types not measured here
+           * (a workflow, a monitor) are stopped the way a shell is, which is the documented
+           * way to stop "a running task".
+           */
+          // A conversation between turns has no turn to stop, and setting `interrupted`
+          // then would mark the *next* turn's `result` interrupted. A single-turn session
+          // is never between turns while its query is open, so it is asked as it always
+          // was. A turn the CLI started itself — a background task's notification — is a
+          // turn, and is stopped like any other.
+          const turn = !record.multiTurn || sessionRunning(record);
+          if (!turn && !backgroundRunning(record)) return false;
+          const stopping = [...record.tasks.keys()];
           // Set before asking, so a `result` arriving mid-interrupt is read as
           // `interrupted` rather than as the `error_during_execution` the SDK reports. A
-          // multi-turn session's pump clears it again at that `result`.
-          record.interrupted = true;
+          // multi-turn session's pump clears it again at that `result`. **Not set for
+          // background work alone**: no `result` follows that interrupt (measured above),
+          // so nothing would clear it before the operator's next turn. If the CLI opens a
+          // turn of its own in the instant between this check and the interrupt reaching
+          // it, that turn is stopped too and its `result` reads `failed`; the
+          // conversation stays open either way.
+          if (turn) record.interrupted = true;
           const live = record.query;
           const asked = yield* Effect.result(
             Effect.timeout(
@@ -2730,6 +2807,7 @@ export const claudeCodeHarness = (
                 : `${asked.failure.detail}; its query was closed`,
             );
           }
+          yield* stopTasks(record, stopping);
           /*
            * A single-turn session is over: its attempt or round ends here, so the query is
            * closed rather than left for the pump's `result`.
@@ -2742,7 +2820,61 @@ export const claudeCodeHarness = (
            * answering, so nothing else here has to change.
            */
           if (!record.multiTurn) yield* closeSession(record);
-          return true;
+          return turn ? true : "background";
+        });
+
+      /**
+       * Stops what `interrupt()` left of the tasks listed when a Stop began, and waits,
+       * bounded by {@link TASK_STOP_SETTLE_MILLIS}, for every one of them to say it is over.
+       *
+       * A subagent is not asked again: `interrupt()` stopped it, and a `stopTask` would
+       * make the CLI open a turn about it (measured, at {@link interruptSession}). A
+       * `stopTask` the CLI refuses or does not answer is logged and not acted on — the
+       * session is still promptable, and the task, still listed, is reported by
+       * `sessionStatus` as running rather than claimed stopped.
+       */
+      const stopTasks = (
+        record: SessionRecord,
+        stopping: readonly string[],
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          if (stopping.length === 0) return;
+          const live = record.query;
+          for (const taskId of stopping) {
+            const type = record.tasks.get(taskId);
+            if (
+              type === undefined ||
+              type === "local_agent" ||
+              live === undefined
+            ) {
+              continue;
+            }
+            const stopped = yield* Effect.result(
+              Effect.timeout(
+                Effect.tryPromise(() => live.stopTask(taskId)),
+                controlTimeout,
+              ),
+            );
+            if (stopped._tag === "Failure" && record.tasks.has(taskId)) {
+              yield* Effect.logWarning(
+                "a Claude Code session would not stop a background task; it may still be running",
+                {
+                  sessionId: record.sessionId,
+                  taskId,
+                  taskType: type,
+                  detail: String(stopped.failure),
+                },
+              );
+            }
+          }
+          const settleBy = Date.now() + TASK_STOP_SETTLE_MILLIS;
+          while (
+            !record.closed &&
+            stopping.some((taskId) => record.tasks.has(taskId)) &&
+            Date.now() < settleBy
+          ) {
+            yield* Effect.sleep("10 millis");
+          }
         });
 
       /*
