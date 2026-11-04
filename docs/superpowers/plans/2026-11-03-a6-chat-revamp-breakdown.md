@@ -174,7 +174,10 @@ away; reasoning collapses to one truncated line (markdown); turn footer
 conversation is running (`sessionStatus` / the live stream), not only while a message the
 operator sent is unanswered — today the web decides from accepted messages
 (`importerSessions.svelte.ts:~192`), so a turn the CLI starts itself (a background task's
-notification turn) cannot be stopped from the browser (F5 R4 review). Background work counts too:
+notification turn) cannot be stopped from the browser (F5 R4 review). Also: after a
+`background_stopped` answer with `working: true`, the "may still be running" notice is
+cleared only by the turn watch, so it can stay until the next turn ends — clear it from
+`sessionStatus.background` going false (F5 R6 review). Background work counts too:
 `sessionStatus.background` is true while a background subagent or shell the agent started is
 still running, outside any turn, and a Stop then answers `background_stopped` (F5 R5 review).
 
