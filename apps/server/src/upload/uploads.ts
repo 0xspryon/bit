@@ -370,10 +370,18 @@ export class UploadWriteFailed extends Data.TaggedError("UploadWriteFailed")<{
   readonly message: string;
 }> {}
 
+/** Which file an entry is: its device and inode. */
+interface Entry {
+  readonly dev: number;
+  readonly ino: number;
+}
+
+/** Whether `found` is the file `entry` (a hard link to it counts: that is the same file). */
+const sameEntry = (found: Entry | undefined, entry: Entry): boolean =>
+  found !== undefined && found.dev === entry.dev && found.ino === entry.ino;
+
 /** `path`'s device and inode, not through a link, or `undefined` when it is not there. */
-const statOrUndefined = (
-  path: string,
-): { readonly dev: number; readonly ino: number } | undefined => {
+const statOrUndefined = (path: string): Entry | undefined => {
   try {
     const { dev, ino } = lstatSync(path);
     return { dev, ino };
@@ -409,21 +417,33 @@ export interface StoreUploadsProbe {
  * (`harness/liveAgentSessions.ts`): the files go where the agent already works and the gate
  * already audits, which is what makes this grant nothing new.
  *
- * - **The folder is checked, through symlinks**, to resolve inside `directory`: a link
- *   planted at `uploads` would otherwise carry the bytes wherever it points.
- * - **And checked again around every file**, because the agent works in `directory` and can
- *   swap `uploads` for a link between that check and a write — `O_NOFOLLOW` guards only the
- *   last component of a path. Each temporary is resolved once it is opened and before a
- *   byte is written, and each stored name once it is linked: either resolving anywhere but
- *   the folder that was checked fails the call and undoes the entry this call just made
- *   (an `O_EXCL` temporary, or a name the link created), so no byte and no name is left
- *   where the link points, and no path outside the folder is handed to the harness.
+ * - **The folder is opened once, and every entry is made and removed through that open
+ *   folder.** It is opened `O_DIRECTORY|O_NOFOLLOW`, so a link planted at `uploads` is
+ *   refused, and the open folder is then checked to resolve inside `directory`. From there
+ *   each create, link and unlink names its entry as `/proc/self/fd/<n>/<name>`: the kernel
+ *   resolves that prefix to the folder this call holds, not to whatever `uploads` names by
+ *   then. The agent works in `directory` and can swap `uploads` for a link at any moment —
+ *   `O_NOFOLLOW` guards only a path's last component — but a swap can no longer carry a
+ *   write, or a cleanup's unlink, into the folder the link points at.
+ * - **And the path handed on is checked around every file**, because the harness is given
+ *   `<directory>/uploads/<name>`, and that is still a path the agent can swap. Before a byte
+ *   is written the temporary's path, and once linked each stored name's path, must resolve
+ *   to the checked folder and name the very file this call holds (device and inode); either
+ *   failing fails the call, so no path outside the folder is handed to the harness.
+ * - **Nothing is removed that this call did not make.** Every entry it creates — each
+ *   temporary, each stored name — has its device and inode recorded, and an unlink (of a
+ *   temporary, of a name whose check failed, of what was stored before a failure) is made
+ *   only while the entry in the held folder is still that file. A file the agent put in its
+ *   place is left alone.
  * - **Each file is written atomically**: to a dot-named temporary in the folder
  *   (`O_CREAT|O_EXCL|O_NOFOLLOW`), then hard-linked to its name, which fails rather than
  *   replaces when the name is taken — so a reader never sees half a file, and a name already
  *   used by an earlier message is never overwritten (that message's path line still points
  *   at it). A taken name gets ` (2)`, ` (3)` … before its extension.
  * - **All or none**: a failure part-way removes what this call stored.
+ *
+ * `/proc/self/fd` makes this Linux-only, as the server already is (`harness/ownedProcesses.ts`
+ * reads `/proc/<pid>/stat`).
  */
 export const storeUploads = (
   directory: string,
@@ -434,108 +454,135 @@ export const storeUploads = (
     try: () => {
       const folder = join(directory, UPLOADS_FOLDER);
       mkdirSync(folder, { recursive: true, mode: 0o700 });
-      const real = resolveThroughSymlinks(folder);
-      const inside = relative(resolveThroughSymlinks(directory), real);
-      if (inside === "" || inside.startsWith("..") || isAbsolute(inside)) {
-        throw new Error(
-          `${folder} does not resolve to a folder inside the session's own directory: something has replaced it with a link. Remove it and send the message again`,
-        );
-      }
-      if (!lstatSync(folder).isDirectory()) {
-        throw new Error(`${folder} is not a folder`);
-      }
-      const moved = (path: string) =>
-        new Error(
-          `${path} resolved outside ${real} while it was being written: something replaced ${folder} with a link. Remove it and send the message again`,
-        );
-      /** Whether `path` still resolves to `name` directly in the checked folder. */
-      const inFolder = (path: string, name: string): boolean => {
-        try {
-          return realpathSync(path) === join(real, name);
-        } catch {
-          return false;
-        }
-      };
-      const unlinkQuietly = (path: string) => {
-        try {
-          unlinkSync(path);
-        } catch {
-          // Already gone; nothing else to undo.
-        }
-      };
-      probe.afterCheck?.();
-      const stored: MessageAttachment[] = [];
+      let folderHandle: number;
       try {
-        for (const file of files) {
-          const temporaryName = `.incoming-${crypto.randomUUID()}`;
-          const temporary = join(folder, temporaryName);
-          const handle = openSync(
-            temporary,
-            fsConstants.O_WRONLY |
-              fsConstants.O_CREAT |
-              fsConstants.O_EXCL |
-              fsConstants.O_NOFOLLOW,
-            0o600,
-          );
-          let written: { readonly dev: number; readonly ino: number };
-          try {
-            // Before a byte is written: the file this handle holds is in the checked folder.
-            if (!inFolder(temporary, temporaryName)) {
-              unlinkQuietly(temporary);
-              throw moved(temporary);
-            }
-            let at = 0;
-            while (at < file.bytes.length) {
-              at += writeSync(handle, file.bytes, at);
-            }
-            const { dev, ino } = fstatSync(handle);
-            written = { dev, ino };
-          } finally {
-            closeSync(handle);
-          }
-          probe.afterWrite?.(temporary);
-          try {
-            let path: string | undefined;
-            for (let n = 1; path === undefined; n += 1) {
-              const name = n === 1 ? file.name : numbered(file.name, n);
-              const candidate = join(folder, name);
-              try {
-                linkSync(temporary, candidate);
-              } catch (cause) {
-                if ((cause as NodeJS.ErrnoException).code !== "EEXIST") {
-                  throw cause;
-                }
-                if (n >= 1000) throw cause;
-                continue;
-              }
-              // The name this link made is the bytes written above, in the checked folder.
-              const linked = statOrUndefined(candidate);
-              if (
-                !inFolder(candidate, name) ||
-                linked?.dev !== written.dev ||
-                linked.ino !== written.ino
-              ) {
-                unlinkQuietly(candidate);
-                throw moved(candidate);
-              }
-              path = candidate;
-              stored.push({
-                kind: file.kind,
-                name,
-                mimeType: file.mimeType,
-                path: candidate,
-                bytes: file.bytes.length,
-              });
-            }
-          } finally {
-            unlinkQuietly(temporary);
-          }
-        }
+        folderHandle = openSync(
+          folder,
+          fsConstants.O_RDONLY |
+            fsConstants.O_DIRECTORY |
+            fsConstants.O_NOFOLLOW,
+        );
       } catch (cause) {
-        for (const done of stored) unlinkQuietly(done.path);
-        throw cause;
+        const code = (cause as NodeJS.ErrnoException).code;
+        if (code !== "ELOOP" && code !== "ENOTDIR") throw cause;
+        throw new Error(
+          `${folder} is not a folder inside the session's own directory: something has replaced it with a link or a file. Remove it and send the message again`,
+          { cause },
+        );
       }
-      return stored;
+      try {
+        /** The folder this call holds, whatever `uploads` names by now. */
+        const held = `/proc/self/fd/${String(folderHandle)}`;
+        const inHeld = (name: string) => `${held}/${name}`;
+        const real = realpathSync(held);
+        const inside = relative(resolveThroughSymlinks(directory), real);
+        if (inside === "" || inside.startsWith("..") || isAbsolute(inside)) {
+          throw new Error(
+            `${folder} does not resolve to a folder inside the session's own directory: something has replaced it with a link. Remove it and send the message again`,
+          );
+        }
+        const moved = (path: string) =>
+          new Error(
+            `${path} resolved outside ${real} while it was being written: something replaced ${folder} with a link. Remove it and send the message again`,
+          );
+        if (!sameEntry(statOrUndefined(folder), fstatSync(folderHandle))) {
+          throw moved(folder);
+        }
+        /**
+         * Whether `path` — the path the harness would be given — still resolves to `name`
+         * directly in the checked folder, and is the file `entry`.
+         */
+        const namesEntry = (path: string, name: string, entry: Entry) => {
+          try {
+            if (realpathSync(path) !== join(real, name)) return false;
+          } catch {
+            return false;
+          }
+          return sameEntry(statOrUndefined(path), entry);
+        };
+        /** Unlinks `name` from the held folder only while it is still `entry`. */
+        const removeOwn = (name: string, entry: Entry) => {
+          const at = inHeld(name);
+          if (!sameEntry(statOrUndefined(at), entry)) return;
+          try {
+            unlinkSync(at);
+          } catch {
+            // Already gone; nothing else to undo.
+          }
+        };
+        probe.afterCheck?.();
+        const stored: MessageAttachment[] = [];
+        const made: { readonly name: string; readonly entry: Entry }[] = [];
+        try {
+          for (const file of files) {
+            const temporaryName = `.incoming-${crypto.randomUUID()}`;
+            const temporary = join(folder, temporaryName);
+            const handle = openSync(
+              inHeld(temporaryName),
+              fsConstants.O_WRONLY |
+                fsConstants.O_CREAT |
+                fsConstants.O_EXCL |
+                fsConstants.O_NOFOLLOW,
+              0o600,
+            );
+            let written: Entry;
+            try {
+              const { dev, ino } = fstatSync(handle);
+              written = { dev, ino };
+              // Before a byte is written: the temporary's path is the file this handle holds.
+              if (!namesEntry(temporary, temporaryName, written)) {
+                removeOwn(temporaryName, written);
+                throw moved(temporary);
+              }
+              let at = 0;
+              while (at < file.bytes.length) {
+                at += writeSync(handle, file.bytes, at);
+              }
+            } finally {
+              closeSync(handle);
+            }
+            probe.afterWrite?.(temporary);
+            try {
+              let path: string | undefined;
+              for (let n = 1; path === undefined; n += 1) {
+                const name = n === 1 ? file.name : numbered(file.name, n);
+                try {
+                  linkSync(inHeld(temporaryName), inHeld(name));
+                } catch (cause) {
+                  if ((cause as NodeJS.ErrnoException).code !== "EEXIST") {
+                    throw cause;
+                  }
+                  if (n >= 1000) throw cause;
+                  continue;
+                }
+                // The link made a name for the bytes written above, in the held folder.
+                made.push({ name, entry: written });
+                const candidate = join(folder, name);
+                // And the path handed on is that name.
+                if (!namesEntry(candidate, name, written)) {
+                  throw moved(candidate);
+                }
+                path = candidate;
+                stored.push({
+                  kind: file.kind,
+                  name,
+                  mimeType: file.mimeType,
+                  path: candidate,
+                  bytes: file.bytes.length,
+                });
+              }
+            } finally {
+              removeOwn(temporaryName, written);
+            }
+          }
+        } catch (cause) {
+          for (const { name, entry } of made) removeOwn(name, entry);
+          throw cause;
+        }
+        return stored;
+      } finally {
+        closeSync(folderHandle);
+      }
     },
     catch: (cause) =>
       new UploadWriteFailed({

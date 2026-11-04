@@ -374,6 +374,12 @@ describe("the folder swapped for a link while files are being stored", () => {
       expect(result._tag).toBe("Failure");
       if (result._tag === "Failure") {
         expect(result.failure._tag).toBe("UploadWriteFailed");
+        // The check before the write refused it — the temporary is what it names, not a
+        // stored name a later check would have caught.
+        expect(result.failure.message).toContain(
+          join(directory, "uploads", ".incoming-"),
+        );
+        expect(result.failure.message).not.toContain("a.txt");
       }
       expect(readdirSync(elsewhere)).toEqual([]);
       expect(readdirSync(join(directory, "uploads-real"))).toEqual([]);
@@ -386,25 +392,100 @@ describe("the folder swapped for a link while files are being stored", () => {
     const directory = sessionDirectory();
     const elsewhere = mkdtempSync(join(tmpdir(), "bit-uploads-swapped-"));
     try {
+      let planted = "";
       const result = await Effect.runPromise(
         Effect.result(
           storeUploads(directory, [file("a.txt", "secret bytes")], {
             afterWrite: (temporary) => {
               swap(directory, elsewhere);
               // The agent can list the folder, so it can plant the temporary's name too.
-              writeFileSync(
-                join(elsewhere, basename(temporary)),
-                "agent's bytes",
-              );
+              planted = basename(temporary);
+              writeFileSync(join(elsewhere, planted), "agent's bytes");
             },
           }),
         ),
       );
       expect(result._tag).toBe("Failure");
-      expect(readdirSync(elsewhere)).not.toContain("a.txt");
+      // Nothing named where the link points, and the agent's own file there is not removed
+      // as though it were the temporary.
+      expect(readdirSync(elsewhere)).toEqual([planted]);
+      expect(readdirSync(join(directory, "uploads-real"))).toEqual([]);
     } finally {
       rmSync(elsewhere, { recursive: true, force: true });
     }
+  });
+});
+
+/*
+ * A swap makes a store fail on purpose, so the agent can set off the undo whenever it
+ * likes: the undo must remove only what this call made, in the folder it made it in.
+ */
+describe("undoing a store removes only what it made", () => {
+  test("a swap that fails the second file does not delete a same-named file where the link points", async () => {
+    const directory = sessionDirectory();
+    const victim = mkdtempSync(join(tmpdir(), "bit-uploads-victim-"));
+    try {
+      writeFileSync(join(victim, "a.txt"), "the victim's own a.txt");
+      let writes = 0;
+      const result = await Effect.runPromise(
+        Effect.result(
+          storeUploads(
+            directory,
+            [file("a.txt", "one"), file("b.txt", "two")],
+            {
+              afterWrite: () => {
+                writes += 1;
+                if (writes === 2) {
+                  renameSync(
+                    join(directory, "uploads"),
+                    join(directory, "uploads-real"),
+                  );
+                  symlinkSync(victim, join(directory, "uploads"));
+                }
+              },
+            },
+          ),
+        ),
+      );
+      expect(result._tag).toBe("Failure");
+      expect(readdirSync(victim)).toEqual(["a.txt"]);
+      expect(readFileSync(join(victim, "a.txt"), "utf8")).toBe(
+        "the victim's own a.txt",
+      );
+      // And what the call did store is undone, in the folder it stored it in.
+      expect(readdirSync(join(directory, "uploads-real"))).toEqual([]);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("a stored name the agent replaced with its own file is left alone", async () => {
+    const directory = sessionDirectory();
+    const uploads = join(directory, "uploads");
+    let writes = 0;
+    const result = await Effect.runPromise(
+      Effect.result(
+        // A name no sanitised upload has, so the second link fails with ENOENT.
+        storeUploads(
+          directory,
+          [file("a.txt", "one"), file("no/such.txt", "y")],
+          {
+            afterWrite: () => {
+              writes += 1;
+              if (writes === 2) {
+                rmSync(join(uploads, "a.txt"));
+                writeFileSync(join(uploads, "a.txt"), "the agent's a.txt");
+              }
+            },
+          },
+        ),
+      ),
+    );
+    expect(result._tag).toBe("Failure");
+    expect(readdirSync(uploads)).toEqual(["a.txt"]);
+    expect(readFileSync(join(uploads, "a.txt"), "utf8")).toBe(
+      "the agent's a.txt",
+    );
   });
 });
 
