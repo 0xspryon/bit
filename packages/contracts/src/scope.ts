@@ -423,12 +423,40 @@ const withinPrefix = (subject: Address, prefix: Prefix): boolean => {
 /* ── Entry normalisation, on write ───────────────────────────────────────────────── */
 
 /**
- * The characters a scope entry may not contain: bidi controls (U+061C, U+200E/U+200F,
- * U+202A–U+202E, U+2066–U+2069), zero-width ones (U+200B–U+200D, U+2060, U+FEFF) and the
- * tag characters (U+E0000–U+E007F) — the set the web app marks in code.
+ * The characters a scope entry may not contain because they are not drawn: bidi controls
+ * (U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+2069), zero-width ones (U+200B–U+200D,
+ * U+2060, U+FEFF) and the tag characters (U+E0000–U+E007F) — the set the web app marks in
+ * code. Refused with their own sentence, since "invisible" is the thing to know about them.
+ * Every other character outside printable ASCII is refused by {@link NOT_ASCII} as well.
  */
 const INVISIBLE =
   /[\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/u;
+
+/**
+ * Anything in an entry's value that is not printable ASCII: a space, a control, and every
+ * character past U+007E. **An allowlist, not a list of the bad ones.** A review found nine
+ * characters a denylist of invisible ones let through — the soft hyphen U+00AD, U+2061,
+ * U+180E, the grapheme joiner U+034F, variation selectors U+FE0F and U+E0100, the Hangul
+ * filler U+3164, a space and a no-break space — each drawn as nothing or as a blank, so
+ * `acme\u00AD.com` was listed as `acme.com` and matched as a host nobody called that. Unicode
+ * has more of them than any list will hold, so a host is written in ASCII, and a name in
+ * another script is typed as its punycode (`xn--…`), which is what DNS and
+ * `new URL().hostname` carry anyway. The value is tested whole, a URL's path included, after
+ * only ASCII blanks at either end are dropped.
+ */
+const NOT_ASCII = /[^\x21-\x7E]/u;
+
+/**
+ * What a normalised host may be made of: lowercase ASCII letters and digits, `-`, `.`, `_`,
+ * and `:` for an IPv6 literal (its brackets and any port are gone by now). `*` is let past
+ * here only so a wildcard gets its own refusal below. Anything else — `acme.com,evil.com`,
+ * `acme%2ecom` — names no host the matcher will ever see.
+ */
+const HOST_CHARACTER = /[a-z0-9._:*-]/u;
+
+/** A character as its code point, `U+00AD` or the five-digit `U+E0041`. */
+const codePoint = (char: string): string =>
+  `U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}`;
 
 /**
  * The stored form of one authored entry value, or an instructive refusal.
@@ -456,16 +484,33 @@ export const normaliseScopeEntry = (input: {
    * importer proposes entries from attacker-written program pages. No hostname, address or
    * block contains one, so nothing real is refused. The sentence names the character by its
    * code point and does not echo the value: echoed, it would reorder the sentence too.
+   *
+   * This and the ASCII check after it are one rule — only printable ASCII — said in two
+   * sentences. The cost of the rule is that an internationalised name must be typed as
+   * punycode; the refusal says so.
    */
   const invisible = INVISIBLE.exec(input.value)?.[0];
   if (invisible !== undefined) {
-    const point = (invisible.codePointAt(0) ?? 0)
-      .toString(16)
-      .toUpperCase()
-      .padStart(4, "0");
     return {
       _tag: "refused",
-      detail: `this entry contains an invisible character (U+${point}) that changes how it reads, so it would be listed as one host and matched as another; type the value again without it`,
+      detail: `this entry contains an invisible character (${codePoint(invisible)}) that changes how it reads, so it would be listed as one host and matched as another; type the value again without it`,
+    };
+  }
+  /*
+   * Then everything else that is not printable ASCII, on the value with only ASCII blanks
+   * dropped from its ends (`trim()` would also drop a no-break space there, and the point is
+   * to name it). Named by code point and not echoed, for the reason above.
+   */
+  const foreign = NOT_ASCII.exec(
+    input.value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/gu, ""),
+  )?.[0];
+  if (foreign !== undefined) {
+    return {
+      _tag: "refused",
+      detail:
+        foreign <= "\u007F"
+          ? `this entry contains ${foreign === " " ? "a space" : "a control character"} (${codePoint(foreign)}), which no host has; type the value again without it`
+          : `this entry contains ${codePoint(foreign)}, which is not ASCII; a host is written in ASCII only, so it would be listed as one host and matched as another — type a name in another script as its punycode (xn--…) instead`,
     };
   }
   const raw = input.value.trim();
@@ -509,6 +554,13 @@ export const normaliseScopeEntry = (input: {
     return {
       _tag: "refused",
       detail: `'${raw}' does not name a host`,
+    };
+  }
+  const stray = [...host].find((char) => !HOST_CHARACTER.test(char));
+  if (stray !== undefined) {
+    return {
+      _tag: "refused",
+      detail: `'${raw}' contains '${stray}' (${codePoint(stray)}), which is not a character a host is written with; a host is ASCII letters, digits, '-', '.' and '_'`,
     };
   }
   const address = parseIpAddress(host);

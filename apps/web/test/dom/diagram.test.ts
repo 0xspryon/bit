@@ -17,12 +17,15 @@
  * Compared as strings — `textContent`, `innerHTML` — never as nodes.
  */
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { flushSync, mount, unmount } from "svelte";
+import { compile } from "svelte/compiler";
 
 import Markdown from "../../src/lib/components/Markdown.svelte";
 import MermaidBlock from "../../src/lib/components/MermaidBlock.svelte";
 import type { DiagramEvents, DiagramRenderer } from "../../src/lib/diagram";
 
 import { click, mountInto, settle, type Mounted } from "./dom";
+import GrowingReply from "./fixtures/GrowingReply.svelte";
 
 /*
  * `pele/lazy`, as a stand-in: what it is asked to draw, and an SVG of the source's text.
@@ -184,6 +187,34 @@ describe("a flow figure's frame", () => {
     ).toBe("Copy portal⟨U+202E⟩.mmd");
   });
 
+  test("is at most 640px tall, and scrolls inside its frame past that", async () => {
+    // A 3,000-node chain drew 288,064px tall (U12 review). happy-dom has no layout, so the
+    // rule is read from the component's own compiled style; the browser check measures it.
+    const path = new URL(
+      "../../src/lib/components/MermaidBlock.svelte",
+      import.meta.url,
+    ).pathname;
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    const sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+    try {
+      const stand = standIn();
+      const root = block({ source: FLOW, renderer: stand.renderer });
+      const style = getComputedStyle(root.querySelector(".diagram") ?? root);
+      expect(`${style.maxHeight} ${style.overflow} ${style.alignItems}`).toBe(
+        "640px auto flex-start",
+      );
+    } finally {
+      sheet.remove();
+    }
+  });
+
   test("is taken away with its drawing", () => {
     const stand = standIn();
     block({ source: FLOW, renderer: stand.renderer });
@@ -276,6 +307,75 @@ describe("a reply with a mermaid fence", () => {
     expect(root.querySelector("pre")?.textContent).toBe(
       "flowchart LR\n  broken ---",
     );
+  });
+
+  test("a closed figure is not drawn again as the reply grows, and keeps its Show code", async () => {
+    // Every streamed delta is a new HTML string that replaces every frame. A figure drawn
+    // afresh each time was laid out again on every delta (U12 review).
+    const target = document.body.appendChild(document.createElement("div"));
+    const live = mount(GrowingReply, { target, props: {} });
+    try {
+      let text = `First:\n\n\`\`\`mermaid\n${FLOW}\n\`\`\`\n\nThen`;
+      live.write(text);
+      flushSync();
+      await drawn(target);
+      expect(peleCalls).toHaveLength(1);
+      const toggle =
+        target.querySelector<HTMLButtonElement>("button.code-view");
+      if (toggle === null) throw new Error("no toggle");
+      click(toggle);
+      await settle();
+
+      for (const delta of [" the", " portal", " links", " out.", "\n\nMore."]) {
+        text += delta;
+        live.write(text);
+        flushSync();
+        await settle();
+      }
+      expect(target.querySelector(".markdown")?.textContent).toContain(
+        "Then the portal links out.",
+      );
+      expect(peleCalls).toHaveLength(1);
+      expect(target.querySelectorAll(".code-frame[data-diagram]")).toHaveLength(
+        1,
+      );
+      expect(target.querySelectorAll("button.code-view")).toHaveLength(1);
+      const kept = target.querySelector("button.code-view");
+      expect(kept?.textContent).toBe("Show diagram");
+      expect(kept?.getAttribute("aria-pressed")).toBe("true");
+      expect(
+        visible(target.querySelector(".code-frame[data-diagram] pre")),
+      ).toBe(true);
+
+      // A second closed fence is drawn once, beside the first; the first is still not redrawn.
+      const second = "flowchart TB\n  A --- B";
+      text += `\n\n\`\`\`mermaid\n${second}\n\`\`\`\n`;
+      live.write(text);
+      flushSync();
+      await drawn(target);
+      for (let tries = 0; tries < 50 && peleCalls.length < 2; tries += 1) {
+        await settle();
+      }
+      expect(peleCalls.map((call) => call.source)).toEqual([FLOW, second]);
+      expect(target.querySelectorAll(".diagram-host")).toHaveLength(2);
+
+      // A fence whose code changes is a new figure, and the old one is taken away.
+      text = text.replace("A --- B", "A --- C");
+      live.write(text);
+      flushSync();
+      for (let tries = 0; tries < 50 && peleCalls.length < 3; tries += 1) {
+        await settle();
+      }
+      expect(peleCalls.map((call) => call.source)).toEqual([
+        FLOW,
+        second,
+        "flowchart TB\n  A --- C",
+      ]);
+      expect(target.querySelectorAll(".diagram-host")).toHaveLength(2);
+    } finally {
+      void unmount(live);
+      target.remove();
+    }
   });
 
   test("Copy copies the source as the agent wrote it", async () => {

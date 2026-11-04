@@ -10,7 +10,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import Markdown from "../../src/lib/components/Markdown.svelte";
-import { memoiseByText } from "../../src/lib/markdown";
+import { codeRuns, memoiseByText, proseRuns } from "../../src/lib/markdown";
 import { compile } from "svelte/compiler";
 
 import { click, mountInto, settle, type Mounted } from "./dom";
@@ -577,19 +577,67 @@ describe("characters that do not show as what they are", () => {
     );
   });
 
-  test("an Arabic letter mark and a tag character are markers too; an emoji's variation selector is not", () => {
+  test("an Arabic letter mark and a tag character are markers too; in code so is an emoji's variation selector", () => {
     // U+061C is a bidi control (CVE-2021-42574's list); U+E0000–E007F are tag characters,
     // invisible and outside the BMP, so their code point has five digits.
     const root = render(
-      "```\nad\u061Cmin\u{E0041}\u{E007F}.acme.com \u2764\uFE0F\n```\n\nSee `a\u061Cb\u{E0001}c`.",
+      "```\nad\u061Cmin\u{E0041}\u{E007F}.acme.com \u2764\uFE0F\n```\n\nSee `a\u061Cb\u{E0001}c`, \u2764\uFE0F.",
     );
     expect(root.querySelector("pre > code")?.textContent).toBe(
-      "ad⟨U+061C⟩min⟨U+E0041⟩⟨U+E007F⟩.acme.com \u2764\uFE0F\n",
+      "ad⟨U+061C⟩min⟨U+E0041⟩⟨U+E007F⟩.acme.com \u2764⟨U+FE0F⟩\n",
     );
-    expect(root.querySelectorAll("pre .char-escape")).toHaveLength(3);
+    expect(root.querySelectorAll("pre .char-escape")).toHaveLength(4);
     expect(root.querySelector("p > code")?.textContent).toBe(
       "a⟨U+061C⟩b⟨U+E0001⟩c",
     );
+    // In prose an emoji is written with its selector, and it is left alone.
+    expect(root.querySelector("p")?.textContent).toContain("\u2764\uFE0F.");
+  });
+
+  test("every character drawn as nothing or a blank is a marker in code, and none is in prose", () => {
+    // Each let a host read as another in a fence before the U12 review widened the set.
+    const blanks: ReadonlyArray<readonly [string, string]> = [
+      ["\u00AD", "U+00AD"],
+      ["\u034F", "U+034F"],
+      ["\u115F", "U+115F"],
+      ["\u1160", "U+1160"],
+      ["\u180E", "U+180E"],
+      ["\u2061", "U+2061"],
+      ["\u2062", "U+2062"],
+      ["\u2063", "U+2063"],
+      ["\u2064", "U+2064"],
+      ["\u3164", "U+3164"],
+      ["\uFFA0", "U+FFA0"],
+      ["\uFE00", "U+FE00"],
+      ["\u{E0100}", "U+E0100"],
+      ["\u{E01EF}", "U+E01EF"],
+      ["\u180B", "U+180B"],
+    ];
+    for (const [char, point] of blanks) {
+      const root = render(
+        `\`\`\`\nadmin${char}.acme.com\n\`\`\`\n\nSee \`a${char}b\` and a${char}b.`,
+      );
+      expect(root.querySelector("pre > code")?.textContent, point).toBe(
+        `admin⟨${point}⟩.acme.com\n`,
+      );
+      expect(root.querySelector("p > code")?.textContent, point).toBe(
+        `a⟨${point}⟩b`,
+      );
+      expect(root.querySelector("p")?.textContent, point).toContain(
+        ` a${char}b.`,
+      );
+      // And outside markdown: a tool call's line is marked as code, a thought as prose.
+      expect(
+        codeRuns(`ac${char}me.com`)
+          .map((run) => run.text)
+          .join(""),
+        point,
+      ).toBe(`ac⟨${point}⟩me.com`);
+      expect(
+        proseRuns(`ac${char}me`).some((run) => run.escape),
+        point,
+      ).toBe(false);
+    }
   });
 
   test("in prose, a bidi override before a link is a marker, and the link reads in logical order", () => {

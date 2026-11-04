@@ -836,13 +836,85 @@ describe("normalising an entry on write", () => {
         ).toBe(false);
       }
     }
-    // Right-to-left letters are not invisible, and a plain host still normalises.
+    // A plain host still normalises.
     expect(value("host", "acme.com")).toBe("acme.com");
-    expect(
-      isScopeValueRefusal(
-        normaliseScopeEntry({ kind: "host", value: "\u05D0\u05D1.com" }),
-      ),
-    ).toBe(false);
+  });
+
+  test("a host is ASCII only: every other character is refused by code point, not by a list", () => {
+    /*
+     * A denylist of invisible characters let each of these through (U12 review): each is
+     * drawn as nothing or as a blank, so the entry was listed as `acme.com` and matched as
+     * a host nobody called that. The rule is now an allowlist, and the sentence still names
+     * the character rather than echoing the value.
+     */
+    const cases: ReadonlyArray<readonly [ScopeKind, string, string, string]> = [
+      ["host", "acme\u00AD.com", "U+00AD", "not ASCII"],
+      ["host", "acme\u2061.com", "U+2061", "not ASCII"],
+      ["subtree", "acme\u180E.com", "U+180E", "not ASCII"],
+      ["host", "acme\u034F.com", "U+034F", "not ASCII"],
+      ["host", "acme.com\uFE0F", "U+FE0F", "not ASCII"],
+      ["host", "acme.com\u{E0100}", "U+E0100", "not ASCII"],
+      ["subtree", "acme\u3164.com", "U+3164", "not ASCII"],
+      ["host", "acme\u00A0.com", "U+00A0", "not ASCII"],
+      // `trim()` drops a no-break space at an end; the check does not.
+      ["host", "acme.com\u00A0", "U+00A0", "not ASCII"],
+      ["host", "acme .com", "U+0020", "a space"],
+      ["host", "acme\t.com", "U+0009", "a control character"],
+      ["cidr", "203.0.113.0 /24", "U+0020", "a space"],
+      ["host", "https://acme.com/\u00E9", "U+00E9", "not ASCII"],
+    ];
+    for (const [kind, raw, point, why] of cases) {
+      const result = normaliseScopeEntry({ kind, value: raw });
+      expect(isScopeValueRefusal(result), JSON.stringify(raw)).toBe(true);
+      if (isScopeValueRefusal(result)) {
+        expect(result.detail).toContain(point);
+        expect(result.detail).toContain(why);
+        expect(result.detail).not.toContain(raw.trim());
+        expect(/[^\x20-\x7E\u2014\u2026]/u.test(result.detail)).toBe(false);
+      }
+    }
+    // Blanks around a value are still only blanks.
+    expect(value("host", "  acme.com\t")).toBe("acme.com");
+  });
+
+  test("an internationalised name is refused with the punycode hint, and its punycode is accepted", () => {
+    for (const raw of [
+      "b\u00FCcher.de",
+      "\u05D0\u05D1.com",
+      "\u0430\u0441me.com",
+    ]) {
+      const result = normaliseScopeEntry({ kind: "subtree", value: raw });
+      expect(isScopeValueRefusal(result), raw).toBe(true);
+      if (isScopeValueRefusal(result)) {
+        expect(result.detail).toContain("ASCII only");
+        expect(result.detail).toContain("punycode (xn--");
+      }
+    }
+    expect(value("subtree", "xn--bcher-kva.de")).toBe("xn--bcher-kva.de");
+    expect(value("host", "https://XN--Bcher-kva.DE/x")).toBe(
+      "xn--bcher-kva.de",
+    );
+  });
+
+  test("a normalised host holds only host characters", () => {
+    for (const raw of [
+      "acme.com,evil.com",
+      "acme%2ecom.test",
+      "acme!.com",
+      "acme.com;x",
+    ]) {
+      const result = normaliseScopeEntry({ kind: "host", value: raw });
+      expect(isScopeValueRefusal(result), raw).toBe(true);
+      if (isScopeValueRefusal(result)) {
+        expect(result.detail).toContain(
+          "not a character a host is written with",
+        );
+      }
+    }
+    expect(value("host", "under_score.acme-corp.test")).toBe(
+      "under_score.acme-corp.test",
+    );
+    expect(value("host", "[2001:db8::1]:8443")).toBe("2001:db8::1");
   });
 
   test("a wildcard is refused rather than quietly accepted as an apex", () => {

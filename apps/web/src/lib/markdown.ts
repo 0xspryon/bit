@@ -196,10 +196,16 @@ const rewrite = (
  * letters around it on screen and not in the text, so a fence named `\u202Enosj.live` reads
  * as `evil.json` and copies as something else; a zero-width one (U+200B–200F, U+2060,
  * U+FEFF) or a tag character (U+E0000–E007F, five hex digits) puts a character into a host
- * the eye cannot see. A variation selector is not here: U+FE0F is how `❤️` is written, and
- * marking it would mark every emoji. In code, and in a fence's name, the exact characters are the
- * point, so each is replaced by its code point. Prose marks only the bidi controls, every
- * one ({@link BIDI}): the zero-width joiners and the rest are how joined scripts are written.
+ * the eye cannot see. So does each character that is drawn as nothing or as a blank and is
+ * not whitespace (U12 review): the soft hyphen U+00AD, the grapheme joiner U+034F, the
+ * Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, the Mongolian vowel separator U+180E,
+ * and the invisible operators U+2061–U+2064. And the variation selectors, U+FE00–U+FE0F,
+ * U+E0100–U+E01EF and Mongolian's four: in code they are marked too, so `❤️` in a fence
+ * reads `❤⟨U+FE0F⟩` — the cost of a host that can carry one unseen. In code, and in a
+ * fence's name, the exact
+ * characters are the point, so each is replaced by its code point. Prose marks only the bidi
+ * controls, every one ({@link BIDI}): the zero-width joiners and the rest are how joined
+ * scripts are written, and an emoji's selector is how an emoji is written.
  *
  * The marker is a text node in an element with a constant class, built here after the
  * sanitiser like the rest of the frame. The sanitiser lets no `class` through from the
@@ -208,8 +214,13 @@ const rewrite = (
  * That is what lets `Markdown.svelte`'s Copy put the original character back: the button
  * copies the code as the agent wrote it.
  */
+/*
+ * The combining ones — U+034F and the variation selectors, `\p{Variation_Selector}`
+ * (U+FE00–U+FE0F, U+E0100–U+E01EF, and Mongolian's U+180B–U+180D and U+180F) — sit outside
+ * the class: inside one, a combining mark reads as if it joined the character before it.
+ */
 const HIDDEN =
-  /[\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/u;
+  /[\u00AD\u061C\u115F\u1160\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u3164\uFEFF\uFFA0\u{E0000}-\u{E007F}]|\u034F|\p{Variation_Selector}/u;
 const hiddenName = (char: string): string =>
   `⟨U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}⟩`;
 const marking =

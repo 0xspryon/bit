@@ -149,29 +149,61 @@
    * `MermaidBlock`, given the fence's name and code **as the agent wrote them** (`written`
    * puts back the characters the pipeline marked: the figure's own drawing marks them
    * again). An `$effect` rather than an attachment, because it must run after `{@html}`
-   * has replaced the frames: it re-runs whenever the HTML changes, and each block is
-   * unmounted with the frame it was in.
+   * has replaced the frames: it re-runs whenever the HTML changes.
+   *
+   * **A drawn figure outlives the HTML it was drawn in.** A live reply's text grows by a
+   * delta at a time, and every delta is a new HTML string that `{@html}` puts in place of
+   * every frame, a closed fence's included. Mounting a fresh block each time laid every
+   * figure out again on every delta — about a second each in Chrome for a large one — and
+   * reset its Show code (U12 review). So each block is mounted into a `host` element of its
+   * own, remembered by the fence's place among this reply's figures, its name and its code;
+   * when the new HTML has a frame with the same three, the host — the drawn SVG, the
+   * toggle's state and all — is moved into it, and only a fence that is new, or changed,
+   * is drawn. A block whose fence is gone is unmounted. The host is `display: contents`, so
+   * the block's head, figure and code are laid out by the frame exactly as before.
    */
+  interface Drawn {
+    readonly host: HTMLElement;
+    readonly block: ReturnType<typeof mount>;
+  }
+  let drawn = new Map<string, Drawn>();
   let root: HTMLElement | undefined = $state();
   $effect(() => {
     void html;
     if (root === undefined) return;
-    const blocks = [
-      ...root.querySelectorAll<HTMLElement>(".code-frame[data-diagram]"),
-    ].map((frame) => {
+    const next = new Map<string, Drawn>();
+    const frames = root.querySelectorAll<HTMLElement>(
+      ".code-frame[data-diagram]",
+    );
+    for (const [index, frame] of frames.entries()) {
       const code = frame.querySelector("pre > code");
       const label = frame.querySelector(".code-label");
       const source = code === null ? "" : written(code).replace(/\n$/, "");
       const name = label === null ? "mermaid" : written(label);
-      frame.replaceChildren();
-      return mount(MermaidBlock, {
-        target: frame,
-        props: { source, label: name },
-      });
-    });
-    return () => {
-      for (const block of blocks) void unmount(block);
-    };
+      const key = JSON.stringify([index, name, source]);
+      let kept = drawn.get(key);
+      drawn.delete(key);
+      if (kept === undefined) {
+        const host = document.createElement("div");
+        host.className = "diagram-host";
+        host.style.display = "contents";
+        kept = {
+          host,
+          block: mount(MermaidBlock, {
+            target: host,
+            props: { source, label: name },
+          }),
+        };
+      }
+      frame.replaceChildren(kept.host);
+      next.set(key, kept);
+    }
+    for (const gone of drawn.values()) void unmount(gone.block);
+    drawn = next;
+  });
+  $effect(() => () => {
+    for (const each of drawn.values()) void unmount(each.block);
+    drawn = new Map();
   });
 </script>
 

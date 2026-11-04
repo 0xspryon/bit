@@ -30,8 +30,17 @@ const purifiers = new WeakMap<WindowLike, Purifier>();
 const FOREIGN_URL = /url\s*\(\s*(?!['"]?#)/i;
 
 /**
+ * Two more ways a value could reach a URL past {@link FOREIGN_URL}, dropped as defence in
+ * depth (U12 review): a CSS escape, `u\72l(…)`, which spells `url(` without the letters,
+ * and `image-set(…)`, which loads an image from a bare string. Neither is exploitable
+ * today — pele rejects both — and no figure pele draws needs a backslash in an attribute.
+ */
+const ESCAPED_OR_IMAGE_SET = /\\|image-set\s*\(/i;
+
+/**
  * The private instance, built on first use with its one hook: an attribute whose value
- * reaches outside the SVG through `url(…)` is removed. A private instance, because a hook
+ * reaches outside the SVG through `url(…)`, or holds a backslash or an `image-set(…)`, is
+ * removed. A private instance, because a hook
  * on the global DOMPurify would apply to every other caller in the page.
  *
  * **An instance that is not supported is refused.** DOMPurify built over a window it
@@ -46,7 +55,12 @@ const purify = (view: WindowLike): Purifier => {
     throw new Error("The diagram sanitiser cannot run in this browser.");
   }
   made.addHook("uponSanitizeAttribute", (_node, data) => {
-    if (FOREIGN_URL.test(data.attrValue)) data.keepAttr = false;
+    if (
+      FOREIGN_URL.test(data.attrValue) ||
+      ESCAPED_OR_IMAGE_SET.test(data.attrValue)
+    ) {
+      data.keepAttr = false;
+    }
   });
   purifiers.set(view, made);
   return made;
@@ -62,6 +76,9 @@ const purify = (view: WindowLike): Purifier => {
  * - `FORBID_ATTR: href, xlink:href, src, srcset` — the attributes that load or navigate,
  *   whatever element carries them (`<use href>`, `<feImage>`).
  * - Event handlers (`onclick`, `onload`) and `javascript:` URLs are DOMPurify's defaults.
+ *
+ * Accepted for V1: a fence can restyle its own figure (`style X fill:#f00,font-size:400px`),
+ * and what it draws stays clipped inside the SVG and its frame.
  */
 export const sanitizeDiagramSvg = (
   svg: string,

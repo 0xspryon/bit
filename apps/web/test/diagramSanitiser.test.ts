@@ -65,4 +65,28 @@ describe("the diagram sanitiser", () => {
     expect(out).toContain('marker-end="url(#arrow)"');
     expect(out).toContain('<path d="M0 0L1 1"');
   });
+
+  test("drops any attribute with a backslash or an image-set( in it, and keeps its siblings", () => {
+    // Defence in depth (U12 review): a CSS escape spells `url(` without the letters, and
+    // `image-set` loads from a bare string. pele rejects both today; the sanitiser does too.
+    const out = clean(
+      [
+        '<svg xmlns="http://www.w3.org/2000/svg">',
+        '<rect id="a" width="1" height="1" style="fill: u\\72l(https://attacker.example/e)" />',
+        '<rect id="b" width="1" height="1" fill="\\75rl(x)" />',
+        '<rect id="c" width="1" height="1" style="fill: image-set(\'https://attacker.example/i.png\' 1x)" />',
+        '<rect id="d" width="1" height="1" style="fill: IMAGE-SET (\'x.png\' 1x)" />',
+        '<rect id="e" width="1" height="1" style="fill: #000" />',
+        "</svg>",
+      ].join(""),
+    );
+    expect(out).not.toContain("\\");
+    expect(out.toLowerCase()).not.toContain("image-set");
+    expect(out).not.toContain("attacker.example");
+    // The rest of each rect stays: only the attribute goes.
+    for (const id of ["a", "b", "c", "d"]) {
+      expect(out).toContain(`<rect id="${id}" width="1" height="1"`);
+    }
+    expect(out).toContain('style="fill: #000"');
+  });
 });

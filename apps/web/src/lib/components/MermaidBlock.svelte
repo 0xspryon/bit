@@ -116,9 +116,18 @@
     --pele-series-8: var(--bg-layer-02);
     --pele-font: var(--font-sans);
     --pele-radius: var(--radius-sm);
+    /*
+     * A figure is at most 640px tall, and scrolls inside its frame past that. A reply's
+     * figure is the agent's, and a 3,000-node chain drew 288,064px tall (U12 review): the
+     * thread is the operator's, and no one figure may take it over. Items are not stretched,
+     * so a short figure keeps its own height.
+     */
     display: flex;
+    align-items: flex-start;
     justify-content: center;
-    overflow-x: auto;
+    max-height: 640px;
+    overflow: auto;
+    overscroll-behavior: contain;
     padding: 12px 14px;
   }
   .diagram[hidden] {
