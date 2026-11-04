@@ -144,6 +144,21 @@ describe("a sub-agent's entry", () => {
     expect(ledger.querySelector(".body")?.textContent).toBe(task);
     expect(ledger.textContent).not.toMatch(/[\u200F\u202B-\u202E\u2067\u2069]/);
 
+    // A Hebrew word glued to a host, or one planted letter, keeps none of its controls
+    // (a second review of U14).
+    const glued = draw(
+      entry({
+        headline: "י\u2067com\u200F.\u200Facme\u2069",
+        body: "Fetch שלום\u2800\u2067com\u200F.\u200Facme\u2069 now",
+      }),
+    );
+    expect(glued.querySelector(".agent-type")?.textContent).toBe(
+      "י⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩",
+    );
+    expect(glued.querySelector(".task")?.textContent).toBe(
+      "Fetch שלום\u2800⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ now",
+    );
+
     // Right-to-left words keep the controls they are written with.
     const hebrew = draw(entry({ body: "בדוק \u2067את האתר\u2069 בבקשה" }));
     expect(hebrew.querySelector(".task")?.textContent).toBe(
@@ -173,6 +188,56 @@ describe("a sub-agent's entry", () => {
 });
 
 describe("the target's Live panel", () => {
+  /*
+   * A second review of U14: collapsed, the bar names the newest arrival by its headline, a
+   * sub-agent's type, and drew it as it came, so an RLO in it reversed the bar.
+   */
+  test("collapsed, it marks a bidi control in the newest headline and isolates it", async () => {
+    const app = new App(new FakeServer(), new FakeCountdown());
+    app.viewTargetId = "acme-corp";
+    app.liveTargetId = "acme-corp";
+    app.liveExpanded = false;
+    app.liveItems = [
+      entry({
+        headline: "\u202Eesoprup-lareneg \u2067com\u200F.\u200Facme\u2069",
+      }),
+    ];
+    const panel = mountInto(LiveTranscript, { app });
+    mounted.push(panel);
+    await settle();
+    const headline =
+      panel.target.querySelector<HTMLElement>(".newest .headline");
+    expect(headline?.textContent).toBe(
+      "⟨U+202E⟩esoprup-lareneg ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩",
+    );
+    expect(headline?.querySelectorAll(".char-escape")).toHaveLength(5);
+    expect(
+      panel.target
+        .querySelector(".newest")
+        ?.textContent?.replace(/\s+/gu, " ")
+        .trim(),
+    ).toBe(
+      "Sub-agent — ⟨U+202E⟩esoprup-lareneg ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩",
+    );
+
+    const path = new URL(
+      "../../src/lib/components/LiveTranscript.svelte",
+      import.meta.url,
+    ).pathname;
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+    expect(
+      headline === null ? "" : getComputedStyle(headline).unicodeBidi,
+    ).toBe("isolate");
+  });
+
   test("draws each sub-agent as one row, at where it started, in its newest state", async () => {
     const app = new App(new FakeServer(), new FakeCountdown());
     app.viewTargetId = "acme-corp";

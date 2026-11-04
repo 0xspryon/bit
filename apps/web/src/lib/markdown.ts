@@ -231,21 +231,40 @@ const reveal = marking(HIDDEN);
  * marks between the words of a sentence in an isolate put the words in another order; and
  * an IP address with an RLM or ALM between its octets reads out of order with no isolate at
  * all. So an override, which forces every letter after it backwards whatever its script, is
- * marked wherever it is, and every other control is marked in any word that holds **no
- * right-to-left letter** ({@link RTL_LETTER}).
+ * marked wherever it is, and every other control is kept only **beside a right-to-left
+ * letter** ({@link RTL_LETTER}), on the side it acts on:
  *
- * A word is a whitespace-delimited run of one text node. Right-to-left prose is written
- * with these characters — a mark beside a Hebrew word to keep the punctuation on its side,
- * an isolate round an Arabic phrase quoted in English — and in a word that has a Hebrew or
- * Arabic letter they stay, so that prose reads as it was written. A word with none, a
- * hostname, an address, an English word, has nothing in it for a control to set right, so
- * a control in it can only be reordering what the operator reads.
+ * - an opener — LRE, RLE, LRI, RLI, FSI — if the first letter or digit after it is one,
+ *   since what it reorders is what it opens;
+ * - a closer — PDF, PDI — if the first letter or digit before it is one, what it closes;
+ * - a mark — ALM, LRM, RLM — if the first letter or digit on either side of it is one.
+ *
+ * The search skips every other character, controls, spaces and punctuation included, and
+ * stops at the first letter or digit ({@link STOP}); a digit is never right-to-left, so a
+ * mark between two octets is marked whatever word stands before them.
+ *
+ * Right-to-left prose is written with these characters — a mark beside a Hebrew word to
+ * keep the punctuation on its side, an isolate round an Arabic phrase quoted in English, an
+ * LRM after `C++` in a Hebrew sentence — and beside a Hebrew or Arabic letter they stay, so
+ * that prose reads as it was written. Between two left-to-right letters, a hostname's, an
+ * address's or an English sentence's, a control has nothing to set right and can only be
+ * reordering what the operator reads. A second review of U14 found the rule this replaces,
+ * which kept every control in a whitespace-delimited word holding any right-to-left letter,
+ * bypassed by a word glued together: `שלום` U+2800 RLI `com` RLM `.` RLM `acme` PDI (U+2800,
+ * U+3164, U+FFA0 and U+200B are not whitespace), or a single planted `י` before the RLI.
+ * Judged by its neighbours, every control there is marked, and nothing here reads words.
  */
 const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
 const OVERRIDE = /[\u202D\u202E]/u;
+/** LRE, RLE, LRI, RLI and FSI: judged by what follows them. */
+const OPENER = /[\u202A\u202B\u2066-\u2068]/u;
+/** PDF and PDI: judged by what precedes them. */
+const CLOSER = /[\u202C\u2069]/u;
 /** A letter of a right-to-left script: Hebrew, Arabic, Syriac, Thaana or N'Ko. */
 const RTL_LETTER =
   /(?=\p{L})[\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Syriac}\p{Script=Thaana}\p{Script=Nko}]/u;
+/** Where the search beside a control stops: a letter or a digit, of any script. */
+const STOP = /[\p{L}\p{Nd}]/u;
 
 /** A run of prose as drawn: its words, or one marked character as its code point. */
 export interface ProseRun {
@@ -255,26 +274,55 @@ export interface ProseRun {
 }
 
 /**
+ * For each character of `chars`, whether the first letter or digit before it (`step` 1) or
+ * after it (`step` -1, read from the end) is a right-to-left letter. One pass, so a text of
+ * nothing but controls costs no more than its length.
+ */
+const rtlBeside = (
+  chars: readonly string[],
+  step: 1 | -1,
+): readonly boolean[] => {
+  const beside: boolean[] = new Array<boolean>(chars.length).fill(false);
+  let rtl = false;
+  for (
+    let at = step === 1 ? 0 : chars.length - 1;
+    at >= 0 && at < chars.length;
+    at += step
+  ) {
+    beside[at] = rtl;
+    const char = chars[at] ?? "";
+    if (STOP.test(char)) rtl = RTL_LETTER.test(char);
+  }
+  return beside;
+};
+
+/**
  * Plain text as prose draws it, the bidi controls {@link BIDI} names marked as their code
  * points and everything else as it was. The one rule for prose: {@link rewrite} draws an
- * agent's markdown with it, and `ChatItem` a sub-agent's type and task, which are plain
- * text and never markdown.
+ * agent's markdown with it, and `ChatItem` a sub-agent's type and task and `LiveTranscript`
+ * the newest headline, which are plain text and never markdown.
  */
 export const proseRuns = (text: string): readonly ProseRun[] => {
+  if (!BIDI.test(text)) return text === "" ? [] : [{ text, escape: false }];
+  const chars = [...text];
+  const before = rtlBeside(chars, 1);
+  const after = rtlBeside(chars, -1);
   const runs: ProseRun[] = [];
   let plain = "";
-  for (const word of text.split(/(\s+)/u)) {
-    const hidden = RTL_LETTER.test(word) ? OVERRIDE : BIDI;
-    for (const char of word) {
-      if (!hidden.test(char)) {
-        plain += char;
-        continue;
-      }
-      if (plain !== "") runs.push({ text: plain, escape: false });
-      plain = "";
-      runs.push({ text: hiddenName(char), escape: true });
+  chars.forEach((char, at) => {
+    const kept =
+      !BIDI.test(char) ||
+      (!OVERRIDE.test(char) &&
+        ((!CLOSER.test(char) && after[at] === true) ||
+          (!OPENER.test(char) && before[at] === true)));
+    if (kept) {
+      plain += char;
+      return;
     }
-  }
+    if (plain !== "") runs.push({ text: plain, escape: false });
+    plain = "";
+    runs.push({ text: hiddenName(char), escape: true });
+  });
   if (plain !== "") runs.push({ text: plain, escape: false });
   return runs;
 };

@@ -1364,11 +1364,17 @@ const storedNotification = (
  * completed`, `Background command "…" completed (exit code 0)`), else `Task <status>`, else
  * a constant. Never the notification's other text: an agent's carries the sub-agent's
  * final report in `<result>`.
+ *
+ * Both are read only from the text **before** the first `<result>`, where the CLI writes
+ * its own tags. The report is the sub-agent's words and may hold a `<summary>` of its own,
+ * and a summary may hold a `<` (`Agent "Compare a<b hosts" completed`), so a read that
+ * failed on the real one would otherwise go on to the report's (a second review of U14).
  */
 const notificationLine = (text: string): string => {
-  const summary = /<summary>([^<]*)<\/summary>/.exec(text)?.[1]?.trim();
+  const head = text.split("<result>", 1)[0] ?? "";
+  const summary = /<summary>([\s\S]*?)<\/summary>/.exec(head)?.[1]?.trim();
   if (summary !== undefined && summary !== "") return summary;
-  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1]?.trim();
+  const status = /<status>([^<]+)<\/status>/.exec(head)?.[1]?.trim();
   return status === undefined ? "Task notification" : `Task ${status}`;
 };
 

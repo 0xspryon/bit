@@ -38,6 +38,7 @@
   import ScenarioBar from "./ScenarioBar.svelte";
   import { IconAngleDown, IconAngleUp, IconBlocked } from "../icons";
   import { foldSubagents, kindLabel } from "../chat";
+  import { proseRuns } from "../markdown";
   import type { App } from "../app.svelte";
   import { atBottom } from "../scroll";
 
@@ -205,7 +206,17 @@
       <span class="rule" aria-hidden="true"></span>
       <span class="newest">
         {#if newest !== undefined}
-          {kindLabel(newest.kind)} — {newest.headline}
+          {kindLabel(newest.kind)} —
+          <!--
+            The headline is the agent's words — a sub-agent's type, a tool's name — so its
+            bidi controls are marked as prose marks them (`proseRuns`) and it is an isolate
+            of its own: a control in it cannot reorder it or move the bar around it.
+          -->
+          <span class="headline"
+            >{#each proseRuns(newest.headline) as run, index (index)}{#if run.escape}<span
+                  class="char-escape">{run.text}</span
+                >{:else}{run.text}{/if}{/each}</span
+          >
         {:else if about && app.liveWatching}
           Nothing yet — a run's turns, tool calls and results appear here.
         {/if}
@@ -380,6 +391,22 @@
     font: 400 12px/16px var(--font-sans);
     white-space: nowrap;
     text-overflow: ellipsis;
+  }
+  .newest .headline {
+    unicode-bidi: isolate;
+  }
+  /* A bidi control in a headline, written out as its code point, drawn as prose draws one. */
+  .newest .char-escape {
+    margin: 0 1px;
+    padding: 0 2px;
+    border: 1px solid var(--border-muted);
+    border-radius: 3px;
+    color: var(--text-faint);
+    font-size: 0.85em;
+    font-style: normal;
+    letter-spacing: normal;
+    text-transform: none;
+    white-space: nowrap;
   }
   .grow {
     flex: 1;

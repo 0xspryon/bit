@@ -648,7 +648,9 @@ describe("characters that do not show as what they are", () => {
       "النطاق يشمل admin.acme.com فقط.",
       "התחום כולל את admin.acme.com בלבד.",
       "Scope \u2067النطاق\u2069 then \u200Fעברית\u200E and \u202Bמוטבע\u202C, a\u200Db.",
-      "ܫܠܡܐ\u200F ހެލޯ\u061C ߊߛ\u2068 and \u2067עברית ועוד\u2069.",
+      "ܫܠܡܐ\u200F ހެލޯ\u061C \u2068ߊߛ\u2069 and \u2067עברית ועוד\u2069.",
+      "שלום\u200F! He said \u2067مرحبا بكم\u2069 today, about ה\u200F-CPU.",
+      "קוד C++\u200E הוא שפה.",
     ];
     const root = render(sentences.join("\n\n"));
     expect(
@@ -710,6 +712,74 @@ describe("characters that do not show as what they are", () => {
     expect(root.querySelector("p")?.textContent).toBe(
       "התחום כולל את ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ בלבד\u200F.",
     );
+  });
+
+  /*
+   * A second review of U14: the rule judged whole words, split on whitespace, and a Hebrew
+   * letter anywhere in the word kept every control in it. A blank-looking character that is
+   * not whitespace (U+2800, U+3164, U+FFA0, U+115F, U+1160) or a zero-width space glued a
+   * Hebrew word to a hostname, and so did one planted letter, and `com.acme` read as
+   * `acme.com` with no marker. A control is judged by the letters beside it now.
+   */
+  const written = (text: string): string =>
+    text.replace(
+      /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,
+      (char) =>
+        `⟨U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}⟩`,
+    );
+  const host = "\u2067com\u200F.\u200Facme\u2069";
+
+  test.each([
+    ["a braille blank", "\u2800"],
+    ["a Hangul filler", "\u3164"],
+    ["a zero-width space", "\u200B"],
+    ["a halfwidth Hangul filler", "\uFFA0"],
+    ["a Hangul choseong filler", "\u115F"],
+    ["a Hangul jungseong filler", "\u1160"],
+  ])(
+    "in prose, a Hebrew word glued to a host by %s does not keep the host's controls",
+    (_, glue) => {
+      const sentence = `Host שלום${glue}${host} is in scope.`;
+      const root = render(sentence);
+      expect(root.querySelector("p")?.textContent).toBe(written(sentence));
+      expect(root.querySelectorAll(".char-escape")).toHaveLength(4);
+    },
+  );
+
+  test("in prose, link text glued to a Hebrew word by a blank-looking character is marked", () => {
+    const text = `שלום\u2800${host}`;
+    const root = render(`Open [${text}](https://com.acme) now.`);
+    expect(root.querySelector("a")?.getAttribute("href")).toBe(
+      "https://com.acme",
+    );
+    expect(root.querySelector("a")?.textContent).toBe(written(text));
+    expect(root.querySelectorAll("a .char-escape")).toHaveLength(4);
+  });
+
+  test("in prose, one planted Hebrew letter keeps none of a host's controls", () => {
+    const root = render(`Host י${host} is in scope.`);
+    expect(root.querySelector("p")?.textContent).toBe(
+      "Host י⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ is in scope.",
+    );
+  });
+
+  test("in prose, an opener after a Hebrew word is judged by what it opens, and a mark between digits by the digits", () => {
+    // RLI with no PDI after a Hebrew word would draw `10.0.0.1 out of`; FSI is made
+    // right-to-left by a mark inside it; and an RLM between octets reorders them even
+    // with a Hebrew letter in front.
+    const sentences = [
+      "שלום\u2067out of 10.0.0.1",
+      "שלום\u2068\u200Fout of 10.0.0.1",
+      "א-10\u200F.0.0.1",
+    ];
+    const root = render(sentences.join("\n\n"));
+    expect(
+      [...root.querySelectorAll("p")].map((each) => each.textContent),
+    ).toEqual([
+      "שלום⟨U+2067⟩out of 10.0.0.1",
+      "שלום⟨U+2068⟩\u200Fout of 10.0.0.1",
+      "א-10⟨U+200F⟩.0.0.1",
+    ]);
   });
 
   test("Copy gives back a five-digit tag character and an Arabic letter mark as written", async () => {
