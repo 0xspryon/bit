@@ -14,6 +14,11 @@
    * `rehype-sanitize`'s protocol allowlist. See `markdown.ts`. Nothing else may be passed to
    * `{@html}` here.
    *
+   * **The one other place is a flow figure** (A6 U12): a closed ` ```mermaid ` fence, which
+   * `MermaidBlock` draws client-side from the fence's text. Its SVG is the renderer's, not
+   * the agent's markup, and it passes a second, private sanitiser before it is in the page
+   * (`diagramDraw.ts`).
+   *
    * `renderMarkdown` is remembered by text, so this deriving again — which it does whenever
    * the row above it is rebuilt, on every frame of unrelated live activity — is a lookup
    * rather than a parse.
@@ -21,9 +26,11 @@
    * Sizes are inherited: the live row sets 13px and the replayed one 12px, and a heading or
    * a code block is drawn relative to whichever it is in.
    */
+  import { mount, unmount } from "svelte";
   import type { Attachment } from "svelte/attachments";
 
   import { renderMarkdown } from "../markdown";
+  import MermaidBlock from "./MermaidBlock.svelte";
 
   let { text }: { text: string } = $props();
 
@@ -132,9 +139,43 @@
       resets.clear();
     };
   };
+
+  /**
+   * Each closed mermaid fence in this reply, drawn as a flow figure (A6 U12).
+   *
+   * `markdown.ts` marks such a fence's frame `data-diagram` and leaves it ordinary code, so
+   * the HTML is the same sanitised string whether or not a figure is ever drawn. Here, after
+   * `{@html}` has put it in the page, each marked frame's contents are replaced by a
+   * `MermaidBlock`, given the fence's name and code **as the agent wrote them** (`written`
+   * puts back the characters the pipeline marked: the figure's own drawing marks them
+   * again). An `$effect` rather than an attachment, because it must run after `{@html}`
+   * has replaced the frames: it re-runs whenever the HTML changes, and each block is
+   * unmounted with the frame it was in.
+   */
+  let root: HTMLElement | undefined = $state();
+  $effect(() => {
+    void html;
+    if (root === undefined) return;
+    const blocks = [
+      ...root.querySelectorAll<HTMLElement>(".code-frame[data-diagram]"),
+    ].map((frame) => {
+      const code = frame.querySelector("pre > code");
+      const label = frame.querySelector(".code-label");
+      const source = code === null ? "" : written(code).replace(/\n$/, "");
+      const name = label === null ? "mermaid" : written(label);
+      frame.replaceChildren();
+      return mount(MermaidBlock, {
+        target: frame,
+        props: { source, label: name },
+      });
+    });
+    return () => {
+      for (const block of blocks) void unmount(block);
+    };
+  });
 </script>
 
-<div class="markdown" {@attach copyButtons}>
+<div class="markdown" bind:this={root} {@attach copyButtons}>
   {@html html}
 </div>
 <span class="announce" aria-live="polite">{announced}</span>

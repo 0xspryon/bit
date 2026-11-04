@@ -128,7 +128,11 @@ const htmlAsText: NonNullable<RemarkRehypeOptions["handlers"]>["html"] = (
  *   to point at them they could only collide: each reply with a `[^1]` mints the same one.
  *   `aria-describedby` goes with them, since all it named was a footnote heading's `id`.
  */
-const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
+const rewrite = (
+  node: ElementContent,
+  inLink: boolean,
+  source: string,
+): ElementContent[] => {
   if (!isElement(node)) return markProse(node);
   delete node.properties["id"];
   delete node.properties["ariaDescribedBy"];
@@ -160,23 +164,27 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
     const href = node.properties["href"];
     if (node.properties["dataFootnoteBackref"] !== undefined) return [];
     if (typeof href === "string" && href.startsWith("#")) {
-      return node.children.flatMap((child) => rewrite(child, inLink));
+      return node.children.flatMap((child) => rewrite(child, inLink, source));
     }
     if (typeof href === "string") {
       node.properties["rel"] = ["noopener", "noreferrer"];
       node.properties["target"] = "_blank";
     }
-    node.children = node.children.flatMap((child) => rewrite(child, true));
+    node.children = node.children.flatMap((child) =>
+      rewrite(child, true, source),
+    );
     return [node];
   }
-  node.children = node.children.flatMap((child) => rewrite(child, inLink));
+  node.children = node.children.flatMap((child) =>
+    rewrite(child, inLink, source),
+  );
   if (node.tagName === "code") node.children = node.children.flatMap(reveal);
   if (node.tagName === "table") {
     return [element("div", { className: ["table-wrap"] }, [node])];
   }
   if (node.tagName === "blockquote") quoteSource(node);
   if (node.tagName === "li") taskText(node);
-  if (node.tagName === "pre") return [codeFrame(node)];
+  if (node.tagName === "pre") return [codeFrame(node, source)];
   return [node];
 };
 
@@ -356,7 +364,7 @@ const revealProse = (text: string): string =>
  * fence is the agent's prose: without the header an agent could draw itself a receipt. The
  * header with its Copy button is the one thing a record never has.
  */
-const codeFrame = (pre: Element): Element => {
+const codeFrame = (pre: Element, source: string): Element => {
   const code = pre.children.find(isElement);
   const language = (
     Array.isArray(code?.properties["className"])
@@ -375,7 +383,7 @@ const codeFrame = (pre: Element): Element => {
     typeof meta === "string" && meta.trim() !== ""
       ? meta.trim()
       : (language ?? "");
-  return element("div", { className: ["code-frame"] }, [
+  return element("div", diagramMark(pre, code, language, source), [
     element("div", { className: ["code-head"] }, [
       element(
         "span",
@@ -394,6 +402,72 @@ const codeFrame = (pre: Element): Element => {
     ]),
     pre,
   ]);
+};
+
+/**
+ * Whether a fence's source, as written, ends with its closing fence.
+ *
+ * A reply can arrive cut — a Claude Code text block stopped mid-stream is still sent — and
+ * a fence the agent never closed runs to the end of the reply as code. Drawing that would
+ * draw half a diagram as though it were the agent's figure, so it stays code.
+ *
+ * `fence` is the slice of the reply the fence occupies (its hast position), `code` the code
+ * it parsed to. The fence is closed when it opens with three or more backticks or tildes,
+ * its last line is a run of the same character at least as long (after a quote's `>`
+ * prefixes and indentation), and that line is not the code's own last line: a fence that
+ * is only an opener, ` ``` ` and nothing after it, is not its own closer. The prefix is one
+ * character class, not nested quantifiers, so a line of many `> ` cannot make it backtrack.
+ * The approach is T3 Code's `isClosedCodeFence`.
+ */
+export const isClosedFence = (fence: string, code: string): boolean => {
+  const opening = /^(?:`{3,}|~{3,})/.exec(fence)?.[0];
+  const closing = /(?:^|\n)[ \t>]*(`{3,}|~{3,})[ \t\r]*$/.exec(fence)?.[1];
+  if (opening === undefined || closing === undefined) return false;
+  if (opening[0] !== closing[0] || closing.length < opening.length) {
+    return false;
+  }
+  // A CRLF reply cut after the CR must not count as one more line than the code has.
+  const lines = (text: string): number => text.split(/\r\n|\r|\n/).length;
+  return lines(fence.replace(/\r$/, "")) > lines(code);
+};
+
+/** Every text node under `node`, in order: a fence's code, its markers included. */
+const textOf = (node: ElementContent): string =>
+  node.type === "text"
+    ? node.value
+    : isElement(node)
+      ? node.children.map(textOf).join("")
+      : "";
+
+/**
+ * A fence's frame properties: its class, and `data-diagram` when it is a **closed** mermaid
+ * fence, which `Markdown.svelte` draws as a flow figure (A6 U12, `diagram.ts`).
+ *
+ * Closed is read from the reply's own text at the fence's position, which the sanitiser
+ * carries over: a fence the agent never closed — a reply cut mid-stream — stays code. The
+ * mark is a constant on an element built here; the sanitiser passes no `data-*` from the
+ * source, so only this can make a fence a figure, and what is drawn is the fence's text.
+ */
+const diagramMark = (
+  pre: Element,
+  code: Element | undefined,
+  language: string | undefined,
+  source: string,
+): Element["properties"] => {
+  const start = pre.position?.start.offset;
+  const end = pre.position?.end.offset;
+  // The code's markers (`reveal`) are already in it; none holds a line break.
+  const closed =
+    language === "mermaid" &&
+    start !== undefined &&
+    end !== undefined &&
+    isClosedFence(
+      source.slice(start, end),
+      code === undefined ? "" : textOf(code),
+    );
+  return closed
+    ? { className: ["code-frame"], dataDiagram: "mermaid" }
+    : { className: ["code-frame"] };
 };
 
 /**
@@ -544,7 +618,7 @@ const blank = (tree: Root): boolean =>
 
 const finish = () => (tree: Root, file: { readonly value: unknown }) => {
   tree.children = tree.children.flatMap((node): RootContent[] =>
-    node.type === "doctype" ? [node] : rewrite(node, false),
+    node.type === "doctype" ? [node] : rewrite(node, false, String(file.value)),
   );
   if (blank(tree)) {
     tree.children = [
