@@ -93,6 +93,7 @@ import {
   OPEN_PROMPT,
   TerminalOutcome,
   truncateNarration,
+  type BlockChannel,
   type HarnessNarration,
   type MessageEntry,
   type NarrationDetail,
@@ -473,6 +474,45 @@ const asJson = (value: unknown): string => {
 };
 
 /**
+ * One OpenCode text or reasoning block's id, from any of its events: `started`, a `delta`
+ * or `ended`. `undefined` for an event missing either half, whose block cannot be named.
+ *
+ * The channel is part of it because OpenCode counts the `ordinal` separately for text and
+ * for reasoning in one assistant message — the first thinking block and the first reply
+ * are both ordinal 0. See {@link openCodeNarration}.
+ */
+export const openCodeBlockId = (
+  channel: BlockChannel,
+  data: Record<string, unknown>,
+): string | undefined => {
+  const message = data["assistantMessageID"];
+  const ordinal = data["ordinal"];
+  return typeof message === "string" &&
+    typeof ordinal === "number" &&
+    Number.isInteger(ordinal)
+    ? `${message}:${channel === "reply" ? "text" : "reasoning"}:${String(ordinal)}`
+    : undefined;
+};
+
+/** A text or reasoning delta as a {@link BlockDelta}, or `opaque` if it names no block. */
+const blockDelta = (
+  channel: BlockChannel,
+  data: Record<string, unknown>,
+): NarrationDetail => {
+  const blockId = openCodeBlockId(channel, data);
+  const text = data["delta"];
+  return blockId === undefined || typeof text !== "string"
+    ? { _tag: "opaque" }
+    : { _tag: "delta", blockId, channel, text };
+};
+
+/** `blockId` as a key to spread, absent when the block cannot be named. */
+const blockKey = (channel: BlockChannel, data: Record<string, unknown>) => {
+  const blockId = openCodeBlockId(channel, data);
+  return blockId === undefined ? {} : { blockId };
+};
+
+/**
  * What this application reads one OpenCode event as.
  *
  * ## The tool name arrives on a different event from the arguments
@@ -499,13 +539,26 @@ const asJson = (value: unknown): string => {
  * the arguments, or reusing the last name seen, would put the wrong tool next to a real
  * set of arguments, which is worse than an unnamed call.
  *
- * ## Text comes from `ended`, never from `delta`
+ * ## A finished block comes from `ended`; its deltas only stream it
  *
- * `session.text.delta` is one event per token-ish chunk and is read as `opaque`:
- * `session.text.ended` carries the whole block once (`data.text`), so taking the reply from
- * there means one entry per block instead of hundreds per reply, with no reassembly to get
- * wrong. The deltas are still published — they are what the supervisor's outcome watch
- * reads the stream for — they just carry nothing to render.
+ * `session.text.ended` carries the whole block once (`data.text`), so the `reply` is taken
+ * from there: one entry per block, with no reassembly to get wrong. `session.text.delta`
+ * — one event per ~100 ms batch of tokens, which OpenCode itself coalesces — is a
+ * {@link BlockDelta} (A6 F7): a piece of the block while it is being written, which the
+ * importer and goal conversations coalesce into live partials
+ * (`run/streamingCoalescer.ts`) and the worker and planner supervisors keep off the
+ * narration bus (`narratesOnSharedBus`). Neither reads a delta for the outcome: that is on
+ * `session.execution.*`, and a delta carries none.
+ *
+ * Verified against `@opencode/protocol@2.1.0`'s event union and the 2.2.5 server's
+ * publisher (`packages/core/src/session/runner/publish-llm-event.ts`): no event of a
+ * block carries a part id. A block is named by **`assistantMessageID` and `ordinal`**,
+ * which `started`, every `delta` and `ended` all carry — and the ordinal is counted
+ * **separately** for text and for reasoning within one message, both from 0. So the
+ * `blockId` is {@link openCodeBlockId}: the message, the channel and the ordinal, the same
+ * on every event of the block, which is what lets the finished block replace its partials.
+ * The publisher sends a block's last batched delta before its `ended`, on the one ordered
+ * stream, so no delta follows its block's end.
  *
  * Reads defensively off an already-decoded value, for the same reason {@link flatten}
  * does: the entry union is wide and version-specific, and re-asserting a shape the
@@ -514,8 +567,8 @@ const asJson = (value: unknown): string => {
  * ## Reasoning, and usage, come from the `ended` events too
  *
  * `session.reasoning.ended` carries the whole block as `data.text`, exactly as
- * `session.text.ended` does for a reply, so thinking is one entry per block and the deltas
- * are `opaque` for the same reason text deltas are.
+ * `session.text.ended` does for a reply, so thinking is one entry per block, and
+ * `session.reasoning.delta` streams it exactly as text deltas stream a reply.
  *
  * `session.step.ended` is the per-call usage, and **`session.usage.updated` is not**: the
  * two fire in the same millisecond with the same field shape, and the second is a session
@@ -554,13 +607,25 @@ export const openCodeNarration = (
 
   const detail = ((): NarrationDetail => {
     switch (type) {
+      case "session.text.delta":
+        return blockDelta("reply", data);
+      case "session.reasoning.delta":
+        return blockDelta("thinking", data);
       case "session.text.ended":
         return typeof data["text"] === "string"
-          ? { _tag: "reply", text: truncateNarration(data["text"]) }
+          ? {
+              _tag: "reply",
+              text: truncateNarration(data["text"]),
+              ...blockKey("reply", data),
+            }
           : { _tag: "opaque" };
       case "session.reasoning.ended":
         return typeof data["text"] === "string"
-          ? { _tag: "thinking", text: truncateNarration(data["text"]) }
+          ? {
+              _tag: "thinking",
+              text: truncateNarration(data["text"]),
+              ...blockKey("thinking", data),
+            }
           : { _tag: "opaque" };
       case "session.step.ended": {
         /*

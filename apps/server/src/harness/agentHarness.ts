@@ -379,7 +379,9 @@ export type NarrationDetail =
       /**
        * The harness's id for this block, when it streamed the block as {@link BlockDelta}s
        * first. The finished block **ends** that block's partial updates and replaces them on
-       * a screen (`run/streamingCoalescer.ts`). Absent on a block nothing streamed.
+       * a screen (`run/streamingCoalescer.ts`). Absent on a block nothing streamed; a driver
+       * that streams may also put it on a block that happened to get no deltas, since
+       * ending a block never opened is harmless.
        */
       readonly blockId?: string | undefined;
     }
@@ -534,8 +536,8 @@ export interface BlockDelta {
   readonly _tag: "delta";
   /**
    * The harness's own id for the block, stable from its first piece to the finished block:
-   * an OpenCode text or reasoning part's id, a Claude Code message id with the block's
-   * index. Unique within one session.
+   * an OpenCode block's assistant message id, channel and ordinal (`openCodeBlockId`), a
+   * Claude Code message id with the block's index. Unique within one session.
    */
   readonly blockId: string;
   readonly channel: BlockChannel;

@@ -18,10 +18,12 @@
 import { describe, expect, test } from "bun:test";
 import { Effect, Fiber, Layer, Redacted, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
+import { TestClock } from "effect/testing";
 
 import {
   AgentHarness,
   lastAssistantText,
+  type HarnessNarration,
   type MessageEntry,
   NARRATION_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
@@ -34,6 +36,7 @@ import {
 } from "./openCodeClient";
 import { HarnessResolver } from "./resolver";
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
+import { narrateCoalesced } from "../run/streamingCoalescer";
 import { OpenCodeServer } from "./openCodeServer";
 
 const FAKE_SERVER = {
@@ -1165,26 +1168,79 @@ describe("reading an opencode event", () => {
     });
   });
 
-  test("text comes from `ended` and never from a delta", async () => {
+  test("a text delta streams its block, and the finished reply from `ended` names the same block", async () => {
     const names = new Map<string, string>();
-    // One event per token-ish chunk. Published — the supervisor's outcome watch reads this
-    // stream — but carrying nothing to render, so one frame per reply block reaches a
-    // browser instead of hundreds per turn.
+    // A delta is ephemeral in 2.1: no `durable`, so no sequence. Shaped as the union says.
+    const delta = (text: string) => ({
+      id: "evt_delta",
+      created: 11,
+      type: "session.text.delta",
+      data: {
+        sessionID: "ses_1",
+        assistantMessageID: "msg_1",
+        ordinal: 1,
+        delta: text,
+      },
+    });
+    const first = openCodeNarration(delta("Prob"), names);
+    const second = openCodeNarration(delta("ing"), names);
+    const ended = openCodeNarration(
+      event("session.text.ended", { ordinal: 1, text: "Probing the limiter." }),
+      names,
+    );
+    expect([first.detail, second.detail]).toEqual([
+      {
+        _tag: "delta",
+        blockId: "msg_1:text:1",
+        channel: "reply",
+        text: "Prob",
+      },
+      { _tag: "delta", blockId: "msg_1:text:1", channel: "reply", text: "ing" },
+    ]);
+    // A delta states no outcome: the outcome watch reads `session.execution.*`.
+    expect(first.outcome).toBeUndefined();
+    expect(first.sequence).toBeUndefined();
+    // The whole block, from `ended`, under the id its deltas carried.
+    expect(ended.detail).toEqual({
+      _tag: "reply",
+      text: "Probing the limiter.",
+      blockId: "msg_1:text:1",
+    });
+  });
+
+  test("a block id needs both the message and the ordinal, and a delta without one is opaque", async () => {
+    const names = new Map<string, string>();
     expect(
       openCodeNarration(
-        event("session.text.delta", { ordinal: 1, delta: "Prob" }),
+        {
+          type: "session.text.delta",
+          created: 1,
+          data: { sessionID: "ses_1", assistantMessageID: "msg_1", delta: "x" },
+        },
         names,
       ).detail,
     ).toEqual({ _tag: "opaque" });
     expect(
       openCodeNarration(
-        event("session.text.ended", {
-          ordinal: 1,
-          text: "Probing the limiter.",
-        }),
+        {
+          type: "session.reasoning.delta",
+          created: 1,
+          data: { sessionID: "ses_1", ordinal: 0, delta: "x" },
+        },
         names,
       ).detail,
-    ).toEqual({ _tag: "reply", text: "Probing the limiter." });
+    ).toEqual({ _tag: "opaque" });
+    // A finished block that cannot be named is still the finished block, without an id.
+    expect(
+      openCodeNarration(
+        {
+          type: "session.text.ended",
+          created: 1,
+          data: { sessionID: "ses_1", text: "Done." },
+        },
+        names,
+      ).detail,
+    ).toEqual({ _tag: "reply", text: "Done." });
   });
 
   test("an execution outcome is still stated, and nothing else infers one", async () => {
@@ -1521,28 +1577,63 @@ describe("reading opencode's token usage", () => {
     });
   });
 
-  test("reasoning is narrated from its end event, where the whole block is", () => {
+  test("reasoning streams as thinking, and its ordinal is not the reply's", () => {
     // `session.reasoning.ended` carries `data.text`, exactly as `session.text.ended` does
-    // for a reply, so thinking is one entry per block. The deltas are opaque for the same
-    // reason text deltas are: there would be hundreds of them and nothing to render.
+    // for a reply, so thinking is one entry per block, streamed by its deltas. OpenCode
+    // counts ordinals per channel, so the first thinking block and the first reply of one
+    // message are both ordinal 0, and must still be two blocks.
     const names = new Map<string, string>();
-    const delta = openCodeNarration(
+    const reasoning = openCodeNarration(
       {
-        type: "session.reasoning.delta",
+        id: "evt_r",
         created: 1,
-        data: { sessionID: "ses_1", delta: "The" },
-      },
-      names,
-    );
-    expect(delta.detail).toEqual({ _tag: "opaque" });
-
-    const ended = openCodeNarration(
-      {
-        type: "session.reasoning.ended",
-        created: 2,
+        type: "session.reasoning.delta",
         data: {
           sessionID: "ses_1",
           assistantMessageID: "msg_1",
+          ordinal: 0,
+          delta: "The",
+        },
+      },
+      names,
+    );
+    const text = openCodeNarration(
+      {
+        id: "evt_t",
+        created: 2,
+        type: "session.text.delta",
+        data: {
+          sessionID: "ses_1",
+          assistantMessageID: "msg_1",
+          ordinal: 0,
+          delta: "Reading",
+        },
+      },
+      names,
+    );
+    expect(reasoning.detail).toEqual({
+      _tag: "delta",
+      blockId: "msg_1:reasoning:0",
+      channel: "thinking",
+      text: "The",
+    });
+    expect(text.detail).toEqual({
+      _tag: "delta",
+      blockId: "msg_1:text:0",
+      channel: "reply",
+      text: "Reading",
+    });
+
+    const ended = openCodeNarration(
+      {
+        id: "evt_e",
+        created: 3,
+        type: "session.reasoning.ended",
+        durable: { aggregateID: "ses_1", seq: 7, version: 1 },
+        data: {
+          sessionID: "ses_1",
+          assistantMessageID: "msg_1",
+          ordinal: 0,
           text: "The user wants three files read one at a time.",
         },
       },
@@ -1551,7 +1642,86 @@ describe("reading opencode's token usage", () => {
     expect(ended.detail).toEqual({
       _tag: "thinking",
       text: "The user wants three files read one at a time.",
+      blockId: "msg_1:reasoning:0",
     });
+  });
+
+  test("through the coalescer: partials of the whole text, the finished block replacing them, and an interrupted block ended by the outcome", async () => {
+    // What an importer conversation publishes from a real 2.1 sequence: a reply that
+    // finishes, then a second turn's reply cut off by a Stop before its `ended`.
+    const names = new Map<string, string>();
+    const delta = (ordinal: number, text: string, message = "msg_1") => ({
+      id: "evt",
+      created: 1,
+      type: "session.text.delta",
+      data: {
+        sessionID: "ses_1",
+        assistantMessageID: message,
+        ordinal,
+        delta: text,
+      },
+    });
+    const raw: unknown[] = [
+      delta(0, "Prob"),
+      delta(0, "ing."),
+      {
+        id: "evt_ended",
+        created: 2,
+        type: "session.text.ended",
+        durable: { aggregateID: "ses_1", seq: 5, version: 1 },
+        data: {
+          sessionID: "ses_1",
+          assistantMessageID: "msg_1",
+          ordinal: 0,
+          text: "Probing.",
+        },
+      },
+      delta(0, "I will", "msg_2"),
+      delta(0, " sto", "msg_2"),
+      {
+        id: "evt_interrupted",
+        created: 3,
+        type: "session.execution.interrupted",
+        durable: { aggregateID: "ses_1", seq: 6, version: 1 },
+        data: { sessionID: "ses_1" },
+      },
+    ];
+    const published = await Effect.runPromise(
+      Effect.gen(function* () {
+        const out: HarnessNarration[] = [];
+        yield* narrateCoalesced({
+          events: Stream.fromIterable(raw).pipe(
+            Stream.map((item) => openCodeNarration(item, names)),
+          ),
+          publish: (item) =>
+            Effect.sync(() => {
+              out.push(item);
+            }),
+        });
+        return out;
+      }).pipe(Effect.provide(TestClock.layer())),
+    );
+    expect(
+      published.map((item) => {
+        const detail = item.detail;
+        switch (detail._tag) {
+          case "partial":
+            return `partial ${detail.blockId} ${detail.text}`;
+          case "reply":
+            return `reply ${String(detail.blockId)} ${detail.text}`;
+          default:
+            return `${item.type} ${String(item.outcome)}`;
+        }
+      }),
+    ).toEqual([
+      "partial msg_1:text:0 Prob",
+      "partial msg_1:text:0 Probing.",
+      "reply msg_1:text:0 Probing.",
+      "partial msg_2:text:0 I will",
+      // Held when the Stop landed, and sent before the outcome rather than never.
+      "partial msg_2:text:0 I will sto",
+      "session.execution.interrupted interrupted",
+    ]);
   });
 });
 
