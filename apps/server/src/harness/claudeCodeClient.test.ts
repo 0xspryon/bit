@@ -59,6 +59,7 @@ import {
   claudeCodeHarness,
   liveClaudeCodeSdk,
   newClaudeCodeSessionId,
+  type ClaudeCodeHarnessOptions,
   type ClaudeCodeSdk,
   type HarnessQuery,
 } from "./claudeCodeClient";
@@ -1523,6 +1524,8 @@ const turnDrivenSdk = () => {
     interrupts: 0,
     /** The task ids `stopTask` was called with, in order. */
     stoppedTasks: [] as string[],
+    /** When each `stopTask` was called, by task id, in `Date.now()` milliseconds. */
+    stopTaskAt: new Map<string, number>(),
   };
   /**
    * How the session answers a model switch, changeable mid-test so a retry can succeed.
@@ -1545,15 +1548,24 @@ const turnDrivenSdk = () => {
     refuseInterrupt: boolean;
     /** Acknowledges `stopTask` and leaves the task running, for a task that will not stop. */
     ignoreStopTask: boolean;
+    /** Never answers `stopTask` for these task ids, and leaves the task running. */
+    hangStopTask: Set<string>;
   } = {
     refuse: undefined,
     hang: undefined,
     hangOn: undefined,
     refuseInterrupt: false,
     ignoreStopTask: false,
+    hangStopTask: new Set(),
   };
-  /** The tasks started and not yet over, by `task_id`, with their `task_type`. */
-  const openTasks = new Map<string, string>();
+  /**
+   * The tasks started and not yet over, by `task_id`, with their `task_type` and the
+   * `run_id` of the run going, if the test named one.
+   */
+  const openTasks = new Map<
+    string,
+    { readonly type: string; readonly runId: string | undefined }
+  >();
   const hanging = new Set<(cause: Error) => void>();
   const answer = async (
     request: "setModel" | "applyFlagSettings",
@@ -1613,13 +1625,19 @@ const turnDrivenSdk = () => {
             throw new Error("the CLI did not acknowledge the interrupt");
           }
           // Measured on 2.1.310: an interrupt stops every subagent, and no shell.
-          for (const [taskId, type] of openTasks) {
-            if (type === "local_agent") endTask(taskId, "stopped");
+          for (const [taskId, task] of openTasks) {
+            if (task.type === "local_agent") endTask(taskId, "stopped");
           }
           return undefined;
         },
         stopTask: async (taskId) => {
           seen.stoppedTasks.push(taskId);
+          seen.stopTaskAt.set(taskId, Date.now());
+          if (controls.hangStopTask.has(taskId)) {
+            await new Promise<never>((_, reject) => {
+              hanging.add(reject);
+            });
+          }
           if (!controls.ignoreStopTask && openTasks.has(taskId)) {
             endTask(taskId, "stopped");
           }
@@ -1709,12 +1727,16 @@ const turnDrivenSdk = () => {
   /**
    * Starts a task in the background, as 2.1.310 does for a `run_in_background` `Agent`
    * (`local_agent`) or Bash (`local_bash`) call: `system/task_started`, and no turn.
+   *
+   * `runId` stamps the frame's `run_id`, which a resumed task gets anew under the same
+   * `task_id`; `ambient` marks it as the CLI's own housekeeping, which is not activity.
    */
   const startTask = (
     taskId: string,
     type: "local_agent" | "local_bash",
+    frame: { readonly runId?: string; readonly ambient?: boolean } = {},
   ): void => {
-    openTasks.set(taskId, type);
+    openTasks.set(taskId, { type, runId: frame.runId });
     push({
       type: "system",
       subtype: "task_started",
@@ -1722,26 +1744,47 @@ const turnDrivenSdk = () => {
       task_type: type,
       description: `background ${type}`,
       is_backgrounded: true,
+      ...(frame.runId === undefined ? {} : { run_id: frame.runId }),
+      ...(frame.ambient === undefined ? {} : { ambient: frame.ambient }),
       session_id: sessionId,
       uuid: crypto.randomUUID(),
     } as unknown as SDKMessage);
   };
-  /** Ends a task with its `system/task_notification`, which is all 2.1.310 says of it. */
-  const endTask = (
+  /** A `system/task_notification` for one run of a task, or for no run in particular. */
+  const notification = (
     taskId: string,
     status: "completed" | "failed" | "stopped",
-  ): void => {
-    openTasks.delete(taskId);
-    push({
+    runId: string | undefined,
+  ): SDKMessage =>
+    ({
       type: "system",
       subtype: "task_notification",
       task_id: taskId,
+      ...(runId === undefined ? {} : { run_id: runId }),
       status,
       output_file: `/tmp/${taskId}.out`,
       summary: `task ${status}`,
       session_id: sessionId,
       uuid: crypto.randomUUID(),
-    } as unknown as SDKMessage);
+    }) as unknown as SDKMessage;
+  /**
+   * Ends a task with its `system/task_notification`, which is all 2.1.310 says of it,
+   * naming the run going.
+   */
+  const endTask = (
+    taskId: string,
+    status: "completed" | "failed" | "stopped",
+  ): void => {
+    const runId = openTasks.get(taskId)?.runId;
+    openTasks.delete(taskId);
+    push(notification(taskId, status, runId));
+  };
+  /**
+   * Delivers a notification for an earlier run of a task, late: the run named is over,
+   * and the task's current run goes on.
+   */
+  const lateNotification = (taskId: string, runId: string): void => {
+    push(notification(taskId, "completed", runId));
   };
   /** Ends the turn nobody sent, with a `result` that names no message, as 2.1.310's does. */
   const endUnrequestedTurn = (): void => {
@@ -1827,6 +1870,7 @@ const turnDrivenSdk = () => {
     emitSubagentFrames,
     startTask,
     endTask,
+    lateNotification,
     failStream,
     endStream,
     pulled,
@@ -1838,13 +1882,18 @@ const withTurnDriven = <A>(
     harness: AgentHarness["Service"],
     driver: ReturnType<typeof turnDrivenSdk>,
   ) => Effect.Effect<A, unknown>,
+  options: Omit<ClaudeCodeHarnessOptions, "sdk"> = {},
 ): Promise<A> => {
   const driver = turnDrivenSdk();
   return Effect.runPromise(
     Effect.scoped(
       Effect.flatMap(AgentHarness, (harness) => use(harness, driver)).pipe(
         Effect.provide(
-          claudeCodeHarness({ sdk: driver.sdk, controlTimeout: "2 seconds" }),
+          claudeCodeHarness({
+            controlTimeout: "2 seconds",
+            ...options,
+            sdk: driver.sdk,
+          }),
         ),
         Effect.orDie,
       ),
@@ -2603,6 +2652,112 @@ describe("stopping a conversation's turn (A6 F5)", () => {
       }),
     );
     expect(outcome).toEqual({ stopped: "background", background: true });
+  }, 10_000);
+
+  test("an ambient task is not activity: no background, and a Stop finds nothing to stop", async () => {
+    // `ambient: true` is the CLI's own housekeeping (a live-update watcher, a
+    // skip_transcript task), which SDK 0.3.310 says hosts should not count as activity.
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.startTask("w1", "local_bash", { ambient: true });
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        yield* Effect.sleep("40 millis");
+        const status = yield* harness.sessionStatus(TALK);
+        const stopped = yield* harness.interruptSession(TALK);
+        return {
+          background: status.background,
+          stopped,
+          interrupts: driver.seen.interrupts,
+          stoppedTasks: driver.seen.stoppedTasks,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      background: false,
+      stopped: false,
+      interrupts: 0,
+      stoppedTasks: [],
+    });
+  });
+
+  test("a late notification from a task's earlier run does not end the run still going", async () => {
+    /*
+     * A resumed task keeps its `task_id` and gets a new `run_id`; run ids sort in the order
+     * the runs opened, and a frame naming an earlier run is late (SDK 0.3.310). Reading
+     * run r1's notification as the end of the task would let a Stop answer "nothing was
+     * running" while run r2 acts. r2's own notification does end it.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.startTask("b6", "local_bash", { runId: "r1" });
+        driver.startTask("b6", "local_bash", { runId: "r2" });
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.lateNotification("b6", "r1");
+        yield* Effect.sleep("40 millis");
+        const late = yield* harness.sessionStatus(TALK);
+        const stopped = yield* harness.interruptSession(TALK);
+        const after = yield* harness.sessionStatus(TALK);
+        return {
+          background: [late.background, after.background],
+          stopped,
+          stoppedTasks: driver.seen.stoppedTasks,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      background: [true, false],
+      stopped: "background",
+      stoppedTasks: ["b6"],
+    });
+  });
+
+  test("a stopTask that never answers delays neither the other tasks' nor the Stop past its own bound", async () => {
+    /*
+     * The tasks are asked at once, each bounded by `taskStopTimeout`, not one after the
+     * other under the 30 s control timeout: the supervisors give a whole interrupt 10 s.
+     * Here the control timeout is 2 s and the task bound 200 ms, so a Stop that still
+     * waited on the hung ask under the control timeout, or asked the other shell only
+     * after it, is seen here.
+     */
+    const outcome = await withTurnDriven(
+      (harness, driver) =>
+        Effect.gen(function* () {
+          yield* talking(harness, driver);
+          driver.startTask("h1", "local_bash");
+          driver.startTask("b7", "local_bash");
+          driver.emitResult();
+          yield* harness.waitForIdle(TALK);
+          yield* Effect.sleep("40 millis");
+          driver.controls.hangStopTask.add("h1");
+          const began = Date.now();
+          const stopped = yield* harness.interruptSession(TALK);
+          const took = Date.now() - began;
+          const after = yield* harness.sessionStatus(TALK);
+          const hungAt = driver.seen.stopTaskAt.get("h1") ?? Infinity;
+          const otherAt = driver.seen.stopTaskAt.get("b7") ?? Infinity;
+          return {
+            stopped,
+            asked: [...driver.seen.stoppedTasks].sort(),
+            otherAskedWithHung: Math.abs(otherAt - hungAt) < 100,
+            // 200 ms of ask, then the 2 s settle the hung task, still listed, runs out.
+            withinBound: took < 3_000,
+            // Not claimed stopped: the hung task is still reported running.
+            background: after.background,
+          };
+        }),
+      { taskStopTimeout: "200 millis" },
+    );
+    expect(outcome).toEqual({
+      stopped: "background",
+      asked: ["b7", "h1"],
+      otherAskedWithHung: true,
+      withinBound: true,
+      background: true,
+    });
   }, 10_000);
 
   test("a background task is over at its notification, completed or stopped, and Stop then finds nothing", async () => {

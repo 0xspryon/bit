@@ -597,8 +597,14 @@ interface SessionRecord {
    * on to act. Every task 2.1.310 starts is bracketed by the two frames (measured), so the
    * pair is the whole of it. Ambient tasks (the CLI's own housekeeping, `ambient: true`)
    * are not activity and are not kept.
+   *
+   * Each entry keeps the `run_id` of the run it was last started as. A resumed task keeps
+   * its `task_id` and gets a new `run_id`, and a frame naming a run that sorts before the
+   * one held is late (SDK 0.3.310, `SDKTaskNotificationMessage.run_id`): a late
+   * notification from an earlier run must not end the run still going, or a Stop would
+   * answer "nothing was running" while it acts. See {@link trackTask}.
    */
-  readonly tasks: Map<string, string>;
+  readonly tasks: Map<string, TrackedTask>;
   /** The query has been closed; nothing more will arrive. */
   closed: boolean;
   /**
@@ -650,6 +656,14 @@ interface OwnedCli {
   stopping: Deferred.Deferred<void> | undefined;
 }
 
+/** One entry of {@link SessionRecord.tasks}. */
+interface TrackedTask {
+  /** The CLI's `task_type` (`local_agent`, `local_bash`, …), or `unknown`. */
+  readonly type: string;
+  /** The run this entry is, when the CLI named one: absent from CLIs that predate it. */
+  readonly runId: string | undefined;
+}
+
 /** How much of a CLI's stderr is kept, from the end, for the failure it may explain. */
 const STDERR_TAIL = 4_096;
 
@@ -677,9 +691,26 @@ export interface ClaudeCodeHarnessOptions {
    * started is known before it can be orphaned. Tests shorten it.
    */
   readonly cliTreeRefresh?: number;
+  /**
+   * How long one `stopTask` may take when a Stop asks it of a background task. Defaults to
+   * {@link DEFAULT_TASK_STOP_TIMEOUT}; tests shorten it.
+   */
+  readonly taskStopTimeout?: Duration.Input;
 }
 
 const DEFAULT_CONTROL_TIMEOUT: Duration.Input = "30 seconds";
+
+/**
+ * How long a Stop waits for one background task's `stopTask` to be acknowledged.
+ *
+ * Its own bound, much shorter than {@link DEFAULT_CONTROL_TIMEOUT}, because a Stop asks
+ * every listed task at once and waits for all of them: the worker and planner supervisors
+ * give the whole `interruptSession` 10 s (`SETTLEMENT_ASK_TIMEOUT`), so one task that never
+ * answers must not be allowed 30 s of it. 2.1.310 reports a shell stopped within 10 ms of
+ * its `stopTask` (measured, at `interruptSession`), so 3 s is generous; a task whose ask runs out
+ * is logged and, still listed, reported as possibly running — never as stopped.
+ */
+const DEFAULT_TASK_STOP_TIMEOUT: Duration.Input = "3 seconds";
 
 /**
  * An ended CLI's bounds: a second after `SIGTERM`, a second after `SIGKILL`.
@@ -1297,15 +1328,31 @@ const backgroundRunning = (record: SessionRecord): boolean =>
   !record.closed && record.tasks.size > 0;
 
 /**
+ * Whether a frame naming run `runId` is late for the task entry `held`: the SDK promises
+ * that one task's run ids sort, by plain string comparison, in the order the runs opened,
+ * and that a frame naming a run sorting before the one a reader shows is late (0.3.310,
+ * `SDKTaskStartedMessage.run_id`). Without both ids nothing can be late.
+ */
+const lateRun = (held: TrackedTask | undefined, runId: string | undefined) =>
+  held?.runId !== undefined && runId !== undefined && runId < held.runId;
+
+/**
  * Keeps {@link SessionRecord.tasks} in step with one frame: a task starts at
- * `system/task_started` and is over at its `system/task_notification`.
+ * `system/task_started` and is over at its `system/task_notification` — unless that frame
+ * names an earlier run than the one held ({@link lateRun}), which is a late frame about a
+ * run already over, not news about the one going.
  */
 const trackTask = (record: SessionRecord, message: SDKMessage): void => {
   if (message.type !== "system") return;
   if (message.subtype === "task_started") {
     if (message.ambient === true) return;
-    record.tasks.set(message.task_id, message.task_type ?? "unknown");
+    if (lateRun(record.tasks.get(message.task_id), message.run_id)) return;
+    record.tasks.set(message.task_id, {
+      type: message.task_type ?? "unknown",
+      runId: message.run_id,
+    });
   } else if (message.subtype === "task_notification") {
+    if (lateRun(record.tasks.get(message.task_id), message.run_id)) return;
     record.tasks.delete(message.task_id);
   }
 };
@@ -1329,6 +1376,8 @@ export const claudeCodeHarness = (
       const controlTimeout = options.controlTimeout ?? DEFAULT_CONTROL_TIMEOUT;
       const cliStopBounds = options.cliStopBounds ?? DEFAULT_CLI_STOP_BOUNDS;
       const cliTreeRefresh = options.cliTreeRefresh ?? DEFAULT_CLI_TREE_REFRESH;
+      const taskStopTimeout =
+        options.taskStopTimeout ?? DEFAULT_TASK_STOP_TIMEOUT;
 
       /** The layer's own scope, so the pump below outlives the fiber that started it. */
       const harnessScope = yield* Effect.scope;
@@ -2069,7 +2118,7 @@ export const claudeCodeHarness = (
           contextLimit: undefined,
           lastCallId: undefined,
           interrupted: false,
-          tasks: new Map<string, string>(),
+          tasks: new Map<string, TrackedTask>(),
           closed: false,
           cli: undefined,
           stderrTail: "",
@@ -2827,6 +2876,11 @@ export const claudeCodeHarness = (
        * Stops what `interrupt()` left of the tasks listed when a Stop began, and waits,
        * bounded by {@link TASK_STOP_SETTLE_MILLIS}, for every one of them to say it is over.
        *
+       * The tasks are asked **at once**, each bounded by {@link DEFAULT_TASK_STOP_TIMEOUT}
+       * (`taskStopTimeout`), so one that never answers delays neither the others nor the
+       * Stop beyond that bound: the whole of this takes at most `taskStopTimeout` plus the
+       * settle.
+       *
        * A subagent is not asked again: `interrupt()` stopped it, and a `stopTask` would
        * make the CLI open a turn about it (measured, at {@link interruptSession}). A
        * `stopTask` the CLI refuses or does not answer is logged and not acted on — the
@@ -2840,33 +2894,38 @@ export const claudeCodeHarness = (
         Effect.gen(function* () {
           if (stopping.length === 0) return;
           const live = record.query;
-          for (const taskId of stopping) {
-            const type = record.tasks.get(taskId);
-            if (
-              type === undefined ||
-              type === "local_agent" ||
-              live === undefined
-            ) {
-              continue;
-            }
-            const stopped = yield* Effect.result(
-              Effect.timeout(
-                Effect.tryPromise(() => live.stopTask(taskId)),
-                controlTimeout,
-              ),
-            );
-            if (stopped._tag === "Failure" && record.tasks.has(taskId)) {
-              yield* Effect.logWarning(
-                "a Claude Code session would not stop a background task; it may still be running",
-                {
-                  sessionId: record.sessionId,
-                  taskId,
-                  taskType: type,
-                  detail: String(stopped.failure),
-                },
-              );
-            }
-          }
+          yield* Effect.forEach(
+            stopping,
+            (taskId) =>
+              Effect.gen(function* () {
+                const type = record.tasks.get(taskId)?.type;
+                if (
+                  type === undefined ||
+                  type === "local_agent" ||
+                  live === undefined
+                ) {
+                  return;
+                }
+                const stopped = yield* Effect.result(
+                  Effect.timeout(
+                    Effect.tryPromise(() => live.stopTask(taskId)),
+                    taskStopTimeout,
+                  ),
+                );
+                if (stopped._tag === "Failure" && record.tasks.has(taskId)) {
+                  yield* Effect.logWarning(
+                    "a Claude Code session would not stop a background task; it may still be running",
+                    {
+                      sessionId: record.sessionId,
+                      taskId,
+                      taskType: type,
+                      detail: String(stopped.failure),
+                    },
+                  );
+                }
+              }),
+            { concurrency: "unbounded", discard: true },
+          );
           const settleBy = Date.now() + TASK_STOP_SETTLE_MILLIS;
           while (
             !record.closed &&
