@@ -237,3 +237,8 @@ U13.
   SessionStart context was injected into it, and the operator's episodic-memory MCP server
   ran as its child — so the importer agent could search the operator's past conversations.
   The source comment justifies the setting only by the gate in `.claude/settings.local.json`.
+- **Operator decision pending:** real containment of an agent CLI and its tools. F5 kills a
+  Claude Code CLI's process group and its descendants found in `/proc`; a tool that
+  detaches itself (its own session, `setsid`, a plugin's sync process) can still escape. A
+  cgroup per CLI would contain everything it starts. The gate's list of ended sessions is
+  in memory only, so a CLI orphaned by a hard server kill is allowed again after a restart.
