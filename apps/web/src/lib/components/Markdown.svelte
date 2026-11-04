@@ -40,9 +40,11 @@
    * and not the fence's name: that name is the agent's.
    *
    * A region speaks when its text changes, so a second Copy inside the 1.5 s, writing
-   * "Copied" over "Copied", would go unheard. Each result is therefore written in two
-   * steps: the region is emptied, then the word set on the next frame, after Svelte has
-   * put the empty text in the DOM.
+   * "Copied" over "Copied", would go unheard. Emptying the region and setting the word a
+   * frame later is not enough either: a screen reader samples the accessibility tree, and
+   * both changes can land between two samples. So each result alternates with itself plus
+   * a trailing space — `Copied`, then `Copied ` — and two announcements in a row always
+   * differ in the text itself. The space is not spoken.
    */
   let announced = $state("");
 
@@ -80,9 +82,8 @@
    * The clipboard API needs a secure context, which bit's localhost is; where it is
    * missing or refused, the button says so rather than claiming a copy.
    *
-   * Every reset timer, and the frame that sets the announcement, belongs to the attachment
-   * and is cleared with it, so a reply taken away within the 1.5 s leaves nothing to run
-   * against its detached buttons.
+   * Every reset timer belongs to the attachment and is cleared with it, so a reply taken
+   * away within the 1.5 s leaves nothing to run against its detached buttons.
    */
   const copyButtons: Attachment<HTMLElement> = (root) => {
     const resets = new Map<Element, ReturnType<typeof setTimeout>>();
@@ -96,14 +97,11 @@
         }, COPIED_FOR_MS),
       );
     };
-    let frame = 0;
+    let spaced = false;
     const say = (button: HTMLButtonElement, word: string): void => {
       button.textContent = word;
-      announced = "";
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        announced = word;
-      });
+      announced = spaced ? `${word} ` : word;
+      spaced = !spaced;
       later(button, () => {
         button.textContent = "Copy";
       });
@@ -130,7 +128,6 @@
     root.addEventListener("click", onclick);
     return () => {
       root.removeEventListener("click", onclick);
-      cancelAnimationFrame(frame);
       for (const timer of resets.values()) clearTimeout(timer);
       resets.clear();
     };
@@ -492,8 +489,8 @@
     text-align: right;
   }
   /*
-   * A bidi, zero-width or tag character in code, written out as its code point (`reveal` in
-   * `markdown.ts`): smaller, faint and boxed, so it reads as a note about the text rather
+   * A bidi, zero-width or tag character in code, or a bidi override in prose, written out
+   * as its code point (`reveal` and `revealOverrides` in `markdown.ts`): smaller, faint and boxed, so it reads as a note about the text rather
    * than as part of it.
    */
   .markdown :global(.char-escape) {

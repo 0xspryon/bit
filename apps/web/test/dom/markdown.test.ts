@@ -570,7 +570,7 @@ describe("characters that do not show as what they are", () => {
     );
     expect(root.querySelectorAll("pre .char-escape")).toHaveLength(8);
     expect(root.querySelector("p > code")?.textContent).toBe("a⟨U+200B⟩b");
-    // Prose is the agent's sentence as written: only code is escaped.
+    // Prose is the agent's sentence as written: only code is escaped (bar the overrides).
     expect(root.querySelector("p")?.textContent).toContain(" a\u200Bb.");
     expect(root.querySelector("pre")?.textContent).not.toMatch(
       /[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/,
@@ -590,6 +590,70 @@ describe("characters that do not show as what they are", () => {
     expect(root.querySelector("p > code")?.textContent).toBe(
       "a⟨U+061C⟩b⟨U+E0001⟩c",
     );
+  });
+
+  test("in prose, a bidi override before a link is a marker, and the link reads in logical order", () => {
+    const root = render(
+      "See \u202E www.moc.emca.ni and \u202D[\u202Eadmin.acme.com](https://admin.acme.com) now.",
+    );
+    const p = root.querySelector("p");
+    expect(p?.textContent).toBe(
+      "See ⟨U+202E⟩ www.moc.emca.ni and ⟨U+202D⟩⟨U+202E⟩admin.acme.com now.",
+    );
+    expect(p?.textContent).not.toMatch(/[\u202D\u202E]/);
+    const links = [...root.querySelectorAll("a")];
+    expect(links.map((each) => each.getAttribute("href"))).toEqual([
+      "http://www.moc.emca.ni",
+      "https://admin.acme.com",
+    ]);
+    // The autolinked host is the text it opens, with nothing hidden before it.
+    expect(links.map((each) => each.textContent)).toEqual([
+      "www.moc.emca.ni",
+      "⟨U+202E⟩admin.acme.com",
+    ]);
+    expect(
+      [...root.querySelectorAll("p .char-escape")].map(
+        (each) => each.textContent,
+      ),
+    ).toEqual(["⟨U+202E⟩", "⟨U+202D⟩", "⟨U+202E⟩"]);
+  });
+
+  test("in prose, a bidi override before a plain hostname is a marker, in a heading, a list and a table too", () => {
+    const root = render(
+      [
+        "## Scope \u202Emoc.emca.nimda",
+        "Host: \u202Emoc.emca.nimda is in scope.",
+        "- \u202Emoc.emca.nimda",
+        "| Host |\n| --- |\n| \u202Emoc.emca.nimda |",
+        "![\u202Egnp.x](https://acme.com/x.png)",
+      ].join("\n\n"),
+    );
+    expect(root.textContent).not.toMatch(/[\u202D\u202E]/);
+    expect(
+      [...root.querySelectorAll("h2, p, li, td")].map(
+        (each) => each.textContent,
+      ),
+    ).toEqual([
+      "Scope ⟨U+202E⟩moc.emca.nimda",
+      "Host: ⟨U+202E⟩moc.emca.nimda is in scope.",
+      "⟨U+202E⟩moc.emca.nimda",
+      "⟨U+202E⟩moc.emca.nimda",
+      "⟨U+202E⟩gnp.x",
+    ]);
+    expect(root.querySelectorAll(".char-escape")).toHaveLength(5);
+  });
+
+  test("in prose, right-to-left text and its marks, isolates and joiners are left as written", () => {
+    const sentences = [
+      "النطاق يشمل admin.acme.com فقط.",
+      "התחום כולל את admin.acme.com בלבד.",
+      "Scope \u2067النطاق\u2069 then \u200Fעברית\u200E and \u202Bembedded\u202C, a\u200Db.",
+    ];
+    const root = render(sentences.join("\n\n"));
+    expect(
+      [...root.querySelectorAll("p")].map((each) => each.textContent),
+    ).toEqual(sentences);
+    expect(root.querySelectorAll(".char-escape")).toHaveLength(0);
   });
 
   test("Copy gives back a five-digit tag character and an Arabic letter mark as written", async () => {
@@ -743,12 +807,14 @@ describe("Copy", () => {
     clipboard(() => Promise.reject(new Error("denied")));
     click(button);
     await settle();
-    expect(region.textContent).toBe("Copy failed");
+    expect(region.textContent?.trim()).toBe("Copy failed");
   });
 
   test("a second Copy inside the 1.5 s is announced again", async () => {
     // A polite region speaks when its text changes. Setting "Copied" over "Copied" changes
-    // nothing, so the second copy would go unheard; each one has to be a new change.
+    // nothing, so the second copy would go unheard; each one has to be a new change. An
+    // empty step between them is not enough — a screen reader may sample the tree only
+    // after both — so the text that stays in the region must itself differ, copy to copy.
     clipboard(async (text) => {
       written.push(text);
     });
@@ -760,34 +826,31 @@ describe("Copy", () => {
     if (region === null || button === null) {
       throw new Error("no live region or Copy button");
     }
-    const heard: string[] = [];
-    let last = region.textContent ?? "";
-    const observer = new MutationObserver(() => {
-      const now = region.textContent ?? "";
-      if (now !== last && now !== "") heard.push(now);
-      last = now;
-    });
-    observer.observe(region, {
-      childList: true,
-      characterData: true,
-      subtree: true,
-    });
-    const frame = (): Promise<void> =>
-      new Promise((resolve) => requestAnimationFrame(() => resolve()));
-    try {
+    // What a screen reader that samples once per settled copy would hold.
+    const sampled: string[] = [];
+    for (const clipboardSays of ["ok", "ok", "ok", "refused", "refused"]) {
+      clipboard(
+        clipboardSays === "ok"
+          ? async (text) => {
+              written.push(text);
+            }
+          : () => Promise.reject(new Error("denied")),
+      );
       click(button);
       await settle();
-      await frame();
-      await settle();
-      click(button);
-      await settle();
-      await frame();
-      await settle();
-      expect(heard).toEqual(["Copied", "Copied"]);
-      expect(region.textContent).toBe("Copied");
-    } finally {
-      observer.disconnect();
+      sampled.push(region.textContent ?? "");
     }
+    expect(sampled.map((each) => each.trim())).toEqual([
+      "Copied",
+      "Copied",
+      "Copied",
+      "Copy failed",
+      "Copy failed",
+    ]);
+    // Each sample differs from the one before it, so each is a change to announce.
+    expect(
+      sampled.every((each, at) => at === 0 || each !== sampled[at - 1]),
+    ).toBe(true);
   });
 
   test("a reply taken away mid-'Copied' leaves no timer behind", async () => {

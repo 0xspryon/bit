@@ -129,7 +129,7 @@ const htmlAsText: NonNullable<RemarkRehypeOptions["handlers"]>["html"] = (
  *   `aria-describedby` goes with them, since all it named was a footnote heading's `id`.
  */
 const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
-  if (!isElement(node)) return [node];
+  if (!isElement(node)) return revealOverrides(node);
   delete node.properties["id"];
   delete node.properties["ariaDescribedBy"];
   if (node.tagName === "img") {
@@ -141,16 +141,16 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
         : typeof src === "string"
           ? src
           : "image";
-    const text: ElementContent = { type: "text", value: label };
+    const text = revealOverrides({ type: "text", value: label });
     return typeof src === "string" && !inLink && !src.startsWith("#")
       ? [
           element(
             "a",
             { href: src, rel: ["noopener", "noreferrer"], target: "_blank" },
-            [text],
+            text,
           ),
         ]
-      : [text];
+      : text;
   }
   if (node.tagName === "a") {
     const href = node.properties["href"];
@@ -186,8 +186,9 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
  * U+FEFF) or a tag character (U+E0000–E007F, five hex digits) puts a character into a host
  * the eye cannot see. A variation selector is not here: U+FE0F is how `❤️` is written, and
  * marking it would mark every emoji. In code, and in a fence's name, the exact characters are the
- * point, so each is replaced by its code point. Prose is left alone: there, these are how
- * right-to-left text and joined scripts are written.
+ * point, so each is replaced by its code point. Prose is left alone but for the two
+ * overrides ({@link OVERRIDE}): there, the rest are how right-to-left text and joined
+ * scripts are written.
  *
  * The marker is a text node in an element with a constant class, built here after the
  * sanitiser like the rest of the frame. The sanitiser lets no `class` through from the
@@ -200,22 +201,39 @@ const HIDDEN =
   /[\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/u;
 const hiddenName = (char: string): string =>
   `⟨U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}⟩`;
-const reveal = (node: ElementContent): ElementContent[] => {
-  if (isElement(node)) {
-    node.children = node.children.flatMap(reveal);
-    return [node];
-  }
-  if (node.type !== "text" || !HIDDEN.test(node.value)) return [node];
-  return [...node.value].flatMap((char): ElementContent[] =>
-    HIDDEN.test(char)
-      ? [
-          element("span", { className: ["char-escape"] }, [
-            { type: "text", value: hiddenName(char) },
-          ]),
-        ]
-      : [{ type: "text", value: char }],
-  );
-};
+const marking =
+  (hidden: RegExp) =>
+  (node: ElementContent): ElementContent[] => {
+    if (isElement(node)) {
+      node.children = node.children.flatMap(marking(hidden));
+      return [node];
+    }
+    if (node.type !== "text" || !hidden.test(node.value)) return [node];
+    return [...node.value].flatMap((char): ElementContent[] =>
+      hidden.test(char)
+        ? [
+            element("span", { className: ["char-escape"] }, [
+              { type: "text", value: hiddenName(char) },
+            ]),
+          ]
+        : [{ type: "text", value: char }],
+    );
+  };
+const reveal = marking(HIDDEN);
+
+/**
+ * The two characters marked in prose too: U+202D and U+202E, the left-to-right and
+ * right-to-left **overrides**. Every other bidi control only says which way a run of text
+ * goes, and right-to-left words already carry that themselves; an override instead forces
+ * every letter after it to be drawn backwards, whatever script it is in. In a sentence, one
+ * before a link makes `www.moc.emca.ni` read as `in.acme.com.www` while it opens the `.ni`
+ * host, and one before a plain hostname does the same to the name the operator copies by
+ * eye. Arabic and Hebrew are written without them, so marking them leaves real
+ * right-to-left prose as it was — which is why the embeddings, isolates, marks and
+ * zero-width characters stay unmarked here.
+ */
+const OVERRIDE = /[\u202D\u202E]/u;
+const revealOverrides = marking(OVERRIDE);
 /** The same, as plain text, for an attribute: an `aria-label` cannot hold a span. */
 const revealText = (text: string): string =>
   text.replace(new RegExp(HIDDEN.source, "gu"), hiddenName);
@@ -438,7 +456,11 @@ const finish = () => (tree: Root, file: { readonly value: unknown }) => {
   );
   if (blank(tree)) {
     tree.children = [
-      element("p", {}, [{ type: "text", value: String(file.value) }]),
+      element(
+        "p",
+        {},
+        revealOverrides({ type: "text", value: String(file.value) }),
+      ),
     ];
   }
 };
