@@ -610,9 +610,29 @@ export class ImporterSessions {
     this.currentId = fresh.id;
   }
 
-  /** Fills the composer with a pre-written first message. Sends nothing. */
-  useStarter(key: StarterKey): void {
-    this.draft = STARTERS[key].draft;
+  /**
+   * Fills the composer with a pre-written first message, sends nothing, and answers where
+   * the caret goes: at the end of the starter's words, where the operator's own begin.
+   *
+   * **It never drops what the operator typed.** A box that is empty, or that holds only a
+   * starter as it was put there, is replaced, so a second chip swaps the first. Anything
+   * else is the operator's — often a pasted statement of work, which is long and may not be
+   * on the clipboard any more — so the starter goes in front of it, a blank line between,
+   * and the caret stays at the starter's end.
+   */
+  useStarter(key: StarterKey): number {
+    const starter = STARTERS[key].draft;
+    const before = this.draft;
+    const untouched =
+      before.trim() === "" ||
+      Object.values(STARTERS).some((each) => each.draft === before);
+    if (untouched) {
+      this.draft = starter;
+      return starter.length;
+    }
+    const lead = starter.replace(/\s+$/u, "");
+    this.draft = `${lead}\n\n${before.replace(/^\s+/u, "")}`;
+    return lead.length;
   }
 
   /** Sends the draft into the session on screen, resuming it if it was only being read. */

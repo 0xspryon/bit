@@ -154,6 +154,100 @@ describe("D2: a new session", () => {
   });
 });
 
+describe("D2: what a new session shows, and what the first message turns it into", () => {
+  const LEAD =
+    "Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread.";
+  const chat = (): Element | null =>
+    document.querySelector('section[aria-label^="Load the scope"]');
+  const starters = (): string[] =>
+    [...document.querySelectorAll(".starter")].map(
+      (each) => each.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    );
+
+  test("leads with the target's name, the lead, the composer and the two starters, and no footnote", async () => {
+    await show("importer-first");
+
+    expect(chat()?.querySelector("h2")?.textContent).toBe(
+      "Load the scope for acme-corp",
+    );
+    expect(chat()?.querySelector(".hero-text")?.textContent).toBe(LEAD);
+    expect(composer().placeholder).toBe(
+      "Paste a policy or scope URL, or say what is in and out of scope…",
+    );
+    expect(starters()).toEqual([
+      "Read a HackerOne or Bugcrowd program page",
+      "Paste a statement of work",
+    ]);
+    // The footnote tells a recorded call from narration; an empty page has neither.
+    expect(chat()?.querySelector(".footnote")).toBeNull();
+  });
+
+  test("a new session beside earlier ones leads the same way", async () => {
+    await show("importer-new");
+
+    expect(chat()?.querySelector("h2")?.textContent).toBe(
+      "Load the scope for acme-corp",
+    );
+    expect(starters()).toHaveLength(2);
+  });
+
+  test("the statement-of-work starter fills the box with its message, and a second starter swaps the first", async () => {
+    await show("importer-first");
+
+    click(button("Paste a statement of work"));
+    await settle();
+    expect(composer().value).toBe(
+      "Here is the statement of work. Load what it puts in and out of scope:\n\n",
+    );
+
+    click(button("Read a HackerOne or Bugcrowd program page"));
+    await settle();
+    expect(composer().value).toBe("Read the program page at https://");
+  });
+
+  test("a starter chosen over the operator's own words keeps them, after it", async () => {
+    await show("importer-first");
+    type(composer(), "In scope: *.acme.com. Out: legacy.acme.com.");
+
+    click(button("Paste a statement of work"));
+    await settle();
+
+    const box = composer();
+    expect(box.value).toBe(
+      "Here is the statement of work. Load what it puts in and out of scope:\n\nIn scope: *.acme.com. Out: legacy.acme.com.",
+    );
+    // The caret is where the starter ends, not after the operator's words.
+    expect(box.selectionStart).toBe(
+      "Here is the statement of work. Load what it puts in and out of scope:"
+        .length,
+    );
+  });
+
+  test("once a filled starter is sent the page is the conversation: no lead, no starters, the footnote", async () => {
+    await show("importer-first");
+    click(button("Read a HackerOne or Bugcrowd program page"));
+    await settle();
+    type(composer(), "Read the program page at https://hackerone.com/acme");
+    composer().focus();
+
+    press("Enter");
+    await settle();
+
+    expect(chat()?.classList.contains("idle")).toBe(false);
+    expect(chat()?.querySelector("h2")).toBeNull();
+    expect(starters()).toEqual([]);
+    expect(headings()).toEqual([
+      "Read the program page at https://hackerone.com/acme",
+    ]);
+    expect(chat()?.querySelector(".footnote")?.textContent).toContain(
+      "A call marked recorded is a committed event",
+    );
+    expect(composer().placeholder).toBe(
+      "Correct it, or add what the pages do not say…",
+    );
+  });
+});
+
 describe("sending a message", () => {
   test("Enter sends it as the heading of a new group and the composer stays open", async () => {
     await show("importer-first");

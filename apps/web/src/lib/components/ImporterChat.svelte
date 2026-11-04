@@ -157,16 +157,19 @@
   /**
    * Fills the composer with a pre-written first message and puts the cursor after it.
    *
-   * Focus, because the draft ends where the operator's own words go (a URL, a pasted
-   * statement), and a click that leaves the caret on the button asks them to find the box.
+   * **Fill, never send** (D2: "really just pre-written first messages"). Each starter ends
+   * where the operator's own words go — the program page's URL, the pasted statement — so
+   * sending it as it stands would ask the importer to read nothing.
+   *
+   * Focus, because a click that leaves the caret on the button asks them to find the box.
    * After a `tick`: the textarea's value follows the state, not the other way round.
    */
   async function choose(key: StarterKey): Promise<void> {
-    importer.useStarter(key);
+    const caret = importer.useStarter(key);
     await tick();
     if (box === undefined) return;
     box.focus();
-    box.setSelectionRange(box.value.length, box.value.length);
+    box.setSelectionRange(caret, caret);
   }
 
   /**
@@ -336,7 +339,11 @@
             {importer.notice}
           </p>
         {/if}
-        <form class="box" onsubmit={submit} aria-busy={importer.sending}>
+        <form
+          class={["box", groups.length === 0 && "first"]}
+          onsubmit={submit}
+          aria-busy={importer.sending}
+        >
           <label class="visually-hidden" for="importer-message"
             >Message the importer</label
           >
@@ -549,9 +556,16 @@
     field-sizing: content;
     resize: none;
   }
-  /* D2's empty box is taller than D3's: room for a pasted URL before the first line. */
+  /*
+    D2's empty box is taller than D3's — room for a pasted URL before the first line — and
+    its border is the strong one, as D2 draws it: on a page with nothing else on it, the box
+    is the thing to look at.
+  */
   textarea.first {
     min-height: 46px;
+  }
+  .box.first {
+    border-color: var(--border-strong);
   }
   textarea::placeholder {
     color: var(--text-faint);
@@ -647,9 +661,9 @@
   .starter {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: 7px;
     height: 28px;
-    padding: 0 12px;
+    padding: 0 10px;
     box-sizing: border-box;
     border: 1px dashed var(--border-strong);
     border-radius: 14px;

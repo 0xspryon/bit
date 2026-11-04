@@ -347,7 +347,12 @@
     <div class="composer">{@render composer()}</div>
   {/if}
 
-  {#if thread}
+  <!--
+    Not on an empty page. The footnote tells a recorded call from narration, and a thread
+    with no turns has neither: D2 draws the lead, the composer and its starters, and nothing
+    under them.
+  -->
+  {#if thread && anything}
     <p class="footnote">{@render footnote()}</p>
   {/if}
 </section>
@@ -524,8 +529,13 @@
     border-radius: 0;
     background: transparent;
   }
-  /* No conversation: the lead, the composer and what hangs off it, as one centred block. */
+  /*
+   * No conversation: the lead, the composer and what hangs off it, as one centred block, and
+   * a little narrower than the thread's column — D2 draws the empty composer at 760px, D3
+   * the composer under a thread at 800px.
+   */
   .thread.idle {
+    --column: 760px;
     justify-content: center;
     padding-top: 0;
   }
