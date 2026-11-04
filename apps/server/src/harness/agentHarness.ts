@@ -1046,8 +1046,9 @@ export class AgentHarness extends Context.Service<
      *   (`outcomeOf` reads it as `interrupted`). **The queued message then runs at once, on
      *   its own**, as a turn of its own with its own `result` — the operator who queued it
      *   and pressed Stop sees the conversation answer it. The query stays open: the third
-     *   message, thirty seconds later, was answered normally. So `accepted`/`completed` stay
-     *   true across an interrupt, and the implementation only has to keep the query open
+     *   message, thirty seconds later, was answered normally. Each `result` names the message
+     *   it answered, so the driver's count of unanswered messages stays true across an
+     *   interrupt, and the implementation only has to keep the query open
      *   rather than close it (it used to close it, which made Stop end the conversation).
      * - **OpenCode 2.2.5, `zai-coding-plan/glm-5.3-flash`.** `session.interrupt` answers
      *   `interrupted: true` in ~20 ms and the session is idle with `outcome: "interrupted"`

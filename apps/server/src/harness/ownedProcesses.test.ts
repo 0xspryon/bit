@@ -33,7 +33,10 @@ import {
   reapOwnedProcesses,
   recordOwnedProcess,
   renderReapOutcome,
+  stopOwnedChild,
+  trackProcessTree,
   type ReapBounds,
+  type StopBounds,
 } from "./ownedProcesses";
 
 /** The approved scratch root for harness probes. */
@@ -419,5 +422,149 @@ describe("renderReapOutcome", () => {
     ).toBe(
       "/fleet/harness/owned-processes/bad.json: unreadable — dropped an undecodable record",
     );
+  });
+});
+
+/* ── Stopping a spawned child and everything it started ──────────────────────── */
+
+describe("stopOwnedChild", () => {
+  const STOP: StopBounds = { terminateGrace: 300, killGrace: 1_000, poll: 10 };
+
+  /**
+   * A detached `sh` running `body`, standing in for a Claude Code CLI, and the stop's view
+   * of it. Waits for the `ready` marker, for the reason {@link sleeper} gives.
+   */
+  const standIn = async (body: (directory: string) => string) => {
+    const directory = scratch();
+    const readyFile = join(directory, "ready");
+    const child = Bun.spawn({
+      cmd: [
+        "sh",
+        "-c",
+        `${body(directory)}; echo ready > ${readyFile}; while true; do sleep 0.2; done`,
+      ],
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+      detached: true,
+    });
+    spawned.push(child.pid);
+    const tree = trackProcessTree(child.pid, leadsOwnGroup(child.pid));
+    expect(await waitUntil(() => existsSync(readyFile))).toBe(true);
+    const stoppable = {
+      pid: child.pid,
+      tree,
+      exited: () => child.exitCode !== null || child.signalCode !== null,
+      kill: (signal: NodeJS.Signals) => {
+        child.kill(signal);
+      },
+    };
+    return { child, directory, stoppable };
+  };
+
+  const pidIn = async (file: string): Promise<number> => {
+    expect(await waitUntil(() => recordedChildPid(file) !== undefined)).toBe(
+      true,
+    );
+    const pid = recordedChildPid(file) as number;
+    spawned.push(pid);
+    return pid;
+  };
+
+  test("reaches a tool in a session of its own when the CLI has to be killed", async () => {
+    /*
+     * Claude Code 2.1.310 starts each Bash tool with `setsid`, out of the CLI's group, so a
+     * group kill alone leaves it running (A6 F5's third review). `trap '' TERM` is inherited
+     * through `setsid` and `exec`, so neither goes on `SIGTERM` and this is the kill path.
+     */
+    const { directory, stoppable } = await standIn(
+      (dir) => `trap '' TERM; setsid sleep 30 & echo $! > ${join(dir, "tool")}`,
+    );
+    const tool = await pidIn(join(directory, "tool"));
+    expect(processIdentity(tool)).toBeDefined();
+
+    const outcome = await Effect.runPromise(stopOwnedChild(stoppable, STOP));
+
+    expect(outcome).toBe("killed");
+    expect(alive(stoppable.pid)).toBe(false);
+    expect(processIdentity(tool)).toBeUndefined();
+  });
+
+  test("a tool started while the stop waits is caught and killed too", async () => {
+    // On `SIGTERM` the stand-in starts a fresh tool in its own session, as a CLI mid-step
+    // can; only a tree read again while waiting knows it exists.
+    const { directory, stoppable } = await standIn(
+      (dir) => `trap 'setsid sleep 30 & echo $! > ${join(dir, "late")}' TERM`,
+    );
+
+    const outcome = await Effect.runPromise(stopOwnedChild(stoppable, STOP));
+    const late = recordedChildPid(join(directory, "late"));
+
+    expect(outcome).toBe("killed");
+    expect(late).toBeDefined();
+    if (late !== undefined) spawned.push(late);
+    expect(
+      late === undefined ? undefined : processIdentity(late),
+    ).toBeUndefined();
+  });
+
+  test("what a CLI that died on its own left in its group is still stopped", async () => {
+    const directory = scratch();
+    const toolFile = join(directory, "tool");
+    const child = Bun.spawn({
+      cmd: ["sh", "-c", `sleep 30 & echo $! > ${toolFile}; exit 3`],
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+      detached: true,
+    });
+    spawned.push(child.pid);
+    const tree = trackProcessTree(child.pid, leadsOwnGroup(child.pid));
+    const tool = await pidIn(toolFile);
+    await child.exited;
+    // What the harness does straight after the runtime reports the exit.
+    tree.adoptOrphanedGroup();
+
+    const outcome = await Effect.runPromise(
+      stopOwnedChild(
+        { pid: child.pid, tree, exited: () => true, kill: () => undefined },
+        STOP,
+      ),
+    );
+
+    expect(outcome).toBe("terminated");
+    expect(processIdentity(tool)).toBeUndefined();
+  });
+
+  test("a stop for a child whose pid now leads a stranger's group signals nothing", async () => {
+    /*
+     * A6 F5's third review: a CLI that had exited was probed with `kill(-pid, 0)` and, if
+     * something held the group, signalled — at a recycled pid, that is a stranger. The
+     * stranger here leads its own group, and the tree was taken with an identity that is
+     * not its own: exactly what a recycled pid looks like.
+     */
+    const stranger = await sleeper({ withChild: true });
+    expect(leadsOwnGroup(stranger.pid)).toBe(true);
+    const strangerChild = await pidIn(stranger.childPidFile);
+    let killed = 0;
+    // Built as a value, not a literal, so the shape the stop used to take — `ownsGroup` —
+    // can ride along: it is what the stop decided from before identities were checked.
+    const child = {
+      pid: stranger.pid,
+      ownsGroup: true,
+      tree: trackProcessTree(stranger.pid, true, "starttime:1"),
+      exited: () => true,
+      kill: () => {
+        killed += 1;
+      },
+    };
+
+    const outcome = await Effect.runPromise(stopOwnedChild(child, STOP));
+
+    expect(outcome).toBe("already_gone");
+    expect(killed).toBe(0);
+    await Bun.sleep(100);
+    expect(alive(stranger.pid)).toBe(true);
+    expect(alive(strangerChild)).toBe(true);
   });
 });

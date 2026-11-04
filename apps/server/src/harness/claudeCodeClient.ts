@@ -143,6 +143,8 @@ import { claudeCodeMessageId } from "./messageId";
 import {
   leadsOwnGroup,
   stopOwnedChild,
+  trackProcessTree,
+  type ProcessTree,
   type StopBounds,
 } from "./ownedProcesses";
 import {
@@ -452,7 +454,8 @@ interface SessionRecord {
    */
   readonly resumed: boolean;
   /**
-   * Completed by the pump when every accepted message has produced its `result`.
+   * Completed by the pump at a `result` that leaves no turn open and no accepted message
+   * unanswered (see {@link unanswered}).
    *
    * **Replaced, not reused, when an idle session accepts another message.** A `Deferred`
    * completes once, and a conversation's second turn needs a fresh one — otherwise
@@ -475,30 +478,51 @@ interface SessionRecord {
    */
   readonly ended: Deferred.Deferred<void>;
   /**
-   * How many messages this session has accepted, and how many have completed.
+   * The driver uuids of the messages this session has accepted and no `result` has
+   * answered yet, oldest first.
    *
-   * The pair is what makes `waitForIdle` mean "idle after the last accepted message"
-   * (DECISIONS.md §24.1, consequence 4). The SDK emits one `result` per turn and a steered
-   * session has two turns, so a pump that stopped at the first `result` would end the
-   * session while the directive's own turn was still queued. Counted here rather than
-   * inferred from the stream, because the only thing that knows a second message was
-   * accepted is the call that accepted it.
+   * With {@link turnOpen}, what "a turn is running" means here (DECISIONS.md §24.1,
+   * consequence 4): `waitForIdle` settles, `sessionStatus` reads idle and Stop finds
+   * nothing to interrupt only when no turn is open and nothing accepted is unanswered.
+   *
+   * **Answered by uuid, not counted.** This used to be a pair of counters — messages sent,
+   * `result`s seen — and the CLI runs turns nobody sent: when a `run_in_background` task
+   * finishes it queues a `<task-notification>` and runs a turn of its own, with its own
+   * `result` (A6 F5's third review, seen live). The `result` count then overtook the sent
+   * count for good, and every Stop after it answered "nothing was running" while a tool
+   * ran. Every message is sent with a uuid, and the CLI lists on a `result` the uuids of
+   * the messages that turn consumed (`user_message_uuids`, measured on 2.1.310), so a
+   * turn nobody asked for answers nothing and a message folded into a running turn is
+   * answered with it.
    */
-  accepted: number;
-  completed: number;
+  readonly unanswered: Set<string>;
+  /**
+   * A turn is running on the stream: a turn-opening frame (`system/init`, a reply, a tool
+   * result) has arrived since the last `result`, which closes it. Read off the stream
+   * because it is the only place a turn the CLI started itself shows up. See
+   * {@link unanswered}.
+   */
+  turnOpen: boolean;
+  /**
+   * Whether this CLI has said which messages a turn answers — any frame carrying
+   * `user_message_uuid(s)`. Until it has, a `result` naming no uuid answers the oldest
+   * unanswered message, which is how a producer that predates the field pairs them; once
+   * it has, such a `result` ends a turn nobody sent and answers nothing.
+   */
+  stamped: boolean;
   /**
    * The pump has decided this session is over and is on its way out.
    *
    * Set **synchronously**, in the same microtask as the check that decided it, and read
    * synchronously by `prompt` before it accepts a steer. That is what closes the one
    * window the supervisor's own claim cannot: between the pump reading
-   * `completed >= accepted` and `closeSession` running there is an Effect boundary, and a
+   * {@link unanswered} as empty and `closeSession` running there is an Effect boundary, and a
    * steer that landed in it would be queued into a session that is about to close and
    * reported as delivered.
    *
    * **Both sides have to be yield-free for that to be true**, which is a requirement on
    * `prompt` rather than on this field: a review found a `yield* Deferred.isDone(...)`
-   * between the read and the `accepted += 1`, which is a fiber suspension point and left
+   * between the read and the message being added to {@link unanswered}, which is a fiber suspension point and left
    * the window open. `prompt` now uses `Deferred.isDoneUnsafe` and carries the reasoning at
    * the line.
    *
@@ -562,6 +586,16 @@ interface SessionRecord {
    * prompted.
    */
   cli: OwnedCli | undefined;
+  /**
+   * The last {@link STDERR_TAIL} characters the CLI wrote to stderr.
+   *
+   * The SDK appends a stderr tail to "process exited with code N" only from a CLI it
+   * spawned itself, and this harness spawns it (`spawnOwnedCli`), so the tail is kept here
+   * instead: logged when the CLI exits non-zero, and added to the stream's failure.
+   */
+  stderrTail: string;
+  /** The CLI exited with a non-zero code of its own; the stream's failure carries the tail. */
+  cliFailed: boolean;
 }
 
 /**
@@ -572,7 +606,16 @@ interface OwnedCli {
   readonly child: ChildProcess;
   /** Whether the kernel confirmed at spawn that the child leads its own group. */
   readonly ownsGroup: boolean;
+  /**
+   * The CLI and everything it started, followed by pid and start time, which is what is
+   * signalled to stop it: Claude Code starts each Bash tool in a session of its own, out of
+   * the CLI's group (A6 F5's third review). See `trackProcessTree`.
+   */
+  readonly tree: ProcessTree;
 }
+
+/** How much of a CLI's stderr is kept, from the end, for the failure it may explain. */
+const STDERR_TAIL = 4_096;
 
 /** What a caller may vary about this harness. */
 export interface ClaudeCodeHarnessOptions {
@@ -1115,6 +1158,7 @@ const flatten = (entry: SessionMessage): MessageEntry => {
 const userMessage = (
   record: SessionRecord,
   text: string,
+  uuid: string,
   delivery: Extract<PromptDelivery, { _tag: "steer" }> | undefined,
 ): SDKUserMessage =>
   ({
@@ -1122,15 +1166,72 @@ const userMessage = (
     message: { role: "user", content: text },
     parent_tool_use_id: null,
     session_id: record.sessionId,
+    // Every message carries one, the opening prompt included, so the `result` that answers
+    // it can be told from a turn the CLI ran on its own. See `SessionRecord.unanswered`.
+    uuid,
     ...(delivery === undefined
       ? {}
       : {
-          uuid: claudeCodeMessageId(delivery.messageId),
           // `later` lets the work in flight finish; `now` cuts it off. The mapping is in
           // one place so a caller never names a driver's word.
           priority: delivery.urgency === "preemptive" ? "now" : "later",
         }),
   }) as SDKUserMessage;
+
+/**
+ * The frames that mean a turn is under way: the CLI opens every turn with `system/init`
+ * (measured on 2.1.310, a task-notification turn included), and a reply or a tool result
+ * cannot arrive outside one. Everything else the CLI says between turns — task and
+ * background-task bookkeeping, rate limits, command lifecycle — is not a turn, and reading
+ * it as one would leave the session "running" with nothing to wait for.
+ */
+const opensTurn = (message: SDKMessage): boolean =>
+  message.type === "assistant" ||
+  message.type === "user" ||
+  message.type === "stream_event" ||
+  message.type === "tool_progress" ||
+  (message.type === "system" &&
+    (message.subtype === "init" ||
+      (message.subtype === "session_state_changed" &&
+        message.state !== "idle")));
+
+/** The uuids of the messages a frame says its turn has consumed, if it says. */
+const answeredUuids = (message: SDKMessage): readonly string[] | undefined => {
+  const stamp = message as {
+    readonly user_message_uuids?: readonly string[];
+    readonly user_message_uuid?: string;
+  };
+  if (
+    stamp.user_message_uuids !== undefined &&
+    stamp.user_message_uuids.length > 0
+  ) {
+    return stamp.user_message_uuids;
+  }
+  return stamp.user_message_uuid === undefined
+    ? undefined
+    : [stamp.user_message_uuid];
+};
+
+/**
+ * What a `result` answers: the messages it names, or — from a CLI that has never named
+ * one on this session — the oldest still waiting. A `result` naming none from a CLI that
+ * does name them ended a turn nobody sent, and answers nothing.
+ */
+const answer = (record: SessionRecord, message: SDKMessage): void => {
+  const named = answeredUuids(message);
+  if (named !== undefined) {
+    record.stamped = true;
+    for (const uuid of named) record.unanswered.delete(uuid);
+    return;
+  }
+  if (record.stamped) return;
+  const oldest = record.unanswered.values().next();
+  if (oldest.done !== true) record.unanswered.delete(oldest.value);
+};
+
+/** A turn is running on this session's query, or one it accepted is still to answer. */
+const sessionRunning = (record: SessionRecord): boolean =>
+  !record.closed && (record.turnOpen || record.unanswered.size > 0);
 
 export const claudeCodeHarness = (
   options: ClaudeCodeHarnessOptions = {},
@@ -1257,6 +1358,7 @@ export const claudeCodeHarness = (
             // Closing a query that has already exited throws in some SDK paths. The
             // session is over either way and this must not become the run's failure.
           }
+          forgetIfFinished(record);
         }).pipe(Effect.andThen(Queue.end(record.narration)));
 
       /**
@@ -1276,7 +1378,7 @@ export const claudeCodeHarness = (
           const outcome = yield* stopOwnedChild(
             {
               pid: child.pid,
-              ownsGroup: cli.ownsGroup,
+              tree: cli.tree,
               exited: () =>
                 child.exitCode !== null || child.signalCode !== null,
               kill: (signal) => {
@@ -1285,6 +1387,12 @@ export const claudeCodeHarness = (
             },
             cliStopBounds,
           );
+          // Nothing of it is left, so nothing is ever signalled for it again — its pid may
+          // already be someone else's. A survivor is kept, for the finalizer to try again.
+          if (outcome !== "survived" && record.cli === cli) {
+            record.cli = undefined;
+          }
+          forgetIfFinished(record);
           if (outcome === "survived") {
             yield* Effect.logError(
               "an ended Claude Code session's CLI survived SIGKILL; it may still be running",
@@ -1297,6 +1405,15 @@ export const claudeCodeHarness = (
             );
           }
         });
+
+      /**
+       * Drops a record from {@link records} once nothing of it is left to stop: its query is
+       * closed and its CLI, and everything the CLI started, are gone. {@link sessions} keeps
+       * it, for the reason given there; the finalizer has nothing to do for it.
+       */
+      const forgetIfFinished = (record: SessionRecord): void => {
+        if (record.closed && record.cli === undefined) records.delete(record);
+      };
 
       /** Closes one session's query and stops its CLI: the whole of ending it. */
       const endRecord = (record: SessionRecord): Effect.Effect<void> =>
@@ -1340,9 +1457,15 @@ export const claudeCodeHarness = (
           });
           const pid = child.pid;
           const ownsGroup = pid !== undefined && leadsOwnGroup(pid);
-          record.cli = { child, ownsGroup };
+          const cli: OwnedCli | undefined =
+            pid === undefined
+              ? undefined
+              : { child, ownsGroup, tree: trackProcessTree(pid, ownsGroup) };
+          record.cli = cli;
+          record.stderrTail = "";
           child.stderr.setEncoding("utf8");
           child.stderr.on("data", (data: string) => {
+            record.stderrTail = (record.stderrTail + data).slice(-STDERR_TAIL);
             // Diagnostics only. A line on the CLI's stderr is not an outcome, and this must
             // not be able to fail the run.
             void Effect.runPromise(
@@ -1353,6 +1476,34 @@ export const claudeCodeHarness = (
             ).catch(() => undefined);
           });
           child.stderr.on("error", () => undefined);
+          child.once("exit", (code, signal) => {
+            if (cli !== undefined) {
+              /*
+               * Straight after the runtime reaped it, while its group's id cannot have been
+               * handed on if anything is left in it: what it left running there is taken in
+               * now, and if nothing is left, `record.cli` goes, so a stop asked for later —
+               * an end, the finalizer — signals nothing at a pid that may be a stranger's
+               * by then (A6 F5's third review).
+               */
+              cli.tree.adoptOrphanedGroup();
+              if (!cli.tree.alive() && record.cli === cli) {
+                record.cli = undefined;
+                forgetIfFinished(record);
+              }
+            }
+            // Not one this harness ended: a CLI that fails on its own says why on stderr.
+            if (code !== null && code !== 0 && !record.closed) {
+              record.cliFailed = true;
+              void Effect.runPromise(
+                Effect.logWarning("a Claude Code CLI exited with a failure", {
+                  sessionId: record.sessionId,
+                  code,
+                  signal,
+                  stderr: record.stderrTail,
+                }),
+              ).catch(() => undefined);
+            }
+          });
           if (pid !== undefined && !ownsGroup) {
             void Effect.runPromise(
               Effect.logWarning(
@@ -1405,6 +1556,27 @@ export const claudeCodeHarness = (
               try: async () => {
                 for await (const message of live) {
                   const outcome = outcomeOf(message, record.interrupted);
+                  if (answeredUuids(message) !== undefined) {
+                    record.stamped = true;
+                  }
+                  if (
+                    message.type !== "result" &&
+                    !record.turnOpen &&
+                    opensTurn(message)
+                  ) {
+                    /*
+                     * A turn has begun, the CLI's own included. A conversation that had gone
+                     * idle gets a fresh `idle`, as `prompt` gives it for a message it
+                     * accepts, so `waitForIdle` asked now waits for this turn.
+                     */
+                    record.turnOpen = true;
+                    if (
+                      record.multiTurn &&
+                      Deferred.isDoneUnsafe(record.idle)
+                    ) {
+                      record.idle = Deferred.makeUnsafe<void, HarnessFailure>();
+                    }
+                  }
                   if (message.type === "result") {
                     record.outcome = outcome;
                     // The interrupt was for this turn. A conversation's query outlives it, and
@@ -1416,7 +1588,8 @@ export const claudeCodeHarness = (
                       string,
                       unknown
                     >;
-                    record.completed += 1;
+                    record.turnOpen = false;
+                    answer(record, message);
                   }
                   for (const entry of narrate(message, outcome, record)) {
                     Queue.offerUnsafe(record.narration, entry);
@@ -1435,9 +1608,10 @@ export const claudeCodeHarness = (
                    * was about to produce its real answer.
                    *
                    * So the session is only finished when every message it has accepted has
-                   * been answered.
+                   * been answered — by uuid, so a turn the CLI ran on its own neither
+                   * finishes it early nor leaves it waiting. See `SessionRecord.unanswered`.
                    */
-                  if (record.completed < record.accepted) continue;
+                  if (record.unanswered.size > 0) continue;
                   if (record.multiTurn) {
                     /*
                      * A conversation: the turn is over and the session is not.
@@ -1463,7 +1637,11 @@ export const claudeCodeHarness = (
               catch: (cause) =>
                 transport(
                   "query.stream",
-                  `the Claude Code stream ended in failure: ${String(cause)}`,
+                  `the Claude Code stream ended in failure: ${String(cause)}${
+                    !record.cliFailed || record.stderrTail.trim() === ""
+                      ? ""
+                      : `; the CLI's stderr ended: ${record.stderrTail.trim()}`
+                  }`,
                 ),
             }),
           );
@@ -1566,10 +1744,11 @@ export const claudeCodeHarness = (
             record.wake = undefined;
             waiting?.();
           };
-          // The opening prompt is message one. Counted here rather than in `prompt`, so
-          // that `accepted` is true from the moment anything can be read from it.
-          record.accepted = 1;
-          record.offer(userMessage(record, text, undefined));
+          // The opening prompt is message one. Recorded here rather than in `prompt`, so
+          // that `unanswered` is true from the moment anything can be read from it.
+          const opening = crypto.randomUUID();
+          record.unanswered.add(opening);
+          record.offer(userMessage(record, text, opening, undefined));
 
           const input = async function* (): AsyncGenerator<SDKUserMessage> {
             await released.promise;
@@ -1738,8 +1917,9 @@ export const claudeCodeHarness = (
           resumed: input.resume !== undefined,
           idle,
           ended: yield* Deferred.make<void>(),
-          accepted: 0,
-          completed: 0,
+          unanswered: new Set<string>(),
+          turnOpen: false,
+          stamped: false,
           settling: false,
           deliveredIds: new Set<string>(),
           query: undefined,
@@ -1754,6 +1934,8 @@ export const claudeCodeHarness = (
           interrupted: false,
           closed: false,
           cli: undefined,
+          stderrTail: "",
+          cliFailed: false,
         };
         sessions.set(sessionId, record);
         records.add(record);
@@ -2103,8 +2285,8 @@ export const claudeCodeHarness = (
          * That is what makes {@link SessionRecord.settling}'s claim true, and it was not
          * before: this sequence used `yield* Deferred.isDone(...)`, which is a fiber
          * suspension point — so the pump, which is where `settling = true` and
-         * `closeSession` live, could interleave between the check and the `accepted += 1`
-         * that stops the pump settling. The outcome would be a steer reported
+         * `closeSession` live, could interleave between the check and the claim on
+         * `unanswered` that stops the pump settling. The outcome would be a steer reported
          * `delivered: true` into a query that is closing: on this driver the message is
          * dropped rather than becoming unsupervised work, so the harm is a lying receipt
          * rather than a rogue execution, but the comment stated the window was closed and
@@ -2113,15 +2295,16 @@ export const claudeCodeHarness = (
          * `Deferred.isDoneUnsafe` is the synchronous read (`effect@4.0.5`'s
          * `Deferred.d.ts`), and `makeUnsafe` was already synchronous — so the whole of
          * "decide, claim, offer" is now one microtask. The `offer === undefined` guard moved
-         * **above** it for a second reason: `accepted` must not be incremented on a path
+         * **above** it for a second reason: nothing may be added to `unanswered` on a path
          * that then refuses, or `waitForIdle` would wait for a turn nobody started.
          */
         if (Deferred.isDoneUnsafe(record.idle)) {
           record.idle = Deferred.makeUnsafe<void, HarnessFailure>();
         }
         record.deliveredIds.add(delivery.messageId);
-        record.accepted += 1;
-        offer(userMessage(record, text, delivery));
+        const uuid = claudeCodeMessageId(delivery.messageId);
+        record.unanswered.add(uuid);
+        offer(userMessage(record, text, uuid, delivery));
         return { delivered: true };
       });
 
@@ -2145,9 +2328,10 @@ export const claudeCodeHarness = (
         const record = sessions.get(sessionId);
         if (record !== undefined) {
           /*
-           * A turn is in flight exactly when a message this session accepted has not
-           * produced its `result` yet, which is the pair `waitForIdle` already settles on
-           * (DECISIONS.md §24.1, consequence 4) rather than a second notion of liveness.
+           * A turn is in flight exactly when one is open on the stream or a message this
+           * session accepted has not been answered yet, which is what `waitForIdle`
+           * already settles on (DECISIONS.md §24.1, consequence 4) rather than a second
+           * notion of liveness. See `SessionRecord.unanswered`.
            *
            * **`record.outcome` is the *last completed* turn's**, set by the pump on every
            * `result`, so a steered session in its second turn holds the first turn's
@@ -2158,9 +2342,9 @@ export const claudeCodeHarness = (
            * bitten.
            *
            * `closed` is checked too: a query that ended with messages still unanswered is
-           * not running, and `accepted > completed` alone would say it was for ever.
+           * not running, and `unanswered` alone would say it was for ever.
            */
-          const running = !record.closed && record.completed < record.accepted;
+          const running = sessionRunning(record);
           return {
             activity: running ? "running" : "idle",
             outcome: running ? undefined : record.outcome,
@@ -2414,8 +2598,10 @@ export const claudeCodeHarness = (
           }
           // A conversation between turns has nothing running, and asking anyway would mark
           // the *next* turn's `result` as interrupted. A single-turn session is never
-          // between turns while its query is open, so it is asked as it always was.
-          if (record.multiTurn && record.completed >= record.accepted) {
+          // between turns while its query is open, so it is asked as it always was. A turn
+          // the CLI started itself — a background task's notification — is running, and
+          // is stopped like any other.
+          if (record.multiTurn && !sessionRunning(record)) {
             return false;
           }
           // Set before asking, so a `result` arriving mid-interrupt is read as
@@ -2461,8 +2647,8 @@ export const claudeCodeHarness = (
            * stop a turn and carry on talking. Measured on 2.1.310 (`AgentHarness.
            * interruptSession`): the interrupted turn ends with its own `result`, a message
            * already queued behind it then runs as a turn of its own, and a later message is
-           * answered normally. So `accepted` and `completed` stay paired across the interrupt
-           * and nothing else here has to change.
+           * answered normally. The interrupted turn's `result` names the message it was
+           * answering, so nothing else here has to change.
            */
           if (!record.multiTurn) yield* closeSession(record);
           return true;

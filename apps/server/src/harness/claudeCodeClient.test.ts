@@ -1567,6 +1567,11 @@ const turnDrivenSdk = () => {
   let streamFailure: Error | undefined;
   /** Set by {@link endStream}: the stream returns once it has been woken. */
   let streamEnded = false;
+  /**
+   * The uuids of the messages pulled and not yet answered, oldest first: what the next
+   * `result` names in `user_message_uuids`, as 2.1.310 does for a turn that was asked for.
+   */
+  const toAnswer: (string | undefined)[] = [];
   const push = (message: SDKMessage): void => {
     pending.push(message);
     const waiting = wake;
@@ -1587,6 +1592,7 @@ const turnDrivenSdk = () => {
           seen.prompts.push(String(record.message?.content));
           seen.uuids.push(record.uuid);
           seen.priorities.push(record.priority);
+          toAnswer.push(record.uuid);
           // A reply arrives with the turn; the `result` that *ends* it is the test's.
           push(assistant(sessionId));
         }
@@ -1645,8 +1651,45 @@ const turnDrivenSdk = () => {
     sessionInfo: () => Promise.resolve(undefined),
   };
 
-  /** Ends one turn, as the driver does: one `result` per accepted message. */
+  /**
+   * Ends one turn, as the driver does: one `result` per accepted message, naming the
+   * message it answered.
+   */
   const emitResult = (): void => {
+    const uuid = toAnswer.shift();
+    push({
+      ...(result(sessionId, "success") as object),
+      ...(uuid === undefined
+        ? {}
+        : { user_message_uuid: uuid, user_message_uuids: [uuid] }),
+    } as unknown as SDKMessage);
+  };
+  /**
+   * Starts a turn nobody sent, as 2.1.310 does when a `run_in_background` task finishes
+   * (measured): `task_notification`, then the turn's own `system/init` and reply, none of
+   * them naming a message.
+   */
+  const startUnrequestedTurn = (): void => {
+    push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "b1",
+      status: "completed",
+      output_file: "/tmp/b1.out",
+      summary: "background command finished",
+      session_id: sessionId,
+      uuid: "00000000-0000-4000-8000-00000000fff1",
+    } as unknown as SDKMessage);
+    push({
+      type: "system",
+      subtype: "init",
+      session_id: sessionId,
+      uuid: "00000000-0000-4000-8000-00000000fff2",
+    } as unknown as SDKMessage);
+    push(assistant(sessionId));
+  };
+  /** Ends the turn nobody sent, with a `result` that names no message, as 2.1.310's does. */
+  const endUnrequestedTurn = (): void => {
     push(result(sessionId, "success"));
   };
   /**
@@ -1688,7 +1731,17 @@ const turnDrivenSdk = () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   };
-  return { sdk, seen, controls, emitResult, failStream, endStream, pulled };
+  return {
+    sdk,
+    seen,
+    controls,
+    emitResult,
+    startUnrequestedTurn,
+    endUnrequestedTurn,
+    failStream,
+    endStream,
+    pulled,
+  };
 };
 
 const withTurnDriven = <A>(
@@ -1845,9 +1898,10 @@ describe("a second accepted message, and what settlement means after one", () =>
       }),
     );
 
-    // The opening prompt carries neither, exactly as every worker and round session always
-    // has: there is nothing to be idempotent about and no timing to choose.
-    expect(seen.uuids[0]).toBeUndefined();
+    // The opening prompt has no timing to choose. It does carry a uuid of its own, so the
+    // `result` that answers it can be told from a turn the CLI ran by itself.
+    expect(seen.uuids[0]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(seen.uuids[0]).not.toBe(seen.uuids[1]);
     expect(seen.priorities[0]).toBeUndefined();
     /*
      * A **UUID**, because the SDK's `uuid` is one, derived from the application's own hex
@@ -2213,7 +2267,7 @@ describe("stopping a conversation's turn (A6 F5)", () => {
 
   test("a message queued behind the stopped turn runs after it, and the session is idle only once it has", async () => {
     // The measured Claude Code behaviour: the queued message is a turn of its own, run at
-    // once. `accepted`/`completed` stay paired, so `waitForIdle` waits for it.
+    // once, and its `result` names it, so `waitForIdle` waits for it.
     const outcome = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
         yield* talking(harness, driver);
@@ -2248,6 +2302,74 @@ describe("stopping a conversation's turn (A6 F5)", () => {
     );
     expect(outcome.stopped).toBe(false);
     expect(outcome.interrupts).toBe(0);
+  });
+
+  test("after a turn the CLI ran on its own, Stop still interrupts the next one", async () => {
+    /*
+     * A6 F5's third review, seen live: a finished `run_in_background` task makes the CLI run
+     * a turn nobody sent, with a `result` of its own. Counting `result`s against messages
+     * sent then read every later turn as idle, and Stop answered "nothing was running"
+     * while a tool ran.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.startUnrequestedTurn();
+        yield* Effect.sleep("40 millis");
+        const during = yield* harness.sessionStatus(TALK);
+        // Waits for the CLI's own turn, rather than answering with the last one's idle.
+        const waiting = yield* Effect.forkChild(harness.waitForIdle(TALK));
+        yield* Effect.sleep("40 millis");
+        const waitedEarly = waiting.pollUnsafe() !== undefined;
+        driver.endUnrequestedTurn();
+        yield* Fiber.join(waiting);
+        const afterOwn = yield* harness.sessionStatus(TALK);
+        yield* steer(harness, "ee");
+        yield* Effect.promise(() => driver.pulled(2));
+        yield* Effect.sleep("40 millis");
+        const runningNext = yield* harness.sessionStatus(TALK);
+        const stopped = yield* harness.interruptSession(TALK);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        const afterStop = yield* harness.sessionStatus(TALK);
+        return {
+          during,
+          waitedEarly,
+          afterOwn,
+          runningNext,
+          stopped,
+          afterStop,
+          interrupts: driver.seen.interrupts,
+        };
+      }),
+    );
+    expect(outcome.during.activity).toBe("running");
+    expect(outcome.waitedEarly).toBe(false);
+    expect(outcome.afterOwn.activity).toBe("idle");
+    expect(outcome.runningNext.activity).toBe("running");
+    expect(outcome.stopped).toBe(true);
+    expect(outcome.interrupts).toBe(1);
+    expect(outcome.afterStop.activity).toBe("idle");
+    expect(outcome.afterStop.outcome).toBe("interrupted");
+  });
+
+  test("a Stop during a turn the CLI ran on its own interrupts it", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.startUnrequestedTurn();
+        yield* Effect.sleep("40 millis");
+        const stopped = yield* harness.interruptSession(TALK);
+        driver.endUnrequestedTurn();
+        yield* harness.waitForIdle(TALK);
+        return { stopped, interrupts: driver.seen.interrupts };
+      }),
+    );
+    expect(outcome).toEqual({ stopped: true, interrupts: 1 });
   });
 
   test("an interrupt the CLI will not acknowledge fails, and the query is closed", async () => {
@@ -2942,9 +3064,15 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
     }
   };
 
+  /*
+   * The tool is started with `setsid`, in a session and group of its own, because that is
+   * what Claude Code 2.1.310 does with every Bash tool: a stop that signalled only the
+   * CLI's group passed these tests with a stand-in whose tool shared it, and left a real
+   * CLI's tools running (A6 F5's third review).
+   */
   test("the CLI and the tool it is running are gone by the time endSession returns", async () => {
     const outcome = await endedWhileRunning(
-      (pidFile) => `sleep 30 & echo $! > '${pidFile}'; wait`,
+      (pidFile) => `setsid sleep 30 & echo $! > '${pidFile}'; wait`,
     );
     expect(outcome.before).toEqual({ leader: true, tool: true });
     expect(outcome.after).toEqual({ leader: false, tool: false });
@@ -2954,14 +3082,90 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
   }, 10_000);
 
   test("a CLI that ignores SIGTERM is killed, tool and all, within the bounds", async () => {
-    // `trap '' TERM` is inherited by the child, so neither of them goes on SIGTERM.
+    // `trap '' TERM` is inherited by the child through `setsid`, so neither of them goes on
+    // SIGTERM: the kill path, which is the one the CLI's own handler does not cover.
     const outcome = await endedWhileRunning(
-      (pidFile) => `trap '' TERM; sleep 30 & echo $! > '${pidFile}'; wait`,
+      (pidFile) =>
+        `trap '' TERM; setsid sleep 30 & echo $! > '${pidFile}'; wait`,
     );
     expect(outcome.before).toEqual({ leader: true, tool: true });
     expect(outcome.after).toEqual({ leader: false, tool: false });
     expect(outcome.took).toBeGreaterThanOrEqual(250);
     expect(outcome.took).toBeLessThan(1_500);
+  }, 10_000);
+
+  test("a CLI that fails on its own says why: its stderr reaches the stream's failure", async () => {
+    /*
+     * The SDK adds a stderr tail to "process exited with code N" only from a CLI it spawned
+     * itself; this harness spawns it, so the tail is kept here (A6 F5's third review).
+     */
+    const sdk: ClaudeCodeSdk = {
+      query: ({ prompt, options }) => {
+        const spawn = options.spawnClaudeCodeProcess;
+        if (spawn === undefined)
+          throw new Error("the harness spawned nothing itself");
+        const child = spawn({
+          command: "sh",
+          args: ["-c", "echo 'Error: not logged in' >&2; sleep 0.1; exit 3"],
+          env: { PATH: process.env["PATH"] },
+          signal: new AbortController().signal,
+        });
+        const exited = new Promise<number>((resolve) => {
+          (child as unknown as NodeJS.EventEmitter).once(
+            "exit",
+            (code: number | null) => {
+              resolve(code ?? -1);
+            },
+          );
+        });
+        void (async () => {
+          for await (const _message of prompt) void _message;
+        })();
+        const query: HarnessQuery = {
+          setMcpServers: async () => ({}),
+          interrupt: async () => undefined,
+          getContextUsage: async () => ({}),
+          setModel: async () => undefined,
+          applyFlagSettings: async () => undefined,
+          close: () => undefined,
+          // What the SDK's own stream does when its CLI exits non-zero.
+          [Symbol.asyncIterator]: async function* () {
+            const code = await exited;
+            yield* [] as SDKMessage[];
+            throw new Error(
+              `Claude Code process exited with code ${String(code)}`,
+            );
+          },
+        };
+        return query;
+      },
+      sessionMessages: () => Promise.resolve([]),
+      sessionInfo: () => Promise.resolve(undefined),
+    };
+    const failure = await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(AgentHarness, (harness) =>
+          Effect.gen(function* () {
+            yield* harness.createSession({
+              title: "conversation",
+              model: "claude-sonnet-5",
+              directory: "/tmp/goal",
+              sessionId: TALK,
+              multiTurn: true,
+            });
+            yield* harness.prompt(TALK, "go");
+            return yield* Effect.flip(harness.waitForIdle(TALK));
+          }),
+        ).pipe(
+          Effect.provide(
+            claudeCodeHarness({ sdk, controlTimeout: "2 seconds" }),
+          ),
+          Effect.orDie,
+        ),
+      ),
+    );
+    expect(failure.message).toContain("exited with code 3");
+    expect(failure.message).toContain("Error: not logged in");
   }, 10_000);
 
   test("a resumed opening under the same id is not ended by the earlier opening's close", async () => {
