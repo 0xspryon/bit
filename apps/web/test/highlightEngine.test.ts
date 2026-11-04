@@ -7,7 +7,9 @@ import { describe, expect, test } from "bun:test";
 
 import {
   tokenise,
+  TOKENIZE_BLOCK_BUDGET_MS,
   TOKENIZE_MAX_LINE_LENGTH,
+  TokeniseOverBudget,
   type ToneLines,
 } from "../src/lib/highlightEngine";
 import { GRAMMARS, grammarOf } from "../src/lib/highlightLanguages";
@@ -100,6 +102,47 @@ describe("the tones Shiki gives", () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]?.map((run) => run.text).join("")).toBe(line);
     expect(lines[0]?.some((run) => run.tone === "key")).toBe(false);
+  });
+
+  test("a hostile block is given up at its budget, not after every line's own limit", async () => {
+    // The review's block: `(a,a,a,…` lines just under the length limit, each of which
+    // runs Oniguruma to nearly its per-line limit. Sixty took 5 s before the block budget.
+    const line = `(${Array.from({ length: 495 }, () => "a").join(",")}`;
+    expect(line.length).toBeLessThan(TOKENIZE_MAX_LINE_LENGTH);
+    const hostile = Array.from({ length: 60 }, () => line).join("\n");
+    await tokenise("x", "typescript");
+    const started = performance.now();
+    let failed: unknown;
+    let begun = 0;
+    try {
+      await tokenise(hostile, "typescript", {
+        budgetMs: 300,
+        onStart: () => (begun += 1),
+      });
+    } catch (error) {
+      failed = error;
+    }
+    const took = performance.now() - started;
+    expect(failed).toBeInstanceOf(TokeniseOverBudget);
+    expect(begun).toBe(1);
+    // The budget, and at most a line or two past it, never sixty lines' worth.
+    expect(took).toBeLessThan(1_000);
+  });
+
+  test("the budget is read before every line, from the clock it is given", async () => {
+    let time = 0;
+    const now = (): number => (time += 400);
+    await expect(
+      tokenise("var a\nvar b\nvar c", "javascript", { budgetMs: 1000, now }),
+    ).rejects.toBeInstanceOf(TokeniseOverBudget);
+    // An ordinary block is nowhere near the real budget.
+    const ordinary = Array.from(
+      { length: 1000 },
+      (_, index) => `const v${String(index)} = f(${String(index)}) // c`,
+    ).join("\n");
+    const started = performance.now();
+    expect(await tokenise(ordinary, "javascript")).toHaveLength(1000);
+    expect(performance.now() - started).toBeLessThan(TOKENIZE_BLOCK_BUDGET_MS);
   });
 
   test("a hidden character stays in the run's text, for the page to mark", async () => {

@@ -576,6 +576,32 @@ describe("add_scope_entry", () => {
     expect(called.isError).toBe(true);
     expect(called.text).toContain("invalid");
   });
+
+  test("a value naming a user before the host is refused, and no host is guessed", async () => {
+    // A program page's link is attacker-written. Read with userinfo cut at the last `@`,
+    // this was stored as evil.com; with the authority ended first it would be acme.com.
+    // The `user@` is refused either way, so neither host is written.
+    const called = await callTool(
+      importerUrl,
+      importerToken,
+      "add_scope_entry",
+      {
+        effect: "in",
+        kind: "host",
+        value: "https://evil.com@acme.com/x@evil.com",
+        source_url: PAGE_A,
+        note: "in-scope targets",
+      },
+    );
+    expect(called.isError).toBe(true);
+    expect(called.text).toContain("names a user before the host");
+    const stored = await runtime.runPromise(
+      Effect.flatMap(ObservationStore, (store) => store.targetScope(TARGET)),
+    );
+    expect(stored.entries.map((entry) => entry.value)).not.toContain(
+      "evil.com",
+    );
+  });
 });
 
 describe("record_imported_asset", () => {
@@ -679,8 +705,9 @@ describe("the panel's receipt", () => {
       expect(IMPORTER_TOOLS).toContain(call.tool);
     }
 
-    // Refused calls are not on the receipt. Four `add_scope_entry` calls were made above
-    // and two were refused — the contradiction and the bad CIDR — so two entries landed:
+    // Refused calls are not on the receipt. Five `add_scope_entry` calls were made above
+    // and three were refused — the contradiction, the bad CIDR and the value with a user
+    // before its host — so two entries landed:
     // the original and the idempotent duplicate, which really was a call the importer
     // made and which the operator should see it make.
     const entryCalls = calls.filter((call) => call.tool === "add_scope_entry");

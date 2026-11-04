@@ -74,46 +74,84 @@ export interface Highlights {
   readonly request: (code: string, grammar: Grammar) => Promise<void>;
 }
 
-/** How many fences' tones are kept, and how many characters of code across them. */
+/**
+ * How many fences' tones are kept, and roughly how many bytes they may hold between them.
+ *
+ * **Weighed by what is stored, not by the code.** A review found a budget of two million
+ * code characters let the cache hold about 150 MB: a dense block is a run every character
+ * or two, and each run is an object as well as its text — about 77 bytes a character in
+ * Chrome. So an entry is weighed as its key's text, its lines and its runs
+ * ({@link weightOf}), and the budget is bytes. One entry is never evicted by its own
+ * arrival, or a block heavier than the budget would be tokenised again on every render; the
+ * heaviest a block can be (60,000 characters, a run each) is about 5 MB, so the cache holds
+ * at most the budget and that.
+ */
 const KEPT_ENTRIES = 256;
-const KEPT_CHARS = 2_000_000;
+const KEPT_BYTES = 4_000_000;
+/** An estimate of a run's own cost, past its text: the object, its two fields, its slot. */
+const RUN_BYTES = 64;
+/** An estimate of a line's own cost, past its runs: the array and its slot. */
+const LINE_BYTES = 32;
+
+/** What one cache entry costs, roughly, in bytes: two a character of text, and the objects. */
+export const weightOf = (key: string, lines: ToneLines | null): number => {
+  let bytes = key.length * 2;
+  for (const line of lines ?? []) {
+    bytes += LINE_BYTES;
+    for (const run of line) bytes += RUN_BYTES + run.text.length * 2;
+  }
+  return bytes;
+};
 
 /**
  * A cache of tones in front of `tokenise`, keyed by grammar and code: one tokenising per
  * fence, however many times a reply is re-rendered around it, and one in flight at a time.
  *
- * Least recently used, bounded by both count and characters, so a few very long blocks
- * cannot hold the page's memory. **A failure is remembered as plain**: a grammar that will
- * not load or a block that will not tokenise would fail again, and asking again would only
- * make each re-render a new failure.
+ * Least recently used, bounded by count and by {@link weightOf}, so a few very long blocks
+ * cannot hold the page's memory. **A failure is remembered as plain**: `tokenise` rejects
+ * only for the block's own sake — it ran past its time, or its grammar would not load on a
+ * second, fresh worker ({@link createWorkerTokenise}) — and asking again would only make
+ * each re-render a new failure.
+ *
+ * `bytes` reports what the kept entries weigh, for a test to hold the budget to.
  */
-export const createHighlights = (tokenise: Tokenise): Highlights => {
-  const kept = new Map<string, ToneLines | null>();
+export const createHighlights = (
+  tokenise: Tokenise,
+): Highlights & { readonly bytes: () => number } => {
+  const kept = new Map<
+    string,
+    { readonly lines: ToneLines | null; readonly weight: number }
+  >();
   const waiting = new Map<string, Promise<void>>();
-  let chars = 0;
+  let bytes = 0;
   const keyOf = (code: string, grammar: Grammar): string =>
     `${grammar}\n${code}`;
   const keep = (key: string, lines: ToneLines | null): void => {
-    kept.set(key, lines);
-    chars += key.length;
-    for (const [oldest] of kept) {
-      if (kept.size <= KEPT_ENTRIES && chars <= KEPT_CHARS) break;
+    const weight = weightOf(key, lines);
+    bytes -= kept.get(key)?.weight ?? 0;
+    kept.delete(key);
+    kept.set(key, { lines, weight });
+    bytes += weight;
+    for (const [oldest, entry] of kept) {
+      if (kept.size <= KEPT_ENTRIES && bytes <= KEPT_BYTES) break;
+      if (oldest === key) break;
       kept.delete(oldest);
-      chars -= oldest.length;
+      bytes -= entry.weight;
     }
   };
   const tooLarge = (code: string): boolean =>
     code.length > HIGHLIGHT_MAX_CHARS ||
     code.split("\n", HIGHLIGHT_MAX_LINES + 1).length > HIGHLIGHT_MAX_LINES;
   return {
+    bytes: () => bytes,
     peek: (code, grammar) => {
       if (tooLarge(code)) return null;
       const key = keyOf(code, grammar);
-      const lines = kept.get(key);
-      if (lines === undefined) return undefined;
+      const entry = kept.get(key);
+      if (entry === undefined) return undefined;
       kept.delete(key);
-      kept.set(key, lines);
-      return lines;
+      kept.set(key, entry);
+      return entry.lines;
     },
     request: (code, grammar) => {
       if (tooLarge(code)) return Promise.resolve();
@@ -135,48 +173,193 @@ export const createHighlights = (tokenise: Tokenise): Highlights => {
   };
 };
 
+/** What the page sends the worker: one block. */
+export interface WorkerRequest {
+  readonly id: number;
+  readonly code: string;
+  readonly grammar: Grammar;
+}
+
+/** What the worker answers about one block (`highlight.worker.ts`). */
+export interface WorkerAnswer {
+  readonly id: number;
+  readonly started?: true;
+  readonly lines?: ToneLines;
+  readonly failed?: string;
+  readonly retry?: boolean;
+}
+
+/** What the page needs of a worker: the browser's `Worker`, or a test's stand-in. */
+export interface HighlightWorker {
+  onmessage: ((event: MessageEvent<WorkerAnswer>) => void) | null;
+  onerror: ((event: ErrorEvent) => void) | null;
+  postMessage: (message: WorkerRequest) => void;
+  terminate: () => void;
+}
+
 /**
- * The worker, started on the first request. If it cannot start, or dies, every request in
- * flight fails — the fences stay plain — and the next request starts a new one.
+ * How long the page waits on the worker. `loadMs` from sending a block to the worker's
+ * word that tokenising started — Shiki, the WASM and a grammar are fetched in that time —
+ * and `blockMs` from then to its answer. `blockMs` is a backstop: the worker gives a block
+ * up itself at its budget (`TOKENIZE_BLOCK_BUDGET_MS`, a second) and a line later, and this
+ * is for the line that does not stop when told, which only terminating the worker ends. It
+ * is a literal rather than that constant plus a second because importing a value from
+ * `highlightEngine.ts` would put Shiki in the page's bundle; a test holds the two apart.
  */
-let worker: Worker | undefined;
-let nextId = 0;
-const answers = new Map<
-  number,
-  { resolve: (lines: ToneLines) => void; reject: (error: Error) => void }
->();
-const stopWorker = (why: string): void => {
-  worker?.terminate();
-  worker = undefined;
-  for (const each of answers.values()) each.reject(new Error(why));
-  answers.clear();
+export interface WorkerTiming {
+  readonly loadMs: number;
+  readonly blockMs: number;
+}
+export const WORKER_TIMING: WorkerTiming = {
+  loadMs: 20_000,
+  blockMs: 2_000,
 };
-const startWorker = (): Worker => {
-  const made = new Worker(new URL("./highlight.worker.ts", import.meta.url), {
-    type: "module",
-  });
-  made.onmessage = (
-    event: MessageEvent<{ id: number; lines?: ToneLines; failed?: string }>,
-  ) => {
-    const answer = answers.get(event.data.id);
-    if (answer === undefined) return;
-    answers.delete(event.data.id);
-    if (event.data.lines !== undefined) answer.resolve(event.data.lines);
-    else answer.reject(new Error(event.data.failed ?? "tokenising failed"));
+
+/** How many times one block is sent to a worker before it is drawn plain. */
+const TRIES = 2;
+
+/**
+ * A {@link Tokenise} that sends each block to a worker, **one at a time**, and times it.
+ *
+ * One at a time because the worker can only tokenise one block at once anyway, and because
+ * it makes "the block that ran over" a fact rather than a guess: whatever is in flight when
+ * the deadline passes is the block that held it. That block is drawn plain; the worker is
+ * terminated, since a line that ignores its own time limit is not otherwise stopped; and
+ * the blocks still queued go to a new one, never having been sent to the old.
+ *
+ * **One failure does not spread.** A worker that crashes, or a grammar or the WASM that
+ * will not load, fails the block in flight only, and that block is sent once more on a
+ * fresh worker before it is drawn plain — a network blip is not a reply's fences plain until
+ * a reload. A block that ran past its budget is not sent again: it would only run past it
+ * again.
+ */
+export const createWorkerTokenise = (
+  start: () => HighlightWorker,
+  timing: WorkerTiming = WORKER_TIMING,
+): Tokenise => {
+  interface Job {
+    readonly code: string;
+    readonly grammar: Grammar;
+    readonly resolve: (lines: ToneLines) => void;
+    readonly reject: (error: Error) => void;
+    tries: number;
+    id: number;
+  }
+  const queue: Job[] = [];
+  let worker: HighlightWorker | undefined;
+  let current: Job | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let nextId = 0;
+
+  const disarm = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
   };
-  made.onerror = () => stopWorker("the highlighter stopped");
-  return made;
+  const arm = (ms: number, onLate: () => void): void => {
+    disarm();
+    timer = setTimeout(onLate, ms);
+  };
+  const stop = (): void => {
+    disarm();
+    const old = worker;
+    worker = undefined;
+    old?.terminate();
+  };
+  /** The block in flight is done with; send the next. */
+  const settle = (): void => {
+    disarm();
+    current = undefined;
+    pump();
+  };
+  /**
+   * The block in flight failed for want of a working worker: once more, on a new one. On
+   * its last try the block is plain, and the worker is kept unless `dead` says it is gone
+   * or stuck — a grammar that would not load twice says nothing about the next block's.
+   */
+  const again = (job: Job, why: string, dead: boolean): void => {
+    const retry = job.tries < TRIES;
+    if (dead || retry) stop();
+    else disarm();
+    current = undefined;
+    if (retry) queue.unshift(job);
+    else job.reject(new Error(why));
+    pump();
+  };
+  const listen = (made: HighlightWorker): void => {
+    made.onmessage = (event) => {
+      const job = current;
+      if (made !== worker || job === undefined || event.data.id !== job.id) {
+        return;
+      }
+      if (event.data.started === true) {
+        arm(timing.blockMs, () => {
+          stop();
+          job.reject(new Error("the highlighter took too long on this block"));
+          settle();
+        });
+        return;
+      }
+      if (event.data.lines !== undefined) {
+        job.resolve(event.data.lines);
+        settle();
+        return;
+      }
+      const why = event.data.failed ?? "tokenising failed";
+      if (event.data.retry === true) {
+        again(job, why, false);
+        return;
+      }
+      job.reject(new Error(why));
+      settle();
+    };
+    made.onerror = () => {
+      if (made !== worker) return;
+      if (current === undefined) stop();
+      else again(current, "the highlighter stopped", true);
+    };
+  };
+  const pump = (): void => {
+    while (current === undefined) {
+      const job = queue.shift();
+      if (job === undefined) return;
+      job.tries += 1;
+      if (worker === undefined) {
+        try {
+          worker = start();
+        } catch {
+          worker = undefined;
+          if (job.tries < TRIES) queue.unshift(job);
+          else job.reject(new Error("the highlighter could not start"));
+          continue;
+        }
+        listen(worker);
+      }
+      nextId += 1;
+      job.id = nextId;
+      current = job;
+      arm(timing.loadMs, () =>
+        again(job, "the highlighter did not load", true),
+      );
+      worker.postMessage({ id: job.id, code: job.code, grammar: job.grammar });
+    }
+  };
+
+  return (code, grammar) =>
+    new Promise((resolve, reject) => {
+      queue.push({ code, grammar, resolve, reject, tries: 0, id: 0 });
+      pump();
+    });
 };
-const workerTokenise: Tokenise = (code, grammar) =>
-  new Promise((resolve, reject) => {
-    worker ??= startWorker();
-    nextId += 1;
-    answers.set(nextId, { resolve, reject });
-    worker.postMessage({ id: nextId, code, grammar });
-  });
 
 /** The app's highlights: Shiki in a worker, one cache for every reply on the page. */
-export const appHighlights: Highlights = createHighlights(workerTokenise);
+export const appHighlights: Highlights = createHighlights(
+  createWorkerTokenise(
+    () =>
+      new Worker(new URL("./highlight.worker.ts", import.meta.url), {
+        type: "module",
+      }),
+  ),
+);
 
 /** The constant class each tone is drawn with. `plain` is no element at all. */
 const TONE_CLASS: Readonly<Record<Exclude<Tone, "plain">, string>> = {

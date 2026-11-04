@@ -682,8 +682,17 @@
     text-transform: none;
     white-space: nowrap;
   }
+  /*
+   * Both hidden boxes are anchored at `top: 0; left: 0`, for the reason `.visually-hidden`
+   * is (`styles/tokens.css`): absolute with no offsets sits at its static position in the
+   * initial containing block, so a Copy region a hundred thousand pixels down a thread made
+   * the document that tall, and the window scrolled under the shell. At the origin of
+   * whatever box they are positioned in, they extend nothing.
+   */
   .announce {
     position: absolute;
+    top: 0;
+    left: 0;
     width: 1px;
     height: 1px;
     overflow: hidden;
@@ -693,6 +702,8 @@
   /* remark-rehype labels a footnote section with a heading meant only for screen readers. */
   .markdown :global(.sr-only) {
     position: absolute;
+    top: 0;
+    left: 0;
     width: 1px;
     height: 1px;
     overflow: hidden;

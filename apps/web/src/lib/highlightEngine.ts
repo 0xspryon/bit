@@ -13,8 +13,9 @@
  * one hostile line can hang the tokenising thread. The code highlighted here is an agent's
  * fence, which in the importer is a program page's words, so a line built to make a regex
  * backtrack is an input to expect. Oniguruma is also given a time limit per line
- * ({@link TOKENIZE_TIME_LIMIT_MS}) and a length past which a line is left plain
- * ({@link TOKENIZE_MAX_LINE_LENGTH}).
+ * ({@link TOKENIZE_TIME_LIMIT_MS}), a length past which a line is left plain
+ * ({@link TOKENIZE_MAX_LINE_LENGTH}), and a block a time limit of its own
+ * ({@link TOKENIZE_BLOCK_BUDGET_MS}).
  *
  * ## What comes out is data
  *
@@ -28,6 +29,7 @@ import {
   type LanguageRegistration,
   type ThemeRegistrationRaw,
 } from "@shikijs/core";
+import { EncodedTokenMetadata, INITIAL } from "@shikijs/core/textmate";
 import { createOnigurumaEngine } from "@shikijs/engine-oniguruma";
 
 import type { Grammar } from "./highlightLanguages";
@@ -156,6 +158,26 @@ const TONE_THEME: ThemeRegistrationRaw = {
 export const TOKENIZE_MAX_LINE_LENGTH = 1000;
 /** How long Oniguruma may spend on one line before the rest of it is left untokenised. */
 export const TOKENIZE_TIME_LIMIT_MS = 100;
+/**
+ * How long one block may take to tokenise, in all, before it is given up and drawn plain.
+ *
+ * **The per-line limit does not bound a block.** A review measured 60 lines of
+ * `(a,a,a,…` (991 characters each, just under the line length) as TypeScript: each ran to
+ * nearly its 100 ms, and the block took 5 s; two of them held the worker for 11 s, and
+ * every other fence on the page waited behind them. So the block is tokenised a line at a
+ * time against this deadline, and one that passes it fails with
+ * {@link TokeniseOverBudget}. 1,000 lines of ordinary JavaScript take about 300 ms, so
+ * nothing a reply would show is near it; a hostile block costs at most this plus one line.
+ */
+export const TOKENIZE_BLOCK_BUDGET_MS = 1000;
+
+/** A block that ran past its budget: drawn plain, and not worth asking for again. */
+export class TokeniseOverBudget extends Error {
+  constructor(budgetMs: number) {
+    super(`tokenising took longer than ${String(budgetMs)} ms`);
+    this.name = "TokeniseOverBudget";
+  }
+}
 
 let core: Promise<HighlighterCore> | undefined;
 const loading = new Map<Grammar, Promise<void>>();
@@ -188,33 +210,78 @@ const load = (shiki: HighlighterCore, grammar: Grammar): Promise<void> => {
   return loaded;
 };
 
+/** How {@link tokenise} is run: its budget, and a call made when loading is done. */
+export interface TokeniseOptions {
+  /** The block's budget, {@link TOKENIZE_BLOCK_BUDGET_MS} unless a test says otherwise. */
+  readonly budgetMs?: number;
+  /**
+   * Called once Shiki, the WASM and the grammar are loaded and tokenising starts. The
+   * worker tells the page, which times the block from here rather than from its request:
+   * fetching a grammar is the network's time, and not the block's.
+   */
+  readonly onStart?: () => void;
+  /** The clock the budget is read from; `performance.now` unless a test says otherwise. */
+  readonly now?: () => number;
+}
+
 /**
  * `code` as lines of toned runs, in `grammar`. Neighbouring runs of one tone are joined, so
- * a line is as few spans as its tones need.
+ * a line is as few spans as its tones need. Rejects with {@link TokeniseOverBudget} when the
+ * block takes longer than its budget.
+ *
+ * The lines are walked here rather than by Shiki's `codeToTokensBase`, which tokenises the
+ * whole block in one synchronous call and so cannot be stopped between lines. The walk is
+ * the one Shiki makes — split at `\n` and `\r\n`, an empty line no runs, a line at the
+ * length limit one plain run, each line's state carried to the next — with the clock read
+ * before every line.
  */
 export const tokenise = async (
   code: string,
   grammar: Grammar,
+  options: TokeniseOptions = {},
 ): Promise<ToneLines> => {
   const shiki = await highlighter();
   await load(shiki, grammar);
-  const lines = shiki.codeToTokensBase(code, {
-    lang: grammar,
-    theme: "bit-tone",
-    tokenizeMaxLineLength: TOKENIZE_MAX_LINE_LENGTH,
-    tokenizeTimeLimit: TOKENIZE_TIME_LIMIT_MS,
-  });
-  return lines.map((tokens) => {
+  const budgetMs = options.budgetMs ?? TOKENIZE_BLOCK_BUDGET_MS;
+  const now = options.now ?? (() => performance.now());
+  options.onStart?.();
+  const deadline = now() + budgetMs;
+  const { colorMap } = shiki.setTheme("bit-tone");
+  const engine = shiki.getLanguage(grammar);
+  const parts = code.split(/(\r?\n)/);
+  const lines: ToneRun[][] = [];
+  let state = INITIAL;
+  for (let index = 0; index < parts.length; index += 2) {
+    if (now() > deadline) throw new TokeniseOverBudget(budgetMs);
+    const line = parts[index] ?? "";
     const runs: ToneRun[] = [];
-    for (const token of tokens) {
-      const tone = TONE_OF.get(token.color?.toLowerCase() ?? "") ?? "plain";
+    lines.push(runs);
+    if (line === "") continue;
+    if (line.length >= TOKENIZE_MAX_LINE_LENGTH) {
+      runs.push({ text: line, tone: "plain" });
+      continue;
+    }
+    const result = engine.tokenizeLine2(line, state, TOKENIZE_TIME_LIMIT_MS);
+    state = result.ruleStack;
+    const count = result.tokens.length / 2;
+    for (let token = 0; token < count; token += 1) {
+      const start = result.tokens[2 * token] ?? 0;
+      const end =
+        token + 1 < count ? (result.tokens[2 * token + 2] ?? 0) : line.length;
+      if (start === end) continue;
+      const color =
+        colorMap[
+          EncodedTokenMetadata.getForeground(result.tokens[2 * token + 1] ?? 0)
+        ];
+      const tone = TONE_OF.get(color?.toLowerCase() ?? "") ?? "plain";
+      const text = line.substring(start, end);
       const last = runs.at(-1);
       if (last !== undefined && last.tone === tone) {
-        runs[runs.length - 1] = { text: last.text + token.content, tone };
-      } else if (token.content !== "") {
-        runs.push({ text: token.content, tone });
+        runs[runs.length - 1] = { text: last.text + text, tone };
+      } else {
+        runs.push({ text, tone });
       }
     }
-    return runs;
-  });
+  }
+  return lines;
 };

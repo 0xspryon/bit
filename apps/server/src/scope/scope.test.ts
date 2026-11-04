@@ -863,7 +863,7 @@ describe("normalising an entry on write", () => {
       ["cidr", "203.0.113.0 /24", "U+0020", "a space"],
       // In the host a URL names, it is still the host's character.
       ["host", "https://acme\u00AD.com/x", "U+00AD", "not ASCII"],
-      ["subtree", "https://user@acme\u3164.com:8443/", "U+3164", "not ASCII"],
+      ["subtree", "https://acme\u3164.com:8443/", "U+3164", "not ASCII"],
     ];
     for (const [kind, raw, point, why] of cases) {
       const result = normaliseScopeEntry({ kind, value: raw });
@@ -879,7 +879,7 @@ describe("normalising an entry on write", () => {
     expect(value("host", "  acme.com\t")).toBe("acme.com");
   });
 
-  test("a character outside ASCII in a pasted URL's path, query or userinfo is not the host's", () => {
+  test("a character outside ASCII in a pasted URL's path or query is not the host's", () => {
     /*
      * A host or subtree entry keeps only the host a URL names, as `https://acme.com/x` is
      * stored as `acme.com`; telling the operator to type `/über` as punycode would be
@@ -889,7 +889,14 @@ describe("normalising an entry on write", () => {
     expect(value("subtree", "https://acme.com/a b?q=\u00E9#\u00E9")).toBe(
       "acme.com",
     );
-    expect(value("host", "https://\u00FCser@acme.com/")).toBe("acme.com");
+    // Userinfo is refused whatever it is written in (below), not told to be punycode.
+    const user = normaliseScopeEntry({
+      kind: "host",
+      value: "https://\u00FCser@acme.com/",
+    });
+    expect(isScopeValueRefusal(user) ? user.detail : user).toContain(
+      "names a user before the host",
+    );
     // A host that is not ASCII is still refused with the hint, path or none.
     const result = normaliseScopeEntry({
       kind: "host",
@@ -1016,5 +1023,83 @@ describe("the entry renderer", () => {
     expect(
       describeScopeLabel({ _tag: "assetLabel", label: assetLabel("out") }),
     ).toBe("this asset alone (set by hand)");
+  });
+});
+
+/*
+ * A pasted URL is read as `new URL()` reads it: the authority ends at the first `/`, `?`,
+ * `#` or `\`, and only then is userinfo looked for. A review found the reverse order —
+ * userinfo cut at the last `@` anywhere — storing each of the URLs below as the host after
+ * the `@`, which is a different host from the one the URL names: an entry the operator
+ * reads as acme.com that covers evil.com, and a subject on acme.com scored as victim.org.
+ */
+describe("a pasted URL names the host new URL() names", () => {
+  const value = (kind: ScopeKind, raw: string): string => {
+    const result = normaliseScopeEntry({ kind, value: raw });
+    return isScopeValueRefusal(result) ? `refused: ${result.detail}` : result;
+  };
+  const pasted: ReadonlyArray<readonly [string, string]> = [
+    ["https://acme.com/x@evil.com", "acme.com"],
+    ["https://acme.com?next=a@evil.com", "acme.com"],
+    ["https://acme.com#@evil.com", "acme.com"],
+    ["https://app.acme.com/login?u=me@victim.org", "app.acme.com"],
+    ["https://acme.com\\@evil.com", "acme.com"],
+    ["acme.com/x@evil.com", "acme.com"],
+    // A `://` past the start is in a path or query, not a scheme.
+    ["acme.com/?next=https://evil.com", "acme.com"],
+    ["https://acme.com/?next=https://evil.com/", "acme.com"],
+    ["HTTPS://ACME.com/x@Evil.com", "acme.com"],
+  ];
+
+  for (const [raw, host] of pasted) {
+    test(`${raw} is ${host}, as subject and as entry`, () => {
+      if (/^[a-z]+:\/\//iu.test(raw)) {
+        expect(new URL(raw).hostname).toBe(host);
+      }
+      expect(normaliseHost(raw)).toBe(host);
+      expect(value("host", raw)).toBe(host);
+      expect(value("subtree", raw)).toBe(host);
+      // And the matcher agrees: an entry from the URL covers the host it names, only.
+      const entries = [entry("in", "host", value("host", raw))];
+      expect(stateOf(entries, host)).toBe("in");
+      for (const other of ["evil.com", "victim.org"]) {
+        expect(stateOf(entries, normaliseHost(other))).toBe("out");
+      }
+    });
+  }
+
+  test("a host or subtree entry that names a user before the host is refused", () => {
+    for (const kind of ["host", "subtree"] as const) {
+      for (const raw of [
+        "https://user@acme.com",
+        "https://user:pass@acme.com/",
+        "user@acme.com",
+        "user:pass@acme.com:8443",
+        "https://evil.com@acme.com/x",
+        "https://a@b@acme.com",
+      ]) {
+        const result = normaliseScopeEntry({ kind, value: raw });
+        expect(isScopeValueRefusal(result), `${kind} ${raw}`).toBe(true);
+        if (isScopeValueRefusal(result)) {
+          expect(result.detail).toBe(
+            "this entry names a user before the host (the part before '@'); type the host on its own",
+          );
+          // Not echoed: the part before the `@` may be a password.
+          expect(result.detail).not.toContain("pass");
+        }
+      }
+    }
+    // An `@` past the authority is not userinfo: the path is dropped, the host is kept.
+    expect(value("host", "https://acme.com/a@b")).toBe("acme.com");
+  });
+
+  test("a subject's host still drops userinfo, as new URL().hostname does", () => {
+    // Subjects and labels are read, not authored: the host a URL names is the host.
+    expect(normaliseHost("https://user:pw@acme.com/x@evil.com")).toBe(
+      "acme.com",
+    );
+    expect(new URL("https://user:pw@acme.com/x@evil.com").hostname).toBe(
+      "acme.com",
+    );
   });
 });

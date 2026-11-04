@@ -1099,4 +1099,55 @@ describe("one host's state", () => {
     );
     expect(state.state).toBe("in");
   });
+
+  test("a pasted URL is read as the host it names, written and asked about alike", async () => {
+    // A review found `https://acme.com/x@evil.com` stored as evil.com and a subject on
+    // app.acme.test with `?u=me@victim.test` in its query scored as victim.test.
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const written = yield* store.addScopeEntry(OPERATOR, {
+          effect: "in",
+          kind: "host",
+          value: "https://app.acme.test/x@evil.test",
+          source: "operator",
+        });
+        const refusal = yield* Effect.flip(
+          store.addScopeEntry(OPERATOR, {
+            effect: "in",
+            kind: "subtree",
+            value: "https://user:pass@acme.test/",
+            source: "operator",
+          }),
+        );
+        return {
+          value: written.entry.value,
+          refusal,
+          asked: yield* store.scopeStateOfHost(
+            TARGET,
+            "https://app.acme.test/login?u=me@victim.test",
+          ),
+          fragment: yield* store.scopeStateOfHost(
+            TARGET,
+            "https://app.acme.test#@victim.test",
+          ),
+          victim: yield* store.scopeStateOfHost(TARGET, "victim.test"),
+          evil: yield* store.scopeStateOfHost(TARGET, "evil.test"),
+          entries: (yield* store.targetScope(TARGET)).entries.map(
+            (entry) => entry.value,
+          ),
+        };
+      }),
+    );
+    expect(outcome.value).toBe("app.acme.test");
+    expect(outcome.refusal).toBeInstanceOf(MutationError);
+    expect((outcome.refusal as MutationError).detail).toContain(
+      "names a user before the host",
+    );
+    expect(outcome.asked.state).toBe("in");
+    expect(outcome.fragment.state).toBe("in");
+    expect(outcome.victim.state).toBe("out");
+    expect(outcome.evil.state).toBe("out");
+    expect(outcome.entries).toEqual(["app.acme.test"]);
+  });
 });

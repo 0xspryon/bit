@@ -230,7 +230,7 @@ export interface ScopeSubject {
  * matching everything.
  */
 export const normaliseHost = (raw: string): string => {
-  let text = authorityOf(raw.trim().toLowerCase());
+  let text = hostOfAuthority(authorityOf(raw.trim().toLowerCase()));
   if (text === "") return "";
 
   /*
@@ -256,8 +256,23 @@ export const normaliseHost = (raw: string): string => {
 };
 
 /**
- * What of a host, an address or a URL {@link normaliseHost} keeps before it reads brackets
- * and a port: the text without a scheme, userinfo, path, query or fragment.
+ * A scheme at the very start of the text, `https://` and its like. Only at the start: a
+ * `://` later on is in a path or a query — `acme.com/?next=https://evil.com` — and reading
+ * the host from after it would name evil.com. A backslash counts as a slash, as
+ * `new URL()` counts one for the web's schemes.
+ */
+const SCHEME = /^[a-z][a-z0-9+.-]*:[/\\]{2}/iu;
+
+/**
+ * The authority of a host, an address or a URL: the text without a scheme, path, query or
+ * fragment, **with any userinfo still in it** ({@link hostOfAuthority} drops that).
+ *
+ * **The authority ends at the first `/`, `?`, `#` or `\\` — before an `@` is looked for**,
+ * as `new URL()` reads it. A review found the reverse order storing a pasted URL as a
+ * different host: cut at the last `@` first, `https://acme.com/x@evil.com` was evil.com, and
+ * so were `https://acme.com?next=a@evil.com` and `https://acme.com#@evil.com`;
+ * `https://app.acme.com/login?u=me@victim.org` was victim.org. An `@` in a path, query or
+ * fragment is a character there and says nothing about the host.
  *
  * Case-blind: every separator it cuts at is ASCII, and lowercasing never turns another
  * character into one, so it cuts the same text before lowercasing as after. That is what
@@ -265,22 +280,19 @@ export const normaliseHost = (raw: string): string => {
  */
 const authorityOf = (raw: string): string => {
   let text = raw;
-  // A scheme, if present. Everything up to and including `://` is not the host.
-  const scheme = text.indexOf("://");
-  if (scheme !== -1) text = text.slice(scheme + 3);
-
-  // Userinfo, if present. `new URL().hostname` never yields it, but an operator pasting
-  // a URL from a browser bar can, and no host contains an `@`.
-  const at = text.lastIndexOf("@");
-  if (at !== -1) text = text.slice(at + 1);
-
-  // A path, query or fragment, if present. The authority ends at the first of them.
-  for (const separator of ["/", "?", "#"]) {
-    const index = text.indexOf(separator);
-    if (index !== -1) text = text.slice(0, index);
-  }
-  return text;
+  const scheme = SCHEME.exec(text);
+  if (scheme !== null) text = text.slice(scheme[0].length);
+  const end = text.search(/[/?#\\]/u);
+  return end === -1 ? text : text.slice(0, end);
 };
+
+/**
+ * An authority's host and port: what follows its last `@`, as `new URL()` reads userinfo.
+ * `new URL().hostname` never carries userinfo, but an operator pasting a URL from a
+ * browser bar can, and no host contains an `@`.
+ */
+const hostOfAuthority = (authority: string): string =>
+  authority.slice(authority.lastIndexOf("@") + 1);
 
 /** Why a value could not be reduced to something the matcher can use. */
 export interface ScopeValueRefusal {
@@ -463,8 +475,9 @@ const INVISIBLE =
  * `new URL().hostname` carry anyway. The value is tested after only ASCII blanks at either
  * end are dropped — the whole of a CIDR's, and of a host or subtree entry the part that is
  * kept: its {@link authorityOf}, before it is lowercased. A pasted URL's path, query and
- * userinfo are dropped from such an entry, so `https://acme.com/über` is stored as
+ * fragment are dropped from such an entry, so `https://acme.com/über` is stored as
  * `acme.com`, as `https://acme.com/x` is, and is not told to type its path as punycode.
+ * (Userinfo is refused before this, so none is left in the part tested.)
  */
 const NOT_ASCII = /[^\x21-\x7E]/u;
 
@@ -525,6 +538,21 @@ export const normaliseScopeEntry = (input: {
    * Named by code point and not echoed, for the reason above.
    */
   const blankless = input.value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/gu, "");
+  /*
+   * A user named before the host — `user@acme.com`, `https://user:pass@acme.com/` — is
+   * refused rather than dropped. It is not part of what the entry covers, and a value that
+   * carries one is likelier a URL copied with credentials, or one built to read as one host
+   * and be another, than a host the operator meant; and dropping it quietly is how the
+   * reverse order stored `https://acme.com/x@evil.com` as evil.com. Only the authority is
+   * looked at: an `@` in a path or a query is not userinfo, and that path is dropped anyway.
+   */
+  if (input.kind !== "cidr" && authorityOf(blankless).includes("@")) {
+    return {
+      _tag: "refused",
+      detail:
+        "this entry names a user before the host (the part before '@'); type the host on its own",
+    };
+  }
   const foreign = NOT_ASCII.exec(
     input.kind === "cidr" ? blankless : authorityOf(blankless),
   )?.[0];

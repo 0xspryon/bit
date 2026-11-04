@@ -1142,6 +1142,37 @@ describe("what cannot wrap scrolls in its own block", () => {
     sheet = undefined;
   });
 
+  test("the hidden Copy region and footnote heading are anchored, so the window never scrolls", async () => {
+    // Absolute with no offsets sits at its static position in the initial containing block:
+    // a Copy region far down a thread made the document 107,346 px tall. Anchored at the
+    // origin, as `.visually-hidden` is, it extends nothing (measured in the CDP check).
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+
+    const one = mountInto(Markdown, {
+      text: "Noted[^1].\n\n[^1]: From the page.",
+    });
+    mounted.push(one);
+    const placed = (element: Element | null): string => {
+      if (element === null) return "missing";
+      const style = getComputedStyle(element);
+      return `${style.position} ${style.top} ${style.left}`;
+    };
+    expect(placed(one.target.querySelector('[aria-live="polite"]'))).toBe(
+      "absolute 0px 0px",
+    );
+    expect(placed(one.target.querySelector(".sr-only"))).toBe(
+      "absolute 0px 0px",
+    );
+  });
+
   test("a long unbroken token is in a scrolling pre, and prose wraps anywhere", async () => {
     // The same options as the test transform, so the scoping hash matches the mounted DOM.
     const { css } = compile(await Bun.file(path).text(), {
