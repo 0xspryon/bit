@@ -58,6 +58,9 @@ import { RunNarrations, type RunNarration } from "./narration";
 import {
   NARRATION_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
+  REPLY_FIELD_MAX,
+  truncateNarration,
+  truncateReply,
   type MessageEntry,
   type NarrationDetail,
 } from "../harness/agentHarness";
@@ -1217,10 +1220,68 @@ describe("projecting live activity", () => {
       headline: "Thinking",
       streaming: true,
     });
+    // Neither carries a call where the driver named none.
+    expect(partial !== undefined && "blockCall" in partial).toBe(false);
     // A block nothing streamed carries neither field, so an old reader sees what it did.
     const plain = projectedItem(narration({ _tag: "reply", text: "Done." }));
     expect(plain !== undefined && "blockId" in plain).toBe(false);
     expect(plain !== undefined && "streaming" in plain).toBe(false);
+  });
+
+  test("U5 review: a block's model call is on the wire, under its session, the same on its partial, its finished copy and its replay", () => {
+    const partial = projectedItem(
+      narration({
+        _tag: "partial",
+        blockId: "msg_1:text:0",
+        call: "msg_1",
+        channel: "reply",
+        text: "I will",
+      }),
+    );
+    const thought = projectedItem(
+      narration(
+        {
+          _tag: "thinking",
+          text: "Per-IP?",
+          blockId: "msg_1:reasoning:0",
+          call: "msg_1",
+        },
+        { id: 2 },
+      ),
+    );
+    const replayed = projectReplay({
+      entries: [
+        {
+          type: "assistant",
+          text: "",
+          error: undefined,
+          parts: [
+            {
+              _tag: "reply",
+              text: "I will probe.",
+              blockId: "msg_1:text:0",
+              call: "msg_1",
+            },
+          ],
+          model: undefined,
+          at: 1,
+        },
+      ],
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_abc",
+      users: "operator",
+      fallbackAt: 0,
+    }).items[0];
+    expect(partial?.blockCall).toBe("ses_abc:msg_1");
+    expect(thought?.blockCall).toBe("ses_abc:msg_1");
+    expect(replayed?.blockCall).toBe("ses_abc:msg_1");
+    // And it survives the wire.
+    const wire = JSON.parse(
+      JSON.stringify(Schema.encodeUnknownSync(LiveFrame)(partial)),
+    ) as unknown;
+    expect(
+      (Schema.decodeUnknownSync(LiveFrame)(wire) as LiveItem).blockCall,
+    ).toBe("ses_abc:msg_1");
   });
 
   test("a delta is never on the wire, and an empty partial is nothing", () => {
@@ -2206,9 +2267,11 @@ describe("projecting a replay", () => {
     ).toEqual([
       ["turn.operator", "You", true],
       ["turn.other", "system", true],
-      ["turn.reply", "Reply", true],
+      // A finished reply has its own, larger cap (A6 U5 review): 12,000 characters is whole.
+      ["turn.reply", "Reply", false],
       ["turn.other", "error", true],
     ]);
+    expect(items[2]?.body).toBe(long);
     // A planner round's `user` entry, the other way a `user` entry is drawn.
     expect(capped(replay([entry({ text: long })], "other")[0]?.body)).toBe(
       true,
@@ -2216,6 +2279,27 @@ describe("projecting a replay", () => {
     // And a short one is untouched.
     expect(replay([entry({ text: "add acme.com" })])[0]?.body).toBe(
       "add acme.com",
+    );
+  });
+
+  test("U5 review: a finished reply keeps up to 32,000 characters, replayed as live, and says where it cut", () => {
+    const huge = "y".repeat(REPLY_FIELD_MAX + 500);
+    const fromText = replay([entry({ type: "assistant", text: huge })])[0];
+    const fromPart = replay([
+      entry({
+        type: "assistant",
+        parts: [{ _tag: "reply", text: truncateReply(huge), blockId: "m:0" }],
+      }),
+    ])[0];
+    for (const item of [fromText, fromPart]) {
+      expect(item?.body.length).toBe(
+        REPLY_FIELD_MAX + NARRATION_TRUNCATED_MARK.length,
+      );
+      expect(item?.body.endsWith(NARRATION_TRUNCATED_MARK)).toBe(true);
+    }
+    // Thinking is not a reply: it keeps the field cap.
+    expect(truncateNarration("t".repeat(REPLY_FIELD_MAX)).length).toBe(
+      NARRATION_FIELD_MAX + NARRATION_TRUNCATED_MARK.length,
     );
   });
 

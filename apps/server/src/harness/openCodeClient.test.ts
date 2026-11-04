@@ -1244,11 +1244,33 @@ describe("reading an opencode event", () => {
       {
         _tag: "delta",
         blockId: "msg_1:text:1",
+        call: "msg_1",
         channel: "reply",
         text: "Prob",
       },
-      { _tag: "delta", blockId: "msg_1:text:1", channel: "reply", text: "ing" },
+      {
+        _tag: "delta",
+        blockId: "msg_1:text:1",
+        call: "msg_1",
+        channel: "reply",
+        text: "ing",
+      },
     ]);
+    // A finished reply keeps up to its own cap (A6 U5 review): 10,000 characters whole,
+    // where a thought of the same length is cut at the field cap.
+    const long = "z".repeat(10_000);
+    const longReply = openCodeNarration(
+      event("session.text.ended", { ordinal: 2, text: long }),
+      names,
+    ).detail;
+    const longThought = openCodeNarration(
+      event("session.reasoning.ended", { ordinal: 2, text: long }),
+      names,
+    ).detail;
+    expect(longReply._tag === "reply" && longReply.text).toBe(long);
+    expect(longThought._tag === "thinking" && longThought.text.length).toBe(
+      NARRATION_FIELD_MAX + NARRATION_TRUNCATED_MARK.length,
+    );
     // A delta states no outcome: the outcome watch reads `session.execution.*`.
     expect(first.outcome).toBeUndefined();
     expect(first.sequence).toBeUndefined();
@@ -1257,6 +1279,8 @@ describe("reading an opencode event", () => {
       _tag: "reply",
       text: "Probing the limiter.",
       blockId: "msg_1:text:1",
+      // The call on its own (A6 U5 review): the wire's `blockCall`.
+      call: "msg_1",
     });
   });
 
@@ -1723,12 +1747,14 @@ describe("reading opencode's token usage", () => {
     expect(reasoning.detail).toEqual({
       _tag: "delta",
       blockId: "msg_1:reasoning:0",
+      call: "msg_1",
       channel: "thinking",
       text: "The",
     });
     expect(text.detail).toEqual({
       _tag: "delta",
       blockId: "msg_1:text:0",
+      call: "msg_1",
       channel: "reply",
       text: "Reading",
     });
@@ -1752,6 +1778,7 @@ describe("reading opencode's token usage", () => {
       _tag: "thinking",
       text: "The user wants three files read one at a time.",
       blockId: "msg_1:reasoning:0",
+      call: "msg_1",
     });
   });
 
@@ -2841,6 +2868,14 @@ describe("a session's stored messages, as the live stream's parts (A6 F10)", () 
       expect.stringMatching(/^msg_.*:reasoning:0$/),
       expect.stringMatching(/^msg_.*:text:0$/),
     ]);
+    // Each names its message as its call (A6 U5 review), as the live events do.
+    for (const entry of entries) {
+      for (const part of entry.parts) {
+        if (part._tag === "reply" || part._tag === "thinking") {
+          expect(part.blockId?.startsWith(`${String(part.call)}:`)).toBe(true);
+        }
+      }
+    }
   });
 
   test("a system entry with no summary replays capped, not as the whole model-facing text", async () => {

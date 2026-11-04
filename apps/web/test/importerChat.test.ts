@@ -871,6 +871,82 @@ describe("the importer's words from the live feed", () => {
     expect(feed.map((each) => each.body)).toEqual(["arrived after the read"]);
   });
 
+  test("U5 review: a partial whose block began before the read is kept while the replay does not hold its block", () => {
+    // `withBlock` keeps a block's first partial id on every later one, so a block that was
+    // being written when the replay was asked for stays below the floor until it ends.
+    const growing = {
+      ...said(15, "Reading the policy page and"),
+      blockId: "ses:msg_9:0",
+      blockCall: "ses:msg_9",
+      streaming: true as const,
+    };
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [said(10, "in the replay"), growing],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: [],
+    });
+    expect(feed.map((each) => each.body)).toEqual([
+      "Reading the policy page and",
+    ]);
+    // Once the replay holds the block, its copy there is the block, and the partial goes.
+    const held = importerFeed({
+      own: [],
+      floors: {},
+      live: [growing],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: [
+        { ...replayItem(0, "turn.reply", "Reading."), blockId: "ses:msg_9:0" },
+      ],
+    });
+    expect(held).toEqual([]);
+    // A finished block below the floor is the replay's, partial or not before it.
+    const finished = importerFeed({
+      own: [],
+      floors: {},
+      live: [{ ...said(15, "done"), blockId: "ses:msg_9:0" }],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: [],
+    });
+    expect(finished).toEqual([]);
+  });
+
+  test("U5 review: returning to a chat mid-block draws the block in the running turn, writing", () => {
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: [replayItem(0, "turn.operator", "Read the page")],
+      }),
+      items: importerFeed({
+        own: [],
+        floors: {},
+        live: [
+          {
+            ...said(15, "Reading the policy page and"),
+            blockId: "ses:msg_9:0",
+            blockCall: "ses:msg_9",
+            streaming: true,
+          },
+        ],
+        importId: "imp_1",
+        historyFloor: 20,
+        replayed: [replayItem(0, "turn.operator", "Read the page")],
+      }),
+      working: true,
+    });
+    expect(
+      groups.map((group) => [
+        group.subject.midBlock,
+        group.rows.map((row) => `${row.item.body} [${String(row.stream)}]`),
+      ]),
+    ).toEqual([[false, ["Reading the policy page and [writing]"]]]);
+  });
+
   test("a record is kept whatever the floor: it is durable, and the replay never holds one", () => {
     // `scope.entry.added` carries no activity order, and dropping it would lose the half of
     // the screen that survives a reload.
@@ -2235,6 +2311,8 @@ describe("A6 U5: blocks still being written", () => {
       headline: "",
       body,
       blockId,
+      // The call, as the server names it beside the block (A6 U5 review).
+      blockCall: blockId.replace(/:(?:text:|reasoning:)?\d+$/u, ""),
       streaming: true,
       importId: "imp_1",
     });
@@ -2304,6 +2382,41 @@ describe("A6 U5: blocks still being written", () => {
     ]);
     // Alone, it is still being written.
     expect([...streamStates([thought]).values()]).toEqual(["writing"]);
+  });
+
+  test("U5 review: the same call is the server's `blockCall`, never read out of `blockId`", () => {
+    // Block ids shaped alike, calls the server says differ: the thought is still writing.
+    const thought = {
+      ...partial("Weighing it", "s:msg_1:reasoning:0", "turn.thinking"),
+      blockCall: "s:call_a",
+    };
+    const answer = {
+      ...partial("The answer", "s:msg_1:text:0"),
+      blockCall: "s:call_b",
+    };
+    expect([...streamStates([thought, answer]).values()]).toEqual([
+      "writing",
+      "writing",
+    ]);
+    // Ids that share nothing, one call: the thought is done.
+    expect(
+      [
+        ...streamStates([
+          { ...thought, blockId: "x" },
+          { ...answer, blockId: "y", blockCall: "s:call_a" },
+        ]).values(),
+      ][0],
+    ).toBe("done");
+    // No call named: nothing is decided from the id.
+    const unnamed = (each: LiveItem): LiveItem =>
+      Object.fromEntries(
+        Object.entries(each).filter(([key]) => key !== "blockCall"),
+      ) as LiveItem;
+    const unnamedThought = unnamed(thought);
+    const unnamedAnswer = unnamed(answer);
+    expect([...streamStates([unnamedThought, unnamedAnswer]).values()][0]).toBe(
+      "writing",
+    );
   });
 
   test("a thought past the 4,000-character cap is shortened, not writing", () => {

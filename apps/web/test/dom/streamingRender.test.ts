@@ -173,9 +173,11 @@ describe("A6 U5: drawing a block being written", () => {
         kind: "turn.thinking",
         headline: "Thinking",
         streaming: true,
+        blockCall: "ses:msg_1",
       }),
       block("activity:2", "ses:msg_1:text:0", "The answer", {
         streaming: true,
+        blockCall: "ses:msg_1",
       }),
     ];
     const target = document.body.appendChild(document.createElement("div"));
@@ -191,5 +193,42 @@ describe("A6 U5: drawing a block being written", () => {
           `${row.querySelector(".kind")?.textContent ?? ""}: ${row.querySelector(".chip.stream")?.textContent?.trim() ?? ""}`,
       ),
     ).toEqual(["Thinking: written", "Reply: writing…"]);
+  });
+
+  test("U5 review: the Live panel keeps a thought opened while it was written open when it finishes", () => {
+    const app = new App(new FakeServer(), new FakeCountdown());
+    app.viewTargetId = "acme-corp";
+    app.liveTargetId = "acme-corp";
+    app.liveExpanded = true;
+    const thought = (id: string, body: string, streaming: boolean) =>
+      block(id, "ses:msg_1:reasoning:0", body, {
+        kind: "turn.thinking",
+        headline: "Thinking",
+        blockCall: "ses:msg_1",
+        ...(streaming ? { streaming: true as const } : {}),
+      });
+    app.liveItems = [thought("activity:1", "Weighing the scope", true)];
+    const target = document.body.appendChild(document.createElement("div"));
+    const panel = mount(LiveTranscript, { target, props: { app } });
+    cleanups.push(() => {
+      void unmount(panel);
+      target.remove();
+    });
+    flushSync();
+    const opened = target.querySelector(".items > li details");
+    if (!(opened instanceof HTMLDetailsElement)) throw new Error("no details");
+    opened.open = true;
+    app.liveItems = [
+      ...(withBlock(
+        app.liveItems,
+        thought("activity:2", "Weighing the scope, then the policy.", false),
+      ) ?? app.liveItems),
+    ];
+    flushSync();
+    const after = target.querySelector(".items > li details");
+    // The same element, still open, now holding the finished thought.
+    expect(after === opened).toBe(true);
+    expect(opened.open).toBe(true);
+    expect(after?.textContent).toContain("then the policy.");
   });
 });

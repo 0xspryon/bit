@@ -181,9 +181,53 @@
    */
   let pinned = $state(true);
 
+  /**
+   * Where {@link follow} last put the view, until the next scroll event that is not its own.
+   *
+   * **A scroll event is not always the reader's** (A6 U5 review). Setting `scrollTop` fires
+   * one a frame later, and by then the page can be taller than the follow made it: a
+   * mermaid figure drawn in between added ~476 px, so the event read "not at the bottom",
+   * unpinned the view, and it never followed again. An event finding the view where the
+   * follow put it is that follow's own, and says nothing about the reader; any other —
+   * a wheel, a drag, a key, a jump — moves it, and is read as before. Not state: nothing
+   * is drawn from it.
+   */
+  let followedTo: number | undefined;
+
   function trackPinned(): void {
     if (list === undefined) return;
+    if (followedTo !== undefined && Math.abs(list.scrollTop - followedTo) < 1) {
+      return;
+    }
+    followedTo = undefined;
     pinned = atBottom(list);
+  }
+
+  /** Puts the view at the bottom, and remembers where, for {@link trackPinned}. */
+  function follow(): void {
+    if (list === undefined) return;
+    list.scrollTop = list.scrollHeight;
+    followedTo = list.scrollTop;
+  }
+
+  /**
+   * Follows content that grows **after** it is drawn, while {@link pinned} (A6 U5 review):
+   * a figure, a highlighted fence or an image lays out after the row that holds it, without
+   * a row arriving or a reply's text changing, so nothing else would scroll to it. Each turn
+   * is watched ({@link watchSize}); `undefined` where there is no `ResizeObserver`.
+   */
+  const resized =
+    typeof ResizeObserver === "undefined"
+      ? undefined
+      : new ResizeObserver(() => {
+          if (pinned) follow();
+        });
+  $effect(() => () => resized?.disconnect());
+
+  /** Watches one turn's size for {@link resized}, for as long as it is drawn. */
+  function watchSize(node: HTMLElement) {
+    resized?.observe(node);
+    return () => resized?.unobserve(node);
   }
 
   /** How many rows are on screen, which is what an arrival changes. */
@@ -219,7 +263,7 @@
     const arrived = rowCount;
     void streamed;
     if (arrived === 0 || list === undefined || !pinned) return;
-    list.scrollTop = list.scrollHeight;
+    follow();
   });
 
   let anything = $derived(groups.length > 0);
@@ -278,7 +322,7 @@
   >
     {#each groups as group (group.key)}
       {@const place = thread && footer !== undefined ? lastProse(group) : null}
-      <li class="group">
+      <li class="group" {@attach watchSize}>
         {#snippet closing()}
           {@render footer?.(group)}
         {/snippet}

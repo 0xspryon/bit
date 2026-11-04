@@ -26,7 +26,10 @@ import {
 
 import { App, IMPORT_POLL_MS, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
-import { NARRATION_SHORTENED_MARK } from "../../src/lib/chat";
+import {
+  NARRATION_SHORTENED_MARK,
+  REPLY_PAST_CAP_LABEL,
+} from "../../src/lib/chat";
 import { ENDED_NOTE, MID_BLOCK_NOTE } from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
@@ -1336,6 +1339,8 @@ describe("A6 U5: a block while it is being written", () => {
       callId: null,
       body,
       blockId,
+      // The call, as the server names it beside the block (A6 U5 review).
+      blockCall: blockId.replace(/:(?:text:|reasoning:)?\d+$/u, ""),
       ...over,
     });
   const partial = (
@@ -1453,6 +1458,31 @@ describe("A6 U5: a block while it is being written", () => {
     expect(
       document.querySelector(".importer .reasoning .cut")?.textContent,
     ).toBe("shortened");
+  });
+
+  test("U5 review: a reply streaming past the partial cap says the rest shows when it finishes, then finishes whole", async () => {
+    const { fake } = await inFlight();
+    const head = "word ".repeat(800);
+    fake.watch.send(
+      partial(
+        "activity:44",
+        "ses:msg_l:0",
+        `${head}${NARRATION_SHORTENED_MARK}`,
+      ),
+    );
+    await settle();
+    expect(writing()).toEqual([REPLY_PAST_CAP_LABEL]);
+    expect(REPLY_PAST_CAP_LABEL).toBe(
+      "writing… — the rest shows when it finishes",
+    );
+    // The finished reply carries up to 32,000 characters: it replaces the cut partial whole.
+    const whole = `${head}${"more ".repeat(4_000)}the end.`;
+    fake.watch.send(block("activity:45", "ses:msg_l:0", whole));
+    await settle();
+    expect(writing()).toEqual([]);
+    const last = replies().at(-1)?.textContent ?? "";
+    expect(last).toContain("the end.");
+    expect(last).not.toContain("(shortened)");
   });
 
   test("when the turn ends, a partial that never finished is gone — a retried call's first attempt", async () => {

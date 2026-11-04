@@ -50,6 +50,7 @@ import {
   AgentHarness,
   lastAssistantText,
   NARRATION_FIELD_MAX,
+  REPLY_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
   SESSION_NOT_FOUND_TAG,
   type HarnessNarration,
@@ -1350,6 +1351,38 @@ describe("outcomes", () => {
     expect(detail.input.endsWith(NARRATION_TRUNCATED_MARK)).toBe(true);
   });
 
+  test("U5 review: a finished reply keeps up to 32,000 characters, a thought only the field cap", async () => {
+    const sessionId = "ignored";
+    const frame = (block: Record<string, unknown>, uuid: string) =>
+      ({
+        type: "assistant",
+        message: { id: "msg_long", role: "assistant", content: [block] },
+        parent_tool_use_id: null,
+        session_id: sessionId,
+        uuid,
+      }) as unknown as SDKMessage;
+    const outcome = await run([
+      frame(
+        { type: "thinking", thinking: "t".repeat(10_000) },
+        "00000000-0000-4000-8000-00000000fff4",
+      ),
+      frame(
+        { type: "text", text: "r".repeat(REPLY_FIELD_MAX + 10) },
+        "00000000-0000-4000-8000-00000000fff5",
+      ),
+      result(sessionId, "success"),
+    ]);
+    const lengths = [...outcome.narrated].flatMap((entry) =>
+      entry.detail._tag === "thinking" || entry.detail._tag === "reply"
+        ? [[entry.detail._tag, entry.detail.text.length]]
+        : [],
+    );
+    expect(lengths).toEqual([
+      ["thinking", NARRATION_FIELD_MAX + NARRATION_TRUNCATED_MARK.length],
+      ["reply", REPLY_FIELD_MAX + NARRATION_TRUNCATED_MARK.length],
+    ]);
+  });
+
   test("an error result settles failed", async () => {
     const outcome = await run([result("x", "error_during_execution")]);
     expect(outcome.status.outcome).toBe("failed");
@@ -1549,6 +1582,12 @@ describe("partial messages (A6 F8)", () => {
       ["thinking", `${message}:0`],
       ["reply", `${message}:1`],
     ]);
+    // Every delta and both finished blocks name the call itself (A6 U5 review), so the wire
+    // can say "the same call" without a reader parsing the block id.
+    expect(new Set(pieces.map((piece) => piece.call))).toEqual(
+      new Set([message]),
+    );
+    expect(finished.map((block) => block.call)).toEqual([message, message]);
     expect(finished[0]?.text).toBe(
       thinking.map((piece) => piece.text).join(""),
     );

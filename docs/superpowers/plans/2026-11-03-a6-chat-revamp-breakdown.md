@@ -338,6 +338,10 @@ U8, U13, F12.
   shown) and GLM 5.3 Flash. U5 says so while the block streams ("writing… — shown here up
   to 4,000 characters"); whether replies should have a larger cap, or none, is the
   operator's call. GLM 5.3 Flash's thinking passes the cap often (a 33 s thought).
+  **Decided (U5 review, 2026-11-05):** a finished reply has its own cap,
+  `REPLY_FIELD_MAX` = 32,000 characters, live and on replay (`truncateReply`); thinking,
+  every tool field and every partial stay at 4,000. A reply streaming past 4,000 says
+  "writing… — the rest shows when it finishes", and its finished block brings the whole.
 - **Found in U5's live runs, not U5's:** a reload of a session that is still running draws
   "You are reading an earlier session. Your next message continues it…" above it, as for a
   session the page opened from the picker, while the turn runs with Stop under it.

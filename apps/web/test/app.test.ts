@@ -32,6 +32,7 @@ import {
   TargetRefused,
   TargetUnavailable,
   Unauthenticated,
+  type LiveItem,
   type LiveUsage,
 } from "@bit/contracts";
 
@@ -3883,10 +3884,22 @@ describe("A6 U5: partial blocks on the live feed", () => {
       callId: null,
       body,
       blockId,
+      // The call, as the server names it beside the block (A6 U5 review): these fixtures'
+      // block ids are `<session>:<call>:<block>`, so it is what precedes the block.
+      blockCall: blockId.replace(/:(?:text:|reasoning:)?\d+$/u, ""),
       ...over,
     });
-  const partial = (id: string, blockId: string, body: string) =>
-    block(id, blockId, body, { streaming: true });
+  const partial = (
+    id: string,
+    blockId: string,
+    body: string,
+    over: Partial<Parameters<typeof liveActivity>[0]> = {},
+  ) => block(id, blockId, body, { streaming: true, ...over });
+  /** The item as a driver that could not name the call sends it. */
+  const withoutCall = (item: LiveItem): LiveItem =>
+    Object.fromEntries(
+      Object.entries(item).filter(([key]) => key !== "blockCall"),
+    ) as LiveItem;
   const shown = (app: App) =>
     app.liveItems.map(
       (item) =>
@@ -3965,11 +3978,63 @@ describe("A6 U5: partial blocks on the live feed", () => {
     const { app, fake } = await watching();
     // A retried API call: the first attempt's block never finishes.
     fake.watch.send(partial("activity:1", "ses:msg_a:0", "First try"));
-    fake.watch.send(partial("activity:2", "other:msg_x:0", "Another session"));
+    // A goal agent's session on the same target: another subject's calls end nothing here.
+    fake.watch.send(
+      partial("activity:2", "other:msg_x:0", "Another session", {
+        importId: null,
+        goalId: "goal_1",
+      }),
+    );
     fake.watch.send(partial("activity:3", "ses:msg_b:0", "Second try"));
     expect(shown(app)).toEqual([
       "activity:2 partial Another session",
       "activity:3 partial Second try",
+    ]);
+  });
+
+  test("U5 review: a call is the server's `blockCall`, so a block naming none ends nothing", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(partial("activity:1", "ses:msg_a:0", "First try"));
+    // Block ids alike, but the server named no call for this one: nothing is parsed.
+    const unnamed = withoutCall(block("activity:2", "ses:msg_b:0", "Unnamed"));
+    fake.watch.send(unnamed);
+    expect(shown(app)).toEqual([
+      "activity:1 partial First try",
+      "activity:2 finished Unnamed",
+    ]);
+    // Same call by the server's word, whatever the ids look like: no partial is dropped.
+    fake.watch.send(
+      partial("activity:3", "ses:zzz", "Same call", { blockCall: "ses:msg_a" }),
+    );
+    expect(shown(app)).toContain("activity:1 partial First try");
+  });
+
+  test("U5 review: GLM after a reload — a finished thought with no partial here goes above its call's reply", async () => {
+    const { app, fake } = await watching();
+    // The reload dropped the thought's partial; the reply of the same call streams on.
+    fake.watch.send(partial("activity:5", "ses:msg_1:text:0", "The answer"));
+    fake.watch.send(block("activity:6", "ses:msg_1:text:0", "The answer."));
+    fake.watch.send(
+      block("activity:7", "ses:msg_1:reasoning:0", "Weighing it", {
+        kind: "turn.thinking",
+        headline: "Thinking",
+      }),
+    );
+    expect(shown(app)).toEqual([
+      "activity:7 finished Weighing it",
+      "activity:6 finished The answer.",
+    ]);
+    // Another call's thought, and a reply with no partial here, still go at the end.
+    fake.watch.send(
+      block("activity:8", "ses:msg_2:reasoning:0", "Next", {
+        kind: "turn.thinking",
+        headline: "Thinking",
+      }),
+    );
+    fake.watch.send(block("activity:9", "ses:msg_1:text:1", "More."));
+    expect(shown(app).slice(2)).toEqual([
+      "activity:8 finished Next",
+      "activity:9 finished More.",
     ]);
   });
 

@@ -69,6 +69,12 @@
  *   no cursor. A reconnect, or a reload, catches up from finished blocks only, so a block
  *   still being written then shows nothing until it ends. A partial whose finished block
  *   never comes — a turn cut off mid-block — stays as last sent until the client drops it.
+ * - **A partial is capped at 4,000 characters, a finished reply at 32,000** (A6 U5 review).
+ *   A partial past its cap ends in the server's `… (shortened)` mark and stops growing
+ *   while the agent goes on; the finished reply then replaces it with the whole of it, up to
+ *   its own cap. Thinking and every tool field stay at 4,000, finished or not.
+ * - {@link LiveItem.blockCall} names a block's model call, so a client that needs "the same
+ *   call" compares it rather than reading into `blockId`.
  *
  * **A client asks for partials** (`partials=1` on the live endpoint) and gets none
  * otherwise. That is the forward-compatibility rule for this one feature: a tab one deploy
@@ -575,6 +581,20 @@ export const LiveItem = Schema.Struct({
    * without it, and a stored fixture, still decode.
    */
   blockId: Schema.optionalKey(Schema.String),
+  /**
+   * Which **model call** wrote this block, on an item that carries a {@link blockId}: the
+   * same on every block of one call — its partials, its finished copy, its replayed copy —
+   * and different on any other call's. Opaque, like `blockId`: compare it, never parse it.
+   *
+   * Set by the server from what the harness names the call by (A6 U5 review): Claude Code's
+   * `message.id`, OpenCode's `assistantMessageID`, under the harness session. Two rules need
+   * "the same call" and could otherwise only get it by reading into `blockId`: a thought is
+   * no longer being written once a reply of its own call has started (GLM closes its
+   * reasoning only at the step's end), and a block of a newer call ends an older call's
+   * partials. Absent wherever `blockId` is, or where the driver could not name the call; a
+   * reader then treats the block as its own call, which makes both rules do nothing.
+   */
+  blockCall: Schema.optionalKey(Schema.String),
   /**
    * `true` on a **partial** item: the block is still being written and `body` is its text
    * so far. Absent on the finished block and on every other item. See this module's header

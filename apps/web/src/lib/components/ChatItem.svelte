@@ -46,6 +46,7 @@
     SUBAGENT_KIND,
     SUBAGENT_NOTE,
     NARRATION_SHORTENED_MARK,
+    REPLY_PAST_CAP_LABEL,
     THINKING_KIND,
     callSignature,
     kindLabel,
@@ -218,13 +219,14 @@
       <div class="reply"><Markdown text={item.body} /></div>
       {#if streamState !== null}
         <!--
-          D3's mark on the reply being written (A6 U5). Past the server's 4,000-character
-          cap the words have stopped moving while the agent goes on, and that is said.
+          D3's mark on the reply being written (A6 U5). Past the 4,000 characters a partial
+          carries, the words have stopped moving while the agent goes on: that is said, and
+          that the finished reply (up to 32,000) brings the rest (A6 U5 review).
         -->
         <p class="writing" role="status">
           <StreamCursor
             label={streamState === "shortened"
-              ? "writing… — shown here up to 4,000 characters"
+              ? REPLY_PAST_CAP_LABEL
               : "writing…"}
           />
         </p>
@@ -464,7 +466,9 @@
       {#if streamState !== null}
         <!-- A block still being written (A6 U5): said in words, as an outcome is. -->
         <span class="chip outcome stream" data-tint="plain">
-          {STREAM_LABELS[streamState]}
+          {streamState === "shortened" && item.kind === REPLY_KIND
+            ? REPLY_PAST_CAP_LABEL
+            : STREAM_LABELS[streamState]}
         </span>
       {/if}
       <span class="time mono">{time}</span>

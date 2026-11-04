@@ -128,6 +128,8 @@ export interface StreamingCoalescer {
 
 interface OpenBlock {
   readonly channel: BlockDelta["channel"];
+  /** The model call, as the block's first delta named it. */
+  readonly call: string | undefined;
   /** Everything so far, kept to one character past the cap so the cut can be marked. */
   text: string;
   /** Text has arrived since the last update. */
@@ -172,6 +174,7 @@ export const makeStreamingCoalescer = (options: {
         yield* options.publish({
           _tag: "partial",
           blockId,
+          ...(block.call === undefined ? {} : { call: block.call }),
           channel: block.channel,
           text: truncateNarration(block.text),
         });
@@ -218,6 +221,7 @@ export const makeStreamingCoalescer = (options: {
             }
             block = {
               channel: piece.channel,
+              call: piece.call,
               text: "",
               held: false,
               publishedAt: undefined,

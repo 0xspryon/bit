@@ -96,6 +96,7 @@ import {
   TerminalOutcome,
   subagentDescription,
   truncateNarration,
+  truncateReply,
   type BlockChannel,
   type HarnessNarration,
   type MessageEntry,
@@ -510,17 +511,26 @@ const blockDelta = (
   channel: BlockChannel,
   data: Record<string, unknown>,
 ): NarrationDetail => {
-  const blockId = openCodeBlockId(channel, data);
+  const key = blockKey(channel, data);
   const text = data["delta"];
-  return blockId === undefined || typeof text !== "string"
+  return key.blockId === undefined || typeof text !== "string"
     ? { _tag: "opaque" }
-    : { _tag: "delta", blockId, channel, text };
+    : { _tag: "delta", blockId: key.blockId, call: key.call, channel, text };
 };
 
-/** `blockId` as a key to spread, absent when the block cannot be named. */
-const blockKey = (channel: BlockChannel, data: Record<string, unknown>) => {
+/**
+ * `blockId`, and the call it is a block of — the `assistantMessageID` it is made from, on
+ * its own (A6 U5 review) — as keys to spread, absent when the block cannot be named.
+ */
+const blockKey = (
+  channel: BlockChannel,
+  data: Record<string, unknown>,
+): { readonly blockId?: string; readonly call?: string } => {
   const blockId = openCodeBlockId(channel, data);
-  return blockId === undefined ? {} : { blockId };
+  const call = data["assistantMessageID"];
+  return blockId === undefined || typeof call !== "string"
+    ? {}
+    : { blockId, call };
 };
 
 /**
@@ -656,7 +666,7 @@ export const openCodeNarration = (
         return typeof data["text"] === "string"
           ? {
               _tag: "reply",
-              text: truncateNarration(data["text"]),
+              text: truncateReply(data["text"]),
               ...blockKey("reply", data),
               ...named,
             }
@@ -1033,13 +1043,7 @@ const assistantContentParts = (
     ordinals[channel] += 1;
     return messageId === undefined
       ? {}
-      : (() => {
-          const blockId = openCodeBlockId(channel, {
-            assistantMessageID: messageId,
-            ordinal,
-          });
-          return blockId === undefined ? {} : { blockId };
-        })();
+      : blockKey(channel, { assistantMessageID: messageId, ordinal });
   };
   return content.flatMap((part): MessagePart[] => {
     const record = (part ?? {}) as {
@@ -1059,7 +1063,7 @@ const assistantContentParts = (
       return [
         {
           _tag: "reply",
-          text: truncateNarration(record.text),
+          text: truncateReply(record.text),
           ...keyed("reply"),
           ...named,
         },

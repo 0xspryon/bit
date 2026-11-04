@@ -128,8 +128,10 @@ export interface ImporterTurn {
    * True on the turn the importer is on when this page holds nothing of its reply but the
    * harness is still working on it (A6 U5): a reload while Claude Code is part way through
    * a block, which it writes to its transcript only once the block is complete, and whose
-   * partials before the reload are not sent again. Drawn as in progress ("writing…")
-   * rather than as a message the harness holds no reply to.
+   * partials before the reload are not sent again — the next one, with the whole text so
+   * far, comes with the block's next words (A6 U5 review: a block that has paused, a GLM
+   * thought left open while nothing follows it, sends none until it finishes). Drawn as in
+   * progress ("writing…") rather than as a message the harness holds no reply to.
    */
   readonly midBlock: boolean;
 }
@@ -139,7 +141,7 @@ export interface ImporterTurn {
  * ImporterTurn.midBlock}).
  */
 export const MID_BLOCK_NOTE =
-  "The importer is still on this message. What it is writing now shows here once it finishes the block it is on: the words so far are not sent again after a reload.";
+  "This reply is still being written; it shows here with its next words, or once the block is finished.";
 
 /** One importer turn as a chat group. */
 export type ImporterGroup = ChatGroup<ImporterTurn>;
@@ -683,6 +685,11 @@ export const importerFeed = (input: {
    * {@link ImporterSession.historyFloor}.
    */
   readonly historyFloor?: number | undefined;
+  /**
+   * The replay's items ({@link ImporterHistory.items}), for the one thing the floor cannot
+   * decide alone: whether a block still being written is in it (A6 U5 review).
+   */
+  readonly replayed?: readonly LiveItem[] | undefined;
   /** {@link ImporterSession.midTurn}: rows sent as steers while a turn ran. */
   readonly midTurn?: readonly string[] | undefined;
   /** Whether the session is working: a steer can only wait behind a turn that is. */
@@ -704,12 +711,27 @@ export const importerFeed = (input: {
    * A record (`scope.entry.added`, `asset.imported`) carries no activity order and is kept
    * whatever the floor: it is durable, the replay never contains one, and dropping it would
    * lose the half of the screen that survives a reload.
+   *
+   * **A partial is kept whatever the floor while the replay does not hold its block** (A6
+   * U5 review). Each partial keeps the id of the block's first one (`withBlock`), so a block
+   * that began before the replay was asked for sits below the floor for as long as it is
+   * written — and the replay cannot hold it: a harness stores a block only once it is
+   * finished. Dropped by the floor, it showed nothing from a return to the chat until its
+   * block ended. Once the replay does hold the block, its copy there is the block.
    */
+  const inReplay = new Set<string>();
+  for (const item of input.replayed ?? []) {
+    if (item.blockId !== undefined) inReplay.add(item.blockId);
+  }
   const mine = input.live.filter(
     (item) =>
       item.importId === importId &&
       (input.historyFloor === undefined ||
-        (activityOrder(item) ?? Number.POSITIVE_INFINITY) > input.historyFloor),
+        (activityOrder(item) ?? Number.POSITIVE_INFINITY) >
+          input.historyFloor ||
+        (isPartial(item) &&
+          item.blockId !== undefined &&
+          !inReplay.has(item.blockId))),
   );
   /*
    * Where an operator row goes among the importer's words: after everything published

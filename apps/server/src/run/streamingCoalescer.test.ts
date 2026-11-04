@@ -284,6 +284,20 @@ describe("memory", () => {
     expect(outcome).toEqual([]);
   });
 
+  test("U5 review: a partial names the model call its block's deltas named", async () => {
+    const outcome = await withCoalescer((coalescer, published) =>
+      Effect.gen(function* () {
+        yield* coalescer.delta({ ...reply("m1:0", "I will"), call: "m1" });
+        yield* coalescer.delta(reply("b2", "Unnamed"));
+        return published.map((partial) => [partial.blockId, partial.call]);
+      }),
+    );
+    expect(outcome).toEqual([
+      ["m1:0", "m1"],
+      ["b2", undefined],
+    ]);
+  });
+
   test("a block's text is capped as the finished block's is, and stops growing past it", async () => {
     const outcome = await withCoalescer((coalescer, published) =>
       Effect.gen(function* () {

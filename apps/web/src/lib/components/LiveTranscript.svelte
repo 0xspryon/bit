@@ -37,7 +37,7 @@
   import ChatItem from "./ChatItem.svelte";
   import ScenarioBar from "./ScenarioBar.svelte";
   import { IconAngleDown, IconAngleUp, IconBlocked } from "../icons";
-  import { foldSubagents, kindLabel, streamStates } from "../chat";
+  import { blockKeys, foldSubagents, kindLabel, streamStates } from "../chat";
   import MarkedText from "./MarkedText.svelte";
   import type { App } from "../app.svelte";
   import { atBottom } from "../scroll";
@@ -59,6 +59,15 @@
    * reads it: a GLM thought the agent has moved on from says so here too, not "writing…".
    */
   let streams = $derived(streamStates(items));
+  /**
+   * Each row's key, by block where the item is one (A6 U5 review), as the chat keys its
+   * rows: a block's partials and its finished copy are one row, so a thought opened while
+   * it was being written stays open when it finishes rather than being mounted afresh.
+   */
+  let rows = $derived.by(() => {
+    const keyOf = blockKeys();
+    return items.map((item) => ({ key: keyOf(item), item }));
+  });
   let records = $derived(
     items.filter((item) => item.origin === "record").length,
   );
@@ -306,8 +315,8 @@
         role="log"
         aria-label="Live run items, oldest first"
       >
-        {#each items as item (item.id)}
-          <ChatItem {item} stream={streams.get(item.id)} />
+        {#each rows as row (row.key)}
+          <ChatItem item={row.item} stream={streams.get(row.item.id)} />
         {/each}
       </ol>
 

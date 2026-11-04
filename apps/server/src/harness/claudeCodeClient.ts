@@ -132,6 +132,7 @@ import {
   SESSION_NOT_FOUND_TAG,
   subagentDescription,
   truncateNarration,
+  truncateReply,
   type HarnessFailure,
   type HarnessNarration,
   type McpRegistration,
@@ -1140,6 +1141,18 @@ export const claudeCodeBlockId = (messageId: string, index: number): string =>
   `${messageId}:${String(index)}`;
 
 /**
+ * A block's `blockId` and its call (A6 U5 review), as keys to spread: the call is the
+ * `message.id` the id is made from, carried on its own so nothing reads it back out.
+ */
+const claudeCodeBlockKey = (
+  messageId: string,
+  index: number,
+): { readonly blockId: string; readonly call: string } => ({
+  blockId: claudeCodeBlockId(messageId, index),
+  call: messageId,
+});
+
+/**
  * What one `stream_event` narrates: a delta for a main-thread `text_delta` or
  * `thinking_delta`, and nothing for anything else. The block bookkeeping frames update
  * {@link SessionRecord.streamed} on the way.
@@ -1174,14 +1187,14 @@ const narrateStreamEvent = (
       if (streamed.messageId === undefined || !Number.isInteger(event.index)) {
         return [];
       }
-      const blockId = claudeCodeBlockId(streamed.messageId, event.index);
+      const key = claudeCodeBlockKey(streamed.messageId, event.index);
       const delta = event.delta;
       if (delta.type === "text_delta") {
-        return [{ _tag: "delta", blockId, channel: "reply", text: delta.text }];
+        return [{ _tag: "delta", ...key, channel: "reply", text: delta.text }];
       }
       if (delta.type === "thinking_delta") {
         return [
-          { _tag: "delta", blockId, channel: "thinking", text: delta.thinking },
+          { _tag: "delta", ...key, channel: "thinking", text: delta.thinking },
         ];
       }
       return [];
@@ -1203,16 +1216,19 @@ const finishedBlockKey = (
   blockCount: number,
   kind: "text" | "thinking",
   streamed: StreamedBlock,
-): { readonly blockId?: string } => {
+): BlockKey => {
   if (fromSubagent(message) || blockCount !== 1) return {};
   const id = (message as { message?: { id?: unknown } }).message?.id;
   return typeof id === "string" &&
     id === streamed.messageId &&
     streamed.index !== undefined &&
     streamed.kind === kind
-    ? { blockId: claudeCodeBlockId(id, streamed.index) }
+    ? claudeCodeBlockKey(id, streamed.index)
     : {};
 };
+
+/** A `text` or `thinking` block's `blockId` and `call`, or nothing where it has none. */
+type BlockKey = { readonly blockId?: string; readonly call?: string };
 
 /**
  * The tools that start a sub-agent: `Agent`, and `Task`, its name before Claude Code 2.1
@@ -1424,12 +1440,7 @@ const modelOfMessage = (message: unknown): string | undefined => {
 const assistantParts = (
   blocks: readonly unknown[],
   model: string | undefined,
-  key: (
-    kind: "text" | "thinking",
-    position: number,
-  ) => {
-    readonly blockId?: string;
-  },
+  key: (kind: "text" | "thinking", position: number) => BlockKey,
   subagents: SubagentCalls,
 ): MessagePart[] => {
   const parts: MessagePart[] = [];
@@ -1446,7 +1457,7 @@ const assistantParts = (
     if (record.type === "text" && typeof record.text === "string") {
       parts.push({
         _tag: "reply",
-        text: truncateNarration(record.text),
+        text: truncateReply(record.text),
         ...key("text", position),
         ...named,
       });
@@ -2054,7 +2065,7 @@ const flattenTranscript = (
               (_, position) =>
                 callId === undefined
                   ? {}
-                  : { blockId: claudeCodeBlockId(callId, first + position) },
+                  : claudeCodeBlockKey(callId, first + position),
               subagents,
             )
           : entry.type === "user"

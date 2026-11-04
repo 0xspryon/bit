@@ -424,6 +424,7 @@ export class ImporterSessions {
             // The replay/live boundary. Undefined on a session whose words were never asked
             // for, which takes nothing away: it has no replay to collide with.
             historyFloor: this.current.historyFloor,
+            replayed: this.current.history.items,
             midTurn: this.current.midTurn,
             working: this.current.working,
             taken: this.current.taken,

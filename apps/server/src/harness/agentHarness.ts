@@ -434,9 +434,30 @@ export const NARRATION_TRUNCATED_MARK = "\n… (shortened)";
 
 /** Caps one narration field, saying so in the value when it cuts. */
 export const truncateNarration = (value: string): string =>
-  value.length <= NARRATION_FIELD_MAX
+  truncateAt(value, NARRATION_FIELD_MAX);
+
+/**
+ * The most characters a **finished** reply carries (A6 U5 review, the operator's decision).
+ *
+ * A reply is what the operator reads the session for, and 4,000 characters cut ordinary
+ * answers short — a glossary, a summary of a program's scope — live and on reload alike. So
+ * a finished `reply` gets its own cap: eight times the field cap, which holds every reply
+ * measured in the live runs whole, and still bounds what one item costs the narration bus
+ * ({@link NARRATION_FIELD_MAX}'s reason) at 64 KB of UTF-16. Thinking, tool arguments and
+ * results, and every **partial** stay at {@link NARRATION_FIELD_MAX}: a partial is resent
+ * every ~50 ms with the whole text so far, so its cap is what bounds the stream's rate, and
+ * the finished block replaces it with the whole reply when it ends.
+ */
+export const REPLY_FIELD_MAX = 32_000;
+
+/** Caps a finished reply's text at {@link REPLY_FIELD_MAX}, saying so when it cuts. */
+export const truncateReply = (value: string): string =>
+  truncateAt(value, REPLY_FIELD_MAX);
+
+const truncateAt = (value: string, max: number): string =>
+  value.length <= max
     ? value
-    : `${value.slice(0, NARRATION_FIELD_MAX)}${NARRATION_TRUNCATED_MARK}`;
+    : `${value.slice(0, max)}${NARRATION_TRUNCATED_MARK}`;
 
 /**
  * What one narrated moment *is*, in this application's vocabulary.
@@ -471,7 +492,10 @@ export const truncateNarration = (value: string): string =>
 export type NarrationDetail =
   | {
       readonly _tag: "reply";
-      /** One complete block of assistant text, never a token delta. */
+      /**
+       * One complete block of assistant text, never a token delta. Capped by
+       * {@link REPLY_FIELD_MAX}, not {@link NARRATION_FIELD_MAX}.
+       */
       readonly text: string;
       /** The model that wrote the block, when the harness said. See `LiveItem.model`. */
       readonly model?: string | undefined;
@@ -483,6 +507,8 @@ export type NarrationDetail =
        * ending a block never opened is harmless.
        */
       readonly blockId?: string | undefined;
+      /** The model call that wrote the block, wherever {@link blockId} is ({@link BlockDelta.call}). */
+      readonly call?: string | undefined;
     }
   | BlockDelta
   | BlockPartial
@@ -539,6 +565,8 @@ export type NarrationDetail =
       readonly text: string;
       /** As on `reply`: the streamed block this finishes, if it was streamed. */
       readonly blockId?: string | undefined;
+      /** As on `reply`. */
+      readonly call?: string | undefined;
       /** As on `reply`. */
       readonly model?: string | undefined;
     }
@@ -756,6 +784,14 @@ export interface BlockDelta {
    * Unique within one session.
    */
   readonly blockId: string;
+  /**
+   * The model call the block belongs to — Claude Code's `message.id`, OpenCode's
+   * `assistantMessageID` — the same on every block of one call (A6 U5 review). What the live
+   * item's `blockCall` is made from, so a reader that needs "the same call" never has to
+   * read it out of {@link blockId}. Optional only so a driver that cannot name the call
+   * still streams.
+   */
+  readonly call?: string | undefined;
   readonly channel: BlockChannel;
   /** The new text only, appended to what the block already holds. */
   readonly text: string;
@@ -774,6 +810,8 @@ export interface BlockDelta {
 export interface BlockPartial {
   readonly _tag: "partial";
   readonly blockId: string;
+  /** The block's call, as its deltas named it ({@link BlockDelta.call}). */
+  readonly call?: string | undefined;
   readonly channel: BlockChannel;
   readonly text: string;
 }

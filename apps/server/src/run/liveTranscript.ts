@@ -129,6 +129,7 @@ import {
 import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
 import {
   truncateNarration,
+  truncateReply,
   type MessageEntry,
   type MessagePart,
 } from "../harness/agentHarness";
@@ -650,8 +651,23 @@ const subjectIds = (subject: NarrationSubject) => ({
  * The harness promises it unique within one session, and two sessions narrate onto one
  * target's stream (an importer's and a goal's), so the session is part of it.
  */
-const wireBlockId = (harnessSessionId: string, blockId: string | undefined) =>
-  blockId === undefined ? {} : { blockId: `${harnessSessionId}:${blockId}` };
+const wireBlockId = (
+  harnessSessionId: string,
+  detail: {
+    readonly blockId?: string | undefined;
+    readonly call?: string | undefined;
+  },
+) =>
+  detail.blockId === undefined
+    ? {}
+    : {
+        blockId: `${harnessSessionId}:${detail.blockId}`,
+        // The block's model call, under the session for the same reason (A6 U5 review):
+        // what a reader compares for "the same call", rather than reading `blockId`.
+        ...(detail.call === undefined
+          ? {}
+          : { blockCall: `${harnessSessionId}:${detail.call}` }),
+      };
 
 /** The fields of a {@link LiveItem} that say where and when, not what. */
 type ItemBase = Pick<
@@ -731,7 +747,7 @@ export const projectPart = (
             output: null,
             callId: null,
             outcome: null,
-            ...wireBlockId(harnessSessionId, detail.blockId),
+            ...wireBlockId(harnessSessionId, detail),
             ...model,
           };
     case "toolCall":
@@ -802,7 +818,7 @@ export const projectPart = (
             output: null,
             callId: null,
             outcome: null,
-            ...wireBlockId(harnessSessionId, detail.blockId),
+            ...wireBlockId(harnessSessionId, detail),
             ...model,
           };
   }
@@ -966,7 +982,7 @@ export const projectReplay = (input: {
         ...baseAt(at),
         kind: "turn.reply",
         headline: "Reply",
-        body: truncateNarration(entry.text),
+        body: truncateReply(entry.text),
         tool: null,
         toolName: null,
         input: null,
@@ -1051,7 +1067,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
             output: null,
             callId: null,
             outcome: null,
-            ...wireBlockId(item.harnessSessionId, detail.blockId),
+            ...wireBlockId(item.harnessSessionId, detail),
             streaming: true,
           };
     case "delta":
