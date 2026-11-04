@@ -176,6 +176,9 @@ const decisionsFrom = (answered: readonly AnsweredDecision[]) =>
     all: Effect.succeed([]),
     answered: Stream.fromArray(answered),
     subscriberCount: Effect.succeed(0),
+    holdSession: () => Effect.void,
+    endSession: () => Effect.void,
+    sessionEnded: () => Effect.succeed(false),
   }) satisfies PolicyDecisions["Service"];
 
 const NO_NARRATION = narrationsFrom([]);

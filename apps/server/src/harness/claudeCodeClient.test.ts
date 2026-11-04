@@ -26,7 +26,7 @@
  * What is **not** here: a real Claude Code turn. That needs a login and a model, and is
  * exercised live; see the report.
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -42,6 +42,7 @@ import { Effect, Fiber, Layer, Redacted, Stream } from "effect";
 
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
 import { CLAUDE_CODE_MINIMUM, compareVersions } from "../policy/claudeCodeGate";
+import { processIdentity } from "./ownedProcesses";
 import { HarnessResolver } from "./resolver";
 import {
   AgentHarness,
@@ -2277,7 +2278,7 @@ describe("ending a conversation's session (A6 F5, from its review)", () => {
     driver: ReturnType<typeof turnDrivenSdk>,
   ) =>
     Effect.gen(function* () {
-      yield* harness.createSession({
+      const ref = yield* harness.createSession({
         title: "conversation",
         model: "claude-sonnet-5",
         directory: "/tmp/goal",
@@ -2286,6 +2287,7 @@ describe("ending a conversation's session (A6 F5, from its review)", () => {
       });
       yield* harness.prompt(TALK, "go");
       yield* Effect.promise(() => driver.pulled(1));
+      return ref;
     });
 
   test("a conversation between turns has its query closed, and takes no message afterwards", async () => {
@@ -2295,10 +2297,10 @@ describe("ending a conversation's session (A6 F5, from its review)", () => {
      */
     const outcome = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
-        yield* talking(harness, driver);
+        const ref = yield* talking(harness, driver);
         driver.emitResult();
         yield* harness.waitForIdle(TALK);
-        yield* harness.endSession(TALK);
+        yield* harness.endSession(ref);
         const status = yield* harness.sessionStatus(TALK);
         const refused = yield* Effect.flip(
           harness.prompt(TALK, "are you there?", {
@@ -2330,17 +2332,17 @@ describe("ending a conversation's session (A6 F5, from its review)", () => {
      */
     const outcome = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
-        yield* talking(harness, driver);
+        const ref = yield* talking(harness, driver);
         yield* harness.prompt(TALK, "and then the API", {
           _tag: "steer",
           urgency: "queued",
           messageId: "dd".padEnd(32, "0"),
         });
         yield* Effect.promise(() => driver.pulled(2));
-        yield* harness.endSession(TALK);
+        yield* harness.endSession(ref);
         const status = yield* harness.sessionStatus(TALK);
         // Ending twice is ending once.
-        yield* harness.endSession(TALK);
+        yield* harness.endSession(ref);
         return {
           closes: driver.seen.closes,
           interrupts: driver.seen.interrupts,
@@ -2356,7 +2358,9 @@ describe("ending a conversation's session (A6 F5, from its review)", () => {
   test("a session this process does not hold is already ended", async () => {
     const outcome = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
-        yield* harness.endSession("66666666-0000-4000-8000-000000000001");
+        yield* harness.endSession({
+          id: "66666666-0000-4000-8000-000000000001",
+        });
         return driver.seen.closes;
       }),
     );
@@ -2807,5 +2811,201 @@ describe("switching a Claude Code session's model", () => {
       }
     }
     expect(outcome.switches).toEqual([]);
+  });
+});
+
+/* ── Ending a session stops its CLI, now (A6 F5, second review) ─────────────── */
+
+describe("ending a session stops the CLI it runs in, and what that CLI started", () => {
+  /*
+   * The review's finding: `Query.close()` only ends the CLI's stdin, and SDK 0.3.310 sends
+   * `SIGTERM` 2 s later, so an ended import's CLI went on to run a tool 0.93 s after its end
+   * had returned. These run a real stand-in for the CLI — a shell with a child of its own,
+   * as a CLI running a tool has — through the harness's own spawner, which is the thing
+   * under test: the scripted SDK asks for the process exactly as the real one does, through
+   * `options.spawnClaudeCodeProcess`.
+   */
+  const TALK = "77777777-0000-4000-8000-000000000001";
+
+  /** An SDK whose query spawns `script` and then reads nothing until it is closed. */
+  const spawningSdk = (script: string) => {
+    const seen = { closes: 0, leader: undefined as number | undefined };
+    const sdk: ClaudeCodeSdk = {
+      query: ({ prompt, options }) => {
+        const spawn = options.spawnClaudeCodeProcess;
+        if (spawn === undefined)
+          throw new Error("the harness spawned nothing itself");
+        const child = spawn({
+          command: "sh",
+          args: ["-c", script],
+          env: { PATH: process.env["PATH"] },
+          signal: new AbortController().signal,
+        });
+        seen.leader = (child as unknown as { pid?: number }).pid;
+        // Pulls the opening prompt, as the SDK does, so `launch` is not left parked.
+        void (async () => {
+          for await (const _message of prompt) void _message;
+        })();
+        let wake: (() => void) | undefined;
+        let closed = false;
+        const query: HarnessQuery = {
+          setMcpServers: async () => ({}),
+          interrupt: async () => undefined,
+          getContextUsage: async () => ({}),
+          setModel: async () => undefined,
+          applyFlagSettings: async () => undefined,
+          close: () => {
+            // What the SDK's own close does at once: end the CLI's stdin. Its `SIGTERM`
+            // comes 2 s later, which no test here waits for.
+            seen.closes += 1;
+            closed = true;
+            child.stdin.end();
+            wake?.();
+          },
+          // Nothing to say until it is closed, and then the stream ends.
+          [Symbol.asyncIterator]: async function* () {
+            while (!closed) {
+              await new Promise<void>((resolve) => {
+                wake = resolve;
+              });
+            }
+            yield* [] as SDKMessage[];
+          },
+        };
+        return query;
+      },
+      sessionMessages: () => Promise.resolve([]),
+      sessionInfo: () => Promise.resolve(undefined),
+    };
+    return { sdk, seen };
+  };
+
+  /** Opens a conversation on a CLI running `script`, ends it, and says what was left. */
+  const endedWhileRunning = async (script: (pidFile: string) => string) => {
+    const scratch = await mkdtemp(join(tmpdir(), "bit-cli-stop-"));
+    const pidFile = join(scratch, "tool.pid");
+    const { sdk, seen } = spawningSdk(script(pidFile));
+    try {
+      return await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              const ref = yield* harness.createSession({
+                title: "conversation",
+                model: "claude-sonnet-5",
+                directory: scratch,
+                sessionId: TALK,
+                multiTurn: true,
+              });
+              yield* harness.prompt(TALK, "go");
+              // The stand-in's own child writes its pid once it is running.
+              const tool = yield* Effect.promise(async () => {
+                for (let tries = 0; tries < 200; tries += 1) {
+                  const text = await readFile(pidFile, "utf8").catch(() => "");
+                  if (text.trim() !== "") return Number(text.trim());
+                  await new Promise((resolve) => setTimeout(resolve, 10));
+                }
+                throw new Error("the stand-in CLI never started its tool");
+              });
+              const leader = seen.leader;
+              if (leader === undefined) throw new Error("no CLI was spawned");
+              const before = {
+                leader: processIdentity(leader) !== undefined,
+                tool: processIdentity(tool) !== undefined,
+              };
+              const started = Date.now();
+              yield* harness.endSession(ref);
+              const took = Date.now() - started;
+              // Read at the instant `endSession` returned: that is the contract.
+              const after = {
+                leader: processIdentity(leader) !== undefined,
+                tool: processIdentity(tool) !== undefined,
+              };
+              // Ending twice is ending once.
+              yield* harness.endSession(ref);
+              return { before, after, took, closes: seen.closes };
+            }),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                sdk,
+                controlTimeout: "2 seconds",
+                cliStopBounds: { terminateGrace: 300, killGrace: 500, poll: 5 },
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  };
+
+  test("the CLI and the tool it is running are gone by the time endSession returns", async () => {
+    const outcome = await endedWhileRunning(
+      (pidFile) => `sleep 30 & echo $! > '${pidFile}'; wait`,
+    );
+    expect(outcome.before).toEqual({ leader: true, tool: true });
+    expect(outcome.after).toEqual({ leader: false, tool: false });
+    expect(outcome.closes).toBe(1);
+    // Inside the SIGTERM grace, and far inside the SDK's own 2 s.
+    expect(outcome.took).toBeLessThan(1_000);
+  }, 10_000);
+
+  test("a CLI that ignores SIGTERM is killed, tool and all, within the bounds", async () => {
+    // `trap '' TERM` is inherited by the child, so neither of them goes on SIGTERM.
+    const outcome = await endedWhileRunning(
+      (pidFile) => `trap '' TERM; sleep 30 & echo $! > '${pidFile}'; wait`,
+    );
+    expect(outcome.before).toEqual({ leader: true, tool: true });
+    expect(outcome.after).toEqual({ leader: false, tool: false });
+    expect(outcome.took).toBeGreaterThanOrEqual(250);
+    expect(outcome.took).toBeLessThan(1_500);
+  }, 10_000);
+
+  test("a resumed opening under the same id is not ended by the earlier opening's close", async () => {
+    /*
+     * The race the review named: an old close ending "the session with this id" while a
+     * resume under that id has created its session ends the new CLI and orphans the old one.
+     * Ending by ref ends the opening the ref stands for.
+     */
+    const driver = turnDrivenSdk();
+    const outcome = await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(AgentHarness, (harness) =>
+          Effect.gen(function* () {
+            const first = yield* harness.createSession({
+              title: "conversation",
+              model: "claude-sonnet-5",
+              directory: "/tmp/goal",
+              sessionId: TALK,
+              multiTurn: true,
+            });
+            const second = yield* harness.createSession({
+              title: "conversation",
+              model: "claude-sonnet-5",
+              directory: "/tmp/goal",
+              resume: TALK,
+              multiTurn: true,
+            });
+            yield* harness.prompt(TALK, "go");
+            yield* Effect.promise(() => driver.pulled(1));
+            // The earlier opening's close, landing after the resume took the id.
+            yield* harness.endSession(first);
+            const afterFirst = driver.seen.closes;
+            yield* harness.endSession(second);
+            return { afterFirst, afterSecond: driver.seen.closes };
+          }),
+        ).pipe(
+          Effect.provide(
+            claudeCodeHarness({ sdk: driver.sdk, controlTimeout: "2 seconds" }),
+          ),
+          Effect.orDie,
+        ),
+      ),
+    );
+    // The query belongs to the second opening: the first's end closed nothing of it.
+    expect(outcome).toEqual({ afterFirst: 0, afterSecond: 1 });
   });
 });

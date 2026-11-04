@@ -182,6 +182,17 @@ export interface SessionStatus {
   readonly tokens?: Record<string, unknown> | undefined;
 }
 
+/**
+ * What {@link AgentHarness.createSession} answers: the session's id, and — by the object's
+ * identity — the one opening it stands for.
+ *
+ * **Keep the object; it is the handle {@link AgentHarness.endSession} takes.** A resume
+ * opens a session under an id that is already in use, so two opens can share one id while
+ * only one of them is current, and ending "the session with this id" would end whichever
+ * opened last. Ending the object this call returned ends the opening it stands for and no
+ * other (A6 F5 review). Nothing is added to the shape for it: a harness recognises its own
+ * answers by identity, so a ref rebuilt from the id is one it did not hand out.
+ */
 export interface SessionRef {
   readonly id: string;
 }
@@ -1062,6 +1073,20 @@ export class AgentHarness extends Context.Service<
      */
     readonly queuedOnInterrupt: "runs" | "held";
     /**
+     * Whether the harness is holding an operator message for this session that it will run
+     * only with the session's next message — what a Stop has to tell the operator about.
+     *
+     * Asked after an interrupt, and only of a `held` harness: the spine cannot infer it,
+     * because on OpenCode a queued message starts the moment the turn ahead of it finishes,
+     * with no idle between, so "delivered while busy and not idle since" also describes the
+     * message that *became* the stopped turn (A6 F5 review). OpenCode answers from the
+     * session's inbox. A `runs` harness holds nothing after an interrupt by definition — what
+     * was queued is already running — and answers `false`.
+     */
+    readonly holding: (
+      sessionId: string,
+    ) => Effect.Effect<boolean, HarnessFailure>;
+    /**
      * Ends one session, so that **nothing of it runs after this returns**: the turn in
      * flight is stopped, and a message queued behind it is dropped rather than run.
      *
@@ -1071,20 +1096,28 @@ export class AgentHarness extends Context.Service<
      * it is told to, and revoking its credential is not telling it — the agent keeps running
      * on its own authority (its shell, the policy gate's allowances) until the harness is.
      *
-     * Idempotent, and a session this process does not hold — or has already ended — is
-     * answered successfully with nothing done. A failure means the harness could not be
-     * reached, so whether the session is still running is uncertain; the caller has nothing
-     * better to do than log it, because its own authority is going either way.
+     * **Takes the {@link SessionRef} `createSession` returned, not an id**, and ends that
+     * opening only: see {@link SessionRef}. A ref this harness did not hand out, or one whose
+     * session has already ended, is answered successfully with nothing done, so this is
+     * idempotent. A failure means the harness could not be reached, so whether the session
+     * is still running is uncertain; the caller has nothing better to do than log it,
+     * because its own authority is going either way.
      *
-     * - **Claude Code** closes the query, which ends the CLI's stdin and then signals the
-     *   subprocess: the CLI, and every message queued in it, goes.
+     * - **Claude Code** owns the CLI subprocess — it spawns it, in a process group of its
+     *   own — and stops it here: the query is closed, the group is sent `SIGTERM` at once
+     *   and `SIGKILL` after a short bound, and this returns once the group is gone. Closing
+     *   the query alone is not enough: SDK 0.3.310's `close()` only ends the CLI's stdin and
+     *   signals it 2 s later, and a review watched an ended import run a tool in that
+     *   window. The tool processes the CLI started are in its group and go with it.
      * - **OpenCode** keeps a session for ever by design, so ending one means emptying it:
      *   every message waiting in the session's inbox is cancelled, then the execution in
      *   flight is interrupted. Cancelled first, so a turn that finishes between the two
-     *   calls has nothing to go straight on to.
+     *   calls has nothing to go straight on to. A ref superseded by a later `createSession`
+     *   for the same id is left alone: OpenCode runs one execution per session, and that
+     *   execution is the later opening's.
      */
     readonly endSession: (
-      sessionId: string,
+      session: SessionRef,
     ) => Effect.Effect<void, HarnessFailure>;
     /**
      * The harness's narration for one session, from now on.

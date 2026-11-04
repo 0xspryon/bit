@@ -247,6 +247,9 @@ export const stubHarness = (
     // Claude Code's answer, which is the one that makes a queued message visible after a
     // Stop. A test about a harness that holds it says `held`.
     queuedOnInterrupt: "runs",
+    // Nothing held, which is what a `runs` harness always answers. A test about a held
+    // message says so.
+    holding: () => Effect.succeed(false),
     // Ended without recording, like `unregisterMcpServer`: a test about closing overrides it.
     endSession: () => Effect.void,
     // Empty rather than open: a suite that wants a stream which stays up until it is

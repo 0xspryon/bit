@@ -506,7 +506,7 @@ const scriptedHarness = (script: Script) => {
             script.interrupted.push(sessionId);
             return true;
           }),
-    endSession: (sessionId) =>
+    endSession: ({ id: sessionId }) =>
       Effect.sync(() => {
         script.ended.push(sessionId);
       }),

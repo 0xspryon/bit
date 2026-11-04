@@ -72,6 +72,11 @@ const interruptedDetail = <Meta>(
   if (found.working && found.followUp) {
     return `${stopped} Its harness went straight on to a message you sent while that turn ran, and is answering it now; stop again to stop that too.`;
   }
+  // A `runs` harness that went on to the follow-up and finished it inside the settle: the
+  // conversation is quiet again, and what it last said answers the operator's message.
+  if (found.followUp) {
+    return `${stopped} Its harness went straight on to the message you sent while that turn ran, and has answered it. Everything written before and after the stop is kept, and your next message carries the conversation on in the same session.`;
+  }
   if (found.working) {
     return `${stopped} The turn is still finishing, so a little more may appear before it goes quiet. Everything it wrote is kept, and your next message carries the conversation on in the same session.`;
   }

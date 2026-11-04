@@ -207,6 +207,83 @@ export const signalGroup = (
 };
 
 /**
+ * A child this process spawned, as {@link stopOwnedChild} needs to see it.
+ *
+ * `pid` is `undefined` for a spawn that never produced a process. `ownsGroup` is whether
+ * the kernel says the child leads its own group ({@link leadsOwnGroup}, read at spawn),
+ * which is what allows the group to be signalled at all. `exited` reads the runtime's own
+ * record of the direct child, which is the only exit this process can `wait()` for.
+ */
+export interface StoppableChild {
+  readonly pid: number | undefined;
+  readonly ownsGroup: boolean;
+  readonly exited: () => boolean;
+  readonly kill: (signal: NodeJS.Signals) => void;
+}
+
+/** How long a child is given after `SIGTERM`, then after `SIGKILL`, and how often it is looked at. */
+export interface StopBounds {
+  readonly terminateGrace: number;
+  readonly killGrace: number;
+  readonly poll: number;
+}
+
+/**
+ * What became of a stop: `already_gone` — nothing was running; `terminated` — gone within
+ * the `SIGTERM` grace; `killed` — gone after `SIGKILL`; `survived` — still there after both
+ * bounds, which the caller reports, because it cannot do more.
+ */
+export type StopOutcome = "already_gone" | "terminated" | "killed" | "survived";
+
+/**
+ * Stops a child **and every process in its group**, now, and waits for them, bounded.
+ *
+ * `SIGTERM` to the group and the child at once, then `SIGKILL` once the grace is spent.
+ * "Gone" means the direct child has exited *and* nothing is left in its group, because the
+ * child exiting first is the ordinary case and a process it started — a shell command, a
+ * tool — is exactly what must not be left behind. Without a group of its own only the
+ * direct child can be signalled, which the caller is expected to have said at spawn.
+ *
+ * The group signals carry the same guards as {@link signalGroup}, and the group is only
+ * ever signalled for a child that was verified at spawn to lead it.
+ */
+export const stopOwnedChild = Effect.fnUntraced(function* (
+  child: StoppableChild,
+  bounds: StopBounds,
+) {
+  const pid = child.pid;
+  if (pid === undefined) return "already_gone" as StopOutcome;
+  const gone = () =>
+    child.exited() && !(child.ownsGroup && signalGroup(pid, 0));
+  if (gone()) return "already_gone" as StopOutcome;
+  const send = (signal: NodeJS.Signals) => {
+    if (child.ownsGroup) signalGroup(pid, signal);
+    if (!child.exited()) {
+      try {
+        child.kill(signal);
+      } catch {
+        // Raced with its own exit; `gone` is the real answer.
+      }
+    }
+  };
+  const waitGone = Effect.fnUntraced(function* (within: number) {
+    const deadline = Date.now() + within;
+    for (;;) {
+      if (gone()) return true;
+      if (Date.now() >= deadline) return false;
+      yield* Effect.sleep(bounds.poll);
+    }
+  });
+  send("SIGTERM");
+  if (yield* waitGone(bounds.terminateGrace)) {
+    return "terminated" as StopOutcome;
+  }
+  send("SIGKILL");
+  if (yield* waitGone(bounds.killGrace)) return "killed" as StopOutcome;
+  return "survived" as StopOutcome;
+});
+
+/**
  * What one record holds.
  *
  * `command` is for the operator reading the log line that says what was killed; nothing

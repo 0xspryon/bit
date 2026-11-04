@@ -119,6 +119,7 @@ import {
   type GatedDirectory,
 } from "../policy/install";
 import { POLICY_AUDIT_FILE } from "../policy/install";
+import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 import {
@@ -383,6 +384,7 @@ export class GoalConversations extends Context.Service<
     never,
     | HarnessResolver
     | TargetStores
+    | PolicyDecisions
     | FleetStore
     | McpCredentials
     | WorkerEndpoints
@@ -524,7 +526,7 @@ const make = Effect.fnUntraced(function* () {
    * bug (`closeSession` there; this module's header on why).
    */
   const sessions = yield* makeLiveAgentSessions<LiveConversation["meta"]>(
-    { fleet, endpoints },
+    { fleet, endpoints, gate: yield* PolicyDecisions },
     {
       // The **goal** endpoint. A goal credential at the planner URL is a `401` before any
       // tool list is produced — which is what makes "no `add_intent`" a property of the

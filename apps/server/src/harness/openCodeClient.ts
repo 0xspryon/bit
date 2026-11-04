@@ -96,6 +96,7 @@ import {
   type HarnessNarration,
   type MessageEntry,
   type NarrationDetail,
+  type SessionRef,
   type SessionTitle,
   type SessionWindow,
 } from "./agentHarness";
@@ -1068,6 +1069,22 @@ export const openCodeHarness = (
        */
       const contextLimits = new Map<string, SessionWindow>();
 
+      /**
+       * The latest {@link SessionRef} this process handed out for each session id.
+       *
+       * What `endSession` checks a ref against. A resume opens an id that may already have
+       * been opened here, and OpenCode runs one execution per session, so once a later
+       * opening exists the execution is its, and an earlier opening's close must not empty
+       * or interrupt it (A6 F5 review). One entry per id ever opened, bounded by what an
+       * operator has opened, like the spine's own per-id permits.
+       */
+      const latestRef = new Map<string, SessionRef>();
+      const handOut = (id: string): SessionRef => {
+        const ref: SessionRef = { id };
+        latestRef.set(id, ref);
+        return ref;
+      };
+
       const createSession: AgentHarness["Service"]["createSession"] = Effect.fn(
         "openCodeHarness.createSession",
       )(function* (input) {
@@ -1090,7 +1107,7 @@ export const openCodeHarness = (
          * answer for its window is no answer rather than the catalogue's figure for a model
          * reference we are guessing at.
          */
-        if (input.resume !== undefined) return { id: input.resume };
+        if (input.resume !== undefined) return handOut(input.resume);
         const session = yield* bounded(
           "session.create",
           timeouts.control,
@@ -1132,7 +1149,7 @@ export const openCodeHarness = (
             compactionAt: view.compactionAt,
           });
         }
-        return { id: session.id };
+        return handOut(session.id);
       });
 
       /**
@@ -1610,6 +1627,26 @@ export const openCodeHarness = (
         });
 
       /**
+       * Whether an operator message is waiting in the session's inbox, which is where
+       * OpenCode keeps one held across an interrupt (`AgentHarness.holding`).
+       *
+       * The inbox lists what has been admitted and not yet delivered into the transcript;
+       * a message that started running is no longer in it. Only `user` items count: a
+       * `synthetic`, `compaction` or `move` item is OpenCode's own and not something the
+       * operator sent.
+       */
+      const holding: AgentHarness["Service"]["holding"] = Effect.fn(
+        "openCodeHarness.holding",
+      )(function* (sessionId) {
+        const waiting = yield* bounded(
+          "session.inbox.list",
+          timeouts.control,
+          api.session.inbox.list({ sessionID: sessionId as Session.ID }),
+        );
+        return waiting.some((item) => item.type === "user");
+      });
+
+      /**
        * Empties the session, then stops it: every inbox item still waiting is cancelled, and
        * the execution in flight is interrupted (A6 F5).
        *
@@ -1622,11 +1659,19 @@ export const openCodeHarness = (
        * already delivered), so a race with delivery costs nothing.
        *
        * A session the server does not have (404) is already ended: nothing of it can run.
+       *
+       * **A superseded ref ends nothing.** When a later `createSession` has handed out a ref
+       * for the same id — a resume that opened while this opening was closing — the
+       * session's one execution belongs to that later opening, and emptying it here would
+       * cancel the operator's newer messages. A ref this process never handed out (a session
+       * opened by a process before it) is ended as asked: nothing newer here can hold it.
        */
       const endSession: AgentHarness["Service"]["endSession"] = Effect.fn(
         "openCodeHarness.endSession",
-      )(function* (sessionId) {
-        const sessionID = sessionId as Session.ID;
+      )(function* (session) {
+        const latest = latestRef.get(session.id);
+        if (latest !== undefined && latest !== session) return;
+        const sessionID = session.id as Session.ID;
         const waiting = yield* Effect.result(
           bounded(
             "session.inbox.list",
@@ -1741,6 +1786,7 @@ export const openCodeHarness = (
         messages,
         interruptSession,
         queuedOnInterrupt: "held",
+        holding,
         endSession,
         sessionEvents,
       });

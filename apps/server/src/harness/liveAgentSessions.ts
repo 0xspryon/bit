@@ -20,8 +20,10 @@
  *    gated directory → session → credential → MCP registration → prompt. A failure at any
  *    step closes the scope, which revokes the credential and unregisters the server —
  *    including when the *next* step is the one that failed.
- * 4. **{@link LiveAgentSessions.closeSession}**: narrator interrupted first, so nothing is
- *    published for a session whose credential is about to go; then the harness session
+ * 4. **{@link LiveAgentSessions.closeSession}**: the policy gate told first
+ *    (`PolicyDecisions.endSession`), so it refuses the session's tool calls from that
+ *    instant; then the narrator interrupted, so nothing is published for a session whose
+ *    credential is about to go; then the harness session
  *    ended (`AgentHarness.endSession`), so nothing of it runs once its authority is gone;
  *    then the scope; then a belt-and-braces revoke whose expected answer is zero and whose
  *    non-zero answer is a logged bug rather than a handled condition. Anything keyed by the
@@ -81,11 +83,13 @@ import {
   SESSION_NOT_FOUND_TAG,
   type AgentHarness,
   type HarnessFailure,
+  type SessionRef,
   type SteerUrgency,
 } from "./agentHarness";
 import type { HarnessNotReady } from "./resolver";
 import type { CredentialRefused, IssuedCredential } from "../mcp/credentials";
 import type { DatabaseError } from "../persistence/sql";
+import type { PolicyDecisions } from "../policy/service";
 import type {
   FleetError,
   FleetStore,
@@ -144,6 +148,12 @@ export interface LiveAgentSession<Meta> {
   readonly id: string;
   readonly targetId: string;
   readonly sessionId: string;
+  /**
+   * What `createSession` answered for this opening, kept because it — not
+   * {@link sessionId} — is what `AgentHarness.endSession` ends: a resume can open a newer
+   * session under the same id, and ending by id would end that one.
+   */
+  readonly harnessSession: SessionRef;
   readonly instanceId: string;
   readonly model: string;
   readonly harness: AgentHarness["Service"];
@@ -392,6 +402,14 @@ interface TurnState {
  */
 export const INTERRUPT_SETTLE: Duration.Input = "2 seconds";
 
+/**
+ * How many sessions the layer finalizer closes at once. Enough that a shutdown against a
+ * harness that has stopped answering costs one control timeout for a realistic number of
+ * open conversations rather than one each; bounded so a long list is not a burst of
+ * requests at a harness that is already struggling.
+ */
+export const SHUTDOWN_CLOSE_CONCURRENCY = 8;
+
 export interface LiveAgentSessions<Meta> {
   /** The entry for one id, preambled or not. For reads that only need the session id. */
   readonly get: (id: string) => LiveAgentSession<Meta> | undefined;
@@ -537,11 +555,21 @@ export const makeLiveAgentSessions = <Meta>(
   deps: {
     readonly fleet: FleetStore["Service"];
     readonly endpoints: { readonly urls: Effect.Effect<WorkerUrls> };
+    /**
+     * The policy gate's record of which sessions are held and which have ended
+     * (`PolicyDecisions.holdSession`): every session this registry opens is held from the
+     * moment it exists and ended the moment it is closed, so the gate refuses its tool
+     * calls whatever its harness is still doing.
+     */
+    readonly gate: Pick<
+      PolicyDecisions["Service"],
+      "holdSession" | "endSession"
+    >;
   },
   role: LiveSessionRole<Meta>,
 ): Effect.Effect<LiveAgentSessions<Meta>, never, Scope.Scope> =>
   Effect.gen(function* () {
-    const { fleet, endpoints } = deps;
+    const { fleet, endpoints, gate } = deps;
 
     /**
      * One entry per id this process is holding a session for.
@@ -616,6 +644,9 @@ export const makeLiveAgentSessions = <Meta>(
       const current = live.get(entry.id)?.scope === entry.scope;
       if (current) live.delete(entry.id);
       const buildsAtClose = builds.get(entry.id) ?? 0;
+      // The gate first, before anything suspends: from here every tool call of this opening
+      // is refused, whatever the harness does in the time it takes to stop it.
+      yield* gate.endSession(entry.sessionId, entry.scope);
       if (entry.narrator !== undefined) yield* Fiber.interrupt(entry.narrator);
       /*
        * The harness session is ended **before** the scope is closed, so the agent has stopped
@@ -623,24 +654,19 @@ export const makeLiveAgentSessions = <Meta>(
        * an unregister round trip takes. The scope's own release (see `acquire`) would end it
        * too, last; this one is first, and the guard makes the second a no-op.
        *
-       * Skipped for a stale entry whose session another live entry now holds: a resume can
-       * continue the same harness session under a fresh entry, and ending it would end that.
+       * By the opening's own ref, so a stale entry whose id a resumed open now holds ends
+       * its own session and not the newer one: the harness tells them apart
+       * (`AgentHarness.endSession`), which this registry cannot — a resumed open is not in
+       * the map until it publishes.
        */
-      const sharedWithNewer = [...live.values()].some(
-        (other) =>
-          other.scope !== entry.scope && other.sessionId === entry.sessionId,
-      );
-      if (sharedWithNewer) {
-        ended.add(entry.scope);
-        yield* Effect.logInfo(
-          "a closed session's harness session is held by a newer entry, so it was left running",
-          annotate(entry),
-        );
-      } else {
-        yield* endHarnessSession(entry.harness, entry.sessionId, entry.scope, {
+      yield* endHarnessSession(
+        entry.harness,
+        entry.harnessSession,
+        entry.scope,
+        {
           [role.words.idKey]: entry.id,
-        });
-      }
+        },
+      );
       yield* Scope.close(entry.scope, Exit.void);
       if (!current) {
         yield* Effect.logDebug(
@@ -687,15 +713,17 @@ export const makeLiveAgentSessions = <Meta>(
      */
     const endHarnessSession = (
       harness: AgentHarness["Service"],
-      sessionId: string,
+      session: SessionRef,
       scope: Scope.Closeable,
       annotations: Record<string, string>,
     ): Effect.Effect<void> =>
       Effect.suspend(() => {
         if (ended.has(scope)) return Effect.void;
         ended.add(scope);
-        return harness
-          .endSession(sessionId)
+        const sessionId = session.id;
+        return gate
+          .endSession(sessionId, scope)
+          .pipe(Effect.andThen(harness.endSession(session)), Effect.asVoid)
           .pipe(
             Effect.catch((failure) =>
               Effect.logWarning(
@@ -757,11 +785,14 @@ export const makeLiveAgentSessions = <Meta>(
 
     // Owned by the calling layer's scope, so a `SIGINT` closes every session rather than
     // dropping it with a live credential behind it.
+    // Concurrently, and bounded: each close waits on its harness's `endSession`, which is
+    // bounded by the control timeout, and a shutdown against a harness that has stopped
+    // answering would otherwise wait for that timeout once per session (A6 F5 review).
     yield* Effect.addFinalizer(() =>
       Effect.forEach(
         [...live.values()],
         (entry) => closeSession(entry, "shutdown"),
-        { discard: true },
+        { concurrency: SHUTDOWN_CLOSE_CONCURRENCY, discard: true },
       ),
     );
 
@@ -811,9 +842,13 @@ export const makeLiveAgentSessions = <Meta>(
             sessionId: plan.sessionId,
             ...(plan.options === undefined ? {} : { options: plan.options }),
             ...(plan.resume === undefined ? {} : { resume: plan.resume }),
-          }),
+          }).pipe(
+            // Held from the moment it exists, so the gate allows it — including when an
+            // older opening of the same id ends while this one is still being built.
+            Effect.tap((made) => gate.holdSession(made.id, scope)),
+          ),
           (made) =>
-            endHarnessSession(harness, made.id, scope, {
+            endHarnessSession(harness, made, scope, {
               [role.words.idKey]: id,
             }),
         );
@@ -936,7 +971,7 @@ export const makeLiveAgentSessions = <Meta>(
                         scope,
                       );
                       yield* register(plan, input.id, urls, created, directory);
-                      return created.id;
+                      return created;
                     }).pipe(Scope.provide(scope)),
                   );
                   if (opened._tag === "Failure") {
@@ -952,11 +987,12 @@ export const makeLiveAgentSessions = <Meta>(
                   const narrator =
                     narrate === undefined
                       ? undefined
-                      : yield* Effect.forkIn(narrate(opened.success), scope);
+                      : yield* Effect.forkIn(narrate(opened.success.id), scope);
                   const entry: LiveAgentSession<Meta> = {
                     id: input.id,
                     targetId: plan.targetId,
-                    sessionId: opened.success,
+                    sessionId: opened.success.id,
+                    harnessSession: opened.success,
                     instanceId: harness.instance.instanceId,
                     model: plan.model,
                     harness,
@@ -1098,11 +1134,35 @@ export const makeLiveAgentSessions = <Meta>(
             .waitForIdle(entry.sessionId)
             .pipe(Effect.timeoutOption(INTERRUPT_SETTLE)),
         );
+        /*
+         * On a harness that holds a queued message, whether one is held is the harness's to
+         * say, not this registry's to infer: OpenCode starts a queued message the moment the
+         * turn ahead of it finishes, with no idle between, so `followUp` is still counted
+         * for the message that became the turn just stopped (A6 F5 review). Asked after the
+         * settle, when the interrupt has done what it does to the inbox. A harness that
+         * cannot be asked leaves the inference standing, which is all there is.
+         */
+        const held =
+          entry.harness.queuedOnInterrupt === "held"
+            ? yield* entry.harness
+                .holding(entry.sessionId)
+                .pipe(
+                  Effect.catch((failure) =>
+                    Effect.as(
+                      Effect.logWarning(
+                        "the harness would not say whether it holds a message after a Stop; the answer is inferred from what this server delivered",
+                        { ...annotate(entry), detail: failure.message },
+                      ),
+                      followUp,
+                    ),
+                  ),
+                )
+            : followUp;
         return {
           _tag: "interrupted",
           entry,
           working: settled._tag === "Success" && Option.isNone(settled.success),
-          followUp,
+          followUp: held,
         } as const;
       });
 

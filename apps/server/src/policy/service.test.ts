@@ -315,6 +315,57 @@ describe("the policy HTTP boundary", () => {
     expect(response.status).toBe(400);
     expect(response.body.effect).toBe("deny");
   });
+  test("a call from a session bit has ended is refused, whatever the scope says, until it is held again", async () => {
+    /*
+     * The backstop behind `AgentHarness.endSession` (A6 F5 review): an ended conversation's
+     * harness may take a moment to stop, or may not answer, and a tool call it makes in the
+     * meantime must not be allowed because the scope is permissive. Held again — a resume
+     * of the same session — it is decided as before.
+     */
+    const outcome = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const endpoint = yield* ControlPlaneEndpoint;
+          const decisions = yield* PolicyDecisions;
+          const ask = (sessionId: string) =>
+            Effect.promise(async () => {
+              const response = await fetch(endpoint.policyUrl, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  ...request("bash", { command: "ls" }),
+                  sessionId,
+                }),
+              });
+              return (await response.json()) as {
+                effect?: string;
+                reason?: string;
+              };
+            });
+          const first = {};
+          const second = {};
+          yield* decisions.holdSession("ses_talk", first);
+          const held = yield* ask("ses_talk");
+          yield* decisions.endSession("ses_talk", first);
+          const ended = yield* ask("ses_talk");
+          const other = yield* ask("ses_worker");
+          yield* decisions.holdSession("ses_talk", second);
+          const resumed = yield* ask("ses_talk");
+          // An older opening letting go again does not end the newer one's.
+          yield* decisions.endSession("ses_talk", first);
+          const stillResumed = yield* ask("ses_talk");
+          return { held, ended, other, resumed, stillResumed };
+        }).pipe(Effect.provide(endpointLayer)),
+      ),
+    );
+    expect(outcome.held.effect).toBe("allow");
+    expect(outcome.ended.effect).toBe("deny");
+    expect(outcome.ended.reason).toContain("has been ended by bit");
+    // A session nobody ended — a worker's — is decided exactly as before.
+    expect(outcome.other.effect).toBe("allow");
+    expect(outcome.resumed.effect).toBe("allow");
+    expect(outcome.stillResumed.effect).toBe("allow");
+  });
 });
 
 /**

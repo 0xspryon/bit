@@ -2054,7 +2054,9 @@ describe("ending an opencode session (A6 F5, from its review)", () => {
         Effect.provide(
           Effect.result(
             Effect.flatMap(AgentHarness, (harness) =>
-              harness.endSession("ses_1"),
+              // A ref this process never handed out: a session opened by an earlier
+              // process, which is ended as asked.
+              harness.endSession({ id: "ses_1" }),
             ),
           ),
           layer,
@@ -2107,6 +2109,69 @@ describe("ending an opencode session (A6 F5, from its review)", () => {
   test("a server that cannot be reached is a failure, not a session said to be ended", async () => {
     const { answer } = await ending(() => json({}, 500));
     expect(answer._tag).toBe("Failure");
+  });
+  test("an opening superseded by a resume of the same session ends nothing; the resume's own ref does", async () => {
+    /*
+     * OpenCode runs one execution per session, so once a resume has opened the session again
+     * the execution is the resume's, and the earlier opening's close — which can land after
+     * the resume has begun (A6 F5 second review) — must not empty or interrupt it.
+     */
+    const { layer, recorded } = clientWith((url, init) => {
+      if (url.endsWith("/inbox") && (init?.method ?? "GET") === "GET") {
+        return json({ data: [waiting("msg_a")] });
+      }
+      if (url.includes("/inbox/") && init?.method === "DELETE") {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      if (url.endsWith("/interrupt")) return json({ interrupted: true });
+      return json({}, 500);
+    });
+    const counts = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              const opening = {
+                title: "import",
+                model: "zai/glm",
+                directory: "/tmp/import",
+                resume: "ses_1",
+                multiTurn: true,
+              };
+              const first = yield* harness.createSession(opening);
+              const second = yield* harness.createSession(opening);
+              yield* harness.endSession(first);
+              const afterFirst = recorded.urls.length;
+              yield* harness.endSession(second);
+              return { afterFirst, afterSecond: recorded.urls.length };
+            }),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(counts).toEqual({ afterFirst: 0, afterSecond: 3 });
+  });
+
+  test("whether a message is held is read from the session's inbox", async () => {
+    // What a Stop asks after an interrupt (`AgentHarness.holding`): the inbox lists what was
+    // admitted and not yet run, so a queued message the interrupt left behind is in it, and
+    // one that had already become the stopped turn is not.
+    const heldWith = (items: readonly unknown[]) => {
+      const { layer } = clientWith((url) =>
+        url.endsWith("/inbox") ? json({ data: items }) : json({}, 500),
+      );
+      return Effect.runPromise(
+        Effect.scoped(
+          Effect.provide(
+            Effect.flatMap(AgentHarness, (harness) => harness.holding("ses_1")),
+            layer,
+          ),
+        ),
+      );
+    };
+    expect(await heldWith([waiting("msg_a")])).toBe(true);
+    expect(await heldWith([])).toBe(false);
   });
 });
 

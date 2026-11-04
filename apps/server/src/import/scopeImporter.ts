@@ -177,6 +177,7 @@ import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { newImportId } from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
+import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 
@@ -563,6 +564,7 @@ export class ScopeImporter extends Context.Service<
     | HarnessResolver
     | FleetStore
     | McpCredentials
+    | PolicyDecisions
     | WorkerEndpoints
     | ScopeImportProgress
     | TargetStores
@@ -621,7 +623,7 @@ export class ScopeImporter extends Context.Service<
        * with its reason recorded once the session is closed.
        */
       const sessions = yield* makeLiveAgentSessions<ImportSessionMeta>(
-        { fleet, endpoints },
+        { fleet, endpoints, gate: yield* PolicyDecisions },
         {
           // The **importer** endpoint. The path selects the toolkit and the grant decides
           // whether the request is served at all: an importer credential at the worker URL

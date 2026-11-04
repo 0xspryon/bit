@@ -756,6 +756,11 @@ const agent =
         Layer.provide(targetStores),
         Layer.provide(fleet),
         Layer.provide(credentials),
+        // The same instance the policy route decides with (memoised: the endpoint below
+        // provides this same layer), because the conversations tell it which sessions they
+        // have ended and the route refuses those sessions' tool calls. Two instances would
+        // be a backstop that never fires.
+        Layer.provide(PolicyDecisions.layer),
         // `provideMerge`, so the bus the supervisor publishes to is also in this graph's
         // context and can be handed to the browser API below. With `provide` it was the
         // supervisor's private dependency, which was right while nothing subscribed.

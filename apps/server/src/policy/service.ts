@@ -343,6 +343,46 @@ export class PolicyDecisions extends Context.Service<
      * actually attached before answering one. Without it the test would be a sleep.
      */
     readonly subscriberCount: Effect.Effect<number>;
+    /**
+     * Records that `holder` holds harness session `sessionId`'s authority (A6 F5 review).
+     *
+     * ## Ended sessions, and why they are refused here
+     *
+     * The gate is the one boundary every tool call of every harness crosses before it runs,
+     * so it is where "this session's authority is over" can be enforced whatever the harness
+     * does next. Ending a session asks the harness to stop it, and the harness may take a
+     * moment — a Claude Code CLI given `SIGTERM`, an OpenCode execution being interrupted —
+     * or may not answer at all. A tool call from that session in the meantime is refused
+     * here, by {@link sessionEnded}, rather than allowed because the scope happened to say
+     * nothing about it.
+     *
+     * Kept on this service because the route and the conversation spine both have to reach
+     * the **same** registry, and this is the service already handed across the listener's
+     * memo-map boundary as an instance (`http/controlPlane.ts`).
+     *
+     * **Held by a holder, ended per holder.** A resume continues a session under the same
+     * id in a fresh opening, which may start before an older opening's close has finished,
+     * so "this id is ended" would refuse the newer opening's calls. A session is refused
+     * once it has been ended and no holder holds it. The holder is any object the caller
+     * keeps for the opening — the spine uses the session's `Scope` — compared by identity.
+     *
+     * Only the conversation spine holds and ends sessions. A worker's or a round's session is
+     * never ended here, so its calls are decided exactly as before.
+     */
+    readonly holdSession: (
+      sessionId: string,
+      holder: object,
+    ) => Effect.Effect<void>;
+    /**
+     * Records that `holder` has let go of `sessionId`, which is refused from now on unless
+     * another holder still holds it. Idempotent.
+     */
+    readonly endSession: (
+      sessionId: string,
+      holder: object,
+    ) => Effect.Effect<void>;
+    /** Whether `sessionId` has been ended and nothing holds it: its tool calls are refused. */
+    readonly sessionEnded: (sessionId: string) => Effect.Effect<boolean>;
   }
 >()("bit/policy/PolicyDecisions") {
   static readonly layer = Layer.effect(
@@ -352,6 +392,10 @@ export class PolicyDecisions extends Context.Service<
       const pubsub = yield* PubSub.sliding<AnsweredDecision>(DECISION_BUFFER);
       let answeredCount = 0;
       let subscribers = 0;
+      // One entry per conversation session ended in this process, which is bounded by what
+      // an operator has opened — the same bound the spine's per-id permits carry.
+      const holders = new Map<string, Set<object>>();
+      const ended = new Set<string>();
       return PolicyDecisions.of({
         record: (entry) =>
           Effect.flatMap(Clock.currentTimeMillis, (at) => {
@@ -405,6 +449,25 @@ export class PolicyDecisions extends Context.Service<
           ),
         ),
         subscriberCount: Effect.sync(() => subscribers),
+        holdSession: (sessionId, holder) =>
+          Effect.sync(() => {
+            const held = holders.get(sessionId) ?? new Set<object>();
+            held.add(holder);
+            holders.set(sessionId, held);
+          }),
+        endSession: (sessionId, holder) =>
+          Effect.sync(() => {
+            const held = holders.get(sessionId);
+            held?.delete(holder);
+            if (held !== undefined && held.size === 0)
+              holders.delete(sessionId);
+            ended.add(sessionId);
+          }),
+        sessionEnded: (sessionId) =>
+          Effect.sync(
+            () =>
+              ended.has(sessionId) && (holders.get(sessionId)?.size ?? 0) === 0,
+          ),
       });
     }),
   );
@@ -456,7 +519,16 @@ export const policyRoutes = (config: PolicyConfig) =>
             );
           }
           const body = decoded.success;
-          const decision = decide(config, body);
+          // Before the scope is consulted: a session bit has ended has no authority for any
+          // call, in scope or not. See `PolicyDecisions.holdSession`.
+          const decision: PolicyDecision = (yield* decisions.sessionEnded(
+            body.sessionId,
+          ))
+            ? {
+                effect: "deny",
+                reason: `session ${body.sessionId} has been ended by bit, so its authority is over and no tool of it runs`,
+              }
+            : decide(config, body);
           yield* decisions.record({ ...body, ...decision });
           return HttpServerResponse.jsonUnsafe(decision);
         }),

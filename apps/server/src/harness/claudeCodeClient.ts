@@ -83,6 +83,8 @@
  *   stream and narration shows only tool-call heartbeats (`--forward-subagent-text`,
  *   Claude Code 2.1.211+).
  */
+import { spawn as spawnChild, type ChildProcess } from "node:child_process";
+
 import {
   MODEL_OPTION_DEFAULT_CHOICE,
   type HarnessModelView,
@@ -101,6 +103,7 @@ import {
   type SDKUserMessage,
   type SessionMessage,
   type SDKSessionInfo,
+  type SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   Deferred,
@@ -130,12 +133,18 @@ import {
   type MessageEntry,
   type NarrationDetail,
   type PromptDelivery,
+  type SessionRef,
   type SessionStatus,
   type SessionTitle,
   type TerminalOutcome,
 } from "./agentHarness";
 import { HarnessProcessError, HarnessTransportError } from "./errors";
 import { claudeCodeMessageId } from "./messageId";
+import {
+  leadsOwnGroup,
+  stopOwnedChild,
+  type StopBounds,
+} from "./ownedProcesses";
 import {
   CLAUDE_CODE_DRIVER,
   defaultInstanceIdForDriver,
@@ -543,6 +552,26 @@ interface SessionRecord {
   interrupted: boolean;
   /** The query has been closed; nothing more will arrive. */
   closed: boolean;
+  /**
+   * The CLI subprocess, once the SDK has had this harness spawn it (`spawnOwnedCli`).
+   *
+   * Owned here rather than left to the SDK so that ending a session can stop it *now*:
+   * `Query.close()` only ends the CLI's stdin and signals it 2 s later, and a CLI given
+   * that long finishes the step it is on — a review watched one run a tool 0.93 s after its
+   * session was ended (A6 F5). Undefined until the query spawns, and for a session never
+   * prompted.
+   */
+  cli: OwnedCli | undefined;
+}
+
+/**
+ * The CLI process one session runs in, spawned by this harness in a process group of its
+ * own, so the tool processes it starts can be stopped with it.
+ */
+interface OwnedCli {
+  readonly child: ChildProcess;
+  /** Whether the kernel confirmed at spawn that the child leads its own group. */
+  readonly ownsGroup: boolean;
 }
 
 /** What a caller may vary about this harness. */
@@ -559,9 +588,28 @@ export interface ClaudeCodeHarnessOptions {
    * outcome.
    */
   readonly controlTimeout?: Duration.Input;
+  /**
+   * How long an ended session's CLI is given after `SIGTERM`, then after `SIGKILL`, before
+   * `endSession` reports it survived. Tests shorten it.
+   */
+  readonly cliStopBounds?: StopBounds;
 }
 
 const DEFAULT_CONTROL_TIMEOUT: Duration.Input = "30 seconds";
+
+/**
+ * An ended CLI's bounds: a second after `SIGTERM`, a second after `SIGKILL`.
+ *
+ * Short, because `endSession` is on the close path of an operator's End and of shutdown,
+ * and long enough for a CLI that handles `SIGTERM` to exit on its own — it does in tens of
+ * milliseconds. Nothing of it can act on bit in the meantime either way: the policy gate
+ * refuses an ended session's tool calls from the moment the spine ends it.
+ */
+const DEFAULT_CLI_STOP_BOUNDS: StopBounds = {
+  terminateGrace: 1_000,
+  killGrace: 1_000,
+  poll: 10,
+};
 
 /**
  * How long `switchModel` waits, after a control request **failed** (not timed out), for
@@ -1093,6 +1141,7 @@ export const claudeCodeHarness = (
       const sdk = options.sdk ?? liveClaudeCodeSdk;
       const defaultModel = options.defaultModel ?? CLAUDE_CODE_DEFAULT_MODEL;
       const controlTimeout = options.controlTimeout ?? DEFAULT_CONTROL_TIMEOUT;
+      const cliStopBounds = options.cliStopBounds ?? DEFAULT_CLI_STOP_BOUNDS;
 
       /** The layer's own scope, so the pump below outlives the fiber that started it. */
       const harnessScope = yield* Effect.scope;
@@ -1164,6 +1213,22 @@ export const claudeCodeHarness = (
       const sessions = new Map<string, SessionRecord>();
 
       /**
+       * The record each {@link SessionRef} `createSession` handed out stands for.
+       *
+       * What `endSession` resolves, rather than {@link sessions}: a resume creates a record
+       * under an id that may already have one, and `sessions` then names only the newer. An
+       * earlier opening's close ends the earlier record — its own CLI — and leaves the newer
+       * one running (A6 F5 review).
+       */
+      const handedOut = new WeakMap<SessionRef, SessionRecord>();
+
+      /**
+       * Every record this layer created, superseded ones included, so the finalizer reaches a
+       * CLI that {@link sessions} no longer names.
+       */
+      const records = new Set<SessionRecord>();
+
+      /**
        * Closes one session's query and ends its narration.
        *
        * Called when the pump sees a terminal `result`, and again from this layer's
@@ -1194,13 +1259,115 @@ export const claudeCodeHarness = (
           }
         }).pipe(Effect.andThen(Queue.end(record.narration)));
 
+      /**
+       * Stops a session's CLI and its process group now, and waits for it, bounded.
+       *
+       * After {@link closeSession}, never instead of it: the query is closed first, so the
+       * SDK has let go of the process and reads its exit as the end it asked for. A CLI that
+       * outlives both bounds is logged, since there is nothing further to try; one whose
+       * group could not be verified at spawn has only the direct child to stop, which the
+       * spawn already warned about.
+       */
+      const stopCli = (record: SessionRecord): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          const cli = record.cli;
+          if (cli === undefined) return;
+          const { child } = cli;
+          const outcome = yield* stopOwnedChild(
+            {
+              pid: child.pid,
+              ownsGroup: cli.ownsGroup,
+              exited: () =>
+                child.exitCode !== null || child.signalCode !== null,
+              kill: (signal) => {
+                child.kill(signal);
+              },
+            },
+            cliStopBounds,
+          );
+          if (outcome === "survived") {
+            yield* Effect.logError(
+              "an ended Claude Code session's CLI survived SIGKILL; it may still be running",
+              { sessionId: record.sessionId, pid: child.pid },
+            );
+          } else if (outcome === "killed") {
+            yield* Effect.logWarning(
+              "an ended Claude Code session's CLI ignored SIGTERM and was killed",
+              { sessionId: record.sessionId, pid: child.pid },
+            );
+          }
+        });
+
+      /** Closes one session's query and stops its CLI: the whole of ending it. */
+      const endRecord = (record: SessionRecord): Effect.Effect<void> =>
+        Effect.andThen(closeSession(record), stopCli(record));
+
+      // Every CLI goes with the layer, at once rather than one after another: each stop is
+      // bounded, but a shutdown waiting on them in turn would wait for the sum.
       yield* Effect.addFinalizer(() =>
-        Effect.forEach(
-          [...sessions.values()],
-          (record) => closeSession(record),
-          { discard: true },
-        ),
+        Effect.forEach([...records], endRecord, {
+          concurrency: "unbounded",
+          discard: true,
+        }),
       );
+
+      /**
+       * The SDK's `spawnClaudeCodeProcess` for one session: the CLI it was going to start,
+       * started by this harness instead, `detached` so that it leads a process group of its
+       * own and {@link stopCli} can stop it with every tool process it starts.
+       *
+       * Everything the SDK decides is unchanged — the binary (the one it carries, which is
+       * what the version floor checked), the arguments, the environment, the directory.
+       * What moves here is the process, and the one thing the SDK's own spawn did with it
+       * that a custom one does not: reading stderr. It is drained here, because an unread
+       * pipe fills and stalls the CLI, and logged as before.
+       *
+       * Known limit of detaching, as for `opencode serve` (`openCodeServer.ts`): the CLI no
+       * longer gets the terminal's `SIGINT` with the server, so it is stopped by this layer's
+       * finalizer, and if the server is killed outright it sees its stdin close — and its
+       * policy gate unreachable, which refuses every tool call.
+       */
+      const spawnOwnedCli =
+        (record: SessionRecord) => (spawnOptions: SpawnOptions) => {
+          const child = spawnChild(spawnOptions.command, spawnOptions.args, {
+            ...(spawnOptions.cwd === undefined
+              ? {}
+              : { cwd: spawnOptions.cwd }),
+            env: spawnOptions.env,
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: true,
+            windowsHide: true,
+          });
+          const pid = child.pid;
+          const ownsGroup = pid !== undefined && leadsOwnGroup(pid);
+          record.cli = { child, ownsGroup };
+          child.stderr.setEncoding("utf8");
+          child.stderr.on("data", (data: string) => {
+            // Diagnostics only. A line on the CLI's stderr is not an outcome, and this must
+            // not be able to fail the run.
+            void Effect.runPromise(
+              Effect.logDebug("claude code stderr", {
+                sessionId: record.sessionId,
+                data,
+              }),
+            ).catch(() => undefined);
+          });
+          child.stderr.on("error", () => undefined);
+          if (pid !== undefined && !ownsGroup) {
+            void Effect.runPromise(
+              Effect.logWarning(
+                "could not verify a Claude Code CLI leads its own process group; ending its session stops the CLI only, not the tools it started",
+                { sessionId: record.sessionId, pid },
+              ),
+            ).catch(() => undefined);
+          }
+          // Ended while the SDK was still starting it: nothing may run, so it is stopped as
+          // soon as it exists.
+          if (record.closed) {
+            void Effect.runPromise(stopCli(record)).catch(() => undefined);
+          }
+          return child;
+        };
 
       const recordFor = (
         operation: string,
@@ -1482,16 +1649,9 @@ export const claudeCodeHarness = (
                   forwardSubagentText: true,
                   // Needed for `messages` to have anything to read later.
                   persistSession: true,
-                  stderr: (data) => {
-                    // Diagnostics only. A line on the CLI's stderr is not an outcome, and
-                    // this must not be able to fail the run.
-                    void Effect.runPromise(
-                      Effect.logDebug("claude code stderr", {
-                        sessionId: record.sessionId,
-                        data,
-                      }),
-                    ).catch(() => undefined);
-                  },
+                  // This harness starts the CLI, so that ending the session can stop it at
+                  // once; stderr is read there. See `spawnOwnedCli`.
+                  spawnClaudeCodeProcess: spawnOwnedCli(record),
                 },
               }),
             catch: (cause) =>
@@ -1564,7 +1724,7 @@ export const claudeCodeHarness = (
           NARRATION_BUFFER,
         );
         const idle = yield* Deferred.make<void, HarnessFailure>();
-        sessions.set(sessionId, {
+        const record: SessionRecord = {
           sessionId,
           title: input.title,
           model: input.model,
@@ -1593,10 +1753,15 @@ export const claudeCodeHarness = (
           lastCallId: undefined,
           interrupted: false,
           closed: false,
-        });
+          cli: undefined,
+        };
+        sessions.set(sessionId, record);
+        records.add(record);
         // `parentSessionId` is ignored: Claude Code has no lineage concept to route prompt
         // caching through, and nothing in this application passes it for a worker session.
-        return { id: sessionId };
+        const ref: SessionRef = { id: sessionId };
+        handedOut.set(ref, record);
+        return ref;
       });
 
       /** One control request to a live query, bounded and mapped like the others here. */
@@ -1891,6 +2056,15 @@ export const claudeCodeHarness = (
       )(function* (sessionId, text, delivery = OPEN_PROMPT) {
         const record = yield* recordFor("session.prompt", sessionId);
         if (delivery._tag === "open") {
+          // Ended before it was ever prompted: launching would start a CLI for a session
+          // whose authority is already over.
+          if (record.closed) {
+            return yield* transport(
+              "session.prompt",
+              `session ${sessionId} has been ended; nothing was started`,
+              { tag: SESSION_NOT_FOUND_TAG, status: 404 },
+            );
+          }
           if (record.query !== undefined) {
             return yield* transport(
               "session.prompt",
@@ -2267,7 +2441,7 @@ export const claudeCodeHarness = (
             // no longer steer, and a subprocess left behind by it is the one leak worth
             // paying a forced close for. Reported as the failure it is — `false` would say
             // nothing was running, which is the one thing this does not know.
-            yield* closeSession(record);
+            yield* endRecord(record);
             yield* Effect.logWarning(
               "a Claude Code session would not acknowledge an interrupt; its query was closed anyway",
               { sessionId, detail: String(asked.failure) },
@@ -2295,17 +2469,22 @@ export const claudeCodeHarness = (
         });
 
       /*
-       * Closing the query is the whole of it: `Query.close()` ends the CLI's stdin and then
-       * signals the subprocess, so the CLI goes and every message queued in it goes with
-       * it. Nothing is interrupted first, on purpose: an interrupt is what makes the CLI go
-       * straight on to a queued message (measured; `AgentHarness.interruptSession`).
+       * The query is closed, then the CLI and its process group are stopped and waited for:
+       * `Query.close()` alone ends the CLI's stdin and leaves it running for 2 s, which is
+       * long enough to finish a tool call (A6 F5 review). The CLI goes, and every message
+       * queued in it goes with it. Nothing is interrupted first, on purpose: an interrupt is
+       * what makes the CLI go straight on to a queued message (measured;
+       * `AgentHarness.interruptSession`).
+       *
+       * By the ref `createSession` returned, so a superseded opening's close ends its own
+       * CLI and not the newer one now under the same id. See {@link handedOut}.
        */
       const endSession: AgentHarness["Service"]["endSession"] = Effect.fn(
         "claudeCodeHarness.endSession",
-      )(function* (sessionId) {
-        const record = sessions.get(sessionId);
+      )(function* (session) {
+        const record = handedOut.get(session);
         if (record === undefined) return;
-        yield* closeSession(record);
+        yield* endRecord(record);
       });
 
       const sessionEvents: AgentHarness["Service"]["sessionEvents"] = (
@@ -2334,6 +2513,8 @@ export const claudeCodeHarness = (
         messages,
         interruptSession,
         queuedOnInterrupt: "runs",
+        // A queued message runs at once after an interrupt, so nothing is ever held.
+        holding: () => Effect.succeed(false),
         endSession,
         sessionEvents,
       });

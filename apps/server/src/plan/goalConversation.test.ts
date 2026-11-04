@@ -66,6 +66,7 @@ import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { operatorScope } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
+import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 import { GoalConversations } from "./goalConversation";
@@ -251,7 +252,7 @@ const fakeHarness = (
       Effect.sync(() => {
         recorder.unregistrations.push({ sessionId, name });
       }),
-    endSession: (sessionId) =>
+    endSession: ({ id: sessionId }) =>
       Effect.sync(() => {
         recorder.ended.push(sessionId);
       }),
@@ -375,6 +376,7 @@ const world = (options?: {
         Layer.provide(fleet),
         Layer.provide(credentials),
         Layer.provide(RunNarrations.layer),
+        Layer.provide(PolicyDecisions.layer),
         Layer.provide(
           Layer.succeed(
             WorkerEndpoints,
