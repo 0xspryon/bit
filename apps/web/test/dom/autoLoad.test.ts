@@ -15,10 +15,11 @@ import type { ScopeEntryView } from "@bit/contracts";
 
 import { App } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
+import Assets from "../../src/lib/screens/Assets.svelte";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import { FakeServer, emptyScope, importerSessionView, ok } from "../fakeServer";
-import { click, mountInto, settle, type Mounted } from "./dom";
+import { click, focused, mountInto, settle, type Mounted } from "./dom";
 
 const entry = (value: string): ScopeEntryView => ({
   entryId: `ent_${value}`,
@@ -74,6 +75,24 @@ const hasButton = (label: string): boolean =>
   [...document.querySelectorAll("button")].some(
     (each) => each.textContent?.trim() === label,
   );
+
+/** Typing, as the field sees it: the value changes and an `input` event says so. */
+const typeIn = (input: HTMLInputElement, value: string): void => {
+  input.value = value;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+};
+
+/** Deletes an entry the way the operator does: its remove button, then the dialog's. */
+const deleteEntry = async (value: string): Promise<void> => {
+  const remove = document.querySelector<HTMLButtonElement>(
+    `button[aria-label="Remove ${value}"]`,
+  );
+  if (remove === null) throw new Error(`no remove button for ${value}`);
+  click(remove);
+  await settle();
+  click(button("Delete entry"));
+  await settle();
+};
 
 describe("an empty Scope tab", () => {
   test("offers the importer first and typing an entry second, under D1's copy", async () => {
@@ -165,15 +184,88 @@ describe("an empty Scope tab", () => {
   });
 
   test("what the operator started typing is not taken away when the last entry goes", async () => {
-    // The bar is hidden on an empty scope only while it holds nothing: deleting the last
+    // The bar is hidden on an empty scope only until it has been on screen: deleting the last
     // entry with a half-typed one in the field must not swallow it.
-    const { app } = await openScope();
-    expect(document.querySelector("form.add")).toBeNull();
-    app.entryValue = "api.acme.test";
+    const { app } = await openScope("acme.test");
+    const input = (): HTMLInputElement | null =>
+      document.querySelector<HTMLInputElement>(field);
+    const typed = input();
+    if (typed === null) throw new Error("no Add bar beside an entry");
+    typed.focus();
+    typeIn(typed, "api.acme.test");
+
+    await deleteEntry("acme.test");
+
+    expect(app.viewScope?.entries.length).toBe(0);
+    expect(input()?.value ?? "no field").toBe("api.acme.test");
+  });
+
+  test("erasing the field after the last entry goes keeps the field, and focus in it", async () => {
+    // The reviewer's sequence: type, delete the last entry, erase what was typed. The bar
+    // used to stay only while it held text, so the last backspace unmounted the field the
+    // operator was typing in and dropped focus to <body>.
+    await openScope("acme.test");
+    const typed = document.querySelector<HTMLInputElement>(field);
+    if (typed === null) throw new Error("no Add bar beside an entry");
+    typed.focus();
+    typeIn(typed, "a");
+    typeIn(typed, "ab");
+
+    await deleteEntry("acme.test");
+    expect(hasButton("Add an entry by hand")).toBe(true);
+
+    // Back into the field, as the hand does after the dialog, and erase.
+    const again = document.querySelector<HTMLInputElement>(field);
+    if (again === null)
+      throw new Error("deleting the entry took the field away");
+    again.focus();
+    typeIn(again, "a");
+    typeIn(again, "");
     await settle();
-    expect(document.querySelector<HTMLInputElement>(field)?.value ?? "").toBe(
-      "api.acme.test",
+
+    const after = document.querySelector<HTMLInputElement>(field);
+    if (after === null)
+      throw new Error("erasing the field took the Add bar away");
+    expect(after.value).toBe("");
+    // Compared as a boolean and a description, never as nodes (AGENTS.md).
+    expect(document.activeElement === after ? "the field" : focused()).toBe(
+      "the field",
     );
+  });
+});
+
+describe("the Add bar on an empty scope, across targets", () => {
+  test("opening it on one target does not open it on another, and it is still open on the first", async () => {
+    // Assets is held mounted across the target change, so the state that opened the bar
+    // survives it: what keeps the second target's empty state free of the bar is that the
+    // bar was asked for on the first one, not that the screen happened to be remounted.
+    const fake = new FakeServer();
+    fake.onScope = () => ok(emptyScope({ entries: [] }));
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    const toScopeOf = async (id: string): Promise<void> => {
+      app.openTarget(id);
+      await settle();
+      app.toSection("assets");
+      await settle();
+      app.toAssetsTab("scope");
+      await settle();
+    };
+    await toScopeOf("acme-corp");
+    mounted = mountInto(Assets, { app });
+    await settle();
+
+    click(button("Add an entry by hand"));
+    expect(document.querySelector(field)).not.toBeNull();
+
+    await toScopeOf("beta-corp");
+    expect(app.viewTargetId).toBe("beta-corp");
+    expect(hasButton("Add an entry by hand")).toBe(true);
+    expect(document.querySelector("form.add")).toBeNull();
+
+    await toScopeOf("acme-corp");
+    expect(document.querySelector(field)).not.toBeNull();
   });
 });
 

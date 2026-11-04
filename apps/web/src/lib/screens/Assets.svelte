@@ -88,8 +88,12 @@
 
   /**
    * Whether the Add bar is on screen: always once there are entries, and on an empty scope
-   * once it was asked for — or while it still holds something the operator typed or a
-   * refusal of it, so deleting the last entry never takes a half-typed entry away.
+   * once it was asked for or used on this target ({@link keepAddBar}) — or while it holds a
+   * value or a refusal, which is what keeps a delete's refusal in view.
+   *
+   * A bar once in the operator's hands stays there for that target. It used to stay on an
+   * emptied scope only while it held text, so erasing a half-typed entry after deleting the
+   * last one unmounted the field being typed in and dropped focus to `<body>`.
    */
   let addShown = $derived(
     scope !== undefined &&
@@ -99,13 +103,18 @@
         app.scopeRefusal !== ""),
   );
 
+  /** Marks the bar as asked for on this target, when its field is focused or typed in. */
+  const keepAddBar = (): void => {
+    handEntryFor = app.viewTargetId;
+  };
+
   /**
    * Hands the operator the entry field: opens the Add bar if the empty state is hiding it,
    * then focuses the field. `flushSync` mounts the bar inside this click, so the field the
    * button names is focused by the click that named it rather than a frame later.
    */
   const toEntryField = (): void => {
-    handEntryFor = app.viewTargetId;
+    keepAddBar();
     flushSync();
     entryField?.scrollIntoView({ block: "nearest" });
     entryField?.focus();
@@ -766,6 +775,8 @@
                 type="text"
                 bind:this={entryField}
                 bind:value={app.entryValue}
+                onfocus={keepAddBar}
+                oninput={keepAddBar}
                 placeholder="acme.test"
                 aria-label="Host, apex or address block"
               />

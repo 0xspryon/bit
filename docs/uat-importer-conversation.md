@@ -39,7 +39,9 @@ free `opencode/*` models hit "Free usage limit reached" and will look like a bro
 1. Open a target → **Assets** → **Scope**.
 2. On an empty target you should see **"No scope authored for this target"**, with
    _Auto-load scope…_ and _Add an entry by hand_.
-3. Add `atlassian.com` with **In** and _Apex and subdomains_.
+3. Press _Add an entry by hand_. ✅ The **Add an entry** bar opens under the empty state
+   (D1 draws none until it is asked for), with focus in its field. Add `atlassian.com` with
+   **In** and _Apex and subdomains_.
    - ✅ A row appears under **IN SCOPE** reading `atlassian.com` · `and every subdomain`.
    - ✅ **OUT OF SCOPE** reads `0 entries` and `None.`
 4. Add `id.atlassian.com` the same way. ✅ `IN SCOPE 2 entries`.
