@@ -69,4 +69,10 @@ export default defineConfig({
     }),
   ],
   server: { proxy: { "/api": controlPlane() } },
+  /**
+   * The highlighter's worker (`src/lib/highlight.worker.ts`) loads each grammar with its own
+   * `import()`, and code-splitting needs ES-module output: Vite's default for a worker is
+   * one IIFE, which would put every grammar into one file fetched with the first fence.
+   */
+  worker: { format: "es" },
 });

@@ -60,6 +60,14 @@ Object.defineProperty(
     },
   },
 );
+/*
+ * No `Worker`. Bun has a native one, and with it every reply in this suite with a closed
+ * ` ```json ` fence would start the app's real highlighter (`highlight.ts`) — Shiki in a
+ * worker — and have its code rebuilt at some later moment, in whichever test was running
+ * then. Here the app's highlighter cannot start and its fences stay plain; a test of
+ * highlighting passes `Markdown` a stand-in instead.
+ */
+Reflect.deleteProperty(globalThis, "Worker");
 installRunes();
 installComponents("client");
 installIcons("client");

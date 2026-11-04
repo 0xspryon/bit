@@ -54,6 +54,8 @@ import remarkRehype, {
 } from "remark-rehype";
 import { unified } from "unified";
 
+import { grammarOf } from "./highlightLanguages";
+
 const element = (
   tagName: string,
   properties: Element["properties"],
@@ -98,8 +100,9 @@ const htmlAsText: NonNullable<RemarkRehypeOptions["handlers"]>["html"] = (
  *   decides the width of the whole thread on a tablet. OpenCode wraps its tables the same
  *   way.
  * - **A fence is framed, with its name and a Copy button** ({@link codeFrame}). Its
- *   language is also copied to `data-language` on the `<pre>`. There is no highlighting —
- *   that is its own slice and its own dependency weight.
+ *   language is also copied to `data-language` on the `<pre>`. A closed fence in a
+ *   language bit highlights is marked for it, and highlighted later, outside this
+ *   pipeline ({@link frameMark}).
  * - **A link opens elsewhere, without an opener.** The page is a working session; following
  *   a link an agent quoted should not navigate it away, and the page it opens should get
  *   neither `window.opener` nor a referrer naming this app.
@@ -394,7 +397,7 @@ const codeFrame = (pre: Element, source: string): Element => {
     typeof meta === "string" && meta.trim() !== ""
       ? meta.trim()
       : (language ?? "");
-  return element("div", diagramMark(pre, code, language, source), [
+  return element("div", frameMark(pre, code, language, source), [
     element("div", { className: ["code-head"] }, [
       element(
         "span",
@@ -451,34 +454,45 @@ const textOf = (node: ElementContent): string =>
       : "";
 
 /**
- * A fence's frame properties: its class, and `data-diagram` when it is a **closed** mermaid
- * fence, which `Markdown.svelte` draws as a flow figure (A6 U12, `diagram.ts`).
+ * A fence's frame properties: its class, and, when it is **closed**, what `Markdown.svelte`
+ * makes of it afterwards:
+ *
+ * - `data-diagram="mermaid"` for a mermaid fence, drawn as a flow figure (A6 U12,
+ *   `diagram.ts`);
+ * - `data-highlight="<grammar>"` for a fence in a language bit highlights (A6 U11,
+ *   `highlight.ts`), whose code is then drawn by weight and tone.
  *
  * Closed is read from the reply's own text at the fence's position, which the sanitiser
- * carries over: a fence the agent never closed — a reply cut mid-stream — stays code. The
- * mark is a constant on an element built here; the sanitiser passes no `data-*` from the
- * source, so only this can make a fence a figure, and what is drawn is the fence's text.
+ * carries over: a fence the agent never closed — a reply cut mid-stream — stays code, and
+ * a fence still streaming is never tokenised. Each mark is a constant on an element built
+ * here — the grammar's own name from `highlightLanguages.ts`, never the fence's language
+ * as written — and the sanitiser passes no `data-*` from the source, so only this can mark
+ * a fence, and what is drawn or highlighted is the fence's text.
  */
-const diagramMark = (
+const frameMark = (
   pre: Element,
   code: Element | undefined,
   language: string | undefined,
   source: string,
 ): Element["properties"] => {
+  const grammar = language === undefined ? undefined : grammarOf(language);
+  if (language !== "mermaid" && grammar === undefined) {
+    return { className: ["code-frame"] };
+  }
   const start = pre.position?.start.offset;
   const end = pre.position?.end.offset;
   // The code's markers (`reveal`) are already in it; none holds a line break.
   const closed =
-    language === "mermaid" &&
     start !== undefined &&
     end !== undefined &&
     isClosedFence(
       source.slice(start, end),
       code === undefined ? "" : textOf(code),
     );
-  return closed
+  if (!closed) return { className: ["code-frame"] };
+  return grammar === undefined
     ? { className: ["code-frame"], dataDiagram: "mermaid" }
-    : { className: ["code-frame"] };
+    : { className: ["code-frame"], dataHighlight: grammar };
 };
 
 /**

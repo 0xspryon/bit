@@ -19,6 +19,10 @@
    * the agent's markup, and it passes a second, private sanitiser before it is in the page
    * (`diagramDraw.ts`).
    *
+   * **Highlighting is not `{@html}` either** (A6 U11): a closed fence in a known language
+   * has its code's children rebuilt here, from tones the highlighter returns as data, with
+   * constant classes and text nodes (`toneCode` in `highlight.ts`).
+   *
    * `renderMarkdown` is remembered by text, so this deriving again — which it does whenever
    * the row above it is rebuilt, on every frame of unrelated live activity — is a lookup
    * rather than a parse.
@@ -29,10 +33,19 @@
   import { mount, unmount } from "svelte";
   import type { Attachment } from "svelte/attachments";
 
+  import { appHighlights, toneCode, type Highlights } from "../highlight";
+  import { isGrammar } from "../highlightLanguages";
   import { renderMarkdown } from "../markdown";
   import MermaidBlock from "./MermaidBlock.svelte";
 
-  let { text }: { text: string } = $props();
+  let {
+    text,
+    highlights = appHighlights,
+  }: {
+    text: string;
+    /** Where fences' tones come from: Shiki in a worker in the app, a stand-in in tests. */
+    highlights?: Highlights;
+  } = $props();
 
   const html = $derived(renderMarkdown(text));
 
@@ -204,6 +217,72 @@
   $effect(() => () => {
     for (const each of drawn.values()) void unmount(each.block);
     drawn = new Map();
+  });
+
+  /**
+   * Each closed fence in a known language, drawn by weight and tone (A6 U11).
+   *
+   * `markdown.ts` marks such a frame `data-highlight` with its grammar and leaves its code
+   * plain. Here, after `{@html}`, the code as written (`written`, the text Copy copies) is
+   * looked up in `highlights`: known tones are built into the `<code>` at once
+   * (`toneCode`), and unknown ones are asked for, and `settled` brings this back when
+   * they arrive. A block drawn plain — too large, or not tokenised — is simply left.
+   *
+   * **A highlighted `<code>` outlives the HTML it was built in**, as a drawn figure does:
+   * every delta of a live reply is new HTML for every frame, so each built `<code>` is
+   * remembered by the fence's place among this reply's highlighted fences, its grammar and
+   * its code, and moved into the new frame in place of the plain one. The spans are built
+   * once per fence, not once per delta, and the tones are tokenised once per fence and
+   * grammar across every reply on the page (`createHighlights`).
+   *
+   * The `toned` class on a built `<code>` is set only here: the sanitiser passes a `<code>`
+   * no class but `language-…`.
+   */
+  let toned = new Map<string, Element>();
+  let settled = $state(0);
+  $effect(() => {
+    void html;
+    void settled;
+    if (root === undefined) return;
+    let live = true;
+    const next = new Map<string, Element>();
+    const frames = root.querySelectorAll<HTMLElement>(
+      ".code-frame[data-highlight]",
+    );
+    for (const [index, frame] of frames.entries()) {
+      const grammar = frame.dataset["highlight"] ?? "";
+      const code = frame.querySelector("pre > code");
+      if (!isGrammar(grammar) || code === null) continue;
+      const source = written(code);
+      const key = JSON.stringify([index, grammar, source]);
+      const kept = toned.get(key);
+      if (kept !== undefined) {
+        toned.delete(key);
+        if (kept !== code) code.replaceWith(kept);
+        next.set(key, kept);
+        continue;
+      }
+      // The one newline `remark-rehype` adds after a fence's last line is not the agent's.
+      const body = source.replace(/\n$/, "");
+      const lines = highlights.peek(body, grammar);
+      if (lines === undefined) {
+        void highlights.request(body, grammar).then(() => {
+          if (live) settled += 1;
+        });
+        continue;
+      }
+      if (lines === null) continue;
+      const built = toneCode(lines, body);
+      if (built === null) continue;
+      if (body !== source) built.append(source.slice(body.length));
+      code.replaceChildren(built);
+      code.classList.add("toned");
+      next.set(key, code);
+    }
+    toned = next;
+    return () => {
+      live = false;
+    };
   });
 </script>
 
@@ -491,6 +570,31 @@
   }
   .markdown :global(pre code) {
     font-size: inherit;
+  }
+  /*
+   * A highlighted fence (A6 U11, `highlight.ts`), by weight and tone as D8 draws it: the
+   * code's own ink is muted, and what it says is lifted out of it — a word of the language
+   * or a key (`var`, `yield`, `"host"`, `<form`, `Host:`) in the base ink at 500, a value
+   * or a called name (`"app.partner.com"`, `false`, `expres`) in the base ink, and a
+   * comment faint. Punctuation and operators keep the muted ink. No hue anywhere, so both
+   * themes are the reply's own tokens, and nothing in a fence can look like a state colour.
+   *
+   * A fence that is not highlighted — plain, unknown, too long, or still streaming — keeps
+   * the base ink above, so it never reads as the records' muted box. A highlighted one is
+   * told from a record by its header and Copy, as every fence is, and by its base-ink words.
+   */
+  .markdown :global(pre code.toned) {
+    color: var(--text-muted);
+  }
+  .markdown :global(.tone-key) {
+    color: var(--text-base);
+    font-weight: 500;
+  }
+  .markdown :global(.tone-value) {
+    color: var(--text-base);
+  }
+  .markdown :global(.tone-comment) {
+    color: var(--text-faint);
   }
   /*
    * A table fills the thread's width, as D8 draws it; the wrapper scrolls only when its
