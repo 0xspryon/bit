@@ -537,7 +537,8 @@ export interface BlockDelta {
   /**
    * The harness's own id for the block, stable from its first piece to the finished block:
    * an OpenCode block's assistant message id, channel and ordinal (`openCodeBlockId`), a
-   * Claude Code message id with the block's index. Unique within one session.
+   * Claude Code call's message id with the block's stream index (`claudeCodeBlockId`).
+   * Unique within one session.
    */
   readonly blockId: string;
   readonly channel: BlockChannel;

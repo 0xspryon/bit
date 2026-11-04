@@ -50,7 +50,9 @@ import {
   NARRATION_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
   SESSION_NOT_FOUND_TAG,
+  type HarnessNarration,
 } from "./agentHarness";
+import { narrateCoalesced } from "../run/streamingCoalescer";
 import {
   assembleImporterPrompt,
   assembleImporterResumePrompt,
@@ -419,6 +421,31 @@ describe("starting a session", () => {
     expect(options?.forwardSubagentText).toBe(true);
     // Needed for `messages` to have anything to read later.
     expect(options?.persistSession).toBe(true);
+    // A worker's attempt and a planner round have no live partial view (A6 F8).
+    expect(options?.includePartialMessages).toBe(false);
+  });
+
+  test("a conversation asks for partial messages, and a single-turn session does not", async () => {
+    // Only a conversation — an importer's or a goal's — shows a block while it is being
+    // written. Asked for per `query()`, so a worker's attempt does not pay for hundreds of
+    // frames per block that its supervisor would drop before the bus anyway.
+    const options = await withHarness({}, (harness, seen) =>
+      Effect.gen(function* () {
+        for (const multiTurn of [true, false]) {
+          const sessionId = newClaudeCodeSessionId();
+          yield* harness.createSession({
+            title: "bit: t",
+            model: "claude-sonnet-5",
+            directory: "/tmp/ws",
+            sessionId,
+            multiTurn,
+          });
+          yield* harness.prompt(sessionId, "go");
+        }
+        return seen.map((launched) => launched.options.includePartialMessages);
+      }),
+    );
+    expect(options).toEqual([true, false]);
   });
 
   test("a session cannot be prompted twice", async () => {
@@ -1194,6 +1221,332 @@ describe("outcomes", () => {
       }),
     );
     expect(interrupted).toBe(false);
+  });
+});
+
+/* ── Partial messages (A6 F8) ───────────────────────────────────────────────── */
+
+/**
+ * Real frames from the CLI, sanitised: `testdata/claude-code-partials/*.jsonl`.
+ *
+ * Recorded 2026-11-04 from `@anthropic-ai/claude-agent-sdk@0.3.310` driving its bundled CLI
+ * 2.1.310 on `claude-haiku-4-5`, `includePartialMessages: true`, summarized thinking, no
+ * setting sources and no tools beyond `Agent`, by a throwaway probe calling `query()`
+ * directly. Kept as the CLI sent them, in its order, except: `system` frames (they carry
+ * local paths), `rate_limit_event`, `thinking_tokens` and tool-result frames are dropped;
+ * the session id is a fixed one; every thinking `signature` reads `sig-redacted`; receipt
+ * time, `timestamp` and `request_id` are gone.
+ *
+ * - `thinking-then-reply` — one call: a thinking block (stream index 0), then a text block
+ *   (index 1). The CLI sends each block as its own `assistant` frame holding only that
+ *   block, **before** the block's `content_block_stop`.
+ * - `interrupted-reply` — a reply cut by `interrupt()` after 15 text deltas. The CLI still
+ *   sends an `assistant` frame for the cut block, holding exactly the text streamed, then
+ *   `[Request interrupted by user]`, the block's stop, and an `error_during_execution`
+ *   result (`terminal_reason: aborted_streaming`).
+ * - `beside-a-subagent` — the main thread's call after it started a background `Agent`.
+ *   While its thinking block is open, the subagent's own `assistant` frames (a thinking
+ *   block, then `PONG`; `parent_tool_use_id` set; a message id of their own) arrive between
+ *   its deltas. The CLI forwarded no `stream_event` for the subagent.
+ */
+const partialFrames = async (name: string): Promise<SDKMessage[]> =>
+  (
+    await readFile(
+      join(
+        import.meta.dir,
+        "testdata",
+        "claude-code-partials",
+        `${name}.jsonl`,
+      ),
+      "utf8",
+    )
+  )
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as SDKMessage);
+
+/** The `message.id` of the stream's one `message_start` frame — each fixture streams one call. */
+const streamedMessageId = (frames: readonly SDKMessage[]): string => {
+  const ids = frames.flatMap((frame) => {
+    const event = (
+      frame as { event?: { type?: unknown; message?: { id?: unknown } } }
+    ).event;
+    return frame.type === "stream_event" &&
+      event?.type === "message_start" &&
+      typeof event.message?.id === "string"
+      ? [event.message.id]
+      : [];
+  });
+  const [only] = ids;
+  if (ids.length !== 1 || only === undefined) {
+    throw new Error(`expected one streamed call, found ${String(ids.length)}`);
+  }
+  return only;
+};
+
+/** How many `content_block_delta` frames of one delta type the stream carries. */
+const deltaFrames = (frames: readonly SDKMessage[], type: string): number =>
+  frames.filter(
+    (frame) =>
+      frame.type === "stream_event" &&
+      (frame as { event: { delta?: { type?: unknown } } }).event.delta?.type ===
+        type,
+  ).length;
+
+/** A frame list with every frame `drop` matches removed. */
+const without = (
+  frames: readonly SDKMessage[],
+  drop: (frame: SDKMessage) => boolean,
+): SDKMessage[] => frames.filter((frame) => !drop(frame));
+
+describe("partial messages (A6 F8)", () => {
+  /**
+   * A conversation's first turn narrating `messages`, up to its `result` — Stopped after its
+   * prompt when `stop` is set. A conversation, because only a conversation asks for these
+   * frames and only a conversation stays open across a Stop.
+   */
+  const narrated = (messages: readonly SDKMessage[], stop = false) => {
+    const sessionId = newClaudeCodeSessionId();
+    return withHarness({ messages }, (harness) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-haiku-4-5",
+          directory: "/tmp/ws",
+          sessionId,
+          multiTurn: true,
+        });
+        const narration = yield* Effect.forkChild(
+          Stream.runCollect(
+            harness
+              .sessionEvents(sessionId)
+              .pipe(Stream.takeUntil((entry) => entry.type === "result")),
+          ),
+        );
+        yield* harness.prompt(sessionId, "go");
+        if (stop) yield* harness.interruptSession(sessionId);
+        return [...(yield* Fiber.join(narration))];
+      }),
+    );
+  };
+
+  /** What the importer and goal conversations publish from `entries`. */
+  const coalesced = (entries: readonly HarnessNarration[]) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const out: HarnessNarration[] = [];
+        yield* narrateCoalesced({
+          events: Stream.fromIterable(entries),
+          publish: (entry) =>
+            Effect.sync(() => {
+              out.push(entry);
+            }),
+        });
+        return out;
+      }),
+    );
+
+  const deltas = (entries: readonly HarnessNarration[]) =>
+    entries.flatMap((entry) =>
+      entry.detail._tag === "delta" ? [entry.detail] : [],
+    );
+
+  const blocks = (entries: readonly HarnessNarration[]) =>
+    entries.flatMap((entry) =>
+      entry.detail._tag === "reply" || entry.detail._tag === "thinking"
+        ? [entry.detail]
+        : [],
+    );
+
+  test("a thinking block and a reply stream under their stream index, and each finished block carries its deltas' id", async () => {
+    const frames = await partialFrames("thinking-then-reply");
+    const message = streamedMessageId(frames);
+    const entries = await narrated(frames);
+
+    const pieces = deltas(entries);
+    const thinking = pieces.filter((piece) => piece.channel === "thinking");
+    const reply = pieces.filter((piece) => piece.channel === "reply");
+    // Every `thinking_delta` and `text_delta` frame is one delta, named by the call's
+    // `message.id` and the block's index **in the stream** — 0 and 1, where each finished
+    // block sits at position 0 of its own split `assistant` frame.
+    expect(thinking.length).toBe(deltaFrames(frames, "thinking_delta"));
+    expect(reply.length).toBe(deltaFrames(frames, "text_delta"));
+    expect(thinking.length).toBeGreaterThan(0);
+    expect(reply.length).toBeGreaterThan(0);
+    expect(new Set(thinking.map((piece) => piece.blockId))).toEqual(
+      new Set([`${message}:0`]),
+    );
+    expect(new Set(reply.map((piece) => piece.blockId))).toEqual(
+      new Set([`${message}:1`]),
+    );
+
+    // The finished blocks carry the same ids, so each replaces its partials, and what was
+    // streamed is what was finished.
+    const finished = blocks(entries);
+    expect(finished.map((block) => [block._tag, block.blockId])).toEqual([
+      ["thinking", `${message}:0`],
+      ["reply", `${message}:1`],
+    ]);
+    expect(finished[0]?.text).toBe(
+      thinking.map((piece) => piece.text).join(""),
+    );
+    expect(finished[1]?.text).toBe(reply.map((piece) => piece.text).join(""));
+
+    // The rest of the stream — `message_start`, block starts and stops, the signature,
+    // `message_delta`, `message_stop` — narrates nothing: one entry per delta and no more.
+    expect(
+      entries.filter((entry) => entry.type === "stream_event").length,
+    ).toBe(pieces.length);
+    // The usage join and the outcome read the same frames as before: the call's id from
+    // its `assistant` frames, the exact count from the `result`, the outcome on it alone.
+    expect(
+      entries.flatMap((entry) =>
+        entry.detail._tag === "usage" ? [entry.detail.callId] : [],
+      ),
+    ).toEqual([message, message, message]);
+    expect(entries.flatMap((entry) => entry.outcome ?? [])).toEqual([
+      "succeeded",
+    ]);
+    expect(entries.at(-1)?.type).toBe("result");
+  });
+
+  test("published through the coalescer, a block's partials grow and its finished block replaces them", async () => {
+    const frames = await partialFrames("thinking-then-reply");
+    const message = streamedMessageId(frames);
+    const out = await coalesced(await narrated(frames));
+    const reply = `${message}:1`;
+    const shown = out.flatMap((entry) =>
+      entry.detail._tag === "partial" && entry.detail.blockId === reply
+        ? [entry.detail.text]
+        : [],
+    );
+    const finishedAt = out.findIndex(
+      (entry) =>
+        entry.detail._tag === "reply" && entry.detail.blockId === reply,
+    );
+    const finished = out[finishedAt]?.detail;
+    if (finished?._tag !== "reply") throw new Error("no finished reply");
+    expect(shown.length).toBeGreaterThan(0);
+    expect(finished.text.startsWith(shown[0] ?? "-")).toBe(true);
+    // The last partial is the whole block, and nothing about it follows the finished block.
+    expect(shown.at(-1)).toBe(finished.text);
+    expect(
+      out
+        .slice(finishedAt + 1)
+        .some(
+          (entry) =>
+            entry.detail._tag === "partial" && entry.detail.blockId === reply,
+        ),
+    ).toBe(false);
+  });
+
+  test("a subagent's frames between the main thread's deltas take no id and move none", async () => {
+    const frames = await partialFrames("beside-a-subagent");
+    const message = streamedMessageId(frames);
+    // The CLI forwarded no subagent `stream_event` in this run, so one is made here from a
+    // real main-thread delta: the same frame, nested under the `Agent` call, the shape
+    // `SDKPartialAssistantMessage.parent_tool_use_id` documents.
+    const at = frames.findIndex(
+      (frame) =>
+        frame.type === "stream_event" &&
+        (frame as { event: { type: string } }).event.type ===
+          "content_block_delta",
+    );
+    const real = frames[at] as unknown as {
+      event: { index: number; delta: Record<string, unknown> };
+    };
+    const nested = {
+      ...real,
+      parent_tool_use_id: "toolu_018ecppo3bZ4oAT1uoxXwXMi",
+      event: {
+        ...real.event,
+        index: 7,
+        delta: { type: "text_delta", text: "SUBAGENT" },
+      },
+    } as unknown as SDKMessage;
+    const entries = await narrated([
+      ...frames.slice(0, at),
+      nested,
+      ...frames.slice(at),
+    ]);
+
+    expect(
+      deltas(entries).some((piece) => piece.text.includes("SUBAGENT")),
+    ).toBe(false);
+    expect(new Set(deltas(entries).map((piece) => piece.blockId))).toEqual(
+      new Set([`${message}:0`, `${message}:1`]),
+    );
+    // The subagent's thinking and `PONG` still narrate, with no id: they are not this
+    // call's blocks, though they arrived while its block 0 was open.
+    expect(blocks(entries).map((block) => [block._tag, block.blockId])).toEqual(
+      [
+        ["thinking", undefined],
+        ["reply", undefined],
+        ["thinking", `${message}:0`],
+        ["reply", `${message}:1`],
+      ],
+    );
+    expect(blocks(entries)[1]?.text).toBe("PONG");
+  });
+
+  test("a reply cut by a Stop ends with the CLI's cut block, under the streamed id, then the outcome", async () => {
+    const frames = await partialFrames("interrupted-reply");
+    const message = streamedMessageId(frames);
+    const entries = await narrated(frames, true);
+    const reply = `${message}:1`;
+    const streamed = deltas(entries)
+      .filter((piece) => piece.blockId === reply)
+      .map((piece) => piece.text)
+      .join("");
+    const cut = blocks(entries).find((block) => block._tag === "reply");
+    expect(cut?.blockId).toBe(reply);
+    expect(cut?.text).toBe(streamed);
+    expect(entries.at(-1)?.outcome).toBe("interrupted");
+
+    const out = await coalesced(entries);
+    const finishedAt = out.findIndex(
+      (entry) =>
+        entry.detail._tag === "reply" && entry.detail.blockId === reply,
+    );
+    expect(finishedAt).toBeGreaterThan(-1);
+    expect(
+      out
+        .slice(finishedAt + 1)
+        .some((entry) => entry.detail._tag === "partial"),
+    ).toBe(false);
+  });
+
+  test("a cut block the CLI sends no frame for is ended by the turn's outcome, with its held text", async () => {
+    const frames = await partialFrames("interrupted-reply");
+    const message = streamedMessageId(frames);
+    const reply = `${message}:1`;
+    // As though the CLI sent nothing for the cut block, which this build has not seen but
+    // cannot rule out (a cut during thinking, a later CLI).
+    const entries = await narrated(
+      without(
+        frames,
+        (frame) =>
+          frame.type === "assistant" &&
+          (frame as { message: { content: { type: string }[] } }).message
+            .content[0]?.type === "text",
+      ),
+      true,
+    );
+    const streamed = deltas(entries)
+      .filter((piece) => piece.blockId === reply)
+      .map((piece) => piece.text)
+      .join("");
+    const out = await coalesced(entries);
+    const resultAt = out.findIndex((entry) => entry.type === "result");
+    const partials = out.flatMap((entry, index) =>
+      entry.detail._tag === "partial" && entry.detail.blockId === reply
+        ? [{ index, text: entry.detail.text }]
+        : [],
+    );
+    // Everything streamed is sent, before the turn's end, and nothing after it.
+    expect(partials.at(-1)?.text).toBe(streamed);
+    expect(partials.every((partial) => partial.index < resultAt)).toBe(true);
+    expect(out[resultAt]?.outcome).toBe("interrupted");
   });
 });
 

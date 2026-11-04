@@ -378,6 +378,14 @@ export const liveClaudeCodeSdk: ClaudeCodeSdk = {
   sessionInfo: (sessionId, options) => sdkGetSessionInfo(sessionId, options),
 };
 
+/** The main thread's block being streamed. See {@link SessionRecord.streamed}. */
+interface StreamedBlock {
+  messageId: string | undefined;
+  index: number | undefined;
+  /** The block's `content_block.type` at its start: `text`, `thinking`, `tool_use`, … */
+  kind: string | undefined;
+}
+
 /** Everything one session is, before and after it is running. */
 interface SessionRecord {
   readonly sessionId: string;
@@ -576,6 +584,27 @@ interface SessionRecord {
    * `assistant` frame states no usage rather than inventing a call to hang it on.
    */
   lastCallId: string | undefined;
+  /**
+   * The main thread's block being streamed, from its `stream_event` frames (A6 F8).
+   *
+   * **How a finished block finds its stream index.** A delta's `blockId` is the call's
+   * `message.id` and the content block's `index`, but a delta frame carries only the index
+   * and the CLI's finished `assistant` frame carries only the message: it splits one call
+   * into one frame per block, each holding that block alone at position 0 (measured on
+   * 2.1.310). So the stream's own order joins them, as {@link lastCallId} joins a `result`
+   * to its call: `message_start` names the message, `content_block_start` the block, and
+   * the Messages API streams one block at a time, start to stop. The CLI sends a block's
+   * `assistant` frame after its last delta and before its `content_block_stop` — before the
+   * next block can start — so the block started last is the one a main-thread `assistant`
+   * frame of the same message finishes, whichever side of the stop it lands.
+   *
+   * Only the main thread sets it ({@link fromSubagent}), and a frame it does not fit — a
+   * subagent's, another message's, a block of another kind, a frame holding several blocks
+   * — gets no `blockId` rather than a wrong one. Empty on a session that asked for no
+   * partial messages, whose finished blocks therefore carry none. Kept until the next
+   * `message_start`, never cleared by a stop, so a late `assistant` frame still finds it.
+   */
+  streamed: StreamedBlock;
   /**
    * Set by {@link interruptSession}, so the outcome is `interrupted` and not `failed`.
    * Cleared at the next `result` on a multi-turn session, whose query outlives the turn.
@@ -880,8 +909,11 @@ const resultText = (value: unknown): string => {
  *
  * - `assistant` → `text` blocks become `reply`, `tool_use` blocks (`{ id, name, input }`)
  *   become `toolCall`, `thinking` blocks become `thinking`. All three are complete when
- *   they arrive; the SDK streams partial content as `stream_event` messages, which this
- *   build does not ask for.
+ *   they arrive. A `reply` or `thinking` the stream wrote first carries that stream's
+ *   `blockId` ({@link finishedBlockKey}), so it ends and replaces its partials.
+ * - `stream_event` → a main-thread `text_delta` or `thinking_delta` becomes a `delta`
+ *   ({@link narrateStreamEvent}); every other stream frame narrates **nothing**. Only a
+ *   conversation asks for these frames (`includePartialMessages`, A6 F8).
  * - `assistant` → one `usage` entry as well, from `message.usage`. See
  *   {@link usageOfAssistant} for why its output count is omitted rather than reported, and
  *   why several frames of one call carrying the same figures is correct here.
@@ -892,7 +924,11 @@ const resultText = (value: unknown): string => {
  *   `toolResult`. A tool's output comes back as a *user* message because that is how the
  *   Messages API carries it, which reads oddly and is the SDK's shape rather than ours.
  * - everything else → one `opaque` entry, so the stream's shape and the supervisor's
- *   outcome watch are unchanged by this mapping.
+ *   outcome watch are unchanged by this mapping. `stream_event` is the exception, above:
+ *   one call streams hundreds of frames — a `tool_use` block's input arrives as
+ *   `input_json_delta`s — and an `opaque` entry for each would crowd a conversation's
+ *   sliding narration bus (`run/narration.ts`) with entries nothing renders. None of them
+ *   carries an outcome; the `result` still does.
  *
  * **`toolResult.tool` is `undefined` here, and it is not an oversight.** A `tool_result`
  * block names the call it answers (`tool_use_id`) and not the tool, and the id is enough
@@ -1050,6 +1086,90 @@ const usageOfResult = (
   };
 };
 
+/**
+ * The `blockId` a Claude Code block streams and finishes under: the call's `message.id` and
+ * the content block's index **in the stream**. Unique within a session because a message
+ * id is one API call's. See {@link SessionRecord.streamed} for how a finished block, which
+ * carries no index, is given the same one.
+ */
+export const claudeCodeBlockId = (messageId: string, index: number): string =>
+  `${messageId}:${String(index)}`;
+
+/**
+ * What one `stream_event` narrates: a delta for a main-thread `text_delta` or
+ * `thinking_delta`, and nothing for anything else. The block bookkeeping frames update
+ * {@link SessionRecord.streamed} on the way.
+ *
+ * A subagent's frames are skipped whole, before anything is read or remembered: its blocks
+ * are not this session's call, and letting its `message_start` replace the main thread's
+ * would give the main thread's finished block no id — or the subagent's a wrong one. The
+ * CLI 2.1.310 forwarded none in the run the fixtures come from, so this is the documented
+ * `parent_tool_use_id` meaning, held to as {@link fromSubagent} holds to it.
+ *
+ * `input_json_delta` (a tool call's arguments being written), `signature_delta` and
+ * `citations_delta` stay out: a tool call narrates once, finished, as before.
+ */
+const narrateStreamEvent = (
+  message: Extract<SDKMessage, { type: "stream_event" }>,
+  streamed: StreamedBlock,
+): readonly NarrationDetail[] => {
+  if (fromSubagent(message)) return [];
+  const event = message.event;
+  switch (event.type) {
+    case "message_start":
+      streamed.messageId =
+        typeof event.message.id === "string" ? event.message.id : undefined;
+      streamed.index = undefined;
+      streamed.kind = undefined;
+      return [];
+    case "content_block_start":
+      streamed.index = Number.isInteger(event.index) ? event.index : undefined;
+      streamed.kind = event.content_block.type;
+      return [];
+    case "content_block_delta": {
+      if (streamed.messageId === undefined || !Number.isInteger(event.index)) {
+        return [];
+      }
+      const blockId = claudeCodeBlockId(streamed.messageId, event.index);
+      const delta = event.delta;
+      if (delta.type === "text_delta") {
+        return [{ _tag: "delta", blockId, channel: "reply", text: delta.text }];
+      }
+      if (delta.type === "thinking_delta") {
+        return [
+          { _tag: "delta", blockId, channel: "thinking", text: delta.thinking },
+        ];
+      }
+      return [];
+    }
+    default:
+      return [];
+  }
+};
+
+/**
+ * The `blockId` key for a finished `text` or `thinking` block, when it is the block the
+ * main thread's stream was writing — `{}` otherwise. See {@link SessionRecord.streamed}.
+ *
+ * Only a frame holding that one block fits: the CLI splits a call into one `assistant`
+ * frame per block, so a frame holding several is not one this join can name.
+ */
+const finishedBlockKey = (
+  message: SDKMessage,
+  blockCount: number,
+  kind: "text" | "thinking",
+  streamed: StreamedBlock,
+): { readonly blockId?: string } => {
+  if (fromSubagent(message) || blockCount !== 1) return {};
+  const id = (message as { message?: { id?: unknown } }).message?.id;
+  return typeof id === "string" &&
+    id === streamed.messageId &&
+    streamed.index !== undefined &&
+    streamed.kind === kind
+    ? { blockId: claudeCodeBlockId(id, streamed.index) }
+    : {};
+};
+
 const narrate = (
   message: SDKMessage,
   outcome: TerminalOutcome | undefined,
@@ -1060,7 +1180,7 @@ const narrate = (
    * two facts a usage entry needs are not on the frame that needs them. It is one object
    * per session, so one session's call ids can never be read for another's.
    */
-  session: Pick<SessionRecord, "contextLimit" | "lastCallId">,
+  session: Pick<SessionRecord, "contextLimit" | "lastCallId" | "streamed">,
 ): readonly HarnessNarration[] => {
   const at = Date.now();
   const frame = (detail: NarrationDetail): HarnessNarration => ({
@@ -1070,6 +1190,12 @@ const narrate = (
     outcome,
     detail,
   });
+
+  // A stream frame narrates its delta or nothing — never `opaque`; see this function's
+  // header. It carries no outcome: only a `result` does.
+  if (message.type === "stream_event") {
+    return narrateStreamEvent(message, session.streamed).map(frame);
+  }
 
   // Read off an `unknown` view of the message rather than narrowing the SDK's own union:
   // `BetaMessage`'s content blocks are a wide, version-specific union, and asserting a
@@ -1091,7 +1217,11 @@ const narrate = (
         input?: unknown;
       };
       if (record.type === "text" && typeof record.text === "string") {
-        details.push({ _tag: "reply", text: truncateNarration(record.text) });
+        details.push({
+          _tag: "reply",
+          text: truncateNarration(record.text),
+          ...finishedBlockKey(message, blocks.length, "text", session.streamed),
+        });
       } else if (
         record.type === "thinking" &&
         typeof record.thinking === "string"
@@ -1103,6 +1233,12 @@ const narrate = (
         details.push({
           _tag: "thinking",
           text: truncateNarration(record.thinking),
+          ...finishedBlockKey(
+            message,
+            blocks.length,
+            "thinking",
+            session.streamed,
+          ),
         });
       } else if (record.type === "tool_use" && typeof record.id === "string") {
         details.push({
@@ -2041,6 +2177,18 @@ export const claudeCodeHarness = (
                   forwardSubagentText: true,
                   // Needed for `messages` to have anything to read later.
                   persistSession: true,
+                  /*
+                   * A block streamed as it is written (A6 F8), for a conversation only.
+                   *
+                   * Only the importer and goal conversations show partials, and they are
+                   * the only `multiTurn` sessions (`harness/liveAgentSessions.ts`). A
+                   * worker's attempt and a planner round would have each block's
+                   * hundreds of frames serialised by the CLI, parsed by the SDK and
+                   * mapped here only for their supervisors to drop the deltas before the
+                   * bus (`narratesOnSharedBus`); the option is per `query()`, so they do
+                   * not ask. Their finished blocks then carry no `blockId`, as before.
+                   */
+                  includePartialMessages: record.multiTurn,
                   // This harness starts the CLI, so that ending the session can stop it at
                   // once; stderr is read there. See `spawnOwnedCli`.
                   spawnClaudeCodeProcess: spawnOwnedCli(record),
@@ -2144,6 +2292,7 @@ export const claudeCodeHarness = (
           tokens: undefined,
           contextLimit: undefined,
           lastCallId: undefined,
+          streamed: { messageId: undefined, index: undefined, kind: undefined },
           interrupted: false,
           tasks: new Map<string, TrackedTask>(),
           closed: false,

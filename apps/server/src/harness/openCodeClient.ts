@@ -557,6 +557,10 @@ const blockKey = (channel: BlockChannel, data: Record<string, unknown>) => {
  * **separately** for text and for reasoning within one message, both from 0. So the
  * `blockId` is {@link openCodeBlockId}: the message, the channel and the ordinal, the same
  * on every event of the block, which is what lets the finished block replace its partials.
+ * Its uniqueness rests on one 2.2.5 behaviour: a retried step (`Retry`, `RecoverFull`, an
+ * overflow `Compacted`) reuses the `assistantMessageID` and restarts the ordinals at 0, which
+ * is safe only because those retries happen before any output has started
+ * (`runner/step.ts`, `!outputStarted`) — an OpenCode upgrade must re-check this.
  * The publisher sends a block's last batched delta before its `ended`, on the one ordered
  * stream, so no delta follows its block's end.
  *
