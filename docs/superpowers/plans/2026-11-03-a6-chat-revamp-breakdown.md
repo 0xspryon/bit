@@ -178,7 +178,10 @@ turns boxed with "You · 18:02"; consecutive tool calls collapse to one muted li
 away; reasoning collapses to one truncated line (markdown); turn footer
 "Importer · <model> · 41s"; record-write states kept.
 
-**U5 — Live streaming in the thread (S), F6 + U4 → U5.** From F6: request the live stream with `?partials=1`;
+**U5 — Live streaming in the thread (S), F6 + U4 → U5.** From U4's last fix round: a reload while Claude Code is partway through a
+text block shows "The harness holds this message and no reply to it." until the block
+finishes (the CLI writes a block only once complete, and partials from before the reload are
+not resent) — show the turn as in progress ("writing…") instead. From F6: request the live stream with `?partials=1`;
 replace by `blockId` and never add a partial's `id` to the shown-ids set; when the session
 goes idle, hide "writing…" for any partial with no finished block; on stream reopen, drop
 every partial (finished blocks replayed after a gap carry no `blockId`). From F7's live run (GLM 5.3): `session.reasoning.ended` arrives only at the
