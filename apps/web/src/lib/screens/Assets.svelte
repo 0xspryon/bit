@@ -41,6 +41,7 @@
     type ScopeKind,
     type ScopeState,
   } from "@bit/contracts";
+  import { flushSync } from "svelte";
 
   import type { App } from "../app.svelte";
   import Banner from "../components/Banner.svelte";
@@ -62,17 +63,53 @@
   let { app }: { app: App } = $props();
 
   /**
-   * The entry field, so the empty state's button can reach it.
+   * The entry field, so the empty state's buttons can reach it. `undefined` while the Add
+   * bar is not on screen ({@link addShown}).
    *
-   * The panel that carries "Add the first entry" is the Scope tab's right-hand column and
-   * the field is its left-hand one, both mounted together, so the button hands the
-   * operator the thing it names rather than setting a state flag. Before this it assigned
-   * `entryValue = ""` to an already-empty field, which is the design's "action that
-   * appears to work and does nothing" on the first screen a new target shows.
+   * "Add an entry by hand" and the panel's "Add the first entry" both hand the operator the
+   * field they name ({@link toEntryField}) rather than only setting a state flag. An earlier
+   * version assigned `entryValue = ""` to an already-empty field, which is the design's
+   * "action that appears to work and does nothing" on the first screen a new target shows.
    */
   let entryField = $state<HTMLInputElement | undefined>(undefined);
 
   let scope = $derived(app.viewScope);
+
+  /**
+   * The target the operator asked to type an entry on, from the empty state, or `""`.
+   *
+   * A6 D1 draws an empty scope as the empty state and the strip, and no Add bar: the bar is
+   * what **Add an entry by hand** opens. With the bar always there the button could only
+   * focus a field already on screen, and the empty state read as a form with a heading.
+   * Held as a target id rather than a flag, so asking on one target does not open the bar on
+   * the next one's empty state.
+   */
+  let handEntryFor = $state("");
+
+  /**
+   * Whether the Add bar is on screen: always once there are entries, and on an empty scope
+   * once it was asked for — or while it still holds something the operator typed or a
+   * refusal of it, so deleting the last entry never takes a half-typed entry away.
+   */
+  let addShown = $derived(
+    scope !== undefined &&
+      (scope.entries.length > 0 ||
+        handEntryFor === app.viewTargetId ||
+        app.entryValue.trim() !== "" ||
+        app.scopeRefusal !== ""),
+  );
+
+  /**
+   * Hands the operator the entry field: opens the Add bar if the empty state is hiding it,
+   * then focuses the field. `flushSync` mounts the bar inside this click, so the field the
+   * button names is focused by the click that named it rather than a frame later.
+   */
+  const toEntryField = (): void => {
+    handEntryFor = app.viewTargetId;
+    flushSync();
+    entryField?.scrollIntoView({ block: "nearest" });
+    entryField?.focus();
+  };
 
   /**
    * The entry the delete dialog is asking about, read from the entries as they are now.
@@ -487,9 +524,10 @@
               how to get one.
 
               Both buttons are the same decision made two ways. The importer is a page; the
-              hand entry is the form beside this, so that button hands the operator the
-              field it names rather than describing it. `data-focus-fallback` because
-              deleting the last entry lands here: the lists it was in are gone with it.
+              hand entry is the Add bar, which D1 keeps off an empty scope until this
+              button opens it — then it hands the operator the field it names (`addShown`).
+              `data-focus-fallback` because deleting the last entry lands here: the lists
+              it was in are gone with it.
             -->
             <div
               class="empty scope-empty"
@@ -513,14 +551,7 @@
                   <IconDownload width="14" height="14" />
                   Auto-load scope…
                 </Button>
-                <Button
-                  size="page"
-                  variant="outline"
-                  onclick={() => {
-                    entryField?.scrollIntoView({ block: "nearest" });
-                    entryField?.focus();
-                  }}
-                >
+                <Button size="page" variant="outline" onclick={toEntryField}>
                   <IconPlus width="14" height="14" />
                   Add an entry by hand
                 </Button>
@@ -672,8 +703,11 @@
 
             "Continue" selects the session and opens the page; it does not prompt it.
           -->
+          <!-- While it is the only bar at the bottom it spans the column under the centred
+               empty state, as D1 draws it; once the Add bar is there it keeps that bar's
+               width, so the two stack as one column. -->
           <div
-            class="last-session"
+            class={["last-session", !addShown && "wide"]}
             role="group"
             aria-label="Last importer session"
           >
@@ -695,77 +729,79 @@
           </div>
         {/if}
 
-        <form
-          class="add"
-          onsubmit={(event) => {
-            event.preventDefault();
-            void app.addScopeEntry();
-          }}
-        >
-          <span class="list-label">Add an entry</span>
-          <div class="add-row">
-            <div class="toggle">
-              <button
-                type="button"
-                class={["toggle-half", app.entryEffect === "in" && "on"]}
-                aria-pressed={app.entryEffect === "in"}
-                onclick={() => (app.entryEffect = "in")}>In</button
+        {#if addShown}
+          <form
+            class="add"
+            onsubmit={(event) => {
+              event.preventDefault();
+              void app.addScopeEntry();
+            }}
+          >
+            <span class="list-label">Add an entry</span>
+            <div class="add-row">
+              <div class="toggle">
+                <button
+                  type="button"
+                  class={["toggle-half", app.entryEffect === "in" && "on"]}
+                  aria-pressed={app.entryEffect === "in"}
+                  onclick={() => (app.entryEffect = "in")}>In</button
+                >
+                <button
+                  type="button"
+                  class={["toggle-half", app.entryEffect === "out" && "on"]}
+                  aria-pressed={app.entryEffect === "out"}
+                  onclick={() => (app.entryEffect = "out")}>Out</button
+                >
+              </div>
+              <select
+                bind:value={app.entryKind}
+                aria-label="What this entry covers"
               >
-              <button
-                type="button"
-                class={["toggle-half", app.entryEffect === "out" && "on"]}
-                aria-pressed={app.entryEffect === "out"}
-                onclick={() => (app.entryEffect = "out")}>Out</button
+                {#each KINDS as kind (kind.id)}
+                  <option value={kind.id}>{kind.label}</option>
+                {/each}
+              </select>
+              <input
+                class="mono value"
+                type="text"
+                bind:this={entryField}
+                bind:value={app.entryValue}
+                placeholder="acme.test"
+                aria-label="Host, apex or address block"
+              />
+              <Button
+                type="submit"
+                variant="primary"
+                size="sm"
+                loading={app.scopeBusy}
+                disabled={app.entryValue.trim() === ""}
               >
+                Add
+              </Button>
             </div>
-            <select
-              bind:value={app.entryKind}
-              aria-label="What this entry covers"
-            >
-              {#each KINDS as kind (kind.id)}
-                <option value={kind.id}>{kind.label}</option>
-              {/each}
-            </select>
-            <input
-              class="mono value"
-              type="text"
-              bind:this={entryField}
-              bind:value={app.entryValue}
-              placeholder="acme.test"
-              aria-label="Host, apex or address block"
-            />
-            <Button
-              type="submit"
-              variant="primary"
-              size="sm"
-              loading={app.scopeBusy}
-              disabled={app.entryValue.trim() === ""}
-            >
-              Add
-            </Button>
-          </div>
-          <!-- What this entry will mean, before it is added. The same sentence the row
+            <!-- What this entry will mean, before it is added. The same sentence the row
                will show and the agent will read. -->
-          {#if app.entryValue.trim() !== ""}
-            <p class="preview-line mono">
-              {describeScopeEntry({
-                kind: app.entryKind,
-                value: app.entryValue.trim(),
-              })}{app.entryEffect === "out" ? " — excluded" : ""}
-            </p>
-          {/if}
-          {#if app.scopeRefusal !== ""}
-            <div
-              class={[
-                "refusal",
-                app.scopeRefusalContradiction && "contradiction",
-              ]}
-              role="alert"
-            >
-              {app.scopeRefusal}
-            </div>
-          {/if}
-        </form>
+            {#if app.entryValue.trim() !== ""}
+              <p class="preview-line mono">
+                {describeScopeEntry({
+                  kind: app.entryKind,
+                  value: app.entryValue.trim(),
+                })}{app.entryEffect === "out" ? " — excluded" : ""}
+              </p>
+            {/if}
+            {#if app.scopeRefusal !== ""}
+              <div
+                class={[
+                  "refusal",
+                  app.scopeRefusalContradiction && "contradiction",
+                ]}
+                role="alert"
+              >
+                {app.scopeRefusal}
+              </div>
+            {/if}
+          </form>
+        {/if}
       </div>
     {/if}
   {/snippet}
@@ -791,8 +827,7 @@
               // The panel overlays the page below 1280px, so it has to get out of the
               // way of the field this button names before the field is focused.
               app.scopeBlockOpen = false;
-              entryField?.scrollIntoView({ block: "nearest" });
-              entryField?.focus();
+              toEntryField();
             }}
           >
             <IconPlus width="13" height="13" />
@@ -1490,6 +1525,10 @@
   .scope-empty {
     flex: 1;
     justify-content: center;
+    /* D1's own measure: 14px between the parts and a 560px column, so the lead breaks
+       after "or" rather than leaving "you, or" to start its second line. */
+    gap: 14px;
+    max-width: 560px;
     margin: 24px auto;
   }
   .scope-empty:focus {
@@ -1509,6 +1548,11 @@
     border-radius: 7px;
     background: var(--bg-deep);
     color: var(--icon-muted);
+  }
+  /* Under the empty state there is no list or Add bar for it to line up with, and D1 runs
+     it across the column. */
+  .last-session.wide {
+    max-width: none;
   }
   .last-text {
     flex: 1;

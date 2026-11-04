@@ -156,7 +156,10 @@ describe("the last-session strip", () => {
     // The newest one's tally, not the older one's "wrote nothing".
     expect(said).toContain("wrote 7 in · 3 out · 14 assets.");
     expect(said).not.toContain("ended without");
-    // Under the empty state and above the form, which is where D1 draws it.
+    // Across the column, as D1 draws it under the empty state: there is no list or Add bar
+    // there for it to keep the 760px reading width of.
+    expect(found?.className ?? "").toContain("wide");
+    // Under the empty state, which is where D1 draws it.
     const empty = document.querySelector(".scope-empty");
     expect(
       empty !== null &&
@@ -197,6 +200,8 @@ describe("the last-session strip", () => {
     expect(strip()?.textContent?.replace(/\s+/g, " ")).toContain(
       "wrote 7 in · 3 out · 14 assets.",
     );
+    // Beside entries it keeps the width of the lists and the Add bar it sits between.
+    expect(strip()?.className ?? "").not.toContain("wide");
     // The primary button has moved to the header, and is the only door in beside the strip.
     expect(hasButton("Auto-load…")).toBe(true);
     expect(hasButton("Auto-load scope…")).toBe(false);

@@ -652,7 +652,18 @@ describe("the Scope tab", () => {
   });
 
   test("the add form offers the three reaches by name, not by jargon", async () => {
-    const html = await scopeBody(() => {});
+    // A scope with an entry: on an empty one A6 D1 keeps the bar behind "Add an entry by
+    // hand" (dom/autoLoad.test.ts), and the form's words are the claim here.
+    const html = await scopeBody((fake) => {
+      fake.onScope = () =>
+        ok(
+          emptyScope({
+            entries: [
+              entry({ effect: "in", kind: "subtree", value: "acme.test" }),
+            ],
+          }),
+        );
+    });
     // The operator picks what the entry covers in words. `subtree` is our word, not
     // theirs, and a control labelled with it would be the silent-coverage problem moved
     // into the form.

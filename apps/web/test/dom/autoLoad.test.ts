@@ -17,7 +17,7 @@ import { App } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
-import { FakeServer, emptyScope, ok } from "../fakeServer";
+import { FakeServer, emptyScope, importerSessionView, ok } from "../fakeServer";
 import { click, mountInto, settle, type Mounted } from "./dom";
 
 const entry = (value: string): ScopeEntryView => ({
@@ -111,20 +111,74 @@ describe("an empty Scope tab", () => {
     expect(fake.countOf("startScopeImport")).toBe(0);
   });
 
-  test("Add an entry by hand puts focus in the entry field", async () => {
+  test("D1 draws no Add bar under the empty state: the button is what opens it", async () => {
     await openScope();
-    const field = document.querySelector<HTMLInputElement>(
-      'input[aria-label="Host, apex or address block"]',
-    );
-    if (field === null) throw new Error("no entry field on the Scope tab");
-    expect(document.activeElement).not.toBe(field);
+    // Before this the bar was always there and the button could only focus a field already
+    // on screen; D1 has the empty state and the strip, and nothing else.
+    expect(document.querySelector("form.add")).toBeNull();
+    expect(document.querySelector(field)).toBeNull();
+    // The empty state is what the tab shows.
+    expect(
+      document.querySelector(".scope-empty .empty-lead")?.textContent?.trim(),
+    ).toBe("No scope authored for this target");
+  });
+
+  test("Add an entry by hand opens the Add bar and puts focus in its field, in the one click", async () => {
+    await openScope();
 
     click(button("Add an entry by hand"));
 
-    // Not a flag set somewhere: the field it names, focused.
-    expect(document.activeElement).toBe(field);
+    // Not a flag set somewhere: the field it names, on screen and focused — with no settle
+    // between, because the click that names it is the one that has to hand it over.
+    const found = document.querySelector<HTMLInputElement>(field);
+    if (found === null) throw new Error("the click did not open the Add bar");
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "Host, apex or address block",
+    );
+    // The empty state stays: the scope is still empty until something is added.
+    expect(hasButton("Auto-load scope…")).toBe(true);
+  });
+
+  test("the strip spans the column alone, and takes the Add bar's width once the bar is there", async () => {
+    const fake = new FakeServer();
+    fake.onScope = () => ok(emptyScope({ entries: [] }));
+    fake.onImporterSessions = () => ok({ sessions: [importerSessionView()] });
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    app.toSection("assets");
+    await settle();
+    app.toAssetsTab("scope");
+    await settle();
+    mounted = mountInto(Target, { app });
+    await settle();
+
+    const strip = (): string =>
+      document.querySelector('[aria-label="Last importer session"]')
+        ?.className ?? "no strip";
+    expect(strip()).toContain("wide");
+    click(button("Add an entry by hand"));
+    expect(strip()).not.toContain("wide");
+    expect(strip()).toContain("last-session");
+  });
+
+  test("what the operator started typing is not taken away when the last entry goes", async () => {
+    // The bar is hidden on an empty scope only while it holds nothing: deleting the last
+    // entry with a half-typed one in the field must not swallow it.
+    const { app } = await openScope();
+    expect(document.querySelector("form.add")).toBeNull();
+    app.entryValue = "api.acme.test";
+    await settle();
+    expect(document.querySelector<HTMLInputElement>(field)?.value ?? "").toBe(
+      "api.acme.test",
+    );
   });
 });
+
+/** The Add bar's value field, by its accessible name. */
+const field = 'input[aria-label="Host, apex or address block"]';
 
 describe("a Scope tab with entries", () => {
   test("the importer moves into the header as Auto-load…, and the empty state is gone", async () => {
@@ -132,6 +186,8 @@ describe("a Scope tab with entries", () => {
 
     expect(hasButton("Auto-load scope…")).toBe(false);
     expect(hasButton("Add an entry by hand")).toBe(false);
+    // With entries the Add bar is simply there, as it always was.
+    expect(document.querySelector(field)).not.toBeNull();
 
     click(button("Auto-load…"));
     await settle();
