@@ -395,6 +395,16 @@ export class ImporterSessions {
   }
 
   /**
+   * Forgets the server's registry, on sign-out: the next sign-in may be to another server,
+   * whose agents are its own. A page reached before that server's registry is read names no
+   * agent, rather than one this server may not define.
+   */
+  forgetServerAgents(): void {
+    this.#serverAgents = undefined;
+    if (this.#server !== undefined) this.agents = undefined;
+  }
+
+  /**
    * Picks the agent the empty session's first message opens a conversation as (D7).
    *
    * **Only before that message**: the agent is pinned once a conversation has started, so a

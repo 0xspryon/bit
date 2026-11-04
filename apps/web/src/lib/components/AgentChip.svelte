@@ -55,6 +55,14 @@
   } = $props();
 
   let open = $state(false);
+  /** The listbox's id, for the trigger's `aria-controls` while it is open. */
+  const listId = $props.id();
+  /**
+   * The row that holds the list's one tab stop (a roving tabindex): the agent in use when
+   * the list opens, then whichever row the arrows, Home or End moved to. Tab leaves the
+   * list from it rather than walking every row.
+   */
+  let active = $state("");
   let root = $state<HTMLDivElement | undefined>(undefined);
   let trigger = $state<HTMLButtonElement | undefined>(undefined);
   let list = $state<HTMLDivElement | undefined>(undefined);
@@ -100,16 +108,14 @@
     // The list is placed in the composer's box, above it, so it covers the conversation and
     // never the draft: D7 sets it 32px left of the chip, 18px in from the box's edge.
     left = Math.max(0, (trigger?.offsetLeft ?? 0) - 32);
+    active = agent?.id ?? agents?.agents[0]?.id ?? "";
     open = true;
   }
 
   /** The focus goes to the agent in use when the list opens, as a listbox's does. */
   const focusSelected = (node: HTMLDivElement) => {
     const rows = [...node.querySelectorAll<HTMLButtonElement>(".row")];
-    (
-      rows.find((row) => row.getAttribute("aria-selected") === "true") ??
-      rows[0]
-    )?.focus();
+    (rows.find((row) => row.tabIndex === 0) ?? rows[0])?.focus();
   };
 
   function pick(id: string): void {
@@ -126,7 +132,8 @@
       close(true);
       return;
     }
-    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    const moves = ["ArrowDown", "ArrowUp", "Home", "End"];
+    if (!moves.includes(event.key)) return;
     const focused = document.activeElement;
     if (list === undefined || focused === null || !list.contains(focused)) {
       return;
@@ -134,8 +141,19 @@
     event.preventDefault();
     const rows = [...list.querySelectorAll<HTMLButtonElement>(".row")];
     const at = rows.findIndex((row) => row === focused);
-    const delta = event.key === "ArrowDown" ? 1 : -1;
-    rows[Math.min(rows.length - 1, Math.max(0, at + delta))]?.focus();
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? rows.length - 1
+          : Math.min(
+              rows.length - 1,
+              Math.max(0, at + (event.key === "ArrowDown" ? 1 : -1)),
+            );
+    const row = rows[next];
+    if (row === undefined) return;
+    active = row.dataset.agent ?? active;
+    row.focus();
   }
 </script>
 
@@ -169,17 +187,17 @@
           : "The agent is fixed for this conversation."}
     >
       <IconDownload width="12" height="12" aria-hidden="true" />
-      <span class={["name", unknown && "raw"]}>{label}</span>
-      {#if unknown}
-        <span class="tag">unknown</span>
-      {/if}
-      {#if locked}
-        <span class="visually-hidden">
-          {unknown
+      <!--
+        The hidden words follow the name with no whitespace between them, so the accessible
+        text reads "Importer, fixed for this conversation" and not "Importer , fixed…".
+      -->
+      <span class={["name", unknown && "raw"]}>{label}</span>{#if unknown}<span
+          class="tag">unknown</span
+        >{/if}{#if locked}<span class="visually-hidden"
+          >{unknown
             ? ", an agent this server does not define"
-            : ", fixed for this conversation"}
-        </span>
-      {/if}
+            : ", fixed for this conversation"}</span
+        >{/if}
     </span>
   {:else}
     <button
@@ -188,6 +206,7 @@
       type="button"
       aria-haspopup="listbox"
       aria-expanded={open}
+      aria-controls={open ? listId : undefined}
       aria-label="Agent: {label}"
       title="The agent this conversation will run as. It is fixed once the first message is sent."
       onclick={toggle}
@@ -209,6 +228,7 @@
         <p class="head" aria-hidden="true">Agent</p>
         <div
           class="rows"
+          id={listId}
           role="listbox"
           aria-label="Agent"
           bind:this={list}
@@ -221,6 +241,8 @@
               type="button"
               role="option"
               aria-selected={selected}
+              tabindex={each.id === active ? 0 : -1}
+              data-agent={each.id}
               onclick={() => pick(each.id)}
             >
               <IconDownload

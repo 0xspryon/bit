@@ -10,7 +10,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 
-import type { ImporterSessionView } from "@bit/contracts";
+import type { AgentsView, ImporterSessionView } from "@bit/contracts";
 
 import { App, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
@@ -22,6 +22,7 @@ import {
   importerSessionView,
   importerTurnAccepted,
   ok,
+  unreachable,
 } from "../fakeServer";
 import { click, mountInto, press, settle, type Mounted } from "./dom";
 
@@ -95,8 +96,10 @@ const harness = {
 const openOn = async (
   sessions: ImporterSessionView[],
   sessionId?: string,
+  agents?: AgentsView,
 ): Promise<{ app: App; fake: FakeServer }> => {
   const fake = new FakeServer();
+  if (agents !== undefined) fake.onAgents = () => ok(agents);
   fake.onScope = () => ok(emptyScope());
   fake.onImporterSessions = () => ok({ sessions });
   fake.onHarnesses = () => ok([harness]);
@@ -121,6 +124,20 @@ const openOn = async (
   mounted.push(mountInto(TitleBar, { app }), mountInto(Target, { app }));
   await settle();
   return { app, fake };
+};
+
+/** A registry of three, so a list has rows to move between. */
+const THREE: AgentsView = {
+  agents: [
+    { id: "importer", label: "Importer", writes: WRITES },
+    {
+      id: "scout",
+      label: "Scout",
+      writes: "Assets it finds on the hosts in scope",
+    },
+    { id: "triage", label: "Triage", writes: "Notes on findings" },
+  ],
+  defaultAgentId: "scout",
 };
 
 describe("D7: before the first message", () => {
@@ -214,6 +231,65 @@ describe("D7: before the first message", () => {
   });
 });
 
+describe("D7's list from the keyboard", () => {
+  test("the list is one tab stop: the agent in use holds it, and the trigger controls the list while it is open", async () => {
+    await openOn([], undefined, THREE);
+    const chip = chipButton();
+    if (chip === null) throw new Error("no chip");
+    expect(chip.hasAttribute("aria-controls")).toBe(false);
+
+    click(chip);
+    await settle();
+
+    const id = listbox()?.id ?? "";
+    expect(id).not.toBe("");
+    expect(chip.getAttribute("aria-controls")).toBe(id);
+    // The registry's default is the agent in use before a pick.
+    expect(options().map((row) => row.tabIndex)).toEqual([-1, 0, -1]);
+    expect(document.activeElement).toBe(options()[1] ?? null);
+  });
+
+  test("arrows, Home and End move the focus and the one tab stop with it", async () => {
+    await openOn([], undefined, THREE);
+    const chip = chipButton();
+    if (chip === null) throw new Error("no chip");
+    click(chip);
+    await settle();
+
+    press("End");
+    await settle();
+    expect(document.activeElement).toBe(options()[2] ?? null);
+    expect(options().map((row) => row.tabIndex)).toEqual([-1, -1, 0]);
+
+    press("Home");
+    await settle();
+    expect(document.activeElement).toBe(options()[0] ?? null);
+    expect(options().map((row) => row.tabIndex)).toEqual([0, -1, -1]);
+
+    press("ArrowDown");
+    await settle();
+    expect(document.activeElement).toBe(options()[1] ?? null);
+    expect(options().map((row) => row.tabIndex)).toEqual([-1, 0, -1]);
+  });
+
+  test("Tab is left to the browser, which takes it out of the list, and the list closes behind it", async () => {
+    await openOn([], undefined, THREE);
+    const chip = chipButton();
+    if (chip === null) throw new Error("no chip");
+    click(chip);
+    await settle();
+
+    const tab = press("Tab");
+    expect(tab.defaultPrevented).toBe(false);
+    // happy-dom does not move focus on Tab: take the browser's step, to the next stop.
+    const next = document.querySelector<HTMLElement>("button.chip");
+    if (next === null) throw new Error("no model chip");
+    next.focus();
+    await settle();
+    expect(listbox()).toBeNull();
+  });
+});
+
 describe("D7: after the first message", () => {
   test("the chip is locked: no chevron, not a button, and it says the agent is fixed", async () => {
     await show("importer-first");
@@ -226,8 +302,8 @@ describe("D7: after the first message", () => {
     const chip = chipLabel();
     expect(chip).not.toBeNull();
     expect(chip?.querySelector(".caret")).toBeNull();
-    // Its accessible text: the agent, then that it is fixed.
-    expect(said(chip)).toBe("Importer , fixed for this conversation");
+    // Its accessible text: the agent, then that it is fixed, with no stray space between.
+    expect(said(chip)).toBe("Importer, fixed for this conversation");
     expect(said(chip?.querySelector(".visually-hidden"))).toBe(
       ", fixed for this conversation",
     );
@@ -305,6 +381,53 @@ describe("D7 against the server", () => {
     });
     expect(app.importer.current?.agentId).toBe("importer");
     expect(chipButton()).toBeNull();
+  });
+
+  test("while the first message is with the server the chip is pinned, and a pick changes nothing", async () => {
+    const { app, fake } = await openOn([], undefined, THREE);
+    const release = fake.hold("openImporterConversation");
+    typeInto(composer(), "Read https://hackerone.com/acme");
+    composer().focus();
+    press("Enter");
+    await settle();
+
+    expect(app.importer.sending).toBe(true);
+    expect(chipButton()).toBeNull();
+    expect(chipLabel()).not.toBeNull();
+    // A pick that reached the store anyway — a list left open, a stale handler — is refused:
+    // the message in flight was sent as the default agent, and the session must say so.
+    app.importer.pickAgent("triage");
+    await settle();
+    expect(app.importer.current?.agentId).toBeUndefined();
+
+    release();
+    await settle();
+    expect(app.importer.current?.agentId).toBe("scout");
+  });
+
+  test("signing out forgets the server's registry, so the next server's page names none it has not read", async () => {
+    const { app, fake } = await openOn([], undefined, THREE);
+    expect(app.importer.agents?.defaultAgentId).toBe("scout");
+
+    app.signOut();
+    expect(app.importer.agents).toBeUndefined();
+
+    // The next sign-in's registry does not answer: nothing of the last one may stand in.
+    fake.onAgents = () => unreachable("connection refused");
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    app.toSection("assets");
+    await settle();
+    app.openImporter();
+    await settle();
+
+    expect(app.importer.agents).toBeUndefined();
+    expect(chipButton()).toBeNull();
+    expect(chipLabel()?.getAttribute("title")).toBe(
+      "The server's agents have not been read.",
+    );
   });
 
   test("a first message with no pick carries no agent, and the server's default is shown pinned", async () => {

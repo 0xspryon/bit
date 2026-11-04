@@ -1935,6 +1935,7 @@ export class App {
     this.runDetail = "";
     // The next sign-in may be to another server, whose registry is its own.
     this.#agentsRead = false;
+    this.importer.forgetServerAgents();
     this.#clearGoals();
     // The connection carries a bearer that has just been dropped, so it has to go with it:
     // a stream left open on a signed-out session is a credential still in use. What it
