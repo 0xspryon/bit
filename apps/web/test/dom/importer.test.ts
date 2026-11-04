@@ -384,9 +384,14 @@ describe("D3: streaming", () => {
     expect(chips().filter((chip) => chip === "pending")).toHaveLength(1);
     expect(hasButton("Stop")).toBe(true);
     expect(text()).toContain("The importer is working");
-    // Mid-stream the composer is open for a correction, and the model cannot move.
+    // Mid-stream the composer is open for a correction, and the model can still move (D6):
+    // the harness is the session's, its models are not.
     expect(composer().disabled).toBe(false);
-    expect(text()).toContain("pinned while the session is running");
+    expect(text()).not.toContain("pinned while the session is running");
+    expect(text()).toContain("OpenCode for this session · any of its models");
+    expect(
+      document.querySelector('button[aria-label^="Model: "]'),
+    ).not.toBeNull();
   });
 
   test("Stop leaves the unfinished write unresolved rather than letting it read as pending for ever", async () => {
@@ -625,16 +630,20 @@ describe("D6: the model chip is the picker the operator already has", () => {
     expect(app.pickedModelOptions).toEqual([]);
   });
 
-  test("once a session has started its model is shown and not editable", async () => {
+  test("once a session has started its harness is pinned and its model chip switches the model", async () => {
     await show("importer-complete");
 
+    // Not the new session's picker: that one chooses a harness too.
     expect(
       document.querySelector('button[aria-label^="Harness and model"]'),
     ).toBeNull();
-    // A span, not a disabled button: "not ever" rather than "not yet".
-    const held = document.querySelector(".chip.held");
-    expect(held?.tagName).toBe("SPAN");
-    expect(held?.textContent).toContain("openai/gpt-5.6-sol");
+    const chip = document.querySelector('button[aria-label^="Model: "]');
+    expect(chip?.textContent).toContain("openai/gpt-5.6-sol");
+    expect(chip?.getAttribute("aria-label")).toBe(
+      "Model: openai/gpt-5.6-sol. Change this session's model",
+    );
+    // D3's caption beside it.
+    expect(text()).toContain("OpenCode for this session · any of its models");
   });
 });
 
@@ -805,7 +814,9 @@ describe("S5: the picker is not part of the composer it opens from", () => {
     app.importer.send();
     await settle();
     expect(headings()).toHaveLength(1);
-    expect(document.querySelector(".chip.held")).not.toBeNull();
+    expect(
+      document.querySelector('button[aria-label^="Model: "]'),
+    ).not.toBeNull();
     expect(dialog()).toBeNull();
     expect(app.importPickerOpen).toBe(false);
 

@@ -78,12 +78,19 @@
     onclose,
     opener,
     children,
+    footer,
   }: {
     /** Escape, or a click outside the panel. */
     onclose: () => void;
     /** The control that opened the dialog, which focus returns to when it closes. */
     opener: HTMLElement | null;
     children: Snippet;
+    /**
+     * D6's footer under the columns: a note and the actions, for a picker whose picks are
+     * staged and applied together ("Use for this session") rather than taking effect as
+     * they are made. Absent, the panel is the columns alone, as before.
+     */
+    footer?: Snippet;
   } = $props();
 
   let panel = $state<HTMLElement | null>(null);
@@ -126,14 +133,19 @@
           onclick={onclose}
         ></button>
         <div
-          class="panel"
+          class={["panel", footer !== undefined && "with-footer"]}
           role="dialog"
           aria-modal="true"
           aria-label="Choose a harness and model"
           tabindex="-1"
           bind:this={panel}
         >
-          {@render children()}
+          {#if footer === undefined}
+            {@render children()}
+          {:else}
+            <div class="columns">{@render children()}</div>
+            <div class="footer">{@render footer()}</div>
+          {/if}
         </div>
       </div>
     {/if}
@@ -198,6 +210,30 @@
     box-shadow: var(--elevation-overlay);
     background: var(--bg-layer-01);
     animation: rise var(--dur-panel) var(--ease-panel);
+  }
+  /*
+   * With D6's footer the panel is a column: the three columns over the footer, the columns
+   * taking what the footer leaves. 400 rather than 340 so the columns keep the height they
+   * had without one.
+   */
+  .panel.with-footer {
+    flex-direction: column;
+    max-height: min(100%, 400px);
+  }
+  .columns {
+    display: flex;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  /* D6: a hairline over it, the page's own surface, the note and the actions on one line. */
+  .footer {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border-top: 1px solid var(--border-base);
+    background: var(--bg-base);
   }
   /* A container that is focused so Tab starts inside it, not a control: no ring. */
   .panel:focus {

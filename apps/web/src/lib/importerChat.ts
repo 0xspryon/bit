@@ -67,10 +67,12 @@
  * already holds, not an answer only the server could give.
  */
 import type {
+  ConversationModelSwitched,
   ImporterContinuationRefusal,
   ImporterConversationView,
   ImporterSessionView,
   LiveItem,
+  ModelOptionSelection,
 } from "@bit/contracts";
 
 import {
@@ -280,6 +282,22 @@ export interface ImporterSession {
    * default (`AgentsView.defaultAgentId`). Never changed once the session has a message.
    */
   readonly agentId?: string;
+  /**
+   * The harness instance the session is pinned to (`HarnessInstanceView.instanceId`), when
+   * the server named it: the index row's, or the instance an accepted first message opened
+   * on. What a model switch is offered within — another instance is a new session.
+   */
+  readonly harnessInstanceId?: string;
+  /**
+   * What the session's model is set to, when this tab knows: the options its opening
+   * message sent, or what the server answered a switch with. Absent when unknown.
+   *
+   * V2(chat): the index row does not carry a session's model options, so after a reload the
+   * picker's Reasoning column starts on the model's default rather than the session's own
+   * setting — which is still what a switch from there sends, since the server sets exactly
+   * the options a switch names. V2 puts `modelOptions` on `ImporterSessionView`.
+   */
+  readonly modelOptions?: readonly ModelOptionSelection[];
 }
 
 /**
@@ -784,6 +802,9 @@ export const indexedSession = (
   indexed: true,
   importId: view.importId,
   agentId: view.agentId,
+  ...(view.harnessInstanceId === null
+    ? {}
+    : { harnessInstanceId: view.harnessInstanceId }),
   ...(view.endedReason === "operator" ? { ended: true } : {}),
   ...(strandedOn === undefined ? {} : { strandedOn }),
 });
@@ -805,4 +826,60 @@ export const lastSessionSentence = (
     return "ended without writing anything.";
   }
   return `wrote ${tallyLine({ in: entriesIn, out: entriesOut, assets, messages: null })}.`;
+};
+
+/** A model and its options as one phrase: `claude-sonnet-4-5 (effort: high)`. */
+const modelPhrase = (
+  model: string,
+  options: readonly ModelOptionSelection[],
+): string =>
+  options.length === 0
+    ? model
+    : `${model} (${options.map((each) => `${each.id}: ${each.value}`).join(", ")})`;
+
+/**
+ * What the composer says once a model switch was accepted (A6 F4, U3), honest about when
+ * it applies.
+ *
+ * - **Live, mid-turn**: the harness takes it from its **next model call**. The step already
+ *   running finishes on the old model — measured on both harnesses (F3/F4): a turn sent
+ *   before the switch still answered on the old model — so the sentence says so rather than
+ *   implying the reply being written has moved.
+ * - **Live, between turns**: the next message runs on it.
+ * - **Recorded**: this server does not hold the session, so only its record changed; the
+ *   next message reopens it on the new model.
+ * - **Unchanged**: the session was already on exactly this; nothing moved.
+ *
+ * Options the new model does not offer were dropped by the server, never sent, and are
+ * named by their ids — the ids the Reasoning column shows beside each setting.
+ */
+export const switchedNotice = (input: {
+  readonly switched: ConversationModelSwitched;
+  /** The model the session was on before, as this tab showed it. */
+  readonly previous: string;
+  /** Whether a turn was running when the switch was answered. */
+  readonly working: boolean;
+}): string => {
+  const { switched, previous, working } = input;
+  const now = modelPhrase(switched.model, switched.modelOptions);
+  const dropped = switched.droppedModelOptionIds;
+  const droppedLine =
+    dropped.length === 0
+      ? ""
+      : ` ${switched.model} does not offer ${dropped.join(", ")}, so ${
+          dropped.length === 1 ? "that setting was" : "those settings were"
+        } not sent.`;
+  if (!switched.changed) {
+    return `This session was already on ${now}, so nothing changed.${droppedLine}`;
+  }
+  const head = `Now on ${now}.`;
+  if (switched.applied === "recorded") {
+    return `${head} This session is not running on this server, so the change is recorded and your next message reopens it on ${switched.model}.${droppedLine}`;
+  }
+  if (working) {
+    const before =
+      previous === switched.model ? "its earlier settings" : previous;
+    return `${head} The importer takes it from its next model call: the step it is on now finishes on ${before}.${droppedLine}`;
+  }
+  return `${head} Your next message runs on it.${droppedLine}`;
 };

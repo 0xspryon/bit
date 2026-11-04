@@ -38,6 +38,7 @@ import {
   BitApi,
   GOAL_UPLOAD_FIELD,
   SessionGuard,
+  type ConversationModelDraft,
   type GoalDraft,
   type GoalEndDraft,
   type ImporterConversationDraft,
@@ -947,6 +948,27 @@ export const server = {
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.stopImporterTurn({ params: { targetId, importId } }),
+      ),
+    ),
+
+  /**
+   * Moves one import's session onto another model of its harness, or other options of its
+   * model (A6 F4). The answer's `applied` says whether the harness took it live — from its
+   * next model call — or only the record changed, for the next message to reopen on; a
+   * `ConversationModelRefused` carries the sentence the error dialog prints.
+   */
+  switchImporterModel: (
+    baseUrl: string,
+    targetId: string,
+    importId: string,
+    draft: ConversationModelDraft,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.switchImporterModel({
+          params: { targetId, importId },
+          payload: draft,
+        }),
       ),
     ),
 

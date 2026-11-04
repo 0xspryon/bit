@@ -1302,6 +1302,23 @@ export class FakeServer implements ServerClient {
   ) => Answer<"stopScopeImport"> = (_baseUrl, targetId, importId) =>
     ok(scopeImportView({ targetId, importId, status: "stopped" }));
 
+  /**
+   * A switch the harness took live and that changed the record: the dull answer to a model
+   * switch (A6 F4), echoing the model asked for with nothing dropped.
+   */
+  onSwitchImporterModel: (
+    ...args: Parameters<ServerClient["switchImporterModel"]>
+  ) => Answer<"switchImporterModel"> = (_baseUrl, _targetId, importId, draft) =>
+    ok({
+      conversationId: importId,
+      harnessInstanceId: "opencode",
+      model: draft.model,
+      modelOptions: [...(draft.modelOptions ?? [])],
+      droppedModelOptionIds: [],
+      applied: "live",
+      changed: true,
+    });
+
   /** A turn the harness stopped, settled: the dull answer to a Stop (A6 F5). */
   onStopImporterTurn: (
     ...args: Parameters<ServerClient["stopImporterTurn"]>
@@ -1519,6 +1536,13 @@ export class FakeServer implements ServerClient {
   stopImporterTurn = (...args: Parameters<ServerClient["stopImporterTurn"]>) =>
     this.record("stopImporterTurn", args, () =>
       this.onStopImporterTurn(...args),
+    );
+
+  switchImporterModel = (
+    ...args: Parameters<ServerClient["switchImporterModel"]>
+  ) =>
+    this.record("switchImporterModel", args, () =>
+      this.onSwitchImporterModel(...args),
     );
 
   stopGoalTurn = (...args: Parameters<ServerClient["stopGoalTurn"]>) =>

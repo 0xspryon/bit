@@ -17,44 +17,68 @@
    * form so that Enter in its filter is not a submission of the draft. The run composer's
    * picker is still a popover; that was not asked for.
    *
-   * ## Three states, because a session's model is not always the operator's to change
+   * ## Two faces, because a session is pinned to its harness and not to its model
    *
-   * - **A new session**: a real control. The chip is the model the server resolved (or the
-   *   operator's pick) and opens the picker, which is the only time a choice means anything.
-   * - **A session with messages**: the model it ran on, shown and not editable ("changing
-   *   harness starts a new session and never moves this one"). A span, not a button — a
-   *   disabled control reads as "not yet", and this one is "not ever".
-   * - **A session that is working**: the same, dimmed, with the composer's hint beside it.
+   * - **A new session**: picks take effect as they are made, as before. The chip is the model
+   *   the server resolved (or the operator's pick); any harness, any model.
+   * - **A started session** (D6, U3): the chip still opens the picker, now with D6's footer.
+   *   Picks are **staged** and applied together by "Use for this session", which asks the
+   *   server to switch the session's model (A6 F4) — one call, because the server refuses a
+   *   second switch while one is in flight, and a model then a reasoning level picked one
+   *   after the other would otherwise be two. The dialog stays open while the call is out,
+   *   so a refusal's `ErrorDialog` opens over it and closing that returns to the picker; an
+   *   accepted switch closes it and the chip shows the model the server answered with.
+   *   Another harness in the rail is **a new session**, and the footer says so before it is
+   *   confirmed: "Open a new session" starts one on that harness, carrying the draft over.
+   *
+   * A started session that cannot be talked to at all — stranded, ended, refused, or with
+   * no harness this page can resolve — keeps the plain label: there is nothing to switch.
    *
    * ## The Reasoning column
    *
    * D6's third column, and the same one the composer's picker renders
-   * ({@link ModelOptionsColumn}). It is a real control because the draft carries it:
-   * `ImportModelDraft.modelOptions`, `RunDraft`'s field, which the server resolves against
-   * the model it actually picked and hands to `createSession`. The state behind it is the
-   * importer's own (`importModelOptionsByModel`), kept apart from a run's.
+   * ({@link ModelOptionsColumn}). For a new session the draft carries it
+   * (`ImportModelDraft.modelOptions`), from the importer's own `importModelOptionsByModel`.
+   * For a started one it is what the switch sends (`ConversationModelDraft.modelOptions`):
+   * the server sets exactly the options a switch names, so the column says what the
+   * session will be on, and it starts from what this tab knows the session is set to.
    */
+  import {
+    droppedModelOptionIds,
+    explicitModelOptionSelections,
+    modelOptionDescriptors,
+    type ModelOptionSelection,
+  } from "@bit/contracts";
   import type { Attachment } from "svelte/attachments";
 
-  import type { App } from "../app.svelte";
+  import { withModelOptionPicked, type App } from "../app.svelte";
   import { IconAngleDown } from "../icons";
+  import ErrorDialog from "./ErrorDialog.svelte";
   import HarnessChoice from "./HarnessChoice.svelte";
   import HarnessDialog from "./HarnessDialog.svelte";
   import ModelOptionsColumn from "./ModelOptionsColumn.svelte";
 
+  /** A started session, as far as its model goes. */
+  interface PinnedModel {
+    /** The harness's display name: the glyph and the footer's words. */
+    readonly harness: string;
+    /** The instance the session is pinned to, when the server named it. */
+    readonly instanceId: string | undefined;
+    readonly model: string;
+    /** What the model is set to, when this tab knows. */
+    readonly modelOptions: readonly ModelOptionSelection[] | undefined;
+  }
+
   let {
     app,
     pinned,
-    dimmed = false,
+    switchable = false,
   }: {
     app: App;
-    /**
-     * The `provider/model` a started session ran on, or `null` for a new session, whose
-     * model is still the operator's to choose.
-     */
-    pinned: { readonly harness: string; readonly model: string } | null;
-    /** The session is mid-turn, so its model is held and shown quietly. */
-    dimmed?: boolean;
+    /** A started session's model, or `null` for a new session, whose model is still open. */
+    pinned: PinnedModel | null;
+    /** Whether a started session can be switched at all: it is talked to, not read-only. */
+    switchable?: boolean;
   } = $props();
 
   /** The chip, which the dialog hands focus back to when it closes. */
@@ -75,6 +99,9 @@
    * remembering, and the one forgotten is the one that reopens it. The chip's own button
    * does not need this: it lives in the same branch as the dialog, so the dialog's opener
    * cannot be gone while the dialog is open.
+   *
+   * A started session's dialog needs none of this: its open flag is this component's own
+   * ({@link sessionOpen}) and goes with it.
    */
   const closesWithBranch: Attachment = () => () => {
     app.importPickerOpen = false;
@@ -85,6 +112,108 @@
   );
   let model = $derived(pinned?.model ?? app.effectiveImportModel);
   let letter = $derived((harness.slice(0, 1) || "?").toLowerCase());
+
+  /* ── A started session's picker: staged, then applied together ─────────────── */
+
+  /**
+   * The session's own harness instance: by the id the server named, or — for a declared
+   * session in the state picker, which names none — by its harness's display name.
+   */
+  let sessionInstance = $derived(
+    pinned === null
+      ? undefined
+      : pinned.instanceId !== undefined
+        ? app.harnesses.find((each) => each.instanceId === pinned.instanceId)
+        : app.harnesses.find((each) => each.displayName === pinned.harness),
+  );
+  let sessionOpen = $state(false);
+  let stagedInstanceId = $state("");
+  let stagedModel = $state("");
+  /** What was set per instance and model while the dialog was open. */
+  let stagedOptions = $state<Record<string, readonly ModelOptionSelection[]>>(
+    {},
+  );
+  let query = $state("");
+  /** The footer's confirm button: the refusal dialog's opener while the picker is up. */
+  let confirmButton = $state<HTMLButtonElement | null>(null);
+
+  let stagedInstance = $derived(
+    app.harnesses.find((each) => each.instanceId === stagedInstanceId),
+  );
+  let stagedModelView = $derived(
+    stagedInstance?.models.find((entry) => entry.id === stagedModel),
+  );
+  let stagedDescriptors = $derived(modelOptionDescriptors(stagedModelView));
+  /** {@link App.modelOptionKey}'s rule, over the staged instance and model. */
+  let stagedKey = $derived(`${stagedInstanceId}\u0000${stagedModel}`);
+  let stagedSelections = $derived(stagedOptions[stagedKey] ?? []);
+  let stagedDropped = $derived(
+    droppedModelOptionIds(stagedDescriptors, stagedSelections),
+  );
+  /** Another harness than the session's: confirming opens a new session on it. */
+  let otherHarness = $derived(
+    sessionInstance !== undefined &&
+      stagedInstanceId !== sessionInstance.instanceId,
+  );
+  let switching = $derived(app.importer.switching);
+
+  function openSession(): void {
+    if (pinned === null || sessionInstance === undefined) return;
+    stagedInstanceId = sessionInstance.instanceId;
+    stagedModel = pinned.model;
+    stagedOptions = {
+      [`${sessionInstance.instanceId}\u0000${pinned.model}`]:
+        pinned.modelOptions ?? [],
+    };
+    query = "";
+    sessionOpen = true;
+  }
+
+  function pickInstance(instanceId: string): void {
+    stagedInstanceId = instanceId;
+    // A model belongs to one catalogue: back on the session's own harness its model is the
+    // session's, on another the harness's default.
+    stagedModel =
+      instanceId === sessionInstance?.instanceId && pinned !== null
+        ? pinned.model
+        : (app.harnesses.find((each) => each.instanceId === instanceId)
+            ?.defaultModel ?? "");
+    query = "";
+  }
+
+  function pickOption(descriptorId: string, value: string): void {
+    const next = withModelOptionPicked(
+      stagedOptions,
+      stagedKey,
+      stagedDescriptors,
+      descriptorId,
+      value,
+    );
+    if (next !== undefined) stagedOptions = next;
+  }
+
+  /**
+   * "Use for this session", or "Open a new session" when another harness is staged.
+   *
+   * The switch is one call with the model and its options together. The dialog stays open
+   * until the server answers: an accepted switch closes it, a refused one leaves it under the
+   * error dialog so the operator can pick again or cancel.
+   */
+  async function confirm(): Promise<void> {
+    if (stagedModel === "" || switching !== undefined) return;
+    const options = explicitModelOptionSelections(
+      stagedDescriptors,
+      stagedSelections,
+    );
+    if (otherHarness) {
+      sessionOpen = false;
+      app.startImporterSessionOn(stagedInstanceId, stagedModel, options ?? []);
+      return;
+    }
+    if (await app.importer.switchModel(stagedModel, options)) {
+      sessionOpen = false;
+    }
+  }
 </script>
 
 {#if pinned === null}
@@ -138,14 +267,101 @@
       </HarnessDialog>
     {/if}
   </div>
+{:else if switchable && sessionInstance !== undefined}
+  <div class="picker">
+    <button
+      class={["chip", switching !== undefined && "switching"]}
+      type="button"
+      aria-haspopup="dialog"
+      aria-expanded={sessionOpen}
+      aria-label="Model: {model}. Change this session's model"
+      title="The model this session runs on. Models and reasoning can change at any time, including mid-run; the harness is fixed."
+      bind:this={trigger}
+      onclick={openSession}
+    >
+      <span class="glyph" aria-hidden="true">{letter}</span>
+      <span class="model">{model}</span>
+      <IconAngleDown class="caret" width="11" height="11" />
+    </button>
+
+    {#if sessionOpen}
+      <HarnessDialog opener={trigger} onclose={() => (sessionOpen = false)}>
+        <HarnessChoice
+          instances={app.harnesses}
+          active={stagedInstance}
+          model={stagedModel}
+          bind:query
+          onPickInstance={pickInstance}
+          onPickModel={(modelId) => (stagedModel = modelId)}
+        >
+          {#snippet options()}
+            <ModelOptionsColumn
+              instance={stagedInstance}
+              model={stagedModel}
+              modelView={stagedModelView}
+              descriptors={stagedDescriptors}
+              selections={stagedSelections}
+              dropped={stagedDropped}
+              onPick={pickOption}
+              subject="A session"
+            />
+          {/snippet}
+        </HarnessChoice>
+
+        {#snippet footer()}
+          <p class="foot-note">
+            {#if otherHarness}
+              This session stays on {harness}. {stagedInstance?.displayName ??
+                stagedInstanceId} is another harness, so this opens a new session
+              on it and leaves this one as it is.
+            {:else}
+              This session stays on {harness} — picking another harness opens a new
+              one. Models and reasoning inside it can change at any time, including
+              mid-run.
+            {/if}
+          </p>
+          <button
+            class="foot-button"
+            type="button"
+            onclick={() => (sessionOpen = false)}>Cancel</button
+          >
+          <button
+            class="foot-button primary"
+            type="button"
+            bind:this={confirmButton}
+            aria-disabled={stagedModel === "" || switching !== undefined}
+            onclick={() => void confirm()}
+          >
+            {otherHarness
+              ? "Open a new session"
+              : switching !== undefined
+                ? "Switching…"
+                : "Use for this session"}
+          </button>
+        {/snippet}
+      </HarnessDialog>
+    {/if}
+  </div>
 {:else}
   <span
-    class={["chip", "held", dimmed && "dim"]}
-    title="The model this session runs on. Changing harness starts a new session; it never moves this one."
+    class={["chip", "held"]}
+    title="The model this session ran on. Changing harness starts a new session; it never moves this one."
   >
     <span class="glyph" aria-hidden="true">{letter}</span>
     <span class="model">{model}</span>
   </span>
+{/if}
+
+{#if app.importer.switchFailure !== undefined}
+  <!--
+    A refused switch, over the picker while it is still open (it stays up while the call is
+    out), so closing it puts the operator back on the choice the server refused.
+  -->
+  <ErrorDialog
+    {...app.importer.switchFailure}
+    opener={sessionOpen ? confirmButton : trigger}
+    ondismiss={() => app.importer.dismissSwitchFailure()}
+  />
 {/if}
 
 <style>
@@ -179,8 +395,10 @@
   .chip.held {
     cursor: default;
   }
-  .chip.dim {
-    opacity: 0.55;
+  /* A switch is with the server: the chip shows the model it is still on, quietly. */
+  .chip.switching {
+    color: var(--text-muted);
+    cursor: progress;
   }
   .glyph {
     display: inline-flex;
@@ -214,5 +432,49 @@
     display: flex;
     /* Gives way before the send button does, as every control on this strip does. */
     min-width: 0;
+  }
+  /* ── D6's footer: the note, Cancel, and the one solid action ───────────────── */
+  .foot-note {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    color: var(--text-muted);
+    font: 400 11px/16px var(--font-sans);
+    text-wrap: pretty;
+  }
+  .foot-button {
+    flex: none;
+    height: 30px;
+    padding: 0 13px;
+    box-sizing: border-box;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text-base);
+    font: 500 12px/28px var(--font-sans);
+    cursor: pointer;
+  }
+  .foot-button:hover {
+    background: var(--overlay-hover);
+  }
+  /* D6's "Use for this session": the inverse fill, darkened by an inset overlay on hover. */
+  .foot-button.primary {
+    padding: 0 15px;
+    border-color: transparent;
+    background: var(--bg-inverse);
+    color: var(--text-inverse);
+  }
+  .foot-button.primary:hover {
+    background: var(--bg-inverse);
+    box-shadow: inset 0 0 0 999px
+      color-mix(in srgb, var(--text-inverse) 12%, transparent);
+  }
+  .foot-button.primary[aria-disabled="true"] {
+    cursor: progress;
+    opacity: 0.7;
+  }
+  .foot-button:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 1px;
   }
 </style>

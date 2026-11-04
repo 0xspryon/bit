@@ -261,7 +261,7 @@ export const fromSummary = (summary: TargetSummary, now: number): Target => ({
  * marks as its default **removes** the entry instead of storing `"default"` as a value, and
  * an id the model has no descriptor for is refused (`undefined`) rather than stored.
  */
-const withModelOptionPicked = (
+export const withModelOptionPicked = (
   store: Record<string, readonly ModelOptionSelection[]>,
   key: string,
   descriptors: readonly ModelOptionDescriptor[],
@@ -2693,13 +2693,21 @@ export class App {
       return { _tag: "refused", detail: "No server answered at this address." };
     };
     return {
-      open: async (text, agentId) =>
-        answer(
+      open: async (text, agentId) => {
+        // The Reasoning column's choices go with the opening message, normalised against
+        // the descriptors this tab holds and absent when nothing was set — as
+        // `startScopeImport` sends them. They were dropped here before U3.
+        const importOptions = explicitModelOptionSelections(
+          this.importModelDescriptors,
+          this.pickedImportModelOptions,
+        );
+        const sent = answer(
           await this.client.openImporterConversation(this.serverUrl, targetId, {
             text,
             ...(agentId === undefined ? {} : { agentId }),
             ...(this.pickedImportInstanceId !== "" ||
-            this.pickedImportModel !== ""
+            this.pickedImportModel !== "" ||
+            importOptions !== undefined
               ? {
                   importModel: {
                     ...(this.pickedImportInstanceId === ""
@@ -2708,11 +2716,47 @@ export class App {
                     ...(this.pickedImportModel === ""
                       ? {}
                       : { model: this.pickedImportModel }),
+                    ...(importOptions === undefined
+                      ? {}
+                      : { modelOptions: importOptions }),
                   },
                 }
               : {}),
           }),
-        ),
+        );
+        return sent._tag === "accepted"
+          ? { ...sent, modelOptions: importOptions ?? [] }
+          : sent;
+      },
+      /**
+       * Moves one import onto another model of its harness (A6 F4). An expired session signs
+       * out; any other refusal, or no server answering, is a sentence for the error dialog.
+       */
+      switchModel: async (importId, draft) => {
+        const call = await this.client.switchImporterModel(
+          this.serverUrl,
+          targetId,
+          importId,
+          draft,
+        );
+        if (call._tag === "Ok")
+          return { _tag: "switched", switched: call.value };
+        if (call._tag === "Refused") {
+          if (call.error._tag === "Unauthenticated") this.signOut("expired");
+          return {
+            _tag: "refused",
+            detail: this.#refusalText(
+              call.error,
+              "The model was not switched.",
+            ),
+          };
+        }
+        return {
+          _tag: "refused",
+          detail:
+            "No server answered at this address, so whether the model was switched is not known. Pick it again once the server is back.",
+        };
+      },
       send: async (importId, text) =>
         answer(
           await this.client.sendImporterMessage(
@@ -4582,6 +4626,28 @@ export class App {
     if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
       this.signOut("expired");
     }
+  }
+
+  /**
+   * Opens a new importer session on another harness (D6): a session is pinned to the harness
+   * it started on, so a harness picked in an open session's picker is a new session, never a
+   * move. The pick becomes the new session's — its harness, model and reasoning — and the
+   * operator's draft, if any, is carried over to it rather than dropped.
+   */
+  startImporterSessionOn(
+    instanceId: string,
+    model: string,
+    options: readonly ModelOptionSelection[],
+  ) {
+    this.importer.start({ keepDraft: true });
+    this.pickedImportInstanceId = instanceId;
+    this.pickedImportModel = model;
+    this.importModelQuery = "";
+    this.importPickerOpen = false;
+    this.importModelOptionsByModel = {
+      ...this.importModelOptionsByModel,
+      [`${instanceId}\u0000${model}`]: options,
+    };
   }
 
   toggleImportPicker() {

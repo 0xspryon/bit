@@ -60,10 +60,13 @@
  */
 import type {
   AgentsView,
+  ConversationModelDraft,
+  ConversationModelSwitched,
   ConversationStopped,
   ImporterConversationView,
   ImporterTurnAccepted,
   LiveItem,
+  ModelOptionSelection,
 } from "@bit/contracts";
 
 import type { ErrorNotice } from "./components/ErrorDialog.svelte";
@@ -77,6 +80,7 @@ import {
   type ImporterGroup,
   type ImporterSession,
   acceptedNotice,
+  switchedNotice,
 } from "./importerChat";
 import {
   mockAgents,
@@ -151,7 +155,12 @@ export type ImporterScenario =
 
 /** What the server answered a message with, as the page needs it. */
 export type ImporterSent =
-  | { readonly _tag: "accepted"; readonly turn: ImporterTurnAccepted }
+  | {
+      readonly _tag: "accepted";
+      readonly turn: ImporterTurnAccepted;
+      /** What an opening message set its model's options to, when it opened one. */
+      readonly modelOptions?: readonly ModelOptionSelection[];
+    }
   | {
       readonly _tag: "refused";
       readonly detail: string;
@@ -161,6 +170,11 @@ export type ImporterSent =
        */
       readonly ended?: boolean;
     };
+
+/** What the server answered a model switch with, as the page needs it (A6 F4). */
+export type ImporterSwitchAnswer =
+  | { readonly _tag: "switched"; readonly switched: ConversationModelSwitched }
+  | { readonly _tag: "refused"; readonly detail: string };
 
 /** What the server answered a Stop with, as the page needs it. */
 export type ImporterStopAnswer =
@@ -189,6 +203,14 @@ export interface ImporterServer {
    * harness is interrupted and the session stays open for the next message.
    */
   readonly stop: (importId: string) => Promise<ImporterStopAnswer>;
+  /**
+   * Moves one import's session onto another model of its pinned harness, or other options
+   * of its model (A6 F4). Never another harness: that is a new session.
+   */
+  readonly switchModel: (
+    importId: string,
+    draft: ConversationModelDraft,
+  ) => Promise<ImporterSwitchAnswer>;
   /**
    * Reads one import's conversation back from the harness (S6), with the activity publish
    * order the read is to be joined at.
@@ -305,6 +327,40 @@ export class ImporterSessions {
    * scenarios, and `undefined` while the server's has not been read (or could not be).
    */
   agents = $state.raw<AgentsView | undefined>(undefined);
+  /**
+   * The model switch with the server and not yet answered, or `undefined` (A6 F4). One at a
+   * time: the server refuses a second while one is in flight (`switch_in_flight`), so the
+   * page does not offer it.
+   */
+  switching = $state<
+    | {
+        readonly sessionId: string;
+        readonly importId: string;
+        readonly model: string;
+      }
+    | undefined
+  >(undefined);
+  /**
+   * What the server answered the last accepted switch with, in words ({@link switchedNotice}),
+   * and the session it is about. Empty when there is nothing to say.
+   */
+  switchNotice = $state<
+    { readonly sessionId: string; readonly text: string } | undefined
+  >(undefined);
+  /** A switch the server refused, for the error dialog; `undefined` when there is none. */
+  switchFailure = $state<ErrorNotice | undefined>(undefined);
+  /**
+   * True while a message sent behind an in-flight switch is with the server (F4's review):
+   * the server delivers it once the switch has answered, which can take up to ~90 s when
+   * the switch has to reopen the session first. The composer says it is waiting.
+   */
+  waitingForSwitch = $state(false);
+  /**
+   * The model each import was switched to by this tab, until a reading of the index agrees.
+   * A reading that left before the switch answered still names the old model; without this
+   * it would put the chip back on a model the session has left.
+   */
+  readonly #switchedTo = new Map<string, string>();
   /** The server's registry as last read, kept across visits: it is read once per page load. */
   #serverAgents: AgentsView | undefined = undefined;
   #server: ImporterServer | undefined = undefined;
@@ -376,6 +432,11 @@ export class ImporterSessions {
     this.refused = false;
     this.sending = false;
     this.stopping = false;
+    this.switching = undefined;
+    this.switchNotice = undefined;
+    this.switchFailure = undefined;
+    this.waitingForSwitch = false;
+    this.#switchedTo.clear();
     this.stopFailure = undefined;
     this.pickerOpen = false;
     this.#sent = 0;
@@ -453,7 +514,8 @@ export class ImporterSessions {
         .map((session) => [session.id, session]),
     );
     const own = this.sessions.filter((session) => session.indexed !== true);
-    const refreshed = indexed.map((session) => {
+    const refreshed = indexed.map((listed) => {
+      const session = this.#withSwitchedModel(listed);
       const kept = touched.get(session.id);
       return kept === undefined
         ? session
@@ -466,6 +528,10 @@ export class ImporterSessions {
               ? {}
               : { historyFloor: kept.historyFloor }),
             ...(kept.loaded === undefined ? {} : { loaded: kept.loaded }),
+            // What this tab knows the model is set to, while it is still on that model.
+            ...(kept.modelOptions !== undefined && kept.model === session.model
+              ? { modelOptions: kept.modelOptions }
+              : {}),
             reading: kept.reading,
           };
     });
@@ -491,6 +557,23 @@ export class ImporterSessions {
     if (current !== undefined) void this.#loadHistory(current);
   }
 
+  /**
+   * An index row, with the model this tab switched its import to if the row still names
+   * the old one — a reading that left before the switch answered. Once a reading agrees the
+   * entry is dropped, and from then on the server's row is the model, whoever changed it.
+   */
+  #withSwitchedModel(session: ImporterSession): ImporterSession {
+    const importId = session.importId;
+    if (importId === undefined) return session;
+    const switched = this.#switchedTo.get(importId);
+    if (switched === undefined) return session;
+    if (switched === session.model) {
+      this.#switchedTo.delete(importId);
+      return session;
+    }
+    return { ...session, model: switched };
+  }
+
   /** Puts the prototype into one of the states the brief shows. */
   load(scenario: ImporterScenario): void {
     const now = this.#now();
@@ -502,6 +585,11 @@ export class ImporterSessions {
     this.refused = false;
     this.sending = false;
     this.stopping = false;
+    this.switching = undefined;
+    this.switchNotice = undefined;
+    this.switchFailure = undefined;
+    this.waitingForSwitch = false;
+    this.#switchedTo.clear();
     this.stopFailure = undefined;
     this.draft = "";
     this.pickerOpen = false;
@@ -567,6 +655,7 @@ export class ImporterSessions {
   /** Opens a session from the picker. An older one is read-only until the operator types. */
   open(id: string): void {
     this.pickerOpen = false;
+    this.switchNotice = undefined;
     this.notice = "";
     this.refused = false;
     const opened = this.sessions.find((session) => session.id === id);
@@ -682,11 +771,12 @@ export class ImporterSessions {
    * Reuses the empty one the operator is already looking at rather than stacking a second:
    * two blank threads are one choice, not two.
    */
-  start(): void {
+  start(options: { readonly keepDraft?: boolean } = {}): void {
     this.pickerOpen = false;
-    this.draft = "";
+    if (options.keepDraft !== true) this.draft = "";
     this.notice = "";
     this.refused = false;
+    this.switchNotice = undefined;
     if (this.current?.tally.messages === 0) return;
     this.#sent += 1;
     const fresh = mockNewSession(this.#now(), `ses_new_${String(this.#sent)}`);
@@ -802,6 +892,12 @@ export class ImporterSessions {
     this.sending = true;
     this.notice = "";
     this.refused = false;
+    // Behind a switch of this very import, the server holds the message until the switch
+    // has answered: say so, since that can be a minute and a half.
+    this.waitingForSwitch =
+      this.switching !== undefined &&
+      session.importId !== undefined &&
+      this.switching.importId === session.importId;
     // Taken before the message goes, so whatever the importer says in answer sorts after
     // it — including what it says before this request has been answered.
     const after = server.highWater();
@@ -814,6 +910,7 @@ export class ImporterSessions {
         : await server.send(session.importId, text);
     const pinnedAgent = agentId ?? this.agents?.defaultAgentId;
     this.sending = false;
+    this.waitingForSwitch = false;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
     if (answer._tag === "refused") {
@@ -837,6 +934,7 @@ export class ImporterSessions {
         importId: turn.importId,
         model: turn.model,
         harness: server.harnessName(turn.harnessInstanceId),
+        harnessInstanceId: turn.harnessInstanceId,
         indexed: true,
         reading: false,
         working: true,
@@ -846,6 +944,10 @@ export class ImporterSessions {
         // Until the list is read again and says so itself, the agent the message was sent
         // as. A session that had one keeps it: a reopen runs as the row's agent.
         ...pinAgent(before.agentId ?? pinnedAgent),
+        // An opening message's options are what the new session's model is set to.
+        ...(answer.modelOptions === undefined
+          ? {}
+          : { modelOptions: answer.modelOptions }),
       };
     };
     const stillThere = this.sessions.some((each) => each.id === session.id);
@@ -925,8 +1027,107 @@ export class ImporterSessions {
     );
   }
 
+  /**
+   * Moves the session on screen onto another model of its harness, or other options of its
+   * model (A6 F4, D6), and answers whether it moved.
+   *
+   * **Only a started session, and only within its harness**: the caller offers nothing
+   * else, and another harness is a new session ({@link start}). The chip follows the
+   * server's answer, never the pick: the session's model changes when the server says the
+   * switch was accepted, and a refusal leaves it as it was and opens the error dialog with
+   * the server's sentence — the switch already in flight, a harness that did not clearly
+   * answer, a model its catalogue does not list, a record that could not be written.
+   *
+   * Without a server — the state picker's scenarios — there is nothing to ask, so the pick
+   * is applied here and the line under the composer says that is all it was.
+   */
+  async switchModel(
+    model: string,
+    modelOptions: readonly ModelOptionSelection[] | undefined,
+  ): Promise<boolean> {
+    const session = this.current;
+    if (session === undefined || session.tally.messages === 0) return false;
+    if (this.switching !== undefined) return false;
+    const server = this.#server;
+    if (server === undefined) {
+      this.#replace(session.id, (before) => ({
+        ...before,
+        model,
+        modelOptions: modelOptions ?? [],
+      }));
+      this.switchNotice = {
+        sessionId: session.id,
+        text: `Now on ${model} here only: the state picker has no server to ask.`,
+      };
+      return true;
+    }
+    const importId = session.importId;
+    if (importId === undefined) return false;
+    this.switching = { sessionId: session.id, importId, model };
+    this.switchNotice = undefined;
+    const answer = await server.switchModel(importId, {
+      model,
+      ...(modelOptions === undefined ? {} : { modelOptions }),
+    });
+    this.switching = undefined;
+    // The page was left or reset meanwhile: nothing here is the answer's to change.
+    if (this.#server !== server) return false;
+    if (answer._tag === "refused") {
+      this.switchFailure = {
+        title: "Model not switched",
+        sentence: sentenceCase(answer.detail),
+      };
+      // The record may have moved under this tab — another switch was in flight, or one the
+      // harness answered uncertainly — so the chip is the server's row again, not this tab's.
+      server.reread();
+      return false;
+    }
+    const switched = answer.switched;
+    const now = this.sessions.find((each) => each.id === session.id) ?? session;
+    this.switchNotice = {
+      sessionId: session.id,
+      text: switchedNotice({
+        switched,
+        previous: now.model,
+        working: now.working,
+      }),
+    };
+    this.#switchedTo.set(switched.conversationId, switched.model);
+    this.sessions = this.sessions.map((each) =>
+      each.id === session.id ||
+      each.importId === importId ||
+      each.importId === switched.conversationId
+        ? {
+            ...each,
+            model: switched.model,
+            modelOptions: switched.modelOptions,
+            // The import the switch landed on: a successor's, if the one addressed had
+            // been taken over, and the one the next message goes to.
+            ...(each.id === session.id
+              ? { importId: switched.conversationId }
+              : {}),
+          }
+        : each,
+    );
+    server.reread();
+    return true;
+  }
+
+  /** Closes the error dialog a refused switch opened. */
+  dismissSwitchFailure(): void {
+    this.switchFailure = undefined;
+  }
+
   /** Closes the error dialog a refused Stop opened. */
   dismissStopFailure(): void {
     this.stopFailure = undefined;
   }
 }
+
+/**
+ * The server's sentence with its first letter raised, since the dialog shows it on its own:
+ * the server words a switch's refusal as a clause ("another model switch of import … has not
+ * answered yet"). The words are otherwise the server's, as they stand.
+ */
+const sentenceCase = (text: string): string =>
+  text === "" ? text : `${text[0]?.toUpperCase() ?? ""}${text.slice(1)}`;

@@ -54,7 +54,9 @@
    * `aria-disabled` and says why. The agent chip is D7's selector ({@link AgentChip}) over
    * the server's registry, pinned once the first message is sent; the model chip is the
    * real picker ({@link ImporterModelPicker}) over whatever harnesses the app holds — the
-   * server's when connected, `mockHarnesses` in the state picker.
+   * server's when connected, `mockHarnesses` in the state picker. Once the session has
+   * started its harness is pinned and its model is not (D6): the chip switches the model of
+   * the running session (A6 F4), and another harness is a new session.
    */
   import { tick } from "svelte";
 
@@ -124,11 +126,33 @@
     importer.draft.trim() !== "" && !blocked && !importer.sending,
   );
   let working = $derived(session?.working ?? false);
-  /** A session that has started keeps its model; only an empty one may choose. */
+  /**
+   * A started session's harness and model: the harness is pinned to it, the model is not
+   * (D6). `null` for the empty session, whose harness and model are still open.
+   */
   let pinned = $derived(
     session === undefined || session.tally.messages === 0
       ? null
-      : { harness: session.harness, model: session.model },
+      : {
+          harness: session.harness,
+          instanceId: session.harnessInstanceId,
+          model: session.model,
+          modelOptions: session.modelOptions,
+        },
+  );
+  /** The model switch in flight for the session on screen, if any (A6 F4). */
+  let switchingHere = $derived(
+    importer.switching !== undefined &&
+      importer.switching.sessionId === session?.id
+      ? importer.switching
+      : undefined,
+  );
+  /** What the server said about this session's last accepted switch. */
+  let switchNote = $derived(
+    importer.switchNotice !== undefined &&
+      importer.switchNotice.sessionId === session?.id
+      ? importer.switchNotice.text
+      : "",
   );
   let box = $state<HTMLTextAreaElement | undefined>(undefined);
   /** Whether the focus is anywhere in the composer's box, for its strong border. */
@@ -324,6 +348,21 @@
 
     {#snippet composer()}
       <div class="stack">
+        {#if importer.sending && importer.waitingForSwitch && switchingHere !== undefined}
+          <!--
+            A message sent behind a switch of this session: the server holds it until the
+            switch has answered (F4's review measured up to ~90 s, when the switch has to
+            reopen the session first). Said, so a send that sits there is not read as lost.
+          -->
+          <p class="notice waiting" role="status">
+            Waiting for the model switch: this message is delivered once the
+            switch has answered, which can take up to a minute and a half.
+          </p>
+        {/if}
+        {#if switchNote !== ""}
+          <!-- The server's answer to the last switch, in words that say when it applies. -->
+          <p class="notice switched" role="status">{switchNote}</p>
+        {/if}
         {#if importer.notice !== ""}
           <!--
             The server's sentence about the last message: a refusal, or the note on one it
@@ -380,9 +419,21 @@
                 importer.sending}
               onpick={(agentId) => importer.pickAgent(agentId)}
             />
-            <ImporterModelPicker {app} {pinned} dimmed={working} />
-            {#if working}
-              <span class="hint">pinned while the session is running</span>
+            <ImporterModelPicker {app} {pinned} switchable={!blocked} />
+            {#if pinned !== null && !blocked}
+              <!--
+                D3's caption: the harness is the session's for good, its models are not. While
+                a switch is out it says which model the session is moving to instead.
+              -->
+              {#if switchingHere !== undefined}
+                <span class="hint" role="status"
+                  >Switching to {switchingHere.model}…</span
+                >
+              {:else}
+                <span class="hint"
+                  >{pinned.harness} for this session · any of its models</span
+                >
+              {/if}
             {/if}
             <span class="grow"></span>
             <button
@@ -602,10 +653,20 @@
   .grow {
     flex: 1;
   }
+  /*
+    The strip's caption (D3: "OpenCode for this session · any of its models"). D3 sets it
+    faint; muted here, as the turn footer is, because faint is below AA at 11px and this is
+    a sentence the operator reads. It gives way before the chips do.
+  */
   .hint {
+    min-width: 0;
+    overflow: hidden;
     font: 400 11px/16px var(--font-sans);
     color: var(--text-muted);
+    white-space: nowrap;
+    text-overflow: ellipsis;
   }
+
   .icon-btn,
   .send {
     display: inline-flex;
