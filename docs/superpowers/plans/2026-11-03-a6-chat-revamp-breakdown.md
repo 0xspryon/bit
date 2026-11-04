@@ -240,7 +240,11 @@ to render diagram" with the source, a Show code / Show diagram toggle, Copy copi
 source. `overflow-x: auto`, SVG `max-width: 100%`. Out of V1: KaTeX labels and the expand
 dialog. New dependencies: `pele`, `dompurify`.
 
-**U13 — Uploads in the composer (M), F2 + F9 → U13.** From F9's review: Bun answers a body over 128 MiB
+**U13 — Uploads in the composer (M), F2 + F9 → U13.** **Step 0 (from F9's last review):** in
+`upload/uploads.ts:537-543`, a `writeSync` that throws partway leaves a partial
+`.incoming-<uuid>` file in `uploads/` (the temporary is never recorded in `made`) — remove
+it via `removeOwn`, and add a test; also add a test that fails if only the dev/ino half of
+the pre-write check (`:501`) is removed. From F9's review: Bun answers a body over 128 MiB
 that declares its length with an **empty 413** before the server can send a sentence —
 the browser's `FormData` declares its length, so turn a 413 into a sentence through F2.
 Replayed attachments carry no bytes: add a route that serves a file from a session's
