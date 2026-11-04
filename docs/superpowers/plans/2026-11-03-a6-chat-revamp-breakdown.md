@@ -164,7 +164,9 @@ session stays on <harness> — picking another harness opens a new one. Models a
 inside it can change at any time, including mid-run." Choosing a model in an open session
 calls F4; choosing another harness opens a new session.
 
-**U4 — D3/D4 transcript layout (M), F10 → U4.** From F10's review (decided): a steer sent while a
+**U4 — D3/D4 transcript layout (M), F10 → U4.** From U3's review: a harness error (e.g. OpenCode's
+"Free usage limit reached") currently shows only as "The importer wrote nothing in reply" —
+show the harness's own error sentence in the thread (as text, marked). From F10's review (decided): a steer sent while a
 turn runs is drawn where the operator sent it but marked **queued** until the server says
 the harness took it (a later `result` names it in `user_message_uuids`); then it reads as
 an ordinary operator turn. Pair a tool call with its result across that boundary so a
@@ -207,7 +209,9 @@ it shows for a session whose agent this build no longer defines (the composer is
 refused with the server's sentence, F1 `609da09`). Also from F1's review: `startWith` checks
 the agent's authority role on every open path — keep that when the chip can choose.
 
-**U8 — D5 sessions list (M).** The server half of S9 is done (`d0d82a2`:
+**U8 — D5 sessions list (M).** From U3's review: a new empty session's URL becomes
+`/assets/estate`, and so does the session menu's "Start a new session" — give a new session
+a URL that keeps the operator on the importer page. The server half of S9 is done (`d0d82a2`:
 `AgentHarness.sessionTitle`, `import/importerTitle.ts`, nullable `title` in the
 contract); this task is the web half. Spec S9: session named from the harness title (with its five
 constraints), the write summary ("7 in · 3 out · 14 assets"), the model it ended on, the
