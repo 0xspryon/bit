@@ -31,10 +31,12 @@
  */
 import {
   closeSync,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
   openSync,
+  realpathSync,
   unlinkSync,
   writeSync,
   constants as fsConstants,
@@ -368,6 +370,18 @@ export class UploadWriteFailed extends Data.TaggedError("UploadWriteFailed")<{
   readonly message: string;
 }> {}
 
+/** `path`'s device and inode, not through a link, or `undefined` when it is not there. */
+const statOrUndefined = (
+  path: string,
+): { readonly dev: number; readonly ino: number } | undefined => {
+  try {
+    const { dev, ino } = lstatSync(path);
+    return { dev, ino };
+  } catch {
+    return undefined;
+  }
+};
+
 /** `name` with ` (n)` before its extension. */
 const numbered = (name: string, n: number): string => {
   const extension = extname(name);
@@ -375,6 +389,17 @@ const numbered = (name: string, n: number): string => {
   const suffix = ` (${String(n)})`;
   return `${stem.slice(0, NAME_MAX - extension.length - suffix.length)}${suffix}${extension}`;
 };
+
+/**
+ * Moments inside {@link storeUploads} a test can act in, to swap the folder for a link at
+ * the two places a concurrent agent could. Never passed outside tests.
+ */
+export interface StoreUploadsProbe {
+  /** After the folder was checked, before any file is opened in it. */
+  readonly afterCheck?: () => void;
+  /** After a file's bytes were written to its temporary, before it is linked to its name. */
+  readonly afterWrite?: (temporary: string) => void;
+}
 
 /**
  * Writes one message's files into `<directory>/uploads/`, all or none, and answers what the
@@ -386,6 +411,13 @@ const numbered = (name: string, n: number): string => {
  *
  * - **The folder is checked, through symlinks**, to resolve inside `directory`: a link
  *   planted at `uploads` would otherwise carry the bytes wherever it points.
+ * - **And checked again around every file**, because the agent works in `directory` and can
+ *   swap `uploads` for a link between that check and a write — `O_NOFOLLOW` guards only the
+ *   last component of a path. Each temporary is resolved once it is opened and before a
+ *   byte is written, and each stored name once it is linked: either resolving anywhere but
+ *   the folder that was checked fails the call and undoes the entry this call just made
+ *   (an `O_EXCL` temporary, or a name the link created), so no byte and no name is left
+ *   where the link points, and no path outside the folder is handed to the harness.
  * - **Each file is written atomically**: to a dot-named temporary in the folder
  *   (`O_CREAT|O_EXCL|O_NOFOLLOW`), then hard-linked to its name, which fails rather than
  *   replaces when the name is taken — so a reader never sees half a file, and a name already
@@ -396,15 +428,14 @@ const numbered = (name: string, n: number): string => {
 export const storeUploads = (
   directory: string,
   files: readonly ReadUpload[],
+  probe: StoreUploadsProbe = {},
 ): Effect.Effect<readonly MessageAttachment[], UploadWriteFailed> =>
   Effect.try({
     try: () => {
       const folder = join(directory, UPLOADS_FOLDER);
       mkdirSync(folder, { recursive: true, mode: 0o700 });
-      const inside = relative(
-        resolveThroughSymlinks(directory),
-        resolveThroughSymlinks(folder),
-      );
+      const real = resolveThroughSymlinks(folder);
+      const inside = relative(resolveThroughSymlinks(directory), real);
       if (inside === "" || inside.startsWith("..") || isAbsolute(inside)) {
         throw new Error(
           `${folder} does not resolve to a folder inside the session's own directory: something has replaced it with a link. Remove it and send the message again`,
@@ -413,10 +444,31 @@ export const storeUploads = (
       if (!lstatSync(folder).isDirectory()) {
         throw new Error(`${folder} is not a folder`);
       }
+      const moved = (path: string) =>
+        new Error(
+          `${path} resolved outside ${real} while it was being written: something replaced ${folder} with a link. Remove it and send the message again`,
+        );
+      /** Whether `path` still resolves to `name` directly in the checked folder. */
+      const inFolder = (path: string, name: string): boolean => {
+        try {
+          return realpathSync(path) === join(real, name);
+        } catch {
+          return false;
+        }
+      };
+      const unlinkQuietly = (path: string) => {
+        try {
+          unlinkSync(path);
+        } catch {
+          // Already gone; nothing else to undo.
+        }
+      };
+      probe.afterCheck?.();
       const stored: MessageAttachment[] = [];
       try {
         for (const file of files) {
-          const temporary = join(folder, `.incoming-${crypto.randomUUID()}`);
+          const temporaryName = `.incoming-${crypto.randomUUID()}`;
+          const temporary = join(folder, temporaryName);
           const handle = openSync(
             temporary,
             fsConstants.O_WRONLY |
@@ -425,14 +477,23 @@ export const storeUploads = (
               fsConstants.O_NOFOLLOW,
             0o600,
           );
+          let written: { readonly dev: number; readonly ino: number };
           try {
-            let written = 0;
-            while (written < file.bytes.length) {
-              written += writeSync(handle, file.bytes, written);
+            // Before a byte is written: the file this handle holds is in the checked folder.
+            if (!inFolder(temporary, temporaryName)) {
+              unlinkQuietly(temporary);
+              throw moved(temporary);
             }
+            let at = 0;
+            while (at < file.bytes.length) {
+              at += writeSync(handle, file.bytes, at);
+            }
+            const { dev, ino } = fstatSync(handle);
+            written = { dev, ino };
           } finally {
             closeSync(handle);
           }
+          probe.afterWrite?.(temporary);
           try {
             let path: string | undefined;
             for (let n = 1; path === undefined; n += 1) {
@@ -440,33 +501,38 @@ export const storeUploads = (
               const candidate = join(folder, name);
               try {
                 linkSync(temporary, candidate);
-                path = candidate;
-                stored.push({
-                  kind: file.kind,
-                  name,
-                  mimeType: file.mimeType,
-                  path: candidate,
-                  bytes: file.bytes.length,
-                });
               } catch (cause) {
                 if ((cause as NodeJS.ErrnoException).code !== "EEXIST") {
                   throw cause;
                 }
                 if (n >= 1000) throw cause;
+                continue;
               }
+              // The name this link made is the bytes written above, in the checked folder.
+              const linked = statOrUndefined(candidate);
+              if (
+                !inFolder(candidate, name) ||
+                linked?.dev !== written.dev ||
+                linked.ino !== written.ino
+              ) {
+                unlinkQuietly(candidate);
+                throw moved(candidate);
+              }
+              path = candidate;
+              stored.push({
+                kind: file.kind,
+                name,
+                mimeType: file.mimeType,
+                path: candidate,
+                bytes: file.bytes.length,
+              });
             }
           } finally {
-            unlinkSync(temporary);
+            unlinkQuietly(temporary);
           }
         }
       } catch (cause) {
-        for (const done of stored) {
-          try {
-            unlinkSync(done.path);
-          } catch {
-            // Already gone; nothing else to undo.
-          }
-        }
+        for (const done of stored) unlinkQuietly(done.path);
         throw cause;
       }
       return stored;

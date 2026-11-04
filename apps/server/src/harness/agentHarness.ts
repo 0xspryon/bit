@@ -367,11 +367,21 @@ export interface MessageEntry {
   readonly marker?: string;
   /**
    * On a `user` entry whose message carried files (A6 F9), the files, read from the
-   * harness's own record of it: the prompt's `[Attached …]` lines, which are taken out of
-   * {@link text}, with the type the harness's image block or file part kept. Absent when the
-   * message carried none.
+   * harness's own record of it: the prompt's `[Attached …]` lines naming files stored in the
+   * folder the caller gave ({@link MessageRead.uploadsFolder}), which are taken out of
+   * {@link text}, typed by OpenCode's file part or else by the stored name. Absent when the
+   * message carried none, or the caller named no folder.
    */
   readonly attachments?: readonly ReplayedAttachment[];
+}
+
+/** What a caller tells {@link AgentHarness.messages} about the session it reads. */
+export interface MessageRead {
+  /**
+   * The session's own `uploads/` folder, absolute, as the caller knows it — never as the
+   * transcript says it. See `harness/attachments.ts`'s `splitAttachmentLines`.
+   */
+  readonly uploadsFolder?: string | undefined;
 }
 
 /**
@@ -1162,9 +1172,15 @@ export class AgentHarness extends Context.Service<
      * transcript and the round and goal narrations replay it as it stands. A new
      * implementation that cannot keep the promise must sort or refuse; it must not
      * return a truncated or reversed list under this type.
+     *
+     * `read.uploadsFolder` is where the caller stored the files this session's messages
+     * carried (A6 F9): `<the session's working directory>/uploads`, from the caller's own
+     * record of where the session runs. Only a path line naming a file stored there is read
+     * back as {@link MessageEntry.attachments}; without it, every line stays in the words.
      */
     readonly messages: (
       sessionId: string,
+      read?: MessageRead,
     ) => Effect.Effect<readonly MessageEntry[], HarnessFailure>;
     /**
      * Asks the harness to stop whatever the session is doing.

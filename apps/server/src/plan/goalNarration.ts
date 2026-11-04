@@ -153,6 +153,11 @@ export const goalConversationNarration = Effect.fnUntraced(function* (input: {
   readonly recorded: RecordedGoalSession | undefined;
   /** The session **this process** is holding for this goal, if any. */
   readonly liveSessionId: string | undefined;
+  /**
+   * The session's own `uploads/` folder, from this server's record of where it runs: only a
+   * path line naming a file stored there is replayed as a file (A6 F9).
+   */
+  readonly uploadsFolder?: string | undefined;
   readonly limit?: number | undefined;
   readonly fetchTimeout?: Duration.Input | undefined;
 }) {
@@ -215,7 +220,9 @@ export const goalConversationNarration = Effect.fnUntraced(function* (input: {
   const displayName = resolved.success.instance.displayName;
   const fetched = yield* Effect.result(
     Effect.timeout(
-      resolved.success.harness.messages(sessionId),
+      resolved.success.harness.messages(sessionId, {
+        uploadsFolder: input.uploadsFolder,
+      }),
       input.fetchTimeout ?? GOAL_NARRATION_FETCH_TIMEOUT,
     ),
   );

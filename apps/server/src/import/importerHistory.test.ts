@@ -708,3 +708,79 @@ describe("the view is a union on its continuation (A6 F10, from F1's review)", (
     expect("refusal" in decoded).toBe(false);
   });
 });
+
+/* ── Where a replay may find a message's files (A6 F9) ────────────────────────── */
+
+describe("the uploads folder the replay is given", () => {
+  /** The folder `messages` was asked to read files in, for one replay. */
+  const folderFor = async (input: {
+    readonly recorded?: RecordedImportSession;
+    readonly live?: { readonly directory: string };
+    readonly continuation?: SessionContinuation;
+  }) => {
+    const asked: (string | undefined)[] = [];
+    await Effect.runPromise(
+      importerConversation({
+        resolver: HarnessResolver.fromEntries([
+          {
+            instance: STUB_INSTANCE,
+            harness: stubHarness({
+              messages: (_, read) => {
+                asked.push(read?.uploadsFolder);
+                return Effect.succeed([]);
+              },
+              ...(input.continuation === undefined
+                ? {}
+                : { sessionContinuation: continuing(input.continuation) }),
+            }),
+          },
+        ]),
+        targetId: TARGET,
+        importId: IMPORT,
+        recorded: input.recorded ?? recorded(),
+        liveSessionId: input.live === undefined ? undefined : SESSION,
+        liveDirectory: input.live?.directory,
+        importDirectory,
+      }),
+    );
+    return asked;
+  };
+
+  test("a held session's: the directory the registry gated, which for a successor is not this import's", async () => {
+    expect(
+      await folderFor({
+        live: { directory: importDirectory(TARGET, "imp_0") },
+      }),
+    ).toEqual([`${importDirectory(TARGET, "imp_0")}/uploads`]);
+  });
+
+  test("a resumable one's: the import directory the harness resolves it in, as the reopen recognised it", async () => {
+    expect(
+      await folderFor({
+        continuation: {
+          _tag: "resumable",
+          directory: importDirectory(TARGET, "imp_0"),
+          detail: "still held",
+        },
+      }),
+    ).toEqual([`${importDirectory(TARGET, "imp_0")}/uploads`]);
+  });
+
+  test("one resolved somewhere this server does not gate: none, so no line is read as a file", async () => {
+    expect(
+      await folderFor({
+        continuation: {
+          _tag: "resumable",
+          directory: "/home/op/.ssh",
+          detail: "still held",
+        },
+      }),
+    ).toEqual([undefined]);
+  });
+
+  test("a refused one, which is not asked where it runs: this import's own", async () => {
+    expect(
+      await folderFor({ recorded: recorded({ endedReason: "operator" }) }),
+    ).toEqual([`${importDirectory(TARGET, IMPORT)}/uploads`]);
+  });
+});

@@ -8,11 +8,13 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { Effect } from "effect";
 import { HttpServerRequest } from "effect/http";
@@ -343,6 +345,66 @@ describe("storing a message's files", () => {
     }
     expect(readdirSync(elsewhere)).toEqual([]);
     rmSync(elsewhere, { recursive: true, force: true });
+  });
+});
+
+/*
+ * The agent works in the session's directory, so it can swap `uploads` for a link at any
+ * moment — after the folder was checked, and again after a file was written. The probe is
+ * where that swap happens here; on a live server it is a race the agent runs.
+ */
+describe("the folder swapped for a link while files are being stored", () => {
+  /** Moves `uploads` aside and leaves a link to `elsewhere` in its place. */
+  const swap = (directory: string, elsewhere: string) => {
+    renameSync(join(directory, "uploads"), join(directory, "uploads-real"));
+    symlinkSync(elsewhere, join(directory, "uploads"));
+  };
+
+  test("after the check: refused before a byte is written, and nothing lands where the link points", async () => {
+    const directory = sessionDirectory();
+    const elsewhere = mkdtempSync(join(tmpdir(), "bit-uploads-swapped-"));
+    try {
+      const result = await Effect.runPromise(
+        Effect.result(
+          storeUploads(directory, [file("a.txt", "secret bytes")], {
+            afterCheck: () => swap(directory, elsewhere),
+          }),
+        ),
+      );
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure._tag).toBe("UploadWriteFailed");
+      }
+      expect(readdirSync(elsewhere)).toEqual([]);
+      expect(readdirSync(join(directory, "uploads-real"))).toEqual([]);
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  test("after the write: a name linked where the link points is undone, and no path outside is handed on", async () => {
+    const directory = sessionDirectory();
+    const elsewhere = mkdtempSync(join(tmpdir(), "bit-uploads-swapped-"));
+    try {
+      const result = await Effect.runPromise(
+        Effect.result(
+          storeUploads(directory, [file("a.txt", "secret bytes")], {
+            afterWrite: (temporary) => {
+              swap(directory, elsewhere);
+              // The agent can list the folder, so it can plant the temporary's name too.
+              writeFileSync(
+                join(elsewhere, basename(temporary)),
+                "agent's bytes",
+              );
+            },
+          }),
+        ),
+      );
+      expect(result._tag).toBe("Failure");
+      expect(readdirSync(elsewhere)).not.toContain("a.txt");
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
   });
 });
 

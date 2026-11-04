@@ -227,6 +227,8 @@ const uploadLimitsOf = (config: BrowserApiConfig): UploadLimits => ({
  * browser's MIME type trusted after the allow-list, no image compression, HEIC/HEIF
  * refused. Proper V2: T3's two-step upload (signed, size-pinned URL; claim on send;
  * pending sweep), byte sniffing, compression to fit the limit, HEIC conversion if wanted.
+ * And uploads are read whole into memory (bounded by UPLOAD_MAX_TOTAL_BYTES); proper
+ * V2 streams each part to disk as it arrives.
  */
 export const messageWithFiles = <A, I>(
   payload: A | Stream.Stream<Multipart.Part, Multipart.MultipartError>,

@@ -1819,6 +1819,7 @@ export class ScopeImporter extends Context.Service<
           importId: input.importId,
           recorded: input.recorded,
           liveSessionId: held?.sessionId,
+          liveDirectory: held?.directory,
           importDirectory: fleet.paths.importDirectory,
           ...(input.limit === undefined ? {} : { limit: input.limit }),
           ...(input.fetchTimeout === undefined

@@ -70,6 +70,8 @@
  * needed to change — but the note must not promise that only the first message was
  * trimmed, and it does not.
  */
+import { join } from "node:path";
+
 import {
   type ImporterContinuation,
   type ImporterContinuationRefusal,
@@ -89,6 +91,7 @@ import { roleDirectoryMatcher, sessionReopen } from "../harness/sessionReopen";
 import { isRoleDirectoryId } from "../persistence/fleet";
 import type { CallerContext } from "../persistence/store";
 import { projectReplay } from "../run/liveTranscript";
+import { UPLOADS_FOLDER } from "../upload/uploads";
 
 /** How long the harness is given to answer about one conversation. */
 export const IMPORTER_HISTORY_FETCH_TIMEOUT: Duration.Input = "5 seconds";
@@ -366,6 +369,11 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
   readonly recorded: RecordedImportSession;
   /** The session **this process** is holding for this import, if any. */
   readonly liveSessionId: string | undefined;
+  /**
+   * The directory that held session runs in, as the spine gated it — which for a successor
+   * is the original import's, not this one's. Where its files are stored (A6 F9).
+   */
+  readonly liveDirectory?: string | undefined;
   /** `FleetPaths.importDirectory`. Passed in; see {@link importerReopen}. */
   readonly importDirectory: (targetId: string, importId: string) => string;
   readonly limit?: number | undefined;
@@ -508,9 +516,37 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
         ? ""
         : continuationNote(reopen);
 
+  /*
+   * Where this session's files are stored (A6 F9): `uploads/` in the directory it runs in,
+   * named from this server's own record — the registry's for a held session, the import
+   * directory the reopen recognised for a resumable one. A refused session is not asked
+   * where it runs (nothing will be sent to it), so it is read in this import's own
+   * directory, which is where it runs unless it was a successor's; a successor's lines then
+   * stay words. A replay reads a path line as a file only inside this folder, so a line
+   * the operator typed naming anywhere else stays their words; with no folder, every one
+   * does.
+   */
+  const importFolder = (importId: string): string | undefined => {
+    try {
+      return input.importDirectory(input.targetId, importId);
+    } catch {
+      // `FleetPaths` throws on an id it will not build a path from: no folder, no files.
+      return undefined;
+    }
+  };
+  const runsIn = live
+    ? input.liveDirectory
+    : reopen === undefined
+      ? importFolder(input.importId)
+      : reopen._tag === "resume"
+        ? importFolder(reopen.directoryImportId)
+        : undefined;
   const fetched = yield* Effect.result(
     Effect.timeout(
-      harness.messages(sessionId),
+      harness.messages(sessionId, {
+        uploadsFolder:
+          runsIn === undefined ? undefined : join(runsIn, UPLOADS_FOLDER),
+      }),
       input.fetchTimeout ?? IMPORTER_HISTORY_FETCH_TIMEOUT,
     ),
   );

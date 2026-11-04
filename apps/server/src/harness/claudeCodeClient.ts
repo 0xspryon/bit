@@ -1519,6 +1519,7 @@ const cliMarker = (entry: SessionMessage): string | undefined => {
  */
 const flattenTranscript = (
   entries: readonly SessionMessage[],
+  uploadsFolder: string | undefined,
 ): MessageEntry[] => {
   const blocksSeen = new Map<string, number>();
   return entries.map((entry): MessageEntry => {
@@ -1547,26 +1548,16 @@ const flattenTranscript = (
             .join("\n");
     const marker = cliMarker(entry);
     /*
-     * The files an operator's message carried (A6 F9): its trailing `[Attached …]` lines,
-     * taken out of the words, each image's type from its image block — the blocks precede
-     * the text in the order the lines name them (`userContent`).
+     * The files an operator's message carried (A6 F9): its trailing `[Attached …]` lines
+     * naming files in the session's own `uploads/` folder, taken out of the words. Each is
+     * typed by its stored name, not by the message's image blocks: the CLI re-encodes a large
+     * image before storing it (measured: a 6.4 MiB PNG came back as `image/jpeg`), and the
+     * blocks are not the lines one for one, so neither their types nor their order say which
+     * file is which.
      */
-    const imageTypes = blocks.flatMap((part) => {
-      const block = part as {
-        type?: unknown;
-        source?: { media_type?: unknown };
-      };
-      return block.type === "image" &&
-        typeof block.source?.media_type === "string"
-        ? [block.source.media_type]
-        : [];
-    });
-    let nextImage = 0;
     const split =
       entry.type === "user" && marker === undefined
-        ? splitAttachmentLines(text, (_, kind) =>
-            kind === "image" ? imageTypes[nextImage++] : undefined,
-          )
+        ? splitAttachmentLines(text, { uploadsFolder })
         : undefined;
     return {
       type: entry.type,
@@ -3227,7 +3218,7 @@ export const claudeCodeHarness = (
 
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(
         "claudeCodeHarness.messages",
-      )(function* (sessionId) {
+      )(function* (sessionId, read) {
         const directory = sessions.get(sessionId)?.directory;
         const entries = yield* Effect.tryPromise({
           try: () =>
@@ -3243,6 +3234,7 @@ export const claudeCodeHarness = (
         });
         return flattenTranscript(
           entries.filter((entry) => !isLocalCommandEntry(entry)),
+          read?.uploadsFolder,
         );
       });
 

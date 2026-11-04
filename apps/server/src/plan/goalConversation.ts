@@ -83,7 +83,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { isAbsolute, relative } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 
 import type { AgentHarness } from "../harness/agentHarness";
 import {
@@ -138,7 +138,7 @@ import {
   uploadNameRefusal,
   type CollectedUpload,
 } from "./goalUploads";
-import type { ReadUpload } from "../upload/uploads";
+import { UPLOADS_FOLDER, type ReadUpload } from "../upload/uploads";
 
 /**
  * One file as the HTTP layer hands it over: read off the wire, not yet anywhere on disk.
@@ -1102,12 +1102,29 @@ const make = Effect.fnUntraced(function* () {
       input.goalId,
     );
     const here = sessions.get(input.goalId);
+    /*
+     * Where this conversation's files are stored (A6 F9): `uploads/` in the goal's own
+     * directory, the only one a goal conversation runs or resumes in (see `reopen`). The
+     * replay reads a path line as a file only inside it; `goalDirectory` throws on an id it
+     * will not build a path from, and then no line is read as one.
+     */
+    let uploadsFolder: string | undefined;
+    try {
+      uploadsFolder = join(
+        here?.directory ??
+          fleet.paths.goalDirectory(input.targetId, input.goalId),
+        UPLOADS_FOLDER,
+      );
+    } catch {
+      uploadsFolder = undefined;
+    }
     return yield* goalConversationNarration({
       resolver,
       targetId: input.targetId,
       goalId: input.goalId,
       recorded,
       liveSessionId: here?.sessionId,
+      uploadsFolder,
       ...(input.limit === undefined ? {} : { limit: input.limit }),
       ...(input.fetchTimeout === undefined
         ? {}

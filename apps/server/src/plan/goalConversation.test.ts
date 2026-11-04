@@ -121,6 +121,8 @@ interface Recorder {
     /** The files it carried (A6 F9), as `[kind, name, path]`. Absent when it carried none. */
     attachments?: readonly (readonly [string, string, string])[];
   }[];
+  /** The uploads folder each `messages` read was given (A6 F9). */
+  readonly reads: (string | undefined)[];
 }
 
 const emptyRecorder = (): Recorder => {
@@ -134,6 +136,7 @@ const emptyRecorder = (): Recorder => {
     unregistrations: [],
     ended: [],
     prompts: [],
+    reads: [],
   };
 };
 
@@ -297,9 +300,10 @@ const fakeHarness = (
             });
             return { delivered: true };
           }),
-    messages: () =>
-      Effect.succeed(
-        (
+    messages: (_sessionId, read) =>
+      Effect.sync(() => {
+        recorder.reads.push(read?.uploadsFolder);
+        return (
           options?.messages ?? [
             { type: "user", text: "what is happening?" },
             { type: "assistant", text: "one round has run." },
@@ -310,8 +314,8 @@ const fakeHarness = (
           parts: [],
           model: undefined,
           at: undefined,
-        })),
-      ),
+        }));
+      }),
     sessionEvents: () => Stream.never,
     ...(options?.interrupt === undefined
       ? {}
@@ -1481,6 +1485,20 @@ describe("a restart with a goal conversation live", () => {
     // rides above the same delimiter on every turn of a goal that has files.
     expect(view.note).toContain("shown as you wrote them");
 
+    await second.runtime.dispose();
+  });
+
+  test("the replay is told the goal's own uploads folder, held or not, and reads files nowhere else", async () => {
+    const { root, first, make, ready } = world();
+    await ready;
+    await sending(first.runtime, "hello");
+    await replaying(first.runtime);
+    await first.runtime.dispose();
+    const second = make();
+    await replaying(second.runtime);
+    const folder = join(root, "targets", TARGET, "goal", GOAL, "uploads");
+    expect(first.recorder.reads).toEqual([folder]);
+    expect(second.recorder.reads).toEqual([folder]);
     await second.runtime.dispose();
   });
 

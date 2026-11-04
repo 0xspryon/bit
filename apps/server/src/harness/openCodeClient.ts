@@ -910,7 +910,10 @@ const assistantContentParts = (
  * reply actually lives. Only an `assistant` entry has parts or a model; `at` is
  * `time.created` on every kind.
  */
-const flatten = (entry: unknown): MessageEntry => {
+const flatten = (
+  entry: unknown,
+  uploadsFolder: string | undefined,
+): MessageEntry => {
   const record = (entry ?? {}) as {
     id?: unknown;
     type?: unknown;
@@ -950,9 +953,10 @@ const flatten = (entry: unknown): MessageEntry => {
             .map((part) => (typeof part.text === "string" ? part.text : ""))
             .join("\n");
   /*
-   * The files an operator's message carried (A6 F9): its trailing `[Attached …]` lines,
-   * taken out of the words, each file's type from the file part OpenCode stored for it
-   * (matched by its `file://` uri) when it was sent inline.
+   * The files an operator's message carried (A6 F9): its trailing `[Attached …]` lines
+   * naming files in the session's own `uploads/` folder, taken out of the words, each
+   * file's type from the file part OpenCode stored for it (matched by its `file://` uri,
+   * never by position) when it was sent inline.
    */
   const fileTypes = new Map<string, string>();
   for (const file of Array.isArray(record.files) ? record.files : []) {
@@ -966,7 +970,10 @@ const flatten = (entry: unknown): MessageEntry => {
   }
   const split =
     type === "user"
-      ? splitAttachmentLines(words, (path) => fileTypes.get(path))
+      ? splitAttachmentLines(words, {
+          uploadsFolder,
+          mimeOf: (path) => fileTypes.get(path),
+        })
       : undefined;
   return {
     type,
@@ -1901,7 +1908,7 @@ export const openCodeHarness = (
        */
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(
         "openCodeHarness.messages",
-      )(function* (sessionId) {
+      )(function* (sessionId, read) {
         const entries: MessageEntry[] = [];
         let cursor: string | undefined;
         for (let page = 0; page < MESSAGE_PAGE_CEILING; page += 1) {
@@ -1915,7 +1922,9 @@ export const openCodeHarness = (
             }),
           );
           if (listed.data.length === 0) return entries;
-          for (const entry of listed.data) entries.push(flatten(entry));
+          for (const entry of listed.data) {
+            entries.push(flatten(entry, read?.uploadsFolder));
+          }
           const next = listed.cursor.next;
           if (typeof next !== "string") return entries;
           cursor = next;
