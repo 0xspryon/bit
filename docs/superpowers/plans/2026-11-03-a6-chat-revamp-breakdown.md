@@ -270,3 +270,9 @@ U13.
   server (`bit_ingest`, `bit_retrieve`) in its tool catalogue, most likely from the
   operator's global OpenCode config — so an importer session could call tools outside what
   bit grants it (F7 review). Same class as the Claude Code user-settings item above.
+- **Operator decision pending:** subagent activity. When an importer uses a subagent
+  (possible because it loads the operator's user settings), its thinking, tool calls and
+  replies appear live as the importer's own rows, but vanish on reload — the CLI keeps a
+  subagent's transcript in a separate `subagents/` folder the replay does not read (F10
+  review). Choose: replay subagent transcripts labelled as a subagent's, or keep subagent
+  frames out of the live chat. Tied to the user-settings decision above.
