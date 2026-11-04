@@ -1430,6 +1430,17 @@ const isLocalCommandEntry = (entry: SessionMessage): boolean =>
  *   and no message this server sends carries an `origin` ({@link userMessage}). Not in the
  *   published `SessionMessage` type, so read through a cast like `isCompletedLocalCommand`.
  *   A task notification is `task`; any other kind but `human` is named by its kind.
+ * - **`isCompactSummary` / `is_meta`.** When the CLI compacts a session it stores the
+ *   summary (`This session is being continued from a previous conversation…`, several KB
+ *   of its own prose) as a `user` entry with **string** content, `isCompactSummary: true`,
+ *   `isVisibleInTranscriptOnly: true` and no `origin`. SDK 0.3.310 keeps
+ *   `isCompactSummary: true` and adds `is_meta: true`, which it sets for any of `isMeta`,
+ *   `isCompactSummary` and `isVisibleInTranscriptOnly` — none of which a message this
+ *   server sends carries (`compaction.cli.jsonl`). The summary is `compacted`; any other
+ *   `is_meta` entry is `meta`. Neither is declared on `SessionMessage`; read through a cast.
+ *   **A replay after a compaction starts at the summary:** `getSessionMessages` follows the
+ *   chain back only to the compaction boundary (whose `parentUuid` is null), so nothing
+ *   said before it is in the read — the summary is all the replay holds of it.
  * - **The interrupt note**, as a last resort, because nothing else marks it: after a Stop
  *   the CLI writes `[Request interrupted by user for tool use]` (or `… by user]` for a cut
  *   reply) as a `user` entry whose content is exactly one `text` block opening with that text,
@@ -1438,8 +1449,9 @@ const isLocalCommandEntry = (entry: SessionMessage): boolean =>
  *   attachment has more than one block, and one sent as words is a string.
  *
  * Everything else in the user's role is the operator's (or, in a planner round, a steer).
- * Should a later SDK stop passing `origin` through, a notification reads as the operator's
- * again; no operator message can be hidden by this.
+ * Should a later SDK stop passing `origin` or `is_meta` through, a notification or a
+ * compaction summary reads as the operator's again; no operator message can be hidden by
+ * this.
  */
 const cliMarker = (entry: SessionMessage): string | undefined => {
   if (entry.type !== "user") return undefined;
@@ -1451,6 +1463,12 @@ const cliMarker = (entry: SessionMessage): string | undefined => {
   if (typeof kind === "string" && kind !== "human") {
     return kind === "task-notification" ? "task" : kind;
   }
+  const flags = entry as {
+    readonly isCompactSummary?: unknown;
+    readonly is_meta?: unknown;
+  };
+  if (flags.isCompactSummary === true) return "compacted";
+  if (flags.is_meta === true) return "meta";
   const content = (entry.message as { readonly content?: unknown } | undefined)
     ?.content;
   if (!Array.isArray(content) || content.length !== 1) return undefined;
@@ -1475,8 +1493,8 @@ const cliMarker = (entry: SessionMessage): string | undefined => {
  * the two functions {@link narrate} reads live frames with, so a replay is the live
  * conversation's own items. A `user` entry whose content is a string is the words sent —
  * the operator's, under whatever framing the caller trims — and has no parts. One the CLI
- * wrote itself — an interrupt note, a task notification — carries a `marker`
- * ({@link cliMarker}), whatever its content's shape.
+ * wrote itself — an interrupt note, a task notification, a compaction summary — carries
+ * a `marker` ({@link cliMarker}), whatever its content's shape.
  *
  * **A finished block gets the `blockId` it streamed under**, when the transcript lets this
  * name it: the CLI writes one entry per content block of a call (the split the stream

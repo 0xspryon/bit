@@ -819,10 +819,10 @@ export interface ReplayProjection {
  *   framing off the text first, and drops an entry it never wants shown (a round's prompt).
  * - a `user` entry the harness wrote itself ({@link MessageEntry.marker}) — Claude Code's
  *   `[Request interrupted by user for tool use]` after a Stop, its `<task-notification>`
- *   when a task ends — as `turn.other` under what it marks (`interrupted`, `task`), in
- *   either kind of session: nobody said it, so it is never `You` and never opens a turn of
- *   the operator's, and it stays on screen because it is where the Stop landed or the task
- *   ended.
+ *   when a task ends, its summary when it compacts a session — as `turn.other` under what
+ *   it marks (`interrupted`, `task`, `compacted`), in either kind of session: nobody said
+ *   it, so it is never `You` and never opens a turn of the operator's, and it stays on
+ *   screen because it is where the Stop landed, the task ended, or the replay begins.
  * - an entry the harness lists that is neither side — OpenCode's `shell`, `synthetic`,
  *   `system` — as `turn.other` under the harness's own word, so it never reads as the agent;
  * - an `error` the harness recorded on an entry, as `turn.other` labelled `error`,

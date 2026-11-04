@@ -4993,6 +4993,103 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
   });
 
   /**
+   * A compaction's summary, read back through the **real** `getSessionMessages`.
+   *
+   * `testdata/claude-code-transcript/compaction.cli.jsonl` is in the CLI's on-disk form,
+   * built (not recorded) on the shape of the manual compactions CLI 2.1.304–2.1.316 stored
+   * on this machine: an operator turn, the `compact_boundary` system entry (`parentUuid`
+   * null, `logicalParentUuid` the turn's reply), the summary as a string `user` entry with
+   * `isCompactSummary` and `isVisibleInTranscriptOnly` and no `origin`, then an operator
+   * follow-up and its reply. The summary's text is cut to a few lines and the boundary's
+   * `compactMetadata` to its counts; the trigger is `auto`, as it is in a session bit drives.
+   *
+   * SDK 0.3.310 reads the chain back only to the boundary, so the turn before it is not in
+   * the answer at all: the replay starts at the summary. The summary is the CLI's prose, not
+   * the operator's, and must neither read as `You` nor open a turn of theirs.
+   */
+  test("a compaction summary replays as `compacted`, not as a message the operator sent, and the replay starts at it", async () => {
+    const COMPACTED = "00000000-0000-4000-8000-0000000000f4";
+    const SUMMARY_OPENING =
+      "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
+    const root = await mkdtemp(join(tmpdir(), "bit-compacted-"));
+    const previous = process.env["CLAUDE_CONFIG_DIR"];
+    try {
+      const project = join(root, "projects", "-tmp-bit-compacted-ws");
+      await mkdir(project, { recursive: true });
+      await writeFile(
+        join(project, `${COMPACTED}.jsonl`),
+        await readFile(
+          join(
+            import.meta.dir,
+            "testdata",
+            "claude-code-transcript",
+            "compaction.cli.jsonl",
+          ),
+          "utf8",
+        ),
+      );
+      process.env["CLAUDE_CONFIG_DIR"] = root;
+      const { sdk } = scriptedSdk();
+      const entries = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            harness.messages(COMPACTED),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                sdk: {
+                  ...sdk,
+                  sessionMessages: liveClaudeCodeSdk.sessionMessages,
+                },
+                controlTimeout: "2 seconds",
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+      expect(
+        entries.map((entry) => [
+          entry.type,
+          entry.marker ?? null,
+          entry.text.split("\n")[0],
+        ]),
+      ).toEqual([
+        ["user", "compacted", SUMMARY_OPENING],
+        ["user", null, "Reply with the single word after."],
+        ["assistant", null, "after"],
+      ]);
+      for (const subject of [
+        { _tag: "import", importId: "imp_1" },
+        { _tag: "goal", goalId: "goal_1" },
+      ] as const) {
+        const replayed = projectReplay({
+          entries,
+          subject,
+          harnessSessionId: COMPACTED,
+          users: "operator",
+          fallbackAt: 0,
+        }).items;
+        expect(
+          replayed.map((item) =>
+            item.kind === "turn.other"
+              ? `${item.headline}: ${(item.body ?? "").split("\n")[0]}`
+              : `${item.kind}: ${item.body ?? ""}`,
+          ),
+        ).toEqual([
+          `compacted: ${SUMMARY_OPENING}`,
+          "turn.operator: Reply with the single word after.",
+          "turn.reply: after",
+        ]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  /**
    * The rule is the SDK's markers, not the content's shape (A6 F10 re-review). An
    * attachment (U13) makes an operator's message a **list** of blocks, which a rule keyed on
    * "a list is the CLI's" would turn into a harness note; and a `<task-notification>` is a
@@ -5056,6 +5153,8 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
             },
           ]),
           user("h", [{ type: "text", text: "[Request interrupted by user]" }]),
+          // The SDK's `is_meta` without `isCompactSummary`: the CLI's, though not a summary.
+          user("i", "a note the CLI keeps for itself", { is_meta: true }),
         ],
       },
       (harness) => harness.messages(SESSION),
@@ -5069,6 +5168,7 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
       "task",
       "interrupted",
       "interrupted",
+      "meta",
     ]);
     expect(
       projectReplay({
@@ -5087,6 +5187,7 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
       `task: ${notification}`,
       "interrupted: [Request interrupted by user for tool use]",
       "interrupted: [Request interrupted by user]",
+      "meta: a note the CLI keeps for itself",
     ]);
   });
 });
