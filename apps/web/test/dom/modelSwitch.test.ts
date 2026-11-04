@@ -372,6 +372,43 @@ describe("U3: switching a started session's model", () => {
   });
 });
 
+describe("U4 step 0: a switch answered after the page was left", () => {
+  test("is read into the list the page is showing on its return, so the chip is the server's model", async () => {
+    const { app, fake } = await openOn();
+    const release = fake.hold("switchImporterModel");
+    await openPicker();
+    click(inPicker(FIVE));
+    await settle();
+    click(inPicker("Use for this session"));
+    await settle();
+
+    // Back to the estate and return to the chat while the switch is out: the page is a new
+    // one, and its list was read before the server moved the record.
+    await applyPlace(app, parsePath("/t/acme-corp/assets/estate"));
+    await settle();
+    await applyPlace(app, parsePath("/t/acme-corp/assets/chat/ses_old"));
+    await settle();
+    expect(app.importer.current?.id).toBe("ses_old");
+    expect(app.importer.current?.model).toBe(SOL);
+
+    // The server answers the switch, and its row now names the new model.
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: [importerSessionView({ sessionId: "ses_old", model: FIVE })],
+      });
+    const before = fake.countOf("importerSessions");
+    release();
+    await settle();
+    await settle();
+
+    expect(fake.countOf("importerSessions")).toBeGreaterThan(before);
+    expect(app.importer.current?.model).toBe(FIVE);
+    // Nothing is drawn for an answer to a page that was left: no notice, no dialog.
+    expect(app.importer.switchNotice).toBeUndefined();
+    expect(alert()).toBeNull();
+  });
+});
+
 describe("U3: a refused switch", () => {
   const refuse = (
     fake: FakeServer,

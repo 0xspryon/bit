@@ -29,7 +29,13 @@ import {
   type LanguageRegistration,
   type ThemeRegistrationRaw,
 } from "@shikijs/core";
-import { EncodedTokenMetadata, INITIAL } from "@shikijs/core/textmate";
+import {
+  EncodedTokenMetadata,
+  INITIAL,
+  type IGrammar,
+  type ITokenizeLineResult2,
+  type StateStack,
+} from "@shikijs/core/textmate";
 import { createOnigurumaEngine } from "@shikijs/engine-oniguruma";
 
 import type { Grammar } from "./highlightLanguages";
@@ -225,6 +231,35 @@ export interface TokeniseOptions {
 }
 
 /**
+ * One line through Oniguruma, tried a second time if the first stopped at the per-line
+ * limit and the block's budget has time left.
+ *
+ * **A line that stops early comes back partly plain**: the tokens up to where it stopped,
+ * then the rest as one untoned token. On a loaded machine the *first* line of a grammar
+ * can do that with nothing hostile in it, since its regexes are compiled on first use and
+ * that compile is billed to the line. The retry starts from the same state, with the
+ * compile paid, so an ordinary line comes back whole; a hostile one stops early again and
+ * is kept as it is, and costs at most one more per-line limit, never past the deadline.
+ */
+export const tokeniseLine = (
+  grammar: Pick<IGrammar, "tokenizeLine2">,
+  line: string,
+  state: StateStack,
+  deadline: number,
+  now: () => number,
+): ITokenizeLineResult2 => {
+  const first = grammar.tokenizeLine2(line, state, TOKENIZE_TIME_LIMIT_MS);
+  if (!first.stoppedEarly) return first;
+  const left = deadline - now();
+  if (left <= 0) return first;
+  return grammar.tokenizeLine2(
+    line,
+    state,
+    Math.min(TOKENIZE_TIME_LIMIT_MS, left),
+  );
+};
+
+/**
  * `code` as lines of toned runs, in `grammar`. Neighbouring runs of one tone are joined, so
  * a line is as few spans as its tones need. Rejects with {@link TokeniseOverBudget} when the
  * block takes longer than its budget.
@@ -261,7 +296,7 @@ export const tokenise = async (
       runs.push({ text: line, tone: "plain" });
       continue;
     }
-    const result = engine.tokenizeLine2(line, state, TOKENIZE_TIME_LIMIT_MS);
+    const result = tokeniseLine(engine, line, state, deadline, now);
     state = result.ruleStack;
     const count = result.tokens.length / 2;
     for (let token = 0; token < count; token += 1) {

@@ -3,11 +3,15 @@
  * grammars and the tone theme, with no DOM. What the page makes of the tones is
  * `test/dom/highlight.test.ts`.
  */
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
+
+import { INITIAL, type ITokenizeLineResult2 } from "@shikijs/core/textmate";
 
 import {
   tokenise,
+  tokeniseLine,
   TOKENIZE_BLOCK_BUDGET_MS,
+  TOKENIZE_TIME_LIMIT_MS,
   TOKENIZE_MAX_LINE_LENGTH,
   TokeniseOverBudget,
   type ToneLines,
@@ -19,6 +23,18 @@ const read = (lines: ToneLines): string[][] =>
   lines.map((line) =>
     line.map((run) => `${run.tone === "plain" ? "" : run.tone}:${run.text}`),
   );
+
+/*
+ * Every grammar is loaded and run once before any test asserts on its tones. The first line
+ * a grammar tokenises pays for compiling its regexes, and on a loaded machine that can pass
+ * the per-line limit; the engine retries such a line, but a test's exact runs should not
+ * rest on the retry's timing either.
+ */
+beforeAll(async () => {
+  for (const grammar of GRAMMARS) {
+    await tokenise("a = 1 // x\n<b c=\"d\">'e'</b>", grammar);
+  }
+}, 60_000);
 
 describe("the tones Shiki gives", () => {
   test("D8's js sample: words heavier, names in the base ink, symbols muted", async () => {
@@ -153,6 +169,69 @@ describe("the tones Shiki gives", () => {
         .map((run) => run.text)
         .join(""),
     ).toBe('{"ho\u200Bst": "\u202Eevil"}');
+  });
+});
+
+describe("a line that stops at the per-line limit", () => {
+  const result = (
+    stoppedEarly: boolean,
+    tag: number,
+  ): ITokenizeLineResult2 => ({
+    tokens: new Uint32Array([0, tag]),
+    ruleStack: INITIAL,
+    stoppedEarly,
+  });
+
+  /** A grammar whose lines stop early as `stops` says, logging each call's limit. */
+  const grammar = (stops: boolean[]) => {
+    const limits: number[] = [];
+    return {
+      limits,
+      tokenizeLine2: (_line: string, _state: unknown, limit?: number) => {
+        limits.push(limit ?? -1);
+        return result(stops[limits.length - 1] ?? false, limits.length);
+      },
+    };
+  };
+
+  test("is tried once more from the same state, and the second answer is kept", () => {
+    const fake = grammar([true, false]);
+    const answer = tokeniseLine(fake, "var a", INITIAL, 1_000, () => 0);
+    expect(fake.limits).toEqual([
+      TOKENIZE_TIME_LIMIT_MS,
+      TOKENIZE_TIME_LIMIT_MS,
+    ]);
+    expect(answer.stoppedEarly).toBe(false);
+    expect([...answer.tokens]).toEqual([0, 2]);
+  });
+
+  test("only once: a line that stops early again is kept as it came back", () => {
+    const fake = grammar([true, true, false]);
+    const answer = tokeniseLine(fake, "var a", INITIAL, 1_000, () => 0);
+    expect(fake.limits).toHaveLength(2);
+    expect(answer.stoppedEarly).toBe(true);
+  });
+
+  test("a line that did not stop early is not tried again", () => {
+    const fake = grammar([false]);
+    tokeniseLine(fake, "var a", INITIAL, 1_000, () => 0);
+    expect(fake.limits).toHaveLength(1);
+  });
+
+  test("the retry stays inside the block's budget, by the clock it is given", () => {
+    // No time left: no retry.
+    const spent = grammar([true, false]);
+    let time = 1_000;
+    expect(
+      tokeniseLine(spent, "var a", INITIAL, 1_000, () => time).stoppedEarly,
+    ).toBe(true);
+    expect(spent.limits).toHaveLength(1);
+
+    // 30 ms left: the retry is given those, not a whole per-line limit.
+    const short = grammar([true, false]);
+    time = 970;
+    tokeniseLine(short, "var a", INITIAL, 1_000, () => time);
+    expect(short.limits).toEqual([TOKENIZE_TIME_LIMIT_MS, 30]);
   });
 });
 

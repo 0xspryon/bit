@@ -1142,8 +1142,15 @@ export class ImporterSessions {
       ...(modelOptions === undefined ? {} : { modelOptions }),
     });
     this.switches = this.switches.filter((each) => each !== inFlight);
-    // The page was left or reset meanwhile: nothing here is the answer's to change.
-    if (this.#server !== server) return false;
+    // The page was left or reset meanwhile: nothing here is the answer's to draw. But the
+    // page may be the same target's again (Back, then return), listed from a reading that
+    // left before the server had moved the record, so its chip would stay on the model this
+    // switch left. Read the list again on the page's server, which now holds the answer:
+    // the chip follows the server's row, and no notice or dialog is put up.
+    if (this.#server !== server) {
+      this.#server?.reread();
+      return false;
+    }
     if (answer._tag === "refused") {
       // Kept with the session it refused, which is not necessarily the one on screen now.
       this.switchFailures = [
