@@ -134,6 +134,7 @@
     session === undefined || session.tally.messages === 0
       ? null
       : {
+          sessionId: session.id,
           harness: session.harness,
           instanceId: session.harnessInstanceId,
           model: session.model,
@@ -141,12 +142,7 @@
         },
   );
   /** The model switch in flight for the session on screen, if any (A6 F4). */
-  let switchingHere = $derived(
-    importer.switching !== undefined &&
-      importer.switching.sessionId === session?.id
-      ? importer.switching
-      : undefined,
-  );
+  let switchingHere = $derived(importer.switchingOf(session?.id));
   /** What the server said about this session's last accepted switch. */
   let switchNote = $derived(
     importer.switchNotice !== undefined &&
@@ -191,6 +187,16 @@
     if (box === undefined) return;
     box.focus();
     box.setSelectionRange(caret, caret);
+  }
+
+  /**
+   * Puts focus in the composer once the page has drawn: after the model picker opened a new
+   * session on another harness, the chip that opened it is gone with the session it was
+   * for, and the draft it carried over is here.
+   */
+  async function focusComposer(): Promise<void> {
+    await tick();
+    box?.focus();
   }
 
   /**
@@ -419,7 +425,12 @@
                 importer.sending}
               onpick={(agentId) => importer.pickAgent(agentId)}
             />
-            <ImporterModelPicker {app} {pinned} switchable={!blocked} />
+            <ImporterModelPicker
+              {app}
+              {pinned}
+              switchable={!blocked}
+              onNewSession={focusComposer}
+            />
             {#if pinned !== null && !blocked}
               <!--
                 D3's caption: the harness is the session's for good, its models are not. While
@@ -430,7 +441,10 @@
                   >Switching to {switchingHere.model}…</span
                 >
               {:else}
-                <span class="hint"
+                <!-- The title is the whole caption, where a long model name ellipses it. -->
+                <span
+                  class="hint"
+                  title="{pinned.harness} for this session · any of its models"
                   >{pinned.harness} for this session · any of its models</span
                 >
               {/if}

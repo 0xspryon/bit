@@ -176,6 +176,24 @@ export type ImporterSwitchAnswer =
   | { readonly _tag: "switched"; readonly switched: ConversationModelSwitched }
   | { readonly _tag: "refused"; readonly detail: string };
 
+/** A model switch of one session that is with the server and not yet answered. */
+export interface ModelSwitchInFlight {
+  readonly sessionId: string;
+  readonly importId: string;
+  readonly model: string;
+}
+
+/** The line over the composer about a session's last accepted switch. */
+export interface SwitchNotice {
+  readonly sessionId: string;
+  readonly text: string;
+  /**
+   * The same confirmation in the past tense, for a switch answered while a turn was running:
+   * what {@link text} becomes when that turn ends. Absent when there is no turn to end.
+   */
+  readonly onceIdle?: string;
+}
+
 /** What the server answered a Stop with, as the page needs it. */
 export type ImporterStopAnswer =
   | { readonly _tag: "stopped"; readonly stopped: ConversationStopped }
@@ -328,25 +346,22 @@ export class ImporterSessions {
    */
   agents = $state.raw<AgentsView | undefined>(undefined);
   /**
-   * The model switch with the server and not yet answered, or `undefined` (A6 F4). One at a
-   * time: the server refuses a second while one is in flight (`switch_in_flight`), so the
-   * page does not offer it.
+   * The model switches with the server and not yet answered (A6 F4), **one per session at
+   * most**: the server refuses a second switch of the same import while one is in flight
+   * (`switch_in_flight`), so the page does not offer it — but a switch of another session
+   * is another import's, and nothing stops it. Read one session's with {@link switchingOf}.
    */
-  switching = $state<
-    | {
-        readonly sessionId: string;
-        readonly importId: string;
-        readonly model: string;
-      }
-    | undefined
-  >(undefined);
+  switches = $state.raw<readonly ModelSwitchInFlight[]>([]);
   /**
    * What the server answered the last accepted switch with, in words ({@link switchedNotice}),
    * and the session it is about. Empty when there is nothing to say.
+   *
+   * It is about *the next thing to happen*, so it goes when that has happened: the next
+   * message this tab sends in the session clears it, and a confirmation worded for a turn
+   * that was running is reworded to the past ({@link SwitchNotice.onceIdle}) when that turn
+   * ends, rather than going on saying the step "is on now" finishes on the old model.
    */
-  switchNotice = $state<
-    { readonly sessionId: string; readonly text: string } | undefined
-  >(undefined);
+  switchNotice = $state<SwitchNotice | undefined>(undefined);
   /** A switch the server refused, for the error dialog; `undefined` when there is none. */
   switchFailure = $state<ErrorNotice | undefined>(undefined);
   /**
@@ -432,7 +447,7 @@ export class ImporterSessions {
     this.refused = false;
     this.sending = false;
     this.stopping = false;
-    this.switching = undefined;
+    this.switches = [];
     this.switchNotice = undefined;
     this.switchFailure = undefined;
     this.waitingForSwitch = false;
@@ -539,6 +554,7 @@ export class ImporterSessions {
       (kept) => !indexed.some((session) => session.id === kept.id),
     );
     this.sessions = [...own, ...refreshed, ...unlisted];
+    this.#turnsEnded();
     if (!this.sessions.some((session) => session.id === this.currentId)) {
       this.currentId = own[0]?.id ?? refreshed[0]?.id ?? "";
     }
@@ -585,7 +601,7 @@ export class ImporterSessions {
     this.refused = false;
     this.sending = false;
     this.stopping = false;
-    this.switching = undefined;
+    this.switches = [];
     this.switchNotice = undefined;
     this.switchFailure = undefined;
     this.waitingForSwitch = false;
@@ -752,6 +768,7 @@ export class ImporterSessions {
         this.#busyStop = undefined;
         if (this.notice === busy.text) this.notice = "";
       }
+      this.#turnsEnded();
       // The turn wrote what it wrote: the list's tally is the server's to restate.
       server.reread();
     });
@@ -840,6 +857,9 @@ export class ImporterSessions {
       (item) => item.kind === "turn.operator",
     ).length;
     this.draft = "";
+    if (this.switchNotice?.sessionId === session.id) {
+      this.switchNotice = undefined;
+    }
     this.#replace(session.id, (before) => ({
       ...before,
       reading: false,
@@ -895,9 +915,12 @@ export class ImporterSessions {
     // Behind a switch of this very import, the server holds the message until the switch
     // has answered: say so, since that can be a minute and a half.
     this.waitingForSwitch =
-      this.switching !== undefined &&
       session.importId !== undefined &&
-      this.switching.importId === session.importId;
+      this.switches.some((each) => each.importId === session.importId);
+    // The switch confirmation on screen as the message leaves, which an accepted message
+    // makes stale: "your next message runs on it" has been. One that a switch answering
+    // meanwhile puts up is about this message's successor, and stays.
+    const noticeBefore = this.switchNotice;
     // Taken before the message goes, so whatever the importer says in answer sorts after
     // it — including what it says before this request has been answered.
     const after = server.highWater();
@@ -922,6 +945,13 @@ export class ImporterSessions {
     const turn = answer.turn;
     if (this.draft.trim() === text) this.draft = "";
     this.notice = acceptedNotice(turn);
+    if (
+      noticeBefore !== undefined &&
+      this.switchNotice === noticeBefore &&
+      noticeBefore.sessionId === session.id
+    ) {
+      this.switchNotice = undefined;
+    }
     const at = this.#now();
     const landed = (before: ImporterSession): ImporterSession => {
       const index = before.items.filter(
@@ -1001,6 +1031,7 @@ export class ImporterSessions {
     const importId = session.importId;
     if (server === undefined || importId === undefined) {
       this.#replace(session.id, (before) => ({ ...before, working: false }));
+      this.#turnsEnded();
       return;
     }
     if (this.stopping) return;
@@ -1025,6 +1056,27 @@ export class ImporterSessions {
         ? { ...each, working: false }
         : each,
     );
+    this.#turnsEnded();
+  }
+
+  /** The switch of one session that is with the server, if there is one. */
+  switchingOf(sessionId: string | undefined): ModelSwitchInFlight | undefined {
+    return this.switches.find((each) => each.sessionId === sessionId);
+  }
+
+  /**
+   * Rewords a switch confirmation that was about a running turn once its session is idle:
+   * the turn it described has ended, so the step it named "is on now" no longer is. Called
+   * wherever a session's `working` can go false — a watched turn ending, a Stop, a reading
+   * of the list — and once only: the reworded line has nothing left to change to, so a
+   * later turn (from another tab, say) does not bring the present tense back.
+   */
+  #turnsEnded(): void {
+    const notice = this.switchNotice;
+    if (notice?.onceIdle === undefined) return;
+    const session = this.sessions.find((each) => each.id === notice.sessionId);
+    if (session?.working === true) return;
+    this.switchNotice = { sessionId: notice.sessionId, text: notice.onceIdle };
   }
 
   /**
@@ -1047,7 +1099,7 @@ export class ImporterSessions {
   ): Promise<boolean> {
     const session = this.current;
     if (session === undefined || session.tally.messages === 0) return false;
-    if (this.switching !== undefined) return false;
+    if (this.switchingOf(session.id) !== undefined) return false;
     const server = this.#server;
     if (server === undefined) {
       this.#replace(session.id, (before) => ({
@@ -1063,13 +1115,20 @@ export class ImporterSessions {
     }
     const importId = session.importId;
     if (importId === undefined) return false;
-    this.switching = { sessionId: session.id, importId, model };
-    this.switchNotice = undefined;
+    const inFlight: ModelSwitchInFlight = {
+      sessionId: session.id,
+      importId,
+      model,
+    };
+    this.switches = [...this.switches, inFlight];
+    if (this.switchNotice?.sessionId === session.id) {
+      this.switchNotice = undefined;
+    }
     const answer = await server.switchModel(importId, {
       model,
       ...(modelOptions === undefined ? {} : { modelOptions }),
     });
-    this.switching = undefined;
+    this.switches = this.switches.filter((each) => each !== inFlight);
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return false;
     if (answer._tag === "refused") {
@@ -1084,14 +1143,19 @@ export class ImporterSessions {
     }
     const switched = answer.switched;
     const now = this.sessions.find((each) => each.id === session.id) ?? session;
-    this.switchNotice = {
-      sessionId: session.id,
-      text: switchedNotice({
-        switched,
-        previous: now.model,
-        working: now.working,
-      }),
-    };
+    // Put up only over the session it is about: the line is the session on screen's, and
+    // opening another clears it anyway, so an answer for a session left meanwhile would
+    // only take the place of that one's own.
+    if (this.currentId === session.id) {
+      const said = { switched, previous: now.model, working: now.working };
+      this.switchNotice = {
+        sessionId: session.id,
+        text: switchedNotice(said),
+        ...(now.working
+          ? { onceIdle: switchedNotice({ ...said, turnEnded: true }) }
+          : {}),
+      };
+    }
     this.#switchedTo.set(switched.conversationId, switched.model);
     this.sessions = this.sessions.map((each) =>
       each.id === session.id ||

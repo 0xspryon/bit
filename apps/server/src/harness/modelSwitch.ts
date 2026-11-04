@@ -68,11 +68,9 @@ export const checkModelSwitch = (input: {
     if (!listed.includes(input.model)) {
       return yield* new ConversationModelRefused({
         reason: "model_unavailable",
-        detail: `'${input.model}' is not a model harness instance '${input.instanceId}' offers (${
-          listed.length === 0
-            ? "it reported none"
-            : `it offers ${listed.map((id) => `'${id}'`).join(", ")}`
-        }). ${capitalised(input.what)} is pinned to that harness; a model of another harness is a new session.`,
+        // The refused model and the catalogue it is not in, never the catalogue itself: an
+        // OpenCode catalogue is dozens of ids, and the picker that sent this lists them.
+        detail: `'${input.model}' is not in the catalogue of ${harness.instance.displayName} (harness instance '${input.instanceId}'), the harness ${input.what} is pinned to. Pick one of its models in the model picker; a model of another harness is a new session.`,
       });
     }
     const { options, dropped } = modelOptionsFor(

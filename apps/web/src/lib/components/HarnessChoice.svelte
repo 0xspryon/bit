@@ -41,7 +41,11 @@
    * ## Keyboard
    *
    * Up and down walk the column the focus is in, clamped rather than wrapping, with the
-   * row brought just inside the edge (`preventScroll` then `block: "nearest"`). That lives
+   * row brought just inside the edge (`preventScroll` then `block: "nearest"`). The model
+   * list is **one tab stop** (a roving tabindex, as D7's agent list): a catalogue is dozens
+   * of models, and Tab walking each of them put the footer's actions 38 stops from the
+   * filter. The stop is the row last focused, else the model in use, else the first shown;
+   * Home and End go to the first and last row. That lives
    * here because it is about these columns; the popover's Tab trap stays with the popover,
    * because it is about being a popover. Escape calls {@link onDismiss} when a caller gives
    * one, so the inline usage gets the same key as the popover rather than nothing.
@@ -88,6 +92,8 @@
   let railColumn = $state<HTMLElement | null>(null);
   let modelColumn = $state<HTMLElement | null>(null);
   let optionColumn = $state<HTMLElement | null>(null);
+  /** The model row the arrows last moved to, or a click focused: the list's tab stop. */
+  let focusedModel = $state("");
 
   /** The filter, in one place, so the two callers cannot come to disagree about it. */
   let shown = $derived.by(() => {
@@ -97,6 +103,15 @@
       ? all
       : all.filter((entry) => entry.id.toLowerCase().includes(wanted));
   });
+
+  /** The one model row in the tab order, among those the filter shows. */
+  let modelStop = $derived(
+    (
+      shown.find((entry) => entry.id === focusedModel) ??
+      shown.find((entry) => entry.id === model) ??
+      shown[0]
+    )?.id,
+  );
 
   /**
    * Focus into the filter when this appears.
@@ -141,11 +156,26 @@
       onDismiss();
       return;
     }
+    const focused = document.activeElement;
+    if (
+      (event.key === "Home" || event.key === "End") &&
+      focused instanceof HTMLElement &&
+      focused.classList.contains("model-row") &&
+      modelColumn?.contains(focused) === true
+    ) {
+      // Only from a row: in the filter, Home and End are the caret's.
+      event.preventDefault();
+      stepRow(
+        modelColumn,
+        ".model-row",
+        event.key === "Home" ? -Infinity : Infinity,
+      );
+      return;
+    }
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     // Arrows belong to whichever column the focus is already in — one window handler
     // rather than a listener per element, because a keydown handler on a plain container
     // is the thing the a11y lint is right to object to.
-    const focused = document.activeElement;
     if (focused === null || root === null || !root.contains(focused)) return;
     const delta = event.key === "ArrowDown" ? 1 : -1;
     if (optionColumn?.contains(focused) === true) {
@@ -259,6 +289,8 @@
               class="model-row"
               class:selected={entry.id === model}
               type="button"
+              tabindex={entry.id === modelStop ? 0 : -1}
+              onfocus={() => (focusedModel = entry.id)}
               onclick={() => onPickModel(entry.id)}
             >
               <span class="model-name mono">{entry.id}</span>

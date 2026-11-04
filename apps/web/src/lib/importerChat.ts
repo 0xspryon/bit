@@ -844,7 +844,8 @@ const modelPhrase = (
  * - **Live, mid-turn**: the harness takes it from its **next model call**. The step already
  *   running finishes on the old model — measured on both harnesses (F3/F4): a turn sent
  *   before the switch still answered on the old model — so the sentence says so rather than
- *   implying the reply being written has moved.
+ *   implying the reply being written has moved. Once that turn has ended the line is put
+ *   in the past (`turnEnded`), since the step it named is no longer "on now".
  * - **Live, between turns**: the next message runs on it.
  * - **Recorded**: this server does not hold the session, so only its record changed; the
  *   next message reopens it on the new model.
@@ -859,6 +860,11 @@ export const switchedNotice = (input: {
   readonly previous: string;
   /** Whether a turn was running when the switch was answered. */
   readonly working: boolean;
+  /**
+   * Whether that turn has since ended: the same confirmation in the past tense, since the
+   * step it named as running no longer is.
+   */
+  readonly turnEnded?: boolean;
 }): string => {
   const { switched, previous, working } = input;
   const now = modelPhrase(switched.model, switched.modelOptions);
@@ -879,6 +885,9 @@ export const switchedNotice = (input: {
   if (working) {
     const before =
       previous === switched.model ? "its earlier settings" : previous;
+    if (input.turnEnded === true) {
+      return `${head} The turn that was running finished its step on ${before} and used the new model for any model call after it. Your next message runs on it.${droppedLine}`;
+    }
     return `${head} The importer takes it from its next model call: the step it is on now finishes on ${before}.${droppedLine}`;
   }
   return `${head} Your next message runs on it.${droppedLine}`;

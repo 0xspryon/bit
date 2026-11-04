@@ -15,6 +15,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import {
   ConversationModelRefused,
+  ImporterConversationRefused,
   type ImporterSessionView,
 } from "@bit/contracts";
 
@@ -26,6 +27,7 @@ import { FakeCountdown } from "../fakeCountdown";
 import {
   FakeServer,
   emptyScope,
+  scopeImportView,
   importerModelView,
   importerSessionView,
   importerTurnAccepted,
@@ -116,13 +118,14 @@ const openOn = async (
     importerSessionView({ sessionId: "ses_old", model: SOL }),
   ],
   sessionId: string | undefined = "ses_old",
-): Promise<{ app: App; fake: FakeServer }> => {
+): Promise<{ app: App; fake: FakeServer; countdown: FakeCountdown }> => {
   const fake = new FakeServer();
   fake.onScope = () => ok(emptyScope());
   fake.onImporterSessions = () => ok({ sessions });
   fake.onHarnesses = () => ok(mockHarnesses());
   fake.onImporterModel = () => ok(importerModelView({ model: SOL }));
-  const app = new App(fake, new FakeCountdown());
+  const countdown = new FakeCountdown();
+  const app = new App(fake, countdown);
   app.password = "correct-horse";
   await app.connect();
   app.openTarget("acme-corp");
@@ -133,7 +136,7 @@ const openOn = async (
   await settle();
   mounted.push(mountInto(TitleBar, { app }), mountInto(Target, { app }));
   await settle();
-  return { app, fake };
+  return { app, fake, countdown };
 };
 
 const openPicker = async (): Promise<HTMLElement> => {
@@ -449,7 +452,7 @@ describe("U3: a refused switch", () => {
       ["harness_unreachable", "the harness did not clearly answer."],
       [
         "model_unavailable",
-        "'openai/gpt-5.5' is not a model harness instance 'opencode' offers.",
+        "'openai/gpt-5.5' is not in the catalogue of OpenCode (harness instance 'opencode'), the harness import imp_1 is pinned to. Pick one of its models in the model picker; a model of another harness is a new session.",
       ],
       ["store_unavailable", "import imp_1's record could not be written."],
     ] as const;
@@ -627,6 +630,331 @@ describe("D3: the caption beside the model chip", () => {
     expect(app.importer.current?.model).toBe(FIVE);
     expect(page()).toContain(
       `Now on ${FIVE} here only: the state picker has no server to ask.`,
+    );
+  });
+});
+
+describe("U3 review: the switch confirmation goes stale with what it described", () => {
+  const NEXT = `Now on ${FIVE}. Your next message runs on it.`;
+  const MID = `Now on ${FIVE}. The importer takes it from its next model call: the step it is on now finishes on ${SOL}.`;
+  const ENDED = `Now on ${FIVE}. The turn that was running finished its step on ${SOL} and used the new model for any model call after it. Your next message runs on it.`;
+
+  const switchTo = async (model: string): Promise<void> => {
+    await openPicker();
+    click(inPicker(model));
+    await settle();
+    click(inPicker("Use for this session"));
+    await settle();
+  };
+
+  const sendMessage = async (text: string): Promise<void> => {
+    typeInto(composer(), text);
+    composer().focus();
+    press("Enter");
+    await settle();
+  };
+
+  test("'your next message runs on it' goes once that message has been accepted", async () => {
+    const { fake } = await openOn();
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_old",
+          model: FIVE,
+        }),
+      );
+    await switchTo(FIVE);
+    expect(page()).toContain(NEXT);
+
+    await sendMessage("And the staging hosts");
+    expect(fake.countOf("sendImporterMessage")).toBe(1);
+    expect(page()).not.toContain("Now on");
+  });
+
+  test("a refused message leaves it: the next message is still the one that runs on it", async () => {
+    const { fake } = await openOn();
+    fake.onSendImporterMessage = () =>
+      refused(
+        new ImporterConversationRefused({
+          reason: "harness_unreachable",
+          detail: "the harness did not answer.",
+        }),
+      );
+    await switchTo(FIVE);
+    await sendMessage("And the staging hosts");
+    expect(page()).toContain(NEXT);
+  });
+
+  test("mid-turn it is put in the past once that turn ends", async () => {
+    const { fake, countdown } = await openOn([
+      importerSessionView({ sessionId: "ses_old", model: SOL, running: true }),
+    ]);
+    await switchTo(FIVE);
+    expect(page()).toContain(MID);
+
+    // The turn the switch landed in ends: the watch reads the import as no longer running,
+    // and the list read after it agrees.
+    fake.onScopeImport = (_baseUrl, targetId, importId) =>
+      ok(scopeImportView({ targetId, importId, status: "finished" }));
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: [importerSessionView({ sessionId: "ses_old", model: FIVE })],
+      });
+    countdown.fire();
+    await settle();
+
+    expect(page()).not.toContain("is on now");
+    expect(page()).toContain(ENDED);
+  });
+});
+
+describe("U3 review: a switch's answer and the dialog it was sent from", () => {
+  test("a dialog cancelled and opened again while the switch is out keeps its new pick when the first answer comes", async () => {
+    const { app, fake } = await openOn();
+    const release = fake.hold("switchImporterModel");
+    await openPicker();
+    click(inPicker(FIVE));
+    await settle();
+    click(inPicker("Use for this session"));
+    await settle();
+    click(inPicker("Cancel"));
+    await settle();
+    expect(picker()).toBeNull();
+
+    await openPicker();
+    click(inPicker("openai/gpt-5.6-terra"));
+    await settle();
+
+    release();
+    await settle();
+    // The first switch landed; the dialog the operator opened since is still theirs.
+    expect(app.importer.current?.model).toBe(FIVE);
+    expect(picker()).not.toBeNull();
+    expect(said(picker()?.querySelector(".model-row.selected"))).toBe(
+      "openai/gpt-5.6-terra",
+    );
+    expect(inPicker("Use for this session").getAttribute("aria-disabled")).toBe(
+      "false",
+    );
+  });
+
+  test("the dialog that sent the switch still closes on its answer", async () => {
+    const { fake } = await openOn();
+    const release = fake.hold("switchImporterModel");
+    await openPicker();
+    click(inPicker(FIVE));
+    await settle();
+    click(inPicker("Use for this session"));
+    await settle();
+    expect(picker()).not.toBeNull();
+    release();
+    await settle();
+    expect(picker()).toBeNull();
+  });
+});
+
+describe("U3 review: focus after 'Open a new session'", () => {
+  test("is in the composer, where the draft it carried over is", async () => {
+    await openOn();
+    typeInto(composer(), "Now the wildcard rows");
+    await openPicker();
+    click(railRow("Claude Code"));
+    await settle();
+    const confirm = inPicker("Open a new session");
+    confirm.focus();
+    click(confirm);
+    await settle();
+
+    expect(picker()).toBeNull();
+    expect(document.activeElement).toBe(composer());
+    expect(composer().value).toBe("Now the wildcard rows");
+  });
+});
+
+describe("U3 review: a switch in flight is its own session's", () => {
+  const TWO = [
+    importerSessionView({ sessionId: "ses_old", model: SOL }),
+    importerSessionView({
+      sessionId: "ses_other",
+      importId: "imp_2",
+      model: SOL,
+      openedAt: 1_700_000_100_000,
+    }),
+  ];
+
+  test("with a switch out on one session another's chip is not switching, and can switch too", async () => {
+    const { app, fake } = await openOn(TWO);
+    const release = fake.hold("switchImporterModel");
+    await openPicker();
+    click(inPicker(FIVE));
+    await settle();
+    click(inPicker("Use for this session"));
+    await settle();
+    press("Escape");
+    await settle();
+    expect(sessionChip().classList.contains("switching")).toBe(true);
+
+    app.importer.open("ses_other");
+    await settle();
+    expect(sessionChip().classList.contains("switching")).toBe(false);
+    expect(page()).not.toContain("Switching to");
+    expect(page()).toContain("OpenCode for this session · any of its models");
+
+    await openPicker();
+    click(inPicker("openai/gpt-5.6-terra"));
+    await settle();
+    const confirm = inPicker("Use for this session");
+    expect(confirm.getAttribute("aria-disabled")).toBe("false");
+    click(confirm);
+    await settle();
+
+    const switches = fake.calls.filter(
+      (each) => each.method === "switchImporterModel",
+    );
+    expect(switches.map((each) => each.args[2])).toEqual(["imp_1", "imp_2"]);
+    release();
+    await settle();
+    expect(
+      app.importer.sessions.find((each) => each.id === "ses_old")?.model,
+    ).toBe(FIVE);
+    expect(
+      app.importer.sessions.find((each) => each.id === "ses_other")?.model,
+    ).toBe("openai/gpt-5.6-terra");
+  });
+});
+
+describe("U3 review: the keyboard and the footer", () => {
+  const rows = (): HTMLButtonElement[] => [
+    ...(picker()?.querySelectorAll<HTMLButtonElement>(".model-row") ?? []),
+  ];
+  const stops = (): number[] => rows().map((row) => row.tabIndex);
+
+  test("the model list is one tab stop, on the model in use, and arrows, Home and End move it", async () => {
+    await openPicker_();
+    const all = rows();
+    expect(all.length).toBeGreaterThan(3);
+    expect(stops().filter((each) => each === 0)).toHaveLength(1);
+    const selected = all.findIndex((row) => row.classList.contains("selected"));
+    expect(stops()[selected]).toBe(0);
+
+    all[selected]?.focus();
+    await settle();
+    press("End");
+    await settle();
+    expect(document.activeElement).toBe(rows()[all.length - 1] ?? null);
+    expect(stops()[all.length - 1]).toBe(0);
+    expect(stops().filter((each) => each === 0)).toHaveLength(1);
+
+    press("Home");
+    await settle();
+    expect(document.activeElement).toBe(rows()[0] ?? null);
+    expect(stops()[0]).toBe(0);
+
+    press("ArrowDown");
+    await settle();
+    expect(document.activeElement).toBe(rows()[1] ?? null);
+    expect(
+      stops()
+        .map((each, at) => (each === 0 ? at : -1))
+        .filter((at) => at >= 0),
+    ).toEqual([1]);
+  });
+
+  test("Home and End in the filter are the caret's, not the list's", async () => {
+    await openPicker_();
+    const filter = picker()?.querySelector<HTMLInputElement>("input.search");
+    expect(document.activeElement).toBe(filter ?? null);
+    const home = press("Home");
+    expect(home.defaultPrevented).toBe(false);
+    expect(document.activeElement).toBe(filter ?? null);
+  });
+
+  test("the footer's confirm is a few tab stops from the filter, not one per model", async () => {
+    await openPicker_();
+    const panel = picker();
+    if (panel === null) throw new Error("no picker");
+    const order = [
+      ...panel.querySelectorAll<HTMLElement>(
+        "button:not(:disabled), input:not(:disabled), [tabindex]",
+      ),
+    ].filter((each) => each.tabIndex >= 0);
+    const filter = order.findIndex((each) => each.matches("input.search"));
+    const confirm = order.findIndex((each) =>
+      said(each).startsWith("Use for this session"),
+    );
+    expect(filter).toBeGreaterThanOrEqual(0);
+    // The filter, one model row, the Reasoning rows, Cancel: the models are one stop.
+    expect(
+      order.filter((each) => each.classList.contains("model-row")),
+    ).toHaveLength(1);
+    expect(confirm - filter).toBeLessThanOrEqual(
+      2 + panel.querySelectorAll(".option-row").length + 1,
+    );
+  });
+
+  test("the confirm button is described by the footer's note, so the other-harness explanation is announced", async () => {
+    await openPicker_();
+    const confirm = inPicker("Use for this session");
+    const id = confirm.getAttribute("aria-describedby") ?? "";
+    expect(id).not.toBe("");
+    expect(said(document.getElementById(id))).toBe(FOOTER);
+
+    click(railRow("Claude Code"));
+    await settle();
+    const other = inPicker("Open a new session");
+    expect(
+      said(
+        document.getElementById(other.getAttribute("aria-describedby") ?? ""),
+      ),
+    ).toBe(
+      "This session stays on OpenCode. Claude Code is another harness, so this opens a new session on it and leaves this one as it is.",
+    );
+  });
+
+  const openPicker_ = async (): Promise<void> => {
+    await openOn();
+    await openPicker();
+  };
+});
+
+describe("U3 review: D6's frame and D3's caption", () => {
+  test("the modal has D6's header — its title and a close button that closes it", async () => {
+    await openOn();
+    await openPicker();
+    expect(said(picker()?.querySelector(".header h2"))).toBe(
+      "Harness, model and reasoning",
+    );
+    const close = picker()?.querySelector<HTMLButtonElement>(
+      '.header button[aria-label="Close"]',
+    );
+    if (close === null || close === undefined)
+      throw new Error("no close button");
+    click(close);
+    await settle();
+    expect(picker()).toBeNull();
+    expect(document.activeElement).toBe(sessionChip());
+  });
+
+  test("a new session's modal has the same header", async () => {
+    await openOn([], undefined);
+    const chip = document.querySelector<HTMLButtonElement>(
+      'button[aria-label^="Harness and model"]',
+    );
+    if (chip === null) throw new Error("no new-session chip");
+    click(chip);
+    await settle();
+    expect(said(picker()?.querySelector(".header h2"))).toBe(
+      "Harness, model and reasoning",
+    );
+  });
+
+  test("the caption carries its whole text as a title, for when a long model name cuts it", async () => {
+    await openOn();
+    const caption = document.querySelector(".strip .hint");
+    expect(caption?.getAttribute("title")).toBe(
+      "OpenCode for this session · any of its models",
     );
   });
 });

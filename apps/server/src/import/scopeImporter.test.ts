@@ -3043,7 +3043,12 @@ describe("switching an import's model", () => {
       _tag: "ConversationModelRefused",
       reason: "model_unavailable",
     });
-    expect(refused.failure.message).toContain("scripted/other");
+    // The sentence names the refused model and the catalogue it is not in, and does not
+    // list that catalogue: on OpenCode it is dozens of ids, which the picker already shows.
+    expect(refused.failure.message).toBe(
+      `model_unavailable: 'anthropic/claude-opus-5-5' is not in the catalogue of Scripted harness (harness instance 'stub'), the harness import ${importId} is pinned to. Pick one of its models in the model picker; a model of another harness is a new session.`,
+    );
+    expect(refused.failure.message).not.toContain("scripted/other");
     expect(built.script.switches).toEqual([]);
     expect(rowOf(built.root, importId)?.model).toBe("scripted/model");
     await runtime.dispose();

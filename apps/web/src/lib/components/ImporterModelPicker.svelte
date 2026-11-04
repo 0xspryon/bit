@@ -60,6 +60,8 @@
 
   /** A started session, as far as its model goes. */
   interface PinnedModel {
+    /** The session, whose own switch in flight is the only one this chip is about. */
+    readonly sessionId: string;
     /** The harness's display name: the glyph and the footer's words. */
     readonly harness: string;
     /** The instance the session is pinned to, when the server named it. */
@@ -73,12 +75,18 @@
     app,
     pinned,
     switchable = false,
+    onNewSession,
   }: {
     app: App;
     /** A started session's model, or `null` for a new session, whose model is still open. */
     pinned: PinnedModel | null;
     /** Whether a started session can be switched at all: it is talked to, not read-only. */
     switchable?: boolean;
+    /**
+     * "Open a new session" was confirmed. The chip that opened the dialog goes with the
+     * session it was for, so the caller says where focus lands: the composer, with the draft.
+     */
+    onNewSession?: () => void;
   } = $props();
 
   /** The chip, which the dialog hands focus back to when it closes. */
@@ -127,6 +135,15 @@
         : app.harnesses.find((each) => each.displayName === pinned.harness),
   );
   let sessionOpen = $state(false);
+  /**
+   * Which opening of the dialog is on screen, counted. A switch's answer closes the dialog
+   * only if it is still the opening that sent it: an operator who cancelled while it was
+   * out and opened the dialog again is making another pick, and the first answer is not a
+   * reason to throw it away. Not state: nothing renders from it.
+   */
+  let opening = 0;
+  /** The footer's note, which the confirm button is described by. */
+  const noteId = $props.id();
   let stagedInstanceId = $state("");
   let stagedModel = $state("");
   /** What was set per instance and model while the dialog was open. */
@@ -155,7 +172,8 @@
     sessionInstance !== undefined &&
       stagedInstanceId !== sessionInstance.instanceId,
   );
-  let switching = $derived(app.importer.switching);
+  /** This session's switch with the server, if any: another session's is not this chip's. */
+  let switching = $derived(app.importer.switchingOf(pinned?.sessionId));
 
   function openSession(): void {
     if (pinned === null || sessionInstance === undefined) return;
@@ -166,6 +184,7 @@
         pinned.modelOptions ?? [],
     };
     query = "";
+    opening += 1;
     sessionOpen = true;
   }
 
@@ -208,10 +227,12 @@
     if (otherHarness) {
       sessionOpen = false;
       app.startImporterSessionOn(stagedInstanceId, stagedModel, options ?? []);
+      onNewSession?.();
       return;
     }
+    const sent = opening;
     if (await app.importer.switchModel(stagedModel, options)) {
-      sessionOpen = false;
+      if (sent === opening) sessionOpen = false;
     }
   }
 </script>
@@ -235,6 +256,7 @@
     {#if app.importPickerOpen}
       <HarnessDialog
         opener={trigger}
+        title="Harness, model and reasoning"
         onclose={() => (app.importPickerOpen = false)}
       >
         <HarnessChoice
@@ -285,7 +307,11 @@
     </button>
 
     {#if sessionOpen}
-      <HarnessDialog opener={trigger} onclose={() => (sessionOpen = false)}>
+      <HarnessDialog
+        opener={trigger}
+        title="Harness, model and reasoning"
+        onclose={() => (sessionOpen = false)}
+      >
         <HarnessChoice
           instances={app.harnesses}
           active={stagedInstance}
@@ -309,7 +335,7 @@
         </HarnessChoice>
 
         {#snippet footer()}
-          <p class="foot-note">
+          <p class="foot-note" id={noteId}>
             {#if otherHarness}
               This session stays on {harness}. {stagedInstance?.displayName ??
                 stagedInstanceId} is another harness, so this opens a new session
@@ -329,6 +355,7 @@
             class="foot-button primary"
             type="button"
             bind:this={confirmButton}
+            aria-describedby={noteId}
             aria-disabled={stagedModel === "" || switching !== undefined}
             onclick={() => void confirm()}
           >

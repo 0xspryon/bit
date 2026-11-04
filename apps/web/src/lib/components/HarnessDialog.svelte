@@ -6,10 +6,11 @@
    * ## Why not `Modal`
    *
    * `Modal` is a titled card: a heading and a close button over a padded body, a footer of
-   * actions under it, 560px wide. The picker has none of those — the columns *are* the
-   * panel, a pick takes effect as it is made so there is nothing to confirm, and they are
-   * 622px wide because three columns need that. Putting them in `Modal` would have been a
-   * redesign of the picker, which is the one thing its move to a modal was not to be.
+   * actions under it, 560px wide. The picker's columns are not a padded body — they run to
+   * the panel's edges, each scrolling on its own — and D6's frame is its own: a header row
+   * with its title and a close button ({@link title}), the columns, and D6's footer when the
+   * picks are staged, at D6's 820px. Putting them in `Modal` would have been a redesign of
+   * the picker, which is the one thing its move to a modal was not to be.
    *
    * What `Modal` does that matters here is focus, and that is shared rather than redone:
    * `dialogFocus` holds both dialogs' rules for where focus goes in and where it comes back
@@ -73,10 +74,12 @@
   import { untrack, type Snippet } from "svelte";
   import { holdFocus } from "../dialogFocus";
   import { dialogKeydown, enterLayer, toBody } from "../dialogLayer";
+  import { IconClose } from "../icons";
 
   let {
     onclose,
     opener,
+    title,
     children,
     footer,
   }: {
@@ -84,6 +87,11 @@
     onclose: () => void;
     /** The control that opened the dialog, which focus returns to when it closes. */
     opener: HTMLElement | null;
+    /**
+     * D6's header row: this title and a close button over the columns. Absent, the panel
+     * starts with the columns, as the popover did.
+     */
+    title?: string;
     children: Snippet;
     /**
      * D6's footer under the columns: a note and the actions, for a picker whose picks are
@@ -133,18 +141,37 @@
           onclick={onclose}
         ></button>
         <div
-          class={["panel", footer !== undefined && "with-footer"]}
+          class={[
+            "panel",
+            footer !== undefined && "with-footer",
+            title !== undefined && "framed",
+          ]}
           role="dialog"
           aria-modal="true"
           aria-label="Choose a harness and model"
           tabindex="-1"
           bind:this={panel}
         >
-          {#if footer === undefined}
+          {#if title !== undefined}
+            <div class="header">
+              <h2 class="title">{title}</h2>
+              <button
+                class="close"
+                type="button"
+                aria-label="Close"
+                onclick={onclose}
+              >
+                <IconClose width="14" height="14" />
+              </button>
+            </div>
+          {/if}
+          {#if footer === undefined && title === undefined}
             {@render children()}
           {:else}
             <div class="columns">{@render children()}</div>
-            <div class="footer">{@render footer()}</div>
+            {#if footer !== undefined}
+              <div class="footer">{@render footer()}</div>
+            {/if}
           {/if}
         </div>
       </div>
@@ -220,6 +247,59 @@
     flex-direction: column;
     max-height: min(100%, 400px);
   }
+  /*
+   * D6's frame: the header row over the columns, at D6's width (820px, the scrim's padding
+   * keeping it inside a window narrower than that), and the strong border D6 draws it with.
+   * The columns keep their own widths; the model list takes what the wider panel adds. The
+   * height bounds grow by the header's 47px so the columns keep the height they had.
+   */
+  .panel.framed {
+    flex-direction: column;
+    width: 820px;
+    max-height: min(100%, 388px);
+    border-color: var(--border-strong);
+    border-radius: var(--radius-xl);
+  }
+  .panel.framed.with-footer {
+    max-height: min(100%, 448px);
+  }
+  .header {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 12px;
+    padding: 13px 14px;
+    border-bottom: 1px solid var(--border-base);
+  }
+  .title {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    color: var(--text-base);
+    font: 530 14px/20px var(--font-sans);
+  }
+  .close {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--icon-muted);
+    cursor: pointer;
+  }
+  .close:hover {
+    background: var(--overlay-hover);
+    color: var(--icon-base);
+  }
+  .close:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 1px;
+  }
   .columns {
     display: flex;
     flex: 1 1 auto;
@@ -245,7 +325,8 @@
    * limits it, so the popover's offset-from-the-trigger arithmetic is not needed.
    */
   @media (max-width: 920px) {
-    .panel {
+    .panel,
+    .panel.framed {
       width: 470px;
     }
   }
