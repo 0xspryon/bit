@@ -181,7 +181,9 @@ thinking partial as done once a reply partial of the same message starts (the `b
 prefix is the message id). A thinking block over the 4,000-character cap stops growing while
 the model keeps thinking (seen frozen ~30 s) — show it as truncated rather than as still
 writing. Apply partial updates by item id,
-"writing…" indicator, markdown over partial text with unclosed fences handled.
+"writing…" indicator, markdown over partial text with unclosed fences handled. From F8's review: a retried API call (new `message_start`, non-streaming
+fallback, refusal `supersedes`) leaves the first attempt's block unfinished; the turn's end
+flushes it, so at turn end drop any partial that has no finished block.
 
 **U6 — D3 Stop pill and Send now (S), F5 + U4 → U6.** Show Stop whenever the **server** says the
 conversation is running (`sessionStatus` / the live stream), not only while a message the
