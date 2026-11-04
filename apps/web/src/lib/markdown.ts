@@ -90,20 +90,21 @@ const htmlAsText: NonNullable<RemarkRehypeOptions["handlers"]>["html"] = (
 /**
  * What the sanitised tree is given, and what it is relieved of, on its way out.
  *
- * Three things GitHub's own rendering also has:
+ * Three things GitHub's own rendering also has (one of them, the frame, in its own way):
  *
  * - **A table is wrapped in a scroller.** A table's width is its widest row, which is the
  *   agent's column count and not the operator's screen; without this a quoted scope table
  *   decides the width of the whole thread on a tablet. OpenCode wraps its tables the same
  *   way.
- * - **A fence's language is copied to `data-language`.** `remark-rehype` writes it as
- *   `class="language-x"` on the `<code>`, which the sanitiser allows and which stays there;
- *   the copy goes on the `<pre>` so a stylesheet can show it as a label without a
- *   highlighter. There is no highlighting — that is its own slice and its own dependency
- *   weight.
+ * - **A fence is framed, with its name and a Copy button** ({@link codeFrame}). Its
+ *   language is also copied to `data-language` on the `<pre>`. There is no highlighting —
+ *   that is its own slice and its own dependency weight.
  * - **A link opens elsewhere, without an opener.** The page is a working session; following
  *   a link an agent quoted should not navigate it away, and the page it opens should get
  *   neither `window.opener` nor a referrer naming this app.
+ *
+ * And one GitHub's renderer leaves to the reader: a quote's closing `— source` line is
+ * marked as its source ({@link quoteSource}).
  *
  * And three GitHub does not do:
  *
@@ -167,20 +168,166 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
   if (node.tagName === "table") {
     return [element("div", { className: ["table-wrap"] }, [node])];
   }
-  if (node.tagName === "pre") {
-    const code = node.children.find(isElement);
-    const language = (
-      Array.isArray(code?.properties["className"])
-        ? code.properties["className"]
-        : []
-    )
-      .map(String)
-      .find((name) => name.startsWith("language-"));
-    if (language !== undefined) {
-      node.properties["dataLanguage"] = language.slice("language-".length);
-    }
-  }
+  if (node.tagName === "blockquote") quoteSource(node);
+  if (node.tagName === "li") taskText(node);
+  if (node.tagName === "pre") return [codeFrame(node)];
   return [node];
+};
+
+/**
+ * A fence, framed as A6 D8 draws it: a header naming it, a **Copy** button, then the block.
+ *
+ * The header's name is the fence's info string after the language — ` ```json entry-10.json `
+ * is named `entry-10.json` — or the language alone when that is all there is (` ```js ` is
+ * `js`), or nothing. The words after the language are `meta` on the `<code>`'s `data`,
+ * which `remark-rehype` puts there and the sanitiser carries over untouched because `data`
+ * is never serialised; it is read here as a string and becomes a **text node**, escaped by
+ * the serialiser like any other, so an info string of `"><script>` is a name, not markup.
+ * The language is copied from the `class="language-x"` the sanitiser passed, as before.
+ *
+ * Every element of the frame is built here, after the sanitiser, from constants: the
+ * classes, `type="button"`, and the button's word. Nothing in the schema is widened for it,
+ * and no attribute of it comes from the source. The button has no handler in the markup —
+ * `Markdown.svelte` listens on its own root for a click on a `.code-copy` and copies the
+ * text of the `<pre>` in the same frame, so there is no script in the HTML to inject into.
+ *
+ * Every fence gets the header, even one with nothing to name. A6 D8 draws a long unbroken
+ * line in a headerless, hairline-edged box, but that box is exactly the chat's committed
+ * record (`ChatItem`'s `.block`: the same edge, background, mono 12/20 and muted ink), and a
+ * fence is the agent's prose: without the header an agent could draw itself a receipt. The
+ * header with its Copy button is the one thing a record never has.
+ */
+const codeFrame = (pre: Element): Element => {
+  const code = pre.children.find(isElement);
+  const language = (
+    Array.isArray(code?.properties["className"])
+      ? code.properties["className"]
+      : []
+  )
+    .map(String)
+    .find((name) => name.startsWith("language-"))
+    ?.slice("language-".length);
+  if (language !== undefined) pre.properties["dataLanguage"] = language;
+  const meta: unknown =
+    code?.data !== undefined && "meta" in code.data
+      ? code.data.meta
+      : undefined;
+  const label =
+    typeof meta === "string" && meta.trim() !== ""
+      ? meta.trim()
+      : (language ?? "");
+  return element("div", { className: ["code-frame"] }, [
+    element("div", { className: ["code-head"] }, [
+      element("span", { className: ["code-label"] }, [
+        { type: "text", value: label },
+      ]),
+      element("button", { type: "button", className: ["code-copy"] }, [
+        { type: "text", value: "Copy" },
+      ]),
+    ]),
+    pre,
+  ]);
+};
+
+/**
+ * A task item's own words, after its checkbox, in a `<span class="task-text">`: what a done
+ * item's strike-through is drawn on, so it stops before a list nested under the item.
+ *
+ * In a tight list the checkbox is the item's first child; in a loose one it opens the
+ * item's first paragraph. The words run from the checkbox to the first block element.
+ * Only nodes the sanitiser passed are moved, into an element with a constant class.
+ */
+const BLOCKS = new Set(["ul", "ol", "p", "pre", "div", "blockquote", "table"]);
+const taskText = (item: Element): void => {
+  const holder = item.children.find(isElement);
+  const host = holder?.tagName === "p" ? holder : item;
+  const box = host.children.findIndex(
+    (child) => isElement(child) && child.tagName === "input",
+  );
+  if (box === -1) return;
+  let end = box + 1;
+  while (end < host.children.length) {
+    const next = host.children[end];
+    if (next !== undefined && isElement(next) && BLOCKS.has(next.tagName)) {
+      break;
+    }
+    end += 1;
+  }
+  const words = host.children.slice(box + 1, end);
+  // The space GFM leaves after `[x]`: the box's own margin is the gap D8 draws.
+  const lead = words[0];
+  if (lead?.type === "text") lead.value = lead.value.trimStart();
+  if (words.length === 0) return;
+  host.children.splice(
+    box + 1,
+    words.length,
+    element("span", { className: ["task-text"] }, words),
+  );
+};
+
+/**
+ * A quote's last line is the line it came from, when the agent writes it as one: a line
+ * starting with an em dash, after the quoted text.
+ *
+ * ```md
+ * > "Testing is permitted against any Acme-owned property except WordPress properties."
+ * > — hackerone.com/acme/policy · line 219
+ * ```
+ *
+ * That is how prose attributes a quotation anyway, so it needs no new syntax and reads
+ * correctly anywhere the markdown is shown raw. Written on its own line (no blank line
+ * before it) it is part of the quote's last paragraph, after a soft break; after a blank
+ * line it is a paragraph of its own. Either way it is split off into a `<p
+ * class="quote-source">` and the dash is dropped, since the line's own style now says what
+ * the dash said. A quote that is *only* such a line is left alone: there is nothing for it
+ * to be the source of.
+ *
+ * It only moves nodes the sanitiser already passed and splits one text node; the class is
+ * a constant.
+ */
+const SOURCE_DASH = /\n\s*—\s*/;
+const quoteSource = (quote: Element): void => {
+  const blocks = quote.children.filter(isElement);
+  const last = blocks.at(-1);
+  if (last?.tagName !== "p") return;
+  const first = last.children[0];
+  if (
+    blocks.length > 1 &&
+    first?.type === "text" &&
+    /^\s*—/.test(first.value)
+  ) {
+    first.value = first.value.replace(/^\s*—\s*/, "");
+    last.properties["className"] = ["quote-source"];
+    return;
+  }
+  // A soft break, then the dash: the last text node holding one is where the quote ends.
+  const at = last.children.findLastIndex(
+    (child) => child.type === "text" && SOURCE_DASH.test(child.value),
+  );
+  const split = last.children[at];
+  if (split?.type !== "text") return;
+  const match = [
+    ...split.value.matchAll(new RegExp(SOURCE_DASH.source, "g")),
+  ].at(-1);
+  if (match === undefined) return;
+  const before = split.value.slice(0, match.index);
+  const after = split.value.slice(match.index + match[0].length);
+  const quoted = [
+    ...last.children.slice(0, at),
+    ...(before === "" ? [] : [{ type: "text" as const, value: before }]),
+  ];
+  if (quoted.every(textless)) return;
+  const source = [
+    ...(after === "" ? [] : [{ type: "text" as const, value: after }]),
+    ...last.children.slice(at + 1),
+  ];
+  last.children = quoted;
+  quote.children.splice(
+    quote.children.indexOf(last) + 1,
+    0,
+    { type: "text", value: "\n" },
+    element("p", { className: ["quote-source"] }, source),
+  );
 };
 
 /**

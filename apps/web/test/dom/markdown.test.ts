@@ -11,7 +11,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import Markdown from "../../src/lib/components/Markdown.svelte";
 import { memoiseByText } from "../../src/lib/markdown";
-import { click, mountInto, type Mounted } from "./dom";
+import { compile } from "svelte/compiler";
+
+import { click, mountInto, settle, type Mounted } from "./dom";
 
 let mounted: Mounted[] = [];
 afterEach(() => {
@@ -258,6 +260,401 @@ describe("the edges of what a reply can be", () => {
     const root = render("---");
     expect(root.querySelector("hr")).not.toBeNull();
     expect(root.textContent?.trim()).toBe("");
+  });
+});
+
+/*
+ * A6 D8, "What the transcript can render": task lists, quotes with their source line,
+ * tables, and fences framed with a name and a Copy button.
+ */
+describe("D8's framing", () => {
+  test("a task list is read-only checkboxes, done ones marked, words beside them", () => {
+    const root = render(
+      "- [x] Read the program policy page\n- [ ] Confirm the WordPress rule\n  - [ ] Ask the client",
+    );
+    const boxes = [
+      ...root.querySelectorAll<HTMLInputElement>("li.task-list-item > input"),
+    ];
+    expect(
+      boxes.map((each) => `${each.type}/${each.checked}/${each.disabled}`),
+    ).toEqual([
+      "checkbox/true/true",
+      "checkbox/false/true",
+      "checkbox/false/true",
+    ]);
+    expect(
+      [...root.querySelectorAll(".task-text")].map((each) =>
+        each.textContent?.trim(),
+      ),
+    ).toEqual([
+      "Read the program policy page",
+      "Confirm the WordPress rule",
+      "Ask the client",
+    ]);
+    // The nested list is beside the item's words, not inside the span a strike is drawn on.
+    expect(root.querySelector(".task-text ul")).toBeNull();
+    // Not a control: a click changes nothing.
+    for (const each of boxes) click(each);
+    expect(boxes.map((each) => String(each.checked)).join()).toBe(
+      "true,false,false",
+    );
+  });
+
+  test("a loose task list keeps its box in the item's paragraph", () => {
+    const root = render("1. [x] first\n\n2. [ ] second");
+    expect(
+      [...root.querySelectorAll("li > p > input + .task-text")].map(
+        (each) => each.textContent,
+      ),
+    ).toEqual(["first", "second"]);
+  });
+
+  test("a fence is framed: its info string names it, and Copy is beside the name", () => {
+    const root = render(
+      [
+        '```json entry-10.json\n{"host": "app.partner.com"}\n```',
+        "```js\nvar=expres() + yield * expres2()\n```",
+        "```\nhttps://acme.com/legacy/partner/handoff?sig=9f2c1ab7e4d05583c1f0\n```",
+      ].join("\n\n"),
+    );
+    const frames = [...root.querySelectorAll(".code-frame")];
+    expect(
+      frames.map(
+        (frame) =>
+          `${frame.querySelector(".code-head > .code-label")?.textContent}|${frame.querySelector("pre")?.getAttribute("data-language") ?? "-"}`,
+      ),
+    ).toEqual(["entry-10.json|json", "js|js", "|-"]);
+    expect(
+      [...root.querySelectorAll(".code-head > button.code-copy")].map(
+        (each) => `${each.getAttribute("type")} ${each.textContent}`,
+      ),
+    ).toEqual(["button Copy", "button Copy", "button Copy"]);
+    // The block is still the agent's text exactly.
+    expect(frames[0]?.querySelector("pre > code")?.textContent).toBe(
+      '{"host": "app.partner.com"}\n',
+    );
+  });
+
+  test("a table is still in its scroller, with a header row and body rows", () => {
+    const root = render(
+      "| Host | Dir |\n| --- | --- |\n| `*.acme.com` | in |\n| `blog.acme.com` | out |",
+    );
+    expect(
+      root.querySelector(".table-wrap > table > thead th")?.textContent,
+    ).toBe("Host");
+    expect(
+      [...root.querySelectorAll("tbody tr")].map((row) =>
+        row.textContent?.trim(),
+      ),
+    ).toEqual(["*.acme.com\nin", "blog.acme.com\nout"]);
+  });
+
+  test("a quote's closing em-dash line is the line it came from, on its own line or after a blank", () => {
+    for (const text of [
+      '> "Testing is permitted against any Acme-owned property."\n> — hackerone.com/acme/policy · line 219',
+      '> "Testing is permitted against any Acme-owned property."\n>\n> — hackerone.com/acme/policy · line 219',
+    ]) {
+      const quote = render(text).querySelector("blockquote");
+      expect(
+        [...(quote?.children ?? [])].map(
+          (each) => `${each.className}:${each.textContent}`,
+        ),
+      ).toEqual([
+        ':"Testing is permitted against any Acme-owned property."',
+        "quote-source:hackerone.com/acme/policy · line 219",
+      ]);
+    }
+  });
+
+  test("of two dash lines, only the last is the source", () => {
+    const quote = render("> a\n> — b\n> — c").querySelector("blockquote");
+    expect(
+      [...(quote?.children ?? [])].map(
+        (each) => `${each.className}:${each.textContent}`,
+      ),
+    ).toEqual([":a\n— b", "quote-source:c"]);
+  });
+
+  test("a dash that is not a closing line is left in the quote", () => {
+    // Mid-line, and a quote that is nothing but the dash line: neither has a source.
+    for (const text of ["> one — two", "> — only the source"]) {
+      const root = render(text);
+      expect(root.querySelector(".quote-source")).toBeNull();
+      expect(root.querySelector("blockquote")?.textContent?.trim()).toBe(
+        text.slice(2),
+      );
+    }
+  });
+});
+
+describe("inline code", () => {
+  test("is code wherever prose goes: a sentence, a heading, a list item, a cell, a link", () => {
+    const root = render(
+      [
+        "Inline, an expression reads `var=expres() + yield * expres2()` — fenced, it keeps its own frame.",
+        "## The `source` field",
+        "- a `nested` item\n  - and `deeper`",
+        "| Host | Note |\n| --- | --- |\n| `*.acme.com` | in |",
+        "See [`policy:219`](https://hackerone.com/acme/policy).",
+      ].join("\n\n"),
+    );
+    expect(
+      [...root.querySelectorAll("code")].map(
+        (each) =>
+          `${each.parentElement?.tagName.toLowerCase()}:${each.textContent}`,
+      ),
+    ).toEqual([
+      "p:var=expres() + yield * expres2()",
+      "h2:source",
+      "li:nested",
+      "li:deeper",
+      "td:*.acme.com",
+      "a:policy:219",
+    ]);
+    expect(root.querySelector("a")?.getAttribute("href")).toBe(
+      "https://hackerone.com/acme/policy",
+    );
+    // A span is never a block: no fence frame, no Copy.
+    expect(root.querySelector(".code-frame, pre")).toBeNull();
+  });
+
+  test("is escaped text, whatever it holds", () => {
+    const root = render(
+      "Quoted: `<script>alert(1)</script>` and `<img src=x onerror=alert(2)>` and `[x](javascript:alert(3))`.",
+    );
+    expect(root.querySelector("script, img, [onerror], a")).toBeNull();
+    expect(
+      [...root.querySelectorAll("p > code")].map((each) => each.textContent),
+    ).toEqual([
+      "<script>alert(1)</script>",
+      "<img src=x onerror=alert(2)>",
+      "[x](javascript:alert(3))",
+    ]);
+    expect(
+      [...root.querySelectorAll("p > code")]
+        .map((each) => each.getAttributeNames().join("|"))
+        .join(),
+    ).toBe(",,");
+  });
+});
+
+describe("D8's framing, from a program page", () => {
+  test("a fence's name is text, whatever the info string says", () => {
+    const root = render(
+      '```js "><script>alert(1)</script><img src=x onerror=alert(2)>\nx\n```',
+    );
+    expect(root.querySelector("script, img, [onerror]")).toBeNull();
+    const label = root.querySelector(".code-label");
+    expect(label?.textContent).toBe(
+      '"><script>alert(1)</script><img src=x onerror=alert(2)>',
+    );
+    expect(label?.getAttributeNames().join()).toBe("class");
+    expect(root.querySelectorAll(".code-frame")).toHaveLength(1);
+  });
+
+  test("a fence's language cannot become an attribute or a handler", () => {
+    const root = render('```x"onmouseover="alert(1)\ny\n```');
+    const pre = root.querySelector("pre");
+    expect(pre?.getAttributeNames().sort().join()).toBe("data-language");
+    expect(root.querySelector("[onmouseover]")).toBeNull();
+    expect(pre?.getAttribute("data-language")).toBe('x"onmouseover="alert(1)');
+  });
+
+  test("HTML in a task item is text, and a checkbox written as HTML is not one", () => {
+    const root = render(
+      "- [ ] <img src=x onerror=alert(1)> <script>alert(1)</script>\n- <input type=checkbox>",
+    );
+    expect(root.querySelector("script, img, [onerror]")).toBeNull();
+    expect(root.querySelectorAll("input")).toHaveLength(1);
+    expect(root.querySelector(".task-text")?.textContent).toBe(
+      "<img src=x onerror=alert(1)> <script>alert(1)</script>",
+    );
+  });
+
+  test("a javascript: link in a table cell is a link to nowhere", () => {
+    const root = render(
+      "| Host | Link |\n| --- | --- |\n| a | [go](javascript:alert(1)) |",
+    );
+    const link = root.querySelector("td a");
+    expect(link?.textContent).toBe("go");
+    expect(link?.hasAttribute("href")).toBe(false);
+    expect(root.innerHTML).not.toContain("javascript:");
+  });
+
+  test("a quote's source line keeps HTML as text and links sanitised", () => {
+    const root = render(
+      "> quoted\n> — <img src=x onerror=alert(1)> [page](javascript:alert(2))",
+    );
+    const source = root.querySelector(".quote-source");
+    expect(root.querySelector("img, [onerror]")).toBeNull();
+    expect(source?.textContent).toBe("<img src=x onerror=alert(1)> page");
+    expect(source?.querySelector("a")?.hasAttribute("href")).toBe(false);
+  });
+
+  test("a Copy button or a frame written as HTML is text, so every button is the pipeline's own", () => {
+    const root = render(
+      '<div class="code-frame"><button class="code-copy">Copy</button><pre><code>x</code></pre></div>\n\n```\nreal\n```',
+    );
+    // The HTML block is shown as the source it is — itself in a frame — and the frame's
+    // text holds the button the agent wrote, as characters.
+    const frames = [...root.querySelectorAll(".code-frame")];
+    expect(frames).toHaveLength(2);
+    expect(
+      [...root.querySelectorAll("button")]
+        .map((each) => `${each.parentElement?.className}>${each.outerHTML}`)
+        .join(),
+    ).toBe(
+      'code-head><button type="button" class="code-copy">Copy</button>,code-head><button type="button" class="code-copy">Copy</button>',
+    );
+    expect(frames[0]?.querySelector("pre > code")?.textContent).toContain(
+      '<button class="code-copy">Copy</button>',
+    );
+  });
+});
+
+describe("Copy", () => {
+  const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  let written: string[] = [];
+  const clipboard = (writeText: (text: string) => Promise<void>): void => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+  };
+  afterEach(() => {
+    written = [];
+    if (original === undefined) {
+      Reflect.deleteProperty(navigator, "clipboard");
+    } else {
+      Object.defineProperty(navigator, "clipboard", original);
+    }
+  });
+
+  test("puts the fence's text on the clipboard exactly, and says it did", async () => {
+    clipboard(async (text) => {
+      written.push(text);
+    });
+    const json =
+      '{\n  "host":       "app.partner.com",\n  "subdomains": false\n}';
+    const root = render(
+      `\`\`\`json entry-10.json\n${json}\n\`\`\`\n\n\`\`\`js\nvar=1\n\`\`\``,
+    );
+    const buttons = [
+      ...root.querySelectorAll<HTMLButtonElement>("button.code-copy"),
+    ];
+    const first = buttons[0];
+    const second = buttons[1];
+    if (first === undefined || second === undefined) {
+      throw new Error("expected two Copy buttons");
+    }
+    click(first);
+    await settle();
+    expect(written).toEqual([json]);
+    expect(first.textContent).toBe("Copied");
+    expect(second.textContent).toBe("Copy");
+
+    // Each button copies its own frame.
+    click(second);
+    await settle();
+    expect(written).toEqual([json, "var=1"]);
+  });
+
+  test("says so when the clipboard refuses, rather than claiming a copy", async () => {
+    clipboard(() => Promise.reject(new Error("denied")));
+    const button =
+      render("```\nx\n```").querySelector<HTMLButtonElement>(
+        "button.code-copy",
+      );
+    if (button === null) throw new Error("no Copy button");
+    click(button);
+    await settle();
+    expect(button.textContent).toBe("Copy failed");
+  });
+});
+
+/*
+ * happy-dom does no layout — every `scrollWidth` and `clientWidth` is 0 — so whether a long
+ * line widens the thread is measured in a browser (the slice's CDP check). What can be
+ * checked here is the contract that measurement rests on, under the component's own
+ * compiled stylesheet: the line is in a block that scrolls, and prose around it wraps.
+ */
+describe("what cannot wrap scrolls in its own block", () => {
+  const path = new URL(
+    "../../src/lib/components/Markdown.svelte",
+    import.meta.url,
+  ).pathname;
+  let sheet: HTMLStyleElement | undefined;
+  afterEach(() => {
+    sheet?.remove();
+    sheet = undefined;
+  });
+
+  test("a long unbroken token is in a scrolling pre, and prose wraps anywhere", async () => {
+    // The same options as the test transform, so the scoping hash matches the mounted DOM.
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+
+    const token = `https://acme.com/legacy/partner/handoff?redirect=${"a".repeat(400)}`;
+    const root = render(
+      `Prose with ${token} in it.\n\n\`\`\`\n${token}\n\`\`\``,
+    );
+    const pre = root.querySelector("pre");
+    if (pre === null) throw new Error("no pre");
+    const frame = getComputedStyle(pre.parentElement ?? pre);
+    const block = getComputedStyle(pre);
+    expect(
+      `${block.overflowX} ${block.whiteSpace} ${frame.maxWidth} ${frame.minWidth}`,
+    ).toBe("auto pre 100% 0");
+    expect(getComputedStyle(root).overflowWrap).toBe("anywhere");
+  });
+
+  test("a long inline span wraps with its sentence, and a header's capitals leave code alone", async () => {
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+
+    const root = render(
+      `Prose with \`${"tok3n".repeat(80)}\` in it.\n\n| \`Host\` |\n| --- |\n| a |`,
+    );
+    const span = getComputedStyle(root.querySelector("p > code") ?? root);
+    expect(`${span.whiteSpace} ${span.overflowWrap}`).toBe("normal anywhere");
+    expect(
+      getComputedStyle(root.querySelector("th code") ?? root).textTransform,
+    ).toBe("none");
+  });
+
+  test("in a list mixing tasks and bullets, only the task loses its bullet", async () => {
+    // GFM marks the whole list `contains-task-list` when one item is a task; a rule on
+    // the list stripped every bullet in it.
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+
+    const root = render("- a bullet\n- [ ] a task");
+    expect(
+      [...root.querySelectorAll("li")]
+        .map((each) => getComputedStyle(each).listStyleType)
+        .join(),
+    ).toBe("disc,none");
   });
 });
 
