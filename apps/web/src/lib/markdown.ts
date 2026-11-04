@@ -180,10 +180,12 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
  * Characters that change how code reads without showing as anything, shown as what they
  * are: `⟨U+202E⟩`, in a `<span class="char-escape">`.
  *
- * A bidi control (U+202A–202E, U+2066–2069) reorders the letters around it on screen and
- * not in the text, so a fence named `\u202Enosj.live` reads as `evil.json` and copies as
- * something else; a zero-width one (U+200B–200F, U+2060, U+FEFF) puts a character into a
- * host the eye cannot see. In code, and in a fence's name, the exact characters are the
+ * A bidi control (U+061C, U+202A–202E, U+2066–2069: CVE-2021-42574's list) reorders the
+ * letters around it on screen and not in the text, so a fence named `\u202Enosj.live` reads
+ * as `evil.json` and copies as something else; a zero-width one (U+200B–200F, U+2060,
+ * U+FEFF) or a tag character (U+E0000–E007F, five hex digits) puts a character into a host
+ * the eye cannot see. A variation selector is not here: U+FE0F is how `❤️` is written, and
+ * marking it would mark every emoji. In code, and in a fence's name, the exact characters are the
  * point, so each is replaced by its code point. Prose is left alone: there, these are how
  * right-to-left text and joined scripts are written.
  *
@@ -194,7 +196,8 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
  * That is what lets `Markdown.svelte`'s Copy put the original character back: the button
  * copies the code as the agent wrote it.
  */
-const HIDDEN = /[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/u;
+const HIDDEN =
+  /[\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/u;
 const hiddenName = (char: string): string =>
   `⟨U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}⟩`;
 const reveal = (node: ElementContent): ElementContent[] => {
@@ -340,7 +343,11 @@ const taskText = (item: Element): void => {
  * It only moves nodes the sanitiser already passed and splits one text node; the class is
  * a constant.
  */
-const SOURCE_DASH = /\n\s*—\s*/;
+/*
+ * Spaces and tabs only, either side of the dash: `\s` would take the line break after a
+ * lone `—` too, and the line under it would become the source.
+ */
+const SOURCE_DASH = /\n[ \t]*—[ \t]*/;
 /** A line break anywhere in a node: a soft one in its text, or a hard `<br>`. */
 const breaks = (node: ElementContent): boolean =>
   node.type === "text"

@@ -391,6 +391,20 @@ describe("D8's framing", () => {
     }
   });
 
+  test("a dash alone on a line mid-quote does not make the next line the source", () => {
+    // The space after a dash is not a line break: a lone `—` with more quote under it is
+    // still the quote's own text, and so is the line after it.
+    for (const text of [
+      "> quoted\n> —\n> more quote text",
+      "> quoted\n> — \t\n> more quote text",
+    ]) {
+      const quote = render(text).querySelector("blockquote");
+      expect(quote?.querySelector(".quote-source")).toBeNull();
+      expect(quote?.textContent).toContain("—");
+      expect(quote?.textContent).toContain("more quote text");
+    }
+  });
+
   test("a dash that is not a closing line is left in the quote", () => {
     // Mid-line, and a quote that is nothing but the dash line: neither has a source.
     for (const text of ["> one — two", "> — only the source"]) {
@@ -563,6 +577,49 @@ describe("characters that do not show as what they are", () => {
     );
   });
 
+  test("an Arabic letter mark and a tag character are markers too; an emoji's variation selector is not", () => {
+    // U+061C is a bidi control (CVE-2021-42574's list); U+E0000–E007F are tag characters,
+    // invisible and outside the BMP, so their code point has five digits.
+    const root = render(
+      "```\nad\u061Cmin\u{E0041}\u{E007F}.acme.com \u2764\uFE0F\n```\n\nSee `a\u061Cb\u{E0001}c`.",
+    );
+    expect(root.querySelector("pre > code")?.textContent).toBe(
+      "ad⟨U+061C⟩min⟨U+E0041⟩⟨U+E007F⟩.acme.com \u2764\uFE0F\n",
+    );
+    expect(root.querySelectorAll("pre .char-escape")).toHaveLength(3);
+    expect(root.querySelector("p > code")?.textContent).toBe(
+      "a⟨U+061C⟩b⟨U+E0001⟩c",
+    );
+  });
+
+  test("Copy gives back a five-digit tag character and an Arabic letter mark as written", async () => {
+    const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (text: string) => {
+          written.push(text);
+        },
+      },
+    });
+    try {
+      const source = "ad\u061Cmin\u{E0041}\u{E007F}.acme.com";
+      const root = render(`\`\`\`\n${source}\n\`\`\``);
+      const button = root.querySelector<HTMLButtonElement>("button.code-copy");
+      if (button === null) throw new Error("no Copy button");
+      click(button);
+      await settle();
+      expect(written).toEqual([source]);
+    } finally {
+      if (original === undefined) {
+        Reflect.deleteProperty(navigator, "clipboard");
+      } else {
+        Object.defineProperty(navigator, "clipboard", original);
+      }
+    }
+  });
+
   test("a marker written by the agent is text, and Copy gives it back as written", async () => {
     const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
     const written: string[] = [];
@@ -689,6 +746,50 @@ describe("Copy", () => {
     expect(region.textContent).toBe("Copy failed");
   });
 
+  test("a second Copy inside the 1.5 s is announced again", async () => {
+    // A polite region speaks when its text changes. Setting "Copied" over "Copied" changes
+    // nothing, so the second copy would go unheard; each one has to be a new change.
+    clipboard(async (text) => {
+      written.push(text);
+    });
+    const one = mountInto(Markdown, { text: "```\nx\n```" });
+    mounted.push(one);
+    const region = one.target.querySelector('[aria-live="polite"]');
+    const button =
+      one.target.querySelector<HTMLButtonElement>("button.code-copy");
+    if (region === null || button === null) {
+      throw new Error("no live region or Copy button");
+    }
+    const heard: string[] = [];
+    let last = region.textContent ?? "";
+    const observer = new MutationObserver(() => {
+      const now = region.textContent ?? "";
+      if (now !== last && now !== "") heard.push(now);
+      last = now;
+    });
+    observer.observe(region, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
+    const frame = (): Promise<void> =>
+      new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    try {
+      click(button);
+      await settle();
+      await frame();
+      await settle();
+      click(button);
+      await settle();
+      await frame();
+      await settle();
+      expect(heard).toEqual(["Copied", "Copied"]);
+      expect(region.textContent).toBe("Copied");
+    } finally {
+      observer.disconnect();
+    }
+  });
+
   test("a reply taken away mid-'Copied' leaves no timer behind", async () => {
     clipboard(async (text) => {
       written.push(text);
@@ -781,6 +882,44 @@ describe("what cannot wrap scrolls in its own block", () => {
     expect(
       getComputedStyle(root.querySelector("th code") ?? root).textTransform,
     ).toBe("none");
+  });
+
+  test("inline code is isolated from a bidi control in the prose around it", async () => {
+    // U+202E in a sentence reverses what follows it, code included, unless the code is its
+    // own isolate: `nosj.live` would read as `evil.json`.
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+
+    const root = render(
+      [
+        "## Heading \u202E `nosj.live`",
+        "Prose then override \u202E and inline `nosj.live` code",
+        "- item \u202E `nosj.live`",
+        "| Host |\n| --- |\n| cell \u202E `nosj.live` |",
+      ].join("\n\n"),
+    );
+    const codes = [
+      ...root.querySelectorAll("h2 code, p code, li code, td code"),
+    ];
+    expect(codes).toHaveLength(4);
+    expect(
+      codes.map((each) => {
+        const style = getComputedStyle(each);
+        return `${each.parentElement?.tagName} ${style.unicodeBidi} ${style.direction}`;
+      }),
+    ).toEqual([
+      "H2 isolate ltr",
+      "P isolate ltr",
+      "LI isolate ltr",
+      "TD isolate ltr",
+    ]);
   });
 
   test("a table with no body has no record's deep header", async () => {
