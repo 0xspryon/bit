@@ -78,6 +78,8 @@ import {
   goalUsageScope,
   roundUsageScope,
   usageScope,
+  withBlock,
+  withoutPartials,
   type ContextMeter,
   type SentTurn,
 } from "./chat";
@@ -5357,6 +5359,13 @@ export class App {
 
   #connectLive(targetId: string, cursor: number) {
     const generation = ++this.#liveGeneration;
+    /*
+     * Every partial goes when a connection opens (A6 U5): none is resent, and a block that
+     * finished while the feed was down comes back — if at all — as a finished block on the
+     * record of what the harness wrote, not as this connection's, so a partial kept from
+     * the last one would stay beside it as a second, shorter copy.
+     */
+    this.liveItems = withoutPartials(this.liveItems);
     this.liveWatching = true;
     this.#armSilence(targetId);
     this.#stopLive = this.client.watchLive(this.serverUrl, targetId, {
@@ -5587,6 +5596,19 @@ export class App {
       this.liveUsage = { ...this.liveUsage, [scope]: frame };
       return;
     }
+    /*
+     * A partial (A6 U5): replaced by its `blockId`, never deduplicated by its `id` — that is
+     * the frame's own and names nothing else, so remembering it would hide nothing that
+     * could come again and would push real ids out of the bounded memory below. Nothing
+     * else here is about a partial: it moves no cursor, takes nothing and refreshes nothing.
+     */
+    if (frame.streaming === true) {
+      const placed = withBlock(this.liveItems, frame);
+      if (placed !== undefined && placed !== this.liveItems) {
+        this.#keepLive(placed);
+      }
+      return;
+    }
     if (this.#shown.has(frame.id)) return;
     this.#shown.add(frame.id);
     this.#shownOrder.push(frame.id);
@@ -5597,16 +5619,20 @@ export class App {
     if (frame.sequence !== null) {
       this.liveCursor = Math.max(this.liveCursor, frame.sequence);
     }
-    const next = [...this.liveItems, frame];
-    this.liveItems =
-      next.length > App.LIVE_KEPT
-        ? next.slice(next.length - App.LIVE_KEPT)
-        : next;
+    // A finished block takes its partial's place; anything else is added at the end.
+    this.#keepLive(
+      withBlock(this.liveItems, frame) ?? [...this.liveItems, frame],
+    );
     // A take is kept on its importer session, since this list slides (A6 U4 review).
     this.importer.noteTaken(frame);
     this.#refreshIntentsFor(targetId, frame);
     this.#refreshGoalBriefingFor(targetId, frame);
     this.#refreshPlanRoundsFor(targetId, frame);
+  }
+
+  /** Puts `next` on screen, the newest {@link App.LIVE_KEPT} of it. */
+  #keepLive(next: readonly LiveItem[]) {
+    this.liveItems = next.slice(Math.max(0, next.length - App.LIVE_KEPT));
   }
 
   /**

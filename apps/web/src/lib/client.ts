@@ -1073,8 +1073,17 @@ export const server = {
         Effect.flatMap(
           api.fleet.live({
             params: { targetId },
-            query:
-              options.cursor === undefined ? {} : { cursor: options.cursor },
+            /*
+             * Partials asked for (A6 U5): `App.applyLiveFrame` replaces a block's partial
+             * by its `blockId` and never dedupes one by id, which is what the server needs
+             * to know before it sends them (`live.ts`, "Partial items").
+             */
+            query: {
+              partials: "1",
+              ...(options.cursor === undefined
+                ? {}
+                : { cursor: options.cursor }),
+            },
           }),
           (stream) =>
             Stream.runForEach(stream, (frame) =>

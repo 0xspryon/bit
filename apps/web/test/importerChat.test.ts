@@ -17,9 +17,16 @@ import {
   type ScopeImportTool,
 } from "@bit/contracts";
 
-import { callSignature, operatorTurn, resultLine } from "../src/lib/chat";
+import {
+  NARRATION_SHORTENED_MARK,
+  callSignature,
+  operatorTurn,
+  resultLine,
+  streamStates,
+} from "../src/lib/chat";
 import {
   LOADING_HISTORY,
+  MID_BLOCK_NOTE,
   NO_HISTORY,
   QUEUED_NOTE,
   buildImporterChat,
@@ -2209,5 +2216,131 @@ describe("U4 review 3: steers the harness took as one", () => {
       ["MG-PAGE", ["page noted"]],
       ["MG-OTHER", ["other noted"]],
     ]);
+  });
+});
+
+/*
+ * A6 U5: a block while it is being written. The feed's partials are applied by `blockId`
+ * before they reach here (`App.applyLiveFrame`, `withBlock`); what is decided here is which
+ * of them a turn draws, and how each stands.
+ */
+describe("A6 U5: blocks still being written", () => {
+  const partial = (
+    body: string,
+    blockId: string,
+    kind: "turn.reply" | "turn.thinking" = "turn.reply",
+  ): LiveItem =>
+    item({
+      kind,
+      headline: "",
+      body,
+      blockId,
+      streaming: true,
+      importId: "imp_1",
+    });
+  const rowsOf = (input: Parameters<typeof buildImporterChat>[0]) =>
+    buildImporterChat(input).map((group) =>
+      group.rows.map(
+        (row) =>
+          `${row.item.body}${row.stream === undefined ? "" : ` [${row.stream}]`}`,
+      ),
+    );
+
+  test("the turn being worked on draws its partial as writing", () => {
+    expect(
+      rowsOf({
+        history: NO_HISTORY,
+        items: [operator(1, "load it"), partial("Reading", "s:m1:0")],
+        working: true,
+      }),
+    ).toEqual([["Reading [writing]"]]);
+  });
+
+  test("once the session is idle, a partial that never got its finished block is gone", () => {
+    expect(
+      rowsOf({
+        history: NO_HISTORY,
+        items: [
+          operator(1, "load it"),
+          partial("First try", "s:m1:0"),
+          reply("Second try, finished."),
+        ],
+        working: false,
+      }),
+    ).toEqual([["Second try, finished."]]);
+  });
+
+  test("a partial left in an earlier turn is gone while a later turn is worked on", () => {
+    expect(
+      rowsOf({
+        history: NO_HISTORY,
+        items: [
+          operator(1, "load it"),
+          partial("Left behind", "s:m1:0"),
+          operator(2, "and the portal"),
+          partial("Now writing", "s:m2:0"),
+        ],
+        working: true,
+      }),
+    ).toEqual([[], ["Now writing [writing]"]]);
+  });
+
+  test("GLM: a thought is no longer writing once a reply of the same message has started", () => {
+    const thought = partial(
+      "Weighing it",
+      "s:msg_1:reasoning:0",
+      "turn.thinking",
+    );
+    const other = partial(
+      "An older step",
+      "s:msg_0:reasoning:0",
+      "turn.thinking",
+    );
+    const answer = partial("The answer", "s:msg_1:text:0");
+    expect([...streamStates([other, thought, answer]).values()]).toEqual([
+      "writing",
+      "done",
+      "writing",
+    ]);
+    // Alone, it is still being written.
+    expect([...streamStates([thought]).values()]).toEqual(["writing"]);
+  });
+
+  test("a thought past the 4,000-character cap is shortened, not writing", () => {
+    const long = partial(
+      `${"x".repeat(4_000)}${NARRATION_SHORTENED_MARK}`,
+      "s:m1:0",
+      "turn.thinking",
+    );
+    expect([...streamStates([long]).values()]).toEqual(["shortened"]);
+  });
+
+  test("a block's row keeps one key from its first partial to its finished copy", () => {
+    const keys = (items: LiveItem[]) =>
+      buildImporterChat({ history: NO_HISTORY, items, working: true }).flatMap(
+        (group) => group.rows.map((row) => row.key),
+      );
+    const first = partial("Read", "s:m1:0");
+    const finished = { ...reply("Read it."), blockId: "s:m1:0" };
+    expect(keys([operator(1, "go"), first])).toEqual(
+      keys([operator(1, "go"), finished]),
+    );
+  });
+
+  test("a reload while the harness is part way through a block shows the turn in progress", () => {
+    const history = {
+      ...NO_HISTORY,
+      source: "harness" as const,
+      items: [replayItem(0, "turn.operator", "load it", { importId: "imp_1" })],
+    };
+    const working = buildImporterChat({ history, items: [], working: true });
+    expect(
+      working.map((group) => [group.subject.midBlock, group.prose]),
+    ).toEqual([[true, { _tag: "pending", note: MID_BLOCK_NOTE }]]);
+    // Idle, it is the harness holding a message with no reply, as before.
+    const idle = buildImporterChat({ history, items: [], working: false });
+    expect(
+      idle.map((group) => [group.subject.midBlock, group.prose._tag]),
+    ).toEqual([[false, "none"]]);
   });
 });

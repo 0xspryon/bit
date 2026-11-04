@@ -47,7 +47,22 @@
     highlights?: Highlights;
   } = $props();
 
-  const html = $derived(renderMarkdown(text));
+  /**
+   * The HTML for {@link text}, parsed only when the text has changed (A6 U5).
+   *
+   * A live block's partials arrive about every 50 ms, and every one rebuilds the chat's
+   * groups, so every row's props are read again even where the words are the same: the
+   * derived below re-runs for every reply on screen, not only the one being written. The
+   * last text and its HTML are kept, so an unchanged reply is a string comparison rather
+   * than a markdown parse, and only the block being written is parsed again. Its closed
+   * fences are not tokenised again either: their tones and built code are kept below.
+   */
+  let rendered: { readonly text: string; readonly html: string } | undefined;
+  const html = $derived.by(() => {
+    if (rendered?.text !== text)
+      rendered = { text, html: renderMarkdown(text) };
+    return rendered.html;
+  });
 
   /** How long a Copy button says what happened before it says Copy again. */
   const COPIED_FOR_MS = 1500;

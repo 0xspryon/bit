@@ -511,7 +511,153 @@ export interface ChatRow {
    * doubled by a paraphrase of the request that produced it.
    */
   readonly summary: string | null;
+  /**
+   * How a block still being written stands ({@link StreamState}), on a partial reply or
+   * thought (A6 U5). Absent on a finished block and on every other row.
+   */
+  readonly stream?: StreamState;
 }
+
+/* ── Partial blocks (A6 U5) ─────────────────────────────────────────────────── */
+
+/**
+ * The mark the server puts at the end of a narration field it cut at 4,000 characters
+ * (`truncateNarration` in the server's `agentHarness.ts`). Copied, not imported: the
+ * contracts do not carry it, and the web never reads server code. A partial ending in it
+ * has stopped growing on screen while the agent goes on writing.
+ */
+export const NARRATION_SHORTENED_MARK = "\n… (shortened)";
+
+/**
+ * Where a partial block stands, which is what its row says about it:
+ *
+ * - `writing` — still being written: "writing…" on a reply, a shimmer on a thought.
+ * - `shortened` — past the server's 4,000-character cap, so nothing more of it will be
+ *   drawn until it ends ({@link NARRATION_SHORTENED_MARK}); said, rather than shown as
+ *   writing over text that has stopped moving (seen frozen ~30 s on a GLM thought).
+ * - `done` — a thought the agent has moved on from but the harness has not closed: GLM on
+ *   OpenCode ends a reasoning block only at its step's end (`session.reasoning.ended`), so
+ *   its thought would read as writing for the whole reply that follows it.
+ */
+export type StreamState = "writing" | "shortened" | "done";
+
+/** Whether an item is a partial: a block still being written (`LiveItem.streaming`). */
+export const isPartial = (item: LiveItem): boolean => item.streaming === true;
+
+/**
+ * The model call a block belongs to, read off its wire `blockId`
+ * (`<harness session>:<block>`). The contract calls the id opaque; this is the one place
+ * the web reads into it, for the two rules that need "the same model call" (U5's brief:
+ * "the `blockId` prefix is the message id"). Claude Code's block is `<message.id>:<index>`
+ * and OpenCode's `<message id>:text|reasoning:<ordinal>`, so dropping the trailing ordinal,
+ * then the channel, leaves the session and the call. An id in neither shape is its own
+ * call, which only makes the rules below do nothing.
+ */
+export const blockCall = (blockId: string): string =>
+  blockId.replace(/:\d+$/u, "").replace(/:(?:text|reasoning)$/u, "");
+
+/** The harness session a wire `blockId` was streamed in: what precedes its first colon. */
+export const blockSession = (blockId: string): string => {
+  const at = blockId.indexOf(":");
+  return at === -1 ? blockId : blockId.slice(0, at);
+};
+
+/**
+ * How each partial in `items` stands, by item id. Only partials are in it.
+ *
+ * A thought is `done` once a reply of the **same model call** has started — partial or
+ * finished — because a model writes one block at a time, so the thought it left is not
+ * being written any more whatever the harness says. A block past the cap is `shortened`
+ * whichever it is.
+ */
+export const streamStates = (
+  items: readonly LiveItem[],
+): ReadonlyMap<string, StreamState> => {
+  const states = new Map<string, StreamState>();
+  if (!items.some(isPartial)) return states;
+  const replied = new Set<string>();
+  for (const item of items) {
+    if (item.kind === REPLY_KIND && item.blockId !== undefined) {
+      replied.add(blockCall(item.blockId));
+    }
+  }
+  for (const item of items) {
+    if (!isPartial(item)) continue;
+    states.set(
+      item.id,
+      item.body.endsWith(NARRATION_SHORTENED_MARK)
+        ? "shortened"
+        : item.kind === THINKING_KIND &&
+            item.blockId !== undefined &&
+            replied.has(blockCall(item.blockId))
+          ? "done"
+          : "writing",
+    );
+  }
+  return states;
+};
+
+/**
+ * What the operator's view should hold once a frame arrives, for a frame that is a block
+ * (A6 U5), or `undefined` for one this does not apply to — everything else, appended as
+ * before. The rules of `live.ts` ("Partial items"), with the client's own two on top:
+ *
+ * - A partial **replaces** the partial for its `blockId` where that one is, keeping its
+ *   `id` — so the row's key and its place among the operator's messages (which is read
+ *   from the id's publish order) are where the block began, not where it has got to — or
+ *   is added at the end. A partial for a block whose finished copy is already here is
+ *   dropped: that block is done.
+ * - A finished block **replaces** its partial where it is, under its own id.
+ * - **A newer model call ends an older one's partials.** A block of a call, partial or
+ *   finished, drops every partial of another call in the same harness session: a model
+ *   writes one call at a time, so those were left unfinished — a retried API call's first
+ *   attempt, which the server's turn-end flush leaves behind (A6 F8 review). Dropped here
+ *   for every reader of the feed, the goal chat and the Live panel included, which have no
+ *   turn end to drop them at.
+ *
+ * `items` itself, unchanged, when the frame changes nothing.
+ */
+export const withBlock = (
+  items: readonly LiveItem[],
+  frame: LiveItem,
+): readonly LiveItem[] | undefined => {
+  const blockId = frame.blockId;
+  if (blockId === undefined) return undefined;
+  if (frame.kind !== REPLY_KIND && frame.kind !== THINKING_KIND) {
+    return undefined;
+  }
+  const call = blockCall(blockId);
+  const session = blockSession(blockId);
+  const stale = (item: LiveItem): boolean =>
+    isPartial(item) &&
+    item.blockId !== undefined &&
+    item.blockId !== blockId &&
+    blockSession(item.blockId) === session &&
+    blockCall(item.blockId) !== call;
+  const at = items.findLastIndex((item) => item.blockId === blockId);
+  const here = at === -1 ? undefined : items[at];
+  // The block's finished copy is here: a partial for it is late, and changes nothing.
+  if (isPartial(frame) && here !== undefined && !isPartial(here)) return items;
+  const placed =
+    here === undefined
+      ? [...items, frame]
+      : items.with(
+          at,
+          isPartial(frame) && isPartial(here)
+            ? { ...frame, id: here.id }
+            : frame,
+        );
+  return placed.some(stale) ? placed.filter((item) => !stale(item)) : placed;
+};
+
+/**
+ * What a reconnected feed starts from (A6 U5): every partial dropped. Partials are never
+ * replayed, and a finished block that ends one while the feed is down arrives after the
+ * reconnect with no partial of this connection's to replace — so the old partial would stay
+ * beside it as a second copy.
+ */
+export const withoutPartials = (items: readonly LiveItem[]): LiveItem[] =>
+  items.some(isPartial) ? items.filter((item) => !isPartial(item)) : [...items];
 
 /**
  * What a round's prose situation is, in the words the chat prints.
@@ -1139,6 +1285,26 @@ export const rowsFor = (
       .map(([, record]) => record.id),
   );
   const rows: ChatRow[] = [];
+  const states = streamStates(items);
+  /*
+   * A block's row is keyed by its `blockId` (A6 U5), so its partials and then its finished
+   * copy — each a frame of its own id — are one row to `{#each}`: the reply's markdown is
+   * redrawn in place rather than mounted afresh, and an opened thought, a drawn figure and
+   * a highlighted fence are kept when the block finishes. A key already taken in this group
+   * (the same block replayed and live, say) falls back to the item's own id, since two rows
+   * on one key would stop the list drawing at all.
+   */
+  const used = new Set<string>();
+  const keyOf = (item: LiveItem): string => {
+    const key =
+      item.blockId !== undefined &&
+      (item.kind === REPLY_KIND || item.kind === THINKING_KIND)
+        ? `block:${item.blockId}`
+        : item.id;
+    const free = used.has(key) ? item.id : key;
+    used.add(free);
+    return free;
+  };
   for (const item of items) {
     // Folded into the call it answers. One that names no call stays a row of its own —
     // falling back to the tool name would attribute one command's output to another.
@@ -1182,13 +1348,15 @@ export const rowsFor = (
       continue;
     }
     if (claimed.has(item.id)) continue;
+    const stream = states.get(item.id);
     rows.push({
-      key: item.id,
+      key: keyOf(item),
       item,
       proposedBy: null,
       result: null,
       write: null,
       summary: null,
+      ...(stream === undefined ? {} : { stream }),
     });
   }
   return rows;
@@ -1626,6 +1794,16 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
          * `conversationLive` rather than the `true` this argument used to be: a conversation
          * is not a round, but it does end, and after it has nothing a chat is waiting for
          * can arrive. See {@link GoalChatInput.conversationLive}.
+         */
+        /*
+         * Partials (A6 U5) are drawn as the importer's are — replaced by `blockId` in the
+         * feed, one row per block, "writing…" on a block being written.
+         *
+         * V2(chat): this page has no turn end for the goal agent, so a partial left by a
+         * model call that is never followed by another — a cut block with no finished copy —
+         * stays "writing…" until the next call's first block, or a reconnect, drops it. The
+         * importer drops one when its session goes idle. Proper V2: the server narrates the
+         * goal conversation's turn end, and this drops the turn's unfinished partials there.
          */
         rows: rowsFor(
           [...(prose._tag === "replayed" ? replayed : []), ...ordered],

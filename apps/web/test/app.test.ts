@@ -3850,3 +3850,139 @@ describe("the context meter", () => {
     expect(app.liveUsage).toEqual({});
   });
 });
+
+/*
+ * A6 U5: a block while it is being written. The server sends partials — a reply or a thought
+ * with `streaming: true`, the whole text so far, its own `activity:<n>` id — then the finished
+ * block, all under one `blockId` (`live.ts`, "Partial items").
+ */
+describe("A6 U5: partial blocks on the live feed", () => {
+  const watching = async () => {
+    const { app, fake, clock } = open();
+    fake.onTargets = () => ok([targetSummary({ id: "acme-corp" })]);
+    await signIn(app);
+    app.openTarget("acme-corp");
+    await settle();
+    return { app, fake, clock };
+  };
+  const block = (
+    id: string,
+    blockId: string,
+    body: string,
+    over: Partial<Parameters<typeof liveActivity>[0]> = {},
+  ) =>
+    liveActivity({
+      id,
+      importId: "imp_1",
+      attemptId: null,
+      kind: "turn.reply",
+      headline: "Reply",
+      tool: null,
+      toolName: null,
+      input: null,
+      callId: null,
+      body,
+      blockId,
+      ...over,
+    });
+  const partial = (id: string, blockId: string, body: string) =>
+    block(id, blockId, body, { streaming: true });
+  const shown = (app: App) =>
+    app.liveItems.map(
+      (item) =>
+        `${item.id} ${item.streaming === true ? "partial" : "finished"} ${item.body}`,
+    );
+
+  test("the live connection asks for partials", async () => {
+    const { fake } = await watching();
+    // `FakeServer` records the cursor; the query itself is the client's, so read its source.
+    const source = await Bun.file(
+      new URL("../src/lib/client.ts", import.meta.url).pathname,
+    ).text();
+    expect(source).toContain('partials: "1"');
+    expect(fake.watches).toHaveLength(1);
+  });
+
+  test("a partial replaces the last in place, keeping where the block began, and the finished block replaces it", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(liveActivity({ id: "activity:1", importId: "imp_1" }));
+    fake.watch.send(partial("activity:2", "ses:msg_a:0", "Reading"));
+    fake.watch.send(partial("activity:4", "ses:msg_a:0", "Reading the policy"));
+    expect(shown(app)).toEqual([
+      "activity:1 finished ",
+      "activity:2 partial Reading the policy",
+    ]);
+    fake.watch.send(
+      block("activity:6", "ses:msg_a:0", "Reading the policy page."),
+    );
+    expect(shown(app)).toEqual([
+      "activity:1 finished ",
+      "activity:6 finished Reading the policy page.",
+    ]);
+    // A partial after its finished block is a late frame: the block is done.
+    fake.watch.send(partial("activity:7", "ses:msg_a:0", "Reading"));
+    expect(shown(app)).toEqual([
+      "activity:1 finished ",
+      "activity:6 finished Reading the policy page.",
+    ]);
+  });
+
+  test("a partial's id is never remembered as shown: an item with that id later is still drawn", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(partial("activity:3", "ses:msg_a:0", "Draft"));
+    // The finished block, then an unrelated item under the id the partial had — a restarted
+    // server's publish order starts again at zero.
+    fake.watch.send(block("activity:5", "ses:msg_a:0", "Draft done."));
+    fake.watch.send(liveActivity({ id: "activity:3", importId: "imp_1" }));
+    expect(app.liveItems.map((item) => item.id)).toEqual([
+      "activity:5",
+      "activity:3",
+    ]);
+    // And two thousand partials do not push a record's id out of the dedupe memory.
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    for (let n = 0; n < App.LIVE_IDS_KEPT + 10; n += 1) {
+      fake.watch.send(
+        partial(`activity:${String(100 + n)}`, "ses:msg_b:0", `x${String(n)}`),
+      );
+    }
+    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    expect(
+      app.liveItems.filter((item) => item.id === "record:e1"),
+    ).toHaveLength(1);
+  });
+
+  test("a reconnect drops every partial, and keeps the finished blocks", async () => {
+    const { app, fake, clock } = await watching();
+    fake.watch.send(block("activity:1", "ses:msg_a:0", "Done before."));
+    fake.watch.send(partial("activity:2", "ses:msg_b:0", "Half a"));
+    fake.watch.close({ _tag: "failed", detail: "network" });
+    clock.fire();
+    expect(fake.watches).toHaveLength(2);
+    expect(shown(app)).toEqual(["activity:1 finished Done before."]);
+  });
+
+  test("a block of a newer model call drops an older call's partial in the same session, not another session's", async () => {
+    const { app, fake } = await watching();
+    // A retried API call: the first attempt's block never finishes.
+    fake.watch.send(partial("activity:1", "ses:msg_a:0", "First try"));
+    fake.watch.send(partial("activity:2", "other:msg_x:0", "Another session"));
+    fake.watch.send(partial("activity:3", "ses:msg_b:0", "Second try"));
+    expect(shown(app)).toEqual([
+      "activity:2 partial Another session",
+      "activity:3 partial Second try",
+    ]);
+  });
+
+  test("on OpenCode a thought and its reply are one call: the reply does not drop the thought", async () => {
+    const { app, fake } = await watching();
+    fake.watch.send(
+      partial("activity:1", "ses:msg_1:reasoning:0", "Thinking it over"),
+    );
+    fake.watch.send(partial("activity:2", "ses:msg_1:text:0", "The answer"));
+    fake.watch.send(block("activity:3", "ses:msg_1:text:0", "The answer."));
+    expect(shown(app)).toEqual([
+      "activity:1 partial Thinking it over",
+      "activity:3 finished The answer.",
+    ]);
+  });
+});

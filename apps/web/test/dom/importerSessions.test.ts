@@ -26,7 +26,8 @@ import {
 
 import { App, IMPORT_POLL_MS, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
-import { ENDED_NOTE } from "../../src/lib/importerChat";
+import { NARRATION_SHORTENED_MARK } from "../../src/lib/chat";
+import { ENDED_NOTE, MID_BLOCK_NOTE } from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import {
@@ -39,6 +40,7 @@ import {
   liveOpened,
   ok,
   refused,
+  replayItem,
   scopeImportView,
   unreachable,
 } from "../fakeServer";
@@ -1276,5 +1278,248 @@ describe("the Stop pill (A6 F5)", () => {
     click(close);
     await settle();
     expect(dialog()).toBeNull();
+  });
+});
+
+/*
+ * A6 U5: the importer's words while they are being written. The server sends a block's
+ * partials — its whole text so far, `streaming: true` — then the finished block, all under
+ * one `blockId`; the thread draws one row for it throughout. Compared as strings and by
+ * `===` on elements, never with `toEqual` on a node.
+ */
+describe("A6 U5: a block while it is being written", () => {
+  const running = (fake: FakeServer, yes: boolean) => {
+    fake.onScopeImport = (_baseUrl, targetId, importId) =>
+      ok(
+        scopeImportView({
+          targetId,
+          importId,
+          status: yes ? "running" : "finished",
+        }),
+      );
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: SESSIONS.map((each) =>
+          each.importId === "imp_newest" ? { ...each, running: yes } : each,
+        ),
+      });
+  };
+  /** A session on screen with a turn in flight, its feed open. */
+  const inFlight = async () => {
+    const opened = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    opened.fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    running(opened.fake, true);
+    const box = composer();
+    typeInto(box, "Load the staging hosts");
+    box.focus();
+    press("Enter");
+    await settle();
+    return opened;
+  };
+  const block = (
+    id: string,
+    blockId: string,
+    body: string,
+    over: Partial<Parameters<typeof liveActivity>[0]> = {},
+  ) =>
+    liveActivity({
+      id,
+      attemptId: null,
+      importId: "imp_newest",
+      kind: "turn.reply",
+      headline: "Reply",
+      tool: null,
+      toolName: null,
+      input: null,
+      callId: null,
+      body,
+      blockId,
+      ...over,
+    });
+  const partial = (
+    id: string,
+    blockId: string,
+    body: string,
+    over: Partial<Parameters<typeof liveActivity>[0]> = {},
+  ) => block(id, blockId, body, { streaming: true, ...over });
+  const thinking = { kind: "turn.thinking", headline: "Thinking" } as const;
+  const replies = (): HTMLElement[] => [
+    ...document.querySelectorAll<HTMLElement>(
+      ".importer li.prose:not(.reasoning)",
+    ),
+  ];
+  const writing = (): string[] =>
+    [...document.querySelectorAll(".importer .writing")].map(
+      (each) => each.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    );
+  const cursors = (): number =>
+    document.querySelectorAll(".importer .stream-cursor").length;
+
+  test("a reply grows in one row marked writing, and its finished block replaces it in that row", async () => {
+    const { fake } = await inFlight();
+    const before = replies().length;
+    fake.watch.send(partial("activity:10", "ses:msg_a:0", "Reading"));
+    await settle();
+    const row = replies().at(-1);
+    expect(row?.textContent).toContain("Reading");
+    expect(writing()).toEqual(["writing…"]);
+    // One cursor: the reply's own, not a second at the end of the turn.
+    expect(cursors()).toBe(1);
+    const markdown = row?.querySelector(".markdown");
+
+    fake.watch.send(
+      partial("activity:12", "ses:msg_a:0", "Reading the policy"),
+    );
+    await settle();
+    expect(replies()).toHaveLength(before + 1);
+    expect(replies().at(-1) === row).toBe(true);
+    expect(row?.querySelector(".markdown") === markdown).toBe(true);
+    expect(row?.textContent).toContain("Reading the policy");
+
+    fake.watch.send(
+      block("activity:15", "ses:msg_a:0", "Reading the policy page."),
+    );
+    await settle();
+    expect(replies()).toHaveLength(before + 1);
+    // The same row and the same rendered reply, now finished: no mark on it.
+    expect(replies().at(-1) === row).toBe(true);
+    expect(row?.querySelector(".markdown") === markdown).toBe(true);
+    expect(row?.textContent).toContain("Reading the policy page.");
+    expect(writing()).toEqual([]);
+    // The turn is still running, so the turn's own cursor is back.
+    expect(cursors()).toBe(1);
+  });
+
+  test("a thought shimmers while it is written, keeps its row and its opened state when it finishes", async () => {
+    const { fake } = await inFlight();
+    fake.watch.send(
+      partial("activity:20", "ses:msg_t:0", "Weighing the table", thinking),
+    );
+    await settle();
+    const details = document.querySelector<HTMLDetailsElement>(
+      ".importer .reasoning details",
+    );
+    expect(
+      document.querySelector(".importer .reasoning .gist.shimmer"),
+    ).not.toBeNull();
+    expect(details?.querySelector("summary")?.textContent).toContain(
+      "(being written)",
+    );
+    if (details !== null && details !== undefined) details.open = true;
+    fake.watch.send(
+      block("activity:22", "ses:msg_t:0", "Weighing the table rows.", thinking),
+    );
+    await settle();
+    const after = document.querySelector<HTMLDetailsElement>(
+      ".importer .reasoning details",
+    );
+    expect(after === details).toBe(true);
+    expect(after?.open).toBe(true);
+    expect(
+      document.querySelector(".importer .reasoning .gist.shimmer"),
+    ).toBeNull();
+    expect(after?.textContent).toContain("Weighing the table rows.");
+  });
+
+  test("GLM: a thought stops shimmering once a reply of the same message starts", async () => {
+    const { fake } = await inFlight();
+    fake.watch.send(
+      partial("activity:30", "ses_glm:msg_1:reasoning:0", "Weighing", thinking),
+    );
+    await settle();
+    expect(document.querySelector(".importer .gist.shimmer")).not.toBeNull();
+    fake.watch.send(
+      partial("activity:31", "ses_glm:msg_1:text:0", "The answer"),
+    );
+    await settle();
+    expect(document.querySelector(".importer .gist.shimmer")).toBeNull();
+    expect(writing()).toEqual(["writing…"]);
+  });
+
+  test("a thought past the 4,000-character cap says it is shortened, and does not shimmer", async () => {
+    const { fake } = await inFlight();
+    fake.watch.send(
+      partial(
+        "activity:40",
+        "ses:msg_t:0",
+        `${"long thought ".repeat(320)}${NARRATION_SHORTENED_MARK}`,
+        thinking,
+      ),
+    );
+    await settle();
+    expect(document.querySelector(".importer .gist.shimmer")).toBeNull();
+    expect(
+      document.querySelector(".importer .reasoning .cut")?.textContent,
+    ).toBe("shortened");
+  });
+
+  test("when the turn ends, a partial that never finished is gone — a retried call's first attempt", async () => {
+    const { app, fake } = await inFlight();
+    fake.watch.send(partial("activity:50", "ses:msg_a:0", "Abandoned attempt"));
+    await settle();
+    expect(document.querySelector(".importer")?.textContent).toContain(
+      "Abandoned attempt",
+    );
+    running(fake, false);
+    const poll = (app.countdown as FakeCountdown).live.filter(
+      (armed) => armed.ms === IMPORT_POLL_MS,
+    );
+    poll[0]?.fire();
+    await settle();
+    expect(app.importer.current?.working).toBe(false);
+    expect(document.querySelector(".importer")?.textContent).not.toContain(
+      "Abandoned attempt",
+    );
+    expect(writing()).toEqual([]);
+  });
+
+  test("a reload part way through a block shows the turn writing, not a message with no reply", async () => {
+    const fake = new FakeServer();
+    fake.onScope = () => ok(emptyScope());
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: SESSIONS.map((each) =>
+          each.importId === "imp_newest" ? { ...each, running: true } : each,
+        ),
+      });
+    fake.onHarnesses = () => ok([harness("claude-code", "Claude Code")]);
+    // The harness holds the message and none of the block it is writing.
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          live: true,
+          continuation: "live",
+          items: [
+            replayItem(0, "turn.operator", "Read the policy page", {
+              importId,
+            }),
+          ],
+        }),
+      );
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    app.toSection("assets");
+    await settle();
+    app.toAssetsTab("scope");
+    await settle();
+    mounted.push(mountInto(TitleBar, { app }), mountInto(Target, { app }));
+    await settle();
+    click(button("Continue that session"));
+    await settle();
+    const thread = document.querySelector(".importer")?.textContent ?? "";
+    expect(thread).toContain(MID_BLOCK_NOTE);
+    expect(thread).not.toContain(
+      "The harness holds this message and no reply to it.",
+    );
+    expect(
+      document.querySelector(".importer .streaming")?.textContent?.trim(),
+    ).toBe("writing…");
   });
 });

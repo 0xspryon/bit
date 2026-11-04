@@ -85,6 +85,7 @@ import {
   activityOrder,
   claimedRecords,
   foldSubagents,
+  isPartial,
   operatorTurn,
   rowsFor,
   type ChatGroup,
@@ -123,7 +124,22 @@ export interface ImporterTurn {
    * was accepted (live) or stored (replayed). The start of the turn footer's duration.
    */
   readonly startedAt: number | null;
+  /**
+   * True on the turn the importer is on when this page holds nothing of its reply but the
+   * harness is still working on it (A6 U5): a reload while Claude Code is part way through
+   * a block, which it writes to its transcript only once the block is complete, and whose
+   * partials before the reload are not sent again. Drawn as in progress ("writing…")
+   * rather than as a message the harness holds no reply to.
+   */
+  readonly midBlock: boolean;
 }
+
+/**
+ * The note on a turn the page was reloaded into part way through a block ({@link
+ * ImporterTurn.midBlock}).
+ */
+export const MID_BLOCK_NOTE =
+  "The importer is still on this message. What it is writing now shows here once it finishes the block it is on: the words so far are not sent again after a reload.";
 
 /** One importer turn as a chat group. */
 export type ImporterGroup = ChatGroup<ImporterTurn>;
@@ -952,6 +968,9 @@ const leadingProse = (history: ImporterHistory, other: boolean): RoundProse => {
  * all of them. No groups at all is the empty session, which {@link Chat} says in its own
  * words.
  */
+/** Not a block still being written: what a turn the importer is not on draws. */
+const settled = (item: LiveItem): boolean => !isPartial(item);
+
 export const buildImporterChat = (
   input: ImporterChatInput,
 ): readonly ImporterGroup[] => {
@@ -1026,9 +1045,11 @@ export const buildImporterChat = (
         working: false,
         queued: false,
         startedAt: null,
+        midBlock: false,
       },
       prose,
-      rows: rowsFor(cut.leading, false, placed.pairing),
+      // A block left partial before the turn the importer is on is never finished now.
+      rows: rowsFor(cut.leading.filter(settled), false, placed.pairing),
     });
   }
 
@@ -1038,8 +1059,16 @@ export const buildImporterChat = (
     // "Latest" is the turn the importer is on, which a queued message after it is not.
     const latest = position === active;
     const working = latest && input.working;
+    /*
+     * A partial is drawn only in the turn the importer is working on (A6 U5). Once the turn
+     * is over — the session idle, or a later message's turn begun — a block that never got
+     * its finished copy was left: the first attempt of a retried model call, which the
+     * server's turn-end flush leaves partial, or one cut off with nothing to close it.
+     */
+    const items = working ? turn.items : turn.items.filter(settled);
     const replayed = fromReplay(turn.operator);
-    const spoke = turn.items.some((item) => item.origin === "activity");
+    const spoke = items.some((item) => item.origin === "activity");
+    const midBlock = replayed && !spoke && working;
     const take = takeOf(turn.operator, taken);
     groups.push({
       key: `turn:${String(number)}`,
@@ -1050,37 +1079,40 @@ export const buildImporterChat = (
         working,
         queued,
         startedAt: take?.at ?? turn.operator.at,
+        midBlock,
       },
       prose: queued
         ? { _tag: "pending", note: QUEUED_NOTE }
-        : replayed
-          ? spoke
-            ? {
-                _tag: "replayed",
-                note: replayNote(),
-                ephemeral: true,
-                // Said once, on the first turn: the answer stopped short of the oldest items.
-                truncated:
-                  history.truncated &&
-                  position === 0 &&
-                  cut.leading.length === 0,
-              }
-            : {
-                _tag: "none",
-                note: "The harness holds this message and no reply to it.",
-              }
-          : spoke
-            ? { _tag: "live" }
-            : latest
+        : midBlock
+          ? { _tag: "pending", note: MID_BLOCK_NOTE }
+          : replayed
+            ? spoke
               ? {
-                  _tag: "pending",
-                  note: "Sent. The importer has not answered yet.",
+                  _tag: "replayed",
+                  note: replayNote(),
+                  ephemeral: true,
+                  // Said once, on the first turn: the answer stopped short of the oldest items.
+                  truncated:
+                    history.truncated &&
+                    position === 0 &&
+                    cut.leading.length === 0,
                 }
               : {
                   _tag: "none",
-                  note: "The importer wrote nothing in reply to this message.",
-                },
-      rows: rowsFor(turn.items, working, placed.pairing),
+                  note: "The harness holds this message and no reply to it.",
+                }
+            : spoke
+              ? { _tag: "live" }
+              : latest
+                ? {
+                    _tag: "pending",
+                    note: "Sent. The importer has not answered yet.",
+                  }
+                : {
+                    _tag: "none",
+                    note: "The importer wrote nothing in reply to this message.",
+                  },
+      rows: rowsFor(items, working, placed.pairing),
     });
   });
 

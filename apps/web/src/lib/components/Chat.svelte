@@ -199,8 +199,25 @@
    * for as long as the reader stayed scrolled up — and it would then never catch the
    * arrival that should have resumed following.
    */
+  /**
+   * How much of the blocks still being written is on screen (A6 U5): a reply grows in place
+   * without adding a row, and the view follows it as it follows a new row.
+   */
+  let streamed = $derived(
+    groups.reduce(
+      (total, group) =>
+        group.rows.reduce(
+          (sum, row) =>
+            row.stream === undefined ? sum : sum + row.item.body.length,
+          total,
+        ),
+      0,
+    ),
+  );
+
   $effect(() => {
     const arrived = rowCount;
+    void streamed;
     if (arrived === 0 || list === undefined || !pinned) return;
     list.scrollTop = list.scrollHeight;
   });
@@ -325,6 +342,7 @@
                   result={entry.row.result}
                   write={entry.row.write}
                   summary={entry.row.summary}
+                  stream={entry.row.stream}
                   narrated
                   footer={place?._tag === "row" && place.key === entry.key
                     ? closing
@@ -346,6 +364,7 @@
                 result={row.result}
                 write={row.write}
                 summary={row.summary}
+                stream={row.stream}
               />
             {/each}
           </ol>

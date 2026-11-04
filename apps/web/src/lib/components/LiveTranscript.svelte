@@ -37,7 +37,7 @@
   import ChatItem from "./ChatItem.svelte";
   import ScenarioBar from "./ScenarioBar.svelte";
   import { IconAngleDown, IconAngleUp, IconBlocked } from "../icons";
-  import { foldSubagents, kindLabel } from "../chat";
+  import { foldSubagents, kindLabel, streamStates } from "../chat";
   import MarkedText from "./MarkedText.svelte";
   import type { App } from "../app.svelte";
   import { atBottom } from "../scroll";
@@ -54,6 +54,11 @@
    * `finished` row for the same sub-agent.
    */
   let items = $derived(foldSubagents(arrived));
+  /**
+   * How each block still being written stands (A6 U5), from the rows around it, as the chat
+   * reads it: a GLM thought the agent has moved on from says so here too, not "writing…".
+   */
+  let streams = $derived(streamStates(items));
   let records = $derived(
     items.filter((item) => item.origin === "record").length,
   );
@@ -302,7 +307,7 @@
         aria-label="Live run items, oldest first"
       >
         {#each items as item (item.id)}
-          <ChatItem {item} />
+          <ChatItem {item} stream={streams.get(item.id)} />
         {/each}
       </ol>
 

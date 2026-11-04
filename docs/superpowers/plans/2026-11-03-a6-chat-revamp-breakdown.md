@@ -330,3 +330,14 @@ U8, U13, F12.
   source, U10). Adding it changes the prompt and needs the F1 prompt-hash pins in
   `apps/server/src/agent/registry.test.ts` updated. The source line is the agent's claim,
   not a checked citation.
+- **Not decided (found in U5's live runs, 2026-11-04): a reply longer than 4,000 characters
+  is cut, live and after a reload.** The server caps every narration field at
+  `NARRATION_FIELD_MAX` (`agentHarness.ts`), a finished reply included, and the replay caps
+  the same way (`projectReplay`), so the thread ends a long answer with `… (shortened)` and
+  the rest is nowhere on the page — seen on both Haiku 4.5 (a 30-term glossary, ~3,950
+  shown) and GLM 5.3 Flash. U5 says so while the block streams ("writing… — shown here up
+  to 4,000 characters"); whether replies should have a larger cap, or none, is the
+  operator's call. GLM 5.3 Flash's thinking passes the cap often (a 33 s thought).
+- **Found in U5's live runs, not U5's:** a reload of a session that is still running draws
+  "You are reading an earlier session. Your next message continues it…" above it, as for a
+  session the page opened from the picker, while the turn runs with Stop under it.

@@ -374,7 +374,14 @@
         <span class="visually-hidden" role="status"
           >The importer is working.</span
         >
-        {#if !group.rows.some((row) => row.write === "pending")}
+        {#if group.subject.midBlock}
+          <!--
+            Reloaded part way through a block (A6 U5): the harness is writing, and its words
+            so far are not sent again, so the turn says so rather than "no reply".
+          -->
+          <div class="streaming"><StreamCursor label="writing…" /></div>
+        {:else if !group.rows.some((row) => row.write === "pending" || row.stream === "writing" || row.stream === "shortened")}
+          <!-- A reply being written draws its own mark (`ChatItem`), so not a second here. -->
           <div class="streaming"><StreamCursor /></div>
         {/if}
       {/if}

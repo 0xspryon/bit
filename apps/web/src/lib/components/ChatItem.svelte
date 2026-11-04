@@ -45,11 +45,13 @@
     REPLY_KIND,
     SUBAGENT_KIND,
     SUBAGENT_NOTE,
+    NARRATION_SHORTENED_MARK,
     THINKING_KIND,
     callSignature,
     kindLabel,
     outcomeTint,
     resultLine,
+    type StreamState,
     type WriteState,
   } from "../chat";
   import { IconAngleRight, IconClock } from "../icons";
@@ -65,6 +67,7 @@
     summary = null,
     narrated = false,
     footer,
+    stream = undefined,
   }: {
     item: LiveItem;
     proposedBy?: LiveItem | null;
@@ -85,7 +88,30 @@
      * reply — the one reading where a row is prose — and ignored on anything else.
      */
     footer?: Snippet | undefined;
+    /**
+     * How the block stands if it is still being written (A6 U5, `streamStates` in
+     * `chat.ts`): which needs the rows around it, so a chat that has them says. Without
+     * one, a partial is `writing`, or `shortened` past the cap — what the item alone says.
+     */
+    stream?: StreamState | undefined;
   } = $props();
+
+  /** {@link stream}, or what the item alone says; `null` on a finished block. */
+  let streamState = $derived<StreamState | null>(
+    stream ??
+      (item.streaming !== true
+        ? null
+        : item.body.endsWith(NARRATION_SHORTENED_MARK)
+          ? "shortened"
+          : "writing"),
+  );
+
+  /** What the ledger reading's chip says of a block still being written. */
+  const STREAM_LABELS: Record<StreamState, string> = {
+    writing: "writing…",
+    shortened: "shortened",
+    done: "written",
+  };
 
   /**
    * What each write state says, as a sentence an operator can act on.
@@ -190,6 +216,19 @@
     <li class="prose" data-origin={item.origin}>
       <span class="visually-hidden">{item.origin}</span>
       <div class="reply"><Markdown text={item.body} /></div>
+      {#if streamState !== null}
+        <!--
+          D3's mark on the reply being written (A6 U5). Past the server's 4,000-character
+          cap the words have stopped moving while the agent goes on, and that is said.
+        -->
+        <p class="writing" role="status">
+          <StreamCursor
+            label={streamState === "shortened"
+              ? "writing… — shown here up to 4,000 characters"
+              : "writing…"}
+          />
+        </p>
+      {/if}
       {@render footer?.()}
     </li>
   {:else if thinking}
@@ -204,7 +243,19 @@
         <summary>
           <span class="glyph" aria-hidden="true"><IconClock /></span>
           <span class="visually-hidden">What it considered: </span>
-          <span class="gist"><MarkedText text={gist(item.body)} /></span>
+          <!--
+            D3's shimmer while the thought is being written (A6 U5); still under reduced
+            motion. A thought past the cap, or one the agent has moved on from, does not
+            shimmer: the first says so, the second is simply what was thought.
+          -->
+          <span class={["gist", streamState === "writing" && "shimmer"]}
+            ><MarkedText text={gist(item.body)} /></span
+          >
+          {#if streamState === "writing"}
+            <span class="visually-hidden"> (being written)</span>
+          {:else if streamState === "shortened"}
+            <span class="cut">shortened</span>
+          {/if}
           <span class="chevron" aria-hidden="true"><IconAngleRight /></span>
         </summary>
         <div class="thought"><Markdown text={item.body} /></div>
@@ -408,6 +459,12 @@
       {#if item.outcome !== null}
         <span class="chip outcome" data-tint={outcomeTint(item.outcome)}>
           {item.outcome}
+        </span>
+      {/if}
+      {#if streamState !== null}
+        <!-- A block still being written (A6 U5): said in words, as an outcome is. -->
+        <span class="chip outcome stream" data-tint="plain">
+          {STREAM_LABELS[streamState]}
         </span>
       {/if}
       <span class="time mono">{time}</span>
@@ -781,6 +838,51 @@
   }
   .reasoning .aside {
     padding-left: 24px;
+  }
+  /*
+   * D3's shimmer on a thought still being written (A6 U5): a lighter band passing along the
+   * line, drawn in the text itself. Between the summary's muted ink and the base ink rather
+   * than D3's faint, which is below AA at 13px. Without motion it is the muted line.
+   */
+  .reasoning .gist.shimmer {
+    background-image: linear-gradient(
+      90deg,
+      var(--text-muted) 30%,
+      var(--text-base) 50%,
+      var(--text-muted) 70%
+    );
+    background-size: 220% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    animation: shimmer 2.6s linear infinite;
+  }
+  @keyframes shimmer {
+    from {
+      background-position: 160% 0;
+    }
+    to {
+      background-position: -60% 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .reasoning .gist.shimmer {
+      background-image: none;
+      color: var(--text-muted);
+      -webkit-text-fill-color: currentColor;
+      animation: none;
+    }
+  }
+  .reasoning .cut {
+    flex: none;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  .prose .writing {
+    margin-top: 6px;
+    font-size: 12px;
+    line-height: 16px;
   }
   /* A harness's own error: its sentence in the danger ink, behind a rule. */
   .harness-error {
