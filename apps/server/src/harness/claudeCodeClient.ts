@@ -924,7 +924,8 @@ const resultText = (value: unknown): string => {
  *   `toolResult`. A tool's output comes back as a *user* message because that is how the
  *   Messages API carries it, which reads oddly and is the SDK's shape rather than ours.
  * - everything else → one `opaque` entry, so the stream's shape and the supervisor's
- *   outcome watch are unchanged by this mapping. `stream_event` is the exception, above:
+ *   outcome watch are unchanged by this mapping. `stream_event` and `system/thinking_tokens`
+ *   are the exceptions, narrating nothing. A `stream_event`:
  *   one call streams hundreds of frames — a `tool_use` block's input arrives as
  *   `input_json_delta`s — and an `opaque` entry for each would crowd a conversation's
  *   sliding narration bus (`run/narration.ts`) with entries nothing renders. None of them
@@ -1195,6 +1196,14 @@ const narrate = (
   // header. It carries no outcome: only a `result` does.
   if (message.type === "stream_event") {
     return narrateStreamEvent(message, session.streamed).map(frame);
+  }
+  // A thinking-progress estimate narrates nothing either, for the same reason: the CLI sends
+  // about one per thinking delta once a conversation's thinking is summarized (A6 F8's
+  // review measured 84 in one run), with or without partial messages, so a worker's too.
+  // An `opaque` entry each would take that many of the sliding bus's slots
+  // (`run/narration.ts`) for entries nothing renders. It carries no outcome.
+  if (message.type === "system" && message.subtype === "thinking_tokens") {
+    return [];
   }
 
   // Read off an `unknown` view of the message rather than narrowing the SDK's own union:
@@ -2189,6 +2198,31 @@ export const claudeCodeHarness = (
                    * not ask. Their finished blocks then carry no `blockId`, as before.
                    */
                   includePartialMessages: record.multiTurn,
+                  /*
+                   * A conversation's thinking carries words (A6 F8's review). Without this the
+                   * API sends a thinking block's text as `""` and the operator sees an empty
+                   * "Thinking" row; with it, a summary. A worker or a round shows thinking to
+                   * nobody, so it does not ask.
+                   *
+                   * **The display alone, not the SDK's `thinking` option.** That option always
+                   * adds `--thinking=adaptive` as well (unless given a budget), which turns a
+                   * thinking *mode* on and is refused by Haiku 4.5; `--thinking-display`
+                   * changes only what an existing thinking block shows. Measured on CLI
+                   * 2.1.310: haiku-4-5 thinking 0 → 966 characters, sonnet-5 0 → 95, output
+                   * tokens about the same.
+                   *
+                   * Set at launch and never changed for a live session, because the display
+                   * mode is part of the request and moving it mid-session would break the
+                   * prompt cache. A session resumed by this build from one started before it
+                   * pays that break once, on its first turn.
+                   *
+                   * `extraArgs` is an untyped passthrough onto the CLI's argv: nothing checks
+                   * the flag's name or its value, so re-check `claude --help` for
+                   * `--thinking-display` on every CLI upgrade.
+                   */
+                  ...(record.multiTurn
+                    ? { extraArgs: { "thinking-display": "summarized" } }
+                    : {}),
                   // This harness starts the CLI, so that ending the session can stop it at
                   // once; stderr is read there. See `spawnOwnedCli`.
                   spawnClaudeCodeProcess: spawnOwnedCli(record),

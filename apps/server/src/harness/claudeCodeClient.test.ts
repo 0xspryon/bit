@@ -448,6 +448,66 @@ describe("starting a session", () => {
     expect(options).toEqual([true, false]);
   });
 
+  test("a conversation's thinking is summarized by the display flag alone, and a single-turn session's is not", async () => {
+    // Without it a thinking block arrives as `""`. The SDK's `thinking` option would also
+    // add `--thinking=adaptive`, which Haiku 4.5 refuses, so it must stay unset.
+    const launches = await withHarness({}, (harness, seen) =>
+      Effect.gen(function* () {
+        for (const multiTurn of [true, false]) {
+          const sessionId = newClaudeCodeSessionId();
+          yield* harness.createSession({
+            title: "bit: t",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId,
+            multiTurn,
+          });
+          yield* harness.prompt(sessionId, "go");
+        }
+        return seen.map((launched) => ({
+          extraArgs: launched.options.extraArgs,
+          thinking: launched.options.thinking,
+        }));
+      }),
+    );
+    expect(launches).toEqual([
+      {
+        extraArgs: { "thinking-display": "summarized" },
+        thinking: undefined,
+      },
+      { extraArgs: undefined, thinking: undefined },
+    ]);
+  });
+
+  test("a conversation's later messages and a switch of model leave the display flag as it launched", async () => {
+    // The display is part of every request: changing it inside a session breaks the
+    // prompt cache. Only a launch sets it; nothing after does.
+    const sessionId = newClaudeCodeSessionId();
+    const launches = await withHarness({}, (harness, seen) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-haiku-4-5",
+          directory: "/tmp/ws",
+          sessionId,
+          multiTurn: true,
+        });
+        yield* harness.prompt(sessionId, "go");
+        yield* harness.switchModel(sessionId, "claude-sonnet-5", undefined);
+        return seen.map((launched) => ({
+          extraArgs: launched.options.extraArgs,
+          switches: launched.switches,
+        }));
+      }),
+    );
+    expect(launches).toEqual([
+      {
+        extraArgs: { "thinking-display": "summarized" },
+        switches: ["model:claude-sonnet-5", "effort:null"],
+      },
+    ]);
+  });
+
   test("a session cannot be prompted twice", async () => {
     // Carrying work on after a turn means a new attempt identity (DECISIONS.md §15), so a
     // second prompt into the same session is refused rather than queued.
@@ -899,6 +959,39 @@ describe("outcomes", () => {
     // something we do not display" must not read as "the agent replied with nothing".
     expect(entries).toHaveLength(2);
     expect(entries[0]?.detail).toEqual({ _tag: "opaque" });
+  });
+
+  test("a thinking-progress estimate narrates nothing, where any other system frame is opaque", async () => {
+    // A summarized conversation's CLI sends about one of these per thinking delta, with or
+    // without partial messages; an `opaque` entry each would fill the sliding bus.
+    const thinkingTokens = (n: number): SDKMessage =>
+      ({
+        type: "system",
+        subtype: "thinking_tokens",
+        estimated_tokens: n * 10,
+        estimated_tokens_delta: 10,
+        session_id: "ignored",
+        uuid: `00000000-0000-4000-8000-0000000000a${String(n)}`,
+      }) as unknown as SDKMessage;
+    const outcome = await run([
+      thinkingTokens(1),
+      thinkingTokens(2),
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        session_id: "ignored",
+        uuid: "00000000-0000-4000-8000-00000000fff9",
+      } as unknown as SDKMessage,
+      thinkingTokens(3),
+      result("ignored", "success"),
+    ]);
+    expect(
+      [...outcome.narrated].map((entry) => [entry.type, entry.detail._tag]),
+    ).toEqual([
+      ["system", "opaque"],
+      ["result", "opaque"],
+    ]);
+    expect(outcome.status.outcome).toBe("succeeded");
   });
 
   /* ── Usage: per call, never per turn ───────────────────────────────────────── */
@@ -1514,6 +1607,141 @@ describe("partial messages (A6 F8)", () => {
         .slice(finishedAt + 1)
         .some((entry) => entry.detail._tag === "partial"),
     ).toBe(false);
+  });
+
+  /*
+   * A synthesised call: text (stream index 0), a `tool_use` (1), text (2), in the order the
+   * CLI sends them — each block's `assistant` frame before its `content_block_stop`. The
+   * real fixtures hold no call with a tool between two texts.
+   */
+  const callId = "msg_synth_text_tool_text";
+  const event = (body: Record<string, unknown>): SDKMessage =>
+    ({
+      type: "stream_event",
+      event: body,
+      parent_tool_use_id: null,
+      session_id: "ignored",
+      uuid: crypto.randomUUID(),
+    }) as unknown as SDKMessage;
+  const finishedFrame = (block: Record<string, unknown>): SDKMessage =>
+    ({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: callId,
+        model: "claude-haiku-4-5",
+        usage: { input_tokens: 10 },
+        content: [block],
+      },
+      parent_tool_use_id: null,
+      session_id: "ignored",
+      uuid: crypto.randomUUID(),
+    }) as unknown as SDKMessage;
+  const textBlock = (index: number, text: string): SDKMessage[] => [
+    event({
+      type: "content_block_start",
+      index,
+      content_block: { type: "text", text: "" },
+    }),
+    event({
+      type: "content_block_delta",
+      index,
+      delta: { type: "text_delta", text },
+    }),
+    finishedFrame({ type: "text", text }),
+    event({ type: "content_block_stop", index }),
+  ];
+  const toolStart = event({
+    type: "content_block_start",
+    index: 1,
+    content_block: { type: "tool_use", id: "toolu_s", name: "Bash", input: {} },
+  });
+  const toolRest: SDKMessage[] = [
+    event({
+      type: "content_block_delta",
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: '{"command":"ls"}' },
+    }),
+    finishedFrame({
+      type: "tool_use",
+      id: "toolu_s",
+      name: "Bash",
+      input: { command: "ls" },
+    }),
+    event({ type: "content_block_stop", index: 1 }),
+  ];
+  const textToolText = (
+    duringTool: readonly SDKMessage[] = [],
+  ): SDKMessage[] => [
+    event({ type: "message_start", message: { id: callId } }),
+    ...textBlock(0, "Looking."),
+    toolStart,
+    ...duringTool,
+    ...toolRest,
+    ...textBlock(2, "Done."),
+    event({ type: "message_stop" }),
+    result("ignored", "success"),
+  ];
+
+  test("text, a tool call and text in one call: each text finishes under its own stream index", async () => {
+    const entries = await narrated(textToolText());
+    expect(blocks(entries).map((block) => [block.text, block.blockId])).toEqual(
+      [
+        ["Looking.", `${callId}:0`],
+        ["Done.", `${callId}:2`],
+      ],
+    );
+    expect(deltas(entries).map((piece) => piece.blockId)).toEqual([
+      `${callId}:0`,
+      `${callId}:2`,
+    ]);
+    // The call narrates once, finished, and its argument deltas narrate nothing.
+    expect(
+      entries.flatMap((entry) =>
+        entry.detail._tag === "toolCall" ? [entry.detail.callId] : [],
+      ),
+    ).toEqual(["toolu_s"]);
+  });
+
+  /*
+   * A finished text frame of the same call, arriving while the `tool_use` block is the one
+   * open — a frame the stream did not write (a retried or non-streaming block, say). The
+   * open block is a tool call, so the text is not it, and it must take no id: neither the
+   * tool block's (the kind check) nor the earlier text's (recording the `tool_use` start,
+   * which moves the stream off block 0).
+   */
+  test("a finished block of another kind than the one streaming takes no id", async () => {
+    const entries = await narrated(
+      textToolText([finishedFrame({ type: "text", text: "Stray." })]),
+    );
+    expect(blocks(entries).map((block) => [block.text, block.blockId])).toEqual(
+      [
+        ["Looking.", `${callId}:0`],
+        ["Stray.", undefined],
+        ["Done.", `${callId}:2`],
+      ],
+    );
+  });
+
+  test("a finished thinking block while a reply is streaming takes no id", async () => {
+    const entries = await narrated([
+      event({ type: "message_start", message: { id: callId } }),
+      event({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      }),
+      finishedFrame({ type: "thinking", thinking: "Hm.", signature: "s" }),
+      finishedFrame({ type: "text", text: "Hi." }),
+      event({ type: "content_block_stop", index: 0 }),
+      result("ignored", "success"),
+    ]);
+    expect(blocks(entries).map((block) => [block._tag, block.blockId])).toEqual(
+      [
+        ["thinking", undefined],
+        ["reply", `${callId}:0`],
+      ],
+    );
   });
 
   test("a cut block the CLI sends no frame for is ended by the turn's outcome, with its held text", async () => {
