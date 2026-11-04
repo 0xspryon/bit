@@ -1277,3 +1277,141 @@ describe("a reloaded write and its record, when the replay or the feed is cut", 
     ]);
   });
 });
+
+/* ── Sub-agents (A6 U14) ─────────────────────────────────────────────────────── */
+
+describe("a sub-agent is one entry, where it started, in its newest state", () => {
+  const subagent = (
+    callId: string,
+    outcome: string,
+    over: Partial<LiveItem> = {},
+  ): LiveItem =>
+    item({
+      kind: "subagent",
+      headline: "general-purpose",
+      body: "Say PONG",
+      tool: "Agent",
+      toolName: "Agent",
+      callId,
+      outcome,
+      ...over,
+    });
+  const rows = (groups: ReturnType<typeof buildImporterChat>) =>
+    groups.map((group) =>
+      group.rows.map((row) =>
+        row.item.kind === "subagent"
+          ? `${row.key} subagent ${String(row.item.callId)} ${String(row.item.outcome)}`
+          : `${row.item.kind} ${row.item.body}`,
+      ),
+    );
+
+  test("live: running then finished is one entry, keyed by the first, finished", () => {
+    const started = subagent("toolu_fg", "running");
+    const ended = subagent("toolu_fg", "finished");
+    const groups = buildImporterChat({
+      history: NO_HISTORY,
+      items: [
+        operator(1, "use a sub-agent"),
+        started,
+        ended,
+        reply("It said PONG."),
+      ],
+      working: false,
+    });
+    expect(rows(groups)).toEqual([
+      [`${started.id} subagent toolu_fg finished`, "turn.reply It said PONG."],
+    ]);
+  });
+
+  test("a background sub-agent that ends after the next message stays one entry, in the turn it started", () => {
+    const started = subagent("toolu_bg", "running", { body: "Say PING later" });
+    const groups = buildImporterChat({
+      history: NO_HISTORY,
+      items: [
+        operator(1, "start one in the background"),
+        started,
+        reply("Started."),
+        operator(2, "anything else?"),
+        reply("Not yet."),
+        subagent("toolu_bg", "finished", { body: "Say PING later" }),
+      ],
+      working: false,
+    });
+    expect(rows(groups)).toEqual([
+      [`${started.id} subagent toolu_bg finished`, "turn.reply Started."],
+      ["turn.reply Not yet."],
+    ]);
+  });
+
+  test("a reload mid-run: the replay's running entry is finished by the live tail's state", () => {
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: [
+          replayItem(0, "turn.operator", "start one in the background"),
+          replayItem(1, "subagent", "Say PING later", {
+            headline: "general-purpose",
+            tool: "Agent",
+            toolName: "Agent",
+            callId: "toolu_bg",
+            outcome: "running",
+          }),
+          replayItem(2, "turn.reply", "Started."),
+        ],
+      }),
+      items: [subagent("toolu_bg", "finished", { body: "Say PING later" })],
+      working: false,
+    });
+    expect(rows(groups)).toEqual([
+      ["replay:1 subagent toolu_bg finished", "turn.reply Started."],
+    ]);
+  });
+
+  test("a reload equals the live session, row for row", () => {
+    const states = (ids: () => string) => [
+      { ...operator(1, "use two"), id: ids() },
+      { ...subagent("a", "running"), id: ids() },
+      { ...subagent("b", "running", { headline: "explore" }), id: ids() },
+      { ...subagent("a", "failed"), id: ids() },
+      { ...reply("One failed."), id: ids() },
+      { ...subagent("b", "stopped", { headline: "explore" }), id: ids() },
+    ];
+    let n = 0;
+    const liveItems = states(() => `activity:${String((n += 1))}`);
+    let r = 0;
+    const replayed = states(() => `replay:${String(r++)}`);
+    const view = (groups: ReturnType<typeof buildImporterChat>) =>
+      groups.map((group) =>
+        group.rows.map((row) => [
+          row.item.kind,
+          row.item.headline,
+          row.item.body,
+          row.item.callId,
+          row.item.outcome,
+        ]),
+      );
+    const fromLive = buildImporterChat({
+      history: NO_HISTORY,
+      items: liveItems,
+      working: false,
+    });
+    const fromReplay = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: replayed,
+      }),
+      items: [],
+      working: false,
+    });
+    expect(view(fromReplay)).toEqual(view(fromLive));
+    expect(view(fromLive)).toEqual([
+      [
+        ["subagent", "general-purpose", "Say PONG", "a", "failed"],
+        ["subagent", "explore", "Say PONG", "b", "stopped"],
+        ["turn.reply", "Importer", "One failed.", null, null],
+      ],
+    ]);
+  });
+});

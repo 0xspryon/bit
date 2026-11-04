@@ -316,7 +316,7 @@ export const capSessionTitle = (value: string): string | undefined => {
 /**
  * One block of a stored message, in the vocabulary the live stream narrates it in (A6 F10).
  *
- * The same four {@link NarrationDetail} cases a driver produces from its event stream, so a
+ * The same five {@link NarrationDetail} cases a driver produces from its event stream, so a
  * replay is projected into `LiveItem`s by the **same** function as live narration
  * (`run/liveTranscript.ts`, `projectDetail`) and a reloaded conversation renders as the
  * watched one did. A `blockId` is set where the driver can name the block as its stream
@@ -324,7 +324,10 @@ export const capSessionTitle = (value: string): string | undefined => {
  */
 export type MessagePart = Extract<
   NarrationDetail,
-  { readonly _tag: "reply" | "thinking" | "toolCall" | "toolResult" }
+  {
+    readonly _tag:
+      "reply" | "thinking" | "toolCall" | "toolResult" | "subagent";
+  }
 >;
 
 /** One entry of a session's message log, reduced to what this application reads. */
@@ -489,6 +492,7 @@ export type NarrationDetail =
       /** The harness said this call failed. Not a policy decision; see above. */
       readonly failed: boolean;
     }
+  | SubagentState
   | {
       /**
        * What the agent considered, as one complete block.
@@ -584,6 +588,82 @@ export type NarrationDetail =
       readonly compactionAt: number | undefined;
     }
   | { readonly _tag: "opaque" };
+
+/**
+ * Where a sub-agent stands, as {@link SubagentState} says it.
+ *
+ * `running` from the call until something ends it; `finished` when it handed back;
+ * `failed` when the harness says the call or the task failed; `stopped` when it was stopped
+ * or cancelled before it ended on its own.
+ */
+export type SubagentStatus = "running" | "finished" | "failed" | "stopped";
+
+/**
+ * A **sub-agent** the session's agent started, and where it stands — instead of its call,
+ * its result and everything it said (A6 U14, decided by the operator).
+ *
+ * A harness's sub-agent tool (Claude Code's `Agent`, formerly `Task`; OpenCode's
+ * `subagent`, formerly `task`) starts another agent with its own context, and that agent's
+ * reasoning, tool calls and replies are not the calling agent's. Narrated as the caller's
+ * rows they read as if the caller wrote them, and on Claude Code they also vanished on a
+ * reload, since its transcript keeps them elsewhere. So a driver narrates a sub-agent's
+ * own frames as nothing, and its call as this: what it is and how it stands. Each driver
+ * produces one when the call is made (`running`) and one when it ends, both carrying the
+ * same {@link callId} and the same description, live and in a replay, so a reader keeps the
+ * newest state per call and draws **one entry** at the place of the first.
+ *
+ * Its own words never reach this: a finished foreground call's result is the sub-agent's
+ * final report, and a background one's completion notice carries it too. Neither is
+ * carried here, and a replay drops the notice rather than drawing it.
+ *
+ * V2(chat): a sub-agent's own transcript is not shown — only one entry per sub-agent.
+ * Proper V2: replay its transcript (Claude Code keeps it in a "subagents/" folder beside the
+ * session's transcript; OpenCode runs it as a child session) labelled as the sub-agent's.
+ */
+export interface SubagentState {
+  readonly _tag: "subagent";
+  /** The calling tool call's id: the sub-agent's identity for every state of it. */
+  readonly callId: string;
+  /** The calling tool as the harness named it (`Agent`, `subagent`). */
+  readonly tool: string;
+  /**
+   * Its type as the calling agent asked for it — Claude Code's `subagent_type`, OpenCode's
+   * `agent` — or `undefined` when the call named none. Agent text: shown as plain text.
+   */
+  readonly agentType: string | undefined;
+  /**
+   * The calling agent's short description of the task, or, when it gave none, the start of
+   * the prompt; one line, capped at {@link SUBAGENT_DESCRIPTION_MAX}. Agent text.
+   */
+  readonly description: string;
+  readonly status: SubagentStatus;
+  /** The model that made the call, when the harness said. See `LiveItem.model`. */
+  readonly model?: string | undefined;
+}
+
+/** The most characters a {@link SubagentState.description} carries. */
+export const SUBAGENT_DESCRIPTION_MAX = 200;
+
+/**
+ * A sub-agent's description from what its call said: the `description` when there is one,
+ * else the `prompt`, as one line, capped at {@link SUBAGENT_DESCRIPTION_MAX} with an
+ * ellipsis when cut.
+ */
+export const subagentDescription = (
+  description: unknown,
+  prompt: unknown,
+): string => {
+  const pick =
+    typeof description === "string" && description.trim() !== ""
+      ? description
+      : typeof prompt === "string"
+        ? prompt
+        : "";
+  const line = pick.replace(/\s+/g, " ").trim();
+  return line.length <= SUBAGENT_DESCRIPTION_MAX
+    ? line
+    : `${line.slice(0, SUBAGENT_DESCRIPTION_MAX - 1).trimEnd()}…`;
+};
 
 /** Which kind of block a streamed piece of text belongs to: a reply, or thinking. */
 export type BlockChannel = "reply" | "thinking";

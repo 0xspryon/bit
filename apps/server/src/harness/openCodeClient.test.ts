@@ -37,6 +37,7 @@ import {
   openCodeCompactionAt,
   openCodeHarness,
   openCodeNarration,
+  openCodeSubagents,
   outcomeIsLastTurns,
 } from "./openCodeClient";
 import { HarnessResolver } from "./resolver";
@@ -2959,5 +2960,326 @@ describe("a replayed message's files", () => {
         expect(entries[0]?.attachments).toBeUndefined();
       }
     });
+  });
+});
+
+/* ── Sub-agents (A6 U14) ─────────────────────────────────────────────────────── */
+
+/**
+ * OpenCode's sub-agent tool, as 2.2.5 runs it (`packages/core/src/tool/plugin/subagent.ts`
+ * in the opencode source): the tool is `subagent` (`task` before 2.2), its input
+ * `{ agent, description, prompt, background? }`. The sub-agent runs as a **child session**,
+ * whose events carry its own `sessionID` and never reach the parent's stream
+ * (`sessionOf`). Its call's result `metadata` is `{ sessionID, status }`: `completed` when
+ * it handed back, `running` when it was launched in the background, after which a
+ * `session.synthetic` notice on the parent, metadata `{ source: "subagent", childID, state }`
+ * (`session/subagent-completion.ts`), says it ended. Built from those sources, not
+ * recorded: no live OpenCode run with a sub-agent backs these shapes.
+ */
+describe("sub-agents, as one entry each (A6 U14)", () => {
+  const event = (type: string, data: Record<string, unknown>) => ({
+    type,
+    created: 10,
+    durable: { aggregateID: "ses_1", seq: 4, version: 1 },
+    data: { sessionID: "ses_1", assistantMessageID: "msg_1", ...data },
+  });
+  const states = (details: readonly { readonly _tag: string }[]) =>
+    details.flatMap((detail) =>
+      detail._tag === "subagent"
+        ? [
+            ((state: {
+              callId: string;
+              status: string;
+              agentType: string | undefined;
+              description: string;
+            }) =>
+              `${state.callId} ${state.status} ${String(state.agentType)} · ${state.description}`)(
+              detail as never,
+            ),
+          ]
+        : [],
+    );
+  const live = (events: readonly unknown[]) => {
+    const names = new Map<string, string>();
+    const models = new Map<string, string>();
+    const subagents = openCodeSubagents();
+    return events.map(
+      (each) =>
+        openCodeNarration(each, names, undefined, models, subagents).detail,
+    );
+  };
+  const foreground = [
+    event("session.step.started", {
+      model: { providerID: "zai", id: "glm-5.3-flash" },
+    }),
+    event("session.tool.input.started", { id: "call_fg", name: "subagent" }),
+    event("session.tool.called", {
+      id: "call_fg",
+      input: {
+        agent: "explore",
+        description: "Find the login form",
+        prompt: "Look for a login form on the page and say where it posts.",
+      },
+      executed: true,
+    }),
+    event("session.tool.success", {
+      id: "call_fg",
+      content: [
+        {
+          type: "text",
+          text: '<subagent sessionID="ses_child" state="completed">\nIt posts to /session.\n</subagent>',
+        },
+      ],
+      metadata: { sessionID: "ses_child", status: "completed" },
+      executed: true,
+    }),
+  ];
+
+  test("live: a subagent call is one entry that runs, then finishes, and its reply is not carried", () => {
+    const details = live(foreground);
+    expect(states(details)).toEqual([
+      "call_fg running explore · Find the login form",
+      "call_fg finished explore · Find the login form",
+    ]);
+    expect(details.some((detail) => detail._tag === "toolCall")).toBe(false);
+    expect(details.some((detail) => detail._tag === "toolResult")).toBe(false);
+    expect(JSON.stringify(details)).not.toContain("It posts to /session.");
+    expect(details[2]).toEqual({
+      _tag: "subagent",
+      callId: "call_fg",
+      tool: "subagent",
+      agentType: "explore",
+      description: "Find the login form",
+      status: "running",
+      model: "zai/glm-5.3-flash",
+    });
+  });
+
+  test("live: a background subagent runs until the parent's completion notice, which ends it", () => {
+    const details = live([
+      event("session.tool.input.started", { id: "call_bg", name: "subagent" }),
+      event("session.tool.called", {
+        id: "call_bg",
+        input: {
+          agent: "general",
+          prompt: "Check robots.txt",
+          background: true,
+        },
+        executed: true,
+      }),
+      event("session.tool.success", {
+        id: "call_bg",
+        content: [
+          {
+            type: "text",
+            text: "The subagent is working in the background (sessionID: ses_bg).",
+          },
+        ],
+        metadata: { sessionID: "ses_bg", status: "running" },
+        executed: true,
+      }),
+      event("session.text.ended", { ordinal: 0, text: "Started it." }),
+      event("session.synthetic", {
+        text: '<subagent sessionID="ses_bg" state="completed" description="">\nrobots.txt disallows /admin\n</subagent>',
+        metadata: {
+          source: "subagent",
+          childID: "ses_bg",
+          agent: "general",
+          state: "completed",
+        },
+      }),
+    ]);
+    // No description given: the prompt's start stands in for one.
+    expect(states(details)).toEqual([
+      "call_bg running general · Check robots.txt",
+      "call_bg finished general · Check robots.txt",
+    ]);
+    expect(details[2]).toEqual({ _tag: "opaque" });
+    expect(details[4]?._tag).toBe("subagent");
+    expect(JSON.stringify(details)).not.toContain("disallows");
+  });
+
+  test("live: a failed or cancelled subagent ends its entry so; a call with the old name `task` is one too", () => {
+    const failed = live([
+      event("session.tool.input.started", { id: "c1", name: "task" }),
+      event("session.tool.called", {
+        id: "c1",
+        input: { subagent_type: "general", description: "Old name" },
+        executed: true,
+      }),
+      event("session.tool.failed", {
+        id: "c1",
+        error: { message: "Subagent failed (sessionID: ses_c1): boom" },
+      }),
+      event("session.tool.input.started", { id: "c2", name: "subagent" }),
+      event("session.tool.called", {
+        id: "c2",
+        input: { agent: "general", description: "Cancelled one" },
+        executed: true,
+      }),
+      event("session.tool.failed", {
+        id: "c2",
+        error: { message: "Subagent cancelled (sessionID: ses_c2)" },
+      }),
+    ]);
+    expect(states(failed)).toEqual([
+      "c1 running general · Old name",
+      "c1 failed general · Old name",
+      "c2 running general · Cancelled one",
+      "c2 stopped general · Cancelled one",
+    ]);
+  });
+
+  test("replay equals live: the stored tool parts and the completion notice are the same entries", async () => {
+    // Shaped on the recorded answer's own entries, so the client's schema decodes them.
+    const recorded = (await storedMessages()) as Record<string, unknown>[];
+    const [user, assistant] = recorded;
+    const tool =
+      (assistant?.["content"] as Record<string, unknown>[]).find(
+        (part) => part["type"] === "tool",
+      ) ?? {};
+    const subagentPart = (
+      id: string,
+      input: Record<string, unknown>,
+      output: string,
+      metadata: Record<string, unknown>,
+    ) => ({
+      ...tool,
+      id,
+      name: "subagent",
+      state: {
+        status: "completed",
+        input,
+        content: [{ type: "text", text: output }],
+        metadata,
+      },
+    });
+    const stored = [
+      { ...user, id: "msg_u", text: "Use subagents." },
+      {
+        ...assistant,
+        id: "msg_1",
+        model: { providerID: "zai", id: "glm-5.3-flash" },
+        content: [
+          subagentPart(
+            "call_fg",
+            {
+              agent: "explore",
+              description: "Find the login form",
+              prompt: "Look for a login form.",
+            },
+            "It posts to /session.",
+            { sessionID: "ses_child", status: "completed" },
+          ),
+          subagentPart(
+            "call_bg",
+            { agent: "general", prompt: "Check robots.txt", background: true },
+            "working in the background",
+            { sessionID: "ses_bg", status: "running" },
+          ),
+          { type: "text", text: "Started it." },
+        ],
+      },
+      {
+        id: "msg_s",
+        type: "synthetic",
+        time: user?.["time"],
+        text: '<subagent sessionID="ses_bg" state="completed">\nrobots.txt disallows /admin\n</subagent>',
+        metadata: {
+          source: "subagent",
+          childID: "ses_bg",
+          agent: "general",
+          state: "completed",
+        },
+      },
+    ];
+    let served = false;
+    const { layer } = clientWith((url) => {
+      if (!url.includes("/message")) return json({ data: [] });
+      const page = served ? [] : stored;
+      served = true;
+      return json({
+        data: page,
+        cursor: { previous: null, next: page.length === 0 ? null : "next" },
+      });
+    });
+    const entries = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (client) => client.messages("ses_1")),
+          layer,
+        ),
+      ),
+    );
+    expect(states(entries.flatMap((entry) => entry.parts))).toEqual([
+      "call_fg running explore · Find the login form",
+      "call_fg finished explore · Find the login form",
+      "call_bg running general · Check robots.txt",
+      "call_bg finished general · Check robots.txt",
+    ]);
+    // The notice's words — the sub-agent's reply — are gone, and it is no `synthetic` note.
+    const subject = { _tag: "import", importId: "imp_1" } as const;
+    const replayed = projectReplay({
+      entries,
+      subject,
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    expect(JSON.stringify(replayed)).not.toContain("disallows");
+    expect(JSON.stringify(replayed)).not.toContain("It posts to");
+    expect(replayed.some((item) => item.kind === "turn.other")).toBe(false);
+
+    // The same events, live, project to the same sub-agent items.
+    const liveDetails = live([
+      event("session.step.started", {
+        model: { providerID: "zai", id: "glm-5.3-flash" },
+      }),
+      ...foreground.slice(1),
+      event("session.tool.input.started", { id: "call_bg", name: "subagent" }),
+      event("session.tool.called", {
+        id: "call_bg",
+        input: {
+          agent: "general",
+          prompt: "Check robots.txt",
+          background: true,
+        },
+        executed: true,
+      }),
+      event("session.tool.success", {
+        id: "call_bg",
+        content: [{ type: "text", text: "working in the background" }],
+        metadata: { sessionID: "ses_bg", status: "running" },
+        executed: true,
+      }),
+      event("session.synthetic", {
+        text: "…",
+        metadata: { source: "subagent", childID: "ses_bg", state: "completed" },
+      }),
+    ]);
+    const liveItems = liveDetails.flatMap((detail, id) => {
+      const frame = projectNarration({
+        id,
+        targetId: "acme",
+        subject,
+        harnessSessionId: "ses_1",
+        entry: {
+          type: "x",
+          sequence: undefined,
+          at: 0,
+          outcome: undefined,
+          detail,
+        },
+      });
+      return frame?._tag === "item" ? [frame] : [];
+    });
+    const shape = (item: LiveItem) =>
+      Object.fromEntries(
+        Object.entries(item).filter(([key]) => key !== "id" && key !== "at"),
+      );
+    const agents = (items: readonly LiveItem[]) =>
+      items.filter((item) => item.kind === "subagent").map(shape);
+    expect(agents(liveItems)).toEqual(agents(replayed));
+    expect(agents(replayed)).toHaveLength(4);
   });
 });

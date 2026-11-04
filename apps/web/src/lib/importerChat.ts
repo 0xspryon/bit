@@ -77,6 +77,7 @@ import {
   OPERATOR_TURN_KIND,
   activityOrder,
   claimedRecords,
+  foldSubagents,
   rowsFor,
   type ChatGroup,
   type RoundProse,
@@ -568,7 +569,9 @@ export const buildImporterChat = (
     input.items,
     history.truncated || (input.recordsSkipped ?? 0) > 0,
   );
-  const cut = cutAtOperator(placed.items);
+  // Folded before the cut: a background sub-agent can end turns after it started, and is
+  // still one entry, where it started (A6 U14).
+  const cut = cutAtOperator(foldSubagents(placed.items));
   const turnCount = cut.turns.length;
 
   const groups: ImporterGroup[] = [];

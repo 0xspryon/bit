@@ -328,6 +328,25 @@ export const LIVE_ITEM_KINDS = [
    * Replay only. Labelled with that word so it never reads as the agent having said it.
    */
   "turn.other",
+  /**
+   * A **sub-agent** the agent started, in place of everything it did (A6 U14, decided by
+   * the operator). One state of it: several items share one {@link LiveItem.callId} — the
+   * calling tool call's — as it starts and ends, and a reader keeps the newest per call and
+   * draws **one entry** where the first arrived. Live and replayed alike: both drivers
+   * narrate their sub-agent tool (Claude Code's `Agent`, OpenCode's `subagent`) as this
+   * and the sub-agent's own thinking, tool calls and replies as nothing.
+   *
+   * - `headline`: its type as the calling agent asked for it (`general-purpose`,
+   *   `explore`), or `sub-agent` when the call named none. **Agent text**, plain.
+   * - `body`: the calling agent's short description of its task, or the start of the prompt
+   *   it gave, one line, at most 200 characters. **Agent text**, plain.
+   * - `outcome`: `running`, `finished`, `failed` or `stopped`.
+   * - `tool` / `toolName`: the calling tool as the harness named it; `callId` as above.
+   *
+   * A sub-agent's own words — its final report, a background one's completion notice —
+   * are never on an item.
+   */
+  "subagent",
   "action.denied",
 ] as const;
 

@@ -94,6 +94,7 @@ import {
   AgentHarness,
   OPEN_PROMPT,
   TerminalOutcome,
+  subagentDescription,
   truncateNarration,
   type BlockChannel,
   type HarnessNarration,
@@ -103,6 +104,8 @@ import {
   type SessionRef,
   type SessionTitle,
   type SessionWindow,
+  type SubagentState,
+  type SubagentStatus,
 } from "./agentHarness";
 import {
   inlinesOnOpenCode,
@@ -613,6 +616,11 @@ export const openCodeNarration = (
    * of a step this stream joined after it started carries no model.
    */
   models: Map<string, string> = new Map(),
+  /**
+   * The sub-agents this stream has seen started (A6 U14), so a call's settling and a
+   * background one's notice narrate as its state. See {@link OpenCodeSubagents}.
+   */
+  subagents: OpenCodeSubagents = openCodeSubagents(),
 ): HarnessNarration => {
   const record = (entry ?? {}) as {
     type?: unknown;
@@ -705,20 +713,39 @@ export const openCodeNarration = (
         }
         return { _tag: "opaque" };
       }
-      case "session.tool.called":
-        return callId === undefined
-          ? { _tag: "opaque" }
-          : {
-              _tag: "toolCall",
-              callId,
-              tool: names.get(callId),
-              input: truncateNarration(asJson(data["input"])),
-              ...named,
-            };
+      case "session.tool.called": {
+        if (callId === undefined) return { _tag: "opaque" };
+        // A sub-agent: its entry, not its call (A6 U14).
+        const subagent = openCodeSubagentCall(
+          names.get(callId),
+          data["input"],
+          stepModel,
+        );
+        if (subagent !== undefined) {
+          subagents.calls.set(callId, subagent);
+          return openCodeSubagentState(callId, subagent, "running");
+        }
+        return {
+          _tag: "toolCall",
+          callId,
+          tool: names.get(callId),
+          input: truncateNarration(asJson(data["input"])),
+          ...named,
+        };
+      }
       case "session.tool.success": {
         if (callId === undefined) return { _tag: "opaque" };
         const tool = names.get(callId);
         names.delete(callId);
+        const subagent = subagents.calls.get(callId);
+        if (subagent !== undefined) {
+          return (
+            openCodeSubagentSettled(subagents, callId, subagent, {
+              ok: true,
+              metadata: data["metadata"],
+            }) ?? { _tag: "opaque" }
+          );
+        }
         return {
           _tag: "toolResult",
           callId,
@@ -732,6 +759,15 @@ export const openCodeNarration = (
         const tool = names.get(callId);
         names.delete(callId);
         const error = (data["error"] ?? {}) as { message?: unknown };
+        const subagent = subagents.calls.get(callId);
+        if (subagent !== undefined) {
+          return (
+            openCodeSubagentSettled(subagents, callId, subagent, {
+              ok: false,
+              message: typeof error.message === "string" ? error.message : "",
+            }) ?? { _tag: "opaque" }
+          );
+        }
         const content = partsText(data["content"]);
         const message =
           typeof error.message === "string" ? error.message : "the tool failed";
@@ -745,6 +781,13 @@ export const openCodeNarration = (
           failed: true,
         };
       }
+      case "session.synthetic":
+        // A background sub-agent's end; any other notice stays `opaque`, as it was.
+        return (
+          openCodeSubagentNotice(subagents, data["metadata"]) ?? {
+            _tag: "opaque",
+          }
+        );
       default:
         return { _tag: "opaque" };
     }
@@ -785,6 +828,162 @@ const millisOf = (value: unknown): number | undefined => {
 };
 
 /**
+ * OpenCode's sub-agent tools: `subagent`, and `task`, its name before 2.2 renamed it
+ * (`database/v1-migration.bun.ts`'s `RENAMED_TOOLS`). A tool from an MCP server is
+ * namespaced (`bit-<id>.…`), so neither name can be somebody else's.
+ */
+const OPENCODE_SUBAGENT_TOOLS: ReadonlySet<string> = new Set([
+  "subagent",
+  "task",
+]);
+
+/** What one sub-agent call said about itself, kept for its later states. */
+interface OpenCodeSubagentCall {
+  readonly tool: string;
+  readonly agentType: string | undefined;
+  readonly description: string;
+  readonly model: string | undefined;
+}
+
+/**
+ * The sub-agents one stream or one read has seen (A6 U14): each call by its id, and each
+ * background one's child session by its id, which is all OpenCode's completion notice
+ * names. Created per stream and per read, like the tool-name map, and bounded by the
+ * sub-agent calls a session makes.
+ */
+export interface OpenCodeSubagents {
+  readonly calls: Map<string, OpenCodeSubagentCall>;
+  readonly children: Map<string, string>;
+}
+
+export const openCodeSubagents = (): OpenCodeSubagents => ({
+  calls: new Map(),
+  children: new Map(),
+});
+
+/**
+ * A `subagent` call's input as the call it is (`tool/plugin/subagent.ts`: `agent`,
+ * `description`, `prompt`; `subagent_type` from before 2.2), or `undefined` for any other
+ * tool.
+ */
+const openCodeSubagentCall = (
+  tool: string | undefined,
+  input: unknown,
+  model: string | undefined,
+): OpenCodeSubagentCall | undefined => {
+  if (tool === undefined || !OPENCODE_SUBAGENT_TOOLS.has(tool))
+    return undefined;
+  const fields = (input ?? {}) as {
+    agent?: unknown;
+    subagent_type?: unknown;
+    description?: unknown;
+    prompt?: unknown;
+  };
+  const agent =
+    typeof fields.agent === "string" && fields.agent.trim() !== ""
+      ? fields.agent
+      : fields.subagent_type;
+  return {
+    tool,
+    agentType:
+      typeof agent === "string" && agent.trim() !== ""
+        ? subagentDescription(agent, undefined)
+        : undefined,
+    description: subagentDescription(fields.description, fields.prompt),
+    model,
+  };
+};
+
+const openCodeSubagentState = (
+  callId: string,
+  call: OpenCodeSubagentCall,
+  status: SubagentStatus,
+): SubagentState => ({
+  _tag: "subagent",
+  callId,
+  tool: call.tool,
+  agentType: call.agentType,
+  description: call.description,
+  status,
+  ...(call.model === undefined ? {} : { model: call.model }),
+});
+
+/**
+ * A settled `subagent` call as its state, from the tool's own result metadata
+ * (`{ sessionID, status }`): `running` there is a **background** launch — the call returned
+ * at once and the child session goes on — so nothing ends yet and the child is remembered
+ * for the notice that will; anything else is `finished`. A failed call is `failed`, or
+ * `stopped` when OpenCode says it was cancelled. The result's text — the sub-agent's own
+ * reply — is never carried.
+ */
+const openCodeSubagentSettled = (
+  subagents: OpenCodeSubagents,
+  callId: string,
+  call: OpenCodeSubagentCall,
+  settled:
+    | { readonly ok: true; readonly metadata: unknown }
+    | { readonly ok: false; readonly message: string },
+): SubagentState | undefined => {
+  if (!settled.ok) {
+    return openCodeSubagentState(
+      callId,
+      call,
+      settled.message.startsWith("Subagent cancelled") ? "stopped" : "failed",
+    );
+  }
+  const metadata = (settled.metadata ?? {}) as {
+    sessionID?: unknown;
+    status?: unknown;
+  };
+  if (metadata.status === "running") {
+    if (typeof metadata.sessionID === "string") {
+      subagents.children.set(metadata.sessionID, callId);
+    }
+    return undefined;
+  }
+  return openCodeSubagentState(callId, call, "finished");
+};
+
+/**
+ * A background sub-agent's end, from the `synthetic` notice OpenCode adds to the parent
+ * when its child session ends (`session/subagent-completion.ts`: metadata
+ * `{ source: "subagent", childID, state }`, `state` `completed`, `error` or `cancelled`), or
+ * `undefined` when the notice is not one, or names a child this stream or read did not see
+ * launched.
+ */
+const openCodeSubagentNotice = (
+  subagents: OpenCodeSubagents,
+  metadata: unknown,
+): SubagentState | undefined => {
+  const fields = (metadata ?? {}) as {
+    source?: unknown;
+    childID?: unknown;
+    state?: unknown;
+  };
+  if (fields.source !== "subagent" || typeof fields.childID !== "string") {
+    return undefined;
+  }
+  const callId = subagents.children.get(fields.childID);
+  const call = callId === undefined ? undefined : subagents.calls.get(callId);
+  if (callId === undefined || call === undefined) return undefined;
+  const status: SubagentStatus | undefined =
+    fields.state === "completed"
+      ? "finished"
+      : fields.state === "error"
+        ? "failed"
+        : fields.state === "cancelled"
+          ? "stopped"
+          : undefined;
+  return status === undefined
+    ? undefined
+    : openCodeSubagentState(callId, call, status);
+};
+
+/** Whether a `synthetic` entry's metadata is a sub-agent's completion notice at all. */
+const isSubagentNotice = (metadata: unknown): boolean =>
+  (metadata as { source?: unknown } | undefined)?.source === "subagent";
+
+/**
  * One stored assistant message's content as parts, in the live stream's vocabulary (A6 F10).
  *
  * `@opencode/schema`'s `Session.Message.Assistant.content` is a list of `text`, `reasoning`
@@ -801,6 +1000,7 @@ const assistantContentParts = (
   messageId: string | undefined,
   content: readonly unknown[],
   model: string | undefined,
+  subagents: OpenCodeSubagents,
 ): MessagePart[] => {
   const ordinals = { reply: 0, thinking: 0 };
   const named = model === undefined ? {} : { model };
@@ -827,6 +1027,7 @@ const assistantContentParts = (
         status?: unknown;
         input?: unknown;
         content?: unknown;
+        metadata?: unknown;
         error?: { message?: unknown } | undefined;
       };
     };
@@ -855,6 +1056,28 @@ const assistantContentParts = (
     const state = record.state ?? {};
     // A `streaming` call's input is still the JSON text being written; the others hold
     // the parsed object.
+    // A sub-agent: its entry and its state, not its call and result (A6 U14).
+    const subagent = openCodeSubagentCall(tool, state.input, model);
+    if (subagent !== undefined) {
+      subagents.calls.set(record.id, subagent);
+      const running = openCodeSubagentState(record.id, subagent, "running");
+      const settled =
+        state.status === "completed"
+          ? openCodeSubagentSettled(subagents, record.id, subagent, {
+              ok: true,
+              metadata: state.metadata,
+            })
+          : state.status === "error"
+            ? openCodeSubagentSettled(subagents, record.id, subagent, {
+                ok: false,
+                message:
+                  typeof state.error?.message === "string"
+                    ? state.error.message
+                    : "",
+              })
+            : undefined;
+      return settled === undefined ? [running] : [running, settled];
+    }
     const input =
       typeof state.input === "string" ? state.input : asJson(state.input);
     const call: MessagePart = {
@@ -913,11 +1136,13 @@ const assistantContentParts = (
 const flatten = (
   entry: unknown,
   uploadsFolder: string | undefined,
+  subagents: OpenCodeSubagents = openCodeSubagents(),
 ): MessageEntry => {
   const record = (entry ?? {}) as {
     id?: unknown;
     type?: unknown;
     text?: unknown;
+    metadata?: unknown;
     description?: unknown;
     model?: unknown;
     time?: { created?: unknown } | undefined;
@@ -931,6 +1156,22 @@ const flatten = (
   const type = typeof record.type === "string" ? record.type : "unknown";
   const content = Array.isArray(record.content) ? record.content : [];
   const model = type === "assistant" ? modelRefName(record.model) : undefined;
+  /*
+   * A background sub-agent's completion notice (A6 U14): its end, as its state, and never
+   * its words, which are the sub-agent's own reply. Dropped as words even when it names a
+   * child this read did not see launched, for the same reason.
+   */
+  if (type === "synthetic" && isSubagentNotice(record.metadata)) {
+    const ended = openCodeSubagentNotice(subagents, record.metadata);
+    return {
+      type,
+      text: "",
+      error: undefined,
+      parts: ended === undefined ? [] : [ended],
+      model: undefined,
+      at: millisOf(record.time?.created),
+    };
+  }
   /*
    * A `system` entry's `text` is what the **model** was told — measured on 2.2.5, a whole
    * "the tool catalog has changed" listing every tool — and `@opencode/schema` gives it a
@@ -991,6 +1232,7 @@ const flatten = (
             typeof record.id === "string" ? record.id : undefined,
             content,
             model,
+            subagents,
           )
         : [],
     model,
@@ -1910,6 +2152,8 @@ export const openCodeHarness = (
         "openCodeHarness.messages",
       )(function* (sessionId, read) {
         const entries: MessageEntry[] = [];
+        // One read's sub-agents, across its pages: a notice names its child, not its call.
+        const subagents = openCodeSubagents();
         let cursor: string | undefined;
         for (let page = 0; page < MESSAGE_PAGE_CEILING; page += 1) {
           const listed = yield* bounded(
@@ -1923,7 +2167,7 @@ export const openCodeHarness = (
           );
           if (listed.data.length === 0) return entries;
           for (const entry of listed.data) {
-            entries.push(flatten(entry, read?.uploadsFolder));
+            entries.push(flatten(entry, read?.uploadsFolder, subagents));
           }
           const next = listed.cursor.next;
           if (typeof next !== "string") return entries;
@@ -2070,6 +2314,8 @@ export const openCodeHarness = (
         const names = new Map<string, string>();
         /** Each open step's model, for the same stream. See {@link openCodeNarration}. */
         const models = new Map<string, string>();
+        /** The sub-agents this stream saw started. See {@link openCodeNarration}. */
+        const subagents = openCodeSubagents();
         return api.event.subscribe().pipe(
           Stream.mapError(fail("event.subscribe")),
           Stream.filterMap(
@@ -2085,6 +2331,7 @@ export const openCodeHarness = (
                       names,
                       contextLimits.get(sessionId),
                       models,
+                      subagents,
                     ),
                   )
                 : Result.fail(event),

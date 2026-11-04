@@ -95,7 +95,70 @@ const KIND_LABELS: Record<string, string | undefined> = {
    */
   "turn.other": "Harness",
   "tool.result": "Tool result",
+  /** A sub-agent the agent started, as one entry (A6 U14). See {@link SUBAGENT_KIND}. */
+  subagent: "Sub-agent",
   "action.denied": "Denied",
+};
+
+/**
+ * The kind a sub-agent's entry carries: the server's string (`live.ts`'s `subagent`).
+ *
+ * One state of one sub-agent: its type in `headline`, its task in `body` (both the calling
+ * agent's words, drawn as plain text), and `running`, `finished`, `failed` or `stopped` in
+ * `outcome`. Several share a `callId` as it starts and ends; {@link foldSubagents} makes
+ * them one entry.
+ */
+export const SUBAGENT_KIND = "subagent";
+
+/**
+ * What a sub-agent entry says about what it does not show (A6 U14, decided by the
+ * operator). The server narrates a sub-agent's own thinking, tool calls and replies as
+ * nothing, live and on reload, so the entry says where they went.
+ */
+export const SUBAGENT_NOTE =
+  "Its own messages and tool calls are not shown here: viewing a sub-agent's work is postponed to V2.";
+
+/**
+ * Each sub-agent as **one** item, at the place its first state arrived, carrying its
+ * newest state (A6 U14).
+ *
+ * The server sends a sub-agent's states as separate items sharing the calling tool call's
+ * `callId` — `running` at the call, then how it ended — live and in a replay alike. A
+ * background sub-agent can end turns later, so the states of one can sit in different
+ * groups of a conversation; the importer chat folds its whole list before cutting it into
+ * turns, and {@link rowsFor} folds each group again, which changes nothing a second time.
+ *
+ * The folded item keeps the **first** state's `id` and `at` — the row's key, so the entry
+ * is updated in place rather than drawn anew, and when it started — and takes everything
+ * else from the newest. Newest by list order, which is arrival order live and the harness's
+ * order in a replay; a replay's states come before the live tail's, so a reload's `running`
+ * is overtaken by a `finished` that arrives after it. A state with no `callId` cannot be
+ * joined to anything and stays an item of its own.
+ */
+export const foldSubagents = (
+  items: readonly LiveItem[],
+): readonly LiveItem[] => {
+  const newest = new Map<string, LiveItem>();
+  for (const item of items) {
+    if (item.kind === SUBAGENT_KIND && item.callId !== null) {
+      newest.set(item.callId, item);
+    }
+  }
+  if (newest.size === 0) return items;
+  const placed = new Set<string>();
+  const folded: LiveItem[] = [];
+  for (const item of items) {
+    const callId = item.kind === SUBAGENT_KIND ? item.callId : null;
+    if (callId === null) {
+      folded.push(item);
+      continue;
+    }
+    if (placed.has(callId)) continue;
+    placed.add(callId);
+    const last = newest.get(callId) ?? item;
+    folded.push(last === item ? item : { ...last, id: item.id, at: item.at });
+  }
+  return folded;
 };
 
 /**
@@ -138,11 +201,13 @@ export const outcomeTint = (
     case "ok":
     case "positive":
     case "met":
+    case "finished":
       return "success";
     case "negative":
     case "inconclusive":
     case "uncertain":
     case "interrupted":
+    case "stopped":
       return "warning";
     default:
       return "plain";
@@ -853,10 +918,12 @@ const unrecorded = (
  * ({@link claimedRecords}); without one, the group is paired on its own.
  */
 export const rowsFor = (
-  items: readonly LiveItem[],
+  group: readonly LiveItem[],
   roundRunning: boolean,
   pairing?: ReadonlyMap<string, LiveItem>,
 ): readonly ChatRow[] => {
+  // A sub-agent's states, as the one entry it is drawn as (A6 U14).
+  const items = foldSubagents(group);
   /** Results by the call they answer. A result with no `callId` cannot be paired at all. */
   const results = new Map<string, LiveItem>();
   for (const item of items) {

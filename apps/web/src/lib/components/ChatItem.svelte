@@ -43,6 +43,8 @@
 
   import {
     REPLY_KIND,
+    SUBAGENT_KIND,
+    SUBAGENT_NOTE,
     THINKING_KIND,
     callSignature,
     kindLabel,
@@ -169,6 +171,36 @@
           reload shows it only while the harness still has it.
         </p>
       </details>
+    </li>
+  {:else if item.kind === SUBAGENT_KIND}
+    <!--
+      A sub-agent the agent started, as one entry (A6 U14): what it is and how it stands,
+      and a note that what it did is not shown. Its type and its task are the calling
+      agent's words, drawn as text and nothing else. A block, like a tool call: it is
+      something the agent did, not something it said.
+    -->
+    <li
+      class="block subagent"
+      data-origin={item.origin}
+      data-status={item.outcome ?? ""}
+      title={item.callId === null ? undefined : `call ${item.callId}`}
+    >
+      <span class="visually-hidden">{item.origin}</span>
+      <div class="sig mono">
+        <span class="what">{kindLabel(item.kind)}</span>
+        <span class="agent-type">{item.headline}</span>
+        <span
+          class="chip"
+          data-tint={outcomeTint(item.outcome ?? "running")}
+          data-status={item.outcome ?? "running"}
+        >
+          {item.outcome ?? "running"}
+        </span>
+      </div>
+      {#if item.body !== ""}
+        <div class="ret task">{item.body}</div>
+      {/if}
+      <p class="state-note">{SUBAGENT_NOTE}</p>
     </li>
   {:else}
     <!--
@@ -352,6 +384,11 @@
       request beneath it would be the same fact twice.
     -->
       <p class="body">{summary}</p>
+    {/if}
+
+    {#if item.kind === SUBAGENT_KIND}
+      <!-- What a sub-agent's entry does not show, and why (A6 U14). -->
+      <p class="note">{SUBAGENT_NOTE}</p>
     {/if}
 
     <!--
@@ -683,6 +720,23 @@
   }
   .ret[data-unresolved="true"] {
     color: var(--state-fg-warning);
+  }
+  /*
+   * A sub-agent's task is the calling agent's sentence, so it reads as one: sans, wrapping,
+   * where a call's line is mono. Its note sits under it, as a write's state note does.
+   */
+  .subagent .task {
+    color: var(--text-base);
+    font: 400 13px/20px var(--font-sans);
+    overflow-wrap: anywhere;
+  }
+  .subagent .agent-type {
+    margin-right: 6px;
+    color: var(--text-base);
+    overflow-wrap: anywhere;
+  }
+  .subagent .state-note {
+    margin: 2px 0 0;
   }
   .state-note {
     display: block;

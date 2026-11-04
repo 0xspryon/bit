@@ -80,8 +80,11 @@
  *   `.claude/settings.local.json` is where the gate lives and a future default of `[]`
  *   would silently un-gate every run.
  * - `forwardSubagentText: true` — without it a subagent's text and thinking never reach the
- *   stream and narration shows only tool-call heartbeats (`--forward-subagent-text`,
- *   Claude Code 2.1.211+).
+ *   stream (`--forward-subagent-text`, Claude Code 2.1.211+). Since A6 U14 `narrate` drops
+ *   every subagent frame and narrates its call as one entry instead, so nothing reads them
+ *   today; kept on because they are what a V2 live view of a subagent would read (see
+ *   `SubagentState`), and turning it off is a change to the CLI's own stream that this
+ *   slice has not measured.
  */
 import { spawn as spawnChild, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -127,6 +130,7 @@ import {
   AgentHarness,
   OPEN_PROMPT,
   SESSION_NOT_FOUND_TAG,
+  subagentDescription,
   truncateNarration,
   type HarnessFailure,
   type HarnessNarration,
@@ -138,6 +142,8 @@ import {
   type SessionRef,
   type SessionStatus,
   type SessionTitle,
+  type SubagentState,
+  type SubagentStatus,
   type TerminalOutcome,
 } from "./agentHarness";
 import {
@@ -613,6 +619,12 @@ interface SessionRecord {
    */
   streamed: StreamedBlock;
   /**
+   * The sub-agents this session's agent started, by the calling `Agent` call's id, so a
+   * later frame — the call's result, the task's notification — can say which one ended
+   * and be narrated as its {@link SubagentState} (A6 U14). See {@link SubagentCalls}.
+   */
+  readonly subagents: SubagentCalls;
+  /**
    * Set by {@link interruptSession}, so the outcome is `interrupted` and not `failed`.
    * Cleared at the next `result` on a multi-turn session, whose query outlives the turn.
    *
@@ -989,16 +1001,13 @@ const promptTokensOf = (usage: unknown): number => {
  * `null` on every frame of the main loop (`null` on all eight of DECISIONS.md §24.4's
  * captures, which ran no subagent).
  *
- * **Read from the SDK's documentation, not from a measurement, and that is the whole of the
- * evidence.** `sdk.d.ts:3686` states it in as many words — "`parent_tool_use_id` is non-null
- * when the message was produced inside a subagent started by that tool_use" — and no run in
- * this repository has ever produced one: §24.4's probe started no subagent, so **nothing
- * here has observed a forwarded frame at all**, and whether such a frame even carries
- * `message.usage` is unknown. The guard is written so that it does not need to know: it
- * excludes the frame *before* any usage is read, so the unmeasured case costs a measurement
- * this build would rather not have than produce a wrong one. What would change if the
- * documented meaning turned out to be narrower is that a subagent's context could reach a
- * pane's meter again, which is the defect this exists to prevent.
+ * **Read first from the SDK's documentation** — `sdk.d.ts:3686`: "`parent_tool_use_id` is
+ * non-null when the message was produced inside a subagent started by that tool_use" — and
+ * since **measured** (A6 U14, CLI 2.1.310, `testdata/claude-code-subagents/`): a
+ * foreground and a background `Agent` call each had their prompt, thinking and reply
+ * forwarded as frames carrying the call's id, those frames carried `message.usage` of their
+ * own, and every main-thread frame carried `null`. The guard excludes such a frame before
+ * any usage is read, and `narrate` drops it whole.
  *
  * **It matters because this build pins `forwardSubagentText: true`** — without it a
  * subagent's text and thinking never reach the stream — and the policy gate's default
@@ -1030,8 +1039,9 @@ const fromSubagent = (message: SDKMessage): boolean =>
  * "MAIN AGENT LOOP ONLY — excludes Task subagent, sidechain, and auxiliary model calls", so
  * the `iterations` this driver's output count comes from describe main-loop calls. Letting a
  * subagent's frame set {@link SessionRecord.lastCallId} would hang that output count on a
- * call it is not about. The subagent's *text and thinking still narrate* — they are what the
- * forwarding option exists for, and they are transcript content rather than a measurement.
+ * call it is not about. Its text and thinking narrate nothing either since A6 U14: the
+ * frame is dropped before this is reached, and its call is narrated as one entry
+ * (`SubagentState`).
  */
 const usageOfAssistant = (
   message: SDKMessage,
@@ -1178,6 +1188,160 @@ const finishedBlockKey = (
     : {};
 };
 
+/**
+ * The tools that start a sub-agent: `Agent`, and `Task`, its name before Claude Code 2.1
+ * renamed it. A tool from an MCP server is always namespaced (`mcp__…`), so neither name
+ * can be somebody else's.
+ */
+const SUBAGENT_TOOLS: ReadonlySet<string> = new Set(["Agent", "Task"]);
+
+/** What one sub-agent call said about itself, kept for its later states. */
+interface SubagentCall {
+  readonly tool: string;
+  readonly agentType: string | undefined;
+  readonly description: string;
+  readonly model: string | undefined;
+  /**
+   * The call returned at once and the sub-agent runs on: its result is a placeholder, and
+   * only the task's notification says it ended. Set from the call's `run_in_background`,
+   * from the CLI's `task_started`/`task_updated` (`is_backgrounded`, live only) and from
+   * the placeholder itself ({@link ASYNC_LAUNCH}), whichever says so first.
+   */
+  background: boolean;
+  /** The CLI's task id for it, from `task_started`, which `task_updated` names it by. */
+  taskId?: string;
+}
+
+/**
+ * The sub-agents a session's agent started, by call id, for one read of the stream or of
+ * the transcript. Grows by one per sub-agent call, which an agent makes a handful of times
+ * in a session, and goes with the session.
+ */
+type SubagentCalls = Map<string, SubagentCall>;
+
+/**
+ * How Claude Code's `Agent` result opens when the sub-agent was started in the background:
+ * `Async agent launched successfully. …` (measured on 2.1.310), a placeholder for a result
+ * that arrives later as the task's notification. **The one signal a replay has** when the
+ * call did not say `run_in_background: true`: the CLI starts an agent in the background by
+ * default (its tool description says so), and `getSessionMessages` keeps neither the
+ * `task_started` frame nor the result's `toolUseResult.isAsync`. Should a later CLI word it
+ * differently, a background sub-agent that was not asked for by name shows as finished
+ * when it was launched, which is the claim a reader can least be misled by.
+ */
+const ASYNC_LAUNCH = "Async agent launched";
+
+const subagentCall = (
+  tool: string,
+  input: unknown,
+  model: string | undefined,
+): SubagentCall => {
+  const fields = (input ?? {}) as {
+    subagent_type?: unknown;
+    description?: unknown;
+    prompt?: unknown;
+    run_in_background?: unknown;
+  };
+  return {
+    tool,
+    agentType:
+      typeof fields.subagent_type === "string" &&
+      fields.subagent_type.trim() !== ""
+        ? subagentDescription(fields.subagent_type, undefined)
+        : undefined,
+    description: subagentDescription(fields.description, fields.prompt),
+    model,
+    background: fields.run_in_background === true,
+  };
+};
+
+const subagentState = (
+  callId: string,
+  call: SubagentCall,
+  status: SubagentStatus,
+): SubagentState => ({
+  _tag: "subagent",
+  callId,
+  tool: call.tool,
+  agentType: call.agentType,
+  description: call.description,
+  status,
+  ...(call.model === undefined ? {} : { model: call.model }),
+});
+
+/**
+ * A sub-agent call's result as its state: `finished`, or `failed` when the result is an
+ * error — and **nothing** for a background launch's placeholder, since that sub-agent is
+ * still running and its notification will say when it ends. The result's text is never
+ * carried: a foreground result is the sub-agent's own final report.
+ */
+const subagentResult = (
+  callId: string,
+  call: SubagentCall,
+  text: string,
+  failed: boolean,
+): MessagePart[] => {
+  if (!failed && text.trimStart().startsWith(ASYNC_LAUNCH)) {
+    call.background = true;
+  }
+  if (call.background) return [];
+  return [subagentState(callId, call, failed ? "failed" : "finished")];
+};
+
+/**
+ * How a task's notification names its end: the SDK's `task_notification.status`
+ * (`completed`, `failed`, `stopped`), or the stored `<task-notification>`'s `<status>`,
+ * which says `killed` where the frame says `stopped`. Anything else is not an end this
+ * reads, and leaves the sub-agent running.
+ */
+const notifiedStatus = (status: string): SubagentStatus | undefined => {
+  switch (status) {
+    case "completed":
+      return "finished";
+    case "failed":
+      return "failed";
+    case "stopped":
+    case "killed":
+      return "stopped";
+    default:
+      return undefined;
+  }
+};
+
+/**
+ * A background sub-agent's end, from its task's notification, or nothing when the
+ * notification is not about one. A foreground sub-agent's task is notified too — just
+ * before its result — and is left to the result, so each sub-agent ends once.
+ */
+const subagentNotified = (
+  subagents: SubagentCalls,
+  toolUseId: string | undefined,
+  status: string,
+): MessagePart[] => {
+  const call = toolUseId === undefined ? undefined : subagents.get(toolUseId);
+  const ended = notifiedStatus(status);
+  return call === undefined ||
+    toolUseId === undefined ||
+    !call.background ||
+    ended === undefined
+    ? []
+    : [subagentState(toolUseId, call, ended)];
+};
+
+/**
+ * The `<tool-use-id>` and `<status>` of a stored `<task-notification>`, the user entry the
+ * CLI writes when a task ends (`testdata/claude-code-transcript/`).
+ */
+const storedNotification = (
+  text: string,
+): { readonly toolUseId: string; readonly status: string } | undefined => {
+  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1];
+  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1];
+  return toolUseId === undefined || status === undefined
+    ? undefined
+    : { toolUseId: toolUseId.trim(), status: status.trim() };
+};
+
 /** The model an `assistant` message names (`message.model`), or `undefined`. */
 const modelOfMessage = (message: unknown): string | undefined => {
   const model = (message as { model?: unknown } | undefined)?.model;
@@ -1204,6 +1368,7 @@ const assistantParts = (
   ) => {
     readonly blockId?: string;
   },
+  subagents: SubagentCalls,
 ): MessagePart[] => {
   const parts: MessagePart[] = [];
   const named = model === undefined ? {} : { model };
@@ -1237,6 +1402,16 @@ const assistantParts = (
         ...key("thinking", position),
         ...named,
       });
+    } else if (
+      record.type === "tool_use" &&
+      typeof record.id === "string" &&
+      typeof record.name === "string" &&
+      SUBAGENT_TOOLS.has(record.name)
+    ) {
+      // A sub-agent: its entry, not its call (A6 U14).
+      const call = subagentCall(record.name, record.input, model);
+      subagents.set(record.id, call);
+      parts.push(subagentState(record.id, call, "running"));
     } else if (record.type === "tool_use" && typeof record.id === "string") {
       parts.push({
         _tag: "toolCall",
@@ -1256,7 +1431,10 @@ const assistantParts = (
  * the Messages API carries it. Shared by the stream and the transcript, as
  * {@link assistantParts} is.
  */
-const userParts = (blocks: readonly unknown[]): MessagePart[] =>
+const userParts = (
+  blocks: readonly unknown[],
+  subagents: SubagentCalls,
+): MessagePart[] =>
   blocks.flatMap((block): MessagePart[] => {
     const record = (block ?? {}) as {
       type?: unknown;
@@ -1264,6 +1442,18 @@ const userParts = (blocks: readonly unknown[]): MessagePart[] =>
       content?: unknown;
       is_error?: unknown;
     };
+    const call =
+      record.type === "tool_result" && typeof record.tool_use_id === "string"
+        ? subagents.get(record.tool_use_id)
+        : undefined;
+    if (call !== undefined && typeof record.tool_use_id === "string") {
+      return subagentResult(
+        record.tool_use_id,
+        call,
+        resultText(record.content),
+        record.is_error === true,
+      );
+    }
     return record.type === "tool_result" &&
       typeof record.tool_use_id === "string"
       ? [
@@ -1288,7 +1478,10 @@ const narrate = (
    * two facts a usage entry needs are not on the frame that needs them. It is one object
    * per session, so one session's call ids can never be read for another's.
    */
-  session: Pick<SessionRecord, "contextLimit" | "lastCallId" | "streamed">,
+  session: Pick<
+    SessionRecord,
+    "contextLimit" | "lastCallId" | "streamed" | "subagents"
+  >,
 ): readonly HarnessNarration[] => {
   const at = Date.now();
   const frame = (detail: NarrationDetail): HarnessNarration => ({
@@ -1312,6 +1505,57 @@ const narrate = (
   if (message.type === "system" && message.subtype === "thinking_tokens") {
     return [];
   }
+  /*
+   * A sub-agent's own frames narrate nothing (A6 U14, decided by the operator): its
+   * thinking, tool calls, replies and the prompt it was given are not this session's agent
+   * speaking, and drawn as this session's rows they read as if the caller wrote them. Its
+   * call is narrated instead, as one entry with its state ({@link SubagentState}, which
+   * carries the V2 note). Every Claude Code session reads its frames here — a conversation,
+   * a worker's attempt, a planner round — and all of them are dropped, for the same reason
+   * in each: a worker's transcript is the worker's, and a sub-agent's work in it would be
+   * misattributed exactly as in a chat. Its usage was already never read
+   * ({@link usageOfAssistant}), and its partial frames are skipped by
+   * {@link narrateStreamEvent}. Nothing at all rather than `opaque`: an `opaque` per frame
+   * would only take slots on the sliding bus for entries nothing renders.
+   */
+  if (
+    (message.type === "assistant" || message.type === "user") &&
+    fromSubagent(message)
+  ) {
+    return [];
+  }
+  /*
+   * A task's start and end, read for the sub-agents among them: a start or update says
+   * whether one runs in the background, which its result alone may not (the CLI starts an
+   * agent in the background by default), and a background one's notification is what says
+   * it ended. Anything else here is the `opaque` it always was.
+   */
+  if (message.type === "system") {
+    if (message.subtype === "task_started") {
+      const call =
+        message.tool_use_id === undefined
+          ? undefined
+          : session.subagents.get(message.tool_use_id);
+      if (call !== undefined) {
+        call.taskId = message.task_id;
+        if (message.is_backgrounded === true) call.background = true;
+      }
+    } else if (message.subtype === "task_updated") {
+      // Names its task only; a sub-agent moved to the background after it started.
+      if (message.patch.is_backgrounded === true) {
+        for (const call of session.subagents.values()) {
+          if (call.taskId === message.task_id) call.background = true;
+        }
+      }
+    } else if (message.subtype === "task_notification") {
+      const ended = subagentNotified(
+        session.subagents,
+        message.tool_use_id,
+        message.status,
+      );
+      if (ended.length > 0) return ended.map(frame);
+    }
+  }
 
   // Read off an `unknown` view of the message rather than narrowing the SDK's own union:
   // `BetaMessage`'s content blocks are a wide, version-specific union, and asserting a
@@ -1324,12 +1568,16 @@ const narrate = (
 
   if (message.type === "assistant") {
     details.push(
-      ...assistantParts(blocks, modelOfMessage(message.message), (kind) =>
-        finishedBlockKey(message, blocks.length, kind, session.streamed),
+      ...assistantParts(
+        blocks,
+        modelOfMessage(message.message),
+        (kind) =>
+          finishedBlockKey(message, blocks.length, kind, session.streamed),
+        session.subagents,
       ),
     );
   } else if (message.type === "user") {
-    details.push(...userParts(blocks));
+    details.push(...userParts(blocks, session.subagents));
   }
 
   /*
@@ -1522,6 +1770,7 @@ const flattenTranscript = (
   uploadsFolder: string | undefined,
 ): MessageEntry[] => {
   const blocksSeen = new Map<string, number>();
+  const subagents: SubagentCalls = new Map();
   return entries.map((entry): MessageEntry => {
     const message = (entry.message ?? {}) as {
       id?: unknown;
@@ -1548,6 +1797,25 @@ const flattenTranscript = (
             .join("\n");
     const marker = cliMarker(entry);
     /*
+     * A background sub-agent's notification (A6 U14): its end, as the sub-agent's state,
+     * and not its words, which carry the sub-agent's own result. Live, the same end comes
+     * from the `task_notification` frame and the stored note is never narrated, so the
+     * replay drops it too. A notification about anything else — a `Bash` task — is the
+     * `task` note it was.
+     */
+    const notified = marker === "task" ? storedNotification(text) : undefined;
+    if (notified !== undefined && subagents.has(notified.toolUseId)) {
+      return {
+        type: entry.type,
+        text: "",
+        marker: "task",
+        error: undefined,
+        parts: subagentNotified(subagents, notified.toolUseId, notified.status),
+        model: undefined,
+        at: Number.isFinite(at) ? at : undefined,
+      };
+    }
+    /*
      * The files an operator's message carried (A6 F9): its trailing `[Attached …]` lines
      * naming files in the session's own `uploads/` folder, taken out of the words. Each is
      * typed by its stored name, not by the message's image blocks: the CLI re-encodes a large
@@ -1572,13 +1840,17 @@ const flattenTranscript = (
       error: undefined,
       parts:
         entry.type === "assistant"
-          ? assistantParts(blocks, modelOfMessage(message), (_, position) =>
-              callId === undefined
-                ? {}
-                : { blockId: claudeCodeBlockId(callId, first + position) },
+          ? assistantParts(
+              blocks,
+              modelOfMessage(message),
+              (_, position) =>
+                callId === undefined
+                  ? {}
+                  : { blockId: claudeCodeBlockId(callId, first + position) },
+              subagents,
             )
           : entry.type === "user"
-            ? userParts(blocks)
+            ? userParts(blocks, subagents)
             : [],
       model: entry.type === "assistant" ? modelOfMessage(message) : undefined,
       at: Number.isFinite(at) ? at : undefined,
@@ -2433,7 +2705,8 @@ export const claudeCodeHarness = (
                   settingSources: ["user", "project", "local"],
                   // Our `PreToolUse` gate is the permission authority; see the header.
                   permissionMode: "dontAsk",
-                  // Without this, a subagent's text never reaches the stream.
+                  // Without this, a subagent's text never reaches the stream. Narration
+                  // drops it (A6 U14); kept for V2 — see the header.
                   forwardSubagentText: true,
                   // Needed for `messages` to have anything to read later.
                   persistSession: true,
@@ -2580,6 +2853,7 @@ export const claudeCodeHarness = (
           contextLimit: undefined,
           lastCallId: undefined,
           streamed: { messageId: undefined, index: undefined, kind: undefined },
+          subagents: new Map(),
           interrupted: false,
           tasks: new Map<string, TrackedTask>(),
           closed: false,

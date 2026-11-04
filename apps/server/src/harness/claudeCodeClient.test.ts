@@ -1157,7 +1157,7 @@ describe("outcomes", () => {
     expect(measured[1]?.contextLimit).toBe(CONTEXT_WINDOW);
   });
 
-  test("a subagent's call narrates its words and does not feed the meter", async () => {
+  test("a subagent's call narrates as its entry, its words as nothing, and does not feed the meter", async () => {
     /*
      * `forwardSubagentText: true` is pinned so that a subagent's text and thinking reach
      * the stream, and the policy gate's default answer is `allow`, so a `Task` call is
@@ -1226,15 +1226,26 @@ describe("outcomes", () => {
     ]);
     const entries = [...outcome.narrated];
 
-    // The subagent's words still narrate — that is what the forwarding option is for, and
-    // they are transcript content rather than a measurement.
+    // The subagent's words narrate nothing (A6 U14): they are not this session's agent
+    // speaking. Its call narrates as one sub-agent entry, running, and as no tool call.
     expect(
       entries.some(
         (entry) =>
           entry.detail._tag === "reply" &&
           entry.detail.text === "Subagent reporting.",
       ),
-    ).toBe(true);
+    ).toBe(false);
+    expect(
+      entries.flatMap((entry) =>
+        entry.detail._tag === "subagent"
+          ? [
+              `${entry.detail.callId} ${entry.detail.tool} ${entry.detail.status}`,
+            ]
+          : entry.detail._tag === "toolCall"
+            ? [`call ${entry.detail.callId}`]
+            : [],
+      ),
+    ).toEqual(["toolu_task Task running"]);
 
     const measured = usageOf(entries);
     // Two measurements: the main call, and the turn's top-up of that same call. The
@@ -1575,17 +1586,15 @@ describe("partial messages (A6 F8)", () => {
     expect(new Set(deltas(entries).map((piece) => piece.blockId))).toEqual(
       new Set([`${message}:0`, `${message}:1`]),
     );
-    // The subagent's thinking and `PONG` still narrate, with no id: they are not this
-    // call's blocks, though they arrived while its block 0 was open.
+    // The subagent's thinking and `PONG` narrate nothing (A6 U14), though they arrived
+    // while this call's block 0 was open; the main thread's blocks keep their ids.
     expect(blocks(entries).map((block) => [block._tag, block.blockId])).toEqual(
       [
-        ["thinking", undefined],
-        ["reply", undefined],
         ["thinking", `${message}:0`],
         ["reply", `${message}:1`],
       ],
     );
-    expect(blocks(entries)[1]?.text).toBe("PONG");
+    expect(blocks(entries).some((block) => block.text === "PONG")).toBe(false);
   });
 
   test("a reply cut by a Stop ends with the CLI's cut block, under the streamed id, then the outcome", async () => {
@@ -5577,4 +5586,295 @@ test("a real transcript's messages with files replay as the operator's, carrying
     else process.env["CLAUDE_CONFIG_DIR"] = previous;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+/* ── Sub-agents (A6 U14) ─────────────────────────────────────────────────────── */
+
+/**
+ * A real run with two sub-agents: `testdata/claude-code-subagents/`.
+ *
+ * Recorded 2026-11-04 from `@anthropic-ai/claude-agent-sdk@0.3.310` driving its bundled CLI
+ * 2.1.310 on `claude-haiku-4-5` (`includePartialMessages`, `forwardSubagentText`, no setting
+ * sources), by a throwaway probe calling `query()` directly: a conversation of two turns.
+ * The first asks for a **foreground** `Agent` (`run_in_background: false`, `Say PONG`); the
+ * second for a **background** one (`run_in_background: true`, `Say PING later`).
+ *
+ * - `frames.jsonl` — the SDK frames as the CLI sent them, in its order, except: every
+ *   `stream_event`, `rate_limit_event` and `system` frame other than `task_*` is dropped;
+ *   the session id is a fixed one; every thinking `signature` reads `sig-redacted`; local
+ *   paths are rewritten. Each sub-agent's prompt, thinking and `PONG`/`PING` arrive as
+ *   frames carrying `parent_tool_use_id`. The foreground task's `task_notification` lands
+ *   just **before** its call's result (the `[Subagent hand-back]` report); the background
+ *   call's result is the `Async agent launched` placeholder, and in this run its
+ *   sub-agent finished before the turn's `result`.
+ * - `messages.jsonl` — `getSessionMessages` read back after the run: the calls and their
+ *   results, and the background one's `<task-notification>` as a `user` entry with
+ *   `origin.kind: "task-notification"`. None of a sub-agent's own frames are in it.
+ */
+const subagentFixture = async (name: string): Promise<unknown[]> =>
+  (
+    await readFile(
+      join(import.meta.dir, "testdata", "claude-code-subagents", name),
+      "utf8",
+    )
+  )
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as unknown);
+
+describe("sub-agents, as one entry each (A6 U14)", () => {
+  const SESSION = "00000000-0000-4000-8000-0000000000f9";
+  const FOREGROUND = "toolu_017TrDc21wUaAJ83MdQSfYyo";
+  const BACKGROUND = "toolu_01L3EUzQq3pjZ222nAXXxWzz";
+
+  /** A conversation narrating `frames` until `done` says so. */
+  const narratedUntil = (
+    frames: readonly SDKMessage[],
+    done: (entry: HarnessNarration) => boolean,
+  ) =>
+    withHarness({ messages: frames }, (harness) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "bit: t",
+          model: "claude-haiku-4-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+          multiTurn: true,
+        });
+        const narration = yield* Effect.forkChild(
+          Stream.runCollect(
+            harness.sessionEvents(SESSION).pipe(Stream.takeUntil(done)),
+          ),
+        );
+        yield* harness.prompt(SESSION, "go");
+        return [...(yield* Fiber.join(narration))];
+      }),
+    );
+
+  const frames = async () =>
+    (await subagentFixture("frames.jsonl")) as SDKMessage[];
+  const transcript = async () =>
+    (await subagentFixture("messages.jsonl")) as SessionMessage[];
+
+  /** Each sub-agent state, as `<call> <status> <type> · <description>`. */
+  const states = (details: readonly { readonly _tag: string }[]) =>
+    details.flatMap((detail) =>
+      detail._tag === "subagent"
+        ? [
+            ((state: {
+              callId: string;
+              status: string;
+              agentType: string | undefined;
+              description: string;
+            }) =>
+              `${state.callId} ${state.status} ${String(state.agentType)} · ${state.description}`)(
+              detail as never,
+            ),
+          ]
+        : [],
+    );
+
+  test("live: a sub-agent's own frames narrate nothing, and each call is one entry that runs, then finishes", async () => {
+    const recorded = await frames();
+    // The fixture does hold the sub-agents' own words, nested under their calls.
+    const nested = recorded.filter(
+      (frame) =>
+        (frame as { parent_tool_use_id?: unknown }).parent_tool_use_id != null,
+    );
+    expect(nested).toHaveLength(5);
+    expect(JSON.stringify(nested)).toContain('"text":"PONG"');
+    expect(JSON.stringify(nested)).toContain('"text":"PING"');
+
+    let seen = 0;
+    const live = await narratedUntil(recorded, (entry) => {
+      if (entry.type === "result") seen += 1;
+      return seen === 2;
+    });
+    const details = live.map((entry) => entry.detail);
+
+    expect(states(details)).toEqual([
+      `${FOREGROUND} running general-purpose · Say PONG`,
+      `${FOREGROUND} finished general-purpose · Say PONG`,
+      `${BACKGROUND} running general-purpose · Say PING later`,
+      `${BACKGROUND} finished general-purpose · Say PING later`,
+    ]);
+    // Nothing a sub-agent said reaches narration: not its prompt, its thinking, `PONG` or
+    // `PING`, and not the hand-back report its call returned.
+    const words = JSON.stringify(
+      details.filter((detail) => detail._tag !== "subagent"),
+    );
+    expect(words).not.toContain("Reply with exactly the word");
+    expect(words).not.toContain("Subagent hand-back");
+    expect(
+      details.flatMap((detail) =>
+        detail._tag === "reply" || detail._tag === "thinking"
+          ? [detail.text]
+          : [],
+      ),
+    ).toEqual([
+      "",
+      "",
+      "The agent replied with:\n\n**PONG**",
+      "",
+      "",
+      "Started.",
+    ]);
+    // And neither call is also a tool call or a tool result.
+    expect(
+      details.filter(
+        (detail) =>
+          (detail._tag === "toolCall" || detail._tag === "toolResult") &&
+          (detail.callId === FOREGROUND || detail.callId === BACKGROUND),
+      ),
+    ).toEqual([]);
+    // The calling agent's model is the entry's, as on any call it made.
+    expect(
+      details.flatMap((detail) =>
+        detail._tag === "subagent" ? [detail.model] : [],
+      ),
+    ).toEqual(Array(4).fill("claude-haiku-4-5-20251001"));
+  });
+
+  test("live: a background sub-agent stays running past its turn's end, until its task's notification", async () => {
+    // The measured order for a sub-agent still working when its turn ends (2.1.310, the
+    // background-agent probe): its frames and its task's end arrive after the `result`.
+    // Made from the recording by moving them there.
+    const recorded = await frames();
+    const late = (frame: SDKMessage) =>
+      (frame as { parent_tool_use_id?: unknown }).parent_tool_use_id ===
+        BACKGROUND ||
+      (frame.type === "system" &&
+        (frame.subtype === "task_updated" ||
+          frame.subtype === "task_notification") &&
+        recorded.indexOf(frame) >
+          recorded.findIndex((each) => each.type === "result"));
+    const reordered = [
+      ...recorded.filter((frame) => !late(frame)),
+      ...recorded.filter(late),
+    ];
+    let ended = false;
+    const live = await narratedUntil(reordered, (entry) => {
+      ended =
+        entry.detail._tag === "subagent" &&
+        entry.detail.callId === BACKGROUND &&
+        entry.detail.status !== "running";
+      return ended;
+    });
+    expect(ended).toBe(true);
+    const turnEnd = live.map((entry) => entry.type).lastIndexOf("result");
+    const background = live.flatMap((entry, at) =>
+      entry.detail._tag === "subagent" && entry.detail.callId === BACKGROUND
+        ? [`${String(at > turnEnd)} ${entry.detail.status}`]
+        : [],
+    );
+    // Running when launched, nothing at the placeholder result, finished only after the
+    // turn's `result`, from the notification.
+    expect(background).toEqual(["false running", "true finished"]);
+    expect(live.at(-1)?.type).toBe("system");
+  });
+
+  test("live: a background task that failed or was stopped ends its entry so", async () => {
+    const recorded = await frames();
+    for (const [status, shown] of [
+      ["failed", "failed"],
+      ["stopped", "stopped"],
+    ] as const) {
+      const edited = recorded.map((frame) =>
+        frame.type === "system" &&
+        frame.subtype === "task_notification" &&
+        frame.tool_use_id === BACKGROUND
+          ? ({ ...frame, status } as SDKMessage)
+          : frame,
+      );
+      let seen = 0;
+      const live = await narratedUntil(edited, (entry) => {
+        if (entry.type === "result") seen += 1;
+        return seen === 2;
+      });
+      expect(states(live.map((entry) => entry.detail)).at(-1)).toBe(
+        `${BACKGROUND} ${shown} general-purpose · Say PING later`,
+      );
+    }
+  });
+
+  test("replay: the stored calls and the background one's notification are the same entries, and the notification's words are gone", async () => {
+    const entries = await withHarness(
+      { transcript: await transcript() },
+      (harness) => harness.messages(SESSION),
+    );
+    expect(states(entries.flatMap((entry) => entry.parts))).toEqual([
+      `${FOREGROUND} running general-purpose · Say PONG`,
+      `${FOREGROUND} finished general-purpose · Say PONG`,
+      `${BACKGROUND} running general-purpose · Say PING later`,
+      `${BACKGROUND} finished general-purpose · Say PING later`,
+    ]);
+    const notice = entries.at(-1);
+    expect(notice?.marker).toBe("task");
+    expect(notice?.text).toBe("");
+    const all = JSON.stringify(
+      entries.map((entry) => ({
+        text: entry.text,
+        parts: entry.parts.filter((part) => part._tag !== "subagent"),
+      })),
+    );
+    expect(all).not.toContain("Subagent hand-back");
+    expect(all).not.toContain("<task-notification>");
+  });
+
+  test("replay equals live: the same sub-agent items, through the one projection", async () => {
+    const subject = { _tag: "import", importId: "imp_1" } as const;
+    let seen = 0;
+    const live = await narratedUntil(await frames(), (entry) => {
+      if (entry.type === "result") seen += 1;
+      return seen === 2;
+    });
+    const liveItems = live.flatMap((entry, id) => {
+      const frame = projectNarration({
+        id,
+        targetId: "acme",
+        subject,
+        harnessSessionId: SESSION,
+        entry,
+      });
+      return frame?._tag === "item" ? [frame] : [];
+    });
+    const replayed = projectReplay({
+      entries: await withHarness(
+        { transcript: await transcript() },
+        (harness) => harness.messages(SESSION),
+      ),
+      subject,
+      harnessSessionId: SESSION,
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    const shape = (item: LiveItem) =>
+      Object.fromEntries(
+        Object.entries(item).filter(([key]) => key !== "id" && key !== "at"),
+      );
+    const agents = (items: readonly LiveItem[]) =>
+      items.filter((item) => item.kind === "subagent").map(shape);
+    expect(agents(liveItems)).toEqual(agents(replayed));
+    expect(agents(liveItems)[0]).toEqual({
+      _tag: "item",
+      origin: "activity",
+      sequence: null,
+      attemptId: null,
+      roundId: null,
+      goalId: null,
+      importId: "imp_1",
+      kind: "subagent",
+      headline: "general-purpose",
+      body: "Say PONG",
+      tool: "Agent",
+      toolName: "Agent",
+      input: null,
+      output: null,
+      callId: FOREGROUND,
+      outcome: "running",
+      model: "claude-haiku-4-5-20251001",
+    });
+    // And neither side draws the background notice as a `task` note.
+    expect(replayed.some((item) => item.kind === "turn.other")).toBe(false);
+  });
 });

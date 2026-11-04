@@ -668,7 +668,8 @@ type ItemBase = Pick<
 >;
 
 /**
- * One reply, thinking block, tool call or tool result as one item, or nothing — **the one
+ * One reply, thinking block, tool call, tool result or sub-agent state as one item, or
+ * nothing — **the one
  * projection live narration and a replay share** (A6 F10).
  *
  * {@link projectNarration} calls it for a live entry and {@link projectReplay} for each part
@@ -698,6 +699,21 @@ export const projectPart = (
       ? {}
       : { model: detail.model };
   switch (detail._tag) {
+    case "subagent":
+      // One state of a sub-agent; the reader keeps the newest per `callId` (`live.ts`).
+      return {
+        ...base,
+        kind: "subagent",
+        headline: detail.agentType ?? "sub-agent",
+        body: detail.description,
+        tool: detail.tool,
+        toolName: detail.tool,
+        input: null,
+        output: null,
+        callId: detail.callId,
+        outcome: detail.status,
+        ...model,
+      };
     case "reply":
       // A reply with no text is the harness closing an empty block. Nothing to show, and
       // an empty bubble would read as the agent having said nothing when it said nothing
@@ -971,6 +987,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
     case "thinking":
     case "toolCall":
     case "toolResult":
+    case "subagent":
       return projectPart(base, detail, item.subject, item.harnessSessionId);
     case "partial":
       /*
