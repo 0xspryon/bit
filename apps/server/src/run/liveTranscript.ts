@@ -670,6 +670,15 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
    * each.
    */
   const serverName = bitMcpServerName(subjectKey(item.subject));
+  /**
+   * A streamed block's id on the wire: the harness's, under the session that streamed it.
+   * The harness promises it unique within one session, and two sessions narrate onto one
+   * target's stream (an importer's and a goal's), so the session is part of it.
+   */
+  const blockKey = (blockId: string | undefined) =>
+    blockId === undefined
+      ? {}
+      : { blockId: `${item.harnessSessionId}:${blockId}` };
   const detail = item.entry.detail;
   switch (detail._tag) {
     case "reply":
@@ -689,7 +698,38 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
             output: null,
             callId: null,
             outcome: null,
+            ...blockKey(detail.blockId),
           };
+    case "partial":
+      /*
+       * A block still being written, with its whole text so far (`run/streamingCoalescer.ts`).
+       *
+       * The finished block's kind and headline, so a reader that renders it renders it as
+       * what it will be; `streaming` and the shared `blockId` are what say it is not that
+       * yet. Live only: it is on the bus and nowhere else, and `liveTranscript` sends it only
+       * to a client that asked (`live.ts`, "Partial items"). Nothing yet is nothing, as for a
+       * finished block.
+       */
+      return detail.text.trim() === ""
+        ? undefined
+        : {
+            ...base,
+            kind: detail.channel === "reply" ? "turn.reply" : "turn.thinking",
+            headline: detail.channel === "reply" ? "Reply" : "Thinking",
+            body: detail.text,
+            tool: null,
+            toolName: null,
+            input: null,
+            output: null,
+            callId: null,
+            outcome: null,
+            ...blockKey(detail.blockId),
+            streaming: true,
+          };
+    case "delta":
+      // A piece of a block: never on the wire itself. Where it is wanted, the coalescer has
+      // already made it a `partial`; anywhere else it is as good as `opaque`.
+      return undefined;
     case "toolCall":
       return {
         ...base,
@@ -757,6 +797,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
             output: null,
             callId: null,
             outcome: null,
+            ...blockKey(detail.blockId),
           };
     case "usage":
       /*
@@ -917,6 +958,11 @@ export interface LiveTranscriptInput {
   ) => Effect.Effect<string | undefined>;
   /** Where to resume. Absent means {@link LIVE_REPLAY_BUDGET} back from the end. */
   readonly cursor?: number | undefined;
+  /**
+   * Send partial items (`streaming: true`) of blocks still being written. Off unless the
+   * client asked: `live.ts`, "Partial items", says why a tab that did not ask gets none.
+   */
+  readonly partials?: boolean | undefined;
   /** Overridable so a test does not wait a real second. */
   readonly sweep?: Duration.Input | undefined;
   readonly heartbeat?: Duration.Input | undefined;
@@ -950,13 +996,17 @@ export const liveTranscript = (
   const budget = input.replayBudget ?? LIVE_REPLAY_BUDGET;
   const sweep = input.sweep ?? LIVE_SWEEP;
   const heartbeat = input.heartbeat ?? LIVE_HEARTBEAT;
+  const partials = input.partials === true;
 
   const activity = Stream.merge(
     input.narrations.subscribe({ targetId: input.targetId }).pipe(
       Stream.filterMap(
         Filter.make((item: RunNarration) => {
           const projected = projectNarration(item);
-          return projected === undefined
+          return projected === undefined ||
+            (!partials &&
+              projected._tag === "item" &&
+              projected.streaming === true)
             ? Result.fail(item)
             : Result.succeed(projected);
         }),

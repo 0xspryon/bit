@@ -73,7 +73,7 @@ import {
   type GoalUploadsAccepted,
   type SteerUrgency,
 } from "@bit/contracts";
-import { Context, Effect, Layer, Stream, type Duration } from "effect";
+import { Context, Effect, Layer, type Duration } from "effect";
 
 import {
   closeSync,
@@ -121,6 +121,7 @@ import {
 import { POLICY_AUDIT_FILE } from "../policy/install";
 import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
+import { narrateCoalesced } from "../run/streamingCoalescer";
 import { WorkerEndpoints } from "../run/supervisor";
 import {
   assembleGoalFollowUpPrompt,
@@ -615,15 +616,19 @@ const make = Effect.fnUntraced(function* () {
     readonly goalId: string;
     readonly sessionId: string;
   }) {
+    // Block deltas coalesced into partial updates for the live chat, and published
+    // nowhere else (`run/streamingCoalescer.ts`).
     const outcome = yield* Effect.result(
-      Stream.runForEach(input.harness.sessionEvents(input.sessionId), (entry) =>
-        narrations.publish({
-          targetId: input.targetId,
-          subject: { _tag: "goal", goalId: input.goalId },
-          harnessSessionId: input.sessionId,
-          entry,
-        }),
-      ),
+      narrateCoalesced({
+        events: input.harness.sessionEvents(input.sessionId),
+        publish: (entry) =>
+          narrations.publish({
+            targetId: input.targetId,
+            subject: { _tag: "goal", goalId: input.goalId },
+            harnessSessionId: input.sessionId,
+            entry,
+          }),
+      }),
     );
     if (outcome._tag === "Failure") {
       yield* Effect.logWarning(

@@ -60,6 +60,7 @@ import { continuationMessage } from "../recovery/continuation";
 import { ScopeImporter, type ScopeImportRequest } from "./scopeImporter";
 import type {
   AgentHarness,
+  HarnessNarration,
   McpRegistration,
   PromptDelivery,
 } from "../harness/agentHarness";
@@ -166,6 +167,18 @@ const NARRATION = [
 ] as const;
 
 /**
+ * {@link NARRATION}'s first line in the pieces a streaming driver delivers it in (A6 F6).
+ * The first piece alone is a text no finished block ever says, so finding it anywhere
+ * durable would mean a partial was stored.
+ */
+const STREAMED_PIECES = [
+  "Let me sta",
+  "rt by looking",
+  " at the first page.",
+] as const;
+const STREAMED_BLOCK = "msg_stream:0";
+
+/**
  * The last thing the scripted session says, which is its closing report.
  *
  * Distinct from the narration above in both content and route: this arrives through
@@ -228,6 +241,11 @@ interface Script {
   readonly streamsEnded: { sessionId: string; unregisteredAt: number }[];
   /** Makes the narration stream fail once it has said its lines, as a dropped stream does. */
   failEvents: boolean;
+  /**
+   * Streams the first line as {@link STREAMED_PIECES} deltas before its finished block, as
+   * a driver that streams does (A6 F6).
+   */
+  streamBlocks: boolean;
   /** Resolves once the scripted session has finished making its calls. */
   done: Promise<void>;
   /** Makes `createSession` fail, for a session that never opens. */
@@ -300,6 +318,7 @@ const newScript = (readable: readonly string[]): Script => {
     subscribed: [],
     streamsEnded: [],
     failEvents: false,
+    streamBlocks: false,
     done: Promise.resolve(),
     failCreate: false,
     failPrompt: false,
@@ -539,15 +558,32 @@ const scriptedHarness = (script: Script) => {
      */
     sessionEvents: (sessionId) =>
       Stream.concat(
-        Stream.fromArray(
-          NARRATION.map((text, at) => ({
+        Stream.fromArray([
+          ...(script.streamBlocks
+            ? STREAMED_PIECES.map((text): HarnessNarration => ({
+                type: "stream_event",
+                sequence: undefined,
+                at: 1_700_000_000_000,
+                outcome: undefined,
+                detail: {
+                  _tag: "delta",
+                  blockId: STREAMED_BLOCK,
+                  channel: "reply",
+                  text,
+                },
+              }))
+            : []),
+          ...NARRATION.map((text, at): HarnessNarration => ({
             type: "assistant",
             sequence: at,
             at: 1_700_000_000_000 + at,
             outcome: undefined,
-            detail: { _tag: "reply" as const, text },
+            detail:
+              script.streamBlocks && at === 0
+                ? { _tag: "reply", text, blockId: STREAMED_BLOCK }
+                : { _tag: "reply", text },
           })),
-        ),
+        ]),
         Stream.suspend(() =>
           script.failEvents
             ? Stream.fail(
@@ -685,6 +721,8 @@ const importWith = async (
     readonly agent?: ScopeImportRequest["agent"];
     /** Makes the narration stream fail after its lines. See `Script.failEvents`. */
     readonly failEvents?: boolean;
+    /** Streams the first line as deltas first. See `Script.streamBlocks`. */
+    readonly streamBlocks?: boolean;
     /**
      * Runs once the runtime exists and before the import starts: where a test subscribes
      * to the narration bus, which replays nothing to a late subscriber.
@@ -698,6 +736,7 @@ const importWith = async (
   built.script.failCreate = options.failCreate === true;
   built.script.failPrompt = options.failPrompt === true;
   built.script.failEvents = options.failEvents === true;
+  built.script.streamBlocks = options.streamBlocks === true;
   const runtime = ManagedRuntime.make(built.layer);
   if (options.beforeStart !== undefined) await options.beforeStart(runtime);
   const outcome = await runtime.runPromise(
@@ -1194,6 +1233,53 @@ describe("the importer narrates to the chat", () => {
       roundId: null,
       goalId: null,
     });
+    await runtime.dispose();
+  });
+
+  test("a streamed block is published as partials and its finished block, and stored nowhere", async () => {
+    /*
+     * A6 F6. The deltas reach the bus coalesced — the first piece at once, the rest held and
+     * flushed by the block's end, before the finished block — and never as themselves. And
+     * no partial is anywhere durable: not the event log, not the import's own row.
+     */
+    // Four entries, unless this machine stalled 50 ms between two pieces, which publishes
+    // the middle one too: so the partials are read up to the finished block, not counted.
+    const narration = collectNarration(4);
+    const { runtime, started, view } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      streamBlocks: true,
+      beforeStart: narration.beforeStart,
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const items = await narration.taken();
+    const details = items.map((item) => item.entry.detail);
+    const finished = details.findIndex((detail) => detail._tag === "reply");
+    const partials = details.slice(0, finished);
+    expect(partials.every((detail) => detail._tag === "partial")).toBe(true);
+    const texts = partials.map((detail) =>
+      detail._tag === "partial" ? detail.text : "",
+    );
+    // The first piece at once; the whole block, flushed by its end, last.
+    expect(texts[0]).toBe(STREAMED_PIECES[0]);
+    expect(texts.at(-1)).toBe(NARRATION[0]);
+    // Each is the whole text so far, never a piece.
+    expect(texts.every((text) => NARRATION[0].startsWith(text))).toBe(true);
+    expect(details[finished]).toEqual({
+      _tag: "reply",
+      text: NARRATION[0],
+      blockId: STREAMED_BLOCK,
+    });
+    expect(details.some((detail) => detail._tag === "delta")).toBe(false);
+    expect(items.every((item) => item.subject._tag === "import")).toBe(true);
+
+    const events = await runtime.runPromise(
+      Effect.flatMap(TargetStores, (stores) =>
+        withTargetStore(stores, TARGET, (store) => store.eventsAfter(0, 1_000)),
+      ),
+    );
+    expect(JSON.stringify(events)).not.toContain(STREAMED_PIECES[0]);
+    expect(JSON.stringify(events)).not.toContain(STREAMED_PIECES[1]);
+    expect(JSON.stringify(view)).not.toContain(STREAMED_PIECES[0]);
     await runtime.dispose();
   });
 

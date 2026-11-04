@@ -2309,13 +2309,21 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
      * there. A negative or fractional value is clamped rather than refused — it can only
      * ask for *more* history than exists, which reads from the beginning.
      *
+     * `partials=1` asks for the partial items of a block still being written
+     * ({@link LiveItem.streaming}); without it none are sent, which is what keeps a tab one
+     * deploy behind — which would show each as a reply of its own — seeing exactly what it
+     * always did. `live.ts` says how a client applies them.
+     *
      * The refusals are the same three the rest of this target's routes give, from the same
      * check, because watching a target is reading it: a stream that opened against a
      * target the rail says is unavailable would be the one place those two disagree.
      */
     HttpApiEndpoint.get("live", "/targets/:targetId/live", {
       params: { targetId: Schema.String },
-      query: { cursor: Schema.optional(Schema.FiniteFromString) },
+      query: {
+        cursor: Schema.optional(Schema.FiniteFromString),
+        partials: Schema.optional(Schema.Literal("1")),
+      },
       success: HttpApiSchema.StreamSse({ data: LiveFrame }),
       error: [TargetNotFound, TargetUnavailable],
     }),

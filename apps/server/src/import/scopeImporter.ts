@@ -138,7 +138,6 @@ import {
   Fiber,
   Layer,
   Semaphore,
-  Stream,
   type Duration,
 } from "effect";
 
@@ -179,6 +178,7 @@ import { newImportId } from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
+import { narrateCoalesced } from "../run/streamingCoalescer";
 import { WorkerEndpoints } from "../run/supervisor";
 
 /**
@@ -733,17 +733,19 @@ export class ScopeImporter extends Context.Service<
         readonly importId: string;
         readonly sessionId: string;
       }) {
+        // Block deltas coalesced into partial updates for the live chat, and published
+        // nowhere else (`run/streamingCoalescer.ts`).
         const outcome = yield* Effect.result(
-          Stream.runForEach(
-            input.harness.sessionEvents(input.sessionId),
-            (entry) =>
+          narrateCoalesced({
+            events: input.harness.sessionEvents(input.sessionId),
+            publish: (entry) =>
               narrations.publish({
                 targetId: input.targetId,
                 subject: { _tag: "import", importId: input.importId },
                 harnessSessionId: input.sessionId,
                 entry,
               }),
-          ),
+          }),
         );
         if (outcome._tag === "Failure") {
           yield* Effect.logWarning(

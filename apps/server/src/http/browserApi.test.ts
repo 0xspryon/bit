@@ -2218,6 +2218,67 @@ describe("the live transcript's activity channel, on the wire", () => {
     expect(activityOf(live.frames)[0]?.body).toBe("Probing the limiter.");
   });
 
+  test("a partial reaches only a client that asked for partials, and the finished block both", async () => {
+    // A6 F6: a tab one deploy behind would show each partial as a reply of its own, so it is
+    // sent none; a tab that asks (`partials=1`) gets the partial, keyed to its block.
+    const during = async () => {
+      await connectionSubscribed(narrationSubscribers);
+      await publish({
+        type: "bit.partial",
+        detail: {
+          _tag: "partial",
+          blockId: "b1",
+          channel: "reply",
+          text: "Probing the",
+        },
+      });
+      await publish({
+        type: "session.text.ended",
+        detail: { _tag: "reply", text: "Probing the limiter.", blockId: "b1" },
+      });
+    };
+    const finished = (frames: readonly LiveFrame[]) =>
+      activityOf(frames).some(
+        (item) => item.kind === "turn.reply" && item.streaming === undefined,
+      );
+
+    await quietBuses();
+    const plain = await liveFrames(
+      `/targets/${targetId}/live?cursor=99`,
+      finished,
+      during,
+    );
+    await quietBuses();
+    const asked = await liveFrames(
+      `/targets/${targetId}/live?cursor=99&partials=1`,
+      finished,
+      during,
+    );
+
+    const view = (frames: readonly LiveFrame[]) =>
+      activityOf(frames).map((item) => [
+        item.body,
+        item.streaming ?? false,
+        item.blockId ?? null,
+        item.sequence,
+      ]);
+    const block = `${SUPERVISED.harnessSessionId}:b1`;
+    expect(view(plain.frames)).toEqual([
+      ["Probing the limiter.", false, block, null],
+    ]);
+    expect(view(asked.frames)).toEqual([
+      ["Probing the", true, block, null],
+      ["Probing the limiter.", false, block, null],
+    ]);
+  });
+
+  test("a partials value other than 1 is refused, not read as yes", async () => {
+    const refused = await read(
+      await signedIn(`/targets/${targetId}/live?partials=yes`),
+    );
+    expect(refused.status).toBe(400);
+  });
+
   test("a refused action reaches the browser, attributed to the run holding its session", async () => {
     await quietBuses();
     const live = await liveFrames(

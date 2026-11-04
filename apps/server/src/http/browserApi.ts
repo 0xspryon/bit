@@ -2734,6 +2734,8 @@ const fleetHandlers = HttpApiBuilder.group(
                       )?.attemptId,
                   ),
                 ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
+                // Only a client that asked: `live.ts`, "Partial items".
+                partials: query.partials === "1",
                 // Both default inside `liveTranscript`; an installation passes neither.
                 ...(config.liveHeartbeat === undefined
                   ? {}

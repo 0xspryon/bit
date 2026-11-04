@@ -47,6 +47,35 @@
  * unique within one server run and meaningless outside it; there is no replay on that
  * channel, so there is nothing for it to collide with.
  *
+ * ## Partial items: a block while it is being written
+ *
+ * A reply or a thinking block can be shown while the agent is still writing it (A6 F6). The
+ * server sends **partial** items for it — `turn.reply` or `turn.thinking` like the finished
+ * block, with {@link LiveItem.streaming} `true` and the **whole text so far** in `body`,
+ * never a piece of it — at most one per block every ~50 ms, and then the finished block,
+ * which has no `streaming`. All of them carry the same {@link LiveItem.blockId}.
+ *
+ * How a client applies them:
+ *
+ * - A partial **replaces** whatever the client shows for its `blockId`, or is shown new.
+ *   Its `id` is that frame's own (`activity:<n>`, like any narration item) and identifies
+ *   nothing else, so a client must not let it hide the next partial or the finished block.
+ * - The finished block **replaces** the partial with its `blockId`, and no partial for that
+ *   block follows it.
+ * - Partials are lossy twice over and a client must not mind: the server coalesces, and the
+ *   bus drops the oldest frames for a reader that is behind. Each carries all the text so
+ *   far, so a missed one costs nothing once the next one, or the finished block, arrives.
+ * - **Partials are never stored and never replayed.** They carry `sequence: null` and move
+ *   no cursor. A reconnect, or a reload, catches up from finished blocks only, so a block
+ *   still being written then shows nothing until it ends. A partial whose finished block
+ *   never comes — a turn cut off mid-block — stays as last sent until the client drops it.
+ *
+ * **A client asks for partials** (`partials=1` on the live endpoint) and gets none
+ * otherwise. That is the forward-compatibility rule for this one feature: a tab one deploy
+ * behind deduplicates by `id` and would show every partial as a reply of its own, so it is
+ * sent exactly the frames it always was. A tab that receives one anyway still decodes it —
+ * both fields are optional keys, and a struct that does not know them ignores them.
+ *
  * Browser-safe: Effect Schema and `effect/http-api` only.
  */
 import { Schema } from "effect";
@@ -475,6 +504,22 @@ export const LiveItem = Schema.Struct({
    * nothing" into the same word.
    */
   outcome: Schema.NullOr(Schema.String),
+  /**
+   * Which streamed block this item is, on a `turn.reply` or `turn.thinking` that was
+   * streamed: shared by the block's partial updates and its finished block, and the key a
+   * client replaces by (this module's header). An opaque string — compare it, never parse
+   * it. Absent on everything else, including a finished block nothing streamed.
+   *
+   * An optional key rather than a `null` field like the rest, so a frame from a build
+   * without it, and a stored fixture, still decode.
+   */
+  blockId: Schema.optionalKey(Schema.String),
+  /**
+   * `true` on a **partial** item: the block is still being written and `body` is its text
+   * so far. Absent on the finished block and on every other item. See this module's header
+   * for how a client applies one; it is never stored and never replayed.
+   */
+  streaming: Schema.optionalKey(Schema.Literal(true)),
 });
 export type LiveItem = typeof LiveItem.Type;
 

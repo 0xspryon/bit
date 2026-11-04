@@ -372,7 +372,15 @@ export type NarrationDetail =
       readonly _tag: "reply";
       /** One complete block of assistant text, never a token delta. */
       readonly text: string;
+      /**
+       * The harness's id for this block, when it streamed the block as {@link BlockDelta}s
+       * first. The finished block **ends** that block's partial updates and replaces them on
+       * a screen (`run/streamingCoalescer.ts`). Absent on a block nothing streamed.
+       */
+      readonly blockId?: string | undefined;
     }
+  | BlockDelta
+  | BlockPartial
   | {
       readonly _tag: "toolCall";
       /** The harness's own id for this call, so a result can be matched to it. */
@@ -421,6 +429,8 @@ export type NarrationDetail =
       readonly _tag: "thinking";
       /** The block's text, capped by {@link NARRATION_FIELD_MAX}. May be empty. */
       readonly text: string;
+      /** As on `reply`: the streamed block this finishes, if it was streamed. */
+      readonly blockId?: string | undefined;
     }
   | {
       /**
@@ -497,6 +507,52 @@ export type NarrationDetail =
       readonly compactionAt: number | undefined;
     }
   | { readonly _tag: "opaque" };
+
+/** Which kind of block a streamed piece of text belongs to: a reply, or thinking. */
+export type BlockChannel = "reply" | "thinking";
+
+/**
+ * A piece of a reply or thinking block **while it is being written** — a token delta.
+ *
+ * Produced by a driver that streams (A6 F7 and F8 make OpenCode's `session.text.delta` /
+ * reasoning deltas and Claude Code's `text_delta` / `thinking_delta` into these). It is
+ * never shown as it is: the importer and goal conversations hand it to
+ * `run/streamingCoalescer.ts`, which turns a block's pieces into at most one
+ * {@link BlockPartial} per ~50 ms carrying the block's whole text so far. Anywhere else —
+ * a worker's attempt, a planner round — it is projected as nothing, like `opaque`.
+ *
+ * The block ends with the finished `reply` or `thinking` carrying the same
+ * {@link blockId}. A delta after that is late and is dropped.
+ */
+export interface BlockDelta {
+  readonly _tag: "delta";
+  /**
+   * The harness's own id for the block, stable from its first piece to the finished block:
+   * an OpenCode text or reasoning part's id, a Claude Code message id with the block's
+   * index. Unique within one session.
+   */
+  readonly blockId: string;
+  readonly channel: BlockChannel;
+  /** The new text only, appended to what the block already holds. */
+  readonly text: string;
+}
+
+/**
+ * A block's **whole text so far**, as the coalescer publishes it — never produced by a
+ * harness driver.
+ *
+ * The full text rather than the piece, so a reader that missed an update (the bus is a
+ * sliding buffer) loses nothing but an intermediate frame: the next one carries all of it.
+ * Capped by {@link NARRATION_FIELD_MAX}, as the finished block will be. **Live only**:
+ * published on the narration bus for the live stream, never written anywhere, and gone
+ * once the finished block replaces it.
+ */
+export interface BlockPartial {
+  readonly _tag: "partial";
+  readonly blockId: string;
+  readonly channel: BlockChannel;
+  readonly text: string;
+}
 
 /**
  * What one session's model takes, as the two numbers a context meter needs.

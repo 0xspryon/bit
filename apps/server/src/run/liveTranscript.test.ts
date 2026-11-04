@@ -28,8 +28,9 @@ import { join } from "node:path";
 import {
   bitMcpServerName,
   claudeCodeToolName,
+  LiveFrame,
+  LiveItem as LiveItemSchema,
   openCodeToolName,
-  type LiveFrame,
   type LiveItem,
   type RecordedEvent,
 } from "@bit/contracts";
@@ -39,7 +40,9 @@ import {
   Fiber,
   Layer,
   Queue,
+  Schema,
   Stream,
+  Struct,
   type Scope,
 } from "effect";
 
@@ -1154,6 +1157,119 @@ describe("projecting live activity", () => {
     ).toBeUndefined();
   });
 
+  test("a partial is its block's kind, streaming, with the block's id under its session", () => {
+    // A6 F6: the whole text so far, and the id the finished block will share.
+    const partial = projectedItem(
+      narration({
+        _tag: "partial",
+        blockId: "msg_1:0",
+        channel: "reply",
+        text: "I will probe",
+      }),
+    );
+    const finished = projectedItem(
+      narration(
+        {
+          _tag: "reply",
+          text: "I will probe the limiter.",
+          blockId: "msg_1:0",
+        },
+        { id: 2 },
+      ),
+    );
+    const thinking = projectedItem(
+      narration({
+        _tag: "partial",
+        blockId: "msg_1:1",
+        channel: "thinking",
+        text: "Per-IP?",
+      }),
+    );
+    expect(partial).toMatchObject({
+      kind: "turn.reply",
+      headline: "Reply",
+      body: "I will probe",
+      streaming: true,
+      blockId: "ses_abc:msg_1:0",
+      origin: "activity",
+      sequence: null,
+      id: "activity:1",
+    });
+    // The finished block shares the block id and is not streaming: it replaces the partial.
+    expect(finished?.blockId).toBe(partial?.blockId);
+    expect(finished?.streaming).toBeUndefined();
+    expect(finished?.id).toBe("activity:2");
+    expect(thinking).toMatchObject({
+      kind: "turn.thinking",
+      headline: "Thinking",
+      streaming: true,
+    });
+    // A block nothing streamed carries neither field, so an old reader sees what it did.
+    const plain = projectedItem(narration({ _tag: "reply", text: "Done." }));
+    expect(plain !== undefined && "blockId" in plain).toBe(false);
+    expect(plain !== undefined && "streaming" in plain).toBe(false);
+  });
+
+  test("a delta is never on the wire, and an empty partial is nothing", () => {
+    expect(
+      projectedItem(
+        narration({
+          _tag: "delta",
+          blockId: "b1",
+          channel: "reply",
+          text: "I will",
+        }),
+      ),
+    ).toBeUndefined();
+    expect(
+      projectedItem(
+        narration({
+          _tag: "partial",
+          blockId: "b1",
+          channel: "reply",
+          text: " ",
+        }),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("a partial decodes, and a reader one deploy behind reads it as an ordinary reply", () => {
+    const partial = projectedItem(
+      narration({
+        _tag: "partial",
+        blockId: "b1",
+        channel: "reply",
+        text: "I will probe",
+      }),
+    );
+    // Through the wire's own encoding and back, as the browser decodes a frame.
+    const wire = JSON.parse(
+      JSON.stringify(Schema.encodeUnknownSync(LiveFrame)(partial)),
+    ) as unknown;
+    expect(Schema.decodeUnknownSync(LiveFrame)(wire)).toEqual(
+      partial as LiveItem,
+    );
+    // The item as a build without the two fields declares it: they are ignored, not refused.
+    const Before = Schema.Struct(
+      Struct.omit(LiveItemSchema.fields, ["blockId", "streaming"]),
+    );
+    const old = Schema.decodeUnknownSync(Before)(wire);
+    expect(old.kind).toBe("turn.reply");
+    expect(old.body).toBe("I will probe");
+    // A frame from a build without them still decodes on this one.
+    const older = Struct.omit(wire as Record<string, unknown>, [
+      "blockId",
+      "streaming",
+    ]);
+    expect(
+      Schema.decodeUnknownSync(LiveItemSchema)(older).streaming,
+    ).toBeUndefined();
+    // `streaming` is only ever `true`: absence, not `false`, is "finished".
+    expect(() =>
+      Schema.decodeUnknownSync(LiveItemSchema)({ ...older, streaming: false }),
+    ).toThrow();
+  });
+
   test("a usage entry is a frame of its own, not a row in the transcript", () => {
     /*
      * A measurement about the session rather than a turn in it. If this were an item it
@@ -1538,6 +1654,55 @@ describe("the record and live activity, together", () => {
         .filter((item) => item.origin === "record")
         .every((item) => item.sequence !== null),
     ).toBe(true);
+  });
+
+  test("partials reach only a stream that asked, and move no cursor", async () => {
+    // A6 F6. The record's cursor frames are the same with partials as without: a partial
+    // has no position, so a reconnect resumes exactly where it would have.
+    const streamed = narrationsFrom([
+      narration({
+        _tag: "partial",
+        blockId: "b1",
+        channel: "reply",
+        text: "Starting",
+      }),
+      narration({ _tag: "reply", text: "Starting.", blockId: "b1" }, { id: 2 }),
+    ]);
+    const read = (partials: boolean) =>
+      withStore(newDatabasePath(), (store) =>
+        Effect.gen(function* () {
+          yield* seed(store);
+          return yield* Effect.promise(() =>
+            framesUntil(
+              over(store, { cursor: 0, narrations: streamed, partials }),
+              (collected) =>
+                items(collected).some(
+                  (item) =>
+                    item.body === "Starting." && item.origin === "activity",
+                ) && caughtUp(collected),
+            ),
+          );
+        }),
+      );
+    const without = await read(false);
+    const asked = await read(true);
+    const activity = (frames: readonly LiveFrame[]) =>
+      items(frames)
+        .filter((item) => item.origin === "activity")
+        .map((item) => [item.body, item.streaming ?? false, item.sequence]);
+    expect(activity(without)).toEqual([["Starting.", false, null]]);
+    expect(activity(asked)).toEqual([
+      ["Starting", true, null],
+      ["Starting.", false, null],
+    ]);
+    const cursors = (frames: readonly LiveFrame[]) =>
+      frames.flatMap((frame) =>
+        frame._tag === "cursor" ? [frame.sequence] : [],
+      );
+    expect(cursors(asked)).toEqual(cursors(without));
+    expect(records(asked).map((item) => item.id)).toEqual(
+      records(without).map((item) => item.id),
+    );
   });
 
   test("another target's narration does not appear", async () => {
