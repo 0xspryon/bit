@@ -1413,13 +1413,37 @@ const isLocalCommandEntry = (entry: SessionMessage): boolean =>
     .isCompletedLocalCommand === true;
 
 /**
+ * What a `user` entry's text blocks mark, for an entry the CLI wrote itself.
+ *
+ * **Told by the content's shape, because nothing else survives the read.** Every message
+ * this server sends is string content ({@link userMessage}), and the CLI stores it as a
+ * string with `promptSource: "sdk"`; the CLI's own note in the user's role is a **list** of
+ * `text` blocks with no `promptSource`. Measured on 2.1.310 after a Stop that cut a `Bash`
+ * call: the `tool_result` refusing the call, then a separate `user` entry
+ * `[{type: "text", text: "[Request interrupted by user for tool use]"}]`
+ * (`testdata/claude-code-transcript/interrupted-tool.cli.jsonl`). SDK 0.3.310's
+ * `getSessionMessages` drops `promptSource`, so the shape is the one discriminator left —
+ * and a `tool_result` list has no top-level `text` block, so it never reaches here.
+ *
+ * The interrupt notes (`… for tool use`, and the plain one a cut reply gets) are
+ * `interrupted`. Any other text the CLI stores there is labelled as the harness's, which is
+ * all that can honestly be said of it: it is not the operator's.
+ */
+const cliMarker = (text: string): string =>
+  text.trimStart().startsWith("[Request interrupted by user")
+    ? "interrupted"
+    : "Claude Code";
+
+/**
  * The stored transcript as {@link MessageEntry}s, each with its parts (A6 F10).
  *
  * **Parts as the stream narrated them.** An `assistant` entry's blocks go through
  * {@link assistantParts} and a `user` entry's `tool_result`s through {@link userParts},
  * the two functions {@link narrate} reads live frames with, so a replay is the live
  * conversation's own items. A `user` entry whose content is a string is the words sent —
- * the operator's, under whatever framing the caller trims — and has no parts.
+ * the operator's, under whatever framing the caller trims — and has no parts. One whose
+ * content is a list of `text` blocks is the CLI's own note, and carries a `marker`
+ * ({@link cliMarker}).
  *
  * **A finished block gets the `blockId` it streamed under**, when the transcript lets this
  * name it: the CLI writes one entry per content block of a call (the split the stream
@@ -1451,21 +1475,29 @@ const flattenTranscript = (
     if (callId !== undefined) blocksSeen.set(callId, first + blocks.length);
     const stamp = (entry as { readonly timestamp?: unknown }).timestamp;
     const at = typeof stamp === "string" ? Date.parse(stamp) : Number.NaN;
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : blocks
+            .filter(
+              (part): part is { type: string; text: string } =>
+                typeof part === "object" &&
+                part !== null &&
+                (part as { type?: unknown }).type === "text" &&
+                typeof (part as { text?: unknown }).text === "string",
+            )
+            .map((part) => part.text)
+            .join("\n");
+    const marker =
+      entry.type === "user" &&
+      typeof message.content !== "string" &&
+      text.trim() !== ""
+        ? cliMarker(text)
+        : undefined;
     return {
       type: entry.type,
-      text:
-        typeof message.content === "string"
-          ? message.content
-          : blocks
-              .filter(
-                (part): part is { type: string; text: string } =>
-                  typeof part === "object" &&
-                  part !== null &&
-                  (part as { type?: unknown }).type === "text" &&
-                  typeof (part as { text?: unknown }).text === "string",
-              )
-              .map((part) => part.text)
-              .join("\n"),
+      text,
+      ...(marker === undefined ? {} : { marker }),
       // The stored transcript carries no error channel of its own; a failure arrives as a
       // `result` message on the live stream and is settled from there. Reporting
       // `undefined` is the honest answer rather than scraping text for the word "error".
@@ -2307,8 +2339,10 @@ export const claudeCodeHarness = (
                    * pays that break once, on its first turn.
                    *
                    * `extraArgs` is an untyped passthrough onto the CLI's argv: nothing checks
-                   * the flag's name or its value, so re-check `claude --help` for
-                   * `--thinking-display` on every CLI upgrade.
+                   * the flag's name or its value. `claude --help` does not list
+                   * `--thinking-display` (2.1.310 accepts it in its argument parser without
+                   * documenting it), so the only check on a CLI upgrade is a real run: a
+                   * multi-turn session's thinking blocks must still carry words.
                    */
                   ...(record.multiTurn
                     ? { extraArgs: { "thinking-display": "summarized" } }

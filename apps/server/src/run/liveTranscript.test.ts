@@ -51,10 +51,16 @@ import {
   projectDecision,
   projectEvent,
   projectNarration,
+  projectReplay,
   type LiveTranscriptInput,
 } from "./liveTranscript";
 import { RunNarrations, type RunNarration } from "./narration";
-import type { NarrationDetail } from "../harness/agentHarness";
+import {
+  NARRATION_FIELD_MAX,
+  NARRATION_TRUNCATED_MARK,
+  type MessageEntry,
+  type NarrationDetail,
+} from "../harness/agentHarness";
 import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
 import { FleetStore } from "../persistence/fleet";
 import { AWKWARD_TEXT, multiCaseInput } from "../persistence/fixtures";
@@ -605,6 +611,8 @@ describe("projecting the record", () => {
       "entry scope_1 created · in · subtree · acme.com and every subdomain",
     );
     expect(made.outcome).toBe("new");
+    // The id its call's result names as `entry_id`, so a chat joins them by content.
+    expect(made.writeId).toBe("scope_1");
 
     // A no-op add has a record too, and it must not read as an addition.
     const again = entry({ created: false });
@@ -612,6 +620,7 @@ describe("projecting the record", () => {
       "already in scope as entry scope_1 · in · subtree · acme.com and every subdomain · nothing changed",
     );
     expect(again.outcome).toBe("known");
+    expect(again.writeId).toBe("scope_1");
 
     // An event written before `created` existed was always a real addition.
     expect(entry({}).outcome).toBe("new");
@@ -645,6 +654,7 @@ describe("projecting the record", () => {
           intentId: null,
           attemptId: null,
           operation: "import_asset",
+          operationId: "op-asset-1",
           subjectId: "asset_1",
           payload: {
             assetId: "asset_1",
@@ -664,6 +674,8 @@ describe("projecting the record", () => {
       "app.acme.com recorded as a new host asset · read off https://hackerone.test/acme",
     );
     expect(made.outcome).toBe("new");
+    // The `operation_id` its call was sent with — not the asset, which two calls can share.
+    expect(made.writeId).toBe("op-asset-1");
     const known = asset(false);
     expect(known.body).toContain("already on the estate");
     expect(known.outcome).toBe("known");
@@ -678,6 +690,7 @@ describe("projecting the record", () => {
     );
     expect(item.kind).toBe("intent.added");
     expect(item.body).toBe("Probe the account limiter.");
+    expect("writeId" in item).toBe(false);
   });
 
   test("a goal being added reads as its objective, with no attempt borrowed from its subject", () => {
@@ -2059,5 +2072,71 @@ describe("what a live connection borrows", () => {
     expect(timeline.both).toEqual([TARGET]);
     expect(timeline.stillHeld).toEqual([TARGET]);
     expect(timeline.after).toEqual([]);
+  });
+});
+
+/* ── The replay's own bodies (A6 F10 review) ─────────────────────────────────── */
+
+describe("projecting a replay", () => {
+  const long = "x".repeat(NARRATION_FIELD_MAX * 3);
+  const entry = (over: Partial<MessageEntry>): MessageEntry => ({
+    type: "user",
+    text: "",
+    error: undefined,
+    parts: [],
+    model: undefined,
+    at: 1,
+    ...over,
+  });
+  const replay = (
+    entries: readonly MessageEntry[],
+    users: "operator" | "other" = "operator",
+  ) =>
+    projectReplay({
+      entries,
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_1",
+      users,
+      fallbackAt: 0,
+    }).items;
+  const capped = (body: string | undefined) =>
+    body !== undefined &&
+    body.length === NARRATION_FIELD_MAX + NARRATION_TRUNCATED_MARK.length &&
+    body.endsWith(NARRATION_TRUNCATED_MARK);
+
+  test("every body a stored entry supplies is capped as a live part's is, and says so", () => {
+    const items = replay([
+      entry({ text: long }),
+      entry({ type: "system", text: long }),
+      entry({ type: "assistant", text: long }),
+      entry({ type: "assistant", error: long }),
+    ]);
+    expect(
+      items.map((item) => [item.kind, item.headline, capped(item.body)]),
+    ).toEqual([
+      ["turn.operator", "You", true],
+      ["turn.other", "system", true],
+      ["turn.reply", "Reply", true],
+      ["turn.other", "error", true],
+    ]);
+    // A planner round's `user` entry, the other way a `user` entry is drawn.
+    expect(capped(replay([entry({ text: long })], "other")[0]?.body)).toBe(
+      true,
+    );
+    // And a short one is untouched.
+    expect(replay([entry({ text: "add acme.com" })])[0]?.body).toBe(
+      "add acme.com",
+    );
+  });
+
+  test("a user entry the harness wrote itself is drawn as what it marks, never as the operator", () => {
+    const note = "[Request interrupted by user for tool use]";
+    for (const users of ["operator", "other"] as const) {
+      expect(
+        replay([entry({ text: note, marker: "interrupted" })], users).map(
+          (item) => [item.kind, item.headline, item.body],
+        ),
+      ).toEqual([["turn.other", "interrupted", note]]);
+    }
   });
 });

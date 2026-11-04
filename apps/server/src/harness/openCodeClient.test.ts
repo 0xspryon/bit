@@ -2605,8 +2605,10 @@ const storedMessages = async (): Promise<unknown[]> =>
   ) as unknown[];
 
 describe("a session's stored messages, as the live stream's parts (A6 F10)", () => {
-  const read = async (): Promise<readonly MessageEntry[]> => {
-    const stored = await storedMessages();
+  const read = async (
+    edit: (stored: unknown[]) => unknown[] = (stored) => stored,
+  ): Promise<readonly MessageEntry[]> => {
+    const stored = edit(await storedMessages());
     let served = false;
     const { layer } = clientWith((url) => {
       if (!url.includes("/message")) return json({ data: [] });
@@ -2689,6 +2691,34 @@ describe("a session's stored messages, as the live stream's parts (A6 F10)", () 
       expect.stringMatching(/^msg_.*:reasoning:0$/),
       expect.stringMatching(/^msg_.*:text:0$/),
     ]);
+  });
+
+  test("a system entry with no summary replays capped, not as the whole model-facing text", async () => {
+    // The fixture's `system` entry with its `description` gone and its text the size of a
+    // real tool catalogue: what the replay falls back to when OpenCode gave no summary.
+    const catalogue = "tool: shell — runs a command.\n".repeat(2_000);
+    const entries = await read((stored) =>
+      stored.map((entry) => {
+        const record = entry as Record<string, unknown>;
+        if (record["type"] !== "system") return entry;
+        const rest: Record<string, unknown> = { ...record, text: catalogue };
+        delete rest["description"];
+        return rest;
+      }),
+    );
+    expect(entries[2]?.text).toBe(catalogue);
+    const replayed = projectReplay({
+      entries,
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    const system = replayed.find(
+      (item) => item.kind === "turn.other" && item.headline === "system",
+    );
+    expect(system?.body.length).toBeLessThan(NARRATION_FIELD_MAX + 64);
+    expect(system?.body.endsWith(NARRATION_TRUNCATED_MARK)).toBe(true);
   });
 
   test("a replayed item equals the item the live events made of the same message, but for its id and time", async () => {

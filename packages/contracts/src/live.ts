@@ -524,10 +524,16 @@ export const LiveItem = Schema.Struct({
    */
   outcome: Schema.NullOr(Schema.String),
   /**
-   * Which streamed block this item is, on a `turn.reply` or `turn.thinking` that was
-   * streamed: shared by the block's partial updates and its finished block, and the key a
-   * client replaces by (this module's header). An opaque string — compare it, never parse
-   * it. Absent on everything else, including a finished block nothing streamed.
+   * Which block this item is, on a `turn.reply` or `turn.thinking`: shared by the block's
+   * partial updates and its finished block, and the key a client replaces by (this module's
+   * header). An opaque string — compare it, never parse it. Absent on every other kind.
+   *
+   * **Its presence does not mean the block streamed.** A replayed block carries the key its
+   * stream used whether or not anything streamed it: Claude Code's replay gives every text
+   * and thinking block one, from its call's id and its index in that call, and OpenCode's
+   * from its message id and its ordinal in its channel. It is absent only where the driver
+   * could not name the block — an entry with no call or message id, or one whose words came
+   * as plain text rather than as blocks.
    *
    * An optional key rather than a `null` field like the rest, so a frame from a build
    * without it, and a stored fixture, still decode.
@@ -550,6 +556,20 @@ export const LiveItem = Schema.Struct({
    * operator turn, a record, a block streamed before its step's model was seen.
    */
   model: Schema.optionalKey(Schema.String),
+  /**
+   * On a record a write tool produced, the id the write that produced it is known by, so a
+   * client can join the record to its call by content rather than by position (A6 F10
+   * review): the entry id on `scope.entry.added` — the `entry_id` its `add_scope_entry`
+   * call's result carries — and the operation id on `asset.imported` — the `operation_id`
+   * its `record_imported_asset` call was sent with.
+   *
+   * Pairing by position alone mis-files a record as soon as either side is cut short: a
+   * replay that keeps only the newest items and a record feed that opens part way back are
+   * cut independently, so the i-th call left on screen is not the i-th record's writer.
+   * Absent on every other record and on every activity item, and an optional key like
+   * {@link blockId} so a frame from a build without it still decodes.
+   */
+  writeId: Schema.optionalKey(Schema.String),
 });
 export type LiveItem = typeof LiveItem.Type;
 

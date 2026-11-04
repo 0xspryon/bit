@@ -208,6 +208,12 @@ export class ImporterSessions {
    * constructor body, and {@link groups} is one.
    */
   #live: () => readonly LiveItem[] = () => [];
+  /**
+   * How many of the target's events the live feed did not send (`LiveOpened.skipped`), read
+   * where {@link groups} is derived, for {@link #live}'s reason. Non-zero stops the chat
+   * pairing a replayed write with a record by position (`buildImporterChat`).
+   */
+  #skipped: () => number = () => 0;
   #sent = 0;
   /**
    * The imports whose conversation is being read right now, by import id.
@@ -262,9 +268,11 @@ export class ImporterSessions {
   constructor(
     now: () => number = () => Date.now(),
     live: () => readonly LiveItem[] = () => [],
+    skipped: () => number = () => 0,
   ) {
     this.#now = now;
     this.#live = live;
+    this.#skipped = skipped;
     this.load("default");
   }
 
@@ -288,6 +296,7 @@ export class ImporterSessions {
             historyFloor: this.current.historyFloor,
           }),
           working: this.current.working,
+          recordsSkipped: this.#skipped(),
         }),
   );
 

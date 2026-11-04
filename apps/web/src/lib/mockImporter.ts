@@ -149,6 +149,7 @@ const feed = (prefix: string, start: number) => {
       headline: string,
       body: string,
       seconds: number,
+      writeId?: string,
     ): LiveItem =>
       base({
         id: `record:evt_${prefix}_${String((sequence += 1))}`,
@@ -158,6 +159,7 @@ const feed = (prefix: string, start: number) => {
         at: at(seconds),
         headline,
         body,
+        ...(writeId === undefined ? {} : { writeId }),
       }),
   };
 };
@@ -228,6 +230,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
           value,
           `entry ent_${String(entries)} created · ${effect} · ${kind} · ${covers(kind, value)}`,
           seconds + 1,
+          `ent_${String(entries)}`,
         ),
       );
     }
@@ -260,6 +263,7 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
         host,
         `${host} recorded as a new host asset · read off ${POLICY}`,
         seconds + 1,
+        `op_${host}`,
       ),
     );
   };

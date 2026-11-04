@@ -595,14 +595,67 @@ export const activityOrder = (item: LiveItem): number | undefined => {
 };
 
 /**
- * Pairs a round's write calls to the records they produced, in order.
+ * The id a write call's record is known by, read off the call itself, or `undefined`.
  *
- * **In order, and not by any shared id, because there is no shared id.** A `tool.call`
- * carries the harness's `callId` and the record it produces carries the store's own
- * subject id; nothing joins them. What is true is that a round's writes are committed in
- * the order it made them, so the i-th `add_intent` call of a round belongs with the i-th
- * `intent.added` that round wrote — and a round's records cannot be interleaved with
- * another round's here, because the rows have already been filtered to this round.
+ * The other half of `LiveItem.writeId` (A6 F10 review): `add_scope_entry`'s **result** names
+ * the entry it wrote or found (`entry_id`), and a `record_imported_asset` call is **sent**
+ * with the `operation_id` its record carries. So an asset call is keyed from the moment it
+ * is made and an entry call from the moment its result arrives. The planner's and goal
+ * agent's writes have no such id — nothing joins an `add_intent` call to its intent — and
+ * pair by order alone, as they always have.
+ *
+ * Read from capped JSON, so a field cut off by the server's cap reads as no id, and the
+ * call falls back to order where order is allowed — never to another call's record.
+ */
+const callWriteId = (
+  call: LiveItem,
+  result: LiveItem | undefined,
+): string | undefined => {
+  switch (call.toolName) {
+    case "add_scope_entry":
+      return stringField(result?.output ?? null, "entry_id");
+    case "record_imported_asset":
+      return stringField(call.input, "operation_id");
+    default:
+      return undefined;
+  }
+};
+
+/** A top-level string field of a JSON object's text, or `undefined` for anything else. */
+const stringField = (json: string | null, key: string): string | undefined => {
+  if (json === null) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const value = (parsed as Record<string, unknown>)[key];
+    return typeof value === "string" && value !== "" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Pairs write calls to the records they produced: by content where both sides carry the
+ * write's id, and by order otherwise — but only among items at or after `orderFrom`.
+ *
+ * **By id first.** A call whose id is known ({@link callWriteId}) takes the record carrying
+ * the same `writeId`, and only that one: if that record is not in `items`, the call is
+ * unpaired, which is the honest rendering of "its record is not on this page". It never
+ * takes the next record in line, which would be another call's.
+ *
+ * **By order for the rest**, as this function always paired: a round's writes are committed
+ * in the order it made them, so the i-th unpaired `add_intent` call belongs with the i-th
+ * unclaimed `intent.added`. A keyed call that found no match may still take a record that
+ * carries no id at all (a frame from a build without `writeId`); it never takes one carrying
+ * a different id. An unkeyed call — an entry write whose result has not arrived yet — may
+ * take any unclaimed record of its kind, which is the ordinary in-flight case.
+ *
+ * Order is only sound over a stretch where neither side has been cut, which is what
+ * `orderFrom` is for: `importerChat.ts` pairs a whole session at once, from a replay that
+ * keeps the newest items and a record feed that opens part way back, cut independently. In
+ * a long session the i-th call left on screen is then not the i-th record's writer, and
+ * pairing them by position would put one write's receipt on another's call. Calls and
+ * records before `orderFrom` pair by id or not at all.
  *
  * The matching is deliberately **not** conditioned on the record arriving after the call.
  * It generally does, and the exceptions are real: the record channel is ordered and the
@@ -613,35 +666,71 @@ export const activityOrder = (item: LiveItem): number | undefined => {
 const pairWrites = (
   items: readonly LiveItem[],
   results: ReadonlyMap<string, LiveItem>,
+  orderFrom = 0,
 ): ReadonlyMap<string, LiveItem> => {
-  /** Unclaimed records per kind, oldest first. */
-  const unclaimed = new Map<string, LiveItem[]>();
-  for (const item of items) {
-    if (item.origin !== "record") continue;
-    const queue = unclaimed.get(item.kind);
-    if (queue === undefined) unclaimed.set(item.kind, [item]);
+  /** Records by kind and write id, oldest first: an entry found twice has two records. */
+  const byId = new Map<string, LiveItem[]>();
+  /** Every record of each kind that order may hand out, oldest first. */
+  const inOrder = new Map<string, LiveItem[]>();
+  const keyOf = (kind: string, id: string) => `${kind}\u0000${id}`;
+  items.forEach((item, position) => {
+    if (item.origin !== "record") return;
+    if (item.writeId !== undefined) {
+      const key = keyOf(item.kind, item.writeId);
+      const queue = byId.get(key);
+      if (queue === undefined) byId.set(key, [item]);
+      else queue.push(item);
+    }
+    if (position < orderFrom) return;
+    const queue = inOrder.get(item.kind);
+    if (queue === undefined) inOrder.set(item.kind, [item]);
     else queue.push(item);
-  }
+  });
+  const taken = new Set<string>();
   const paired = new Map<string, LiveItem>();
-  for (const item of items) {
-    if (item.kind !== "tool.call" || item.toolName === null) continue;
+  /** Calls left for the order pass, with the id each was looking for. */
+  const leftover: { call: LiveItem; kind: string; id: string | undefined }[] =
+    [];
+  items.forEach((item, position) => {
+    if (item.kind !== "tool.call" || item.toolName === null) return;
     const wanted = WRITE_TOOLS[item.toolName];
-    if (wanted === undefined) continue;
+    if (wanted === undefined) return;
     /*
-     * A call whose result says it wrote nothing takes no place in the queue.
+     * A call whose result says it wrote nothing takes no record.
      *
-     * Position is the whole of the pairing, so a call that claims a record it did not write
-     * hands every later call the record of the one before it. Two results say so
-     * definitively: a **failed** one (a refused write rolled back — the store commits a
-     * record in the same transaction as the write or not at all), and a **replayed** one (an
-     * exact retry, answered from its receipt). A call whose result has not arrived yet still
-     * claims the next record: that is the ordinary in-flight case, and the result arriving
-     * re-derives this.
+     * Under order pairing, a call that claims a record it did not write hands every later
+     * call the record of the one before it. Two results say so definitively: a **failed**
+     * one (a refused write rolled back — the store commits a record in the same transaction
+     * as the write or not at all), and a **replayed** one (an exact retry, answered from its
+     * receipt). A call whose result has not arrived yet still claims the next record: that
+     * is the ordinary in-flight case, and the result arriving re-derives this.
      */
     const result = item.callId === null ? undefined : results.get(item.callId);
-    if (result !== undefined && wroteNothing(result)) continue;
-    const record = unclaimed.get(wanted)?.shift();
-    if (record !== undefined) paired.set(item.id, record);
+    if (result !== undefined && wroteNothing(result)) return;
+    const id = callWriteId(item, result);
+    if (id !== undefined) {
+      const record = byId
+        .get(keyOf(wanted, id))
+        ?.find((each) => !taken.has(each.id));
+      if (record !== undefined) {
+        paired.set(item.id, record);
+        taken.add(record.id);
+        return;
+      }
+    }
+    if (position >= orderFrom) leftover.push({ call: item, kind: wanted, id });
+  });
+  for (const { call, kind, id } of leftover) {
+    const record = inOrder
+      .get(kind)
+      ?.find(
+        (each) =>
+          !taken.has(each.id) &&
+          (id === undefined || each.writeId === undefined),
+      );
+    if (record === undefined) continue;
+    paired.set(call.id, record);
+    taken.add(record.id);
   }
   return paired;
 };
@@ -649,10 +738,13 @@ const pairWrites = (
 /**
  * Which record each write call in `items` produced, by the call's item id — the pairing
  * {@link rowsFor} folds by, over a whole list. Exported for `importerChat.ts`, which pairs
- * across a whole session before cutting it into turns (A6 F10).
+ * across a whole session before cutting it into turns (A6 F10), and hands the result back
+ * to {@link rowsFor} for each turn so a turn never re-pairs by order what the session
+ * pairing deliberately left apart. `orderFrom` is {@link pairWrites}'.
  */
 export const claimedRecords = (
   items: readonly LiveItem[],
+  orderFrom = 0,
 ): ReadonlyMap<string, LiveItem> => {
   const results = new Map<string, LiveItem>();
   for (const item of items) {
@@ -660,7 +752,7 @@ export const claimedRecords = (
       results.set(item.callId, item);
     }
   }
-  return pairWrites(items, results);
+  return pairWrites(items, results, orderFrom);
 };
 
 /**
@@ -716,11 +808,13 @@ const unrecorded = (
  * Exported for `importerChat.ts`, which cuts a conversation into groups by a rule of its
  * own and then needs exactly this per group. `roundRunning` is whether anything more can
  * still arrive *in this group*, which is what separates a `pending` write from an
- * `unresolved` one.
+ * `unresolved` one. `pairing` is a pairing made over more than this group
+ * ({@link claimedRecords}); without one, the group is paired on its own.
  */
 export const rowsFor = (
   items: readonly LiveItem[],
   roundRunning: boolean,
+  pairing?: ReadonlyMap<string, LiveItem>,
 ): readonly ChatRow[] => {
   /** Results by the call they answer. A result with no `callId` cannot be paired at all. */
   const results = new Map<string, LiveItem>();
@@ -729,9 +823,17 @@ export const rowsFor = (
       results.set(item.callId, item);
     }
   }
-  const paired = pairWrites(items, results);
-  /** Records that have been claimed by a call, so they are not also rendered alone. */
-  const claimed = new Set([...paired.values()].map((record) => record.id));
+  const paired = pairing ?? pairWrites(items, results);
+  /**
+   * Records claimed by a call **in this group**, so they are not also rendered alone. A
+   * record whose call is elsewhere stays a row of its own rather than vanishing.
+   */
+  const here = new Set(items.map((item) => item.id));
+  const claimed = new Set(
+    [...paired.entries()]
+      .filter(([callId]) => here.has(callId))
+      .map(([, record]) => record.id),
+  );
   const rows: ChatRow[] = [];
   for (const item of items) {
     // Folded into the call it answers. One that names no call stays a row of its own —

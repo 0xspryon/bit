@@ -409,6 +409,13 @@ export interface ImporterChatInput {
    * never allowed to be quiet about.
    */
   readonly working: boolean;
+  /**
+   * How many of the target's committed events the record feed did not send
+   * (`LiveOpened.skipped`). Non-zero means the records on screen start part way back, so
+   * the oldest replayed write calls may have no record here: see {@link placedByCall}.
+   * `0` when omitted.
+   */
+  readonly recordsSkipped?: number;
 }
 
 /** A conversation cut at each operator row. */
@@ -436,16 +443,31 @@ const cutAtOperator = (items: readonly LiveItem[]): Cut => {
 /** Whether an item came from the server's replay rather than this tab's feed. */
 const fromReplay = (item: LiveItem): boolean => item.id.startsWith("replay:");
 
+/** A session's items in the order they are drawn, and which call each record pairs with. */
+interface Placed {
+  readonly items: readonly LiveItem[];
+  /** {@link claimedRecords}' answer for the whole session, by call item id. */
+  readonly pairing: ReadonlyMap<string, LiveItem>;
+}
+
 /**
  * The conversation with each record moved to sit right after the write call it pairs with,
  * and every record nothing claims, from before this tab's first message, moved to the front.
  *
  * A reload's records come from the record channel, in the store's order and with no operator
  * row before them, while the calls that wrote them come back in the replay under the turns
- * they were made in (A6 F10). Paired across the **whole** session — the same in-order
- * pairing `rowsFor` makes within a group ({@link claimedRecords}) — and placed beside their
- * calls, each record lands in its call's turn, where `rowsFor` folds the two into one
- * `recorded` row as it does live.
+ * they were made in (A6 F10). Paired across the **whole** session ({@link claimedRecords})
+ * and placed beside their calls, each record lands in its call's turn, and each turn is
+ * drawn with this same pairing, so `rowsFor` folds the two into one `recorded` row as it
+ * does live and never re-pairs a turn on its own.
+ *
+ * **By the write's id first, and by order only where nothing has been cut** (A6 F10
+ * review). The replay keeps the newest items (`truncated`) and the record feed opens part
+ * way back across the whole target (`recordsSkipped`), each cut on its own, so in a long
+ * session the k-th call left on screen is not the k-th record's writer: pairing them by
+ * position put `b.com`'s call on `a.com`'s receipt and left the last calls `unresolved`.
+ * When either side is cut, order pairs only what follows this tab's first message — the
+ * live stretch, which this tab saw whole — and before it a call pairs by id or not at all.
  *
  * A record no call claims is placed by nothing, so it goes to the front, where the cut puts
  * it in the leading "earlier in this session" group with the sentence that says why — not
@@ -456,11 +478,17 @@ const fromReplay = (item: LiveItem): boolean => item.id.startsWith("replay:");
 const placedByCall = (
   replay: readonly LiveItem[],
   feed: readonly LiveItem[],
-): LiveItem[] => {
+  cut: boolean,
+): Placed => {
   const all = [...replay, ...feed];
-  const claimed = claimedRecords(all);
-  const moved = new Set([...claimed.values()].map((record) => record.id));
   const firstSent = feed.findIndex((item) => item.kind === OPERATOR_TURN_KIND);
+  const orderFrom = !cut
+    ? 0
+    : firstSent < 0
+      ? all.length
+      : replay.length + firstSent;
+  const claimed = claimedRecords(all, orderFrom);
+  const moved = new Set([...claimed.values()].map((record) => record.id));
   // Only beside a replay: with none, there is no turn for such a record to be misfiled
   // under, and the feed's own order stands.
   const stray =
@@ -477,7 +505,7 @@ const placedByCall = (
     const record = claimed.get(item.id);
     if (record !== undefined) placed.push(record);
   }
-  return placed;
+  return { items: placed, pairing: claimed };
 };
 
 /**
@@ -535,7 +563,12 @@ export const buildImporterChat = (
   input: ImporterChatInput,
 ): readonly ImporterGroup[] => {
   const { history } = input;
-  const cut = cutAtOperator(placedByCall(history.items, input.items));
+  const placed = placedByCall(
+    history.items,
+    input.items,
+    history.truncated || (input.recordsSkipped ?? 0) > 0,
+  );
+  const cut = cutAtOperator(placed.items);
   const turnCount = cut.turns.length;
 
   const groups: ImporterGroup[] = [];
@@ -567,7 +600,7 @@ export const buildImporterChat = (
       key: "earlier",
       subject: { message: null, number: null, at: null, working: false },
       prose,
-      rows: rowsFor(cut.leading, false),
+      rows: rowsFor(cut.leading, false, placed.pairing),
     });
   }
 
@@ -610,7 +643,7 @@ export const buildImporterChat = (
                 _tag: "none",
                 note: "The importer wrote nothing in reply to this message.",
               },
-      rows: rowsFor(turn.items, working),
+      rows: rowsFor(turn.items, working, placed.pairing),
     });
   });
 

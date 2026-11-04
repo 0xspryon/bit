@@ -995,3 +995,179 @@ describe("a reloaded session is the live one, row for row", () => {
     ]);
   });
 });
+
+/* ── Pairing a reloaded write with its record when a side is cut (A6 F10 review) ── */
+
+describe("a reloaded write and its record, when the replay or the feed is cut", () => {
+  /**
+   * One replayed `add_scope_entry` turn: the operator's message, the call, and its result
+   * naming the entry — positions `4n` to `4n+2` of the replay, so ids stay unique.
+   */
+  const replayedTurn = (
+    n: number,
+    value: string,
+    answered: boolean,
+  ): LiveItem[] => [
+    replayItem(4 * n, "turn.operator", `add ${value}`),
+    replayItem(4 * n + 1, "tool.call", "", {
+      headline: "add_scope_entry",
+      toolName: "add_scope_entry",
+      callId: `call_${value}`,
+      input: JSON.stringify({ effect: "in", kind: "host", value }),
+    }),
+    ...(answered
+      ? [
+          replayItem(4 * n + 2, "tool.result", "", {
+            callId: `call_${value}`,
+            outcome: "ok",
+            output: JSON.stringify({
+              entry_id: `ent_${value}`,
+              value,
+              created: true,
+            }),
+          }),
+        ]
+      : []),
+  ];
+  /** The record `projectEvent` sends for that entry, carrying its `writeId`. */
+  const receipt = (value: string, writeId: string | null = `ent_${value}`) => ({
+    ...entryRecord(value),
+    body: `entry ent_${value} created · in · host · ${value}`,
+    ...(writeId === null ? {} : { writeId }),
+  });
+  /** Each write row as "the value its call sent → the record it shows, and its state". */
+  const writes = (groups: ReturnType<typeof buildImporterChat>) =>
+    groups.flatMap((group) =>
+      group.rows.flatMap((row) => {
+        const callItem = row.proposedBy ?? row.item;
+        if (callItem.kind !== "tool.call") return [];
+        const sent = (JSON.parse(callItem.input ?? "{}") as { value: string })
+          .value;
+        return [
+          `${group.key} ${sent} → ${row.proposedBy === null ? "-" : row.item.headline} ${String(row.write)}`,
+        ];
+      }),
+    );
+  const harness = (items: LiveItem[], truncated: boolean) =>
+    history({ source: "harness", note: "From the harness.", items, truncated });
+
+  test("a replay cut short of the oldest call keeps every later write on its own record", () => {
+    // Three turns wrote a.com, b.com and c.com; the replay kept only the newest two. The
+    // feed holds all three records. By position, b.com's call took a.com's receipt.
+    const groups = buildImporterChat({
+      history: harness(
+        [...replayedTurn(1, "b.com", true), ...replayedTurn(2, "c.com", true)],
+        true,
+      ),
+      items: [receipt("a.com"), receipt("b.com"), receipt("c.com")],
+      working: false,
+    });
+    expect(writes(groups)).toEqual([
+      "turn:1 b.com → b.com recorded",
+      "turn:2 c.com → c.com recorded",
+    ]);
+    // a.com's receipt is nobody's on this page, and is said as such rather than hung on one.
+    expect(groups[0]?.key).toBe("earlier");
+    expect(groups[0]?.rows.map((row) => row.item.headline)).toEqual(["a.com"]);
+  });
+
+  test("a feed opened after the oldest record leaves that write unpaired, never on the next record", () => {
+    // The whole replay, but the record feed opened part way back (`skipped > 0`): a.com's
+    // receipt is not here. By position a.com's call took b.com's and c.com's read unresolved.
+    const groups = buildImporterChat({
+      history: harness(
+        [
+          ...replayedTurn(0, "a.com", true),
+          ...replayedTurn(1, "b.com", true),
+          ...replayedTurn(2, "c.com", true),
+        ],
+        false,
+      ),
+      items: [receipt("b.com"), receipt("c.com")],
+      recordsSkipped: 200,
+      working: false,
+    });
+    expect(writes(groups)).toEqual([
+      "turn:1 a.com → - unresolved",
+      "turn:2 b.com → b.com recorded",
+      "turn:3 c.com → c.com recorded",
+    ]);
+  });
+
+  test("with no id on either side, a cut side pairs nothing by position", () => {
+    // Calls whose results never came back (a Stop) and receipts from a build that sends no
+    // `writeId`: only position could join them, and position is what the cut broke.
+    const cutReplay = buildImporterChat({
+      history: harness(
+        [
+          ...replayedTurn(1, "b.com", false),
+          ...replayedTurn(2, "c.com", false),
+        ],
+        true,
+      ),
+      items: [receipt("a.com", null), receipt("b.com", null)],
+      working: false,
+    });
+    expect(writes(cutReplay)).toEqual([
+      "turn:1 b.com → - unresolved",
+      "turn:2 c.com → - unresolved",
+    ]);
+    const cutFeed = buildImporterChat({
+      history: harness(
+        [
+          ...replayedTurn(0, "a.com", false),
+          ...replayedTurn(1, "b.com", false),
+        ],
+        false,
+      ),
+      items: [receipt("b.com", null)],
+      recordsSkipped: 1,
+      working: false,
+    });
+    expect(writes(cutFeed)).toEqual([
+      "turn:1 a.com → - unresolved",
+      "turn:2 b.com → - unresolved",
+    ]);
+    // Uncut, the same id-less pair still joins by position, as it always has.
+    const whole = buildImporterChat({
+      history: harness(replayedTurn(0, "a.com", false), false),
+      items: [receipt("a.com", null)],
+      working: false,
+    });
+    expect(writes(whole)).toEqual(["turn:1 a.com → a.com recorded"]);
+  });
+
+  test("an asset write joins its record by the operation id it was sent with", () => {
+    // Two calls for the same host with different operation ids: the asset is the same, so
+    // only the operation id can tell their records apart. The replay lost the first call.
+    const assetCall = (index: number, op: string) =>
+      replayItem(index, "tool.call", "", {
+        headline: "record_imported_asset",
+        toolName: "record_imported_asset",
+        callId: `call_${op}`,
+        input: JSON.stringify({
+          url: "https://app.acme.com",
+          value: `app.acme.com (${op})`,
+          operation_id: op,
+        }),
+      });
+    const assetRecord = (op: string) => ({
+      ...record("asset.imported", `app.acme.com via ${op}`),
+      writeId: op,
+    });
+    const groups = buildImporterChat({
+      history: harness(
+        [
+          replayItem(0, "turn.operator", "record the hosts again"),
+          assetCall(1, "op_2"),
+        ],
+        true,
+      ),
+      items: [assetRecord("op_1"), assetRecord("op_2")],
+      working: false,
+    });
+    expect(writes(groups)).toEqual([
+      "turn:1 app.acme.com (op_2) → app.acme.com via op_2 recorded",
+    ]);
+  });
+});

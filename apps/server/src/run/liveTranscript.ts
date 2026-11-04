@@ -127,7 +127,11 @@ import {
   roundIdFromScope,
 } from "../persistence/store";
 import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
-import type { MessageEntry, MessagePart } from "../harness/agentHarness";
+import {
+  truncateNarration,
+  type MessageEntry,
+  type MessagePart,
+} from "../harness/agentHarness";
 import type {
   NarrationSubject,
   RunNarration,
@@ -439,6 +443,8 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
       return {
         ...base,
         kind: "scope.entry.added",
+        // What the `add_scope_entry` call's result names as `entry_id`; see `writeId`.
+        ...(entryId === "" ? {} : { writeId: entryId }),
         headline: text(event.payload, "value"),
         body: isNew
           ? `entry ${entryId} created · ${phrase}`
@@ -458,6 +464,8 @@ export const projectEvent = (event: RecordedEvent): LiveItem => {
       return {
         ...base,
         kind: "asset.imported",
+        // The `operation_id` the `record_imported_asset` call was sent with; see `writeId`.
+        ...(event.operationId === null ? {} : { writeId: event.operationId }),
         headline: identity,
         body: isNew
           ? `${identity} recorded as a new ${text(event.payload, "kind")} asset${from}`
@@ -809,6 +817,10 @@ export interface ReplayProjection {
  * - a `user` entry's words — the operator's in a conversation (`turn.operator`, `You`), a
  *   steer in a planner round (`turn.other`, labelled `user`). The caller trims its own
  *   framing off the text first, and drops an entry it never wants shown (a round's prompt).
+ * - a `user` entry the harness wrote itself ({@link MessageEntry.marker}) — Claude Code's
+ *   `[Request interrupted by user for tool use]` after a Stop — as `turn.other` under what
+ *   it marks (`interrupted`), in either kind of session: nobody said it, so it is never
+ *   `You`, and it stays on screen because it is where the Stop landed.
  * - an entry the harness lists that is neither side — OpenCode's `shell`, `synthetic`,
  *   `system` — as `turn.other` under the harness's own word, so it never reads as the agent;
  * - an `error` the harness recorded on an entry, as `turn.other` labelled `error`,
@@ -816,7 +828,7 @@ export interface ReplayProjection {
  *
  * Ids are `replay:<n>`, `n` the item's position in this answer: a render key, never a cursor
  * and never an activity order (`activity:<n>`), so a client's replay/live floor cannot read
- * one. `at` is the entry's own time, or `fallbackAt` (when the answer was built) for an
+ * one. Every body is capped as a live part's is ({@link truncateNarration}). `at` is the entry's own time, or `fallbackAt` (when the answer was built) for an
  * entry whose harness kept none. `model` is each assistant entry's own, which is what a
  * turn's footer names rather than the session's current model.
  */
@@ -838,12 +850,17 @@ export const projectReplay = (input: {
     at,
     ...ids,
   });
+  /*
+   * Every body below is capped as a live part's text is (`truncateNarration`, which says in
+   * the value that it cut): a stored entry is not bounded by anything the stream bounds,
+   * and an OpenCode `system` entry with no summary is a whole tool catalogue.
+   */
   const note = (at: number, headline: string, body: string, failed: boolean) =>
     items.push({
       ...baseAt(at),
       kind: "turn.other",
       headline,
-      body,
+      body: truncateNarration(body),
       tool: null,
       toolName: null,
       input: null,
@@ -856,12 +873,16 @@ export const projectReplay = (input: {
     const at = entry.at ?? input.fallbackAt;
     if (entry.type === "user") {
       if (entry.text.trim() !== "") {
-        if (input.users === "operator") {
+        if (entry.marker !== undefined) {
+          // Words the harness stored in the user's place, never sent by anyone: drawn as
+          // what they mark, so a Stop shows where it landed and is not read as a message.
+          note(at, entry.marker, entry.text, false);
+        } else if (input.users === "operator") {
           items.push({
             ...baseAt(at),
             kind: "turn.operator",
             headline: "You",
-            body: entry.text,
+            body: truncateNarration(entry.text),
             tool: null,
             toolName: null,
             input: null,
@@ -895,7 +916,7 @@ export const projectReplay = (input: {
         ...baseAt(at),
         kind: "turn.reply",
         headline: "Reply",
-        body: entry.text,
+        body: truncateNarration(entry.text),
         tool: null,
         toolName: null,
         input: null,

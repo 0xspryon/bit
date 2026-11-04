@@ -4762,4 +4762,114 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
     );
     expect(liveItems[0]?.model).toBe("claude-haiku-4-5-20251001");
   });
+
+  /**
+   * A Stop that cut a tool call, read back through the **real** `getSessionMessages`.
+   *
+   * `testdata/claude-code-transcript/interrupted-tool.cli.jsonl` is in the CLI's on-disk
+   * form, not the SDK's: recorded 2026-11-04 by CLI 2.1.310 (`claude-haiku-4-5`) in an
+   * importer session stopped mid-`Bash`, then sent one more message. Sanitised: the session
+   * id is a fixed one, the thinking `signature` reads `sig-redacted`, and each entry keeps
+   * only the fields the SDK reads plus `promptSource`. After the Stop the CLI stored the
+   * refused call's `tool_result` and then its own `[Request interrupted by user for tool
+   * use]` as a `user` entry — list content, no `promptSource` — which the SDK strips from
+   * both kinds of entry anyway. It is read by the real SDK so a later one that changed the
+   * shape fails here rather than in a replay.
+   */
+  test("the CLI's interrupt note replays as `interrupted`, not as a message the operator sent", async () => {
+    const STOPPED = "00000000-0000-4000-8000-0000000000f2";
+    const root = await mkdtemp(join(tmpdir(), "bit-interrupted-"));
+    const previous = process.env["CLAUDE_CONFIG_DIR"];
+    try {
+      const project = join(root, "projects", "-tmp-bit-interrupted-ws");
+      await mkdir(project, { recursive: true });
+      await writeFile(
+        join(project, `${STOPPED}.jsonl`),
+        await readFile(
+          join(
+            import.meta.dir,
+            "testdata",
+            "claude-code-transcript",
+            "interrupted-tool.cli.jsonl",
+          ),
+          "utf8",
+        ),
+      );
+      process.env["CLAUDE_CONFIG_DIR"] = root;
+      const { sdk } = scriptedSdk();
+      const entries = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            harness.messages(STOPPED),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                sdk: {
+                  ...sdk,
+                  sessionMessages: liveClaudeCodeSdk.sessionMessages,
+                },
+                controlTimeout: "2 seconds",
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+      // The note is there to be told apart, and is the only entry marked.
+      expect(
+        entries.map((entry) => [entry.type, entry.marker ?? null]),
+      ).toEqual([
+        ["user", null],
+        ["assistant", null],
+        ["assistant", null],
+        ["user", null],
+        ["user", "interrupted"],
+        ["user", null],
+        ["assistant", null],
+        ["assistant", null],
+      ]);
+      // Both kinds of session read `user` entries as the operator's words; neither may
+      // read the note as one.
+      for (const subject of [
+        { _tag: "import", importId: "imp_1" },
+        { _tag: "goal", goalId: "goal_1" },
+      ] as const) {
+        const replayed = projectReplay({
+          entries,
+          subject,
+          harnessSessionId: STOPPED,
+          users: "operator",
+          fallbackAt: 0,
+        }).items;
+        expect(
+          replayed
+            .filter((item) => item.kind === "turn.operator")
+            .map((item) => item.body),
+        ).toEqual([
+          expect.stringMatching(/^Now use your Bash tool once/),
+          "Reply with only the word continued.",
+        ]);
+        // No thinking rows: the session predates summarized display, so its thinking
+        // blocks are empty and project to nothing, as they did live.
+        expect(
+          replayed.map((item) =>
+            item.kind === "turn.other"
+              ? `${item.headline}: ${item.body}`
+              : item.kind,
+          ),
+        ).toEqual([
+          "turn.operator",
+          "tool.call",
+          "tool.result",
+          "interrupted: [Request interrupted by user for tool use]",
+          "turn.operator",
+          "turn.reply",
+        ]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

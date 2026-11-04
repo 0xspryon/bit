@@ -350,6 +350,16 @@ export interface MessageEntry {
   readonly model: string | undefined;
   /** When the harness recorded the entry, in epoch milliseconds, or `undefined`. */
   readonly at: number | undefined;
+  /**
+   * Set on a `user` entry the **harness wrote itself** rather than one anybody sent, by what
+   * it marks; absent on everything else (A6 F10 review).
+   *
+   * Claude Code stores its own notes in the user's role. After a Stop that cut a tool call
+   * the CLI writes `[Request interrupted by user for tool use]` as a `user` entry, and a
+   * replay that read every `user` entry as the operator's words drew it as a message the
+   * operator sent. It is `interrupted`. {@link text} still holds the harness's words.
+   */
+  readonly marker?: string;
 }
 
 /**

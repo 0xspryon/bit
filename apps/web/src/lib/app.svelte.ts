@@ -1652,8 +1652,10 @@ export class App {
    * are derived and an arriving entry moves them. Guarded by target, for
    * {@link liveTargetId}'s reason: one target's feed never shows under another.
    */
-  importer = new ImporterSessions(undefined, () =>
-    this.liveTargetId === this.viewTargetId ? this.liveItems : [],
+  importer = new ImporterSessions(
+    undefined,
+    () => (this.liveTargetId === this.viewTargetId ? this.liveItems : []),
+    () => (this.liveTargetId === this.viewTargetId ? this.liveSkipped : 0),
   );
   /**
    * Which half of the Auto-load page is showing: the links and the model, or the import's
