@@ -524,6 +524,16 @@ interface SessionRecord {
    */
   readonly unanswered: Set<string>;
   /**
+   * The steers this session was sent that no frame has yet said it consumed, by their driver
+   * uuid, each with the application's id for it (A6 U4).
+   *
+   * The CLI stamps its reply frames with `user_message_uuids`, the messages the turn has
+   * consumed so far — a queued steer's uuid appears on the first frame of the turn that took
+   * it, or of the running turn it was folded into. That first sighting is narrated as
+   * `taken` ({@link takenNarration}) and the entry removed, so each is said once.
+   */
+  readonly untaken: Map<string, string>;
+  /**
    * A turn is running on the stream: a turn-opening frame (`system/init`, a main-thread
    * reply or tool result — never a subagent's, see `opensTurn`) has arrived since the last
    * `result`, which closes it. Read off the stream
@@ -1643,6 +1653,8 @@ const narrate = (
       session.contextLimit,
     );
     if (usage !== undefined) details.push(usage);
+    const failure = resultError(message, outcome);
+    if (failure !== undefined) details.push(failure);
   }
 
   // A `user` message that is a plain prompt echo, or a `system` frame, lands here: one
@@ -1651,6 +1663,33 @@ const narrate = (
   return details.length === 0
     ? [frame({ _tag: "opaque" })]
     : details.map(frame);
+};
+
+/**
+ * The harness's own sentence for a turn it ended in error (A6 U4), or `undefined`.
+ *
+ * Only a `result` whose outcome is `failed` — so never an interrupt this application asked
+ * for, which {@link outcomeOf} calls `interrupted` — and only when the CLI said something:
+ * its `errors`, joined. A failed `result` with none narrates nothing, rather than a sentence
+ * this server would have to word. A provider refusing a call is already an `assistant`
+ * frame carrying the CLI's `API Error: …` text, narrated as a reply; this is what that
+ * leaves: a turn that ran out of turns or budget, or broke while executing.
+ */
+export const resultError = (
+  message: SDKMessage,
+  outcome: TerminalOutcome | undefined,
+): NarrationDetail | undefined => {
+  if (message.type !== "result" || outcome !== "failed") return undefined;
+  const errors = (message as { readonly errors?: unknown }).errors;
+  const said = Array.isArray(errors)
+    ? errors.filter(
+        (each): each is string =>
+          typeof each === "string" && each.trim() !== "",
+      )
+    : [];
+  return said.length === 0
+    ? undefined
+    : { _tag: "error", message: truncateNarration(said.join("\n")) };
 };
 
 /**
@@ -2050,6 +2089,36 @@ const answeredUuids = (message: SDKMessage): readonly string[] | undefined => {
   return stamp.user_message_uuid === undefined
     ? undefined
     : [stamp.user_message_uuid];
+};
+
+/**
+ * A `taken` entry for each steer this frame is the first to say was consumed (A6 U4), and
+ * nothing for any other frame. Removes each from {@link SessionRecord.untaken}, so a later
+ * frame naming it again — every reply frame of that turn does, and its `result` — says
+ * nothing more. A uuid this session did not send as a steer (the opening prompt, a turn
+ * the CLI ran itself) is not in the map and narrates nothing.
+ */
+export const takenNarration = (
+  record: Pick<SessionRecord, "untaken">,
+  message: SDKMessage,
+): readonly HarnessNarration[] => {
+  const named = answeredUuids(message);
+  if (named === undefined || record.untaken.size === 0) return [];
+  const at = Date.now();
+  const taken: HarnessNarration[] = [];
+  for (const uuid of named) {
+    const messageId = record.untaken.get(uuid);
+    if (messageId === undefined) continue;
+    record.untaken.delete(uuid);
+    taken.push({
+      type: message.type,
+      sequence: undefined,
+      at,
+      outcome: undefined,
+      detail: { _tag: "taken", messageId },
+    });
+  }
+  return taken;
 };
 
 /**
@@ -2529,6 +2598,11 @@ export const claudeCodeHarness = (
                     record.turnOpen = false;
                     answer(record, message);
                   }
+                  // Before the frame's own entries: the turn that took a steer is that
+                  // steer's work, so its first words sort after the take.
+                  for (const entry of takenNarration(record, message)) {
+                    Queue.offerUnsafe(record.narration, entry);
+                  }
                   for (const entry of narrate(message, outcome, record)) {
                     Queue.offerUnsafe(record.narration, entry);
                   }
@@ -2896,6 +2970,7 @@ export const claudeCodeHarness = (
           idle,
           ended: yield* Deferred.make<void>(),
           unanswered: new Set<string>(),
+          untaken: new Map<string, string>(),
           turnOpen: false,
           stamped: false,
           settling: false,
@@ -3287,6 +3362,7 @@ export const claudeCodeHarness = (
         record.deliveredIds.add(delivery.messageId);
         const uuid = claudeCodeMessageId(delivery.messageId);
         record.unanswered.add(uuid);
+        record.untaken.set(uuid, delivery.messageId);
         offer(userMessage(record, content, uuid, delivery));
         return { delivered: true };
       });

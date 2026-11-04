@@ -79,3 +79,5 @@ export { default as IconScroll } from "line-awesome/svg/scroll-solid.svg?compone
 export { default as IconCollapse } from "line-awesome/svg/angle-double-left-solid.svg?component";
 export { default as IconExpand } from "line-awesome/svg/angle-double-right-solid.svg?component";
 export { default as IconHistory } from "line-awesome/svg/history-solid.svg?component";
+/** D3's reasoning line: the thought, folded to one line behind a clock. */
+export { default as IconClock } from "line-awesome/svg/clock.svg?component";

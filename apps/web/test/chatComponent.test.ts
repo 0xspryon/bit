@@ -549,10 +549,14 @@ describe("the separator, which the caller owns", () => {
 
   test("a thread labels every harness entry but the agent's own words", () => {
     const html = body({ groups: [mixed()], readonly: true, layout: "thread" });
-    expect(labels(html)).toEqual(["shell", "synthetic", "error"]);
+    expect(labels(html)).toEqual(["shell", "synthetic"]);
     expect(html).toContain("three entries are in scope");
     // The agent's words are prose, unlabelled.
-    expect(html.match(/<li class="prose/g)).toHaveLength(2);
+    expect(html.match(/<li class="prose svelte-/g)).toHaveLength(2);
+    // A harness's error is its sentence, said to be the harness's (A6 U4), not a ledger line.
+    expect(html.match(/<li class="prose harness-error/g)).toHaveLength(1);
+    expect(html).toContain("The harness stopped this turn with an error:");
+    expect(html).toContain("the model stopped");
   });
 
   test("a panel keeps a kind on every replayed row, the agent's included", () => {

@@ -325,9 +325,21 @@ export const LIVE_ITEM_KINDS = [
    * or tool use nor the operator's words (A6 F10), named in {@link LiveItem.headline} by the
    * harness's own word: an OpenCode `shell` or `synthetic` entry, a steer a planner round
    * was sent (`user`), or an `error` the harness recorded on a turn (`outcome` `failed`).
-   * Replay only. Labelled with that word so it never reads as the agent having said it.
+   * Replay only, except `error`, which is live too (A6 U4): a turn the harness ended with
+   * an error of its own — a provider refusing the call — says so as it happens, with the
+   * harness's sentence in `body`. Labelled with that word so it never reads as the agent
+   * having said it.
    */
   "turn.other",
+  /**
+   * The harness **took** a message the operator sent while a turn was running (A6 U4): it
+   * was queued behind the work in flight and is now in the conversation. Carries
+   * {@link LiveItem.messageId} — the id the send's answer named
+   * (`ImporterTurnAccepted.messageId`) — and nothing to read. Live only: a replay holds the
+   * message itself, where the harness put it. A chat draws the message as queued until
+   * this arrives, and never draws this item.
+   */
+  "turn.taken",
   /**
    * A **sub-agent** the agent started, in place of everything it did (A6 U14, decided by
    * the operator). One state of it: several items share one {@link LiveItem.callId} — the
@@ -600,6 +612,12 @@ export const LiveItem = Schema.Struct({
    * {@link blockId} so a frame from a build without it still decodes.
    */
   writeId: Schema.optionalKey(Schema.String),
+  /**
+   * On a `turn.taken` item, the application's id for the message the harness took — the
+   * `messageId` the send was answered with — so a client can join the two by content.
+   * Absent on every other item, and an optional key so older frames still decode.
+   */
+  messageId: Schema.optionalKey(Schema.String),
 });
 export type LiveItem = typeof LiveItem.Type;
 

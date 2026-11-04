@@ -140,7 +140,8 @@ describe("a thought", () => {
         item: item({ kind: "turn.thinking", headline: "Thinking", body }),
         narrated,
       });
-      expect(row.querySelector(".thought")?.textContent).toBe(shown);
+      // Narrated, the thought opens as markdown (U4), whose paragraph may end in a newline.
+      expect(row.querySelector(".thought")?.textContent?.trim()).toBe(shown);
     }
   });
 });

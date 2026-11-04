@@ -47,7 +47,8 @@
   import type { Snippet } from "svelte";
 
   import ChatItem from "./ChatItem.svelte";
-  import { lastProse, type ChatGroup } from "../chat";
+  import ToolRun from "./ToolRun.svelte";
+  import { lastProse, threadEntries, type ChatGroup } from "../chat";
   import { atBottom } from "../scroll";
 
   let {
@@ -301,7 +302,33 @@
           </p>
         {/if}
 
-        {#if group.rows.length > 0}
+        {#if group.rows.length > 0 && thread}
+          <!--
+            A thread draws a turn as D3 does (A6 U4): the agent's prose full width, and each
+            run of consecutive tool calls folded into one muted line, its calls one click
+            away. The panel's ledger, below, keeps one row per item: its rows carry their
+            kind, time and ids, which is what a panel among other things on a page is for.
+          -->
+          <ol class="items">
+            {#each threadEntries(group.rows) as entry (entry.key)}
+              {#if entry._tag === "tools"}
+                <ToolRun rows={entry.rows} summary={entry.summary} />
+              {:else}
+                <ChatItem
+                  item={entry.row.item}
+                  proposedBy={entry.row.proposedBy}
+                  result={entry.row.result}
+                  write={entry.row.write}
+                  summary={entry.row.summary}
+                  narrated
+                  footer={place?._tag === "row" && place.key === entry.key
+                    ? closing
+                    : undefined}
+                />
+              {/if}
+            {/each}
+          </ol>
+        {:else if group.rows.length > 0}
           <ol class="items">
             {#each group.rows as row (row.key)}
               <ChatItem
@@ -310,10 +337,6 @@
                 result={row.result}
                 write={row.write}
                 summary={row.summary}
-                narrated={thread}
-                footer={place?._tag === "row" && place.key === row.key
-                  ? closing
-                  : undefined}
               />
             {/each}
           </ol>
@@ -580,8 +603,9 @@
     padding-top: 0;
     border-top: 0;
   }
+  /* D3: 18px between the agent's lines — prose, a folded run, reasoning. */
   .thread .items {
-    gap: 12px;
+    gap: 18px;
   }
   .thread .controls {
     justify-content: center;

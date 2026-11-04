@@ -52,6 +52,7 @@
     resultLine,
     type WriteState,
   } from "../chat";
+  import { IconAngleRight, IconClock } from "../icons";
   import Markdown from "./Markdown.svelte";
   import MarkedText from "./MarkedText.svelte";
   import StreamCursor from "./StreamCursor.svelte";
@@ -127,6 +128,27 @@
    */
   let thinking = $derived(item.kind === THINKING_KIND);
 
+  /**
+   * A turn the harness ended in its own error (A6 U4): the `turn.other` item labelled
+   * `error`, live and replayed alike. Drawn as its sentence, not as a ledger line.
+   */
+  let harnessError = $derived(
+    item.kind === "turn.other" &&
+      item.headline === "error" &&
+      item.outcome === "failed",
+  );
+
+  /**
+   * A thought's collapsed line: its first line with words in it, the markdown that would
+   * only be noise in one line (a heading's hashes, emphasis, code ticks) taken off. The
+   * whole thought, as markdown, is what opens under it.
+   */
+  const gist = (text: string): string =>
+    (text.split("\n").find((line) => line.trim() !== "") ?? "")
+      .replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|>\s*)/, "")
+      .replace(/(\*\*|__|`)/g, "")
+      .trim();
+
   /** When it happened, as a wall-clock time. Display only: never an ordering key. */
   let time = $derived(
     new Date(item.at).toLocaleTimeString(undefined, {
@@ -171,16 +193,37 @@
       {@render footer?.()}
     </li>
   {:else if thinking}
-    <li class="prose" data-origin={item.origin}>
+    <!--
+      D3: reasoning as one truncated line — a clock, the thought's first line, a chevron —
+      opened to the whole of it as markdown, with the note that it is what was considered
+      and not what was done. The line is prose, marked as prose is.
+    -->
+    <li class="prose reasoning" data-origin={item.origin}>
       <span class="visually-hidden">{item.origin}</span>
-      <details class="raw">
-        <summary>What it considered</summary>
-        <p class="thought"><MarkedText text={item.body} /></p>
+      <details>
+        <summary>
+          <span class="glyph" aria-hidden="true"><IconClock /></span>
+          <span class="visually-hidden">What it considered: </span>
+          <span class="gist"><MarkedText text={gist(item.body)} /></span>
+          <span class="chevron" aria-hidden="true"><IconAngleRight /></span>
+        </summary>
+        <div class="thought"><Markdown text={item.body} /></div>
         <p class="aside">
           What the agent was considering, not what it did. Not stored here: a
           reload shows it only while the harness still has it.
         </p>
       </details>
+    </li>
+  {:else if harnessError}
+    <!--
+      The harness ended the turn with an error of its own (A6 U4) — a provider refusing the
+      call, say. Its sentence, as the harness wrote it and marked as prose, rather than a
+      turn that reads as though the importer chose to say nothing.
+    -->
+    <li class="prose harness-error" data-origin={item.origin}>
+      <span class="visually-hidden">{item.origin}</span>
+      <p class="error-head">The harness stopped this turn with an error:</p>
+      <p class="error-text"><MarkedText text={item.body} /></p>
     </li>
   {:else if item.kind === SUBAGENT_KIND}
     <!--
@@ -679,10 +722,78 @@
     white-space: pre-wrap;
   }
   .prose .thought {
-    margin-top: 4px;
+    margin-top: 8px;
+    padding-left: 24px;
+    border-left: 0;
     color: var(--text-muted);
     font-size: 12px;
     line-height: var(--lh-compact);
+  }
+  /*
+   * D3's reasoning line: a faint clock, the thought's first line cut to the column with an
+   * ellipsis, and a chevron that turns when it is open. Muted rather than D3's faint, which
+   * is below AA at 13px.
+   */
+  .reasoning summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    border-radius: var(--radius-xs);
+    color: var(--text-muted);
+    font: 400 13px/20px var(--font-sans);
+    list-style: none;
+    cursor: pointer;
+  }
+  .reasoning summary::-webkit-details-marker {
+    display: none;
+  }
+  .reasoning summary:hover {
+    opacity: 0.85;
+  }
+  .reasoning summary:focus-visible {
+    outline: 1px solid var(--border-focus);
+    outline-offset: 2px;
+  }
+  .reasoning .glyph,
+  .reasoning .chevron {
+    display: inline-flex;
+    flex: none;
+    width: 14px;
+    height: 14px;
+    color: var(--icon-faint);
+  }
+  .reasoning .glyph :global(svg),
+  .reasoning .chevron :global(svg) {
+    width: 14px;
+    height: 14px;
+  }
+  .reasoning details[open] .chevron {
+    transform: rotate(90deg);
+  }
+  .reasoning .gist {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    unicode-bidi: isolate;
+  }
+  .reasoning .aside {
+    padding-left: 24px;
+  }
+  /* A harness's own error: its sentence in the danger ink, behind a rule. */
+  .harness-error {
+    padding-left: 12px;
+    border-left: 2px solid var(--state-border-danger);
+  }
+  .harness-error .error-head {
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 18px;
+  }
+  .harness-error .error-text {
+    color: var(--state-fg-danger);
   }
   .prose .aside {
     margin-top: 4px;

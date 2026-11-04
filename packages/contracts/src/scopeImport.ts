@@ -740,6 +740,14 @@ export const ImporterTurnAccepted = Schema.Struct({
    */
   pagesNotAdded: Schema.Array(Schema.String),
   acceptedAt: EpochMillis,
+  /**
+   * The id the message was delivered under, on a `continued` turn: the steer the live
+   * session was given. A `turn.taken` item carrying the same id says the harness has taken
+   * it off its queue (A6 U4), which is how a chat tells a message sent mid-turn that is
+   * still waiting from one the importer is working on. Absent on `opened` and `resumed`,
+   * whose message opens the turn it is in.
+   */
+  messageId: Schema.optionalKey(Schema.String),
 });
 export type ImporterTurnAccepted = typeof ImporterTurnAccepted.Type;
 

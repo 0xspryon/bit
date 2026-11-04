@@ -38,7 +38,14 @@ import {
   kindLabel,
   outcomeTint,
   roundUsageScope,
+  rowsFor,
   turnModel,
+  turnModels,
+  turnEndedAt,
+  durationLabel,
+  threadEntries,
+  toolRunAttention,
+  toolRunCount,
   usageScope,
   type ContextMeter,
   type SentTurn,
@@ -1403,5 +1410,132 @@ describe("a replayed round's rows", () => {
     });
     expect(turnModel(view.groups[0] ?? { rows: [] })).toBe("claude-sonnet-5");
     expect(turnModel({ rows: [] })).toBeUndefined();
+  });
+});
+
+/* ── A6 U4: a thread's turn, as D3 and D4 draw it ─────────────────────────── */
+
+describe("U4: consecutive tool calls fold into one line", () => {
+  test("each run of tool rows is one entry; prose between runs splits them", () => {
+    const rows = rowsFor(
+      [
+        activity({ body: "fetching" }),
+        call("c1", "fetch_page"),
+        result("c1", false),
+        call("c2", "add_intent"),
+        call("c3", "add_intent"),
+        activity({ body: "written" }),
+        call("c4", "fetch_page"),
+      ],
+      false,
+    );
+    const entries = threadEntries(rows);
+    expect(
+      entries.map((entry) =>
+        entry._tag === "row"
+          ? `row:${entry.row.item.body}`
+          : `${toolRunCount(entry.summary.count)} · ${entry.summary.names.join(", ")}`,
+      ),
+    ).toEqual([
+      "row:fetching",
+      "Ran 3 commands · fetch_page, add_intent",
+      "row:written",
+      "Ran 1 command · fetch_page",
+    ]);
+    // A run is keyed by its first row, so it keeps its place as it grows.
+    expect(entries[1]?.key).toBe(`tools:${rows[1]?.key ?? ""}`);
+  });
+
+  test("the folded line names what needs the operator and leaves the expected unsaid", () => {
+    const [run] = threadEntries(
+      rowsFor(
+        [
+          call("c1", "add_intent"),
+          result("c1", true),
+          call("c2", "add_intent"),
+          call("c3", "fetch_page"),
+          { ...result("c3", true), toolName: "fetch_page" },
+        ],
+        false,
+      ),
+    );
+    if (run?._tag !== "tools") throw new Error("not a run");
+    // One refused write, one write with neither record nor failure, one failed read.
+    expect(toolRunAttention(run.summary)).toEqual([
+      "1 refused",
+      "1 unresolved",
+      "1 failed",
+    ]);
+    const [quiet] = threadEntries(
+      rowsFor([call("c9", "fetch_page"), result("c9", false)], false),
+    );
+    if (quiet?._tag !== "tools") throw new Error("not a run");
+    expect(toolRunAttention(quiet.summary)).toEqual([]);
+    expect(quiet.summary.pending).toBe(false);
+    const [inFlight] = threadEntries(rowsFor([call("c8", "add_intent")], true));
+    if (inFlight?._tag !== "tools") throw new Error("not a run");
+    expect(inFlight.summary.pending).toBe(true);
+  });
+
+  test("a record no call claims, a sub-agent and a harness note are not tool calls", () => {
+    const entries = threadEntries(
+      rowsFor(
+        [
+          record({ body: "intent int_x was added" }),
+          activity({
+            kind: "subagent",
+            headline: "explore",
+            callId: "a1",
+            outcome: "running",
+          }),
+          activity({
+            kind: "turn.other",
+            headline: "interrupted",
+            body: "stopped",
+          }),
+        ],
+        false,
+      ),
+    );
+    expect(entries.map((entry) => entry._tag)).toEqual(["row", "row", "row"]);
+  });
+});
+
+describe("U4: a turn footer's facts", () => {
+  test("the models that answered, each once in the order they did", () => {
+    const rows = rowsFor(
+      [
+        activity({ body: "a", model: "claude-sonnet-4-5" }),
+        { ...call("c1", "fetch_page"), model: "claude-sonnet-4-5" },
+        activity({ body: "b", model: "claude-haiku-4-5" }),
+        activity({ body: "c", model: "claude-sonnet-4-5" }),
+      ],
+      false,
+    );
+    expect(turnModels({ rows })).toEqual([
+      "claude-sonnet-4-5",
+      "claude-haiku-4-5",
+    ]);
+    expect(turnModels({ rows: [] })).toEqual([]);
+  });
+
+  test("the turn ends at its last item, a folded result included", () => {
+    const rows = rowsFor(
+      [
+        activity({ body: "a", at: AT + 1_000 }),
+        { ...call("c1", "fetch_page"), at: AT + 2_000 },
+        { ...result("c1", false), at: AT + 9_000 },
+      ],
+      false,
+    );
+    expect(turnEndedAt({ rows })).toBe(AT + 9_000);
+    expect(turnEndedAt({ rows: [] })).toBeUndefined();
+  });
+
+  test("a duration as D4 words it", () => {
+    expect(durationLabel(41_000)).toBe("41s");
+    expect(durationLabel(400)).toBe("0s");
+    expect(durationLabel(125_000)).toBe("2m 05s");
+    expect(durationLabel(3_720_000)).toBe("1h 02m");
   });
 });

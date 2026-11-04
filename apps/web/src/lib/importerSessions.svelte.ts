@@ -422,9 +422,14 @@ export class ImporterSessions {
             // The replay/live boundary. Undefined on a session whose words were never asked
             // for, which takes nothing away: it has no replay to collide with.
             historyFloor: this.current.historyFloor,
+            midTurn: this.current.midTurn,
+            working: this.current.working,
           }),
           working: this.current.working,
           recordsSkipped: this.#skipped(),
+          ...(this.current.midTurn === undefined
+            ? {}
+            : { midTurn: this.current.midTurn }),
         }),
   );
 
@@ -552,6 +557,9 @@ export class ImporterSessions {
             history: kept.history,
             items: kept.items,
             ...(kept.floors === undefined ? {} : { floors: kept.floors }),
+            // Which of those rows were sent mid-turn, and so wait for a take (A6 U4): this
+            // tab's knowledge of its own rows, as the floors are.
+            ...(kept.midTurn === undefined ? {} : { midTurn: kept.midTurn }),
             ...(kept.historyFloor === undefined
               ? {}
               : { historyFloor: kept.historyFloor }),
@@ -965,14 +973,25 @@ export class ImporterSessions {
     ) {
       this.switchNotice = undefined;
     }
-    const at = this.#now();
+    /*
+     * The server's time for the message, not this tab's: the turn footer's duration runs
+     * from here to the importer's last item, which the server stamped, so both ends are one
+     * clock (A6 U4). It is also the "You · 18:02" under the bubble.
+     */
+    const at = turn.acceptedAt;
+    // Delivered as a steer while a turn ran: queued until the harness takes it (A6 U4).
+    const midTurn = turn.messageId !== undefined && session.working;
     const landed = (before: ImporterSession): ImporterSession => {
       const index = before.items.filter(
         (item) => item.kind === "turn.operator",
       ).length;
-      const row = operatorTurn({ index: index + 1, text, at, after });
+      const row = {
+        ...operatorTurn({ index: index + 1, text, at, after }),
+        ...(turn.messageId === undefined ? {} : { messageId: turn.messageId }),
+      };
       return {
         ...before,
+        ...(midTurn ? { midTurn: [...(before.midTurn ?? []), row.id] } : {}),
         id: turn.harnessSessionId,
         importId: turn.importId,
         model: turn.model,

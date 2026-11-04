@@ -514,7 +514,16 @@ export interface LiveAgentSessions<Meta> {
      * was never asked.
      */
     uploads?: readonly ReadUpload[],
-  ) => Effect.Effect<void, HarnessFailure | UploadWriteFailed>;
+  ) => Effect.Effect<
+    {
+      /**
+       * The id the steer was delivered under: what a `taken` narration names when the
+       * harness takes it off its queue (A6 U4).
+       */
+      readonly messageId: string;
+    },
+    HarnessFailure | UploadWriteFailed
+  >;
   /**
    * Stops the turn running in one id's session, and keeps the session (A6 F5).
    *
@@ -1132,6 +1141,7 @@ export const makeLiveAgentSessions = <Meta>(
           uploads === undefined || uploads.length === 0
             ? []
             : yield* storeUploads(entry.directory, uploads);
+        const messageId = crypto.randomUUID().replaceAll("-", "");
         const accepted = yield* Effect.result(
           entry.harness.prompt(
             entry.sessionId,
@@ -1146,7 +1156,7 @@ export const makeLiveAgentSessions = <Meta>(
                * messages behaviour is measured.
                */
               urgency,
-              messageId: crypto.randomUUID().replaceAll("-", ""),
+              messageId,
             },
             attachments,
           ),
@@ -1156,6 +1166,7 @@ export const makeLiveAgentSessions = <Meta>(
           return yield* Effect.fail(accepted.failure);
         }
         if (accepted.success.delivered) yield* promptAccepted(entry);
+        return { messageId };
       });
 
     const interrupt: LiveAgentSessions<Meta>["interrupt"] = (id) =>

@@ -1366,7 +1366,13 @@ describe("the importer narrates to the chat", () => {
     if (sent._tag !== "Success") return;
     expect(sent.success.conversation).toBe("continued");
     expect(built.script.prompts[1]).toBe("Anything else?");
-    expect(built.script.deliveries[1]?._tag).toBe("steer");
+    const steer = built.script.deliveries[1];
+    expect(steer?._tag).toBe("steer");
+    // The answer names the id the steer went under (A6 U4), which a `taken` item will carry
+    // when the harness takes it off its queue.
+    expect(sent.success.messageId).toBe(
+      steer?._tag === "steer" ? steer.messageId : "no steer",
+    );
     // Still the one session: a dropped stream is not a reason to open another.
     expect(built.script.created).toHaveLength(1);
     await runtime.dispose();

@@ -43,6 +43,7 @@ import { Duration, Effect, Fiber, Layer, Redacted, Stream } from "effect";
 
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
 import { CLAUDE_CODE_MINIMUM, compareVersions } from "../policy/claudeCodeGate";
+import { claudeCodeMessageId } from "./messageId";
 import { processIdentity } from "./ownedProcesses";
 import { HarnessResolver } from "./resolver";
 import {
@@ -66,6 +67,8 @@ import {
   DEFAULT_INTERRUPT_TIMEOUT,
   liveClaudeCodeSdk,
   newClaudeCodeSessionId,
+  resultError,
+  takenNarration,
   type ClaudeCodeHarnessOptions,
   type ClaudeCodeSdk,
   type HarnessQuery,
@@ -2518,6 +2521,68 @@ const withTurnDriven = <A>(
 };
 
 const SESSION = "22222222-0000-4000-8000-000000000001";
+
+describe("U4: a steer taken, and a turn the harness ended in error", () => {
+  const STEER = "aaaaaaaabbbbbbbbccccccccdddddddd";
+  const OTHER = "11111111222222223333333344444444";
+  const frame = (uuids: readonly string[] | undefined): SDKMessage =>
+    ({
+      type: "assistant",
+      session_id: "s",
+      parent_tool_use_id: null,
+      message: { id: "m", content: [] },
+      ...(uuids === undefined
+        ? {}
+        : { user_message_uuid: uuids.at(-1), user_message_uuids: uuids }),
+    }) as unknown as SDKMessage;
+
+  test("the first frame naming a steer's uuid says it was taken, once, under the application's id", () => {
+    const record = {
+      untaken: new Map([
+        [claudeCodeMessageId(STEER), STEER],
+        [claudeCodeMessageId(OTHER), OTHER],
+      ]),
+    };
+    // A frame naming no steer (the opening prompt's turn) says nothing.
+    expect(takenNarration(record, frame(["opening-uuid"]))).toEqual([]);
+    expect(takenNarration(record, frame(undefined))).toEqual([]);
+
+    const first = takenNarration(
+      record,
+      frame(["opening-uuid", claudeCodeMessageId(STEER)]),
+    );
+    expect(first.map((entry) => entry.detail)).toEqual([
+      { _tag: "taken", messageId: STEER },
+    ]);
+    // Every later frame of that turn names it again, and its `result`: nothing more.
+    expect(takenNarration(record, frame([claudeCodeMessageId(STEER)]))).toEqual(
+      [],
+    );
+    expect([...record.untaken.values()]).toEqual([OTHER]);
+  });
+
+  test("a failed result says the CLI's errors; a success, an interrupt or a silent failure says nothing", () => {
+    const failed = {
+      type: "result",
+      subtype: "error_max_turns",
+      errors: ["Reached maximum number of turns (3)"],
+    } as unknown as SDKMessage;
+    expect(resultError(failed, "failed")).toEqual({
+      _tag: "error",
+      message: "Reached maximum number of turns (3)",
+    });
+    expect(resultError(failed, "interrupted")).toBeUndefined();
+    expect(
+      resultError({ ...failed, errors: [] } as unknown as SDKMessage, "failed"),
+    ).toBeUndefined();
+    expect(
+      resultError(
+        { type: "result", subtype: "success" } as unknown as SDKMessage,
+        "succeeded",
+      ),
+    ).toBeUndefined();
+  });
+});
 
 describe("a second accepted message, and what settlement means after one", () => {
   test("waitForIdle waits for the steer's own turn, not the one it took over from", async () => {

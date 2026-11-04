@@ -1391,6 +1391,8 @@ export class ScopeImporter extends Context.Service<
           readonly added: readonly string[];
           readonly notAdded: readonly string[];
         },
+        /** The steer's id, on a `continued` turn: see `ImporterTurnAccepted.messageId`. */
+        messageId?: string,
       ): ImporterTurnAccepted => ({
         targetId: entry.targetId,
         importId: entry.id,
@@ -1402,6 +1404,7 @@ export class ScopeImporter extends Context.Service<
         pagesAdded: [...pages.added],
         pagesNotAdded: [...pages.notAdded],
         acceptedAt: Date.now(),
+        ...(messageId === undefined ? {} : { messageId }),
       });
 
       /**
@@ -1479,6 +1482,7 @@ export class ScopeImporter extends Context.Service<
           "continued",
           "",
           widened ?? { added: [], notAdded: [] },
+          delivered.success.messageId,
         );
       });
 

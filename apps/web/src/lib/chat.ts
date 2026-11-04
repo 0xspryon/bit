@@ -95,6 +95,11 @@ const KIND_LABELS: Record<string, string | undefined> = {
    */
   "turn.other": "Harness",
   "tool.result": "Tool result",
+  /**
+   * The harness took a message sent while a turn ran (A6 U4). The importer chat never draws
+   * it — it only stops drawing that message as queued — so this word is the Live panel's.
+   */
+  "turn.taken": "Message taken",
   /** A sub-agent the agent started, as one entry (A6 U14). See {@link SUBAGENT_KIND}. */
   subagent: "Sub-agent",
   "action.denied": "Denied",
@@ -617,7 +622,185 @@ export const turnModel = (
   return undefined;
 };
 
-/** What a planner round's separator needs, and the whole of what the chat is given. */
+/**
+ * Every model that answered in a turn, oldest first, each once (A6 U4): the turn footer's
+ * `claude-sonnet-4-5 → claude-haiku-4-5` after a switch mid-turn. Read from the agent's own
+ * items (`LiveItem.model`), so a turn is named for the models that answered it rather than
+ * the session's current one. Empty when the harness named none.
+ */
+export const turnModels = (
+  group: Pick<ChatGroup<unknown>, "rows">,
+): readonly string[] => {
+  const models: string[] = [];
+  for (const row of group.rows) {
+    for (const item of [row.proposedBy, row.item]) {
+      const model = item?.model;
+      if (model !== undefined && !models.includes(model)) models.push(model);
+    }
+  }
+  return models;
+};
+
+/**
+ * The time of a turn's last item, in epoch milliseconds, or `undefined` for a turn with
+ * none: the end of the span a turn footer's duration measures (A6 U4). Every item it reads
+ * is the server's or the harness's — a call, its result, the record a write produced — so
+ * it is on the same clock as a start the server stamped.
+ */
+export const turnEndedAt = (
+  group: Pick<ChatGroup<unknown>, "rows">,
+): number | undefined => {
+  let last: number | undefined;
+  for (const row of group.rows) {
+    for (const item of [row.proposedBy, row.item, row.result]) {
+      if (item != null && (last === undefined || item.at > last))
+        last = item.at;
+    }
+  }
+  return last;
+};
+
+/** A turn's length as a footer says it: `41s`, `2m 05s`, `1h 02m`. */
+export const durationLabel = (ms: number): string => {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${String(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${String(minutes)}m ${String(seconds % 60).padStart(2, "0")}s`;
+  }
+  return `${String(Math.floor(minutes / 60))}h ${String(minutes % 60).padStart(2, "0")}m`;
+};
+
+/**
+ * What a run of tool calls folded into one line says about itself (A6 U4, D3): how many
+ * calls, which tools, and what among them needs the operator — the rest is one click away.
+ */
+export interface ToolRunSummary {
+  /** Calls in the run, each once: a write folded into its record is one call. */
+  readonly count: number;
+  /** The distinct tool names, in the order first called, our MCP prefix already off. */
+  readonly names: readonly string[];
+  /** Writes the harness reported failed: nothing was written. */
+  readonly refused: number;
+  /** Writes that ended with neither a record nor a stated failure. Must stay visible. */
+  readonly unresolved: number;
+  /** Calls that are not writes whose result the harness reported failed. */
+  readonly failed: number;
+  /** A write still in flight: the line says "writing…", as D3 draws it. */
+  readonly pending: boolean;
+}
+
+/**
+ * One line of a thread (A6 U4): a row drawn as itself, or consecutive tool calls folded into
+ * one muted line — D3's ">_ Ran 3 commands · write_scope_entry" — with their rows, drawn as
+ * they always were, one click away.
+ */
+export type ThreadEntry =
+  | { readonly _tag: "row"; readonly key: string; readonly row: ChatRow }
+  | {
+      readonly _tag: "tools";
+      /** The first row's key, so a run that grows keeps its place and its open state. */
+      readonly key: string;
+      readonly rows: readonly ChatRow[];
+      readonly summary: ToolRunSummary;
+    };
+
+/**
+ * Whether a row is a tool call: a call, a write folded into the record it produced, or a
+ * result whose call is not here. A record no call claims is not — it is something that was
+ * committed, not something the agent ran — and stays a row of its own, as does a
+ * sub-agent, a refused action and a harness note.
+ */
+const isToolRow = (row: ChatRow): boolean =>
+  row.proposedBy !== null ||
+  row.item.kind === "tool.call" ||
+  row.item.kind === "tool.result";
+
+/** The name a tool row's line gives it: the call's reduced name, as its signature does. */
+const toolRowName = (row: ChatRow): string => {
+  const call = row.proposedBy ?? row.item;
+  return call.toolName ?? call.tool ?? call.headline;
+};
+
+/** What a run of tool rows says when folded: see {@link ToolRunSummary}. */
+export const toolRunSummary = (rows: readonly ChatRow[]): ToolRunSummary => {
+  const names: string[] = [];
+  let refused = 0;
+  let unresolved = 0;
+  let failed = 0;
+  for (const row of rows) {
+    const name = toolRowName(row);
+    if (!names.includes(name)) names.push(name);
+    if (row.write === "refused") refused += 1;
+    else if (row.write === "unresolved") unresolved += 1;
+    else if (
+      row.write === null &&
+      (row.result ?? (row.item.kind === "tool.result" ? row.item : null))
+        ?.outcome === "failed"
+    ) {
+      failed += 1;
+    }
+  }
+  return {
+    count: rows.length,
+    names,
+    refused,
+    unresolved,
+    failed,
+    pending: rows.some((row) => row.write === "pending"),
+  };
+};
+
+/** "Ran 1 command", "Ran 3 commands": the folded line's count, as D3 words it. */
+export const toolRunCount = (count: number): string =>
+  `Ran ${String(count)} ${count === 1 ? "command" : "commands"}`;
+
+/**
+ * What the folded line says needs attention, each as a short phrase: refused and failed
+ * calls and unresolved writes. Recorded writes and ordinary results are the expected
+ * outcome and are said only once the run is opened.
+ */
+export const toolRunAttention = (summary: ToolRunSummary): readonly string[] =>
+  [
+    summary.refused > 0 ? `${String(summary.refused)} refused` : "",
+    summary.unresolved > 0 ? `${String(summary.unresolved)} unresolved` : "",
+    summary.failed > 0 ? `${String(summary.failed)} failed` : "",
+  ].filter((part) => part !== "");
+
+/**
+ * A group's rows as a thread draws them: each run of consecutive tool rows folded into one
+ * entry, everything else as itself. A single call is a run too ("Ran 1 command").
+ */
+export const threadEntries = (
+  rows: readonly ChatRow[],
+): readonly ThreadEntry[] => {
+  const entries: ThreadEntry[] = [];
+  let run: ChatRow[] = [];
+  const close = (): void => {
+    const first = run[0];
+    if (first !== undefined) {
+      entries.push({
+        _tag: "tools",
+        key: `tools:${first.key}`,
+        rows: run,
+        summary: toolRunSummary(run),
+      });
+    }
+    run = [];
+  };
+  for (const row of rows) {
+    if (isToolRow(row)) {
+      run.push(row);
+      continue;
+    }
+    close();
+    entries.push({ _tag: "row", key: row.key, row });
+  }
+  close();
+  return entries;
+};
+
+/** What a planner round's separator needs, and the whole of what the chat is given. */ /** What a planner round's separator needs, and the whole of what the chat is given. */
 export interface PlannerSubject {
   /** The row. Where the status and the disposition come from, and the only durable half. */
   readonly round: PlanRoundView;

@@ -105,6 +105,18 @@ export interface ImporterTurn {
   readonly at: number | null;
   /** True while the importer is still working on this message. */
   readonly working: boolean;
+  /**
+   * True while this message waits behind a turn already running (A6 U4): it was sent
+   * mid-turn and the harness has not yet said it took it (`turn.taken`). Drawn where the
+   * operator sent it, marked queued; once taken it is an ordinary turn.
+   */
+  readonly queued: boolean;
+  /**
+   * When the importer started on this message, on the server's clock, or `null` on the
+   * leading group: when the harness took it, for a message that waited; otherwise when it
+   * was accepted (live) or stored (replayed). The start of the turn footer's duration.
+   */
+  readonly startedAt: number | null;
 }
 
 /** One importer turn as a chat group. */
@@ -298,7 +310,34 @@ export interface ImporterSession {
    * the options a switch names. V2 puts `modelOptions` on `ImporterSessionView`.
    */
   readonly modelOptions?: readonly ModelOptionSelection[];
+  /**
+   * The operator rows in {@link items} that were sent while a turn was running and were
+   * delivered as steers (they carry `messageId`), by row id (A6 U4). Such a row is queued
+   * until a `turn.taken` item names its message: see {@link importerFeed} for where it is
+   * placed meanwhile and {@link ImporterTurn.queued} for how it is drawn.
+   */
+  readonly midTurn?: readonly string[];
 }
+
+/** The kind a harness's "took a queued message" item carries (`live.ts`). */
+export const TAKEN_KIND = "turn.taken";
+
+/** Each `turn.taken` item in `items` by the message it names. */
+const takenByMessage = (
+  items: readonly LiveItem[],
+): ReadonlyMap<string, LiveItem> => {
+  const taken = new Map<string, LiveItem>();
+  for (const item of items) {
+    if (item.kind === TAKEN_KIND && item.messageId !== undefined) {
+      taken.set(item.messageId, item);
+    }
+  }
+  return taken;
+};
+
+/** What a message waiting behind the running turn says, under its bubble. */
+export const QUEUED_NOTE =
+  "Queued: the importer reads this once it reaches a break in the work it is doing.";
 
 /**
  * What the composer says under a message the server accepted: the server's own note, then
@@ -366,6 +405,10 @@ export const importerFeed = (input: {
    * {@link ImporterSession.historyFloor}.
    */
   readonly historyFloor?: number | undefined;
+  /** {@link ImporterSession.midTurn}: rows sent as steers while a turn ran. */
+  readonly midTurn?: readonly string[] | undefined;
+  /** Whether the session is working: a steer can only wait behind a turn that is. */
+  readonly working?: boolean | undefined;
 }): readonly LiveItem[] => {
   const { importId } = input;
   if (importId === undefined) return input.own;
@@ -390,15 +433,36 @@ export const importerFeed = (input: {
   );
   if (mine.length === 0) return input.own;
 
+  /*
+   * Where an operator row goes among the importer's words: after everything published
+   * before its floor.
+   *
+   * **A steer sent mid-turn is placed where the harness took it** (A6 U4). Until then the
+   * importer is still on the turn before it, and everything it publishes is that turn's: so
+   * a row still queued sorts after all of it (an infinite floor), and once a `turn.taken`
+   * item names its message, the take's own publish order is its floor — what follows the
+   * take is the steer's work. A row the harness never said it took is placed by its send
+   * floor once the session is idle, as every row was before: the take may have been dropped
+   * from the lossy activity channel, and an idle session has nothing left to keep apart.
+   */
+  const taken = takenByMessage(mine);
+  const floorOf = (row: LiveItem): number => {
+    const sent = input.floors?.[row.id] ?? -1;
+    const take =
+      row.messageId === undefined ? undefined : taken.get(row.messageId);
+    if (take !== undefined) return activityOrder(take) ?? sent;
+    if (input.working === true && input.midTurn?.includes(row.id) === true) {
+      return Number.POSITIVE_INFINITY;
+    }
+    return sent;
+  };
+
   // The page's own rows in runs, each opened by an operator row and carrying its floor.
   const runs: { floor: number; items: LiveItem[] }[] = [];
   for (const item of input.own) {
     if (item.kind === OPERATOR_TURN_KIND || runs.length === 0) {
       runs.push({
-        floor:
-          item.kind === OPERATOR_TURN_KIND
-            ? (input.floors?.[item.id] ?? -1)
-            : -1,
+        floor: item.kind === OPERATOR_TURN_KIND ? floorOf(item) : -1,
         items: [],
       });
     }
@@ -442,7 +506,46 @@ export interface ImporterChatInput {
    * `0` when omitted.
    */
   readonly recordsSkipped?: number;
+  /** {@link ImporterSession.midTurn}. Empty when omitted. */
+  readonly midTurn?: readonly string[];
 }
+
+/**
+ * Each tool result moved to sit right after the call it answers, when that call is earlier
+ * in the list (A6 U4).
+ *
+ * A result can land after an operator row that came between it and its call — a call still
+ * running when a steer was taken, a reply that took a while — and cut at that row, it would
+ * be a row of its own under the wrong message while its call's row waited for it. Beside
+ * its call it is folded into that row, in the call's turn, as it would have been had it
+ * arrived first. A result whose call is not here stays where it is.
+ */
+const besideCalls = (items: readonly LiveItem[]): readonly LiveItem[] => {
+  const calls = new Set<string>();
+  const late = new Map<string, LiveItem[]>();
+  const moved = new Set<string>();
+  for (const item of items) {
+    if (item.callId === null) continue;
+    if (item.kind === "tool.call") calls.add(item.callId);
+    else if (item.kind === "tool.result" && calls.has(item.callId)) {
+      const list = late.get(item.callId);
+      if (list === undefined) late.set(item.callId, [item]);
+      else list.push(item);
+      moved.add(item.id);
+    }
+  }
+  if (moved.size === 0) return items;
+  const placed: LiveItem[] = [];
+  for (const item of items) {
+    if (moved.has(item.id)) continue;
+    placed.push(item);
+    if (item.kind === "tool.call" && item.callId !== null) {
+      placed.push(...(late.get(item.callId) ?? []));
+      late.delete(item.callId);
+    }
+  }
+  return placed;
+};
 
 /** A conversation cut at each operator row. */
 interface Cut {
@@ -589,15 +692,26 @@ export const buildImporterChat = (
   input: ImporterChatInput,
 ): readonly ImporterGroup[] => {
   const { history } = input;
+  // A take is never drawn: it only says which operator row is no longer queued (A6 U4).
+  const taken = takenByMessage(input.items);
   const placed = placedByCall(
     history.items,
-    input.items,
+    input.items.filter((item) => item.kind !== TAKEN_KIND),
     history.truncated || (input.recordsSkipped ?? 0) > 0,
   );
   // Folded before the cut: a background sub-agent can end turns after it started, and is
-  // still one entry, where it started (A6 U14).
-  const cut = cutAtOperator(foldSubagents(placed.items));
+  // still one entry, where it started (A6 U14). A late result joins its call likewise.
+  const cut = cutAtOperator(besideCalls(foldSubagents(placed.items)));
   const turnCount = cut.turns.length;
+  const midTurn = new Set(input.midTurn ?? []);
+  /** Whether a turn's message still waits behind the turn running before it. */
+  const waiting = (operator: LiveItem): boolean =>
+    input.working &&
+    midTurn.has(operator.id) &&
+    operator.messageId !== undefined &&
+    !taken.has(operator.messageId);
+  // The turn the importer is on: the newest whose message is not still waiting.
+  const active = cut.turns.findLastIndex((turn) => !waiting(turn.operator));
 
   const groups: ImporterGroup[] = [];
 
@@ -626,7 +740,14 @@ export const buildImporterChat = (
       : leadingProse(history, turnCount > 0);
     groups.push({
       key: "earlier",
-      subject: { message: null, number: null, at: null, working: false },
+      subject: {
+        message: null,
+        number: null,
+        at: null,
+        working: false,
+        queued: false,
+        startedAt: null,
+      },
       prose,
       rows: rowsFor(cut.leading, false, placed.pairing),
     });
@@ -634,10 +755,16 @@ export const buildImporterChat = (
 
   cut.turns.forEach((turn, position) => {
     const number = position + 1;
-    const latest = position === cut.turns.length - 1;
+    const queued = waiting(turn.operator);
+    // "Latest" is the turn the importer is on, which a queued message after it is not.
+    const latest = position === active;
     const working = latest && input.working;
     const replayed = fromReplay(turn.operator);
     const spoke = turn.items.some((item) => item.origin === "activity");
+    const take =
+      turn.operator.messageId === undefined
+        ? undefined
+        : taken.get(turn.operator.messageId);
     groups.push({
       key: `turn:${String(number)}`,
       subject: {
@@ -645,32 +772,38 @@ export const buildImporterChat = (
         number,
         at: turn.operator.at,
         working,
+        queued,
+        startedAt: take?.at ?? turn.operator.at,
       },
-      prose: replayed
-        ? spoke
-          ? {
-              _tag: "replayed",
-              note: history.note,
-              ephemeral: true,
-              // Said once, on the first turn: the answer stopped short of the oldest items.
-              truncated:
-                history.truncated && position === 0 && cut.leading.length === 0,
-            }
-          : {
-              _tag: "none",
-              note: "The harness holds this message and no reply to it.",
-            }
-        : spoke
-          ? { _tag: "live" }
-          : latest
+      prose: queued
+        ? { _tag: "pending", note: QUEUED_NOTE }
+        : replayed
+          ? spoke
             ? {
-                _tag: "pending",
-                note: "Sent. The importer has not answered yet.",
+                _tag: "replayed",
+                note: history.note,
+                ephemeral: true,
+                // Said once, on the first turn: the answer stopped short of the oldest items.
+                truncated:
+                  history.truncated &&
+                  position === 0 &&
+                  cut.leading.length === 0,
               }
             : {
                 _tag: "none",
-                note: "The importer wrote nothing in reply to this message.",
-              },
+                note: "The harness holds this message and no reply to it.",
+              }
+          : spoke
+            ? { _tag: "live" }
+            : latest
+              ? {
+                  _tag: "pending",
+                  note: "Sent. The importer has not answered yet.",
+                }
+              : {
+                  _tag: "none",
+                  note: "The importer wrote nothing in reply to this message.",
+                },
       rows: rowsFor(turn.items, working, placed.pairing),
     });
   });

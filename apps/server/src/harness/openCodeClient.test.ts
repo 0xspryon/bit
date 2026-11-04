@@ -1155,6 +1155,51 @@ describe("reading an opencode event", () => {
     });
   });
 
+  test("U4: a message taken off the inbox is narrated as taken, under the application's id", async () => {
+    const id = "0123456789abcdef0123456789abcdef";
+    const taken = openCodeNarration(
+      event("session.inbox.delivered", { inboxID: `msg_${id}` }),
+      new Map(),
+    );
+    expect(taken.detail).toEqual({ _tag: "taken", messageId: id });
+    // An inbox id this server did not mint — the opening prompt's, another client's — is not
+    // one a chat is waiting on, and narrates nothing.
+    for (const inboxID of ["msg_01JABCDEF", "msg_", "other", 7]) {
+      expect(
+        openCodeNarration(
+          event("session.inbox.delivered", { inboxID }),
+          new Map(),
+        ).detail,
+      ).toEqual({ _tag: "opaque" });
+    }
+  });
+
+  test("U4: a turn the harness ended in its own error says the harness's sentence", async () => {
+    const failed = openCodeNarration(
+      event("session.execution.failed", {
+        error: {
+          type: "ProviderError",
+          message: "Free usage limit reached. Upgrade to continue.",
+        },
+      }),
+      new Map(),
+    );
+    expect(failed.detail).toEqual({
+      _tag: "error",
+      message: "Free usage limit reached. Upgrade to continue.",
+    });
+    expect(failed.outcome).toBe("failed");
+    // No sentence, nothing worded here in its place.
+    expect(
+      openCodeNarration(
+        event("session.execution.failed", {
+          error: { type: "X", message: " " },
+        }),
+        new Map(),
+      ).detail,
+    ).toEqual({ _tag: "opaque" });
+  });
+
   test("a result for a call whose name was never seen says so rather than borrowing one", async () => {
     // Reachable: a stream joined between `input.started` and the result has an id and no
     // name. Reusing the last name seen would put the wrong tool beside a real result.

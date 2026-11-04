@@ -112,7 +112,7 @@ import {
   splitAttachmentLines,
   withAttachmentLines,
 } from "./attachments";
-import { openCodeMessageId } from "./messageId";
+import { isDerivedMessageId, openCodeMessageId } from "./messageId";
 import { HarnessDecodeError, HarnessTransportError } from "./errors";
 import {
   defaultInstanceIdForDriver,
@@ -780,6 +780,30 @@ export const openCodeNarration = (
           ),
           failed: true,
         };
+      }
+      case "session.inbox.delivered": {
+        /*
+         * A message taken off the session's inbox into its transcript (A6 U4): the steer
+         * that was queued behind the work in flight is now being read. The inbox id is the
+         * message id in OpenCode's space (`openCodeMessageId`), so the application's id is
+         * that without its prefix; an id not in that shape is not one this server sent.
+         */
+        const inbox = data["inboxID"];
+        const messageId =
+          typeof inbox === "string" && inbox.startsWith("msg_")
+            ? inbox.slice(4)
+            : undefined;
+        return messageId !== undefined && isDerivedMessageId(messageId)
+          ? { _tag: "taken", messageId }
+          : { _tag: "opaque" };
+      }
+      case "session.execution.failed": {
+        // The turn ended in the harness's own error — a provider refusing the call, say
+        // ("Free usage limit reached") — and the sentence is the harness's (A6 U4).
+        const error = (data["error"] ?? {}) as { message?: unknown };
+        return typeof error.message === "string" && error.message.trim() !== ""
+          ? { _tag: "error", message: truncateNarration(error.message) }
+          : { _tag: "opaque" };
       }
       case "session.synthetic":
         // A background sub-agent's end; any other notice stays `opaque`, as it was.

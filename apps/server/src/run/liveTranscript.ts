@@ -1019,6 +1019,41 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
       // A piece of a block: never on the wire itself. Where it is wanted, the coalescer has
       // already made it a `partial`; anywhere else it is as good as `opaque`.
       return undefined;
+    case "taken":
+      /*
+       * The harness took a steer (A6 U4). Carries the application's id for the message and
+       * nothing to read: a chat matches it to the message the operator sent and stops
+       * drawing that message as queued. Live only — a replay holds the message itself,
+       * where the harness put it.
+       */
+      return {
+        ...base,
+        kind: "turn.taken",
+        headline: "Taken",
+        body: "",
+        tool: null,
+        toolName: null,
+        input: null,
+        output: null,
+        callId: null,
+        outcome: null,
+        messageId: detail.messageId,
+      };
+    case "error":
+      // The item a replay draws for an entry's `error` (`projectReplay`), so a turn that
+      // failed reads the same watched and reloaded: the harness's sentence, as its own.
+      return {
+        ...base,
+        kind: "turn.other",
+        headline: "error",
+        body: truncateNarration(detail.message),
+        tool: null,
+        toolName: null,
+        input: null,
+        output: null,
+        callId: null,
+        outcome: "failed",
+      };
     case "usage":
       /*
        * One model call's measurement, as its own frame.

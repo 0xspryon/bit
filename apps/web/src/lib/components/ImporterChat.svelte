@@ -62,7 +62,14 @@
 
   import type { App } from "../app.svelte";
   import { IconArrowUp, IconFile, IconLink, IconPlus } from "../icons";
-  import { turnModel } from "../chat";
+  import {
+    durationLabel,
+    turnEndedAt,
+    turnModels,
+    type ChatGroup,
+  } from "../chat";
+  import type { ImporterTurn } from "../importerChat";
+  import CopyButton from "./CopyButton.svelte";
   import { ENDED_NOTE, strandedNote } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import AgentChip from "./AgentChip.svelte";
@@ -150,6 +157,60 @@
       ? importer.switchNotice.text
       : "",
   );
+  /**
+   * The agent this session runs as, by its registry label: the first word of a turn's
+   * footer (D4's "Importer · …"). The registry's default before a session has one, and
+   * "Importer" where no registry has been read (the page is the importer's either way).
+   */
+  let agentLabel = $derived.by(() => {
+    const id = session?.agentId ?? importer.agents?.defaultAgentId;
+    return (
+      importer.agents?.agents.find((agent) => agent.id === id)?.label ??
+      "Importer"
+    );
+  });
+
+  /** "18:02": when the operator's message was sent, as D3 sets it under the bubble. */
+  const clock = (at: number): string =>
+    new Date(at).toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+
+  /**
+   * A finished turn's footer, D4's "Importer · openai/gpt-5.6-sol · 41s" (A6 U4).
+   *
+   * - **The models are the turn's own** (`turnModels`, from each item's `model`), so an
+   *   earlier turn keeps the model that answered it after a switch, and a turn switched
+   *   mid-way names both: `claude-sonnet-4-5 → claude-haiku-4-5`. The session's current
+   *   model only where the harness named none.
+   * - **The duration** runs from when the importer started on the message — accepted, or
+   *   taken off the queue, on the server's clock; stored, on a replay — to the turn's last
+   *   item, which the server or the harness stamped. Both ends one clock, so it is a length
+   *   and not a difference between two machines. Left out when the turn has no items.
+   */
+  const footerOf = (group: ChatGroup<ImporterTurn>): string => {
+    const models = turnModels(group);
+    const model =
+      models.length > 0 ? models.join(" → ") : (session?.model ?? "");
+    const ended = turnEndedAt(group);
+    const started = group.subject.startedAt;
+    const took =
+      ended !== undefined && started !== null && ended >= started
+        ? durationLabel(ended - started)
+        : "";
+    return [agentLabel, model, took].filter((part) => part !== "").join(" · ");
+  };
+
+  /** The importer's words in a turn, as the footer's Copy copies them. */
+  const replyText = (group: ChatGroup<ImporterTurn>): string =>
+    group.rows
+      .filter((row) => row.item.kind === "turn.reply")
+      .map((row) => row.item.body.trim())
+      .filter((body) => body !== "")
+      .join("\n\n");
+
   let box = $state<HTMLTextAreaElement | undefined>(undefined);
   /** Whether the focus is anywhere in the composer's box, for its strong border. */
   let focused = $state(false);
@@ -272,8 +333,26 @@
           chat asks them to paste the program's pages, so it is as often a page author's
           words, and a bidi control in a pasted host reorders it here as in a reply.
         -->
-        <div class="you">
+        <div class={["you", group.subject.queued && "queued"]}>
           <div class="bubble"><MarkedText text={group.subject.message} /></div>
+          <!--
+            D3's line under the bubble: who and when, and a copy of the words. A message
+            still waiting behind the running turn says so here, until the harness takes it.
+          -->
+          <div class="said">
+            {#if group.subject.queued}
+              <span class="queued-mark">queued</span>
+            {/if}
+            <span class="when"
+              >You{group.subject.at === null
+                ? ""
+                : ` · ${clock(group.subject.at)}`}</span
+            >
+            <CopyButton
+              text={group.subject.message}
+              label="Copy your message"
+            />
+          </div>
         </div>
       {/if}
     {/snippet}
@@ -302,25 +381,20 @@
 
     {#snippet footer(group)}
       <!--
-        Under the finished reply, in OpenCode's manner: the model it ran on, small and muted.
-        Not while the turn is in flight, as OpenCode's is not — the cursor is what is under a
-        reply still being written, and a caption that appeared mid-stream would then move
-        down with every row that landed above it.
-
-        **The model that answered this turn**, from the turn's own items (`turnModel`, A6
-        F10), and the session's current model only where the harness named none: after a
-        switch, an earlier turn was still answered by the model it was answered by.
-
-        **No duration yet.** A replayed turn now carries the harness's own times (A6 F10),
-        but a live one's start is this tab's clock while every reply's `at` is the
-        server's; U4 draws the footer's duration once both ends come from one clock.
+        Under the finished reply, as D4 draws it: a copy of the turn's words, then the agent,
+        the model or models that answered and how long the turn took (`footerOf`). Not while
+        the turn is in flight, as OpenCode's is not — the cursor is what is under a reply
+        still being written, and a caption that appeared mid-stream would then move down
+        with every row that landed above it.
       -->
-      {@const model = turnModel(group) ?? session?.model ?? ""}
-      {#if !group.subject.working && model !== ""}
-        <p class="foot">
-          <!-- An expression, because Svelte trims the space off the end of an element's text. -->
-          <span class="visually-hidden">{"Model: "}</span>{model}
-        </p>
+      {#if !group.subject.working}
+        <div class="foot">
+          <CopyButton
+            text={replyText(group)}
+            label="Copy the importer's reply"
+          />
+          <p class="foot-text">{footerOf(group)}</p>
+        </div>
       {/if}
     {/snippet}
 
@@ -526,8 +600,35 @@
     display: flex;
     flex: 1 1 100%;
     min-width: 0;
-    justify-content: flex-end;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 7px;
     padding-bottom: 8px;
+  }
+  /* D3's "You · 18:02" and its copy glyph, right-aligned under the bubble. */
+  .said {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--text-muted);
+    font: 400 11px/16px var(--font-mono);
+  }
+  /*
+    A message still waiting behind the running turn: its bubble dashed and its words
+    muted, so it reads as sent and not yet read, and a word beside the time that says so.
+  */
+  .queued .bubble {
+    border: 1px dashed var(--border-strong);
+    background: transparent;
+    color: var(--text-muted);
+  }
+  .queued-mark {
+    padding: 0 6px;
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-sm);
+    font: 500 10px/16px var(--font-sans);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
   .bubble {
     max-width: 560px;
@@ -546,7 +647,13 @@
     only place on the turn the model is said, not decoration beside a label that said it.
   */
   .foot {
-    margin: 8px 0 0;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin: 14px 0 0;
+  }
+  .foot-text {
+    margin: 0;
     font: 400 11px/16px var(--font-mono);
     color: var(--text-muted);
     overflow-wrap: anywhere;

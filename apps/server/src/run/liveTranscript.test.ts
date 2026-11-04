@@ -1283,6 +1283,57 @@ describe("projecting live activity", () => {
     ).toThrow();
   });
 
+  test("U4: a steer taken is an item carrying the message's id, and nothing to read", () => {
+    const item = projectedItem(
+      narration(
+        { _tag: "taken", messageId: "aaaaaaaabbbbbbbbccccccccdddddddd" },
+        { subject: { _tag: "import", importId: "imp_1" } },
+      ),
+    );
+    expect(item?.kind).toBe("turn.taken");
+    expect(item?.messageId).toBe("aaaaaaaabbbbbbbbccccccccdddddddd");
+    expect(item?.body).toBe("");
+    expect(item?.importId).toBe("imp_1");
+  });
+
+  test("U4: a harness's error is the item a replay draws for one, its sentence as the body", () => {
+    const live = projectedItem(
+      narration(
+        { _tag: "error", message: "Free usage limit reached." },
+        { subject: { _tag: "import", importId: "imp_1" } },
+      ),
+    );
+    const replayed = projectReplay({
+      entries: [
+        {
+          type: "assistant",
+          text: "",
+          error: "Free usage limit reached.",
+          parts: [],
+          model: undefined,
+          at: 1_700_000_000_000,
+        },
+      ],
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+    }).items[0];
+    const drawn = (item: LiveItem | undefined) => ({
+      kind: item?.kind,
+      headline: item?.headline,
+      body: item?.body,
+      outcome: item?.outcome,
+    });
+    expect(drawn(live)).toEqual({
+      kind: "turn.other",
+      headline: "error",
+      body: "Free usage limit reached.",
+      outcome: "failed",
+    });
+    expect(drawn(replayed)).toEqual(drawn(live));
+  });
+
   test("a usage entry is a frame of its own, not a row in the transcript", () => {
     /*
      * A measurement about the session rather than a turn in it. If this were an item it

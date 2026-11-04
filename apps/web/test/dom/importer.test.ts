@@ -78,8 +78,15 @@ const type = (box: HTMLTextAreaElement, value: string): void => {
 /** The conversation's groups, each as its separator's words. */
 const headings = (): string[] =>
   [...document.querySelectorAll('[role="log"] > .group > .sep')].map(
-    (each) => each.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    (each) =>
+      (each.querySelector(".bubble") ?? each).textContent
+        ?.replace(/\s+/g, " ")
+        .trim() ?? "",
   );
+
+/** `text` as a regular expression that matches it literally. */
+const escapeRe = (text: string): string =>
+  text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** Each group's own text, separator and all. */
 const groupText = (index: number): string =>
@@ -444,7 +451,7 @@ describe("D4: multi-turn", () => {
 });
 
 describe("S3: nothing labels what the importer says", () => {
-  test("no header over a reply: the separator is the operator's words, and nothing else", async () => {
+  test("no header over a reply: the separator is the operator's words, and who and when", async () => {
     await show("importer-complete");
 
     const seps = [...document.querySelectorAll('[role="log"] > .group > .sep')];
@@ -452,7 +459,12 @@ describe("S3: nothing labels what the importer says", () => {
     for (const sep of seps) {
       const bubble = sep.querySelector(".bubble")?.textContent?.trim() ?? "";
       expect(bubble).not.toBe("");
-      expect(sep.textContent?.trim()).toBe(bubble);
+      // D3: the bubble, then "You · 18:02" under it (U4) — nothing over the reply.
+      expect(sep.textContent?.replace(/\s+/g, " ").trim()).toMatch(
+        new RegExp(
+          `^${escapeRe(bubble.replace(/\s+/g, " "))} You · \\d\\d:\\d\\d$`,
+        ),
+      );
     }
   });
 
@@ -464,7 +476,10 @@ describe("S3: nothing labels what the importer says", () => {
     const each = footers();
     expect(each).toHaveLength(2);
     for (const footer of each) {
-      expect(footer?.says).toBe(`Model: ${model}`);
+      // D4: the agent, the model that answered and how long the turn took (U4).
+      expect(footer?.says).toMatch(
+        new RegExp(`^Importer · ${escapeRe(model)} · \\d+s$`),
+      );
       expect(footer?.in?.classList.contains("prose")).toBe(true);
     }
   });
@@ -492,7 +507,11 @@ describe("S3: nothing labels what the importer says", () => {
     for (const footer of replayedFooters) {
       expect(footer.in?.classList.contains("prose")).toBe(true);
       // The fixture's replayed items name no model, so the session's is the fallback.
-      expect(footer.says).toBe(`Model: ${app.importer.current?.model ?? ""}`);
+      expect(footer.says).toMatch(
+        new RegExp(
+          `^Importer · ${escapeRe(app.importer.current?.model ?? "")} · \\d+s$`,
+        ),
+      );
     }
   });
 
@@ -506,7 +525,7 @@ describe("S3: nothing labels what the importer says", () => {
     // Strings only: a failing match against an object holding a DOM node runs away.
     expect(
       footers().flatMap((each) => (each === null ? [] : [each.says])),
-    ).toEqual(["Model: claude-sonnet-5"]);
+    ).toEqual(["Importer · claude-sonnet-5 · 40s"]);
   });
 });
 

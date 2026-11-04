@@ -587,6 +587,34 @@ export type NarrationDetail =
        */
       readonly compactionAt: number | undefined;
     }
+  | {
+      /**
+       * The harness took a message this session was sent as a steer (A6 U4): it is now in
+       * the conversation, where until now it was queued behind the work in flight.
+       *
+       * What lets a chat draw a follow-up sent mid-turn as **queued** until it is read, and
+       * keep the rest of the running turn's work above it. Claude Code says so on the first
+       * frame whose `user_message_uuids` names the message (the turn that consumed it, or
+       * the running turn it was folded into); OpenCode on `session.inbox.delivered`. One
+       * entry per message, each at most once per session.
+       */
+      readonly _tag: "taken";
+      /** The application's id for the message, as `PromptDelivery.messageId` gave it. */
+      readonly messageId: string;
+    }
+  | {
+      /**
+       * The harness ended a turn with an error of its own (A6 U4): a provider refusing the
+       * call ("Free usage limit reached"), a turn that ran out of turns. Not a tool's
+       * failure, which is its `toolResult`, and not an interrupt this application asked
+       * for. OpenCode's `session.execution.failed`; Claude Code's error `result`.
+       *
+       * `message` is the **harness's own sentence**, capped, and it is untrusted text: a
+       * provider's error can quote anything.
+       */
+      readonly _tag: "error";
+      readonly message: string;
+    }
   | { readonly _tag: "opaque" };
 
 /**

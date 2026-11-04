@@ -21,6 +21,7 @@ import { callSignature, operatorTurn, resultLine } from "../src/lib/chat";
 import {
   LOADING_HISTORY,
   NO_HISTORY,
+  QUEUED_NOTE,
   buildImporterChat,
   importerFeed,
   indexedSession,
@@ -1413,5 +1414,120 @@ describe("a sub-agent is one entry, where it started, in its newest state", () =
         ["turn.reply", "Importer", "One failed.", null, null],
       ],
     ]);
+  });
+});
+
+/*
+ * A6 U4: a message sent while a turn runs waits behind it, and the running turn's work stays
+ * the running turn's until the harness takes the message.
+ */
+describe("U4: a steer sent mid-turn", () => {
+  const MESSAGE = "aaaaaaaabbbbbbbbccccccccdddddddd";
+  const live = (n: number, over: Partial<LiveItem> & Pick<LiveItem, "kind">) =>
+    item({ id: `activity:${String(n)}`, importId: "imp_1", ...over });
+  const first = operator(1, "load the policy");
+  const steer = { ...operator(2, "and the portal"), messageId: MESSAGE };
+  const own = [first, steer];
+  const floors = { [first.id]: 0, [steer.id]: 5 };
+  const before = [
+    live(6, { kind: "turn.reply", body: "reading it" }),
+    live(7, {
+      kind: "tool.call",
+      headline: "fetch_page",
+      toolName: "fetch_page",
+      callId: "f1",
+    }),
+  ];
+  const take = live(8, { kind: "turn.taken", messageId: MESSAGE });
+  const after = [
+    live(9, {
+      kind: "tool.result",
+      headline: "fetch_page",
+      toolName: "fetch_page",
+      callId: "f1",
+      output: "nine rows",
+      outcome: "ok",
+    }),
+    live(10, { kind: "turn.reply", body: "adding the portal" }),
+  ];
+  const chat = (liveItems: readonly LiveItem[], working: boolean) =>
+    buildImporterChat({
+      history: NO_HISTORY,
+      working,
+      midTurn: [steer.id],
+      items: importerFeed({
+        own,
+        floors,
+        live: liveItems,
+        importId: "imp_1",
+        midTurn: [steer.id],
+        working,
+      }),
+    });
+  const read = (groups: ReturnType<typeof chat>) =>
+    groups.map((group) => ({
+      message: group.subject.message,
+      queued: group.subject.queued,
+      working: group.subject.working,
+      rows: group.rows.map((row) =>
+        row.item.kind === "tool.call"
+          ? `${row.item.toolName ?? ""}→${row.result?.output ?? "…"}`
+          : row.item.body,
+      ),
+    }));
+
+  test("waits at the end, queued, while the turn before it does the work", () => {
+    const groups = chat(before, true);
+    expect(read(groups)).toEqual([
+      {
+        message: "load the policy",
+        queued: false,
+        working: true,
+        rows: ["reading it", "fetch_page→…"],
+      },
+      { message: "and the portal", queued: true, working: false, rows: [] },
+    ]);
+    expect(groups[1]?.prose).toEqual({ _tag: "pending", note: QUEUED_NOTE });
+  });
+
+  test("once taken it opens its own turn there, and a late result still folds into its call", () => {
+    const groups = chat([...before, take, ...after], true);
+    expect(read(groups)).toEqual([
+      {
+        message: "load the policy",
+        queued: false,
+        working: false,
+        rows: ["reading it", "fetch_page→nine rows"],
+      },
+      {
+        message: "and the portal",
+        queued: false,
+        working: true,
+        rows: ["adding the portal"],
+      },
+    ]);
+    // Its turn starts when the harness took it, on the server's clock.
+    expect(groups[1]?.subject.startedAt).toBe(take.at);
+    // The take itself is no row.
+    expect(
+      groups.flatMap((group) => group.rows.map((row) => row.item.kind)),
+    ).not.toContain("turn.taken");
+  });
+
+  test("a session gone idle with no take places it where it was sent, as before", () => {
+    const groups = chat([...before, ...after], false);
+    expect(read(groups).map((group) => [group.message, group.queued])).toEqual([
+      ["load the policy", false],
+      ["and the portal", false],
+    ]);
+    // Sent at floor 5, and nothing said where the harness took it: everything published
+    // after the send is under it, as every row was placed before U4 (the take may have been
+    // dropped from the lossy channel).
+    expect(read(groups)[1]?.rows).toEqual([
+      "reading it",
+      "fetch_page→nine rows",
+      "adding the portal",
+    ]);
+    expect(read(groups)[0]?.rows).toEqual([]);
   });
 });
