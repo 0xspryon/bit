@@ -240,7 +240,15 @@ to render diagram" with the source, a Show code / Show diagram toggle, Copy copi
 source. `overflow-x: auto`, SVG `max-width: 100%`. Out of V1: KaTeX labels and the expand
 dialog. New dependencies: `pele`, `dompurify`.
 
-**U13 — Uploads in the composer (M), F2 + F9 → U13.** Paste, drop and the `+` picker;
+**U13 — Uploads in the composer (M), F2 + F9 → U13.** From F9's review: Bun answers a body over 128 MiB
+that declares its length with an **empty 413** before the server can send a sentence —
+the browser's `FormData` declares its length, so turn a 413 into a sentence through F2.
+Replayed attachments carry no bytes: add a route that serves a file from a session's
+`uploads/` only after checking the path is inside it (never trust a replayed path). Show
+the empty-file and files-only refusals. **Decided:** retire the goal's old attach route
+and its per-goal list once the goal composer sends files with the message (message files
+currently share `goal/<id>/uploads/`, are re-listed in every later goal prompt, and count
+against the attach route's per-goal cap). Paste, drop and the `+` picker;
 thumbnails for images, name and size for files, remove, refusal through F2; the attachment
 chip with copy-path in operator turns, live and on reload.
 
@@ -280,3 +288,12 @@ U13.
   subagent's transcript in a separate `subagents/` folder the replay does not read (F10
   review). Choose: replay subagent transcripts labelled as a subagent's, or keep subagent
   frames out of the live chat. Tied to the user-settings decision above.
+- **Operator decision pending:** evidence leaving the session directory. Claude Code keeps a
+  full-size copy of every uploaded image in `/tmp/claude-<uid>/<project>/<session>/images/`
+  and a JPEG copy in its transcript under `~/.claude/projects` (F9 review). Same class as the
+  user-settings item.
+- **Accepted for V1 (operator may override):** a line in the operator's text (e.g. pasted
+  from a target page) shaped like `[Attached file "x" is saved at: /some/path]` is
+  indistinguishable to the _agent_ from a real attachment line. The replay no longer trusts
+  such lines (F9 fix), but the live prompt does; a per-message nonce on real lines would
+  close it. Treated as ordinary prompt injection for V1.
