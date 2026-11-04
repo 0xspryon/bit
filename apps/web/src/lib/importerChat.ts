@@ -424,6 +424,16 @@ export const queuedRows = (
  * later ones removed; what followed each stays where it was, now in the one turn. A take of
  * one message, and a row no take names, are left alone.
  */
+/**
+ * What one take is known by when rows are joined: the messages it names, sorted (A6 U4
+ * step 0). Not its `id` — an activity item's id is this process's publish order
+ * (`activity:<n>`), which restarts at zero with the server, so a take recorded before a
+ * restart and one seen after it can share one. A message is taken once, so two takes
+ * never name the same messages.
+ */
+const takeKey = (take: LiveItem): string =>
+  [...messagesOf(take)].sort().join("\n");
+
 const joinedByTake = (
   items: readonly LiveItem[],
   taken: ReadonlyMap<string, LiveItem>,
@@ -437,10 +447,11 @@ const joinedByTake = (
       joined.push(item);
       continue;
     }
-    const at = first.get(take.id);
+    const key = takeKey(take);
+    const at = first.get(key);
     const into = at === undefined ? undefined : joined[at];
     if (at === undefined || into === undefined) {
-      first.set(take.id, joined.length);
+      first.set(key, joined.length);
       joined.push(item);
       continue;
     }

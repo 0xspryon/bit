@@ -281,6 +281,13 @@ interface Script {
   holdMessages:
     { readonly entered: () => void; readonly gate: Promise<void> } | undefined;
   /**
+   * Parks the **next** `ScopeImportProgress.settle` before it writes, until `gate` opens,
+   * signalling `entered` on the way in, then clears itself: a turn's settle caught writing,
+   * for a message delivered past the settling fiber's report read (A6 U4 step 0).
+   */
+  holdSettle:
+    { readonly entered: () => void; readonly gate: Promise<void> } | undefined;
+  /**
    * Streams the first line as {@link STREAMED_PIECES} deltas before its finished block, as
    * a driver that streams does (A6 F6).
    */
@@ -362,6 +369,7 @@ const newScript = (readable: readonly string[]): Script => {
     steerLatency: 0,
     written: [],
     holdMessages: undefined,
+    holdSettle: undefined,
     streamBlocks: false,
     done: Promise.resolve(),
     failCreate: false,
@@ -712,7 +720,7 @@ const world = (readable: readonly string[]) => {
    */
   const base = Layer.mergeAll(
     FleetStore.layer(root),
-    ScopeImportProgress.layer,
+    heldSettle(script),
     McpCredentials.layer,
     McpCallCounter.layer,
     PolicyDecisions.layer,
@@ -753,6 +761,33 @@ const world = (readable: readonly string[]) => {
 
   return { script, layer, root };
 };
+
+/**
+ * The production progress registry, with its next `settle` parked while
+ * `script.holdSettle` is set. Read at call time, so a test may set it after the world is
+ * built.
+ */
+const heldSettle = (script: Script) =>
+  Layer.effect(
+    ScopeImportProgress,
+    Effect.gen(function* () {
+      const inner = yield* ScopeImportProgress;
+      return ScopeImportProgress.of({
+        ...inner,
+        settle: (input) =>
+          Effect.andThen(
+            Effect.promise(async () => {
+              const hold = script.holdSettle;
+              if (hold === undefined) return;
+              script.holdSettle = undefined;
+              hold.entered();
+              await hold.gate;
+            }),
+            inner.settle(input),
+          ),
+      });
+    }),
+  ).pipe(Layer.provide(ScopeImportProgress.layer));
 
 /**
  * The scripted harness, with its opening prompt parked while `script.holdPrompt` is set.
@@ -2053,6 +2088,60 @@ describe("a message the harness's transcript does not hold yet", () => {
     releaseFirst();
     await reading;
     // Sent now: past the first turn's idle point, before it has settled.
+    const releaseSecond = holdTurn(built);
+    const late = await sendTo(
+      runtime,
+      started.importId,
+      "And the staging hosts",
+    );
+    if (late._tag !== "Success") throw new Error("the message was refused");
+    open();
+    await settleTicks();
+    // Its turn is running: the import is working, and the message is still waiting.
+    expect((await viewOf(runtime, started.importId))?.status).toBe("running");
+    expect(
+      (await replayOf(runtime, started.importId)).queued.map(
+        (message) => message.messageId,
+      ),
+    ).toEqual([late.success.messageId ?? ""]);
+    // Its turn ends: settled, and nothing held.
+    releaseSecond();
+    await settleTicks();
+    expect((await viewOf(runtime, started.importId))?.status).toBe("finished");
+    expect(await heldSteersOf(runtime, started.importId)).toBe(0);
+    await runtime.dispose();
+  });
+
+  /*
+   * Review 3's last check: a message delivered while the settling fiber is writing
+   * `finished` — past the report read's check, before the release — finds that fiber still
+   * in `turns` and starts none of its own, and `resume` finds the import still `running`.
+   * Without the check made in the same step as the release, the fiber settled `finished`
+   * and left, and the import read `finished` for the whole of the message's turn.
+   */
+  test("U4 step 0: a message sent while the turn before it writes its settle is waited for, then let go", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const releaseFirst = holdTurn(built);
+    const sent = await sendTo(runtime, started.importId, "And the portal");
+    expect(sent._tag).toBe("Success");
+    // The settle's write is held, once, after the first turn goes idle and its report is read.
+    let entered = () => {};
+    const writing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let open = () => {};
+    built.script.holdSettle = {
+      entered,
+      gate: new Promise<void>((resolve) => {
+        open = resolve;
+      }),
+    };
+    releaseFirst();
+    await writing;
+    // Sent now: past every earlier check, before the settle has written.
     const releaseSecond = holdTurn(built);
     const late = await sendTo(
       runtime,

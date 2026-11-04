@@ -2032,6 +2032,36 @@ describe("U4 review 3: steers the harness took as one", () => {
     ]);
   });
 
+  test("U4 step 0: two takes sharing an id across a server restart are two turns, not one", () => {
+    const THIRD = "99999999aaaaaaaabbbbbbbbcccccccc";
+    const FOURTH = "ddddddddeeeeeeeeffffffff00000000";
+    // Recorded before the restart, and seen after it under the same publish-order id.
+    const before = live(8, { kind: "turn.taken", messageIds: [PAGE, OTHER] });
+    const after = live(8, { kind: "turn.taken", messageIds: [FOURTH, THIRD] });
+    const rows = [
+      own(1, "MG-PAGE", PAGE),
+      own(2, "MG-OTHER", OTHER),
+      own(3, "MG-THIRD", THIRD),
+      own(4, "MG-FOURTH", FOURTH),
+    ];
+    const current = session({
+      working: false,
+      loaded: true,
+      items: rows,
+      floors: Object.fromEntries(rows.map((row, at) => [row.id, at])),
+      taken: {
+        [PAGE]: before,
+        [OTHER]: before,
+        [THIRD]: after,
+        [FOURTH]: after,
+      },
+    });
+    expect(drawn(current, [after]).map((group) => group.message)).toEqual([
+      "MG-PAGE\nMG-OTHER",
+      "MG-THIRD\nMG-FOURTH",
+    ]);
+  });
+
   test("a take naming one row of this tab's and one from another tab asks for the replay, and draws one turn", () => {
     const first = own(1, "load the policy");
     const page = own(2, "MG-PAGE", PAGE);
