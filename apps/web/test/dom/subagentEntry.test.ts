@@ -124,8 +124,8 @@ describe("a sub-agent's entry", () => {
 
   /*
    * U14's review: an RLO in the type moved the status chip in front of it, and one in the
-   * task drew the sentence backwards. Every bidi control in a word with no right-to-left
-   * letter is marked, as prose marks one (`proseRuns`), and both are their own isolate.
+   * task drew the sentence backwards. Every bidi control is marked, as prose marks one
+   * (`proseRuns`), whatever is beside it, and both are their own isolate.
    */
   test("a bidi control in its type or task is a marker, in both readings, and each is an isolate", async () => {
     const item = entry({
@@ -159,10 +159,29 @@ describe("a sub-agent's entry", () => {
       "Fetch שלום\u2800⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ now",
     );
 
-    // Right-to-left words keep the controls they are written with.
-    const hebrew = draw(entry({ body: "בדוק \u2067את האתר\u2069 בבקשה" }));
+    // One planted letter after an opener keeps no control either (a third review of U14):
+    // it reordered the rest of its run through an Arabic-Indic digit.
+    const planted = draw(
+      entry({
+        headline: "\u2068יcom.\u0660acmeי\u2069",
+        body: "Visit \u202Bיcom.\u0640acmeי\u202C for details",
+      }),
+    );
+    expect(planted.querySelector(".agent-type")?.textContent).toBe(
+      "⟨U+2068⟩יcom.\u0660acmeי⟨U+2069⟩",
+    );
+    expect(planted.querySelector(".task")?.textContent).toBe(
+      "Visit ⟨U+202B⟩יcom.\u0640acmeי⟨U+202C⟩ for details",
+    );
+
+    // Right-to-left letters with no controls draw as written; a control among them is a
+    // marker like any other.
+    const hebrew = draw(
+      entry({ headline: "סוכן", body: "בדוק \u2067את האתר\u2069 בבקשה" }),
+    );
+    expect(hebrew.querySelector(".agent-type")?.textContent).toBe("סוכן");
     expect(hebrew.querySelector(".task")?.textContent).toBe(
-      "בדוק \u2067את האתר\u2069 בבקשה",
+      "בדוק ⟨U+2067⟩את האתר⟨U+2069⟩ בבקשה",
     );
 
     const path = new URL(
@@ -236,6 +255,14 @@ describe("the target's Live panel", () => {
     expect(
       headline === null ? "" : getComputedStyle(headline).unicodeBidi,
     ).toBe("isolate");
+
+    // One planted letter after an opener keeps no control (a third review of U14).
+    app.liveItems = [entry({ headline: "\u2067יcom.\u0660acmeי\u2069" })];
+    await settle();
+    const planted =
+      panel.target.querySelector<HTMLElement>(".newest .headline");
+    expect(planted?.textContent).toBe("⟨U+2067⟩יcom.\u0660acmeי⟨U+2069⟩");
+    expect(planted?.querySelectorAll(".char-escape")).toHaveLength(2);
   });
 
   test("draws each sub-agent as one row, at where it started, in its newest state", async () => {

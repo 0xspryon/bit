@@ -643,14 +643,12 @@ describe("characters that do not show as what they are", () => {
     expect(root.querySelectorAll(".char-escape")).toHaveLength(5);
   });
 
-  test("in prose, right-to-left text and its marks, isolates and joiners are left as written", () => {
+  test("in prose, right-to-left letters with no controls, and joiners, are left as written", () => {
     const sentences = [
       "النطاق يشمل admin.acme.com فقط.",
       "התחום כולל את admin.acme.com בלבד.",
-      "Scope \u2067النطاق\u2069 then \u200Fעברית\u200E and \u202Bמוטבע\u202C, a\u200Db.",
-      "ܫܠܡܐ\u200F ހެލޯ\u061C \u2068ߊߛ\u2069 and \u2067עברית ועוד\u2069.",
-      "שלום\u200F! He said \u2067مرحبا بكم\u2069 today, about ה\u200F-CPU.",
-      "קוד C++\u200E הוא שפה.",
+      "ܫܠܡܐ ހެލޯ ߊߛ and עברית ועוד, a\u200Db.",
+      "שלום! He said مرحبا بكم today, about ה-CPU.",
     ];
     const root = render(sentences.join("\n\n"));
     expect(
@@ -660,9 +658,36 @@ describe("characters that do not show as what they are", () => {
   });
 
   /*
+   * A third review of U14 bypassed the last rule that judged a control by its neighbours, so
+   * none is judged: right-to-left prose written with marks, isolates and embeddings shows
+   * each as a marker, and its letters stay as written.
+   */
+  test("in prose, every bidi control in right-to-left text is a marker too", () => {
+    const sentences = [
+      "Scope \u2067النطاق\u2069 then \u200Fעברית\u200E and \u202Bמוטבע\u202C, a\u200Db.",
+      "ܫܠܡܐ\u200F ހެލޯ\u061C \u2068ߊߛ\u2069 and \u2067עברית ועוד\u2069.",
+      "שלום\u200F! He said \u2067مرحبا بكم\u2069 today, about ה\u200F-CPU.",
+      "קוד C++\u200E הוא שפה.",
+    ];
+    const root = render(sentences.join("\n\n"));
+    expect(
+      [...root.querySelectorAll("p")].map((each) => each.textContent),
+    ).toEqual([
+      "Scope ⟨U+2067⟩النطاق⟨U+2069⟩ then ⟨U+200F⟩עברית⟨U+200E⟩ and ⟨U+202B⟩מוטבע⟨U+202C⟩, a\u200Db.",
+      "ܫܠܡܐ⟨U+200F⟩ ހެލޯ⟨U+061C⟩ ⟨U+2068⟩ߊߛ⟨U+2069⟩ and ⟨U+2067⟩עברית ועוד⟨U+2069⟩.",
+      "שלום⟨U+200F⟩! He said ⟨U+2067⟩مرحبا بكم⟨U+2069⟩ today, about ה⟨U+200F⟩-CPU.",
+      "קוד C++⟨U+200E⟩ הוא שפה.",
+    ]);
+    expect(root.querySelectorAll(".char-escape")).toHaveLength(17);
+    expect(root.textContent).not.toMatch(
+      /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u,
+    );
+  });
+
+  /*
    * The cases a review measured in Chrome, in a left-to-right paragraph (U14's review): each
-   * drew a host or a sentence in an order other than the one stored. Every bidi control in a
-   * word with no right-to-left letter is a marker now, so each reads as stored.
+   * drew a host or a sentence in an order other than the one stored. Every bidi control in
+   * prose is a marker now, so each reads as stored.
    */
   test("in prose, an isolate and marks inside a link are markers, and the link reads as stored", () => {
     // RLI com RLM . RLM acme PDI, stored `com.acme`, drew as `acme.com`.
@@ -705,12 +730,12 @@ describe("characters that do not show as what they are", () => {
     );
   });
 
-  test("in a right-to-left sentence, a control in a word with no right-to-left letter is still a marker", () => {
+  test("in a right-to-left sentence, every control is a marker, inside a host and out", () => {
     const root = render(
       "התחום כולל את \u2067com\u200F.\u200Facme\u2069 בלבד\u200F.",
     );
     expect(root.querySelector("p")?.textContent).toBe(
-      "התחום כולל את ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ בלבד\u200F.",
+      "התחום כולל את ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ בלבד⟨U+200F⟩.",
     );
   });
 
@@ -719,7 +744,7 @@ describe("characters that do not show as what they are", () => {
    * letter anywhere in the word kept every control in it. A blank-looking character that is
    * not whitespace (U+2800, U+3164, U+FFA0, U+115F, U+1160) or a zero-width space glued a
    * Hebrew word to a hostname, and so did one planted letter, and `com.acme` read as
-   * `acme.com` with no marker. A control is judged by the letters beside it now.
+   * `acme.com` with no marker. No control is judged by what is beside it now.
    */
   const written = (text: string): string =>
     text.replace(
@@ -763,7 +788,7 @@ describe("characters that do not show as what they are", () => {
     );
   });
 
-  test("in prose, an opener after a Hebrew word is judged by what it opens, and a mark between digits by the digits", () => {
+  test("in prose, an opener after a Hebrew word and a mark between digits are markers", () => {
     // RLI with no PDI after a Hebrew word would draw `10.0.0.1 out of`; FSI is made
     // right-to-left by a mark inside it; and an RLM between octets reorders them even
     // with a Hebrew letter in front.
@@ -777,10 +802,53 @@ describe("characters that do not show as what they are", () => {
       [...root.querySelectorAll("p")].map((each) => each.textContent),
     ).toEqual([
       "שלום⟨U+2067⟩out of 10.0.0.1",
-      "שלום⟨U+2068⟩\u200Fout of 10.0.0.1",
+      "שלום⟨U+2068⟩⟨U+200F⟩out of 10.0.0.1",
       "א-10⟨U+200F⟩.0.0.1",
     ]);
   });
+
+  /*
+   * A third review of U14: one planted right-to-left letter after an opener kept the opener,
+   * and it reordered the rest of its run through characters nothing marks — an Arabic-Indic
+   * digit, a tatweel, more Hebrew letters. `Visit ` RLI `יcom.٠acmeי` PDI ` for details.`
+   * read as `Visit '·acme.com' for details.`; so did FSI and RLE…PDF, and across bold and
+   * link text. Each control is a marker, and the host reads as stored.
+   */
+  test.each([
+    ["RLI…PDI", "Visit \u2067יcom.\u0660acmeי\u2069 for details."],
+    ["FSI…PDI", "Visit \u2068יcom.\u0660acmeי\u2069 for details."],
+    ["RLE…PDF", "Visit \u202Bיcom.\u0660acmeי\u202C for details."],
+    [
+      "RLI…PDI round a tatweel",
+      "Visit \u2067יcom.\u0640acmeי\u2069 for details.",
+    ],
+    [
+      "RLI…PDI round a Hebrew letter",
+      "Visit \u2067יcom.שacmeי\u2069 for details.",
+    ],
+    ["RLI…PDI in bold", "Visit **\u2067יcom.\u0660acmeי\u2069** for details."],
+    [
+      "RLI…PDI round bold",
+      "Visit \u2067י**com**.\u0660acmeי\u2069 for details.",
+    ],
+    [
+      "RLI…PDI in link text",
+      "Visit [\u2067יcom.\u0660acmeי\u2069](https://com.acme) for details.",
+    ],
+  ])(
+    "in prose, a planted letter after an opener keeps no control: %s",
+    (_, source) => {
+      const root = render(source);
+      const stored = source
+        .replaceAll("**", "")
+        .replace(/\[(.*)\]\(.*\)/u, "$1");
+      expect(root.querySelector("p")?.textContent).toBe(written(stored));
+      expect(root.querySelectorAll(".char-escape")).toHaveLength(2);
+      expect(root.textContent).not.toMatch(
+        /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u,
+      );
+    },
+  );
 
   test("Copy gives back a five-digit tag character and an Arabic letter mark as written", async () => {
     const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");

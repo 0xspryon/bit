@@ -186,9 +186,8 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
  * U+FEFF) or a tag character (U+E0000–E007F, five hex digits) puts a character into a host
  * the eye cannot see. A variation selector is not here: U+FE0F is how `❤️` is written, and
  * marking it would mark every emoji. In code, and in a fence's name, the exact characters are the
- * point, so each is replaced by its code point. Prose marks only the bidi controls, and
- * only where no right-to-left letter needs them ({@link BIDI}): there, the rest are how
- * right-to-left text and joined scripts are written.
+ * point, so each is replaced by its code point. Prose marks only the bidi controls, every
+ * one ({@link BIDI}): the zero-width joiners and the rest are how joined scripts are written.
  *
  * The marker is a text node in an element with a constant class, built here after the
  * sanitiser like the rest of the frame. The sanitiser lets no `class` through from the
@@ -223,48 +222,39 @@ const reveal = marking(HIDDEN);
 
 /**
  * The bidi controls marked in prose: U+061C, U+200E/U+200F (the marks), U+202A–U+202E (the
- * embeddings and overrides) and U+2066–U+2069 (the isolates).
+ * embeddings and overrides) and U+2066–U+2069 (the isolates). **Every one, wherever it is.**
  *
  * Each one moves the letters around it on screen and not in the text. A review measured it
  * in Chrome, inside a link in a left-to-right paragraph: `com` RLM `.` RLM `acme` in an RLI
  * isolate (stored `com.acme`) reads as `acme.com`, and so does the same in an RLE embedding;
  * marks between the words of a sentence in an isolate put the words in another order; and
  * an IP address with an RLM or ALM between its octets reads out of order with no isolate at
- * all. So an override, which forces every letter after it backwards whatever its script, is
- * marked wherever it is, and every other control is kept only **beside a right-to-left
- * letter** ({@link RTL_LETTER}), on the side it acts on:
+ * all.
  *
- * - an opener — LRE, RLE, LRI, RLI, FSI — if the first letter or digit after it is one,
- *   since what it reorders is what it opens;
- * - a closer — PDF, PDI — if the first letter or digit before it is one, what it closes;
- * - a mark — ALM, LRM, RLM — if the first letter or digit on either side of it is one.
+ * Three rounds of U14 review tried to keep the controls right-to-left prose is written with
+ * and mark only the ones that could reorder a Latin host, and each rule was bypassed. Keeping
+ * every control in a word with a right-to-left letter fell to a Hebrew word glued to a host by
+ * a blank that is not whitespace (U+2800, U+3164, U+FFA0, U+200B), or one planted `י`.
+ * Keeping a control beside a right-to-left letter, on the side it acts on, fell to one planted
+ * letter after an opener: the opener stays, and then reorders the rest of its run through
+ * characters nothing marks — Arabic-Indic digits, tatweel, more Hebrew letters — so
+ * `Visit ` RLI `יcom.٠acmeי` PDI ` for details.` reads `Visit '·acme.com' for details.`,
+ * and so with FSI, or RLE…PDF, across `**bold**` and link text alike. A rule that judges a
+ * control by what is next to it is a rule about which letters an agent plants, and the
+ * agent writes them.
  *
- * The search skips every other character, controls, spaces and punctuation included, and
- * stops at the first letter or digit ({@link STOP}); a digit is never right-to-left, so a
- * mark between two octets is marked whatever word stands before them.
+ * So none is judged. The cost: right-to-left prose written with controls — a mark beside a
+ * Hebrew word to keep its punctuation on its side, an isolate round an Arabic phrase quoted
+ * in English — draws a `⟨U+…⟩` badge where each control is and lays out by the plain bidi
+ * algorithm. That is cosmetic: right-to-left letters with no controls draw as written, and
+ * nothing is lost, since each marker names the character it stands for.
  *
- * Right-to-left prose is written with these characters — a mark beside a Hebrew word to
- * keep the punctuation on its side, an isolate round an Arabic phrase quoted in English, an
- * LRM after `C++` in a Hebrew sentence — and beside a Hebrew or Arabic letter they stay, so
- * that prose reads as it was written. Between two left-to-right letters, a hostname's, an
- * address's or an English sentence's, a control has nothing to set right and can only be
- * reordering what the operator reads. A second review of U14 found the rule this replaces,
- * which kept every control in a whitespace-delimited word holding any right-to-left letter,
- * bypassed by a word glued together: `שלום` U+2800 RLI `com` RLM `.` RLM `acme` PDI (U+2800,
- * U+3164, U+FFA0 and U+200B are not whitespace), or a single planted `י` before the RLI.
- * Judged by its neighbours, every control there is marked, and nothing here reads words.
+ * V2(chat): an IP address (or other digit run) can still be reordered with no control at
+ * all — visible right-to-left characters next to digits do this under the standard bidi
+ * rules (e.g. "Host י1.٠2.٠3.٠4י now" reads as 4.3.2.1). Proper V2: isolate or mark
+ * right-to-left characters inside a token that mixes them with Latin letters or digits.
  */
 const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
-const OVERRIDE = /[\u202D\u202E]/u;
-/** LRE, RLE, LRI, RLI and FSI: judged by what follows them. */
-const OPENER = /[\u202A\u202B\u2066-\u2068]/u;
-/** PDF and PDI: judged by what precedes them. */
-const CLOSER = /[\u202C\u2069]/u;
-/** A letter of a right-to-left script: Hebrew, Arabic, Syriac, Thaana or N'Ko. */
-const RTL_LETTER =
-  /(?=\p{L})[\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Syriac}\p{Script=Thaana}\p{Script=Nko}]/u;
-/** Where the search beside a control stops: a letter or a digit, of any script. */
-const STOP = /[\p{L}\p{Nd}]/u;
 
 /** A run of prose as drawn: its words, or one marked character as its code point. */
 export interface ProseRun {
@@ -274,55 +264,24 @@ export interface ProseRun {
 }
 
 /**
- * For each character of `chars`, whether the first letter or digit before it (`step` 1) or
- * after it (`step` -1, read from the end) is a right-to-left letter. One pass, so a text of
- * nothing but controls costs no more than its length.
- */
-const rtlBeside = (
-  chars: readonly string[],
-  step: 1 | -1,
-): readonly boolean[] => {
-  const beside: boolean[] = new Array<boolean>(chars.length).fill(false);
-  let rtl = false;
-  for (
-    let at = step === 1 ? 0 : chars.length - 1;
-    at >= 0 && at < chars.length;
-    at += step
-  ) {
-    beside[at] = rtl;
-    const char = chars[at] ?? "";
-    if (STOP.test(char)) rtl = RTL_LETTER.test(char);
-  }
-  return beside;
-};
-
-/**
- * Plain text as prose draws it, the bidi controls {@link BIDI} names marked as their code
- * points and everything else as it was. The one rule for prose: {@link rewrite} draws an
+ * Plain text as prose draws it, every bidi control {@link BIDI} names marked as its code
+ * point and everything else as it was. The one rule for prose: {@link rewrite} draws an
  * agent's markdown with it, and `ChatItem` a sub-agent's type and task and `LiveTranscript`
  * the newest headline, which are plain text and never markdown.
  */
 export const proseRuns = (text: string): readonly ProseRun[] => {
   if (!BIDI.test(text)) return text === "" ? [] : [{ text, escape: false }];
-  const chars = [...text];
-  const before = rtlBeside(chars, 1);
-  const after = rtlBeside(chars, -1);
   const runs: ProseRun[] = [];
   let plain = "";
-  chars.forEach((char, at) => {
-    const kept =
-      !BIDI.test(char) ||
-      (!OVERRIDE.test(char) &&
-        ((!CLOSER.test(char) && after[at] === true) ||
-          (!OPENER.test(char) && before[at] === true)));
-    if (kept) {
+  for (const char of text) {
+    if (!BIDI.test(char)) {
       plain += char;
-      return;
+      continue;
     }
     if (plain !== "") runs.push({ text: plain, escape: false });
     plain = "";
     runs.push({ text: hiddenName(char), escape: true });
-  });
+  }
   if (plain !== "") runs.push({ text: plain, escape: false });
   return runs;
 };
