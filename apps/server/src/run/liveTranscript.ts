@@ -843,12 +843,17 @@ export interface ReplayProjection {
  * - an entry the harness lists that is neither side — OpenCode's `shell`, `synthetic`,
  *   `system` — as `turn.other` under the harness's own word, so it never reads as the agent;
  * - an `error` the harness recorded on an entry, as `turn.other` labelled `error`,
- *   `outcome` `failed`.
+ *   `outcome` `failed` — once a turn: OpenCode records a failed turn's error on its
+ *   assistant message (`step.failed`) **and** on the `idle` entry that ends the turn
+ *   (`execution.failed`), and live narrates only the second. An `idle` entry's error that
+ *   repeats one already drawn since the turn's `user` entry is dropped (A6 U4 review).
  *
  * Ids are `replay:<n>`, `n` the item's position in this answer: a render key, never a cursor
  * and never an activity order (`activity:<n>`), so a client's replay/live floor cannot read
  * one. Every body is capped as a live part's is ({@link truncateNarration}). `at` is the entry's own time, or `fallbackAt` (when the answer was built) for an
- * entry whose harness kept none. `model` is each assistant entry's own, which is what a
+ * entry whose harness kept none — or, where the harness keeps one time per message, when it
+ * finished the message ({@link MessageEntry.endedAt}), which is what a live item's time is;
+ * a message it never marked finished keeps its start and says so (`endUnknown`). `model` is each assistant entry's own, which is what a
  * turn's footer names rather than the session's current model.
  */
 export const projectReplay = (input: {
@@ -887,10 +892,23 @@ export const projectReplay = (input: {
       callId: null,
       outcome: failed ? "failed" : null,
     });
+  /** The errors drawn since the last `user` entry: a turn's, for the `idle` rule above. */
+  let turnErrors = new Set<string>();
   for (const entry of input.entries) {
     const before = items.length;
-    const at = entry.at ?? input.fallbackAt;
+    const started = entry.at ?? input.fallbackAt;
+    /*
+     * The item's time: the entry's, or when the harness finished it where it keeps one time
+     * per message (`endedAt`). Only the entry's own parts move; a `user` entry has none.
+     */
+    const at =
+      entry.endedAt === undefined || entry.endedAt === null
+        ? started
+        : entry.endedAt;
+    const untimed = entry.endedAt === null;
     if (entry.type === "user") {
+      // A message opens a turn; a note the harness wrote in the user's place does not.
+      if (entry.marker === undefined) turnErrors = new Set<string>();
       if (entry.text.trim() !== "") {
         if (entry.marker !== undefined) {
           // Words the harness stored in the user's place, never sent by anyone: drawn as
@@ -930,11 +948,13 @@ export const projectReplay = (input: {
       );
       if (item !== undefined) items.push(item);
     }
-    // An assistant entry whose words were never parts (a driver that gives text only).
+    // An assistant entry whose words were never parts (a driver that gives text only). Not
+    // one whose words are its error (Claude Code's stored API error), drawn as that below.
     if (
       entry.type === "assistant" &&
       entry.parts.length === 0 &&
-      entry.text.trim() !== ""
+      entry.text.trim() !== "" &&
+      entry.error === undefined
     ) {
       items.push({
         ...baseAt(at),
@@ -950,7 +970,20 @@ export const projectReplay = (input: {
         ...(entry.model === undefined ? {} : { model: entry.model }),
       });
     }
-    if (entry.error !== undefined) note(at, "error", entry.error, true);
+    if (entry.error !== undefined) {
+      const said = entry.error.trim();
+      if (!(entry.type === "idle" && turnErrors.has(said))) {
+        note(at, "error", entry.error, true);
+      }
+      turnErrors.add(said);
+    }
+    // A message the harness never marked finished: its items' time is its start, and says so.
+    if (untimed) {
+      for (let index = before; index < items.length; index += 1) {
+        const item = items[index];
+        if (item !== undefined) items[index] = { ...item, endUnknown: true };
+      }
+    }
     if (items.length === before) blank += 1;
   }
   return { items, blank };

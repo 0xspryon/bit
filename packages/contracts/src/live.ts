@@ -618,6 +618,16 @@ export const LiveItem = Schema.Struct({
    * Absent on every other item, and an optional key so older frames still decode.
    */
   messageId: Schema.optionalKey(Schema.String),
+  /**
+   * `true` on a **replayed** item whose `at` is when the harness began the entry it came
+   * from, and nothing says when that entry ended (A6 U4 review). OpenCode stores times per
+   * message, so every part of a message shares one; a replay stamps a finished message's
+   * parts with its `time.completed`, which is what a live item's `at` approximates — and a
+   * message the harness never marked completed gets its start and this flag. A turn footer
+   * measures no length from a turn holding one, rather than a wrong one. Absent everywhere
+   * else, and an optional key so older frames still decode.
+   */
+  endUnknown: Schema.optionalKey(Schema.Literal(true)),
 });
 export type LiveItem = typeof LiveItem.Type;
 

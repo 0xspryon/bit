@@ -643,7 +643,9 @@ export const turnModels = (
 
 /**
  * The time of a turn's last item, in epoch milliseconds, or `undefined` for a turn with
- * none: the end of the span a turn footer's duration measures (A6 U4). Every item it reads
+ * none — or with an item whose end the harness did not keep (`LiveItem.endUnknown`): the
+ * end of the span a turn footer's duration measures (A6 U4). A harness note other than an
+ * error is not counted: live never narrates one, so counting it made a replay longer. Every item it reads
  * is the server's or the harness's — a call, its result, the record a write produced — so
  * it is on the same clock as a start the server stamped.
  */
@@ -653,8 +655,19 @@ export const turnEndedAt = (
   let last: number | undefined;
   for (const row of group.rows) {
     for (const item of [row.proposedBy, row.item, row.result]) {
-      if (item != null && (last === undefined || item.at > last))
-        last = item.at;
+      if (item == null) continue;
+      /*
+       * A note the harness stored that live never narrates — OpenCode's `system` entry,
+       * written when the **next** turn starts and stored before its message; Claude Code's
+       * interrupt note — is not the agent's work and does not end its turn (A6 U4 review):
+       * counted, it stretched a turn's replayed length past what was watched. A harness's
+       * error is live too, and is counted.
+       */
+      if (item.kind === "turn.other" && item.outcome !== "failed") continue;
+      // A replayed item whose harness kept only when its message began (A6 U4 review): the
+      // turn's end is unknown, and no length is better than a wrong one.
+      if (item.endUnknown === true) return undefined;
+      if (last === undefined || item.at > last) last = item.at;
     }
   }
   return last;
@@ -800,7 +813,7 @@ export const threadEntries = (
   return entries;
 };
 
-/** What a planner round's separator needs, and the whole of what the chat is given. */ /** What a planner round's separator needs, and the whole of what the chat is given. */
+/** What a planner round's separator needs, and the whole of what the chat is given. */
 export interface PlannerSubject {
   /** The row. Where the status and the disposition come from, and the only durable half. */
   readonly round: PlanRoundView;
@@ -1261,7 +1274,10 @@ export const buildChat = (input: {
   );
   const narration = input.narration;
   const groups = [...shown].reverse().map((round): ChatRound => {
-    const mine = input.items.filter((item) => item.roundId === round.roundId);
+    // A take (A6 U4) only tells the importer's chat a queued message was read; not a row.
+    const mine = input.items.filter(
+      (item) => item.roundId === round.roundId && item.kind !== TAKEN_KIND,
+    );
     const live = mine.filter((item) => {
       const order = activityOrder(item);
       if (order === undefined) return true;
@@ -1338,6 +1354,13 @@ export interface SentTurn {
  * conversation's replay carries for a `user` entry (A6 F10).
  */
 export const OPERATOR_TURN_KIND = "turn.operator";
+
+/**
+ * The kind a harness's "took a queued message" item carries (`live.ts`, A6 U4). Never drawn
+ * as a row by any chat: the importer's reads it to stop drawing a message as queued, and the
+ * goal and planner panels drop it.
+ */
+export const TAKEN_KIND = "turn.taken";
 
 /**
  * One operator message as a chat row.
@@ -1504,7 +1527,10 @@ export interface GoalChatInput {
  * position, which is the store's own order.
  */
 export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
-  const mine = input.items.filter((item) => item.goalId === input.goalId);
+  // A take (A6 U4) only tells the importer's chat a queued message was read; it is not a row.
+  const mine = input.items.filter(
+    (item) => item.goalId === input.goalId && item.kind !== TAKEN_KIND,
+  );
   const live = mine.filter((item) => {
     const order = activityOrder(item);
     if (order === undefined) return true;

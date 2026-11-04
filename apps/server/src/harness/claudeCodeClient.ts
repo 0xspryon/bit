@@ -1616,7 +1616,10 @@ const narrate = (
   const blocks = Array.isArray(content) ? content : [];
   const details: NarrationDetail[] = [];
 
-  if (message.type === "assistant") {
+  const failed = assistantError(message, blocks);
+  if (failed !== undefined) {
+    details.push(failed);
+  } else if (message.type === "assistant") {
     details.push(
       ...assistantParts(
         blocks,
@@ -1666,14 +1669,70 @@ const narrate = (
 };
 
 /**
+ * The words of a block list's `text` blocks, joined: what the CLI wrote in a message it
+ * made itself in the model's place.
+ */
+const textOfBlocks = (blocks: readonly unknown[]): string =>
+  blocks
+    .filter(
+      (part): part is { type: string; text: string } =>
+        typeof part === "object" &&
+        part !== null &&
+        (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string",
+    )
+    .map((part) => part.text)
+    .join("\n");
+
+/**
+ * A provider's refusal of a call, as the `error` it is, or `undefined` (A6 U4 review).
+ *
+ * When the API refuses a call — a rate limit, a billing or authentication failure, an
+ * overloaded or erroring server — the CLI does not end the turn with an error `result`
+ * alone: it writes an `assistant` message **in the model's place**, its text the CLI's own
+ * sentence ("API Error: …", "You've hit your session limit · …"), and flags the frame with
+ * `SDKAssistantMessage.error` (`'rate_limit' | 'billing_error' | …`). Narrated as a reply,
+ * that sentence read as the importer speaking. So a frame with `error` set is the harness's
+ * error: the sentence it wrote, or the error's own word when it wrote none. Capped, and
+ * untrusted: a provider's message can quote anything.
+ */
+export const assistantError = (
+  message: SDKMessage,
+  blocks: readonly unknown[],
+): NarrationDetail | undefined => {
+  if (message.type !== "assistant") return undefined;
+  const flagged = (message as { readonly error?: unknown }).error;
+  if (typeof flagged !== "string" || flagged === "") return undefined;
+  const said = textOfBlocks(blocks).trim();
+  return {
+    _tag: "error",
+    message: truncateNarration(said === "" ? flagged : said),
+  };
+};
+
+/**
+ * The model name the CLI gives a message it wrote itself rather than one the model
+ * produced: an API error in the model's place, or its `No response requested.` filler.
+ */
+const CLI_SYNTHETIC_MODEL = "<synthetic>";
+
+/** The CLI's filler for a turn that asked the model nothing. Not an error. */
+const CLI_NO_RESPONSE = "No response requested.";
+
+/**
  * The harness's own sentence for a turn it ended in error (A6 U4), or `undefined`.
  *
  * Only a `result` whose outcome is `failed` — so never an interrupt this application asked
  * for, which {@link outcomeOf} calls `interrupted` — and only when the CLI said something:
  * its `errors`, joined. A failed `result` with none narrates nothing, rather than a sentence
- * this server would have to word. A provider refusing a call is already an `assistant`
- * frame carrying the CLI's `API Error: …` text, narrated as a reply; this is what that
- * leaves: a turn that ran out of turns or budget, or broke while executing.
+ * this server would have to word. A provider refusing a call is an `assistant` frame with
+ * `error` set, which {@link assistantError} narrates; this is what that leaves: a turn that
+ * ran out of turns or budget, or broke while executing.
+ *
+ * **Live only.** The CLI's transcript stores no `result` message, so a reload has nothing
+ * to read this from: a turn that ended this way shows its error while watched and not after
+ * a reload. The provider refusal above is stored, as the assistant message it is, and is
+ * drawn either way.
  */
 export const resultError = (
   message: SDKMessage,
@@ -1876,6 +1935,30 @@ const flattenTranscript = (
             .join("\n");
     const marker = cliMarker(entry);
     /*
+     * A provider's refusal the CLI stored in the model's place (A6 U4 review): the `error`
+     * it is live ({@link assistantError}), not a reply. The stored entry carries the same
+     * `error` field, but SDK 0.3.310's `getSessionMessages` does not pass it (nor
+     * `isApiErrorMessage`) through, so it is told here by what the SDK does keep: the
+     * `<synthetic>` model the CLI gives every message it writes itself, which a model's own
+     * reply never carries. The one synthetic message that is not an error is the CLI's
+     * `No response requested.` filler, which stays what it was.
+     */
+    if (
+      entry.type === "assistant" &&
+      modelOfMessage(message) === CLI_SYNTHETIC_MODEL &&
+      text.trim() !== "" &&
+      text.trim() !== CLI_NO_RESPONSE
+    ) {
+      return {
+        type: entry.type,
+        text,
+        error: truncateNarration(text),
+        parts: [],
+        model: undefined,
+        at: Number.isFinite(at) ? at : undefined,
+      };
+    }
+    /*
      * A background sub-agent's notification (A6 U14): its end, as the sub-agent's state,
      * and not its words, which carry the sub-agent's own result. Live, the same end comes
      * from the `task_notification` frame and the stored note is never narrated, so the
@@ -1930,9 +2013,9 @@ const flattenTranscript = (
       ...(split === undefined || split.attachments.length === 0
         ? {}
         : { attachments: split.attachments }),
-      // The stored transcript carries no error channel of its own; a failure arrives as a
-      // `result` message on the live stream and is settled from there. Reporting
-      // `undefined` is the honest answer rather than scraping text for the word "error".
+      // No other error is read from the transcript: a turn's own failure arrives as a
+      // `result` message on the live stream only (`resultError`), and the CLI stores none.
+      // A provider's refusal is the synthetic entry above.
       error: undefined,
       parts:
         entry.type === "assistant"

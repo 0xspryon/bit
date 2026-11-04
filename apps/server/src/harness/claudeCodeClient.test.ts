@@ -770,6 +770,54 @@ describe("outcomes", () => {
     );
   };
 
+  /*
+   * A6 U4 review: the CLI writes a provider's refusal of a call — a rate limit, billing — as
+   * an `assistant` frame in the model's place, flagged with `error`. It is the harness's
+   * error, not the importer speaking.
+   */
+  test("an assistant frame the CLI flagged with `error` is narrated as that error, not as a reply", async () => {
+    const sessionId = "ignored";
+    const refused = {
+      ...(assistant(sessionId) as object),
+      message: {
+        role: "assistant",
+        model: "<synthetic>",
+        content: [
+          {
+            type: "text",
+            text: "API Error: Request rejected (429) · rate limited ‮moc.live",
+          },
+        ],
+      },
+      error: "rate_limit",
+    } as unknown as SDKMessage;
+    const silent = {
+      ...(assistant(sessionId) as object),
+      message: { role: "assistant", model: "<synthetic>", content: [] },
+      error: "billing_error",
+    } as unknown as SDKMessage;
+    const outcome = await run([
+      refused,
+      silent,
+      assistant(sessionId),
+      result(sessionId, "success"),
+    ]);
+    const details = [...outcome.narrated]
+      .map((entry) => entry.detail)
+      .filter((detail) => detail._tag !== "opaque" && detail._tag !== "usage");
+    expect(details).toEqual([
+      // The CLI's own sentence, as it wrote it.
+      {
+        _tag: "error",
+        message: "API Error: Request rejected (429) · rate limited ‮moc.live",
+      },
+      // No sentence: the error's own word.
+      { _tag: "error", message: "billing_error" },
+      // An ordinary frame is still a reply.
+      { _tag: "reply", text: "hi" },
+    ]);
+  });
+
   test("a successful result settles succeeded, and the stream carries it", async () => {
     const sessionId = "ignored";
     const outcome = await run([
@@ -4841,6 +4889,83 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
       `${SESSION}:msg_011CghRHgNq4ZzyFwmFcMC63:0`,
     );
     expect(liveItems[0]?.model).toBe("claude-haiku-4-5-20251001");
+  });
+
+  /**
+   * A provider's refusal the CLI stored in the model's place, read back through the
+   * **real** `getSessionMessages` (A6 U4 review).
+   *
+   * `testdata/claude-code-transcript/api-error.cli.jsonl` is in the CLI's on-disk form,
+   * modelled on entries CLI 2.1.270–2.1.316 wrote on this machine: an `assistant` entry with
+   * `model: "<synthetic>"`, the CLI's sentence as its text, and `error: "rate_limit"`,
+   * `isApiErrorMessage: true` beside it — which SDK 0.3.310's `getSessionMessages` drops —
+   * then the CLI's `No response requested.` filler, the one synthetic entry that is no error.
+   */
+  test("a stored API error replays as the harness's error, and the CLI's filler as it was", async () => {
+    const REFUSED = "00000000-0000-4000-8000-0000000000f6";
+    const root = await mkdtemp(join(tmpdir(), "bit-api-error-"));
+    const previous = process.env["CLAUDE_CONFIG_DIR"];
+    try {
+      const project = join(root, "projects", "-tmp-bit-api-error-ws");
+      await mkdir(project, { recursive: true });
+      await writeFile(
+        join(project, `${REFUSED}.jsonl`),
+        await readFile(
+          join(
+            import.meta.dir,
+            "testdata",
+            "claude-code-transcript",
+            "api-error.cli.jsonl",
+          ),
+          "utf8",
+        ),
+      );
+      process.env["CLAUDE_CONFIG_DIR"] = root;
+      const { sdk } = scriptedSdk();
+      const entries = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            harness.messages(REFUSED),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                sdk: {
+                  ...sdk,
+                  sessionMessages: liveClaudeCodeSdk.sessionMessages,
+                },
+                controlTimeout: "2 seconds",
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+      const replayed = projectReplay({
+        entries,
+        subject: { _tag: "import", importId: "imp_1" },
+        harnessSessionId: REFUSED,
+        users: "operator",
+        fallbackAt: 0,
+      }).items;
+      expect(
+        replayed.map((item) => [item.kind, item.headline, item.body]),
+      ).toEqual([
+        ["turn.operator", "You", "Load the scope from https://example.com/"],
+        [
+          "turn.other",
+          "error",
+          "You've hit your session limit · resets 1:20pm (Africa/Douala)",
+        ],
+        ["turn.operator", "You", "Try again"],
+        ["turn.reply", "Reply", "No response requested."],
+      ]);
+      // The error names no model, so no footer says `<synthetic>` answered it.
+      expect(replayed[1]?.model).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   /**

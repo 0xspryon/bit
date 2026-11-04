@@ -17,6 +17,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   bitMcpServerName,
   claudeCodeToolName,
+  type ImporterConversationView,
   type ImporterSessionView,
   type LiveItem,
 } from "@bit/contracts";
@@ -178,6 +179,7 @@ const turnItems = (
 const openWith = async (
   items: readonly LiveItem[],
   running = false,
+  queued: ImporterConversationView["queued"] = [],
 ): Promise<{ app: App; fake: FakeServer }> => {
   const fake = new FakeServer();
   fake.onScope = () => ok(emptyScope());
@@ -194,6 +196,7 @@ const openWith = async (
         live: true,
         continuation: "live",
         items: [...items],
+        queued: [...queued],
       }),
     );
   fake.onScopeImport = (_baseUrl, targetId, importId) =>
@@ -600,6 +603,200 @@ describe("U4: a harness's own error", () => {
     expect(said(document.querySelector(".importer"))).not.toContain(
       "wrote nothing in reply",
     );
+    // A turn with no reply text still gets its footer (A6 U4 review): it ran on a model and
+    // took time. No Copy, since there are no words to copy.
+    expect(footers().at(-1)).toMatch(/^Importer · openai\/gpt-5\.6-sol/u);
+    expect(
+      [...document.querySelectorAll(".importer .foot")]
+        .at(-1)
+        ?.querySelectorAll("button"),
+    ).toHaveLength(0);
+  });
+
+  test("a turn stopped after a tool call, before it answered, gets its footer too", async () => {
+    await openWith([
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 3, {
+        kind: "tool.call",
+        headline: "fetch_page",
+        tool: "fetch_page",
+        toolName: "fetch_page",
+        input: "{}",
+        callId: "f1",
+        model: "m-one",
+      }),
+      at("replay", 2, 5, {
+        kind: "turn.other",
+        headline: "interrupted",
+        body: "[Request interrupted by user for tool use]",
+      }),
+    ]);
+    // Ends at the call (3 s): the interrupt note is the harness's, and live draws none.
+    expect(footers()).toEqual(["Importer · m-one · 3s"]);
+  });
+});
+
+/*
+ * A6 U4 review: a message the harness has not taken is in no transcript, so a reload drew
+ * it nowhere and its reply joined the turn before. The server's replay carries it now.
+ */
+describe("U4 review: a queued message across a reload", () => {
+  const MESSAGE_ID = "aaaaaaaabbbbbbbbccccccccdddddddd";
+
+  test("a reload while it waits draws it queued; once taken it is its own turn", async () => {
+    const { fake } = await openWith(
+      [OPERATOR("replay", 0, "Load the scope"), ...turnItems("replay", 1)],
+      true,
+      [
+        {
+          messageId: MESSAGE_ID,
+          text: "Also the partner portal",
+          acceptedAt: AT + 50_000,
+        },
+      ],
+    );
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(
+      at("activity", 101, 52, {
+        kind: "turn.reply",
+        body: "Still on the policy.",
+      }),
+    );
+    await settle();
+    const [first, second] = groups();
+    expect(said(second?.querySelector(".bubble"))).toBe(
+      "Also the partner portal",
+    );
+    expect(second?.querySelector(".you")?.classList.contains("queued")).toBe(
+      true,
+    );
+    expect(said(second)).toContain(QUEUED_NOTE);
+    expect(said(first)).toContain("Still on the policy.");
+
+    fake.watch.send(
+      at("activity", 102, 55, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageId: MESSAGE_ID,
+      }),
+    );
+    fake.watch.send(
+      at("activity", 103, 58, {
+        kind: "turn.reply",
+        body: "Adding the partner portal.",
+        model: "m-two",
+      }),
+    );
+    await settle();
+    const [one, two] = groups();
+    expect(two?.querySelector(".you")?.classList.contains("queued")).toBe(
+      false,
+    );
+    expect(said(two?.querySelector(".said"))).toBe(
+      `You · ${clock(AT + 50_000)}`,
+    );
+    expect(said(two)).toContain("Adding the partner portal.");
+    expect(said(one)).not.toContain("Adding the partner portal.");
+  });
+
+  test("a take naming a message this tab has no row for reads the replay again", async () => {
+    const { fake } = await openWith(
+      [OPERATOR("replay", 0, "Load the scope"), ...turnItems("replay", 1)],
+      true,
+    );
+    let reads = 0;
+    // Sent from another tab: the harness took it, and the transcript holds it now.
+    fake.onImporterMessages = (_baseUrl, targetId, importId) => {
+      reads += 1;
+      return ok(
+        importerConversationView({
+          targetId,
+          importId,
+          harnessSessionId: "ses_a",
+          live: true,
+          continuation: "live",
+          items: [
+            OPERATOR("replay", 0, "Load the scope"),
+            ...turnItems("replay", 1),
+            OPERATOR("replay", 20, "From the other tab"),
+          ],
+        }),
+      );
+    };
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(
+      at("activity", 201, 60, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageId: MESSAGE_ID,
+      }),
+    );
+    fake.watch.send(
+      at("activity", 202, 62, {
+        kind: "turn.reply",
+        body: "On the other tab's message.",
+      }),
+    );
+    await settle();
+    expect(reads).toBe(1);
+    const all = groups();
+    expect(all.map((group) => said(group.querySelector(".bubble")))).toEqual([
+      "Load the scope",
+      "From the other tab",
+    ]);
+    expect(said(all[1])).toContain("On the other tab's message.");
+    expect(said(all[0])).not.toContain("On the other tab's message.");
+  });
+
+  test("a take that slides out of the live window does not put its message back in the queue", async () => {
+    const { app, fake } = await openWith(
+      [OPERATOR("replay", 0, "Load the scope")],
+      true,
+    );
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_a",
+          messageId: MESSAGE_ID,
+          acceptedAt: AT + 5_000,
+        }),
+      );
+    await send("Also the partner portal");
+    fake.watch.send(
+      at("activity", 1, 9, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageId: MESSAGE_ID,
+      }),
+    );
+    fake.watch.send(
+      at("activity", 2, 10, {
+        kind: "turn.reply",
+        body: "Adding the partner portal.",
+      }),
+    );
+    // Another import's chatter, enough to push both out of the tab's window.
+    for (let n = 0; n < App.LIVE_KEPT; n += 1) {
+      fake.watch.send(
+        at("activity", 1_000 + n, 11, {
+          kind: "turn.reply",
+          body: "elsewhere",
+          importId: "imp_other",
+        }),
+      );
+    }
+    await settle();
+    expect(app.liveItems.some((item) => item.kind === "turn.taken")).toBe(
+      false,
+    );
+    const [, second] = groups();
+    expect(second?.querySelector(".you")?.classList.contains("queued")).toBe(
+      false,
+    );
+    expect(said(second)).not.toContain(QUEUED_NOTE);
   });
 });
 

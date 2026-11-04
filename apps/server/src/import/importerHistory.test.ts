@@ -681,6 +681,7 @@ describe("the view is a union on its continuation (A6 F10, from F1's review)", (
     ephemeral: false,
     note: "n",
     items: [],
+    queued: [],
     truncated: false,
     omittedBlank: 0,
     at: 1,

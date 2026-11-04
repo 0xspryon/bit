@@ -2896,6 +2896,98 @@ describe("a session's stored messages, as the live stream's parts (A6 F10)", () 
       ["tool.result", undefined],
     ]);
   });
+
+  /*
+   * A6 U4 review: OpenCode stores one time per message, its start; a replay stamped every
+   * part with it, so a turn that took 3 s live read 0 s after a reload. A finished message's
+   * parts take its `time.completed`; one with none says its end is unknown.
+   */
+  test("a finished message's parts carry when it completed, and an unfinished one's say their end is unknown", async () => {
+    const project = (entries: readonly MessageEntry[]) =>
+      projectReplay({
+        entries,
+        subject: { _tag: "import", importId: "imp_1" },
+        harnessSessionId: "ses_1",
+        users: "operator",
+        fallbackAt: 0,
+      }).items;
+    const replayed = project(await read());
+    // The first turn: its operator message when it was sent, each assistant message's parts
+    // when that message completed (both stored in the fixture), never when it started.
+    expect(
+      replayed
+        .filter((item) => item.kind !== "tool.result")
+        .map((item) => [item.kind, item.at, item.endUnknown ?? false])
+        .slice(0, 6),
+    ).toEqual([
+      ["turn.operator", 1_793_774_087_890, false],
+      ["turn.thinking", 1_793_774_092_936, false],
+      ["turn.reply", 1_793_774_092_936, false],
+      ["tool.call", 1_793_774_092_936, false],
+      ["turn.other", 1_793_774_092_947, false],
+      ["turn.thinking", 1_793_774_096_645, false],
+    ]);
+
+    const unfinished = project(
+      await read((stored) =>
+        stored.map((entry, index) =>
+          index === 3
+            ? {
+                ...(entry as object),
+                time: { created: 1_793_774_092_958 },
+              }
+            : entry,
+        ),
+      ),
+    );
+    const late = unfinished.filter((item) => item.endUnknown === true);
+    expect(late.map((item) => [item.kind, item.at])).toEqual([
+      ["turn.thinking", 1_793_774_092_958],
+      ["turn.reply", 1_793_774_092_958],
+    ]);
+  });
+
+  /*
+   * A6 U4 review: a turn that failed in the harness is stored with its error twice — on the
+   * assistant message (`step.failed`) and on the `idle` that ended the turn
+   * (`execution.failed`) — and live narrates it once.
+   */
+  test("a turn's error stored on its assistant message and its idle entry is drawn once", async () => {
+    const SAID = "Free usage limit reached. Visit ‮opencode.ai";
+    const replayed = projectReplay({
+      entries: await read((stored) =>
+        stored.map((entry, index) =>
+          index === 3
+            ? {
+                ...(entry as object),
+                error: { type: "unknown", message: SAID },
+              }
+            : index === 4
+              ? {
+                  ...(entry as object),
+                  outcome: "failed",
+                  error: { type: "unknown", message: SAID },
+                }
+              : index === 8
+                ? {
+                    ...(entry as object),
+                    outcome: "failed",
+                    error: { type: "unknown", message: "Another failure" },
+                  }
+                : entry,
+        ),
+      ),
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    expect(
+      replayed
+        .filter((item) => item.headline === "error")
+        .map((item) => item.body),
+    ).toEqual([SAID, "Another failure"]);
+  });
 });
 
 /* ── A message's files, replayed (A6 F9) ─────────────────────────────────────── */

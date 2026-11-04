@@ -884,6 +884,26 @@ export type ImporterContinuationRefusal =
   typeof ImporterContinuationRefusal.Type;
 
 /**
+ * A message the operator sent into a live importer session that the harness has **not yet
+ * taken**: delivered as a steer while a turn ran, and still queued behind it (A6 U4 review).
+ *
+ * The harness's transcript does not hold such a message until it takes it, so a replay of
+ * the transcript alone loses it on a reload — and the reply to it then reads as part of the
+ * turn before. This process holds it from the moment the send is accepted until the
+ * harness's `turn.taken` names it (or the session settles or closes), and the replay carries
+ * it beside the transcript so a reloaded tab draws it queued, where it waits.
+ */
+export const ImporterQueuedMessage = Schema.Struct({
+  /** The id the send was answered with (`ImporterTurnAccepted.messageId`). */
+  messageId: Schema.String,
+  /** The operator's own words, as sent. Untrusted text, as every message is. */
+  text: Schema.String,
+  /** When the server accepted it (`ImporterTurnAccepted.acceptedAt`). */
+  acceptedAt: EpochMillis,
+});
+export type ImporterQueuedMessage = typeof ImporterQueuedMessage.Type;
+
+/**
  * One importer session as a reloaded tab replays it (S6).
  *
  * **The harness's copy, and nothing of ours.** This build stores no word of a conversation
@@ -926,6 +946,16 @@ const ImporterConversationViewFields = {
    * exact split rather than a guess. Ids are `replay:<n>`: a render key, not a cursor.
    */
   items: Schema.Array(LiveItem),
+  /**
+   * The operator's messages this process delivered into the live session that the harness
+   * has not taken yet, oldest first (A6 U4 review): what {@link items} cannot hold, since the
+   * transcript does not have them until they are taken. Each is drawn queued at the end of
+   * the conversation until a `turn.taken` names it. **The one exception to "nothing of
+   * ours"**: held in memory by this process only, never stored, and empty on any session
+   * this process does not hold (`live` false). Read after {@link items}, so a message taken
+   * between the two reads is in the transcript rather than in both.
+   */
+  queued: Schema.Array(ImporterQueuedMessage),
   /** Messages this answer stopped short of. */
   truncated: Schema.Boolean,
   /** How many harness entries produced no item. See `RoundNarration.omittedBlank`. */

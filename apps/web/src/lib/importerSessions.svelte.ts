@@ -74,9 +74,11 @@ import type { ErrorNotice } from "./components/ErrorDialog.svelte";
 import { operatorTurn } from "./chat";
 import {
   NO_HISTORY,
+  TAKEN_KIND,
   buildImporterChat,
-  historyOf,
   importerFeed,
+  takesUnknownMessage,
+  withReplay,
   type ImporterGroup,
   type ImporterSession,
   acceptedNotice,
@@ -424,12 +426,16 @@ export class ImporterSessions {
             historyFloor: this.current.historyFloor,
             midTurn: this.current.midTurn,
             working: this.current.working,
+            taken: this.current.taken,
           }),
           working: this.current.working,
           recordsSkipped: this.#skipped(),
           ...(this.current.midTurn === undefined
             ? {}
             : { midTurn: this.current.midTurn }),
+          ...(this.current.taken === undefined
+            ? {}
+            : { taken: this.current.taken }),
         }),
   );
 
@@ -560,6 +566,8 @@ export class ImporterSessions {
             // Which of those rows were sent mid-turn, and so wait for a take (A6 U4): this
             // tab's knowledge of its own rows, as the floors are.
             ...(kept.midTurn === undefined ? {} : { midTurn: kept.midTurn }),
+            // And where the harness took them, once seen: the live window slides on.
+            ...(kept.taken === undefined ? {} : { taken: kept.taken }),
             ...(kept.historyFloor === undefined
               ? {}
               : { historyFloor: kept.historyFloor }),
@@ -753,16 +761,71 @@ export class ImporterSessions {
     if (answered === undefined) return;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
+    // With the messages the server still holds queued in the live session (A6 U4 review):
+    // the transcript does not have them until they are taken, and a reload must not lose one.
     this.#replace(session.id, (before) =>
       before.loaded === true || before.items.length > 0
         ? before
-        : {
-            ...before,
-            history: historyOf(answered.view),
-            historyFloor: answered.floor,
-            loaded: true,
-          },
+        : withReplay(before, answered),
     );
+  }
+
+  /**
+   * Records a `turn.taken` item on the session it is about, the first time this tab sees it
+   * (A6 U4 review), and reads the replay again if it names a message this tab has no row for.
+   *
+   * **Recorded, because the live feed slides.** Whether a message is still queued, and where
+   * its turn starts, are read off its take; the feed keeps only the newest
+   * `App.LIVE_KEPT` items, and a take that fell out of it would have put its message back
+   * in the queue. So the take is kept on the session, as the floors are.
+   *
+   * **Read again, for a message drawn nowhere**: one sent from another tab, or one the
+   * server's replay missed by a hair (taken between its two reads). The reply to it would
+   * otherwise sit in the turn before under no "You". Not while this tab has a message with
+   * the server, whose take can outrun the answer that mints its row — and is recorded here
+   * for when it lands. Called by the app for every new live item.
+   */
+  noteTaken(item: LiveItem): void {
+    if (item.kind !== TAKEN_KIND || item.messageId === undefined) return;
+    const messageId = item.messageId;
+    const session = this.sessions.find(
+      (each) => each.importId !== undefined && each.importId === item.importId,
+    );
+    if (session === undefined) return;
+    if (session.taken?.[messageId] === undefined) {
+      this.#replace(session.id, (before) => ({
+        ...before,
+        taken: { ...before.taken, [messageId]: item },
+      }));
+    }
+    if (this.sending || !takesUnknownMessage(session, item)) return;
+    void this.#rereadHistory(session.id);
+  }
+
+  /**
+   * Reads one session's conversation again and installs it over what this tab holds
+   * (`withReplay`): rows the answer covers are replaced by its own, and only rows the server
+   * accepted after building it are kept. One read per import at a time, as
+   * {@link #loadHistory}'s; a read that fails or lands after the page moved on changes
+   * nothing.
+   */
+  async #rereadHistory(sessionId: string): Promise<void> {
+    const server = this.#server;
+    const session = this.sessions.find((each) => each.id === sessionId);
+    const importId = session?.importId;
+    if (
+      server === undefined ||
+      importId === undefined ||
+      this.#reading.has(importId)
+    ) {
+      return;
+    }
+    this.#reading.add(importId);
+    const answered = await server
+      .history(importId)
+      .finally(() => this.#reading.delete(importId));
+    if (answered === undefined || this.#server !== server) return;
+    this.#replace(sessionId, (before) => withReplay(before, answered));
   }
 
   /**
@@ -982,9 +1045,15 @@ export class ImporterSessions {
     // Delivered as a steer while a turn ran: queued until the harness takes it (A6 U4).
     const midTurn = turn.messageId !== undefined && session.working;
     const landed = (before: ImporterSession): ImporterSession => {
-      const index = before.items.filter(
-        (item) => item.kind === "turn.operator",
-      ).length;
+      // Past every `operator:<n>` the session holds, rather than a count of them: a replay
+      // read again replaces rows (`withReplay`), and a count could then mint an id one of
+      // the rows it kept already has.
+      const index = Math.max(
+        0,
+        ...before.items.map((item) =>
+          Number(/^operator:(\d+)$/u.exec(item.id)?.[1] ?? 0),
+        ),
+      );
       const row = {
         ...operatorTurn({ index: index + 1, text, at, after }),
         ...(turn.messageId === undefined ? {} : { messageId: turn.messageId }),

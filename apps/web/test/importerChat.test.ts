@@ -29,9 +29,16 @@ import {
   sessionLabel,
   tallyLine,
   type ImporterHistory,
+  type ImporterSession,
   acceptedNotice,
+  takesUnknownMessage,
+  withReplay,
 } from "../src/lib/importerChat";
-import { importerSessionView, replayItem } from "./fakeServer";
+import {
+  importerConversationView,
+  importerSessionView,
+  replayItem,
+} from "./fakeServer";
 import {
   mockCompletedSession,
   mockReloadedSession,
@@ -1450,11 +1457,16 @@ describe("U4: a steer sent mid-turn", () => {
     }),
     live(10, { kind: "turn.reply", body: "adding the portal" }),
   ];
-  const chat = (liveItems: readonly LiveItem[], working: boolean) =>
+  const chat = (
+    liveItems: readonly LiveItem[],
+    working: boolean,
+    taken?: Readonly<Record<string, LiveItem>>,
+  ) =>
     buildImporterChat({
       history: NO_HISTORY,
       working,
       midTurn: [steer.id],
+      ...(taken === undefined ? {} : { taken }),
       items: importerFeed({
         own,
         floors,
@@ -1462,6 +1474,7 @@ describe("U4: a steer sent mid-turn", () => {
         importId: "imp_1",
         midTurn: [steer.id],
         working,
+        taken,
       }),
     });
   const read = (groups: ReturnType<typeof chat>) =>
@@ -1514,6 +1527,27 @@ describe("U4: a steer sent mid-turn", () => {
     ).not.toContain("turn.taken");
   });
 
+  test("a take recorded on the session still holds once it has slid out of the live window (A6 U4 review)", () => {
+    // The feed keeps only its newest items (`App.LIVE_KEPT`): the take is gone from it, and
+    // the session's record of it is what still says where the steer was taken.
+    const groups = chat([...before, ...after], true, { [MESSAGE]: take });
+    expect(read(groups)).toEqual([
+      {
+        message: "load the policy",
+        queued: false,
+        working: false,
+        rows: ["reading it", "fetch_page→nine rows"],
+      },
+      {
+        message: "and the portal",
+        queued: false,
+        working: true,
+        rows: ["adding the portal"],
+      },
+    ]);
+    expect(groups[1]?.subject.startedAt).toBe(take.at);
+  });
+
   test("a session gone idle with no take places it where it was sent, as before", () => {
     const groups = chat([...before, ...after], false);
     expect(read(groups).map((group) => [group.message, group.queued])).toEqual([
@@ -1529,5 +1563,176 @@ describe("U4: a steer sent mid-turn", () => {
       "adding the portal",
     ]);
     expect(read(groups)[0]?.rows).toEqual([]);
+  });
+});
+
+/*
+ * A6 U4 review: a message still queued in the live session is in no transcript, so the
+ * server's replay carries it beside the transcript, and the page draws it as its own row.
+ */
+describe("a replay's queued messages, and a replay read again", () => {
+  const MESSAGE = "aaaaaaaabbbbbbbbccccccccdddddddd";
+  const session = (over: Partial<ImporterSession> = {}): ImporterSession => ({
+    ...indexedSession(
+      importerSessionView({ importId: "imp_1" }),
+      "Claude Code",
+    ),
+    working: true,
+    ...over,
+  });
+  const view = (over: Parameters<typeof importerConversationView>[0] = {}) =>
+    importerConversationView({
+      importId: "imp_1",
+      live: true,
+      continuation: "live",
+      at: AT + 10_000,
+      ...over,
+    });
+
+  test("a queued message is a row of its own at the end, waiting, until its take", () => {
+    const installed = withReplay(session(), {
+      view: view({
+        queued: [
+          {
+            messageId: MESSAGE,
+            text: "and the portal",
+            acceptedAt: AT + 5_000,
+          },
+        ],
+      }),
+      floor: 7,
+    });
+    expect(
+      installed.items.map((row) => [row.kind, row.body, row.messageId]),
+    ).toEqual([["turn.operator", "and the portal", MESSAGE]]);
+    expect(installed.midTurn).toEqual([`operator:queued:${MESSAGE}`]);
+    expect(installed.historyFloor).toBe(7);
+    expect(installed.loaded).toBe(true);
+
+    const groups = (live: readonly LiveItem[]) =>
+      buildImporterChat({
+        history: installed.history,
+        working: true,
+        midTurn: installed.midTurn ?? [],
+        items: importerFeed({
+          own: installed.items,
+          floors: installed.floors,
+          live,
+          importId: "imp_1",
+          historyFloor: installed.historyFloor,
+          midTurn: installed.midTurn,
+          working: true,
+        }),
+      });
+    const tail = item({
+      id: "activity:8",
+      importId: "imp_1",
+      kind: "turn.reply",
+      body: "still on it",
+    });
+    const waiting = groups([tail]);
+    expect(
+      waiting.map((group) => [group.subject.message, group.subject.queued]),
+    ).toEqual([
+      ["Read the policy page", false],
+      ["and the portal", true],
+    ]);
+    // The work before the take is the replayed turn's, not the queued message's.
+    expect(waiting[0]?.rows.map((row) => row.item.body)).toContain(
+      "still on it",
+    );
+
+    const take = item({
+      id: "activity:9",
+      importId: "imp_1",
+      kind: "turn.taken",
+      messageId: MESSAGE,
+    });
+    const answer = item({
+      id: "activity:10",
+      importId: "imp_1",
+      kind: "turn.reply",
+      body: "adding the portal",
+    });
+    const taken = groups([tail, take, answer]);
+    expect(
+      taken.map((group) => [group.subject.message, group.subject.queued]),
+    ).toEqual([
+      ["Read the policy page", false],
+      ["and the portal", false],
+    ]);
+    expect(taken[1]?.rows.map((row) => row.item.body)).toEqual([
+      "adding the portal",
+    ]);
+  });
+
+  test("read again, the answer replaces the rows it holds and keeps the ones accepted after it", () => {
+    const before = session({
+      items: [
+        {
+          ...operatorTurn({
+            index: 1,
+            text: "sent before",
+            at: AT + 9_000,
+            after: 3,
+          }),
+          messageId: "m1",
+        },
+        {
+          ...operatorTurn({
+            index: 2,
+            text: "sent after",
+            at: AT + 11_000,
+            after: 4,
+          }),
+          messageId: "m2",
+        },
+      ],
+      floors: { "operator:1": 3, "operator:2": 4 },
+      midTurn: ["operator:1", "operator:2"],
+      loaded: true,
+      historyFloor: 1,
+    });
+    const again = withReplay(before, {
+      // Built at AT + 10 s: "sent before" is in it (here, in its transcript); "sent after" is not.
+      view: view({
+        items: [
+          replayItem(0, "turn.operator", "sent before", { importId: "imp_1" }),
+        ],
+      }),
+      floor: 9,
+    });
+    expect(again.items.map((row) => row.body)).toEqual(["sent after"]);
+    expect(again.floors).toEqual({ "operator:2": 4 });
+    expect(again.midTurn).toEqual(["operator:2"]);
+    expect(again.historyFloor).toBe(9);
+  });
+
+  test("a take for a message with no row asks for the replay again; one for a known row, or under the floor, does not", () => {
+    const loaded = session({
+      loaded: true,
+      historyFloor: 5,
+      items: [
+        {
+          ...operatorTurn({ index: 1, text: "mine", at: AT, after: 5 }),
+          messageId: "mine",
+        },
+      ],
+    });
+    const take = (n: number, messageId: string) =>
+      item({
+        id: `activity:${String(n)}`,
+        importId: "imp_1",
+        kind: "turn.taken",
+        messageId,
+      });
+    expect(takesUnknownMessage(loaded, take(6, "theirs"))).toBe(true);
+    expect(takesUnknownMessage(loaded, take(6, "mine"))).toBe(false);
+    // At or under the floor: the replay was built after it, and holds the message.
+    expect(takesUnknownMessage(loaded, take(5, "theirs"))).toBe(false);
+    // A session whose replay has not been read reads it anyway.
+    expect(
+      takesUnknownMessage({ ...loaded, loaded: false }, take(6, "theirs")),
+    ).toBe(false);
   });
 });

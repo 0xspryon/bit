@@ -289,6 +289,9 @@ const empty = (input: {
       ephemeral: false,
       note: input.note,
       items: [],
+      // A message still queued in a live session is the caller's to add (`ScopeImporter`'s
+      // `replay`): this module reads the harness, which does not hold one until it is taken.
+      queued: [],
       truncated: false,
       // Nothing was left out, because nothing came back. A count here would imply there had
       // been something to count.
@@ -638,6 +641,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
           (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
           standingNote,
         items: [],
+        queued: [],
         truncated: false,
         omittedBlank: blank,
         at,
@@ -676,6 +680,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
           : "") +
         standingNote,
       items: kept,
+      queued: [],
       truncated: kept.length < items.length,
       omittedBlank: blank,
       at,

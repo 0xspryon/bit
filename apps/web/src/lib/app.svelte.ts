@@ -5598,6 +5598,8 @@ export class App {
       next.length > App.LIVE_KEPT
         ? next.slice(next.length - App.LIVE_KEPT)
         : next;
+    // A take is kept on its importer session, since this list slides (A6 U4 review).
+    this.importer.noteTaken(frame);
     this.#refreshIntentsFor(targetId, frame);
     this.#refreshGoalBriefingFor(targetId, frame);
     this.#refreshPlanRoundsFor(targetId, frame);

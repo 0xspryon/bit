@@ -124,6 +124,7 @@ import {
   type ConversationModelSwitched,
   type ConversationStopped,
   type ImporterConversationView,
+  type ImporterQueuedMessage,
   type ImporterTurnAccepted,
   type ImportModelDraft,
   type ModelOptionSelection,
@@ -154,7 +155,11 @@ import { operatorPages, type ImporterPromptInput } from "./importerPrompt";
 import { importerSessionTitle } from "./importerTitle";
 import { ScopeImportProgress, widenPages } from "./progress";
 import { IMPORTER_AGENT, type AgentDefinition } from "../agent/registry";
-import { lastAssistantText, type AgentHarness } from "../harness/agentHarness";
+import {
+  lastAssistantText,
+  truncateNarration,
+  type AgentHarness,
+} from "../harness/agentHarness";
 import {
   makeLiveAgentSessions,
   type LiveAgentSession,
@@ -681,6 +686,43 @@ export class ScopeImporter extends Context.Service<
       const turns = new Map<string, Fiber.Fiber<void>>();
 
       /**
+       * The operator's messages each live import's harness has not taken yet, by import id
+       * and then by message id (A6 U4 review), and the message ids it has taken.
+       *
+       * **Why this process keeps them at all**, when it keeps no other word of a
+       * conversation (DECISIONS.md §8): a steer delivered while a turn runs is queued in the
+       * harness, and neither harness's transcript holds it until it is taken — so a reload in
+       * that window lost the message, and the reply to it then read as part of the turn
+       * before. {@link replay} carries these beside the transcript, and a reloaded tab draws
+       * them queued.
+       *
+       * Added when a `continued` send is accepted ({@link deliverTurn}); removed when the
+       * harness narrates `taken` for it ({@link narrate}), when the turn settles idle (nothing
+       * can still be queued in a session that is idle), and with the session, when its
+       * narrator ends. `taken` is there for the race the other way round: the harness can
+       * take a steer before `deliver` has returned to say it was delivered, and a take seen
+       * first must stop the message being added afterwards. Memory only, bounded by the
+       * messages an operator sends to a session this process holds.
+       */
+      const steers = new Map<
+        string,
+        {
+          readonly queued: Map<string, ImporterQueuedMessage>;
+          readonly taken: Set<string>;
+        }
+      >();
+      const steersOf = (importId: string) => {
+        const held = steers.get(importId);
+        if (held !== undefined) return held;
+        const fresh = {
+          queued: new Map<string, ImporterQueuedMessage>(),
+          taken: new Set<string>(),
+        };
+        steers.set(importId, fresh);
+        return fresh;
+      };
+
+      /**
        * Every import whose first turn has not yet learned how its open went, by import id.
        *
        * **What makes "still opening" visible before the spine publishes anything.** The
@@ -755,14 +797,26 @@ export class ScopeImporter extends Context.Service<
         const outcome = yield* Effect.result(
           narrateCoalesced({
             events: input.harness.sessionEvents(input.sessionId),
-            publish: (entry) =>
-              narrations.publish({
+            publish: (entry) => {
+              // The harness took a queued message: it is in the transcript from here on,
+              // and no longer this process's to replay (`steers`).
+              if (entry.detail._tag === "taken") {
+                const held = steersOf(input.importId);
+                held.queued.delete(entry.detail.messageId);
+                held.taken.add(entry.detail.messageId);
+              }
+              return narrations.publish({
                 targetId: input.targetId,
                 subject: { _tag: "import", importId: input.importId },
                 harnessSessionId: input.sessionId,
                 entry,
-              }),
+              });
+            },
           }),
+        ).pipe(
+          // The narrator ends with the session (`closeSession` interrupts it first): what it
+          // held queued went with the session, and is not this process's to replay.
+          Effect.ensuring(Effect.sync(() => steers.delete(input.importId))),
         );
         if (outcome._tag === "Failure") {
           yield* Effect.logWarning(
@@ -998,6 +1052,16 @@ export class ScopeImporter extends Context.Service<
          * to review. The detail carries what went wrong so the panel can say so.
          */
         const settled = yield* Effect.result(harness.waitForIdle(sessionId));
+        /*
+         * Idle: whatever was queued has been taken, whether or not the take was seen. Only
+         * what was accepted before now, so a message accepted after the session went idle —
+         * which the next turn will take — is not dropped with it.
+         */
+        const idleAt = Date.now();
+        for (const [id, message] of steers.get(importId)?.queued ?? []) {
+          if (message.acceptedAt <= idleAt)
+            steers.get(importId)?.queued.delete(id);
+        }
         if (yield* progress.stopped(importId)) return;
 
         /*
@@ -1468,6 +1532,22 @@ export class ScopeImporter extends Context.Service<
             detail: `${delivered.failure.message}. The harness would not take the message, so this import's session has been closed; your next message opens a fresh one under a new import.`,
           });
         }
+        const turn = accepted(
+          entry,
+          "continued",
+          "",
+          widened ?? { added: [], notAdded: [] },
+          delivered.success.messageId,
+        );
+        // Queued until the harness takes it (`steers`), unless it already has.
+        const held = steersOf(entry.id);
+        if (!held.taken.has(delivered.success.messageId)) {
+          held.queued.set(delivered.success.messageId, {
+            messageId: delivered.success.messageId,
+            text: truncateNarration(text),
+            acceptedAt: turn.acceptedAt,
+          });
+        }
         if ((yield* progress.resume(entry.id)) && !turns.has(entry.id)) {
           const fiber = yield* Effect.forkIn(
             settleTurn(entry.id, entry.harness, entry.sessionId).pipe(
@@ -1477,13 +1557,7 @@ export class ScopeImporter extends Context.Service<
           );
           turns.set(entry.id, fiber);
         }
-        return accepted(
-          entry,
-          "continued",
-          "",
-          widened ?? { added: [], notAdded: [] },
-          delivered.success.messageId,
-        );
+        return turn;
       });
 
       /**
@@ -1817,7 +1891,7 @@ export class ScopeImporter extends Context.Service<
         "ScopeImporter.replay",
       )(function* (input) {
         const held = sessions.get(input.importId);
-        return yield* importerConversation({
+        const view = yield* importerConversation({
           resolver,
           targetId: input.targetId,
           importId: input.importId,
@@ -1830,6 +1904,20 @@ export class ScopeImporter extends Context.Service<
             ? {}
             : { fetchTimeout: input.fetchTimeout }),
         });
+        /*
+         * The messages still queued in the live session (`steers`), read **after** the
+         * transcript: one taken between the two reads is then in the transcript and not
+         * here, rather than in both — and a tab that sees its take name a message it has no
+         * row for reads the replay again.
+         */
+        return {
+          ...view,
+          queued: view.live
+            ? [...(steers.get(input.importId)?.queued.values() ?? [])].sort(
+                (left, right) => left.acceptedAt - right.acceptedAt,
+              )
+            : [],
+        };
       });
 
       /** The import ids a switch has claimed (`switchFrom`). */

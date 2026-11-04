@@ -64,6 +64,7 @@
   import { IconArrowUp, IconFile, IconLink, IconPlus } from "../icons";
   import {
     durationLabel,
+    lastProse,
     turnEndedAt,
     turnModels,
     type ChatGroup,
@@ -387,12 +388,18 @@
         still being written, and a caption that appeared mid-stream would then move down
         with every row that landed above it.
       -->
-      {#if !group.subject.working}
+      {@const words = replyText(group)}
+      {#if !group.subject.working && !group.subject.queued && (group.subject.number !== null || lastProse(group) !== null)}
+        <!--
+          Also under a turn with no reply text (A6 U4 review): one that ended in the
+          harness's error, or was stopped before it answered, still ran on a model and took
+          time. Its Copy is left out, as there are no words to copy. Not on a message still
+          queued, nor on the leading group unless it holds replayed words of its own.
+        -->
         <div class="foot">
-          <CopyButton
-            text={replyText(group)}
-            label="Copy the importer's reply"
-          />
+          {#if words !== ""}
+            <CopyButton text={words} label="Copy the importer's reply" />
+          {/if}
           <p class="foot-text">{footerOf(group)}</p>
         </div>
       {/if}

@@ -355,6 +355,20 @@ export interface MessageEntry {
   /** When the harness recorded the entry, in epoch milliseconds, or `undefined`. */
   readonly at: number | undefined;
   /**
+   * When the harness **finished** the entry, for a harness that keeps one time per message
+   * rather than per block (A6 U4 review), or absent where {@link at} already is the block's
+   * own time.
+   *
+   * OpenCode stores an assistant message's parts with the message's `time.created`, which is
+   * when the model started on it — so a replay that stamped its parts with that drew a turn
+   * that took 3 s as one that took 0 s. Its `time.completed` is when the last part was done,
+   * which is what a live item's time approximates. `null` is a message the harness never
+   * marked completed: its parts' end is unknown, and the replay says so on them
+   * (`LiveItem.endUnknown`) rather than give a time that is not one. Claude Code stores one
+   * entry per block with its own `timestamp`, and leaves this absent.
+   */
+  readonly endedAt?: number | null;
+  /**
    * Set on a `user` entry the **harness wrote itself** rather than one anybody sent, by what
    * it marks; absent on everything else (A6 F10 review).
    *

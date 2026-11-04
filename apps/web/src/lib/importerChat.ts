@@ -34,12 +34,15 @@
  * appears twice" structural rather than hopeful: everything the server's answer contains was
  * published at or below the floor, and everything after it is only live.
  *
- * The operator's own rows need no such cancellation, unlike the goal chat's, and the reason is
- * the arrangement rather than luck: the replay is asked for when a session is **opened** and
- * never again, so every `turn.operator` row this tab mints is minted after the answer it
- * could have collided with. The goal chat re-reads after a send and therefore needs
- * `replayedThrough` and a text match; this does not, and must not start re-reading without
- * building one.
+ * The operator's own rows need no text match, unlike the goal chat's, and the reason is the
+ * arrangement rather than luck: the replay is asked for when a session is **opened**, so
+ * every `turn.operator` row this tab mints is minted after the answer it could have collided
+ * with. It is read **again** in one case only (A6 U4 review): a `turn.taken` naming a
+ * message this tab has no row for — sent from another tab, or taken between the server's two
+ * reads ({@link takesUnknownMessage}). That read replaces this tab's rows rather than
+ * matching them ({@link withReplay}): the server's answer holds every message it accepted
+ * before building it, taken (in the transcript) or still queued (`queued`), so only rows it
+ * accepted later are kept, told apart by the server's own clock.
  *
  * ## What is not joined, and says so
  *
@@ -77,9 +80,11 @@ import type {
 
 import {
   OPERATOR_TURN_KIND,
+  TAKEN_KIND,
   activityOrder,
   claimedRecords,
   foldSubagents,
+  operatorTurn,
   rowsFor,
   type ChatGroup,
   type RoundProse,
@@ -317,23 +322,121 @@ export interface ImporterSession {
    * placed meanwhile and {@link ImporterTurn.queued} for how it is drawn.
    */
   readonly midTurn?: readonly string[];
+  /**
+   * Each `turn.taken` item this tab has seen for this session, by the message it names,
+   * kept from the first sighting (A6 U4 review) — as {@link floors} are, and for their
+   * reason: the live feed is a sliding window (`App.LIVE_KEPT`), and a take that slid out
+   * of it would put its message back in the queue, and its turn's work back under the turn
+   * before. Recorded by `ImporterSessions.noteTaken`.
+   */
+  readonly taken?: Readonly<Record<string, LiveItem>>;
 }
 
-/** The kind a harness's "took a queued message" item carries (`live.ts`). */
-export const TAKEN_KIND = "turn.taken";
+export { TAKEN_KIND };
 
-/** Each `turn.taken` item in `items` by the message it names. */
+/**
+ * Each `turn.taken` item by the message it names: those this session recorded
+ * ({@link ImporterSession.taken}), and any in `items` it has not.
+ */
 const takenByMessage = (
   items: readonly LiveItem[],
+  recorded?: Readonly<Record<string, LiveItem>>,
 ): ReadonlyMap<string, LiveItem> => {
-  const taken = new Map<string, LiveItem>();
+  const taken = new Map<string, LiveItem>(Object.entries(recorded ?? {}));
   for (const item of items) {
-    if (item.kind === TAKEN_KIND && item.messageId !== undefined) {
+    if (
+      item.kind === TAKEN_KIND &&
+      item.messageId !== undefined &&
+      !taken.has(item.messageId)
+    ) {
       taken.set(item.messageId, item);
     }
   }
   return taken;
 };
+
+/**
+ * The rows a replay's still-queued messages are drawn as (A6 U4 review): each the operator's
+ * row for its message, carrying the message's id so its `turn.taken` finds it, at the time
+ * the server accepted it. Ids of their own (`operator:queued:<id>`), so no row this tab
+ * mints later can share one.
+ */
+export const queuedRows = (
+  queued: ImporterConversationView["queued"],
+  floor: number,
+): readonly LiveItem[] =>
+  queued.map((message) => ({
+    ...operatorTurn({
+      index: 0,
+      text: message.text,
+      at: message.acceptedAt,
+      after: floor,
+    }),
+    id: `operator:queued:${message.messageId}`,
+    messageId: message.messageId,
+  }));
+
+/**
+ * A session with the server's replay installed (S6), and the messages it holds queued
+ * drawn as rows waiting at the end (A6 U4 review).
+ *
+ * `answered.floor` is the activity publish order this tab had seen when the read was asked
+ * for: the replay/live boundary ({@link ImporterSession.historyFloor}).
+ *
+ * **On a second read, this tab's own rows are replaced by the answer's**, and that is what
+ * keeps a message off the screen twice. Every message the server accepted before it built
+ * the answer is in it — in the transcript if the harness took it, in `queued` if not — so
+ * the rows this tab minted for those are dropped. Rows the server accepted **after** it
+ * built the answer (`at`, the server's `acceptedAt`, past `view.at`, the same clock) cannot
+ * be in it, and are kept, with what follows them and their floors.
+ */
+export const withReplay = (
+  session: ImporterSession,
+  answered: { readonly view: ImporterConversationView; readonly floor: number },
+): ImporterSession => {
+  const { view, floor } = answered;
+  const cut = session.items.findIndex(
+    (item) => item.kind === OPERATOR_TURN_KIND && item.at > view.at,
+  );
+  const kept = cut < 0 ? [] : session.items.slice(cut);
+  const queued = queuedRows(view.queued, floor);
+  const keptIds = new Set(kept.map((item) => item.id));
+  const floors: Record<string, number> = {};
+  for (const [id, at] of Object.entries(session.floors ?? {})) {
+    if (keptIds.has(id)) floors[id] = at;
+  }
+  for (const row of queued) floors[row.id] = floor;
+  const midTurn = [
+    ...queued.map((row) => row.id),
+    ...(session.midTurn ?? []).filter((id) => keptIds.has(id)),
+  ];
+  return {
+    ...session,
+    history: historyOf(view),
+    historyFloor: floor,
+    loaded: true,
+    items: [...queued, ...kept],
+    floors,
+    midTurn,
+  };
+};
+
+/**
+ * Whether a `turn.taken` item names a message this session has no row for — one sent from
+ * another tab, or taken between the replay's two reads — so the replay must be read again
+ * to draw it (A6 U4 review). Only a take the session's replay cannot already hold (published
+ * after its floor) and only for a session whose replay has been read.
+ */
+export const takesUnknownMessage = (
+  session: ImporterSession,
+  take: LiveItem,
+): boolean =>
+  take.kind === TAKEN_KIND &&
+  take.messageId !== undefined &&
+  session.loaded === true &&
+  (session.historyFloor === undefined ||
+    (activityOrder(take) ?? Number.POSITIVE_INFINITY) > session.historyFloor) &&
+  !session.items.some((item) => item.messageId === take.messageId);
 
 /** What a message waiting behind the running turn says, under its bubble. */
 export const QUEUED_NOTE =
@@ -409,6 +512,8 @@ export const importerFeed = (input: {
   readonly midTurn?: readonly string[] | undefined;
   /** Whether the session is working: a steer can only wait behind a turn that is. */
   readonly working?: boolean | undefined;
+  /** {@link ImporterSession.taken}: the takes recorded, whether or not still in `live`. */
+  readonly taken?: Readonly<Record<string, LiveItem>> | undefined;
 }): readonly LiveItem[] => {
   const { importId } = input;
   if (importId === undefined) return input.own;
@@ -431,8 +536,6 @@ export const importerFeed = (input: {
       (input.historyFloor === undefined ||
         (activityOrder(item) ?? Number.POSITIVE_INFINITY) > input.historyFloor),
   );
-  if (mine.length === 0) return input.own;
-
   /*
    * Where an operator row goes among the importer's words: after everything published
    * before its floor.
@@ -445,7 +548,8 @@ export const importerFeed = (input: {
    * floor once the session is idle, as every row was before: the take may have been dropped
    * from the lossy activity channel, and an idle session has nothing left to keep apart.
    */
-  const taken = takenByMessage(mine);
+  const taken = takenByMessage(mine, input.taken);
+  if (mine.length === 0) return input.own;
   const floorOf = (row: LiveItem): number => {
     const sent = input.floors?.[row.id] ?? -1;
     const take =
@@ -508,6 +612,8 @@ export interface ImporterChatInput {
   readonly recordsSkipped?: number;
   /** {@link ImporterSession.midTurn}. Empty when omitted. */
   readonly midTurn?: readonly string[];
+  /** {@link ImporterSession.taken}. Only `items`' own takes when omitted. */
+  readonly taken?: Readonly<Record<string, LiveItem>>;
 }
 
 /**
@@ -693,7 +799,7 @@ export const buildImporterChat = (
 ): readonly ImporterGroup[] => {
   const { history } = input;
   // A take is never drawn: it only says which operator row is no longer queued (A6 U4).
-  const taken = takenByMessage(input.items);
+  const taken = takenByMessage(input.items, input.taken);
   const placed = placedByCall(
     history.items,
     input.items.filter((item) => item.kind !== TAKEN_KIND),

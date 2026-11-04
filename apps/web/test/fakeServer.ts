@@ -301,6 +301,8 @@ export const importerConversationView = (
         importId: "imp_1",
       }),
     ],
+    // Nothing queued in the live session by default (A6 U4 review).
+    queued: [],
     truncated: false,
     omittedBlank: 0,
     at: AT,

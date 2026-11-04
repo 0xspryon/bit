@@ -49,6 +49,7 @@ import {
   Fiber,
   Layer,
   ManagedRuntime,
+  Queue,
   Redacted,
   Stream,
 } from "effect";
@@ -257,6 +258,16 @@ interface Script {
   /** Makes the narration stream fail once it has said its lines, as a dropped stream does. */
   failEvents: boolean;
   /**
+   * Narrates one more entry on the open session's stream, after its lines: a take (A6 U4
+   * review), say. Set once the stream is open; `undefined` before.
+   */
+  emit: ((entry: HarnessNarration) => void) | undefined;
+  /**
+   * How long a steer's `prompt` takes to return once it has been given the message, in
+   * milliseconds: the window in which a harness can take it before the send hears back.
+   */
+  steerLatency: number;
+  /**
    * Streams the first line as {@link STREAMED_PIECES} deltas before its finished block, as
    * a driver that streams does (A6 F6).
    */
@@ -334,6 +345,8 @@ const newScript = (readable: readonly string[]): Script => {
     subscribed: [],
     streamsEnded: [],
     failEvents: false,
+    emit: undefined,
+    steerLatency: 0,
     streamBlocks: false,
     done: Promise.resolve(),
     failCreate: false,
@@ -480,7 +493,7 @@ const scriptedHarness = (script: Script) => {
                 });
               }
               return { delivered: true };
-            })
+            }).pipe(Effect.tap(() => Effect.sleep(script.steerLatency)))
         : script.failPrompt
           ? Effect.fail(
               new HarnessTransportError({
@@ -625,7 +638,13 @@ const scriptedHarness = (script: Script) => {
                   cause: undefined,
                 }),
               )
-            : Stream.never,
+            : Stream.callback<HarnessNarration>((queue) =>
+                Effect.sync(() => {
+                  script.emit = (entry) => {
+                    Queue.offerUnsafe(queue, entry);
+                  };
+                }),
+              ),
         ),
       ).pipe(
         Stream.onStart(
@@ -1781,6 +1800,116 @@ const replayOf = (
       });
     }),
   );
+
+/**
+ * A6 U4 review: a steer the harness has not taken is in neither harness's transcript, so the
+ * replay carries it beside the transcript until the take, and a reloaded tab draws it queued.
+ */
+describe("a message still queued in the live session", () => {
+  /** A take of `messageId`, as a driver narrates it. */
+  const take = (messageId: string): HarnessNarration => ({
+    type: "assistant",
+    sequence: undefined,
+    at: 1_700_000_000_500,
+    outcome: undefined,
+    detail: { _tag: "taken", messageId },
+  });
+  /** Holds the steer's turn open until `release` is called: the session stays working. */
+  const holdTurn = (built: ReturnType<typeof world>) => {
+    let release = () => {};
+    built.script.onSteer = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    return () => release();
+  };
+  const settleTicks = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  test("is in the replay, with its words and when it was accepted, until the harness takes it", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const release = holdTurn(built);
+    const sent = await sendTo(runtime, started.importId, "And the portal");
+    if (sent._tag !== "Success") throw new Error("the message was refused");
+    const messageId = sent.success.messageId ?? "";
+    expect(messageId).not.toBe("");
+
+    const waiting = await replayOf(runtime, started.importId);
+    expect(waiting.live).toBe(true);
+    expect(waiting.queued).toEqual([
+      {
+        messageId,
+        text: "And the portal",
+        acceptedAt: sent.success.acceptedAt,
+      },
+    ]);
+
+    built.script.emit?.(take(messageId));
+    await settleTicks();
+    expect((await replayOf(runtime, started.importId)).queued).toEqual([]);
+    release();
+    await runtime.dispose();
+  });
+
+  test("a take that outruns the send's own answer still keeps it out", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    let release = () => {};
+    // The harness takes the steer the moment it is given it, and `deliver` returns after.
+    built.script.steerLatency = 30;
+    built.script.onSteer = () => {
+      const steer = built.script.deliveries.at(-1);
+      if (steer?._tag === "steer") built.script.emit?.(take(steer.messageId));
+      return new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    };
+    const sent = await sendTo(runtime, started.importId, "And the portal");
+    expect(sent._tag).toBe("Success");
+    await settleTicks();
+    expect((await replayOf(runtime, started.importId)).queued).toEqual([]);
+    release();
+    await runtime.dispose();
+  });
+
+  test("a session that has gone idle holds nothing queued, whether or not the take was seen", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const release = holdTurn(built);
+    const sent = await sendTo(runtime, started.importId, "And the portal");
+    expect(sent._tag).toBe("Success");
+    expect((await replayOf(runtime, started.importId)).queued).toHaveLength(1);
+    release();
+    await settleTicks();
+    expect((await replayOf(runtime, started.importId)).queued).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a session this process does not hold has nothing queued", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const release = holdTurn(built);
+    await sendTo(runtime, started.importId, "And the portal");
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.stop(started.importId),
+      ),
+    );
+    const after = await replayOf(runtime, started.importId);
+    expect(after.live).toBe(false);
+    expect(after.queued).toEqual([]);
+    release();
+    await runtime.dispose();
+  });
+});
 
 describe("a turn into a live session", () => {
   test("is delivered as a queued steer, carrying the operator's words and no copy of the rules", async () => {

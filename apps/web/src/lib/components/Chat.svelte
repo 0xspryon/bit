@@ -96,8 +96,10 @@
      * the operator's bubble being on the other side is what says who spoke — and the facts
      * a label carried, the model, in a quiet line under the finished reply instead. The
      * caller decides what it says and **whether it says anything yet**, because only the
-     * caller knows if its subject is finished; this decides only where it goes. A group with
-     * no prose gets none, since a caption needs words to sit under.
+     * caller knows if its subject is finished; this decides only where it goes. A group
+     * with rows and no prose — a turn that ended in the harness's error, or was stopped
+     * before it said anything — gets it under its last row (A6 U4 review): the turn still
+     * ran on a model and took time. A group with no rows gets none.
      *
      * Thread layout only. The panel's ledger rows carry their own kind, time and id, and a
      * caption under one of them would be a second header on a row that already has one.
@@ -328,6 +330,10 @@
               {/if}
             {/each}
           </ol>
+          {#if place === null && footer !== undefined}
+            <!-- No prose to hang it under: under the turn's last row instead. -->
+            {@render closing()}
+          {/if}
         {:else if group.rows.length > 0}
           <ol class="items">
             {#each group.rows as row (row.key)}

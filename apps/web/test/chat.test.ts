@@ -222,6 +222,25 @@ const chat = (input: {
     inFlight: new Set(input.inFlight ?? []),
   });
 
+describe("a take in the planner panel (A6 U4 review)", () => {
+  test("is not a row: no empty 'Message taken' under a round", () => {
+    const view = chat({
+      items: [
+        activity({ body: "reading" }),
+        activity({
+          kind: "turn.taken",
+          headline: "Taken",
+          body: "",
+          messageId: "aaaaaaaabbbbbbbbccccccccdddddddd",
+        }),
+      ],
+    });
+    expect(
+      view.groups.flatMap((group) => group.rows.map((row) => row.item.kind)),
+    ).toEqual(["turn.reply"]);
+  });
+});
+
 describe("labels", () => {
   test("a kind this build knows reads as words, and one it does not reads as itself", () => {
     expect(kindLabel("plan.round.settled")).toBe("Planner round settled");
@@ -774,6 +793,25 @@ describe("the goal conversation", () => {
       awaiting: input.awaiting ?? false,
       conversationLive: input.conversationLive ?? true,
     });
+
+  test("a take is not a row: no empty 'Message taken' in the goal panel (A6 U4 review)", () => {
+    const view = built({
+      items: [
+        activity({ roundId: null, goalId: GOAL, body: "on it" }),
+        activity({
+          roundId: null,
+          goalId: GOAL,
+          kind: "turn.taken",
+          headline: "Taken",
+          body: "",
+          messageId: "aaaaaaaabbbbbbbbccccccccdddddddd",
+        }),
+      ],
+    });
+    expect(
+      view.groups.flatMap((group) => group.rows.map((row) => row.item.kind)),
+    ).toEqual(["turn.reply"]);
+  });
 
   test("a goal nobody has talked to has no group at all, not an empty one", () => {
     // The fifth source, and the shape it is rendered in: `Chat` prints its `empty`
@@ -1530,6 +1568,49 @@ describe("U4: a turn footer's facts", () => {
     );
     expect(turnEndedAt({ rows })).toBe(AT + 9_000);
     expect(turnEndedAt({ rows: [] })).toBeUndefined();
+  });
+
+  test("a turn holding an item whose end the harness did not keep has no end, so no length", () => {
+    // A6 U4 review: an OpenCode message never marked completed is replayed at its start.
+    const rows = rowsFor(
+      [
+        activity({ body: "a", at: AT + 1_000 }),
+        activity({ body: "b", at: AT + 2_000, endUnknown: true }),
+      ],
+      false,
+    );
+    expect(turnEndedAt({ rows })).toBeUndefined();
+  });
+
+  test("a harness note live never draws does not stretch the turn; its error does end it", () => {
+    // OpenCode stores a `system` entry when the next turn starts, before that turn's message.
+    const rows = rowsFor(
+      [
+        activity({ body: "a", at: AT + 4_000 }),
+        activity({
+          kind: "turn.other",
+          headline: "system",
+          body: "Instructions updated: core/codemode",
+          at: AT + 19_000,
+        }),
+      ],
+      false,
+    );
+    expect(turnEndedAt({ rows })).toBe(AT + 4_000);
+    const failed = rowsFor(
+      [
+        activity({ body: "a", at: AT + 4_000 }),
+        activity({
+          kind: "turn.other",
+          headline: "error",
+          body: "Free usage limit reached",
+          outcome: "failed",
+          at: AT + 6_000,
+        }),
+      ],
+      false,
+    );
+    expect(turnEndedAt({ rows: failed })).toBe(AT + 6_000);
   });
 
   test("a duration as D4 words it", () => {

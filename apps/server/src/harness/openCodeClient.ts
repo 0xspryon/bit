@@ -1169,7 +1169,7 @@ const flatten = (
     metadata?: unknown;
     description?: unknown;
     model?: unknown;
-    time?: { created?: unknown } | undefined;
+    time?: { created?: unknown; completed?: unknown } | undefined;
     error?: { message?: unknown } | undefined;
     content?: ReadonlyArray<{ type?: unknown; text?: unknown }> | undefined;
     files?: ReadonlyArray<{
@@ -1261,6 +1261,16 @@ const flatten = (
         : [],
     model,
     at: millisOf(record.time?.created),
+    /*
+     * When the model finished the message (A6 U4 review). Its parts are all stored with the
+     * message's `time.created`, when it started, so that alone made a 3 s turn replay as
+     * 0 s; `time.completed` (`Session.Message.Assistant`'s optional `time.completed`, in the
+     * schema since 2.1, and on every finished message 2.2.5 lists) is when they were done.
+     * `null` for an assistant message with none: its end is unknown, and said so.
+     */
+    ...(type === "assistant"
+      ? { endedAt: millisOf(record.time?.completed) ?? null }
+      : {}),
   };
 };
 
