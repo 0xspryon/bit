@@ -31,20 +31,31 @@
 
   /** How long a Copy button says what happened before it says Copy again. */
   const COPIED_FOR_MS = 1500;
-  const resets = new WeakMap<
-    HTMLButtonElement,
-    ReturnType<typeof setTimeout>
-  >();
 
-  const say = (button: HTMLButtonElement, word: string): void => {
-    clearTimeout(resets.get(button));
-    button.textContent = word;
-    resets.set(
-      button,
-      setTimeout(() => {
-        button.textContent = "Copy";
-      }, COPIED_FOR_MS),
-    );
+  /**
+   * What the last Copy did, for a screen reader. The button's own word changes too, but its
+   * `aria-label` ("Copy entry-10.json") is what is read for it, and a changed word inside a
+   * button is not announced anyway. One polite region per reply, outside the `{@html}`, so
+   * it is this component's and no agent text can be in it.
+   */
+  let announced = $state("");
+
+  /**
+   * The code as the agent wrote it. `markdown.ts` shows each bidi or zero-width character in
+   * code as a `.char-escape` marker, `⟨U+202E⟩`; this puts the character back. Only the
+   * pipeline makes a `.char-escape` (the sanitiser passes no such class from the source),
+   * so an agent's own `⟨U+202E⟩` is copied as those characters.
+   */
+  const written = (code: Element): string => {
+    const copy = code.cloneNode(true);
+    if (!(copy instanceof Element)) return "";
+    for (const mark of copy.querySelectorAll(".char-escape")) {
+      const point = /^⟨U\+([0-9A-F]+)⟩$/.exec(mark.textContent ?? "")?.[1];
+      if (point !== undefined) {
+        mark.replaceWith(String.fromCodePoint(Number.parseInt(point, 16)));
+      }
+    }
+    return copy.textContent ?? "";
   };
 
   /**
@@ -61,8 +72,32 @@
    *
    * The clipboard API needs a secure context, which bit's localhost is; where it is
    * missing or refused, the button says so rather than claiming a copy.
+   *
+   * Every reset timer belongs to the attachment and is cleared with it, so a reply taken
+   * away within the 1.5 s leaves nothing to run against its detached buttons.
    */
   const copyButtons: Attachment<HTMLElement> = (root) => {
+    const resets = new Map<Element, ReturnType<typeof setTimeout>>();
+    const later = (key: Element, run: () => void): void => {
+      clearTimeout(resets.get(key));
+      resets.set(
+        key,
+        setTimeout(() => {
+          resets.delete(key);
+          run();
+        }, COPIED_FOR_MS),
+      );
+    };
+    const say = (button: HTMLButtonElement, word: string): void => {
+      button.textContent = word;
+      announced = word;
+      later(button, () => {
+        button.textContent = "Copy";
+      });
+      later(root, () => {
+        announced = "";
+      });
+    };
     const onclick = (event: MouseEvent): void => {
       if (!(event.target instanceof Element)) return;
       const button = event.target.closest(".code-copy");
@@ -71,7 +106,7 @@
       }
       const code = button.closest(".code-frame")?.querySelector("pre > code");
       if (code === null || code === undefined) return;
-      const copied = (code.textContent ?? "").replace(/\n$/, "");
+      const copied = written(code).replace(/\n$/, "");
       Promise.resolve()
         .then(() => navigator.clipboard.writeText(copied))
         .then(
@@ -80,13 +115,18 @@
         );
     };
     root.addEventListener("click", onclick);
-    return () => root.removeEventListener("click", onclick);
+    return () => {
+      root.removeEventListener("click", onclick);
+      for (const timer of resets.values()) clearTimeout(timer);
+      resets.clear();
+    };
   };
 </script>
 
 <div class="markdown" {@attach copyButtons}>
   {@html html}
 </div>
+<span class="announce" aria-live="polite">{announced}</span>
 
 <style>
   /*
@@ -387,11 +427,19 @@
   }
   .markdown :global(th) {
     border-bottom-color: var(--border-base);
-    background: var(--bg-deep);
     color: var(--text-muted);
     font: 500 11px/16px var(--font-sans);
     letter-spacing: 0.04em;
     text-transform: uppercase;
+  }
+  /*
+   * The header's deep fill only over a body. A header row alone, deep inside a solid edge,
+   * is drawn the way the chat draws a committed record (`ChatItem`'s `.block`), and a GFM
+   * table needs no body: `| RECORDED add_scope_entry(…) |` over `|---|` would be an agent's
+   * receipt. Alone, it is a plain row in a hairline box, which no record is.
+   */
+  .markdown :global(table:has(tbody) th) {
+    background: var(--bg-deep);
   }
   .markdown :global(tbody tr:last-child td) {
     border-bottom: 0;
@@ -420,6 +468,31 @@
   .markdown :global(th[align="right"]),
   .markdown :global(td[align="right"]) {
     text-align: right;
+  }
+  /*
+   * A bidi or zero-width character in code, written out as its code point (`reveal` in
+   * `markdown.ts`): smaller, faint and boxed, so it reads as a note about the text rather
+   * than as part of it.
+   */
+  .markdown :global(.char-escape) {
+    margin: 0 1px;
+    padding: 0 2px;
+    border: 1px solid var(--border-muted);
+    border-radius: 3px;
+    color: var(--text-faint);
+    font-size: 0.85em;
+    font-style: normal;
+    letter-spacing: normal;
+    text-transform: none;
+    white-space: nowrap;
+  }
+  .announce {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   /* remark-rehype labels a footnote section with a heading meant only for screen readers. */
   .markdown :global(.sr-only) {

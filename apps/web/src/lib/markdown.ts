@@ -38,8 +38,9 @@
  * {@link finish} runs last, on already-sanitised hast. It only adds attributes whose values
  * are constants or are copied from attributes the sanitiser already passed, replaces an
  * image with a link to the same, already-checked URL, and otherwise only takes things away:
- * attributes, anchors, a back-reference. The one thing it builds from the source is a text
- * node, which the serialiser escapes like any other. Putting it before the sanitiser would
+ * attributes, anchors, a back-reference. What it builds from the source is text: text
+ * nodes, and one `aria-label` on a fence's Copy button, a plain string in a fixed
+ * attribute. The serialiser escapes both like any other. Putting it before the sanitiser would
  * mean widening the schema to let its attributes through, which would let the same
  * attributes through from the source as well.
  */
@@ -165,6 +166,7 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
     return [node];
   }
   node.children = node.children.flatMap((child) => rewrite(child, inLink));
+  if (node.tagName === "code") node.children = node.children.flatMap(reveal);
   if (node.tagName === "table") {
     return [element("div", { className: ["table-wrap"] }, [node])];
   }
@@ -173,6 +175,47 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
   if (node.tagName === "pre") return [codeFrame(node)];
   return [node];
 };
+
+/**
+ * Characters that change how code reads without showing as anything, shown as what they
+ * are: `⟨U+202E⟩`, in a `<span class="char-escape">`.
+ *
+ * A bidi control (U+202A–202E, U+2066–2069) reorders the letters around it on screen and
+ * not in the text, so a fence named `\u202Enosj.live` reads as `evil.json` and copies as
+ * something else; a zero-width one (U+200B–200F, U+2060, U+FEFF) puts a character into a
+ * host the eye cannot see. In code, and in a fence's name, the exact characters are the
+ * point, so each is replaced by its code point. Prose is left alone: there, these are how
+ * right-to-left text and joined scripts are written.
+ *
+ * The marker is a text node in an element with a constant class, built here after the
+ * sanitiser like the rest of the frame. The sanitiser lets no `class` through from the
+ * source but a fence's language and the task list's and footnotes' own, so a
+ * `.char-escape` is only ever this one, and the agent's own `⟨U+202E⟩` stays plain text.
+ * That is what lets `Markdown.svelte`'s Copy put the original character back: the button
+ * copies the code as the agent wrote it.
+ */
+const HIDDEN = /[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/u;
+const hiddenName = (char: string): string =>
+  `⟨U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}⟩`;
+const reveal = (node: ElementContent): ElementContent[] => {
+  if (isElement(node)) {
+    node.children = node.children.flatMap(reveal);
+    return [node];
+  }
+  if (node.type !== "text" || !HIDDEN.test(node.value)) return [node];
+  return [...node.value].flatMap((char): ElementContent[] =>
+    HIDDEN.test(char)
+      ? [
+          element("span", { className: ["char-escape"] }, [
+            { type: "text", value: hiddenName(char) },
+          ]),
+        ]
+      : [{ type: "text", value: char }],
+  );
+};
+/** The same, as plain text, for an attribute: an `aria-label` cannot hold a span. */
+const revealText = (text: string): string =>
+  text.replace(new RegExp(HIDDEN.source, "gu"), hiddenName);
 
 /**
  * A fence, framed as A6 D8 draws it: a header naming it, a **Copy** button, then the block.
@@ -186,9 +229,12 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
  * The language is copied from the `class="language-x"` the sanitiser passed, as before.
  *
  * Every element of the frame is built here, after the sanitiser, from constants: the
- * classes, `type="button"`, and the button's word. Nothing in the schema is widened for it,
- * and no attribute of it comes from the source. The button has no handler in the markup —
- * `Markdown.svelte` listens on its own root for a click on a `.code-copy` and copies the
+ * classes, `type="button"`, and the button's word. Nothing in the schema is widened for it.
+ * One attribute carries source text: the button's `aria-label`, `Copy <name>` (or `Copy
+ * code`), so a screen reader can tell one fence's button from the next. It is a string the
+ * serialiser escapes as an attribute value, and the name in it has its hidden characters
+ * written out ({@link reveal}) as the visible label does. The button has no handler in the
+ * markup — `Markdown.svelte` listens on its own root for a click on a `.code-copy` and copies the
  * text of the `<pre>` in the same frame, so there is no script in the HTML to inject into.
  *
  * Every fence gets the header, even one with nothing to name. A6 D8 draws a long unbroken
@@ -218,12 +264,20 @@ const codeFrame = (pre: Element): Element => {
       : (language ?? "");
   return element("div", { className: ["code-frame"] }, [
     element("div", { className: ["code-head"] }, [
-      element("span", { className: ["code-label"] }, [
-        { type: "text", value: label },
-      ]),
-      element("button", { type: "button", className: ["code-copy"] }, [
-        { type: "text", value: "Copy" },
-      ]),
+      element(
+        "span",
+        { className: ["code-label"] },
+        reveal({ type: "text", value: label }),
+      ),
+      element(
+        "button",
+        {
+          type: "button",
+          className: ["code-copy"],
+          ariaLabel: label === "" ? "Copy code" : `Copy ${revealText(label)}`,
+        },
+        [{ type: "text", value: "Copy" }],
+      ),
     ]),
     pre,
   ]);
@@ -280,12 +334,18 @@ const taskText = (item: Element): void => {
  * line it is a paragraph of its own. Either way it is split off into a `<p
  * class="quote-source">` and the dash is dropped, since the line's own style now says what
  * the dash said. A quote that is *only* such a line is left alone: there is nothing for it
- * to be the source of.
+ * to be the source of. So is a dash line with any more of the quote after it, soft break or
+ * hard: a source is where a quote ends, and a dash line mid-quote is the quote's own text.
  *
  * It only moves nodes the sanitiser already passed and splits one text node; the class is
  * a constant.
  */
 const SOURCE_DASH = /\n\s*—\s*/;
+/** A line break anywhere in a node: a soft one in its text, or a hard `<br>`. */
+const breaks = (node: ElementContent): boolean =>
+  node.type === "text"
+    ? node.value.includes("\n")
+    : isElement(node) && (node.tagName === "br" || node.children.some(breaks));
 const quoteSource = (quote: Element): void => {
   const blocks = quote.children.filter(isElement);
   const last = blocks.at(-1);
@@ -294,7 +354,8 @@ const quoteSource = (quote: Element): void => {
   if (
     blocks.length > 1 &&
     first?.type === "text" &&
-    /^\s*—/.test(first.value)
+    /^\s*—/.test(first.value) &&
+    !last.children.some(breaks)
   ) {
     first.value = first.value.replace(/^\s*—\s*/, "");
     last.properties["className"] = ["quote-source"];
@@ -312,6 +373,10 @@ const quoteSource = (quote: Element): void => {
   if (match === undefined) return;
   const before = split.value.slice(0, match.index);
   const after = split.value.slice(match.index + match[0].length);
+  // Only the quote's last line: a dash line with more of the quote under it is quoted text.
+  if (after.includes("\n") || last.children.slice(at + 1).some(breaks)) {
+    return;
+  }
   const quoted = [
     ...last.children.slice(0, at),
     ...(before === "" ? [] : [{ type: "text" as const, value: before }]),

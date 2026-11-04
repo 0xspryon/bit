@@ -375,6 +375,22 @@ describe("D8's framing", () => {
     ).toEqual([":a\n— b", "quote-source:c"]);
   });
 
+  test("a dash line with a line after it is quoted text, not the quote's source", () => {
+    // Soft break, after a blank line, and a hard break (two trailing spaces): in each, the
+    // dash line is followed by more of the quote, so it is not where the quote came from.
+    for (const text of [
+      "> line1\n> — not source\n> line3",
+      "> line1\n>\n> — not source\n> line3",
+      "> line1\n> — not source  \n> line3",
+      "> line1\n> — not *source\nline3*",
+    ]) {
+      const quote = render(text).querySelector("blockquote");
+      expect(quote?.querySelector(".quote-source")).toBeNull();
+      expect(quote?.textContent).toContain("— not source");
+      expect(quote?.textContent).toContain("line3");
+    }
+  });
+
   test("a dash that is not a closing line is left in the quote", () => {
     // Mid-line, and a quote that is nothing but the dash line: neither has a source.
     for (const text of ["> one — two", "> — only the source"]) {
@@ -504,11 +520,76 @@ describe("D8's framing, from a program page", () => {
         .map((each) => `${each.parentElement?.className}>${each.outerHTML}`)
         .join(),
     ).toBe(
-      'code-head><button type="button" class="code-copy">Copy</button>,code-head><button type="button" class="code-copy">Copy</button>',
+      'code-head><button type="button" class="code-copy" aria-label="Copy code">Copy</button>,code-head><button type="button" class="code-copy" aria-label="Copy code">Copy</button>',
     );
     expect(frames[0]?.querySelector("pre > code")?.textContent).toContain(
       '<button class="code-copy">Copy</button>',
     );
+  });
+});
+
+describe("characters that do not show as what they are", () => {
+  test("in a fence's name, a bidi override is a visible marker and the letters stay in order", () => {
+    const root = render("```json \u202Enosj.live\n{}\n```");
+    const label = root.querySelector(".code-label");
+    expect(label?.textContent).toBe("⟨U+202E⟩nosj.live");
+    expect(label?.querySelector(".char-escape")?.textContent).toBe("⟨U+202E⟩");
+    expect(label?.textContent).not.toContain("\u202E");
+  });
+
+  test("in a fence and in inline code, each one is a marker; prose is left alone", () => {
+    const hidden = [
+      "\u202A",
+      "\u202E",
+      "\u2066",
+      "\u2069",
+      "\u200B",
+      "\u200F",
+      "\u2060",
+      "\uFEFF",
+    ];
+    const root = render(
+      `\`\`\`\nadmin${hidden.join("")}.acme.com\n\`\`\`\n\nSee \`a\u200Bb\` and a\u200Bb.`,
+    );
+    expect(root.querySelector("pre > code")?.textContent).toBe(
+      "admin⟨U+202A⟩⟨U+202E⟩⟨U+2066⟩⟨U+2069⟩⟨U+200B⟩⟨U+200F⟩⟨U+2060⟩⟨U+FEFF⟩.acme.com\n",
+    );
+    expect(root.querySelectorAll("pre .char-escape")).toHaveLength(8);
+    expect(root.querySelector("p > code")?.textContent).toBe("a⟨U+200B⟩b");
+    // Prose is the agent's sentence as written: only code is escaped.
+    expect(root.querySelector("p")?.textContent).toContain(" a\u200Bb.");
+    expect(root.querySelector("pre")?.textContent).not.toMatch(
+      /[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/,
+    );
+  });
+
+  test("a marker written by the agent is text, and Copy gives it back as written", async () => {
+    const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (text: string) => {
+          written.push(text);
+        },
+      },
+    });
+    try {
+      const root = render("```\nadmin\u200B.acme.com ⟨U+202E⟩ \u202Eevil\n```");
+      // The agent's own "⟨U+202E⟩" is plain text, not a marker.
+      expect(root.querySelectorAll(".char-escape")).toHaveLength(2);
+      const button = root.querySelector<HTMLButtonElement>("button.code-copy");
+      if (button === null) throw new Error("no Copy button");
+      click(button);
+      await settle();
+      expect(written).toEqual(["admin\u200B.acme.com ⟨U+202E⟩ \u202Eevil"]);
+    } finally {
+      if (original === undefined) {
+        Reflect.deleteProperty(navigator, "clipboard");
+      } else {
+        Object.defineProperty(navigator, "clipboard", original);
+      }
+    }
   });
 });
 
@@ -557,6 +638,72 @@ describe("Copy", () => {
     click(second);
     await settle();
     expect(written).toEqual([json, "var=1"]);
+  });
+
+  test("each button names its fence, as text", () => {
+    const root = render(
+      [
+        "```json entry-10.json\n{}\n```",
+        "```js\nx\n```",
+        "```\nx\n```",
+        '```js "><script>alert(1)</script>\nx\n```',
+        "```json \u202Enosj.live\n{}\n```",
+      ].join("\n\n"),
+    );
+    expect(root.querySelector("script")).toBeNull();
+    expect(
+      [...root.querySelectorAll("button.code-copy")].map((each) =>
+        each.getAttribute("aria-label"),
+      ),
+    ).toEqual([
+      "Copy entry-10.json",
+      "Copy js",
+      "Copy code",
+      'Copy "><script>alert(1)</script>',
+      "Copy ⟨U+202E⟩nosj.live",
+    ]);
+  });
+
+  test("the result is announced, once, outside the agent's markup", async () => {
+    clipboard(async (text) => {
+      written.push(text);
+    });
+    const one = mountInto(Markdown, { text: "```\nx\n```" });
+    mounted.push(one);
+    const live = one.target.querySelectorAll('[aria-live="polite"]');
+    expect(live).toHaveLength(1);
+    const region = live[0];
+    if (region === undefined) throw new Error("no live region");
+    expect(region.closest(".markdown")).toBeNull();
+    expect(region.textContent).toBe("");
+    const button =
+      one.target.querySelector<HTMLButtonElement>("button.code-copy");
+    if (button === null) throw new Error("no Copy button");
+    click(button);
+    await settle();
+    expect(region.textContent).toBe("Copied");
+
+    clipboard(() => Promise.reject(new Error("denied")));
+    click(button);
+    await settle();
+    expect(region.textContent).toBe("Copy failed");
+  });
+
+  test("a reply taken away mid-'Copied' leaves no timer behind", async () => {
+    clipboard(async (text) => {
+      written.push(text);
+    });
+    const one = mountInto(Markdown, { text: "```\nx\n```" });
+    const button =
+      one.target.querySelector<HTMLButtonElement>("button.code-copy");
+    if (button === null) throw new Error("no Copy button");
+    click(button);
+    await settle();
+    expect(button.textContent).toBe("Copied");
+    one.destroy();
+    // Had the reset timer survived, it would write "Copy" into the detached button.
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+    expect(button.textContent).toBe("Copied");
   });
 
   test("says so when the clipboard refuses, rather than claiming a copy", async () => {
@@ -634,6 +781,30 @@ describe("what cannot wrap scrolls in its own block", () => {
     expect(
       getComputedStyle(root.querySelector("th code") ?? root).textTransform,
     ).toBe("none");
+  });
+
+  test("a table with no body has no record's deep header", async () => {
+    // A header row alone, on the deep background inside a solid edge, is the chat's
+    // committed record (`ChatItem`'s `.block`); an agent could draw itself a receipt.
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    // The token sheet is not loaded here; a stand-in value makes the fill comparable.
+    sheet.textContent = `:root { --bg-deep: rgb(1, 2, 3); }\n${css?.code ?? ""}`;
+    document.head.append(sheet);
+
+    const root = render(
+      '| RECORDED `add_scope_entry("evil.example")` |\n|---|\n\n| Host |\n| --- |\n| a |',
+    );
+    const [alone, bodied] = [...root.querySelectorAll("th")].map(
+      (each) => getComputedStyle(each).backgroundColor,
+    );
+    expect(bodied).toBe("rgb(1, 2, 3)");
+    expect(alone).not.toBe(bodied);
   });
 
   test("in a list mixing tasks and bullets, only the task loses its bullet", async () => {
