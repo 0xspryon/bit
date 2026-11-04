@@ -891,9 +891,10 @@ export type ImporterContinuationRefusal =
  * The harness's transcript does not hold such a message until it takes it — and Claude Code
  * narrates the take 30–130 ms before it writes the entry — so a replay of the transcript
  * alone loses it on a reload, and the reply to it then reads as part of the turn before.
- * This process holds it from the moment the send is accepted until the session settles or
- * closes, and the replay carries it beside the transcript for as long as the transcript
- * does not hold its id (`LiveItem.messageId` on the replayed `turn.operator`), so a
+ * This process holds it from the moment the send is accepted until a replay has read it in
+ * the transcript, or the session settles or closes (review 3), and the replay carries it
+ * beside the transcript for as long as the transcript
+ * does not hold its id (`LiveItem.messageIds` on the replayed `turn.operator`), so a
  * reloaded tab draws it once: queued while it waits, as its own turn once taken.
  */
 export const ImporterQueuedMessage = Schema.Struct({
@@ -909,6 +910,13 @@ export const ImporterQueuedMessage = Schema.Struct({
    * on the lossy live channel, so a tab reloaded after it has no other way to know.
    */
   taken: Schema.Boolean,
+  /**
+   * When the harness took this message **together with others** in one take (A6 U4 review
+   * 3), every message of that take, this one included, oldest first — Claude Code stores
+   * such a take as one entry, and a chat draws it as one turn. Absent on a message taken
+   * alone and on one still waiting.
+   */
+  takenTogether: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 export type ImporterQueuedMessage = typeof ImporterQueuedMessage.Type;
 
@@ -965,8 +973,12 @@ const ImporterConversationViewFields = {
    *
    * **Joined to {@link items} by id, never by time** (A6 U4 review 2): what this process
    * held is read **before** the transcript, and a message the transcript then holds — a
-   * replayed `turn.operator` carrying its `messageId` — is left out here. So every message
-   * accepted before the read began is in exactly one of the two.
+   * replayed `turn.operator` naming it in `messageIds` — is left out here. So every message
+   * accepted before the read began is in exactly one of the two. "Holds" means anywhere in
+   * the transcript, not only in {@link items}' window (review 3), and a message a read has
+   * once found there is not this process's to hold any more: a copy older than the limit,
+   * or one a compaction later summarised away, is not put back at the end of the
+   * conversation.
    */
   queued: Schema.Array(ImporterQueuedMessage),
   /** Messages this answer stopped short of. */

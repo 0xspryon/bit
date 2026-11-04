@@ -794,7 +794,7 @@ export const openCodeNarration = (
             ? inbox.slice(4)
             : undefined;
         return messageId !== undefined && isDerivedMessageId(messageId)
-          ? { _tag: "taken", messageId }
+          ? { _tag: "taken", messageIds: [messageId] }
           : { _tag: "opaque" };
       }
       case "session.execution.failed": {
@@ -1256,7 +1256,7 @@ const flatten = (
   return {
     type,
     text: split?.text ?? words,
-    ...(ours === undefined ? {} : { messageId: ours }),
+    ...(ours === undefined ? {} : { messageIds: [ours] }),
     ...(split === undefined || split.attachments.length === 0
       ? {}
       : { attachments: split.attachments }),

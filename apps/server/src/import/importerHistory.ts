@@ -381,6 +381,16 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
   readonly importDirectory: (targetId: string, importId: string) => string;
   readonly limit?: number | undefined;
   readonly fetchTimeout?: Duration.Input | undefined;
+  /**
+   * Told the application's ids of every operator message the transcript the harness
+   * answered holds (`MessageEntry.messageIds`), **all of it** — read before the answer is cut
+   * to {@link limit} (A6 U4 review 3). Not called when the harness was not read.
+   *
+   * What the importer joins the steers it holds to (`ImporterConversationView.queued`):
+   * a steer whose copy is older than the newest `limit` items is still written, and joined
+   * to the cut answer's items alone it was put back at the end of the conversation.
+   */
+  readonly onTranscript?: ((written: ReadonlySet<string>) => void) | undefined;
 }) {
   const limit = input.limit ?? IMPORTER_HISTORY_READ_LIMIT;
   const base = { targetId: input.targetId, importId: input.importId };
@@ -579,6 +589,10 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
         standingNote,
     });
   }
+
+  input.onTranscript?.(
+    new Set(fetched.success.flatMap((entry) => entry.messageIds ?? [])),
+  );
 
   if (fetched.success.length === 0) {
     return empty({

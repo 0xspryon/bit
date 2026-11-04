@@ -677,7 +677,10 @@ export class ScopeImporter extends Context.Service<
               // What the session held queued went with it, and is not this process's to
               // replay (`steers`). Not on the narrator's exit: a narration stream can end
               // while the session lives on.
-              Effect.sync(() => steers.delete(entry.id)),
+              Effect.sync(() => {
+                steers.delete(entry.id);
+                deliveries.delete(entry.id);
+              }),
               markEnded(entry.targetId, entry.id, reason),
             ),
           words: {
@@ -714,15 +717,19 @@ export class ScopeImporter extends Context.Service<
        * before its transcript holds the message, so a replay read in that gap — which is when
        * a tab that saw the take of a message it had no row for reads it — found it in neither
        * half. A take only marks the message `taken`; {@link replay} leaves out whatever its
-       * transcript holds, by id. Removed when the turn settles idle (everything accepted
-       * before then is in the transcript by then), and with the session when it closes
-       * (`afterClose`) — never by a replay, since two tabs reading at once on the same take
-       * would otherwise race: one read could take the message off while the other's
-       * transcript was read before it was written.
+       * transcript holds, by id. Removed when a replay finds it **written** (review 3:
+       * anywhere in the transcript, so a copy older than the replay's window or later
+       * compacted away is not put back at the end), when the turn settles idle (everything
+       * delivered before its wait began is in the transcript by then), and with the session
+       * when it closes (`afterClose`). Never on a take alone, nor by a replay that has not
+       * found it written: two tabs reading at once on the same take would otherwise race,
+       * one read taking the message off while the other's transcript was read before it was
+       * written.
        *
        * `taken` is there for the race the other way round: the harness can take a steer
        * before `deliver` has returned to say it was delivered, and a take seen first must
-       * still mark the message taken when it is added. Memory only, bounded by the messages
+       * still mark the message taken when it is added — with the messages taken with it,
+       * when the harness took several as one (review 3). Memory only, bounded by the messages
        * an operator sends to a session this process holds.
        *
        * V2(chat): queued steers live in memory only; a server restart loses a steer that was
@@ -733,7 +740,8 @@ export class ScopeImporter extends Context.Service<
         string,
         {
           readonly queued: Map<string, ImporterQueuedMessage>;
-          readonly taken: Set<string>;
+          /** Each message taken, to the messages taken with it when there were several. */
+          readonly taken: Map<string, readonly string[] | undefined>;
         }
       >();
       const steersOf = (importId: string) => {
@@ -741,11 +749,43 @@ export class ScopeImporter extends Context.Service<
         if (held !== undefined) return held;
         const fresh = {
           queued: new Map<string, ImporterQueuedMessage>(),
-          taken: new Set<string>(),
+          taken: new Map<string, readonly string[] | undefined>(),
         };
         steers.set(importId, fresh);
         return fresh;
       };
+      /** A held message, marked taken — with the messages taken with it, if any. */
+      const tookIt = (
+        message: ImporterQueuedMessage,
+        together: readonly string[] | undefined,
+      ): ImporterQueuedMessage => ({
+        messageId: message.messageId,
+        text: message.text,
+        acceptedAt: message.acceptedAt,
+        taken: true,
+        ...(together === undefined ? {} : { takenTogether: [...together] }),
+      });
+      /**
+       * How many messages have been accepted into each import's live session, ever (A6 U4
+       * review 3): what lets {@link settleTurn} tell that a message arrived while it was
+       * finishing — after the session's idle point, during the closing report's read —
+       * which `turns` alone cannot, since the settling fiber is still in it then. Counted in
+       * {@link deliverTurn} **before** it asks whether the import is working again.
+       */
+      const deliveries = new Map<string, number>();
+      const deliveriesTo = (importId: string): number =>
+        deliveries.get(importId) ?? 0;
+      /**
+       * Takes an import's fiber out of {@link turns}, only if it is the calling fiber's own:
+       * a fiber that has finished settling may already have been followed by a fresh one
+       * for the next message, which must stay findable by `stop`.
+       */
+      const releaseTurn = (importId: string) =>
+        Effect.withFiber((fiber) =>
+          Effect.sync(() => {
+            if (turns.get(importId) === fiber) turns.delete(importId);
+          }),
+        );
 
       /**
        * Every import whose first turn has not yet learned how its open went, by import id.
@@ -823,15 +863,19 @@ export class ScopeImporter extends Context.Service<
           narrateCoalesced({
             events: input.harness.sessionEvents(input.sessionId),
             publish: (entry) => {
-              // The harness took a queued message: it is being worked on, and stays this
-              // process's to replay until the transcript holds it (`steers`).
+              // The harness took queued messages: they are being worked on, and stay this
+              // process's to replay until the transcript holds them (`steers`). Several
+              // taken as one are one turn, and are held saying so (A6 U4 review 3).
               if (entry.detail._tag === "taken") {
                 const held = steersOf(input.importId);
-                const id = entry.detail.messageId;
-                held.taken.add(id);
-                const message = held.queued.get(id);
-                if (message !== undefined) {
-                  held.queued.set(id, { ...message, taken: true });
+                const ids = entry.detail.messageIds;
+                const together = ids.length > 1 ? [...ids] : undefined;
+                for (const id of ids) {
+                  held.taken.set(id, together);
+                  const message = held.queued.get(id);
+                  if (message !== undefined) {
+                    held.queued.set(id, tookIt(message, together));
+                  }
                 }
               }
               return narrations.publish({
@@ -1056,75 +1100,110 @@ export class ScopeImporter extends Context.Service<
        * The first turn's tail, and a later turn's whole fiber: a message delivered into a
        * session marks the import `running` again (`progress.resume`) and this is what settles
        * it once the session has finished with it.
+       *
+       * **A loop, until no message arrived since its wait began** (A6 U4 review 3). A message
+       * delivered while this fiber is finishing — after the idle point, during the closing
+       * report's read — finds it still in `turns` and starts no fiber of its own; this one
+       * used to settle over it, leaving the import `finished` while the message's turn ran
+       * and the message held in `steers` until the session closed. Now it waits again for any
+       * message delivered since its wait began ({@link deliveries}), and takes itself out of
+       * `turns` in the same synchronous step as its last check, so a message delivered after
+       * that check starts a fiber of its own.
        */
       const settleTurn = Effect.fnUntraced(function* (
         importId: string,
         harness: AgentHarness["Service"],
         sessionId: string,
       ) {
-        /*
-         * Wait for the session to go idle, then settle.
-         *
-         * `waitForIdle` rather than a poll, and nothing is read out of the result: what
-         * the import *did* is already in `scope_entries`, in `asset_imports` and on the
-         * panel, written call by call as it went. The only thing this adds is "it is no
-         * longer going to write anything", which is what turns the last link's `reading`
-         * into `read`.
-         *
-         * A failure here is still `finished`, not `failed`, and that is D15 rather than
-         * carelessness: the session ending badly says nothing about whether the pages it
-         * already read produced entries. Those entries are written and are the operator's
-         * to review. The detail carries what went wrong so the panel can say so.
-         */
-        const settled = yield* Effect.result(harness.waitForIdle(sessionId));
-        /*
-         * Idle: whatever was queued has been taken, whether or not the take was seen. Only
-         * what was accepted before now, so a message accepted after the session went idle —
-         * which the next turn will take — is not dropped with it.
-         */
-        const idleAt = Date.now();
-        for (const [id, message] of steers.get(importId)?.queued ?? []) {
-          if (message.acceptedAt <= idleAt)
-            steers.get(importId)?.queued.delete(id);
+        for (;;) {
+          // Where this wait starts: the messages delivered so far, and when.
+          const mark = { delivered: deliveriesTo(importId), at: Date.now() };
+          /** Whether a message was delivered since this wait began. */
+          const more = () => deliveriesTo(importId) !== mark.delivered;
+          /*
+           * Wait for the session to go idle, then settle.
+           *
+           * `waitForIdle` rather than a poll, and nothing is read out of the result: what
+           * the import *did* is already in `scope_entries`, in `asset_imports` and on the
+           * panel, written call by call as it went. The only thing this adds is "it is no
+           * longer going to write anything", which is what turns the last link's `reading`
+           * into `read`.
+           *
+           * A failure here is still `finished`, not `failed`, and that is D15 rather than
+           * carelessness: the session ending badly says nothing about whether the pages it
+           * already read produced entries. Those entries are written and are the operator's
+           * to review. The detail carries what went wrong so the panel can say so.
+           */
+          const settled = yield* Effect.result(harness.waitForIdle(sessionId));
+          /*
+           * Idle: whatever was delivered before the wait began has been taken, whether or
+           * not the take was seen. Only that: a message delivered after it may have arrived
+           * after the idle point this wait saw — the next turn's to take — and is dropped by
+           * the next pass, whose wait begins after it.
+           */
+          for (const [id, message] of steers.get(importId)?.queued ?? []) {
+            if (message.acceptedAt <= mark.at)
+              steers.get(importId)?.queued.delete(id);
+          }
+          // A session that ended has nothing more to wait for, whatever was sent to it.
+          const ended = settled._tag === "Failure";
+          if (!ended && more()) continue;
+          if (yield* progress.stopped(importId)) return;
+
+          /*
+           * The session's closing report, read once, after it has settled.
+           *
+           * **This is the only account anything in this process has of why an import wrote
+           * what it wrote.** The prompt asks for it in as many words, and the most common
+           * outcome of a real import needs it: a client-rendered program page answers `200`
+           * with no scope in it, so every step here succeeds, nothing is written, and
+           * without this the operator is told "nothing could be read" and no more.
+           *
+           * `messages` rather than the narration bus, and that distinction is D16's: this is
+           * one message, pulled after the fact, for a panel and a toast that have no browser
+           * subscribed to anything — the create-target path, where an import is still a batch
+           * job. The session's narration *is* drained now (`narrate`), but onto a bus that
+           * keeps nothing for a reader who is not there, so it cannot stand in for this. The
+           * call list is untouched; what this produces is a single status line.
+           *
+           * A failure to read it is not a failure of the import. The entries are written and
+           * are the operator's to review; the report is an explanation, and an explanation
+           * that could not be fetched leaves the import exactly as `finished` as it was.
+           */
+          const report = yield* Effect.map(
+            Effect.result(harness.messages(sessionId)),
+            (read) =>
+              read._tag === "Failure"
+                ? null
+                : importReport(lastAssistantText(read.success)),
+          );
+          // Delivered while the report was read: that message's turn is the one to settle.
+          if (!ended && more()) continue;
+
+          yield* progress.settle({
+            importId: importId,
+            status: "finished",
+            detail:
+              settled._tag === "Failure"
+                ? `the importer's session ended early: ${settled.failure.message}. Anything it had already written is kept.${report === null ? "" : ` It reported: ${report}`}`
+                : report,
+          });
+          /*
+           * The last check and the release in one synchronous step: a message delivered
+           * before it is waited for here; one delivered after it finds no fiber in `turns`
+           * and starts its own.
+           */
+          const done = yield* Effect.withFiber((fiber) =>
+            Effect.sync(() => {
+              if (!ended && more()) return false;
+              if (turns.get(importId) === fiber) turns.delete(importId);
+              return true;
+            }),
+          );
+          if (done) return;
+          // Delivered between the settle and the check: the import is working again.
+          yield* progress.resume(importId);
         }
-        if (yield* progress.stopped(importId)) return;
-
-        /*
-         * The session's closing report, read once, after it has settled.
-         *
-         * **This is the only account anything in this process has of why an import wrote
-         * what it wrote.** The prompt asks for it in as many words, and the most common
-         * outcome of a real import needs it: a client-rendered program page answers `200`
-         * with no scope in it, so every step here succeeds, nothing is written, and
-         * without this the operator is told "nothing could be read" and no more.
-         *
-         * `messages` rather than the narration bus, and that distinction is D16's: this is
-         * one message, pulled after the fact, for a panel and a toast that have no browser
-         * subscribed to anything — the create-target path, where an import is still a batch
-         * job. The session's narration *is* drained now (`narrate`), but onto a bus that
-         * keeps nothing for a reader who is not there, so it cannot stand in for this. The
-         * call list is untouched; what this produces is a single status line.
-         *
-         * A failure to read it is not a failure of the import. The entries are written and
-         * are the operator's to review; the report is an explanation, and an explanation
-         * that could not be fetched leaves the import exactly as `finished` as it was.
-         */
-        const report = yield* Effect.map(
-          Effect.result(harness.messages(sessionId)),
-          (read) =>
-            read._tag === "Failure"
-              ? null
-              : importReport(lastAssistantText(read.success)),
-        );
-
-        yield* progress.settle({
-          importId: importId,
-          status: "finished",
-          detail:
-            settled._tag === "Failure"
-              ? `the importer's session ended early: ${settled.failure.message}. Anything it had already written is kept.${report === null ? "" : ` It reported: ${report}`}`
-              : report,
-        });
       });
 
       const startWith = Effect.fn("ScopeImporter.start")(function* (
@@ -1357,7 +1436,7 @@ export class ScopeImporter extends Context.Service<
               predecessor: request.predecessor,
               earlierPages: carried.added,
             }).pipe(
-              Effect.ensuring(Effect.sync(() => turns.delete(importId))),
+              Effect.ensuring(releaseTurn(importId)),
               Effect.ensuring(releaseOpening(importId)),
               // A turn stopped before its open was known still answers whoever is waiting on
               // it. A no-op when the open already completed the deferred.
@@ -1573,17 +1652,29 @@ export class ScopeImporter extends Context.Service<
          */
         if (sessions.get(entry.id) === entry) {
           const held = steersOf(entry.id);
-          held.queued.set(delivered.success.messageId, {
+          const waiting: ImporterQueuedMessage = {
             messageId: delivered.success.messageId,
             text: truncateNarration(text),
             acceptedAt: turn.acceptedAt,
-            taken: held.taken.has(delivered.success.messageId),
-          });
+            taken: false,
+          };
+          held.queued.set(
+            delivered.success.messageId,
+            held.taken.has(delivered.success.messageId)
+              ? tookIt(waiting, held.taken.get(delivered.success.messageId))
+              : waiting,
+          );
         }
+        /*
+         * Counted before the import is marked working, so a settling fiber still in `turns`
+         * — which this send will not start another beside — sees it on its next check, and
+         * waits for this message's turn rather than settling over it (`settleTurn`).
+         */
+        deliveries.set(entry.id, deliveriesTo(entry.id) + 1);
         if ((yield* progress.resume(entry.id)) && !turns.has(entry.id)) {
           const fiber = yield* Effect.forkIn(
             settleTurn(entry.id, entry.harness, entry.sessionId).pipe(
-              Effect.ensuring(Effect.sync(() => turns.delete(entry.id))),
+              Effect.ensuring(releaseTurn(entry.id)),
             ),
             own,
           );
@@ -1926,12 +2017,19 @@ export class ScopeImporter extends Context.Service<
         /*
          * What this process holds of the session's steers, read **before** the transcript
          * (A6 U4 review 2): a message accepted before this read is here, and stays here
-         * until the session idles or closes, so whether the transcript below has written it
-         * yet or not, it is in one of the two. Which one is decided by id, not by when.
+         * until a read has found it written, or the session idles or closes — so whether the
+         * transcript below has written it yet or not, it is in one of the two. Which one is
+         * decided by id, not by when.
          */
         const pending = [
           ...(steers.get(input.importId)?.queued.values() ?? []),
         ];
+        /*
+         * The ids the **whole** transcript holds, not only the newest `limit` items this
+         * answer keeps (A6 U4 review 3): a steer whose copy is older than the window is
+         * written all the same, and joined to the window alone it was put back at the end.
+         */
+        let written: ReadonlySet<string> = new Set();
         const view = yield* importerConversation({
           resolver,
           targetId: input.targetId,
@@ -1944,15 +2042,22 @@ export class ScopeImporter extends Context.Service<
           ...(input.fetchTimeout === undefined
             ? {}
             : { fetchTimeout: input.fetchTimeout }),
+          onTranscript: (ids) => {
+            written = ids;
+          },
         });
-        // Less what the transcript holds by id: each message is drawn once.
-        const written = new Set(
-          view.items.flatMap((item) =>
-            item.kind === "turn.operator" && item.messageId !== undefined
-              ? [item.messageId]
-              : [],
-          ),
-        );
+        /*
+         * A message a read has found written is no longer this process's to hold (review 3):
+         * the transcript has it, and a compaction that later summarises it away must not put
+         * it back at the end. Race-free where review 2's removal was not: a read that then
+         * misses it in `pending` read `steers` after this removal, which came after this
+         * transcript held it — so its own transcript read, later still, holds it too, unless
+         * the harness has since dropped it, which is the case this is for.
+         */
+        if (view.live) {
+          const holding = steers.get(input.importId)?.queued;
+          for (const id of written) holding?.delete(id);
+        }
         return {
           ...view,
           queued: view.live

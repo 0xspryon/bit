@@ -1286,12 +1286,12 @@ describe("projecting live activity", () => {
   test("U4: a steer taken is an item carrying the message's id, and nothing to read", () => {
     const item = projectedItem(
       narration(
-        { _tag: "taken", messageId: "aaaaaaaabbbbbbbbccccccccdddddddd" },
+        { _tag: "taken", messageIds: ["aaaaaaaabbbbbbbbccccccccdddddddd"] },
         { subject: { _tag: "import", importId: "imp_1" } },
       ),
     );
     expect(item?.kind).toBe("turn.taken");
-    expect(item?.messageId).toBe("aaaaaaaabbbbbbbbccccccccdddddddd");
+    expect(item?.messageIds).toEqual(["aaaaaaaabbbbbbbbccccccccdddddddd"]);
     expect(item?.body).toBe("");
     expect(item?.importId).toBe("imp_1");
   });
@@ -1334,29 +1334,42 @@ describe("projecting live activity", () => {
     expect(drawn(replayed)).toEqual(drawn(live));
   });
 
-  test("U4 review 2: a replayed message carries the application's id the driver named, and only that one", () => {
-    const user = (text: string, messageId?: string) => ({
+  test("U4 review 2: a replayed message carries the application's ids the driver named, and only those", () => {
+    const user = (text: string, ...messageIds: string[]) => ({
       type: "user",
       text,
       error: undefined,
       parts: [],
       model: undefined,
       at: 1_700_000_000_000,
-      ...(messageId === undefined ? {} : { messageId }),
+      ...(messageIds.length === 0 ? {} : { messageIds }),
     });
     const items = projectReplay({
       entries: [
         user("the opening"),
         user("and the portal", "aaaaaaaabbbbbbbbccccccccdddddddd"),
+        // Two steers the harness took as one and stored as one entry (review 3).
+        user(
+          "MG-PAGE\nMG-OTHER",
+          "11111111222222223333333344444444",
+          "55555555666666667777777788888888",
+        ),
       ],
       subject: { _tag: "import", importId: "imp_1" },
       harnessSessionId: "ses_1",
       users: "operator",
       fallbackAt: 0,
     }).items;
-    expect(items.map((item) => [item.kind, item.messageId ?? null])).toEqual([
+    expect(items.map((item) => [item.kind, item.messageIds ?? null])).toEqual([
       ["turn.operator", null],
-      ["turn.operator", "aaaaaaaabbbbbbbbccccccccdddddddd"],
+      ["turn.operator", ["aaaaaaaabbbbbbbbccccccccdddddddd"]],
+      [
+        "turn.operator",
+        [
+          "11111111222222223333333344444444",
+          "55555555666666667777777788888888",
+        ],
+      ],
     ]);
   });
 

@@ -334,8 +334,9 @@ export const LIVE_ITEM_KINDS = [
   /**
    * The harness **took** a message the operator sent while a turn was running (A6 U4): it
    * was queued behind the work in flight and is now in the conversation. Carries
-   * {@link LiveItem.messageId} — the id the send's answer named
-   * (`ImporterTurnAccepted.messageId`) — and nothing to read. Live only: a replay holds the
+   * {@link LiveItem.messageIds} — the ids the sends' answers named
+   * (`ImporterTurnAccepted.messageId`), several when the harness took them as one — and
+   * nothing to read. Live only: a replay holds the
    * message itself, where the harness put it. A chat draws the message as queued until
    * this arrives, and never draws this item.
    */
@@ -613,15 +614,23 @@ export const LiveItem = Schema.Struct({
    */
   writeId: Schema.optionalKey(Schema.String),
   /**
-   * The application's id for an operator's message — the `messageId` the send was answered
-   * with — on the items that are about one: a `turn.taken` item, naming the message the
-   * harness took; and a **replayed** `turn.operator` item that the harness stored under an
-   * id derived from ours (A6 U4 review 2), so a client joins its own row, the take and the
-   * transcript's copy by id rather than by words or time. Absent on every other item —
-   * including a replayed message the server cannot name, such as an opening prompt — and an
-   * optional key so older frames still decode.
+   * The application's ids for operator messages — each the `messageId` its send was answered
+   * with — on the items that are about them, oldest first and never empty: a `turn.taken`
+   * item, naming the messages the harness took; a **replayed** `turn.operator` item that the
+   * harness stored under an id derived from ours (A6 U4 review 2); and an operator row a
+   * client drew for a message of its own. A client joins its own row, the take and the
+   * transcript's copy by id rather than by words or time.
+   *
+   * **A list, because a harness can take several messages as one** (A6 U4 review 3). Claude
+   * Code dequeues every steer waiting behind a turn at once, names them all on one frame,
+   * and stores them as **one** user entry — their words joined by a line break — under the
+   * last one's uuid. So one take, and one replayed message, can be several of ours, and a
+   * chat draws them as one turn. OpenCode takes them one at a time: always one id there.
+   *
+   * Absent on every other item — including a replayed message the server cannot name, such
+   * as an opening prompt — and an optional key so older frames still decode.
    */
-  messageId: Schema.optionalKey(Schema.String),
+  messageIds: Schema.optionalKey(Schema.Array(Schema.String)),
   /**
    * `true` on a **replayed** item whose `at` is when the harness began the entry it came
    * from, and nothing says when that entry ended (A6 U4 review). OpenCode stores times per

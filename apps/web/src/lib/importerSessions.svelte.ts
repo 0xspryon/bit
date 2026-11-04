@@ -787,16 +787,21 @@ export class ImporterSessions {
    * for when it lands. Called by the app for every new live item.
    */
   noteTaken(item: LiveItem): void {
-    if (item.kind !== TAKEN_KIND || item.messageId === undefined) return;
-    const messageId = item.messageId;
+    const ids = item.messageIds ?? [];
+    if (item.kind !== TAKEN_KIND || ids.length === 0) return;
     const session = this.sessions.find(
       (each) => each.importId !== undefined && each.importId === item.importId,
     );
     if (session === undefined) return;
-    if (session.taken?.[messageId] === undefined) {
+    // Under each message it names: a take of several is one turn (A6 U4 review 3).
+    const unseen = ids.filter((id) => session.taken?.[id] === undefined);
+    if (unseen.length > 0) {
       this.#replace(session.id, (before) => ({
         ...before,
-        taken: { ...before.taken, [messageId]: item },
+        taken: {
+          ...before.taken,
+          ...Object.fromEntries(unseen.map((id) => [id, item] as const)),
+        },
       }));
     }
     if (this.sending || !takesUnknownMessage(session, item)) return;
@@ -1066,7 +1071,9 @@ export class ImporterSessions {
       );
       const row = {
         ...operatorTurn({ index: index + 1, text, at, after }),
-        ...(turn.messageId === undefined ? {} : { messageId: turn.messageId }),
+        ...(turn.messageId === undefined
+          ? {}
+          : { messageIds: [turn.messageId] }),
       };
       return {
         ...before,

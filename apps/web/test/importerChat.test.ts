@@ -1434,7 +1434,7 @@ describe("U4: a steer sent mid-turn", () => {
   const live = (n: number, over: Partial<LiveItem> & Pick<LiveItem, "kind">) =>
     item({ id: `activity:${String(n)}`, importId: "imp_1", ...over });
   const first = operator(1, "load the policy");
-  const steer = { ...operator(2, "and the portal"), messageId: MESSAGE };
+  const steer = { ...operator(2, "and the portal"), messageIds: [MESSAGE] };
   const own = [first, steer];
   const floors = { [first.id]: 0, [steer.id]: 5 };
   const before = [
@@ -1446,7 +1446,7 @@ describe("U4: a steer sent mid-turn", () => {
       callId: "f1",
     }),
   ];
-  const take = live(8, { kind: "turn.taken", messageId: MESSAGE });
+  const take = live(8, { kind: "turn.taken", messageIds: [MESSAGE] });
   const after = [
     live(9, {
       kind: "tool.result",
@@ -1605,8 +1605,8 @@ describe("a replay's queued messages, and a replay read again", () => {
       floor: 7,
     });
     expect(
-      installed.items.map((row) => [row.kind, row.body, row.messageId]),
-    ).toEqual([["turn.operator", "and the portal", MESSAGE]]);
+      installed.items.map((row) => [row.kind, row.body, row.messageIds]),
+    ).toEqual([["turn.operator", "and the portal", [MESSAGE]]]);
     expect(installed.midTurn).toEqual([`operator:queued:${MESSAGE}`]);
     expect(installed.historyFloor).toBe(7);
     expect(installed.loaded).toBe(true);
@@ -1648,7 +1648,7 @@ describe("a replay's queued messages, and a replay read again", () => {
       id: "activity:9",
       importId: "imp_1",
       kind: "turn.taken",
-      messageId: MESSAGE,
+      messageIds: [MESSAGE],
     });
     const answer = item({
       id: "activity:10",
@@ -1676,7 +1676,7 @@ describe("a replay's queued messages, and a replay read again", () => {
       messageId: string,
     ) => ({
       ...operatorTurn({ index, text, at, after: index + 2 }),
-      messageId,
+      messageIds: [messageId],
     });
     const before = session({
       items: [
@@ -1709,7 +1709,7 @@ describe("a replay's queued messages, and a replay read again", () => {
           items: [
             replayItem(0, "turn.operator", "written", {
               importId: "imp_1",
-              messageId: "m1",
+              messageIds: ["m1"],
             }),
           ],
           queued: [
@@ -1805,7 +1805,7 @@ describe("a replay's queued messages, and a replay read again", () => {
       id: "activity:6",
       importId: "imp_1",
       kind: "turn.taken",
-      messageId: MESSAGE,
+      messageIds: [MESSAGE],
     });
     expect(takesUnknownMessage(loaded, take)).toBe(true);
     const again = withReplay(
@@ -1893,7 +1893,7 @@ describe("a replay's queued messages, and a replay read again", () => {
           items: [
             replayItem(0, "turn.operator", "theirs", {
               importId: "imp_1",
-              messageId: "theirs",
+              messageIds: ["theirs"],
             }),
           ],
         }),
@@ -1906,7 +1906,7 @@ describe("a replay's queued messages, and a replay read again", () => {
           id: "activity:6",
           importId: "imp_1",
           kind: "turn.taken",
-          messageId: "theirs",
+          messageIds: ["theirs"],
         }),
       ),
     ).toBe(false);
@@ -1919,7 +1919,7 @@ describe("a replay's queued messages, and a replay read again", () => {
       items: [
         {
           ...operatorTurn({ index: 1, text: "mine", at: AT, after: 5 }),
-          messageId: "mine",
+          messageIds: ["mine"],
         },
       ],
     });
@@ -1928,7 +1928,7 @@ describe("a replay's queued messages, and a replay read again", () => {
         id: `activity:${String(n)}`,
         importId: "imp_1",
         kind: "turn.taken",
-        messageId,
+        messageIds: [messageId],
       });
     expect(takesUnknownMessage(loaded, take(6, "theirs"))).toBe(true);
     expect(takesUnknownMessage(loaded, take(6, "mine"))).toBe(false);
@@ -1938,5 +1938,246 @@ describe("a replay's queued messages, and a replay read again", () => {
     expect(
       takesUnknownMessage({ ...loaded, loaded: false }, take(6, "theirs")),
     ).toBe(false);
+  });
+});
+
+/*
+ * A6 U4 review 3: Claude Code takes every steer waiting behind a turn at once, names them all
+ * on one frame, and stores them as ONE user entry (texts a line apart, under the last one's
+ * uuid). They are one message to the agent, with one reply — so one turn here, live and
+ * after a reload alike. OpenCode takes them one at a time: a take of one is unchanged.
+ */
+describe("U4 review 3: steers the harness took as one", () => {
+  const PAGE = "11111111222222223333333344444444";
+  const OTHER = "55555555666666667777777788888888";
+  const live = (n: number, over: Partial<LiveItem> & Pick<LiveItem, "kind">) =>
+    item({ id: `activity:${String(n)}`, importId: "imp_1", ...over });
+  const own = (index: number, text: string, messageId?: string): LiveItem => ({
+    ...operatorTurn({ index, text, at: AT + index * 1_000, after: index }),
+    ...(messageId === undefined ? {} : { messageIds: [messageId] }),
+  });
+  const view = (over: Parameters<typeof importerConversationView>[0] = {}) =>
+    importerConversationView({
+      importId: "imp_1",
+      live: true,
+      continuation: "live",
+      at: AT + 10_000,
+      ...over,
+    });
+  const session = (over: Partial<ImporterSession> = {}): ImporterSession => ({
+    ...indexedSession(
+      importerSessionView({ importId: "imp_1" }),
+      "Claude Code",
+    ),
+    working: true,
+    ...over,
+  });
+  /** The groups the page draws for a session and the live feed, as `App` builds them. */
+  const drawn = (current: ImporterSession, feed: readonly LiveItem[]) =>
+    buildImporterChat({
+      history: current.history,
+      working: current.working,
+      ...(current.midTurn === undefined ? {} : { midTurn: current.midTurn }),
+      ...(current.taken === undefined ? {} : { taken: current.taken }),
+      items: importerFeed({
+        own: current.items,
+        floors: current.floors,
+        live: feed,
+        importId: "imp_1",
+        historyFloor: current.historyFloor,
+        midTurn: current.midTurn,
+        working: current.working,
+        taken: current.taken,
+      }),
+    }).map((group) => ({
+      message: group.subject.message,
+      queued: group.subject.queued,
+      prose: group.prose._tag,
+      rows: group.rows.map((row) => row.item.body),
+    }));
+  const take = live(8, { kind: "turn.taken", messageIds: [PAGE, OTHER] });
+  const answer = live(9, { kind: "turn.reply", body: "Both noted." });
+
+  test("live, two of this tab's messages taken as one are one turn with one reply", () => {
+    const first = own(1, "load the policy");
+    const page = own(2, "MG-PAGE", PAGE);
+    const other = own(3, "MG-OTHER", OTHER);
+    const current = session({
+      working: false,
+      loaded: true,
+      items: [first, page, other],
+      floors: { [first.id]: 0, [page.id]: 6, [other.id]: 7 },
+      midTurn: [page.id, other.id],
+      taken: { [PAGE]: take, [OTHER]: take },
+    });
+    expect(
+      drawn(current, [
+        live(5, { kind: "turn.reply", body: "reading it" }),
+        take,
+        answer,
+      ]),
+    ).toEqual([
+      {
+        message: "load the policy",
+        queued: false,
+        prose: "live",
+        rows: ["reading it"],
+      },
+      {
+        message: "MG-PAGE\nMG-OTHER",
+        queued: false,
+        prose: "live",
+        rows: ["Both noted."],
+      },
+    ]);
+  });
+
+  test("a take naming one row of this tab's and one from another tab asks for the replay, and draws one turn", () => {
+    const first = own(1, "load the policy");
+    const page = own(2, "MG-PAGE", PAGE);
+    const loaded = session({
+      loaded: true,
+      historyFloor: 4,
+      items: [first, page],
+      floors: { [first.id]: 0, [page.id]: 6 },
+      midTurn: [page.id],
+      taken: { [PAGE]: take, [OTHER]: take },
+    });
+    // The other tab's message has no row here: read again.
+    expect(takesUnknownMessage(loaded, take)).toBe(true);
+    expect(
+      takesUnknownMessage(
+        { ...loaded, items: [...loaded.items, own(3, "MG-OTHER", OTHER)] },
+        take,
+      ),
+    ).toBe(false);
+
+    // Read in the gap: both held by the server, taken together, neither written yet.
+    const held = new Set(loaded.items.map((row) => row.id));
+    const gap = withReplay(
+      loaded,
+      {
+        view: view({
+          items: [
+            replayItem(0, "turn.operator", "load the policy", {
+              importId: "imp_1",
+            }),
+          ],
+          queued: [
+            {
+              messageId: PAGE,
+              text: "MG-PAGE",
+              acceptedAt: AT + 2_000,
+              taken: true,
+              takenTogether: [PAGE, OTHER],
+            },
+            {
+              messageId: OTHER,
+              text: "MG-OTHER",
+              acceptedAt: AT + 3_000,
+              taken: true,
+              takenTogether: [PAGE, OTHER],
+            },
+          ],
+        }),
+        floor: 7,
+      },
+      held,
+    );
+    expect(drawn({ ...gap, working: false }, [take, answer])).toEqual([
+      {
+        message: "load the policy",
+        queued: false,
+        prose: "none",
+        rows: [],
+      },
+      {
+        message: "MG-PAGE\nMG-OTHER",
+        queued: false,
+        prose: "live",
+        rows: ["Both noted."],
+      },
+    ]);
+
+    // Read once written: Claude Code's one entry, named as both. This tab's row goes.
+    const written = withReplay(
+      loaded,
+      {
+        view: view({
+          items: [
+            replayItem(0, "turn.operator", "load the policy", {
+              importId: "imp_1",
+            }),
+            replayItem(1, "turn.operator", "MG-PAGE\nMG-OTHER", {
+              importId: "imp_1",
+              messageIds: [PAGE, OTHER],
+            }),
+          ],
+        }),
+        floor: 8,
+      },
+      held,
+    );
+    expect(written.items).toEqual([]);
+    expect(
+      drawn({ ...written, working: false }, [take, answer]).map(
+        (group) => group.message,
+      ),
+    ).toEqual(["load the policy", "MG-PAGE\nMG-OTHER"]);
+  });
+
+  test("a reload while they are taken and not yet written draws them as one row, not queued", () => {
+    const reloaded = withReplay(session(), {
+      view: view({
+        queued: [
+          {
+            messageId: PAGE,
+            text: "MG-PAGE",
+            acceptedAt: AT + 2_000,
+            taken: true,
+            takenTogether: [PAGE, OTHER],
+          },
+          {
+            messageId: OTHER,
+            text: "MG-OTHER",
+            acceptedAt: AT + 3_000,
+            taken: true,
+            takenTogether: [PAGE, OTHER],
+          },
+        ],
+      }),
+      floor: 7,
+    });
+    expect(
+      reloaded.items.map((row) => [row.body, row.messageIds ?? null]),
+    ).toEqual([["MG-PAGE\nMG-OTHER", [PAGE, OTHER]]]);
+    expect(reloaded.midTurn).toEqual([]);
+  });
+
+  test("OpenCode's takes of one each stay two turns", () => {
+    const first = own(1, "load the policy");
+    const page = own(2, "MG-PAGE", PAGE);
+    const other = own(3, "MG-OTHER", OTHER);
+    const takePage = live(8, { kind: "turn.taken", messageIds: [PAGE] });
+    const takeOther = live(10, { kind: "turn.taken", messageIds: [OTHER] });
+    const current = session({
+      working: false,
+      loaded: true,
+      items: [first, page, other],
+      floors: { [first.id]: 0, [page.id]: 6, [other.id]: 7 },
+      midTurn: [page.id, other.id],
+    });
+    expect(
+      drawn(current, [
+        takePage,
+        live(9, { kind: "turn.reply", body: "page noted" }),
+        takeOther,
+        live(11, { kind: "turn.reply", body: "other noted" }),
+      ]).map((group) => [group.message, group.rows]),
+    ).toEqual([
+      ["load the policy", []],
+      ["MG-PAGE", ["page noted"]],
+      ["MG-OTHER", ["other noted"]],
+    ]);
   });
 });

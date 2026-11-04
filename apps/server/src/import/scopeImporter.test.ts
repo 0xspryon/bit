@@ -274,6 +274,13 @@ interface Script {
    */
   written: MessageEntry[];
   /**
+   * Parks the **next** `messages` read until `gate` opens, signalling `entered` on the way
+   * in, then clears itself: the closing report's read, for a message sent while a turn is
+   * settling (A6 U4 review 3). Later reads are not held.
+   */
+  holdMessages:
+    { readonly entered: () => void; readonly gate: Promise<void> } | undefined;
+  /**
    * Streams the first line as {@link STREAMED_PIECES} deltas before its finished block, as
    * a driver that streams does (A6 F6).
    */
@@ -354,6 +361,7 @@ const newScript = (readable: readonly string[]): Script => {
     emit: undefined,
     steerLatency: 0,
     written: [],
+    holdMessages: undefined,
     streamBlocks: false,
     done: Promise.resolve(),
     failCreate: false,
@@ -578,23 +586,32 @@ const scriptedHarness = (script: Script) => {
     // the report rather than the first thing said, which is why there is more than one
     // assistant entry here.
     messages: () =>
-      Effect.sync(() => [
-        ...[
-          { type: "user", text: "…the prompt…", error: undefined },
-          { type: "assistant", text: NARRATION[0], error: undefined },
-          { type: "assistant", text: NARRATION[1], error: undefined },
-          // A trailing entry with no words, which a harness records for a turn that was all
-          // tool calls. "The last thing it said" means the last thing it said in words.
-          { type: "assistant", text: "", error: undefined },
-          { type: "assistant", text: REPORT, error: undefined },
-        ].map((entry) => ({
-          ...entry,
-          parts: [],
-          model: undefined,
-          at: undefined,
-        })),
-        ...script.written,
-      ]),
+      Effect.andThen(
+        Effect.promise(async () => {
+          const hold = script.holdMessages;
+          if (hold === undefined) return;
+          script.holdMessages = undefined;
+          hold.entered();
+          await hold.gate;
+        }),
+        Effect.sync(() => [
+          ...[
+            { type: "user", text: "…the prompt…", error: undefined },
+            { type: "assistant", text: NARRATION[0], error: undefined },
+            { type: "assistant", text: NARRATION[1], error: undefined },
+            // A trailing entry with no words, which a harness records for a turn that was all
+            // tool calls. "The last thing it said" means the last thing it said in words.
+            { type: "assistant", text: "", error: undefined },
+            { type: "assistant", text: REPORT, error: undefined },
+          ].map((entry) => ({
+            ...entry,
+            parts: [],
+            model: undefined,
+            at: undefined,
+          })),
+          ...script.written,
+        ]),
+      ),
     /*
      * A stream that really narrates, and really stays open.
      *
@@ -1786,6 +1803,7 @@ const sendTo = (
 const replayOf = (
   runtime: ManagedRuntime.ManagedRuntime<ScopeImporter | TargetStores, unknown>,
   importId: string,
+  limit?: number,
 ) =>
   runtime.runPromise(
     Effect.gen(function* () {
@@ -1805,8 +1823,18 @@ const replayOf = (
           confirmedAt: row.confirmedAt,
           agentId: row.agentId,
         },
+        ...(limit === undefined ? {} : { limit }),
       });
     }),
+  );
+
+/** How many messages the importer holds outside the import's transcript (`heldSteers`). */
+const heldSteersOf = (
+  runtime: ManagedRuntime.ManagedRuntime<ScopeImporter | TargetStores, unknown>,
+  importId: string,
+) =>
+  runtime.runPromise(
+    Effect.flatMap(ScopeImporter, (importer) => importer.heldSteers(importId)),
   );
 
 /**
@@ -1815,23 +1843,23 @@ const replayOf = (
  * transcript holds it **by id** — Claude Code narrates the take before it writes the message.
  */
 describe("a message the harness's transcript does not hold yet", () => {
-  /** A take of `messageId`, as a driver narrates it. */
-  const take = (messageId: string): HarnessNarration => ({
+  /** A take of `messageIds`, as a driver narrates it: several when taken as one. */
+  const take = (...messageIds: string[]): HarnessNarration => ({
     type: "assistant",
     sequence: undefined,
     at: 1_700_000_000_500,
     outcome: undefined,
-    detail: { _tag: "taken", messageId },
+    detail: { _tag: "taken", messageIds },
   });
-  /** The harness's stored copy of a steer, named by the driver as ours. */
-  const stored = (messageId: string, text: string): MessageEntry => ({
+  /** The harness's stored copy of steers, named by the driver as ours. */
+  const stored = (text: string, ...messageIds: string[]): MessageEntry => ({
     type: "user",
     text,
     error: undefined,
     parts: [],
     model: undefined,
     at: 1_700_000_000_600,
-    messageId,
+    messageIds,
   });
   /** Holds the steer's turn open until `release` is called: the session stays working. */
   const holdTurn = (built: ReturnType<typeof world>) => {
@@ -1886,7 +1914,9 @@ describe("a message the harness's transcript does not hold yet", () => {
     const gap = await replayOf(runtime, started.importId);
     expect(
       gap.items.some(
-        (item) => item.kind === "turn.operator" && item.messageId === messageId,
+        (item) =>
+          item.kind === "turn.operator" &&
+          item.messageIds?.includes(messageId) === true,
       ),
     ).toBe(false);
     expect(gap.queued).toEqual([
@@ -1899,22 +1929,151 @@ describe("a message the harness's transcript does not hold yet", () => {
     ]);
 
     // Written: the transcript has it, under our id, and `queued` does not.
-    built.script.written.push(stored(messageId, "And the portal"));
+    built.script.written.push(stored("And the portal", messageId));
     const written = await replayOf(runtime, started.importId);
     expect(
       written.items
         .filter((item) => item.kind === "turn.operator")
-        .map((item) => [item.body, item.messageId ?? null]),
+        .map((item) => [item.body, item.messageIds ?? null]),
     ).toEqual([
       ["…the prompt…", null],
-      ["And the portal", messageId],
+      ["And the portal", [messageId]],
     ]);
     expect(written.queued).toEqual([]);
-    // And a replay read does not take it off what the process holds: a second read racing
-    // the first (two tabs on one take) still finds it in one half or the other.
+    /*
+     * Review 3: and a read that found it written takes it off what the process holds, so a
+     * harness that then drops the copy — a compaction summarising the turn away, here the
+     * transcript shortened back — does not put it back at the end of the conversation.
+     */
     built.script.written.length = 0;
-    expect((await replayOf(runtime, started.importId)).queued).toHaveLength(1);
+    expect(await heldSteersOf(runtime, started.importId)).toBe(0);
+    expect((await replayOf(runtime, started.importId)).queued).toEqual([]);
     release();
+    await runtime.dispose();
+  });
+
+  test("review 3: a steer written further back than the replay's window is not put back at the end", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const release = holdTurn(built);
+    const sent = await sendTo(runtime, started.importId, "And the portal");
+    if (sent._tag !== "Success") throw new Error("the message was refused");
+    const messageId = sent.success.messageId ?? "";
+    built.script.emit?.(take(messageId));
+    await settleTicks();
+    // Written, then answered at length: its copy is older than the newest two items.
+    const reply = (text: string): MessageEntry => ({
+      type: "assistant",
+      text,
+      error: undefined,
+      parts: [],
+      model: undefined,
+      at: 1_700_000_000_700,
+    });
+    built.script.written.push(
+      stored("And the portal", messageId),
+      reply("Reading the portal."),
+      reply("Two hosts there."),
+      reply("Both added."),
+    );
+    const cut = await replayOf(runtime, started.importId, 2);
+    expect(cut.truncated).toBe(true);
+    expect(cut.items.map((item) => item.kind)).not.toContain("turn.operator");
+    expect(cut.queued).toEqual([]);
+    release();
+    await runtime.dispose();
+  });
+
+  test("review 3: steers taken as one are held saying so until the transcript holds them, then both leave", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const release = holdTurn(built);
+    const first = await sendTo(runtime, started.importId, "MG-PAGE");
+    const second = await sendTo(runtime, started.importId, "MG-OTHER");
+    if (first._tag !== "Success" || second._tag !== "Success") {
+      throw new Error("a message was refused");
+    }
+    const ids = [first.success.messageId ?? "", second.success.messageId ?? ""];
+    built.script.emit?.(take(...ids));
+    await settleTicks();
+    const gap = await replayOf(runtime, started.importId);
+    expect(
+      gap.queued.map((message) => [
+        message.text,
+        message.taken,
+        message.takenTogether ?? null,
+      ]),
+    ).toEqual([
+      ["MG-PAGE", true, ids],
+      ["MG-OTHER", true, ids],
+    ]);
+    // Claude Code's stored shape: one entry, both texts, and the driver names it as both.
+    built.script.written.push(stored("MG-PAGE\nMG-OTHER", ...ids));
+    const written = await replayOf(runtime, started.importId);
+    expect(written.queued).toEqual([]);
+    expect(
+      written.items
+        .filter((item) => item.kind === "turn.operator")
+        .map((item) => item.messageIds ?? null),
+    ).toEqual([null, ids]);
+    release();
+    await runtime.dispose();
+  });
+
+  /*
+   * Review 3, the older race: a message delivered while the turn before it is settling —
+   * past its idle point, while the closing report is read — found that fiber still in
+   * `turns` and started none of its own. The fiber then settled the import `finished` over
+   * the new turn, and the message stayed held until the session closed.
+   */
+  test("review 3: a message sent while the turn before it settles is waited for, then let go", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const releaseFirst = holdTurn(built);
+    const sent = await sendTo(runtime, started.importId, "And the portal");
+    expect(sent._tag).toBe("Success");
+    // The settle's closing-report read is held, once, after the first turn goes idle.
+    let entered = () => {};
+    const reading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let open = () => {};
+    built.script.holdMessages = {
+      entered,
+      gate: new Promise<void>((resolve) => {
+        open = resolve;
+      }),
+    };
+    releaseFirst();
+    await reading;
+    // Sent now: past the first turn's idle point, before it has settled.
+    const releaseSecond = holdTurn(built);
+    const late = await sendTo(
+      runtime,
+      started.importId,
+      "And the staging hosts",
+    );
+    if (late._tag !== "Success") throw new Error("the message was refused");
+    open();
+    await settleTicks();
+    // Its turn is running: the import is working, and the message is still waiting.
+    expect((await viewOf(runtime, started.importId))?.status).toBe("running");
+    expect(
+      (await replayOf(runtime, started.importId)).queued.map(
+        (message) => message.messageId,
+      ),
+    ).toEqual([late.success.messageId ?? ""]);
+    // Its turn ends: settled, and nothing held.
+    releaseSecond();
+    await settleTicks();
+    expect((await viewOf(runtime, started.importId))?.status).toBe("finished");
+    expect(await heldSteersOf(runtime, started.importId)).toBe(0);
     await runtime.dispose();
   });
 

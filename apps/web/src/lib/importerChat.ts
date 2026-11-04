@@ -41,7 +41,7 @@
  * message this tab has no row for — one sent from another tab ({@link takesUnknownMessage}).
  * That read is joined to this tab's rows **by message id** ({@link withReplay}, A6 U4 review
  * 2): the server's answer holds every steer it accepted before the read began exactly once,
- * in the transcript (a `turn.operator` carrying its `messageId`) or beside it (`queued`), so
+ * in the transcript (a `turn.operator` naming it in `messageIds`) or beside it (`queued`), so
  * a row of this tab's is dropped for the transcript's copy, kept for a held one, and kept
  * when the answer does not have it at all.
  *
@@ -318,7 +318,7 @@ export interface ImporterSession {
   readonly modelOptions?: readonly ModelOptionSelection[];
   /**
    * The operator rows in {@link items} that were sent while a turn was running and were
-   * delivered as steers (they carry `messageId`), by row id (A6 U4). Such a row is queued
+   * delivered as steers (they carry `messageIds`), by row id (A6 U4). Such a row is queued
    * until a `turn.taken` item names its message: see {@link importerFeed} for where it is
    * placed meanwhile and {@link ImporterTurn.queued} for how it is drawn.
    */
@@ -345,45 +345,130 @@ const takenByMessage = (
 ): ReadonlyMap<string, LiveItem> => {
   const taken = new Map<string, LiveItem>(Object.entries(recorded ?? {}));
   for (const item of items) {
-    if (
-      item.kind === TAKEN_KIND &&
-      item.messageId !== undefined &&
-      !taken.has(item.messageId)
-    ) {
-      taken.set(item.messageId, item);
+    if (item.kind !== TAKEN_KIND) continue;
+    for (const id of item.messageIds ?? []) {
+      if (!taken.has(id)) taken.set(id, item);
     }
   }
   return taken;
 };
+
+/** The messages an item is about ({@link LiveItem.messageIds}), none when it names none. */
+export const messagesOf = (item: LiveItem): readonly string[] =>
+  item.messageIds ?? [];
+
+/** The take that took a row's messages, if this session has seen one. */
+const takeOf = (
+  row: LiveItem,
+  taken: ReadonlyMap<string, LiveItem>,
+): LiveItem | undefined =>
+  messagesOf(row)
+    .map((id) => taken.get(id))
+    .find((take) => take !== undefined);
 
 /**
  * The rows a replay's held messages are drawn as (A6 U4 review): each the operator's row for
  * its message, carrying the message's id so its `turn.taken` finds it, at the time the
  * server accepted it. Ids of their own (`operator:queued:<id>`), so no row this tab mints
  * later can share one.
+ *
+ * Messages the harness took as one (`takenTogether`, A6 U4 review 3) are **one** row: their
+ * words in the order they were sent, a line apart — as the harness stored them — under the
+ * first one's time, naming all of them. One message, one turn, one reply.
  */
 export const queuedRows = (
   queued: ImporterConversationView["queued"],
   floor: number,
-): readonly LiveItem[] =>
-  queued.map((message) => ({
-    ...operatorTurn({
-      index: 0,
-      text: message.text,
-      at: message.acceptedAt,
-      after: floor,
-    }),
-    id: `operator:queued:${message.messageId}`,
-    messageId: message.messageId,
-  }));
+): readonly LiveItem[] => {
+  const rows: LiveItem[] = [];
+  const grouped = new Map<string, number>();
+  for (const message of queued) {
+    const together = message.takenTogether;
+    const at =
+      together === undefined
+        ? undefined
+        : together
+            .map((id) => grouped.get(id))
+            .find((index) => index !== undefined);
+    const joined = at === undefined ? undefined : rows[at];
+    if (at !== undefined && joined !== undefined) {
+      rows[at] = {
+        ...joined,
+        body: `${joined.body}\n${message.text}`,
+        messageIds: [...messagesOf(joined), message.messageId],
+      };
+      grouped.set(message.messageId, at);
+      continue;
+    }
+    grouped.set(message.messageId, rows.length);
+    rows.push({
+      ...operatorTurn({
+        index: 0,
+        text: message.text,
+        at: message.acceptedAt,
+        after: floor,
+      }),
+      id: `operator:queued:${message.messageId}`,
+      messageIds: [message.messageId],
+    });
+  }
+  return rows;
+};
 
-/** The message ids a replay's transcript holds: its `turn.operator` items' (A6 U4 review 2). */
+/**
+ * The conversation with the operator rows the harness took **as one** made one row (A6 U4
+ * review 3): Claude Code takes every steer waiting behind a turn at once and stores them as
+ * one message, answered by one reply, so they are one turn here too — live as after a
+ * reload, which draws the stored entry. The rows a take naming several messages finds are
+ * joined into the first of them, their words a line apart in the order they came, and the
+ * later ones removed; what followed each stays where it was, now in the one turn. A take of
+ * one message, and a row no take names, are left alone.
+ */
+const joinedByTake = (
+  items: readonly LiveItem[],
+  taken: ReadonlyMap<string, LiveItem>,
+): readonly LiveItem[] => {
+  const first = new Map<string, number>();
+  const joined: LiveItem[] = [];
+  for (const item of items) {
+    const take =
+      item.kind === OPERATOR_TURN_KIND ? takeOf(item, taken) : undefined;
+    if (take === undefined || messagesOf(take).length < 2) {
+      joined.push(item);
+      continue;
+    }
+    const at = first.get(take.id);
+    const into = at === undefined ? undefined : joined[at];
+    if (at === undefined || into === undefined) {
+      first.set(take.id, joined.length);
+      joined.push(item);
+      continue;
+    }
+    joined[at] = {
+      ...into,
+      body: `${into.body}\n${item.body}`,
+      messageIds: [...messagesOf(into), ...messagesOf(item)],
+      ...(into.attachments === undefined && item.attachments === undefined
+        ? {}
+        : {
+            attachments: [
+              ...(into.attachments ?? []),
+              ...(item.attachments ?? []),
+            ],
+          }),
+    };
+  }
+  return joined;
+};
+
+/**
+ * The message ids a replay's transcript holds: its `turn.operator` items' (A6 U4 review 2),
+ * several on an entry the harness stored for messages it took as one (review 3).
+ */
 const writtenIds = (items: readonly LiveItem[]): ReadonlySet<string> =>
   new Set(
     items.flatMap((item) =>
-      item.kind === OPERATOR_TURN_KIND && item.messageId !== undefined
-        ? [item.messageId]
-        : [],
+      item.kind === OPERATOR_TURN_KIND ? messagesOf(item) : [],
     ),
   );
 
@@ -399,7 +484,7 @@ const writtenIds = (items: readonly LiveItem[]): ReadonlySet<string> =>
  * **Joined by message id, never by time** (A6 U4 review 2). The server reads what it holds
  * outside the transcript (`queued`) before the transcript, so every message it accepted
  * before the read began is in exactly one of the two: the transcript (a `turn.operator`
- * carrying its `messageId`) or `queued`. So:
+ * naming it in `messageIds`) or `queued`. So:
  *
  * - a row this tab holds whose message the **transcript** has is dropped: the transcript's
  *   copy is drawn, where the harness put it;
@@ -410,6 +495,10 @@ const writtenIds = (items: readonly LiveItem[]): ReadonlySet<string> =>
  *   the session, which the harness wrote before any steer could be taken, and the take that
  *   asked for this read is of such a steer;
  * - a row minted **after** the read was asked for, and not in the answer by id, is kept.
+ *
+ * A row names its messages as a list (A6 U4 review 3): it goes if the transcript has **any**
+ * of them — a message the harness took with others is in their one entry — and the held
+ * messages taken together are added as one row ({@link queuedRows}).
  *
  * A clock comparison could not do this: the server stamps the answer after reading the
  * transcript, so a message accepted during the read was either dropped (it was older than
@@ -435,18 +524,16 @@ export const withReplay = (
       (!message.taken || session.taken?.[messageId] !== undefined)
     );
   };
-  const kept = session.items.filter((item) =>
-    item.messageId === undefined
-      ? !held.has(item.id)
-      : !written.has(item.messageId) &&
-        (ownWins(item.messageId) ||
-          (!held.has(item.id) && !waiting.has(item.messageId))),
-  );
-  const keptMessages = new Set(
-    kept.flatMap((item) =>
-      item.messageId === undefined ? [] : [item.messageId],
-    ),
-  );
+  const kept = session.items.filter((item) => {
+    const ids = messagesOf(item);
+    if (ids.length === 0) return !held.has(item.id);
+    return (
+      !ids.some((id) => written.has(id)) &&
+      (ids.every(ownWins) ||
+        (!held.has(item.id) && !ids.some((id) => waiting.has(id))))
+    );
+  });
+  const keptMessages = new Set(kept.flatMap(messagesOf));
   const added = [...waiting.values()].filter(
     (message) => !keptMessages.has(message.messageId),
   );
@@ -460,7 +547,9 @@ export const withReplay = (
   // Only a message still waiting is queued: one the harness took is an ordinary turn.
   const midTurn = [
     ...rows
-      .filter((row) => waiting.get(row.messageId ?? "")?.taken === false)
+      .filter((row) =>
+        messagesOf(row).every((id) => waiting.get(id)?.taken === false),
+      )
       .map((row) => row.id),
     ...(session.midTurn ?? []).filter((id) => keptIds.has(id)),
   ];
@@ -488,12 +577,14 @@ export const takesUnknownMessage = (
   take: LiveItem,
 ): boolean =>
   take.kind === TAKEN_KIND &&
-  take.messageId !== undefined &&
   session.loaded === true &&
   (session.historyFloor === undefined ||
     (activityOrder(take) ?? Number.POSITIVE_INFINITY) > session.historyFloor) &&
-  !session.items.some((item) => item.messageId === take.messageId) &&
-  !session.history.items.some((item) => item.messageId === take.messageId);
+  messagesOf(take).some(
+    (id) =>
+      !session.items.some((item) => messagesOf(item).includes(id)) &&
+      !session.history.items.some((item) => messagesOf(item).includes(id)),
+  );
 
 /** What a message waiting behind the running turn says, under its bubble. */
 export const QUEUED_NOTE =
@@ -609,8 +700,7 @@ export const importerFeed = (input: {
   if (mine.length === 0) return input.own;
   const floorOf = (row: LiveItem): number => {
     const sent = input.floors?.[row.id] ?? -1;
-    const take =
-      row.messageId === undefined ? undefined : taken.get(row.messageId);
+    const take = takeOf(row, taken);
     if (take !== undefined) return activityOrder(take) ?? sent;
     if (input.working === true && input.midTurn?.includes(row.id) === true) {
       return Number.POSITIVE_INFINITY;
@@ -863,16 +953,19 @@ export const buildImporterChat = (
     history.truncated || (input.recordsSkipped ?? 0) > 0,
   );
   // Folded before the cut: a background sub-agent can end turns after it started, and is
-  // still one entry, where it started (A6 U14). A late result joins its call likewise.
-  const cut = cutAtOperator(besideCalls(foldSubagents(placed.items)));
+  // still one entry, where it started (A6 U14). A late result joins its call likewise, and
+  // messages the harness took as one are one turn (A6 U4 review 3).
+  const cut = cutAtOperator(
+    besideCalls(foldSubagents(joinedByTake(placed.items, taken))),
+  );
   const turnCount = cut.turns.length;
   const midTurn = new Set(input.midTurn ?? []);
   /** Whether a turn's message still waits behind the turn running before it. */
   const waiting = (operator: LiveItem): boolean =>
     input.working &&
     midTurn.has(operator.id) &&
-    operator.messageId !== undefined &&
-    !taken.has(operator.messageId);
+    messagesOf(operator).length > 0 &&
+    takeOf(operator, taken) === undefined;
   // The turn the importer is on: the newest whose message is not still waiting.
   const active = cut.turns.findLastIndex((turn) => !waiting(turn.operator));
 
@@ -936,10 +1029,7 @@ export const buildImporterChat = (
     const working = latest && input.working;
     const replayed = fromReplay(turn.operator);
     const spoke = turn.items.some((item) => item.origin === "activity");
-    const take =
-      turn.operator.messageId === undefined
-        ? undefined
-        : taken.get(turn.operator.messageId);
+    const take = takeOf(turn.operator, taken);
     groups.push({
       key: `turn:${String(number)}`,
       subject: {

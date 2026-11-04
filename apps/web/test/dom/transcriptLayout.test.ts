@@ -513,7 +513,7 @@ describe("U4: a message sent while a turn runs", () => {
       at("activity", 4, 9, {
         kind: "turn.taken",
         headline: "Taken",
-        messageId: MESSAGE_ID,
+        messageIds: [MESSAGE_ID],
       }),
     );
     fake.watch.send(
@@ -575,6 +575,70 @@ describe("U4: a message sent while a turn runs", () => {
     expect(said(document.querySelector(".importer"))).not.toContain(
       QUEUED_NOTE,
     );
+  });
+
+  /*
+   * A6 U4 review 3: Claude Code takes two steers queued behind one turn as one message, and
+   * answers it once. The tab drew two turns, the first "wrote nothing in reply" — which was
+   * false. One bubble with both texts in order, one reply, one footer.
+   */
+  test("two messages the harness took as one are one turn: one bubble, one reply, one footer", async () => {
+    const OTHER_ID = "11111111222222223333333344444444";
+    const { app, fake } = await openWith(
+      [OPERATOR("replay", 0, "Load the scope")],
+      true,
+    );
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(
+      at("activity", 1, 1, { kind: "turn.reply", body: "Reading the page." }),
+    );
+    await settle();
+    let next = 0;
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) => {
+      next += 1;
+      return ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_a",
+          messageId: next === 1 ? MESSAGE_ID : OTHER_ID,
+          acceptedAt: AT + 4_000 + next * 1_000,
+        }),
+      );
+    };
+    await send("MG-PAGE");
+    await send("MG-OTHER");
+    fake.watch.send(
+      at("activity", 2, 8, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageIds: [MESSAGE_ID, OTHER_ID],
+      }),
+    );
+    fake.watch.send(
+      at("activity", 3, 11, {
+        kind: "turn.reply",
+        body: "Both noted.",
+        model: "m-two",
+      }),
+    );
+    await settle();
+    await endTurn(app, fake);
+
+    const drawn = groups();
+    expect(drawn).toHaveLength(2);
+    const merged = drawn[1];
+    // Both texts, in the order they were sent, a line apart (`said` folds the break).
+    expect(said(merged?.querySelector(".bubble"))).toBe("MG-PAGE MG-OTHER");
+    expect(said(merged)).toContain("Both noted.");
+    expect(said(document.querySelector(".importer"))).not.toContain(
+      "wrote nothing in reply",
+    );
+    // From the take (AT + 8 s) to the reply (AT + 11 s).
+    expect(footers()).toEqual([
+      expect.stringContaining("Importer"),
+      "Importer · m-two · 3s",
+    ]);
   });
 });
 
@@ -678,7 +742,7 @@ describe("U4 review: a queued message across a reload", () => {
       at("activity", 102, 55, {
         kind: "turn.taken",
         headline: "Taken",
-        messageId: MESSAGE_ID,
+        messageIds: [MESSAGE_ID],
       }),
     );
     fake.watch.send(
@@ -729,7 +793,7 @@ describe("U4 review: a queued message across a reload", () => {
       at("activity", 201, 60, {
         kind: "turn.taken",
         headline: "Taken",
-        messageId: MESSAGE_ID,
+        messageIds: [MESSAGE_ID],
       }),
     );
     fake.watch.send(
@@ -795,7 +859,7 @@ describe("U4 review: a queued message across a reload", () => {
       at("activity", 301, 60, {
         kind: "turn.taken",
         headline: "Taken",
-        messageId: MESSAGE_ID,
+        messageIds: [MESSAGE_ID],
       }),
     );
     await settle();
@@ -810,7 +874,7 @@ describe("U4 review: a queued message across a reload", () => {
       at("activity", 303, 63, {
         kind: "turn.taken",
         headline: "Taken",
-        messageId: MESSAGE_ID,
+        messageIds: [MESSAGE_ID],
       }),
     );
     await settle();
@@ -848,7 +912,7 @@ describe("U4 review: a queued message across a reload", () => {
       at("activity", 1, 9, {
         kind: "turn.taken",
         headline: "Taken",
-        messageId: MESSAGE_ID,
+        messageIds: [MESSAGE_ID],
       }),
     );
     fake.watch.send(

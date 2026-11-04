@@ -231,7 +231,7 @@ describe("a take in the planner panel (A6 U4 review)", () => {
           kind: "turn.taken",
           headline: "Taken",
           body: "",
-          messageId: "aaaaaaaabbbbbbbbccccccccdddddddd",
+          messageIds: ["aaaaaaaabbbbbbbbccccccccdddddddd"],
         }),
       ],
     });
@@ -804,7 +804,7 @@ describe("the goal conversation", () => {
           kind: "turn.taken",
           headline: "Taken",
           body: "",
-          messageId: "aaaaaaaabbbbbbbbccccccccdddddddd",
+          messageIds: ["aaaaaaaabbbbbbbbccccccccdddddddd"],
         }),
       ],
     });

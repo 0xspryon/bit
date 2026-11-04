@@ -68,6 +68,7 @@ import {
   liveClaudeCodeSdk,
   newClaudeCodeSessionId,
   resultError,
+  storedSteers,
   takenNarration,
   type ClaudeCodeHarnessOptions,
   type ClaudeCodeSdk,
@@ -2593,6 +2594,7 @@ describe("U4: a steer taken, and a turn the harness ended in error", () => {
         [claudeCodeMessageId(STEER), STEER],
         [claudeCodeMessageId(OTHER), OTHER],
       ]),
+      takenTogether: new Map<string, readonly string[]>(),
     };
     // A frame naming no steer (the opening prompt's turn) says nothing.
     expect(takenNarration(record, frame(["opening-uuid"]))).toEqual([]);
@@ -2603,13 +2605,80 @@ describe("U4: a steer taken, and a turn the harness ended in error", () => {
       frame(["opening-uuid", claudeCodeMessageId(STEER)]),
     );
     expect(first.map((entry) => entry.detail)).toEqual([
-      { _tag: "taken", messageId: STEER },
+      { _tag: "taken", messageIds: [STEER] },
     ]);
     // Every later frame of that turn names it again, and its `result`: nothing more.
     expect(takenNarration(record, frame([claudeCodeMessageId(STEER)]))).toEqual(
       [],
     );
     expect([...record.untaken.values()]).toEqual([OTHER]);
+    // Taken alone: nothing recorded as taken together.
+    expect(record.takenTogether.size).toBe(0);
+  });
+
+  /*
+   * A6 U4 review 3, measured on CLI 2.1.310: two steers queued behind one turn are dequeued
+   * together, named on the same frame, and stored as one entry. One take, in the order they
+   * were sent — whatever order the frame lists them in — and recorded as taken together.
+   */
+  test("steers one frame first names are one take, in the order they were sent", () => {
+    const THIRD = "9999999988888888777777776666666a";
+    const record = {
+      untaken: new Map([
+        [claudeCodeMessageId(STEER), STEER],
+        [claudeCodeMessageId(OTHER), OTHER],
+        [claudeCodeMessageId(THIRD), THIRD],
+      ]),
+      takenTogether: new Map<string, readonly string[]>(),
+    };
+    const taken = takenNarration(
+      record,
+      frame([
+        "opening-uuid",
+        claudeCodeMessageId(OTHER),
+        claudeCodeMessageId(STEER),
+      ]),
+    );
+    expect(taken.map((entry) => entry.detail)).toEqual([
+      { _tag: "taken", messageIds: [STEER, OTHER] },
+    ]);
+    const together = [claudeCodeMessageId(STEER), claudeCodeMessageId(OTHER)];
+    expect(record.takenTogether.get(claudeCodeMessageId(STEER))).toEqual(
+      together,
+    );
+    expect(record.takenTogether.get(claudeCodeMessageId(OTHER))).toEqual(
+      together,
+    );
+    expect([...record.untaken.values()]).toEqual([THIRD]);
+  });
+
+  test("a stored entry names the steers taken with it whose own uuid the transcript does not hold", () => {
+    const [a, b, c] = ["a", "b", "c"].map((letter) => letter.repeat(32)) as [
+      string,
+      string,
+      string,
+    ];
+    const uuid = claudeCodeMessageId;
+    const together = new Map([
+      [uuid(a), [uuid(a), uuid(b)]],
+      [uuid(b), [uuid(a), uuid(b)]],
+    ]);
+    // Stored as one entry under the last one's uuid: that entry is both.
+    expect([
+      ...storedSteers([a, b, c], together, new Set([uuid(b), uuid(c)])),
+    ]).toEqual([
+      [uuid(b), [a, b]],
+      [uuid(c), [c]],
+    ]);
+    // Stored one entry each, had the CLI done so: each names itself only.
+    expect([
+      ...storedSteers([a, b], together, new Set([uuid(a), uuid(b)])),
+    ]).toEqual([
+      [uuid(a), [a]],
+      [uuid(b), [b]],
+    ]);
+    // Not written yet: nothing named.
+    expect(storedSteers([a, b], together, new Set()).size).toBe(0);
   });
 
   /*
@@ -2652,12 +2721,218 @@ describe("U4: a steer taken, and a turn the harness ended in error", () => {
       }),
     );
     expect(
-      entries.map((entry) => [entry.text, entry.messageId ?? null]),
+      entries.map((entry) => [entry.text, entry.messageIds ?? null]),
     ).toEqual([
       ["the opening", null],
-      ["and the portal", STEER],
+      ["and the portal", [STEER]],
       ["someone else's", null],
     ]);
+  });
+
+  /*
+   * A6 U4 review 3: the reviewer's live run, two steers queued behind one turn (CLI 2.1.310,
+   * haiku). The first frame of the turn that read them named both uuids, and the transcript
+   * stored them as ONE `user` entry, the texts joined by a line break, under the second's
+   * uuid alone. Named by that uuid only, the first steer was never found written and was
+   * drawn twice. Taken through the driver's own pump and read back through `messages`.
+   */
+  test("two steers taken together and stored as one entry are named as both, from the take the pump saw", async () => {
+    const { taken, entries } = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "import",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+        });
+        yield* harness.prompt(SESSION, "the opening");
+        yield* Effect.promise(() => driver.pulled(1));
+        for (const [messageId, text] of [
+          [STEER, "MG-PAGE"],
+          [OTHER, "MG-OTHER"],
+        ] as const) {
+          yield* harness.prompt(SESSION, text, {
+            _tag: "steer",
+            urgency: "queued",
+            messageId,
+          });
+        }
+        yield* Effect.promise(() => driver.pulled(3));
+        const narration = yield* Effect.forkChild(
+          Stream.runCollect(
+            harness.sessionEvents(SESSION).pipe(
+              Stream.filter((entry) => entry.detail._tag === "taken"),
+              Stream.take(1),
+            ),
+          ),
+        );
+        yield* Effect.sleep("20 millis");
+        // The first frame of the turn that read them names both, as 2.1.310's does.
+        driver.emit({
+          type: "assistant",
+          session_id: SESSION,
+          parent_tool_use_id: null,
+          uuid: "reply-uuid",
+          message: {
+            id: "msg_merged",
+            role: "assistant",
+            model: "claude-haiku-4-5",
+            content: [{ type: "text", text: "Both noted." }],
+          },
+          user_message_uuid: claudeCodeMessageId(OTHER),
+          user_message_uuids: [
+            driver.seen.uuids[0] ?? "opening",
+            claudeCodeMessageId(STEER),
+            claudeCodeMessageId(OTHER),
+          ],
+        } as unknown as SDKMessage);
+        const taken = [...(yield* Fiber.join(narration))].map(
+          (entry) => entry.detail,
+        );
+        // The stored shape: one `sdk` string entry, both texts, the last uuid only.
+        driver.transcript.push(
+          {
+            type: "user",
+            uuid: driver.seen.uuids[0] ?? "opening",
+            session_id: SESSION,
+            message: { role: "user", content: "the opening" },
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+          },
+          {
+            type: "user",
+            uuid: claudeCodeMessageId(OTHER),
+            session_id: SESSION,
+            message: { role: "user", content: "MG-PAGE\nMG-OTHER" },
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+          },
+        );
+        return { taken, entries: yield* harness.messages(SESSION) };
+      }),
+    );
+    expect(taken).toEqual([{ _tag: "taken", messageIds: [STEER, OTHER] }]);
+    expect(
+      entries.map((entry) => [entry.text, entry.messageIds ?? null]),
+    ).toEqual([
+      ["the opening", null],
+      ["MG-PAGE\nMG-OTHER", [STEER, OTHER]],
+    ]);
+  });
+
+  /**
+   * The same, read back through the **real** `getSessionMessages` (A6 U4 review 3).
+   *
+   * `testdata/claude-code-transcript/steers-taken-together.cli.jsonl` is the CLI's on-disk
+   * form of a live run (CLI 2.1.310, haiku-4-5), cut to its operator turns and replies with
+   * the long texts shortened and the ids replaced: the two steers' `enqueue`s while a turn
+   * ran, their two `dequeue`s in the same millisecond, then **one** `user` entry holding
+   * both texts a line apart under the second steer's uuid, with `mergedSendUuids` naming
+   * the first — which SDK 0.3.310's `getSessionMessages` drops (measured), so the driver can
+   * name the first only from the take it saw.
+   */
+  test("the CLI's stored merged entry, read through the real SDK, is named as both steers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bit-merged-steers-"));
+    const previous = process.env["CLAUDE_CONFIG_DIR"];
+    try {
+      const project = join(root, "projects", "-tmp-ws");
+      await mkdir(project, { recursive: true });
+      await writeFile(
+        join(project, `${SESSION}.jsonl`),
+        await readFile(
+          join(
+            import.meta.dir,
+            "testdata",
+            "claude-code-transcript",
+            "steers-taken-together.cli.jsonl",
+          ),
+          "utf8",
+        ),
+      );
+      process.env["CLAUDE_CONFIG_DIR"] = root;
+      const driver = turnDrivenSdk();
+      const entries = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              yield* harness.createSession({
+                title: "import",
+                model: "claude-haiku-4-5",
+                directory: "/tmp/ws",
+                sessionId: SESSION,
+              });
+              yield* harness.prompt(SESSION, "Load the scope.");
+              yield* Effect.promise(() => driver.pulled(1));
+              for (const [messageId, text] of [
+                [STEER, "MG-PAGE"],
+                [OTHER, "MG-OTHER"],
+              ] as const) {
+                yield* harness.prompt(SESSION, text, {
+                  _tag: "steer",
+                  urgency: "queued",
+                  messageId,
+                });
+              }
+              yield* Effect.promise(() => driver.pulled(3));
+              const narration = yield* Effect.forkChild(
+                Stream.runCollect(
+                  harness.sessionEvents(SESSION).pipe(
+                    Stream.filter((entry) => entry.detail._tag === "taken"),
+                    Stream.take(1),
+                  ),
+                ),
+              );
+              yield* Effect.sleep("20 millis");
+              driver.emit({
+                type: "assistant",
+                session_id: SESSION,
+                parent_tool_use_id: null,
+                uuid: "reply-uuid",
+                message: {
+                  id: "msg_011CgicEHWcYAqPDocbKeqDT",
+                  role: "assistant",
+                  model: "claude-haiku-4-5-20251001",
+                  content: [{ type: "text", text: "61. Scope creep" }],
+                },
+                user_message_uuid: claudeCodeMessageId(OTHER),
+                user_message_uuids: [
+                  claudeCodeMessageId(STEER),
+                  claudeCodeMessageId(OTHER),
+                ],
+              } as unknown as SDKMessage);
+              yield* Fiber.join(narration);
+              return yield* harness.messages(SESSION);
+            }),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                controlTimeout: "2 seconds",
+                sdk: {
+                  ...driver.sdk,
+                  sessionMessages: liveClaudeCodeSdk.sessionMessages,
+                },
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+      expect(
+        entries
+          .filter((entry) => entry.type === "user")
+          .map((entry) => [entry.text, entry.messageIds ?? null]),
+      ).toEqual([
+        ["Load the scope.", null],
+        [
+          "MG-PAGE: once you reach this, list ten more scope terms, numbered, one line each.\nMG-OTHER: and after those ten, say the word finished.",
+          [STEER, OTHER],
+        ],
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("a failed result says the CLI's errors; a success, an interrupt or a silent failure says nothing", () => {

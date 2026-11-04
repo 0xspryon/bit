@@ -927,10 +927,11 @@ export const projectReplay = (input: {
             callId: null,
             outcome: null,
             // Which steer of ours this is, where the driver could name it (A6 U4 review 2):
-            // what a client joins its own row and the message's `turn.taken` to.
-            ...(entry.messageId === undefined
+            // what a client joins its own row and the message's `turn.taken` to. Several when
+            // the harness stored several steers as one entry (review 3).
+            ...(entry.messageIds === undefined || entry.messageIds.length === 0
               ? {}
-              : { messageId: entry.messageId }),
+              : { messageIds: [...entry.messageIds] }),
             // The files the message carried (A6 F9), its path lines already out of `body`.
             ...(entry.attachments === undefined ||
             entry.attachments.length === 0
@@ -1059,10 +1060,10 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
       return undefined;
     case "taken":
       /*
-       * The harness took a steer (A6 U4). Carries the application's id for the message and
-       * nothing to read: a chat matches it to the message the operator sent and stops
-       * drawing that message as queued. Live only — a replay holds the message itself,
-       * where the harness put it.
+       * The harness took a steer (A6 U4), or several as one (review 3). Carries the
+       * application's ids for the messages and nothing to read: a chat matches it to the
+       * messages the operator sent and stops drawing them as queued. Live only — a replay
+       * holds the message itself, where the harness put it.
        */
       return {
         ...base,
@@ -1075,7 +1076,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
         output: null,
         callId: null,
         outcome: null,
-        messageId: detail.messageId,
+        messageIds: [...detail.messageIds],
       };
     case "error":
       // The item a replay draws for an entry's `error` (`projectReplay`), so a turn that

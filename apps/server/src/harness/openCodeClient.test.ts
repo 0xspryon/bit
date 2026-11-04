@@ -1161,7 +1161,7 @@ describe("reading an opencode event", () => {
       event("session.inbox.delivered", { inboxID: `msg_${id}` }),
       new Map(),
     );
-    expect(taken.detail).toEqual({ _tag: "taken", messageId: id });
+    expect(taken.detail).toEqual({ _tag: "taken", messageIds: [id] });
     // An inbox id this server did not mint — the opening prompt's, another client's — is not
     // one a chat is waiting on, and narrates nothing.
     for (const inboxID of ["msg_01JABCDEF", "msg_", "other", 7]) {
@@ -2185,10 +2185,10 @@ describe("reading a session's messages", () => {
       ),
     );
     expect(
-      entries.map((entry) => [entry.text, entry.messageId ?? null]),
+      entries.map((entry) => [entry.text, entry.messageIds ?? null]),
     ).toEqual([
       ["the opening", null],
-      ["and the portal", OURS],
+      ["and the portal", [OURS]],
       ["too short", null],
     ]);
   });

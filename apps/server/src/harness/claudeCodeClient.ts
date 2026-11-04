@@ -534,6 +534,22 @@ interface SessionRecord {
    */
   readonly untaken: Map<string, string>;
   /**
+   * Each steer the CLI took **together with others**, by its driver uuid, to the uuids of
+   * every steer of that take, oldest first (A6 U4 review 3). Written by
+   * {@link takenNarration}; read by `messages` to name the stored entry.
+   *
+   * The CLI dequeues every steer waiting behind a turn at once (measured, CLI 2.1.310: two
+   * dequeued in the same millisecond), names them all on the first frame of the turn that
+   * reads them, and stores them as **one** `user` entry — their texts joined by a line break
+   * — under the **last** one's uuid alone. Named by that uuid only, the earlier steers were
+   * never found in the transcript, so a replay drew them a second time. On disk the entry
+   * also lists the earlier steers' uuids (`mergedSendUuids`), but SDK 0.3.310's
+   * `getSessionMessages` drops that field (measured), so the take is the only record of
+   * the group this process can read. Kept for the session's life: a stored entry is read
+   * again on every replay.
+   */
+  readonly takenTogether: Map<string, readonly string[]>;
+  /**
    * A turn is running on the stream: a turn-opening frame (`system/init`, a main-thread
    * reply or tool result — never a subagent's, see `opensTurn`) has arrived since the last
    * `result`, which closes it. Read off the stream
@@ -1907,11 +1923,11 @@ const flattenTranscript = (
   entries: readonly SessionMessage[],
   uploadsFolder: string | undefined,
   /**
-   * The steers this process delivered into the session, by the UUID each was stored under
-   * (`claudeCodeMessageId`) to the application's id for it: what names an operator entry's
-   * `messageId`. Empty for a session this process does not hold.
+   * The steers this process delivered into the session, by the UUID their entry was stored
+   * under to the application's ids it holds ({@link storedSteers}): what names an operator
+   * entry's `messageIds`. Empty for a session this process does not hold.
    */
-  steers: ReadonlyMap<string, string> = new Map(),
+  steers: ReadonlyMap<string, readonly string[]> = new Map(),
 ): MessageEntry[] => {
   const blocksSeen = new Map<string, number>();
   const subagents: SubagentCalls = new Map();
@@ -2012,7 +2028,8 @@ const flattenTranscript = (
       entry.type === "user" && marker === undefined
         ? splitAttachmentLines(text, { uploadsFolder })
         : undefined;
-    // A steer of ours is stored under the UUID it was delivered with (A6 U4 review 2).
+    // A steer of ours is stored under the UUID it was delivered with (A6 U4 review 2), and
+    // steers taken together under the last one's (review 3).
     const steer =
       entry.type === "user" && marker === undefined
         ? steers.get(entry.uuid)
@@ -2021,7 +2038,7 @@ const flattenTranscript = (
       type: entry.type,
       text: split?.text ?? text,
       ...(marker === undefined ? {} : { marker }),
-      ...(steer === undefined ? {} : { messageId: steer }),
+      ...(steer === undefined ? {} : { messageIds: steer }),
       ...(split === undefined || split.attachments.length === 0
         ? {}
         : { attachments: split.attachments }),
@@ -2187,33 +2204,78 @@ const answeredUuids = (message: SDKMessage): readonly string[] | undefined => {
 };
 
 /**
- * A `taken` entry for each steer this frame is the first to say was consumed (A6 U4), and
- * nothing for any other frame. Removes each from {@link SessionRecord.untaken}, so a later
- * frame naming it again — every reply frame of that turn does, and its `result` — says
- * nothing more. A uuid this session did not send as a steer (the opening prompt, a turn
- * the CLI ran itself) is not in the map and narrates nothing.
+ * One `taken` entry naming every steer this frame is the first to say was consumed (A6 U4),
+ * and nothing for any other frame. Removes each from {@link SessionRecord.untaken}, so a
+ * later frame naming it again — every reply frame of that turn does, and its `result` —
+ * says nothing more. A uuid this session did not send as a steer (the opening prompt, a
+ * turn the CLI ran itself) is not in the map and narrates nothing.
+ *
+ * **One entry for the steers one frame first names, not one each** (A6 U4 review 3): the
+ * CLI took them as one message and answers them with one reply, so they are one take. In
+ * the order they were sent ({@link SessionRecord.untaken}'s), and a take of more than one
+ * is kept in {@link SessionRecord.takenTogether} for the transcript read.
  */
 export const takenNarration = (
-  record: Pick<SessionRecord, "untaken">,
+  record: Pick<SessionRecord, "untaken" | "takenTogether">,
   message: SDKMessage,
 ): readonly HarnessNarration[] => {
   const named = answeredUuids(message);
   if (named === undefined || record.untaken.size === 0) return [];
-  const at = Date.now();
-  const taken: HarnessNarration[] = [];
-  for (const uuid of named) {
-    const messageId = record.untaken.get(uuid);
-    if (messageId === undefined) continue;
-    record.untaken.delete(uuid);
-    taken.push({
+  const naming = new Set(named);
+  // Sent order, which is the order the CLI joins their words in.
+  const taken = [...record.untaken].filter(([uuid]) => naming.has(uuid));
+  if (taken.length === 0) return [];
+  for (const [uuid] of taken) record.untaken.delete(uuid);
+  if (taken.length > 1) {
+    const together = taken.map(([uuid]) => uuid);
+    for (const uuid of together) record.takenTogether.set(uuid, together);
+  }
+  return [
+    {
       type: message.type,
       sequence: undefined,
-      at,
+      at: Date.now(),
       outcome: undefined,
-      detail: { _tag: "taken", messageId },
-    });
+      detail: {
+        _tag: "taken",
+        messageIds: taken.map(([, messageId]) => messageId),
+      },
+    },
+  ];
+};
+
+/**
+ * The application's ids each stored steer entry holds, by the uuid the CLI stored it under
+ * (A6 U4 review 2, 3), for {@link flattenTranscript}.
+ *
+ * A steer is stored under the uuid it was delivered with (`claudeCodeMessageId`, one-way,
+ * hence matched against the ids this session was delivered). Steers taken together are
+ * stored as one entry under the last one's uuid, so that entry names every steer of the take
+ * up to it whose own uuid the transcript does not hold — written separately, each would be
+ * its own entry, and is named there. `present` is the uuids of the transcript's entries.
+ */
+export const storedSteers = (
+  delivered: Iterable<string>,
+  takenTogether: ReadonlyMap<string, readonly string[]>,
+  present: ReadonlySet<string>,
+): ReadonlyMap<string, readonly string[]> => {
+  const ours = new Map(
+    [...delivered].map((id) => [claudeCodeMessageId(id), id] as const),
+  );
+  const named = new Map<string, readonly string[]>();
+  for (const [uuid, messageId] of ours) {
+    if (!present.has(uuid)) continue;
+    const together = takenTogether.get(uuid) ?? [uuid];
+    const upTo = together.slice(0, together.indexOf(uuid));
+    named.set(uuid, [
+      ...upTo.flatMap((earlier) => {
+        const id = ours.get(earlier);
+        return id === undefined || present.has(earlier) ? [] : [id];
+      }),
+      messageId,
+    ]);
   }
-  return taken;
+  return named;
 };
 
 /**
@@ -3066,6 +3128,7 @@ export const claudeCodeHarness = (
           ended: yield* Deferred.make<void>(),
           unanswered: new Set<string>(),
           untaken: new Map<string, string>(),
+          takenTogether: new Map<string, readonly string[]>(),
           turnOpen: false,
           stamped: false,
           settling: false,
@@ -3723,17 +3786,6 @@ export const claudeCodeHarness = (
       )(function* (sessionId, read) {
         const record = sessions.get(sessionId);
         const directory = record?.directory;
-        /*
-         * Each steer this session was delivered, by the UUID the CLI stores it under. The
-         * derivation is one-way (`claudeCodeMessageId`), so the stored entry is named by
-         * matching it against the ids this process delivered, which it holds only while it
-         * holds the session.
-         */
-        const steers = new Map(
-          [...(record?.deliveredIds ?? [])].map(
-            (id) => [claudeCodeMessageId(id), id] as const,
-          ),
-        );
         const entries = yield* Effect.tryPromise({
           try: () =>
             sdk.sessionMessages(
@@ -3746,10 +3798,22 @@ export const claudeCodeHarness = (
               `could not read session ${sessionId}'s transcript: ${String(cause)}`,
             ),
         });
+        const kept = entries.filter((entry) => !isLocalCommandEntry(entry));
+        /*
+         * Each steer this session was delivered, by the UUID the CLI stores it under, and
+         * steers it took together by the last one's (`storedSteers`). The derivation is
+         * one-way (`claudeCodeMessageId`), so the stored entry is named by matching it
+         * against the ids this process delivered, which it holds only while it holds the
+         * session.
+         */
         return flattenTranscript(
-          entries.filter((entry) => !isLocalCommandEntry(entry)),
+          kept,
           read?.uploadsFolder,
-          steers,
+          storedSteers(
+            record?.deliveredIds ?? [],
+            record?.takenTogether ?? new Map(),
+            new Set(kept.map((entry) => entry.uuid)),
+          ),
         );
       });
 

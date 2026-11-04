@@ -391,9 +391,11 @@ export interface MessageEntry {
    */
   readonly attachments?: readonly ReplayedAttachment[];
   /**
-   * On a `user` entry that is a steer this application delivered, the application's id for
-   * it (`PromptDelivery.messageId`) — the same id the delivery's answer and its `taken`
-   * narration carry — and absent on every other entry (A6 U4 review 2).
+   * On a `user` entry that holds steers this application delivered, the application's ids
+   * for them (`PromptDelivery.messageId`), oldest first — the same ids the deliveries'
+   * answers and their `taken` narration carry — and absent on every other entry (A6 U4
+   * review 2). Several when the harness took several steers as one and stored them as one
+   * entry (review 3): Claude Code does, under the last one's uuid alone.
    *
    * Read back from the id the harness **stored the entry under**, which each driver derived
    * from ours when it delivered it (`harness/messageId.ts`): OpenCode's `msg_<hex>` is
@@ -402,7 +404,7 @@ export interface MessageEntry {
    * (a restart) names none of its Claude Code steers. A caller joins a message it holds to
    * the transcript by this and never by its words or its time.
    */
-  readonly messageId?: string;
+  readonly messageIds?: readonly string[];
 }
 
 /** What a caller tells {@link AgentHarness.messages} about the session it reads. */
@@ -623,11 +625,18 @@ export type NarrationDetail =
        * keep the rest of the running turn's work above it. Claude Code says so on the first
        * frame whose `user_message_uuids` names the message (the turn that consumed it, or
        * the running turn it was folded into); OpenCode on `session.inbox.delivered`. One
-       * entry per message, each at most once per session.
+       * entry per take, each message in at most one per session.
        */
       readonly _tag: "taken";
-      /** The application's id for the message, as `PromptDelivery.messageId` gave it. */
-      readonly messageId: string;
+      /**
+       * The application's ids for the messages taken, as `PromptDelivery.messageId` gave
+       * them, oldest first and never empty. **Several when the harness took them as one**
+       * (A6 U4 review 3): Claude Code dequeues every steer waiting behind a turn at once,
+       * names them all on the same frame, and stores them as one transcript entry — so they
+       * are one message to the agent, answered by one reply, and a chat draws them as one
+       * turn. OpenCode takes one at a time.
+       */
+      readonly messageIds: readonly string[];
     }
   | {
       /**
