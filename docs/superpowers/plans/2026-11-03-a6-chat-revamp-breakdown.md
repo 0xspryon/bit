@@ -117,7 +117,12 @@ being written shows nothing until it ends; V2 resumes the in-flight block.
 the coalescer; `session.text.ended` / `reasoning.ended` close the item
 (`openCodeClient.ts:496` today reads only `ended`).
 
-**F8 — Claude Code partial messages (S), F6 → F8.** `includePartialMessages: true`; handle
+**F8 — Claude Code partial messages (S), F6 → F8.** From F6's review: the `blockId` on each delta must
+equal the one on the finished block — derive it from the `stream_event`'s `message.id`
+plus the content-block index, and recover the index from the stream, not from the block's
+position in the CLI's split `assistant` message. Confirm an interrupted turn's `result`
+carries an outcome (the coalescer ends open blocks on it) and whether the CLI emits an
+`assistant` message for a cut block. `includePartialMessages: true`; handle
 `text_delta` and `thinking_delta` `stream_event`s; the `assistant` message closes the
 items. Check the outcome watch and usage mapping still read the same events.
 
@@ -167,7 +172,10 @@ turns boxed with "You · 18:02"; consecutive tool calls collapse to one muted li
 away; reasoning collapses to one truncated line (markdown); turn footer
 "Importer · <model> · 41s"; record-write states kept.
 
-**U5 — Live streaming in the thread (S), F6 + U4 → U5.** Apply partial updates by item id,
+**U5 — Live streaming in the thread (S), F6 + U4 → U5.** From F6: request the live stream with `?partials=1`;
+replace by `blockId` and never add a partial's `id` to the shown-ids set; when the session
+goes idle, hide "writing…" for any partial with no finished block; on stream reopen, drop
+every partial (finished blocks replayed after a gap carry no `blockId`). Apply partial updates by item id,
 "writing…" indicator, markdown over partial text with unclosed fences handled.
 
 **U6 — D3 Stop pill and Send now (S), F5 + U4 → U6.** Show Stop whenever the **server** says the
