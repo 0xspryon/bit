@@ -244,7 +244,10 @@ dialog. New dependencies: `pele`, `dompurify`.
 `upload/uploads.ts:537-543`, a `writeSync` that throws partway leaves a partial
 `.incoming-<uuid>` file in `uploads/` (the temporary is never recorded in `made`) — remove
 it via `removeOwn`, and add a test; also add a test that fails if only the dev/ino half of
-the pre-write check (`:501`) is removed. From F9's review: Bun answers a body over 128 MiB
+the pre-write check (`:501`) is removed. **Also step 0 (operator decision): mark real attachment lines so pasted
+look-alikes can't pass as attachments to the agent** — e.g. a per-message random marker on
+the server-written attachment block that the agent is told about in that same message
+(text a page author cannot know in advance), with the replay parser requiring it too. From F9's review: Bun answers a body over 128 MiB
 that declares its length with an **empty 413** before the server can send a sentence —
 the browser's `FormData` declares its length, so turn a 413 into a sentence through F2.
 Replayed attachments carry no bytes: add a route that serves a file from a session's
@@ -256,6 +259,20 @@ against the attach route's per-goal cap). Paste, drop and the `+` picker;
 thumbnails for images, name and size for files, remove, refusal through F2; the attachment
 chip with copy-path in operator turns, live and on reload.
 
+**U14 — Sub-agent entry (S), F10 → U14. Decided by the operator.** A sub-agent's own
+reasoning, tool calls and replies currently appear live in the calling agent's chat as if
+the caller wrote them, and vanish on reload. Instead: show **one sub-agent entry** in the
+chat (what it is — e.g. its type/description — and whether it is running or finished),
+both live and on reload, and **omit its content** from the caller's chat. The entry carries
+a visible note that viewing a sub-agent's content is postponed to V2, and the code carries
+a `V2(chat):` comment: proper V2 replays the sub-agent's own transcript (Claude Code keeps
+it in a `subagents/` folder) labelled as the sub-agent's.
+
+**F12 — Built server cannot open Claude Code sessions (S), last.** `bun dist/main.js`
+refuses every Claude Code import with `import_ungated`: it resolves the policy hook at
+`apps/plugins/claudeCodeGate.ts`, which does not exist (`bun src/main.ts` works). Fix the
+resolution so the built server finds the gate. **Remind the operator when the plan is done.**
+
 ## Order
 
 Slices run **one at a time** on branch `a6-chat-revamp`, each committed by its implementer.
@@ -263,40 +280,40 @@ After each, a separate reviewer agent reviews the code against its brief and the
 and checks the UI in a real browser (headless Chrome over CDP on the dev server) at tablet
 width and up. Fixes go back to the implementer; the next slice starts after review passes.
 
-F1, F2, F3, F4, F5, F6, F7, F8, F10, F9, U1, U10, U12, U11, U2, U7, U3, U4, U5, U6, U9, U8,
-U13.
+F1, F2, F3, F4, F5, F6, F7, F8, F10, F9, U1, U10, U14, U12, U11, U2, U7, U3, U4, U5, U6, U9,
+U8, U13, F12.
 
 ## Known issues found along the way (not in any slice)
 
 - The **built** server (`bun dist/main.js`) cannot open Claude Code sessions: it refuses
   `import_ungated` because it resolves the policy hook at `apps/plugins/claudeCodeGate.ts`,
   which does not exist; `bun src/main.ts` works. Predates this work (found in F4's review).
-- **Operator decision pending:** importer (and goal) Claude Code CLIs load the operator's
+- **Decided (operator, 2026-11-04): intended.** Importer (and goal) Claude Code CLIs load the operator's
   _user_ settings (`settingSources: ["user", …]`, `claudeCodeClient.ts:~1478`). Seen live in
   F5's review: the operator's own hooks ran against the importer, the superpowers
   SessionStart context was injected into it, and the operator's episodic-memory MCP server
   ran as its child — so the importer agent could search the operator's past conversations.
   The source comment justifies the setting only by the gate in `.claude/settings.local.json`.
-- **Operator decision pending:** real containment of an agent CLI and its tools. F5 kills a
+- **Decided (operator, 2026-11-04): V2.** Recorded as `V2(chat):` notes in `harness/ownedProcesses.ts` and `policy/service.ts`. Real containment of an agent CLI and its tools. F5 kills a
   Claude Code CLI's process group and its descendants found in `/proc`; a tool that
   detaches itself (its own session, `setsid`, a plugin's sync process) can still escape. A
   cgroup per CLI would contain everything it starts. The gate's list of ended sessions is
   in memory only, so a CLI orphaned by a hard server kill is allowed again after a restart.
-- **Operator decision pending:** an importer's OpenCode session listed a global `bit` MCP
+- **Decided (operator, 2026-11-04): intended**, as for Claude Code. An importer's OpenCode session listed a global `bit` MCP
   server (`bit_ingest`, `bit_retrieve`) in its tool catalogue, most likely from the
   operator's global OpenCode config — so an importer session could call tools outside what
   bit grants it (F7 review). Same class as the Claude Code user-settings item above.
-- **Operator decision pending:** subagent activity. When an importer uses a subagent
+- **Decided (operator, 2026-11-04): task U14.** Subagent activity. When an importer uses a subagent
   (possible because it loads the operator's user settings), its thinking, tool calls and
   replies appear live as the importer's own rows, but vanish on reload — the CLI keeps a
   subagent's transcript in a separate `subagents/` folder the replay does not read (F10
   review). Choose: replay subagent transcripts labelled as a subagent's, or keep subagent
   frames out of the live chat. Tied to the user-settings decision above.
-- **Operator decision pending:** evidence leaving the session directory. Claude Code keeps a
+- **Decided (operator, 2026-11-04): fine** — bit delegates to the harnesses and does not manage how they handle images. Evidence leaving the session directory. Claude Code keeps a
   full-size copy of every uploaded image in `/tmp/claude-<uid>/<project>/<session>/images/`
   and a JPEG copy in its transcript under `~/.claude/projects` (F9 review). Same class as the
   user-settings item.
-- **Accepted for V1 (operator may override):** a line in the operator's text (e.g. pasted
+- **Decided (operator, 2026-11-04): implement** — see U13 step 0. A line in the operator's text (e.g. pasted
   from a target page) shaped like `[Attached file "x" is saved at: /some/path]` is
   indistinguishable to the _agent_ from a real attachment line. The replay no longer trusts
   such lines (F9 fix), but the live prompt does; a per-message nonce on real lines would

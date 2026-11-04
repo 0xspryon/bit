@@ -381,6 +381,13 @@ export class PolicyDecisions extends Context.Service<
       sessionId: string,
       holder: object,
     ) => Effect.Effect<void>;
+    /*
+     * V2(chat): the list of ended sessions lives in this process's memory only. A server
+     * crash (no finalizer) loses it, so a CLI orphaned by the crash is allowed again after
+     * a restart. Proper V2: persist ended sessions (or the CLI identities they owned) and
+     * refuse them across restarts, alongside the cgroup containment noted in
+     * `harness/ownedProcesses.ts`.
+     */
     /** Whether `sessionId` has been ended and nothing holds it: its tool calls are refused. */
     readonly sessionEnded: (sessionId: string) => Effect.Effect<boolean>;
   }

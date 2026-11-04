@@ -333,6 +333,14 @@ export interface TreeLook {
   readonly signal: (signal: NodeJS.Signals) => void;
 }
 
+/*
+ * V2(chat): an agent CLI and its tools are contained by tracking its process tree through
+ * `/proc` (descendants, and members of groups they lead, by pid + start time) and
+ * signalling what is found. A tool that detaches itself before the tree is next read — its
+ * own session via `setsid`, a plugin's sync process, anything reparented within the 1 s
+ * refresh — can escape, and nothing here limits what an escaped process does. Proper V2: a
+ * cgroup per CLI, so everything it starts is contained and killed together.
+ */
 /**
  * Starts tracking `root`, which must have just been spawned by this process: its identity
  * is read now, so a root that has already exited gives an empty tree. `identity` is for a
