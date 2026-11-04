@@ -337,6 +337,51 @@ const parseIpv4 = (text: string): Address | undefined => {
 };
 
 /**
+ * Whether a host's last label is a number, by the URL Standard's "ends in a number" test:
+ * all ASCII digits, or `0x` and hex digits. A host that does is parsed as an IPv4 address
+ * by `new URL()` — and is invalid there if that fails — never kept as a name.
+ */
+const endsInNumber = (host: string): boolean => {
+  if (host.includes(":")) return false;
+  const last = host.slice(host.lastIndexOf(".") + 1);
+  return /^\d+$/u.test(last) || /^0x[0-9a-f]*$/u.test(last);
+};
+
+/**
+ * One IPv4 address as `new URL()` reads one, or `undefined`: one to four parts, each
+ * decimal, octal with a leading `0`, or hex with `0x`, the last filling the bytes the
+ * others leave. Used only to name the address in a refusal; {@link parseIpv4} stays the
+ * strict reader of what is stored.
+ */
+const parseLenientIpv4 = (host: string): Address | undefined => {
+  const parts = host.split(".");
+  if (parts.length > 4) return undefined;
+  const numbers: number[] = [];
+  for (const part of parts) {
+    let value: number;
+    if (/^0x[0-9a-f]*$/u.test(part)) {
+      value = part.length === 2 ? 0 : Number.parseInt(part.slice(2), 16);
+    } else if (/^0[0-7]+$/u.test(part)) {
+      value = Number.parseInt(part.slice(1), 8);
+    } else if (/^\d+$/u.test(part)) {
+      if (part.length > 1 && part.startsWith("0")) return undefined;
+      value = Number(part);
+    } else {
+      return undefined;
+    }
+    numbers.push(value);
+  }
+  const last = numbers.pop() ?? 0;
+  if (numbers.some((value) => value > 255)) return undefined;
+  if (last >= 256 ** (4 - numbers.length)) return undefined;
+  const bytes = [...numbers];
+  for (let index = 4 - numbers.length - 1; index >= 0; index -= 1) {
+    bytes.push(Math.floor(last / 256 ** index) % 256);
+  }
+  return { family: 4, bytes };
+};
+
+/**
  * One IPv6 address, or `undefined`.
  *
  * Handles the one `::` run of zeroes and a trailing embedded IPv4 (`::ffff:203.0.113.9`),
@@ -620,6 +665,24 @@ export const normaliseScopeEntry = (input: {
     // An address is stored in its canonical spelling for the reason a CIDR is: one thing,
     // one row. `2001:db8::0001` and `2001:db8::1` are the same address.
     return renderAddress(address);
+  }
+
+  /*
+   * A host whose last label is a number is not a name, and `new URL()` does not read it as
+   * one: `127.1`, `0x7f.0.0.1`, `0177.0.0.1`, `127.0.0.01` and `2130706433` are all
+   * 127.0.0.1 to it, and `acme.123` is no host at all. Stored as typed, such an entry would
+   * be a name no subject is ever spelled as, so an out-of-scope entry written that way
+   * would exclude nothing. Refused, naming the dotted address when there is one.
+   */
+  if (endsInNumber(host)) {
+    const read = parseLenientIpv4(host);
+    return {
+      _tag: "refused",
+      detail:
+        read === undefined
+          ? `'${raw}' ends in a number, so it is not a name, and it is not an address either; write an address as four decimal parts, like 127.0.0.1`
+          : `'${raw}' is read by browsers and HTTP clients as the address ${renderAddress(read)}; write the dotted address (${renderAddress(read)}) instead, so the entry matches what is requested`,
+    };
   }
 
   if (!host.includes(".")) {

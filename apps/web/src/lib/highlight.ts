@@ -245,6 +245,12 @@ export const createWorkerTokenise = (
     tries: number;
     id: number;
   }
+  /*
+   * V2(chat): each hostile fence still costs up to its ~1 s budget and the fences after it
+   * wait (ten crafted blocks delayed the next by ~11 s; the page never freezes and every
+   * fence stays readable as plain code). Proper V2: send small blocks first or give a reply
+   * a total budget so a hostile block cannot hold up the fences after it.
+   */
   const queue: Job[] = [];
   let worker: HighlightWorker | undefined;
   let current: Job | undefined;

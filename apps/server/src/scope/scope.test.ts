@@ -1103,3 +1103,82 @@ describe("a pasted URL names the host new URL() names", () => {
     );
   });
 });
+
+describe("a host that ends in a number is an address or nothing, as new URL() reads it", () => {
+  const refusal = (kind: ScopeKind, raw: string): string | undefined => {
+    const result = normaliseScopeEntry({ kind, value: raw });
+    return isScopeValueRefusal(result) ? result.detail : undefined;
+  };
+  // Every one of these is 127.0.0.1 to new URL(), and was stored as a name that no
+  // subject is ever spelled as — so an out-of-scope entry typed this way excluded nothing.
+  const loopback = [
+    "127.1",
+    "127.0.1",
+    "0x7f.0.0.1",
+    "0X7F.0.0.1",
+    "0177.0.0.1",
+    "127.0.0.01",
+    "127.000.0.1",
+    "2130706433",
+    "0x7f000001",
+    "http://127.1/",
+    "https://0x7f.0.0.1:8443/admin",
+  ];
+  for (const raw of loopback) {
+    test(`'${raw}' is refused, naming 127.0.0.1`, () => {
+      const url = /^[a-z]+:\/\//iu.test(raw) ? raw : `http://${raw}/`;
+      expect(new URL(url).hostname).toBe("127.0.0.1");
+      for (const kind of ["host", "subtree"] as const) {
+        const detail = refusal(kind, raw);
+        expect(detail).toContain(
+          "read by browsers and HTTP clients as the address 127.0.0.1",
+        );
+        expect(detail).toContain("write the dotted address (127.0.0.1)");
+      }
+    });
+  }
+
+  // new URL() refuses these outright: a last label that is a number makes the whole host an
+  // address, and these are not one.
+  const neither = [
+    "acme.123",
+    "acme.0x1",
+    "acme.09",
+    "1.2.3.256",
+    "1.2.3.4.5",
+    "08.0.0.1",
+  ];
+  for (const raw of neither) {
+    test(`'${raw}' is refused as neither name nor address`, () => {
+      expect(() => new URL(`http://${raw}/`)).toThrow();
+      expect(refusal("host", raw)).toContain(
+        "ends in a number, so it is not a name, and it is not an address either",
+      );
+    });
+  }
+
+  test("the dotted address, and names that only contain digits, are still accepted", () => {
+    const accepted: ReadonlyArray<readonly [string, string]> = [
+      ["127.0.0.1", "127.0.0.1"],
+      ["http://10.0.0.1./", "10.0.0.1"],
+      ["1e3.com", "1e3.com"],
+      ["acme.com.1a", "acme.com.1a"],
+      ["123.acme.com", "123.acme.com"],
+    ];
+    for (const [raw, host] of accepted) {
+      const url = raw.startsWith("http://") ? raw : `http://${raw}/`;
+      expect(new URL(url).hostname).toBe(host);
+      expect(normaliseScopeEntry({ kind: "host", value: raw })).toBe(host);
+    }
+  });
+
+  test("a subject spelled that way is never in scope: no entry can be a name like it", () => {
+    // A subject is read through the same normaliser, and `127.1` stays a name there. With
+    // its kind of entry refused, no name entry can cover it, so the verdict falls to the
+    // default — out — rather than borrowing an in-scope block it does not spell.
+    const entries = [entry("in", "cidr", "127.0.0.0/8")];
+    expect(stateOf(entries, "127.0.0.1")).toBe("in");
+    expect(stateOf(entries, normaliseHost("127.1"))).toBe("out");
+    expect(stateOf(entries, normaliseHost("0x7f.0.0.1"))).toBe("out");
+  });
+});
