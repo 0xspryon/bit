@@ -170,7 +170,11 @@ away; reasoning collapses to one truncated line (markdown); turn footer
 **U5 — Live streaming in the thread (S), F6 + U4 → U5.** Apply partial updates by item id,
 "writing…" indicator, markdown over partial text with unclosed fences handled.
 
-**U6 — D3 Stop pill and Send now (S), F5 + U4 → U6.**
+**U6 — D3 Stop pill and Send now (S), F5 + U4 → U6.** Show Stop whenever the **server** says the
+conversation is running (`sessionStatus` / the live stream), not only while a message the
+operator sent is unanswered — today the web decides from accepted messages
+(`importerSessions.svelte.ts:~192`), so a turn the CLI starts itself (a background task's
+notification turn) cannot be stopped from the browser (F5 R4 review).
 
 **U7 — D7 agent chip (S), F1 → U7.** Chip and list from the registry ("only agent", what
 it can write); locked once the conversation has started. Today the chip is hardcoded text "Importer"
