@@ -12,15 +12,24 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import type { LiveItem } from "@bit/contracts";
 
-import ChatItem from "../../src/lib/components/ChatItem.svelte";
-import { SUBAGENT_NOTE } from "../../src/lib/chat";
+import { compile } from "svelte/compiler";
 
-import { mountInto, type Mounted } from "./dom";
+import { App } from "../../src/lib/app.svelte";
+import ChatItem from "../../src/lib/components/ChatItem.svelte";
+import LiveTranscript from "../../src/lib/components/LiveTranscript.svelte";
+import { SUBAGENT_NOTE } from "../../src/lib/chat";
+import { FakeCountdown } from "../fakeCountdown";
+import { FakeServer } from "../fakeServer";
+
+import { mountInto, settle, type Mounted } from "./dom";
 
 let mounted: Mounted[] = [];
+let sheet: HTMLStyleElement | undefined;
 afterEach(() => {
   for (const each of mounted) each.destroy();
   mounted = [];
+  sheet?.remove();
+  sheet = undefined;
 });
 
 const entry = (over: Partial<LiveItem> = {}): LiveItem => ({
@@ -111,5 +120,90 @@ describe("a sub-agent's entry", () => {
     );
     expect(ledger.querySelector(".body")?.textContent).toBe("Say PONG");
     expect(ledger.textContent).toContain(SUBAGENT_NOTE);
+  });
+
+  /*
+   * U14's review: an RLO in the type moved the status chip in front of it, and one in the
+   * task drew the sentence backwards. Every bidi control in a word with no right-to-left
+   * letter is marked, as prose marks one (`proseRuns`), and both are their own isolate.
+   */
+  test("a bidi control in its type or task is a marker, in both readings, and each is an isolate", async () => {
+    const item = entry({
+      headline: "\u202Eesoprup-lareneg",
+      body: "Fetch \u2067com\u200F.\u200Facme\u2069 and \u202Bwrite\u202C it",
+    });
+    const type = "⟨U+202E⟩esoprup-lareneg";
+    const task =
+      "Fetch ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ and ⟨U+202B⟩write⟨U+202C⟩ it";
+    const row = draw(item);
+    expect(row.querySelector(".agent-type")?.textContent).toBe(type);
+    expect(row.querySelector(".task")?.textContent).toBe(task);
+    expect(row.querySelectorAll(".char-escape")).toHaveLength(7);
+    const ledger = draw(item, false);
+    expect(ledger.querySelector(".headline")?.textContent).toBe(type);
+    expect(ledger.querySelector(".body")?.textContent).toBe(task);
+    expect(ledger.textContent).not.toMatch(/[\u200F\u202B-\u202E\u2067\u2069]/);
+
+    // Right-to-left words keep the controls they are written with.
+    const hebrew = draw(entry({ body: "בדוק \u2067את האתר\u2069 בבקשה" }));
+    expect(hebrew.querySelector(".task")?.textContent).toBe(
+      "בדוק \u2067את האתר\u2069 בבקשה",
+    );
+
+    const path = new URL(
+      "../../src/lib/components/ChatItem.svelte",
+      import.meta.url,
+    ).pathname;
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+    expect(
+      [".agent-type", ".task"].map(
+        (selector) =>
+          getComputedStyle(row.querySelector(selector) ?? row).unicodeBidi,
+      ),
+    ).toEqual(["isolate", "isolate"]);
+  });
+});
+
+describe("the target's Live panel", () => {
+  test("draws each sub-agent as one row, at where it started, in its newest state", async () => {
+    const app = new App(new FakeServer(), new FakeCountdown());
+    app.viewTargetId = "acme-corp";
+    app.liveTargetId = "acme-corp";
+    app.liveExpanded = true;
+    const reply = (id: string, body: string): LiveItem => ({
+      ...entry({ id, body }),
+      kind: "turn.reply",
+      headline: "reply",
+      tool: null,
+      toolName: null,
+      callId: null,
+      outcome: null,
+    });
+    app.liveItems = [
+      entry({ id: "activity:1" }),
+      reply("activity:2", "Started it."),
+      entry({ id: "activity:3", callId: "toolu_other", body: "Say PING" }),
+      entry({ id: "activity:4", outcome: "finished" }),
+    ];
+    const panel = mountInto(LiveTranscript, { app });
+    mounted.push(panel);
+    await settle();
+    const rows = [...panel.target.querySelectorAll(".items > li")].map(
+      (row) =>
+        `${row.querySelector(".kind")?.textContent ?? ""} ${row.querySelector(".body")?.textContent ?? ""} ${[...row.querySelectorAll(".outcome")].map((chip) => chip.textContent?.trim()).join(",")}`,
+    );
+    expect(rows).toEqual([
+      "Sub-agent Say PONG finished",
+      "Reply Started it. ",
+      "Sub-agent Say PING running",
+    ]);
   });
 });

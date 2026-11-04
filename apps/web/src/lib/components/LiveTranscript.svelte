@@ -37,7 +37,7 @@
   import ChatItem from "./ChatItem.svelte";
   import ScenarioBar from "./ScenarioBar.svelte";
   import { IconAngleDown, IconAngleUp, IconBlocked } from "../icons";
-  import { kindLabel } from "../chat";
+  import { foldSubagents, kindLabel } from "../chat";
   import type { App } from "../app.svelte";
   import { atBottom } from "../scroll";
 
@@ -45,11 +45,18 @@
 
   /** Whether the live state is about the target on screen. Nothing else is shown if not. */
   let about = $derived(app.liveTargetId === app.viewTargetId);
-  let items = $derived(about ? app.liveItems : []);
+  /** Everything that arrived for the target on screen, in arrival order. */
+  let arrived = $derived(about ? app.liveItems : []);
+  /**
+   * The rows: what arrived, each sub-agent as **one** row at the place it started, carrying
+   * its newest state (A6 U14) — as the chat draws it, rather than a `running` row and a
+   * `finished` row for the same sub-agent.
+   */
+  let items = $derived(foldSubagents(arrived));
   let records = $derived(
     items.filter((item) => item.origin === "record").length,
   );
-  let newest = $derived(items.at(-1));
+  let newest = $derived(arrived.at(-1));
   /** Whether the ⓘ explanation is open. */
   let explaining = $state(false);
 
@@ -159,10 +166,11 @@
    * never catch the arrival that should have resumed following.
    */
   $effect(() => {
-    const arrived = items.length;
+    // Every arrival, a sub-agent's new state included, though it adds no row.
+    const count = arrived.length;
     // Read unconditionally too: opening the dock has to land at the newest item.
     const expanded = app.liveExpanded;
-    if (arrived === 0 || !expanded || list === undefined || !pinned) return;
+    if (count === 0 || !expanded || list === undefined || !pinned) return;
     list.scrollTop = list.scrollHeight;
   });
 </script>

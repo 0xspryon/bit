@@ -647,13 +647,69 @@ describe("characters that do not show as what they are", () => {
     const sentences = [
       "النطاق يشمل admin.acme.com فقط.",
       "התחום כולל את admin.acme.com בלבד.",
-      "Scope \u2067النطاق\u2069 then \u200Fעברית\u200E and \u202Bembedded\u202C, a\u200Db.",
+      "Scope \u2067النطاق\u2069 then \u200Fעברית\u200E and \u202Bמוטבע\u202C, a\u200Db.",
+      "ܫܠܡܐ\u200F ހެލޯ\u061C ߊߛ\u2068 and \u2067עברית ועוד\u2069.",
     ];
     const root = render(sentences.join("\n\n"));
     expect(
       [...root.querySelectorAll("p")].map((each) => each.textContent),
     ).toEqual(sentences);
     expect(root.querySelectorAll(".char-escape")).toHaveLength(0);
+  });
+
+  /*
+   * The cases a review measured in Chrome, in a left-to-right paragraph (U14's review): each
+   * drew a host or a sentence in an order other than the one stored. Every bidi control in a
+   * word with no right-to-left letter is a marker now, so each reads as stored.
+   */
+  test("in prose, an isolate and marks inside a link are markers, and the link reads as stored", () => {
+    // RLI com RLM . RLM acme PDI, stored `com.acme`, drew as `acme.com`.
+    const root = render(
+      "Open [\u2067com\u200F.\u200Facme\u2069](https://com.acme) now.",
+    );
+    expect(root.querySelector("a")?.textContent).toBe(
+      "⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩",
+    );
+    expect(root.textContent).not.toMatch(/[\u200F\u2067\u2069]/);
+  });
+
+  test("in prose, an embedding and marks inside a link are markers", () => {
+    const root = render(
+      "Open [\u202Bcom\u200F.\u200Facme\u202C](https://com.acme) now.",
+    );
+    expect(root.querySelector("a")?.textContent).toBe(
+      "⟨U+202B⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+202C⟩",
+    );
+    expect(root.textContent).not.toMatch(/[\u200F\u202B\u202C]/);
+  });
+
+  test("in prose, marks between the words of an isolated sentence are markers", () => {
+    // RLI out RLM ␠ RLM of scope is RLM ␠ RLM acme.com PDI drew its words reordered.
+    const root = render(
+      "Note: [\u2067out\u200F \u200Fof scope is\u200F \u200Facme.com\u2069](https://acme.com).",
+    );
+    expect(root.querySelector("a")?.textContent).toBe(
+      "⟨U+2067⟩out⟨U+200F⟩ ⟨U+200F⟩of scope is⟨U+200F⟩ ⟨U+200F⟩acme.com⟨U+2069⟩",
+    );
+    expect(root.querySelectorAll("a .char-escape")).toHaveLength(6);
+  });
+
+  test("in prose, a mark between an address's octets is a marker, with no isolate", () => {
+    const root = render(
+      "Host 10.\u200F0.\u061C0.\u200E1 and [1.\u200F2.3.4](http://1.2.3.4) are in scope.",
+    );
+    expect(root.querySelector("p")?.textContent).toBe(
+      "Host 10.⟨U+200F⟩0.⟨U+061C⟩0.⟨U+200E⟩1 and 1.⟨U+200F⟩2.3.4 are in scope.",
+    );
+  });
+
+  test("in a right-to-left sentence, a control in a word with no right-to-left letter is still a marker", () => {
+    const root = render(
+      "התחום כולל את \u2067com\u200F.\u200Facme\u2069 בלבד\u200F.",
+    );
+    expect(root.querySelector("p")?.textContent).toBe(
+      "התחום כולל את ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ בלבד\u200F.",
+    );
   });
 
   test("Copy gives back a five-digit tag character and an Arabic letter mark as written", async () => {

@@ -129,7 +129,7 @@ const htmlAsText: NonNullable<RemarkRehypeOptions["handlers"]>["html"] = (
  *   `aria-describedby` goes with them, since all it named was a footnote heading's `id`.
  */
 const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
-  if (!isElement(node)) return revealOverrides(node);
+  if (!isElement(node)) return markProse(node);
   delete node.properties["id"];
   delete node.properties["ariaDescribedBy"];
   if (node.tagName === "img") {
@@ -141,7 +141,7 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
         : typeof src === "string"
           ? src
           : "image";
-    const text = revealOverrides({ type: "text", value: label });
+    const text = markProse({ type: "text", value: label });
     return typeof src === "string" && !inLink && !src.startsWith("#")
       ? [
           element(
@@ -186,9 +186,9 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
  * U+FEFF) or a tag character (U+E0000–E007F, five hex digits) puts a character into a host
  * the eye cannot see. A variation selector is not here: U+FE0F is how `❤️` is written, and
  * marking it would mark every emoji. In code, and in a fence's name, the exact characters are the
- * point, so each is replaced by its code point. Prose is left alone but for the two
- * overrides ({@link OVERRIDE}): there, the rest are how right-to-left text and joined
- * scripts are written.
+ * point, so each is replaced by its code point. Prose marks only the bidi controls, and
+ * only where no right-to-left letter needs them ({@link BIDI}): there, the rest are how
+ * right-to-left text and joined scripts are written.
  *
  * The marker is a text node in an element with a constant class, built here after the
  * sanitiser like the rest of the frame. The sanitiser lets no `class` through from the
@@ -222,19 +222,77 @@ const marking =
 const reveal = marking(HIDDEN);
 
 /**
- * The two characters marked in prose too: U+202D and U+202E, the left-to-right and
- * right-to-left **overrides**. Every other bidi control only says which way a run of text
- * goes, and right-to-left words already carry that themselves; an override instead forces
- * every letter after it to be drawn backwards, whatever script it is in. In a sentence, one
- * before a link makes `www.moc.emca.ni` read as `in.acme.com.www` while it opens the `.ni`
- * host, and one before a plain hostname does the same to the name the operator copies by
- * eye. Arabic and Hebrew are written without them, so marking them leaves real
- * right-to-left prose as it was — which is why the embeddings, isolates, marks and
- * zero-width characters stay unmarked here.
+ * The bidi controls marked in prose: U+061C, U+200E/U+200F (the marks), U+202A–U+202E (the
+ * embeddings and overrides) and U+2066–U+2069 (the isolates).
+ *
+ * Each one moves the letters around it on screen and not in the text. A review measured it
+ * in Chrome, inside a link in a left-to-right paragraph: `com` RLM `.` RLM `acme` in an RLI
+ * isolate (stored `com.acme`) reads as `acme.com`, and so does the same in an RLE embedding;
+ * marks between the words of a sentence in an isolate put the words in another order; and
+ * an IP address with an RLM or ALM between its octets reads out of order with no isolate at
+ * all. So an override, which forces every letter after it backwards whatever its script, is
+ * marked wherever it is, and every other control is marked in any word that holds **no
+ * right-to-left letter** ({@link RTL_LETTER}).
+ *
+ * A word is a whitespace-delimited run of one text node. Right-to-left prose is written
+ * with these characters — a mark beside a Hebrew word to keep the punctuation on its side,
+ * an isolate round an Arabic phrase quoted in English — and in a word that has a Hebrew or
+ * Arabic letter they stay, so that prose reads as it was written. A word with none, a
+ * hostname, an address, an English word, has nothing in it for a control to set right, so
+ * a control in it can only be reordering what the operator reads.
  */
+const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
 const OVERRIDE = /[\u202D\u202E]/u;
-const revealOverrides = marking(OVERRIDE);
-/** The same, as plain text, for an attribute: an `aria-label` cannot hold a span. */
+/** A letter of a right-to-left script: Hebrew, Arabic, Syriac, Thaana or N'Ko. */
+const RTL_LETTER =
+  /(?=\p{L})[\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Syriac}\p{Script=Thaana}\p{Script=Nko}]/u;
+
+/** A run of prose as drawn: its words, or one marked character as its code point. */
+export interface ProseRun {
+  readonly text: string;
+  /** Whether `text` is a hidden character written out (`⟨U+202E⟩`), to draw as a marker. */
+  readonly escape: boolean;
+}
+
+/**
+ * Plain text as prose draws it, the bidi controls {@link BIDI} names marked as their code
+ * points and everything else as it was. The one rule for prose: {@link rewrite} draws an
+ * agent's markdown with it, and `ChatItem` a sub-agent's type and task, which are plain
+ * text and never markdown.
+ */
+export const proseRuns = (text: string): readonly ProseRun[] => {
+  const runs: ProseRun[] = [];
+  let plain = "";
+  for (const word of text.split(/(\s+)/u)) {
+    const hidden = RTL_LETTER.test(word) ? OVERRIDE : BIDI;
+    for (const char of word) {
+      if (!hidden.test(char)) {
+        plain += char;
+        continue;
+      }
+      if (plain !== "") runs.push({ text: plain, escape: false });
+      plain = "";
+      runs.push({ text: hiddenName(char), escape: true });
+    }
+  }
+  if (plain !== "") runs.push({ text: plain, escape: false });
+  return runs;
+};
+
+/** {@link proseRuns} on a text node, as text nodes and `.char-escape` spans. */
+const markProse = (node: ElementContent): ElementContent[] => {
+  if (node.type !== "text") return [node];
+  const runs = proseRuns(node.value);
+  if (!runs.some((run) => run.escape)) return [node];
+  return runs.map((run): ElementContent =>
+    run.escape
+      ? element("span", { className: ["char-escape"] }, [
+          { type: "text", value: run.text },
+        ])
+      : { type: "text", value: run.text },
+  );
+};
+/** {@link reveal}, as plain text, for an attribute: an `aria-label` cannot hold a span. */
 const revealText = (text: string): string =>
   text.replace(new RegExp(HIDDEN.source, "gu"), hiddenName);
 
@@ -456,11 +514,7 @@ const finish = () => (tree: Root, file: { readonly value: unknown }) => {
   );
   if (blank(tree)) {
     tree.children = [
-      element(
-        "p",
-        {},
-        revealOverrides({ type: "text", value: String(file.value) }),
-      ),
+      element("p", {}, markProse({ type: "text", value: String(file.value) })),
     ];
   }
 };

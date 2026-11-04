@@ -52,6 +52,7 @@
     resultLine,
     type WriteState,
   } from "../chat";
+  import { proseRuns } from "../markdown";
   import Markdown from "./Markdown.svelte";
   import StreamCursor from "./StreamCursor.svelte";
 
@@ -145,6 +146,17 @@
   );
 </script>
 
+<!--
+  A sub-agent's type or task: the calling agent's words, plain text, with every bidi control
+  marked as `Markdown` marks one in prose (`proseRuns`), so a right-to-left override in its
+  type cannot move the status chip, nor one in its task reverse the sentence (U14's review).
+-->
+{#snippet agentText(
+  text: string,
+)}{#each proseRuns(text) as run, index (index)}{#if run.escape}<span
+        class="char-escape">{run.text}</span
+      >{:else}{run.text}{/if}{/each}{/snippet}
+
 {#if narrated}
   <!--
     The transcript reading of a row, for a chat that is a page (A6 D3/D4): the agent's own
@@ -188,7 +200,7 @@
       <span class="visually-hidden">{item.origin}</span>
       <div class="sig mono">
         <span class="what">{kindLabel(item.kind)}</span>
-        <span class="agent-type">{item.headline}</span>
+        <span class="agent-type">{@render agentText(item.headline)}</span>
         <span
           class="chip"
           data-tint={outcomeTint(item.outcome ?? "running")}
@@ -198,7 +210,7 @@
         </span>
       </div>
       {#if item.body !== ""}
-        <div class="ret task">{item.body}</div>
+        <div class="ret task">{@render agentText(item.body)}</div>
       {/if}
       <p class="state-note">{SUBAGENT_NOTE}</p>
     </li>
@@ -339,7 +351,11 @@
           call {proposedBy.callId}
         </span>
       {/if}
-      <span class="headline">{item.headline}</span>
+      <span class="headline"
+        >{#if item.kind === SUBAGENT_KIND}{@render agentText(
+            item.headline,
+          )}{:else}{item.headline}{/if}</span
+      >
       {#if write !== null}
         <span
           class="chip outcome"
@@ -374,6 +390,8 @@
           did is the reply or the tool call beside this.
         </p>
       </details>
+    {:else if item.body !== "" && item.kind === SUBAGENT_KIND}
+      <p class="body">{@render agentText(item.body)}</p>
     {:else if item.body !== ""}
       <p class="body">{item.body}</p>
     {:else if summary !== null}
@@ -726,14 +744,32 @@
    * where a call's line is mono. Its note sits under it, as a write's state note does.
    */
   .subagent .task {
+    unicode-bidi: isolate;
     color: var(--text-base);
     font: 400 13px/20px var(--font-sans);
     overflow-wrap: anywhere;
   }
   .subagent .agent-type {
+    unicode-bidi: isolate;
     margin-right: 6px;
     color: var(--text-base);
     overflow-wrap: anywhere;
+  }
+  /*
+   * A bidi control in a sub-agent's type or task, written out as its code point: drawn as
+   * `Markdown.svelte` draws one, a note about the text rather than part of it.
+   */
+  .char-escape {
+    margin: 0 1px;
+    padding: 0 2px;
+    border: 1px solid var(--border-muted);
+    border-radius: 3px;
+    color: var(--text-faint);
+    font-size: 0.85em;
+    font-style: normal;
+    letter-spacing: normal;
+    text-transform: none;
+    white-space: nowrap;
   }
   .subagent .state-note {
     margin: 2px 0 0;

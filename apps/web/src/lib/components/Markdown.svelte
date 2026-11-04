@@ -489,8 +489,8 @@
     text-align: right;
   }
   /*
-   * A bidi, zero-width or tag character in code, or a bidi override in prose, written out
-   * as its code point (`reveal` and `revealOverrides` in `markdown.ts`): smaller, faint and boxed, so it reads as a note about the text rather
+   * A bidi, zero-width or tag character in code, or a bidi control in prose, written out
+   * as its code point (`reveal` and `proseRuns` in `markdown.ts`): smaller, faint and boxed, so it reads as a note about the text rather
    * than as part of it.
    */
   .markdown :global(.char-escape) {

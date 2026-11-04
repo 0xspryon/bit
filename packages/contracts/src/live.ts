@@ -344,7 +344,9 @@ export const LIVE_ITEM_KINDS = [
    * - `tool` / `toolName`: the calling tool as the harness named it; `callId` as above.
    *
    * A sub-agent's own words — its final report, a background one's completion notice —
-   * are never on an item.
+   * are never on an item: not on this one, and not on the `turn.other` note (`task`) a
+   * Claude Code replay draws for a notification whose call it does not hold (launched
+   * before a compaction), which carries the notification's summary or status alone.
    */
   "subagent",
   "action.denied",

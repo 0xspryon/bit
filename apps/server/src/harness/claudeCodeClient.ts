@@ -1270,22 +1270,39 @@ const subagentState = (
 });
 
 /**
- * A sub-agent call's result as its state: `finished`, or `failed` when the result is an
- * error — and **nothing** for a background launch's placeholder, since that sub-agent is
- * still running and its notification will say when it ends. The result's text is never
- * carried: a foreground result is the sub-agent's own final report.
+ * How the CLI words a tool call a Stop cut short: the call's `tool_result` is an error whose
+ * text opens with this, followed by a `[Request interrupted by user for tool use]` entry.
+ * Measured on 2.1.310 with a Stop during a foreground `Agent` (U14's review): the result was
+ * `is_error: true`, `The user doesn't want to proceed with this tool use. The tool use was
+ * rejected …`. The same words are stored, so a replay reads them too.
+ */
+const REJECTED_TOOL_USE = "The user doesn't want to proceed with this tool use";
+
+/**
+ * A sub-agent call's result as its state: `finished`; `stopped` when the result is an error
+ * a Stop caused — the CLI's {@link REJECTED_TOOL_USE} words, or, live, any error while this
+ * session's turn is being interrupted; `failed` for any other error — and **nothing** for a
+ * background launch's placeholder, since that sub-agent is still running and its
+ * notification will say when it ends. The result's text is never carried: a foreground
+ * result is the sub-agent's own final report.
  */
 const subagentResult = (
   callId: string,
   call: SubagentCall,
   text: string,
   failed: boolean,
+  interrupted: boolean,
 ): MessagePart[] => {
   if (!failed && text.trimStart().startsWith(ASYNC_LAUNCH)) {
     call.background = true;
   }
   if (call.background) return [];
-  return [subagentState(callId, call, failed ? "failed" : "finished")];
+  const status: SubagentStatus = !failed
+    ? "finished"
+    : interrupted || text.trimStart().startsWith(REJECTED_TOOL_USE)
+      ? "stopped"
+      : "failed";
+  return [subagentState(callId, call, status)];
 };
 
 /**
@@ -1340,6 +1357,19 @@ const storedNotification = (
   return toolUseId === undefined || status === undefined
     ? undefined
     : { toolUseId: toolUseId.trim(), status: status.trim() };
+};
+
+/**
+ * A stored task notification as one line: its `<summary>` (`Agent "Say PING later"
+ * completed`, `Background command "…" completed (exit code 0)`), else `Task <status>`, else
+ * a constant. Never the notification's other text: an agent's carries the sub-agent's
+ * final report in `<result>`.
+ */
+const notificationLine = (text: string): string => {
+  const summary = /<summary>([^<]*)<\/summary>/.exec(text)?.[1]?.trim();
+  if (summary !== undefined && summary !== "") return summary;
+  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1]?.trim();
+  return status === undefined ? "Task notification" : `Task ${status}`;
 };
 
 /** The model an `assistant` message names (`message.model`), or `undefined`. */
@@ -1429,11 +1459,14 @@ const assistantParts = (
  * A `user` message's `tool_result` blocks (`{ tool_use_id, content, is_error }`) as
  * `toolResult` parts. A tool's output comes back as a *user* message because that is how
  * the Messages API carries it. Shared by the stream and the transcript, as
- * {@link assistantParts} is.
+ * {@link assistantParts} is. `interrupted` is the live session's own knowledge that its
+ * operator pressed Stop ({@link SessionRecord.interrupted}); a replay has none and passes
+ * `false`.
  */
 const userParts = (
   blocks: readonly unknown[],
   subagents: SubagentCalls,
+  interrupted: boolean,
 ): MessagePart[] =>
   blocks.flatMap((block): MessagePart[] => {
     const record = (block ?? {}) as {
@@ -1452,6 +1485,7 @@ const userParts = (
         call,
         resultText(record.content),
         record.is_error === true,
+        interrupted,
       );
     }
     return record.type === "tool_result" &&
@@ -1480,7 +1514,7 @@ const narrate = (
    */
   session: Pick<
     SessionRecord,
-    "contextLimit" | "lastCallId" | "streamed" | "subagents"
+    "contextLimit" | "lastCallId" | "streamed" | "subagents" | "interrupted"
   >,
 ): readonly HarnessNarration[] => {
   const at = Date.now();
@@ -1577,7 +1611,7 @@ const narrate = (
       ),
     );
   } else if (message.type === "user") {
-    details.push(...userParts(blocks, session.subagents));
+    details.push(...userParts(blocks, session.subagents, session.interrupted));
   }
 
   /*
@@ -1800,8 +1834,7 @@ const flattenTranscript = (
      * A background sub-agent's notification (A6 U14): its end, as the sub-agent's state,
      * and not its words, which carry the sub-agent's own result. Live, the same end comes
      * from the `task_notification` frame and the stored note is never narrated, so the
-     * replay drops it too. A notification about anything else — a `Bash` task — is the
-     * `task` note it was.
+     * replay drops it too. A notification about anything else is a `task` note, below.
      */
     const notified = marker === "task" ? storedNotification(text) : undefined;
     if (notified !== undefined && subagents.has(notified.toolUseId)) {
@@ -1811,6 +1844,24 @@ const flattenTranscript = (
         marker: "task",
         error: undefined,
         parts: subagentNotified(subagents, notified.toolUseId, notified.status),
+        model: undefined,
+        at: Number.isFinite(at) ? at : undefined,
+      };
+    }
+    /*
+     * Any other task notification — a `Bash` task's, or a sub-agent's whose call this read
+     * does not hold (it was launched before a compaction) — is a `task` note, drawn as its
+     * `<summary>`, or its `<status>` when it has none, and **never** its `<result>`: an
+     * agent's notification carries the sub-agent's own final report there, and drawn under
+     * `task` it would be a sub-agent's words in the caller's chat.
+     */
+    if (marker === "task") {
+      return {
+        type: entry.type,
+        text: notificationLine(text),
+        marker,
+        error: undefined,
+        parts: [],
         model: undefined,
         at: Number.isFinite(at) ? at : undefined,
       };
@@ -1850,7 +1901,7 @@ const flattenTranscript = (
               subagents,
             )
           : entry.type === "user"
-            ? userParts(blocks, subagents)
+            ? userParts(blocks, subagents, false)
             : [],
       model: entry.type === "assistant" ? modelOfMessage(message) : undefined,
       at: Number.isFinite(at) ? at : undefined,
