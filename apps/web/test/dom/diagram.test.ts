@@ -187,7 +187,7 @@ describe("a flow figure's frame", () => {
     ).toBe("Copy portal⟨U+202E⟩.mmd");
   });
 
-  test("is at most 640px tall, and scrolls inside its frame past that", async () => {
+  test("is at most 640px tall, scrolls inside its frame past that, and a wide one sideways at its own size", async () => {
     // A 3,000-node chain drew 288,064px tall (U12 review). happy-dom has no layout, so the
     // rule is read from the component's own compiled style; the browser check measures it.
     const path = new URL(
@@ -210,6 +210,17 @@ describe("a flow figure's frame", () => {
       expect(`${style.maxHeight} ${style.overflow} ${style.alignItems}`).toBe(
         "640px auto flex-start",
       );
+      /*
+       * A wide figure scrolls at its own size rather than shrinking to the frame, and is
+       * centred by auto margins, which a scroller can reach past, not by the box.
+       */
+      expect(style.justifyContent).toBe("flex-start");
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      root.querySelector(".diagram")?.append(svg);
+      const figure = getComputedStyle(svg);
+      expect(
+        `${figure.maxWidth} ${figure.flexShrink} ${figure.marginLeft} ${figure.marginRight}`,
+      ).toBe("none 0 auto auto");
     } finally {
       sheet.remove();
     }
@@ -254,6 +265,8 @@ describe("a reply with a mermaid fence", () => {
       links: false,
       images: false,
       zoom: false,
+      // pele's own `max-width: 100%` on the SVG would shrink a wide figure to the frame.
+      responsive: false,
     });
     expect(typeof peleCalls[0]?.options["sanitize"]).toBe("function");
     expect(root.querySelector(".diagram figure")?.textContent).toBe(

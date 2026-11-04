@@ -230,23 +230,8 @@ export interface ScopeSubject {
  * matching everything.
  */
 export const normaliseHost = (raw: string): string => {
-  let text = raw.trim().toLowerCase();
+  let text = authorityOf(raw.trim().toLowerCase());
   if (text === "") return "";
-
-  // A scheme, if present. Everything up to and including `://` is not the host.
-  const scheme = text.indexOf("://");
-  if (scheme !== -1) text = text.slice(scheme + 3);
-
-  // Userinfo, if present. `new URL().hostname` never yields it, but an operator pasting
-  // a URL from a browser bar can, and no host contains an `@`.
-  const at = text.lastIndexOf("@");
-  if (at !== -1) text = text.slice(at + 1);
-
-  // A path, query or fragment, if present. The authority ends at the first of them.
-  for (const separator of ["/", "?", "#"]) {
-    const index = text.indexOf(separator);
-    if (index !== -1) text = text.slice(0, index);
-  }
 
   /*
    * Brackets and the port, which have to be handled together.
@@ -268,6 +253,33 @@ export const normaliseHost = (raw: string): string => {
 
   // A trailing dot is the root label, written explicitly. `acme.com.` is `acme.com`.
   return text.replace(/\.+$/, "");
+};
+
+/**
+ * What of a host, an address or a URL {@link normaliseHost} keeps before it reads brackets
+ * and a port: the text without a scheme, userinfo, path, query or fragment.
+ *
+ * Case-blind: every separator it cuts at is ASCII, and lowercasing never turns another
+ * character into one, so it cuts the same text before lowercasing as after. That is what
+ * lets {@link normaliseScopeEntry} test the kept part as the operator typed it.
+ */
+const authorityOf = (raw: string): string => {
+  let text = raw;
+  // A scheme, if present. Everything up to and including `://` is not the host.
+  const scheme = text.indexOf("://");
+  if (scheme !== -1) text = text.slice(scheme + 3);
+
+  // Userinfo, if present. `new URL().hostname` never yields it, but an operator pasting
+  // a URL from a browser bar can, and no host contains an `@`.
+  const at = text.lastIndexOf("@");
+  if (at !== -1) text = text.slice(at + 1);
+
+  // A path, query or fragment, if present. The authority ends at the first of them.
+  for (const separator of ["/", "?", "#"]) {
+    const index = text.indexOf(separator);
+    if (index !== -1) text = text.slice(0, index);
+  }
+  return text;
 };
 
 /** Why a value could not be reduced to something the matcher can use. */
@@ -423,11 +435,18 @@ const withinPrefix = (subject: Address, prefix: Prefix): boolean => {
 /* ── Entry normalisation, on write ───────────────────────────────────────────────── */
 
 /**
- * The characters a scope entry may not contain because they are not drawn: bidi controls
- * (U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+2069), zero-width ones (U+200B–U+200D,
- * U+2060, U+FEFF) and the tag characters (U+E0000–U+E007F) — the set the web app marks in
- * code. Refused with their own sentence, since "invisible" is the thing to know about them.
- * Every other character outside printable ASCII is refused by {@link NOT_ASCII} as well.
+ * The characters a scope entry is refused with their own sentence for, because they are not
+ * drawn: bidi controls (U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+2069), zero-width ones
+ * (U+200B–U+200D, U+2060, U+FEFF) and the tag characters (U+E0000–U+E007F). "Invisible" is
+ * the thing to know about them.
+ *
+ * **A subset of what the web app marks in code, on purpose.** The web's `HIDDEN`
+ * (`apps/web/src/lib/markdown.ts`) has grown past this list — the soft hyphen, the Hangul
+ * fillers, the invisible operators, the variation selectors and more — because a marker
+ * there is the only defence. Here it is not: every one of those is refused anyway by
+ * {@link NOT_ASCII}, just with the general sentence. So this list only chooses the wording,
+ * and the two need not be kept in step; what must hold is that nothing outside printable
+ * ASCII reaches a stored host, and {@link NOT_ASCII} is what holds it.
  */
 const INVISIBLE =
   /[\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/u;
@@ -441,8 +460,11 @@ const INVISIBLE =
  * `acme\u00AD.com` was listed as `acme.com` and matched as a host nobody called that. Unicode
  * has more of them than any list will hold, so a host is written in ASCII, and a name in
  * another script is typed as its punycode (`xn--…`), which is what DNS and
- * `new URL().hostname` carry anyway. The value is tested whole, a URL's path included, after
- * only ASCII blanks at either end are dropped.
+ * `new URL().hostname` carry anyway. The value is tested after only ASCII blanks at either
+ * end are dropped — the whole of a CIDR's, and of a host or subtree entry the part that is
+ * kept: its {@link authorityOf}, before it is lowercased. A pasted URL's path, query and
+ * userinfo are dropped from such an entry, so `https://acme.com/über` is stored as
+ * `acme.com`, as `https://acme.com/x` is, and is not told to type its path as punycode.
  */
 const NOT_ASCII = /[^\x21-\x7E]/u;
 
@@ -499,10 +521,12 @@ export const normaliseScopeEntry = (input: {
   /*
    * Then everything else that is not printable ASCII, on the value with only ASCII blanks
    * dropped from its ends (`trim()` would also drop a no-break space there, and the point is
-   * to name it). Named by code point and not echoed, for the reason above.
+   * to name it) — of a host or subtree entry, only the part it keeps ({@link NOT_ASCII}).
+   * Named by code point and not echoed, for the reason above.
    */
+  const blankless = input.value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/gu, "");
   const foreign = NOT_ASCII.exec(
-    input.value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/gu, ""),
+    input.kind === "cidr" ? blankless : authorityOf(blankless),
   )?.[0];
   if (foreign !== undefined) {
     return {
@@ -560,7 +584,7 @@ export const normaliseScopeEntry = (input: {
   if (stray !== undefined) {
     return {
       _tag: "refused",
-      detail: `'${raw}' contains '${stray}' (${codePoint(stray)}), which is not a character a host is written with; a host is ASCII letters, digits, '-', '.' and '_'`,
+      detail: `'${raw}' contains '${stray}' (${codePoint(stray)}), which is not a character a host is written with; a host is ASCII letters, digits, '-', '.' and '_', and ':' in an IPv6 address`,
     };
   }
   const address = parseIpAddress(host);

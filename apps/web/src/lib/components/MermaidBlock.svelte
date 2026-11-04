@@ -121,10 +121,17 @@
      * figure is the agent's, and a 3,000-node chain drew 288,064px tall (U12 review): the
      * thread is the operator's, and no one figure may take it over. Items are not stretched,
      * so a short figure keeps its own height.
+     *
+     * A wide figure scrolls sideways too, at its own size (operator's decision, U11 step 0):
+     * shrunk to the frame, a 7,117px chain drew at a tenth of its size, every label too small
+     * to read. It is centred by its own auto margins rather than by `justify-content`: a
+     * centred item wider than its box overflows on the left as well, past where a scroller
+     * can reach, while an auto margin is zero once there is no room for it, so the figure's
+     * left edge stays at the start of the scroll.
      */
     display: flex;
     align-items: flex-start;
-    justify-content: center;
+    justify-content: flex-start;
     max-height: 640px;
     overflow: auto;
     overscroll-behavior: contain;
@@ -134,8 +141,10 @@
     display: none;
   }
   .diagram :global(svg) {
-    max-width: 100%;
+    flex: none;
+    max-width: none;
     height: auto;
+    margin: 0 auto;
   }
   .diagram-error {
     padding: 10px 14px 0;

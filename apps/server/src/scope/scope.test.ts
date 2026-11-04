@@ -861,7 +861,9 @@ describe("normalising an entry on write", () => {
       ["host", "acme .com", "U+0020", "a space"],
       ["host", "acme\t.com", "U+0009", "a control character"],
       ["cidr", "203.0.113.0 /24", "U+0020", "a space"],
-      ["host", "https://acme.com/\u00E9", "U+00E9", "not ASCII"],
+      // In the host a URL names, it is still the host's character.
+      ["host", "https://acme\u00AD.com/x", "U+00AD", "not ASCII"],
+      ["subtree", "https://user@acme\u3164.com:8443/", "U+3164", "not ASCII"],
     ];
     for (const [kind, raw, point, why] of cases) {
       const result = normaliseScopeEntry({ kind, value: raw });
@@ -875,6 +877,35 @@ describe("normalising an entry on write", () => {
     }
     // Blanks around a value are still only blanks.
     expect(value("host", "  acme.com\t")).toBe("acme.com");
+  });
+
+  test("a character outside ASCII in a pasted URL's path, query or userinfo is not the host's", () => {
+    /*
+     * A host or subtree entry keeps only the host a URL names, as `https://acme.com/x` is
+     * stored as `acme.com`; telling the operator to type `/über` as punycode would be
+     * advice about a part of the value that is thrown away.
+     */
+    expect(value("host", "https://acme.com/\u00FCber")).toBe("acme.com");
+    expect(value("subtree", "https://acme.com/a b?q=\u00E9#\u00E9")).toBe(
+      "acme.com",
+    );
+    expect(value("host", "https://\u00FCser@acme.com/")).toBe("acme.com");
+    // A host that is not ASCII is still refused with the hint, path or none.
+    const result = normaliseScopeEntry({
+      kind: "host",
+      value: "https://b\u00FCcher.de/\u00FCber",
+    });
+    expect(isScopeValueRefusal(result)).toBe(true);
+    if (isScopeValueRefusal(result)) {
+      expect(result.detail).toContain("U+00FC");
+      expect(result.detail).toContain("punycode (xn--");
+    }
+    // An invisible character is refused wherever it is: it is a sign, not a typo.
+    const hidden = normaliseScopeEntry({
+      kind: "host",
+      value: "https://acme.com/\u202Ex",
+    });
+    expect(isScopeValueRefusal(hidden)).toBe(true);
   });
 
   test("an internationalised name is refused with the punycode hint, and its punycode is accepted", () => {
@@ -915,6 +946,11 @@ describe("normalising an entry on write", () => {
       "under_score.acme-corp.test",
     );
     expect(value("host", "[2001:db8::1]:8443")).toBe("2001:db8::1");
+    // The refusal names every character a host may have, the IPv6 colon included.
+    const refused = normaliseScopeEntry({ kind: "host", value: "acme!.com" });
+    if (isScopeValueRefusal(refused)) {
+      expect(refused.detail).toContain("and ':' in an IPv6 address");
+    }
   });
 
   test("a wildcard is refused rather than quietly accepted as an apex", () => {

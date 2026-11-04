@@ -105,8 +105,10 @@ const message = (error: unknown): string =>
  * Draws `source` into `into`, and returns what takes it away again. `source` has already
  * had its hidden characters written out (`diagramSource`).
  *
- * `autoDirection: false` keeps the direction the agent wrote: a wide figure scales down to
- * the thread instead of turning on its side.
+ * `autoDirection: false` keeps the direction the agent wrote: a wide figure scrolls sideways
+ * in its frame (`MermaidBlock`) instead of turning on its side. `responsive: false` keeps it
+ * at its own size: otherwise pele writes `max-width: 100%` into the SVG's own `style`, which
+ * no rule in the frame can undo, and a 14,225px chain drew at a twentieth of its size.
  */
 export const drawDiagram = (
   into: HTMLElement,
@@ -159,6 +161,7 @@ export const drawDiagram = (
       images: false,
       zoom: false,
       autoDirection: false,
+      responsive: false,
       sanitize: (svg) => sanitizeDiagramSvg(svg),
       onRender: () => events.rendered(),
       onError: (error) => events.failed(message(error)),
