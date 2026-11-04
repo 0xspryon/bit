@@ -121,6 +121,23 @@
   };
 
   /**
+   * Adds the typed entry, then gives the field back for the next one.
+   *
+   * The Add button is disabled while the call is out (`loading`), and a browser drops focus
+   * from a control that becomes disabled to `<body>` — so a click on Add left the operator
+   * nowhere, with the next entry needing a click back into the field. Focus returns only if
+   * it is still in the form or was dropped like that: an operator who has moved on to
+   * another control while the call was out keeps it.
+   */
+  const addEntry = async (form: HTMLFormElement): Promise<void> => {
+    await app.addScopeEntry();
+    const now = document.activeElement;
+    if (now === null || now === document.body || form.contains(now)) {
+      entryField?.focus();
+    }
+  };
+
+  /**
    * The entry the delete dialog is asking about, read from the entries as they are now.
    * `undefined` when no question is open, and also when the entry it named has gone.
    */
@@ -743,7 +760,7 @@
             class="add"
             onsubmit={(event) => {
               event.preventDefault();
-              void app.addScopeEntry();
+              void addEntry(event.currentTarget);
             }}
           >
             <span class="list-label">Add an entry</span>

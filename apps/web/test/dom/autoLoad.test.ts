@@ -265,6 +265,9 @@ describe("the Add bar on an empty scope, across targets", () => {
     expect(document.querySelector("form.add")).toBeNull();
 
     await toScopeOf("acme-corp");
+    // Only this harness keeps Assets mounted across the switch: the real `Target` screen
+    // remounts it (`openTarget` moves to Goals first), so "still open on return" rests on
+    // the per-target `handEntryFor` check, not on how the app navigates.
     expect(document.querySelector(field)).not.toBeNull();
   });
 });
@@ -285,6 +288,30 @@ describe("a Scope tab with entries", () => {
     await settle();
     expect(app.importerOpen).toBe(true);
     expect(document.querySelector("#importer-message")).not.toBeNull();
+  });
+
+  test("a click on Add leaves focus in the emptied field, ready for the next entry", async () => {
+    // Add is disabled while its call is out, and a browser drops focus from a control that
+    // becomes disabled to <body>: the next entry needed a click back into the field.
+    const { fake } = await openScope("acme.test");
+    const typed = document.querySelector<HTMLInputElement>(field);
+    if (typed === null) throw new Error("no Add bar beside an entry");
+    typed.focus();
+    typeIn(typed, "api.acme.test");
+    await settle();
+    const add = button("Add");
+    add.focus();
+    click(add);
+    await settle();
+
+    expect(fake.countOf("addScopeEntry")).toBe(1);
+    const after = document.querySelector<HTMLInputElement>(field);
+    if (after === null) throw new Error("adding took the Add bar away");
+    expect(after.value).toBe("");
+    // Compared as a description, never as nodes (AGENTS.md).
+    expect(document.activeElement === after ? "the field" : focused()).toBe(
+      "the field",
+    );
   });
 });
 
