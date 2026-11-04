@@ -1693,6 +1693,37 @@ const turnDrivenSdk = () => {
     push(result(sessionId, "success"));
   };
   /**
+   * A background subagent's frames, as 2.1.310 streams them after its parent turn's
+   * `result` (measured, A6 F5's fourth review): a reply and a tool result, each carrying the
+   * `Agent` call they belong to in `parent_tool_use_id`, and no `result` after them.
+   */
+  const emitSubagentFrames = (): void => {
+    push({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "toolu_sub_1", name: "Bash", input: {} },
+        ],
+      },
+      parent_tool_use_id: "toolu_agent_bg",
+      session_id: sessionId,
+      uuid: "00000000-0000-4000-8000-00000000fff3",
+    } as unknown as SDKMessage);
+    push({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "toolu_sub_1", content: "ok" },
+        ],
+      },
+      parent_tool_use_id: "toolu_agent_bg",
+      session_id: sessionId,
+      uuid: "00000000-0000-4000-8000-00000000fff4",
+    } as unknown as SDKMessage);
+  };
+  /**
    * Kills the query with an error, **in the order the pump sees it under SDK 0.3.310**:
    * `Query.readMessages` errors the message stream and calls `cleanup(e)`, which rejects
    * every pending control request at once, but the pump's iterator only throws once
@@ -1738,6 +1769,7 @@ const turnDrivenSdk = () => {
     emitResult,
     startUnrequestedTurn,
     endUnrequestedTurn,
+    emitSubagentFrames,
     failStream,
     endStream,
     pulled,
@@ -2370,6 +2402,91 @@ describe("stopping a conversation's turn (A6 F5)", () => {
       }),
     );
     expect(outcome).toEqual({ stopped: true, interrupts: 1 });
+  });
+
+  test("a background subagent's frames between turns open no turn, and Stop finds nothing to interrupt", async () => {
+    /*
+     * A6 F5's fourth review, measured on 2.1.310: an `Agent` call with
+     * `run_in_background: true` streams its frames after the parent turn's `result`, and no
+     * `result` follows them. Read as a turn, the session stayed "running" for good.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.emitSubagentFrames();
+        yield* Effect.sleep("40 millis");
+        const status = yield* harness.sessionStatus(TALK);
+        const idle = yield* Effect.result(
+          Effect.timeout(harness.waitForIdle(TALK), "200 millis"),
+        );
+        const stopped = yield* harness.interruptSession(TALK);
+        return {
+          activity: status.activity,
+          waitedIdle: idle._tag === "Success",
+          stopped,
+          interrupts: driver.seen.interrupts,
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      activity: "idle",
+      waitedIdle: true,
+      stopped: false,
+      interrupts: 0,
+    });
+  });
+
+  test("a Stop while only a background subagent's frames have arrived does not mark the next turn interrupted", async () => {
+    // The CLI sends no `result` for an interrupt that only stopped a background agent, so
+    // an `interrupted` set then was read off the operator's next, successful turn.
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.emitSubagentFrames();
+        yield* Effect.sleep("40 millis");
+        yield* harness.interruptSession(TALK);
+        yield* steer(harness, "ff");
+        yield* Effect.promise(() => driver.pulled(2));
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        return yield* harness.sessionStatus(TALK);
+      }),
+    );
+    expect(outcome.activity).toBe("idle");
+    expect(outcome.outcome).toBe("succeeded");
+  });
+
+  test("a background subagent's frames after a stopped foreground turn do not reopen it", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        const stopped = yield* harness.interruptSession(TALK);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        driver.emitSubagentFrames();
+        yield* Effect.sleep("40 millis");
+        const status = yield* harness.sessionStatus(TALK);
+        const idle = yield* Effect.result(
+          Effect.timeout(harness.waitForIdle(TALK), "200 millis"),
+        );
+        return {
+          stopped,
+          activity: status.activity,
+          outcome: status.outcome,
+          waitedIdle: idle._tag === "Success",
+        };
+      }),
+    );
+    expect(outcome).toEqual({
+      stopped: true,
+      activity: "idle",
+      outcome: "interrupted",
+      waitedIdle: true,
+    });
   });
 
   test("an interrupt the CLI will not acknowledge fails, and the query is closed", async () => {
@@ -3166,6 +3283,94 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
     );
     expect(failure.message).toContain("exited with code 3");
     expect(failure.message).toContain("Error: not logged in");
+  }, 10_000);
+
+  test("a CLI that dies on its own takes the tool it started in a session of its own with it", async () => {
+    /*
+     * A6 F5's fourth review: the tree was read only when a stop started, so a CLI that
+     * crashed or was OOM-killed had its own-session Bash tools reparented unseen, and they
+     * ran on. `kill -9 $$` is the crash: no handler runs, and nothing ends the session.
+     */
+    const scratch = await mkdtemp(join(tmpdir(), "bit-cli-crash-"));
+    const pidFile = join(scratch, "tool.pid");
+    const { sdk, seen } = spawningSdk(
+      `setsid sleep 30 & echo $! > '${pidFile}'; sleep 0.4; kill -9 $$`,
+    );
+    let tool: number | undefined;
+    try {
+      const outcome = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              yield* harness.createSession({
+                title: "conversation",
+                model: "claude-sonnet-5",
+                directory: scratch,
+                sessionId: TALK,
+                multiTurn: true,
+              });
+              yield* harness.prompt(TALK, "go");
+              return yield* Effect.promise(async () => {
+                for (
+                  let tries = 0;
+                  tries < 200 && tool === undefined;
+                  tries += 1
+                ) {
+                  const text = await readFile(pidFile, "utf8").catch(() => "");
+                  if (text.trim() !== "") tool = Number(text.trim());
+                  else await new Promise((resolve) => setTimeout(resolve, 10));
+                }
+                const leader = seen.leader;
+                if (tool === undefined || leader === undefined) {
+                  throw new Error("the stand-in CLI never started its tool");
+                }
+                const toolStarted = processIdentity(tool) !== undefined;
+                // Past the crash, then up to the stop's bounds for what it left.
+                for (let tries = 0; tries < 300; tries += 1) {
+                  if (
+                    processIdentity(leader) === undefined &&
+                    processIdentity(tool) === undefined
+                  ) {
+                    break;
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, 10));
+                }
+                return {
+                  toolStarted,
+                  leader: processIdentity(leader) !== undefined,
+                  tool: processIdentity(tool) !== undefined,
+                };
+              });
+            }),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                sdk,
+                controlTimeout: "2 seconds",
+                cliStopBounds: { terminateGrace: 300, killGrace: 500, poll: 5 },
+                cliTreeRefresh: 50,
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+      expect(outcome).toEqual({
+        toolStarted: true,
+        leader: false,
+        tool: false,
+      });
+    } finally {
+      // A tool this test failed to see stopped must not outlive it.
+      if (tool !== undefined && processIdentity(tool) !== undefined) {
+        try {
+          process.kill(tool, "SIGKILL");
+        } catch {
+          // Gone already.
+        }
+      }
+      await rm(scratch, { recursive: true, force: true });
+    }
   }, 10_000);
 
   test("a resumed opening under the same id is not ended by the earlier opening's close", async () => {

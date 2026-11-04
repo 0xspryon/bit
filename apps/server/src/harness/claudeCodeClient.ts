@@ -497,8 +497,9 @@ interface SessionRecord {
    */
   readonly unanswered: Set<string>;
   /**
-   * A turn is running on the stream: a turn-opening frame (`system/init`, a reply, a tool
-   * result) has arrived since the last `result`, which closes it. Read off the stream
+   * A turn is running on the stream: a turn-opening frame (`system/init`, a main-thread
+   * reply or tool result — never a subagent's, see `opensTurn`) has arrived since the last
+   * `result`, which closes it. Read off the stream
    * because it is the only place a turn the CLI started itself shows up. See
    * {@link unanswered}.
    */
@@ -572,6 +573,11 @@ interface SessionRecord {
   /**
    * Set by {@link interruptSession}, so the outcome is `interrupted` and not `failed`.
    * Cleared at the next `result` on a multi-turn session, whose query outlives the turn.
+   *
+   * Set only while {@link turnOpen} or {@link unanswered} says a turn is running, both of
+   * which only a `result` ends — so that `result` is always coming, and is the turn's own.
+   * A frame that opened a turn no `result` closes would let this outlive it and mark the
+   * operator's next turn interrupted (A6 F5's fourth review: a background subagent's).
    */
   interrupted: boolean;
   /** The query has been closed; nothing more will arrive. */
@@ -610,8 +616,19 @@ interface OwnedCli {
    * The CLI and everything it started, followed by pid and start time, which is what is
    * signalled to stop it: Claude Code starts each Bash tool in a session of its own, out of
    * the CLI's group (A6 F5's third review). See `trackProcessTree`.
+   *
+   * **Kept current while the CLI lives**, re-read every `cliTreeRefresh`, not only when a
+   * stop starts (A6 F5's fourth review): a tool the CLI starts in a session of its own is
+   * reparented the moment the CLI dies, and a tree read only after that — a crash, an OOM
+   * kill — could no longer find it. What the last read saw is stopped at the exit.
    */
   readonly tree: ProcessTree;
+  /**
+   * The stop under way, if one is. A second asker — `endSession` arriving while the exit
+   * handler stops what a dead CLI left — waits for it rather than starting another, so
+   * "gone when the end returns" still holds and the tree is not read twice per poll.
+   */
+  stopping: Deferred.Deferred<void> | undefined;
 }
 
 /** How much of a CLI's stderr is kept, from the end, for the failure it may explain. */
@@ -636,6 +653,11 @@ export interface ClaudeCodeHarnessOptions {
    * `endSession` reports it survived. Tests shorten it.
    */
   readonly cliStopBounds?: StopBounds;
+  /**
+   * How often, in milliseconds, a live CLI's process tree is re-read, so that what it
+   * started is known before it can be orphaned. Tests shorten it.
+   */
+  readonly cliTreeRefresh?: number;
 }
 
 const DEFAULT_CONTROL_TIMEOUT: Duration.Input = "30 seconds";
@@ -647,12 +669,25 @@ const DEFAULT_CONTROL_TIMEOUT: Duration.Input = "30 seconds";
  * and long enough for a CLI that handles `SIGTERM` to exit on its own — it does in tens of
  * milliseconds. Nothing of it can act on bit in the meantime either way: the policy gate
  * refuses an ended session's tool calls from the moment the spine ends it.
+ *
+ * Polled every 25 ms, not faster: every look reads all of procfs, a few milliseconds of
+ * blocked event loop with a few hundred processes on the machine, and a shutdown stops
+ * every CLI at once (A6 F5's fourth review). 25 ms still gives a tool started during the
+ * grace dozens of looks to be found in.
  */
 const DEFAULT_CLI_STOP_BOUNDS: StopBounds = {
   terminateGrace: 1_000,
   killGrace: 1_000,
-  poll: 10,
+  poll: 25,
 };
+
+/**
+ * A live CLI's tree is re-read once a second: one procfs read, a few milliseconds, per CLI
+ * per second. A tool started and orphaned inside the same second is the window left, and
+ * past it only a cgroup per CLI contains everything — the operator decision recorded in
+ * the A6 breakdown.
+ */
+const DEFAULT_CLI_TREE_REFRESH = 1_000;
 
 /**
  * How long `switchModel` waits, after a control request **failed** (not timed out), for
@@ -1180,20 +1215,25 @@ const userMessage = (
 
 /**
  * The frames that mean a turn is under way: the CLI opens every turn with `system/init`
- * (measured on 2.1.310, a task-notification turn included), and a reply or a tool result
- * cannot arrive outside one. Everything else the CLI says between turns — task and
- * background-task bookkeeping, rate limits, command lifecycle — is not a turn, and reading
- * it as one would leave the session "running" with nothing to wait for.
+ * (measured on 2.1.310, a task-notification turn included), and a main-thread reply or tool
+ * result cannot arrive outside one. A turn opened here is closed only by a `result`, so
+ * nothing may open one that a `result` does not follow.
+ *
+ * **Main thread only** (A6 F5's fourth review). A subagent's frames carry the `Agent` call
+ * they belong to in `parent_tool_use_id`, and one started with `run_in_background: true`
+ * streams them *after* its parent turn's `result` (measured on 2.1.310). No `result`
+ * follows those: an `interrupt()` then stops the background agent (`task_notification
+ * status=stopped`) and sends none. Read as a turn, they left the session "running" with
+ * nothing to close it, and a Stop in that window marked the operator's next turn
+ * interrupted. Everything else the CLI says between turns — task and background-task
+ * bookkeeping, rate limits, command lifecycle, partial and progress frames, which carry the
+ * same `parent_tool_use_id` and only arrive inside a turn `system/init` already opened — is
+ * not a turn either.
  */
 const opensTurn = (message: SDKMessage): boolean =>
-  message.type === "assistant" ||
-  message.type === "user" ||
-  message.type === "stream_event" ||
-  message.type === "tool_progress" ||
-  (message.type === "system" &&
-    (message.subtype === "init" ||
-      (message.subtype === "session_state_changed" &&
-        message.state !== "idle")));
+  ((message.type === "assistant" || message.type === "user") &&
+    message.parent_tool_use_id == null) ||
+  (message.type === "system" && message.subtype === "init");
 
 /** The uuids of the messages a frame says its turn has consumed, if it says. */
 const answeredUuids = (message: SDKMessage): readonly string[] | undefined => {
@@ -1243,6 +1283,7 @@ export const claudeCodeHarness = (
       const defaultModel = options.defaultModel ?? CLAUDE_CODE_DEFAULT_MODEL;
       const controlTimeout = options.controlTimeout ?? DEFAULT_CONTROL_TIMEOUT;
       const cliStopBounds = options.cliStopBounds ?? DEFAULT_CLI_STOP_BOUNDS;
+      const cliTreeRefresh = options.cliTreeRefresh ?? DEFAULT_CLI_TREE_REFRESH;
 
       /** The layer's own scope, so the pump below outlives the fiber that started it. */
       const harnessScope = yield* Effect.scope;
@@ -1371,9 +1412,28 @@ export const claudeCodeHarness = (
        * spawn already warned about.
        */
       const stopCli = (record: SessionRecord): Effect.Effect<void> =>
-        Effect.gen(function* () {
+        Effect.suspend(() => {
           const cli = record.cli;
-          if (cli === undefined) return;
+          if (cli === undefined) return Effect.void;
+          const running = cli.stopping;
+          if (running !== undefined) return Deferred.await(running);
+          const stopping = Deferred.makeUnsafe<void>();
+          cli.stopping = stopping;
+          return Effect.ensuring(
+            stopOnce(record, cli),
+            Effect.sync(() => {
+              cli.stopping = undefined;
+              Deferred.doneUnsafe(stopping, Effect.void);
+            }),
+          );
+        });
+
+      /** One stop of `cli`, the one {@link stopCli} lets run at a time. */
+      const stopOnce = (
+        record: SessionRecord,
+        cli: OwnedCli,
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
           const { child } = cli;
           const outcome = yield* stopOwnedChild(
             {
@@ -1460,8 +1520,21 @@ export const claudeCodeHarness = (
           const cli: OwnedCli | undefined =
             pid === undefined
               ? undefined
-              : { child, ownsGroup, tree: trackProcessTree(pid, ownsGroup) };
+              : {
+                  child,
+                  ownsGroup,
+                  tree: trackProcessTree(pid, ownsGroup),
+                  stopping: undefined,
+                };
           record.cli = cli;
+          // See `OwnedCli.tree`. Unref'd: a CLI's watch must not keep the server alive.
+          const watch =
+            cli === undefined
+              ? undefined
+              : setInterval(() => {
+                  cli.tree.refresh();
+                }, cliTreeRefresh);
+          watch?.unref();
           record.stderrTail = "";
           child.stderr.setEncoding("utf8");
           child.stderr.on("data", (data: string) => {
@@ -1477,6 +1550,7 @@ export const claudeCodeHarness = (
           });
           child.stderr.on("error", () => undefined);
           child.once("exit", (code, signal) => {
+            clearInterval(watch);
             if (cli !== undefined) {
               /*
                * Straight after the runtime reaped it, while its group's id cannot have been
@@ -1484,11 +1558,28 @@ export const claudeCodeHarness = (
                * now, and if nothing is left, `record.cli` goes, so a stop asked for later —
                * an end, the finalizer — signals nothing at a pid that may be a stranger's
                * by then (A6 F5's third review).
+               *
+               * If something is left, it is stopped now rather than at an end that may be
+               * a long way off: a CLI that died on its own — crashed, OOM-killed — leaves
+               * its tools running with nobody's session over them (A6 F5's fourth review).
+               * Not when a stop is already under way: that one is waiting for this exit.
                */
               cli.tree.adoptOrphanedGroup();
-              if (!cli.tree.alive() && record.cli === cli) {
-                record.cli = undefined;
-                forgetIfFinished(record);
+              if (record.cli === cli) {
+                if (!cli.tree.alive()) {
+                  record.cli = undefined;
+                  forgetIfFinished(record);
+                } else if (cli.stopping === undefined) {
+                  void Effect.runPromise(
+                    Effect.andThen(
+                      Effect.logWarning(
+                        "a Claude Code CLI exited and left processes it started running; stopping them",
+                        { sessionId: record.sessionId, pid, code, signal },
+                      ),
+                      stopCli(record),
+                    ),
+                  ).catch(() => undefined);
+                }
               }
             }
             // Not one this harness ended: a CLI that fails on its own says why on stderr.

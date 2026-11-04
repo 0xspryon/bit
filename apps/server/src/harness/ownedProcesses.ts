@@ -307,6 +307,14 @@ export interface ProcessTree {
   /** Refreshes, and says whether anything in the tree is still alive. */
   readonly alive: () => boolean;
   /**
+   * Refreshes **once**, and answers both of the questions a stop asks on every poll from
+   * that one read: whether anything is alive, and — if it goes on to ask — a signal to what
+   * that read found. {@link alive} then {@link signal} would read procfs twice, and one read
+   * is every `/proc/<pid>/stat` on the machine: a few milliseconds of blocked event loop
+   * per read with a few hundred processes (A6 F5's fourth review).
+   */
+  readonly look: () => TreeLook;
+  /**
    * Takes in the members of the root's own group once the root has exited, so that tools it
    * left running in its group are still reached.
    *
@@ -316,6 +324,13 @@ export interface ProcessTree {
    * a late call could take in a stranger that came to lead a group under the same number.
    */
   readonly adoptOrphanedGroup: () => void;
+}
+
+/** One procfs read of a {@link ProcessTree}: see {@link ProcessTree.look}. */
+export interface TreeLook {
+  readonly alive: boolean;
+  /** Signals the tree as this read found it, re-verifying each target at the last moment. */
+  readonly signal: (signal: NodeJS.Signals) => void;
 }
 
 /**
@@ -394,38 +409,55 @@ export const trackProcessTree = (
 
   const refresh = () => refreshWith(snapshot());
 
+  /**
+   * Signals the tree as `byPid` — already folded in by {@link refreshWith} — found it.
+   *
+   * The read is taken before anything is signalled: a process killed first cannot then be
+   * followed to the children it leaves behind.
+   */
+  const signalWith = (
+    byPid: ReadonlyMap<number, ProcEntry> | undefined,
+    signal: NodeJS.Signals,
+  ) => {
+    if (byPid === undefined) {
+      // No procfs: the root's group while the root is verifiably alive, as before.
+      const identity = tracked.get(root);
+      if (ownsGroup && identity !== undefined) {
+        if (processIdentity(root) === identity) signalGroup(root, signal);
+      }
+    } else {
+      for (const group of groupsOf(byPid)) {
+        // Re-verified at the last moment: a member must still be in the group, as the
+        // identity it was taken in with, for the group's id to still be ours.
+        const member = [...tracked].find(
+          ([pid, identity]) =>
+            processIdentity(pid) === identity && processGroupOf(pid) === group,
+        );
+        if (member !== undefined) signalGroup(group, signal);
+      }
+    }
+    for (const [pid, identity] of tracked) {
+      signalVerified(pid, identity, signal);
+    }
+  };
+
+  const look = (): TreeLook => {
+    const byPid = snapshot();
+    refreshWith(byPid);
+    return {
+      alive: tracked.size > 0,
+      signal: (signal) => {
+        signalWith(byPid, signal);
+      },
+    };
+  };
+
   return {
     refresh,
-    alive: () => {
-      refresh();
-      return tracked.size > 0;
-    },
+    look,
+    alive: () => look().alive,
     signal: (signal) => {
-      // Snapshotted before anything is signalled: a process killed first cannot then be
-      // followed to the children it leaves behind.
-      const byPid = snapshot();
-      refreshWith(byPid);
-      if (byPid === undefined) {
-        // No procfs: the root's group while the root is verifiably alive, as before.
-        const identity = tracked.get(root);
-        if (ownsGroup && identity !== undefined) {
-          if (processIdentity(root) === identity) signalGroup(root, signal);
-        }
-      } else {
-        for (const group of groupsOf(byPid)) {
-          // Re-verified at the last moment: a member must still be in the group, as the
-          // identity it was taken in with, for the group's id to still be ours.
-          const member = [...tracked].find(
-            ([pid, identity]) =>
-              processIdentity(pid) === identity &&
-              processGroupOf(pid) === group,
-          );
-          if (member !== undefined) signalGroup(group, signal);
-        }
-      }
-      for (const [pid, identity] of tracked) {
-        signalVerified(pid, identity, signal);
-      }
+      look().signal(signal);
     },
     adoptOrphanedGroup: () => {
       if (!ownsGroup || !rootVerified || adopted) return;
@@ -493,10 +525,23 @@ export const stopOwnedChild = Effect.fnUntraced(function* (
 ) {
   if (child.pid === undefined) return "already_gone" as StopOutcome;
   const tree = child.tree;
-  const gone = () => child.exited() && !(tree?.alive() ?? false);
-  if (gone()) return "already_gone" as StopOutcome;
-  const send = (signal: NodeJS.Signals) => {
-    tree?.signal(signal);
+  /*
+   * **One procfs read per look**, whatever is then decided from it (A6 F5's fourth
+   * review): a read is every `/proc/<pid>/stat` on the machine, and taking one to ask
+   * whether the tree is alive and another to signal it held the event loop for most of
+   * every poll on the `SIGKILL` leg. Taken while the child is still alive too, so a tool
+   * it starts in its own session while it winds down is tracked before it is reparented.
+   */
+  const lookAt = () => {
+    const seen = tree?.look();
+    return {
+      gone: child.exited() && !(seen?.alive ?? false),
+      signal: (signal: NodeJS.Signals) => seen?.signal(signal),
+    };
+  };
+  /** Signals the tree as `seen` found it, and the direct child while it has not exited. */
+  const send = (seen: ReturnType<typeof lookAt>, signal: NodeJS.Signals) => {
+    seen.signal(signal);
     if (!child.exited()) {
       try {
         child.kill(signal);
@@ -505,28 +550,27 @@ export const stopOwnedChild = Effect.fnUntraced(function* (
       }
     }
   };
-  const waitGone = Effect.fnUntraced(function* (within: number) {
-    const deadline = Date.now() + within;
-    for (;;) {
-      if (gone()) return true;
-      if (Date.now() >= deadline) return false;
-      // Caught while waiting: a process started after the signal went out is signalled
-      // the same way, and on the `SIGKILL` leg that is the one chance it gets.
-      yield* Effect.sleep(bounds.poll);
-    }
-  });
-  send("SIGTERM");
-  if (yield* waitGone(bounds.terminateGrace)) {
-    return "terminated" as StopOutcome;
+  let seen = lookAt();
+  if (seen.gone) return "already_gone" as StopOutcome;
+  send(seen, "SIGTERM");
+  const termDeadline = Date.now() + bounds.terminateGrace;
+  for (;;) {
+    yield* Effect.sleep(bounds.poll);
+    // Each look takes in what appeared since the last, so a process started after the
+    // `SIGTERM` went out is in the tree the `SIGKILL` reaches.
+    seen = lookAt();
+    if (seen.gone) return "terminated" as StopOutcome;
+    if (Date.now() >= termDeadline) break;
   }
-  send("SIGKILL");
+  send(seen, "SIGKILL");
   const killDeadline = Date.now() + bounds.killGrace;
   for (;;) {
-    if (gone()) return "killed" as StopOutcome;
-    if (Date.now() >= killDeadline) return "survived" as StopOutcome;
-    // A tool started in the instant before the kill is killed on the next look.
-    tree?.signal("SIGKILL");
     yield* Effect.sleep(bounds.poll);
+    seen = lookAt();
+    if (seen.gone) return "killed" as StopOutcome;
+    if (Date.now() >= killDeadline) return "survived" as StopOutcome;
+    // A tool started in the instant before the kill is killed on this look.
+    seen.signal("SIGKILL");
   }
 });
 

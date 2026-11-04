@@ -35,6 +35,7 @@ import {
   renderReapOutcome,
   stopOwnedChild,
   trackProcessTree,
+  type ProcessTree,
   type ReapBounds,
   type StopBounds,
 } from "./ownedProcesses";
@@ -534,6 +535,55 @@ describe("stopOwnedChild", () => {
 
     expect(outcome).toBe("terminated");
     expect(processIdentity(tool)).toBeUndefined();
+  });
+
+  test("each poll reads procfs once, on the SIGKILL leg too", async () => {
+    /*
+     * A6 F5's fourth review: a read is every `/proc/<pid>/stat` on the machine, ~3.6 ms
+     * with ~430 processes, and the `SIGKILL` leg asked "alive?" then signalled — two reads
+     * a poll, ~70% of the event loop for up to a second per CLI. A tree that never dies,
+     * under a child that has exited, holds the stop on that leg for the whole bound.
+     */
+    let reads = 0;
+    let kills = 0;
+    const read = () => {
+      reads += 1;
+    };
+    const tree: ProcessTree = {
+      refresh: read,
+      alive: () => {
+        read();
+        return true;
+      },
+      signal: (signal) => {
+        read();
+        if (signal === "SIGKILL") kills += 1;
+      },
+      look: () => {
+        read();
+        return {
+          alive: true,
+          signal: (signal) => {
+            if (signal === "SIGKILL") kills += 1;
+          },
+        };
+      },
+      adoptOrphanedGroup: () => undefined,
+    };
+
+    const outcome = await Effect.runPromise(
+      stopOwnedChild(
+        { pid: 1, tree, exited: () => true, kill: () => undefined },
+        { terminateGrace: 50, killGrace: 250, poll: 25 },
+      ),
+    );
+
+    expect(outcome).toBe("survived");
+    // Each SIGKILL rode on a read the poll had already taken; the rest are the SIGTERM
+    // leg's looks (one before the signal, about two per 50 ms grace) and the final look
+    // that found the bound spent.
+    expect(kills).toBeGreaterThanOrEqual(5);
+    expect(reads).toBeLessThanOrEqual(kills + 5);
   });
 
   test("a stop for a child whose pid now leads a stranger's group signals nothing", async () => {
