@@ -1254,6 +1254,7 @@ export class FakeServer implements ServerClient {
             "Scope entries and the hosts they name, from the program pages you give it",
         },
       ],
+      defaultAgentId: "importer",
     });
 
   onAgentSessions: (

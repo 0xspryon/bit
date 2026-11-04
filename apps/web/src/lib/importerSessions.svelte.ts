@@ -59,6 +59,7 @@
  * state at all.
  */
 import type {
+  AgentsView,
   ConversationStopped,
   ImporterConversationView,
   ImporterTurnAccepted,
@@ -78,6 +79,7 @@ import {
   acceptedNotice,
 } from "./importerChat";
 import {
+  mockAgents,
   mockAwaitingSession,
   mockCompletedSession,
   mockEarlierSessions,
@@ -130,6 +132,11 @@ const operatorWordsOf = (draft: string): string => {
   return draft;
 };
 
+/** The `agentId` field a session is pinned with, or nothing when no agent is known yet. */
+const pinAgent = (
+  agentId: string | undefined,
+): { readonly agentId?: string } => (agentId === undefined ? {} : { agentId });
+
 /** The states the prototype can be put into, in `ScenarioBar`'s words. */
 export type ImporterScenario =
   | "default"
@@ -167,8 +174,14 @@ export type ImporterStopAnswer =
  * stand-in reply instead.
  */
 export interface ImporterServer {
-  /** Opens a conversation whose first turn is `text`. */
-  readonly open: (text: string) => Promise<ImporterSent>;
+  /**
+   * Opens a conversation whose first turn is `text`, as the agent `agentId` — or as the
+   * server's default agent when it is `undefined`, the operator having picked none.
+   */
+  readonly open: (
+    text: string,
+    agentId: string | undefined,
+  ) => Promise<ImporterSent>;
   /** Says `text` to one import's session. */
   readonly send: (importId: string, text: string) => Promise<ImporterSent>;
   /**
@@ -286,6 +299,14 @@ export class ImporterSessions {
    * none. Not {@link notice}: that line is about the draft beneath it, and a Stop is not.
    */
   stopFailure = $state<ErrorNotice | undefined>(undefined);
+  /**
+   * The agents a conversation can run as, for the composer's agent chip: the server's
+   * registry when the page is a real target's, the mock one in the state picker's
+   * scenarios, and `undefined` while the server's has not been read (or could not be).
+   */
+  agents = $state.raw<AgentsView | undefined>(undefined);
+  /** The server's registry as last read, kept across visits: it is read once per page load. */
+  #serverAgents: AgentsView | undefined = undefined;
   #server: ImporterServer | undefined = undefined;
 
   constructor(
@@ -358,8 +379,37 @@ export class ImporterSessions {
     this.stopFailure = undefined;
     this.pickerOpen = false;
     this.#sent = 0;
+    this.agents = this.#serverAgents;
     this.sessions = [fresh, ...indexed];
     this.currentId = fresh.id;
+  }
+
+  /**
+   * The server's agent registry (`GET /agents`), read by the app once per page load. Shown
+   * at once when the page is a real target's; kept for the next visit otherwise, so a
+   * scenario's mock registry is not replaced under it.
+   */
+  setServerAgents(view: AgentsView): void {
+    this.#serverAgents = view;
+    if (this.#server !== undefined) this.agents = view;
+  }
+
+  /**
+   * Picks the agent the empty session's first message opens a conversation as (D7).
+   *
+   * **Only before that message**: the agent is pinned once a conversation has started, so a
+   * session with messages is left as it is, and so is one whose first message is with the
+   * server. And only an agent the registry lists: the chip offers nothing else, and the
+   * server would refuse an id it does not define.
+   */
+  pickAgent(agentId: string): void {
+    const session = this.current;
+    if (session === undefined || session.tally.messages !== 0) return;
+    if (this.sending) return;
+    if (this.agents?.agents.some((agent) => agent.id === agentId) !== true) {
+      return;
+    }
+    this.#replace(session.id, (before) => ({ ...before, agentId }));
   }
 
   /**
@@ -446,6 +496,7 @@ export class ImporterSessions {
     this.draft = "";
     this.pickerOpen = false;
     this.#sent = 0;
+    this.agents = mockAgents();
     const show = (
       current: ImporterSession,
       rest: readonly ImporterSession[] = earlier,
@@ -693,6 +744,8 @@ export class ImporterSessions {
       ...before,
       reading: false,
       working: false,
+      // Pinned with the first message: the one picked, or the registry's default.
+      ...pinAgent(before.agentId ?? this.agents?.defaultAgentId),
       items: [
         ...before.items,
         operatorTurn({ index: index + 1, text, at, after: 0 }),
@@ -742,10 +795,14 @@ export class ImporterSessions {
     // Taken before the message goes, so whatever the importer says in answer sorts after
     // it — including what it says before this request has been answered.
     const after = server.highWater();
+    // The agent the chip picked goes with an opening message only: a later one is to a
+    // conversation already pinned to its agent, which the server reads off the row.
+    const agentId = session.agentId;
     const answer =
       session.importId === undefined
-        ? await server.open(text)
+        ? await server.open(text, agentId)
         : await server.send(session.importId, text);
+    const pinnedAgent = agentId ?? this.agents?.defaultAgentId;
     this.sending = false;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
@@ -776,6 +833,9 @@ export class ImporterSessions {
         items: [...before.items, row],
         floors: { ...before.floors, [row.id]: after },
         tally: { ...before.tally, messages: null },
+        // Until the list is read again and says so itself, the agent the message was sent
+        // as. A session that had one keeps it: a reopen runs as the row's agent.
+        ...pinAgent(before.agentId ?? pinnedAgent),
       };
     };
     const stillThere = this.sessions.some((each) => each.id === session.id);

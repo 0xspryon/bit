@@ -42,6 +42,7 @@ export { default as IconLock } from "line-awesome/svg/lock-solid.svg?component";
 export { default as IconCheck } from "line-awesome/svg/check-solid.svg?component";
 export { default as IconAngleUp } from "line-awesome/svg/angle-up-solid.svg?component";
 export { default as IconInfo } from "line-awesome/svg/info-solid.svg?component";
+export { default as IconInfoCircle } from "line-awesome/svg/info-circle-solid.svg?component";
 
 /* ── Crumb bar ── */
 export { default as IconPanel } from "line-awesome/svg/columns-solid.svg?component";

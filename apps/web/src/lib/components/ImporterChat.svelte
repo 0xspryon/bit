@@ -51,24 +51,19 @@
    * ## Not wired, and said
    *
    * Attach is inert for the reason `ComposeBox`'s `+` is: nothing behind it, so it is
-   * `aria-disabled` and says why. The "Importer" chip is a label and not the agent selector
-   * D7 draws: there is no second agent to select. The model chip is the real picker
-   * ({@link ImporterModelPicker}) over whatever harnesses the app holds — the server's when
-   * connected, `mockHarnesses` in the state picker.
+   * `aria-disabled` and says why. The agent chip is D7's selector ({@link AgentChip}) over
+   * the server's registry, pinned once the first message is sent; the model chip is the
+   * real picker ({@link ImporterModelPicker}) over whatever harnesses the app holds — the
+   * server's when connected, `mockHarnesses` in the state picker.
    */
   import { tick } from "svelte";
 
   import type { App } from "../app.svelte";
-  import {
-    IconArrowUp,
-    IconDownload,
-    IconFile,
-    IconLink,
-    IconPlus,
-  } from "../icons";
+  import { IconArrowUp, IconFile, IconLink, IconPlus } from "../icons";
   import { turnModel } from "../chat";
   import { ENDED_NOTE, strandedNote } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
+  import AgentChip from "./AgentChip.svelte";
   import Chat from "./Chat.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
@@ -378,10 +373,13 @@
             >
               <IconPlus width="14" height="14" />
             </button>
-            <span class="agent-chip" title="The agent this chat talks to.">
-              <IconDownload width="12" height="12" aria-hidden="true" />
-              Importer
-            </span>
+            <AgentChip
+              agents={importer.agents}
+              agentId={session?.agentId}
+              locked={(session !== undefined && session.tally.messages !== 0) ||
+                importer.sending}
+              onpick={(agentId) => importer.pickAgent(agentId)}
+            />
             <ImporterModelPicker {app} {pinned} dimmed={working} />
             {#if working}
               <span class="hint">pinned while the session is running</span>
@@ -638,23 +636,6 @@
     outline: 2px solid var(--border-focus);
     outline-offset: 1px;
   }
-  .agent-chip {
-    display: inline-flex;
-    flex: none;
-    align-items: center;
-    gap: 7px;
-    height: 28px;
-    padding: 0 9px;
-    box-sizing: border-box;
-    border: 1px solid var(--border-base);
-    border-radius: 6px;
-    color: var(--text-base);
-    font: 500 12px/16px var(--font-sans);
-  }
-  .agent-chip :global(svg) {
-    color: var(--icon-muted);
-  }
-
   /* ── The server's sentence about the last message ──────────────────────────── */
   .notice {
     margin: 0;

@@ -238,6 +238,12 @@ const IDLE_HELD_IMPORT_ID = "imp_idle_held_in_this_suite";
  * read off a multipart body, recorded before the double refuses `no_harness` as a server
  * without one does.
  */
+/**
+ * The agent each conversation the route opened was handed to the importer as, by id, or
+ * `undefined` for none (the importer's default). Apart from {@link handedToImporter} so the
+ * files tests' exact shapes stay as they were.
+ */
+const agentsHandedToImporter: (string | undefined)[] = [];
 const handedToImporter: {
   readonly route: "converse" | "send";
   readonly text: string;
@@ -260,6 +266,7 @@ const importerHoldingOne = Layer.effect(
     return ScopeImporter.of({
       ...base,
       converse: (input) => {
+        agentsHandedToImporter.push(input.agent?.id);
         handedToImporter.push({
           route: "converse",
           text: input.text,
@@ -1588,6 +1595,8 @@ describe("the agent registry", () => {
             "Scope entries and the hosts they name, from the program pages you give it",
         },
       ],
+      // The chip's agent before the operator picks: one of the listed.
+      defaultAgentId: "importer",
     });
   });
 
@@ -5852,6 +5861,45 @@ describe("a message's files, on the wire (A6 F9)", () => {
         uploads: [{ name: "policy.pdf", kind: "file", body: "%PDF" }],
       },
     ]);
+  });
+
+  test("a first message naming an agent this server does not define is refused, and nothing is opened", async () => {
+    handedToImporter.length = 0;
+    agentsHandedToImporter.length = 0;
+    const response = await read(
+      await signedIn(`/targets/${TARGET}/importer-sessions`, {
+        method: "POST",
+        body: { text: "Load the scope.", agentId: "retired_agent" },
+      }),
+    );
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      _tag: "ImporterConversationRefused",
+      reason: "agent_unavailable",
+      detail:
+        "this server defines no agent 'retired_agent', so no conversation was opened as it; pick one of the agents the composer's chip lists",
+    });
+    // Refused where the id was read: the importer was never asked, as the default or as
+    // anything else.
+    expect(handedToImporter).toEqual([]);
+    expect(agentsHandedToImporter).toEqual([]);
+  });
+
+  test("a first message naming a registry agent hands the importer that agent, and none hands it nothing", async () => {
+    handedToImporter.length = 0;
+    agentsHandedToImporter.length = 0;
+    await signedIn(`/targets/${TARGET}/importer-sessions`, {
+      method: "POST",
+      body: { text: "Load the scope.", agentId: "importer" },
+    });
+    await signedIn(`/targets/${TARGET}/importer-sessions`, {
+      method: "POST",
+      body: { text: "Load the scope." },
+    });
+    // The resolved definition, whose authority the importer's `startWith` checks — the
+    // role-mismatch refusal is `scopeImporter.test.ts`'s "an agent granted another
+    // authority", on this same `converse`.
+    expect(agentsHandedToImporter).toEqual(["importer", undefined]);
   });
 
   test("a JSON message is still a message, with no files", async () => {

@@ -273,6 +273,13 @@ export interface ImporterSession {
    * a message to it opens a fresh session, and the server says so.
    */
   readonly ended?: boolean;
+  /**
+   * The agent this session runs as (`AgentView.id`). On a session the server lists, the one
+   * its row pinned at the first message. On the page's own empty session, the one the
+   * operator picked on the agent chip for its first message, or absent for the server's
+   * default (`AgentsView.defaultAgentId`). Never changed once the session has a message.
+   */
+  readonly agentId?: string;
 }
 
 /**
@@ -776,6 +783,7 @@ export const indexedSession = (
   reading: true,
   indexed: true,
   importId: view.importId,
+  agentId: view.agentId,
   ...(view.endedReason === "operator" ? { ended: true } : {}),
   ...(strandedOn === undefined ? {} : { strandedOn }),
 });

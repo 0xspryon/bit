@@ -109,11 +109,26 @@ export const AGENTS: readonly AgentDefinition<ImporterPromptInput>[] = [
  */
 export const DEFAULT_AGENT_ID = IMPORTER_AGENT.id;
 
-/** The definition with this id, or `undefined` for one this server does not define. */
+/**
+ * The definition with this id, or `undefined` for one this server does not define.
+ *
+ * `agents` is the registry to look in, {@link AGENTS} unless a test hands in its own: an
+ * id resolved here is still checked against the authority an import session can carry
+ * (`startWith`), so a registry holding an agent of another role is refused there, not here.
+ */
 export const agentById = (
   id: string,
+  agents: readonly AgentDefinition<ImporterPromptInput>[] = AGENTS,
 ): AgentDefinition<ImporterPromptInput> | undefined =>
-  AGENTS.find((agent) => agent.id === id);
+  agents.find((agent) => agent.id === id);
+
+/**
+ * Why a draft naming `id` opens no conversation: no agent by that name here. The same
+ * reason, `agent_unavailable`, a row naming a retired agent is refused with, because it is
+ * the same fact about a different moment.
+ */
+export const unknownAgentDetail = (id: string): string =>
+  `this server defines no agent '${id}', so no conversation was opened as it; pick one of the agents the composer's chip lists`;
 
 /** What the browser is shown of an agent: its id, its name and what it can write. */
 export const agentView = (

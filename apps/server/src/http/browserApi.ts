@@ -40,6 +40,7 @@ import {
   GoalMessageDraft,
   GoalRefused,
   ImporterConversationDraft,
+  ImporterConversationRefused,
   ImporterMessageDraft,
   ImporterModelUnavailable,
   IntentNotFound,
@@ -119,7 +120,13 @@ import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { renderScopeBlock } from "../scope/scopePrompt";
 import { isWithin, POLICY_AUDIT_FILE } from "../policy/install";
 import { HarnessResolver, isReady } from "../harness/resolver";
-import { AGENTS, agentView } from "../agent/registry";
+import {
+  AGENTS,
+  DEFAULT_AGENT_ID,
+  agentById,
+  agentView,
+  unknownAgentDetail,
+} from "../agent/registry";
 import { chooseImporterModel } from "../import/importerModel";
 import { importerSessionTitles } from "../import/importerTitle";
 import { ScopeImporter } from "../import/scopeImporter";
@@ -1423,7 +1430,11 @@ const fleetHandlers = HttpApiBuilder.group(
        * The agents a conversation can run as: the registry, as the chip lists it. Never
        * fails — the registry is this build's own, and it always has the importer.
        */
-      agents: () => Effect.succeed({ agents: AGENTS.map(agentView) }),
+      agents: () =>
+        Effect.succeed({
+          agents: AGENTS.map(agentView),
+          defaultAgentId: DEFAULT_AGENT_ID,
+        }),
 
       /**
        * Starts one import against a target that already exists.
@@ -1557,11 +1568,25 @@ const fleetHandlers = HttpApiBuilder.group(
           ImporterConversationDraft,
           uploadLimitsOf(config),
         );
+        /*
+         * The agent the chip chose, resolved here where its id was read, so one this server
+         * does not define is refused before anything is opened — never quietly opened as the
+         * default. Its authority is checked by the importer's `startWith`, on every open path.
+         */
+        const agent =
+          draft.agentId === undefined ? undefined : agentById(draft.agentId);
+        if (draft.agentId !== undefined && agent === undefined) {
+          return yield* new ImporterConversationRefused({
+            reason: "agent_unavailable",
+            detail: unknownAgentDetail(draft.agentId),
+          });
+        }
         return yield* importer.converse({
           targetId: row.targetId,
           targetName: row.name,
           workspacePath: row.workspacePath ?? null,
           text: draft.text,
+          ...(agent === undefined ? {} : { agent }),
           ...(uploads.length === 0 ? {} : { uploads }),
           ...(draft.importModel === undefined
             ? {}

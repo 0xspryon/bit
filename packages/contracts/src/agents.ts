@@ -30,5 +30,10 @@ export type AgentView = typeof AgentView.Type;
 export const AgentsView = Schema.Struct({
   /** Every agent this server defines, in the registry's order. */
   agents: Schema.Array(AgentView),
+  /**
+   * The agent a new conversation opens as when its draft names none: the chip shows it
+   * before the operator picks, and tags it "default here" in the list. One of `agents`.
+   */
+  defaultAgentId: Schema.String,
 });
 export type AgentsView = typeof AgentsView.Type;

@@ -33,6 +33,7 @@
 import {
   bitMcpServerName,
   claudeCodeToolName,
+  type AgentsView,
   type HarnessInstanceView,
   type ImporterModelView,
   type ImporterSessionView,
@@ -745,4 +746,20 @@ export const mockImporterModel = (): ImporterModelView => ({
   model: IMPORTER_MODEL,
   origin: "preferred",
   detail: `OpenCode offers ${IMPORTER_MODEL}`,
+});
+
+/**
+ * The agent registry the composer's chip lists while there is no server to ask: the
+ * server's own one entry (`apps/server/src/agent/registry.ts`), as `GET /agents` answers.
+ */
+export const mockAgents = (): AgentsView => ({
+  agents: [
+    {
+      id: "importer",
+      label: "Importer",
+      writes:
+        "Scope entries and the hosts they name, from the program pages you give it",
+    },
+  ],
+  defaultAgentId: "importer",
 });

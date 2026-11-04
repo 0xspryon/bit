@@ -59,7 +59,11 @@ import {
   type ModelOptionSelection,
 } from "@bit/contracts";
 
-import { IMPORTER_AGENT, type AgentDefinition } from "../agent/registry";
+import {
+  IMPORTER_AGENT,
+  agentById,
+  type AgentDefinition,
+} from "../agent/registry";
 import { agentUnavailableDetail } from "./importerHistory";
 import { operatorTextOf, type ImporterPromptInput } from "./importerPrompt";
 import { ScopeImportProgress } from "./progress";
@@ -2866,7 +2870,9 @@ describe("an agent granted another authority", () => {
             targetName: "Acme Corp",
             workspacePath: workspace,
             text: "Load the scope.",
-            agent: ROUND_GRANTED,
+            // As the route resolves a draft's `agentId`: by id, from a registry that
+            // defines it — here one holding an agent of another role.
+            agent: agentById("round_granted", [IMPORTER_AGENT, ROUND_GRANTED]),
           }),
         );
       }),

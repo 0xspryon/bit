@@ -574,6 +574,16 @@ export type ScopeImportStartResult = typeof ScopeImportStartResult.Type;
 export const ImporterConversationDraft = Schema.Struct({
   text: ImporterMessageDraft.fields.text,
   importModel: Schema.optional(ImportModelDraft),
+  /**
+   * The agent the conversation runs as (`AgentView.id`), chosen on the composer's agent
+   * chip before the first message; absent for the server's default (`defaultAgentId`).
+   *
+   * Only here, on the opening message: the agent is pinned once a conversation has started,
+   * so a later message ({@link ImporterMessageDraft}) has no such field. An id the server's
+   * registry does not define, or an agent an import session cannot be opened as, is
+   * refused `agent_unavailable` with nothing opened — never opened as another agent.
+   */
+  agentId: Schema.optional(Schema.String),
 });
 export type ImporterConversationDraft = typeof ImporterConversationDraft.Type;
 

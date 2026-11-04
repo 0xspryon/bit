@@ -1933,6 +1933,8 @@ export class App {
     this.runIntentId = "";
     this.runFallback = null;
     this.runDetail = "";
+    // The next sign-in may be to another server, whose registry is its own.
+    this.#agentsRead = false;
     this.#clearGoals();
     // The connection carries a bearer that has just been dropped, so it has to go with it:
     // a stream left open on a signed-out session is a credential still in use. What it
@@ -2690,10 +2692,11 @@ export class App {
       return { _tag: "refused", detail: "No server answered at this address." };
     };
     return {
-      open: async (text) =>
+      open: async (text, agentId) =>
         answer(
           await this.client.openImporterConversation(this.serverUrl, targetId, {
             text,
+            ...(agentId === undefined ? {} : { agentId }),
             ...(this.pickedImportInstanceId !== "" ||
             this.pickedImportModel !== ""
               ? {
@@ -4365,6 +4368,7 @@ export class App {
     void this.loadHarnesses();
     void this.loadImporterModel();
     void this.loadImporterSessions(targetId);
+    if (!this.#agentsRead) void this.loadAgents();
 
     const running =
       this.scopeImportId !== "" &&
@@ -4497,6 +4501,29 @@ export class App {
     this.programLinks = this.programLinks.map((link) =>
       link.id === id ? { ...link, url } : link,
     );
+  }
+
+  /* ── The agent registry ──────────────────────────────────────────────────── */
+
+  /** Whether {@link loadAgents} has had the registry: it is read once per page load. */
+  #agentsRead = false;
+
+  /**
+   * Reads the agents a conversation can run as (`GET /agents`), for the composer's agent
+   * chip (D7). Once per page load: the registry is the server's code, and it changes only
+   * when the server does. A failure is silent and tried again on the next visit; until then
+   * the chip names no agent and offers no list, and a first message goes as the server's
+   * default.
+   */
+  async loadAgents() {
+    const call = await this.client.agents(this.serverUrl);
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") this.signOut("expired");
+      return;
+    }
+    if (call._tag === "Unreachable") return;
+    this.#agentsRead = true;
+    this.importer.setServerAgents(call.value);
   }
 
   /* ── The importer's model ─────────────────────────────────────────────────── */
