@@ -52,8 +52,8 @@
     resultLine,
     type WriteState,
   } from "../chat";
-  import { proseRuns } from "../markdown";
   import Markdown from "./Markdown.svelte";
+  import MarkedText from "./MarkedText.svelte";
   import StreamCursor from "./StreamCursor.svelte";
 
   let {
@@ -147,15 +147,13 @@
 </script>
 
 <!--
-  A sub-agent's type or task: the calling agent's words, plain text, with every bidi control
-  marked as `Markdown` marks one in prose (`proseRuns`), so a right-to-left override in its
-  type cannot move the status chip, nor one in its task reverse the sentence (U14's review).
+  Every piece of agent or tool text below is drawn through `MarkedText`, never raw: a fetched
+  page reaches a tool's arguments and results, and a bidi or zero-width character in them
+  would otherwise make `https://` RLI `com` RLM `.` RLM `acme` PDI read as `https://acme.com`.
+  The narrated reading's prose — a thought, a sub-agent's type and task — is marked as prose
+  (bidi controls); everything that reads as code or as a ledger line is marked as code (bidi,
+  zero-width and tag characters).
 -->
-{#snippet agentText(
-  text: string,
-)}{#each proseRuns(text) as run, index (index)}{#if run.escape}<span
-        class="char-escape">{run.text}</span
-      >{:else}{run.text}{/if}{/each}{/snippet}
 
 {#if narrated}
   <!--
@@ -177,7 +175,7 @@
       <span class="visually-hidden">{item.origin}</span>
       <details class="raw">
         <summary>What it considered</summary>
-        <p class="thought">{item.body}</p>
+        <p class="thought"><MarkedText text={item.body} /></p>
         <p class="aside">
           What the agent was considering, not what it did. Not stored here: a
           reload shows it only while the harness still has it.
@@ -200,7 +198,7 @@
       <span class="visually-hidden">{item.origin}</span>
       <div class="sig mono">
         <span class="what">{kindLabel(item.kind)}</span>
-        <span class="agent-type">{@render agentText(item.headline)}</span>
+        <span class="agent-type"><MarkedText text={item.headline} /></span>
         <span
           class="chip"
           data-tint={outcomeTint(item.outcome ?? "running")}
@@ -210,7 +208,7 @@
         </span>
       </div>
       {#if item.body !== ""}
-        <div class="ret task">{@render agentText(item.body)}</div>
+        <div class="ret task"><MarkedText text={item.body} /></div>
       {/if}
       <p class="state-note">{SUBAGENT_NOTE}</p>
     </li>
@@ -233,16 +231,16 @@
       <span class="visually-hidden">{item.origin}</span>
       <div class="sig mono">
         {#if call !== null}
-          {callSignature(call)}
+          <MarkedText text={callSignature(call)} code />
         {:else if item.kind === "tool.result"}
-          {item.toolName ?? item.headline}
+          <MarkedText text={item.toolName ?? item.headline} code />
         {:else}
           <span class="what">{kindLabel(item.kind)}</span>
-          {item.headline}
+          <MarkedText text={item.headline} code />
         {/if}
       </div>
       {#if call === null && item.kind !== "tool.result" && item.body !== ""}
-        <div class="ret mono">{item.body}</div>
+        <div class="ret mono"><MarkedText text={item.body} code /></div>
       {/if}
       <!--
         A write folded into its record answers with the **record's** sentence — D3's
@@ -253,12 +251,15 @@
       -->
       {#if write === "recorded"}
         <div class="ret mono">
-          → {item.body !== "" ? item.body : (answer ?? "")}
+          → <MarkedText
+            text={item.body !== "" ? item.body : (answer ?? "")}
+            code
+          />
           <span class="chip" data-tint="success" title={item.id}>recorded</span>
         </div>
       {:else if answer !== null}
         <div class="ret mono" data-failed={result?.outcome === "failed"}>
-          → {answer}
+          → <MarkedText text={answer} code />
         </div>
       {:else if write === "pending"}
         <div class="ret writing mono">
@@ -280,12 +281,12 @@
         <details class="raw">
           <summary>Full call</summary>
           {#if call?.input != null}
-            <pre class="mono">{call.input}</pre>
+            <pre class="mono"><MarkedText text={call.input} code /></pre>
           {/if}
           {#if result !== null && result.output !== null}
-            <pre class="mono">{result.output}</pre>
+            <pre class="mono"><MarkedText text={result.output} code /></pre>
           {:else if item.output !== null}
-            <pre class="mono">{item.output}</pre>
+            <pre class="mono"><MarkedText text={item.output} code /></pre>
           {/if}
         </details>
       {/if}
@@ -351,11 +352,7 @@
           call {proposedBy.callId}
         </span>
       {/if}
-      <span class="headline"
-        >{#if item.kind === SUBAGENT_KIND}{@render agentText(
-            item.headline,
-          )}{:else}{item.headline}{/if}</span
-      >
+      <span class="headline"><MarkedText text={item.headline} code /></span>
       {#if write !== null}
         <span
           class="chip outcome"
@@ -383,17 +380,15 @@
     -->
       <details class="io">
         <summary class="io-label">What it considered</summary>
-        <p class="thought">{item.body}</p>
+        <p class="thought"><MarkedText text={item.body} /></p>
         <p class="note">
           What the agent was considering, not what it did. Not stored here: a
           reload shows it only while the harness still has it. What it actually
           did is the reply or the tool call beside this.
         </p>
       </details>
-    {:else if item.body !== "" && item.kind === SUBAGENT_KIND}
-      <p class="body">{@render agentText(item.body)}</p>
     {:else if item.body !== ""}
-      <p class="body">{item.body}</p>
+      <p class="body"><MarkedText text={item.body} code /></p>
     {:else if summary !== null}
       <!--
       The one-line domain summary, in place of the body a tool call does not have. The
@@ -401,7 +396,7 @@
       the server's own sentence about what was written — and showing a paraphrase of the
       request beneath it would be the same fact twice.
     -->
-      <p class="body">{summary}</p>
+      <p class="body"><MarkedText text={summary} code /></p>
     {/if}
 
     {#if item.kind === SUBAGENT_KIND}
@@ -432,19 +427,22 @@
     {#if item.input !== null}
       <details class="io">
         <summary class="io-label">Arguments</summary>
-        <pre class="io-text mono">{item.input}</pre>
+        <pre class="io-text mono"><MarkedText text={item.input} code /></pre>
       </details>
     {:else if proposedBy !== null && proposedBy.input !== null}
       <details class="io">
         <summary class="io-label">Arguments the round asked with</summary>
-        <pre class="io-text mono">{proposedBy.input}</pre>
+        <pre class="io-text mono"><MarkedText
+            text={proposedBy.input}
+            code
+          /></pre>
       </details>
     {/if}
 
     {#if item.output !== null}
       <details class="io">
         <summary class="io-label">Result</summary>
-        <pre class="io-text mono">{item.output}</pre>
+        <pre class="io-text mono"><MarkedText text={item.output} code /></pre>
       </details>
     {/if}
 
@@ -455,7 +453,7 @@
             ? " (the harness reported a failure)"
             : ""}
         </summary>
-        <pre class="io-text mono">{result.output}</pre>
+        <pre class="io-text mono"><MarkedText text={result.output} code /></pre>
       </details>
     {/if}
   </li>
@@ -754,22 +752,6 @@
     margin-right: 6px;
     color: var(--text-base);
     overflow-wrap: anywhere;
-  }
-  /*
-   * A bidi control in a sub-agent's type or task, written out as its code point: drawn as
-   * `Markdown.svelte` draws one, a note about the text rather than part of it.
-   */
-  .char-escape {
-    margin: 0 1px;
-    padding: 0 2px;
-    border: 1px solid var(--border-muted);
-    border-radius: 3px;
-    color: var(--text-faint);
-    font-size: 0.85em;
-    font-style: normal;
-    letter-spacing: normal;
-    text-transform: none;
-    white-space: nowrap;
   }
   .subagent .state-note {
     margin: 2px 0 0;

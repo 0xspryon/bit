@@ -132,6 +132,10 @@ const rewrite = (node: ElementContent, inLink: boolean): ElementContent[] => {
   if (!isElement(node)) return markProse(node);
   delete node.properties["id"];
   delete node.properties["ariaDescribedBy"];
+  // A link's `[x](url "title")` is a tooltip of the agent's words, drawn by the browser,
+  // where a span cannot go: its bidi controls are written out in the text instead.
+  const title = node.properties["title"];
+  if (typeof title === "string") node.properties["title"] = revealProse(title);
   if (node.tagName === "img") {
     const src = node.properties["src"];
     const alt = node.properties["alt"];
@@ -263,28 +267,48 @@ export interface ProseRun {
   readonly escape: boolean;
 }
 
+/** Plain text as runs, each character `hidden` matches written out as its code point. */
+const runsOf =
+  (hidden: RegExp) =>
+  (text: string): readonly ProseRun[] => {
+    if (!hidden.test(text)) return text === "" ? [] : [{ text, escape: false }];
+    const runs: ProseRun[] = [];
+    let plain = "";
+    for (const char of text) {
+      if (!hidden.test(char)) {
+        plain += char;
+        continue;
+      }
+      if (plain !== "") runs.push({ text: plain, escape: false });
+      plain = "";
+      runs.push({ text: hiddenName(char), escape: true });
+    }
+    if (plain !== "") runs.push({ text: plain, escape: false });
+    return runs;
+  };
+
 /**
  * Plain text as prose draws it, every bidi control {@link BIDI} names marked as its code
  * point and everything else as it was. The one rule for prose: {@link rewrite} draws an
- * agent's markdown with it, and `ChatItem` a sub-agent's type and task and `LiveTranscript`
- * the newest headline, which are plain text and never markdown.
+ * agent's markdown with it, and `MarkedText` the plain-text prose outside markdown — a
+ * sub-agent's type and task, a thought, the operator's own message.
  */
-export const proseRuns = (text: string): readonly ProseRun[] => {
-  if (!BIDI.test(text)) return text === "" ? [] : [{ text, escape: false }];
-  const runs: ProseRun[] = [];
-  let plain = "";
-  for (const char of text) {
-    if (!BIDI.test(char)) {
-      plain += char;
-      continue;
-    }
-    if (plain !== "") runs.push({ text: plain, escape: false });
-    plain = "";
-    runs.push({ text: hiddenName(char), escape: true });
-  }
-  if (plain !== "") runs.push({ text: plain, escape: false });
-  return runs;
-};
+export const proseRuns = runsOf(BIDI);
+
+/**
+ * Plain text as code draws it: every bidi, zero-width and tag character {@link HIDDEN}
+ * names marked as its code point, as {@link reveal} marks a fence.
+ *
+ * For untrusted text drawn **outside** markdown that reads as code or as a record rather
+ * than as prose: a tool call's signature and its `→` result line, the verbatim payloads
+ * under "Full call", every line of the ledger row, and a harness transcript's entries. A
+ * fetched page reaches all of them — a `WebFetch` call's URL is the agent's argument, and
+ * its result is the page's words — so `WebFetch(url="https://` RLI `com` RLM `.` RLM `acme`
+ * PDI `/x")` would otherwise read as `https://acme.com/x` (measured in review). In these
+ * places the exact characters are the point, as in a fence, so the zero-width ones are
+ * marked too.
+ */
+export const codeRuns = runsOf(HIDDEN);
 
 /** {@link proseRuns} on a text node, as text nodes and `.char-escape` spans. */
 const markProse = (node: ElementContent): ElementContent[] => {
@@ -302,6 +326,9 @@ const markProse = (node: ElementContent): ElementContent[] => {
 /** {@link reveal}, as plain text, for an attribute: an `aria-label` cannot hold a span. */
 const revealText = (text: string): string =>
   text.replace(new RegExp(HIDDEN.source, "gu"), hiddenName);
+/** {@link markProse}, as plain text, for an attribute: a link's `title`. */
+const revealProse = (text: string): string =>
+  text.replace(new RegExp(BIDI.source, "gu"), hiddenName);
 
 /**
  * A fence, framed as A6 D8 draws it: a header naming it, a **Copy** button, then the block.

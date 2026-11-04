@@ -73,6 +73,31 @@ describe("the transcript panel", () => {
     expect(html).not.toContain("Could not ask the harness");
   });
 
+  test("an entry's text and error mark bidi and zero-width characters as code does", async () => {
+    // A transcript holds whatever the agent fetched: a host reordered by an isolate, or
+    // with a zero-width space in it, shows each hidden character as its code point.
+    const html = await panelAfter({
+      source: "harness",
+      ephemeral: true,
+      note: "From Claude Code, which may delete it.",
+      entries: [
+        {
+          index: 0,
+          type: "tool_result",
+          text: "Scope: \u2067com\u200F.\u200Facme\u2069 only, \u05E9\u05DC\u05D5\u05DD",
+          error: "ac\u200Bme.com refused",
+        },
+      ],
+    });
+    expect(html).toContain('<span class="char-escape');
+    const plain = html.replace(/<[^>]*>/g, "");
+    expect(plain).toContain(
+      "Scope: ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ only, \u05E9\u05DC\u05D5\u05DD",
+    );
+    expect(plain).toContain("ac⟨U+200B⟩me.com refused");
+    expect(/[\u200B\u200F\u2067\u2069]/u.test(html)).toBe(false);
+  });
+
   test("a transcript the harness does not hold reads as gone, with nothing drawn", async () => {
     const html = await panelAfter({
       source: "absent",

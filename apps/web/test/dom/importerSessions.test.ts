@@ -935,6 +935,20 @@ describe("the importer's words, as they are produced", () => {
     );
   });
 
+  test("the operator's own message marks a bidi control as prose does, and leaves right-to-left letters as written", async () => {
+    // The empty chat asks for the program's pages pasted in, so the operator's bubble is
+    // as often a page author's words as the operator's own.
+    await continueOn(SESSIONS, [harness("claude-code", "Claude Code")]);
+    await send(
+      "Scope: \u2067com\u200F.\u200Facme\u2069 and \u05E9\u05DC\u05D5\u05DD",
+    );
+    const bubble = [...document.querySelectorAll(".importer .bubble")].at(-1);
+    expect(bubble?.textContent).toBe(
+      "Scope: ⟨U+2067⟩com⟨U+200F⟩.⟨U+200F⟩acme⟨U+2069⟩ and \u05E9\u05DC\u05D5\u05DD",
+    );
+    expect(bubble?.querySelectorAll(".char-escape")).toHaveLength(4);
+  });
+
   test("words published before the message was accepted still go under it", async () => {
     const { fake } = await continueOn(SESSIONS, [
       harness("claude-code", "Claude Code"),

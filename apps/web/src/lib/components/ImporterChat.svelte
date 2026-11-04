@@ -72,6 +72,7 @@
   import Chat from "./Chat.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
+  import MarkedText from "./MarkedText.svelte";
   import StreamCursor from "./StreamCursor.svelte";
 
   let { app }: { app: App } = $props();
@@ -236,9 +237,13 @@
           survives anything — it is in the harness's copy as a `user` entry and in this
           tab's feed as a minted row — so a group whose words and calls have both gone is
           still legible as "this is what you asked".
+
+          It is marked as prose is (`MarkedText`): the operator's own words, but the empty
+          chat asks them to paste the program's pages, so it is as often a page author's
+          words, and a bidi control in a pasted host reorders it here as in a reply.
         -->
         <div class="you">
-          <div class="bubble">{group.subject.message}</div>
+          <div class="bubble"><MarkedText text={group.subject.message} /></div>
         </div>
       {/if}
     {/snippet}

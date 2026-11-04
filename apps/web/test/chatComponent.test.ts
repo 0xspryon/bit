@@ -533,12 +533,18 @@ describe("the separator, which the caller owns", () => {
         }),
       ]),
     });
-  /** The harness's word on each narrated `turn.other` block, in order. */
+  /**
+   * The harness's word on each narrated `turn.other` block, in order. Svelte's hydration
+   * comments are taken out first: the word is drawn through `MarkedText`, which wraps it
+   * in its own.
+   */
   const labels = (html: string): string[] =>
     [
-      ...html.matchAll(
-        /<span class="what[^"]*">[^<]*<\/span>\s*([^<\s][^<]*?)\s*<!--/g,
-      ),
+      ...html
+        .replace(/<!--[^]*?-->/g, "")
+        .matchAll(
+          /<span class="what[^"]*">[^<]*<\/span>\s*([^<\s][^<]*?)\s*</g,
+        ),
     ].map((match) => match[1] ?? "");
 
   test("a thread labels every harness entry but the agent's own words", () => {

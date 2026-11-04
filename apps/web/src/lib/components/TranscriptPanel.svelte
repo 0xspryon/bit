@@ -35,6 +35,7 @@
    * is nothing to ask about and nothing is drawn, which is the usual case on both.
    */
   import Button from "./Button.svelte";
+  import MarkedText from "./MarkedText.svelte";
   import type { App } from "../app.svelte";
 
   let { app, attemptId }: { app: App; attemptId: string } = $props();
@@ -88,13 +89,19 @@
             <li class="entry">
               <span class="entry-type mono">{entry.type}</span>
               {#if entry.error !== undefined}
-                <span class="entry-error">{entry.error}</span>
+                <span class="entry-error"
+                  ><MarkedText text={entry.error} code /></span
+                >
               {/if}
               <!--
                 `white-space: pre-wrap` rather than any parsing: the text is the harness's
-                own and choosing how to structure it is the later slice's decision.
+                own and choosing how to structure it is the later slice's decision. It holds
+                whatever the agent fetched, so it is marked as code is (`MarkedText`): a
+                bidi or zero-width character in it shows as its code point.
               -->
-              <span class="entry-text">{entry.text}</span>
+              <span class="entry-text"
+                ><MarkedText text={entry.text} code /></span
+              >
             </li>
           {/each}
         </ol>

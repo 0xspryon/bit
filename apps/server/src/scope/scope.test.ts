@@ -804,6 +804,47 @@ describe("normalising an entry on write", () => {
     });
   }
 
+  test("an entry with an invisible character in it is refused, by code point, without echoing it", () => {
+    /*
+     * `moc.emca` behind a right-to-left override is listed as `acme.com` and matches
+     * nothing called that; a zero-width space or a tag letter in a host is a letter nobody
+     * sees. The importer proposes entries from program pages a stranger wrote, so each is
+     * refused, and the sentence names the character rather than repeating the value, which
+     * would reorder the sentence too.
+     */
+    const cases: ReadonlyArray<readonly [ScopeKind, string, string]> = [
+      ["subtree", "\u202Emoc.emca", "U+202E"],
+      ["host", "\u2067com\u200F.\u200Facme\u2069", "U+2067"],
+      ["host", "ac\u200Bme.com", "U+200B"],
+      ["subtree", "acme\u2060.com", "U+2060"],
+      ["host", "acme.com\u{E0041}", "U+E0041"],
+      // `trim()` would drop it at the end; the check runs on the value as given.
+      ["host", "acme.com\uFEFF", "U+FEFF"],
+      ["cidr", "203.0.113.0\u200E/24", "U+200E"],
+    ];
+    for (const [kind, raw, point] of cases) {
+      const result = normaliseScopeEntry({ kind, value: raw });
+      expect(isScopeValueRefusal(result)).toBe(true);
+      if (isScopeValueRefusal(result)) {
+        expect(result.detail).toContain(`invisible character (${point})`);
+        expect(result.detail).toContain("type the value again without it");
+        expect(result.detail).not.toContain(raw.trim());
+        expect(
+          /[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/u.test(
+            result.detail,
+          ),
+        ).toBe(false);
+      }
+    }
+    // Right-to-left letters are not invisible, and a plain host still normalises.
+    expect(value("host", "acme.com")).toBe("acme.com");
+    expect(
+      isScopeValueRefusal(
+        normaliseScopeEntry({ kind: "host", value: "\u05D0\u05D1.com" }),
+      ),
+    ).toBe(false);
+  });
+
   test("a wildcard is refused rather than quietly accepted as an apex", () => {
     /*
      * `*.acme.test` is what a programme page writes, and it is what a subtree entry on

@@ -423,6 +423,14 @@ const withinPrefix = (subject: Address, prefix: Prefix): boolean => {
 /* ── Entry normalisation, on write ───────────────────────────────────────────────── */
 
 /**
+ * The characters a scope entry may not contain: bidi controls (U+061C, U+200E/U+200F,
+ * U+202A–U+202E, U+2066–U+2069), zero-width ones (U+200B–U+200D, U+2060, U+FEFF) and the
+ * tag characters (U+E0000–U+E007F) — the set the web app marks in code.
+ */
+const INVISIBLE =
+  /[\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/u;
+
+/**
  * The stored form of one authored entry value, or an instructive refusal.
  *
  * Run on write, so the stored form is the matched form and no read has to normalise
@@ -437,6 +445,29 @@ export const normaliseScopeEntry = (input: {
   readonly kind: ScopeKind;
   readonly value: string;
 }): string | ScopeValueRefusal => {
+  /*
+   * A character that is not drawn, refused before anything else — and tested on the value
+   * as given, since `trim()` would quietly drop a U+FEFF at either end.
+   *
+   * A bidi control reorders the letters around it on screen and not in the text, so
+   * `moc.emca` behind a right-to-left override is listed as `acme.com` and matches nothing
+   * called that; a zero-width or tag character puts a letter into a host that nobody can
+   * see. Either way the entry would read as one host and match as another, and the
+   * importer proposes entries from attacker-written program pages. No hostname, address or
+   * block contains one, so nothing real is refused. The sentence names the character by its
+   * code point and does not echo the value: echoed, it would reorder the sentence too.
+   */
+  const invisible = INVISIBLE.exec(input.value)?.[0];
+  if (invisible !== undefined) {
+    const point = (invisible.codePointAt(0) ?? 0)
+      .toString(16)
+      .toUpperCase()
+      .padStart(4, "0");
+    return {
+      _tag: "refused",
+      detail: `this entry contains an invisible character (U+${point}) that changes how it reads, so it would be listed as one host and matched as another; type the value again without it`,
+    };
+  }
   const raw = input.value.trim();
   if (raw === "") {
     return { _tag: "refused", detail: "an entry needs a value" };
