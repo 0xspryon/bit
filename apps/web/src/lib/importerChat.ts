@@ -38,11 +38,12 @@
  * arrangement rather than luck: the replay is asked for when a session is **opened**, so
  * every `turn.operator` row this tab mints is minted after the answer it could have collided
  * with. It is read **again** in one case only (A6 U4 review): a `turn.taken` naming a
- * message this tab has no row for — sent from another tab, or taken between the server's two
- * reads ({@link takesUnknownMessage}). That read replaces this tab's rows rather than
- * matching them ({@link withReplay}): the server's answer holds every message it accepted
- * before building it, taken (in the transcript) or still queued (`queued`), so only rows it
- * accepted later are kept, told apart by the server's own clock.
+ * message this tab has no row for — one sent from another tab ({@link takesUnknownMessage}).
+ * That read is joined to this tab's rows **by message id** ({@link withReplay}, A6 U4 review
+ * 2): the server's answer holds every steer it accepted before the read began exactly once,
+ * in the transcript (a `turn.operator` carrying its `messageId`) or beside it (`queued`), so
+ * a row of this tab's is dropped for the transcript's copy, kept for a held one, and kept
+ * when the answer does not have it at all.
  *
  * ## What is not joined, and says so
  *
@@ -356,10 +357,10 @@ const takenByMessage = (
 };
 
 /**
- * The rows a replay's still-queued messages are drawn as (A6 U4 review): each the operator's
- * row for its message, carrying the message's id so its `turn.taken` finds it, at the time
- * the server accepted it. Ids of their own (`operator:queued:<id>`), so no row this tab
- * mints later can share one.
+ * The rows a replay's held messages are drawn as (A6 U4 review): each the operator's row for
+ * its message, carrying the message's id so its `turn.taken` finds it, at the time the
+ * server accepted it. Ids of their own (`operator:queued:<id>`), so no row this tab mints
+ * later can share one.
  */
 export const queuedRows = (
   queued: ImporterConversationView["queued"],
@@ -376,38 +377,91 @@ export const queuedRows = (
     messageId: message.messageId,
   }));
 
+/** The message ids a replay's transcript holds: its `turn.operator` items' (A6 U4 review 2). */
+const writtenIds = (items: readonly LiveItem[]): ReadonlySet<string> =>
+  new Set(
+    items.flatMap((item) =>
+      item.kind === OPERATOR_TURN_KIND && item.messageId !== undefined
+        ? [item.messageId]
+        : [],
+    ),
+  );
+
 /**
- * A session with the server's replay installed (S6), and the messages it holds queued
- * drawn as rows waiting at the end (A6 U4 review).
+ * A session with the server's replay installed (S6), and the messages it holds outside the
+ * transcript drawn as rows at the end (A6 U4 review).
  *
  * `answered.floor` is the activity publish order this tab had seen when the read was asked
- * for: the replay/live boundary ({@link ImporterSession.historyFloor}).
+ * for: the replay/live boundary ({@link ImporterSession.historyFloor}). `held` is the ids of
+ * the rows this session held when the read was asked for — by default every row it holds
+ * now, which is the first read's case (it is asked only for a session with none).
  *
- * **On a second read, this tab's own rows are replaced by the answer's**, and that is what
- * keeps a message off the screen twice. Every message the server accepted before it built
- * the answer is in it — in the transcript if the harness took it, in `queued` if not — so
- * the rows this tab minted for those are dropped. Rows the server accepted **after** it
- * built the answer (`at`, the server's `acceptedAt`, past `view.at`, the same clock) cannot
- * be in it, and are kept, with what follows them and their floors.
+ * **Joined by message id, never by time** (A6 U4 review 2). The server reads what it holds
+ * outside the transcript (`queued`) before the transcript, so every message it accepted
+ * before the read began is in exactly one of the two: the transcript (a `turn.operator`
+ * carrying its `messageId`) or `queued`. So:
+ *
+ * - a row this tab holds whose message the **transcript** has is dropped: the transcript's
+ *   copy is drawn, where the harness put it;
+ * - a row whose message is in `queued` is kept — its send floor and its queued state are
+ *   this tab's own, and better than any the answer could give — unless the server says the
+ *   harness took it and this tab never saw the take: then the answer's row, which says so;
+ * - a row with no message id this tab held when it asked is dropped: it opened or reopened
+ *   the session, which the harness wrote before any steer could be taken, and the take that
+ *   asked for this read is of such a steer;
+ * - a row minted **after** the read was asked for, and not in the answer by id, is kept.
+ *
+ * A clock comparison could not do this: the server stamps the answer after reading the
+ * transcript, so a message accepted during the read was either dropped (it was older than
+ * the stamp and in neither half) or drawn twice.
  */
 export const withReplay = (
   session: ImporterSession,
   answered: { readonly view: ImporterConversationView; readonly floor: number },
+  held: ReadonlySet<string> = new Set(session.items.map((item) => item.id)),
 ): ImporterSession => {
   const { view, floor } = answered;
-  const cut = session.items.findIndex(
-    (item) => item.kind === OPERATOR_TURN_KIND && item.at > view.at,
+  const written = writtenIds(view.items);
+  const waiting = new Map(
+    view.queued
+      .filter((message) => !written.has(message.messageId))
+      .map((message) => [message.messageId, message] as const),
   );
-  const kept = cut < 0 ? [] : session.items.slice(cut);
-  const queued = queuedRows(view.queued, floor);
+  /** Whether this tab's own row for a held message is better than the answer's. */
+  const ownWins = (messageId: string): boolean => {
+    const message = waiting.get(messageId);
+    return (
+      message !== undefined &&
+      (!message.taken || session.taken?.[messageId] !== undefined)
+    );
+  };
+  const kept = session.items.filter((item) =>
+    item.messageId === undefined
+      ? !held.has(item.id)
+      : !written.has(item.messageId) &&
+        (ownWins(item.messageId) ||
+          (!held.has(item.id) && !waiting.has(item.messageId))),
+  );
+  const keptMessages = new Set(
+    kept.flatMap((item) =>
+      item.messageId === undefined ? [] : [item.messageId],
+    ),
+  );
+  const added = [...waiting.values()].filter(
+    (message) => !keptMessages.has(message.messageId),
+  );
+  const rows = queuedRows(added, floor);
   const keptIds = new Set(kept.map((item) => item.id));
   const floors: Record<string, number> = {};
   for (const [id, at] of Object.entries(session.floors ?? {})) {
     if (keptIds.has(id)) floors[id] = at;
   }
-  for (const row of queued) floors[row.id] = floor;
+  for (const row of rows) floors[row.id] = floor;
+  // Only a message still waiting is queued: one the harness took is an ordinary turn.
   const midTurn = [
-    ...queued.map((row) => row.id),
+    ...rows
+      .filter((row) => waiting.get(row.messageId ?? "")?.taken === false)
+      .map((row) => row.id),
     ...(session.midTurn ?? []).filter((id) => keptIds.has(id)),
   ];
   return {
@@ -415,7 +469,8 @@ export const withReplay = (
     history: historyOf(view),
     historyFloor: floor,
     loaded: true,
-    items: [...queued, ...kept],
+    // In the order the server accepted them (`at` is its `acceptedAt` on both kinds).
+    items: [...rows, ...kept].sort((left, right) => left.at - right.at),
     floors,
     midTurn,
   };
@@ -423,9 +478,10 @@ export const withReplay = (
 
 /**
  * Whether a `turn.taken` item names a message this session has no row for — one sent from
- * another tab, or taken between the replay's two reads — so the replay must be read again
- * to draw it (A6 U4 review). Only a take the session's replay cannot already hold (published
- * after its floor) and only for a session whose replay has been read.
+ * another tab — so the replay must be read again to draw it (A6 U4 review). Only a take the
+ * session's replay cannot already hold (published after its floor), only for a session
+ * whose replay has been read, and not when the replay's transcript already holds the
+ * message by id (A6 U4 review 2).
  */
 export const takesUnknownMessage = (
   session: ImporterSession,
@@ -436,7 +492,8 @@ export const takesUnknownMessage = (
   session.loaded === true &&
   (session.historyFloor === undefined ||
     (activityOrder(take) ?? Number.POSITIVE_INFINITY) > session.historyFloor) &&
-  !session.items.some((item) => item.messageId === take.messageId);
+  !session.items.some((item) => item.messageId === take.messageId) &&
+  !session.history.items.some((item) => item.messageId === take.messageId);
 
 /** What a message waiting behind the running turn says, under its bubble. */
 export const QUEUED_NOTE =
@@ -820,6 +877,18 @@ export const buildImporterChat = (
   const active = cut.turns.findLastIndex((turn) => !waiting(turn.operator));
 
   const groups: ImporterGroup[] = [];
+  /*
+   * The harness's note on its copy ("From Claude Code, which may delete it…") is said once
+   * a thread, on the first replayed group, and not under every replayed turn (A6 U4 review
+   * 2): it is about the copy, and the copy is one. Later groups keep the `replayed` state
+   * with no sentence.
+   */
+  let noted = false;
+  const replayNote = (): string => {
+    if (noted) return "";
+    noted = true;
+    return history.note;
+  };
 
   /*
    * The leading group exists for four reasons and no others: replayed words before the
@@ -839,7 +908,7 @@ export const buildImporterChat = (
     const prose: RoundProse = cut.leading.some(fromReplay)
       ? {
           _tag: "replayed",
-          note: history.note,
+          note: replayNote(),
           ephemeral: true,
           truncated: history.truncated,
         }
@@ -887,7 +956,7 @@ export const buildImporterChat = (
           ? spoke
             ? {
                 _tag: "replayed",
-                note: history.note,
+                note: replayNote(),
                 ephemeral: true,
                 // Said once, on the first turn: the answer stopped short of the oldest items.
                 truncated:

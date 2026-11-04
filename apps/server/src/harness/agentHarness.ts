@@ -390,6 +390,19 @@ export interface MessageEntry {
    * message carried none, or the caller named no folder.
    */
   readonly attachments?: readonly ReplayedAttachment[];
+  /**
+   * On a `user` entry that is a steer this application delivered, the application's id for
+   * it (`PromptDelivery.messageId`) — the same id the delivery's answer and its `taken`
+   * narration carry — and absent on every other entry (A6 U4 review 2).
+   *
+   * Read back from the id the harness **stored the entry under**, which each driver derived
+   * from ours when it delivered it (`harness/messageId.ts`): OpenCode's `msg_<hex>` is
+   * stripped back to the hex, and Claude Code's UUID is matched against the ids the session
+   * was delivered — that mapping is one-way, so a session this process no longer holds
+   * (a restart) names none of its Claude Code steers. A caller joins a message it holds to
+   * the transcript by this and never by its words or its time.
+   */
+  readonly messageId?: string;
 }
 
 /** What a caller tells {@link AgentHarness.messages} about the session it reads. */

@@ -5303,6 +5303,10 @@ export class App {
    * grow a DOM nobody scrolls back through. The oldest are dropped, which is sound here in
    * a way it would not be on the server: everything on the record channel is still in the
    * target's event log, and {@link liveCursor} still says where this tab had got to.
+   *
+   * V2(chat): a busy target (many items from other subjects) can slide an earlier turn's
+   * live reply and footer out of view until a reload. Proper V2: keep each conversation's
+   * own items outside the shared sliding window.
    */
   static readonly LIVE_KEPT = 500;
 

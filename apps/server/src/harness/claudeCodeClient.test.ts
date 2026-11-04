@@ -2252,6 +2252,8 @@ const turnDrivenSdk = () => {
    * `result` names in `user_message_uuids`, as 2.1.310 does for a turn that was asked for.
    */
   const toAnswer: (string | undefined)[] = [];
+  /** What `getSessionMessages` answers: the test writes the CLI's stored entries here. */
+  const transcript: SessionMessage[] = [];
   const push = (message: SDKMessage): void => {
     pending.push(message);
     const waiting = wake;
@@ -2348,7 +2350,7 @@ const turnDrivenSdk = () => {
       };
       return query;
     },
-    sessionMessages: () => Promise.resolve([]),
+    sessionMessages: () => Promise.resolve([...transcript]),
     sessionInfo: () => Promise.resolve(undefined),
   };
 
@@ -2541,6 +2543,7 @@ const turnDrivenSdk = () => {
     failStream,
     endStream,
     pulled,
+    transcript,
   };
 };
 
@@ -2607,6 +2610,54 @@ describe("U4: a steer taken, and a turn the harness ended in error", () => {
       [],
     );
     expect([...record.untaken.values()]).toEqual([OTHER]);
+  });
+
+  /*
+   * A6 U4 review 2: a replay joins a steer to the transcript by id. The CLI stores the steer
+   * under the UUID it was delivered with — one-way from ours — so the driver names it by the
+   * ids this session was delivered, and names nothing else.
+   */
+  test("a delivered steer's stored entry is named by the application's id; the opening prompt and others are not", async () => {
+    const entries = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "import",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+        });
+        yield* harness.prompt(SESSION, "the opening");
+        yield* Effect.promise(() => driver.pulled(1));
+        yield* harness.prompt(SESSION, "and the portal", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: STEER,
+        });
+        yield* Effect.promise(() => driver.pulled(2));
+        const user = (uuid: string, text: string): SessionMessage => ({
+          type: "user",
+          uuid,
+          session_id: SESSION,
+          message: { role: "user", content: text },
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+        });
+        driver.transcript.push(
+          user(driver.seen.uuids[0] ?? "opening", "the opening"),
+          user(claudeCodeMessageId(STEER), "and the portal"),
+          // A steer this session was never delivered, under a well-formed id of ours.
+          user(claudeCodeMessageId(OTHER), "someone else's"),
+        );
+        return yield* harness.messages(SESSION);
+      }),
+    );
+    expect(
+      entries.map((entry) => [entry.text, entry.messageId ?? null]),
+    ).toEqual([
+      ["the opening", null],
+      ["and the portal", STEER],
+      ["someone else's", null],
+    ]);
   });
 
   test("a failed result says the CLI's errors; a success, an interrupt or a silent failure says nothing", () => {

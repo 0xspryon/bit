@@ -779,9 +779,10 @@ export class ImporterSessions {
    * `App.LIVE_KEPT` items, and a take that fell out of it would have put its message back
    * in the queue. So the take is kept on the session, as the floors are.
    *
-   * **Read again, for a message drawn nowhere**: one sent from another tab, or one the
-   * server's replay missed by a hair (taken between its two reads). The reply to it would
-   * otherwise sit in the turn before under no "You". Not while this tab has a message with
+   * **Read again, for a message drawn nowhere**: one sent from another tab. The reply to
+   * it would otherwise sit in the turn before under no "You". The answer holds it whether or
+   * not the harness has written it yet (Claude Code narrates the take before it writes the
+   * message), in the transcript or beside it, by id (`withReplay`). Not while this tab has a message with
    * the server, whose take can outrun the answer that mints its row — and is recorded here
    * for when it lands. Called by the app for every new live item.
    */
@@ -804,10 +805,11 @@ export class ImporterSessions {
 
   /**
    * Reads one session's conversation again and installs it over what this tab holds
-   * (`withReplay`): rows the answer covers are replaced by its own, and only rows the server
-   * accepted after building it are kept. One read per import at a time, as
-   * {@link #loadHistory}'s; a read that fails or lands after the page moved on changes
-   * nothing.
+   * (`withReplay`): rows are joined to the answer by message id, and a row with no id is
+   * dropped only if this tab held it when it asked (A6 U4 review 2). One read per import at
+   * a time, as {@link #loadHistory}'s; a read that fails, lands after the page moved on, or
+   * holds no transcript (a harness that could not be read is no reason to wipe the rows
+   * this tab already draws) changes nothing.
    */
   async #rereadHistory(sessionId: string): Promise<void> {
     const server = this.#server;
@@ -820,12 +822,20 @@ export class ImporterSessions {
     ) {
       return;
     }
+    // The rows this read can be an answer for: those held when it was asked for.
+    const held = new Set(session?.items.map((item) => item.id));
     this.#reading.add(importId);
     const answered = await server
       .history(importId)
       .finally(() => this.#reading.delete(importId));
-    if (answered === undefined || this.#server !== server) return;
-    this.#replace(sessionId, (before) => withReplay(before, answered));
+    if (
+      answered === undefined ||
+      this.#server !== server ||
+      answered.view.source !== "harness"
+    ) {
+      return;
+    }
+    this.#replace(sessionId, (before) => withReplay(before, answered, held));
   }
 
   /**

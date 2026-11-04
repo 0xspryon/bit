@@ -523,6 +523,13 @@ export class ScopeImporter extends Context.Service<
      */
     readonly holds: (importId: string) => Effect.Effect<boolean>;
     /**
+     * How many of the operator's messages this process holds for one import outside its
+     * harness's transcript (`ImporterConversationView.queued`), whether or not the session
+     * is still held — `0` once it has closed (A6 U4 review 2). Read-only; what a check that
+     * a close left nothing behind asks.
+     */
+    readonly heldSteers: (importId: string) => Effect.Effect<number>;
+    /**
      * Stops the turn running in one import's session, and keeps the conversation (A6 F5).
      *
      * **Not {@link stop}**, which ends the import's authority for good. This is the spine's
@@ -666,7 +673,13 @@ export class ScopeImporter extends Context.Service<
             }),
           revokeStray: credentials.revokeImport,
           afterClose: (entry, reason) =>
-            markEnded(entry.targetId, entry.id, reason),
+            Effect.andThen(
+              // What the session held queued went with it, and is not this process's to
+              // replay (`steers`). Not on the narrator's exit: a narration stream can end
+              // while the session lives on.
+              Effect.sync(() => steers.delete(entry.id)),
+              markEnded(entry.targetId, entry.id, reason),
+            ),
           words: {
             unregisterRefused:
               "a harness would not take back the scope importer's MCP registration; the credential behind it is revoked either way",
@@ -686,23 +699,35 @@ export class ScopeImporter extends Context.Service<
       const turns = new Map<string, Fiber.Fiber<void>>();
 
       /**
-       * The operator's messages each live import's harness has not taken yet, by import id
-       * and then by message id (A6 U4 review), and the message ids it has taken.
+       * The operator's messages each live import's harness transcript does not hold yet, by
+       * import id and then by message id (A6 U4 review, review 2), and the message ids the
+       * harness has said it took.
        *
        * **Why this process keeps them at all**, when it keeps no other word of a
        * conversation (DECISIONS.md §8): a steer delivered while a turn runs is queued in the
        * harness, and neither harness's transcript holds it until it is taken — so a reload in
        * that window lost the message, and the reply to it then read as part of the turn
        * before. {@link replay} carries these beside the transcript, and a reloaded tab draws
-       * them queued.
+       * them.
        *
-       * Added when a `continued` send is accepted ({@link deliverTurn}); removed when the
-       * harness narrates `taken` for it ({@link narrate}), when the turn settles idle (nothing
-       * can still be queued in a session that is idle), and with the session, when its
-       * narrator ends. `taken` is there for the race the other way round: the harness can
-       * take a steer before `deliver` has returned to say it was delivered, and a take seen
-       * first must stop the message being added afterwards. Memory only, bounded by the
-       * messages an operator sends to a session this process holds.
+       * **A take does not remove one** (review 2). Claude Code narrates the take 30–130 ms
+       * before its transcript holds the message, so a replay read in that gap — which is when
+       * a tab that saw the take of a message it had no row for reads it — found it in neither
+       * half. A take only marks the message `taken`; {@link replay} leaves out whatever its
+       * transcript holds, by id. Removed when the turn settles idle (everything accepted
+       * before then is in the transcript by then), and with the session when it closes
+       * (`afterClose`) — never by a replay, since two tabs reading at once on the same take
+       * would otherwise race: one read could take the message off while the other's
+       * transcript was read before it was written.
+       *
+       * `taken` is there for the race the other way round: the harness can take a steer
+       * before `deliver` has returned to say it was delivered, and a take seen first must
+       * still mark the message taken when it is added. Memory only, bounded by the messages
+       * an operator sends to a session this process holds.
+       *
+       * V2(chat): queued steers live in memory only; a server restart loses a steer that was
+       * still queued (and the harness session that held it), and nothing tells the operator
+       * it was never read. Proper V2: persist queued messages with the app-owned queue.
        */
       const steers = new Map<
         string,
@@ -798,12 +823,16 @@ export class ScopeImporter extends Context.Service<
           narrateCoalesced({
             events: input.harness.sessionEvents(input.sessionId),
             publish: (entry) => {
-              // The harness took a queued message: it is in the transcript from here on,
-              // and no longer this process's to replay (`steers`).
+              // The harness took a queued message: it is being worked on, and stays this
+              // process's to replay until the transcript holds it (`steers`).
               if (entry.detail._tag === "taken") {
                 const held = steersOf(input.importId);
-                held.queued.delete(entry.detail.messageId);
-                held.taken.add(entry.detail.messageId);
+                const id = entry.detail.messageId;
+                held.taken.add(id);
+                const message = held.queued.get(id);
+                if (message !== undefined) {
+                  held.queued.set(id, { ...message, taken: true });
+                }
               }
               return narrations.publish({
                 targetId: input.targetId,
@@ -813,10 +842,6 @@ export class ScopeImporter extends Context.Service<
               });
             },
           }),
-        ).pipe(
-          // The narrator ends with the session (`closeSession` interrupts it first): what it
-          // held queued went with the session, and is not this process's to replay.
-          Effect.ensuring(Effect.sync(() => steers.delete(input.importId))),
         );
         if (outcome._tag === "Failure") {
           yield* Effect.logWarning(
@@ -1539,13 +1564,20 @@ export class ScopeImporter extends Context.Service<
           widened ?? { added: [], notAdded: [] },
           delivered.success.messageId,
         );
-        // Queued until the harness takes it (`steers`), unless it already has.
-        const held = steersOf(entry.id);
-        if (!held.taken.has(delivered.success.messageId)) {
+        /*
+         * Held until the transcript has it (`steers`), marked taken if the take came first.
+         * Only while this process still holds this very session: a close that ran while the
+         * message was out has already dropped the session's `steers`, and a fresh entry made
+         * now would outlive it with nothing left to remove it. No yield from this check to
+         * the write, so a close cannot land between them.
+         */
+        if (sessions.get(entry.id) === entry) {
+          const held = steersOf(entry.id);
           held.queued.set(delivered.success.messageId, {
             messageId: delivered.success.messageId,
             text: truncateNarration(text),
             acceptedAt: turn.acceptedAt,
+            taken: held.taken.has(delivered.success.messageId),
           });
         }
         if ((yield* progress.resume(entry.id)) && !turns.has(entry.id)) {
@@ -1891,6 +1923,15 @@ export class ScopeImporter extends Context.Service<
         "ScopeImporter.replay",
       )(function* (input) {
         const held = sessions.get(input.importId);
+        /*
+         * What this process holds of the session's steers, read **before** the transcript
+         * (A6 U4 review 2): a message accepted before this read is here, and stays here
+         * until the session idles or closes, so whether the transcript below has written it
+         * yet or not, it is in one of the two. Which one is decided by id, not by when.
+         */
+        const pending = [
+          ...(steers.get(input.importId)?.queued.values() ?? []),
+        ];
         const view = yield* importerConversation({
           resolver,
           targetId: input.targetId,
@@ -1904,18 +1945,20 @@ export class ScopeImporter extends Context.Service<
             ? {}
             : { fetchTimeout: input.fetchTimeout }),
         });
-        /*
-         * The messages still queued in the live session (`steers`), read **after** the
-         * transcript: one taken between the two reads is then in the transcript and not
-         * here, rather than in both — and a tab that sees its take name a message it has no
-         * row for reads the replay again.
-         */
+        // Less what the transcript holds by id: each message is drawn once.
+        const written = new Set(
+          view.items.flatMap((item) =>
+            item.kind === "turn.operator" && item.messageId !== undefined
+              ? [item.messageId]
+              : [],
+          ),
+        );
         return {
           ...view,
           queued: view.live
-            ? [...(steers.get(input.importId)?.queued.values() ?? [])].sort(
-                (left, right) => left.acceptedAt - right.acceptedAt,
-              )
+            ? pending
+                .filter((message) => !written.has(message.messageId))
+                .sort((left, right) => left.acceptedAt - right.acceptedAt)
             : [],
         };
       });
@@ -2230,6 +2273,8 @@ export class ScopeImporter extends Context.Service<
         stopTurn,
         holds: (importId) =>
           Effect.sync(() => sessions.get(importId) !== undefined),
+        heldSteers: (importId) =>
+          Effect.sync(() => steers.get(importId)?.queued.size ?? 0),
       });
     }),
   );
@@ -2264,6 +2309,7 @@ export class ScopeImporter extends Context.Service<
       stop: () => Effect.succeed(undefined),
       view: () => Effect.succeed(undefined),
       holds: () => Effect.succeed(false),
+      heldSteers: () => Effect.succeed(0),
       converse: () => Effect.fail(noHarness),
       send: () => Effect.fail(noHarness),
       // No harness, so no session this server could hold: nothing of any import runs here.

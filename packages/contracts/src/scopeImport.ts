@@ -884,14 +884,17 @@ export type ImporterContinuationRefusal =
   typeof ImporterContinuationRefusal.Type;
 
 /**
- * A message the operator sent into a live importer session that the harness has **not yet
- * taken**: delivered as a steer while a turn ran, and still queued behind it (A6 U4 review).
+ * A message the operator sent into a live importer session that the harness's transcript
+ * does **not yet hold**: delivered as a steer, and either still queued behind the turn
+ * running, or taken and not yet written (A6 U4 review, review 2).
  *
- * The harness's transcript does not hold such a message until it takes it, so a replay of
- * the transcript alone loses it on a reload — and the reply to it then reads as part of the
- * turn before. This process holds it from the moment the send is accepted until the
- * harness's `turn.taken` names it (or the session settles or closes), and the replay carries
- * it beside the transcript so a reloaded tab draws it queued, where it waits.
+ * The harness's transcript does not hold such a message until it takes it — and Claude Code
+ * narrates the take 30–130 ms before it writes the entry — so a replay of the transcript
+ * alone loses it on a reload, and the reply to it then reads as part of the turn before.
+ * This process holds it from the moment the send is accepted until the session settles or
+ * closes, and the replay carries it beside the transcript for as long as the transcript
+ * does not hold its id (`LiveItem.messageId` on the replayed `turn.operator`), so a
+ * reloaded tab draws it once: queued while it waits, as its own turn once taken.
  */
 export const ImporterQueuedMessage = Schema.Struct({
   /** The id the send was answered with (`ImporterTurnAccepted.messageId`). */
@@ -900,6 +903,12 @@ export const ImporterQueuedMessage = Schema.Struct({
   text: Schema.String,
   /** When the server accepted it (`ImporterTurnAccepted.acceptedAt`). */
   acceptedAt: EpochMillis,
+  /**
+   * Whether the harness has said it took the message (`turn.taken`): it is being worked on,
+   * not waiting, and is drawn as its own turn rather than queued. A take is narrated only
+   * on the lossy live channel, so a tab reloaded after it has no other way to know.
+   */
+  taken: Schema.Boolean,
 });
 export type ImporterQueuedMessage = typeof ImporterQueuedMessage.Type;
 
@@ -947,13 +956,17 @@ const ImporterConversationViewFields = {
    */
   items: Schema.Array(LiveItem),
   /**
-   * The operator's messages this process delivered into the live session that the harness
-   * has not taken yet, oldest first (A6 U4 review): what {@link items} cannot hold, since the
-   * transcript does not have them until they are taken. Each is drawn queued at the end of
-   * the conversation until a `turn.taken` names it. **The one exception to "nothing of
-   * ours"**: held in memory by this process only, never stored, and empty on any session
-   * this process does not hold (`live` false). Read after {@link items}, so a message taken
-   * between the two reads is in the transcript rather than in both.
+   * The operator's messages this process delivered into the live session that {@link items}
+   * does not hold, oldest first (A6 U4 review): the transcript does not have one until the
+   * harness has taken it and written it. Each is drawn at the end of the conversation,
+   * queued until it is `taken`. **The one exception to "nothing of ours"**: held in memory
+   * by this process only, never stored, and empty on any session this process does not hold
+   * (`live` false).
+   *
+   * **Joined to {@link items} by id, never by time** (A6 U4 review 2): what this process
+   * held is read **before** the transcript, and a message the transcript then holds — a
+   * replayed `turn.operator` carrying its `messageId` — is left out here. So every message
+   * accepted before the read began is in exactly one of the two.
    */
   queued: Schema.Array(ImporterQueuedMessage),
   /** Messages this answer stopped short of. */

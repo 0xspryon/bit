@@ -2150,6 +2150,49 @@ describe("reading a session's messages", () => {
     );
   };
 
+  /*
+   * A6 U4 review 2: a steer is stored under the id it was delivered with, `msg_` plus our
+   * hex, so a replay names it by the application's id — and an id OpenCode minted itself
+   * (the opening prompt's, its sortable `msg_<time><random>`) names nothing.
+   */
+  test("a stored steer is named by the application's id; an id OpenCode minted is not", async () => {
+    const OURS = "aaaaaaaabbbbbbbbccccccccdddddddd";
+    const user = (id: string, text: string, at: number) => ({
+      id,
+      time: { created: 1_793_577_000_000 + at },
+      text,
+      type: "user",
+    });
+    const { layer } = clientWith((url) =>
+      url.includes("/message")
+        ? json({
+            data: [
+              user(messageId(0), "the opening", 0),
+              user(`msg_${OURS}`, "and the portal", 1),
+              // Our prefix and a hex-looking id that is not one of ours in shape.
+              user("msg_abc", "too short", 2),
+            ],
+            cursor: { previous: null, next: null },
+          })
+        : json({ data: [] }),
+    );
+    const entries = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (client) => client.messages("ses_1")),
+          layer,
+        ),
+      ),
+    );
+    expect(
+      entries.map((entry) => [entry.text, entry.messageId ?? null]),
+    ).toEqual([
+      ["the opening", null],
+      ["and the portal", OURS],
+      ["too short", null],
+    ]);
+  });
+
   /** 450 messages: more than the server's 50 default and more than two 200-row pages. */
   const longSession = (): Said[] => [
     { role: "user", text: "begin" },

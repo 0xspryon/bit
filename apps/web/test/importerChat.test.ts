@@ -31,6 +31,7 @@ import {
   type ImporterHistory,
   type ImporterSession,
   acceptedNotice,
+  historyOf,
   takesUnknownMessage,
   withReplay,
 } from "../src/lib/importerChat";
@@ -1597,6 +1598,7 @@ describe("a replay's queued messages, and a replay read again", () => {
             messageId: MESSAGE,
             text: "and the portal",
             acceptedAt: AT + 5_000,
+            taken: false,
           },
         ],
       }),
@@ -1666,46 +1668,248 @@ describe("a replay's queued messages, and a replay read again", () => {
     ]);
   });
 
-  test("read again, the answer replaces the rows it holds and keeps the ones accepted after it", () => {
+  test("read again, rows are joined to the answer by message id, never by time (U4 review 2)", () => {
+    const own = (
+      index: number,
+      text: string,
+      at: number,
+      messageId: string,
+    ) => ({
+      ...operatorTurn({ index, text, at, after: index + 2 }),
+      messageId,
+    });
     const before = session({
       items: [
-        {
-          ...operatorTurn({
-            index: 1,
-            text: "sent before",
-            at: AT + 9_000,
-            after: 3,
-          }),
-          messageId: "m1",
-        },
-        {
-          ...operatorTurn({
-            index: 2,
-            text: "sent after",
-            at: AT + 11_000,
-            after: 4,
-          }),
-          messageId: "m2",
-        },
+        // Held when the read was asked: its message is in the answer's transcript.
+        own(1, "written", AT + 1_000, "m1"),
+        // Held when asked, still waiting in the live session: this tab's row is kept.
+        own(2, "waiting", AT + 2_000, "m2"),
+        // Sent while the read was out, accepted before the answer's stamp and in neither
+        // half of it: a cut at `view.at` dropped it.
+        own(3, "during the read", AT + 9_000, "m3"),
+        // Sent while the read was out, accepted after the stamp, and in the answer's
+        // `queued` (read after the stamp): a cut at `view.at` drew it twice.
+        own(4, "after the stamp", AT + 11_000, "m4"),
       ],
-      floors: { "operator:1": 3, "operator:2": 4 },
-      midTurn: ["operator:1", "operator:2"],
+      floors: {
+        "operator:1": 3,
+        "operator:2": 4,
+        "operator:3": 5,
+        "operator:4": 6,
+      },
+      midTurn: ["operator:2", "operator:3", "operator:4"],
       loaded: true,
       historyFloor: 1,
     });
-    const again = withReplay(before, {
-      // Built at AT + 10 s: "sent before" is in it (here, in its transcript); "sent after" is not.
-      view: view({
+    const again = withReplay(
+      before,
+      {
+        view: view({
+          at: AT + 10_000,
+          items: [
+            replayItem(0, "turn.operator", "written", {
+              importId: "imp_1",
+              messageId: "m1",
+            }),
+          ],
+          queued: [
+            {
+              messageId: "m2",
+              text: "waiting",
+              acceptedAt: AT + 2_000,
+              taken: false,
+            },
+            {
+              messageId: "m4",
+              text: "after the stamp",
+              acceptedAt: AT + 11_000,
+              taken: false,
+            },
+          ],
+        }),
+        floor: 9,
+      },
+      new Set(["operator:1", "operator:2"]),
+    );
+    expect(again.items.map((row) => row.body)).toEqual([
+      "waiting",
+      "during the read",
+      "after the stamp",
+    ]);
+    expect(again.items.map((row) => row.id)).toEqual([
+      "operator:2",
+      "operator:3",
+      "operator:4",
+    ]);
+    expect(again.floors).toEqual({
+      "operator:2": 4,
+      "operator:3": 5,
+      "operator:4": 6,
+    });
+    expect(again.midTurn).toEqual(["operator:2", "operator:3", "operator:4"]);
+    expect(again.historyFloor).toBe(9);
+    // "written" is drawn once, from the transcript.
+    const groups = buildImporterChat({
+      history: again.history,
+      items: again.items,
+      working: true,
+      midTurn: again.midTurn ?? [],
+    });
+    expect(groups.map((group) => group.subject.message)).toEqual([
+      "written",
+      "waiting",
+      "during the read",
+      "after the stamp",
+    ]);
+  });
+
+  test("a row held when the read was asked, with no id, is the transcript's; one sent after it is kept", () => {
+    const before = session({
+      items: [
+        operatorTurn({ index: 1, text: "opened it", at: AT, after: 2 }),
+        operatorTurn({
+          index: 2,
+          text: "reopened it",
+          at: AT + 20_000,
+          after: 8,
+        }),
+      ],
+      floors: { "operator:1": 2, "operator:2": 8 },
+      loaded: true,
+      historyFloor: 1,
+    });
+    const again = withReplay(
+      before,
+      {
+        view: view({
+          at: AT + 30_000,
+          items: [
+            replayItem(0, "turn.operator", "opened it", { importId: "imp_1" }),
+          ],
+        }),
+        floor: 9,
+      },
+      new Set(["operator:1"]),
+    );
+    expect(again.items.map((row) => row.body)).toEqual(["reopened it"]);
+  });
+
+  test("a message the harness took and has not written yet is drawn as its own turn with its reply (U4 review 2)", () => {
+    /*
+     * Claude Code narrates the take 30–130 ms before its transcript holds the message, and a
+     * tab that saw the take of a message it had no row for reads the replay in that gap: the
+     * message is not in `items`, and the server now still holds it, marked taken.
+     */
+    const loaded = session({ loaded: true, historyFloor: 5, items: [] });
+    const take = item({
+      id: "activity:6",
+      importId: "imp_1",
+      kind: "turn.taken",
+      messageId: MESSAGE,
+    });
+    expect(takesUnknownMessage(loaded, take)).toBe(true);
+    const again = withReplay(
+      loaded,
+      {
+        view: view({
+          queued: [
+            {
+              messageId: MESSAGE,
+              text: "from the other tab",
+              acceptedAt: AT + 5_000,
+              taken: true,
+            },
+          ],
+        }),
+        floor: 6,
+      },
+      new Set(),
+    );
+    // A row for it now, so the next sighting of its take asks for nothing.
+    expect(takesUnknownMessage(again, take)).toBe(false);
+    // Not queued: the harness has it.
+    expect(again.midTurn).toEqual([]);
+    const reply7 = item({
+      id: "activity:7",
+      importId: "imp_1",
+      kind: "turn.reply",
+      body: "on it",
+    });
+    const groups = buildImporterChat({
+      history: again.history,
+      working: true,
+      midTurn: again.midTurn ?? [],
+      items: importerFeed({
+        own: again.items,
+        floors: again.floors,
+        live: [take, reply7],
+        importId: "imp_1",
+        historyFloor: again.historyFloor,
+        midTurn: again.midTurn,
+        working: true,
+      }),
+    });
+    expect(
+      groups.map((group) => [group.subject.message, group.subject.queued]),
+    ).toEqual([
+      ["Read the policy page", false],
+      ["from the other tab", false],
+    ]);
+    expect(groups[1]?.rows.map((row) => row.item.body)).toEqual(["on it"]);
+  });
+
+  test("the harness's note on its copy is said once a thread, not under every replayed turn", () => {
+    const replayed = historyOf(
+      view({
+        note: "From Claude Code, which may delete it.",
         items: [
-          replayItem(0, "turn.operator", "sent before", { importId: "imp_1" }),
+          replayItem(0, "turn.operator", "first", { importId: "imp_1" }),
+          replayItem(1, "turn.reply", "one", { importId: "imp_1" }),
+          replayItem(2, "turn.operator", "second", { importId: "imp_1" }),
+          replayItem(3, "turn.reply", "two", { importId: "imp_1" }),
+          replayItem(4, "turn.operator", "third", { importId: "imp_1" }),
+          replayItem(5, "turn.reply", "three", { importId: "imp_1" }),
         ],
       }),
-      floor: 9,
+    );
+    const groups = buildImporterChat({
+      history: replayed,
+      items: [],
+      working: false,
     });
-    expect(again.items.map((row) => row.body)).toEqual(["sent after"]);
-    expect(again.floors).toEqual({ "operator:2": 4 });
-    expect(again.midTurn).toEqual(["operator:2"]);
-    expect(again.historyFloor).toBe(9);
+    expect(
+      groups.map((group) =>
+        group.prose._tag === "replayed" ? group.prose.note : group.prose._tag,
+      ),
+    ).toEqual(["From Claude Code, which may delete it.", "", ""]);
+  });
+
+  test("a take for a message the transcript holds by id asks for nothing", () => {
+    const loaded = session({
+      loaded: true,
+      historyFloor: 5,
+      history: historyOf(
+        view({
+          items: [
+            replayItem(0, "turn.operator", "theirs", {
+              importId: "imp_1",
+              messageId: "theirs",
+            }),
+          ],
+        }),
+      ),
+    });
+    expect(
+      takesUnknownMessage(
+        loaded,
+        item({
+          id: "activity:6",
+          importId: "imp_1",
+          kind: "turn.taken",
+          messageId: "theirs",
+        }),
+      ),
+    ).toBe(false);
   });
 
   test("a take for a message with no row asks for the replay again; one for a known row, or under the floor, does not", () => {

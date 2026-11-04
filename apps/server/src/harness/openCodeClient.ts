@@ -1240,9 +1240,23 @@ const flatten = (
           mimeOf: (path) => fileTypes.get(path),
         })
       : undefined;
+  /*
+   * A steer of ours is stored under the id it was delivered with, `msg_` plus our hex
+   * (`openCodeMessageId`), so the application's id is that without its prefix (A6 U4 review
+   * 2) — the reading `session.inbox.delivered`'s take gets. An id OpenCode minted itself (an
+   * opening prompt's) is not in that shape and names nothing.
+   */
+  const ours =
+    type === "user" &&
+    typeof record.id === "string" &&
+    record.id.startsWith("msg_") &&
+    isDerivedMessageId(record.id.slice(4))
+      ? record.id.slice(4)
+      : undefined;
   return {
     type,
     text: split?.text ?? words,
+    ...(ours === undefined ? {} : { messageId: ours }),
     ...(split === undefined || split.attachments.length === 0
       ? {}
       : { attachments: split.attachments }),

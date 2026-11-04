@@ -74,6 +74,7 @@ import type {
   AgentHarness,
   HarnessNarration,
   McpRegistration,
+  MessageEntry,
   PromptDelivery,
 } from "../harness/agentHarness";
 import type { MessageAttachment } from "../harness/attachments";
@@ -268,6 +269,11 @@ interface Script {
    */
   steerLatency: number;
   /**
+   * Entries the harness has written to its transcript after the scripted ones: a steer it
+   * took and wrote, say (A6 U4 review 2). `messages` answers them last.
+   */
+  written: MessageEntry[];
+  /**
    * Streams the first line as {@link STREAMED_PIECES} deltas before its finished block, as
    * a driver that streams does (A6 F6).
    */
@@ -347,6 +353,7 @@ const newScript = (readable: readonly string[]): Script => {
     failEvents: false,
     emit: undefined,
     steerLatency: 0,
+    written: [],
     streamBlocks: false,
     done: Promise.resolve(),
     failCreate: false,
@@ -571,8 +578,8 @@ const scriptedHarness = (script: Script) => {
     // the report rather than the first thing said, which is why there is more than one
     // assistant entry here.
     messages: () =>
-      Effect.succeed(
-        [
+      Effect.sync(() => [
+        ...[
           { type: "user", text: "…the prompt…", error: undefined },
           { type: "assistant", text: NARRATION[0], error: undefined },
           { type: "assistant", text: NARRATION[1], error: undefined },
@@ -586,7 +593,8 @@ const scriptedHarness = (script: Script) => {
           model: undefined,
           at: undefined,
         })),
-      ),
+        ...script.written,
+      ]),
     /*
      * A stream that really narrates, and really stays open.
      *
@@ -1803,9 +1811,10 @@ const replayOf = (
 
 /**
  * A6 U4 review: a steer the harness has not taken is in neither harness's transcript, so the
- * replay carries it beside the transcript until the take, and a reloaded tab draws it queued.
+ * replay carries it beside the transcript, and a reloaded tab draws it. Review 2: until the
+ * transcript holds it **by id** — Claude Code narrates the take before it writes the message.
  */
-describe("a message still queued in the live session", () => {
+describe("a message the harness's transcript does not hold yet", () => {
   /** A take of `messageId`, as a driver narrates it. */
   const take = (messageId: string): HarnessNarration => ({
     type: "assistant",
@@ -1813,6 +1822,16 @@ describe("a message still queued in the live session", () => {
     at: 1_700_000_000_500,
     outcome: undefined,
     detail: { _tag: "taken", messageId },
+  });
+  /** The harness's stored copy of a steer, named by the driver as ours. */
+  const stored = (messageId: string, text: string): MessageEntry => ({
+    type: "user",
+    text,
+    error: undefined,
+    parts: [],
+    model: undefined,
+    at: 1_700_000_000_600,
+    messageId,
   });
   /** Holds the steer's turn open until `release` is called: the session stays working. */
   const holdTurn = (built: ReturnType<typeof world>) => {
@@ -1825,7 +1844,7 @@ describe("a message still queued in the live session", () => {
   };
   const settleTicks = () => new Promise((resolve) => setTimeout(resolve, 20));
 
-  test("is in the replay, with its words and when it was accepted, until the harness takes it", async () => {
+  test("is in the replay, with its words and when it was accepted, while it waits", async () => {
     const { built, runtime, started } = await importWith([PAGE_GOOD], {
       links: [PAGE_GOOD],
     });
@@ -1843,17 +1862,63 @@ describe("a message still queued in the live session", () => {
         messageId,
         text: "And the portal",
         acceptedAt: sent.success.acceptedAt,
+        taken: false,
       },
     ]);
-
-    built.script.emit?.(take(messageId));
-    await settleTicks();
-    expect((await replayOf(runtime, started.importId)).queued).toEqual([]);
     release();
     await runtime.dispose();
   });
 
-  test("a take that outruns the send's own answer still keeps it out", async () => {
+  test("taken and not yet written, it is still in the replay, marked taken; written, it is the transcript's alone", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    const release = holdTurn(built);
+    const sent = await sendTo(runtime, started.importId, "And the portal");
+    if (sent._tag !== "Success") throw new Error("the message was refused");
+    const messageId = sent.success.messageId ?? "";
+
+    // The take, and a read before the harness has written the message: the gap a tab that
+    // saw the take reads in. It used to be in neither half.
+    built.script.emit?.(take(messageId));
+    await settleTicks();
+    const gap = await replayOf(runtime, started.importId);
+    expect(
+      gap.items.some(
+        (item) => item.kind === "turn.operator" && item.messageId === messageId,
+      ),
+    ).toBe(false);
+    expect(gap.queued).toEqual([
+      {
+        messageId,
+        text: "And the portal",
+        acceptedAt: sent.success.acceptedAt,
+        taken: true,
+      },
+    ]);
+
+    // Written: the transcript has it, under our id, and `queued` does not.
+    built.script.written.push(stored(messageId, "And the portal"));
+    const written = await replayOf(runtime, started.importId);
+    expect(
+      written.items
+        .filter((item) => item.kind === "turn.operator")
+        .map((item) => [item.body, item.messageId ?? null]),
+    ).toEqual([
+      ["…the prompt…", null],
+      ["And the portal", messageId],
+    ]);
+    expect(written.queued).toEqual([]);
+    // And a replay read does not take it off what the process holds: a second read racing
+    // the first (two tabs on one take) still finds it in one half or the other.
+    built.script.written.length = 0;
+    expect((await replayOf(runtime, started.importId)).queued).toHaveLength(1);
+    release();
+    await runtime.dispose();
+  });
+
+  test("a take that outruns the send's own answer still marks it taken", async () => {
     const { built, runtime, started } = await importWith([PAGE_GOOD], {
       links: [PAGE_GOOD],
     });
@@ -1871,7 +1936,11 @@ describe("a message still queued in the live session", () => {
     const sent = await sendTo(runtime, started.importId, "And the portal");
     expect(sent._tag).toBe("Success");
     await settleTicks();
-    expect((await replayOf(runtime, started.importId)).queued).toEqual([]);
+    expect(
+      (await replayOf(runtime, started.importId)).queued.map(
+        (message) => message.taken,
+      ),
+    ).toEqual([true]);
     release();
     await runtime.dispose();
   });
@@ -1906,6 +1975,39 @@ describe("a message still queued in the live session", () => {
     const after = await replayOf(runtime, started.importId);
     expect(after.live).toBe(false);
     expect(after.queued).toEqual([]);
+    release();
+    await runtime.dispose();
+  });
+
+  test("a steer whose delivery returns after the session closed leaves nothing behind (U4 review 2)", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    // The steer's `prompt` returns 60 ms after it was given the message, and the session
+    // is stopped in that window: its `steers` went with the close, and the send's answer,
+    // landing after, must not make a fresh entry no close is left to remove.
+    built.script.steerLatency = 60;
+    let release = () => {};
+    built.script.onSteer = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    const sending = sendTo(runtime, started.importId, "And the portal");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.stop(started.importId),
+      ),
+    );
+    await sending;
+    expect(
+      await runtime.runPromise(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.heldSteers(started.importId),
+        ),
+      ),
+    ).toBe(0);
     release();
     await runtime.dispose();
   });

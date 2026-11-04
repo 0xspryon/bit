@@ -926,6 +926,11 @@ export const projectReplay = (input: {
             output: null,
             callId: null,
             outcome: null,
+            // Which steer of ours this is, where the driver could name it (A6 U4 review 2):
+            // what a client joins its own row and the message's `turn.taken` to.
+            ...(entry.messageId === undefined
+              ? {}
+              : { messageId: entry.messageId }),
             // The files the message carried (A6 F9), its path lines already out of `body`.
             ...(entry.attachments === undefined ||
             entry.attachments.length === 0

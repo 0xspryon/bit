@@ -652,6 +652,7 @@ describe("U4 review: a queued message across a reload", () => {
           messageId: MESSAGE_ID,
           text: "Also the partner portal",
           acceptedAt: AT + 50_000,
+          taken: false,
         },
       ],
     );
@@ -748,6 +749,84 @@ describe("U4 review: a queued message across a reload", () => {
     expect(said(all[0])).not.toContain("On the other tab's message.");
   });
 
+  test("a take read before the harness has written the message still draws it, as its own turn with its reply (U4 review 2)", async () => {
+    // A busy session: the turn before is still running when the other tab's steer is taken.
+    const { fake } = await openWith(
+      [OPERATOR("replay", 0, "Load the scope"), ...turnItems("replay", 1)],
+      true,
+    );
+    let reads = 0;
+    /*
+     * Claude Code narrates the take 30–130 ms before its transcript holds the message, so a
+     * read on the take finds it not in `items`: the server still holds it, marked taken.
+     */
+    fake.onImporterMessages = (_baseUrl, targetId, importId) => {
+      reads += 1;
+      return ok(
+        importerConversationView({
+          targetId,
+          importId,
+          harnessSessionId: "ses_a",
+          live: true,
+          continuation: "live",
+          items: [
+            OPERATOR("replay", 0, "Load the scope"),
+            ...turnItems("replay", 1),
+          ],
+          queued: [
+            {
+              messageId: MESSAGE_ID,
+              text: "From the other tab",
+              acceptedAt: AT + 59_000,
+              taken: true,
+            },
+          ],
+        }),
+      );
+    };
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(
+      at("activity", 300, 58, {
+        kind: "turn.reply",
+        body: "Last words of the turn before.",
+      }),
+    );
+    fake.watch.send(
+      at("activity", 301, 60, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageId: MESSAGE_ID,
+      }),
+    );
+    await settle();
+    fake.watch.send(
+      at("activity", 302, 62, {
+        kind: "turn.reply",
+        body: "On the other tab's message.",
+      }),
+    );
+    // The same take seen again (another frame naming it) asks for nothing more.
+    fake.watch.send(
+      at("activity", 303, 63, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageId: MESSAGE_ID,
+      }),
+    );
+    await settle();
+    expect(reads).toBe(1);
+    const all = groups();
+    expect(all.map((group) => said(group.querySelector(".bubble")))).toEqual([
+      "Load the scope",
+      "From the other tab",
+    ]);
+    expect(all[1]?.querySelector(".you")?.classList.contains("queued")).toBe(
+      false,
+    );
+    expect(said(all[1])).toContain("On the other tab's message.");
+    expect(said(all[0])).not.toContain("On the other tab's message.");
+  });
+
   test("a take that slides out of the live window does not put its message back in the queue", async () => {
     const { app, fake } = await openWith(
       [OPERATOR("replay", 0, "Load the scope")],
@@ -797,6 +876,25 @@ describe("U4 review: a queued message across a reload", () => {
       false,
     );
     expect(said(second)).not.toContain(QUEUED_NOTE);
+  });
+});
+
+describe("U4 review 2: the harness's note on a replay", () => {
+  test("is said once a thread, not under every replayed turn", async () => {
+    await openWith([
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 1, { kind: "turn.reply", body: "Loaded." }),
+      OPERATOR("replay", 2, "And the portal"),
+      at("replay", 3, 3, { kind: "turn.reply", body: "Added." }),
+      OPERATOR("replay", 4, "And the API"),
+      at("replay", 5, 5, { kind: "turn.reply", body: "Added too." }),
+    ]);
+    expect(groups().length).toBe(3);
+    const notes = [
+      ...document.querySelectorAll('.importer [role="log"] .note'),
+    ].filter((each) => said(each).includes("which may delete it"));
+    expect(notes.length).toBe(1);
+    expect(said(groups()[0])).toContain("which may delete it");
   });
 });
 

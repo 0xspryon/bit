@@ -1334,6 +1334,32 @@ describe("projecting live activity", () => {
     expect(drawn(replayed)).toEqual(drawn(live));
   });
 
+  test("U4 review 2: a replayed message carries the application's id the driver named, and only that one", () => {
+    const user = (text: string, messageId?: string) => ({
+      type: "user",
+      text,
+      error: undefined,
+      parts: [],
+      model: undefined,
+      at: 1_700_000_000_000,
+      ...(messageId === undefined ? {} : { messageId }),
+    });
+    const items = projectReplay({
+      entries: [
+        user("the opening"),
+        user("and the portal", "aaaaaaaabbbbbbbbccccccccdddddddd"),
+      ],
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    expect(items.map((item) => [item.kind, item.messageId ?? null])).toEqual([
+      ["turn.operator", null],
+      ["turn.operator", "aaaaaaaabbbbbbbbccccccccdddddddd"],
+    ]);
+  });
+
   test("a usage entry is a frame of its own, not a row in the transcript", () => {
     /*
      * A measurement about the session rather than a turn in it. If this were an item it

@@ -283,7 +283,10 @@
             live stream carries (A6 F10), so a reloaded turn is drawn by `ChatItem` exactly as
             a watched one was, and only this note says where it came from.
           -->
-          <p class="note">{group.prose.note}</p>
+          <!-- Said once a thread: a later replayed group carries no sentence. -->
+          {#if group.prose.note !== ""}
+            <p class="note">{group.prose.note}</p>
+          {/if}
           {#if group.prose.truncated}
             <p class="note">
               Shortened: not every message the harness holds is shown.

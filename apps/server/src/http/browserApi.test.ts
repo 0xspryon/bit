@@ -292,6 +292,7 @@ const importerHoldingOne = Layer.effect(
         ),
       // Held, as the real importer's registry would say of a session open between turns —
       // with no run in flight, which `view` above does not report for this id's twin.
+      heldSteers: () => Effect.succeed(0),
       holds: (importId) =>
         Effect.succeed(
           importId === LIVE_IMPORT_ID || importId === IDLE_HELD_IMPORT_ID,

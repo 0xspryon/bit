@@ -1906,6 +1906,12 @@ const cliMarker = (entry: SessionMessage): string | undefined => {
 const flattenTranscript = (
   entries: readonly SessionMessage[],
   uploadsFolder: string | undefined,
+  /**
+   * The steers this process delivered into the session, by the UUID each was stored under
+   * (`claudeCodeMessageId`) to the application's id for it: what names an operator entry's
+   * `messageId`. Empty for a session this process does not hold.
+   */
+  steers: ReadonlyMap<string, string> = new Map(),
 ): MessageEntry[] => {
   const blocksSeen = new Map<string, number>();
   const subagents: SubagentCalls = new Map();
@@ -2006,10 +2012,16 @@ const flattenTranscript = (
       entry.type === "user" && marker === undefined
         ? splitAttachmentLines(text, { uploadsFolder })
         : undefined;
+    // A steer of ours is stored under the UUID it was delivered with (A6 U4 review 2).
+    const steer =
+      entry.type === "user" && marker === undefined
+        ? steers.get(entry.uuid)
+        : undefined;
     return {
       type: entry.type,
       text: split?.text ?? text,
       ...(marker === undefined ? {} : { marker }),
+      ...(steer === undefined ? {} : { messageId: steer }),
       ...(split === undefined || split.attachments.length === 0
         ? {}
         : { attachments: split.attachments }),
@@ -3709,7 +3721,19 @@ export const claudeCodeHarness = (
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(
         "claudeCodeHarness.messages",
       )(function* (sessionId, read) {
-        const directory = sessions.get(sessionId)?.directory;
+        const record = sessions.get(sessionId);
+        const directory = record?.directory;
+        /*
+         * Each steer this session was delivered, by the UUID the CLI stores it under. The
+         * derivation is one-way (`claudeCodeMessageId`), so the stored entry is named by
+         * matching it against the ids this process delivered, which it holds only while it
+         * holds the session.
+         */
+        const steers = new Map(
+          [...(record?.deliveredIds ?? [])].map(
+            (id) => [claudeCodeMessageId(id), id] as const,
+          ),
+        );
         const entries = yield* Effect.tryPromise({
           try: () =>
             sdk.sessionMessages(
@@ -3725,6 +3749,7 @@ export const claudeCodeHarness = (
         return flattenTranscript(
           entries.filter((entry) => !isLocalCommandEntry(entry)),
           read?.uploadsFolder,
+          steers,
         );
       });
 

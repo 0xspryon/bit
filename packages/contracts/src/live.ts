@@ -613,9 +613,13 @@ export const LiveItem = Schema.Struct({
    */
   writeId: Schema.optionalKey(Schema.String),
   /**
-   * On a `turn.taken` item, the application's id for the message the harness took — the
-   * `messageId` the send was answered with — so a client can join the two by content.
-   * Absent on every other item, and an optional key so older frames still decode.
+   * The application's id for an operator's message — the `messageId` the send was answered
+   * with — on the items that are about one: a `turn.taken` item, naming the message the
+   * harness took; and a **replayed** `turn.operator` item that the harness stored under an
+   * id derived from ours (A6 U4 review 2), so a client joins its own row, the take and the
+   * transcript's copy by id rather than by words or time. Absent on every other item —
+   * including a replayed message the server cannot name, such as an opening prompt — and an
+   * optional key so older frames still decode.
    */
   messageId: Schema.optionalKey(Schema.String),
   /**
