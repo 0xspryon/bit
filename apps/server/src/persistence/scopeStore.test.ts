@@ -1003,6 +1003,53 @@ describe("the effective-state read", () => {
     expect(outcome.restored?.scope.by._tag).toBe("entry");
   });
 
+  test("a host label on a host that ends in a number is refused, and nothing is written", async () => {
+    /*
+     * `127.1` is 127.0.0.1 to every client, so a label keyed by `127.1` would look set and
+     * never decide a subject spelled the way requests spell it. Refused as a scope entry
+     * written that way is, while a dotted address is still an ordinary label.
+     */
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        const refusals = [];
+        for (const host of ["127.1", "0x7f.0.0.1", "acme.123"]) {
+          refusals.push(
+            yield* Effect.flip(
+              store.setHostScopeLabel(OPERATOR, { host, state: "out" }),
+            ),
+          );
+        }
+        const before = yield* store.targetScope(TARGET);
+        yield* store.setHostScopeLabel(OPERATOR, {
+          host: "127.0.0.1",
+          state: "out",
+        });
+        const after = yield* store.targetScope(TARGET);
+        return {
+          refusals,
+          before: before.hostLabels.length,
+          after: after.hostLabels.map((label) => label.host),
+        };
+      }),
+    );
+    for (const refusal of outcome.refusals) {
+      expect(refusal).toBeInstanceOf(MutationError);
+      expect((refusal as MutationError).reason).toBe("invalid");
+    }
+    expect((outcome.refusals[0] as MutationError).detail).toBe(
+      "'127.1' is read by browsers and HTTP clients as the address 127.0.0.1; write the dotted address (127.0.0.1) instead, so the label matches what is requested; no label was set",
+    );
+    expect((outcome.refusals[1] as MutationError).detail).toContain(
+      "as the address 127.0.0.1",
+    );
+    expect((outcome.refusals[2] as MutationError).detail).toContain(
+      "it is not an address either",
+    );
+    expect(outcome.before).toBe(0);
+    expect(outcome.after).toEqual(["127.0.0.1"]);
+  });
+
   test("every label change lands in the event log, attributed to the operator", async () => {
     const path = newDatabasePath();
     const events = await withStore(path, (store) =>

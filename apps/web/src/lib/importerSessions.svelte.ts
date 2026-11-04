@@ -107,6 +107,29 @@ export const STARTERS = {
 } as const;
 export type StarterKey = keyof typeof STARTERS;
 
+/** What a starter leaves for the operator to finish: the program page's scheme. */
+const SEED = "https://";
+
+/**
+ * The operator's own words in a draft: what follows a starter the draft begins with (its
+ * trailing whitespace aside), or the whole draft. A starter that ends in `https://` with
+ * words glued to it was finished by the operator, so the `https://` is theirs too — unless
+ * they pasted a URL of their own after it, which is then the URL.
+ */
+const operatorWordsOf = (draft: string): string => {
+  for (const each of Object.values(STARTERS)) {
+    const lead = each.draft.replace(/\s+$/u, "");
+    if (!draft.startsWith(lead)) continue;
+    const rest = draft.slice(lead.length);
+    const glued = rest !== "" && !/^\s/u.test(rest);
+    if (lead.endsWith(SEED) && glued && !/^https?:\/\//iu.test(rest)) {
+      return `${SEED}${rest}`;
+    }
+    return rest;
+  }
+  return draft;
+};
+
 /** The states the prototype can be put into, in `ScenarioBar`'s words. */
 export type ImporterScenario =
   | "default"
@@ -614,24 +637,34 @@ export class ImporterSessions {
    * Fills the composer with a pre-written first message, sends nothing, and answers where
    * the caret goes: at the end of the starter's words, where the operator's own begin.
    *
-   * **It never drops what the operator typed.** A box that is empty, or that holds only a
-   * starter as it was put there, is replaced, so a second chip swaps the first. Anything
-   * else is the operator's — often a pasted statement of work, which is long and may not be
-   * on the clipboard any more — so the starter goes in front of it, a blank line between,
-   * and the caret stays at the starter's end.
+   * **It never drops what the operator typed.** A box that begins with a starter (its
+   * trailing whitespace aside) holds that starter and then the operator's words, so the
+   * starter is swapped and their words kept: a second chip swaps the first, the same chip
+   * twice changes nothing, and a URL typed after the program starter's `https://` stays one
+   * URL. Anything else is the operator's — often a pasted statement of work, which is long
+   * and may not be on the clipboard any more — so the starter goes in front of it, a blank
+   * line between, and the caret stays at the starter's end. A starter that ends in
+   * `https://` put in front of words that begin with a URL takes the URL as its own rather
+   * than leaving a dangling `https://` on a line of its own.
    */
   useStarter(key: StarterKey): number {
     const starter = STARTERS[key].draft;
-    const before = this.draft;
-    const untouched =
-      before.trim() === "" ||
-      Object.values(STARTERS).some((each) => each.draft === before);
-    if (untouched) {
+    const words = operatorWordsOf(this.draft).replace(/^\s+/u, "");
+    if (words === "") {
       this.draft = starter;
       return starter.length;
     }
     const lead = starter.replace(/\s+$/u, "");
-    this.draft = `${lead}\n\n${before.replace(/^\s+/u, "")}`;
+    if (lead.endsWith(SEED) && /^https?:\/\/\S/iu.test(words)) {
+      const head = lead.slice(0, -SEED.length);
+      this.draft = `${head}${words}`;
+      return head.length;
+    }
+    if (lead !== starter) {
+      this.draft = `${starter}${words}`;
+      return lead.length;
+    }
+    this.draft = `${lead}\n\n${words}`;
     return lead.length;
   }
 

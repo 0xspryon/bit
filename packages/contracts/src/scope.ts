@@ -341,7 +341,7 @@ const parseIpv4 = (text: string): Address | undefined => {
  * all ASCII digits, or `0x` and hex digits. A host that does is parsed as an IPv4 address
  * by `new URL()` — and is invalid there if that fails — never kept as a name.
  */
-const endsInNumber = (host: string): boolean => {
+export const endsInNumber = (host: string): boolean => {
   if (host.includes(":")) return false;
   const last = host.slice(host.lastIndexOf(".") + 1);
   return /^\d+$/u.test(last) || /^0x[0-9a-f]*$/u.test(last);
@@ -674,16 +674,8 @@ export const normaliseScopeEntry = (input: {
    * be a name no subject is ever spelled as, so an out-of-scope entry written that way
    * would exclude nothing. Refused, naming the dotted address when there is one.
    */
-  if (endsInNumber(host)) {
-    const read = parseLenientIpv4(host);
-    return {
-      _tag: "refused",
-      detail:
-        read === undefined
-          ? `'${raw}' ends in a number, so it is not a name, and it is not an address either; write an address as four decimal parts, like 127.0.0.1`
-          : `'${raw}' is read by browsers and HTTP clients as the address ${renderAddress(read)}; write the dotted address (${renderAddress(read)}) instead, so the entry matches what is requested`,
-    };
-  }
+  const numeric = endsInNumberRefusal(raw, host, "entry");
+  if (numeric !== undefined) return { _tag: "refused", detail: numeric };
 
   if (!host.includes(".")) {
     return {
@@ -698,6 +690,29 @@ export const normaliseScopeEntry = (input: {
     };
   }
   return host;
+};
+
+/**
+ * Why a normalised host that ends in a number cannot be stored as a name, or `undefined`
+ * when it can be: a strict address (`127.0.0.1`, `::1`) is an address, and a host whose last
+ * label is not a number is a name. Anything else — `127.1`, `0x7f.0.0.1`, `acme.123` — is
+ * read by `new URL()` as an address or as nothing, so a row keyed by it as typed is a
+ * name no subject is ever spelled as. `what` is what the operator was writing, for the
+ * sentence. Shared by a scope entry and a host's label, so both refuse the same hosts in
+ * the same words.
+ */
+export const endsInNumberRefusal = (
+  raw: string,
+  host: string,
+  what: "entry" | "label",
+): string | undefined => {
+  if (parseIpAddress(host) !== undefined || !endsInNumber(host)) {
+    return undefined;
+  }
+  const read = parseLenientIpv4(host);
+  return read === undefined
+    ? `'${raw}' ends in a number, so it is not a name, and it is not an address either; write an address as four decimal parts, like 127.0.0.1`
+    : `'${raw}' is read by browsers and HTTP clients as the address ${renderAddress(read)}; write the dotted address (${renderAddress(read)}) instead, so the ${what} matches what is requested`;
 };
 
 /** One address back as text, in its canonical spelling. */

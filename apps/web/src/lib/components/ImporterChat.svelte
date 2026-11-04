@@ -136,6 +136,8 @@
       : { harness: session.harness, model: session.model },
   );
   let box = $state<HTMLTextAreaElement | undefined>(undefined);
+  /** Whether the focus is anywhere in the composer's box, for its strong border. */
+  let focused = $state(false);
   /** The Stop pill, which focus returns to when a refused Stop's dialog closes. */
   let stopButton = $state<HTMLButtonElement | undefined>(undefined);
 
@@ -340,7 +342,17 @@
           </p>
         {/if}
         <form
-          class={["box", groups.length === 0 && "first"]}
+          class={[
+            "box",
+            groups.length === 0 && "first",
+            (focused || importer.draft !== "") && "in-use",
+          ]}
+          onfocusin={() => (focused = true)}
+          onfocusout={(event) => {
+            const next = event.relatedTarget;
+            focused =
+              next instanceof Node && event.currentTarget.contains(next);
+          }}
           onsubmit={submit}
           aria-busy={importer.sending}
         >
@@ -557,14 +569,20 @@
     resize: none;
   }
   /*
-    D2's empty box is taller than D3's — room for a pasted URL before the first line — and
-    its border is the strong one, as D2 draws it: on a page with nothing else on it, the box
-    is the thing to look at.
+    D2's empty box is taller than D3's — room for a pasted URL before the first line.
   */
   textarea.first {
     min-height: 46px;
   }
-  .box.first {
+  /*
+    The strong border is the composer in use (the operator's decision): focused, as D2
+    draws it, or holding words not yet sent, as D4 does. At rest and empty it is D3's base
+    border, like every other box on the page. Any focus in the box, because the textarea has no
+    focus style of its own (below) and the chip and the model picker are in the box too.
+    Tracked from `focusin`/`focusout` rather than `:focus-within`, so the DOM suite (whose
+    happy-dom has no `:focus-within`) checks the rule the browser applies.
+  */
+  .box.in-use {
     border-color: var(--border-strong);
   }
   textarea::placeholder {

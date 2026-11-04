@@ -223,6 +223,67 @@ describe("D2: what a new session shows, and what the first message turns it into
     );
   });
 
+  const PROGRAM = "Read the program page at https://";
+  const SOW =
+    "Here is the statement of work. Load what it puts in and out of scope:\n\n";
+
+  test("the same starter twice after a URL is typed into it changes nothing", async () => {
+    await show("importer-first");
+    click(button("Read a HackerOne or Bugcrowd program page"));
+    await settle();
+    type(composer(), `${PROGRAM}hackerone.com/acme`);
+
+    click(button("Read a HackerOne or Bugcrowd program page"));
+    await settle();
+
+    const box = composer();
+    expect(box.value).toBe(`${PROGRAM}hackerone.com/acme`);
+    // Where the URL the operator finished begins.
+    expect(box.selectionStart).toBe("Read the program page at ".length);
+  });
+
+  test("a starter over another starter the operator filled swaps it and keeps their words", async () => {
+    await show("importer-first");
+    click(button("Read a HackerOne or Bugcrowd program page"));
+    await settle();
+    type(composer(), `${PROGRAM}hackerone.com/acme`);
+
+    click(button("Paste a statement of work"));
+    await settle();
+    // The https:// the starter put there is part of the URL the operator finished.
+    expect(composer().value).toBe(`${SOW}https://hackerone.com/acme`);
+
+    click(button("Read a HackerOne or Bugcrowd program page"));
+    await settle();
+    expect(composer().value).toBe(`${PROGRAM}hackerone.com/acme`);
+  });
+
+  test("the program starter over a pasted URL takes the URL, with no https:// left dangling", async () => {
+    await show("importer-first");
+    type(composer(), "https://bugcrowd.com/acme");
+
+    click(button("Read a HackerOne or Bugcrowd program page"));
+    await settle();
+
+    const box = composer();
+    expect(box.value).toBe(
+      "Read the program page at https://bugcrowd.com/acme",
+    );
+    expect(box.selectionStart).toBe("Read the program page at ".length);
+  });
+
+  test("the program starter over a pasted URL after the program starter keeps one URL", async () => {
+    await show("importer-first");
+    type(composer(), `${PROGRAM}https://bugcrowd.com/acme`);
+
+    click(button("Read a HackerOne or Bugcrowd program page"));
+    await settle();
+
+    expect(composer().value).toBe(
+      "Read the program page at https://bugcrowd.com/acme",
+    );
+  });
+
   test("once a filled starter is sent the page is the conversation: no lead, no starters, the footnote", async () => {
     await show("importer-first");
     click(button("Read a HackerOne or Bugcrowd program page"));
@@ -914,5 +975,67 @@ describe("the state picker", () => {
       for (const each of mounted) each.destroy();
       mounted = [];
     }
+  });
+});
+
+/*
+ * The operator's decision on the composer's border: the strong one whenever the composer
+ * has focus or holds a draft (D2, D4), the base one at rest and empty (D3). Checked under
+ * the component's own compiled stylesheet, with the two tokens given values a computed
+ * colour can tell apart.
+ */
+describe("the composer's border", () => {
+  const path = new URL(
+    "../../src/lib/components/ImporterChat.svelte",
+    import.meta.url,
+  ).pathname;
+  let sheet: HTMLStyleElement | undefined;
+  afterEach(() => {
+    sheet?.remove();
+    sheet = undefined;
+  });
+
+  const border = (): string => {
+    const form = composer().closest("form");
+    if (form === null) throw new Error("no composer form");
+    return getComputedStyle(form).borderTopColor;
+  };
+
+  test("is the base border at rest and empty, the strong one focused or holding a draft", async () => {
+    // The same options as the test transform, so the scoping hash matches the mounted DOM.
+    const { compile } = await import("svelte/compiler");
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    sheet = document.createElement("style");
+    sheet.textContent = `:root { --border-base: rgb(1, 2, 3); --border-strong: rgb(200, 100, 50); }\n${css?.code ?? ""}`;
+    document.head.append(sheet);
+    await show("importer-first");
+    const BASE = "rgb(1, 2, 3)";
+    const STRONG = "rgb(200, 100, 50)";
+
+    // D3 at rest: nothing typed, and the focus elsewhere.
+    composer().blur();
+    await settle();
+    expect(border()).toBe(BASE);
+
+    // D2: the operator is in the box.
+    composer().focus();
+    await settle();
+    expect(border()).toBe(STRONG);
+
+    // D4: words not yet sent, even with the focus gone.
+    type(composer(), "In scope: *.acme.com");
+    composer().blur();
+    await settle();
+    expect(border()).toBe(STRONG);
+
+    // Sent or erased, it is at rest again.
+    type(composer(), "");
+    await settle();
+    expect(border()).toBe(BASE);
   });
 });

@@ -58,6 +58,7 @@ import {
   assetIdentityOf,
   describeScopeState,
   dimensionAddress,
+  endsInNumberRefusal,
   isAssetIdentityRefusal,
   isScopeValueRefusal,
   normaliseHost,
@@ -8057,6 +8058,13 @@ const makeStore = Effect.fnUntraced(function* () {
    */
   const scopeStateOfHost = Effect.fn("ObservationStore.scopeStateOfHost")(
     function* (targetId: string, rawHost: string) {
+      /*
+       * V2(chat): a subject that ends in a number (127.1, 0x7f.0.0.1) is matched as a name,
+       * so it reads "out" even when an address block covering its address is in scope —
+       * safe (never "in" for an out host) but inexact. Proper V2: convert such a subject to
+       * its dotted address (parseLenientIpv4) before matching, when the scope-query tool
+       * gets a caller.
+       */
       const host = normaliseHost(rawHost);
       const scope = yield* readScope(targetId);
       return scopeStateOf({
@@ -8329,6 +8337,15 @@ const makeStore = Effect.fnUntraced(function* () {
         return yield* new MutationError({
           reason: "invalid",
           detail: `'${input.host}' does not name a host, so no label was set`,
+        });
+      }
+      // `127.1` is 127.0.0.1 to every client, so a label keyed by it as typed would be set
+      // and never apply: refused as a scope entry spelled that way is, in the same words.
+      const numeric = endsInNumberRefusal(input.host, host, "label");
+      if (numeric !== undefined) {
+        return yield* new MutationError({
+          reason: "invalid",
+          detail: `${numeric}; no label was set`,
         });
       }
       const recordedAt = yield* Clock.currentTimeMillis;
