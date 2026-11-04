@@ -37,6 +37,8 @@
  *    kind, and the only one a screen asks rather than a run: what the harness calls it.
  * 10. {@link AgentHarness.unregisterMcpServer} — take the registration away again when
  *    the credential it carried is revoked.
+ * 11. {@link AgentHarness.endSession} — end a conversation's session, so nothing of it
+ *    runs after this process has let go of it.
  *
  * And one a run never calls and a conversation does: {@link AgentHarness.switchModel},
  * which moves a session onto another model of the same harness, mid-turn or between turns.
@@ -1051,6 +1053,39 @@ export class AgentHarness extends Context.Service<
     readonly interruptSession: (
       sessionId: string,
     ) => Effect.Effect<boolean, HarnessFailure>;
+    /**
+     * What a `queued` steer still waiting behind a turn does when that turn is interrupted,
+     * as measured above: `runs` — the harness runs it at once, as a turn of its own (Claude
+     * Code); `held` — the harness keeps it and runs it with the session's next message
+     * (OpenCode). A value, because it is a property of the harness rather than of a call,
+     * and the Stop answer has to tell the operator which one happened to their message.
+     */
+    readonly queuedOnInterrupt: "runs" | "held";
+    /**
+     * Ends one session, so that **nothing of it runs after this returns**: the turn in
+     * flight is stopped, and a message queued behind it is dropped rather than run.
+     *
+     * The one close a caller has to make, and only for a `multiTurn` session: a worker's or a
+     * round's session ends itself when its single turn does, which is why this seam went
+     * without one until the conversations (A6 F5). A conversation's session ends only when
+     * it is told to, and revoking its credential is not telling it — the agent keeps running
+     * on its own authority (its shell, the policy gate's allowances) until the harness is.
+     *
+     * Idempotent, and a session this process does not hold — or has already ended — is
+     * answered successfully with nothing done. A failure means the harness could not be
+     * reached, so whether the session is still running is uncertain; the caller has nothing
+     * better to do than log it, because its own authority is going either way.
+     *
+     * - **Claude Code** closes the query, which ends the CLI's stdin and then signals the
+     *   subprocess: the CLI, and every message queued in it, goes.
+     * - **OpenCode** keeps a session for ever by design, so ending one means emptying it:
+     *   every message waiting in the session's inbox is cancelled, then the execution in
+     *   flight is interrupted. Cancelled first, so a turn that finishes between the two
+     *   calls has nothing to go straight on to.
+     */
+    readonly endSession: (
+      sessionId: string,
+    ) => Effect.Effect<void, HarnessFailure>;
     /**
      * The harness's narration for one session, from now on.
      *

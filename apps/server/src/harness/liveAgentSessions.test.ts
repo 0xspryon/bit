@@ -26,6 +26,7 @@ import {
   type OpenPlan,
 } from "./liveAgentSessions";
 import { recordModelSwitches, recordPrompts, stubHarness } from "./stubHarness";
+import { turnStopped } from "./turnStop";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import type { WorkerUrls } from "../run/supervisor";
@@ -53,6 +54,10 @@ interface Recorder {
   readonly registrations: { name: string; url: string; bearer: string }[];
   readonly unregistrations: string[];
   readonly prompts: { sessionId: string; delivery: string }[];
+  /** Sessions ended (`AgentHarness.endSession`), in order. */
+  readonly ended: string[];
+  /** `end:<id>` and `unregister:<id>`, interleaved as they happened. */
+  readonly trail: string[];
 }
 
 /**
@@ -123,6 +128,12 @@ const gatedHarness = (
           yield* Deferred.await(gates.unregisterGate);
         }
         recorder.unregistrations.push(sessionId);
+        recorder.trail.push(`unregister:${sessionId}`);
+      }),
+    endSession: (sessionId) =>
+      Effect.sync(() => {
+        recorder.ended.push(sessionId);
+        recorder.trail.push(`end:${sessionId}`);
       }),
     prompt: (sessionId, _text, delivery = { _tag: "open" as const }) =>
       Effect.gen(function* () {
@@ -245,6 +256,8 @@ describe("opening an import session", () => {
       registrations: [],
       unregistrations: [],
       prompts: [],
+      ended: [],
+      trail: [],
     };
     const createEntered = Effect.runSync(Deferred.make<void>());
     const createGate = Effect.runSync(Deferred.make<void>());
@@ -293,6 +306,8 @@ describe("opening an import session", () => {
       registrations: [],
       unregistrations: [],
       prompts: [],
+      ended: [],
+      trail: [],
     };
     const registerEntered = Effect.runSync(Deferred.make<void>());
     const registerGate = Effect.runSync(Deferred.make<void>());
@@ -337,6 +352,8 @@ describe("opening an import session", () => {
       registrations: [],
       unregistrations: [],
       prompts: [],
+      ended: [],
+      trail: [],
     };
     const promptEntered = Effect.runSync(Deferred.make<void>());
     const promptGate = Effect.runSync(Deferred.make<void>());
@@ -381,6 +398,8 @@ const freshRecorder = (): Recorder => ({
   registrations: [],
   unregistrations: [],
   prompts: [],
+  ended: [],
+  trail: [],
 });
 
 describe("closing an import session that is no longer the id's", () => {
@@ -416,6 +435,9 @@ describe("closing an import session that is no longer the id's", () => {
     expect(outcome.result.live).toBe("ses_second");
     expect(outcome.result.grants).toBe(1);
     expect(outcome.result.unregistered).toEqual(["ses_1"]);
+    // The first session ended once, by its close, and not again by the stale one; the second
+    // only by the finalizer.
+    expect(recorder.ended).toEqual(["ses_1", "ses_second"]);
     // One end for the first close and one for the finalizer's: the stale close records none.
     expect(outcome.ended).toEqual([IMPORT, IMPORT]);
     // The first close's reason and the finalizer's; nothing for the stale close.
@@ -797,5 +819,281 @@ describe("a later message and a Stop (A6 F5)", () => {
     );
     expect(outcome.result).toEqual({ askedEarly: 0, found: "interrupted" });
     expect(interrupted).toEqual(["ses_1"]);
+  });
+});
+
+/* ── Closing ends the harness session (A6 F5, from its review) ────────────────── */
+
+describe("every close ends the harness session", () => {
+  /*
+   * A conversation's session does not end itself: a Claude Code query stays open between
+   * turns and across a Stop, and an OpenCode session lives in its server's database. Before
+   * this, a close revoked the credential and unregistered the MCP server and left the agent
+   * running — a review watched an ended import's CLI dequeue a follow-up and run `curl`.
+   */
+  const refusal = () =>
+    new HarnessTransportError({
+      operation: "session.prompt",
+      status: undefined,
+      tag: undefined,
+      detail: "no answer",
+      cause: undefined,
+    });
+
+  test("an operator's close ends it once, before the registration is taken back", async () => {
+    const recorder = freshRecorder();
+    const outcome = await withImporterSessions(
+      gatedHarness(recorder, {}),
+      ({ sessions, plan }) =>
+        Effect.gen(function* () {
+          yield* opening(sessions, plan);
+          yield* sessions.close(IMPORT, "operator");
+          return [...recorder.trail];
+        }),
+    );
+    // Ended first, so the agent has stopped before its authority goes; and once, although
+    // the scope's own release would end it too.
+    expect(outcome.result).toEqual(["end:ses_1", "unregister:ses_1"]);
+    expect(recorder.ended).toEqual(["ses_1"]);
+    expect(outcome.reasons).toEqual(["operator"]);
+  });
+
+  test("a message the harness refuses ends it, as refused", async () => {
+    const recorder = freshRecorder();
+    const base = gatedHarness(recorder, {});
+    const harness: AgentHarness["Service"] = {
+      ...base,
+      prompt: (sessionId, text, delivery) =>
+        delivery?._tag === "steer"
+          ? Effect.fail(refusal())
+          : base.prompt(sessionId, text, delivery),
+    };
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        yield* opening(sessions, plan);
+        const entry = sessions.ready(IMPORT);
+        if (entry === undefined) return yield* Effect.die("not opened");
+        yield* Effect.flip(sessions.deliver(entry, "carry on", "queued"));
+        return [...recorder.ended];
+      }),
+    );
+    expect(outcome.result).toEqual(["ses_1"]);
+    expect(outcome.reasons).toEqual(["refused"]);
+  });
+
+  test("a Stop the harness will not acknowledge ends it, as refused", async () => {
+    const recorder = freshRecorder();
+    const harness: AgentHarness["Service"] = {
+      ...gatedHarness(recorder, {}),
+      interruptSession: () => Effect.fail(refusal()),
+    };
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        yield* opening(sessions, plan);
+        yield* Effect.flip(sessions.interrupt(IMPORT));
+        return [...recorder.ended];
+      }),
+    );
+    expect(outcome.result).toEqual(["ses_1"]);
+    expect(outcome.reasons).toEqual(["refused"]);
+  });
+
+  test("the layer's finalizer ends every session it closes", async () => {
+    const recorder = freshRecorder();
+    const outcome = await withImporterSessions(
+      gatedHarness(recorder, {}),
+      ({ sessions, plan }) =>
+        Effect.gen(function* () {
+          yield* opening(sessions, plan);
+          return [...recorder.ended];
+        }),
+    );
+    expect(outcome.result).toEqual([]);
+    expect(recorder.ended).toEqual(["ses_1"]);
+    expect(outcome.reasons).toEqual(["shutdown"]);
+  });
+
+  test("a session built and never published is ended with its scope", async () => {
+    // The registration fails after `createSession` has made the session: nothing is in the
+    // map, so only the scope's own release can end it.
+    const recorder = freshRecorder();
+    const harness: AgentHarness["Service"] = {
+      ...gatedHarness(recorder, {}),
+      registerMcpServer: () =>
+        Effect.fail(
+          new HarnessTransportError({
+            operation: "mcp.add",
+            status: undefined,
+            tag: undefined,
+            detail: "no answer",
+            cause: undefined,
+          }),
+        ),
+    };
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        const refused = yield* Effect.flip(opening(sessions, plan));
+        return { refused: refused !== undefined, ended: [...recorder.ended] };
+      }),
+    );
+    expect(outcome.result).toEqual({ refused: true, ended: ["ses_1"] });
+    expect(outcome.afterRelease).toBe(0);
+  });
+
+  test("a harness that cannot be reached to end it does not stop the close", async () => {
+    const recorder = freshRecorder();
+    const harness: AgentHarness["Service"] = {
+      ...gatedHarness(recorder, {}),
+      endSession: () => Effect.fail(refusal()),
+    };
+    const outcome = await withImporterSessions(
+      harness,
+      ({ sessions, plan, credentials }) =>
+        Effect.gen(function* () {
+          yield* opening(sessions, plan);
+          yield* sessions.close(IMPORT, "operator");
+          return {
+            grants: yield* credentials.size,
+            held: sessions.get(IMPORT) !== undefined,
+          };
+        }),
+    );
+    // The authority goes either way: the failure is logged, not raised.
+    expect(outcome.result).toEqual({ grants: 0, held: false });
+    expect(recorder.unregistrations).toEqual(["ses_1"]);
+  });
+});
+
+/* ── What a Stop says about a message sent behind the turn (A6 F5 review) ─────── */
+
+describe("a Stop's answer about a follow-up", () => {
+  /**
+   * A harness that is busy from a prompt until the test settles it, and whose interrupt
+   * settles it — the measured behaviour of both harnesses for the turn that was stopped.
+   * `waitForIdle` answers at once when nothing is running, as the real ones do.
+   */
+  const turnHarness = (
+    overrides: Partial<AgentHarness["Service"]> = {},
+  ): {
+    readonly harness: AgentHarness["Service"];
+    readonly settle: Effect.Effect<void>;
+  } => {
+    let idle: Deferred.Deferred<void> | undefined;
+    const settle = Effect.suspend(() => {
+      const ending = idle;
+      idle = undefined;
+      return ending === undefined
+        ? Effect.void
+        : Effect.asVoid(Deferred.succeed(ending, undefined));
+    });
+    return {
+      settle,
+      harness: stubHarness({
+        prompt: () =>
+          Effect.sync(() => {
+            idle ??= Effect.runSync(Deferred.make<void>());
+            return { delivered: true };
+          }),
+        waitForIdle: () =>
+          Effect.suspend(() =>
+            idle === undefined ? Effect.void : Deferred.await(idle),
+          ),
+        interruptSession: () => Effect.as(settle, true),
+        ...overrides,
+      }),
+    };
+  };
+
+  const stopOf = (
+    sessions: LiveAgentSessions<undefined>,
+  ): Effect.Effect<
+    {
+      readonly detail: string;
+      readonly working: boolean;
+      readonly followUp: boolean | undefined;
+    },
+    unknown
+  > =>
+    Effect.map(sessions.interrupt(IMPORT), (found) => ({
+      ...turnStopped({
+        found,
+        conversationId: IMPORT,
+        what: `import ${IMPORT}`,
+      }),
+      followUp: found._tag === "interrupted" ? found.followUp : undefined,
+    }));
+
+  test("a message sent while the turn ran is a follow-up, and Claude Code is said to be answering it", async () => {
+    // `runs`: the harness goes straight on to the follow-up, so the conversation is busy.
+    const { harness } = turnHarness({
+      interruptSession: () => Effect.succeed(true),
+    });
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        yield* opening(sessions, plan);
+        const entry = sessions.ready(IMPORT);
+        if (entry === undefined) return yield* Effect.die("not opened");
+        yield* sessions.deliver(entry, "and the API hosts", "queued");
+        return yield* stopOf(sessions);
+      }),
+    );
+    expect(outcome.result.followUp).toBe(true);
+    expect(outcome.result.working).toBe(true);
+    expect(outcome.result.detail).toContain(
+      "went straight on to a message you sent",
+    );
+  }, 10_000);
+
+  test("with nothing sent behind it, a turn still busy after the Stop is still finishing — no message is claimed", async () => {
+    const { harness } = turnHarness({
+      interruptSession: () => Effect.succeed(true),
+    });
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        yield* opening(sessions, plan);
+        return yield* stopOf(sessions);
+      }),
+    );
+    expect(outcome.result.followUp).toBe(false);
+    expect(outcome.result.working).toBe(true);
+    expect(outcome.result.detail).toContain("still finishing");
+    expect(outcome.result.detail).not.toContain("message you sent");
+  }, 10_000);
+
+  test("a message sent after the conversation went idle started the turn, so it is not a follow-up", async () => {
+    const { harness, settle } = turnHarness();
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        yield* opening(sessions, plan);
+        const entry = sessions.ready(IMPORT);
+        if (entry === undefined) return yield* Effect.die("not opened");
+        // The opening turn ends, and the spine's watcher sees it.
+        yield* settle;
+        for (let step = 0; step < 10; step += 1) yield* Effect.yieldNow;
+        yield* sessions.deliver(entry, "now the API hosts", "queued");
+        return yield* stopOf(sessions);
+      }),
+    );
+    expect(outcome.result.followUp).toBe(false);
+    expect(outcome.result.working).toBe(false);
+    expect(outcome.result.detail).toContain("next message carries");
+  });
+
+  test("on a harness that holds it, the operator is told the message is held for their next one", async () => {
+    // OpenCode: the interrupted turn goes idle and the follow-up stays in its inbox.
+    const { harness } = turnHarness({ queuedOnInterrupt: "held" });
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        yield* opening(sessions, plan);
+        const entry = sessions.ready(IMPORT);
+        if (entry === undefined) return yield* Effect.die("not opened");
+        yield* sessions.deliver(entry, "and the API hosts", "queued");
+        return yield* stopOf(sessions);
+      }),
+    );
+    expect(outcome.result.followUp).toBe(true);
+    expect(outcome.result.working).toBe(false);
+    expect(outcome.result.detail).toContain("has not been answered");
+    expect(outcome.result.detail).toContain("ahead of your next message");
   });
 });

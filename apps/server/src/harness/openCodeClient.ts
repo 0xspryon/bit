@@ -1610,6 +1610,52 @@ export const openCodeHarness = (
         });
 
       /**
+       * Empties the session, then stops it: every inbox item still waiting is cancelled, and
+       * the execution in flight is interrupted (A6 F5).
+       *
+       * OpenCode keeps a session in its own database whether or not bit holds it, so a
+       * conversation bit has let go of is not over until it is emptied. **Cancelled before
+       * interrupted**: an interrupt leaves a queued message held in the inbox (measured;
+       * `AgentHarness.interruptSession`), and a turn that finished on its own between the
+       * two calls would go straight on to one. Listing what is waiting and cancelling each is
+       * the server's own API (`session.inbox.cancel` is documented as a no-op for an item
+       * already delivered), so a race with delivery costs nothing.
+       *
+       * A session the server does not have (404) is already ended: nothing of it can run.
+       */
+      const endSession: AgentHarness["Service"]["endSession"] = Effect.fn(
+        "openCodeHarness.endSession",
+      )(function* (sessionId) {
+        const sessionID = sessionId as Session.ID;
+        const waiting = yield* Effect.result(
+          bounded(
+            "session.inbox.list",
+            timeouts.control,
+            api.session.inbox.list({ sessionID }),
+          ),
+        );
+        if (waiting._tag === "Failure") {
+          if (waiting.failure.status === 404) return;
+          return yield* Effect.fail(waiting.failure);
+        }
+        yield* Effect.forEach(
+          waiting.success,
+          (item) =>
+            bounded(
+              "session.inbox.cancel",
+              timeouts.control,
+              api.session.inbox.cancel({ sessionID, inboxID: item.id }),
+            ),
+          { discard: true },
+        );
+        yield* bounded(
+          "session.interrupt",
+          timeouts.control,
+          api.session.interrupt({ sessionID }),
+        );
+      });
+
+      /**
        * The generated subscription, filtered and reduced.
        *
        * ## Why `event.subscribe()` and not `session.log`
@@ -1694,6 +1740,8 @@ export const openCodeHarness = (
         sessionTitle,
         messages,
         interruptSession,
+        queuedOnInterrupt: "held",
+        endSession,
         sessionEvents,
       });
     }),

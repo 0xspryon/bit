@@ -224,6 +224,14 @@ export class ImporterSessions {
   #unwatch: (() => void) | undefined = undefined;
   /** The import {@link #unwatch} is for. */
   #watching: string | undefined = undefined;
+  /**
+   * A Stop's sentence about a conversation that was still busy when it was answered, and the
+   * ids it is about. It describes the turn the Stop left running, so it is over when that
+   * turn is: the turn watch clears it from {@link notice} when the import goes idle.
+   */
+  #busyStop:
+    { readonly ids: readonly string[]; readonly text: string } | undefined =
+    undefined;
 
   /** Every session on the target, in no particular order. */
   sessions = $state.raw<readonly ImporterSession[]>([]);
@@ -555,6 +563,13 @@ export class ImporterSessions {
           ? { ...session, working: false }
           : session,
       );
+      // A Stop's "is answering it now" is about the turn that just ended, so it goes with
+      // the pill rather than outliving it. Only if it is still what the line says.
+      const busy = this.#busyStop;
+      if (busy !== undefined && busy.ids.includes(importId)) {
+        this.#busyStop = undefined;
+        if (this.notice === busy.text) this.notice = "";
+      }
       // The turn wrote what it wrote: the list's tally is the server's to restate.
       server.reread();
     });
@@ -767,6 +782,9 @@ export class ImporterSessions {
     const stopped = answer.stopped;
     this.notice = stopped.detail;
     this.refused = false;
+    this.#busyStop = stopped.working
+      ? { ids: [importId, stopped.conversationId], text: stopped.detail }
+      : undefined;
     if (stopped.working) return;
     this.sessions = this.sessions.map((each) =>
       each.importId === importId || each.importId === stopped.conversationId

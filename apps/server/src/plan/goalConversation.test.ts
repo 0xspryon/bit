@@ -110,6 +110,8 @@ interface Recorder {
   readonly gated: string[];
   readonly registrations: { name: string; url: string; bearer: string }[];
   readonly unregistrations: { sessionId: string; name: string }[];
+  /** Sessions the spine ended (`AgentHarness.endSession`), in order. */
+  readonly ended: string[];
   readonly prompts: {
     sessionId: string;
     text: string;
@@ -127,6 +129,7 @@ const emptyRecorder = (): Recorder => {
     gated: [],
     registrations: [],
     unregistrations: [],
+    ended: [],
     prompts: [],
   };
 };
@@ -247,6 +250,10 @@ const fakeHarness = (
     unregisterMcpServer: (sessionId, name) =>
       Effect.sync(() => {
         recorder.unregistrations.push({ sessionId, name });
+      }),
+    endSession: (sessionId) =>
+      Effect.sync(() => {
+        recorder.ended.push(sessionId);
       }),
     prompt: (sessionId, text, delivery = { _tag: "open" as const }) =>
       options?.promptFails === true
@@ -1689,6 +1696,9 @@ describe("when a conversation may not be had", () => {
     expect(first.recorder.unregistrations).toEqual([
       { sessionId: accepted.harnessSessionId, name: `bit-${GOAL}` },
     ]);
+    // And the harness session with it: a conversation's session does not end itself, and
+    // one left running would go on acting on its own authority after the close (A6 F5).
+    expect(first.recorder.ended).toEqual([accepted.harnessSessionId]);
 
     await first.runtime.dispose();
   });
@@ -1708,6 +1718,7 @@ describe("when a conversation may not be had", () => {
 
     expect(await Effect.runPromise(credentials.size)).toBe(0);
     expect(first.recorder.unregistrations).toHaveLength(1);
+    expect(first.recorder.ended).toHaveLength(1);
   });
 });
 
@@ -2033,6 +2044,7 @@ describe("a goal conversation's urgency and Stop (A6 F5)", () => {
       });
     }
     expect(first.recorder.unregistrations).toEqual([]);
+    expect(first.recorder.ended).toEqual([]);
     const next = await sending(first.runtime, "carry on");
     expect(next.conversation).toBe("continued");
     expect(next.harnessSessionId).toBe(opened.harnessSessionId);
@@ -2076,6 +2088,7 @@ describe("a goal conversation's urgency and Stop (A6 F5)", () => {
       expect(stopped.failure.reason).toBe("harness_unreachable");
     }
     expect(first.recorder.unregistrations).toHaveLength(1);
+    expect(first.recorder.ended).toHaveLength(1);
     const live = await first.runtime.runPromise(
       Effect.map(GoalConversations, (conversations) =>
         conversations.live(GOAL),

@@ -21,10 +21,12 @@
  *    step closes the scope, which revokes the credential and unregisters the server —
  *    including when the *next* step is the one that failed.
  * 4. **{@link LiveAgentSessions.closeSession}**: narrator interrupted first, so nothing is
- *    published for a session whose credential is about to go; then the scope; then a
- *    belt-and-braces revoke whose expected answer is zero and whose non-zero answer is a
- *    logged bug rather than a handled condition. Anything keyed by the id — the map entry,
- *    the id-wide revoke, `afterClose` — is touched only while the id is still this entry's.
+ *    published for a session whose credential is about to go; then the harness session
+ *    ended (`AgentHarness.endSession`), so nothing of it runs once its authority is gone;
+ *    then the scope; then a belt-and-braces revoke whose expected answer is zero and whose
+ *    non-zero answer is a logged bug rather than a handled condition. Anything keyed by the
+ *    id — the map entry, the id-wide revoke, `afterClose` — is touched only while the id is
+ *    still this entry's.
  * 5. **The layer finalizer**, closing every session still open, which is what makes "no
  *    longer than the process" true.
  * 6. **{@link LiveAgentSessions.switchModel}**: one model switch at a time per id, under the
@@ -350,7 +352,10 @@ const switchFoundNoSession = (failure: HarnessFailure): boolean =>
  * - `not_live` — no session is held under the id, so nothing of it runs in this process.
  * - `idle` — a session is held and the harness said nothing was running in it.
  * - `interrupted` — the harness stopped a running turn. `working` is whether the session
- *   was still busy once {@link INTERRUPT_SETTLE} had passed.
+ *   was still busy once {@link INTERRUPT_SETTLE} had passed. `followUp` is whether a message
+ *   had been delivered behind the stopped turn — sent while the conversation was busy, and
+ *   the conversation not idle since — which is the message a harness then either runs at
+ *   once or holds (`AgentHarness.queuedOnInterrupt`).
  */
 export type LiveInterrupt<Meta> =
   | { readonly _tag: "not_live" }
@@ -359,7 +364,23 @@ export type LiveInterrupt<Meta> =
       readonly _tag: "interrupted";
       readonly entry: LiveAgentSession<Meta>;
       readonly working: boolean;
+      readonly followUp: boolean;
     };
+
+/**
+ * What the spine knows about one session's turns, for a Stop's answer and nothing else.
+ *
+ * `busy` is set when a prompt is accepted and cleared when the harness next says the session
+ * is idle; `followUps` counts the messages delivered while it was busy. `epoch` moves on every
+ * delivery, so an idle that a watcher saw *before* a later message landed does not clear that
+ * message's turn. `watching` keeps it to one `waitForIdle` per session at a time.
+ */
+interface TurnState {
+  busy: boolean;
+  followUps: number;
+  epoch: number;
+  watching: boolean;
+}
 
 /**
  * How long an interrupted turn is given to go idle before a Stop is answered.
@@ -453,8 +474,9 @@ export interface LiveAgentSessions<Meta> {
    * waited for under the opening permit, so its opening turn is the one stopped.
    *
    * An interrupted turn is then given {@link INTERRUPT_SETTLE} to go idle, which it does in
-   * tens of milliseconds on both harnesses. `working: true` means it did not: on Claude Code
-   * that is a message queued behind the stopped turn, which the harness runs at once.
+   * tens of milliseconds on both harnesses. `working: true` means it did not; whether that
+   * is a message delivered behind the stopped turn (which Claude Code runs at once) or the
+   * turn still finishing is `followUp`, which this registry tracks rather than infers.
    *
    * **A harness that will not acknowledge the interrupt has the session closed, as
    * `refused`**, and the failure returned. Whether its turn stopped is uncertain, and a
@@ -595,6 +617,30 @@ export const makeLiveAgentSessions = <Meta>(
       if (current) live.delete(entry.id);
       const buildsAtClose = builds.get(entry.id) ?? 0;
       if (entry.narrator !== undefined) yield* Fiber.interrupt(entry.narrator);
+      /*
+       * The harness session is ended **before** the scope is closed, so the agent has stopped
+       * before its registration and credential go, rather than running on for however long
+       * an unregister round trip takes. The scope's own release (see `acquire`) would end it
+       * too, last; this one is first, and the guard makes the second a no-op.
+       *
+       * Skipped for a stale entry whose session another live entry now holds: a resume can
+       * continue the same harness session under a fresh entry, and ending it would end that.
+       */
+      const sharedWithNewer = [...live.values()].some(
+        (other) =>
+          other.scope !== entry.scope && other.sessionId === entry.sessionId,
+      );
+      if (sharedWithNewer) {
+        ended.add(entry.scope);
+        yield* Effect.logInfo(
+          "a closed session's harness session is held by a newer entry, so it was left running",
+          annotate(entry),
+        );
+      } else {
+        yield* endHarnessSession(entry.harness, entry.sessionId, entry.scope, {
+          [role.words.idKey]: entry.id,
+        });
+      }
       yield* Scope.close(entry.scope, Exit.void);
       if (!current) {
         yield* Effect.logDebug(
@@ -622,6 +668,93 @@ export const makeLiveAgentSessions = <Meta>(
       yield* Effect.logInfo(role.words.closed, annotate(entry));
     });
 
+    /**
+     * The scopes whose harness session has been ended, so that ending is done once.
+     *
+     * Both `closeSession` and the scope's own release (registered in `acquire`) end it, and
+     * the first one wins: `closeSession` for every published entry, so the agent stops before
+     * its authority goes; the release for an open that built a session and never published
+     * it — an acquire step that failed after `createSession`, or an opener interrupted or
+     * killed while `building`.
+     */
+    const ended = new WeakSet<Scope.Closeable>();
+
+    /**
+     * Ends one harness session (`AgentHarness.endSession`), once per scope, and logs a
+     * failure rather than raising it: a close cannot fail, and its authority goes either way.
+     * A harness that could not be reached leaves an agent whose state is uncertain, which is
+     * worth a warning and not worth keeping the credential alive for.
+     */
+    const endHarnessSession = (
+      harness: AgentHarness["Service"],
+      sessionId: string,
+      scope: Scope.Closeable,
+      annotations: Record<string, string>,
+    ): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        if (ended.has(scope)) return Effect.void;
+        ended.add(scope);
+        return harness
+          .endSession(sessionId)
+          .pipe(
+            Effect.catch((failure) =>
+              Effect.logWarning(
+                "the harness could not be reached to end a closed session, so whether it is still running is uncertain; its credential is revoked either way",
+                { ...annotations, sessionId, detail: failure.message },
+              ),
+            ),
+          );
+      });
+
+    /** Per session, by its scope, which every copy of an entry shares. */
+    const turns = new WeakMap<Scope.Closeable, TurnState>();
+    const turnsOf = (scope: Scope.Closeable): TurnState => {
+      const held = turns.get(scope);
+      if (held !== undefined) return held;
+      const made: TurnState = {
+        busy: false,
+        followUps: 0,
+        epoch: 0,
+        watching: false,
+      };
+      turns.set(scope, made);
+      return made;
+    };
+
+    /**
+     * Records that a prompt was accepted into one session, and watches for it going idle.
+     *
+     * The watcher waits for idle and clears the state only if nothing was delivered while it
+     * waited; otherwise it waits again, for the later message's turn. Forked into the
+     * session's scope, so a close interrupts it. A wait that fails is read as idle: the
+     * state only words a Stop, and "still finishing" is the safer thing to say than a
+     * message that may not exist.
+     */
+    const promptAccepted = (entry: LiveAgentSession<Meta>) =>
+      Effect.gen(function* () {
+        const state = turnsOf(entry.scope);
+        if (state.busy) state.followUps += 1;
+        state.busy = true;
+        state.epoch += 1;
+        if (state.watching) return;
+        state.watching = true;
+        yield* Effect.forkIn(
+          Effect.gen(function* () {
+            for (;;) {
+              const epoch = state.epoch;
+              yield* Effect.result(entry.harness.waitForIdle(entry.sessionId));
+              if (state.epoch === epoch) {
+                state.busy = false;
+                state.followUps = 0;
+                state.watching = false;
+                return;
+              }
+            }
+          }),
+          entry.scope,
+        );
+      });
+
     // Owned by the calling layer's scope, so a `SIGINT` closes every session rather than
     // dropping it with a live credential behind it.
     yield* Effect.addFinalizer(() =>
@@ -648,8 +781,17 @@ export const makeLiveAgentSessions = <Meta>(
      *
      * **3. The credential, then the registration**, both in the session's scope, so both go
      * when {@link closeSession} closes it.
+     *
+     * The session itself is released with the scope too (`AgentHarness.endSession`), which
+     * is what ends a session an open built and never published. A published one is ended
+     * earlier, by {@link closeSession}; see {@link ended}.
      */
-    const acquire = (plan: OpenPlan<Meta>, urls: WorkerUrls) =>
+    const acquire = (
+      plan: OpenPlan<Meta>,
+      urls: WorkerUrls,
+      id: string,
+      scope: Scope.Closeable,
+    ) =>
       Effect.gen(function* () {
         const harness = plan.harness;
         const directory: GatedDirectory = yield* gatedRoleDirectory({
@@ -661,14 +803,20 @@ export const makeLiveAgentSessions = <Meta>(
           auditPath: `${fleet.paths.evidenceDirectory(plan.targetId)}/${POLICY_AUDIT_FILE}`,
           workspace: plan.workspace,
         });
-        const created = yield* createGatedSession(harness, {
-          title: plan.title,
-          model: plan.model,
-          directory,
-          sessionId: plan.sessionId,
-          ...(plan.options === undefined ? {} : { options: plan.options }),
-          ...(plan.resume === undefined ? {} : { resume: plan.resume }),
-        });
+        const created = yield* Effect.acquireRelease(
+          createGatedSession(harness, {
+            title: plan.title,
+            model: plan.model,
+            directory,
+            sessionId: plan.sessionId,
+            ...(plan.options === undefined ? {} : { options: plan.options }),
+            ...(plan.resume === undefined ? {} : { resume: plan.resume }),
+          }),
+          (made) =>
+            endHarnessSession(harness, made.id, scope, {
+              [role.words.idKey]: id,
+            }),
+        );
         if (plan.afterCreate !== undefined) yield* plan.afterCreate(created.id);
         return { created, directory };
       });
@@ -781,7 +929,12 @@ export const makeLiveAgentSessions = <Meta>(
                 Effect.gen(function* () {
                   const opened = yield* Effect.result(
                     Effect.gen(function* () {
-                      const { created, directory } = yield* acquire(plan, urls);
+                      const { created, directory } = yield* acquire(
+                        plan,
+                        urls,
+                        input.id,
+                        scope,
+                      );
                       yield* register(plan, input.id, urls, created, directory);
                       return created.id;
                     }).pipe(Scope.provide(scope)),
@@ -852,6 +1005,7 @@ export const makeLiveAgentSessions = <Meta>(
                   };
                   live.set(input.id, preambledEntry);
                   stage = { _tag: "ready" };
+                  yield* promptAccepted(preambledEntry);
                   return preambledEntry;
                 }),
               ).pipe(
@@ -911,6 +1065,7 @@ export const makeLiveAgentSessions = <Meta>(
           yield* closeSession(entry, "refused");
           return yield* Effect.fail(accepted.failure);
         }
+        if (accepted.success.delivered) yield* promptAccepted(entry);
       });
 
     const interrupt: LiveAgentSessions<Meta>["interrupt"] = (id) =>
@@ -922,6 +1077,10 @@ export const makeLiveAgentSessions = <Meta>(
         }
         const entry = ready(id);
         if (entry === undefined) return { _tag: "not_live" } as const;
+        // Read before the harness is asked: on Claude Code the follow-up starts running the
+        // moment the turn ahead of it is interrupted, and is then the turn, not a follow-up.
+        const state = turnsOf(entry.scope);
+        const followUp = state.followUps > 0;
         const asked = yield* Effect.result(
           entry.harness.interruptSession(entry.sessionId),
         );
@@ -930,6 +1089,9 @@ export const makeLiveAgentSessions = <Meta>(
           return yield* Effect.fail(asked.failure);
         }
         if (!asked.success) return { _tag: "idle", entry } as const;
+        // Run at once or held, the message is no longer queued behind a turn: a second Stop
+        // stops the turn it became, or finds the conversation idle.
+        state.followUps = 0;
         // A wait that fails is a stream that ended, which is not a session still working.
         const settled = yield* Effect.result(
           entry.harness
@@ -940,6 +1102,7 @@ export const makeLiveAgentSessions = <Meta>(
           _tag: "interrupted",
           entry,
           working: settled._tag === "Success" && Option.isNone(settled.success),
+          followUp,
         } as const;
       });
 

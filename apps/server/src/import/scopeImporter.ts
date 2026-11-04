@@ -1341,23 +1341,14 @@ export class ScopeImporter extends Context.Service<
          * there was no session to close, and the import is over all the same.
          */
         yield* markEnded(view.targetId, importId, "operator");
-        if (entry !== undefined) {
-          yield* entry.harness
-            .interruptSession(entry.sessionId)
-            .pipe(
-              Effect.catch((failure) =>
-                Effect.as(
-                  Effect.logWarning(
-                    "a harness would not interrupt a scope import; its credential is revoked and its session is closed either way",
-                    { importId, detail: failure.message },
-                  ),
-                  false,
-                ),
-              ),
-            );
-        }
-        // An interrupt mid-open is the spine's to clean up: it closes a scope in no map,
-        // and an entry it had published but not yet prompted.
+        /*
+         * No interrupt first. The close ends the harness session (`AgentHarness.endSession`),
+         * which stops the turn in flight and drops anything queued behind it; an interrupt
+         * would only stop the turn, and on Claude Code it is what makes the CLI go straight
+         * on to a queued message — which it then ran after the operator had ended the import.
+         * An interrupt mid-open is the spine's to clean up: it closes a scope in no map
+         * (ending the session it built), and an entry it had published but not yet prompted.
+         */
         if (turn !== undefined) yield* Fiber.interrupt(turn);
         yield* sessions.close(importId, "operator");
         return view;

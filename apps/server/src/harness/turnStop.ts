@@ -47,11 +47,35 @@ export const turnStopped = <Meta>(input: {
         conversationId,
         outcome: "interrupted",
         working: found.working,
-        detail: found.working
-          ? `Stopped the turn ${what} was taking. Its harness went straight on to a message you sent while that turn ran, and is answering it now; stop again to stop that too.`
-          : `Stopped the turn ${what} was taking. Everything it wrote before the stop is kept, and your next message carries the conversation on in the same session.`,
+        detail: interruptedDetail(found, what),
       };
   }
+};
+
+/**
+ * What an interrupted turn's answer says, from what the spine tracked rather than guessed.
+ *
+ * `working` alone only says the session was not idle within `INTERRUPT_SETTLE`; whether that
+ * is because of a message the operator sent is `followUp`, and what the harness did with that
+ * message is `queuedOnInterrupt` — Claude Code runs it at once, OpenCode holds it for the
+ * next message (`V2(chat):` at `LiveAgentSessions.deliver`: no app-owned queue to hold it on
+ * both alike). The operator is told which, because on OpenCode nothing on screen would.
+ */
+const interruptedDetail = <Meta>(
+  found: Extract<LiveInterrupt<Meta>, { readonly _tag: "interrupted" }>,
+  what: string,
+): string => {
+  const stopped = `Stopped the turn ${what} was taking.`;
+  if (found.followUp && found.entry.harness.queuedOnInterrupt === "held") {
+    return `${stopped} The message you sent while it ran has not been answered: its harness is holding it, and will run it, ahead of your next message, when you send one. Everything written before the stop is kept.`;
+  }
+  if (found.working && found.followUp) {
+    return `${stopped} Its harness went straight on to a message you sent while that turn ran, and is answering it now; stop again to stop that too.`;
+  }
+  if (found.working) {
+    return `${stopped} The turn is still finishing, so a little more may appear before it goes quiet. Everything it wrote is kept, and your next message carries the conversation on in the same session.`;
+  }
+  return `${stopped} Everything it wrote before the stop is kept, and your next message carries the conversation on in the same session.`;
 };
 
 /** A harness that would not acknowledge the Stop. The spine has closed the session. */

@@ -1161,6 +1161,75 @@ describe("the Stop pill (A6 F5)", () => {
     expect(stopPill()?.textContent?.trim()).toBe("Stop");
   });
 
+  test("a still-working Stop's sentence goes when that turn ends, with the pill; a settled one's stays", async () => {
+    /*
+     * "Is answering it now; stop again" is about the turn the Stop left running. Once the
+     * server says the import is idle the pill goes, and a sentence still telling the operator
+     * to stop again would be about a turn that is over.
+     */
+    const { app, fake } = await working();
+    const said = "Its harness went straight on to a message you sent.";
+    fake.onStopImporterTurn = (_baseUrl, _targetId, importId) =>
+      ok({
+        conversationId: importId,
+        outcome: "interrupted",
+        working: true,
+        detail: said,
+      });
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill while the turn runs");
+    click(pill);
+    await settle();
+    const notice = (): string =>
+      document.querySelector(".importer .notice")?.textContent?.trim() ?? "";
+    expect(notice()).toBe(said);
+
+    // The follow-up's turn ends: the next poll is told so.
+    fake.onScopeImport = (_baseUrl, targetId, importId) =>
+      ok(scopeImportView({ targetId, importId, status: "finished" }));
+    fake.onImporterSessions = () => ok({ sessions: SESSIONS });
+    const poll = (app.countdown as FakeCountdown).live.filter(
+      (armed) => armed.ms === IMPORT_POLL_MS,
+    );
+    expect(poll).toHaveLength(1);
+    poll[0]?.fire();
+    await settle();
+    expect(stopPill()).toBeNull();
+    expect(app.importer.current?.working).toBe(false);
+    expect(notice()).toBe("");
+  });
+
+  test("a Stop that leaves a message held keeps saying so after the conversation is idle", async () => {
+    // OpenCode holds the follow-up for the next message: that stays true after the turn.
+    const { app, fake } = await working();
+    const said =
+      "Stopped the turn. The message you sent while it ran has not been answered.";
+    fake.onStopImporterTurn = (_baseUrl, _targetId, importId) =>
+      ok({
+        conversationId: importId,
+        outcome: "interrupted",
+        working: false,
+        detail: said,
+      });
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill while the turn runs");
+    click(pill);
+    await settle();
+    fake.onScopeImport = (_baseUrl, targetId, importId) =>
+      ok(scopeImportView({ targetId, importId, status: "finished" }));
+    fake.onImporterSessions = () => ok({ sessions: SESSIONS });
+    for (const armed of (app.countdown as FakeCountdown).live.filter(
+      (each) => each.ms === IMPORT_POLL_MS,
+    )) {
+      armed.fire();
+    }
+    await settle();
+    expect(app.importer.current?.working).toBe(false);
+    expect(
+      document.querySelector(".importer .notice")?.textContent?.trim(),
+    ).toBe(said);
+  });
+
   test("a refusal opens the error dialog with the server's sentence, and the turn is left as it was", async () => {
     const { fake } = await working();
     fake.onStopImporterTurn = () =>

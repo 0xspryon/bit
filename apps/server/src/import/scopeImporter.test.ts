@@ -216,6 +216,8 @@ interface Script {
   /** How each prompt was delivered, in the same order as `prompts`. */
   readonly deliveries: PromptDelivery[];
   readonly interrupted: string[];
+  /** Sessions the spine ended (`AgentHarness.endSession`), in order. */
+  readonly ended: string[];
   /** Sessions whose narration stream was subscribed to: one per opened session (S4). */
   readonly subscribed: string[];
   /**
@@ -294,6 +296,7 @@ const newScript = (readable: readonly string[]): Script => {
     prompts: [],
     deliveries: [],
     interrupted: [],
+    ended: [],
     subscribed: [],
     streamsEnded: [],
     failEvents: false,
@@ -503,6 +506,10 @@ const scriptedHarness = (script: Script) => {
             script.interrupted.push(sessionId);
             return true;
           }),
+    endSession: (sessionId) =>
+      Effect.sync(() => {
+        script.ended.push(sessionId);
+      }),
     // The transcript, in the order `AgentHarness.messages` promises - oldest first, which
     // each real driver has its own test for: the narration the session produced along the
     // way, and its closing report last. `lastAssistantText` has to find
@@ -1436,6 +1443,7 @@ describe("a session that outlives its first turn", () => {
     // The registry outlives the runtime as an object, so it can be asked after release.
     expect(await Effect.runPromise(credentials.size)).toBe(0);
     expect(built.script.unregistered).toEqual(["ses_import"]);
+    expect(built.script.ended).toEqual(["ses_import"]);
     const ended = endings(built.root);
     expect(ended).toHaveLength(1);
     expect(typeof ended[0]?.ended_at).toBe("number");
@@ -1456,7 +1464,14 @@ describe("a session that outlives its first turn", () => {
       ),
     );
     expect(stopped).toBeDefined();
-    expect(built.script.interrupted).toEqual(["ses_import"]);
+    /*
+     * Ended, not interrupted. The session is between turns, so an interrupt would have
+     * found nothing to stop and left the CLI running; and on Claude Code an interrupt is
+     * what makes the CLI go straight on to a queued message — which a review saw it do, and
+     * then run `curl`, after the operator had ended the import (A6 F5).
+     */
+    expect(built.script.interrupted).toEqual([]);
+    expect(built.script.ended).toEqual(["ses_import"]);
     expect(built.script.unregistered).toEqual(["ses_import"]);
     const after = await authorityOf(runtime, bearer);
     expect(after.size).toBe(0);
@@ -3335,6 +3350,7 @@ describe("stopping an import's turn (A6 F5)", () => {
     expect(built.script.interrupted).toEqual(["ses_import"]);
     // Not the import's end: nothing was taken back, and the session is still held.
     expect(built.script.unregistered).toEqual([]);
+    expect(built.script.ended).toEqual([]);
     expect(endings(built.root)).toEqual([
       { import_id: importId, ended_at: null, ended_reason: null },
     ]);
@@ -3383,8 +3399,10 @@ describe("stopping an import's turn (A6 F5)", () => {
       expect(stopped.failure.reason).toBe("harness_unreachable");
       expect(stopped.failure.detail).toContain("uncertain");
     }
-    // Let go of: the registration is taken back with the credential.
+    // Let go of: the registration is taken back with the credential, and the harness
+    // session is ended, so an agent this server cannot steer does not run on.
     expect(built.script.unregistered).toEqual(["ses_import"]);
+    expect(built.script.ended).toEqual(["ses_import"]);
 
     const next = await sendTo(runtime, importId, "Are you still there?");
     expect(next._tag).toBe("Success");

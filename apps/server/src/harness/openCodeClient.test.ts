@@ -2033,6 +2033,83 @@ describe("what OpenCode calls a session", () => {
 
 /* ── Switching a session's model ─────────────────────────────────────────────── */
 
+describe("ending an opencode session (A6 F5, from its review)", () => {
+  /**
+   * An inbox item shaped like the server's own `Session.Inbox.User`: the generated client
+   * decodes the whole list, so a stub has to answer with every required field.
+   */
+  const waiting = (id: string) => ({
+    id,
+    sessionID: "ses_1",
+    time: { created: 1_792_532_292_371 },
+    type: "user",
+    payload: { text: "and then the API hosts" },
+    delivery: "queue",
+  });
+
+  const ending = (stub: Parameters<typeof clientWith>[0]) => {
+    const { layer, recorded } = clientWith(stub);
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (harness) =>
+              harness.endSession("ses_1"),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    ).then((answer) => ({ answer, recorded }));
+  };
+
+  /** `METHOD path` for every request, so the order is asserted rather than the set. */
+  const calls = (recorded: Recorded): string[] =>
+    recorded.urls.map(
+      (url, index) =>
+        `${recorded.methods[index] ?? "?"} ${new URL(url).pathname}`,
+    );
+
+  test("every waiting message is cancelled, then the execution in flight is interrupted", async () => {
+    /*
+     * OpenCode keeps a session whether bit holds it or not, and an interrupt alone leaves a
+     * queued message held in the inbox, to run when the session is next woken — by a resume
+     * of an import the operator ended, say. Cancelled first, so a turn that ends on its own
+     * between the two calls has nothing to go on to.
+     */
+    const { answer, recorded } = await ending((url, init) => {
+      if (url.endsWith("/inbox") && (init?.method ?? "GET") === "GET") {
+        return json({ data: [waiting("msg_a"), waiting("msg_b")] });
+      }
+      if (url.includes("/inbox/") && init?.method === "DELETE") {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      if (url.endsWith("/interrupt")) return json({ interrupted: true });
+      return json({}, 500);
+    });
+    expect(answer._tag).toBe("Success");
+    expect(calls(recorded)).toEqual([
+      "GET /api/session/ses_1/inbox",
+      "DELETE /api/session/ses_1/inbox/msg_a",
+      "DELETE /api/session/ses_1/inbox/msg_b",
+      "POST /api/session/ses_1/interrupt",
+    ]);
+  });
+
+  test("a session the server does not have is already ended, and nothing more is asked", async () => {
+    const { answer, recorded } = await ending(() =>
+      json({ _tag: "SessionNotFoundError", message: "no such session" }, 404),
+    );
+    expect(answer._tag).toBe("Success");
+    expect(recorded.urls).toHaveLength(1);
+  });
+
+  test("a server that cannot be reached is a failure, not a session said to be ended", async () => {
+    const { answer } = await ending(() => json({}, 500));
+    expect(answer._tag).toBe("Failure");
+  });
+});
+
 describe("switching an opencode session's model", () => {
   /**
    * A transport that answers the catalogue with two models whose windows differ, a 204 to

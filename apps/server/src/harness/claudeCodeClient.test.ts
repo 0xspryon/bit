@@ -2267,6 +2267,103 @@ describe("stopping a conversation's turn (A6 F5)", () => {
   });
 });
 
+/* ── Ending a conversation's session ─────────────────────────────────────────── */
+
+describe("ending a conversation's session (A6 F5, from its review)", () => {
+  const TALK = "55555555-0000-4000-8000-000000000001";
+
+  const talking = (
+    harness: AgentHarness["Service"],
+    driver: ReturnType<typeof turnDrivenSdk>,
+  ) =>
+    Effect.gen(function* () {
+      yield* harness.createSession({
+        title: "conversation",
+        model: "claude-sonnet-5",
+        directory: "/tmp/goal",
+        sessionId: TALK,
+        multiTurn: true,
+      });
+      yield* harness.prompt(TALK, "go");
+      yield* Effect.promise(() => driver.pulled(1));
+    });
+
+  test("a conversation between turns has its query closed, and takes no message afterwards", async () => {
+    /*
+     * The case the review found: between turns an interrupt is not even sent (nothing is
+     * running), so a close that relied on it left the CLI running for the life of the server.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        driver.emitResult();
+        yield* harness.waitForIdle(TALK);
+        yield* harness.endSession(TALK);
+        const status = yield* harness.sessionStatus(TALK);
+        const refused = yield* Effect.flip(
+          harness.prompt(TALK, "are you there?", {
+            _tag: "steer",
+            urgency: "queued",
+            messageId: "cc".padEnd(32, "0"),
+          }),
+        );
+        return {
+          closes: driver.seen.closes,
+          interrupts: driver.seen.interrupts,
+          status,
+          refused: refused._tag,
+          pulled: driver.seen.prompts.length,
+        };
+      }),
+    );
+    expect(outcome.closes).toBe(1);
+    expect(outcome.interrupts).toBe(0);
+    expect(outcome.status.activity).toBe("idle");
+    expect(outcome.refused).toBe("HarnessTransportError");
+    expect(outcome.pulled).toBe(1);
+  });
+
+  test("a turn with a message queued behind it is closed, not interrupted, so the queued message never becomes a turn", async () => {
+    /*
+     * Not interrupted first: on 2.1.310 an interrupt is what makes the CLI go straight on to
+     * the queued message. Closing the query takes the CLI, and its queue, away instead.
+     */
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* talking(harness, driver);
+        yield* harness.prompt(TALK, "and then the API", {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: "dd".padEnd(32, "0"),
+        });
+        yield* Effect.promise(() => driver.pulled(2));
+        yield* harness.endSession(TALK);
+        const status = yield* harness.sessionStatus(TALK);
+        // Ending twice is ending once.
+        yield* harness.endSession(TALK);
+        return {
+          closes: driver.seen.closes,
+          interrupts: driver.seen.interrupts,
+          status,
+        };
+      }),
+    );
+    expect(outcome.interrupts).toBe(0);
+    expect(outcome.closes).toBe(1);
+    expect(outcome.status.activity).toBe("idle");
+  });
+
+  test("a session this process does not hold is already ended", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.endSession("66666666-0000-4000-8000-000000000001");
+        return driver.seen.closes;
+      }),
+    );
+    expect(outcome).toBe(0);
+  });
+});
+
 /* ── Switching a session's model ─────────────────────────────────────────────── */
 
 describe("switching a Claude Code session's model", () => {

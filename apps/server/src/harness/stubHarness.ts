@@ -244,6 +244,11 @@ export const stubHarness = (
       Effect.succeed({ _tag: "untitled" } satisfies SessionTitle),
     messages: () => Effect.succeed([] as readonly MessageEntry[]),
     interruptSession: () => Effect.succeed(false),
+    // Claude Code's answer, which is the one that makes a queued message visible after a
+    // Stop. A test about a harness that holds it says `held`.
+    queuedOnInterrupt: "runs",
+    // Ended without recording, like `unregisterMcpServer`: a test about closing overrides it.
+    endSession: () => Effect.void,
     // Empty rather than open: a suite that wants a stream which stays up until it is
     // interrupted says so, and most do not read one at all.
     sessionEvents: () => Stream.empty as Stream.Stream<HarnessNarration, never>,

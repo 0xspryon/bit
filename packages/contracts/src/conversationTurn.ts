@@ -53,11 +53,13 @@ export const ConversationStopped = Schema.Struct({
   /**
    * Whether the conversation is still working once the Stop has been answered.
    *
-   * `false` for `idle` and `not_live`, and for an `interrupted` turn that settled. **`true`
-   * when the harness went straight on to a message the operator had queued behind the turn
-   * it stopped**: Claude Code runs a queued message as soon as the turn ahead of it is
-   * interrupted, so the conversation is answering that message now. A screen keeps its
-   * working state on `true` and clears it on `false`.
+   * `false` for `idle` and `not_live`, and for an `interrupted` turn that settled. `true`
+   * when it had not gone quiet shortly after the stop: either the harness went straight on to
+   * a message the operator had sent behind the turn it stopped (Claude Code runs one as soon
+   * as the turn ahead of it is interrupted), or the stopped turn is still finishing.
+   * {@link detail} says which. A screen keeps its working state on `true` and clears it on
+   * `false`, and a sentence it shows from a `true` answer is over once the conversation is
+   * idle.
    */
   working: Schema.Boolean,
   /** A sentence for the operator about what happened, in the server's words. */

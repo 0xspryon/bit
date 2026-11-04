@@ -1170,11 +1170,10 @@ export const claudeCodeHarness = (
        * finalizer for anything still open. Idempotent, because those two can race on a
        * shutdown that lands while a run is settling.
        *
-       * **The harness closes its own sessions**, rather than the interface growing a
-       * `closeSession` the supervisor would have to remember to call. OpenCode's sessions
-       * outlive the run by design — its server keeps them — so a close on the interface
-       * would be a method one implementation ignored, and a leaked CLI subprocess per run
-       * if anybody forgot it.
+       * **A single-turn session closes itself** here, when its turn ends, so a run's
+       * supervisor has no close to remember. A conversation's (`multiTurn`) query stays open
+       * between turns and across a Stop, so it is closed by `endSession` — which the
+       * conversation spine calls on every close (A6 F5) — or by this layer's finalizer.
        */
       const closeSession = (record: SessionRecord): Effect.Effect<void> =>
         Effect.sync(() => {
@@ -2295,6 +2294,20 @@ export const claudeCodeHarness = (
           return true;
         });
 
+      /*
+       * Closing the query is the whole of it: `Query.close()` ends the CLI's stdin and then
+       * signals the subprocess, so the CLI goes and every message queued in it goes with
+       * it. Nothing is interrupted first, on purpose: an interrupt is what makes the CLI go
+       * straight on to a queued message (measured; `AgentHarness.interruptSession`).
+       */
+      const endSession: AgentHarness["Service"]["endSession"] = Effect.fn(
+        "claudeCodeHarness.endSession",
+      )(function* (sessionId) {
+        const record = sessions.get(sessionId);
+        if (record === undefined) return;
+        yield* closeSession(record);
+      });
+
       const sessionEvents: AgentHarness["Service"]["sessionEvents"] = (
         sessionId,
       ) =>
@@ -2320,6 +2333,8 @@ export const claudeCodeHarness = (
         sessionTitle,
         messages,
         interruptSession,
+        queuedOnInterrupt: "runs",
+        endSession,
         sessionEvents,
       });
     }),
