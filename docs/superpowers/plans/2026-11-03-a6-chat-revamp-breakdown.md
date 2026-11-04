@@ -164,7 +164,11 @@ session stays on <harness> — picking another harness opens a new one. Models a
 inside it can change at any time, including mid-run." Choosing a model in an open session
 calls F4; choosing another harness opens a new session.
 
-**U4 — D3/D4 transcript layout (M), F10 → U4.** The turn footer's model must come from the transcript, not
+**U4 — D3/D4 transcript layout (M), F10 → U4.** From F10's review (decided): a steer sent while a
+turn runs is drawn where the operator sent it but marked **queued** until the server says
+the harness took it (a later `result` names it in `user_message_uuids`); then it reads as
+an ordinary operator turn. Pair a tool call with its result across that boundary so a
+result that lands after the steer still folds into its call's row. The turn footer's model must come from the transcript, not
 the session row: after a switch every replayed turn is labelled with the current model
 (`ImporterChat.svelte:275`), but each assistant entry records the model that answered it. Agent prose full width, no bubble; operator
 turns boxed with "You · 18:02"; consecutive tool calls collapse to one muted line
