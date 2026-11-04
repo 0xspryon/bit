@@ -30,7 +30,11 @@ import {
   type ImporterHistory,
   acceptedNotice,
 } from "../src/lib/importerChat";
-import { importerSessionView } from "./fakeServer";
+import { importerSessionView, replayItem } from "./fakeServer";
+import {
+  mockCompletedSession,
+  mockReloadedSession,
+} from "../src/lib/mockImporter";
 
 let order = 0;
 const AT = 1_700_000_000_000;
@@ -502,11 +506,11 @@ describe("the harness's copy is cut at each user entry", () => {
   const held = history({
     source: "harness",
     note: "The harness's copy.",
-    messages: [
-      { index: 0, type: "user", text: "first ask" },
-      { index: 1, type: "assistant", text: "first answer" },
-      { index: 2, type: "assistant", text: "a follow-up" },
-      { index: 3, type: "user", text: "second ask" },
+    items: [
+      replayItem(0, "turn.operator", "first ask"),
+      replayItem(1, "turn.reply", "first answer"),
+      replayItem(2, "turn.reply", "a follow-up"),
+      replayItem(3, "turn.operator", "second ask"),
     ],
   });
 
@@ -520,7 +524,8 @@ describe("the harness's copy is cut at each user entry", () => {
       "first ask",
       "second ask",
     ]);
-    expect(groups[0]?.replayed.map((message) => message.text)).toEqual([
+    // The same rows a live turn has, drawn by `ChatItem` (A6 F10).
+    expect(groups[0]?.rows.map((row) => row.item.body)).toEqual([
       "first answer",
       "a follow-up",
     ]);
@@ -533,11 +538,11 @@ describe("the harness's copy is cut at each user entry", () => {
       items: [],
       working: false,
     });
-    expect(groups[1]?.replayed).toEqual([]);
+    expect(groups[1]?.rows).toEqual([]);
     expect(groups[1]?.prose._tag).toBe("none");
   });
 
-  test("a replayed turn has no time, and live turns come after the replayed ones and are numbered on", () => {
+  test("a replayed turn has the harness's own time, and live turns come after the replayed ones and are numbered on", () => {
     const groups = buildImporterChat({
       history: held,
       items: [operator(1, "third ask"), reply("third answer")],
@@ -548,7 +553,8 @@ describe("the harness's copy is cut at each user entry", () => {
       "turn:2",
       "turn:3",
     ]);
-    expect(groups[0]?.subject.at).toBeNull();
+    // The harness's time for the message, from the replay (A6 F10).
+    expect(groups[0]?.subject.at).toBe(held.items[0]?.at ?? -1);
     expect(groups[2]?.subject.at).not.toBeNull();
     expect(groups[2]?.prose._tag).toBe("live");
   });
@@ -883,9 +889,9 @@ describe("the importer's words from the live feed", () => {
       history: history({
         source: "harness",
         note: "From the harness.",
-        messages: [
-          { index: 0, type: "user", text: "Read the page" },
-          { index: 1, type: "assistant", text: "two in, one out" },
+        items: [
+          replayItem(0, "turn.operator", "Read the page"),
+          replayItem(1, "turn.reply", "two in, one out"),
         ],
       }),
       items: importerFeed({
@@ -904,14 +910,88 @@ describe("the importer's words from the live feed", () => {
     expect(
       groups.map((group) => [
         group.subject.message,
-        group.replayed.map((message) => message.text),
-        group.rows.map((row) => row.item.body),
+        group.rows
+          .filter((row) => row.key.startsWith("replay:"))
+          .map((row) => row.item.body),
+        group.rows
+          .filter((row) => !row.key.startsWith("replay:"))
+          .map((row) => row.item.body),
       ]),
     ).toEqual([
       // The replayed turn: the operator's own sentence, with the reply under it.
       ["Read the page", ["two in, one out"], []],
       // Then the live one. The reply is in exactly one of them.
       ["And staging", [], ["and staging is in too"]],
+    ]);
+  });
+});
+
+/* ── One renderer for live and replay (A6 F10) ──────────────────────────────── */
+
+describe("a reloaded session is the live one, row for row", () => {
+  /** What a reader sees of each group: its heading, and each row's kind, words and state. */
+  const seen = (groups: ReturnType<typeof buildImporterChat>) =>
+    groups.map((group) => ({
+      message: group.subject.message,
+      rows: group.rows.map((row) => [
+        row.item.kind,
+        row.item.body,
+        row.proposedBy?.callId ?? row.item.callId,
+        row.write,
+        row.result?.output ?? null,
+      ]),
+    }));
+
+  test("the replay's items and the record channel give the turns, rows and write states live gave", () => {
+    const now = 1_793_000_000_000;
+    const live = mockCompletedSession(now);
+    const reloaded = mockReloadedSession(now);
+    const fromLive = buildImporterChat({
+      history: live.history,
+      items: live.items,
+      working: false,
+    });
+    const fromReplay = buildImporterChat({
+      history: reloaded.history,
+      items: reloaded.items,
+      working: false,
+    });
+    expect(seen(fromReplay)).toEqual(seen(fromLive));
+    // Not vacuous: there are writes, and every one is folded into the record it produced.
+    const writes = fromReplay.flatMap((group) =>
+      group.rows.flatMap((row) => (row.write === null ? [] : [row.write])),
+    );
+    expect(writes.length).toBeGreaterThan(3);
+    expect(new Set(writes)).toEqual(new Set(["recorded"]));
+    expect(fromReplay.map((group) => group.prose._tag)).toEqual([
+      "replayed",
+      "replayed",
+    ]);
+  });
+
+  test("a record no replayed call claims stays in the leading group, said as such", () => {
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: [
+          replayItem(0, "turn.operator", "read the page"),
+          replayItem(1, "turn.reply", "nothing to write"),
+        ],
+      }),
+      items: [
+        item({
+          kind: "scope.entry.added",
+          origin: "record",
+          id: "record:evt-lonely",
+          body: "entry ent_1 created",
+        }),
+      ],
+      working: false,
+    });
+    expect(groups.map((group) => group.key)).toEqual(["earlier", "turn:1"]);
+    expect(groups[0]?.rows.map((row) => row.item.id)).toEqual([
+      "record:evt-lonely",
     ]);
   });
 });

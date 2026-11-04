@@ -127,6 +127,7 @@ import {
   roundIdFromScope,
 } from "../persistence/store";
 import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
+import type { MessageEntry, MessagePart } from "../harness/agentHarness";
 import type {
   NarrationSubject,
   RunNarration,
@@ -624,41 +625,55 @@ const subjectKey = (subject: NarrationSubject): string => {
 };
 
 /**
- * One narration entry as one live frame, or nothing.
- *
- * `undefined` is the common answer and is the point: most of what a harness narrates is a
- * token delta, a step boundary or a *cumulative* usage total, and `NarrationDetail` reads
- * those as `opaque`. Dropping them here is sound in a way it would not be on the record
- * channel — this channel never claims to be complete — and it is what keeps one item on the
- * wire per reply block and per tool call instead of hundreds per turn.
- *
- * **Not every entry becomes an item.** A `usage` entry becomes a {@link LiveUsage} frame,
- * which is a measurement about the session rather than a turn in it: `live.ts` has the full
- * reasoning, and the short form is that a transcript with one row per model call would bury
- * the work under its own instrumentation, and that these are numbers rather than sentences.
+ * Whose session an item is about, as the four nullable ids: exactly one is set, which is what
+ * the subject's tag buys — an attempt's narration has no round and a round's has no attempt,
+ * and neither is a field left unfilled. The supervisor publishes under the identity whose
+ * session it opened, and a replay is read for one subject, so this is not a guess.
  */
-export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
-  const base = {
-    _tag: "item" as const,
-    // This process's publish order, prefixed so it cannot collide with a record id. See
-    // `RunNarration.id` for what this is not: it is not a cursor and not resumable.
-    id: `activity:${String(item.id)}`,
-    origin: "activity" as const,
-    sequence: null,
-    at: item.entry.at,
-    /**
-     * Whose session narrated this, projected from the bus's tagged subject.
-     *
-     * Exactly one of the four is set, which is what the tag buys: an attempt's narration
-     * has no round and a round's has no attempt, and neither is a field left unfilled.
-     * The supervisor publishes under the identity whose session it opened, so this is not
-     * a guess at attribution.
-     */
-    attemptId: item.subject._tag === "attempt" ? item.subject.attemptId : null,
-    roundId: item.subject._tag === "round" ? item.subject.roundId : null,
-    goalId: item.subject._tag === "goal" ? item.subject.goalId : null,
-    importId: item.subject._tag === "import" ? item.subject.importId : null,
-  };
+const subjectIds = (subject: NarrationSubject) => ({
+  attemptId: subject._tag === "attempt" ? subject.attemptId : null,
+  roundId: subject._tag === "round" ? subject.roundId : null,
+  goalId: subject._tag === "goal" ? subject.goalId : null,
+  importId: subject._tag === "import" ? subject.importId : null,
+});
+
+/**
+ * A streamed block's id on the wire: the harness's, under the session that streamed it.
+ * The harness promises it unique within one session, and two sessions narrate onto one
+ * target's stream (an importer's and a goal's), so the session is part of it.
+ */
+const wireBlockId = (harnessSessionId: string, blockId: string | undefined) =>
+  blockId === undefined ? {} : { blockId: `${harnessSessionId}:${blockId}` };
+
+/** The fields of a {@link LiveItem} that say where and when, not what. */
+type ItemBase = Pick<
+  LiveItem,
+  | "_tag"
+  | "id"
+  | "origin"
+  | "sequence"
+  | "at"
+  | "attemptId"
+  | "roundId"
+  | "goalId"
+  | "importId"
+>;
+
+/**
+ * One reply, thinking block, tool call or tool result as one item, or nothing — **the one
+ * projection live narration and a replay share** (A6 F10).
+ *
+ * {@link projectNarration} calls it for a live entry and {@link projectReplay} for each part
+ * of a stored message, so the item a reloaded conversation draws is the item the watched one
+ * drew: same kind, headline, body, tool names, call id, outcome, `blockId` and `model`.
+ * Only the {@link ItemBase} differs — the id space, and when.
+ */
+export const projectPart = (
+  base: ItemBase,
+  detail: MessagePart,
+  subject: NarrationSubject,
+  harnessSessionId: string,
+): LiveItem | undefined => {
   /**
    * The registration whose prefix this subject's tool names carry.
    *
@@ -669,17 +684,11 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
    * untouched. `mcpToolName.ts` carries the two observed wire forms and the evidence for
    * each.
    */
-  const serverName = bitMcpServerName(subjectKey(item.subject));
-  /**
-   * A streamed block's id on the wire: the harness's, under the session that streamed it.
-   * The harness promises it unique within one session, and two sessions narrate onto one
-   * target's stream (an importer's and a goal's), so the session is part of it.
-   */
-  const blockKey = (blockId: string | undefined) =>
-    blockId === undefined
+  const serverName = bitMcpServerName(subjectKey(subject));
+  const model =
+    detail._tag === "toolResult" || detail.model === undefined
       ? {}
-      : { blockId: `${item.harnessSessionId}:${blockId}` };
-  const detail = item.entry.detail;
+      : { model: detail.model };
   switch (detail._tag) {
     case "reply":
       // A reply with no text is the harness closing an empty block. Nothing to show, and
@@ -698,38 +707,9 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
             output: null,
             callId: null,
             outcome: null,
-            ...blockKey(detail.blockId),
+            ...wireBlockId(harnessSessionId, detail.blockId),
+            ...model,
           };
-    case "partial":
-      /*
-       * A block still being written, with its whole text so far (`run/streamingCoalescer.ts`).
-       *
-       * The finished block's kind and headline, so a reader that renders it renders it as
-       * what it will be; `streaming` and the shared `blockId` are what say it is not that
-       * yet. Live only: it is on the bus and nowhere else, and `liveTranscript` sends it only
-       * to a client that asked (`live.ts`, "Partial items"). Nothing yet is nothing, as for a
-       * finished block.
-       */
-      return detail.text.trim() === ""
-        ? undefined
-        : {
-            ...base,
-            kind: detail.channel === "reply" ? "turn.reply" : "turn.thinking",
-            headline: detail.channel === "reply" ? "Reply" : "Thinking",
-            body: detail.text,
-            tool: null,
-            toolName: null,
-            input: null,
-            output: null,
-            callId: null,
-            outcome: null,
-            ...blockKey(detail.blockId),
-            streaming: true,
-          };
-    case "delta":
-      // A piece of a block: never on the wire itself. Where it is wanted, the coalescer has
-      // already made it a `partial`; anywhere else it is as good as `opaque`.
-      return undefined;
     case "toolCall":
       return {
         ...base,
@@ -753,6 +733,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
         // concurrently, so that is not a hypothetical ordering.
         callId: detail.callId,
         outcome: null,
+        ...model,
       };
     case "toolResult":
       return {
@@ -797,8 +778,201 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
             output: null,
             callId: null,
             outcome: null,
-            ...blockKey(detail.blockId),
+            ...wireBlockId(harnessSessionId, detail.blockId),
+            ...model,
           };
+  }
+};
+
+/** How one replayed session's `user` entries are read. See {@link projectReplay}. */
+export type ReplayUserEntries =
+  /** A conversation's: the operator's own words, a `turn.operator` item each. */
+  | "operator"
+  /** A planner round's: a steer it was sent, a `turn.other` item labelled `user`. */
+  | "other";
+
+/** What {@link projectReplay} made of a session's stored messages. */
+export interface ReplayProjection {
+  readonly items: readonly LiveItem[];
+  /** Entries that produced no item at all: nothing in them to show. */
+  readonly blank: number;
+}
+
+/**
+ * A session's stored messages as the **items the live stream carries** (A6 F10).
+ *
+ * The replay half of "one renderer for live and replay". Each entry's parts go through
+ * {@link projectPart}, the projection {@link projectNarration} uses, so a reloaded
+ * conversation is the same items the watched one was, attributed to the same subject. What a
+ * stored message has that the live stream does not is drawn too, each as what it is:
+ *
+ * - a `user` entry's words — the operator's in a conversation (`turn.operator`, `You`), a
+ *   steer in a planner round (`turn.other`, labelled `user`). The caller trims its own
+ *   framing off the text first, and drops an entry it never wants shown (a round's prompt).
+ * - an entry the harness lists that is neither side — OpenCode's `shell`, `synthetic`,
+ *   `system` — as `turn.other` under the harness's own word, so it never reads as the agent;
+ * - an `error` the harness recorded on an entry, as `turn.other` labelled `error`,
+ *   `outcome` `failed`.
+ *
+ * Ids are `replay:<n>`, `n` the item's position in this answer: a render key, never a cursor
+ * and never an activity order (`activity:<n>`), so a client's replay/live floor cannot read
+ * one. `at` is the entry's own time, or `fallbackAt` (when the answer was built) for an
+ * entry whose harness kept none. `model` is each assistant entry's own, which is what a
+ * turn's footer names rather than the session's current model.
+ */
+export const projectReplay = (input: {
+  readonly entries: readonly MessageEntry[];
+  readonly subject: NarrationSubject;
+  readonly harnessSessionId: string;
+  readonly users: ReplayUserEntries;
+  readonly fallbackAt: number;
+}): ReplayProjection => {
+  const items: LiveItem[] = [];
+  let blank = 0;
+  const ids = subjectIds(input.subject);
+  const baseAt = (at: number): ItemBase => ({
+    _tag: "item",
+    id: `replay:${String(items.length)}`,
+    origin: "activity",
+    sequence: null,
+    at,
+    ...ids,
+  });
+  const note = (at: number, headline: string, body: string, failed: boolean) =>
+    items.push({
+      ...baseAt(at),
+      kind: "turn.other",
+      headline,
+      body,
+      tool: null,
+      toolName: null,
+      input: null,
+      output: null,
+      callId: null,
+      outcome: failed ? "failed" : null,
+    });
+  for (const entry of input.entries) {
+    const before = items.length;
+    const at = entry.at ?? input.fallbackAt;
+    if (entry.type === "user") {
+      if (entry.text.trim() !== "") {
+        if (input.users === "operator") {
+          items.push({
+            ...baseAt(at),
+            kind: "turn.operator",
+            headline: "You",
+            body: entry.text,
+            tool: null,
+            toolName: null,
+            input: null,
+            output: null,
+            callId: null,
+            outcome: null,
+          });
+        } else {
+          note(at, "user", entry.text, false);
+        }
+      }
+    } else if (entry.type !== "assistant" && entry.text.trim() !== "") {
+      note(at, entry.type, entry.text, false);
+    }
+    for (const part of entry.parts) {
+      const item = projectPart(
+        baseAt(at),
+        part,
+        input.subject,
+        input.harnessSessionId,
+      );
+      if (item !== undefined) items.push(item);
+    }
+    // An assistant entry whose words were never parts (a driver that gives text only).
+    if (
+      entry.type === "assistant" &&
+      entry.parts.length === 0 &&
+      entry.text.trim() !== ""
+    ) {
+      items.push({
+        ...baseAt(at),
+        kind: "turn.reply",
+        headline: "Reply",
+        body: entry.text,
+        tool: null,
+        toolName: null,
+        input: null,
+        output: null,
+        callId: null,
+        outcome: null,
+        ...(entry.model === undefined ? {} : { model: entry.model }),
+      });
+    }
+    if (entry.error !== undefined) note(at, "error", entry.error, true);
+    if (items.length === before) blank += 1;
+  }
+  return { items, blank };
+};
+
+/**
+ * One narration entry as one live frame, or nothing.
+ *
+ * `undefined` is the common answer and is the point: most of what a harness narrates is a
+ * token delta, a step boundary or a *cumulative* usage total, and `NarrationDetail` reads
+ * those as `opaque`. Dropping them here is sound in a way it would not be on the record
+ * channel — this channel never claims to be complete — and it is what keeps one item on the
+ * wire per reply block and per tool call instead of hundreds per turn.
+ *
+ * **Not every entry becomes an item.** A `usage` entry becomes a {@link LiveUsage} frame,
+ * which is a measurement about the session rather than a turn in it: `live.ts` has the full
+ * reasoning, and the short form is that a transcript with one row per model call would bury
+ * the work under its own instrumentation, and that these are numbers rather than sentences.
+ */
+export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
+  const base = {
+    _tag: "item" as const,
+    // This process's publish order, prefixed so it cannot collide with a record id. See
+    // `RunNarration.id` for what this is not: it is not a cursor and not resumable.
+    id: `activity:${String(item.id)}`,
+    origin: "activity" as const,
+    sequence: null,
+    at: item.entry.at,
+    ...subjectIds(item.subject),
+  };
+  const detail = item.entry.detail;
+  switch (detail._tag) {
+    case "reply":
+    case "thinking":
+    case "toolCall":
+    case "toolResult":
+      return projectPart(base, detail, item.subject, item.harnessSessionId);
+    case "partial":
+      /*
+       * A block still being written, with its whole text so far (`run/streamingCoalescer.ts`).
+       *
+       * The finished block's kind and headline, so a reader that renders it renders it as
+       * what it will be; `streaming` and the shared `blockId` are what say it is not that
+       * yet. Live only: it is on the bus and nowhere else, and `liveTranscript` sends it only
+       * to a client that asked (`live.ts`, "Partial items"). Nothing yet is nothing, as for a
+       * finished block.
+       */
+      return detail.text.trim() === ""
+        ? undefined
+        : {
+            ...base,
+            kind: detail.channel === "reply" ? "turn.reply" : "turn.thinking",
+            headline: detail.channel === "reply" ? "Reply" : "Thinking",
+            body: detail.text,
+            tool: null,
+            toolName: null,
+            input: null,
+            output: null,
+            callId: null,
+            outcome: null,
+            ...wireBlockId(item.harnessSessionId, detail.blockId),
+            streaming: true,
+          };
+    case "delta":
+      // A piece of a block: never on the wire itself. Where it is wanted, the coalescer has
+      // already made it a `partial`; anywhere else it is as good as `opaque`.
+      return undefined;
     case "usage":
       /*
        * One model call's measurement, as its own frame.

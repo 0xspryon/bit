@@ -117,7 +117,8 @@
    * what happened.
    *
    * The thing that happened is the reply or the tool call beside this row. Thinking is a
-   * draft: it is streamed and never stored, it is not read back on a reload, and an
+   * draft: bit never stores it — a reload reads it back from the harness's copy, like the
+   * rest of the conversation, for as long as the harness keeps it — and an
    * operator who acted on it would be acting on something the agent may have talked itself
    * out of two rows later.
    */
@@ -164,8 +165,8 @@
         <summary>What it considered</summary>
         <p class="thought">{item.body}</p>
         <p class="aside">
-          What the agent was considering, not what it did — and not stored: this
-          is gone on a reload.
+          What the agent was considering, not what it did. Not stored here: a
+          reload shows it only while the harness still has it.
         </p>
       </details>
     </li>
@@ -336,9 +337,9 @@
         <summary class="io-label">What it considered</summary>
         <p class="thought">{item.body}</p>
         <p class="note">
-          What the agent was considering, not what it did — and not stored: this
-          is gone on a reload. What it actually did is the reply or the tool
-          call beside this.
+          What the agent was considering, not what it did. Not stored here: a
+          reload shows it only while the harness still has it. What it actually
+          did is the reply or the tool call beside this.
         </p>
       </details>
     {:else if item.body !== ""}

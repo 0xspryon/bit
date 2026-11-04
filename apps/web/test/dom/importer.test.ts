@@ -11,6 +11,7 @@
  * scenario that stops loading fails here rather than in front of the person judging it.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { flushSync } from "svelte";
 
 import { App, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
@@ -95,7 +96,7 @@ const footers = (): ({ in: Element | null; says: string } | null)[] =>
     const foot = group.querySelector(".foot");
     if (foot === null) return null;
     return {
-      in: foot.closest("li.prose, li.replayed"),
+      in: foot.closest("li.prose"),
       says: foot.textContent?.replace(/\s+/g, " ").trim() ?? "",
     };
   });
@@ -316,19 +317,36 @@ describe("S3: nothing labels what the importer says", () => {
     expect(chips()).toContain("pending");
   });
 
-  test("a replayed reply is unlabelled, and its footer is under the harness's copy", async () => {
+  test("a replayed reply is unlabelled prose, and its footer is under it as live", async () => {
     const app = await show("importer-reloaded");
 
-    const labels = [
-      ...document.querySelectorAll('[role="log"] .replay-type'),
-    ].map((each) => each.textContent);
-    expect(labels).not.toContain("assistant");
+    // The replay is drawn by `ChatItem` like the live thread (A6 F10): the agent's words
+    // are prose rows with no label, and each turn's footer sits inside the last of them.
+    expect(
+      [...document.querySelectorAll('[role="log"] .what')].map(
+        (each) => each.textContent,
+      ),
+    ).not.toContain("Reply");
     const replayedFooters = footers().filter((each) => each !== null);
-    expect(replayedFooters.length).toBeGreaterThan(0);
+    expect(replayedFooters).toHaveLength(2);
     for (const footer of replayedFooters) {
-      expect(footer.in?.classList.contains("replayed")).toBe(true);
+      expect(footer.in?.classList.contains("prose")).toBe(true);
+      // The fixture's replayed items name no model, so the session's is the fallback.
       expect(footer.says).toBe(`Model: ${app.importer.current?.model ?? ""}`);
     }
+  });
+
+  test("a replayed turn's footer names the model that answered it, not the session's", async () => {
+    const app = await show("importer-new");
+    // `questionSession`, nine days old: replayed under `claude-sonnet-5`, while its row
+    // reads `anthropic/claude-code` — a switch moves the row, never the transcript.
+    app.importer.open("ses_question");
+    flushSync();
+    expect(app.importer.current?.model).toBe("anthropic/claude-code");
+    // Strings only: a failing match against an object holding a DOM node runs away.
+    expect(
+      footers().flatMap((each) => (each === null ? [] : [each.says])),
+    ).toEqual(["Model: claude-sonnet-5"]);
   });
 });
 
@@ -688,21 +706,27 @@ describe("a session the harness no longer holds", () => {
   test("when the harness still holds it, its words come back as its copy, labelled", async () => {
     await show("importer-reloaded");
 
+    // No "earlier" group: every record is folded into the replayed call that wrote it,
+    // under the message it answered (A6 F10).
     expect(headings().map((each) => each.slice(0, 22))).toEqual([
-      "earlier in this sessio",
       "Load the scope from ht",
       "It does — shop.acme.co",
     ]);
     expect(text()).toContain(
       "This is its copy, not ours, and it may delete it.",
     );
-    expect(text()).toContain("The table has five rows:");
+    expect(text()).toContain(
+      "The scope table is at line 212 and has five rows:",
+    );
     // S4: the harness's copy is markdown too, so its table is a table and not pipes.
     expect(
-      document.querySelectorAll("li.replayed .table-wrap > table"),
+      document.querySelectorAll("li.prose .table-wrap > table"),
     ).toHaveLength(1);
-    // The records are up in 'earlier', with the reason they are not under a message.
-    expect(text()).toContain("Nothing on the record says which message");
+    // The writes folded into their records, as live, and nothing left unresolved for lack
+    // of a call. (That every row matches the live session's is `importerChat.test.ts`.)
+    expect(chips().length).toBeGreaterThan(0);
+    expect(new Set(chips())).toEqual(new Set(["recorded"]));
+    expect(text()).not.toContain("Nothing on the record says which message");
   });
 });
 

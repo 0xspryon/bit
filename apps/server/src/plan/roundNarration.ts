@@ -46,12 +46,13 @@
  */
 import { Effect, type Duration } from "effect";
 
-import type { RoundNarration, RoundNarrationMessage } from "@bit/contracts";
+import type { RoundNarration } from "@bit/contracts";
 
 import { SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
 import type { HarnessResolver } from "../harness/resolver";
 import { isRoundPromptText } from "./roundPrompt";
 import type { StoredRound } from "../persistence/store";
+import { projectReplay } from "../run/liveTranscript";
 
 /**
  * How long the harness is given to answer about one round.
@@ -94,7 +95,7 @@ const empty = (
   source,
   ephemeral: false,
   note,
-  messages: [],
+  items: [],
   truncated: false,
   // Nothing was left out, because nothing came back. The two figures are about a reply the
   // harness actually gave; reporting a count here would imply there had been something to
@@ -227,11 +228,10 @@ export const roundNarration = Effect.fnUntraced(function* (input: {
    * goal id. A steer carries `STEER_PROMPT_MARKER` instead and is kept, wherever it sits
    * and however many there are.
    *
-   * *The blanks.* The reduced shape has no text for a `tool_use` or `tool_result` block, so
-   * each one became an entry with an empty `text` and no error — 15 of 21 rows on a real
-   * settled round, rendered as turns with nothing in them, with the round's three actual
-   * sentences buried among them. An entry carrying an `error` is **kept** even with no
-   * text: a failure with no prose is still the round telling us something.
+   * *What remains* is projected into the live stream's own items (A6 F10) — replies,
+   * thinking, tool calls with their results, and each steer as a `turn.other` labelled
+   * `user` — so a reloaded round draws as a watched one did. An entry that produced no item
+   * is counted in `omittedBlank`.
    */
   const promptAt = fetched.success.findIndex(
     // A `user` entry carrying **our prompt's own opening sentence**. The type is still
@@ -250,18 +250,21 @@ export const roundNarration = Effect.fnUntraced(function* (input: {
           ...fetched.success.slice(promptAt + 1),
         ];
   const promptOmitted = promptAt >= 0;
-  const speaking = withoutPrompt.filter(
-    (entry) => entry.text.trim() !== "" || entry.error !== undefined,
-  );
-  const omittedBlank = withoutPrompt.length - speaking.length;
-  if (speaking.length === 0) {
+  const { items, blank } = projectReplay({
+    entries: withoutPrompt,
+    subject: { _tag: "round", roundId: round.roundId },
+    harnessSessionId: round.harnessSessionId,
+    users: "other",
+    fallbackAt: Date.now(),
+  });
+  const omittedBlank = blank;
+  if (items.length === 0) {
     /*
-     * Everything the harness held was our prompt and its tool blocks.
+     * Everything the harness held was our prompt and empty entries.
      *
      * Still `harness`, not `none`: the harness **does** hold this round's session and did
-     * answer about it. The round made calls and said nothing in words, which is a real
-     * outcome, and reporting it as `none` would claim the harness held nothing at all —
-     * collapsing it into the case the three sources exist to keep apart.
+     * answer about it, and reporting it as `none` would claim the harness held nothing at
+     * all — collapsing it into the case the three sources exist to keep apart.
      */
     return {
       roundId: round.roundId,
@@ -269,49 +272,38 @@ export const roundNarration = Effect.fnUntraced(function* (input: {
       source: "harness",
       ephemeral: true,
       note:
-        `From ${displayName}, which may delete it. This round narrated no words: everything it holds is ` +
-        `${promptOmitted ? "the prompt we sent and " : ""}${String(omittedBlank)} tool ${omittedBlank === 1 ? "call or result" : "calls and results"}, ` +
-        `which the reduced replay shape carries no text for. A round this tab watched live shows them in full.`,
-      messages: [],
+        `From ${displayName}, which may delete it. This round narrated nothing that can be shown: everything it holds is ` +
+        `${promptOmitted ? "the prompt we sent and " : ""}${String(omittedBlank)} empty ${omittedBlank === 1 ? "message" : "messages"}.`,
+      items: [],
       truncated: false,
       omittedBlank,
       promptOmitted,
     } satisfies RoundNarration;
   }
 
-  const kept = speaking.slice(0, limit);
+  const kept = items.slice(0, limit);
   return {
     roundId: round.roundId,
     harnessSessionId: round.harnessSessionId,
     source: "harness",
     ephemeral: true,
     /**
-     * Two things an operator has to know about what is on screen, in one sentence each.
-     *
-     * That it can be gone tomorrow — it is the harness's copy and this build keeps none of
-     * its own — and that it is the **reduced** `{ type, text, error }` shape, so the paired
-     * tool blocks a live round shows are not here. The second is the one a reader would
-     * otherwise read as a round having done less than it did.
+     * What an operator has to know about what is on screen: that it can be gone tomorrow —
+     * it is the harness's copy and this build keeps none of its own — and what was left out.
      */
     note:
       `From ${displayName}, which may delete it: this build does not store a round's narration, so what is here lasts exactly as long as the harness keeps it.` +
-      ` Replayed messages carry no tool arguments and no call ids, so a tool call and its result are not paired as they are live.` +
       (promptOmitted
         ? ` The prompt this round was given is not replayed here; the briefing panel on this page is the same text.`
         : "") +
       (omittedBlank > 0
-        ? ` ${String(omittedBlank)} tool ${omittedBlank === 1 ? "call or result is" : "calls and results are"} left out: the reduced shape carries no text for them.`
+        ? ` ${String(omittedBlank)} empty ${omittedBlank === 1 ? "message is" : "messages are"} left out.`
         : "") +
-      (speaking.length > kept.length
-        ? ` Shortened: not every message is shown.`
+      (items.length > kept.length
+        ? ` Shortened: not every item is shown.`
         : ""),
-    messages: kept.map((entry, index): RoundNarrationMessage => ({
-      index,
-      type: entry.type,
-      text: entry.text,
-      error: entry.error,
-    })),
-    truncated: speaking.length > kept.length,
+    items: kept,
+    truncated: items.length > kept.length,
     omittedBlank,
     promptOmitted,
   } satisfies RoundNarration;

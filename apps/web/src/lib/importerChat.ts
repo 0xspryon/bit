@@ -67,8 +67,6 @@
  * already holds, not an answer only the server could give.
  */
 import type {
-  GoalNarrationView,
-  ImporterContinuation,
   ImporterContinuationRefusal,
   ImporterConversationView,
   ImporterSessionView,
@@ -78,14 +76,11 @@ import type {
 import {
   OPERATOR_TURN_KIND,
   activityOrder,
+  claimedRecords,
   rowsFor,
   type ChatGroup,
   type RoundProse,
 } from "./chat";
-
-/** One message of the harness's copy, in the reduced shape the replay answers with. */
-export type ReplayedMessage =
-  GoalNarrationView["rounds"][number]["messages"][number];
 
 /**
  * What an importer group's separator needs, and the whole of what the chat is given.
@@ -99,10 +94,10 @@ export interface ImporterTurn {
   /** Which operator message this is, from one. `null` on the leading group. */
   readonly number: number | null;
   /**
-   * When the operator sent it, in epoch milliseconds, or `null`.
+   * When the operator sent it, in epoch milliseconds, or `null` on the leading group.
    *
-   * `null` on every replayed turn: the harness's reduced entries carry no time, and a
-   * time borrowed from somewhere else would be an invention.
+   * On a replayed turn it is the harness's own time for the message (A6 F10); on a live one,
+   * this tab's clock when it was sent. Shown, never used for ordering.
    */
   readonly at: number | null;
   /** True while the importer is still working on this message. */
@@ -128,8 +123,12 @@ export interface ImporterHistory {
   readonly note: string;
   /** True when the harness holds more than it returned — and it stopped short of the oldest. */
   readonly truncated: boolean;
-  /** Oldest first. Empty unless `source` is `harness`. */
-  readonly messages: readonly ReplayedMessage[];
+  /**
+   * The replay, oldest first, as the live stream's own items (A6 F10): the operator's
+   * `turn.operator` rows and the importer's replies, thinking and tool calls. Empty unless
+   * `source` is `harness`.
+   */
+  readonly items: readonly LiveItem[];
   /**
    * What the server will do with the next message, in its words rather than this page's.
    *
@@ -141,25 +140,27 @@ export interface ImporterHistory {
    *
    * Absent until the server has answered, which is the `loading` case: a composer is offered
    * meanwhile, because an unknown is not a refusal and the server's own refusal is the one
-   * that counts.
+   * that counts. A union, as the server's view is, so a `refused` answer always carries
+   * which refusal it is and its sentence, and nothing else carries one: the page words an
+   * end from `import_ended` and shows the server's sentence for any other refusal, and never
+   * reads `refused` alone as an end.
    */
-  readonly continuation?: ImporterContinuation;
-  /**
-   * Which refusal a `refused` {@link continuation} is, and the server's sentence for it.
-   *
-   * Present exactly when `continuation` is `refused`. The page words an end from
-   * `import_ended` and shows the server's sentence for any other refusal, and never reads
-   * `refused` alone as an end: a session whose agent this server does not define is refused
-   * too, and nobody ended it.
-   */
-  readonly refusal?: ImporterContinuationRefusal;
+  readonly standing?: ImporterStanding;
 }
+
+/** What the next message will do: the server's answer, with a refusal only on `refused`. */
+export type ImporterStanding =
+  | { readonly continuation: "live" | "resume" | "fresh" }
+  | {
+      readonly continuation: "refused";
+      readonly refusal: ImporterContinuationRefusal;
+    };
 
 export const NO_HISTORY: ImporterHistory = {
   source: "none",
   note: "",
   truncated: false,
-  messages: [],
+  items: [],
 };
 
 /**
@@ -174,9 +175,11 @@ export const historyOf = (view: ImporterConversationView): ImporterHistory => ({
   source: view.source,
   note: view.note,
   truncated: view.truncated,
-  messages: view.messages,
-  continuation: view.continuation,
-  ...(view.refusal === null ? {} : { refusal: view.refusal }),
+  items: view.items,
+  standing:
+    view.continuation === "refused"
+      ? { continuation: "refused", refusal: view.refusal }
+      : { continuation: view.continuation },
 });
 
 /**
@@ -408,8 +411,8 @@ export interface ImporterChatInput {
   readonly working: boolean;
 }
 
-/** The live feed cut at each operator row. */
-interface LiveCut {
+/** A conversation cut at each operator row. */
+interface Cut {
   readonly leading: readonly LiveItem[];
   readonly turns: readonly {
     readonly operator: LiveItem;
@@ -417,7 +420,7 @@ interface LiveCut {
   }[];
 }
 
-const cutLive = (items: readonly LiveItem[]): LiveCut => {
+const cutAtOperator = (items: readonly LiveItem[]): Cut => {
   const leading: LiveItem[] = [];
   const turns: { operator: LiveItem; items: LiveItem[] }[] = [];
   for (const item of items) {
@@ -430,26 +433,51 @@ const cutLive = (items: readonly LiveItem[]): LiveCut => {
   return { leading, turns };
 };
 
-/** The harness's copy cut at each `user` entry. */
-const cutReplay = (
-  messages: readonly ReplayedMessage[],
-): {
-  readonly leading: readonly ReplayedMessage[];
-  readonly turns: readonly {
-    readonly user: ReplayedMessage;
-    readonly replies: readonly ReplayedMessage[];
-  }[];
-} => {
-  const leading: ReplayedMessage[] = [];
-  const turns: { user: ReplayedMessage; replies: ReplayedMessage[] }[] = [];
-  for (const message of messages) {
-    if (message.type === "user") {
-      turns.push({ user: message, replies: [] });
-      continue;
-    }
-    (turns.at(-1)?.replies ?? leading).push(message);
+/** Whether an item came from the server's replay rather than this tab's feed. */
+const fromReplay = (item: LiveItem): boolean => item.id.startsWith("replay:");
+
+/**
+ * The conversation with each record moved to sit right after the write call it pairs with,
+ * and every record nothing claims, from before this tab's first message, moved to the front.
+ *
+ * A reload's records come from the record channel, in the store's order and with no operator
+ * row before them, while the calls that wrote them come back in the replay under the turns
+ * they were made in (A6 F10). Paired across the **whole** session — the same in-order
+ * pairing `rowsFor` makes within a group ({@link claimedRecords}) — and placed beside their
+ * calls, each record lands in its call's turn, where `rowsFor` folds the two into one
+ * `recorded` row as it does live.
+ *
+ * A record no call claims is placed by nothing, so it goes to the front, where the cut puts
+ * it in the leading "earlier in this session" group with the sentence that says why — not
+ * under whichever replayed turn happens to be last, which would be a claim about which
+ * message it answered. A record that arrived after one of this tab's own messages keeps its
+ * place, as it always has: it is live, and placed by the narration around it.
+ */
+const placedByCall = (
+  replay: readonly LiveItem[],
+  feed: readonly LiveItem[],
+): LiveItem[] => {
+  const all = [...replay, ...feed];
+  const claimed = claimedRecords(all);
+  const moved = new Set([...claimed.values()].map((record) => record.id));
+  const firstSent = feed.findIndex((item) => item.kind === OPERATOR_TURN_KIND);
+  // Only beside a replay: with none, there is no turn for such a record to be misfiled
+  // under, and the feed's own order stands.
+  const stray =
+    replay.length === 0
+      ? []
+      : (firstSent < 0 ? feed : feed.slice(0, firstSent)).filter(
+          (item) => item.origin === "record" && !moved.has(item.id),
+        );
+  const strayIds = new Set(stray.map((record) => record.id));
+  const placed: LiveItem[] = [...stray];
+  for (const item of all) {
+    if (moved.has(item.id) || strayIds.has(item.id)) continue;
+    placed.push(item);
+    const record = claimed.get(item.id);
+    if (record !== undefined) placed.push(record);
   }
-  return { leading, turns };
+  return placed;
 };
 
 /**
@@ -492,6 +520,13 @@ const leadingProse = (history: ImporterHistory, other: boolean): RoundProse => {
 /**
  * Cuts one importer session into groups, one per operator message.
  *
+ * **One list, one cut, replay and live alike** (A6 F10). The replay's items — its own
+ * `turn.operator` rows among the importer's — come first, then the live feed, and the whole
+ * is cut at each operator row. A replayed turn and a live one are therefore the same kind of
+ * group made of the same kind of row, drawn by `ChatItem`; what differs is only the group's
+ * prose state, `replayed` (with the server's note) or `live`. Live narration published
+ * after the replay was read for a turn the replay caught mid-way joins that turn.
+ *
  * Oldest first, with the leading "earlier in this session" group (if there is one) before
  * all of them. No groups at all is the empty session, which {@link Chat} says in its own
  * words.
@@ -500,88 +535,47 @@ export const buildImporterChat = (
   input: ImporterChatInput,
 ): readonly ImporterGroup[] => {
   const { history } = input;
-  const live = cutLive(input.items);
-  const replay = cutReplay(history.messages);
-  const turnCount = replay.turns.length + live.turns.length;
+  const cut = cutAtOperator(placedByCall(history.items, input.items));
+  const turnCount = cut.turns.length;
 
   const groups: ImporterGroup[] = [];
 
   /*
    * The leading group exists for four reasons and no others: replayed words before the
-   * first user message, records with no operator row before them, a session whose history
+   * first operator message, records with no operator row before them, a session whose history
    * the harness answered with an absence while nothing else is on screen (the group is the
    * only place the absence can be said), and a history this page cannot read at all, which
    * stays said above every message typed into it.
    */
   const absent =
     turnCount === 0 &&
-    live.leading.length === 0 &&
+    cut.leading.length === 0 &&
     (history.source === "loading" ||
       history.source === "pending" ||
       history.source === "absent" ||
       history.source === "forgotten");
-  /*
-   * **There is no longer a sixth reason, and the one there was is worth recording as gone.**
-   * Until S6 this page could not read a session's words at all, so an indexed session opened
-   * with a stand-in `pending` history whose note said so — and that note had to stay said
-   * after the operator typed, or one message in an old session looked exactly like a
-   * brand-new one. The page reads the session now, so `pending` is back to meaning what the
-   * server means by it (a session that has not spoken yet), and a turn's own prose says that
-   * better than a group above it. Each absence is said once, before anything else.
-   */
-  if (replay.leading.length > 0 || live.leading.length > 0 || absent) {
-    const prose: RoundProse =
-      replay.leading.length > 0
-        ? {
-            _tag: "replayed",
-            note: history.note,
-            ephemeral: true,
-            truncated: history.truncated && turnCount === 0,
-          }
-        : leadingProse(history, turnCount > 0);
+  if (cut.leading.length > 0 || absent) {
+    const prose: RoundProse = cut.leading.some(fromReplay)
+      ? {
+          _tag: "replayed",
+          note: history.note,
+          ephemeral: true,
+          truncated: history.truncated,
+        }
+      : leadingProse(history, turnCount > 0);
     groups.push({
       key: "earlier",
       subject: { message: null, number: null, at: null, working: false },
       prose,
-      replayed: replay.leading,
-      rows: rowsFor(live.leading, false),
+      rows: rowsFor(cut.leading, false),
     });
   }
 
-  let number = 0;
-  replay.turns.forEach((turn, position) => {
-    number += 1;
-    const last =
-      position === replay.turns.length - 1 && live.turns.length === 0;
-    groups.push({
-      key: `turn:${String(number)}`,
-      subject: {
-        message: turn.user.text,
-        number,
-        at: null,
-        working: false,
-      },
-      prose:
-        turn.replies.length > 0
-          ? {
-              _tag: "replayed",
-              note: history.note,
-              ephemeral: true,
-              truncated: history.truncated && last,
-            }
-          : {
-              _tag: "none",
-              note: "The harness holds this message and no reply to it.",
-            },
-      replayed: turn.replies,
-      rows: [],
-    });
-  });
-
-  live.turns.forEach((turn, position) => {
-    number += 1;
-    const latest = position === live.turns.length - 1;
+  cut.turns.forEach((turn, position) => {
+    const number = position + 1;
+    const latest = position === cut.turns.length - 1;
     const working = latest && input.working;
+    const replayed = fromReplay(turn.operator);
     const spoke = turn.items.some((item) => item.origin === "activity");
     groups.push({
       key: `turn:${String(number)}`,
@@ -591,18 +585,31 @@ export const buildImporterChat = (
         at: turn.operator.at,
         working,
       },
-      prose: spoke
-        ? { _tag: "live" }
-        : latest
+      prose: replayed
+        ? spoke
           ? {
-              _tag: "pending",
-              note: "Sent. The importer has not answered yet.",
+              _tag: "replayed",
+              note: history.note,
+              ephemeral: true,
+              // Said once, on the first turn: the answer stopped short of the oldest items.
+              truncated:
+                history.truncated && position === 0 && cut.leading.length === 0,
             }
           : {
               _tag: "none",
-              note: "The importer wrote nothing in reply to this message.",
-            },
-      replayed: [],
+              note: "The harness holds this message and no reply to it.",
+            }
+        : spoke
+          ? { _tag: "live" }
+          : latest
+            ? {
+                _tag: "pending",
+                note: "Sent. The importer has not answered yet.",
+              }
+            : {
+                _tag: "none",
+                note: "The importer wrote nothing in reply to this message.",
+              },
       rows: rowsFor(turn.items, working),
     });
   });
@@ -695,7 +702,7 @@ export const LOADING_HISTORY: ImporterHistory = {
   source: "loading",
   note: "",
   truncated: false,
-  messages: [],
+  items: [],
 };
 
 /**

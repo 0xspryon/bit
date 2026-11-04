@@ -67,7 +67,18 @@ import {
   targetSummary,
   targetView,
   unreachable,
+  replayItem,
 } from "./fakeServer";
+
+/** A chat group's rows that the server's replay brought (A6 F10): `replay:` ids. */
+const replayedRows = (
+  group: { readonly rows: readonly { readonly key: string }[] } | undefined,
+) => (group?.rows ?? []).filter((row) => row.key.startsWith("replay:"));
+
+/** A chat group's rows from this tab's own feed, everything the replay did not bring. */
+const liveRows = <Row extends { readonly key: string }>(
+  group: { readonly rows: readonly Row[] } | undefined,
+): Row[] => (group?.rows ?? []).filter((row) => !row.key.startsWith("replay:"));
 
 /**
  * Lets everything already in flight finish.
@@ -1796,7 +1807,7 @@ describe("planning a goal", () => {
     const shown = app.goalChat.groups[0];
     expect(shown?.key).toBe("rnd_1");
     expect(shown?.prose._tag).toBe("replayed");
-    expect(shown?.replayed.length).toBe(2);
+    expect(replayedRows(shown).length).toBe(2);
 
     app.closeGoal();
     expect(app.goalNarration).toBeUndefined();
@@ -1833,7 +1844,7 @@ describe("planning a goal", () => {
                 source: "forgotten",
                 ephemeral: false,
                 note: "OpenCode no longer holds session ses_1.",
-                messages: [],
+                items: [],
               }),
             ],
           }),
@@ -2066,8 +2077,8 @@ describe("planning a goal", () => {
     // own history, which is the opposite of degrading honestly.
     const shown = app.goalChat.groups[0];
     expect(shown?.prose._tag).toBe("replayed");
-    expect(shown?.replayed.length).toBe(2);
-    expect(shown?.rows.map((row) => row.item.body)).toEqual([
+    expect(replayedRows(shown).length).toBe(2);
+    expect(liveRows(shown).map((row) => row.item.body)).toEqual([
       "two dimensions have no work out",
     ]);
   });
@@ -2119,7 +2130,7 @@ describe("planning a goal", () => {
     expect(app.goalNarrationFloor).toBe(3);
     const shown = app.goalChat.groups[0];
     expect(shown?.prose._tag).toBe("replayed");
-    expect(shown?.rows).toEqual([]);
+    expect(liveRows(shown)).toEqual([]);
   });
 });
 
@@ -3340,7 +3351,7 @@ describe("the goal conversation", () => {
     // the operator's own message is enough of a conversation to render.
     expect(app.goalConversationChat.groups).toHaveLength(1);
     expect(
-      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+      liveRows(app.goalConversationChat.groups[0]).map((row) => row.item.body),
     ).toEqual(["look at the lockout path"]);
     // And the agent owes an answer until something arrives for this goal.
     expect(app.goalAwaiting).toBe(true);
@@ -3366,9 +3377,9 @@ describe("the goal conversation", () => {
             live: true,
             source: "harness",
             ephemeral: true,
-            messages: [
-              { index: 0, type: "user", text: "ok" },
-              { index: 1, type: "assistant", text: "done" },
+            items: [
+              replayItem(0, "turn.operator", "ok"),
+              replayItem(1, "turn.reply", "done"),
             ],
             note: "From OpenCode, which may delete it.",
           }),
@@ -3392,7 +3403,7 @@ describe("the goal conversation", () => {
     expect(app.goalTurns.map((turn) => turn.text)).toEqual(["ok"]);
     // The row the operator just typed, on screen rather than swallowed.
     expect(
-      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+      liveRows(app.goalConversationChat.groups[0]).map((row) => row.item.body),
     ).toEqual(["ok"]);
   });
 
@@ -3423,7 +3434,7 @@ describe("the goal conversation", () => {
           ephemeral: true,
           // The answer agrees with what is about to be typed, which is what makes a
           // text-only cancellation fire.
-          messages: [{ index: 0, type: "user", text: "ok" }],
+          items: [replayItem(0, "turn.operator", "ok")],
           note: "From OpenCode, which may delete it.",
         }),
       );
@@ -3465,7 +3476,7 @@ describe("the goal conversation", () => {
      * instead would report the cause rather than the harm.
      */
     expect(
-      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+      liveRows(app.goalConversationChat.groups[0]).map((row) => row.item.body),
     ).toEqual(["ok"]);
     // And the bookkeeping that makes it true: captured before the request left, so a turn
     // sent during the trip is out of this answer's reach. A late capture reads
@@ -3512,7 +3523,7 @@ describe("the goal conversation", () => {
           ephemeral: true,
           // An "ok" from earlier in the history, which is what a text-only cancellation
           // fires on.
-          messages: [{ index: 0, type: "user", text: "ok" }],
+          items: [replayItem(0, "turn.operator", "ok")],
           note: "From OpenCode, which may delete it.",
         }),
       );
@@ -3565,7 +3576,7 @@ describe("the goal conversation", () => {
      * chat shows nothing, so the operator cannot tell whether it was sent.
      */
     expect(
-      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+      liveRows(app.goalConversationChat.groups[0]).map((row) => row.item.body),
     ).toEqual(["ok"]);
     // The bookkeeping underneath it: the stale answer installed nothing, so the bound is
     // still visit three's own zero rather than visit one's one.
@@ -3612,7 +3623,7 @@ describe("the goal conversation", () => {
             live: false,
             source: "harness",
             ephemeral: true,
-            messages: [{ index: 0, type: "assistant", text: "earlier words" }],
+            items: [replayItem(0, "turn.reply", "earlier words")],
             note: "From Claude Code. This conversation was opened by a server process that is no longer running.",
           }),
         );
@@ -3696,7 +3707,7 @@ describe("the goal conversation", () => {
 
     expect(app.goalAwaiting).toBe(false);
     expect(
-      app.goalConversationChat.groups[0]?.rows.map((row) => row.item.body),
+      liveRows(app.goalConversationChat.groups[0]).map((row) => row.item.body),
     ).toEqual(["what is happening?", "One round has run so far."]);
   });
 });

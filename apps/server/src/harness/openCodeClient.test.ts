@@ -16,6 +16,7 @@
  * asserted below.
  */
 import { describe, expect, test } from "bun:test";
+import type { LiveItem } from "@bit/contracts";
 import { Effect, Fiber, Layer, Redacted, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
@@ -37,6 +38,7 @@ import {
 import { HarnessResolver } from "./resolver";
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
 import { narrateCoalesced } from "../run/streamingCoalescer";
+import { projectNarration, projectReplay } from "../run/liveTranscript";
 import { OpenCodeServer } from "./openCodeServer";
 
 const FAKE_SERVER = {
@@ -2578,6 +2580,183 @@ describe("switching an opencode session's model", () => {
     expect(seen).toMatchObject([
       { callId: "msg_before", contextLimit: 200_000, compactionAt: 170_000 },
       { callId: "msg_after", contextLimit: 400_000, compactionAt: 231_200 },
+    ]);
+  });
+});
+
+/* ── Stored messages as the live stream's parts (A6 F10) ────────────────────── */
+
+/**
+ * A real `message.list` answer: `testdata/opencode-messages/tool-and-thinking.json`.
+ *
+ * Recorded 2026-11-04 from a throwaway bit server (`HARNESS=opencode`, opencode 2.2.5,
+ * `zai-coding-plan/glm-5.3-flash`): an importer conversation of two turns, each reasoning,
+ * a sentence and a `shell` call, then an answer — the second turn's split by the server
+ * into two assistant messages. Between them OpenCode stored a `system` entry whose text is
+ * the model-facing tool catalogue, and an `idle` after each turn. Sanitised: the importer's
+ * framing above the operator's first message, the `system` text and every `native` blob are
+ * elided, and the snapshot is gone. Times are the wire's epoch milliseconds.
+ */
+const storedMessages = async (): Promise<unknown[]> =>
+  JSON.parse(
+    await Bun.file(
+      `${import.meta.dir}/testdata/opencode-messages/tool-and-thinking.json`,
+    ).text(),
+  ) as unknown[];
+
+describe("a session's stored messages, as the live stream's parts (A6 F10)", () => {
+  const read = async (): Promise<readonly MessageEntry[]> => {
+    const stored = await storedMessages();
+    let served = false;
+    const { layer } = clientWith((url) => {
+      if (!url.includes("/message")) return json({ data: [] });
+      const page = served ? [] : stored;
+      served = true;
+      return json({
+        data: page,
+        cursor: { previous: null, next: page.length === 0 ? null : "next" },
+      });
+    });
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (client) => client.messages("ses_1")),
+          layer,
+        ),
+      ),
+    );
+  };
+
+  test("an assistant message's content becomes the parts the stream narrates, with its model and time", async () => {
+    const entries = await read();
+    expect(
+      entries.map((entry) => [
+        entry.type,
+        entry.parts.map((part) => part._tag).join("+"),
+      ]),
+    ).toEqual([
+      ["user", ""],
+      ["assistant", "thinking+reply+toolCall+toolResult"],
+      ["system", ""],
+      ["assistant", "thinking+reply"],
+      ["idle", ""],
+      ["user", ""],
+      ["assistant", "thinking+toolCall+toolResult"],
+      ["assistant", "reply"],
+      ["idle", ""],
+    ]);
+    // `provider/model`, as this build names an OpenCode model; none on the operator's entry.
+    expect(entries[1]?.model).toBe("zai-coding-plan/glm-5.3-flash");
+    expect(entries[0]?.model).toBeUndefined();
+    // The client decodes the wire's milliseconds into a `DateTime`, and they come back out.
+    expect(entries[0]?.at).toBe(1_793_774_087_890);
+    // A stored tool part is the call **and** its outcome, both named.
+    expect(entries[1]?.parts.slice(2)).toEqual([
+      {
+        _tag: "toolCall",
+        callId: "call_8037366fab464071ae906325",
+        tool: "shell",
+        input: '{"command":"ls -a"}',
+        model: "zai-coding-plan/glm-5.3-flash",
+      },
+      {
+        _tag: "toolResult",
+        callId: "call_8037366fab464071ae906325",
+        tool: "shell",
+        output: ".\n..\n.opencode\n",
+        failed: false,
+      },
+    ]);
+    // A `system` entry reads as its transcript summary, not the model-facing text.
+    expect(entries[2]?.text).toBe("Instructions updated: core/codemode");
+  });
+
+  test("a text or reasoning part is named as its stream named it: message, channel, ordinal", async () => {
+    const entries = await read();
+    expect(
+      entries.flatMap((entry) =>
+        entry.parts.flatMap((part) =>
+          part._tag === "reply" || part._tag === "thinking"
+            ? [part.blockId]
+            : [],
+        ),
+      ),
+    ).toEqual([
+      "msg_1a5446ede001LFYoSkko0SOI62:reasoning:0",
+      "msg_1a5446ede001LFYoSkko0SOI62:text:0",
+      "msg_1a5448299001jPNuDNGU8CwiFU:reasoning:0",
+      "msg_1a5448299001jPNuDNGU8CwiFU:text:0",
+      expect.stringMatching(/^msg_.*:reasoning:0$/),
+      expect.stringMatching(/^msg_.*:text:0$/),
+    ]);
+  });
+
+  test("a replayed item equals the item the live events made of the same message, but for its id and time", async () => {
+    const entries = await read();
+    const message = entries[1];
+    if (message === undefined) throw new Error("no assistant message");
+    const id = "msg_1a5446ede001LFYoSkko0SOI62";
+    const call = "call_8037366fab464071ae906325";
+    const reasoning = message.parts[0];
+    const said = message.parts[1];
+    const event = (type: string, data: Record<string, unknown>) => ({
+      type,
+      created: 1,
+      durable: { aggregateID: "ses_1", seq: 1, version: 1 },
+      data: { sessionID: "ses_1", assistantMessageID: id, ...data },
+    });
+    // The events OpenCode 2.2.5 publishes for that message, in its order.
+    const names = new Map<string, string>();
+    const models = new Map<string, string>();
+    const live = [
+      event("session.step.started", {
+        agent: "build",
+        model: { id: "glm-5.3-flash", providerID: "zai-coding-plan" },
+        started: 1,
+      }),
+      event("session.reasoning.ended", {
+        ordinal: 0,
+        text: reasoning?._tag === "thinking" ? reasoning.text : "",
+      }),
+      event("session.text.ended", {
+        ordinal: 0,
+        text: said?._tag === "reply" ? said.text : "",
+      }),
+      event("session.tool.input.started", { id: call, name: "shell" }),
+      event("session.tool.called", { id: call, input: { command: "ls -a" } }),
+      event("session.tool.success", {
+        id: call,
+        content: [{ type: "text", text: ".\n..\n.opencode\n" }],
+      }),
+    ].map((each) => openCodeNarration(each, names, undefined, models));
+    const subject = { _tag: "import", importId: "imp_1" } as const;
+    const liveItems = live.flatMap((entry, n) => {
+      const frame = projectNarration({
+        id: n,
+        targetId: "acme",
+        subject,
+        harnessSessionId: "ses_1",
+        entry,
+      });
+      return frame?._tag === "item" ? [frame] : [];
+    });
+    const replayed = projectReplay({
+      entries: [message],
+      subject,
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    const shape = (item: LiveItem) =>
+      Object.fromEntries(
+        Object.entries(item).filter(([key]) => key !== "id" && key !== "at"),
+      );
+    expect(replayed.map(shape)).toEqual(liveItems.map(shape));
+    expect(liveItems.map((item) => [item.kind, item.model])).toEqual([
+      ["turn.thinking", "zai-coding-plan/glm-5.3-flash"],
+      ["turn.reply", "zai-coding-plan/glm-5.3-flash"],
+      ["tool.call", "zai-coding-plan/glm-5.3-flash"],
+      ["tool.result", undefined],
     ]);
   });
 });

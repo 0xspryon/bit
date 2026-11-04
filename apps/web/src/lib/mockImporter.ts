@@ -464,45 +464,31 @@ export const mockCompletedSession = (now: number): ImporterSession =>
   todaySession(now, "complete");
 
 /**
- * Today's session as a reloaded tab sees it with the harness **still holding** it: the
- * words come back as the harness's copy, the records come back as records, and the tool
- * calls are not anywhere.
+ * Today's session as a reloaded tab sees it with the harness **still holding** it (A6 F10):
+ * the conversation comes back as the harness's copy — the **same items** the live session
+ * showed, operator turns, replies and tool calls with their results, under `replay:` ids —
+ * and the records come back as records, which the chat folds into the calls that wrote them.
  */
-export const mockReloadedSession = (now: number): ImporterSession => ({
-  ...todaySession(now, "records-only"),
-  history: {
-    source: "harness",
-    note: "The harness still holds this session's messages. This is its copy, not ours, and it may delete it.",
-    truncated: false,
-    messages: [
-      {
-        index: 0,
-        type: "user",
-        text: "Load the scope from https://hackerone.com/acme/policy — and the SOW says the partner portal is in too.",
-      },
-      {
-        index: 1,
-        type: "assistant",
-        text: "The table has five rows:\n\n| # | Asset | Written as | Reading |\n| --- | --- | --- | --- |\n| 1 | `acme.com` | `*.acme.com` | in, apex and every subdomain |\n| 2 | `acmelabs.io` | `*.acmelabs.io` | in, apex and every subdomain |\n| 3 | `203.0.113.0/24` | address block | in |\n| 4 | — | “No WordPress properties” | out, but prose rather than a host |\n| 5 | `status.acme.com` | third-party status page | out |\n\nThree are in scope — **`acme.com`** and **`acmelabs.io`** are written with wildcards, so I am taking them as the host and every subdomain.",
-      },
-      {
-        index: 2,
-        type: "assistant",
-        text: "…that is the whole table. I wrote 3 in-scope entries and 2 out, and recorded 3 hosts as assets. One row I could not turn into an entry: “No WordPress properties” — I excluded blog.acme.com because the page names it, but the rule may reach further.",
-      },
-      {
-        index: 3,
-        type: "user",
-        text: "It does — shop.acme.com is WordPress too. Put it out, and the partner portal app.partner.com is in, host only, no subdomains.",
-      },
-      {
-        index: 4,
-        type: "assistant",
-        text: "Both written. The partner portal is host-only, so a subdomain of it found later will come back uncovered rather than in scope. The scope now reads 4 in, 3 out:\n\n```text\nin\n├── acme.com          subtree\n├── acmelabs.io       subtree\n├── 203.0.113.0/24    cidr\n└── app.partner.com   host only\nout\n├── blog.acme.com     WordPress, named\n├── shop.acme.com     WordPress, from you\n└── status.acme.com   third party\n```\n\nAnything else from the SOW that the program page would not know about?",
-      },
-    ],
-  },
-});
+export const mockReloadedSession = (now: number): ImporterSession => {
+  const live = todaySession(now, "complete");
+  let position = 0;
+  return {
+    ...live,
+    history: {
+      source: "harness",
+      note: "The harness still holds this session's messages. This is its copy, not ours, and it may delete it.",
+      truncated: false,
+      items: live.items
+        .filter((item) => item.origin !== "record")
+        .map((item) => ({
+          ...item,
+          id: `replay:${String((position += 1) - 1)}`,
+          importId: "imp_acme",
+        })),
+    },
+    items: live.items.filter((item) => item.origin === "record"),
+  };
+};
 
 /**
  * A session the operator has sent one message into and nothing has answered yet: the
@@ -558,17 +544,22 @@ const questionSession = (now: number): ImporterSession => ({
     source: "harness",
     note: "The harness still holds this session's messages. This is its copy, not ours, and it may delete it.",
     truncated: false,
-    messages: [
-      {
-        index: 0,
-        type: "user",
-        text: "Here is the SOW for Acme. The scope is whatever the Q4 pentest covers.",
-      },
-      {
-        index: 1,
-        type: "assistant",
-        text: "The statement of work says the Q4 pentest covers “the customer-facing web estate” and names no hosts. I will not guess at them. Which hosts or address blocks does that mean?",
-      },
+    items: [
+      base({
+        id: "replay:0",
+        kind: "turn.operator",
+        at: now - 9 * DAY,
+        headline: "You",
+        body: "Here is the SOW for Acme. The scope is whatever the Q4 pentest covers.",
+      }),
+      base({
+        id: "replay:1",
+        kind: "turn.reply",
+        at: now - 9 * DAY + 40_000,
+        headline: "Reply",
+        body: "The statement of work says the Q4 pentest covers “the customer-facing web estate” and names no hosts. I will not guess at them. Which hosts or address blocks does that mean?",
+        model: "claude-sonnet-5",
+      }),
     ],
   },
   items: [],
@@ -625,7 +616,7 @@ export const mockForgottenSession = (now: number): ImporterSession => {
       source: "forgotten",
       note: "The harness no longer has this session, so what was said in it is gone. What it recorded is below, and on the Assets page.",
       truncated: false,
-      messages: [],
+      items: [],
     },
     items,
     working: false,
@@ -637,7 +628,7 @@ export const mockForgottenSession = (now: number): ImporterSession => {
 /** The same session while the harness has not yet answered: the `loading` state. */
 export const mockOpeningSession = (now: number): ImporterSession => ({
   ...mockForgottenSession(now),
-  history: { source: "loading", note: "", truncated: false, messages: [] },
+  history: { source: "loading", note: "", truncated: false, items: [] },
 });
 
 /** Sessions earlier than today's, newest first, for the picker. */

@@ -106,8 +106,10 @@
       ? []
       : [
           {
-            term: "Messages",
-            value: `${String(app.goalConversation.messages.length)} held by the harness${
+            term: "Replayed",
+            value: `${String(app.goalConversation.items.length)} ${
+              app.goalConversation.items.length === 1 ? "item" : "items"
+            } held by the harness${
               app.goalConversation.truncated ? ", shortened" : ""
             }`,
           },
@@ -216,8 +218,9 @@
     Rows marked <strong>record</strong> are committed events and arrive in the
     order the store assigned them. Rows marked
     <strong>activity</strong> — including your own messages — are not part of the
-    record, are not stored, and are gone on a reload. What the agent said comes back
-    from the harness while the harness keeps it.
+    record and are not stored here. On a reload the conversation — your messages,
+    the agent's words and its tool calls — comes back from the harness while the harness
+    keeps it.
   {/snippet}
 
   {#snippet composer()}

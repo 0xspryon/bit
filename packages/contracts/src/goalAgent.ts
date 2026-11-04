@@ -24,6 +24,7 @@
 import { Schema } from "effect";
 
 import { SteerUrgency } from "./conversationTurn";
+import { LiveItem } from "./live";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
@@ -205,26 +206,6 @@ export const GoalConversationSource = Schema.Literals([
 export type GoalConversationSource = typeof GoalConversationSource.Type;
 
 /**
- * One replayed message of a goal conversation.
- *
- * The same reduced `{ type, text, error }` shape {@link RoundNarrationMessage} carries,
- * declared separately because it holds something a round's never does: a `user` entry here
- * is **the operator's own message**, not a prompt this server assembled. A round's replay
- * drops its prompt (one enormous briefing nobody needs twice); a conversation's keeps
- * every `user` entry, because that half of the conversation is the operator and dropping
- * it would leave the agent answering questions nobody can see.
- */
-export const GoalConversationMessage = Schema.Struct({
-  /** Position in **this answer**, from zero. A render key, not a cursor. */
-  index: Schema.Int,
-  /** The harness's own word for the entry: `user`, `assistant`. Unmapped. */
-  type: Schema.String,
-  text: Schema.String,
-  error: Schema.optional(Schema.String),
-});
-export type GoalConversationMessage = typeof GoalConversationMessage.Type;
-
-/**
  * A goal conversation as a reloaded tab replays it.
  *
  * **The harness's copy, and nothing of ours.** Nothing in this build stores a word of the
@@ -255,16 +236,18 @@ export const GoalConversationView = Schema.Struct({
   ephemeral: Schema.Boolean,
   /** A sentence for the operator, set on every source including a successful read. */
   note: Schema.String,
-  messages: Schema.Array(GoalConversationMessage),
+  /**
+   * The conversation as the **same items the live stream carries** (A6 F10), oldest first,
+   * each with `goalId` set: the agent's replies, thinking and tool calls with their results,
+   * and the operator's own messages as `turn.operator` items — a `user` entry here is the
+   * operator, with this server's framing trimmed off (a round's replay drops its prompt; a
+   * conversation keeps every `user` entry, or the agent would be answering questions nobody
+   * can see). Ids are `replay:<n>`: a render key, not a cursor.
+   */
+  items: Schema.Array(LiveItem),
   /** Messages this answer stopped short of. */
   truncated: Schema.Boolean,
-  /**
-   * How many entries were left out because the reduced shape holds nothing to show.
-   *
-   * {@link RoundNarration.omittedBlank}'s reason exactly: a `tool_use` or `tool_result`
-   * block reduces to an entry with empty text, and rendering those as turns is a column of
-   * labels with nothing under them. Counted so the omission is not silent.
-   */
+  /** How many harness entries produced no item. {@link RoundNarration.omittedBlank}. */
   omittedBlank: Schema.Int,
   /** When this answer was built. The client's join floor for the live tail. */
   at: EpochMillis,

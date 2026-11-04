@@ -85,14 +85,15 @@ const KIND_LABELS: Record<string, string | undefined> = {
   "turn.thinking": "Thinking",
   "tool.call": "Tool call",
   /**
-   * The operator's own message, which **no server ever sends**.
-   *
-   * See {@link operatorTurn}: these rows are minted in this tab so that what was just
-   * typed appears in the conversation. The label is here rather than in `LIVE_ITEM_KINDS`
-   * because that list is what the *server* writes, and claiming a kind the server cannot
-   * produce would make the contract describe a browser.
+   * The operator's own message. Live, minted in this tab ({@link operatorTurn}) so what was
+   * just typed appears; on a reload, the server's replay of the harness's copy (A6 F10).
    */
   "turn.operator": "You",
+  /**
+   * Something the harness holds that is neither side's words — an OpenCode `shell` entry, a
+   * steer a round was sent, an error on a turn. Its `headline` is the harness's own word.
+   */
+  "turn.other": "Harness",
   "tool.result": "Tool result",
   "action.denied": "Denied",
 };
@@ -101,7 +102,7 @@ const KIND_LABELS: Record<string, string | undefined> = {
  * The kind a thinking row carries, named once so the component and the label agree.
  *
  * It is the server's string (`live.ts`'s `turn.thinking`) rather than a browser invention —
- * unlike {@link OPERATOR_TURN_KIND}, which no server sends — and it is a constant here
+ * like {@link OPERATOR_TURN_KIND} — and it is a constant here
  * because {@link ChatItem} branches on it and a typo would silently render a model's
  * deliberation as an ordinary claim about what happened.
  */
@@ -502,52 +503,53 @@ export interface ChatGroup<Subject> {
   /** Whatever the caller needs to render its own separator. Opaque here. */
   readonly subject: Subject;
   readonly prose: RoundProse;
-  /** The harness's replayed messages, oldest first. Empty unless `prose` is `replayed`. */
-  readonly replayed: GoalNarrationView["rounds"][number]["messages"];
-  /** The live conversation, in arrival order. */
+  /**
+   * The conversation's rows, oldest first: what the harness's replay holds, then what
+   * arrived live after it — **one item type for both** (A6 F10), so a reloaded turn is drawn
+   * by {@link ChatItem} exactly as a watched one was.
+   */
   readonly rows: readonly ChatRow[];
 }
 
 /**
- * The harness's word for a replayed entry that is **the agent speaking**.
- *
- * Not "anything but `user`". `AgentHarness.messages` passes each harness's own vocabulary
- * through unmapped, and OpenCode's list carries `shell`, `synthetic`, `idle` and more beside
- * `user` and `assistant`; a caller that cuts turns at `user` (the importer's `cutReplay`)
- * files all of those among the replies. A `shell` entry is a command's output and a
- * `synthetic` one is text the harness injected — neither is the agent saying it — so only
- * this word is read as the agent's prose, and every other word, including one this build
- * has never seen, keeps its label. Both drivers spell the agent's entry this way.
- */
-export const ASSISTANT_ENTRY = "assistant";
-
-/**
  * Where a turn's last piece of the agent's prose is drawn, or `null` when it has none.
  *
- * A live row when one of them is prose, else a replayed entry: the rows are drawn after the
- * replayed list, so a group holding both ends on its rows. Prose means words, not a row
- * kind — a reply with an empty body draws nothing, and an `assistant` entry carrying only
- * an error is a failure rather than something said.
+ * Prose means words, not a row kind — a reply with an empty body draws nothing. Replayed
+ * and live rows are the same rows now (A6 F10), so there is one place to look.
  *
  * It is what {@link Chat} hangs a turn's footer on, as OpenCode does (`copyContentID`: the
  * finished turn's last non-empty text part), rather than on the group's last row: a turn
  * that says what it will write and then writes it is still captioned under its words.
  */
-export type ProsePlace =
-  | { readonly _tag: "row"; readonly key: string }
-  | { readonly _tag: "replayed"; readonly index: number };
+export type ProsePlace = { readonly _tag: "row"; readonly key: string };
 
 export const lastProse = (
-  group: Pick<ChatGroup<unknown>, "rows" | "replayed">,
+  group: Pick<ChatGroup<unknown>, "rows">,
 ): ProsePlace | null => {
   const row = group.rows.findLast(
     (each) => each.item.kind === REPLY_KIND && each.item.body.trim() !== "",
   );
-  if (row !== undefined) return { _tag: "row", key: row.key };
-  const entry = group.replayed.findLast(
-    (each) => each.type === ASSISTANT_ENTRY && each.text.trim() !== "",
-  );
-  return entry === undefined ? null : { _tag: "replayed", index: entry.index };
+  return row === undefined ? null : { _tag: "row", key: row.key };
+};
+
+/**
+ * The model that answered in a turn, from the turn's own items: the last of the agent's
+ * items that names one (`LiveItem.model`, A6 F10), or `undefined` when none does.
+ *
+ * What a turn's footer names, rather than the session's current model: after a switch every
+ * earlier turn was still answered by the model it was answered by, and the transcript says
+ * which. `undefined` is a turn whose harness did not say — a caller may fall back to the
+ * session's model and should say less, not more.
+ */
+export const turnModel = (
+  group: Pick<ChatGroup<unknown>, "rows">,
+): string | undefined => {
+  for (const row of [...group.rows].reverse()) {
+    for (const item of [row.item, row.proposedBy]) {
+      if (item?.model !== undefined) return item.model;
+    }
+  }
+  return undefined;
 };
 
 /** What a planner round's separator needs, and the whole of what the chat is given. */
@@ -642,6 +644,23 @@ const pairWrites = (
     if (record !== undefined) paired.set(item.id, record);
   }
   return paired;
+};
+
+/**
+ * Which record each write call in `items` produced, by the call's item id — the pairing
+ * {@link rowsFor} folds by, over a whole list. Exported for `importerChat.ts`, which pairs
+ * across a whole session before cutting it into turns (A6 F10).
+ */
+export const claimedRecords = (
+  items: readonly LiveItem[],
+): ReadonlyMap<string, LiveItem> => {
+  const results = new Map<string, LiveItem>();
+  for (const item of items) {
+    if (item.kind === "tool.result" && item.callId !== null) {
+      results.set(item.callId, item);
+    }
+  }
+  return pairWrites(items, results);
 };
 
 /**
@@ -796,7 +815,7 @@ const proseFor = (
   replayed: GoalNarrationView["rounds"][number] | undefined,
   hasLive: boolean,
 ): RoundProse => {
-  if (replayed !== undefined && replayed.messages.length > 0) {
+  if (replayed !== undefined && replayed.items.length > 0) {
     return {
       _tag: "replayed",
       note: replayed.note,
@@ -881,8 +900,15 @@ export const buildChat = (input: {
       key: round.roundId,
       subject: { round, inFlight: input.inFlight.has(round.roundId) },
       prose,
-      replayed: prose._tag === "replayed" ? (replayed?.messages ?? []) : [],
-      rows: rowsFor(live, round.status === "running"),
+      // The replay's items first, then the live tail: one list, so a write call the replay
+      // holds pairs with the record the live feed brought (`rowsFor`).
+      rows: rowsFor(
+        [
+          ...(prose._tag === "replayed" ? (replayed?.items ?? []) : []),
+          ...live,
+        ],
+        round.status === "running",
+      ),
     };
   });
   return { groups, older: input.rounds.length - shown.length };
@@ -914,7 +940,10 @@ export interface SentTurn {
   readonly after: number;
 }
 
-/** The kind {@link operatorTurn} mints. Never written by a server. */
+/**
+ * The kind of an operator's message: the one {@link operatorTurn} mints, and the one a
+ * conversation's replay carries for a `user` entry (A6 F10).
+ */
 export const OPERATOR_TURN_KIND = "turn.operator";
 
 /**
@@ -996,7 +1025,7 @@ const goalProseFor = (
   if (conversation === undefined) {
     return hasLive ? { _tag: "live" } : { _tag: "loading" };
   }
-  if (conversation.messages.length > 0) {
+  if (conversation.items.length > 0) {
     return {
       _tag: "replayed",
       note: conversation.note,
@@ -1089,7 +1118,7 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
     return input.narrationFloor === undefined || order > input.narrationFloor;
   });
   const hasLive = live.some((item) => item.origin === "activity");
-  const replayed = input.conversation?.messages ?? [];
+  const replayed = input.conversation?.items ?? [];
 
   if (
     live.length === 0 &&
@@ -1130,9 +1159,9 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
    * brings it back, and then it is cancelled.
    */
   const replayedUser = new Map<string, number>();
-  for (const message of replayed) {
-    if (message.type !== "user") continue;
-    replayedUser.set(message.text, (replayedUser.get(message.text) ?? 0) + 1);
+  for (const item of replayed) {
+    if (item.kind !== OPERATOR_TURN_KIND) continue;
+    replayedUser.set(item.body, (replayedUser.get(item.body) ?? 0) + 1);
   }
   const unreplayed = input.sent.filter((turn) => {
     if (turn.index > input.replayedThrough) return true;
@@ -1169,7 +1198,6 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
           awaiting: input.awaiting,
         },
         prose,
-        replayed: prose._tag === "replayed" ? replayed : [],
         /*
          * The writes on this surface are a steer and an ending, and they pair with the
          * records {@link WRITE_TOOLS} names — `plan.round.steered` and `goal.ended`, both
@@ -1180,7 +1208,10 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
          * is not a round, but it does end, and after it has nothing a chat is waiting for
          * can arrive. See {@link GoalChatInput.conversationLive}.
          */
-        rows: rowsFor(ordered, input.conversationLive),
+        rows: rowsFor(
+          [...(prose._tag === "replayed" ? replayed : []), ...ordered],
+          input.conversationLive,
+        ),
       },
     ],
   };

@@ -47,8 +47,7 @@
   import type { Snippet } from "svelte";
 
   import ChatItem from "./ChatItem.svelte";
-  import Markdown from "./Markdown.svelte";
-  import { ASSISTANT_ENTRY, lastProse, type ChatGroup } from "../chat";
+  import { lastProse, type ChatGroup } from "../chat";
   import { atBottom } from "../scroll";
 
   let {
@@ -186,10 +185,7 @@
 
   /** How many rows are on screen, which is what an arrival changes. */
   let rowCount = $derived(
-    groups.reduce(
-      (total, group) => total + group.rows.length + group.replayed.length,
-      0,
-    ),
+    groups.reduce((total, group) => total + group.rows.length, 0),
   );
 
   /*
@@ -279,56 +275,12 @@
           </p>
         {:else if group.prose._tag === "replayed"}
           <!--
-            Replayed, and labelled as such. It is the harness's own copy in the reduced
-            shape `AgentHarness.messages` answers with, so there are no call ids and no tool
-            arguments in it: a call and its result are not paired here as they are live.
-            That is the cost decision 14 accepted, said rather than hidden.
+            Replayed, and labelled as such: the harness's own copy, which it may delete. The
+            rows themselves are below with the live ones — the replay is the same items the
+            live stream carries (A6 F10), so a reloaded turn is drawn by `ChatItem` exactly as
+            a watched one was, and only this note says where it came from.
           -->
           <p class="note">{group.prose.note}</p>
-          <!--
-            The entry's own word is its label in a panel, always. In a thread the agent's
-            entry goes unlabelled, as OpenCode's does, and **only** the agent's: anything
-            else the harness lists — a `shell` command's output, a `synthetic` injection, a
-            word this build has never seen — keeps it, or it would read as the agent having
-            said it. See `ASSISTANT_ENTRY`.
-          -->
-          <ol class="replay">
-            {#each group.replayed as message (message.index)}
-              <!--
-                An agent entry with no words and no error says nothing, and drawn it would be
-                an empty item: 0px tall, still taking a list gap, and announced as a blank to
-                a screen reader. The server already drops these and counts them in
-                `omittedBlank` (`importerHistory.ts`, `goalNarration.ts`); this is here so
-                the rendering does not depend on that filter staying in place. It cannot
-                strand the footer: `lastProse` never places it on a blank entry.
-              -->
-              {#if message.type !== ASSISTANT_ENTRY || message.text.trim() !== "" || message.error !== undefined}
-                <li class="replayed">
-                  {#if !thread || message.type !== ASSISTANT_ENTRY}
-                    <span class="replay-type mono">{message.type}</span>
-                  {/if}
-                  {#if message.text.trim() !== ""}
-                    <!--
-                      Markdown, as the importer's live row is: the same reply read back after
-                      a reload should not lose its table to pipes. In `layout="panel"` the
-                      live row is still `ChatItem`'s plain-text ledger row, so there the two
-                      differ until S6 unifies them. See `Markdown.svelte` for why this is
-                      safe on text quoted from a program page.
-                    -->
-                    <div class="replay-text">
-                      <Markdown text={message.text} />
-                    </div>
-                  {/if}
-                  {#if message.error !== undefined}
-                    <p class="replay-error">{message.error}</p>
-                  {/if}
-                  {#if place?._tag === "replayed" && place.index === message.index}
-                    {@render closing()}
-                  {/if}
-                </li>
-              {/if}
-            {/each}
-          </ol>
           {#if group.prose.truncated}
             <p class="note">
               Shortened: not every message the harness holds is shown.
@@ -501,46 +453,13 @@
     padding-top: 0;
     border-top: 0;
   }
-  .items,
-  .replay {
+  .items {
     display: flex;
     flex-direction: column;
     gap: 8px;
     margin: 0;
     padding: 0;
     list-style: none;
-  }
-  /*
-   * A replayed message is visibly a thinner thing than a live row, which is accurate: it
-   * has no call id, no arguments and no pairing. The dashed left rule is what says "this is
-   * the harness's copy" without relying on colour.
-   */
-  .replayed {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding-left: 8px;
-    border-left: 1px dashed var(--border-muted);
-  }
-  .replay-type {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-muted);
-  }
-  /* The type a replayed reply's markdown inherits; it draws its own blocks. */
-  .replay-text {
-    min-width: 0;
-    font-size: 12px;
-    line-height: var(--lh-compact);
-    color: var(--text-base);
-  }
-  .replay-error {
-    margin: 0;
-    font-size: 11px;
-    line-height: var(--lh-compact);
-    color: var(--state-fg-danger);
-    overflow-wrap: anywhere;
   }
   .controls,
   .composer {

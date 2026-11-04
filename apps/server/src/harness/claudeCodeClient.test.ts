@@ -38,6 +38,7 @@ import type {
   SessionMessage,
   SDKSessionInfo,
 } from "@anthropic-ai/claude-agent-sdk";
+import type { LiveItem } from "@bit/contracts";
 import { Duration, Effect, Fiber, Layer, Redacted, Stream } from "effect";
 
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
@@ -53,6 +54,7 @@ import {
   type HarnessNarration,
 } from "./agentHarness";
 import { narrateCoalesced } from "../run/streamingCoalescer";
+import { projectNarration, projectReplay } from "../run/liveTranscript";
 import {
   assembleImporterPrompt,
   assembleImporterResumePrompt,
@@ -1857,7 +1859,14 @@ describe("a session this process does not hold", () => {
       harness.messages("11111111-0000-4000-8000-000000000003"),
     );
     expect(entries).toEqual([
-      { type: "assistant", text: "stored reply", error: undefined },
+      {
+        type: "assistant",
+        text: "stored reply",
+        error: undefined,
+        parts: [{ _tag: "reply", text: "stored reply" }],
+        model: undefined,
+        at: undefined,
+      },
     ]);
   });
 
@@ -4522,5 +4531,235 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
     );
     // The query belongs to the second opening: the first's end closed nothing of it.
     expect(outcome).toEqual({ afterFirst: 0, afterSecond: 1 });
+  });
+});
+
+/* ── The transcript as parts, and replay equal to live (A6 F10) ─────────────── */
+
+/**
+ * A real transcript, as SDK 0.3.310's `getSessionMessages` read it back:
+ * `testdata/claude-code-transcript/tool-and-thinking.jsonl`.
+ *
+ * Recorded 2026-11-04 from a throwaway bit server (`HARNESS=claude-code`, CLI 2.1.310,
+ * `claude-haiku-4-5`, summarized thinking): an importer conversation of two turns, each
+ * thinking, a sentence, one `Bash` call and its result, thinking again, and an answer.
+ * Sanitised: the session id is a fixed one, every thinking `signature` reads
+ * `sig-redacted`, the importer's framing above the operator's first message is elided, and
+ * each call's `usage` and other bookkeeping are gone. The CLI stores **one entry per block**,
+ * each repeating its call's `message.id`, which is what the stream-index count rests on.
+ */
+const transcriptFixture = async (): Promise<SessionMessage[]> =>
+  (
+    await readFile(
+      join(
+        import.meta.dir,
+        "testdata",
+        "claude-code-transcript",
+        "tool-and-thinking.jsonl",
+      ),
+      "utf8",
+    )
+  )
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as SessionMessage);
+
+describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
+  const SESSION = "00000000-0000-4000-8000-0000000000f1";
+  const read = async () => {
+    const transcript = await transcriptFixture();
+    return withHarness({ transcript }, (harness) => harness.messages(SESSION));
+  };
+
+  test("each entry's blocks become the parts the stream narrates, with the call's model and the entry's time", async () => {
+    const entries = await read();
+    expect(
+      entries.map((entry) => [
+        entry.type,
+        entry.parts.map((part) => part._tag).join("+"),
+      ]),
+    ).toEqual([
+      ["user", ""],
+      ["assistant", "thinking"],
+      ["assistant", "reply"],
+      ["assistant", "toolCall"],
+      ["user", "toolResult"],
+      ["assistant", "thinking"],
+      ["assistant", "reply"],
+      ["user", ""],
+      ["assistant", "thinking"],
+      ["assistant", "reply"],
+      ["assistant", "toolCall"],
+      ["user", "toolResult"],
+      ["assistant", "thinking"],
+      ["assistant", "reply"],
+    ]);
+    // Thinking has words: the session's thinking was summarized (step 0 of A6 F10).
+    const thinking = entries[1]?.parts[0];
+    expect(thinking?._tag).toBe("thinking");
+    expect(
+      thinking?._tag === "thinking" ? thinking.text.length : 0,
+    ).toBeGreaterThan(50);
+    // The model that answered, per entry, and nothing on the operator's.
+    expect(entries[1]?.model).toBe("claude-haiku-4-5-20251001");
+    expect(entries[0]?.model).toBeUndefined();
+    // The CLI's own time for each entry, which the SDK passes through undeclared.
+    expect(entries[0]?.at).toBe(Date.parse("2026-11-04T06:32:08.323Z"));
+    expect(entries.every((entry) => typeof entry.at === "number")).toBe(true);
+    // A call and its result share the harness's id; the result names no tool, as live.
+    const call = entries[3]?.parts[0];
+    const answer = entries[4]?.parts[0];
+    expect(call?._tag === "toolCall" ? [call.tool, call.input] : []).toEqual([
+      "Bash",
+      '{"command":"ls -a","description":"List all files in working directory"}',
+    ]);
+    expect(
+      answer?._tag === "toolResult"
+        ? [
+            answer.callId === (call?._tag === "toolCall" ? call.callId : ""),
+            answer.tool,
+            answer.output,
+          ]
+        : [],
+    ).toEqual([true, undefined, ".\n..\n.claude"]);
+  });
+
+  test("a text or thinking block is named by its call and its index in the call, as it streamed", async () => {
+    const entries = await read();
+    const ids = entries.flatMap((entry) =>
+      entry.parts.flatMap((part) =>
+        part._tag === "reply" || part._tag === "thinking"
+          ? [part.blockId?.split(":")[1]]
+          : [],
+      ),
+    );
+    // Thinking 0 and the sentence 1 of the first call (its `tool_use` is 2); thinking 0 and
+    // the answer 1 of the call after the result. The same per turn.
+    expect(ids).toEqual(["0", "1", "0", "1", "0", "1", "0", "1"]);
+  });
+
+  /**
+   * The same transcript as the live stream would have carried it: each stored `assistant`
+   * entry is the frame the CLI sent for that block (`claude-code-partial-stream-facts`), and
+   * a call's frames are bracketed by `message_start` and a `content_block_start` per block.
+   */
+  const asStream = (transcript: readonly SessionMessage[]): SDKMessage[] => {
+    const frames: SDKMessage[] = [];
+    const indexOf = new Map<string, number>();
+    const event = (body: Record<string, unknown>): SDKMessage =>
+      ({
+        type: "stream_event",
+        event: body,
+        parent_tool_use_id: null,
+        session_id: SESSION,
+        uuid: crypto.randomUUID(),
+      }) as unknown as SDKMessage;
+    for (const entry of transcript) {
+      if (entry.type === "user") {
+        // The operator's own message is not narrated; a tool result is a `user` frame.
+        if (
+          typeof (entry.message as { content?: unknown }).content !== "string"
+        ) {
+          frames.push({ ...entry, type: "user" } as unknown as SDKMessage);
+        }
+        continue;
+      }
+      const message = entry.message as {
+        id: string;
+        content: { type: string }[];
+      };
+      const index = indexOf.get(message.id);
+      if (index === undefined) {
+        frames.push(
+          event({ type: "message_start", message: { id: message.id } }),
+        );
+      }
+      const at = index ?? 0;
+      indexOf.set(message.id, at + 1);
+      frames.push(
+        event({
+          type: "content_block_start",
+          index: at,
+          content_block: { type: message.content[0]?.type },
+        }),
+      );
+      frames.push({ ...entry, type: "assistant" } as unknown as SDKMessage);
+      frames.push(event({ type: "content_block_stop", index: at }));
+    }
+    frames.push(result(SESSION, "success"));
+    return frames;
+  };
+
+  test("a replayed item equals the item the live stream made of the same block, but for its id and time", async () => {
+    const transcript = await transcriptFixture();
+    const subject = { _tag: "import", importId: "imp_1" } as const;
+    const live = await withHarness(
+      { messages: asStream(transcript) },
+      (harness) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "bit: t",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId: SESSION,
+            multiTurn: true,
+          });
+          const narration = yield* Effect.forkChild(
+            Stream.runCollect(
+              harness
+                .sessionEvents(SESSION)
+                .pipe(Stream.takeUntil((entry) => entry.type === "result")),
+            ),
+          );
+          yield* harness.prompt(SESSION, "go");
+          return [...(yield* Fiber.join(narration))];
+        }),
+    );
+    const liveItems = live.flatMap((entry, id) => {
+      const frame = projectNarration({
+        id,
+        targetId: "acme",
+        subject,
+        harnessSessionId: SESSION,
+        entry,
+      });
+      return frame?._tag === "item" ? [frame] : [];
+    });
+    const replayed = projectReplay({
+      entries: await withHarness({ transcript }, (harness) =>
+        harness.messages(SESSION),
+      ),
+      subject,
+      harnessSessionId: SESSION,
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    const shape = (item: LiveItem) =>
+      Object.fromEntries(
+        Object.entries(item).filter(([key]) => key !== "id" && key !== "at"),
+      );
+    // The replay has the operator's two messages too, which the stream never narrates.
+    expect(
+      replayed.filter((item) => item.kind !== "turn.operator").map(shape),
+    ).toEqual(liveItems.map(shape));
+    expect(liveItems.map((item) => item.kind)).toEqual([
+      "turn.thinking",
+      "turn.reply",
+      "tool.call",
+      "tool.result",
+      "turn.thinking",
+      "turn.reply",
+      "turn.thinking",
+      "turn.reply",
+      "tool.call",
+      "tool.result",
+      "turn.thinking",
+      "turn.reply",
+    ]);
+    // Not vacuous: the live items carry the stream's block ids and the call's model.
+    expect(liveItems[0]?.blockId).toBe(
+      `${SESSION}:msg_011CghRHgNq4ZzyFwmFcMC63:0`,
+    );
+    expect(liveItems[0]?.model).toBe("claude-haiku-4-5-20251001");
   });
 });

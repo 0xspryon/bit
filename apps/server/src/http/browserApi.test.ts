@@ -4667,11 +4667,12 @@ describe("a target's importer sessions", () => {
         // No harness to continue it with, so the composer is told a new session — never a
         // resume it would then be refused.
         continuation: "fresh",
-        // Not refused, so no refusal on the wire: null, not absent.
-        refusal: null,
-        messages: [],
+        items: [],
         truncated: false,
       });
+      // Not refused, so no refusal on the wire at all: the view is a union on
+      // `continuation`, and only `refused` carries one.
+      expect("refusal" in response.body).toBe(false);
       expect(String(response.body["note"])).toContain(
         "no agent harness configured",
       );

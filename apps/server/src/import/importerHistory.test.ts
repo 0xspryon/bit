@@ -19,8 +19,9 @@
  * two that refuse a resume the harness *would* have accepted, because the directory it
  * resolves the session in is not one this server gates.
  */
+import { ImporterConversationView } from "@bit/contracts";
 import { describe, expect, test } from "bun:test";
-import { Effect } from "effect";
+import { Effect, Schema } from "effect";
 
 import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
@@ -65,8 +66,19 @@ const entry = (over: Partial<MessageEntry> = {}): MessageEntry => ({
   type: "assistant",
   text: "two in, one out",
   error: undefined,
+  parts: [],
+  model: undefined,
+  at: undefined,
   ...over,
 });
+
+/** What each replayed item says, in order. */
+const bodies = (view: ImporterConversationView): string[] =>
+  view.items.map((item) => item.body);
+
+/** The view's refusal, which only a `refused` answer has. */
+const refusalOf = (view: ImporterConversationView) =>
+  view.continuation === "refused" ? view.refusal : null;
 
 /**
  * One read, through a resolver holding one scripted harness.
@@ -174,7 +186,7 @@ describe("the five answers, each with its own sentence", () => {
       continuation: { _tag: "unresumable", detail: "the transcript is gone" },
     });
     expect(view.source).toBe("forgotten");
-    expect(view.messages).toEqual([]);
+    expect(view.items).toEqual([]);
     expect(view.note).toContain("no longer holds session");
     expect(view.note).toContain("delete them");
     // What it wrote is unaffected, and that is what makes losing the prose acceptable.
@@ -224,11 +236,13 @@ describe("the five answers, each with its own sentence", () => {
     });
     expect(view.source).toBe("harness");
     expect(view.ephemeral).toBe(true);
-    expect(view.messages.map((message) => message.text)).toEqual([
-      "read the policy page",
-      "two in, one out",
+    expect(bodies(view)).toEqual(["read the policy page", "two in, one out"]);
+    // The operator's words are the operator's turn; the importer's are its reply.
+    expect(view.items.map((item) => [item.id, item.kind])).toEqual([
+      ["replay:0", "turn.operator"],
+      ["replay:1", "turn.reply"],
     ]);
-    expect(view.messages.map((message) => message.index)).toEqual([0, 1]);
+    expect(view.items.every((item) => item.importId === IMPORT)).toBe(true);
     expect(view.truncated).toBe(false);
     expect(view.note).toContain("which may delete it");
   });
@@ -254,7 +268,7 @@ describe("the five answers, each with its own sentence", () => {
 });
 
 describe("tool calls and results, which are most of an importer session", () => {
-  test("blank entries are dropped and counted, and a session of nothing but calls is still harness", async () => {
+  test("empty entries are dropped and counted, and a session of nothing but them is still harness", async () => {
     const view = await read({
       messages: [
         entry({ type: "user", text: "" }),
@@ -264,23 +278,23 @@ describe("tool calls and results, which are most of an importer session", () => 
     });
     // `harness`, not `none`: the harness does hold this session and did answer about it.
     expect(view.source).toBe("harness");
-    expect(view.messages).toEqual([]);
+    expect(view.items).toEqual([]);
     expect(view.omittedBlank).toBe(3);
-    expect(view.note).toContain("3 tool calls and results");
+    expect(view.note).toContain("3 empty messages");
   });
 
   test("an entry with an error and no words is kept: a failure is still the importer telling us something", async () => {
     const view = await read({
       messages: [entry({ text: "", error: "the page would not load" })],
     });
-    expect(view.messages).toEqual([
-      {
-        index: 0,
-        type: "assistant",
-        text: "",
-        error: "the page would not load",
-      },
-    ]);
+    expect(
+      view.items.map((item) => [
+        item.kind,
+        item.headline,
+        item.body,
+        item.outcome,
+      ]),
+    ).toEqual([["turn.other", "error", "the page would not load", "failed"]]);
     expect(view.omittedBlank).toBe(0);
   });
 });
@@ -299,9 +313,9 @@ describe("the operator's words, with this server's framing taken off", () => {
     const view = await read({
       messages: [entry({ type: "user", text: opener })],
     });
-    expect(view.messages[0]?.text).toBe(
+    expect(bodies(view)).toEqual([
       "Read https://hackerone.com/acme/policy and say what is in scope",
-    );
+    ]);
     expect(view.note).toContain("Your messages are shown as you wrote them");
   });
 
@@ -323,18 +337,14 @@ describe("the operator's words, with this server's framing taken off", () => {
         }),
       ],
     });
-    expect(view.messages.map((message) => message.text)).toEqual([
-      "first ask",
-      "first answer",
-      "second ask",
-    ]);
+    expect(bodies(view)).toEqual(["first ask", "first answer", "second ask"]);
   });
 
   test("a later message travels verbatim and is left exactly as it is", async () => {
     const view = await read({
       messages: [entry({ type: "user", text: "also the staging hosts" })],
     });
-    expect(view.messages[0]?.text).toBe("also the staging hosts");
+    expect(bodies(view)).toEqual(["also the staging hosts"]);
     // Nothing was trimmed, so nothing is said about trimming.
     expect(view.note).not.toContain("Your messages are shown");
   });
@@ -348,7 +358,7 @@ describe("the operator's words, with this server's framing taken off", () => {
     const view = await read({
       messages: [entry({ type: "user", text: opener })],
     });
-    expect(view.messages[0]?.text).toBe(opener);
+    expect(bodies(view)).toEqual([opener]);
     expect(view.note).not.toContain("Your messages are shown");
   });
 });
@@ -360,12 +370,8 @@ describe("a long conversation keeps its end", () => {
     );
     const view = await read({ messages: many, limit: 3 });
     expect(view.truncated).toBe(true);
-    expect(view.messages.map((message) => message.text)).toEqual([
-      "line 7",
-      "line 8",
-      "line 9",
-    ]);
-    expect(view.note).toContain("most recent 3 messages");
+    expect(bodies(view)).toEqual(["line 7", "line 8", "line 9"]);
+    expect(view.note).toContain("most recent 3 items");
     expect(view.note).toContain("does not start at the beginning");
   });
 });
@@ -378,13 +384,13 @@ describe("an import the operator ended", () => {
     });
     // The prose is worth reading after the authority is over.
     expect(view.source).toBe("harness");
-    expect(view.messages).toHaveLength(1);
+    expect(view.items).toHaveLength(1);
     expect(view.continuation).toBe("refused");
     expect(view.note).toContain("refuse every write");
     // Said as an end in its own field, so a screen words it as one and not by guessing
     // from `refused`, which a session nobody ended can answer too.
-    expect(view.refusal?.reason).toBe("import_ended");
-    expect(view.refusal?.detail).toContain("You ended this import");
+    expect(refusalOf(view)?.reason).toBe("import_ended");
+    expect(refusalOf(view)?.detail).toContain("You ended this import");
   });
 
   test("is not asked about: the harness is never consulted for a session nothing will be sent to", async () => {
@@ -424,7 +430,7 @@ describe("an import the operator ended", () => {
         },
       });
       expect(view.continuation).toBe("resume");
-      expect(view.refusal).toBeNull();
+      expect(refusalOf(view)).toBeNull();
     }
   });
 });
@@ -447,14 +453,14 @@ describe("a row naming an agent this server does not define", () => {
       continuation: still,
     });
     expect(view.continuation).toBe("refused");
-    expect(view.messages).toHaveLength(1);
+    expect(view.items).toHaveLength(1);
     expect(view.note).toContain(
       agentUnavailableDetail(IMPORT, "retired_agent"),
     );
     expect(view.note).not.toContain("Your next message");
     // Not an end, and said so in the field the screen words the composer from: nobody
     // ended this session, and the sentence is the send's own.
-    expect(view.refusal).toEqual({
+    expect(refusalOf(view)).toEqual({
       reason: "agent_unavailable",
       detail: agentUnavailableDetail(IMPORT, "retired_agent"),
     });
@@ -468,7 +474,7 @@ describe("a row naming an agent this server does not define", () => {
     expect(view.note).toContain(
       agentUnavailableDetail(IMPORT, "retired_agent"),
     );
-    expect(view.refusal?.reason).toBe("agent_unavailable");
+    expect(refusalOf(view)?.reason).toBe("agent_unavailable");
   });
 
   test("the operator's end is said first, as the send checks it first", async () => {
@@ -479,13 +485,13 @@ describe("a row naming an agent this server does not define", () => {
     expect(view.continuation).toBe("refused");
     expect(view.note).toContain("You ended this import");
     expect(view.note).not.toContain("'retired_agent'");
-    expect(view.refusal?.reason).toBe("import_ended");
+    expect(refusalOf(view)?.reason).toBe("import_ended");
   });
 
   test("the importer is not refused", async () => {
     const view = await read({ messages: [], continuation: still });
     expect(view.continuation).toBe("resume");
-    expect(view.refusal).toBeNull();
+    expect(refusalOf(view)).toBeNull();
   });
 });
 
@@ -584,5 +590,121 @@ describe("whether a session this process does not hold can be carried on", () =>
     });
     expect(reopen._tag).toBe("fresh");
     expect(reopen.detail).toContain("could not be asked");
+  });
+});
+
+/* ── The replay as the live stream's items (A6 F10) ─────────────────────────── */
+
+describe("a replayed conversation is the live stream's items", () => {
+  test("a stored call is a tool row with this server's MCP prefix off, and the model that made it", async () => {
+    const tool = "mcp__bit-imp_1__add_scope_entry";
+    const view = await read({
+      messages: [
+        entry({ type: "user", text: "load the policy page", at: 1_000 }),
+        entry({
+          text: "",
+          model: "claude-haiku-4-5-20251001",
+          at: 2_000,
+          parts: [
+            {
+              _tag: "thinking",
+              text: "The page lists two hosts.",
+              blockId: "msg_1:0",
+              model: "claude-haiku-4-5-20251001",
+            },
+            {
+              _tag: "toolCall",
+              callId: "toolu_1",
+              tool,
+              input: '{"value":"acme.com"}',
+              model: "claude-haiku-4-5-20251001",
+            },
+          ],
+        }),
+        entry({
+          type: "user",
+          text: "",
+          at: 3_000,
+          parts: [
+            {
+              _tag: "toolResult",
+              callId: "toolu_1",
+              tool: undefined,
+              output: '{"created":true}',
+              failed: false,
+            },
+          ],
+        }),
+      ],
+    });
+    expect(
+      view.items.map((item) => [
+        item.id,
+        item.kind,
+        item.toolName,
+        item.model,
+        item.at,
+        item.blockId,
+      ]),
+    ).toEqual([
+      ["replay:0", "turn.operator", null, undefined, 1_000, undefined],
+      [
+        "replay:1",
+        "turn.thinking",
+        null,
+        "claude-haiku-4-5-20251001",
+        2_000,
+        `${SESSION}:msg_1:0`,
+      ],
+      [
+        "replay:2",
+        "tool.call",
+        "add_scope_entry",
+        "claude-haiku-4-5-20251001",
+        2_000,
+        undefined,
+      ],
+      ["replay:3", "tool.result", null, undefined, 3_000, undefined],
+    ]);
+    expect(view.items[2]?.tool).toBe(tool);
+    expect(view.omittedBlank).toBe(0);
+  });
+});
+
+describe("the view is a union on its continuation (A6 F10, from F1's review)", () => {
+  const view = {
+    targetId: TARGET,
+    importId: IMPORT,
+    harnessSessionId: SESSION,
+    live: false,
+    source: "none",
+    ephemeral: false,
+    note: "n",
+    items: [],
+    truncated: false,
+    omittedBlank: 0,
+    at: 1,
+  };
+  const decode = Schema.decodeUnknownSync(ImporterConversationView);
+
+  test("a refused answer without its refusal does not decode", () => {
+    expect(() => decode({ ...view, continuation: "refused" })).toThrow();
+    expect(
+      decode({
+        ...view,
+        continuation: "refused",
+        refusal: { reason: "import_ended", detail: "ended" },
+      }).continuation,
+    ).toBe("refused");
+  });
+
+  test("a continuable answer carries no refusal, even one sent beside it", () => {
+    const decoded = decode({
+      ...view,
+      continuation: "resume",
+      refusal: { reason: "import_ended", detail: "ended" },
+    });
+    expect(decoded.continuation).toBe("resume");
+    expect("refusal" in decoded).toBe(false);
   });
 });

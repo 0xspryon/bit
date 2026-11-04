@@ -44,6 +44,7 @@ import {
   ok,
   planRoundView,
   refused,
+  replayItem,
   roundNarration,
   runningRound,
   targetSummary,
@@ -52,6 +53,7 @@ import { FakeCountdown } from "./fakeCountdown";
 import {
   THINKING_KIND,
   contextMeter,
+  rowsFor,
   type ChatRound,
   type ContextMeter as ContextMeterView,
 } from "../src/lib/chat";
@@ -87,7 +89,6 @@ const chatRound = (over: Partial<ChatRound> = {}): ChatRound => ({
   key: "rnd_1",
   subject: { round: row(), inFlight: false },
   prose: { _tag: "loading" },
-  replayed: [],
   rows: [],
   ...over,
 });
@@ -271,7 +272,7 @@ describe("a thinking row", () => {
     expect(html).toContain("The limiter is probably per-IP.");
     // The sentence that stops it being read as the account of the run.
     expect(html).toContain("not what it did");
-    expect(html).toContain("not stored");
+    expect(html).toContain("Not stored here");
   });
 
   test("a thinking row with nothing in it renders no disclosure at all", () => {
@@ -479,23 +480,22 @@ describe("the separator, which the caller owns", () => {
     expect(pending).toContain(`role="status"`);
   });
 
-  test("a replayed group labels what it is and admits what the shape cost", () => {
+  /** A replay's items as a group's rows, the way every builder makes them (A6 F10). */
+  const replayRows = (items: readonly LiveItem[]) => rowsFor(items, false);
+
+  test("a replayed group labels what it is, and its rows are drawn like live ones", () => {
     const html = body({
       groups: [
         chatRound({
           prose: {
             _tag: "replayed",
-            note: "From OpenCode, which may delete it. Replayed messages carry no tool arguments.",
+            note: "From OpenCode, which may delete it.",
             ephemeral: true,
             truncated: true,
           },
-          replayed: [
-            {
-              index: 0,
-              type: "assistant",
-              text: "two dimensions are untested",
-            },
-          ],
+          rows: replayRows([
+            replayItem(0, "turn.reply", "two dimensions are untested"),
+          ]),
         }),
       ],
       readonly: true,
@@ -506,10 +506,9 @@ describe("the separator, which the caller owns", () => {
   });
 
   /*
-   * S3: a thread drops the label over the agent's own words, and only those. The replayed
-   * shape passes each harness's word through unmapped, and OpenCode's list carries `shell`
-   * and `synthetic` entries a `user`-cut files among the replies — which must not read as
-   * the agent having said them.
+   * S3: a thread drops the label over the agent's own words, and only those. A harness entry
+   * that is neither side — OpenCode's `shell` and `synthetic`, an error on a turn — is a
+   * `turn.other` item under the harness's own word, which must not read as the agent.
    */
   const mixed = (): ChatRound =>
     chatRound({
@@ -519,40 +518,50 @@ describe("the separator, which the caller owns", () => {
         ephemeral: true,
         truncated: false,
       },
-      replayed: [
-        { index: 0, type: "assistant", text: "reading the policy page" },
-        { index: 1, type: "shell", text: "$ curl -sI https://acme.com" },
-        { index: 2, type: "synthetic", text: "injected by the harness" },
-        { index: 3, type: "assistant", text: "three entries are in scope" },
-        { index: 4, type: "assistant", text: "", error: "the model stopped" },
-      ],
+      rows: replayRows([
+        replayItem(0, "turn.reply", "reading the policy page"),
+        replayItem(1, "turn.other", "$ curl -sI https://acme.com", {
+          headline: "shell",
+        }),
+        replayItem(2, "turn.other", "injected by the harness", {
+          headline: "synthetic",
+        }),
+        replayItem(3, "turn.reply", "three entries are in scope"),
+        replayItem(4, "turn.other", "the model stopped", {
+          headline: "error",
+          outcome: "failed",
+        }),
+      ]),
     });
+  /** The harness's word on each narrated `turn.other` block, in order. */
   const labels = (html: string): string[] =>
-    [...html.matchAll(/class="replay-type[^"]*"[^>]*>([^<]*)</g)].map(
-      (match) => match[1] ?? "",
-    );
+    [
+      ...html.matchAll(
+        /<span class="what[^"]*">[^<]*<\/span>\s*([^<\s][^<]*?)\s*<!--/g,
+      ),
+    ].map((match) => match[1] ?? "");
 
-  test("a thread labels every replayed entry but the agent's own", () => {
+  test("a thread labels every harness entry but the agent's own words", () => {
     const html = body({ groups: [mixed()], readonly: true, layout: "thread" });
-    expect(labels(html)).toEqual(["shell", "synthetic"]);
+    expect(labels(html)).toEqual(["shell", "synthetic", "error"]);
     expect(html).toContain("three entries are in scope");
+    // The agent's words are prose, unlabelled.
+    expect(html.match(/<li class="prose/g)).toHaveLength(2);
   });
 
-  test("a panel keeps the label on every replayed entry, the agent's included", () => {
+  test("a panel keeps a kind on every replayed row, the agent's included", () => {
     const html = body({ groups: [mixed()], readonly: true });
-    expect(labels(html)).toEqual([
-      "assistant",
-      "shell",
-      "synthetic",
-      "assistant",
-      "assistant",
-    ]);
+    expect(
+      [...html.matchAll(/<span class="kind mono[^"]*">([^<]*)</g)].map(
+        (match) => match[1],
+      ),
+    ).toEqual(["Reply", "Harness", "Harness", "Reply", "Harness"]);
   });
 
   /*
-   * S4: both rows that carry the agent's words render them as markdown. What markdown does
-   * to the text — and what it refuses to do with HTML in it — is `test/dom/markdown.test.ts`;
-   * this is only that both paths go through it.
+   * S4: the agent's words render as markdown, replayed and live alike — one path now, since
+   * a replayed reply is the same `turn.reply` item. What markdown does to the text is
+   * `test/dom/markdown.test.ts`; this is only that both reach it.
    */
   test("the agent's words are markdown on both paths, live and replayed", () => {
     const reply: LiveItem = {
@@ -573,13 +582,13 @@ describe("the separator, which the caller owns", () => {
             ephemeral: true,
             truncated: false,
           },
-          replayed: [
-            {
-              index: 0,
-              type: "assistant",
-              text: "| Asset | In |\n| --- | --- |\n| `acme.com` | yes |",
-            },
-          ],
+          rows: replayRows([
+            replayItem(
+              0,
+              "turn.reply",
+              "| Asset | In |\n| --- | --- |\n| `acme.com` | yes |",
+            ),
+          ]),
         }),
         chatRound({
           key: "rnd_2",
@@ -608,40 +617,6 @@ describe("the separator, which the caller owns", () => {
       `<pre data-language="text"><code class="language-text">src/\n  lib/\n</code></pre>`,
     );
     expect(html).not.toContain("```");
-  });
-
-  test("a replayed agent entry with no words and no error draws no item", () => {
-    const html = body({
-      groups: [
-        chatRound({
-          prose: {
-            _tag: "replayed",
-            note: "From OpenCode, which may delete it.",
-            ephemeral: true,
-            truncated: false,
-          },
-          replayed: [
-            { index: 0, type: "assistant", text: "reading the policy page" },
-            // The server drops both of these first; the client does not rely on it.
-            { index: 1, type: "assistant", text: "" },
-            { index: 2, type: "assistant", text: "  \n " },
-            // An error is something to show, and a non-agent entry keeps its label.
-            {
-              index: 3,
-              type: "assistant",
-              text: "",
-              error: "the model stopped",
-            },
-            { index: 4, type: "idle", text: "" },
-          ],
-        }),
-      ],
-      readonly: true,
-      layout: "thread",
-    });
-    expect(html.match(/<li class="replayed/g)).toHaveLength(3);
-    expect(html).toContain("the model stopped");
-    expect(labels(html)).toEqual(["idle"]);
   });
 
   const foot = createRawSnippet<[ChatRound]>((group) => ({
@@ -892,7 +867,7 @@ describe("the planner's own half of the chat", () => {
      * never asked for it would read as zero messages rather than as no answer, which is
      * what "not read" says instead.
      */
-    expect(html).toContain("Messages");
+    expect(html).toContain("Replayed");
     expect(html).toContain("not read");
   });
 
@@ -927,7 +902,7 @@ describe("the planner's own half of the chat", () => {
 
     const html = render(PlannerChat, { props: { app } }).body;
     // `roundNarration`'s own two messages, and the value names whose count it is.
-    expect(html).toContain("2 held by the harness");
+    expect(html).toContain("2 items held by the harness");
   });
 
   test("a settled round's separator carries its status, its id and what it concluded", async () => {
@@ -1050,9 +1025,9 @@ describe("the goal agent's own half of the chat", () => {
             live: true,
             source: "harness",
             ephemeral: true,
-            messages: [
-              { index: 0, type: "user", text: "what is happening?" },
-              { index: 1, type: "assistant", text: "One round has run." },
+            items: [
+              replayItem(0, "turn.operator", "what is happening?", { goalId }),
+              replayItem(1, "turn.reply", "One round has run.", { goalId }),
             ],
             note: "From OpenCode, which may delete it: this build stores no part of a conversation.",
           }),
@@ -1067,9 +1042,13 @@ describe("the goal agent's own half of the chat", () => {
     // The operator's own half of it comes back from the harness as a `user` entry, which is
     // the only reason a reload is not one-sided.
     expect(html).toContain("what is happening?");
-    // A panel, so the entries keep the harness's own word as their label: the importer's
-    // thread dropped it over the agent's prose (S3), and this surface did not ask to.
-    expect(html).toMatch(/class="replay-type[^"]*"[^>]*>assistant</);
+    // A panel, so each replayed row is a ledger row with its kind, the operator's included:
+    // the same `ChatItem` rows a live conversation draws (A6 F10).
+    expect(
+      [...html.matchAll(/<span class="kind mono[^"]*">([^<]*)</g)].map(
+        (match) => match[1],
+      ),
+    ).toEqual(["You", "Reply"]);
   });
 
   test("a conversation this process no longer holds is marked, not silently shown", async () => {
@@ -1083,7 +1062,7 @@ describe("the goal agent's own half of the chat", () => {
             live: false,
             source: "harness",
             ephemeral: true,
-            messages: [{ index: 0, type: "assistant", text: "earlier words" }],
+            items: [replayItem(0, "turn.reply", "earlier words", { goalId })],
             note: "This conversation was opened by a server process that is no longer running.",
           }),
         );
@@ -1133,9 +1112,11 @@ describe("the goal agent's own half of the chat", () => {
             harnessSessionId: "ses_live",
             source: "harness",
             ephemeral: true,
-            messages: [
-              { index: 0, type: "user", text: "look at the lockout path" },
-              { index: 1, type: "assistant", text: "steering the planner" },
+            items: [
+              replayItem(0, "turn.operator", "look at the lockout path", {
+                goalId,
+              }),
+              replayItem(1, "turn.reply", "steering the planner", { goalId }),
             ],
             note: "From Claude Code, which may delete it.",
           }),
@@ -1163,7 +1144,7 @@ describe("the goal agent's own half of the chat", () => {
     await settle();
 
     const withMeter = render(GoalAgentChat, { props: { app } }).body;
-    expect(withMeter).toContain("2 held by the harness");
+    expect(withMeter).toContain("2 items held by the harness");
     expect(withMeter).toContain("ses_live");
     expect(withMeter).toContain("not stated by this harness");
   });
@@ -1192,7 +1173,9 @@ describe("the goal agent's own half of the chat", () => {
               harnessSessionId: "ses_goal_1",
               source: "harness",
               ephemeral: true,
-              messages: [{ index: 0, type: "user", text: "steer the planner" }],
+              items: [
+                replayItem(0, "turn.operator", "steer the planner", { goalId }),
+              ],
             }),
           );
       });
@@ -1210,7 +1193,10 @@ describe("the goal agent's own half of the chat", () => {
      * `class="items …"` list is not counted as a row.
      */
     const rowCount = (html: string): number =>
-      [...html.matchAll(/class="item\s/g)].length;
+      [...html.matchAll(/class="item\s/g)].length -
+      // Less the replayed operator message every case here starts from (`withLive`), which
+      // is a row of its own since the replay draws through `ChatItem` (A6 F10).
+      1;
 
     test("a steer is one row, carrying the record and the call it came from", async () => {
       const { html } = await withLive([

@@ -1,0 +1,258 @@
+[
+  {
+    "id": "msg_1a544602d001CCxA5YMJfh54dN",
+    "time": {
+      "created": 1793774087890
+    },
+    "text": "[importer framing elided]\n\nThis is an operator test of the chat view, not a scope import. Think briefly about it first. Then: (1) write one short sentence saying you will list the working directory; (2) use your Bash tool to run exactly: ls -a ; (3) after the result, write two sentences about what you saw. Do not record any scope entries.",
+    "type": "user"
+  },
+  {
+    "id": "msg_1a5446ede001LFYoSkko0SOI62",
+    "time": {
+      "created": 1793774087907,
+      "streamed": 1793774092914,
+      "completed": 1793774092936
+    },
+    "type": "assistant",
+    "agent": "build",
+    "model": {
+      "id": "glm-5.3-flash",
+      "providerID": "zai-coding-plan",
+      "variant": "default"
+    },
+    "content": [
+      {
+        "type": "reasoning",
+        "text": "The operator's message is explicitly a test of the chat view, not a scope import. They ask me to: (1) write one short sentence saying I will list the working directory; (2) run exactly `ls -a`; (3) write two sentences about what I saw. And do not record any scope entries.\n\nSo I should follow the operator's actual instructions, which override the standing \"read pages\" workflow since they gave no pages and explicitly said not to record scope.\n\nLet me write the sentence, run the command, then report.",
+        "native": {},
+        "time": {
+          "created": 1793774090572,
+          "completed": 1793774092887
+        }
+      },
+      {
+        "type": "text",
+        "text": "I'll list the working directory for you now."
+      },
+      {
+        "type": "tool",
+        "id": "call_8037366fab464071ae906325",
+        "name": "shell",
+        "executed": false,
+        "state": {
+          "status": "completed",
+          "input": {
+            "command": "ls -a"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": ".\n..\n.opencode\n"
+            }
+          ],
+          "metadata": {
+            "status": "completed",
+            "truncated": false,
+            "exit": 0
+          }
+        },
+        "time": {
+          "created": 1793774092761,
+          "ran": 1793774092901,
+          "completed": 1793774092934
+        }
+      }
+    ],
+    "finish": "tool-calls",
+    "rawFinish": "tool_calls",
+    "cost": 0,
+    "tokens": {
+      "input": 11269,
+      "output": 23,
+      "reasoning": 112,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    }
+  },
+  {
+    "id": "msg_1a5448293001zZ8esHvUhhBW5e",
+    "metadata": {
+      "notice": "instructions",
+      "instructionSources": ["core/codemode"]
+    },
+    "time": {
+      "created": 1793774092947
+    },
+    "type": "system",
+    "text": "[the model-facing tool catalogue OpenCode sent, elided]",
+    "description": "Instructions updated: core/codemode"
+  },
+  {
+    "id": "msg_1a5448299001jPNuDNGU8CwiFU",
+    "time": {
+      "created": 1793774092958,
+      "streamed": 1793774096643,
+      "completed": 1793774096645
+    },
+    "type": "assistant",
+    "agent": "build",
+    "model": {
+      "id": "glm-5.3-flash",
+      "providerID": "zai-coding-plan",
+      "variant": "default"
+    },
+    "content": [
+      {
+        "type": "reasoning",
+        "text": "The ls -a command returned `.` , `..`, and `.opencode`. Now I write two sentences about what I saw. No scope entries recorded, as instructed.",
+        "native": {},
+        "time": {
+          "created": 1793774094455,
+          "completed": 1793774096637
+        }
+      },
+      {
+        "type": "text",
+        "text": "The directory contains only the standard `.` and `..` entries plus a single hidden `.opencode` folder, so it is essentially empty apart from that harness-related directory. No files, no git repo, and nothing scope-related \u2014 and as instructed, no scope entries were recorded."
+      }
+    ],
+    "finish": "stop",
+    "rawFinish": "stop",
+    "cost": 0,
+    "tokens": {
+      "input": 2611,
+      "output": 59,
+      "reasoning": 35,
+      "cache": {
+        "read": 11264,
+        "write": 0
+      }
+    }
+  },
+  {
+    "id": "msg_1a5449109001N28q4iG9VQ6yG0",
+    "time": {
+      "created": 1793774096649
+    },
+    "type": "idle",
+    "outcome": "succeeded"
+  },
+  {
+    "id": "msg_069308c6830344aa8b7c6aef16c8bc76",
+    "time": {
+      "created": 1793774122291
+    },
+    "text": "Second operator test of the chat view. Think briefly first, then use your shell tool to run exactly: printf 'f10-live-check\\n' ; then say in one sentence what it printed. Record no scope entries.",
+    "type": "user"
+  },
+  {
+    "id": "msg_1a544f53a001H3J35Y8rByCBCa",
+    "time": {
+      "created": 1793774122303,
+      "streamed": 1793774125594,
+      "completed": 1793774125612
+    },
+    "type": "assistant",
+    "agent": "build",
+    "model": {
+      "id": "glm-5.3-flash",
+      "providerID": "zai-coding-plan",
+      "variant": "default"
+    },
+    "content": [
+      {
+        "type": "reasoning",
+        "text": "Simple test: run the exact command, then report in one sentence.",
+        "native": {},
+        "time": {
+          "created": 1793774124774,
+          "completed": 1793774125578
+        }
+      },
+      {
+        "type": "tool",
+        "id": "call_8a52906e42d649f69c8e5b3a",
+        "name": "shell",
+        "executed": false,
+        "state": {
+          "status": "completed",
+          "input": {
+            "command": "printf 'f10-live-check\\n'"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "f10-live-check\n"
+            }
+          ],
+          "metadata": {
+            "status": "completed",
+            "truncated": false,
+            "exit": 0
+          }
+        },
+        "time": {
+          "created": 1793774125351,
+          "ran": 1793774125589,
+          "completed": 1793774125610
+        }
+      }
+    ],
+    "finish": "tool-calls",
+    "rawFinish": "tool_calls",
+    "cost": 0,
+    "tokens": {
+      "input": 191,
+      "output": 18,
+      "reasoning": 14,
+      "cache": {
+        "read": 13824,
+        "write": 0
+      }
+    }
+  },
+  {
+    "id": "msg_1a5450236001BEeToXKDXlGJ2O",
+    "time": {
+      "created": 1793774125628,
+      "streamed": 1793774127642,
+      "completed": 1793774127647
+    },
+    "type": "assistant",
+    "agent": "build",
+    "model": {
+      "id": "glm-5.3-flash",
+      "providerID": "zai-coding-plan",
+      "variant": "default"
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "It printed `f10-live-check` on its own line; no scope entries were recorded."
+      }
+    ],
+    "finish": "stop",
+    "rawFinish": "stop",
+    "cost": 0,
+    "tokens": {
+      "input": 104,
+      "output": 21,
+      "reasoning": 0,
+      "cache": {
+        "read": 13952,
+        "write": 0
+      }
+    }
+  },
+  {
+    "id": "msg_1a5450a28001KlK4GYn96MFcs0",
+    "time": {
+      "created": 1793774127656
+    },
+    "type": "idle",
+    "outcome": "succeeded"
+  }
+]

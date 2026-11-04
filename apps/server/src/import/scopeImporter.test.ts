@@ -535,15 +535,22 @@ const scriptedHarness = (script: Script) => {
     // the report rather than the first thing said, which is why there is more than one
     // assistant entry here.
     messages: () =>
-      Effect.succeed([
-        { type: "user", text: "…the prompt…", error: undefined },
-        { type: "assistant", text: NARRATION[0], error: undefined },
-        { type: "assistant", text: NARRATION[1], error: undefined },
-        // A trailing entry with no words, which a harness records for a turn that was all
-        // tool calls. "The last thing it said" means the last thing it said in words.
-        { type: "assistant", text: "", error: undefined },
-        { type: "assistant", text: REPORT, error: undefined },
-      ]),
+      Effect.succeed(
+        [
+          { type: "user", text: "…the prompt…", error: undefined },
+          { type: "assistant", text: NARRATION[0], error: undefined },
+          { type: "assistant", text: NARRATION[1], error: undefined },
+          // A trailing entry with no words, which a harness records for a turn that was all
+          // tool calls. "The last thing it said" means the last thing it said in words.
+          { type: "assistant", text: "", error: undefined },
+          { type: "assistant", text: REPORT, error: undefined },
+        ].map((entry) => ({
+          ...entry,
+          parts: [],
+          model: undefined,
+          at: undefined,
+        })),
+      ),
     /*
      * A stream that really narrates, and really stays open.
      *

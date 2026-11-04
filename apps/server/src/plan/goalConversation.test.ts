@@ -290,7 +290,13 @@ const fakeHarness = (
             { type: "user", text: "what is happening?" },
             { type: "assistant", text: "one round has run." },
           ]
-        ).map((entry) => ({ ...entry, error: undefined })),
+        ).map((entry) => ({
+          ...entry,
+          error: undefined,
+          parts: [],
+          model: undefined,
+          at: undefined,
+        })),
       ),
     sessionEvents: () => Stream.never,
     ...(options?.interrupt === undefined
@@ -1451,10 +1457,11 @@ describe("a restart with a goal conversation live", () => {
     const second = make({ messages: [{ type: "user", text: stored }] });
     const view = await replaying(second.runtime);
 
-    expect(view.messages).toHaveLength(1);
-    // The operator's words, exactly as they wrote them.
-    expect(view.messages[0]?.text).toBe("is anything running right now?");
-    expect(view.messages[0]?.text).not.toContain("You are the goal agent");
+    expect(view.items).toHaveLength(1);
+    // The operator's words, exactly as they wrote them, as the operator's turn.
+    expect(view.items[0]?.kind).toBe("turn.operator");
+    expect(view.items[0]?.body).toBe("is anything running right now?");
+    expect(view.items[0]?.body).not.toContain("You are the goal agent");
     // And said, rather than silently shorter than the thing the agent was given. The note
     // says "your messages" rather than "your first message" because an attachment list
     // rides above the same delimiter on every turn of a goal that has files.
@@ -1473,7 +1480,7 @@ describe("a restart with a goal conversation live", () => {
     await sending(first.runtime, "hello");
     const view = await replaying(first.runtime);
 
-    expect(view.messages[0]?.text).toBe("and the admin console?");
+    expect(view.items[0]?.body).toBe("and the admin console?");
     expect(view.note).not.toContain("shown as you wrote them");
 
     await first.runtime.dispose();
@@ -1491,7 +1498,7 @@ describe("a restart with a goal conversation live", () => {
     // The harness still has the words — Claude Code keeps its transcripts on disk for about
     // thirty days — so the prose comes back.
     expect(view.source).toBe("harness");
-    expect(view.messages.map((message) => message.text)).toEqual([
+    expect(view.items.map((item) => item.body)).toEqual([
       "what is happening?",
       "one round has run.",
     ]);
@@ -1526,7 +1533,7 @@ describe("what the replay says when there is nothing to show", () => {
     expect(view.source).toBe("absent");
     expect(view.harnessSessionId).toBeNull();
     expect(view.live).toBe(false);
-    expect(view.messages).toEqual([]);
+    expect(view.items).toEqual([]);
     expect(view.note).toContain("Nobody has talked to this goal's agent yet");
 
     await first.runtime.dispose();
@@ -1543,7 +1550,7 @@ describe("what the replay says when there is nothing to show", () => {
 
     expect(view.source).toBe("pending");
     expect(view.live).toBe(true);
-    expect(view.messages).toEqual([]);
+    expect(view.items).toEqual([]);
     expect(view.note).toContain("holds nothing for this conversation yet");
     // No restart sentence: this session is ours, so nothing is unreachable.
     expect(view.note).not.toContain("no longer running");

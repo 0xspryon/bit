@@ -274,24 +274,74 @@ export const importerTurnAccepted = (
  * resumable and a `harness` one may not be.
  */
 export const importerConversationView = (
-  over: Partial<ImporterConversationView> = {},
-): ImporterConversationView => ({
-  targetId: "acme-corp",
-  importId: "imp_1",
-  harnessSessionId: "ses_1",
-  live: false,
-  source: "harness",
-  continuation: "resume",
-  refusal: null,
-  ephemeral: true,
-  note: "From the harness, which may delete it.",
-  messages: [
-    { index: 0, type: "user", text: "Read the policy page" },
-    { index: 1, type: "assistant", text: "Two entries in, one out." },
-  ],
-  truncated: false,
-  omittedBlank: 0,
+  over: Partial<
+    Omit<ImporterConversationView, "continuation"> & {
+      continuation: ImporterConversationView["continuation"];
+      refusal: Extract<
+        ImporterConversationView,
+        { continuation: "refused" }
+      >["refusal"];
+    }
+  > = {},
+): ImporterConversationView =>
+  ({
+    targetId: "acme-corp",
+    importId: "imp_1",
+    harnessSessionId: "ses_1",
+    live: false,
+    source: "harness",
+    continuation: "resume",
+    ephemeral: true,
+    note: "From the harness, which may delete it.",
+    items: [
+      replayItem(0, "turn.operator", "Read the policy page", {
+        importId: "imp_1",
+      }),
+      replayItem(1, "turn.reply", "Two entries in, one out.", {
+        importId: "imp_1",
+      }),
+    ],
+    truncated: false,
+    omittedBlank: 0,
+    at: AT,
+    ...over,
+  }) as ImporterConversationView;
+
+/**
+ * One item of a server replay (A6 F10): the live stream's own shape under a `replay:<n>` id,
+ * as `run/liveTranscript.ts`'s `projectReplay` builds it.
+ */
+export const replayItem = (
+  index: number,
+  kind: string,
+  body: string,
+  over: Partial<LiveItem> = {},
+): LiveItem => ({
+  _tag: "item",
+  id: `replay:${String(index)}`,
+  origin: "activity",
+  sequence: null,
+  kind,
   at: AT,
+  attemptId: null,
+  roundId: null,
+  goalId: null,
+  importId: null,
+  headline:
+    kind === "turn.operator"
+      ? "You"
+      : kind === "turn.reply"
+        ? "Reply"
+        : kind === "turn.thinking"
+          ? "Thinking"
+          : "",
+  body,
+  tool: null,
+  toolName: null,
+  input: null,
+  output: null,
+  callId: null,
+  outcome: null,
   ...over,
 });
 
@@ -402,9 +452,14 @@ export const roundNarration = (
   source: "harness",
   ephemeral: true,
   note: "From OpenCode, which may delete it: this build does not store a round's narration.",
-  messages: [
-    { index: 0, type: "assistant", text: "Two dimensions have no work out." },
-    { index: 1, type: "tool", text: "add_intent" },
+  items: [
+    replayItem(0, "turn.reply", "Two dimensions have no work out.", {
+      roundId: "rnd_1",
+    }),
+    replayItem(1, "turn.other", "add_intent", {
+      roundId: "rnd_1",
+      headline: "tool",
+    }),
   ],
   truncated: false,
   // Nothing left out by default. The two figures are not optional on the shape, because an
@@ -443,7 +498,7 @@ export const goalConversationView = (
   source: "absent",
   ephemeral: false,
   note: "Nobody has talked to this goal's agent yet.",
-  messages: [],
+  items: [],
   truncated: false,
   omittedBlank: 0,
   at: AT,

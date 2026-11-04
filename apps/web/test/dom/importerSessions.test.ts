@@ -1000,7 +1000,7 @@ describe("a session this server no longer holds", () => {
           importId,
           source: "forgotten",
           continuation: "fresh",
-          messages: [],
+          items: [],
           note: "Claude Code no longer holds session ses_newest.",
         }),
       );

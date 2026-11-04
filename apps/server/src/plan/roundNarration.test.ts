@@ -69,22 +69,39 @@ const round = (over: Partial<StoredRound> = {}): StoredRound => ({
 });
 
 /** Reads one round against a harness whose `messages` does whatever a test needs. */
+/** An entry as these tests write it: words only, as a driver that gives no parts would. */
+type Said = Pick<MessageEntry, "type" | "text" | "error"> &
+  Partial<MessageEntry>;
+
+const filled = (entry: Said): MessageEntry => ({
+  parts: [],
+  model: undefined,
+  at: undefined,
+  ...entry,
+});
+
 const read = (
   over: Partial<StoredRound>,
-  messages: () => Effect.Effect<readonly MessageEntry[], HarnessTransportError>,
+  messages: () => Effect.Effect<readonly Said[], HarnessTransportError>,
   limit?: number,
 ) =>
   Effect.runPromise(
     roundNarration({
       resolver: HarnessResolver.fromEntries([
-        { instance: STUB_INSTANCE, harness: stubHarness({ messages }) },
+        {
+          instance: STUB_INSTANCE,
+          harness: stubHarness({
+            messages: () =>
+              Effect.map(messages(), (entries) => entries.map(filled)),
+          }),
+        },
       ]),
       round: round(over),
       ...(limit === undefined ? {} : { limit }),
     }),
   );
 
-const entries = (count: number): readonly MessageEntry[] =>
+const entries = (count: number): readonly Said[] =>
   Array.from({ length: count }, (_, index) => ({
     type: index === 0 ? "assistant" : "tool",
     text: `entry ${String(index)}`,
@@ -96,15 +113,16 @@ describe("a round whose prose the harness still has", () => {
     const answer = await read({}, () => Effect.succeed(entries(2)));
 
     expect(answer.source).toBe("harness");
-    expect(answer.messages.map((message) => message.index)).toEqual([0, 1]);
-    expect(answer.messages[0]?.text).toBe("entry 0");
+    expect(answer.items.map((item) => item.id)).toEqual([
+      "replay:0",
+      "replay:1",
+    ]);
+    expect(answer.items[0]?.body).toBe("entry 0");
+    expect(answer.items.every((item) => item.roundId === "rnd_1")).toBe(true);
     // The harness's copy, so it can be gone tomorrow. The flag exists so a reader cannot
     // present this and a durable record as the same kind of thing.
     expect(answer.ephemeral).toBe(true);
     expect(answer.note).toContain("may delete it");
-    // And the cost decision 14 accepted, stated rather than left to be noticed: the shape
-    // is `{ type, text, error }`, so a call and its result do not reconstruct.
-    expect(answer.note).toContain("not paired");
     expect(answer.truncated).toBe(false);
     expect(answer.omittedBlank).toBe(0);
     expect(answer.promptOmitted).toBe(false);
@@ -113,7 +131,7 @@ describe("a round whose prose the harness still has", () => {
   test("a long round is shortened and says so", async () => {
     const answer = await read({}, () => Effect.succeed(entries(5)), 2);
 
-    expect(answer.messages.length).toBe(2);
+    expect(answer.items.length).toBe(2);
     expect(answer.truncated).toBe(true);
     expect(answer.note).toContain("Shortened");
   });
@@ -129,7 +147,7 @@ describe("what is left out of a replay, and said", () => {
    * conversation on every reload.
    */
 
-  test("tool blocks the reduced shape has no text for are left out and counted", async () => {
+  test("entries with nothing to show are left out and counted", async () => {
     const answer = await read({}, () =>
       Effect.succeed([
         {
@@ -148,17 +166,19 @@ describe("what is left out of a replay, and said", () => {
       ]),
     );
 
-    expect(answer.messages.map((message) => message.text)).toEqual([
+    expect(answer.items.map((item) => item.body)).toEqual([
       "two dimensions are untested",
       "recording the disposition",
     ]);
     expect(answer.omittedBlank).toBe(2);
     // Counted rather than silent: an omission a reader cannot count is indistinguishable
     // from a round that said less than it did.
-    expect(answer.note).toContain("2 tool calls and results are left out");
-    // The index is a position in **this answer**, assigned after the omissions, which is
-    // what its contract now says it is.
-    expect(answer.messages.map((message) => message.index)).toEqual([0, 1]);
+    expect(answer.note).toContain("2 empty messages are left out");
+    // The id is a position in **this answer**, assigned after the omissions.
+    expect(answer.items.map((item) => item.id)).toEqual([
+      "replay:0",
+      "replay:1",
+    ]);
   });
 
   test("an entry with an error but no text is kept, because it is still the round talking", async () => {
@@ -168,8 +188,9 @@ describe("what is left out of a replay, and said", () => {
       ]),
     );
 
-    expect(answer.messages).toHaveLength(1);
-    expect(answer.messages[0]?.error).toBe("the tool call failed");
+    expect(answer.items).toHaveLength(1);
+    expect(answer.items[0]?.headline).toBe("error");
+    expect(answer.items[0]?.body).toBe("the tool call failed");
     expect(answer.omittedBlank).toBe(0);
   });
 
@@ -189,7 +210,7 @@ describe("what is left out of a replay, and said", () => {
     );
 
     expect(answer.promptOmitted).toBe(true);
-    expect(answer.messages.map((message) => message.text)).toEqual([
+    expect(answer.items.map((item) => item.body)).toEqual([
       "two dimensions are untested",
     ]);
     expect(answer.note).toContain("not replayed here");
@@ -221,7 +242,7 @@ describe("what is left out of a replay, and said", () => {
     );
 
     expect(answer.promptOmitted).toBe(true);
-    expect(answer.messages.map((message) => message.text)).toEqual([
+    expect(answer.items.map((item) => item.body)).toEqual([
       "The usage limit has been reached",
       "The usage limit has been reached",
     ]);
@@ -243,7 +264,7 @@ describe("what is left out of a replay, and said", () => {
 
     expect(answer.promptOmitted).toBe(false);
     expect(answer.omittedBlank).toBe(2);
-    expect(answer.messages.map((message) => message.text)).toEqual([
+    expect(answer.items.map((item) => item.body)).toEqual([
       "calling add_intent",
     ]);
   });
@@ -261,7 +282,7 @@ describe("what is left out of a replay, and said", () => {
 
     expect(answer.promptOmitted).toBe(false);
     expect(answer.note).not.toContain("not replayed here");
-    expect(answer.messages).toHaveLength(1);
+    expect(answer.items).toHaveLength(1);
   });
 
   test("the prompt is dropped and a steer is kept, in either order", async () => {
@@ -287,12 +308,14 @@ describe("what is left out of a replay, and said", () => {
       );
 
       expect(answer.promptOmitted).toBe(true);
-      expect(answer.messages).toHaveLength(2);
-      const user = answer.messages.filter((message) => message.type === "user");
+      expect(answer.items).toHaveLength(2);
+      const user = answer.items.filter(
+        (item) => item.kind === "turn.other" && item.headline === "user",
+      );
       expect(user).toHaveLength(1);
       // The steer, by its own text. "One survived" was true of the broken rule too.
-      expect(user[0]?.text).toBe(STEER);
-      expect(user[0]?.text).not.toContain(ROUND_PROMPT_MARKER);
+      expect(user[0]?.body).toBe(STEER);
+      expect(user[0]?.body).not.toContain(ROUND_PROMPT_MARKER);
     }
   });
 
@@ -314,7 +337,7 @@ describe("what is left out of a replay, and said", () => {
     );
 
     expect(answer.promptOmitted).toBe(false);
-    expect(answer.messages).toHaveLength(3);
+    expect(answer.items).toHaveLength(3);
     expect(answer.note).not.toContain("not replayed here");
   });
 
@@ -336,7 +359,7 @@ describe("what is left out of a replay, and said", () => {
     );
 
     expect(answer.promptOmitted).toBe(false);
-    expect(answer.messages).toHaveLength(1);
+    expect(answer.items).toHaveLength(1);
   });
 
   test("a round that made calls and said nothing is still `harness`, not `none`", async () => {
@@ -352,10 +375,10 @@ describe("what is left out of a replay, and said", () => {
     );
 
     expect(answer.source).toBe("harness");
-    expect(answer.messages).toEqual([]);
+    expect(answer.items).toEqual([]);
     expect(answer.omittedBlank).toBe(2);
     expect(answer.promptOmitted).toBe(true);
-    expect(answer.note).toContain("narrated no words");
+    expect(answer.note).toContain("narrated nothing that can be shown");
     expect(answer.note).toContain("the prompt we sent");
   });
 
@@ -375,10 +398,7 @@ describe("what is left out of a replay, and said", () => {
       2,
     );
 
-    expect(answer.messages.map((message) => message.text)).toEqual([
-      "one",
-      "two",
-    ]);
+    expect(answer.items.map((item) => item.body)).toEqual(["one", "two"]);
     expect(answer.truncated).toBe(false);
   });
 });
@@ -390,7 +410,7 @@ describe("the three absences", () => {
     );
 
     expect(answer.source).toBe("pending");
-    expect(answer.messages).toEqual([]);
+    expect(answer.items).toEqual([]);
     expect(answer.ephemeral).toBe(false);
     expect(answer.note).toContain("as it says it");
   });
@@ -494,7 +514,7 @@ describe("the instance a round ran on", () => {
     );
 
     expect(answer.source).toBe("harness");
-    expect(answer.messages.length).toBe(1);
+    expect(answer.items.length).toBe(1);
   });
 
   test("a server with no harness at all reports the prose unavailable, not a failure", async () => {

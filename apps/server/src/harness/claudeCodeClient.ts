@@ -131,6 +131,7 @@ import {
   type HarnessNarration,
   type McpRegistration,
   type MessageEntry,
+  type MessagePart,
   type NarrationDetail,
   type PromptDelivery,
   type SessionRef,
@@ -1171,6 +1172,106 @@ const finishedBlockKey = (
     : {};
 };
 
+/** The model an `assistant` message names (`message.model`), or `undefined`. */
+const modelOfMessage = (message: unknown): string | undefined => {
+  const model = (message as { model?: unknown } | undefined)?.model;
+  return typeof model === "string" && model !== "" ? model : undefined;
+};
+
+/**
+ * An `assistant` message's blocks as parts: `text` → `reply`, `thinking` → `thinking`,
+ * `tool_use` (`{ id, name, input }`) → `toolCall`, anything else nothing.
+ *
+ * **One reading for the live stream and the stored transcript** (A6 F10), so a replayed
+ * conversation is made of the same parts its live narration was: {@link narrate} calls it on
+ * each `assistant` frame and {@link flattenTranscript} on each stored `assistant` entry,
+ * which hold the same `BetaMessage` content. `key` names a `text` or `thinking` block's
+ * `blockId` — from the stream on a frame ({@link finishedBlockKey}), from the entry's place
+ * in its call on a transcript — and `model` is the message's own.
+ */
+const assistantParts = (
+  blocks: readonly unknown[],
+  model: string | undefined,
+  key: (
+    kind: "text" | "thinking",
+    position: number,
+  ) => {
+    readonly blockId?: string;
+  },
+): MessagePart[] => {
+  const parts: MessagePart[] = [];
+  const named = model === undefined ? {} : { model };
+  blocks.forEach((block, position) => {
+    const record = (block ?? {}) as {
+      type?: unknown;
+      text?: unknown;
+      thinking?: unknown;
+      id?: unknown;
+      name?: unknown;
+      input?: unknown;
+    };
+    if (record.type === "text" && typeof record.text === "string") {
+      parts.push({
+        _tag: "reply",
+        text: truncateNarration(record.text),
+        ...key("text", position),
+        ...named,
+      });
+    } else if (
+      record.type === "thinking" &&
+      typeof record.thinking === "string"
+    ) {
+      // The field is `thinking`, not `text`. An empty one is reachable and is carried as
+      // it is: the probe's own run produced `{ type: "thinking", thinking: "" }`, and
+      // whether a block with nothing in it is worth a row is the transcript's decision,
+      // not this mapping's.
+      parts.push({
+        _tag: "thinking",
+        text: truncateNarration(record.thinking),
+        ...key("thinking", position),
+        ...named,
+      });
+    } else if (record.type === "tool_use" && typeof record.id === "string") {
+      parts.push({
+        _tag: "toolCall",
+        callId: record.id,
+        tool: typeof record.name === "string" ? record.name : undefined,
+        input: truncateNarration(asJson(record.input)),
+        ...named,
+      });
+    }
+  });
+  return parts;
+};
+
+/**
+ * A `user` message's `tool_result` blocks (`{ tool_use_id, content, is_error }`) as
+ * `toolResult` parts. A tool's output comes back as a *user* message because that is how
+ * the Messages API carries it. Shared by the stream and the transcript, as
+ * {@link assistantParts} is.
+ */
+const userParts = (blocks: readonly unknown[]): MessagePart[] =>
+  blocks.flatMap((block): MessagePart[] => {
+    const record = (block ?? {}) as {
+      type?: unknown;
+      tool_use_id?: unknown;
+      content?: unknown;
+      is_error?: unknown;
+    };
+    return record.type === "tool_result" &&
+      typeof record.tool_use_id === "string"
+      ? [
+          {
+            _tag: "toolResult",
+            callId: record.tool_use_id,
+            tool: undefined,
+            output: truncateNarration(resultText(record.content)),
+            failed: record.is_error === true,
+          },
+        ]
+      : [];
+  });
+
 const narrate = (
   message: SDKMessage,
   outcome: TerminalOutcome | undefined,
@@ -1216,69 +1317,13 @@ const narrate = (
   const details: NarrationDetail[] = [];
 
   if (message.type === "assistant") {
-    for (const block of blocks) {
-      const record = (block ?? {}) as {
-        type?: unknown;
-        text?: unknown;
-        thinking?: unknown;
-        id?: unknown;
-        name?: unknown;
-        input?: unknown;
-      };
-      if (record.type === "text" && typeof record.text === "string") {
-        details.push({
-          _tag: "reply",
-          text: truncateNarration(record.text),
-          ...finishedBlockKey(message, blocks.length, "text", session.streamed),
-        });
-      } else if (
-        record.type === "thinking" &&
-        typeof record.thinking === "string"
-      ) {
-        // The field is `thinking`, not `text`. An empty one is reachable and is carried as
-        // it is: the probe's own run produced `{ type: "thinking", thinking: "" }`, and
-        // whether a block with nothing in it is worth a row is the transcript's decision,
-        // not this mapping's.
-        details.push({
-          _tag: "thinking",
-          text: truncateNarration(record.thinking),
-          ...finishedBlockKey(
-            message,
-            blocks.length,
-            "thinking",
-            session.streamed,
-          ),
-        });
-      } else if (record.type === "tool_use" && typeof record.id === "string") {
-        details.push({
-          _tag: "toolCall",
-          callId: record.id,
-          tool: typeof record.name === "string" ? record.name : undefined,
-          input: truncateNarration(asJson(record.input)),
-        });
-      }
-    }
+    details.push(
+      ...assistantParts(blocks, modelOfMessage(message.message), (kind) =>
+        finishedBlockKey(message, blocks.length, kind, session.streamed),
+      ),
+    );
   } else if (message.type === "user") {
-    for (const block of blocks) {
-      const record = (block ?? {}) as {
-        type?: unknown;
-        tool_use_id?: unknown;
-        content?: unknown;
-        is_error?: unknown;
-      };
-      if (
-        record.type === "tool_result" &&
-        typeof record.tool_use_id === "string"
-      ) {
-        details.push({
-          _tag: "toolResult",
-          callId: record.tool_use_id,
-          tool: undefined,
-          output: truncateNarration(resultText(record.content)),
-          failed: record.is_error === true,
-        });
-      }
-    }
+    details.push(...userParts(blocks));
   }
 
   /*
@@ -1367,33 +1412,78 @@ const isLocalCommandEntry = (entry: SessionMessage): boolean =>
   (entry as { readonly isCompletedLocalCommand?: unknown })
     .isCompletedLocalCommand === true;
 
-/** Reduces one stored transcript entry to the three fields a caller uses. */
-const flatten = (entry: SessionMessage): MessageEntry => {
-  const message = (entry.message ?? {}) as {
-    content?: unknown;
-    text?: unknown;
-  };
-  const parts = Array.isArray(message.content) ? message.content : [];
-  return {
-    type: entry.type,
-    text:
-      typeof message.content === "string"
-        ? message.content
-        : parts
-            .filter(
-              (part): part is { type: string; text: string } =>
-                typeof part === "object" &&
-                part !== null &&
-                (part as { type?: unknown }).type === "text" &&
-                typeof (part as { text?: unknown }).text === "string",
+/**
+ * The stored transcript as {@link MessageEntry}s, each with its parts (A6 F10).
+ *
+ * **Parts as the stream narrated them.** An `assistant` entry's blocks go through
+ * {@link assistantParts} and a `user` entry's `tool_result`s through {@link userParts},
+ * the two functions {@link narrate} reads live frames with, so a replay is the live
+ * conversation's own items. A `user` entry whose content is a string is the words sent —
+ * the operator's, under whatever framing the caller trims — and has no parts.
+ *
+ * **A finished block gets the `blockId` it streamed under**, when the transcript lets this
+ * name it: the CLI writes one entry per content block of a call (the split the stream
+ * makes, `claude-code-partial-stream-facts`), each repeating the call's `message.id`, so a
+ * block's stream index is the number of blocks of that call stored before it plus its
+ * place in its entry. The count is per `message.id` across the whole read, so a `user`
+ * entry (a tool's result) between two blocks of one call does not reset it. That holds only
+ * while every block of a call is stored: a call the transcript holds part of names its
+ * later blocks wrongly, which is harmless — a replayed `blockId` is only ever compared
+ * with a live one for the same session, and a reload's live tail starts after the replay.
+ *
+ * `model` is the entry's `message.model`; `at` is its `timestamp`, which SDK 0.3.310's
+ * `getSessionMessages` passes through from the CLI's record (an ISO string) without
+ * declaring it — read through a cast, like `isCompletedLocalCommand`. Should a later SDK
+ * drop it, replayed items carry no time of their own and the caller says so.
+ */
+const flattenTranscript = (
+  entries: readonly SessionMessage[],
+): MessageEntry[] => {
+  const blocksSeen = new Map<string, number>();
+  return entries.map((entry): MessageEntry => {
+    const message = (entry.message ?? {}) as {
+      id?: unknown;
+      content?: unknown;
+    };
+    const blocks = Array.isArray(message.content) ? message.content : [];
+    const callId = typeof message.id === "string" ? message.id : undefined;
+    const first = callId === undefined ? 0 : (blocksSeen.get(callId) ?? 0);
+    if (callId !== undefined) blocksSeen.set(callId, first + blocks.length);
+    const stamp = (entry as { readonly timestamp?: unknown }).timestamp;
+    const at = typeof stamp === "string" ? Date.parse(stamp) : Number.NaN;
+    return {
+      type: entry.type,
+      text:
+        typeof message.content === "string"
+          ? message.content
+          : blocks
+              .filter(
+                (part): part is { type: string; text: string } =>
+                  typeof part === "object" &&
+                  part !== null &&
+                  (part as { type?: unknown }).type === "text" &&
+                  typeof (part as { text?: unknown }).text === "string",
+              )
+              .map((part) => part.text)
+              .join("\n"),
+      // The stored transcript carries no error channel of its own; a failure arrives as a
+      // `result` message on the live stream and is settled from there. Reporting
+      // `undefined` is the honest answer rather than scraping text for the word "error".
+      error: undefined,
+      parts:
+        entry.type === "assistant"
+          ? assistantParts(blocks, modelOfMessage(message), (_, position) =>
+              callId === undefined
+                ? {}
+                : { blockId: claudeCodeBlockId(callId, first + position) },
             )
-            .map((part) => part.text)
-            .join("\n"),
-    // The stored transcript carries no error channel of its own; a failure arrives as a
-    // `result` message on the live stream and is settled from there. Reporting
-    // `undefined` is the honest answer rather than scraping text for the word "error".
-    error: undefined,
-  };
+          : entry.type === "user"
+            ? userParts(blocks)
+            : [],
+      model: entry.type === "assistant" ? modelOfMessage(message) : undefined,
+      at: Number.isFinite(at) ? at : undefined,
+    };
+  });
 };
 
 /**
@@ -2977,9 +3067,9 @@ export const claudeCodeHarness = (
               `could not read session ${sessionId}'s transcript: ${String(cause)}`,
             ),
         });
-        return entries
-          .filter((entry) => !isLocalCommandEntry(entry))
-          .map(flatten);
+        return flattenTranscript(
+          entries.filter((entry) => !isLocalCommandEntry(entry)),
+        );
       });
 
       const interruptSession: AgentHarness["Service"]["interruptSession"] =

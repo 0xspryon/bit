@@ -38,6 +38,7 @@
 import { Schema } from "effect";
 
 import { SteerUrgency } from "./conversationTurn";
+import { LiveItem } from "./live";
 
 /**
  * The three tools the importer has, and the only three values this can ever hold.
@@ -871,27 +872,6 @@ export type ImporterContinuationRefusal =
   typeof ImporterContinuationRefusal.Type;
 
 /**
- * One replayed message of an importer conversation.
- *
- * The reduced `{ type, text, error }` shape a goal conversation's replay already answers
- * with, so `ImporterChat.svelte` renders it through the same component and needs no second
- * renderer. A `user` entry here is **the operator's own words**: the server trims its own
- * framing off the stored opening prompt at the delimiter it wrote itself
- * (`import/importerPrompt.ts`), which is an exact split rather than a guess at where a
- * person's sentence starts.
- */
-export const ImporterConversationMessage = Schema.Struct({
-  /** Position in **this answer**, from zero. A render key, not a cursor. */
-  index: Schema.Int,
-  /** The harness's own word for the entry: `user`, `assistant`. Unmapped. */
-  type: Schema.String,
-  text: Schema.String,
-  error: Schema.optional(Schema.String),
-});
-export type ImporterConversationMessage =
-  typeof ImporterConversationMessage.Type;
-
-/**
  * One importer session as a reloaded tab replays it (S6).
  *
  * **The harness's copy, and nothing of ours.** This build stores no word of a conversation
@@ -904,7 +884,7 @@ export type ImporterConversationMessage =
  * reason the goal replay is a `200`: "gone" is the ordinary end state of anything old
  * enough, and an error status would make a browser treat it as a fault.
  */
-export const ImporterConversationView = Schema.Struct({
+const ImporterConversationViewFields = {
   targetId: Schema.String,
   /** The import asked about, as addressed. */
   importId: Schema.String,
@@ -916,36 +896,27 @@ export const ImporterConversationView = Schema.Struct({
    * False with a non-null session id is the restart case: the id is ours, the prose may
    * still come back, and the in-memory grant that let the agent act is gone. Whether the
    * conversation can be carried on from there is a *separate* question, and
-   * {@link continuation} is the one that answers it — collapsing the two would make a
-   * readable conversation look continuable, or a continuable one look dead.
+   * `continuation` is the one that answers it — collapsing the two would make a readable
+   * conversation look continuable, or a continuable one look dead.
    */
   live: Schema.Boolean,
   source: ImporterConversationSource,
-  continuation: ImporterContinuation,
-  /**
-   * Which refusal a `refused` {@link continuation} is, and the server's sentence for it.
-   *
-   * Non-null exactly when `continuation` is `refused`, and null otherwise. A reader must
-   * not take `refused` alone as "the operator ended it": a session whose recorded agent this
-   * build does not define is refused too, and nobody ended it.
-   */
-  refusal: Schema.NullOr(ImporterContinuationRefusal),
   /** True only for `harness`: what is shown can disappear. */
   ephemeral: Schema.Boolean,
   /** A sentence for the operator, set on every source including a successful read. */
   note: Schema.String,
-  /** Oldest first, and all of them up to the limit. */
-  messages: Schema.Array(ImporterConversationMessage),
+  /**
+   * The conversation as the **same items the live stream carries** (A6 F10), oldest first
+   * and all of them up to the limit, each with `importId` set: the importer's replies,
+   * thinking and tool calls with their results, and the operator's own messages as
+   * `turn.operator` items. A `user` entry is **the operator's own words**: the server trims
+   * its own framing off at the delimiter it wrote itself (`import/importerPrompt.ts`), an
+   * exact split rather than a guess. Ids are `replay:<n>`: a render key, not a cursor.
+   */
+  items: Schema.Array(LiveItem),
   /** Messages this answer stopped short of. */
   truncated: Schema.Boolean,
-  /**
-   * How many entries were left out because the reduced shape holds nothing to show.
-   *
-   * A `tool_use` or `tool_result` block reduces to an entry with empty text, and rendering
-   * those as turns is a column of labels with nothing under them. Counted so the omission
-   * is not silent — and it is a large count here, because the importer's whole job is tool
-   * calls.
-   */
+  /** How many harness entries produced no item. See `RoundNarration.omittedBlank`. */
   omittedBlank: Schema.Int,
   /**
    * When this answer was built, on the server's clock.
@@ -957,5 +928,27 @@ export const ImporterConversationView = Schema.Struct({
    * `GoalConversationView.at` is — so a reader can tell how old the answer on screen is.
    */
   at: EpochMillis,
-});
+};
+
+/**
+ * One importer session as a reloaded tab replays it (S6), and what its next message will do.
+ *
+ * **A union on `continuation`, so a refusal exists only where it is true** (A6 F10, from F1's
+ * review). `refused` carries {@link ImporterContinuationRefusal} — which refusal, and the
+ * server's sentence — and no other answer carries one. It used to be a nullable field beside
+ * the four answers, non-null by convention only, and a `refused` without a refusal would have
+ * left the composer enabled. A reader must still not take `refused` alone as "the operator
+ * ended it": a session whose recorded agent this build does not define is refused too.
+ */
+export const ImporterConversationView = Schema.Union([
+  Schema.Struct({
+    ...ImporterConversationViewFields,
+    continuation: Schema.Literals(["live", "resume", "fresh"]),
+  }),
+  Schema.Struct({
+    ...ImporterConversationViewFields,
+    continuation: Schema.Literal("refused"),
+    refusal: ImporterContinuationRefusal,
+  }),
+]);
 export type ImporterConversationView = typeof ImporterConversationView.Type;

@@ -2067,8 +2067,8 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
      *
      * **That join is by the client's own arrival order, not by any index on this shape.**
      * There is no index the two channels share: `AgentHarness.messages` carries none at
-     * all, so {@link RoundNarrationMessage.index} is a position in *this answer* and a
-     * render key — see that field, which says what it is not. The browser instead records
+     * all, so a replayed item's `replay:<n>` id is a position in *this answer* and a
+     * render key — see {@link RoundNarration.items}, which says what it is not. The browser instead records
      * the in-process narration publish counter before this request leaves and treats live
      * narration at or below it as already replayed. The residual overlap is accepted and
      * disclosed: the replayed block is labelled a replay rather than claiming completeness.

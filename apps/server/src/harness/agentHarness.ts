@@ -312,11 +312,44 @@ export const capSessionTitle = (value: string): string | undefined => {
     : `${line.slice(0, SESSION_TITLE_MAX - 1).trimEnd()}…`;
 };
 
+/**
+ * One block of a stored message, in the vocabulary the live stream narrates it in (A6 F10).
+ *
+ * The same four {@link NarrationDetail} cases a driver produces from its event stream, so a
+ * replay is projected into `LiveItem`s by the **same** function as live narration
+ * (`run/liveTranscript.ts`, `projectDetail`) and a reloaded conversation renders as the
+ * watched one did. A `blockId` is set where the driver can name the block as its stream
+ * did; a `toolCall`'s `tool` is the harness's own name, as live.
+ */
+export type MessagePart = Extract<
+  NarrationDetail,
+  { readonly _tag: "reply" | "thinking" | "toolCall" | "toolResult" }
+>;
+
 /** One entry of a session's message log, reduced to what this application reads. */
 export interface MessageEntry {
+  /** The harness's own word for the entry — `user`, `assistant`, OpenCode's `shell` … */
   readonly type: string;
+  /**
+   * The entry's plain text: a `user` entry's words, an assistant's text blocks joined. What
+   * the callers that only need words read (`lastAssistantText`, a worker's transcript, the
+   * framing trims); {@link parts} is what a replay renders from.
+   */
   readonly text: string;
   readonly error: string | undefined;
+  /**
+   * The entry's blocks, in order, as the live stream narrates them (A6 F10). Empty for a
+   * `user` entry that is only words — those are {@link text} — and for an entry with no
+   * blocks a renderer could show.
+   */
+  readonly parts: readonly MessagePart[];
+  /**
+   * The model that produced an assistant entry, as the harness names it — Claude Code's
+   * `message.model`, OpenCode's `provider/model` — or `undefined` where it did not say.
+   */
+  readonly model: string | undefined;
+  /** When the harness recorded the entry, in epoch milliseconds, or `undefined`. */
+  readonly at: number | undefined;
 }
 
 /**
@@ -376,6 +409,8 @@ export type NarrationDetail =
       readonly _tag: "reply";
       /** One complete block of assistant text, never a token delta. */
       readonly text: string;
+      /** The model that wrote the block, when the harness said. See `LiveItem.model`. */
+      readonly model?: string | undefined;
       /**
        * The harness's id for this block, when it streamed the block as {@link BlockDelta}s
        * first. The finished block **ends** that block's partial updates and replaces them on
@@ -402,6 +437,8 @@ export type NarrationDetail =
       readonly tool: string | undefined;
       /** The arguments, serialised as JSON, capped by {@link NARRATION_FIELD_MAX}. */
       readonly input: string;
+      /** The model that made the call, when the harness said. See `LiveItem.model`. */
+      readonly model?: string | undefined;
     }
   | {
       readonly _tag: "toolResult";
@@ -437,6 +474,8 @@ export type NarrationDetail =
       readonly text: string;
       /** As on `reply`: the streamed block this finishes, if it was streamed. */
       readonly blockId?: string | undefined;
+      /** As on `reply`. */
+      readonly model?: string | undefined;
     }
   | {
       /**

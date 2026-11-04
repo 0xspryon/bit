@@ -73,7 +73,6 @@
 import {
   type ImporterContinuation,
   type ImporterContinuationRefusal,
-  type ImporterConversationMessage,
   type ImporterConversationView,
   type ImporterSessionEndReason,
 } from "@bit/contracts";
@@ -89,11 +88,12 @@ import type { HarnessResolver } from "../harness/resolver";
 import { roleDirectoryMatcher, sessionReopen } from "../harness/sessionReopen";
 import { isRoleDirectoryId } from "../persistence/fleet";
 import type { CallerContext } from "../persistence/store";
+import { projectReplay } from "../run/liveTranscript";
 
 /** How long the harness is given to answer about one conversation. */
 export const IMPORTER_HISTORY_FETCH_TIMEOUT: Duration.Input = "5 seconds";
 
-/** How many messages one session's replay answers with before it says it stopped. */
+/** How many items one session's replay answers with before it says it stopped (newest kept). */
 export const IMPORTER_HISTORY_READ_LIMIT = 400;
 
 /** The `import_sessions` row this reader needs, as the store answers it. */
@@ -275,23 +275,48 @@ const empty = (input: {
   readonly refusal: ImporterContinuationRefusal | null;
   readonly source: "pending" | "forgotten" | "none" | "absent";
   readonly note: string;
-}): ImporterConversationView => ({
-  targetId: input.targetId,
-  importId: input.importId,
-  harnessSessionId: input.harnessSessionId,
-  live: input.live,
-  source: input.source,
-  continuation: input.continuation,
-  refusal: input.refusal,
-  ephemeral: false,
-  note: input.note,
-  messages: [],
-  truncated: false,
-  // Nothing was left out, because nothing came back. A count here would imply there had
-  // been something to count.
-  omittedBlank: 0,
-  at: Date.now(),
-});
+}): ImporterConversationView =>
+  standing(
+    {
+      targetId: input.targetId,
+      importId: input.importId,
+      harnessSessionId: input.harnessSessionId,
+      live: input.live,
+      source: input.source,
+      ephemeral: false,
+      note: input.note,
+      items: [],
+      truncated: false,
+      // Nothing was left out, because nothing came back. A count here would imply there had
+      // been something to count.
+      omittedBlank: 0,
+      at: Date.now(),
+    },
+    input.continuation,
+    input.refusal,
+  );
+
+/**
+ * A view with its continuation, built so the union holds by construction: a refusal goes on
+ * a `refused` answer and nowhere else, and a `refused` answer always has one — the
+ * continuation of an import with a refusal **is** `refused`, whatever was passed beside it.
+ */
+const standing = (
+  fields: Omit<
+    Extract<ImporterConversationView, { continuation: "refused" }>,
+    "continuation" | "refusal"
+  >,
+  continuation: ImporterContinuation,
+  refusal: ImporterContinuationRefusal | null,
+): ImporterConversationView =>
+  refusal !== null
+    ? { ...fields, continuation: "refused", refusal }
+    : continuation === "refused"
+      ? // Unreachable from this module: `refused` is only ever decided from a refusal. Kept
+        // total rather than asserted, so a later caller that breaks that gets a continuable
+        // answer it can see is wrong, never a composer left enabled under a refusal.
+        { ...fields, continuation: "fresh" }
+      : { ...fields, continuation };
 
 /**
  * What is said when framing was trimmed off one or more of the operator's own messages.
@@ -476,7 +501,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       ? "live"
       : (reopen?._tag ?? "fresh");
   /** Appended to every note, because it is the same fact whether the prose came back or not. */
-  const standing =
+  const standingNote =
     refusal !== undefined
       ? refusal
       : reopen === undefined
@@ -512,7 +537,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
         (deleted
           ? `${displayName} no longer holds session ${sessionId}. Harnesses keep their own transcripts for a while and then delete them, so this is the normal answer for a session left for a while. What it wrote is not affected: its entries are on the Scope tab and its assets in the Estate.`
           : `${displayName} could not be asked about session ${sessionId} — ${failure.message} This is about reaching the harness, not about the conversation.`) +
-        standing,
+        standingNote,
     });
   }
 
@@ -526,14 +551,14 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       source: live ? "pending" : "none",
       note: live
         ? `${displayName} holds nothing for this session yet. What the importer says will appear here as it says it.`
-        : `${displayName} still holds session ${sessionId} and there are no messages under it: this session produced nothing. That is not the same as the harness having forgotten it.${standing}`,
+        : `${displayName} still holds session ${sessionId} and there are no messages under it: this session produced nothing. That is not the same as the harness having forgotten it.${standingNote}`,
     });
   }
 
   /*
    * The framing above each of the operator's messages, taken off before anything else.
    *
-   * Before the blanks and before the limit, for the goal replay's reason in the same
+   * Before the projection and before the limit, for the goal replay's reason in the same
    * position: an entry whose text is about to change size should change size before a budget
    * is spent on it. An entry with no delimiter in it is untouched — which is every entry
    * but the openers, and is also the whole of an import started from links alone, whose
@@ -547,87 +572,79 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
     (entry, index) => entry.text !== fetched.success[index]?.text,
   );
   /*
-   * The blanks, dropped and counted.
-   *
-   * The reduced shape has no text for a `tool_use` or `tool_result` block, so each one
-   * arrives as an entry with an empty `text` and no error. That is the *majority* of an
-   * importer session — reading eight pages and writing thirty entries is almost all tool
-   * calls — which is why the count is said rather than quietly swallowed. An entry carrying
-   * an `error` is kept even with no text: a failure with no prose is still the importer
-   * telling us something.
-   *
-   * Unlike a round's replay, no `user` entry is dropped: they are the operator's. See this
-   * module's header.
+   * The conversation as the live stream's own items (A6 F10): the operator's words, the
+   * importer's replies, thinking, tool calls and their results — the importer's whole job is
+   * tool calls, and they are drawn now rather than counted. What produced no item at all is
+   * counted in `omittedBlank`.
    */
-  const speaking = trimmed.filter(
-    (entry) => entry.text.trim() !== "" || entry.error !== undefined,
-  );
-  const omittedBlank = trimmed.length - speaking.length;
-  if (speaking.length === 0) {
-    return {
-      ...base,
-      harnessSessionId: sessionId,
-      live,
-      // Still `harness`, not `none`: the harness **does** hold this session and did answer
-      // about it. The session made tool calls and said nothing in words, which is a real
-      // state, and reporting it as `none` would collapse it into "the harness held nothing
-      // at all".
-      source: "harness",
+  const at = Date.now();
+  const { items, blank } = projectReplay({
+    entries: trimmed,
+    subject: { _tag: "import", importId: input.importId },
+    harnessSessionId: sessionId,
+    users: "operator",
+    fallbackAt: at,
+  });
+  if (items.length === 0) {
+    return standing(
+      {
+        ...base,
+        harnessSessionId: sessionId,
+        live,
+        // Still `harness`, not `none`: the harness **does** hold this session and did answer
+        // about it. Everything it holds is empty, which is a real state, and reporting it as
+        // `none` would collapse it into "the harness held nothing at all".
+        source: "harness",
+        ephemeral: true,
+        note:
+          `From ${displayName}, which may delete it. Nothing here can be shown: everything the harness holds for this session is ` +
+          `${String(blank)} empty ${blank === 1 ? "message" : "messages"}. What this import wrote is on the Scope tab and in the Estate.` +
+          (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
+          standingNote,
+        items: [],
+        truncated: false,
+        omittedBlank: blank,
+        at,
+      },
       continuation,
-      refusal: refusalOf,
-      ephemeral: true,
-      note:
-        `From ${displayName}, which may delete it. Nothing here is words: everything the harness holds for this session is ` +
-        `${String(omittedBlank)} tool ${omittedBlank === 1 ? "call or result" : "calls and results"}, which the reduced replay shape carries no text for. What they wrote is on the Scope tab and in the Estate.` +
-        (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
-        standing,
-      messages: [],
-      truncated: false,
-      omittedBlank,
-      at: Date.now(),
-    } satisfies ImporterConversationView;
+      refusalOf,
+    );
   }
 
   /*
-   * The newest messages, not the oldest, when there are more than the limit — and still
+   * The newest items, not the oldest, when there are more than the limit — and still
    * oldest-first in the answer.
    *
    * The same end the goal replay keeps and for its reason: a conversation is read to pick up
    * where it left off, which is at its end. What `truncated` therefore says is that the
-   * answer stopped short of the *oldest* messages, and the note says so in words so an
-   * operator does not read the first group on screen as the start of the session.
+   * answer stopped short of the *oldest* items, and the note says so in words so an
+   * operator does not read the first group on screen as the start of the session. The limit
+   * counts items, the unit the screen draws.
    */
-  const kept =
-    speaking.length > limit
-      ? speaking.slice(speaking.length - limit)
-      : speaking;
-  return {
-    ...base,
-    harnessSessionId: sessionId,
-    live,
-    source: "harness",
+  const kept = items.length > limit ? items.slice(items.length - limit) : items;
+  return standing(
+    {
+      ...base,
+      harnessSessionId: sessionId,
+      live,
+      source: "harness",
+      ephemeral: true,
+      note:
+        `From ${displayName}, which may delete it: this build stores no part of a conversation, so what is here lasts exactly as long as the harness keeps it. What the importer *wrote* is durable and is on the Scope tab and in the Estate.` +
+        (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
+        (blank > 0
+          ? ` ${String(blank)} empty ${blank === 1 ? "message is" : "messages are"} left out.`
+          : "") +
+        (kept.length < items.length
+          ? ` Shortened to the most recent ${String(kept.length)} items, so this does not start at the beginning of the session.`
+          : "") +
+        standingNote,
+      items: kept,
+      truncated: kept.length < items.length,
+      omittedBlank: blank,
+      at,
+    },
     continuation,
-    refusal: refusalOf,
-    ephemeral: true,
-    note:
-      `From ${displayName}, which may delete it: this build stores no part of a conversation, so what is here lasts exactly as long as the harness keeps it. What the importer *wrote* is durable and is on the Scope tab and in the Estate.` +
-      ` Replayed messages carry no tool arguments and no call ids, so a tool call and its result are not paired as they are live.` +
-      (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
-      (omittedBlank > 0
-        ? ` ${String(omittedBlank)} tool ${omittedBlank === 1 ? "call or result is" : "calls and results are"} left out: the reduced shape carries no text for them.`
-        : "") +
-      (kept.length < speaking.length
-        ? ` Shortened to the most recent ${String(kept.length)} messages, so this does not start at the beginning of the session.`
-        : "") +
-      standing,
-    messages: kept.map((entry, index): ImporterConversationMessage => ({
-      index,
-      type: entry.type,
-      text: entry.text,
-      ...(entry.error === undefined ? {} : { error: entry.error }),
-    })),
-    truncated: kept.length < speaking.length,
-    omittedBlank,
-    at: Date.now(),
-  } satisfies ImporterConversationView;
+    refusalOf,
+  );
 });

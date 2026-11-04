@@ -66,6 +66,7 @@
     IconLink,
     IconPlus,
   } from "../icons";
+  import { turnModel } from "../chat";
   import { ENDED_NOTE, strandedNote } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import Chat from "./Chat.svelte";
@@ -82,7 +83,11 @@
   /** Set when the session's harness is one this server does not run: see `strandedNote`. */
   let stranded = $derived(session?.strandedOn);
   /** The replay's refusal, when it answered `refused`: which one, and the server's sentence. */
-  let refusal = $derived(session?.history.refusal);
+  let refusal = $derived(
+    session?.history.standing?.continuation === "refused"
+      ? session.history.standing.refusal
+      : undefined,
+  );
   /**
    * The operator ended it: the server refuses a message to it.
    *
@@ -174,9 +179,9 @@
    * that must not happen is "resumes it" over a session that cannot be resumed.
    */
   let readingNote = $derived(
-    session?.history.continuation === "resume"
+    session?.history.standing?.continuation === "resume"
       ? "You are reading an earlier session. Your next message takes it back over: the importer keeps everything above, and works against the scope as it stands now, not as it stood then."
-      : session?.history.continuation === "fresh"
+      : session?.history.standing?.continuation === "fresh"
         ? "You are reading an earlier session that cannot be carried on. Your next message starts a new one, and the importer in it will not have read any of this — what this session wrote is on the Scope tab and in the Estate."
         : "You are reading an earlier session. Your next message continues it, with the scope as it stands now, not as it stood then.",
   );
@@ -267,18 +272,19 @@
         reply still being written, and a caption that appeared mid-stream would then move
         down with every row that landed above it.
 
-        **The model and no duration.** OpenCode's `2m 27s` is two times off one clock, the
-        operator's message's and the reply's, both stored by its server. Nothing here has
-        such a pair: a replayed turn carries no time at all (`ImporterTurn.at`), and a live
-        one's start is this tab's clock while every reply's `at` is the server's — not one
-        clock, and `LiveItem.at` is documented as no ordering key. The end of a turn is
-        known only from a poll that also ends on any failure to answer. A figure built from
-        those would look like a measurement and not be one.
+        **The model that answered this turn**, from the turn's own items (`turnModel`, A6
+        F10), and the session's current model only where the harness named none: after a
+        switch, an earlier turn was still answered by the model it was answered by.
+
+        **No duration yet.** A replayed turn now carries the harness's own times (A6 F10),
+        but a live one's start is this tab's clock while every reply's `at` is the
+        server's; U4 draws the footer's duration once both ends come from one clock.
       -->
-      {#if !group.subject.working && session !== undefined && session.model !== ""}
+      {@const model = turnModel(group) ?? session?.model ?? ""}
+      {#if !group.subject.working && model !== ""}
         <p class="foot">
           <!-- An expression, because Svelte trims the space off the end of an element's text. -->
-          <span class="visually-hidden">{"Model: "}</span>{session.model}
+          <span class="visually-hidden">{"Model: "}</span>{model}
         </p>
       {/if}
     {/snippet}

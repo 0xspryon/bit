@@ -29,6 +29,9 @@ const entries = (count: number): readonly MessageEntry[] =>
     type: index % 2 === 0 ? "assistant" : "tool",
     text: `message ${String(index)}`,
     error: undefined,
+    parts: [],
+    model: undefined,
+    at: undefined,
   }));
 
 const transport = (
@@ -94,7 +97,14 @@ describe("the harness has it", () => {
       stubHarness({
         messages: () =>
           Effect.succeed([
-            { type: "tool", text: "ran it", error: "exit status 2" },
+            {
+              type: "tool",
+              text: "ran it",
+              error: "exit status 2",
+              parts: [],
+              model: undefined,
+              at: undefined,
+            },
           ]),
       }),
     );

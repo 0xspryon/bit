@@ -96,6 +96,7 @@ import {
   type BlockChannel,
   type HarnessNarration,
   type MessageEntry,
+  type MessagePart,
   type NarrationDetail,
   type SessionRef,
   type SessionTitle,
@@ -597,6 +598,14 @@ export const openCodeNarration = (
    * somebody else's session — and a consumer then draws no percentage and no threshold.
    */
   window?: SessionWindow | undefined,
+  /**
+   * The model of each step this stream has seen open, by `assistantMessageID` (A6 F10), so a
+   * block or call can say which model wrote it. `session.step.started` is the only event
+   * that names the model; the blocks of that step carry only the message id. An entry is
+   * dropped when its step ends or fails, which bounds this by the steps in flight. A block
+   * of a step this stream joined after it started carries no model.
+   */
+  models: Map<string, string> = new Map(),
 ): HarnessNarration => {
   const record = (entry ?? {}) as {
     type?: unknown;
@@ -608,9 +617,22 @@ export const openCodeNarration = (
   const sequence = record.durable?.seq;
   const data = record.data ?? {};
   const callId = typeof data["id"] === "string" ? data["id"] : undefined;
+  const step = data["assistantMessageID"];
+  const stepModel = typeof step === "string" ? models.get(step) : undefined;
+  const named = stepModel === undefined ? {} : { model: stepModel };
 
   const detail = ((): NarrationDetail => {
     switch (type) {
+      case "session.step.started": {
+        const model = modelRefName(data["model"]);
+        if (typeof step === "string" && model !== undefined) {
+          models.set(step, model);
+        }
+        return { _tag: "opaque" };
+      }
+      case "session.step.failed":
+        if (typeof step === "string") models.delete(step);
+        return { _tag: "opaque" };
       case "session.text.delta":
         return blockDelta("reply", data);
       case "session.reasoning.delta":
@@ -621,6 +643,7 @@ export const openCodeNarration = (
               _tag: "reply",
               text: truncateNarration(data["text"]),
               ...blockKey("reply", data),
+              ...named,
             }
           : { _tag: "opaque" };
       case "session.reasoning.ended":
@@ -629,6 +652,7 @@ export const openCodeNarration = (
               _tag: "thinking",
               text: truncateNarration(data["text"]),
               ...blockKey("thinking", data),
+              ...named,
             }
           : { _tag: "opaque" };
       case "session.step.ended": {
@@ -647,6 +671,7 @@ export const openCodeNarration = (
          */
         const callId = data["assistantMessageID"];
         if (typeof callId !== "string") return { _tag: "opaque" };
+        models.delete(callId);
         const tokens = (data["tokens"] ?? {}) as {
           input?: unknown;
           output?: unknown;
@@ -681,6 +706,7 @@ export const openCodeNarration = (
               callId,
               tool: names.get(callId),
               input: truncateNarration(asJson(data["input"])),
+              ...named,
             };
       case "session.tool.success": {
         if (callId === undefined) return { _tag: "opaque" };
@@ -726,35 +752,208 @@ export const openCodeNarration = (
   };
 };
 
+/** A `Model.Ref` (`{ id, providerID }`) as the `provider/model` this build names it by. */
+const modelRefName = (value: unknown): string | undefined => {
+  const ref = (value ?? {}) as { id?: unknown; providerID?: unknown };
+  return typeof ref.id === "string" && typeof ref.providerID === "string"
+    ? `${ref.providerID}/${ref.id}`
+    : undefined;
+};
+
 /**
- * Reduces one inbox entry to the three fields a caller uses.
+ * Epoch milliseconds from a time the client decoded: `@opencode/schema` declares message
+ * times as `DateTimeUtcFromMillis`, so a decoded one is a `DateTime.Utc`
+ * (`epochMilliseconds`); a raw number is taken as it is.
+ */
+const millisOf = (value: unknown): number | undefined => {
+  if (typeof value === "number")
+    return Number.isFinite(value) ? value : undefined;
+  const millis = (value as { epochMilliseconds?: unknown } | null | undefined)
+    ?.epochMilliseconds;
+  return typeof millis === "number" && Number.isFinite(millis)
+    ? millis
+    : value instanceof Date
+      ? value.getTime()
+      : undefined;
+};
+
+/**
+ * One stored assistant message's content as parts, in the live stream's vocabulary (A6 F10).
  *
- * The entry union is wide and version-specific, so this reads defensively off an
- * already-decoded value rather than re-asserting a shape the client has validated.
- * `text` falls back to concatenating the entry's text parts, which is where an
- * assistant's reply actually lives.
+ * `@opencode/schema`'s `Session.Message.Assistant.content` is a list of `text`, `reasoning`
+ * and `tool` parts. Text and reasoning become `reply` and `thinking` with the `blockId` their
+ * stream used — {@link openCodeBlockId} from the message id and the part's ordinal, counted
+ * separately per channel as the events count it — so a replayed block is the one the live
+ * stream finished. A `tool` part is **richer than the stream**: its call and its outcome are
+ * one stored part, so it becomes a `toolCall` and, once the call has settled (`completed`
+ * or `error`), its `toolResult` — with the tool's name on both, which the live stream can
+ * only give a result whose call it saw. A call still `streaming` or `running` has no result
+ * yet, as live.
+ */
+const assistantContentParts = (
+  messageId: string | undefined,
+  content: readonly unknown[],
+  model: string | undefined,
+): MessagePart[] => {
+  const ordinals = { reply: 0, thinking: 0 };
+  const named = model === undefined ? {} : { model };
+  const keyed = (channel: BlockChannel) => {
+    const ordinal = ordinals[channel];
+    ordinals[channel] += 1;
+    return messageId === undefined
+      ? {}
+      : (() => {
+          const blockId = openCodeBlockId(channel, {
+            assistantMessageID: messageId,
+            ordinal,
+          });
+          return blockId === undefined ? {} : { blockId };
+        })();
+  };
+  return content.flatMap((part): MessagePart[] => {
+    const record = (part ?? {}) as {
+      type?: unknown;
+      text?: unknown;
+      id?: unknown;
+      name?: unknown;
+      state?: {
+        status?: unknown;
+        input?: unknown;
+        content?: unknown;
+        error?: { message?: unknown } | undefined;
+      };
+    };
+    if (record.type === "text" && typeof record.text === "string") {
+      return [
+        {
+          _tag: "reply",
+          text: truncateNarration(record.text),
+          ...keyed("reply"),
+          ...named,
+        },
+      ];
+    }
+    if (record.type === "reasoning" && typeof record.text === "string") {
+      return [
+        {
+          _tag: "thinking",
+          text: truncateNarration(record.text),
+          ...keyed("thinking"),
+          ...named,
+        },
+      ];
+    }
+    if (record.type !== "tool" || typeof record.id !== "string") return [];
+    const tool = typeof record.name === "string" ? record.name : undefined;
+    const state = record.state ?? {};
+    // A `streaming` call's input is still the JSON text being written; the others hold
+    // the parsed object.
+    const input =
+      typeof state.input === "string" ? state.input : asJson(state.input);
+    const call: MessagePart = {
+      _tag: "toolCall",
+      callId: record.id,
+      tool,
+      input: truncateNarration(input),
+      ...named,
+    };
+    if (state.status === "completed") {
+      return [
+        call,
+        {
+          _tag: "toolResult",
+          callId: record.id,
+          tool,
+          output: truncateNarration(partsText(state.content)),
+          failed: false,
+        },
+      ];
+    }
+    if (state.status === "error") {
+      // Worded as the live `session.tool.failed` is: the error's message, then any output.
+      const message =
+        typeof state.error?.message === "string"
+          ? state.error.message
+          : "the tool failed";
+      const output = partsText(state.content);
+      return [
+        call,
+        {
+          _tag: "toolResult",
+          callId: record.id,
+          tool,
+          output: truncateNarration(
+            output === "" ? message : `${message}\n${output}`,
+          ),
+          failed: true,
+        },
+      ];
+    }
+    return [call];
+  });
+};
+
+/**
+ * Reduces one stored message to what a caller uses, its blocks as parts (A6 F10).
+ *
+ * The entry union is wide and version-specific (`Session.Message.Info`: `user`,
+ * `assistant`, `shell`, `synthetic`, `idle`, `model-switched` …), so this reads defensively
+ * off an already-decoded value rather than re-asserting a shape the client has validated.
+ * `text` falls back to concatenating the entry's text parts, which is where an assistant's
+ * reply actually lives. Only an `assistant` entry has parts or a model; `at` is
+ * `time.created` on every kind.
  */
 const flatten = (entry: unknown): MessageEntry => {
   const record = (entry ?? {}) as {
+    id?: unknown;
     type?: unknown;
     text?: unknown;
+    description?: unknown;
+    model?: unknown;
+    time?: { created?: unknown } | undefined;
     error?: { message?: unknown } | undefined;
     content?: ReadonlyArray<{ type?: unknown; text?: unknown }> | undefined;
   };
-  const parts = Array.isArray(record.content) ? record.content : [];
+  const type = typeof record.type === "string" ? record.type : "unknown";
+  const content = Array.isArray(record.content) ? record.content : [];
+  const model = type === "assistant" ? modelRefName(record.model) : undefined;
+  /*
+   * A `system` entry's `text` is what the **model** was told — measured on 2.2.5, a whole
+   * "the tool catalog has changed" listing every tool — and `@opencode/schema` gives it a
+   * `description`, "a short human-readable summary for transcript display". A transcript is
+   * what this is read for, so the summary is the text when there is one.
+   */
+  const summary =
+    type === "system" &&
+    typeof record.description === "string" &&
+    record.description.trim() !== ""
+      ? record.description
+      : undefined;
   return {
-    type: typeof record.type === "string" ? record.type : "unknown",
+    type,
     text:
-      typeof record.text === "string"
-        ? record.text
-        : parts
-            .filter((part) => part.type === "text")
-            .map((part) => (typeof part.text === "string" ? part.text : ""))
-            .join("\n"),
+      summary !== undefined
+        ? summary
+        : typeof record.text === "string"
+          ? record.text
+          : content
+              .filter((part) => part.type === "text")
+              .map((part) => (typeof part.text === "string" ? part.text : ""))
+              .join("\n"),
     error:
       typeof record.error?.message === "string"
         ? record.error.message
         : undefined,
+    parts:
+      type === "assistant"
+        ? assistantContentParts(
+            typeof record.id === "string" ? record.id : undefined,
+            content,
+            model,
+          )
+        : [],
+    model,
+    at: millisOf(record.time?.created),
   };
 };
 
@@ -1816,6 +2015,8 @@ export const openCodeHarness = (
          * call succeeds or fails, which bounds this by the calls in flight.
          */
         const names = new Map<string, string>();
+        /** Each open step's model, for the same stream. See {@link openCodeNarration}. */
+        const models = new Map<string, string>();
         return api.event.subscribe().pipe(
           Stream.mapError(fail("event.subscribe")),
           Stream.filterMap(
@@ -1830,6 +2031,7 @@ export const openCodeHarness = (
                       event,
                       names,
                       contextLimits.get(sessionId),
+                      models,
                     ),
                   )
                 : Result.fail(event),

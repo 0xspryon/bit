@@ -130,8 +130,8 @@
       (round) => round.roundId === meterRoundId,
     );
     if (replay === undefined) return "not read";
-    const held = replay.messages.length;
-    return `${String(held)} held by the harness${replay.truncated ? ", shortened" : ""}`;
+    const held = replay.items.length;
+    return `${String(held)} ${held === 1 ? "item" : "items"} held by the harness${replay.truncated ? ", shortened" : ""}`;
   });
 
   let meterFacts = $derived<readonly MeterFact[]>(
@@ -165,7 +165,7 @@
            * the budget, or one still in flight — it would read as zero messages rather than
            * as no answer. See {@link messagesHeld}.
            */
-          { term: "Messages", value: messagesHeld },
+          { term: "Replayed", value: messagesHeld },
         ],
   );
 

@@ -141,6 +141,9 @@ describe("the summary of a dead attempt's transcript", () => {
     type,
     text,
     error,
+    parts: [],
+    model: undefined,
+    at: undefined,
   });
 
   /**

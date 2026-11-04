@@ -38,11 +38,23 @@ import {
   kindLabel,
   outcomeTint,
   roundUsageScope,
+  turnModel,
   usageScope,
   type ContextMeter,
   type SentTurn,
 } from "../src/lib/chat";
 import type { GoalConversationView } from "@bit/contracts";
+import { replayItem } from "./fakeServer";
+
+/** A group's rows that came from the server's replay (A6 F10): the same rows, `replay:` ids. */
+const replayedRows = (
+  group: { readonly rows: readonly { readonly key: string }[] } | undefined,
+) => (group?.rows ?? []).filter((row) => row.key.startsWith("replay:"));
+
+/** A group's rows from this tab's own feed: everything the replay did not bring. */
+const liveRows = <Row extends { readonly key: string }>(
+  group: { readonly rows: readonly Row[] } | undefined,
+): Row[] => (group?.rows ?? []).filter((row) => !row.key.startsWith("replay:"));
 
 const AT = 1_700_000_000_000;
 const ROUND = "rnd_1";
@@ -518,7 +530,7 @@ describe("the three absences, which must never be one", () => {
             source: "pending",
             ephemeral: false,
             note: "OpenCode holds nothing for this round yet.",
-            messages: [],
+            items: [],
             truncated: false,
             omittedBlank: 0,
             promptOmitted: false,
@@ -540,7 +552,7 @@ describe("the three absences, which must never be one", () => {
             source: "forgotten",
             ephemeral: false,
             note: "OpenCode no longer holds session ses_1.",
-            messages: [],
+            items: [],
             truncated: false,
             omittedBlank: 0,
             promptOmitted: false,
@@ -568,7 +580,7 @@ describe("the three absences, which must never be one", () => {
             source: "none",
             ephemeral: false,
             note: "OpenCode still holds this round's session and there are no messages under it.",
-            messages: [],
+            items: [],
             truncated: false,
             omittedBlank: 0,
             promptOmitted: false,
@@ -608,13 +620,7 @@ describe("the replay and the live tail", () => {
           source: "harness",
           ephemeral: true,
           note: "From OpenCode, which may delete it.",
-          messages: [
-            {
-              index: 0,
-              type: "assistant",
-              text: "two dimensions are untested",
-            },
-          ],
+          items: [replayItem(0, "turn.reply", "two dimensions are untested")],
           truncated: false,
           omittedBlank: 0,
           promptOmitted: false,
@@ -628,7 +634,7 @@ describe("the replay and the live tail", () => {
     const prose = view.groups[0]?.prose;
     expect(prose?._tag).toBe("replayed");
     expect(prose && "ephemeral" in prose ? prose.ephemeral : false).toBe(true);
-    expect(view.groups[0]?.replayed.length).toBe(1);
+    expect(replayedRows(view.groups[0]).length).toBe(1);
   });
 
   test("a replay and the live tail are shown together, which is what a refresh mid-round needs", () => {
@@ -640,8 +646,8 @@ describe("the replay and the live tail", () => {
       narrationFloor: 10,
     });
     expect(view.groups[0]?.prose._tag).toBe("replayed");
-    expect(view.groups[0]?.replayed.length).toBe(1);
-    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual([
+    expect(replayedRows(view.groups[0]).length).toBe(1);
+    expect(liveRows(view.groups[0]).map((row) => row.item.body)).toEqual([
       "live now",
     ]);
   });
@@ -659,7 +665,7 @@ describe("the replay and the live tail", () => {
             source: "pending",
             ephemeral: false,
             note: "OpenCode holds nothing for this round yet.",
-            messages: [],
+            items: [],
             truncated: false,
             omittedBlank: 0,
             promptOmitted: false,
@@ -668,8 +674,8 @@ describe("the replay and the live tail", () => {
       }),
     });
     expect(view.groups[0]?.prose._tag).toBe("live");
-    expect(view.groups[0]?.replayed.length).toBe(0);
-    expect(view.groups[0]?.rows.length).toBe(1);
+    expect(replayedRows(view.groups[0]).length).toBe(0);
+    expect(liveRows(view.groups[0]).length).toBe(1);
   });
 
   test("narration already inside the replay is dropped from the live tail", () => {
@@ -680,7 +686,7 @@ describe("the replay and the live tail", () => {
       narration: replayed(),
       narrationFloor: 5,
     });
-    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual([
+    expect(liveRows(view.groups[0]).map((row) => row.item.body)).toEqual([
       "after the read",
     ]);
   });
@@ -691,7 +697,7 @@ describe("the replay and the live tail", () => {
       narration: replayed(),
       narrationFloor: 9_999,
     });
-    const rows = view.groups[0]?.rows ?? [];
+    const rows = liveRows(view.groups[0]);
     expect(rows.map((row) => row.item.id)).toEqual(["record:evt-kept"]);
     // A record on its own is not a live narration, so the replayed block still shows.
     expect(view.groups[0]?.prose._tag).toBe("replayed");
@@ -711,7 +717,7 @@ describe("the goal conversation", () => {
     source: "harness",
     ephemeral: true,
     note: "From OpenCode, which may delete it.",
-    messages: [],
+    items: [],
     truncated: false,
     omittedBlank: 0,
     at: AT,
@@ -775,16 +781,14 @@ describe("the goal conversation", () => {
     const view = built({
       conversation: conversation({
         live: false,
-        messages: [
-          { index: 0, type: "assistant", text: "two rounds have run" },
-        ],
+        items: [replayItem(0, "turn.reply", "two rounds have run")],
         note: "From Claude Code. This conversation was opened by a server process that is no longer running.",
       }),
     });
 
     const group = view.groups[0];
     expect(group?.prose._tag).toBe("replayed");
-    expect(group?.replayed).toHaveLength(1);
+    expect(replayedRows(group)).toHaveLength(1);
     // The separator reads this: the words are here and the conversation is not continuable,
     // which are two facts and must not be collapsed into one.
     expect(group?.subject.conversation?.live).toBe(false);
@@ -800,7 +804,7 @@ describe("the goal conversation", () => {
       conversation: conversation(),
     });
 
-    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual([
+    expect(liveRows(view.groups[0]).map((row) => row.item.body)).toEqual([
       "the agent",
     ]);
   });
@@ -831,17 +835,17 @@ describe("the goal conversation", () => {
      */
     const view = built({
       conversation: conversation({
-        messages: [
-          { index: 0, type: "user", text: "look at the lockout path" },
-          { index: 1, type: "assistant", text: "I will steer the planner." },
+        items: [
+          replayItem(0, "turn.operator", "look at the lockout path"),
+          replayItem(1, "turn.reply", "I will steer the planner."),
         ],
       }),
       sent: [sent()],
     });
 
-    expect(view.groups[0]?.replayed).toHaveLength(2);
+    expect(replayedRows(view.groups[0])).toHaveLength(2);
     // No "YOU" row for a sentence the replayed block above already shows.
-    expect(view.groups[0]?.rows).toEqual([]);
+    expect(liveRows(view.groups[0])).toEqual([]);
   });
 
   test("a sentence re-sent after a stale replay is still shown", () => {
@@ -860,19 +864,21 @@ describe("the goal conversation", () => {
      */
     const view = built({
       conversation: conversation({
-        messages: [
-          { index: 0, type: "user", text: "ok" },
-          { index: 1, type: "assistant", text: "done" },
+        items: [
+          replayItem(0, "turn.operator", "ok"),
+          replayItem(1, "turn.reply", "done"),
         ],
       }),
       sent: [sent({ index: 1, text: "ok" })],
       replayedThrough: 0,
     });
 
-    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual(["ok"]);
+    expect(liveRows(view.groups[0]).map((row) => row.item.body)).toEqual([
+      "ok",
+    ]);
     // And the old entry is still in the replayed block above it, which is correct: those
     // are two different messages that happen to say the same thing.
-    expect(view.groups[0]?.replayed).toHaveLength(2);
+    expect(replayedRows(view.groups[0])).toHaveLength(2);
   });
 
   test("the same sentence sent twice with one in the replay still shows two", () => {
@@ -880,7 +886,7 @@ describe("the goal conversation", () => {
     // replay that has caught up with one of them must not hide the other.
     const view = built({
       conversation: conversation({
-        messages: [{ index: 0, type: "user", text: "ok" }],
+        items: [replayItem(0, "turn.operator", "ok")],
       }),
       sent: [
         sent({ index: 1, text: "ok" }),
@@ -888,7 +894,9 @@ describe("the goal conversation", () => {
       ],
     });
 
-    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual(["ok"]);
+    expect(liveRows(view.groups[0]).map((row) => row.item.body)).toEqual([
+      "ok",
+    ]);
   });
 
   test("a sent message the replay does not have is kept", () => {
@@ -896,12 +904,12 @@ describe("the goal conversation", () => {
     // of a replay that does not contain it.
     const view = built({
       conversation: conversation({
-        messages: [{ index: 0, type: "assistant", text: "One round has run." }],
+        items: [replayItem(0, "turn.reply", "One round has run.")],
       }),
       sent: [sent({ text: "and the admin console?" })],
     });
 
-    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual([
+    expect(liveRows(view.groups[0]).map((row) => row.item.body)).toEqual([
       "and the admin console?",
     ]);
   });
@@ -924,7 +932,7 @@ describe("the goal conversation", () => {
       conversation: conversation(),
     });
 
-    expect(view.groups[0]?.rows.map((row) => row.item.body)).toEqual([
+    expect(liveRows(view.groups[0]).map((row) => row.item.body)).toEqual([
       "earlier",
       "look at the lockout path",
       "later",
@@ -1021,7 +1029,7 @@ describe("the goal conversation", () => {
         conversation: conversation(),
       });
 
-      const rows = view.groups[0]?.rows ?? [];
+      const rows = liveRows(view.groups[0]);
       expect(rows).toHaveLength(1);
       expect(rows[0]?.item.kind).toBe("plan.round.steered");
       expect(rows[0]?.item.origin).toBe("record");
@@ -1040,7 +1048,7 @@ describe("the goal conversation", () => {
         conversation: conversation(),
       });
 
-      const rows = view.groups[0]?.rows ?? [];
+      const rows = liveRows(view.groups[0]);
       expect(rows).toHaveLength(1);
       expect(rows[0]?.item.kind).toBe("goal.ended");
       expect(rows[0]?.write).toBe("recorded");
@@ -1074,7 +1082,7 @@ describe("the goal conversation", () => {
         conversation: conversation(),
       });
 
-      const rows = view.groups[0]?.rows ?? [];
+      const rows = liveRows(view.groups[0]);
       expect(rows).toHaveLength(1);
       expect(rows[0]?.item.toolName).toBe("wake_planner");
       // `null`, which is "not a write on this surface" — not `unresolved`, which would be a
@@ -1121,7 +1129,7 @@ describe("the goal conversation", () => {
         conversation: conversation(),
       });
 
-      const rows = view.groups[0]?.rows ?? [];
+      const rows = liveRows(view.groups[0]);
       expect(rows).toHaveLength(1);
       expect(rows[0]?.write).toBe("refused");
     });
@@ -1327,5 +1335,73 @@ describe("the context meter", () => {
     expect(groupDigits(0)).toBe("0");
     expect(groupDigits(999)).toBe("999");
     expect(groupDigits(1_000_000)).toBe("1,000,000");
+  });
+});
+
+/* ── One renderer for live and replay (A6 F10) ──────────────────────────────── */
+
+describe("a replayed round's rows", () => {
+  const replayedRound = (items: readonly LiveItem[]) =>
+    narration({
+      rounds: [
+        {
+          roundId: ROUND,
+          harnessSessionId: "ses_1",
+          source: "harness",
+          ephemeral: true,
+          note: "From Claude Code, which may delete it.",
+          items,
+          truncated: false,
+          omittedBlank: 0,
+          promptOmitted: false,
+        },
+      ],
+    });
+
+  test("a replayed write call folds into the record the live feed brought, as live", () => {
+    // The pairing a reload could never make before: the replay had no calls, so a settled
+    // round's `intent.added` stood alone and its call was nowhere.
+    const call = replayItem(0, "tool.call", "", {
+      roundId: ROUND,
+      tool: "mcp__bit-rnd_1__add_intent",
+      toolName: "add_intent",
+      callId: "toolu_1",
+      input: '{"question":"does the limiter reset?"}',
+    });
+    const answered = replayItem(1, "tool.result", "", {
+      roundId: ROUND,
+      callId: "toolu_1",
+      output: '{"intentId":"int_real"}',
+      outcome: "ok",
+    });
+    const view = chat({
+      rounds: [round({ status: "settled", endedAt: AT + 1_000 })],
+      items: [record({ id: "record:evt-intent" })],
+      narration: replayedRound([call, answered]),
+      narrationFloor: 0,
+    });
+    const rows = view.groups[0]?.rows ?? [];
+    expect(
+      rows.map((row) => [row.key, row.write, row.proposedBy?.callId]),
+    ).toEqual([["record:evt-intent", "recorded", "toolu_1"]]);
+  });
+
+  test("the model a turn's footer names is the transcript's, the newest the turn carries", () => {
+    const view = chat({
+      narration: replayedRound([
+        replayItem(0, "turn.reply", "first", {
+          roundId: ROUND,
+          model: "claude-haiku-4-5-20251001",
+        }),
+        replayItem(1, "turn.reply", "after the switch", {
+          roundId: ROUND,
+          model: "claude-sonnet-5",
+        }),
+        // A result names no model, and does not hide the call's.
+        replayItem(2, "tool.result", "", { roundId: ROUND, callId: "x" }),
+      ]),
+    });
+    expect(turnModel(view.groups[0] ?? { rows: [] })).toBe("claude-sonnet-5");
+    expect(turnModel({ rows: [] })).toBeUndefined();
   });
 });

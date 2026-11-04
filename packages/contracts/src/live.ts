@@ -288,8 +288,9 @@ export const LIVE_ITEM_KINDS = [
    * **Streamed and never stored**, which is a stronger statement than the rest of this
    * channel's. Every other activity kind is lossy *by accident* — the buses are sliding
    * buffers — whereas this one is lossy by decision: there is no durable field for it, no
-   * evidence, no transcript artefact, and it is not read back on a reload even from the
-   * harness's own copy. It lives as long as the harness's retention and no longer.
+   * evidence, no transcript artefact. A reload reads it back from the **harness's** own copy
+   * like the rest of a conversation (A6 F10), so it lives as long as the harness's retention
+   * and no longer — bit never holds a copy.
    *
    * It is **a record of what was considered, not of what happened**, and nothing on this
    * stream contradicts that: the thing that happened is the `turn.reply` or the `tool.call`
@@ -307,6 +308,24 @@ export const LIVE_ITEM_KINDS = [
   "turn.thinking",
   "tool.call",
   "tool.result",
+  /**
+   * The operator's own words in a conversation (A6 F10).
+   *
+   * Never on the live stream: a tab mints its own for a message it sent (`operatorTurn` in
+   * the web's `chat.ts`), because nothing stores what the operator said. The server writes
+   * one only in a **replay** — a `user` entry the harness holds for an importer or goal
+   * conversation, with this server's framing trimmed off — so a reloaded conversation draws
+   * the operator's turns as the live one did.
+   */
+  "turn.operator",
+  /**
+   * Something the harness holds for a session that is neither the agent's reply, thinking
+   * or tool use nor the operator's words (A6 F10), named in {@link LiveItem.headline} by the
+   * harness's own word: an OpenCode `shell` or `synthetic` entry, a steer a planner round
+   * was sent (`user`), or an `error` the harness recorded on a turn (`outcome` `failed`).
+   * Replay only. Labelled with that word so it never reads as the agent having said it.
+   */
+  "turn.other",
   "action.denied",
 ] as const;
 
@@ -520,6 +539,17 @@ export const LiveItem = Schema.Struct({
    * for how a client applies one; it is never stored and never replayed.
    */
   streaming: Schema.optionalKey(Schema.Literal(true)),
+  /**
+   * The model that produced this item, as the harness named it, on the agent's own items —
+   * a reply, thinking, a tool call — when the harness said (A6 F10). What a turn's footer
+   * names, rather than the session's current model, which a switch moves (D6).
+   *
+   * Claude Code's `message.model` (a dated id, `claude-haiku-4-5-20251001`), live and
+   * replayed; OpenCode's `provider/model` of the assistant message, replayed, and live from
+   * the step that opened it. Absent wherever the harness did not say: a tool result, an
+   * operator turn, a record, a block streamed before its step's model was seen.
+   */
+  model: Schema.optionalKey(Schema.String),
 });
 export type LiveItem = typeof LiveItem.Type;
 

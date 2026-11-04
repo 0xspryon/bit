@@ -60,19 +60,17 @@
  */
 import { Effect, type Duration } from "effect";
 
-import type {
-  GoalConversationMessage,
-  GoalConversationView,
-} from "@bit/contracts";
+import type { GoalConversationView } from "@bit/contracts";
 
 import { SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
 import { operatorTextOf } from "./goalPrompt";
 import type { HarnessResolver } from "../harness/resolver";
+import { projectReplay } from "../run/liveTranscript";
 
 /** How long the harness is given to answer about one conversation. */
 export const GOAL_NARRATION_FETCH_TIMEOUT: Duration.Input = "5 seconds";
 
-/** How many messages one conversation's replay answers with before it says it stopped. */
+/** How many items one conversation's replay answers with before it says it stopped (newest kept). */
 export const GOAL_NARRATION_READ_LIMIT = 400;
 
 /** What a goal's recorded session is, as this reader needs it. */
@@ -97,7 +95,7 @@ const empty = (input: {
   source: input.source,
   ephemeral: false,
   note: input.note,
-  messages: [],
+  items: [],
   truncated: false,
   // Nothing was left out, because nothing came back. A count here would imply there had
   // been something to count.
@@ -257,17 +255,6 @@ export const goalConversationNarration = Effect.fnUntraced(function* (input: {
   }
 
   /**
-   * The blanks, dropped and counted.
-   *
-   * The reduced shape has no text for a `tool_use` or `tool_result` block, so each one
-   * arrives as an entry with an empty `text` and no error — on a real settled round that
-   * was 15 of 21 rows, rendered as turns with nothing in them. An entry carrying an
-   * `error` is **kept** even with no text: a failure with no prose is still the agent
-   * telling us something.
-   *
-   * Unlike a round's replay, no `user` entry is dropped. See this module's header.
-   */
-  /**
    * The framing above each of the operator's messages, taken off before anything else.
    *
    * Before the blanks and before the limit, for `roundNarration.ts`'s reason in the same
@@ -283,36 +270,43 @@ export const goalConversationNarration = Effect.fnUntraced(function* (input: {
   const framingOmitted = trimmed.some(
     (entry, index) => entry.text !== fetched.success[index]?.text,
   );
-  const speaking = trimmed.filter(
-    (entry) => entry.text.trim() !== "" || entry.error !== undefined,
-  );
-  const omittedBlank = trimmed.length - speaking.length;
-  if (speaking.length === 0) {
+  /*
+   * The conversation as the live stream's own items (A6 F10): the operator's words, the
+   * agent's replies, thinking and tool calls with their results. What produced no item at all
+   * is counted in `omittedBlank`. Unlike a round's replay, no `user` entry is dropped.
+   */
+  const { items, blank } = projectReplay({
+    entries: trimmed,
+    subject: { _tag: "goal", goalId: input.goalId },
+    harnessSessionId: sessionId,
+    users: "operator",
+    fallbackAt: at,
+  });
+  if (items.length === 0) {
     return {
       targetId: input.targetId,
       goalId: input.goalId,
       harnessSessionId: sessionId,
       live,
       // Still `harness`, not `none`: the harness **does** hold this session and did answer
-      // about it. The conversation made tool calls and said nothing in words, which is a
-      // real state, and reporting it as `none` would collapse it into "the harness held
-      // nothing at all".
+      // about it. Everything it holds is empty, which is a real state, and reporting it as
+      // `none` would collapse it into "the harness held nothing at all".
       source: "harness",
       ephemeral: true,
       note:
-        `From ${displayName}, which may delete it. Nothing here is words: everything the harness holds for this conversation is ` +
-        `${String(omittedBlank)} tool ${omittedBlank === 1 ? "call or result" : "calls and results"}, which the reduced replay shape carries no text for.` +
+        `From ${displayName}, which may delete it. Nothing here can be shown: everything the harness holds for this conversation is ` +
+        `${String(blank)} empty ${blank === 1 ? "message" : "messages"}.` +
         (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
         restart,
-      messages: [],
+      items: [],
       truncated: false,
-      omittedBlank,
+      omittedBlank: blank,
       at,
     } satisfies GoalConversationView;
   }
 
   /**
-   * The newest messages, not the oldest.
+   * The newest items, not the oldest.
    *
    * The opposite end from a round's replay, and deliberately: a round is read to find out
    * what it concluded, which is at its end, and a long conversation is read to pick up
@@ -320,10 +314,7 @@ export const goalConversationNarration = Effect.fnUntraced(function* (input: {
    * conversation would hand an operator the first forty messages of a hundred and call it a
    * replay.
    */
-  const kept =
-    speaking.length > limit
-      ? speaking.slice(speaking.length - limit)
-      : speaking;
+  const kept = items.length > limit ? items.slice(items.length - limit) : items;
   return {
     targetId: input.targetId,
     goalId: input.goalId,
@@ -333,23 +324,17 @@ export const goalConversationNarration = Effect.fnUntraced(function* (input: {
     ephemeral: true,
     note:
       `From ${displayName}, which may delete it: this build stores no part of a conversation, so what is here lasts exactly as long as the harness keeps it.` +
-      ` Replayed messages carry no tool arguments and no call ids, so a tool call and its result are not paired as they are live.` +
       (framingOmitted ? ` ${FRAMING_NOTE}` : "") +
-      (omittedBlank > 0
-        ? ` ${String(omittedBlank)} tool ${omittedBlank === 1 ? "call or result is" : "calls and results are"} left out: the reduced shape carries no text for them.`
+      (blank > 0
+        ? ` ${String(blank)} empty ${blank === 1 ? "message is" : "messages are"} left out.`
         : "") +
-      (kept.length < speaking.length
-        ? ` Shortened to the most recent ${String(kept.length)} messages.`
+      (kept.length < items.length
+        ? ` Shortened to the most recent ${String(kept.length)} items.`
         : "") +
       restart,
-    messages: kept.map((entry, index): GoalConversationMessage => ({
-      index,
-      type: entry.type,
-      text: entry.text,
-      error: entry.error,
-    })),
-    truncated: kept.length < speaking.length,
-    omittedBlank,
+    items: kept,
+    truncated: kept.length < items.length,
+    omittedBlank: blank,
     at,
   } satisfies GoalConversationView;
 });

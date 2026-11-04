@@ -28,6 +28,8 @@
  */
 import { Schema } from "effect";
 
+import { LiveItem } from "./live";
+
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
   description: "Epoch milliseconds.",
@@ -289,49 +291,6 @@ export const RoundNarrationSource = Schema.Literals([
 export type RoundNarrationSource = typeof RoundNarrationSource.Type;
 
 /**
- * One replayed message of a round's narration.
- *
- * **The reduced shape, and the reduction is the cost decision 14 accepted.**
- * `AgentHarness.messages` answers `{ type, text, error }` per entry: no call ids, no tool
- * arguments, no pairing between a call and its result. So a replayed round does **not**
- * reconstruct the paired tool blocks a live round shows, and the view has to say so rather
- * than render a thinner transcript as though it were the same thing.
- *
- * `type` is the harness's own word, unmapped — `assistant`, `tool`, `result` — exactly as
- * `TranscriptEntry.type` is, because mapping it would mean inventing a vocabulary over two
- * harnesses that do not share one.
- */
-export const RoundNarrationMessage = Schema.Struct({
-  /**
-   * Position in **this answer**, from zero. A stable key for rendering, and nothing else.
-   *
-   * **It is not the harness's cursor and it cannot join the live tail**, which an earlier
-   * version of this comment claimed and which would have misled anyone building a client
-   * against the published shape. `AgentHarness.messages` answers
-   * `{ type, text, error }` per entry with no index at all, so the server manufactures this
-   * as the array position of what it kept — after the omissions below, which is why it is a
-   * position in the answer rather than in the harness's log.
-   *
-   * The join between a replay and the live tail is therefore **not** by this field. It is by
-   * the client's own arrival order: the browser records the in-process narration publish
-   * counter before the replay request leaves, and drops live narration at or below it as
-   * already replayed (`apps/web/src/lib/app.svelte.ts`). The overlap that leaves is stated
-   * rather than hidden — an entry the harness already held when it answered, but which this
-   * process published between then and the answer landing, appears in both — and the
-   * replayed block is labelled a replay rather than claiming completeness. It cannot be
-   * closed from here: `HarnessNarration.sequence` exists on the harness seam and OpenCode
-   * populates it from its event store, but that is a different index space from a position
-   * in the `messages` array, and Claude Code leaves it unset. There is no index the two
-   * channels share.
-   */
-  index: Schema.Int,
-  type: Schema.String,
-  text: Schema.String,
-  error: Schema.optional(Schema.String),
-});
-export type RoundNarrationMessage = typeof RoundNarrationMessage.Type;
-
-/**
  * One round's narration as the planner view replays it after a refresh.
  *
  * Paired with the round's own row, never instead of it: the row is where the status and
@@ -357,25 +316,31 @@ export const RoundNarration = Schema.Struct({
    * only thing that distinguishes them on screen.
    */
   note: Schema.String,
-  messages: Schema.Array(RoundNarrationMessage),
+  /**
+   * What the harness holds of the round, as the **same items the live stream carries**
+   * (A6 F10): replies, thinking, tool calls and their results, oldest first, each with
+   * `roundId` set — so a reloaded round draws through the one renderer a watched one does.
+   * A steer the round was sent is a `turn.other` item labelled `user`.
+   *
+   * Every `id` is `replay:<n>`, a position in **this answer** and a render key: not the
+   * harness's cursor, and not a join with the live tail. That join is the client's own
+   * arrival order — it records the in-process narration publish counter before the request
+   * leaves and drops live narration at or below it (`apps/web/src/lib/app.svelte.ts`). The
+   * residual overlap (an entry the harness held when it answered and this process published
+   * before the answer landed) is stated rather than hidden: the block is labelled a replay.
+   */
+  items: Schema.Array(LiveItem),
   /** Messages this answer stopped short of. A long round is thousands of entries. */
   truncated: Schema.Boolean,
   /**
-   * How many entries were left out because the reduced shape holds nothing to show for them.
+   * How many harness entries produced no item: nothing in them to show.
    *
-   * **A number rather than a row each, and the reason is what a row each actually looked
-   * like.** `AgentHarness.messages` reduces every block of a message to `{ type, text,
-   * error }`, so a `tool_use` or `tool_result` block becomes an entry with an empty `text`
-   * and no error. Rendered as turns, those were 15 of 21 rows on a real settled round: a
-   * column of labels saying ASSISTANT and USER with nothing under them, with the round's
-   * three actual sentences buried in it. A reader could not tell them from turns in which
-   * the planner said nothing, which is a blank presented as content — the opposite of
-   * degrading honestly.
-   *
-   * So they are omitted and counted. The count is what keeps the omission from being
-   * silent, and it is also the honest description of what was lost: these are the round's
-   * tool calls and results, and the reduced shape has no text, no arguments and no pairing
-   * for them. They are in the live rows for a round this tab watched.
+   * Since A6 F10 a replay maps every block the live stream would — reply, thinking, tool
+   * call, tool result — so what is left is genuinely empty: a block the provider closed
+   * with no text, a thinking block from a session whose thinking was not summarized
+   * (Claude Code sends it as `""`), a message with no blocks. Counted rather than drawn,
+   * because an empty row reads as the agent having said nothing on purpose, and counted
+   * rather than hidden, because an omission nobody can count reads as less having happened.
    */
   omittedBlank: Schema.Int,
   /**
