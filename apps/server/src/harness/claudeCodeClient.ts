@@ -727,9 +727,11 @@ const DEFAULT_TASK_STOP_TIMEOUT: Duration.Input = "3 seconds";
  * whole `interruptSession` 10 s (`SETTLEMENT_ASK_TIMEOUT`) and abandon it after that. Under
  * the 30 s control timeout a CLI that never acknowledged was still being waited on when the
  * supervisor gave up, so the forced close that follows a refused interrupt never ran and
- * the CLI kept going. 3 s, then at most {@link DEFAULT_CLI_STOP_BOUNDS}' 2 s to end the
- * CLI, fits inside those 10 s with room; and an acknowledged interrupt followed by
- * `stopTask`s takes at most this plus {@link DEFAULT_TASK_STOP_TIMEOUT}, 6 s. 2.1.310
+ * the CLI kept going. Both worst cases fit inside those 10 s: an interrupt never
+ * acknowledged takes this 3 s, then at most {@link DEFAULT_CLI_STOP_BOUNDS}' 2 s to end the
+ * CLI, about 5 s; an acknowledged interrupt followed by `stopTask`s takes this 3 s, plus
+ * {@link DEFAULT_TASK_STOP_TIMEOUT}'s 3 s for the asks (made at once), plus
+ * {@link TASK_STOP_SETTLE_MILLIS}' 2 s for the tasks to say they are over, 8 s. 2.1.310
  * acknowledges an interrupt in ~20 ms (measured, at `interruptSession`), so a CLI that
  * takes 3 s is one this process can no longer steer.
  */

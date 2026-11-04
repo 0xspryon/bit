@@ -125,7 +125,7 @@ import {
 } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import { renderScopeBlock } from "../scope/scopePrompt";
-import { RunNarrations } from "./narration";
+import { narratesOnSharedBus, RunNarrations } from "./narration";
 import {
   SETTLEMENT_ASK_TIMEOUT,
   renderEnd,
@@ -1250,12 +1250,15 @@ const make = Effect.fnUntraced(function* (options?: {
     const outcome = yield* Effect.result(
       Stream.runForEach(harness.sessionEvents(harnessSessionId), (entry) =>
         Effect.andThen(
-          narrations.publish({
-            targetId,
-            subject: { _tag: "attempt", attemptId },
-            harnessSessionId,
-            entry,
-          }),
+          // A block delta stays off the bus: see `narratesOnSharedBus`.
+          narratesOnSharedBus(entry)
+            ? narrations.publish({
+                targetId,
+                subject: { _tag: "attempt", attemptId },
+                harnessSessionId,
+                entry,
+              })
+            : Effect.void,
           Effect.sync(() => {
             if (entry.outcome !== undefined) report.narrated = entry.outcome;
           }),

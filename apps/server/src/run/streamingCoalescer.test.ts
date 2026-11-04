@@ -18,6 +18,7 @@ import {
   type NarrationDetail,
 } from "../harness/agentHarness";
 import {
+  ENDED_BLOCKS_KEPT,
   OPEN_BLOCKS_MAX,
   PARTIAL_NARRATION_TYPE,
   makeStreamingCoalescer,
@@ -234,22 +235,53 @@ describe("memory", () => {
     expect(outcome).toEqual({ during: 2, after: 0 });
   });
 
-  test("blocks that never end are capped, oldest dropped first", async () => {
+  test("blocks that never end are capped, oldest dropped first, and a dropped block stays dropped", async () => {
     const outcome = await withCoalescer((coalescer, published) =>
       Effect.gen(function* () {
         for (let index = 0; index <= OPEN_BLOCKS_MAX; index += 1) {
           yield* coalescer.delta(reply(`b${String(index)}`, "x"));
         }
         const open = yield* coalescer.openBlocks;
+        // Room again: the dropped block must still not come back.
+        yield* coalescer.end("b1");
         const before = published.length;
-        // The oldest was dropped: its next piece opens it afresh, as a new block would.
+        // Reopening it would show "y" in place of "xy": the block losing its start.
         yield* TestClock.adjust("10 millis");
         yield* coalescer.delta(reply("b0", "y"));
-        return { open, reopened: published.slice(before) };
+        yield* TestClock.adjust("1 second");
+        return {
+          open,
+          reopened: published.slice(before),
+          after: yield* coalescer.openBlocks,
+        };
       }),
     );
     expect(outcome.open).toBe(OPEN_BLOCKS_MAX);
-    expect(outcome.reopened.map((partial) => partial.text)).toEqual(["y"]);
+    expect(outcome.reopened).toEqual([]);
+    expect(outcome.after).toBe(OPEN_BLOCKS_MAX - 1);
+  });
+
+  test("a late delta is refused for as long as its block is remembered, a dropped block included", async () => {
+    // The module header says why a delta cannot arrive later than this window; this pins
+    // the window itself, for an ended block and for one dropped at the cap alike.
+    const outcome = await withCoalescer((coalescer, published) =>
+      Effect.gen(function* () {
+        for (let index = 0; index <= OPEN_BLOCKS_MAX; index += 1) {
+          yield* coalescer.delta(reply(`open${String(index)}`, "x"));
+        }
+        // `open0` was dropped, and is the oldest id remembered. Then `ended` ends, and as
+        // many more as the memory holds beside the two of them.
+        yield* coalescer.end("ended");
+        for (let index = 0; index < ENDED_BLOCKS_KEPT - 2; index += 1) {
+          yield* coalescer.end(`later${String(index)}`);
+        }
+        const before = published.length;
+        yield* coalescer.delta(reply("open0", "late"));
+        yield* coalescer.delta(reply("ended", "late"));
+        return published.slice(before);
+      }),
+    );
+    expect(outcome).toEqual([]);
   });
 
   test("a block's text is capped as the finished block's is, and stops growing past it", async () => {
@@ -271,6 +303,35 @@ describe("memory", () => {
     expect(outcome.texts[1]).toBe(
       `${"a".repeat(NARRATION_FIELD_MAX)}${NARRATION_TRUNCATED_MARK}`,
     );
+  });
+
+  test("ending every block flushes each one's held text, then refuses their late pieces", async () => {
+    const outcome = await withCoalescer((coalescer, published) =>
+      Effect.gen(function* () {
+        yield* coalescer.delta({ ...reply("t1", "Hmm"), channel: "thinking" });
+        yield* coalescer.delta(reply("b1", "Sto"));
+        yield* TestClock.adjust("10 millis");
+        yield* coalescer.delta(reply("b1", "pped"));
+        yield* coalescer.endAll;
+        const ended = published.map((partial) => [
+          partial.blockId,
+          partial.text,
+        ]);
+        const open = yield* coalescer.openBlocks;
+        yield* TestClock.adjust("1 second");
+        yield* coalescer.delta(reply("b1", " late"));
+        yield* TestClock.adjust("1 second");
+        return { ended, open, total: published.length };
+      }),
+    );
+    expect(outcome.ended).toEqual([
+      ["t1", "Hmm"],
+      ["b1", "Sto"],
+      // Held when the turn ended, and sent at once rather than lost.
+      ["b1", "Stopped"],
+    ]);
+    expect(outcome.open).toBe(0);
+    expect(outcome.total).toBe(3);
   });
 
   test("closing the scope stops every timer: nothing is published after", async () => {
@@ -348,6 +409,47 @@ describe("narrateCoalesced", () => {
     ]);
     // No delta is ever published as itself.
     expect(published.some((item) => item.detail._tag === "delta")).toBe(false);
+  });
+
+  test("the turn's end ends a block cut off before its finished block, ahead of the outcome", async () => {
+    // A conversation keeps its session — and this scope — open across a Stop, so without
+    // this the held " sto" would never be sent and the block would stay open.
+    const published = await Effect.runPromise(
+      Effect.gen(function* () {
+        const out: HarnessNarration[] = [];
+        yield* narrateCoalesced({
+          events: Stream.fromIterable([
+            entry(reply("b1", "I will")),
+            entry(reply("b1", " sto")),
+            {
+              ...entry({ _tag: "opaque" }),
+              type: "session.execution.interrupted",
+              outcome: "interrupted",
+            },
+            // The next turn's block, after the stop: the old block stays over.
+            entry(reply("b1", "p")),
+            entry(reply("b2", "Next")),
+          ]),
+          publish: (item) =>
+            Effect.sync(() => {
+              out.push(item);
+            }),
+        });
+        return out;
+      }).pipe(Effect.provide(TestClock.layer())),
+    );
+    expect(
+      published.map((item) =>
+        item.detail._tag === "partial"
+          ? `${item.detail.blockId}:${item.detail.text}`
+          : item.type,
+      ),
+    ).toEqual([
+      "b1:I will",
+      "b1:I will sto",
+      "session.execution.interrupted",
+      "b2:Next",
+    ]);
   });
 
   test("a stream that fails fails the narration, as it did before", async () => {

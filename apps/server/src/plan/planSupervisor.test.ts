@@ -2293,6 +2293,84 @@ describe("steering the round that is live on a goal", () => {
     await runtime.dispose();
   });
 
+  test("a round's block deltas stay off the bus; its finished block and outcome do not", async () => {
+    // A round has no live partial view, so a streaming driver's deltas would only crowd a
+    // slow subscriber's sliding buffer. The first two entries on the bus are the terminal
+    // event and the finished block; the round still settles from that event.
+    const recorder = emptyRecorder();
+    const delta = (sequence: number, text: string): HarnessNarration => ({
+      type: "session.text.delta",
+      sequence,
+      at: 1_700_000_000_000 + sequence,
+      outcome: undefined,
+      detail: { _tag: "delta", blockId: "prt_1", channel: "reply", text },
+    });
+    const { scriptFor, release } = scripts({
+      narration: [
+        delta(1, "round "),
+        delta(2, "done"),
+        {
+          type: "session.execution.succeeded",
+          sequence: 3,
+          at: 1_700_000_000_003,
+          outcome: "succeeded",
+          detail: { _tag: "opaque" },
+        },
+        // After the outcome, so receiving it proves the outcome was recorded (the steered
+        // test above says why).
+        {
+          type: "session.text.ended",
+          sequence: 4,
+          at: 1_700_000_000_004,
+          outcome: undefined,
+          detail: { _tag: "reply", text: "round done", blockId: "prt_1" },
+        },
+      ],
+      status: undefined,
+    });
+    const { root, workspace, runtime, ready } = world(scriptFor, recorder);
+    await ready;
+
+    const observed = await runtime.runPromise(
+      Effect.gen(function* () {
+        const narrations = yield* RunNarrations;
+        const collected = yield* Effect.forkChild(
+          Stream.runCollect(
+            Stream.take(narrations.subscribe({ targetId: TARGET }), 2),
+          ),
+        );
+        yield* Effect.timeout(
+          Effect.gen(function* () {
+            while ((yield* narrations.subscriberCount) === 0) {
+              yield* Effect.sleep("5 millis");
+            }
+          }),
+          "10 seconds",
+        );
+        const input = yield* goal(root, workspace, "goal_deltas");
+        const planner = yield* PlanSupervisor;
+        const round = yield* planner.start(input);
+        const received = yield* Fiber.join(collected);
+        yield* release(round.harnessSessionId);
+        yield* awaitSettled(round.roundId);
+        const stores = yield* TargetStores;
+        const row = yield* withTargetStore(stores, TARGET, (store) =>
+          store.loadRound(round.roundId),
+        );
+        return { received, row };
+      }).pipe(Effect.orDie),
+    );
+
+    expect(observed.received.map((item) => item.entry.type)).toEqual([
+      "session.execution.succeeded",
+      "session.text.ended",
+    ]);
+    // The narrated outcome still reached the settlement.
+    expect(observed.row?.status).toBe("settled");
+
+    await runtime.dispose();
+  });
+
   test("a goal with nothing live answers noLiveRound and delivers nothing", async () => {
     const recorder = emptyRecorder();
     const { scriptFor } = scripts({ narration: [], status: undefined });

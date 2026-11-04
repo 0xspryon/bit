@@ -2078,6 +2078,64 @@ describe("the narration bus", () => {
     await runtime.runPromise(releaseAll(held));
     await runtime.dispose();
   });
+
+  test("a worker's block deltas stay off the bus; its finished block does not", async () => {
+    // A streaming driver narrates a block as many deltas and then the finished block. An
+    // attempt has no live partial view, so the deltas would only crowd a slow subscriber's
+    // sliding buffer: the subscriber's first two entries are the start and the finished
+    // block, never a delta in between.
+    const recorder = emptyRecorder();
+    const { scriptFor, held } = scripts({
+      narration: [
+        narration("session.execution.started", 1),
+        narration("session.text.delta", 2, undefined, {
+          _tag: "delta",
+          blockId: "prt_1",
+          channel: "reply",
+          text: "Hel",
+        }),
+        narration("session.text.delta", 3, undefined, {
+          _tag: "delta",
+          blockId: "prt_1",
+          channel: "reply",
+          text: "lo",
+        }),
+        narration("session.text.ended", 4, undefined, {
+          _tag: "reply",
+          text: "Hello",
+          blockId: "prt_1",
+        }),
+      ],
+      stream: "open",
+      status: "succeeded",
+    });
+    const { root, runtime, ready } = world(["alpha"], scriptFor, recorder);
+    await ready;
+
+    const received = await runtime.runPromise(
+      Effect.gen(function* () {
+        const supervisor = yield* RunSupervisor;
+        const narrations = yield* RunNarrations;
+        const collected = yield* Effect.forkChild(
+          Stream.runCollect(
+            Stream.take(narrations.subscribe({ targetId: "alpha" }), 2),
+          ),
+        );
+        yield* waitFor(narrations.subscriberCount, (n) => n === 1);
+        yield* supervisor.start(yield* draft(root, "alpha", "probe alpha"));
+        const items: readonly RunNarration[] = yield* Fiber.join(collected);
+        return items;
+      }).pipe(Effect.orDie),
+    );
+
+    expect(received.map((item) => item.entry.type)).toEqual([
+      "session.execution.started",
+      "session.text.ended",
+    ]);
+
+    await runtime.runPromise(releaseAll(held));
+    await runtime.dispose();
+  });
 });
 
 /* ── Small waits on state, rather than on the clock ──────────────────────────── */

@@ -133,7 +133,7 @@ import {
   roundSettlementFor,
   type SupervisionEnd,
 } from "../run/settlement";
-import { RunNarrations } from "../run/narration";
+import { narratesOnSharedBus, RunNarrations } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 
 /**
@@ -1073,12 +1073,15 @@ const make = Effect.fnUntraced(function* (options?: {
     const outcome = yield* Effect.result(
       Stream.runForEach(harness.sessionEvents(harnessSessionId), (entry) =>
         Effect.andThen(
-          narrations.publish({
-            targetId,
-            subject: { _tag: "round", roundId },
-            harnessSessionId,
-            entry,
-          }),
+          // A block delta stays off the bus: see `narratesOnSharedBus`.
+          narratesOnSharedBus(entry)
+            ? narrations.publish({
+                targetId,
+                subject: { _tag: "round", roundId },
+                harnessSessionId,
+                entry,
+              })
+            : Effect.void,
           Effect.sync(() => {
             if (entry.outcome !== undefined) report.narrated = entry.outcome;
           }),

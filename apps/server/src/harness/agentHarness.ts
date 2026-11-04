@@ -349,14 +349,18 @@ export const truncateNarration = (value: string): string =>
  * them in, and until something had to render them, any shape invented here would have been
  * the format a later slice inherited without having decided it. The live transcript is
  * that slice, so this is the decision — six cases, chosen because they are the six both
- * harnesses can actually produce.
+ * harnesses can actually produce — and A6 F6 added two for streaming, eight in all:
+ * `delta`, a piece of a block while it is being written ({@link BlockDelta}, produced by a
+ * driver), and `partial`, a block's whole text so far ({@link BlockPartial}, produced only
+ * by `run/streamingCoalescer.ts` from the deltas, never by a driver).
  *
- * `opaque` is the honest default and most entries are it: a token delta, a step boundary, a
- * *cumulative* usage total. A reader that can render nothing useful from an entry gets
- * `opaque` rather than an empty `reply`, so "the harness said something we do not display"
- * never reads as "the agent replied with nothing".
+ * `opaque` is the honest default and most entries are it: a step boundary, a *cumulative*
+ * usage total. A token delta was one of them until a driver streams it as a `delta`. A
+ * reader that can render nothing useful from an entry gets `opaque` rather than an empty
+ * `reply`, so "the harness said something we do not display" never reads as "the agent
+ * replied with nothing".
  *
- * Two of the six arrived later than the others, and the comment they replace is worth
+ * Two of the first six arrived later than the others, and the comment they replace is worth
  * keeping: this list used to name "a usage update" among the things that are honestly
  * `opaque`, and that was true of the update both drivers publish most readily. It is not
  * true of the per-call figure underneath it. DECISIONS.md §24.4 measured which event
@@ -519,7 +523,9 @@ export type BlockChannel = "reply" | "thinking";
  * never shown as it is: the importer and goal conversations hand it to
  * `run/streamingCoalescer.ts`, which turns a block's pieces into at most one
  * {@link BlockPartial} per ~50 ms carrying the block's whole text so far. Anywhere else —
- * a worker's attempt, a planner round — it is projected as nothing, like `opaque`.
+ * a worker's attempt, a planner round — it is dropped before the narration bus
+ * (`narratesOnSharedBus` in `run/narration.ts`), so hundreds of them cannot crowd a slow
+ * subscriber's buffer.
  *
  * The block ends with the finished `reply` or `thinking` carrying the same
  * {@link blockId}. A delta after that is late and is dropped.

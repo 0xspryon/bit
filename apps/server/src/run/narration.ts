@@ -64,6 +64,26 @@ import type { HarnessNarration } from "../harness/agentHarness";
 export const NARRATION_BUFFER = 256;
 
 /**
+ * Whether a session's entry may go on this bus as it is. Everything but a block delta may.
+ *
+ * A streaming driver narrates a reply or thinking block as hundreds of token deltas
+ * (`BlockDelta`, A6 F7/F8). Through a {@link NARRATION_BUFFER}-entry sliding bus they would
+ * push a slow subscriber's real entries — tool calls, results, the finished block — out of
+ * its buffer, a block at a time. So a delta never goes on the bus raw: the importer and
+ * goal conversations turn theirs into coalesced partials first
+ * (`run/streamingCoalescer.ts`), and a worker's attempt and a planner round — which have no
+ * live partial view — drop them here. Nothing is lost by dropping: the finished block
+ * still arrives, and a delta carries no outcome.
+ *
+ * Filtered at the publish site rather than by the driver emitting deltas only for sessions
+ * that ask: the driver serves every kind of session through one `sessionEvents`, and
+ * teaching the harness seam which consumer wants partials would put a screen's concern in
+ * the harness. The cost is a predicate per entry.
+ */
+export const narratesOnSharedBus = (entry: HarnessNarration): boolean =>
+  entry.detail._tag !== "delta";
+
+/**
  * Whose session is narrating: a worker's attempt, a planner round, a goal's agent, or a
  * scope importer.
  *

@@ -29,14 +29,39 @@
  * Every update and the end take one lock, so a timer that wakes while the block is ending
  * either publishes before the end does or finds the block gone.
  *
+ * **The turn's end ends every block still open** ({@link StreamingCoalescer.endAll}). A
+ * conversation keeps its harness session — and so this scope — open across turns and
+ * across a Stop, so a block cut off by an interrupt would otherwise stay open with up to an
+ * interval's text never sent. {@link narrateCoalesced} ends them all when an entry with a
+ * terminal `outcome` passes, before publishing that entry. A finished block that still
+ * arrives for one of them afterwards is published as usual and replaces the partial.
+ *
  * ## Bounded memory
  *
  * A session holds the blocks it has open (normally one or two: a thinking block, then its
  * reply), each capped at {@link NARRATION_FIELD_MAX} characters as the finished block is,
  * at most {@link OPEN_BLOCKS_MAX} of them, and the ids of the last
  * {@link ENDED_BLOCKS_KEPT} blocks it ended, so a late delta is recognised. A block that
- * never ends — a turn cut off before its finished block — stays open until the session's
- * narration ends, which closes the scope this lives in and drops everything.
+ * never ends is ended by its turn's end; when the session's narration ends, the scope this
+ * lives in closes and drops everything.
+ *
+ * A block dropped at the {@link OPEN_BLOCKS_MAX} cap is **remembered as ended**, as an
+ * ended block is: its later pieces are refused rather than reopening it with only the new
+ * text, which a reader replacing by `blockId` would show as the block losing its start.
+ *
+ * ### Why a forgotten id cannot come back
+ *
+ * The ended memory is bounded, so after {@link ENDED_BLOCKS_KEPT} later blocks end an id is
+ * forgotten, and a delta for it would open a new block. That delta cannot arrive. A
+ * session's entries come from one ordered stream, handled one at a time, and both drivers
+ * emit every piece of a block before its finished block: OpenCode's publisher flushes a
+ * block's batched delta before it publishes `session.text.ended` / `reasoning.ended`, and
+ * its deltas are ephemeral, so a resumed stream does not replay them; Claude Code's
+ * `content_block_delta`s precede the `assistant` message that carries the block. So a delta
+ * after its block's end is a redelivery of something recent, or a delta of a block dropped
+ * at the cap or ended by its turn — both within the last few ends, and 64 is far above
+ * the one or two blocks a turn ends. Remembering every id instead would make a long
+ * conversation's memory grow with its length, for a case no driver produces.
  *
  * V2(chat): streaming partials are never stored and are not replayed after a reconnect — a
  * reconnect catches up from finished blocks only, so a block still being written shows
@@ -92,6 +117,11 @@ export interface StreamingCoalescer {
    * **before** publishing the finished block. Ending a block never opened is harmless.
    */
   readonly end: (blockId: string) => Effect.Effect<void>;
+  /**
+   * Ends every open block, as {@link end} does each: what is held is published at once, then
+   * nothing more about any of them. For the end of a turn. See the module header.
+   */
+  readonly endAll: Effect.Effect<void>;
   /** How many blocks are open. For tests: the memory claim. */
   readonly openBlocks: Effect.Effect<number>;
 }
@@ -179,6 +209,9 @@ export const makeStreamingCoalescer = (options: {
             if (open.size >= OPEN_BLOCKS_MAX) {
               const oldest = open.keys().next().value;
               if (oldest !== undefined) {
+                // Remembered as ended, so its next piece cannot reopen it with only the
+                // new text.
+                remember(oldest);
                 open.delete(oldest);
                 yield* FiberMap.remove(timers, oldest);
               }
@@ -221,21 +254,30 @@ export const makeStreamingCoalescer = (options: {
         }),
       );
 
+    /** Ends one block. Under the lock. */
+    const endLocked = (blockId: string) =>
+      Effect.gen(function* () {
+        remember(blockId);
+        const block = open.get(blockId);
+        if (block === undefined) return;
+        open.delete(blockId);
+        yield* FiberMap.remove(timers, blockId);
+        if (block.held) yield* flush(blockId, block);
+      });
+
     const end = (blockId: string): Effect.Effect<void> =>
-      Semaphore.withPermit(lock)(
-        Effect.gen(function* () {
-          remember(blockId);
-          const block = open.get(blockId);
-          if (block === undefined) return;
-          open.delete(blockId);
-          yield* FiberMap.remove(timers, blockId);
-          if (block.held) yield* flush(blockId, block);
-        }),
-      );
+      Semaphore.withPermit(lock)(endLocked(blockId));
+
+    const endAll: Effect.Effect<void> = Semaphore.withPermit(lock)(
+      Effect.suspend(() =>
+        Effect.forEach([...open.keys()], endLocked, { discard: true }),
+      ),
+    );
 
     return {
       delta,
       end,
+      endAll,
       openBlocks: Effect.sync(() => open.size),
     } satisfies StreamingCoalescer;
   });
@@ -246,8 +288,10 @@ export const makeStreamingCoalescer = (options: {
  * What the importer and goal conversations run in place of publishing every entry as it
  * comes: a {@link BlockDelta} goes to the coalescer and is never published itself; a
  * finished `reply` or `thinking` with a `blockId` ends that block — the held text first,
- * then the finished block; everything else is published as it was. The coalescer lives as
- * long as this does, so when the session's narration ends every open block goes with it.
+ * then the finished block; an entry with a terminal `outcome` — the turn's end — ends every
+ * block still open first, so an interrupted block's last text is sent; everything else is
+ * published as it was. The coalescer lives as long as this does, so when the session's
+ * narration ends every open block goes with it.
  *
  * **Publishing is not persisting**: `publish` is the narration bus, which nothing stores
  * (`run/narration.ts`). The replay a reload reads comes from the harness's own transcript,
@@ -273,22 +317,34 @@ export const narrateCoalesced = <E>(input: {
             }),
           ),
       });
-      yield* Stream.runForEach(input.events, (entry) => {
-        const detail = entry.detail;
-        switch (detail._tag) {
-          case "delta":
-            return coalescer.delta(detail);
-          case "reply":
-          case "thinking":
-            return detail.blockId === undefined
-              ? input.publish(entry)
-              : Effect.andThen(
-                  coalescer.end(detail.blockId),
-                  input.publish(entry),
-                );
-          default:
-            return input.publish(entry);
-        }
-      });
+      yield* Stream.runForEach(input.events, (entry) =>
+        // The turn is over, however it ended: nothing still open will be written further.
+        entry.outcome === undefined
+          ? narrateOne(coalescer, input.publish, entry)
+          : Effect.andThen(
+              coalescer.endAll,
+              narrateOne(coalescer, input.publish, entry),
+            ),
+      );
     }),
   );
+
+/** What {@link narrateCoalesced} does with one entry, once the turn's end is dealt with. */
+const narrateOne = (
+  coalescer: StreamingCoalescer,
+  publish: (entry: HarnessNarration) => Effect.Effect<void>,
+  entry: HarnessNarration,
+): Effect.Effect<void> => {
+  const detail = entry.detail;
+  switch (detail._tag) {
+    case "delta":
+      return coalescer.delta(detail);
+    case "reply":
+    case "thinking":
+      return detail.blockId === undefined
+        ? publish(entry)
+        : Effect.andThen(coalescer.end(detail.blockId), publish(entry));
+    default:
+      return publish(entry);
+  }
+};
