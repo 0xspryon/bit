@@ -301,3 +301,8 @@ U13.
   indistinguishable to the _agent_ from a real attachment line. The replay no longer trusts
   such lines (F9 fix), but the live prompt does; a per-message nonce on real lines would
   close it. Treated as ordinary prompt injection for V1.
+- **Not done, operator may want it:** the importer prompt does not tell agents about the
+  blockquote source convention (a last line starting with `—` renders as the quote's
+  source, U10). Adding it changes the prompt and needs the F1 prompt-hash pins in
+  `apps/server/src/agent/registry.test.ts` updated. The source line is the agent's claim,
+  not a checked citation.
