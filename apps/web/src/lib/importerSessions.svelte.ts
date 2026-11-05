@@ -91,6 +91,7 @@ import {
   acceptedNotice,
   isolated,
   sessionLabel,
+  sessionWhen,
   switchedNotice,
 } from "./importerChat";
 import {
@@ -1811,7 +1812,7 @@ export class ImporterSessions {
     const mark = `“${parkedMark(words)}”`;
     const where = first
       ? `as ${mark} in the session list`
-      : `on ${isolated(sessionLabel(session))}, marked ${mark} in the session list`;
+      : `on ${named(session, this.#now())}, marked ${mark} in the session list`;
     this.notice = unknown
       ? `No server answered your last message, so whether it was sent is not known. Its words are kept in this tab ${where}.`
       : `Your last message was not sent. Its words are kept in this tab ${where}: open it to see why.`;
@@ -1885,7 +1886,7 @@ export class ImporterSessions {
     const parked = this.parked[held.sessionId];
     if (held.in === "parked" && parked?.text === text)
       this.#unpark(held.sessionId);
-    const name = isolated(sessionLabel(found));
+    const name = named(found, this.#now());
     if (this.currentId === held.sessionId && this.draft.trim() === text) {
       // The words are in the box on screen: the real session takes their place.
       this.draft = "";
@@ -2437,6 +2438,18 @@ const timesSaid = (
   [...session.history.items, ...session.items].filter(
     (item) => item.kind === "turn.operator" && item.body?.trim() === text,
   ).length;
+
+/**
+ * A session as a notice names it: its label, isolated (a title is the harness's), and when it
+ * started — Claude Code titles sessions from bit's own framing, so two are often named alike.
+ * An untitled one's label is already its time.
+ */
+const named = (session: ImporterSession, now: number): string => {
+  const label = isolated(sessionLabel(session));
+  return (session.title?.trim() ?? "") === ""
+    ? label
+    : `${label} (${sessionWhen(session.startedAt, now)})`;
+};
 
 /**
  * What is known of a message no answer came back for (U8 review 4), worded as a model switch
