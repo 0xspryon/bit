@@ -165,9 +165,11 @@
   /**
    * The scroll container, for the one thing this component does to the DOM by hand.
    *
-   * `undefined` until mounted, so every read of it is guarded rather than assumed.
+   * `undefined` until mounted and `null` once torn down — `bind:this` clears it, and a
+   * scroll event queued before the teardown still runs {@link trackPinned} (seen live, U9
+   * review 2) — so every read of it is guarded rather than assumed.
    */
-  let list = $state<HTMLOListElement | undefined>(undefined);
+  let list = $state<HTMLOListElement | null | undefined>(undefined);
 
   /**
    * Whether the view is following the newest turn.
@@ -195,7 +197,7 @@
   let followedTo: number | undefined;
 
   function trackPinned(): void {
-    if (list === undefined) return;
+    if (list == null) return;
     if (followedTo !== undefined && Math.abs(list.scrollTop - followedTo) < 1) {
       return;
     }
@@ -205,7 +207,7 @@
 
   /** Puts the view at the bottom, and remembers where, for {@link trackPinned}. */
   function follow(): void {
-    if (list === undefined) return;
+    if (list == null) return;
     list.scrollTop = list.scrollHeight;
     followedTo = list.scrollTop;
   }
@@ -262,7 +264,7 @@
   $effect(() => {
     const arrived = rowCount;
     void streamed;
-    if (arrived === 0 || list === undefined || !pinned) return;
+    if (arrived === 0 || list == null || !pinned) return;
     follow();
   });
 
