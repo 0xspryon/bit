@@ -18,7 +18,7 @@ import {
 } from "@bit/contracts";
 
 import {
-  NARRATION_SHORTENED_MARK,
+  PARTIAL_BODY_MAX,
   callSignature,
   operatorTurn,
   resultLine,
@@ -903,16 +903,121 @@ describe("the importer's words from the live feed", () => {
       ],
     });
     expect(held).toEqual([]);
-    // A finished block below the floor is the replay's, partial or not before it.
+    // A finished block below the floor the replay holds is the replay's.
     const finished = importerFeed({
       own: [],
       floors: {},
       live: [{ ...said(15, "done"), blockId: "ses:msg_9:0" }],
       importId: "imp_1",
       historyFloor: 20,
-      replayed: [],
+      replayed: [
+        { ...replayItem(0, "turn.reply", "done"), blockId: "ses:msg_9:0" },
+      ],
     });
     expect(finished).toEqual([]);
+  });
+
+  /*
+   * U5 review 2: Claude Code writes a model call's blocks to its transcript only once the
+   * whole call ends. Measured: the thought's finished frame went out live at 2.1 s, and the
+   * replay held only the operator's row from 2.1 s to 12.3 s, when the reply after it
+   * ended. A reload or a return in between read a replay with no thought in it.
+   */
+  const finishedThought = {
+    ...item({ kind: "turn.thinking", body: "Weighing the wildcard" }),
+    id: "activity:15",
+    importId: "imp_1",
+    blockId: "ses:msg_9:0",
+    blockCall: "ses:msg_9",
+  } satisfies LiveItem;
+  const replyGrowing = {
+    ...said(16, "Reading the policy page and"),
+    blockId: "ses:msg_9:1",
+    blockCall: "ses:msg_9",
+    streaming: true as const,
+  };
+
+  test("U5 review 2: a finished thought below the floor is kept while the replay holds only the operator's row", () => {
+    const replayed = [replayItem(0, "turn.operator", "Read the page")];
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [said(10, "an earlier turn's"), finishedThought, replyGrowing],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed,
+    });
+    expect(feed.map((each) => each.body)).toEqual([
+      "Weighing the wildcard",
+      "Reading the policy page and",
+    ]);
+    // Drawn in the turn the replay ends on, the thought above the reply.
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: replayed,
+      }),
+      items: feed,
+      working: true,
+    });
+    expect(
+      groups.map((group) => [
+        group.subject.message,
+        group.rows.map((row) => row.item.body),
+      ]),
+    ).toEqual([
+      [
+        "Read the page",
+        ["Weighing the wildcard", "Reading the policy page and"],
+      ],
+    ]);
+    // Once the replay holds the thought, its copy there is the thought.
+    expect(
+      importerFeed({
+        own: [],
+        floors: {},
+        live: [finishedThought],
+        importId: "imp_1",
+        historyFloor: 20,
+        replayed: [
+          ...replayed,
+          {
+            ...replayItem(1, "turn.thinking", "Weighing the wildcard"),
+            blockId: "ses:msg_9:0",
+          },
+        ],
+      }),
+    ).toEqual([]);
+  });
+
+  test("U5 review 2: a finished block older than one the replay holds is not kept — the replay's window cut it", () => {
+    // A long session's replay is cut to its newest items (`truncated`): a block before the
+    // window is not in it either, and is no block the harness has yet to store.
+    const cutAway = {
+      ...said(5, "before the window"),
+      blockId: "ses:msg_1:0",
+      blockCall: "ses:msg_1",
+    };
+    const inWindow = {
+      ...said(8, "in the window"),
+      blockId: "ses:msg_2:0",
+      blockCall: "ses:msg_2",
+    };
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [cutAway, inWindow, finishedThought],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: [
+        {
+          ...replayItem(0, "turn.reply", "in the window"),
+          blockId: "ses:msg_2:0",
+        },
+      ],
+    });
+    expect(feed.map((each) => each.body)).toEqual(["Weighing the wildcard"]);
   });
 
   test("U5 review: returning to a chat mid-block draws the block in the running turn, writing", () => {
@@ -2421,11 +2526,20 @@ describe("A6 U5: blocks still being written", () => {
 
   test("a thought past the 4,000-character cap is shortened, not writing", () => {
     const long = partial(
-      `${"x".repeat(4_000)}${NARRATION_SHORTENED_MARK}`,
+      "x".repeat(PARTIAL_BODY_MAX),
       "s:m1:0",
       "turn.thinking",
     );
     expect([...streamStates([long]).values()]).toEqual(["shortened"]);
+  });
+
+  test("U5 review 2: a partial is past the cap by its length, as the server cuts it with no mark", () => {
+    // The server's cut partial is exactly the cap long (`streamingCoalescer`'s `flush`).
+    const under = partial("x".repeat(PARTIAL_BODY_MAX - 1), "s:m1:0");
+    const at = partial("x".repeat(PARTIAL_BODY_MAX), "s:m2:0");
+    expect([...streamStates([under]).values()]).toEqual(["writing"]);
+    expect([...streamStates([at]).values()]).toEqual(["shortened"]);
+    expect(PARTIAL_BODY_MAX).toBe(4_000);
   });
 
   test("a block's row keeps one key from its first partial to its finished copy", () => {

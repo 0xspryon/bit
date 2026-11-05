@@ -81,7 +81,9 @@ import type {
 
 import {
   OPERATOR_TURN_KIND,
+  REPLY_KIND,
   TAKEN_KIND,
+  THINKING_KIND,
   activityOrder,
   claimedRecords,
   foldSubagents,
@@ -712,26 +714,57 @@ export const importerFeed = (input: {
    * whatever the floor: it is durable, the replay never contains one, and dropping it would
    * lose the half of the screen that survives a reload.
    *
-   * **A partial is kept whatever the floor while the replay does not hold its block** (A6
-   * U5 review). Each partial keeps the id of the block's first one (`withBlock`), so a block
-   * that began before the replay was asked for sits below the floor for as long as it is
-   * written — and the replay cannot hold it: a harness stores a block only once it is
-   * finished. Dropped by the floor, it showed nothing from a return to the chat until its
-   * block ended. Once the replay does hold the block, its copy there is the block.
+   * **A block is kept whatever the floor while the replay does not hold it** (A6 U5 review,
+   * and its second round for a finished one). A reply or a thought names its block
+   * (`blockId`), and the replay names the blocks it holds the same way, so whether the
+   * replay has it is a lookup, not a guess from the floor. Two blocks sit below the floor
+   * and are not in the replay:
+   *
+   * - a **partial**: each keeps the id of its block's first one (`withBlock`), so a block that
+   *   began before the replay was asked for sits below the floor for as long as it is
+   *   written — and no harness stores a block before it is finished;
+   * - a **finished** block of a model call still running: Claude Code writes a call's blocks
+   *   to its transcript only once the whole call ends, so a thought finished live 2 s in was
+   *   in no replay until the reply after it ended, 10 s later (measured). Dropped by the
+   *   floor, a reload or a return mid-reply lost the thought above it for good.
+   *
+   * Once the replay holds the block, its copy there is the block. **Only a block published
+   * after every block the replay holds is kept** (`heldUpTo`): the blocks a harness has not
+   * stored yet are its newest. An older one the replay lacks is missing for another reason
+   * — cut by the replay's window (`truncated`), or named differently by a transcript that
+   * holds part of a call — and drawing it would put words from before the window under the
+   * turn the replay ends on.
    */
   const inReplay = new Set<string>();
   for (const item of input.replayed ?? []) {
     if (item.blockId !== undefined) inReplay.add(item.blockId);
   }
-  const mine = input.live.filter(
+  const isBlock = (item: LiveItem): boolean =>
+    item.blockId !== undefined &&
+    (item.kind === REPLY_KIND || item.kind === THINKING_KIND);
+  const ours = input.live.filter((item) => item.importId === importId);
+  let heldUpTo = Number.NEGATIVE_INFINITY;
+  for (const item of ours) {
+    const order = activityOrder(item);
+    if (
+      order !== undefined &&
+      isBlock(item) &&
+      inReplay.has(item.blockId ?? "")
+    ) {
+      heldUpTo = Math.max(heldUpTo, order);
+    }
+  }
+  /** Whether a block below the floor is one the replay cannot have yet. */
+  const notYetStored = (item: LiveItem): boolean =>
+    isBlock(item) &&
+    !inReplay.has(item.blockId ?? "") &&
+    (isPartial(item) ||
+      (activityOrder(item) ?? Number.POSITIVE_INFINITY) > heldUpTo);
+  const mine = ours.filter(
     (item) =>
-      item.importId === importId &&
-      (input.historyFloor === undefined ||
-        (activityOrder(item) ?? Number.POSITIVE_INFINITY) >
-          input.historyFloor ||
-        (isPartial(item) &&
-          item.blockId !== undefined &&
-          !inReplay.has(item.blockId))),
+      input.historyFloor === undefined ||
+      (activityOrder(item) ?? Number.POSITIVE_INFINITY) > input.historyFloor ||
+      notYetStored(item),
   );
   /*
    * Where an operator row goes among the importer's words: after everything published

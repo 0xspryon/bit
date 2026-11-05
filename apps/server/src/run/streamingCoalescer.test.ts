@@ -298,7 +298,7 @@ describe("memory", () => {
     ]);
   });
 
-  test("a block's text is capped as the finished block's is, and stops growing past it", async () => {
+  test("a block's text is capped at the field cap with no cut mark, and stops growing past it", async () => {
     const outcome = await withCoalescer((coalescer, published) =>
       Effect.gen(function* () {
         yield* coalescer.delta(reply("b1", "a".repeat(NARRATION_FIELD_MAX)));
@@ -314,9 +314,10 @@ describe("memory", () => {
     );
     expect(outcome.capped).toBe(2);
     expect(outcome.texts).toHaveLength(2);
-    expect(outcome.texts[1]).toBe(
-      `${"a".repeat(NARRATION_FIELD_MAX)}${NARRATION_TRUNCATED_MARK}`,
-    );
+    // Cut at the cap with no mark (A6 U5 review 2): the row says it is shortened, and a
+    // mark in the text sat right above "the rest shows when it finishes".
+    expect(outcome.texts[1]).toBe("a".repeat(NARRATION_FIELD_MAX));
+    expect(outcome.texts[1]).not.toContain(NARRATION_TRUNCATED_MARK.trim());
   });
 
   test("ending every block flushes each one's held text, then refuses their late pieces", async () => {

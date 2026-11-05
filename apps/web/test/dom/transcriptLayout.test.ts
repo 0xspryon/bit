@@ -250,6 +250,28 @@ const endTurn = async (app: App, fake: FakeServer): Promise<void> => {
   await settle();
 };
 
+/**
+ * What the harness's transcript holds once the turn has settled (A6 U5 review 2): a
+ * session whose replay was read while its turn ran reads it again then, so a fake that
+ * went on answering with the replay from before the turn would wipe the turn it wrote.
+ */
+const transcriptOnceSettled = (
+  fake: FakeServer,
+  items: readonly LiveItem[],
+): void => {
+  fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+    ok(
+      importerConversationView({
+        targetId,
+        importId,
+        harnessSessionId: "ses_a",
+        live: true,
+        continuation: "live",
+        items: [...items],
+      }),
+    );
+};
+
 const groups = (): Element[] => [
   ...document.querySelectorAll('.importer [role="log"] > .group'),
 ];
@@ -554,6 +576,40 @@ describe("U4: a message sent while a turn runs", () => {
     expect(said(document.querySelector(".importer"))).not.toContain("Taken");
 
     // Its footer's duration runs from the take (AT + 9 s) to its last item (AT + 12 s).
+    // The transcript stores the message when the harness takes it.
+    transcriptOnceSettled(fake, [
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 1, { kind: "turn.reply", body: "Reading the page." }),
+      at("replay", 2, 6, {
+        kind: "tool.call",
+        headline: "fetch_page",
+        tool: "fetch_page",
+        toolName: "fetch_page",
+        input: "{}",
+        callId: "f1",
+      }),
+      at("replay", 3, 7, { kind: "turn.reply", body: "Six rows in scope." }),
+      at("replay", 4, 9, {
+        kind: "turn.operator",
+        headline: "You",
+        body: "Also the partner portal",
+        messageIds: [MESSAGE_ID],
+      }),
+      at("replay", 5, 10, {
+        kind: "tool.result",
+        headline: "fetch_page",
+        tool: "fetch_page",
+        toolName: "fetch_page",
+        output: "nine rows",
+        callId: "f1",
+        outcome: "ok",
+      }),
+      at("replay", 6, 12, {
+        kind: "turn.reply",
+        body: "Adding the partner portal.",
+        model: "m-two",
+      }),
+    ]);
     await endTurn(app, fake);
     expect(footers().at(-1)).toBe("Importer · m-two · 3s");
   });
@@ -623,6 +679,22 @@ describe("U4: a message sent while a turn runs", () => {
       }),
     );
     await settle();
+    // Claude Code stores the steers it took together as one entry, at the take.
+    transcriptOnceSettled(fake, [
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 1, { kind: "turn.reply", body: "Reading the page." }),
+      at("replay", 2, 8, {
+        kind: "turn.operator",
+        headline: "You",
+        body: "MG-PAGE\nMG-OTHER",
+        messageIds: [MESSAGE_ID, OTHER_ID],
+      }),
+      at("replay", 3, 11, {
+        kind: "turn.reply",
+        body: "Both noted.",
+        model: "m-two",
+      }),
+    ]);
     await endTurn(app, fake);
 
     const drawn = groups();

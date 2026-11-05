@@ -45,12 +45,12 @@
     REPLY_KIND,
     SUBAGENT_KIND,
     SUBAGENT_NOTE,
-    NARRATION_SHORTENED_MARK,
     REPLY_PAST_CAP_LABEL,
     THINKING_KIND,
     callSignature,
     kindLabel,
     outcomeTint,
+    pastPartialCap,
     resultLine,
     type StreamState,
     type WriteState,
@@ -102,7 +102,7 @@
     stream ??
       (item.streaming !== true
         ? null
-        : item.body.endsWith(NARRATION_SHORTENED_MARK)
+        : pastPartialCap(item)
           ? "shortened"
           : "writing"),
   );

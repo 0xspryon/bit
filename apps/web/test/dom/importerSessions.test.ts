@@ -26,10 +26,7 @@ import {
 
 import { App, IMPORT_POLL_MS, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
-import {
-  NARRATION_SHORTENED_MARK,
-  REPLY_PAST_CAP_LABEL,
-} from "../../src/lib/chat";
+import { PARTIAL_BODY_MAX, REPLY_PAST_CAP_LABEL } from "../../src/lib/chat";
 import { ENDED_NOTE, MID_BLOCK_NOTE } from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
@@ -1449,7 +1446,7 @@ describe("A6 U5: a block while it is being written", () => {
       partial(
         "activity:40",
         "ses:msg_t:0",
-        `${"long thought ".repeat(320)}${NARRATION_SHORTENED_MARK}`,
+        "long thought ".repeat(320).slice(0, PARTIAL_BODY_MAX),
         thinking,
       ),
     );
@@ -1462,16 +1459,14 @@ describe("A6 U5: a block while it is being written", () => {
 
   test("U5 review: a reply streaming past the partial cap says the rest shows when it finishes, then finishes whole", async () => {
     const { fake } = await inFlight();
+    // As the server sends it: cut at the cap with no mark (A6 U5 review 2).
     const head = "word ".repeat(800);
-    fake.watch.send(
-      partial(
-        "activity:44",
-        "ses:msg_l:0",
-        `${head}${NARRATION_SHORTENED_MARK}`,
-      ),
-    );
+    expect(head.length).toBe(PARTIAL_BODY_MAX);
+    fake.watch.send(partial("activity:44", "ses:msg_l:0", head));
     await settle();
     expect(writing()).toEqual([REPLY_PAST_CAP_LABEL]);
+    // No "(shortened)" right above "the rest shows when it finishes" while it streams.
+    expect(replies().at(-1)?.textContent ?? "").not.toContain("(shortened)");
     expect(REPLY_PAST_CAP_LABEL).toBe(
       "writing… — the rest shows when it finishes",
     );
@@ -1551,5 +1546,90 @@ describe("A6 U5: a block while it is being written", () => {
     expect(
       document.querySelector(".importer .streaming")?.textContent?.trim(),
     ).toBe("writing…");
+  });
+
+  test("U5 review 2: a replay read mid-reply is read again when the turn settles, and the thought it lacked is drawn", async () => {
+    /*
+     * Claude Code writes a model call's blocks to its transcript only when the whole call
+     * ends: a reload mid-reply reads a replay with the operator's row and no thought, and
+     * the new feed never gets the thought's frame, sent before the reload. Only a read
+     * after the turn settles has it.
+     */
+    const fake = new FakeServer();
+    fake.onScope = () => ok(emptyScope());
+    running(fake, true);
+    fake.onHarnesses = () => ok([harness("claude-code", "Claude Code")]);
+    let settled = false;
+    let reads = 0;
+    fake.onImporterMessages = (_baseUrl, targetId, importId) => {
+      reads += 1;
+      return ok(
+        importerConversationView({
+          targetId,
+          importId,
+          live: true,
+          continuation: "live",
+          items: [
+            replayItem(0, "turn.operator", "Read the policy page", {
+              importId,
+            }),
+            ...(settled
+              ? [
+                  replayItem(1, "turn.thinking", "Weighing the wildcard", {
+                    importId,
+                    blockId: "ses:msg_9:0",
+                  }),
+                  replayItem(2, "turn.reply", "The policy lists two hosts.", {
+                    importId,
+                    blockId: "ses:msg_9:1",
+                  }),
+                ]
+              : []),
+          ],
+        }),
+      );
+    };
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    app.toSection("assets");
+    await settle();
+    app.toAssetsTab("scope");
+    await settle();
+    mounted.push(mountInto(TitleBar, { app }), mountInto(Target, { app }));
+    await settle();
+    click(button("Continue that session"));
+    await settle();
+    const thread = () => document.querySelector(".importer")?.textContent ?? "";
+    expect(thread()).not.toContain("Weighing the wildcard");
+    const before = reads;
+
+    // The call ends, its blocks are written, and the turn settles.
+    settled = true;
+    running(fake, false);
+    const poll = (app.countdown as FakeCountdown).live.filter(
+      (armed) => armed.ms === IMPORT_POLL_MS,
+    );
+    poll[0]?.fire();
+    await settle();
+    expect(app.importer.current?.working).toBe(false);
+    expect(reads).toBe(before + 1);
+    const text = thread();
+    expect(text).toContain("Weighing the wildcard");
+    expect(text).toContain("The policy lists two hosts.");
+    // The thought above its reply.
+    expect(text.indexOf("Weighing the wildcard")).toBeLessThan(
+      text.indexOf("The policy lists two hosts."),
+    );
+    // Read once for the settled turn, not again on every later poll.
+    for (const armed of (app.countdown as FakeCountdown).live.filter(
+      (each) => each.ms === IMPORT_POLL_MS,
+    )) {
+      armed.fire();
+    }
+    await settle();
+    expect(reads).toBe(before + 1);
   });
 });

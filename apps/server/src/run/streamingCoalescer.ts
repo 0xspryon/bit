@@ -39,7 +39,8 @@
  * ## Bounded memory
  *
  * A session holds the blocks it has open (normally one or two: a thinking block, then its
- * reply), each capped at {@link NARRATION_FIELD_MAX} characters as the finished block is,
+ * reply), each capped at {@link NARRATION_FIELD_MAX} characters (published with no cut mark:
+ * see `flush`),
  * at most {@link OPEN_BLOCKS_MAX} of them, and the ids of the last
  * {@link ENDED_BLOCKS_KEPT} blocks it ended, so a late delta is recognised. A block that
  * never ends is ended by its turn's end; when the session's narration ends, the scope this
@@ -79,7 +80,6 @@ import {
 
 import {
   NARRATION_FIELD_MAX,
-  truncateNarration,
   type BlockDelta,
   type BlockPartial,
   type HarnessNarration,
@@ -176,7 +176,12 @@ export const makeStreamingCoalescer = (options: {
           blockId,
           ...(block.call === undefined ? {} : { call: block.call }),
           channel: block.channel,
-          text: truncateNarration(block.text),
+          // Cut at the cap with **no** mark (A6 U5 review 2). A partial is not a field a
+          // reader could misread for whole: its row already says it is still being written,
+          // and past the cap that the rest comes with the finished block, which a mark in
+          // the text then contradicted right above. A client reads "past the cap" off the
+          // length: a partial is exactly {@link NARRATION_FIELD_MAX} long only then.
+          text: block.text.slice(0, NARRATION_FIELD_MAX),
         });
       });
 

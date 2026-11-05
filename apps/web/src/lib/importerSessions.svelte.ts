@@ -310,6 +310,19 @@ export class ImporterSessions {
    * which reads it again.
    */
   readonly #reading = new Set<string>();
+  /**
+   * The imports whose replay on screen was read while their turn was running, by import id
+   * (A6 U5 review 2): read again once the turn settles ({@link #rereadSettled}).
+   *
+   * **A replay read mid-turn can lack blocks it will never be sent again.** Claude Code
+   * writes a model call's blocks to its transcript only when the whole call ends, so a
+   * replay read mid-reply has no thought above the reply, though its finished frame went out
+   * live seconds earlier. `importerFeed` keeps that frame while the live feed holds it, but a
+   * reload starts a new feed, and the bus no longer holds frames from before it: the thought
+   * is in neither, and nothing else reads the replay again. Once the turn has settled, the
+   * transcript holds every block of it.
+   */
+  readonly #readMidTurn = new Set<string>();
   /** Stops watching the turn in flight, if one is being watched. */
   #unwatch: (() => void) | undefined = undefined;
   /** The import {@link #unwatch} is for. */
@@ -466,6 +479,7 @@ export class ImporterSessions {
     const fresh = mockNewSession(this.#now());
     this.#stopWatching();
     this.#reading.clear();
+    this.#readMidTurn.clear();
     this.#server = server;
     this.draft = "";
     this.notice = "";
@@ -585,6 +599,7 @@ export class ImporterSessions {
     );
     this.sessions = [...own, ...refreshed, ...unlisted];
     this.#turnsEnded();
+    this.#rereadSettled();
     if (!this.sessions.some((session) => session.id === this.currentId)) {
       this.currentId = own[0]?.id ?? refreshed[0]?.id ?? "";
     }
@@ -626,6 +641,7 @@ export class ImporterSessions {
     const earlier = mockEarlierSessions(now);
     this.#stopWatching();
     this.#reading.clear();
+    this.#readMidTurn.clear();
     this.#server = undefined;
     this.notice = "";
     this.refused = false;
@@ -756,19 +772,25 @@ export class ImporterSessions {
       return;
     }
     this.#reading.add(importId);
+    const midTurn = this.#asking(importId, session.id);
     const answered = await server
       .history(importId)
       .finally(() => this.#reading.delete(importId));
     if (answered === undefined) return;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
+    const installed = this.sessions.find((each) => each.id === session.id);
+    if (
+      installed === undefined ||
+      installed.loaded === true ||
+      installed.items.length > 0
+    ) {
+      return;
+    }
     // With the messages the server still holds queued in the live session (A6 U4 review):
     // the transcript does not have them until they are taken, and a reload must not lose one.
-    this.#replace(session.id, (before) =>
-      before.loaded === true || before.items.length > 0
-        ? before
-        : withReplay(before, answered),
-    );
+    this.#replace(session.id, (before) => withReplay(before, answered));
+    this.#installed(importId, midTurn);
   }
 
   /**
@@ -831,6 +853,7 @@ export class ImporterSessions {
     // The rows this read can be an answer for: those held when it was asked for.
     const held = new Set(session?.items.map((item) => item.id));
     this.#reading.add(importId);
+    const midTurn = this.#asking(importId, sessionId);
     const answered = await server
       .history(importId)
       .finally(() => this.#reading.delete(importId));
@@ -842,6 +865,53 @@ export class ImporterSessions {
       return;
     }
     this.#replace(sessionId, (before) => withReplay(before, answered, held));
+    this.#installed(importId, midTurn);
+  }
+
+  /**
+   * Whether a read of an import's replay is being asked for mid-turn. One asked while the
+   * session is idle is the read {@link #readMidTurn} waits for, so it is crossed off here,
+   * when asked, and not when the answer lands: an answer that cannot be installed (no
+   * transcript) would otherwise leave it to be asked again on every later reading of the list.
+   */
+  #asking(importId: string, sessionId: string): boolean {
+    const working =
+      this.sessions.find((each) => each.id === sessionId)?.working === true;
+    if (!working) this.#readMidTurn.delete(importId);
+    return working;
+  }
+
+  /**
+   * Notes that the replay just installed for an import was read mid-turn
+   * ({@link #readMidTurn}), and reads it again at once if that turn has settled while the
+   * read was out — the turn watch fired then, and found a read already in flight.
+   */
+  #installed(importId: string, midTurn: boolean): void {
+    if (!midTurn) return;
+    this.#readMidTurn.add(importId);
+    this.#rereadSettled();
+  }
+
+  /**
+   * Reads again the replay of every session whose replay was read mid-turn and whose turn
+   * has since settled ({@link #readMidTurn}, A6 U5 review 2). Called wherever a session's
+   * `working` can go false. Not while this tab has a message with the server: a turn is
+   * starting, and its own settling reads it.
+   */
+  #rereadSettled(): void {
+    if (this.sending) return;
+    for (const session of this.sessions) {
+      const importId = session.importId;
+      if (
+        importId === undefined ||
+        session.working ||
+        !this.#readMidTurn.has(importId) ||
+        this.#reading.has(importId)
+      ) {
+        continue;
+      }
+      void this.#rereadHistory(session.id);
+    }
   }
 
   /**
@@ -869,6 +939,7 @@ export class ImporterSessions {
         if (this.notice === busy.text) this.notice = "";
       }
       this.#turnsEnded();
+      this.#rereadSettled();
       // The turn wrote what it wrote: the list's tally is the server's to restate.
       server.reread();
     });
@@ -1176,6 +1247,7 @@ export class ImporterSessions {
         : each,
     );
     this.#turnsEnded();
+    this.#rereadSettled();
   }
 
   /** The switch of one session that is with the server, if there is one. */

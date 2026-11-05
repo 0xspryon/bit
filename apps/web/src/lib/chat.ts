@@ -521,20 +521,24 @@ export interface ChatRow {
 /* ── Partial blocks (A6 U5) ─────────────────────────────────────────────────── */
 
 /**
- * The mark the server puts at the end of a narration field it cut
- * (`truncateNarration` in the server's `agentHarness.ts`). Copied, not imported: the
- * contracts do not carry it, and the web never reads server code. A partial ending in it
- * has stopped growing on screen while the agent goes on writing: a partial is cut at 4,000
- * characters, where a finished reply is cut only at 32,000 (A6 U5 review, `live.ts`).
+ * The most characters a **partial** carries: the server's field cap (`NARRATION_FIELD_MAX`
+ * in its `agentHarness.ts`). Copied, not imported: the contracts do not carry it, and the
+ * web never reads server code. A partial is cut there with no mark (A6 U5 review 2), so one
+ * this long has stopped growing on screen while the agent goes on writing; a finished reply
+ * is cut only at 32,000 characters (`live.ts`, "Partial items").
  */
-export const NARRATION_SHORTENED_MARK = "\n… (shortened)";
+export const PARTIAL_BODY_MAX = 4_000;
+
+/** Whether a partial has reached {@link PARTIAL_BODY_MAX}, so nothing more of it is drawn. */
+export const pastPartialCap = (item: LiveItem): boolean =>
+  item.body.length >= PARTIAL_BODY_MAX;
 
 /**
  * Where a partial block stands, which is what its row says about it:
  *
  * - `writing` — still being written: "writing…" on a reply, a shimmer on a thought.
  * - `shortened` — past the server's 4,000-character cap for a partial, so nothing more of
- *   it is drawn until it ends ({@link NARRATION_SHORTENED_MARK}); said, rather than shown as
+ *   it is drawn until it ends ({@link pastPartialCap}); said, rather than shown as
  *   writing over text that has stopped moving (seen frozen ~30 s on a GLM thought). A reply
  *   says it is still being written and the rest shows when it finishes — its finished copy
  *   carries up to 32,000 — and a thought that it is shortened, which its finished copy is
@@ -595,7 +599,7 @@ export const streamStates = (
     if (!isPartial(item)) continue;
     states.set(
       item.id,
-      item.body.endsWith(NARRATION_SHORTENED_MARK)
+      pastPartialCap(item)
         ? "shortened"
         : item.kind === THINKING_KIND &&
             item.blockCall !== undefined &&

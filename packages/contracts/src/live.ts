@@ -70,9 +70,11 @@
  *   still being written then shows nothing until it ends. A partial whose finished block
  *   never comes — a turn cut off mid-block — stays as last sent until the client drops it.
  * - **A partial is capped at 4,000 characters, a finished reply at 32,000** (A6 U5 review).
- *   A partial past its cap ends in the server's `… (shortened)` mark and stops growing
- *   while the agent goes on; the finished reply then replaces it with the whole of it, up to
- *   its own cap. Thinking and every tool field stay at 4,000, finished or not.
+ *   A partial is cut at its cap with **no** mark (A6 U5 review 2) — a client reads a partial
+ *   exactly 4,000 characters long as past it — and stops growing while the agent goes on;
+ *   the finished reply then replaces it with the whole of it, up to its own cap, where a
+ *   cut does end in the server's `… (shortened)` mark. Thinking and every tool field stay at
+ *   4,000, finished or not.
  * - {@link LiveItem.blockCall} names a block's model call, so a client that needs "the same
  *   call" compares it rather than reading into `blockId`.
  *
