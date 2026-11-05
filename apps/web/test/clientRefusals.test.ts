@@ -31,7 +31,12 @@ import {
   IntentRefused,
 } from "@bit/contracts";
 
-import { NOT_REFUSALS, REFUSAL_TAGS, server } from "../src/lib/client";
+import {
+  NOT_REFUSALS,
+  REFUSAL_TAGS,
+  RequestNotSent,
+  server,
+} from "../src/lib/client";
 
 const BASE = "http://127.0.0.1:65530";
 
@@ -177,6 +182,51 @@ describe("a goal briefing over the ceiling, through the real client", () => {
 
     const call = await server.goalBriefing(BASE, "acme-corp", "goal_1");
 
+    expect(call._tag).toBe("Unreachable");
+  });
+});
+
+describe("a message over the importer's limit, through the real client (U8 review 5)", () => {
+  const long = "x".repeat(contracts.IMPORTER_MESSAGE_MAX_CHARS + 1);
+
+  test("a later message is refused before any request, never Unreachable", async () => {
+    answering(202, {});
+    const call = await server.sendImporterMessage(
+      BASE,
+      "acme-corp",
+      "imp_1",
+      long,
+    );
+    // Nothing left the browser, so "whether it was sent is not known" would be false.
+    expect(asked).toHaveLength(0);
+    expect(call._tag).toBe("Refused");
+    if (call._tag !== "Refused") return;
+    expect(call.error).toBeInstanceOf(RequestNotSent);
+    expect((call.error as RequestNotSent).detail).toContain(
+      "This message is 32,001 characters; the limit is 32,000.",
+    );
+  });
+
+  test("an opening message too", async () => {
+    answering(202, {});
+    const call = await server.openImporterConversation(BASE, "acme-corp", {
+      text: long,
+    });
+    expect(asked).toHaveLength(0);
+    expect(call._tag).toBe("Refused");
+    if (call._tag !== "Refused") return;
+    expect(call.error).toBeInstanceOf(RequestNotSent);
+  });
+
+  test("one at the limit is sent, so the check refuses only what the contract would", async () => {
+    unreachable();
+    const call = await server.sendImporterMessage(
+      BASE,
+      "acme-corp",
+      "imp_1",
+      "x".repeat(contracts.IMPORTER_MESSAGE_MAX_CHARS),
+    );
+    expect(asked).toHaveLength(1);
     expect(call._tag).toBe("Unreachable");
   });
 });

@@ -11,6 +11,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  IMPORTER_MESSAGE_MAX_CHARS,
   bitMcpServerName,
   claudeCodeToolName,
   type LiveItem,
@@ -38,7 +39,9 @@ import {
   readingNote,
   sessionHover,
   sessionLabel,
+  sessionStarted,
   sessionWhen,
+  messageTooLong,
   tallyLine,
   type ImporterHistory,
   type ImporterSession,
@@ -644,6 +647,33 @@ describe("a session the server lists", () => {
     expect(held.loaded).toBeUndefined();
     // And an unknown count is not the empty session: it keeps a time label.
     expect(sessionLabel(held)).toMatch(/^Session /);
+  });
+});
+
+describe("a session as a notice names it (U8 review 5)", () => {
+  test("by when it started: today, in running words, and with the date before today", () => {
+    const time = new Date(AT).toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    expect(sessionStarted(AT, AT)).toBe(`today at ${time}`);
+    const date = new Date(AT).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    });
+    expect(sessionStarted(AT, AT + 3 * 86_400_000)).toBe(
+      `on ${date} at ${time}`,
+    );
+  });
+
+  test("a message over the importer's limit is refused with both figures", () => {
+    expect(messageTooLong(IMPORTER_MESSAGE_MAX_CHARS + 1)).toBe(
+      "This message is 32,001 characters; the limit is 32,000. Nothing was sent: shorten it, or send it in parts.",
+    );
+    expect(messageTooLong(6_291_456)).toContain(
+      "This message is 6,291,456 characters",
+    );
   });
 });
 

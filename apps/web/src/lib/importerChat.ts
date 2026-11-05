@@ -70,13 +70,14 @@
  * {@link strandedNote} — each of which is a fact about this screen or about a row the page
  * already holds, not an answer only the server could give.
  */
-import type {
-  ConversationModelSwitched,
-  ImporterContinuationRefusal,
-  ImporterConversationView,
-  ImporterSessionView,
-  LiveItem,
-  ModelOptionSelection,
+import {
+  IMPORTER_MESSAGE_MAX_CHARS,
+  type ConversationModelSwitched,
+  type ImporterContinuationRefusal,
+  type ImporterConversationView,
+  type ImporterSessionView,
+  type LiveItem,
+  type ModelOptionSelection,
 } from "@bit/contracts";
 
 import {
@@ -1504,6 +1505,43 @@ export const sessionWhen = (at: number, now: number): string => {
     day: "numeric",
   });
   return `${date}, ${time}`;
+};
+
+/**
+ * Why a message over the importer's limit is not sent (U8 review 5), with both figures: the
+ * composer refuses it before any request, and the client refuses one that reaches it, so
+ * the operator is never told "whether it was sent is not known" of a message that never
+ * left the browser. A pasted statement of work is this page's main use, so the count is
+ * what tells the operator how much to cut.
+ */
+export const messageTooLong = (length: number): string =>
+  `This message is ${length.toLocaleString("en-US")} characters; the limit is ${IMPORTER_MESSAGE_MAX_CHARS.toLocaleString("en-US")}. Nothing was sent: shorten it, or send it in parts.`;
+
+/**
+ * When a session started, as a sentence says it (U8 review 5): "today at 12:25", or "on
+ * 5 Nov at 12:25" before today. {@link sessionWhen}'s instant in running words, for a
+ * notice that names a session: a notice outlives the moment it was written, so it names a
+ * session by what does not change — not by a label the harness may replace with a title
+ * seconds later.
+ */
+export const sessionStarted = (at: number, now: number): string => {
+  const time = new Date(at).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const day = new Date(at);
+  const today = new Date(now);
+  const same =
+    day.getFullYear() === today.getFullYear() &&
+    day.getMonth() === today.getMonth() &&
+    day.getDate() === today.getDate();
+  if (same) return `today at ${time}`;
+  const date = day.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+  return `on ${date} at ${time}`;
 };
 
 /**

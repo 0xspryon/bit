@@ -17,6 +17,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import {
+  IMPORTER_MESSAGE_MAX_CHARS,
   ConversationStopRefused,
   ImporterConversationRefused,
   ImporterModelUnavailable,
@@ -33,6 +34,7 @@ import {
   sendNowButtonTitle,
   sendingNowNote,
   sentNowTitle,
+  sessionStarted,
   sessionWhen,
 } from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
@@ -1091,8 +1093,10 @@ describe("the composer posts to the server", () => {
     expect(composer().value).toBe("");
     expect(text()).toContain("Your last message was not sent");
     expect(text()).toContain("marked “Not sent” in the session list");
-    // Named: the session's own label, isolated as a title is.
-    expect(text()).toMatch(/on \u2068Session \d\d:\d\d\u2069/u);
+    // Named by when it started, which a title arriving later does not change (U8 review 5).
+    expect(text()).toContain(
+      `on the session started ${sessionStarted(1_700_000_200_000, Date.now())}, marked “Not sent”`,
+    );
     const marked = (await rows(app)).filter((row) =>
       row.includes("Not sent “Also load the staging hosts”"),
     );
@@ -1161,6 +1165,253 @@ describe("the composer posts to the server", () => {
     expect(composer().value).toBe("");
     expect(text()).toContain("that message did reach this session");
     expect(fake.countOf("sendImporterMessage")).toBe(1);
+  });
+
+  /**
+   * Fires every outstanding confirmation wait (`CONFIRM_DELAYS` past the first), so a test
+   * sees what the page settles on once it has stopped looking.
+   */
+  const exhaustConfirm = async (app: App): Promise<void> => {
+    const countdown = app.countdown as FakeCountdown;
+    for (let round = 0; round < 10; round += 1) {
+      const waiting = countdown.live.filter((armed) =>
+        [500, 1000, 2000, 4000].includes(armed.ms),
+      );
+      if (waiting.length === 0) return;
+      for (const armed of waiting) armed.fire();
+      await settle();
+      await settle();
+    }
+  };
+
+  /** A message the harness holds queued, as another tab's send left it. */
+  const queuedCopy = (text: string, acceptedAt: number, messageId: string) => ({
+    messageId,
+    text,
+    acceptedAt,
+    taken: false,
+  });
+
+  test("a reply from a thread whose replay never arrived is not looked for: an earlier copy of its words is not it (U8 review 5)", async () => {
+    const fake = new FakeServer();
+    // The replay GET fails, so the thread on screen holds nothing of the session's.
+    fake.onImporterMessages = () => unreachable("connection reset");
+    const app = await continueWith(fake);
+    expect(app.importer.current?.loaded).not.toBe(true);
+    // The POST never reached the server…
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    // …and the real conversation holds the same words, said in an earlier turn.
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          at: Date.now(),
+          items: [replayItem(0, "turn.operator", "Say ok once more.")],
+        }),
+      );
+    const asked = fake.countOf("importerMessages");
+    await send("Say ok once more.");
+    await settle();
+    await exhaustConfirm(app);
+
+    expect(composer().value).toBe("Say ok once more.");
+    expect(text()).toContain("may send it twice");
+    expect(text()).not.toContain("did reach this session");
+    // Not looked for at all: there is no baseline to tell a new copy from an old one.
+    expect(fake.countOf("importerMessages")).toBe(asked);
+  });
+
+  test("…nor when the earlier copy is one another tab has queued (U8 review 5)", async () => {
+    const fake = new FakeServer();
+    fake.onImporterMessages = () => unreachable("connection reset");
+    const app = await continueWith(fake);
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    const sentAt = Date.now();
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          live: true,
+          at: Date.now(),
+          items: [],
+          queued: [queuedCopy("Say ok once more.", sentAt - 30_000, "msg_b")],
+        }),
+      );
+    await send("Say ok once more.");
+    await settle();
+    await exhaustConfirm(app);
+
+    expect(composer().value).toBe("Say ok once more.");
+    expect(text()).toContain("may send it twice");
+    expect(text()).not.toContain("did reach this session");
+  });
+
+  test("a copy another tab queued before this message left is not it, even once it is taken into the transcript (U8 review 5)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    expect(app.importer.current?.loaded).toBe(true);
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    const sentAt = Date.now();
+    // Another tab sent the same words half a minute ago: queued, then taken and written.
+    let reads = 0;
+    fake.onImporterMessages = (_baseUrl, targetId, importId) => {
+      reads += 1;
+      return ok(
+        importerConversationView({
+          targetId,
+          importId,
+          live: true,
+          at: Date.now(),
+          items:
+            reads <= 2
+              ? []
+              : [
+                  replayItem(0, "turn.operator", "Say ok once more.", {
+                    messageIds: ["msg_b"],
+                  }),
+                ],
+          queued:
+            reads <= 2
+              ? [queuedCopy("Say ok once more.", sentAt - 30_000, "msg_b")]
+              : [],
+        }),
+      );
+    };
+    await send("Say ok once more.");
+    await settle();
+    await exhaustConfirm(app);
+
+    expect(reads).toBeGreaterThan(2);
+    expect(composer().value).toBe("Say ok once more.");
+    expect(text()).toContain("may send it twice");
+    expect(text()).not.toContain("did reach this session");
+  });
+
+  test("…while a copy accepted after it left is found, queued in its session (U8 review 5)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          live: true,
+          at: Date.now(),
+          items: [],
+          queued: [queuedCopy("Say ok once more.", Date.now(), "msg_mine")],
+        }),
+      );
+    await send("Say ok once more.");
+    await settle();
+    await settle();
+
+    expect(app.importer.currentId).toBe("ses_newest");
+    expect(composer().value).toBe("");
+    expect(text()).toContain("that message did reach this session");
+  });
+
+  test("a lost first message is still found when the first list read after it fails: the list is read on every try (U8 review 5)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    app.importer.start();
+    await settle();
+    fake.onOpenImporterConversation = () => unreachable("connection reset");
+    const words = "Read https://hackerone.com/acme/policy";
+    openedAfterAll(fake, words);
+    const listed = fake.onImporterSessions;
+    let lists = 0;
+    fake.onImporterSessions = (...args) => {
+      lists += 1;
+      return lists === 1 ? unreachable("connection reset") : listed(...args);
+    };
+    await send(words);
+    await settle();
+    await settle();
+    // The one read so far failed, so the list does not name the session yet.
+    expect(app.importer.current?.importId).toBeUndefined();
+    expect(text()).toContain("whether this message was sent is not known");
+
+    await exhaustConfirm(app);
+    expect(lists).toBeGreaterThan(1);
+    expect(app.importer.currentId).toBe("ses_opened");
+    expect(composer().value).toBe("");
+    expect(text()).toContain("the server did open a session for that message");
+    expect(fake.countOf("openImporterConversation")).toBe(1);
+  });
+
+  test("a titled session is named by its title beside when it started, never by the title alone (U8 review 5)", async () => {
+    const titled = [
+      importerSessionView({
+        sessionId: "ses_newest",
+        importId: "imp_newest",
+        harnessInstanceId: "claude-code",
+        openedAt: 1_700_000_200_000,
+        title: "Full policy sweep",
+      }),
+      ...SESSIONS.slice(1),
+    ];
+    const { app, fake } = await continueOn(titled, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    const release = fake.hold("sendImporterMessage");
+    fake.onSendImporterMessage = refusal;
+    await send("Also load the staging hosts");
+    app.importer.open("ses_older");
+    await settle();
+    release();
+    await settle();
+
+    expect(text()).toContain(
+      `on the session \u2068Full policy sweep\u2069 (started ${sessionStarted(1_700_000_200_000, Date.now())}), marked “Not sent”`,
+    );
+  });
+
+  test("a message over the limit is refused at once with both figures, nothing is sent, and its words stay (U8 review 5)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    const long = "x".repeat(IMPORTER_MESSAGE_MAX_CHARS + 1);
+    await send(long);
+
+    expect(fake.countOf("sendImporterMessage")).toBe(0);
+    expect(composer().value).toBe(long);
+    expect(text()).toContain(
+      "This message is 32,001 characters; the limit is 32,000.",
+    );
+    expect(text()).not.toContain("not known");
+    expect(app.importer.parked).toEqual({});
+
+    // A first message too: nothing is opened, and nothing is parked as "Not confirmed".
+    app.importer.start();
+    await settle();
+    await send(long);
+    expect(fake.countOf("openImporterConversation")).toBe(0);
+    expect(composer().value).toBe(long);
+    expect(text()).toContain("This message is 32,001 characters");
+    expect(app.importer.parked).toEqual({});
+  });
+
+  test("the composer shows the message's length once it nears the limit (U8 review 5)", async () => {
+    await continueOn(SESSIONS, [harness("claude-code", "Claude Code")]);
+    const count = (): string | null =>
+      document.querySelector(".importer .count")?.textContent?.trim() ?? null;
+    typeInto(composer(), "Read the policy");
+    await settle();
+    expect(count()).toBeNull();
+    typeInto(composer(), "x".repeat(29_000));
+    await settle();
+    expect(count()).toBe("29,000 / 32,000");
+    expect(document.querySelector(".importer .count.over")).toBeNull();
+    typeInto(composer(), "x".repeat(IMPORTER_MESSAGE_MAX_CHARS + 5));
+    await settle();
+    expect(count()).toBe("32,005 / 32,000");
+    expect(document.querySelector(".importer .count.over")).not.toBeNull();
   });
 
   test("parked words outlive a return to the page and a reload in the same tab, and Start a new session steps over them (U8 review 4)", async () => {

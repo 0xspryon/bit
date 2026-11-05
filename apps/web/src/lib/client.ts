@@ -37,11 +37,13 @@
 import {
   BitApi,
   GOAL_UPLOAD_FIELD,
+  IMPORTER_MESSAGE_MAX_CHARS,
+  ImporterConversationDraft,
+  ImporterMessageDraft,
   SessionGuard,
   type ConversationModelDraft,
   type GoalDraft,
   type GoalEndDraft,
-  type ImporterConversationDraft,
   type IntentAbandonDraft,
   type IntentDraft,
   type LiveFrame,
@@ -52,9 +54,11 @@ import {
   type SteerUrgency,
   type TargetDraft,
 } from "@bit/contracts";
-import { Effect, Fiber, Layer, Result, Stream } from "effect";
+import { Effect, Fiber, Layer, Result, Schema, Stream } from "effect";
 import { FetchHttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient, HttpApiMiddleware } from "effect/http-api";
+
+import { messageTooLong } from "./importerChat";
 
 /** Where the token is parked so a reload can find it. */
 const TOKEN_KEY = "bit.session.token";
@@ -310,11 +314,51 @@ export const REFUSAL_TAGS = new Set([
 export const NOT_REFUSALS: Readonly<Record<string, string>> = {};
 
 const isRefusal = (error: unknown): boolean =>
-  typeof error === "object" &&
-  error !== null &&
-  "_tag" in error &&
-  typeof (error as { _tag: unknown })._tag === "string" &&
-  REFUSAL_TAGS.has((error as { _tag: string })._tag);
+  error instanceof RequestNotSent ||
+  (typeof error === "object" &&
+    error !== null &&
+    "_tag" in error &&
+    typeof (error as { _tag: unknown })._tag === "string" &&
+    REFUSAL_TAGS.has((error as { _tag: string })._tag));
+
+/**
+ * A request this client would not send, because its payload does not encode against the
+ * contract (U8 review 5): **nothing left the browser**, so it is a refusal the screen words
+ * as one, never "No server answered". Not one of the server's tags, so not in
+ * {@link REFUSAL_TAGS}; {@link isRefusal} knows it by class.
+ *
+ * Why it is checked here before the typed client is called: the typed client encodes the
+ * payload inside the same effect that sends the request and decodes the answer, and its
+ * failure is one `SchemaError` either way. A failed *answer* decode is a server that may
+ * have acted — for a message, one that may have delivered it — and must stay `Unreachable`;
+ * only a failed *request* encode is known to have sent nothing. A message over
+ * `IMPORTER_MESSAGE_MAX_CHARS` was the case: filed as `Unreachable`, the importer page said
+ * whether it was sent was not known, of a message no server ever saw.
+ */
+export class RequestNotSent {
+  readonly _tag = "RequestNotSent";
+  constructor(readonly detail: string) {}
+}
+
+/**
+ * The payload as the contract encodes it, or {@link RequestNotSent} with a sentence: the
+ * length of a message over the importer's limit, the schema's own words otherwise.
+ */
+const encodedOrNotSent = <S extends Schema.Top>(
+  schema: S,
+  payload: S["Type"] & { readonly text: string },
+): Effect.Effect<void, RequestNotSent, S["EncodingServices"]> =>
+  Schema.encodeUnknownEffect(schema)(payload).pipe(
+    Effect.asVoid,
+    Effect.mapError((issue) => {
+      const length = payload.text.trim().length;
+      return new RequestNotSent(
+        length > IMPORTER_MESSAGE_MAX_CHARS
+          ? messageTooLong(length)
+          : `This message could not be sent as written, so nothing left this browser: ${issue.message}`,
+      );
+    }),
+  );
 
 /**
  * Runs one call and sorts the outcome into {@link Call}.
@@ -905,11 +949,14 @@ export const server = {
     draft: ImporterConversationDraft,
   ) =>
     run(
-      Effect.flatMap(client(baseUrl), (api) =>
-        api.fleet.openImporterConversation({
-          params: { targetId },
-          payload: draft,
-        }),
+      Effect.andThen(
+        encodedOrNotSent(ImporterConversationDraft, draft),
+        Effect.flatMap(client(baseUrl), (api) =>
+          api.fleet.openImporterConversation({
+            params: { targetId },
+            payload: draft,
+          }),
+        ),
       ),
     ),
 
@@ -929,11 +976,17 @@ export const server = {
     urgency?: SteerUrgency,
   ) =>
     run(
-      Effect.flatMap(client(baseUrl), (api) =>
-        api.fleet.sendImporterMessage({
-          params: { targetId, importId },
-          payload: { text, ...(urgency === undefined ? {} : { urgency }) },
+      Effect.andThen(
+        encodedOrNotSent(ImporterMessageDraft, {
+          text,
+          ...(urgency === undefined ? {} : { urgency }),
         }),
+        Effect.flatMap(client(baseUrl), (api) =>
+          api.fleet.sendImporterMessage({
+            params: { targetId, importId },
+            payload: { text, ...(urgency === undefined ? {} : { urgency }) },
+          }),
+        ),
       ),
     ),
 

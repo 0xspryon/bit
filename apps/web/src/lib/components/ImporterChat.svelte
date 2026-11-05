@@ -60,6 +60,8 @@
    */
   import { tick } from "svelte";
 
+  import { IMPORTER_MESSAGE_MAX_CHARS } from "@bit/contracts";
+
   import type { App } from "../app.svelte";
   import { IconArrowUp, IconFile, IconLink, IconPlus } from "../icons";
   import {
@@ -139,6 +141,13 @@
   let canSend = $derived(
     importer.draft.trim() !== "" && !blocked && !importer.sending,
   );
+  /**
+   * How long the message is, shown once it nears the limit the server takes (U8 review 5):
+   * a pasted statement of work is this page's main use, and one over the limit is refused
+   * on Send with both figures. Trimmed, as the limit is counted.
+   */
+  let length = $derived(importer.draft.trim().length);
+  let nearLimit = $derived(length > IMPORTER_MESSAGE_MAX_CHARS * 0.9);
   let working = $derived(session?.working ?? false);
   /**
    * Work the agent started in the background still running outside any turn (A6 U6), as
@@ -591,6 +600,15 @@
               {/if}
             {/if}
             <span class="grow"></span>
+            {#if nearLimit}
+              <span
+                class={["count", length > IMPORTER_MESSAGE_MAX_CHARS && "over"]}
+                title="Characters in this message, of the most the importer takes"
+                >{length.toLocaleString("en-US")} / {IMPORTER_MESSAGE_MAX_CHARS.toLocaleString(
+                  "en-US",
+                )}</span
+              >
+            {/if}
             {#if working && session?.importId !== undefined}
               <!--
                 D3's two ways to send while a turn runs (A6 U6). The arrow and Enter queue the
@@ -879,6 +897,18 @@
     color: var(--text-muted);
     white-space: nowrap;
     text-overflow: ellipsis;
+  }
+
+  /* The message's length, once it nears the limit: a figure, so it never gives way. */
+  .count {
+    flex: none;
+    font: 400 11px/16px var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .count.over {
+    color: var(--text-danger, var(--text-base));
   }
 
   .icon-btn,

@@ -72,7 +72,11 @@ import type {
   ModelOptionSelection,
   SteerUrgency,
 } from "@bit/contracts";
-import { sameModel, sameWindow } from "@bit/contracts";
+import {
+  IMPORTER_MESSAGE_MAX_CHARS,
+  sameModel,
+  sameWindow,
+} from "@bit/contracts";
 
 import type { ErrorNotice } from "./components/ErrorDialog.svelte";
 
@@ -90,8 +94,8 @@ import {
   type ImporterSession,
   acceptedNotice,
   isolated,
-  sessionLabel,
-  sessionWhen,
+  messageTooLong,
+  sessionStarted,
   switchedNotice,
 } from "./importerChat";
 import {
@@ -1508,6 +1512,14 @@ export class ImporterSessions {
     if (session.strandedOn !== undefined) return;
     // The operator ended it; the server would refuse, and the composer says so instead.
     if (session.ended === true) return;
+    // Over the limit the server takes (U8 review 5): refused here, with both figures, and
+    // the words stay in the box. Sent, the typed client would refuse to encode it; before
+    // this, that read as "No server answered", so the page said it might have been sent.
+    if (text.length > IMPORTER_MESSAGE_MAX_CHARS) {
+      this.notice = messageTooLong(text.length);
+      this.refused = true;
+      return;
+    }
     if (this.#server !== undefined) {
       void this.#post(this.#server, session, text, urgency);
       return;
@@ -1595,9 +1607,23 @@ export class ImporterSessions {
         : undefined;
     if (opening !== undefined) this.#opening = opening;
     // What a message whose answer is lost is checked against ({@link #confirm}): the
-    // sessions the list held, and how often these words were already in this one.
+    // sessions the list held, when it left, and — for a reply — what this thread already
+    // held of these words. That last only on a thread whose replay has arrived (U8 review
+    // 5): one never read (the replay GET failed, or the operator typed before it came)
+    // holds only this tab's own rows, so any earlier copy in the real replay would read as
+    // this message having arrived, and the page would empty the box for words that never
+    // reached the session. Such a reply is not looked for at all; it stays "Not confirmed".
     const known = new Set(this.sessions.map((each) => each.id));
-    const said = timesSaid(session, text);
+    const baseline: ConfirmBaseline | undefined =
+      session.importId === undefined
+        ? { said: 0, ids: new Set(), sentAt: this.#now() }
+        : session.loaded === true
+          ? {
+              said: timesSaid(session, text),
+              ids: idsSaid(session, text),
+              sentAt: this.#now(),
+            }
+          : undefined;
     const answer =
       session.importId === undefined
         ? await server.open(text, agentId)
@@ -1624,8 +1650,27 @@ export class ImporterSessions {
       if (answer._tag === "refused" && answer.ended === true) {
         void server.reread();
       }
-      if (answer._tag === "unanswered") {
-        void this.#confirm(server, session, text, heldOn, known, said);
+      /*
+       * V2(chat): finding out whether a message with no answer arrived is a text match
+       * against the replay ({@link #confirm}), bounded by the baseline above and by the
+       * server's clock, and it can still be fooled — another tab saying the very same words
+       * within the same second — or give up too early, leaving a delivered message "Not
+       * confirmed". V2 replaces the matching with **idempotency keys**: the client mints a
+       * `clientMessageId` with each message, the server records it beside the outcome, and
+       * on a lost answer the client asks "did you get X?" or sends again under the same id,
+       * which the server answers rather than delivering twice. No text matching, no timing
+       * loop, no baseline. With it, **write-ahead parking**: the words are parked (with that
+       * id) before the request leaves, not after its answer, so a message whose answer
+       * comes after the operator left this page — or closed the tab — is not lost: today a
+       * refused first message whose refusal lands once the operator has left the importer
+       * page loses its words (`#server !== server` above drops the answer, and nothing was
+       * parked). And V2 checks parked words again: words parked on a session the server
+       * stops listing stay invisible (only listed sessions and the page's own unsent ones
+       * are drawn), and a "Not confirmed" entry restored from `sessionStorage` is never
+       * looked for again — the confirmation runs only in the page that sent it.
+       */
+      if (answer._tag === "unanswered" && baseline !== undefined) {
+        void this.#confirm(server, session, text, heldOn, known, baseline);
       }
       return;
     }
@@ -1850,10 +1895,12 @@ export class ImporterSessions {
 
   /**
    * Finds out whether a message whose answer was lost reached the server after all (U8
-   * review 4), by reading the list once more: **a first message** reached it if a session
-   * the list did not hold before it was sent now holds its words; **a later one** if its
-   * session's conversation now holds them more often than before. The replays are read a
-   * few times ({@link CONFIRM_DELAYS}), while the page still holds its copy.
+   * review 4), by reading the list and the replays again: **a first message** reached it if
+   * a session the list did not hold before it was sent now holds its words; **a later one**
+   * if its session's conversation now holds them more often than before ({@link
+   * ConfirmBaseline}: a reply from a thread whose replay never arrived is not looked for).
+   * Both are read a few times ({@link CONFIRM_DELAYS}) — the list too, each time, since a
+   * read of it can fail (U8 review 5) — while the page still holds its copy.
    *
    * Found, the copy the page kept goes — the parked words, or the words in the box while the
    * operator is still where they were put — and the real session is shown: moved to, when
@@ -1867,18 +1914,30 @@ export class ImporterSessions {
     text: string,
     held: WordsHeld,
     known: ReadonlySet<string>,
-    said: number,
+    baseline: ConfirmBaseline,
   ): Promise<void> {
-    await server.reread();
     /** Whether the page still holds its copy of the words: parked, or in the box. */
     const copied = (): boolean =>
       this.parked[held.sessionId]?.text === text ||
       (this.currentId === held.sessionId && this.draft.trim() === text);
+    /** Copies of the words another tab sent before this one, met in an earlier read. */
+    const foreign = new Set<string>();
     let found: ImporterSession | undefined;
     for (const delay of CONFIRM_DELAYS) {
       if (delay > 0) await server.wait(delay);
       if (this.#server !== server || !copied()) return;
-      found = await this.#holding(server, session, text, known, said);
+      // The list on every try, not once (U8 review 5): a read that fails keeps the list as
+      // it was, and a first message's session is found only in a list that names it.
+      await server.reread();
+      if (this.#server !== server || !copied()) return;
+      found = await this.#holding(
+        server,
+        session,
+        text,
+        known,
+        baseline,
+        foreign,
+      );
       if (this.#server !== server) return;
       if (found !== undefined) break;
     }
@@ -1913,15 +1972,24 @@ export class ImporterSessions {
   /**
    * The session that holds a message whose answer was lost, if one does yet ({@link
    * #confirm}): for a first message, one the list did not hold when it was sent whose replay
-   * holds the words; for a later one, its own session, if its replay holds them more often
-   * than its thread did then.
+   * holds the words; for a later one, its own session — by its harness session, which a
+   * resume keeps under a new import — if its replay holds them more often than its thread
+   * did then ({@link ConfirmBaseline}).
+   *
+   * **Not counting what another tab sent before this one** (U8 review 5): a copy of the
+   * words the server holds queued under an id this thread never saw, accepted before this
+   * message left, is not this message. Its id goes into `foreign`, so it is still not
+   * counted once the harness has taken it into the transcript. "Before" is on the server's
+   * clock, which each answer gives (`at`): the send's time is moved onto it by how far that
+   * clock is from this tab's, read from the same answer, less {@link CONFIRM_CLOCK_SLACK}.
    */
   async #holding(
     server: ImporterServer,
     session: ImporterSession,
     text: string,
     known: ReadonlySet<string>,
-    said: number,
+    baseline: ConfirmBaseline,
+    foreign: Set<string>,
   ): Promise<ImporterSession | undefined> {
     const first = session.importId === undefined;
     const candidates = this.sessions.filter((each) =>
@@ -1929,20 +1997,36 @@ export class ImporterSessions {
         ? each.indexed === true &&
           each.importId !== undefined &&
           !known.has(each.id)
-        : each.importId === session.importId,
+        : each.id === session.id,
     );
     for (const each of candidates) {
       if (each.importId === undefined) continue;
       const answered = await server.history(each.importId);
       if (answered === undefined) continue;
+      const view = answered.view;
+      const sentOnServer =
+        baseline.sentAt + (view.at - this.#now()) - CONFIRM_CLOCK_SLACK;
+      for (const message of view.queued) {
+        if (
+          message.text.trim() === text &&
+          !baseline.ids.has(message.messageId) &&
+          message.acceptedAt < sentOnServer
+        ) {
+          foreign.add(message.messageId);
+        }
+      }
       const times =
-        timesSaid(
-          { history: { items: answered.view.items }, items: [] },
-          text,
-        ) +
-        answered.view.queued.filter((message) => message.text.trim() === text)
-          .length;
-      if (times > (first ? 0 : said)) return each;
+        view.items.filter(
+          (item) =>
+            item.kind === "turn.operator" &&
+            item.body?.trim() === text &&
+            !(item.messageIds ?? []).some((id) => foreign.has(id)),
+        ).length +
+        view.queued.filter(
+          (message) =>
+            message.text.trim() === text && !foreign.has(message.messageId),
+        ).length;
+      if (times > baseline.said) return each;
     }
     return undefined;
   }
@@ -2427,6 +2511,45 @@ interface WordsHeld {
  */
 const CONFIRM_DELAYS = [0, 500, 1000, 2000, 4000] as const;
 
+/**
+ * How much earlier than this tab's estimate of the server's clock a send is taken to have
+ * left, in ms ({@link ImporterSessions}'s `#holding`). The estimate reads the server's clock
+ * off an answer's `at` against when it arrived here, so it runs late by that answer's
+ * journey; a second more keeps this message's own copy, accepted after it left, from ever
+ * reading as another tab's. The cost is that a copy another tab sent within that second
+ * before is taken for this one (V2(chat): idempotency keys, at `#post`).
+ */
+const CONFIRM_CLOCK_SLACK = 1000;
+
+/**
+ * What a reply whose answer was lost is checked against ({@link ImporterSessions}'s
+ * `#confirm`), taken as it leaves, and only from a thread whose replay has arrived: how
+ * often the thread held its words — its transcript and its queued messages alike, since a
+ * read thread draws both — under which message ids, and when it left, on this tab's clock.
+ * A first message's is empty: any session the list did not hold that holds its words is it.
+ */
+interface ConfirmBaseline {
+  readonly said: number;
+  readonly ids: ReadonlySet<string>;
+  readonly sentAt: number;
+}
+
+/** The message ids the operator's thread on a session already holds these words under. */
+const idsSaid = (
+  session: {
+    readonly history: { readonly items: readonly LiveItem[] };
+    readonly items: readonly LiveItem[];
+  },
+  text: string,
+): ReadonlySet<string> =>
+  new Set(
+    [...session.history.items, ...session.items].flatMap((item) =>
+      item.kind === "turn.operator" && item.body?.trim() === text
+        ? (item.messageIds ?? [])
+        : [],
+    ),
+  );
+
 /** How often the operator's thread on a session already holds these words, as a message. */
 const timesSaid = (
   session: {
@@ -2440,15 +2563,20 @@ const timesSaid = (
   ).length;
 
 /**
- * A session as a notice names it: its label, isolated (a title is the harness's), and when it
- * started — Claude Code titles sessions from bit's own framing, so two are often named alike.
- * An untitled one's label is already its time.
+ * A session as a notice names it: **always by when it started**, "the session started today
+ * at 12:25", and by its title only beside that, isolated (a title is the harness's). Not by
+ * its label (U8 review 5): an untitled session's label is "Session 12:25", and Claude Code
+ * titles a session seconds into its first turn, so a notice written before the title came
+ * named a row the list no longer showed under that name. The start time is on every row
+ * and never changes; Claude Code's titles come from bit's own framing, so two are often
+ * named alike anyway.
  */
 const named = (session: ImporterSession, now: number): string => {
-  const label = isolated(sessionLabel(session));
-  return (session.title?.trim() ?? "") === ""
-    ? label
-    : `${label} (${sessionWhen(session.startedAt, now)})`;
+  const when = sessionStarted(session.startedAt, now);
+  const title = session.title?.trim() ?? "";
+  return title === ""
+    ? `the session started ${when}`
+    : `the session ${isolated(title)} (started ${when})`;
 };
 
 /**
