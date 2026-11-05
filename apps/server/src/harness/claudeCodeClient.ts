@@ -4205,9 +4205,11 @@ export const claudeCodeHarness = (
       // mostly this server's importer framing, so unrelated sessions on one target come out
       // with the same name (live in U8 on claude-haiku-4-5: two sessions with different
       // operator messages were both "Acme bug bounty scope review"). V1 shows it as the
-      // harness gave it, and the D5 row's date is what tells such sessions apart. The fix —
-      // a title bit authors from the operator's own words, or none — waits on an operator
-      // decision about bit-authored titles.
+      // harness gave it, and the D5 row's date is what tells such sessions apart: the
+      // operator decided (U8, 2026-11-05) to keep the harnesses' names for V1. V2 should
+      // author the title in bit, from the operator's first message rather than the framing,
+      // so names are distinct and read the same on both harnesses (`scopeImporter.ts`'s
+      // session `title:` note has OpenCode's half), and stop reading this one for the list.
       const sessionTitle: AgentHarness["Service"]["sessionTitle"] = Effect.fn(
         "claudeCodeHarness.sessionTitle",
       )(function* (sessionId) {

@@ -996,8 +996,12 @@ export class ScopeImporter extends Context.Service<
               // message (`session/title.ts`, no cut), which is this server's ~3 KB framing
               // with the operator's words at the end, so its names would repeat as Claude
               // Code's do (`claudeCodeClient.ts`, `sessionTitle`); and each title is one more
-              // LLM call per session (`source: "title"` usage, which bit does not read). It
-              // waits on the same operator decision about bit-authored titles.
+              // LLM call per session (`source: "title"` usage, which bit does not read). The
+              // operator decided (U8, 2026-11-05) to keep the harnesses' names for V1. V2
+              // should author the title in bit from the operator's first message — no
+              // framing, no extra model call — and keep it on the import's row, so names are
+              // distinct and the same on both harnesses (`claudeCodeClient.ts`,
+              // `sessionTitle`, has Claude Code's half).
               title: importerSessionTitle(input.request.targetName),
               ...(resume === undefined ? {} : { resume: resume.sessionId }),
               /*
