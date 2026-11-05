@@ -343,6 +343,105 @@ refuses every Claude Code import with `import_ungated`: it resolves the policy h
 `apps/plugins/claudeCodeGate.ts`, which does not exist (`bun src/main.ts` works). Fix the
 resolution so the built server finds the gate. **Remind the operator when the plan is done.**
 
+### Chat shell for goal/planner/worker (prep)
+
+**Done (2026-11-06), web only; the full wiring is a later task, not yet scheduled.** The
+importer's shell around its thread is now shared, so the goal, planner and worker chats can
+mount it. Nothing outside the importer mounts it yet, and the importer looks and behaves as
+before: its DOM suites pass unchanged, except that the composer-border test now compiles
+`ChatComposer.svelte`, where the box's CSS moved.
+
+**What was extracted.**
+
+- `apps/web/src/lib/chatShell.ts` holds the adapter types (`ChatSession`, `ChatComposerSource`,
+  `ChatTurnState`, `ChatWords`, `ComposerNotice`, `ComposerSendNow`) and the turn shape
+  `ThreadTurn`. `ImporterTurn` is now an alias of `ThreadTurn`. The module also holds the
+  rules the shell needs: `turnFooterText`, `replyText`, `clockLabel`, `composerCanSend` and
+  `stopOffered`.
+- `components/ChatShell.svelte` wraps `Chat` with `layout="thread"`. It draws the operator's
+  bubble, the streaming cursor, the turn footer, Stop with an optional elapsed clock, the
+  composer column, the drop of files on the panel, and the two F2 dialogs (a refused file,
+  a refused Stop). It also sets the attachment loader.
+- `components/ChatComposer.svelte` is the box: notices, tray, textarea, `+`, Send now,
+  arrow and count. It has three states:
+  - **open**;
+  - **blocked**: the input is disabled and the placeholder says why (the importer's
+    stranded, ended and refused sessions);
+  - **closed**: a reason sentence takes the input's place, and there is no `+` and no
+    send.
+- `Chat.svelte` has two new optional snippets: `header` (a region at the top) and
+  `subagent` (one sub-agent row, wrapped in `li.subagent-card`, which replaces U14's entry).
+- `ImporterChat.svelte` is now the importer's adapter. Its own parts are the starters
+  (`below`), and the agent chip, model picker and caption (`strip`). The importer also keeps
+  the switch notices and every sentence about why a session cannot be continued. Parked
+  words, `#confirm`, open and the new-session flow were already in `importerSessions` and
+  `TitleBar`.
+
+**How to mount it.** Build a `ChatSession<Subject>`, where `Subject` is `ThreadTurn` or an
+extension of it, as getters over the chat's own state. Then render
+`<ChatShell session id rootClass footnote>`. Optional parts:
+
+- `separator`, `tail` and `footer` override a turn's bubble, cursor and footer, for example
+  for a planner round's status heading.
+- `strip` fills the composer strip and `below` goes under the composer.
+- `dock` is **A7-Q's question dock**. It is drawn above the composer, including a closed
+  one, and stays usable there.
+- `header` is **A7-S's sub-agents chip**, and `subagent` is **A7-S's card**, called per
+  folded row.
+
+All of the A7 slots are empty today. Leaving a field out means the chat cannot do that
+thing:
+
+- no `stop` means no Stop;
+- no `composer.sendNow` means no Send now;
+- no `composer.files` means no `+`, no paste and no drop;
+- no `composer` means a read-only thread (unless there is a `dock` or a `below`);
+- `turn.since` set means an elapsed clock beside Stop.
+
+**The adapter each role needs.**
+
+- **Goal chat.** `groups` from `buildGoalConversation`, which would need to be mapped to
+  `ThreadTurn`: its subject has no `queued`, `sentNow`, `startedAt` or `midBlock`. Its
+  composer is `app.goalMessage` and `app.goalFiles`, with `send` calling `sendGoalMessage`
+  and passing `urgency`. `stop` calls `stopGoalTurn`.
+- **Planner.** `groups` has one `ThreadTurn` per round, with `message: null` or the round's
+  objective, plus a `separator` override for the round's status. The composer is
+  `closed: "Steered from the goal chat"`. `stop` calls `stopRound`, and `turn.since` is the
+  round's `startedAt`.
+- **Worker.** One turn whose `message` is the intent's question, from the attempt
+  transcript. The composer is `closed: "The prompt is the intent's question"`. `stop` calls
+  `stopRun`, and `turn.since` is the attempt's start.
+
+**What is missing per role on the server and in the web state.** The live frames are not
+in this list. `LiveItem`, `LiveUsage`, `LiveTurnEnded` and `LiveConnection` all carry
+`attemptId`, `roundId`, `goalId` and `importId` already, and every role has a Stop route.
+No route was added, and no contract was changed.
+
+- **Goal.**
+  - The web has no Stop or Send now UI: `GoalAgentChat` has a `V2(chat):` note on this.
+    The client already sends `urgency`, but `stopGoalTurn` is in `client.ts` and the app
+    never calls it.
+  - There is no activity route like `importerActivity`, so `turn.working` would come from
+    `goalAwaiting`, which misses turns the harness opens itself and background work.
+  - There is no context route like `importerContext`: the meter has only `LiveUsage`, and
+    no categories.
+  - The server has a switch route (`switchGoalModel`), but `client.ts` does not call it
+    and there is no picker: see the `ImporterModelPicker` `V2(chat):` note in
+    `ImporterChat.svelte`.
+  - The goal replay does not mark queued, taken or carried turns (`turn.taken` and
+    `turn.carried` are importer-only in `buildImporterChat`).
+- **Planner.**
+  - The replay source is `goalNarration` (per round, budgeted by `CHAT_ROUNDS_SHOWN`), and
+    a mapping from it to `ThreadTurn` groups is needed.
+  - There is no activity, context, switch or Send now route. The read-only composer is
+    by design.
+- **Worker.**
+  - The replay source is the attempt `transcript` route (`TranscriptPanel`), plus the live
+    feed (`LiveTranscript`), which are two sources to merge into one turn.
+  - There is no activity, context or switch route, and no uploads.
+- **All roles.** `app.liveConnection` is keyed by `usageScope`, so `connection` comes for
+  free. The shell's `loadFile` is `app.loadUploadedFile`, which is per target.
+
 ## Order
 
 Slices run **one at a time** on branch `a6-chat-revamp`, each committed by its implementer.
