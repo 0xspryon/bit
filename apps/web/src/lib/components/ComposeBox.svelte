@@ -48,14 +48,17 @@
    * like every other primary action in {@link Button}, the radii come from our scale
    * (10px, not their 12px), and the type is ours. Their drag-and-drop, slash-command
    * popover, shell mode, mention parsing, attachment rail and queue/steer delivery are
-   * features rather than shape, and none of them exists on this server.
+   * features rather than shape, and this composer has none of them. (The chats have some
+   * of their own: files dropped, pasted or picked into a tray in the importer's and a
+   * goal's composer, A6 U13's `ComposerTray`, and steer and queue for a message sent
+   * while the agent works.)
    *
    * ## One control with nothing behind it
    *
-   * `+` is rendered, positioned, and unavailable. There is no attachment anywhere in
-   * this product: a run carries an intent, and optionally which harness and which model
-   * (`RunDraft` in `@bit/contracts`). Rendering it as a live control would be a
-   * promise nothing keeps, and leaving it out would make the composer's shape a lie about
+   * `+` is rendered, positioned, and unavailable. A **run** takes no attachment — files
+   * go with a chat message, never with a run: a run carries an intent, and optionally
+   * which harness and which model (`RunDraft` in `@bit/contracts`). Rendering it as a
+   * live control would be a promise nothing keeps, and leaving it out would make the composer's shape a lie about
    * what is coming — so it is here, dimmed, with the reason readable by pointer and by
    * screen reader.
    *
