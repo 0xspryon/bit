@@ -400,10 +400,12 @@ thing:
 
 **The adapter each role needs.**
 
-- **Goal chat.** `groups` from `buildGoalConversation`, which would need to be mapped to
-  `ThreadTurn`: its subject has no `queued`, `sentNow`, `startedAt` or `midBlock`. Its
-  composer is `app.goalMessage` and `app.goalFiles`, with `send` calling `sendGoalMessage`
-  and passing `urgency`. `stop` calls `stopGoalTurn`.
+- **Goal chat: rebuilt on the shared shell with a goal adapter** (operator, 2026-11-06),
+  on both harnesses, in the importer chat's image with goal-specific changes.
+  `GoalAgentChat.svelte` is replaced rather than upgraded, and its current design is not
+  kept. The adapter turns the goal conversation's replay and live items into `ThreadTurn`
+  groups, the way `buildImporterChat` does for the importer. Its composer is the goal's
+  draft and files, with `send` passing `urgency`. `stop` calls `stopGoalTurn`.
 - **Planner.** `groups` has one `ThreadTurn` per round, with `message: null` or the round's
   objective, plus a `separator` override for the round's status. The composer is
   `closed: "Steered from the goal chat"`. `stop` calls `stopRound`, and `turn.since` is the
@@ -417,19 +419,18 @@ in this list. `LiveItem`, `LiveUsage`, `LiveTurnEnded` and `LiveConnection` all 
 `attemptId`, `roundId`, `goalId` and `importId` already, and every role has a Stop route.
 No route was added, and no contract was changed.
 
-- **Goal.**
-  - The web has no Stop or Send now UI: `GoalAgentChat` has a `V2(chat):` note on this.
-    The client already sends `urgency`, but `stopGoalTurn` is in `client.ts` and the app
-    never calls it.
-  - There is no activity route like `importerActivity`, so `turn.working` would come from
-    `goalAwaiting`, which misses turns the harness opens itself and background work.
+- **Goal** (for the rebuild).
+  - Stop and Send now are not wired in the web: `client.ts` has `stopGoalTurn` and sends
+    `urgency`, but the app never calls the stop.
+  - There is no activity route like `importerActivity`, so nothing tells the page about a
+    turn the harness opens itself or about background work.
   - There is no context route like `importerContext`: the meter has only `LiveUsage`, and
     no categories.
   - The server has a switch route (`switchGoalModel`), but `client.ts` does not call it
     and there is no picker: see the `ImporterModelPicker` `V2(chat):` note in
     `ImporterChat.svelte`.
-  - The goal replay does not mark queued, taken or carried turns (`turn.taken` and
-    `turn.carried` are importer-only in `buildImporterChat`).
+  - Nothing marks queued, taken or carried turns for the goal: `turn.taken` and
+    `turn.carried` are read only by `buildImporterChat`.
 - **Planner.**
   - The replay source is `goalNarration` (per round, budgeted by `CHAT_ROUNDS_SHOWN`), and
     a mapping from it to `ThreadTurn` groups is needed.
