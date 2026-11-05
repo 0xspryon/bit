@@ -41,12 +41,15 @@
  *   promised". Callers and tests depend on that distinction.
  * - **The narrow surface.** Nine operations with domain-shaped results, not 200 routes.
  *
- * One dependency note, because it cost an afternoon to find: the package declares
- * `effect: "4.0.1"` as an **exact** peer. Without intervention bun installs a second copy
- * of Effect, and Schema internals from two instances interleave and throw
- * (`s.startsWith is not a function` out of `SchemaAST`). The root `package.json` therefore
- * pins `overrides: { effect: "4.0.5" }` so one copy is resolved for the whole workspace.
- * Check that override on any Effect or client upgrade.
+ * One dependency note, because it cost an afternoon to find: the package pins Effect
+ * **exactly** (`@opencode/client@2.2.5` declares `effect: "4.0.6"` as a peer, and
+ * `@opencode/schema@2.2.5` depends on it outright). Without intervention bun installs a
+ * second copy of Effect, and Schema internals from two instances interleave and throw
+ * (`s.startsWith is not a function` out of `SchemaAST`). The workspace therefore runs on
+ * the client's own Effect, 4.0.6, and the root `package.json` pins
+ * `overrides: { effect: "4.0.6" }` so one copy is resolved for the whole workspace.
+ * Check that override on any Effect or client upgrade: the client follows the `opencode`
+ * server's release (2.2.5), and its exact Effect pin moves with it.
  *
  * `POST /api/experimental/mcp/{server}` — `api.mcp.add` — is how our bearer credential
  * reaches the harness: in a request body, never in the server's argv and never in the
@@ -152,8 +155,10 @@ import { OpenCodeServer } from "./openCodeServer";
  * *first* turn: the row read `succeeded`, so nothing looked half-finished, and the
  * interrupted turn was left alone.
  *
- * **The pinned `@opencode/schema@2.1.0` does not declare `time.busy`**, though the live
- * server (2.2.5) sends it and the current schema declares and documents it. Effect Schema
+ * **`@opencode/schema@2.1.0`, pinned when this was written, did not declare `time.busy`**,
+ * though the live server (2.2.5) sends it. 2.2.5's schema declares it (as a `DateTime`), so
+ * this read could now move onto the generated decode; it stays as it is because it is
+ * tested and right, and moving it is no part of the client upgrade. Effect Schema
  * strips excess properties, so a `busy` read off `api.session.get`'s decoded answer is
  * always `undefined` — the unknown-field read S7a warned against, and it would have
  * silently done nothing. Hence this: the same route, over the same authenticated

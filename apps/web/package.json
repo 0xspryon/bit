@@ -18,7 +18,7 @@
     "@shikijs/engine-oniguruma": "4.6.0",
     "@shikijs/langs": "4.6.0",
     "dompurify": "3.4.17",
-    "effect": "4.0.5",
+    "effect": "4.0.6",
     "pele": "1.13.0",
     "rehype-sanitize": "6.0.0",
     "rehype-stringify": "10.0.1",
