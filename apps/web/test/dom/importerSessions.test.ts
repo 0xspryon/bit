@@ -996,6 +996,38 @@ describe("the composer posts to the server", () => {
     expect(fake.countOf("openImporterConversation")).toBe(1);
   });
 
+  test("…and words the harness has not written yet are looked for again, a little later (U8 review 4)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    app.importer.start();
+    await settle();
+    fake.onOpenImporterConversation = () => unreachable("connection reset");
+    const words = "Read https://hackerone.com/acme/policy";
+    openedAfterAll(fake, words);
+    // The first read is too early: the harness has not written the operator's entry.
+    let written = false;
+    const answer = fake.onImporterMessages;
+    fake.onImporterMessages = (baseUrl, targetId, importId) =>
+      written
+        ? answer(baseUrl, targetId, importId)
+        : ok(importerConversationView({ targetId, importId, items: [] }));
+    await send(words);
+    await settle();
+    await settle();
+    expect(app.importer.current?.importId).toBeUndefined();
+    expect(text()).toContain("whether this message was sent is not known");
+
+    written = true;
+    const countdown = app.countdown as FakeCountdown;
+    countdown.latest.fire();
+    await settle();
+    await settle();
+    expect(app.importer.currentId).toBe("ses_opened");
+    expect(composer().value).toBe("");
+    expect(text()).toContain("the server did open a session for that message");
+  });
+
   test("…and one parked while the operator was elsewhere is dropped, and the notice names the real session (U8 review 4)", async () => {
     const { app, fake, release, fresh } = await sendThenStart();
     typeInto(composer(), "Something else entirely");

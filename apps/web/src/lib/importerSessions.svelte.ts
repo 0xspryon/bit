@@ -294,10 +294,13 @@ export interface ImporterServer {
   >;
   /**
    * Reads the session list again: after an accepted message, so the session it landed in
-   * is listed with the server's figures, and after an `import_ended` refusal, so the
-   * session the operator ended reads as ended and the composer stops offering it.
+   * is listed with the server's figures, after an `import_ended` refusal, so the session
+   * the operator ended reads as ended and the composer stops offering it, and after a lost
+   * answer, to look for the session it may have opened.
    */
   readonly reread: () => Promise<void>;
+  /** Resolves after `ms`: the app's countdown, so a test decides when it is up. */
+  readonly wait: (ms: number) => Promise<void>;
   /**
    * This tab's parked words for the target (`importerParked.ts`): read when the page opens
    * on it, written whenever they change, so a return to the page or a reload keeps them.
@@ -1848,7 +1851,8 @@ export class ImporterSessions {
    * Finds out whether a message whose answer was lost reached the server after all (U8
    * review 4), by reading the list once more: **a first message** reached it if a session
    * the list did not hold before it was sent now holds its words; **a later one** if its
-   * session's conversation now holds them more often than before.
+   * session's conversation now holds them more often than before. The replays are read a
+   * few times ({@link CONFIRM_DELAYS}), while the page still holds its copy.
    *
    * Found, the copy the page kept goes — the parked words, or the words in the box while the
    * operator is still where they were put — and the real session is shown: moved to, when
@@ -1865,34 +1869,17 @@ export class ImporterSessions {
     said: number,
   ): Promise<void> {
     await server.reread();
-    if (this.#server !== server) return;
-    const candidates =
-      session.importId === undefined
-        ? this.sessions.filter(
-            (each) =>
-              each.indexed === true &&
-              each.importId !== undefined &&
-              !known.has(each.id),
-          )
-        : this.sessions.filter((each) => each.importId === session.importId);
+    /** Whether the page still holds its copy of the words: parked, or in the box. */
+    const copied = (): boolean =>
+      this.parked[held.sessionId]?.text === text ||
+      (this.currentId === held.sessionId && this.draft.trim() === text);
     let found: ImporterSession | undefined;
-    for (const each of candidates) {
-      const importId = each.importId;
-      if (importId === undefined) continue;
-      const answered = await server.history(importId);
+    for (const delay of CONFIRM_DELAYS) {
+      if (delay > 0) await server.wait(delay);
+      if (this.#server !== server || !copied()) return;
+      found = await this.#holding(server, session, text, known, said);
       if (this.#server !== server) return;
-      if (answered === undefined) continue;
-      const times =
-        timesSaid(
-          { history: { items: answered.view.items }, items: [] },
-          text,
-        ) +
-        answered.view.queued.filter((message) => message.text.trim() === text)
-          .length;
-      if (times > (session.importId === undefined ? 0 : said)) {
-        found = each;
-        break;
-      }
+      if (found !== undefined) break;
     }
     if (found === undefined) return;
     const parked = this.parked[held.sessionId];
@@ -1920,6 +1907,43 @@ export class ImporterSessions {
       this.notice = `Your last message did reach the server after all: it is on ${name} in the session list.`;
       this.refused = false;
     }
+  }
+
+  /**
+   * The session that holds a message whose answer was lost, if one does yet ({@link
+   * #confirm}): for a first message, one the list did not hold when it was sent whose replay
+   * holds the words; for a later one, its own session, if its replay holds them more often
+   * than its thread did then.
+   */
+  async #holding(
+    server: ImporterServer,
+    session: ImporterSession,
+    text: string,
+    known: ReadonlySet<string>,
+    said: number,
+  ): Promise<ImporterSession | undefined> {
+    const first = session.importId === undefined;
+    const candidates = this.sessions.filter((each) =>
+      first
+        ? each.indexed === true &&
+          each.importId !== undefined &&
+          !known.has(each.id)
+        : each.importId === session.importId,
+    );
+    for (const each of candidates) {
+      if (each.importId === undefined) continue;
+      const answered = await server.history(each.importId);
+      if (answered === undefined) continue;
+      const times =
+        timesSaid(
+          { history: { items: answered.view.items }, items: [] },
+          text,
+        ) +
+        answered.view.queued.filter((message) => message.text.trim() === text)
+          .length;
+      if (times > (first ? 0 : said)) return each;
+    }
+    return undefined;
   }
 
   /**
@@ -2392,6 +2416,15 @@ interface WordsHeld {
   /** What the page said of them then: replaced only while it is still on screen. */
   readonly notice: string;
 }
+
+/**
+ * When a message whose answer was lost is looked for again, in ms after the list is re-read
+ * ({@link ImporterSessions}'s `#confirm`). Not once only: the server answers an opening
+ * before the harness has written the operator's words — Claude Code wrote the user entry
+ * ~60 ms after the 202 (U8 review 4, haiku-4-5) — so the first read can just miss them. A
+ * few reads over about eight seconds, and then the message stays "Not confirmed".
+ */
+const CONFIRM_DELAYS = [0, 500, 1000, 2000, 4000] as const;
 
 /** How often the operator's thread on a session already holds these words, as a message. */
 const timesSaid = (

@@ -2845,6 +2845,10 @@ export class App {
         return undefined;
       },
       reread: () => this.loadImporterSessions(targetId),
+      wait: (ms) =>
+        new Promise<void>((resolve) => {
+          this.countdown.after(ms, resolve);
+        }),
       parked: {
         read: () => this.parkedStore.read(this.serverUrl, targetId),
         write: (parked) =>
