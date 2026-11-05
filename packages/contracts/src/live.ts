@@ -351,9 +351,10 @@ export const LIVE_ITEM_KINDS = [
   "turn.taken",
   /**
    * The harness ended a message's turn **before it wrote anything** and sent the message on
-   * with the next one, whose reply answers both (A6 U6 review 2). Lands in that turn, after
+   * with the next one, whose turn reads both (A6 U6 review 2) — and whose reply, if a Stop
+   * does not end that turn first (review 3), answers both. Lands in that turn, after
    * its take, and carries its {@link LiveItem.messageIds} where the message had ids; nothing
-   * to read. A chat draws the turn as answered with the next message, never this item as a
+   * to read. A chat draws the turn as gone on with the next message, never this item as a
    * row.
    *
    * Live when Claude Code cuts such a turn for a Send now (`priority: "now"`): it aborts the

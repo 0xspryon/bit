@@ -24,7 +24,11 @@ import {
 
 import { App, IMPORT_POLL_MS } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
-import { CARRIED_NOTE, QUEUED_NOTE } from "../../src/lib/importerChat";
+import {
+  CARRIED_NOTE,
+  QUEUED_NOTE,
+  STOPPED_NOTE,
+} from "../../src/lib/importerChat";
 import { mockHarnesses } from "../../src/lib/mockImporter";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
@@ -758,7 +762,7 @@ describe("U6: a message carried on with the Send now after it", () => {
     fake.watch.send(
       at("activity", 2, 5, {
         kind: "turn.carried",
-        headline: "Answered with the next message",
+        headline: "Went on with the next message",
         messageIds: [MESSAGE_ID],
       }),
     );
@@ -793,7 +797,7 @@ describe("U6: a message carried on with the Send now after it", () => {
       }),
       at("replay", 3, 5, {
         kind: "turn.carried",
-        headline: "Answered with the next message",
+        headline: "Went on with the next message",
         messageIds: [MESSAGE_ID],
       }),
       at("replay", 4, 5, {
@@ -824,7 +828,7 @@ describe("U6: a message carried on with the Send now after it", () => {
     expect(
       document.querySelectorAll(".importer li.harness-error"),
     ).toHaveLength(0);
-    expect(drawn[1]).not.toContain("Answered with the next message ");
+    expect(drawn[1]).not.toContain("Went on with the next message ");
   });
 
   test("after a reload: the two stored messages in a row draw the first as answered with the second", async () => {
@@ -832,7 +836,7 @@ describe("U6: a message carried on with the Send now after it", () => {
       OPERATOR("replay", 0, "What is 2+2?"),
       at("replay", 1, 0, {
         kind: "turn.carried",
-        headline: "Answered with the next message",
+        headline: "Went on with the next message",
       }),
       OPERATOR("replay", 2, "Also name a colour."),
       at("replay", 3, 2, {
@@ -845,6 +849,189 @@ describe("U6: a message carried on with the Send now after it", () => {
     expect(drawn[0]).toContain(CARRIED_NOTE);
     expect(drawn[0]).not.toContain("no reply to it");
     expect(drawn[1]).toContain("Two plus two equals four. Blue.");
+  });
+
+  /**
+   * Live, the page's own two sends: A, then B with a Send now, the server answering with
+   * `MESSAGE_ID` then `OTHER_ID`; A taken, and its turn ended before it wrote anything,
+   * carried on with B; B taken. What happens in B's turn is the caller's.
+   */
+  const sendThenSendNow = async () => {
+    const opened = await openWith([
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 1, { kind: "turn.reply", body: "Loaded." }),
+    ]);
+    const { fake } = opened;
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    await settle();
+    let next = 0;
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) => {
+      next += 1;
+      return ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_a",
+          messageId: next === 1 ? MESSAGE_ID : OTHER_ID,
+          acceptedAt: AT + 4_000 + next * 300,
+        }),
+      );
+    };
+    await send("What is 2+2?");
+    fake.watch.send(
+      at("activity", 1, 4, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageIds: [MESSAGE_ID],
+      }),
+    );
+    await settle();
+    await send("Also name a colour.");
+    return opened;
+  };
+
+  /** What the harness stores for that run, A's turn as `aTurn` reads it. */
+  const stored = (aTurn: readonly LiveItem[], bTurn: readonly LiveItem[]) => [
+    OPERATOR("replay", 0, "Load the scope"),
+    at("replay", 1, 1, { kind: "turn.reply", body: "Loaded." }),
+    at("replay", 2, 4, {
+      kind: "turn.operator",
+      headline: "You",
+      body: "What is 2+2?",
+      messageIds: [MESSAGE_ID],
+    }),
+    ...aTurn,
+    at("replay", 20, 5, {
+      kind: "turn.operator",
+      headline: "You",
+      body: "Also name a colour.",
+      messageIds: [OTHER_ID],
+    }),
+    ...bTurn,
+  ];
+
+  const STOP_MARKER = (space: "activity" | "replay", n: number) =>
+    at(space, n, 5, {
+      kind: "turn.other",
+      headline: "interrupted",
+      body: "[Request interrupted by user]",
+    });
+
+  test("U6 review 3: A, Send now B, then a Stop — A went on with B, B reads stopped, and nothing promises a reply", async () => {
+    const { app, fake } = await sendThenSendNow();
+    fake.watch.send(
+      at("activity", 2, 5, {
+        kind: "turn.carried",
+        headline: "Went on with the next message",
+        messageIds: [MESSAGE_ID],
+      }),
+    );
+    fake.watch.send(
+      at("activity", 3, 5, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageIds: [OTHER_ID],
+      }),
+    );
+    // The Stop lands on B's turn: the CLI's marker, live.
+    fake.watch.send(STOP_MARKER("activity", 4));
+    await settle();
+    const check = () => {
+      const drawn = groups().map((group) => said(group));
+      expect(drawn).toHaveLength(3);
+      expect(drawn[1]).toContain(CARRIED_NOTE);
+      expect(drawn[2]).toContain("Also name a colour.");
+      expect(drawn[2]).toContain(STOPPED_NOTE);
+      const page = said(document.querySelector(".importer"));
+      expect(page).not.toMatch(/answers both|reply below/);
+      expect(page).not.toContain("has not answered yet");
+      expect(page).not.toContain("[Request interrupted by user]");
+    };
+    check();
+    transcriptOnceSettled(
+      fake,
+      stored(
+        [
+          at("replay", 3, 5, {
+            kind: "turn.carried",
+            headline: "Went on with the next message",
+            messageIds: [MESSAGE_ID],
+          }),
+        ],
+        [STOP_MARKER("replay", 21)],
+      ),
+    );
+    await endTurn(app, fake);
+    check();
+  });
+
+  test("U6 review 3: A, Send now B, then a Stop — the same after a reload", async () => {
+    await openWith(
+      stored(
+        [
+          at("replay", 3, 5, {
+            kind: "turn.carried",
+            headline: "Went on with the next message",
+            messageIds: [MESSAGE_ID],
+          }),
+        ],
+        [STOP_MARKER("replay", 21)],
+      ),
+    );
+    const drawn = groups().map((group) => said(group));
+    expect(drawn).toHaveLength(3);
+    expect(drawn[1]).toContain(CARRIED_NOTE);
+    expect(drawn[2]).toContain(STOPPED_NOTE);
+    const page = said(document.querySelector(".importer"));
+    expect(page).not.toContain("no reply to it");
+    expect(page).not.toContain("[Request interrupted by user]");
+  });
+
+  test("U6 review 3: a carried turn that wrote something reads as what it wrote, never as carried", async () => {
+    // A carry naming a turn that has rows: a Send now taken after a tool call. The server
+    // no longer sends one (it needs a turn that wrote nothing), and the page draws none.
+    const { app, fake } = await sendThenSendNow();
+    fake.watch.send(
+      at("activity", 2, 4, { kind: "turn.reply", body: "Reading the scope." }),
+    );
+    fake.watch.send(
+      at("activity", 3, 5, {
+        kind: "turn.carried",
+        headline: "Went on with the next message",
+        messageIds: [MESSAGE_ID],
+      }),
+    );
+    fake.watch.send(
+      at("activity", 4, 5, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageIds: [OTHER_ID],
+      }),
+    );
+    fake.watch.send(
+      at("activity", 5, 7, { kind: "turn.reply", body: "Blue." }),
+    );
+    await settle();
+    const drawn = groups().map((group) => said(group));
+    expect(drawn[1]).toContain("Reading the scope.");
+    expect(drawn[1]).not.toContain(CARRIED_NOTE);
+    expect(drawn[2]).toContain("Blue.");
+    transcriptOnceSettled(
+      fake,
+      stored(
+        [
+          at("replay", 3, 4, {
+            kind: "turn.reply",
+            body: "Reading the scope.",
+          }),
+        ],
+        [at("replay", 21, 7, { kind: "turn.reply", body: "Blue." })],
+      ),
+    );
+    await endTurn(app, fake);
+    const settled = groups().map((group) => said(group));
+    expect(settled[1]).toContain("Reading the scope.");
+    expect(settled[1]).not.toContain(CARRIED_NOTE);
   });
 
   test("after a reload, a last message with nothing after it still says the harness holds no reply", async () => {

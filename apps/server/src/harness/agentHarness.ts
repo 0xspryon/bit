@@ -682,7 +682,8 @@ export type NarrationDetail =
   | {
       /**
        * The harness ended a turn **before it wrote anything** and sent its message on with
-       * the next one (A6 U6 review 2): one reply, in the next turn, answers both.
+       * the next one (A6 U6 review 2): the next turn reads both, and its reply, if it gets
+       * one, answers both. A Stop can end that next turn before it replies (review 3).
        *
        * Claude Code, when a message sent with `priority: "now"` (a Send now) lands while the
        * turn that took an earlier message has produced nothing yet: the CLI aborts that
@@ -696,6 +697,21 @@ export type NarrationDetail =
        */
       readonly _tag: "carried";
       readonly messageIds: readonly string[];
+    }
+  | {
+      /**
+       * Words the harness wrote **in the user's place** to mark where something landed (A6
+       * U6 review 3), as a replay reads them from the stored transcript
+       * (`MessageEntry.marker` and its text), so a turn reads the same watched and reloaded.
+       *
+       * Claude Code's interrupt marker, `[Request interrupted by user]` (`… for tool use]`):
+       * the CLI sends it live as a main-thread `user` frame where a Stop landed, before that
+       * turn's `result`, and stores the same entry. Its `marker` is `interrupted`. Never the
+       * operator's words, and never a message.
+       */
+      readonly _tag: "marker";
+      readonly marker: string;
+      readonly text: string;
     }
   | { readonly _tag: "opaque" };
 

@@ -30,6 +30,7 @@ import {
   MID_BLOCK_NOTE,
   NO_HISTORY,
   QUEUED_NOTE,
+  STOPPED_NOTE,
   buildImporterChat,
   importerFeed,
   indexedSession,
@@ -2769,7 +2770,7 @@ describe("a message carried on with the next one", () => {
   const carried = (ids: readonly string[], space = "activity:9"): LiveItem => ({
     ...item({
       kind: "turn.carried",
-      headline: "Answered with the next message",
+      headline: "Went on with the next message",
     }),
     id: space,
     importId: "imp_1",
@@ -2857,6 +2858,111 @@ describe("a message carried on with the next one", () => {
       working: false,
     });
     expect(notes(groups)).toEqual([CARRIED_NOTE, "live"]);
+  });
+
+  /** The CLI's interrupt marker where a Stop landed, live (A6 U6 review 3). */
+  const marker = (): LiveItem =>
+    item({
+      kind: "turn.other",
+      headline: "interrupted",
+      body: "[Request interrupted by user]",
+      importId: "imp_1",
+    });
+
+  test("U6 review 3: the carry note promises no reply", () => {
+    // A Stop just after the Send now can end the next turn before it answers: the note
+    // must be true then too.
+    expect(CARRIED_NOTE).not.toMatch(/answer|reply|below/i);
+  });
+
+  test("U6 review 3: A, Send now B, Stop — A went on with B, and B reads stopped, live", () => {
+    const groups = buildImporterChat({
+      history: NO_HISTORY,
+      items: [
+        mine(0, "What is 2+2?", A),
+        carried([A]),
+        mine(1, "Also name a colour.", B),
+        marker(),
+      ],
+      working: false,
+    });
+    expect(notes(groups)).toEqual([CARRIED_NOTE, STOPPED_NOTE]);
+    // The marker is said in B's note, not drawn as a row beside it.
+    expect(groups.map((group) => group.rows.length)).toEqual([0, 0]);
+  });
+
+  test("U6 review 3: A, Send now B, Stop — the same after a reload", () => {
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: [
+          replayItem(0, "turn.operator", "What is 2+2?", { messageIds: [A] }),
+          replayItem(1, "turn.carried", "", { messageIds: [A] }),
+          replayItem(2, "turn.operator", "Also name a colour.", {
+            messageIds: [B],
+          }),
+          replayItem(3, "turn.other", "[Request interrupted by user]", {
+            headline: "interrupted",
+          }),
+        ],
+      }),
+      items: [],
+      working: false,
+    });
+    expect(notes(groups)).toEqual([CARRIED_NOTE, STOPPED_NOTE]);
+    expect(groups.map((group) => group.rows.length)).toEqual([0, 0]);
+  });
+
+  test("U6 review 3: a Stop in a turn that wrote something keeps its marker as a row, where the Stop landed", () => {
+    const groups = buildImporterChat({
+      history: NO_HISTORY,
+      items: [mine(0, "List the glossary.", A), reply("ASN — "), marker()],
+      working: false,
+    });
+    expect(notes(groups)).toEqual(["live"]);
+    expect(groups[0]?.rows.map((row) => row.item.headline)).toEqual([
+      "Importer",
+      "interrupted",
+    ]);
+  });
+
+  test("U6 review 3: a carried turn that has rows is drawn by its rows, never as carried", () => {
+    // A live carry naming a turn that wrote something (a Send now taken after a tool call):
+    // the turn reads as what it wrote, live and with its rows from a replay.
+    const live = buildImporterChat({
+      history: NO_HISTORY,
+      items: [
+        mine(0, "Read the scope.", A),
+        reply("Reading it."),
+        carried([A]),
+        mine(1, "Also name a colour.", B),
+        reply("Blue."),
+      ],
+      working: false,
+    });
+    expect(notes(live)).toEqual(["live", "live"]);
+    expect(live[0]?.rows).toHaveLength(1);
+    const reloaded = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: [
+          replayItem(0, "turn.operator", "Read the scope.", {
+            messageIds: [A],
+          }),
+          replayItem(1, "turn.reply", "Reading it."),
+          replayItem(2, "turn.operator", "Also name a colour.", {
+            messageIds: [B],
+          }),
+          replayItem(3, "turn.reply", "Blue."),
+        ],
+      }),
+      items: [carried([A], "activity:5")],
+      working: false,
+    });
+    expect(notes(reloaded)[0]).toBe("replayed");
+    expect(notes(reloaded)).not.toContain(CARRIED_NOTE);
   });
 
   test("a live carry below the floor is kept while the replay holds its message and no carry for it, and only then", () => {

@@ -557,6 +557,14 @@ interface SessionRecord {
    */
   readonly sentNow: Set<string>;
   /**
+   * What the turn on the stream has shown since the last `result` (A6 U6 review 3), for
+   * `cutBySendNow`: `wrote` — a main-thread `assistant` frame (a reply, a thought, a tool
+   * call, however short: the CLI sends a cut block's frame too); `stopped` — the CLI's
+   * interrupt marker (`[Request interrupted by user…]`), which says a Stop landed on this
+   * turn and not on the one after it. Both cleared at every `result`.
+   */
+  readonly turnShown: { wrote: boolean; stopped: boolean };
+  /**
    * A turn is running on the stream: a turn-opening frame (`system/init`, a main-thread
    * reply or tool result — never a subagent's, see `opensTurn`) has arrived since the last
    * `result`, which closes it. Read off the stream
@@ -667,6 +675,13 @@ interface SessionRecord {
    * operator's next turn interrupted (A6 F5's fourth review: a background subagent's).
    */
   interrupted: boolean;
+  /**
+   * The {@link interrupted} this turn holds was moved on to it from the turn before, which
+   * a Send now cut before the Stop reached it (A6 U6 review 3, see `cutBySendNow`). The CLI
+   * stops the turn the Send now opens (measured), but should it ever let that turn finish,
+   * a `success` with no interrupt marker in it is what it is: answered, not stopped.
+   */
+  interruptMoved: boolean;
   /**
    * The tasks the CLI has started and not yet said are over, by `task_id`, with their
    * `task_type` (`local_agent`, `local_bash`, …): added at `system/task_started`, removed
@@ -1663,7 +1678,16 @@ const narrate = (
       ),
     );
   } else if (message.type === "user") {
-    details.push(...userParts(blocks, session.subagents, session.interrupted));
+    // The CLI's interrupt marker, where a Stop landed: the note a replay draws for the
+    // stored entry ({@link cliMarker}), so the turn reads the same watched (A6 U6 review 3).
+    const marker = interruptMarkerText(content);
+    if (marker !== undefined) {
+      details.push({ _tag: "marker", marker: INTERRUPT_MARKER, text: marker });
+    } else {
+      details.push(
+        ...userParts(blocks, session.subagents, session.interrupted),
+      );
+    }
   }
 
   /*
@@ -1820,21 +1844,79 @@ export const resultError = (
  * request and answers them with one reply. The transcript holds the two `user` entries in a
  * row, then that reply.
  *
- * So: a non-success `result` this application did not interrupt, whose errors are all
- * diagnostics, while a steer sent `now` is still untaken — the CLI takes it next, which is
- * what cut the turn. A turn cut mid-reply ends on assistant text and is a `success` (no
- * diagnostic); a Stop is {@link SessionRecord.interrupted}; a genuine failure says
- * something besides a diagnostic. None of them is this.
+ * So: a non-success `result`, whose errors are all diagnostics, for a turn that **wrote
+ * nothing** — no main-thread `assistant` frame at all — while a steer sent `now` is still
+ * untaken: the CLI takes it next, which is what cut the turn. A turn cut mid-reply ends on
+ * assistant text and is a `success` (no diagnostic); a genuine failure says something
+ * besides a diagnostic. None of them is this.
+ *
+ * **A turn that wrote something is not carried** (A6 U6 review 3), even when the CLI ends it
+ * with the same diagnostic — a Send now taken after a tool call ends the turn on a tool
+ * result (`last_content_type=tool_result`). That turn has rows, the transcript holds them
+ * between the two messages, and a replay carries nothing (`projectReplay`): it is a turn
+ * the Send now cut short, read as {@link outcomeOf} reads it.
+ *
+ * **A Stop asked as well** ({@link SessionRecord.interrupted}) does not undo the cut unless
+ * it landed on this turn. Measured, CLI 2.1.310 on haiku-4-5 (A6 U6 review 3,
+ * `testdata/claude-code-frames/send-now-then-stop.jsonl`): A, Send now B 330 ms later, then
+ * `interrupt()` 0, 3 or 100 ms after B — every time, A's turn ended exactly as without the
+ * Stop (diagnostic only, no marker), B's turn opened naming B, and the CLI's interrupt
+ * marker and B's own diagnostic-only `result` followed: the Stop stopped **B's** turn, and
+ * the transcript holds A, B, the marker. A Stop asked *before* the Send now (1 and 15 ms
+ * earlier) landed on A instead: the marker arrived in A's turn, before its `result`, and B
+ * then ran and was answered. So the marker, `turnShown.stopped`, is what says which turn
+ * the Stop is for.
  */
 const cutBySendNow = (
-  record: Pick<SessionRecord, "interrupted" | "untaken" | "sentNow">,
+  record: Pick<SessionRecord, "untaken" | "sentNow" | "turnShown">,
   message: SDKMessage,
 ): boolean => {
   if (message.type !== "result" || message.subtype === "success") return false;
-  if (record.interrupted) return false;
+  if (record.turnShown.wrote || record.turnShown.stopped) return false;
   const errors = statedErrors(message);
   if (errors.length === 0 || !errors.every(isCliDiagnostic)) return false;
   return [...record.untaken.keys()].some((uuid) => record.sentNow.has(uuid));
+};
+
+/**
+ * Whether a Stop is this turn's to report ({@link SessionRecord.interrupted}). A Stop moved
+ * on from a turn a Send now cut ({@link SessionRecord.interruptMoved}) is not, should the
+ * turn it moved to end in `success` with no interrupt marker of its own: that turn was
+ * answered, and calling it stopped would be a claim this server knows to be wrong. Not
+ * measured to happen — the CLI stopped B's turn every time — so this is the honest reading
+ * of a case the measurement did not reach.
+ */
+const stopHolds = (
+  record: Pick<SessionRecord, "interrupted" | "interruptMoved" | "turnShown">,
+  message: SDKMessage,
+): boolean =>
+  record.interrupted &&
+  !(
+    record.interruptMoved &&
+    message.type === "result" &&
+    message.subtype === "success" &&
+    !record.turnShown.stopped
+  );
+
+/**
+ * Notes what one frame shows of the turn on the stream, for {@link cutBySendNow}: a
+ * main-thread `assistant` frame is the turn writing, the CLI's interrupt marker is a Stop
+ * landing on it. A sub-agent's frames are its own, not the turn's. Cleared at the `result`.
+ */
+const showTurn = (
+  record: Pick<SessionRecord, "turnShown">,
+  message: SDKMessage,
+): void => {
+  if (fromSubagent(message)) return;
+  if (message.type === "assistant") record.turnShown.wrote = true;
+  else if (
+    message.type === "user" &&
+    interruptMarkerText(
+      (message.message as { readonly content?: unknown } | undefined)?.content,
+    ) !== undefined
+  ) {
+    record.turnShown.stopped = true;
+  }
 };
 
 /**
@@ -1886,6 +1968,31 @@ const outcomeOf = (
   if (interrupted || cut) return "interrupted";
   return message.subtype === "success" ? "succeeded" : "failed";
 };
+
+/**
+ * The CLI's interrupt marker's text, if a `user` message's content is one: a single text
+ * block opening `[Request interrupted by user` (`… for tool use]` when a tool call was
+ * cut). What the CLI writes in the user's place where a Stop landed — stored, and sent live
+ * as a main-thread `user` frame (measured, 2.1.310). Shared by {@link cliMarker} and
+ * {@link narrate}, so a Stop reads the same watched and reloaded.
+ */
+const interruptMarkerText = (content: unknown): string | undefined => {
+  if (!Array.isArray(content) || content.length !== 1) return undefined;
+  const [only] = content as readonly unknown[];
+  const text =
+    typeof only === "object" &&
+    only !== null &&
+    (only as { type?: unknown }).type === "text"
+      ? (only as { text?: unknown }).text
+      : undefined;
+  return typeof text === "string" &&
+    text.trimStart().startsWith("[Request interrupted by user")
+    ? text
+    : undefined;
+};
+
+/** The {@link MessageEntry.marker} the CLI's interrupt marker is stored and narrated under. */
+const INTERRUPT_MARKER = "interrupted";
 
 /**
  * Whether a stored entry is the CLI's own record of a local slash command rather than
@@ -1982,18 +2089,9 @@ const cliMarker = (entry: SessionMessage): string | undefined => {
   if (flags.is_meta === true) return "meta";
   const content = (entry.message as { readonly content?: unknown } | undefined)
     ?.content;
-  if (!Array.isArray(content) || content.length !== 1) return undefined;
-  const [only] = content as readonly unknown[];
-  const text =
-    typeof only === "object" &&
-    only !== null &&
-    (only as { type?: unknown }).type === "text"
-      ? (only as { text?: unknown }).text
-      : undefined;
-  return typeof text === "string" &&
-    text.trimStart().startsWith("[Request interrupted by user")
-    ? "interrupted"
-    : undefined;
+  return interruptMarkerText(content) === undefined
+    ? undefined
+    : INTERRUPT_MARKER;
 };
 
 /**
@@ -2823,8 +2921,13 @@ export const claudeCodeHarness = (
                 for await (const message of live) {
                   // Read before the frame is narrated: the steer that cut it is still untaken.
                   const cut = cutBySendNow(record, message);
-                  const outcome = outcomeOf(message, record.interrupted, cut);
+                  const outcome = outcomeOf(
+                    message,
+                    stopHolds(record, message),
+                    cut,
+                  );
                   trackTask(record, message);
+                  showTurn(record, message);
                   if (answeredUuids(message) !== undefined) {
                     record.stamped = true;
                   }
@@ -2848,10 +2951,22 @@ export const claudeCodeHarness = (
                   }
                   if (message.type === "result") {
                     record.outcome = outcome;
-                    // The interrupt was for this turn. A conversation's query outlives it, and
-                    // the next turn — a queued message running straight after, say — has not
-                    // been interrupted by anyone.
-                    if (record.multiTurn) record.interrupted = false;
+                    /*
+                     * The interrupt was for this turn. A conversation's query outlives it, and
+                     * the next turn — a queued message running straight after, say — has not
+                     * been interrupted by anyone.
+                     *
+                     * **Unless a Send now cut this turn before the Stop reached it** (A6 U6
+                     * review 3): the CLI then stops the turn the Send now opens, B's, and that
+                     * turn's `result` is the Stop's (measured, see `cutBySendNow`). Cleared
+                     * there, so an untaken `now` steer — whose turn's `result` is coming —
+                     * is what the flag waits on.
+                     */
+                    const moved = cut && record.interrupted;
+                    if (record.multiTurn) record.interrupted = moved;
+                    record.interruptMoved = moved;
+                    record.turnShown.wrote = false;
+                    record.turnShown.stopped = false;
                     record.cost = message.total_cost_usd;
                     record.tokens = message.usage as unknown as Record<
                       string,
@@ -3241,6 +3356,7 @@ export const claudeCodeHarness = (
           untaken: new Map<string, string>(),
           takenTogether: new Map<string, readonly string[]>(),
           sentNow: new Set<string>(),
+          turnShown: { wrote: false, stopped: false },
           turnOpen: false,
           stamped: false,
           settling: false,
@@ -3257,6 +3373,7 @@ export const claudeCodeHarness = (
           streamed: { messageId: undefined, index: undefined, kind: undefined },
           subagents: new Map(),
           interrupted: false,
+          interruptMoved: false,
           tasks: new Map<string, TrackedTask>(),
           closed: false,
           cli: undefined,
@@ -3982,7 +4099,11 @@ export const claudeCodeHarness = (
           // turn of its own in the instant between this check and the interrupt reaching
           // it, that turn is stopped too and its `result` reads `failed`; the
           // conversation stays open either way.
-          if (turn) record.interrupted = true;
+          if (turn) {
+            record.interrupted = true;
+            // A Stop of its own, whatever a moved one said: see `stopHolds`.
+            record.interruptMoved = false;
+          }
           const live = record.query;
           const asked = yield* Effect.result(
             Effect.timeout(

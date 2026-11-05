@@ -85,6 +85,7 @@ import {
   type HarnessFailure,
   type SessionRef,
   type SteerUrgency,
+  type TerminalOutcome,
 } from "./agentHarness";
 import type { HarnessNotReady } from "./resolver";
 import type { CredentialRefused, IssuedCredential } from "../mcp/credentials";
@@ -396,6 +397,15 @@ export type LiveInterrupt<Meta> =
       readonly entry: LiveAgentSession<Meta>;
       readonly working: boolean;
       readonly followUp: boolean;
+      /**
+       * How the session's last turn ended, by the harness's status read after the settle
+       * (`SessionStatus.outcome`); `undefined` when it could not be read or did not say.
+       * What tells a follow-up the harness went on to and **answered** (`succeeded`) from
+       * one whose turn the Stop ended too (A6 U6 review 3): a Send now that cut the turn
+       * before it wrote anything is taken at once, and a Stop pressed just after lands on
+       * the Send now's own turn.
+       */
+      readonly lastOutcome: TerminalOutcome | undefined;
       /**
        * Whether background work still runs after the Stop (A6 U6 review): the harness
        * stops it with the turn, and says so through its status, read after the settle.
@@ -1298,6 +1308,8 @@ export const makeLiveAgentSessions = <Meta>(
           entry,
           working: settled._tag === "Success" && Option.isNone(settled.success),
           followUp: held,
+          lastOutcome:
+            after._tag === "Failure" ? undefined : after.success.outcome,
           background:
             after._tag === "Failure" || after.success.background === true,
         } as const;

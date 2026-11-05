@@ -686,7 +686,7 @@ type ItemBase = Pick<
 /**
  * The `turn.carried` item (A6 U6 review 2): the turn of the messages `messageIds` name
  * ended before it wrote anything, and the harness sent them on with the next message, whose
- * reply answers both. Nothing to read: a chat draws the turn's note from it, never a row.
+ * turn reads both — and answers both, if a Stop does not end it first (review 3). Nothing to read: a chat draws the turn's note from it, never a row.
  * Live from Claude Code's cut turn (`carried`), and on replay from two stored operator
  * messages in a row ({@link projectReplay}).
  */
@@ -696,7 +696,7 @@ const carriedItem = (
 ): LiveItem => ({
   ...base,
   kind: "turn.carried",
-  headline: "Answered with the next message",
+  headline: "Went on with the next message",
   body: "",
   tool: null,
   toolName: null,
@@ -705,6 +705,29 @@ const carriedItem = (
   callId: null,
   outcome: null,
   ...(messageIds.length === 0 ? {} : { messageIds: [...messageIds] }),
+});
+
+/**
+ * A harness note as a `turn.other` item: `headline` what it is (an entry's type, or the
+ * harness's `marker` — `interrupted` for Claude Code's interrupt marker), `body` its words,
+ * capped. What a replay draws for a stored entry that is not a message or a part, and what
+ * live narration draws for the interrupt marker (A6 U6 review 3), so the two agree.
+ */
+const markerItem = (
+  base: ItemBase,
+  headline: string,
+  body: string,
+): LiveItem => ({
+  ...base,
+  kind: "turn.other",
+  headline,
+  body: truncateNarration(body),
+  tool: null,
+  toolName: null,
+  input: null,
+  output: null,
+  callId: null,
+  outcome: null,
 });
 
 /**
@@ -889,7 +912,7 @@ export interface ReplayProjection {
  *   repeats one already drawn since the turn's `user` entry is dropped (A6 U4 review).
  * - an operator message stored **directly before another**, nothing the harness wrote
  *   between them, as a `turn.carried` item after it (A6 U6 review 2): its turn ended before
- *   it wrote anything and the harness sent it on with the next, whose reply answers both —
+ *   it wrote anything and the harness sent it on with the next, whose turn reads both —
  *   what Claude Code stores when a Send now cuts a turn that has produced nothing yet. The
  *   item live narration draws for that cut, so the turn reads the same reloaded. Not for
  *   the session's last message (nothing follows it) nor one a Stop ended (the CLI's
@@ -928,15 +951,7 @@ export const projectReplay = (input: {
    */
   const note = (at: number, headline: string, body: string, failed: boolean) =>
     items.push({
-      ...baseAt(at),
-      kind: "turn.other",
-      headline,
-      body: truncateNarration(body),
-      tool: null,
-      toolName: null,
-      input: null,
-      output: null,
-      callId: null,
+      ...markerItem(baseAt(at), headline, body),
       outcome: failed ? "failed" : null,
     });
   /** The errors drawn since the last `user` entry: a turn's, for the `idle` rule above. */
@@ -1143,6 +1158,11 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
       // The turn ended before it wrote anything and its message went on with the next
       // (A6 U6 review 2). The same item a replay draws for two stored messages in a row.
       return carriedItem(base, detail.messageIds);
+    case "marker":
+      // Words the harness wrote in the user's place (A6 U6 review 3): the item a replay
+      // draws for the stored entry (`projectReplay`'s `note`), so a Stop shows where it
+      // landed watched as it does reloaded.
+      return markerItem(base, detail.marker, detail.text);
     case "error":
       // The item a replay draws for an entry's `error` (`projectReplay`), so a turn that
       // failed reads the same watched and reloaded: the harness's sentence, as its own.

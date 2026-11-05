@@ -93,9 +93,19 @@ const interruptedDetail = <Meta>(
     return `${stopped} Its harness went straight on to a message you sent while that turn ran, and is answering it now; stop again to stop that too.`;
   }
   // A `runs` harness that went on to the follow-up and finished it inside the settle: the
-  // conversation is quiet again, and what it last said answers the operator's message.
+  // conversation is quiet again, and what it last said answers the operator's message —
+  // **only when that turn succeeded** (A6 U6 review 3). A Send now taken at once, then a
+  // Stop, lands on the Send now's own turn: the harness went on to the message, and the
+  // Stop ended that turn before it answered. A last turn this server could not read is
+  // not claimed either way.
   if (found.followUp) {
-    return `${stopped} Its harness went straight on to the message you sent while that turn ran, and has answered it. Everything written before and after the stop is kept, and your next message carries the conversation on in the same session.`;
+    if (found.lastOutcome === "succeeded") {
+      return `${stopped} Its harness went straight on to the message you sent while that turn ran, and has answered it. Everything written before and after the stop is kept, and your next message carries the conversation on in the same session.`;
+    }
+    if (found.lastOutcome === "interrupted") {
+      return `${stopped} Its harness had gone on to the message you sent while that turn ran, and the stop ended that turn too, before it answered. Everything written before the stop is kept, and your next message carries the conversation on in the same session.`;
+    }
+    return `${stopped} Its harness went on to the message you sent while that turn ran, and is quiet now; whatever it wrote in reply is above. Your next message carries the conversation on in the same session.`;
   }
   if (found.working) {
     return `${stopped} The turn is still finishing, so a little more may appear before it goes quiet. Everything it wrote is kept, and your next message carries the conversation on in the same session.`;

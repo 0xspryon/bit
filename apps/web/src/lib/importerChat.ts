@@ -154,12 +154,22 @@ export const MID_BLOCK_NOTE =
 
 /**
  * The note on a turn the harness ended before it wrote anything and sent on with the next
- * message (A6 U6 review 2, a `turn.carried` item in the turn): the next reply answers both.
- * What a Claude Code turn a Send now cut that early reads, live and after a reload, in place
- * of an error or "no reply".
+ * message (A6 U6 review 2, a `turn.carried` item in the turn). What a Claude Code turn a
+ * Send now cut that early reads, live and after a reload, in place of an error or "no
+ * reply". **It promises no reply** (review 3): a Stop pressed just after the Send now ends
+ * the next turn too, before it answers, and that turn says so itself ({@link STOPPED_NOTE}).
  */
 export const CARRIED_NOTE =
-  "Answered with the next message: the harness sent the two on together, and the reply below answers both.";
+  "Went on with the next message: the harness sent the two on together.";
+
+/**
+ * The note on a turn a Stop ended before the importer wrote anything in it (A6 U6 review 3):
+ * the turn holds only the harness's interrupt marker ({@link isInterruptMarker}), live as
+ * after a reload, in place of "not answered yet" — which a turn that is over never is — or
+ * the marker's bare `[Request interrupted by user]`.
+ */
+export const STOPPED_NOTE =
+  "Stopped before the importer wrote anything in reply.";
 
 /** One importer turn as a chat group. */
 export type ImporterGroup = ChatGroup<ImporterTurn>;
@@ -1220,6 +1230,21 @@ const settled = (item: LiveItem): boolean => !isPartial(item);
 /** A `turn.carried` item: its turn's message went on with the next (A6 U6 review 2). */
 const isCarried = (item: LiveItem): boolean => item.kind === CARRIED_KIND;
 
+/**
+ * The harness's interrupt marker (A6 U6 review 3): Claude Code's `[Request interrupted by
+ * user]`, a `turn.other` item headed `interrupted` — narrated live where a Stop landed, and
+ * drawn from the stored entry on replay. A row in a turn that wrote something, showing where
+ * the Stop landed; alone in a turn, said as {@link STOPPED_NOTE} instead.
+ *
+ * V2(chat): told by its headline, the server's `MessageEntry.marker`, because the contract
+ * has no kind for a harness's own marker. OpenCode's Stop is a `turn.other` **error**
+ * ("Step interrupted") and is not read as stopped here, so an OpenCode turn a Stop ended
+ * before it wrote anything still shows that error row. A `turn.stopped` kind both harnesses
+ * narrate would make this one rule.
+ */
+export const isInterruptMarker = (item: LiveItem): boolean =>
+  item.kind === "turn.other" && item.headline === "interrupted";
+
 export const buildImporterChat = (
   input: ImporterChatInput,
 ): readonly ImporterGroup[] => {
@@ -1337,11 +1362,22 @@ export const buildImporterChat = (
       turn.items.some(
         (item) => isCarried(item) && messagesOf(item).length === 0,
       );
-    const items = (working ? turn.items : turn.items.filter(settled)).filter(
+    const kept = (working ? turn.items : turn.items.filter(settled)).filter(
       (item) => !isCarried(item),
     );
+    /*
+     * A turn a Stop ended before it wrote anything holds the harness's interrupt marker and
+     * nothing the importer said (A6 U6 review 3): said in the turn's note, not as a row. A
+     * turn that wrote something keeps the marker as its row, where the Stop landed.
+     */
+    const spoke = kept.some(
+      (item) => item.origin === "activity" && !isInterruptMarker(item),
+    );
+    const stopped = !spoke && kept.some(isInterruptMarker);
+    const items = stopped
+      ? kept.filter((item) => !isInterruptMarker(item))
+      : kept;
     const replayed = fromReplay(turn.operator);
-    const spoke = items.some((item) => item.origin === "activity");
     const midBlock = replayed && !spoke && working;
     const take = takeOf(turn.operator, taken);
     groups.push({
@@ -1365,35 +1401,37 @@ export const buildImporterChat = (
           }
         : carried && !spoke
           ? { _tag: "none", note: CARRIED_NOTE }
-          : midBlock
-            ? { _tag: "pending", note: MID_BLOCK_NOTE }
-            : replayed
-              ? spoke
-                ? {
-                    _tag: "replayed",
-                    note: replayNote(),
-                    ephemeral: true,
-                    // Said once, on the first turn: the answer stopped short of the oldest items.
-                    truncated:
-                      history.truncated &&
-                      position === 0 &&
-                      cut.leading.length === 0,
-                  }
-                : {
-                    _tag: "none",
-                    note: "The harness holds this message and no reply to it.",
-                  }
-              : spoke
-                ? { _tag: "live" }
-                : latest
+          : stopped
+            ? { _tag: "none", note: STOPPED_NOTE }
+            : midBlock
+              ? { _tag: "pending", note: MID_BLOCK_NOTE }
+              : replayed
+                ? spoke
                   ? {
-                      _tag: "pending",
-                      note: "Sent. The importer has not answered yet.",
+                      _tag: "replayed",
+                      note: replayNote(),
+                      ephemeral: true,
+                      // Said once, on the first turn: the answer stopped short of the oldest items.
+                      truncated:
+                        history.truncated &&
+                        position === 0 &&
+                        cut.leading.length === 0,
                     }
                   : {
                       _tag: "none",
-                      note: "The importer wrote nothing in reply to this message.",
-                    },
+                      note: "The harness holds this message and no reply to it.",
+                    }
+                : spoke
+                  ? { _tag: "live" }
+                  : latest
+                    ? {
+                        _tag: "pending",
+                        note: "Sent. The importer has not answered yet.",
+                      }
+                    : {
+                        _tag: "none",
+                        note: "The importer wrote nothing in reply to this message.",
+                      },
       rows: rowsFor(items, working, placed.pairing),
     });
   });

@@ -18,7 +18,12 @@ import { join } from "node:path";
 
 import { Deferred, Effect, Exit, Fiber, Layer, Redacted, Scope } from "effect";
 
-import type { AgentHarness, McpRegistration, SessionRef } from "./agentHarness";
+import type {
+  AgentHarness,
+  McpRegistration,
+  SessionRef,
+  TerminalOutcome,
+} from "./agentHarness";
 import { HarnessTransportError } from "./errors";
 import {
   makeLiveAgentSessions,
@@ -1283,24 +1288,56 @@ describe("a Stop's answer about a follow-up", () => {
     expect(outcome.result.detail).not.toContain("message you sent");
   });
 
+  /** A follow-up the harness ran inside the settle, its last turn ending `lastOutcome`. */
+  const followUpEnded = (lastOutcome: TerminalOutcome | undefined) =>
+    withImporterSessions(
+      turnHarness({
+        sessionStatus: () =>
+          Effect.succeed({
+            activity: "idle" as const,
+            ...(lastOutcome === undefined ? {} : { outcome: lastOutcome }),
+          }),
+      }).harness,
+      ({ sessions, plan }) =>
+        Effect.gen(function* () {
+          yield* opening(sessions, plan);
+          const entry = sessions.ready(IMPORT);
+          if (entry === undefined) return yield* Effect.die("not opened");
+          yield* sessions.deliver(entry, "and the API hosts", "preemptive");
+          return yield* stopOf(sessions);
+        }),
+    );
+
   test("a follow-up Claude Code went on to and finished inside the settle is said to have been answered", async () => {
     // `runs`, and the interrupt settles everything: the follow-up ran and is done by the
-    // time the Stop is answered, so the conversation is quiet and has answered it.
-    const { harness } = turnHarness();
-    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
-      Effect.gen(function* () {
-        yield* opening(sessions, plan);
-        const entry = sessions.ready(IMPORT);
-        if (entry === undefined) return yield* Effect.die("not opened");
-        yield* sessions.deliver(entry, "and the API hosts", "queued");
-        return yield* stopOf(sessions);
-      }),
-    );
+    // time the Stop is answered, its turn a success, so it has answered it.
+    const outcome = await followUpEnded("succeeded");
     expect(outcome.result.followUp).toBe(true);
     expect(outcome.result.working).toBe(false);
     expect(outcome.result.detail).toContain(
       "went straight on to the message you sent while that turn ran, and has answered it",
     );
+  });
+
+  test("U6 review 3: a follow-up whose own turn the Stop ended is not said to have been answered", async () => {
+    // A Send now that cut the turn before it wrote anything is taken at once, and a Stop
+    // just after lands on the Send now's turn: Claude Code reports it `interrupted`.
+    const outcome = await followUpEnded("interrupted");
+    expect(outcome.result.followUp).toBe(true);
+    expect(outcome.result.working).toBe(false);
+    expect(outcome.result.detail).not.toContain("answered it");
+    expect(outcome.result.detail).toContain(
+      "the stop ended that turn too, before it answered",
+    );
+  });
+
+  test("U6 review 3: a follow-up whose last turn could not be read is claimed neither answered nor stopped", async () => {
+    for (const lastOutcome of [undefined, "failed"] as const) {
+      const outcome = await followUpEnded(lastOutcome);
+      expect(outcome.result.detail).not.toContain("answered it");
+      expect(outcome.result.detail).not.toContain("ended that turn too");
+      expect(outcome.result.detail).toContain("is quiet now");
+    }
   });
 
   test("an idle the watcher saw before a later message landed does not clear that message's turn", async () => {

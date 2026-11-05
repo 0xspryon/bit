@@ -105,7 +105,7 @@ const KIND_LABELS: Record<string, string | undefined> = {
    * the next one (A6 U6 review 2). The importer chat draws it as that turn's note, never a
    * row, so this word too is the Live panel's.
    */
-  "turn.carried": "Answered with the next message",
+  "turn.carried": "Went on with the next message",
   /** A sub-agent the agent started, as one entry (A6 U14). See {@link SUBAGENT_KIND}. */
   subagent: "Sub-agent",
   "action.denied": "Denied",
@@ -1581,9 +1581,9 @@ export const TAKEN_KIND = "turn.taken";
 
 /**
  * The kind the harness's "this message went on with the next one" item carries (`live.ts`,
- * A6 U6 review 2): a turn ended before it wrote anything, and the next message's reply
- * answers both. Never drawn as a row by any chat: the importer's draws its turn as answered
- * with the next message, and the goal and planner panels drop it.
+ * A6 U6 review 2): a turn ended before it wrote anything, and the next message's turn reads
+ * both. Never drawn as a row by any chat: the importer's draws its turn as gone on with the
+ * next message, and the goal and planner panels drop it.
  */
 export const CARRIED_KIND = "turn.carried";
 

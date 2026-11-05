@@ -3291,6 +3291,476 @@ describe("U6: a Send now that cuts a turn before it wrote anything", () => {
   });
 });
 
+/* ── A Send now, then a Stop; and a Send now that cuts a turn which had written something (A6 U6 review 3) ── */
+
+describe("U6 review 3: a Stop after a Send now, and a carry only for a turn that wrote nothing", () => {
+  const A = "5e1d0a7c9b3f4e2a8c6d1b0f7a9e3c51";
+  const B = "9c2f6b1e4a7d3c8b0e5f2a9d6c1b7e43";
+
+  const lines = async (dir: string, name: string): Promise<string[]> =>
+    (await readFile(join(import.meta.dir, "testdata", dir, name), "utf8"))
+      .split("\n")
+      .filter((line) => line !== "");
+
+  /**
+   * An SDK that answers with recorded frames on a script: `onPull[n]` is the slice of
+   * `lines` sent once the n-th message is pulled, `onInterrupt` the slice sent when
+   * `interrupt()` is asked. Each frame's `pulled-<n>` is the uuid of the n-th message pulled.
+   * `pulled(n)` resolves once n messages have been.
+   */
+  const scriptedSdk = (
+    frames: readonly string[],
+    script: {
+      readonly onPull: Readonly<Record<number, readonly [number, number]>>;
+      readonly onInterrupt?: readonly [number, number];
+    },
+  ) => {
+    const uuids: string[] = [];
+    const pending: SDKMessage[] = [];
+    const waiters: { n: number; resolve: () => void }[] = [];
+    let wake: (() => void) | undefined;
+    const emit = (range: readonly [number, number] | undefined): void => {
+      if (range === undefined) return;
+      for (const line of frames.slice(range[0], range[1])) {
+        pending.push(
+          JSON.parse(
+            line.replace(
+              /pulled-([1-3])/g,
+              (_, n: string) => uuids[Number(n) - 1] ?? "",
+            ),
+          ) as SDKMessage,
+        );
+      }
+      const waiting = wake;
+      wake = undefined;
+      waiting?.();
+    };
+    const sdk: ClaudeCodeSdk = {
+      query: ({ prompt }) => {
+        void (async () => {
+          for await (const message of prompt) {
+            uuids.push((message as { uuid?: string }).uuid ?? "");
+            emit(script.onPull[uuids.length]);
+            for (const waiter of waiters.filter((w) => w.n <= uuids.length)) {
+              waiter.resolve();
+            }
+          }
+        })();
+        return {
+          setMcpServers: async () => ({}),
+          interrupt: async () => {
+            emit(script.onInterrupt);
+          },
+          stopTask: async () => undefined,
+          getContextUsage: async () => ({ maxTokens: CONTEXT_WINDOW }),
+          setModel: async () => undefined,
+          applyFlagSettings: async () => undefined,
+          close: () => undefined,
+          [Symbol.asyncIterator]: async function* () {
+            for (;;) {
+              while (pending.length > 0) {
+                const next = pending.shift();
+                if (next !== undefined) yield next;
+              }
+              await new Promise<void>((resolve) => {
+                wake = resolve;
+              });
+            }
+          },
+        } satisfies HarnessQuery;
+      },
+      sessionMessages: liveClaudeCodeSdk.sessionMessages,
+      sessionInfo: () => Promise.resolve(undefined),
+    };
+    const pulled = (n: number): Promise<void> =>
+      uuids.length >= n
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => waiters.push({ n, resolve }));
+    return { sdk, pulled };
+  };
+
+  /** The index of the n-th (1-based) frame of `type`, for slicing a script. */
+  const nth = (frames: readonly string[], type: string, n: number): number => {
+    let seen = 0;
+    const at = frames.findIndex(
+      (line) =>
+        (JSON.parse(line) as { type?: string }).type === type && ++seen === n,
+    );
+    if (at < 0) throw new Error(`no ${type} #${String(n)}`);
+    return at;
+  };
+
+  /**
+   * The driver over a scripted SDK, with the CLI's transcript at `transcript` (or none):
+   * the opening prompt answered, then `act` — A, B, a Stop, in some order — and what it
+   * narrated from there to idle, the session's status, and the transcript as `messages`
+   * reads it.
+   */
+  const drive = async (input: {
+    readonly session: string;
+    readonly sdk: ReturnType<typeof scriptedSdk>;
+    readonly transcript?: string;
+    readonly act: (
+      harness: AgentHarness["Service"],
+      pulled: (n: number) => Promise<void>,
+    ) => Effect.Effect<void, unknown>;
+  }) => {
+    const root = await mkdtemp(join(tmpdir(), "bit-send-now-stop-"));
+    const previous = process.env["CLAUDE_CONFIG_DIR"];
+    try {
+      const project = join(root, "projects", "-tmp-ws");
+      await mkdir(project, { recursive: true });
+      if (input.transcript !== undefined) {
+        await writeFile(
+          join(project, `${input.session}.jsonl`),
+          await readFile(
+            join(
+              import.meta.dir,
+              "testdata",
+              "claude-code-transcript",
+              input.transcript,
+            ),
+            "utf8",
+          ),
+        );
+      }
+      process.env["CLAUDE_CONFIG_DIR"] = root;
+      return await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              yield* harness.createSession({
+                title: "import",
+                model: "claude-haiku-4-5",
+                directory: "/tmp/ws",
+                sessionId: input.session,
+                multiTurn: true,
+              });
+              yield* harness.prompt(input.session, "Say hi in three words.");
+              yield* harness.waitForIdle(input.session);
+              const entries: HarnessNarration[] = [];
+              const narration = yield* Effect.forkChild(
+                Stream.runForEach(
+                  harness.sessionEvents(input.session),
+                  (entry) =>
+                    Effect.sync(() => {
+                      entries.push(entry);
+                    }),
+                ),
+              );
+              yield* input.act(harness, input.sdk.pulled);
+              yield* harness.waitForIdle(input.session);
+              yield* Effect.sleep("50 millis");
+              yield* Fiber.interrupt(narration);
+              const opened = entries.findIndex(
+                (entry) => entry.type === "result",
+              );
+              // The opening turn's entries, through its `result` frame's last one.
+              const after = entries.findIndex(
+                (entry, index) => index > opened && entry.type !== "result",
+              );
+              const status = yield* harness.sessionStatus(input.session);
+              const stored =
+                input.transcript === undefined
+                  ? []
+                  : yield* harness.messages(input.session);
+              return { entries: entries.slice(after), status, stored };
+            }),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                controlTimeout: "2 seconds",
+                sdk: input.sdk.sdk,
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+    } finally {
+      if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  };
+
+  /** What a run narrated, the details that matter here, in order. */
+  const told = (entries: readonly HarnessNarration[]) =>
+    entries.flatMap((entry) => {
+      const detail = entry.detail;
+      switch (detail._tag) {
+        case "taken":
+        case "carried":
+          return [`${detail._tag} ${detail.messageIds.join(",")}`];
+        case "marker":
+          return [`marker ${detail.marker}: ${detail.text}`];
+        case "error":
+          return [`error ${detail.message}`];
+        case "reply":
+          return [`reply ${detail.text}`];
+        case "toolCall":
+          return [`toolCall ${detail.tool}`];
+        default:
+          return entry.type === "result"
+            ? [`result ${entry.outcome ?? "-"}`]
+            : [];
+      }
+    });
+
+  /** A replay of what the transcript holds, one line an item. */
+  const replayed = (stored: Parameters<typeof projectReplay>[0]["entries"]) =>
+    projectReplay({
+      entries: stored,
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "s",
+      users: "operator",
+      fallbackAt: 0,
+    }).items.map((item) =>
+      item.kind === "turn.carried"
+        ? `carried ${(item.messageIds ?? []).join(",")}`
+        : `${item.kind} ${item.headline}: ${item.body}`,
+    );
+
+  const SEND_NOW_THEN_STOP = "22222222-0000-4000-8000-0000000000e7";
+  const STOP_THEN_SEND_NOW = "22222222-0000-4000-8000-0000000000e8";
+
+  /** A sent idle, then B sent with Send now, as the page sends them. */
+  const sendAB = (
+    harness: AgentHarness["Service"],
+    session: string,
+  ): Effect.Effect<void, unknown> =>
+    Effect.gen(function* () {
+      yield* harness.prompt(session, "What is 2+2? Answer in one sentence.", {
+        _tag: "steer",
+        urgency: "queued",
+        messageId: A,
+      });
+      yield* harness.prompt(session, "Also name a colour. One word.", {
+        _tag: "steer",
+        urgency: "preemptive",
+        messageId: B,
+      });
+    });
+
+  /*
+   * Recorded 2026-11-05 from `@anthropic-ai/claude-agent-sdk@0.3.310` and its CLI 2.1.310 on
+   * `claude-haiku-4-5`, by a throwaway probe calling `query()` directly: A sent `later` idle,
+   * B sent `now` 330 ms later, `interrupt()` 0 ms after B
+   * (`claude-code-frames/send-now-then-stop.jsonl`; the same frames came at 3 and 100 ms).
+   * A's turn ended as with no Stop — diagnostic only, no marker — B's turn opened naming B,
+   * then the interrupt marker and B's diagnostic-only `result`. Sanitised as
+   * `send-now-before-output.jsonl` is. The CLI stored A, B, then the marker
+   * (`claude-code-transcript/send-now-then-stop.cli.jsonl`).
+   */
+  for (const [when, split] of [
+    ["before A's result", "a"],
+    ["after A's result, on B's turn", "b"],
+  ] as const) {
+    test(`A, Send now B, Stop ${when}: A carried, B stopped, live as after a reload`, async () => {
+      const frames = await lines(
+        "claude-code-frames",
+        "send-now-then-stop.jsonl",
+      );
+      const aOpens = nth(frames, "system", 2);
+      const aEnds = nth(frames, "result", 2);
+      const bOpens = nth(frames, "system", 3);
+      const sdk = scriptedSdk(
+        frames,
+        split === "a"
+          ? // The Stop is asked while A's turn is still open, B pulled.
+            {
+              onPull: { 1: [0, aOpens], 2: [aOpens, aEnds] },
+              onInterrupt: [aEnds, frames.length],
+            }
+          : // A's turn has ended and B's opened when the Stop is asked.
+            {
+              onPull: {
+                1: [0, aOpens],
+                2: [aOpens, aEnds],
+                3: [aEnds, bOpens + 1],
+              },
+              onInterrupt: [bOpens + 1, frames.length],
+            },
+      );
+      const { entries, status, stored } = await drive({
+        session: SEND_NOW_THEN_STOP,
+        sdk,
+        transcript: "send-now-then-stop.cli.jsonl",
+        act: (harness, pulled) =>
+          Effect.gen(function* () {
+            yield* sendAB(harness, SEND_NOW_THEN_STOP);
+            yield* Effect.promise(() => pulled(3));
+            if (split === "b") {
+              // B's turn is open: its init names it.
+              for (let step = 0; step < 20; step += 1) yield* Effect.yieldNow;
+            }
+            expect(yield* harness.interruptSession(SEND_NOW_THEN_STOP)).toBe(
+              true,
+            );
+          }),
+      });
+      expect(told(entries)).toEqual([
+        `taken ${A}`,
+        // A's turn: cut by the Send now before it wrote anything, carried on with B.
+        "result interrupted",
+        `carried ${A}`,
+        `taken ${B}`,
+        // B's turn is the one the Stop ended: the CLI's marker, then its `result`.
+        "marker interrupted: [Request interrupted by user]",
+        "result interrupted",
+      ]);
+      // The last turn was stopped, not failed: what the Stop's answer reads.
+      expect(status.outcome).toBe("interrupted");
+      expect(status.activity).toBe("idle");
+      // After a reload: A carried, B ended by the marker — the same reading.
+      expect(replayed(stored).slice(2)).toEqual([
+        "turn.operator You: What is 2+2? Answer in one sentence.",
+        `carried ${A}`,
+        "turn.operator You: Also name a colour. One word.",
+        "turn.other interrupted: [Request interrupted by user]",
+      ]);
+    });
+  }
+
+  /*
+   * Recorded with the same probe, `interrupt()` asked 1 ms **before** B was sent
+   * (`stop-then-send-now.jsonl`): the marker arrived in A's turn, before its `result` — the
+   * Stop landed on A — and B then ran and was answered.
+   */
+  test("Stop, then Send now B: the Stop is A's, A is not carried, and B is answered", async () => {
+    const frames = await lines(
+      "claude-code-frames",
+      "stop-then-send-now.jsonl",
+    );
+    const aOpens = nth(frames, "system", 2);
+    const marker = nth(frames, "user", 1);
+    const sdk = scriptedSdk(frames, {
+      onPull: {
+        1: [0, aOpens],
+        2: [aOpens, marker],
+        3: [marker + 1, frames.length],
+      },
+      onInterrupt: [marker, marker + 1],
+    });
+    const { entries, status, stored } = await drive({
+      session: STOP_THEN_SEND_NOW,
+      sdk,
+      transcript: "stop-then-send-now.cli.jsonl",
+      act: (harness, pulled) =>
+        Effect.gen(function* () {
+          yield* harness.prompt(
+            STOP_THEN_SEND_NOW,
+            "What is 2+2? Answer in one sentence.",
+            { _tag: "steer", urgency: "queued", messageId: A },
+          );
+          yield* Effect.promise(() => pulled(2));
+          for (let step = 0; step < 20; step += 1) yield* Effect.yieldNow;
+          expect(yield* harness.interruptSession(STOP_THEN_SEND_NOW)).toBe(
+            true,
+          );
+          yield* harness.prompt(
+            STOP_THEN_SEND_NOW,
+            "Also name a colour. One word.",
+            { _tag: "steer", urgency: "preemptive", messageId: B },
+          );
+        }),
+    });
+    expect(told(entries)).toEqual([
+      `taken ${A}`,
+      "marker interrupted: [Request interrupted by user]",
+      "result interrupted",
+      `taken ${B}`,
+      "reply Two plus two equals four. Blue.",
+      "result succeeded",
+    ]);
+    expect(status.outcome).toBe("succeeded");
+    expect(replayed(stored).slice(2)).toEqual([
+      "turn.operator You: What is 2+2? Answer in one sentence.",
+      "turn.other interrupted: [Request interrupted by user]",
+      "turn.operator You: Also name a colour. One word.",
+      "turn.reply Reply: Two plus two equals four. Blue.",
+    ]);
+  });
+
+  test("a Send now that cuts a turn which had already written is not a carry, even on the same diagnostic", async () => {
+    /*
+     * The recorded "before output" run, with a tool call and its result put into A's turn
+     * before its end: what a Send now taken after a tool call looks like (`last_content_type=
+     * tool_result`). The turn has rows, so it is a cut turn, not one carried on.
+     */
+    const frames = await lines(
+      "claude-code-frames",
+      "send-now-before-output.jsonl",
+    );
+    const aOpens = nth(frames, "system", 2);
+    const aEnds = nth(frames, "result", 2);
+    const call = JSON.stringify({
+      type: "assistant",
+      message: {
+        model: "claude-haiku-4-5-20251001",
+        id: "msg_tool",
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_1",
+            name: "Read",
+            input: { file_path: "/tmp/ws/a" },
+          },
+        ],
+        stop_reason: null,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+      parent_tool_use_id: null,
+      session_id: "00000000-0000-4000-8000-0000000000e6",
+      uuid: "00000000-0000-4000-8000-00000000c001",
+    });
+    const result = JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "toolu_1", content: "a" },
+        ],
+      },
+      parent_tool_use_id: null,
+      session_id: "00000000-0000-4000-8000-0000000000e6",
+      uuid: "00000000-0000-4000-8000-00000000c002",
+    });
+    const ended = (frames[aEnds] ?? "").replace(
+      "last_content_type=n/a",
+      "last_content_type=tool_result",
+    );
+    const edited = [
+      ...frames.slice(0, aEnds),
+      call,
+      result,
+      ended,
+      ...frames.slice(aEnds + 1),
+    ];
+    const sdk = scriptedSdk(edited, {
+      onPull: { 1: [0, aOpens], 3: [aOpens, edited.length] },
+    });
+    const { entries, status } = await drive({
+      session: "22222222-0000-4000-8000-0000000000e9",
+      sdk,
+      act: (harness) => sendAB(harness, "22222222-0000-4000-8000-0000000000e9"),
+    });
+    expect(told(entries)).toEqual([
+      `taken ${A}`,
+      "toolCall Read",
+      // Not carried: the Send now cut a turn with rows. Not `interrupted` either — nothing
+      // this server can say cut it — and with only a diagnostic, no error row.
+      "result failed",
+      `taken ${B}`,
+      "reply Two plus two equals four. Blue.",
+      "result succeeded",
+    ]);
+    expect(status.outcome).toBe("succeeded");
+  });
+});
+
 describe("a second accepted message, and what settlement means after one", () => {
   test("waitForIdle waits for the steer's own turn, not the one it took over from", async () => {
     /*
@@ -6053,11 +6523,11 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
       // the next (A6 U6 review 2). The CLI's own entries after them are no operator's, and
       // carry nothing.
       "You: What does this screenshot show?",
-      "Answered with the next message: ",
+      "Went on with the next message: ",
       "You: Just the words, as a list.",
-      "Answered with the next message: ",
+      "Went on with the next message: ",
       "You: [Request interrupted by user for tool use]",
-      "Answered with the next message: ",
+      "Went on with the next message: ",
       "You: typed",
       // Drawn as its status, the notification having no summary (A6 U14's review).
       "task: Task completed",
