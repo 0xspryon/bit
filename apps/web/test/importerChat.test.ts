@@ -676,9 +676,11 @@ describe("a session's name (S9, U8)", () => {
     const hover = sessionHover(hostile, AT);
     const tail = hover.slice(hover.lastIndexOf("\u2069") + 1);
     expect(tail).toBe(` · started ${when}`);
-    expect(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u.test(
-      hover.slice(1, hover.lastIndexOf("\u2069")),
-    )).toBe(false);
+    expect(
+      /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u.test(
+        hover.slice(1, hover.lastIndexOf("\u2069")),
+      ),
+    ).toBe(false);
   });
 
   test("falls back to its time where the harness has no title, or only whitespace", () => {

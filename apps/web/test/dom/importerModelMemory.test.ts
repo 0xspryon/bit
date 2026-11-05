@@ -47,16 +47,16 @@ const harness = (
   models: models.map((id) => ({ id })),
 });
 
-const HARNESSES = (claudeReady = true, claudeModels = [HAIKU, "claude-sonnet-5"]) => [
+const HARNESSES = (
+  claudeReady = true,
+  claudeModels = [HAIKU, "claude-sonnet-5"],
+) => [
   harness("opencode", "OpenCode", [FREE, "zai-coding-plan/glm-5.3-flash"]),
   harness("claude-code", "Claude Code", claudeModels, claudeReady),
 ];
 
 /** A page load: a fresh `App` on the server `fake`, opened on `targetId`'s Scope tab. */
-const load = async (
-  fake: FakeServer,
-  targetId = "acme-corp",
-): Promise<App> => {
+const load = async (fake: FakeServer, targetId = "acme-corp"): Promise<App> => {
   for (const each of mounted) each.destroy();
   mounted = [];
   const app = new App(fake, new FakeCountdown());
@@ -171,9 +171,7 @@ describe("the model picked for a new importer session (U8 review)", () => {
     expect(chipModel()).toBe(FREE);
 
     // And D15's own pick is not written down as the operator's: the memory is untouched.
-    expect(
-      browserModelMemory.read(SERVER_URL, "acme-corp")?.model,
-    ).toBe(HAIKU);
+    expect(browserModelMemory.read(SERVER_URL, "acme-corp")?.model).toBe(HAIKU);
     app = await load(server());
     await autoLoad(app);
     expect(chipModel()).toBe(HAIKU);

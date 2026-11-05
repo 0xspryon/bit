@@ -78,7 +78,10 @@ export const browserModelMemory: ModelMemory = {
  */
 export const usableRemembered = (
   remembered: RememberedModel | undefined,
-  harnesses: readonly Pick<HarnessInstanceView, "instanceId" | "ready" | "models">[],
+  harnesses: readonly Pick<
+    HarnessInstanceView,
+    "instanceId" | "ready" | "models"
+  >[],
 ): RememberedModel | undefined => {
   if (remembered === undefined || remembered.model === "") return undefined;
   const harness = harnesses.find(
