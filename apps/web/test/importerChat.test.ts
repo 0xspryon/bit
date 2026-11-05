@@ -946,6 +946,7 @@ describe("the importer's words from the live feed", () => {
       importId: "imp_1",
       historyFloor: 20,
       replayed,
+      callInFlight: true,
     });
     expect(feed.map((each) => each.body)).toEqual([
       "Weighing the wildcard",
@@ -1016,8 +1017,89 @@ describe("the importer's words from the live feed", () => {
           blockId: "ses:msg_2:0",
         },
       ],
+      callInFlight: true,
     });
     expect(feed.map((each) => each.body)).toEqual(["Weighing the wildcard"]);
+  });
+
+  test("U5 review 3: a replay holding only tool rows still cuts the older blocks its window lost", () => {
+    // A write-heavy run: two hundred calls with no prose fill the replay's newest four
+    // hundred items with tool rows, so no block in the live window is one the replay
+    // names. The tool rows it does name are what says how far it reaches.
+    const cutAway = {
+      ...said(5, "before the window"),
+      blockId: "ses:msg_1:0",
+      blockCall: "ses:msg_1",
+    };
+    const call = (n: number): LiveItem => ({
+      ...item({ kind: "tool.call", toolName: "add_scope_entry" }),
+      id: `activity:${String(n)}`,
+      importId: "imp_1",
+      callId: `toolu_${String(n)}`,
+    });
+    const result = (n: number): LiveItem => ({
+      ...item({ kind: "tool.result", toolName: "add_scope_entry" }),
+      id: `activity:${String(n + 1)}`,
+      importId: "imp_1",
+      callId: `toolu_${String(n)}`,
+    });
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [cutAway, call(6), result(6), call(8), result(8), finishedThought],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: [
+        replayItem(0, "tool.call", "", { callId: "toolu_8" }),
+        replayItem(1, "tool.result", "", { callId: "toolu_8" }),
+      ],
+      callInFlight: true,
+    });
+    expect(feed.map((each) => each.body)).toEqual(["Weighing the wildcard"]);
+  });
+
+  test("U5 review 3: a finished block below the floor is not kept once no call can still be running", () => {
+    // A replay read with the session idle holds every finished block both harnesses
+    // stored: one it lacks is missing for another reason, not yet to come.
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [finishedThought, replyGrowing],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: [replayItem(0, "turn.operator", "Read the page")],
+      callInFlight: false,
+    });
+    // The partial is still being written, whatever the session says; the finished one goes.
+    expect(feed.map((each) => each.body)).toEqual([
+      "Reading the policy page and",
+    ]);
+  });
+
+  test("U5 review 3: a finished block above the floor the replay already holds is drawn once", () => {
+    // The turn watch answered, and the settled re-read landed, before the block's last live
+    // frame reached the tab: published after the floor, and in the replay too.
+    const late = {
+      ...item({ kind: "turn.reply", body: "Six are in scope." }),
+      id: "activity:25",
+      importId: "imp_1",
+      blockId: "ses:msg_9:1",
+      blockCall: "ses:msg_9",
+    } satisfies LiveItem;
+    const feed = importerFeed({
+      own: [],
+      floors: {},
+      live: [late, said(26, "a later block")],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: [
+        {
+          ...replayItem(0, "turn.reply", "Six are in scope."),
+          blockId: "ses:msg_9:1",
+        },
+      ],
+    });
+    expect(feed.map((each) => each.body)).toEqual(["a later block"]);
   });
 
   test("U5 review: returning to a chat mid-block draws the block in the running turn, writing", () => {

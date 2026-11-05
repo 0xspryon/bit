@@ -314,13 +314,23 @@ export class ImporterSessions {
    * The imports whose replay on screen was read while their turn was running, by import id
    * (A6 U5 review 2): read again once the turn settles ({@link #rereadSettled}).
    *
-   * **A replay read mid-turn can lack blocks it will never be sent again.** Claude Code
-   * writes a model call's blocks to its transcript only when the whole call ends, so a
-   * replay read mid-reply has no thought above the reply, though its finished frame went out
-   * live seconds earlier. `importerFeed` keeps that frame while the live feed holds it, but a
-   * reload starts a new feed, and the bus no longer holds frames from before it: the thought
-   * is in neither, and nothing else reads the replay again. Once the turn has settled, the
-   * transcript holds every block of it.
+   * **A replay read mid-turn can lack blocks it will never be sent again.** Both harnesses
+   * store a model call's blocks only when the whole call ends — Claude Code writes them to
+   * its transcript then, and OpenCode 2.2.5's message list held only the operator's row for
+   * the whole of a 20 s GLM message (measured, U5 review 3) — so a replay read mid-reply has
+   * no thought above the reply, though its finished frame went out live seconds earlier.
+   * `importerFeed` keeps that frame while the live feed holds it, but a reload starts a new
+   * feed, and the bus no longer holds frames from before it: the thought is in neither, and
+   * nothing else reads the replay again. Once the turn has settled, the harness holds every
+   * block of it.
+   *
+   * V2(chat): until then, a reload mid-call shows the turn without the call's earlier
+   * finished thought or reply — for up to the rest of the call. V2 holds a per-import tail of
+   * the finished reply/thinking items narrated during the running turn on the server, beside
+   * the queued steers in `import/scopeImporter.ts` (about the last 32 blocks / 256 KB,
+   * cleared at turn end, at a Stop's settle and at session end, lost on a restart, which ends
+   * the turn too), and `import/importerHistory.ts` appends the tail's blocks whose `blockId`
+   * the transcript lacks after reading it, so the first replay is already whole.
    */
   readonly #readMidTurn = new Set<string>();
   /** Stops watching the turn in flight, if one is being watched. */
@@ -441,6 +451,8 @@ export class ImporterSessions {
             midTurn: this.current.midTurn,
             working: this.current.working,
             taken: this.current.taken,
+            callInFlight:
+              this.current.working || this.current.replayMidTurn === true,
           }),
           working: this.current.working,
           recordsSkipped: this.#skipped(),
@@ -587,6 +599,9 @@ export class ImporterSessions {
               ? {}
               : { historyFloor: kept.historyFloor }),
             ...(kept.loaded === undefined ? {} : { loaded: kept.loaded }),
+            ...(kept.replayMidTurn === undefined
+              ? {}
+              : { replayMidTurn: kept.replayMidTurn }),
             // What this tab knows the model is set to, while it is still on that model.
             ...(kept.modelOptions !== undefined && kept.model === session.model
               ? { modelOptions: kept.modelOptions }
@@ -789,7 +804,10 @@ export class ImporterSessions {
     }
     // With the messages the server still holds queued in the live session (A6 U4 review):
     // the transcript does not have them until they are taken, and a reload must not lose one.
-    this.#replace(session.id, (before) => withReplay(before, answered));
+    this.#replace(session.id, (before) => ({
+      ...withReplay(before, answered),
+      replayMidTurn: midTurn,
+    }));
     this.#installed(importId, midTurn);
   }
 
@@ -864,7 +882,10 @@ export class ImporterSessions {
     ) {
       return;
     }
-    this.#replace(sessionId, (before) => withReplay(before, answered, held));
+    this.#replace(sessionId, (before) => ({
+      ...withReplay(before, answered, held),
+      replayMidTurn: midTurn,
+    }));
     this.#installed(importId, midTurn);
   }
 

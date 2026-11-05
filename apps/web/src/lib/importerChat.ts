@@ -351,6 +351,12 @@ export interface ImporterSession {
    * before. Recorded by `ImporterSessions.noteTaken`.
    */
   readonly taken?: Readonly<Record<string, LiveItem>>;
+  /**
+   * True when the replay on screen was read while the session was working (A6 U5 review 3):
+   * it can lack the finished blocks of the model call that was running, which
+   * {@link importerFeed} then keeps from the live feed until a replay read idle replaces it.
+   */
+  readonly replayMidTurn?: boolean;
 }
 
 export { TAKEN_KIND };
@@ -677,6 +683,10 @@ export const strandedNote = (instanceId: string): string =>
  * against the row, which is minted on acceptance, would put the start of a reply above the
  * message it answers.
  */
+/** A tool call or its result: what a replay names by `callId` rather than by `blockId`. */
+const isToolItem = (item: LiveItem): boolean =>
+  item.kind === "tool.call" || item.kind === "tool.result";
+
 export const importerFeed = (input: {
   readonly own: readonly LiveItem[];
   readonly floors: Readonly<Record<string, number>> | undefined;
@@ -698,6 +708,13 @@ export const importerFeed = (input: {
   readonly working?: boolean | undefined;
   /** {@link ImporterSession.taken}: the takes recorded, whether or not still in `live`. */
   readonly taken?: Readonly<Record<string, LiveItem>> | undefined;
+  /**
+   * Whether the replay may still lack a finished block because the model call it belongs to
+   * had not ended when the replay was read: the session is working, or its replay was read
+   * while it was ({@link ImporterSession.replayMidTurn}). Below the floor, a finished block
+   * the replay lacks is kept only then. `false` when omitted.
+   */
+  readonly callInFlight?: boolean | undefined;
 }): readonly LiveItem[] => {
   const { importId } = input;
   if (importId === undefined) return input.own;
@@ -723,49 +740,89 @@ export const importerFeed = (input: {
    * - a **partial**: each keeps the id of its block's first one (`withBlock`), so a block that
    *   began before the replay was asked for sits below the floor for as long as it is
    *   written — and no harness stores a block before it is finished;
-   * - a **finished** block of a model call still running: Claude Code writes a call's blocks
-   *   to its transcript only once the whole call ends, so a thought finished live 2 s in was
-   *   in no replay until the reply after it ended, 10 s later (measured). Dropped by the
-   *   floor, a reload or a return mid-reply lost the thought above it for good.
+   * - a **finished** block of a model call still running: **both harnesses** store a call's
+   *   blocks only once the whole call ends — Claude Code writes them to its transcript then,
+   *   and OpenCode 2.2.5's message list held only the operator's row for the whole of a 20 s
+   *   GLM message (measured, U5 review 3) — so a thought finished live 2 s in was in no
+   *   replay until the reply after it ended, 10 s later (measured on Claude Code). Dropped by
+   *   the floor, a reload or a return mid-reply lost the thought above it for good. Kept
+   *   only while that call can still be running ({@link callInFlight}).
+   *
+   * V2(chat): after a **reload** mid-call the live feed starts afresh and holds no frame
+   * from before it, so the call's earlier finished thought or reply is in neither the feed
+   * nor the replay until the turn settles and the replay is read again
+   * (`ImporterSessions.#readMidTurn`): the turn shows its later blocks only, for up to the
+   * rest of the call. V2 keeps a per-import tail of the finished reply and thinking items
+   * narrated during the running turn, beside the queued steers in `import/scopeImporter.ts`
+   * — bounded to about the last 32 blocks / 256 KB, cleared at turn end, at a Stop's settle
+   * and at session end — and `import/importerHistory.ts` appends, after the transcript read,
+   * the tail's blocks whose `blockId` the transcript lacks. It is lost on a server restart,
+   * which ends the turn too.
    *
    * Once the replay holds the block, its copy there is the block. **Only a block published
-   * after every block the replay holds is kept** (`heldUpTo`): the blocks a harness has not
-   * stored yet are its newest. An older one the replay lacks is missing for another reason
+   * after everything the replay is known to hold is kept** (`heldUpTo`: its blocks, and its
+   * tool calls and results by `callId`): the blocks a harness has not stored yet are its
+   * newest. An older one the replay lacks is missing for another reason
    * — cut by the replay's window (`truncated`), or named differently by a transcript that
    * holds part of a call — and drawing it would put words from before the window under the
    * turn the replay ends on.
    */
   const inReplay = new Set<string>();
+  const callsInReplay = new Set<string>();
   for (const item of input.replayed ?? []) {
     if (item.blockId !== undefined) inReplay.add(item.blockId);
+    if (isToolItem(item) && item.callId !== null)
+      callsInReplay.add(item.callId);
   }
   const isBlock = (item: LiveItem): boolean =>
     item.blockId !== undefined &&
     (item.kind === REPLY_KIND || item.kind === THINKING_KIND);
   const ours = input.live.filter((item) => item.importId === importId);
+  /*
+   * The newest thing published live that the replay is known to hold: a block it names, or
+   * a tool call or result whose call it names (A6 U5 review 3). Tool items count because a
+   * write-heavy run is mostly them: two hundred calls with no prose between fill the
+   * replay's newest four hundred items with tool rows alone, and a watermark read off blocks
+   * only would stay at −∞ and let every older reply in the live window back under the floor.
+   */
   let heldUpTo = Number.NEGATIVE_INFINITY;
   for (const item of ours) {
     const order = activityOrder(item);
-    if (
-      order !== undefined &&
-      isBlock(item) &&
-      inReplay.has(item.blockId ?? "")
-    ) {
-      heldUpTo = Math.max(heldUpTo, order);
-    }
+    if (order === undefined) continue;
+    const held = isBlock(item)
+      ? inReplay.has(item.blockId ?? "")
+      : isToolItem(item) &&
+        item.callId !== null &&
+        callsInReplay.has(item.callId);
+    if (held) heldUpTo = Math.max(heldUpTo, order);
   }
-  /** Whether a block below the floor is one the replay cannot have yet. */
+  /**
+   * Whether a block below the floor is one the replay cannot have yet.
+   *
+   * A partial always: no harness stores a block before it ends. A finished one only while
+   * its turn can still be running — the session is working, or the replay on screen was read
+   * while it was ({@link ImporterSession.replayMidTurn}) and its settled re-read has not
+   * landed: both harnesses store a model call's blocks once the whole call ends, so a replay
+   * read with the session idle holds every finished block, and one it lacks is missing for
+   * another reason.
+   */
   const notYetStored = (item: LiveItem): boolean =>
     isBlock(item) &&
     !inReplay.has(item.blockId ?? "") &&
     (isPartial(item) ||
-      (activityOrder(item) ?? Number.POSITIVE_INFINITY) > heldUpTo);
-  const mine = ours.filter(
-    (item) =>
+      (input.callInFlight === true &&
+        (activityOrder(item) ?? Number.POSITIVE_INFINITY) > heldUpTo));
+  const mine = ours.filter((item) => {
+    // A block the replay holds is the replay's, above the floor too (A6 U5 review 3): the
+    // turn watch can answer, and the settled re-read land, before the block's last live
+    // frame reaches this tab, and that frame is then published after the floor.
+    if (isBlock(item) && inReplay.has(item.blockId ?? "")) return false;
+    return (
       input.historyFloor === undefined ||
       (activityOrder(item) ?? Number.POSITIVE_INFINITY) > input.historyFloor ||
-      notYetStored(item),
-  );
+      notYetStored(item)
+    );
+  });
   /*
    * Where an operator row goes among the importer's words: after everything published
    * before its floor.
