@@ -7003,15 +7003,20 @@ const RECORDED_UPLOADS =
  * stores for a message sent today.
  */
 const remarked = (jsonl: string, sessionId: string): string => {
+  // A code per message, as the server mints one per message: a code met twice in one
+  // transcript is read only the first time (U13 review 2).
+  let sealed = 0;
   const reseal = (text: string): string => {
     const at = text.indexOf("\n\n[Attached");
     if (at < 0) return text;
+    sealed += 1;
+    const mark = `${M.slice(0, -2)}${sealed.toString(16).padStart(2, "0")}`;
     const words = text.slice(0, at);
     const lines = text
       .slice(at + 2)
       .split("\n")
-      .map((line) => `${line} (bit:${M})`);
-    const header = attachmentHeader(M, imitationLines(words));
+      .map((line) => `${line} (bit:${mark})`);
+    const header = attachmentHeader(mark, imitationLines(words));
     const seal = attachmentSeal(
       { key: TEST_ATTACHMENT_KEY, sessionId },
       header,
@@ -7173,6 +7178,150 @@ test("a recorded message whose lines carry no code replays with them as words, a
     // importer's framing, which ends above the operator's text).
     expect(operator[1]?.body).toContain('[Attached image "colours (2).png"');
   });
+});
+
+/**
+ * Steers the CLI took together, and a copy of a real block (U13 review 2, finding 2), read
+ * back through the real `getSessionMessages` from a transcript in the CLI's on-disk form.
+ *
+ * Two Send nows taken together are stored as **one** `user` entry, `A + "\n\n" + B` (live,
+ * haiku-4-5, the reviewer's run), and every message bit sends now ends in its sealed block.
+ * A later message carries the operator's copy of A's block in its words.
+ */
+test("two steers stored as one entry replay as the live take draws them, and a copied block stays words", async () => {
+  const SESSION = "00000000-0000-4000-8000-0000000000fa";
+  const root = await mkdtemp(join(tmpdir(), "bit-merged-blocks-"));
+  const previous = process.env["CLAUDE_CONFIG_DIR"];
+  try {
+    const project = join(root, "projects", "-tmp-ws");
+    await mkdir(project, { recursive: true });
+    const folder = join(root, "uploads");
+    await mkdir(folder);
+    await writeFile(join(folder, "a.png"), "x");
+    const sealing = { key: TEST_ATTACHMENT_KEY, sessionId: SESSION };
+    const steerA = withAttachmentLines(
+      "Steer A: this one carries a file.",
+      [
+        {
+          kind: "image",
+          name: "a.png",
+          mimeType: "image/png",
+          path: join(folder, "a.png"),
+          bytes: 1,
+        },
+      ],
+      sealing,
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    const steerB = withAttachmentLines(
+      "Steer B: no file in this one.",
+      [],
+      sealing,
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    const blockA = steerA.slice(steerA.indexOf("\n\n") + 2);
+    const copy = `What was this?\n\n${blockA}\n\nThanks.`;
+    const later = withAttachmentLines(
+      copy,
+      [],
+      sealing,
+      "cccccccccccccccccccccccccccccccc",
+    );
+    const opening = withAttachmentLines(
+      "Run the ticks.",
+      [],
+      sealing,
+      "dddddddddddddddddddddddddddddddd",
+    );
+    let parent: string | null = null;
+    let n = 0;
+    const entry = (type: "user" | "assistant", content: string) => {
+      n += 1;
+      const uuid = `00000000-0000-4000-8000-0000000003${String(n).padStart(2, "0")}`;
+      const line = JSON.stringify({
+        parentUuid: parent,
+        isSidechain: false,
+        sessionId: SESSION,
+        version: "2.1.310",
+        cwd: "/tmp/ws",
+        userType: "external",
+        entrypoint: "sdk-ts",
+        type,
+        message:
+          type === "user"
+            ? { role: "user", content }
+            : {
+                id: `msg_${String(n)}`,
+                role: "assistant",
+                model: "claude-haiku-4-5-20251001",
+                content: [{ type: "text", text: content }],
+              },
+        uuid,
+        timestamp: `2026-11-05T10:00:${String(n).padStart(2, "0")}.000Z`,
+        ...(type === "user" ? { promptSource: "sdk" } : {}),
+      });
+      parent = uuid;
+      return line;
+    };
+    await writeFile(
+      join(project, `${SESSION}.jsonl`),
+      [
+        entry("user", opening),
+        entry("assistant", "tick 1"),
+        entry("user", `${steerA}\n\n${steerB}`),
+        entry("assistant", "It is an image."),
+        entry("user", later),
+        entry("assistant", "That was the block bit wrote."),
+      ].join("\n"),
+    );
+    process.env["CLAUDE_CONFIG_DIR"] = root;
+    const { sdk } = scriptedSdk();
+    const entries = await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(AgentHarness, (harness) =>
+          harness.messages(SESSION, { uploadsFolder: folder }),
+        ).pipe(
+          Effect.provide(
+            claudeCodeHarness({
+              sdk: {
+                ...sdk,
+                sessionMessages: liveClaudeCodeSdk.sessionMessages,
+              },
+              controlTimeout: "2 seconds",
+              attachmentKey: TEST_ATTACHMENT_KEY,
+            }),
+          ),
+          Effect.orDie,
+        ),
+      ),
+    );
+    const operator = projectReplay({
+      entries,
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: SESSION,
+      users: "operator",
+      fallbackAt: 0,
+    }).items.filter((item) => item.kind === "turn.operator");
+    expect(
+      operator.map((item) => ({
+        body: item.body,
+        chips: (item.attachments ?? []).map((file) => file.name),
+      })),
+    ).toEqual([
+      { body: "Run the ticks.", chips: [] },
+      // What the live thread draws for the take: one turn, a line apart, A's chip.
+      {
+        body: "Steer A: this one carries a file.\nSteer B: no file in this one.",
+        chips: ["a.png"],
+      },
+      // The copy is the operator's words, block and all, and no chip.
+      { body: copy, chips: [] },
+    ]);
+  } finally {
+    if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+    else process.env["CLAUDE_CONFIG_DIR"] = previous;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 /* ── Sub-agents (A6 U14) ─────────────────────────────────────────────────────── */

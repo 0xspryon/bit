@@ -151,7 +151,7 @@ import {
 } from "./agentHarness";
 import {
   ephemeralAttachmentKey,
-  splitAttachmentLines,
+  attachmentReader,
   withAttachmentLines,
   type AttachmentReplay,
   type AttachmentSealing,
@@ -2358,6 +2358,9 @@ const flattenTranscript = (
 ): MessageEntry[] => {
   const blocksSeen = new Map<string, number>();
   const subagents: SubagentCalls = new Map();
+  // One reader for the whole read, oldest first: a block's code is read on its first
+  // sighting only, so a real block copied into a later message stays words.
+  const readAttachments = attachmentReader(replay);
   return entries.map((entry): MessageEntry => {
     const message = (entry.message ?? {}) as {
       id?: unknown;
@@ -2444,16 +2447,18 @@ const flattenTranscript = (
       };
     }
     /*
-     * The files an operator's message carried (A6 F9): its trailing `[Attached …]` lines
-     * naming files in the session's own `uploads/` folder, taken out of the words. Each is
-     * typed by its stored name, not by the message's image blocks: the CLI re-encodes a large
-     * image before storing it (measured: a 6.4 MiB PNG came back as `image/jpeg`), and the
-     * blocks are not the lines one for one, so neither their types nor their order say which
-     * file is which.
+     * The files an operator's message carried (A6 F9): bit's sealed block, which ends every
+     * message it sends, naming files in the session's own `uploads/` folder, taken out of the
+     * words. Steers the CLI took together are one entry holding a block per message (U13
+     * review 2), each read and taken off, so the entry reads as the live take does. Each file
+     * is typed by its stored name, not by the message's image blocks: the CLI re-encodes a
+     * large image before storing it (measured: a 6.4 MiB PNG came back as `image/jpeg`), and
+     * the blocks are not the lines one for one, so neither their types nor their order say
+     * which file is which.
      */
     const split =
       entry.type === "user" && marker === undefined
-        ? splitAttachmentLines(text, replay)
+        ? readAttachments(text)
         : undefined;
     // A steer of ours is stored under the UUID it was delivered with (A6 U4 review 2), and
     // steers taken together under the last one's (review 3).

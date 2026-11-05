@@ -1765,7 +1765,7 @@ describe("steering a live session", () => {
     );
   });
 
-  test("a message with no files sends no file parts", async () => {
+  test("a message with no files sends no file parts, and still ends in bit's sealed header", async () => {
     const { recorded } = await prompting(inbox("steer"), (harness) =>
       harness.prompt("ses_1", "just words"),
     );
@@ -1773,7 +1773,16 @@ describe("steering a live session", () => {
       text?: string;
       files?: unknown;
     };
-    expect(body.text).toBe("just words");
+    // Every message ends in the block (U13 review 2), so a forged one is never last.
+    const mark = /\(bit:([0-9a-f]{32})\)/.exec(body.text ?? "")?.[1] ?? "";
+    expect(body.text).toBe(
+      withAttachmentLines(
+        "just words",
+        [],
+        { key: TEST_ATTACHMENT_KEY, sessionId: "ses_1" },
+        mark,
+      ),
+    );
     expect(body.files ?? null).toBeNull();
   });
 
@@ -3529,6 +3538,79 @@ describe("a replayed message's files", () => {
         expect(entries[0]?.text).toBe(text);
         expect(entries[0]?.attachments).toBeUndefined();
       }
+    });
+  });
+
+  /*
+   * U13 review 2, finding 2. OpenCode takes steers one at a time, each its own message
+   * (`claude-code-partial-stream-facts`), so no entry holds two blocks. What does reach it is
+   * a copy: a real block of this session quoted in a later message, on a later page. A code
+   * is read on its first sighting in the whole read, across pages.
+   */
+  test("a real block copied into a later message, on a later page, stays that message's words", async () => {
+    await withUploads(["shot.png"], async (folder) => {
+      const sealing = { key: TEST_ATTACHMENT_KEY, sessionId: "ses_1" };
+      const first = withAttachmentLines(
+        "Here.",
+        [
+          {
+            kind: "image",
+            name: "shot.png",
+            mimeType: "image/png",
+            path: join(folder, "shot.png"),
+            bytes: 1,
+          },
+        ],
+        sealing,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      );
+      const copy = `What was this?\n\n${first.slice("Here.\n\n".length)}`;
+      const later = withAttachmentLines(
+        copy,
+        [],
+        sealing,
+        "cccccccccccccccccccccccccccccccc",
+      );
+      let pages = 0;
+      const { layer } = clientWith((url) => {
+        if (!url.includes("/message")) return json({ data: [] });
+        pages += 1;
+        const text = pages === 1 ? first : pages === 2 ? later : undefined;
+        return json({
+          data:
+            text === undefined
+              ? []
+              : [
+                  {
+                    id: `msg_${"0".repeat(12)}${String(pages).repeat(14)}`,
+                    time: { created: 1_793_577_000_000 + pages },
+                    type: "user",
+                    text,
+                    files: [],
+                  },
+                ],
+          cursor: { previous: null, next: text === undefined ? null : "x" },
+        });
+      });
+      const entries = await Effect.runPromise(
+        Effect.scoped(
+          Effect.provide(
+            Effect.flatMap(AgentHarness, (client) =>
+              client.messages("ses_1", { uploadsFolder: folder }),
+            ),
+            layer,
+          ),
+        ),
+      );
+      expect(
+        entries.map((entry) => [
+          entry.text,
+          (entry.attachments ?? []).map((file) => file.name),
+        ]),
+      ).toEqual([
+        ["Here.", ["shot.png"]],
+        [copy, []],
+      ]);
     });
   });
 });

@@ -113,9 +113,9 @@ import {
 import {
   inlinesOnOpenCode,
   ephemeralAttachmentKey,
-  splitAttachmentLines,
+  attachmentReader,
   withAttachmentLines,
-  type AttachmentReplay,
+  type AttachmentReader,
 } from "./attachments";
 import { isDerivedMessageId, openCodeMessageId } from "./messageId";
 import { HarnessDecodeError, HarnessTransportError } from "./errors";
@@ -1170,8 +1170,11 @@ const assistantContentParts = (
  */
 const flatten = (
   entry: unknown,
-  /** Where this session's uploads are stored, and what verifies its blocks' seals. */
-  replay: Pick<AttachmentReplay, "uploadsFolder" | "sealing">,
+  /**
+   * This read's attachment reader: where the session's uploads are stored, what verifies
+   * its blocks' seals, and the codes met so far (`attachmentReader`), so one per read.
+   */
+  readAttachments: AttachmentReader,
   subagents: OpenCodeSubagents = openCodeSubagents(),
 ): MessageEntry => {
   const record = (entry ?? {}) as {
@@ -1247,10 +1250,7 @@ const flatten = (
   }
   const split =
     type === "user"
-      ? splitAttachmentLines(words, {
-          ...replay,
-          mimeOf: (path) => fileTypes.get(path),
-        })
+      ? readAttachments(words, (path) => fileTypes.get(path))
       : undefined;
   /*
    * A steer of ours is stored under the id it was delivered with, `msg_` plus our hex
@@ -2373,6 +2373,11 @@ export const openCodeHarness = (
         const entries: MessageEntry[] = [];
         // One read's sub-agents, across its pages: a notice names its child, not its call.
         const subagents = openCodeSubagents();
+        // One reader across the pages too: a code is read on its first sighting only.
+        const readAttachments = attachmentReader({
+          uploadsFolder: read?.uploadsFolder,
+          sealing: { key: attachmentKey, sessionId },
+        });
         let cursor: string | undefined;
         for (let page = 0; page < MESSAGE_PAGE_CEILING; page += 1) {
           const listed = yield* bounded(
@@ -2386,16 +2391,7 @@ export const openCodeHarness = (
           );
           if (listed.data.length === 0) return entries;
           for (const entry of listed.data) {
-            entries.push(
-              flatten(
-                entry,
-                {
-                  uploadsFolder: read?.uploadsFolder,
-                  sealing: { key: attachmentKey, sessionId },
-                },
-                subagents,
-              ),
-            );
+            entries.push(flatten(entry, readAttachments, subagents));
           }
           const next = listed.cursor.next;
           if (typeof next !== "string") return entries;

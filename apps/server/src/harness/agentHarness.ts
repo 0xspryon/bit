@@ -458,7 +458,7 @@ export interface MessageEntry {
 export interface MessageRead {
   /**
    * The session's own `uploads/` folder, absolute, as the caller knows it — never as the
-   * transcript says it. See `harness/attachments.ts`'s `splitAttachmentLines`.
+   * transcript says it. See `harness/attachments.ts`'s `attachmentReader`.
    */
   readonly uploadsFolder?: string | undefined;
 }
@@ -1304,11 +1304,12 @@ export class AgentHarness extends Context.Service<
       delivery?: PromptDelivery,
       /**
        * The files this message carried, already stored in the session's own working
-       * directory (A6 F9). Every implementation appends one line per file to `text`
-       * (`withAttachmentLines`), and gives inline what its harness takes inline — Claude
-       * Code an image block per image, OpenCode a file part per image, `text/plain` or PDF
-       * (`harness/attachments.ts`). Absent or empty: the prompt is `text` alone, exactly as
-       * before.
+       * directory (A6 F9). Every implementation ends `text` with bit's sealed block
+       * (`withAttachmentLines`) — one line per file, and the header alone when there are
+       * none (U13 review 2), so a block imitated in the text is never the last one the agent
+       * reads — and gives inline what its harness takes inline: Claude Code an image block
+       * per image, OpenCode a file part per image, `text/plain` or PDF
+       * (`harness/attachments.ts`). A replay takes the block off again.
        */
       attachments?: readonly MessageAttachment[],
     ) => Effect.Effect<PromptAccepted, HarnessFailure>;
