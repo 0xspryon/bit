@@ -4485,6 +4485,22 @@ describe("a target's importer sessions", () => {
          ) VALUES (?, 'op-1', ?, 'https://hackerone.test/acme', 'app.acme.test', 'row 1', ?)`,
         [`asset_${targetId}`, first.scope, first.openedAt + 2],
       );
+      // `importAsset` appends this beside the provenance row, and the tally counts it: an
+      // asset counts on the session whose import created it (U8 review).
+      database.run(
+        `INSERT INTO events (
+           id, sequence, target_id, kind, payload, caller_scope, operation,
+           operation_id, subject_id, recorded_at
+         ) VALUES (?, 4, ?, 'asset.imported', ?, ?, 'import_asset', 'op-1', ?, ?)`,
+        [
+          `evt_${targetId}_asset`,
+          targetId,
+          JSON.stringify({ assetId: `asset_${targetId}`, created: true }),
+          first.scope,
+          `asset_${targetId}`,
+          first.openedAt + 2,
+        ],
+      );
     } finally {
       database.close();
     }

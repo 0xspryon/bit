@@ -6736,19 +6736,25 @@ const makeStore = Effect.fnUntraced(function* () {
    * stored nowhere** — `0024`'s commentary has the argument. `scope.entry.added` events
    * carry the entry's `effect` in their payload and the scope they were written under, and
    * only those with `created` true (or absent, on an event older than the field) count: a
-   * no-op add writes a record too (see `addScopeEntry`) and added nothing;
-   * `asset_imports` rows carry the scope too. Both are inserted in the same transaction as
-   * the entry or asset they describe, so they cannot disagree with it, and a figure that
-   * is read from them cannot go stale.
+   * no-op add writes a record too (see `addScopeEntry`) and added nothing.
+   *
+   * **Assets count by the same rule** (U8 review): an `asset.imported` event whose
+   * `created` is true, which is the one import that put the asset in the target's file.
+   * `importAsset` is the only writer of `asset_imports` and always appends the event, with
+   * `created` read off its own insert, so the field is on every such event. A session that
+   * recorded again an asset another session (or a worker) had already written counts it
+   * nowhere: counting its `asset_imports` rows instead read "0 in · 0 out · 3 assets" for a
+   * session that added nothing, and put the same three assets on two sessions' rows. Both
+   * kinds of event are inserted in the same transaction as the entry or asset they describe,
+   * so they cannot disagree with it, and a figure that is read from them cannot go stale.
    *
    * **The session is the unit, and a session may have had several runs.** `import_sessions`
    * is keyed by import id, so a continuation that mints a fresh id is a second row naming
    * the same `harness_session_id`. Every count therefore ranges over *every* scope any run
    * of the session wrote under (the `IN` subquery), and the outer query keeps one row per
    * session — the one that opened it, with the earliest `opened_at` and the lower import id
-   * on a tie. The assets are `DISTINCT` for the same reason: two runs of one session that
-   * both recorded a host are one asset, and summing per-run counts would put a figure on the
-   * picker that the Assets page disagrees with.
+   * on a tie. Two runs of one session that both recorded a host count it once, because only
+   * the first of them created it.
    *
    * **Only sessions the harness confirmed creating are listed** (`session_created_at`,
    * `0025`). A row is written before its session exists, so an unconfirmed row may name an id
@@ -6816,11 +6822,13 @@ const makeStore = Effect.fnUntraced(function* () {
                   SELECT r.caller_scope FROM import_sessions r
                   WHERE r.target_id = s.target_id
                     AND r.harness_session_id = s.harness_session_id)) AS entries_out,
-            (SELECT count(DISTINCT a.asset_id) FROM asset_imports a
-              WHERE a.caller_scope IN (
-                SELECT r.caller_scope FROM import_sessions r
-                WHERE r.target_id = s.target_id
-                  AND r.harness_session_id = s.harness_session_id)) AS assets,
+            (SELECT count(*) FROM events e
+              WHERE e.kind = 'asset.imported'
+                AND json_extract(e.payload, '$.created') = 1
+                AND e.caller_scope IN (
+                  SELECT r.caller_scope FROM import_sessions r
+                  WHERE r.target_id = s.target_id
+                    AND r.harness_session_id = s.harness_session_id)) AS assets,
             (SELECT CASE WHEN count(*) = count(r.ended_at) THEN max(r.ended_at) END
               FROM import_sessions r
               WHERE r.target_id = s.target_id

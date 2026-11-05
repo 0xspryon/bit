@@ -15,6 +15,8 @@
  *
  * - A session's tally counts its own entries by effect and its own assets, and **not** the
  *   operator's entries, another session's, or another target's.
+ * - **An asset counts on the session that created it, as an entry does.** A second session
+ *   recording the same hosts again added nothing, and its row says so (U8 review).
  * - **A session continued under a second import id keeps one row and one tally.** This is the
  *   case the table's shape exists for, and the one a per-run count would get wrong: a host
  *   both runs recorded is one asset.
@@ -172,6 +174,38 @@ describe("an import session's tally", () => {
       importIds: ["imp_a"],
     });
     expect(second).toMatchObject({ entriesIn: 1, entriesOut: 0, assets: 0 });
+  });
+
+  test("two sessions recording the same assets: only the one that created them counts them (U8 review)", async () => {
+    const path = newDatabasePath();
+    const sessions = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* open(store, "imp_first");
+        yield* Effect.sleep("5 millis");
+        yield* open(store, "imp_second");
+        const first = importerOf("imp_first");
+        const second = importerOf("imp_second");
+        for (const host of ["app", "api", "www"]) {
+          yield* importHost(store, first, `https://${host}.acme.com/`);
+        }
+        // The second session reads the same page and records the same three again, plus
+        // one of its own.
+        for (const host of ["app", "api", "www", "status"]) {
+          yield* importHost(store, second, `https://${host}.acme.com/`);
+        }
+        return yield* store.importSessions(TARGET);
+      }),
+    );
+
+    expect(
+      sessions.map((session) => [session.harnessSessionId, session.assets]),
+    ).toEqual([
+      ["ses_imp_second", 1],
+      ["ses_imp_first", 3],
+    ]);
+    // Nothing in, nothing out, and the assets it re-recorded are not its own either: the
+    // row of a session that added nothing reads as one.
+    expect(sessions[0]).toMatchObject({ entriesIn: 0, entriesOut: 0 });
   });
 
   test("a no-op add leaves a record and does not count as an entry", async () => {
