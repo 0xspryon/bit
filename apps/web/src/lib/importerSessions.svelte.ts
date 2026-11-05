@@ -656,11 +656,15 @@ export class ImporterSessions {
    * A session nobody has said anything in is not a *previous* session; it is the empty one
    * the operator is looking at, and listing it would make "Start a new session" appear to
    * have a twin. An indexed session's count is unknown rather than zero, and it is listed:
-   * the server says it exists.
+   * the server says it exists. One holding a refused message's words ({@link
+   * ImporterSession.unsent}) is listed too: they are on no other row, and nowhere else.
    */
   listed = $derived(
     this.sessions
-      .filter((session) => session.tally.messages !== 0)
+      .filter(
+        (session) =>
+          session.tally.messages !== 0 || session.unsent !== undefined,
+      )
       .toSorted((left, right) => right.startedAt - left.startedAt),
   );
 
@@ -672,7 +676,9 @@ export class ImporterSessions {
   // V2(chat): V1 takes the newest by when a session was opened (bit's own row), so an older
   // session the operator went back to and carried on is still "earlier" once they leave it
   // and return. V2 could order by last activity once the list carries it.
-  newestId = $derived<string | undefined>(this.listed[0]?.id);
+  newestId = $derived<string | undefined>(
+    this.listed.find((session) => session.tally.messages !== 0)?.id,
+  );
 
   /**
    * Opens the page on a target: an empty session to type into, beside the ones the server
@@ -778,7 +784,10 @@ export class ImporterSessions {
             // over an answer that had come, and the page would ask for it again for ever —
             // and the floor would go with it, so the live tail would double up against the
             // replay that replaced it.
-            (session.items.length > 0 || session.loaded === true),
+            (session.items.length > 0 ||
+              session.loaded === true ||
+              // A refused message's words, on no other row (U8 review 3).
+              session.unsent !== undefined),
         )
         .map((session) => [session.id, session]),
     );
@@ -803,6 +812,7 @@ export class ImporterSessions {
               ? {}
               : { historyFloor: kept.historyFloor }),
             ...(kept.loaded === undefined ? {} : { loaded: kept.loaded }),
+            ...(kept.unsent === undefined ? {} : { unsent: kept.unsent }),
             ...(kept.replayMidTurn === undefined
               ? {}
               : { replayMidTurn: kept.replayMidTurn }),
@@ -820,7 +830,13 @@ export class ImporterSessions {
     this.#turnsEnded();
     this.#rereadSettled();
     if (!this.sessions.some((session) => session.id === this.currentId)) {
-      this.currentId = own[0]?.id ?? refreshed[0]?.id ?? "";
+      // Not one holding a refused message's words: landing there without opening it would
+      // leave them off the composer.
+      this.currentId =
+        own.find((session) => session.unsent === undefined)?.id ??
+        refreshed[0]?.id ??
+        own[0]?.id ??
+        "";
     }
     // `working` is the server's figure here, so a session it says is running — a turn sent
     // from another tab, say — is watched to its end like one sent from this one.
@@ -992,6 +1008,15 @@ export class ImporterSessions {
       this.leaveBreakdown();
       this.currentId = id;
       this.draft = "";
+      // A message refused while the operator was elsewhere comes back where it was typed,
+      // with what the server said, as if they had stayed (U8 review 3).
+      const unsent = opened.unsent;
+      if (unsent !== undefined) {
+        this.draft = unsent.text;
+        this.notice = unsent.detail;
+        this.refused = true;
+        this.#replace(id, (before) => ({ ...before, unsent: undefined }));
+      }
       // Asked what is running in it (A6 U6), not only when the list says it is: a turn the
       // harness opened by itself, or background work, runs under an import the list calls
       // finished. Watched to its end, so its cursor and its Stop follow the server here too
@@ -1342,7 +1367,8 @@ export class ImporterSessions {
     this.pickerOpen = false;
     this.becameId = undefined;
     // The words of the message on its way are that message's, not a draft for the next
-    // session, which would then hold a copy of what was just sent.
+    // session, which would then hold a copy of what was just sent. A refusal gives them
+    // back ({@link #refusedElsewhere}).
     if (
       options.keepDraft !== true ||
       (opening !== undefined && this.draft.trim() === opening.text)
@@ -1355,6 +1381,7 @@ export class ImporterSessions {
     const empty = (session: ImporterSession): boolean =>
       session.indexed !== true &&
       session.tally.messages === 0 &&
+      session.unsent === undefined &&
       session.id !== opening?.sessionId;
     if (
       this.current?.tally.messages === 0 &&
@@ -1528,14 +1555,28 @@ export class ImporterSessions {
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
     if (answer._tag === "refused") {
-      this.notice = answer.detail;
-      this.refused = true;
+      if (this.currentId === session.id) {
+        this.notice = answer.detail;
+        this.refused = true;
+      } else {
+        this.#refusedElsewhere(session, text, answer.detail);
+      }
       if (answer.ended === true) server.reread();
       return;
     }
     const turn = answer.turn;
-    if (this.draft.trim() === text) this.draft = "";
-    this.notice = acceptedNotice(turn);
+    /*
+     * The draft and the notice are the page's, so they are this answer's only while the
+     * operator is still on the session it was sent from, or on the one it became (U8 review
+     * 3). Elsewhere the draft is someone else's words and the notice ("A new importer
+     * session was opened for this message…") would be about a message that thread never had.
+     */
+    const here =
+      this.currentId === session.id || this.currentId === turn.harnessSessionId;
+    if (here) {
+      if (this.draft.trim() === text) this.draft = "";
+      this.notice = acceptedNotice(turn);
+    }
     if (
       noticeBefore !== undefined &&
       this.switchNotice === noticeBefore &&
@@ -1629,6 +1670,50 @@ export class ImporterSessions {
     });
     this.#watch(turn.importId);
     server.reread();
+  }
+
+  /**
+   * Puts a refused message's words somewhere the operator will find them, when they had
+   * left the session it was sent from before the answer came (U8 review 3).
+   *
+   * **The words exist nowhere else.** Starting or opening a session clears the draft — the
+   * words on their way were that message's — and a refusal leaves nothing on the session it
+   * was sent from, which, for a first message, is an empty one the picker does not list.
+   *
+   * So they go back into the composer of the session on screen, with the server's sentence,
+   * when that composer is empty and can send: the operator was about to type a message, and
+   * now has this one to send or drop. Otherwise they stay on the session they were sent
+   * from ({@link ImporterSession.unsent}), which is listed and gives them back when opened,
+   * and the page says where they are. The notice on screen is never the refusal itself: it
+   * would read as being about a draft it is not about.
+   */
+  #refusedElsewhere(
+    session: ImporterSession,
+    text: string,
+    detail: string,
+  ): void {
+    const on = this.current;
+    if (
+      on !== undefined &&
+      this.draft.trim() === "" &&
+      on.ended !== true &&
+      on.strandedOn === undefined
+    ) {
+      this.draft = text;
+      this.notice = `Your last message was not sent: ${detail} Its words are back in the box, and sending them goes to this session.`;
+      this.refused = true;
+      return;
+    }
+    const unsent = { text, detail };
+    this.sessions = this.sessions.some((each) => each.id === session.id)
+      ? this.sessions.map((each) =>
+          each.id === session.id ? { ...each, unsent } : each,
+        )
+      : [...this.sessions, { ...session, unsent }];
+    this.notice = `Your last message was not sent. Its words are kept on ${
+      session.tally.messages === 0 ? "“Not sent”" : "its session"
+    } in the session list: open it to see why.`;
+    this.refused = false;
   }
 
   /**

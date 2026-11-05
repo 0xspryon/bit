@@ -833,6 +833,88 @@ describe("the composer posts to the server", () => {
     expect(app.importer.currentId).toBe(fresh);
   });
 
+  /** The first message sent and held, then "Start a new session" while it is out. */
+  const sendThenStart = async (): Promise<{
+    app: App;
+    fake: FakeServer;
+    release: () => void;
+    fresh: string;
+  }> => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    app.importer.start();
+    await settle();
+    const release = holdOpening(fake);
+    await send("Read https://hackerone.com/acme/policy");
+    expect(app.importer.sending).toBe(true);
+    await startNewSession(app);
+    expect(composer().value).toBe("");
+    return { app, fake, release, fresh: app.importer.currentId };
+  };
+
+  test("a first message refused after Start a new session comes back in the new thread's box, with why (U8 review 3)", async () => {
+    const { app, fake, release, fresh } = await sendThenStart();
+    fake.onOpenImporterConversation = () => unreachable("no route");
+    release();
+    await settle();
+
+    expect(app.importer.currentId).toBe(fresh);
+    expect(composer().value).toBe("Read https://hackerone.com/acme/policy");
+    expect(text()).toContain("Your last message was not sent");
+    expect(text()).toContain("No server answered at this address.");
+  });
+
+  test("…and once the new thread has words of its own, they stay, and the refused ones wait on their session (U8 review 3)", async () => {
+    const { app, fake, release, fresh } = await sendThenStart();
+    typeInto(composer(), "Something else entirely");
+    await settle();
+    fake.onOpenImporterConversation = () => unreachable("no route");
+    release();
+    await settle();
+
+    expect(app.importer.currentId).toBe(fresh);
+    expect(composer().value).toBe("Something else entirely");
+    expect(text()).toContain("kept on “Not sent” in the session list");
+    // Not the refusal itself: that would read as being about the draft beneath it.
+    expect(text()).not.toContain("No server answered at this address.");
+    app.importer.pickerOpen = true;
+    await settle();
+    click(button("Not sent"));
+    await settle();
+    expect(composer().value).toBe("Read https://hackerone.com/acme/policy");
+    expect(text()).toContain("No server answered at this address.");
+    // Given back, it is the empty thread again, and the list no longer offers it.
+    app.importer.pickerOpen = true;
+    await settle();
+    expect(hasButton("Not sent")).toBe(false);
+  });
+
+  test("a first message accepted after Start a new session says nothing on the new thread (U8 review 3)", async () => {
+    const { app, fake, release, fresh } = await sendThenStart();
+    fake.onOpenImporterConversation = (_baseUrl, targetId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId: "imp_opened",
+          harnessSessionId: "ses_opened",
+          conversation: "opened",
+          note: "A new importer session was opened for this message.",
+          pagesAdded: ["https://hackerone.com/acme/policy"],
+        }),
+      );
+    release();
+    await settle();
+
+    expect(app.importer.currentId).toBe(fresh);
+    expect(text()).not.toContain("A new importer session was opened");
+    expect(text()).not.toContain("Added as a page this import may cite");
+    // The answer landed on the session it opened, not on the one on screen.
+    expect(app.importer.sessions.some((each) => each.id === "ses_opened")).toBe(
+      true,
+    );
+  });
+
   test("a session the operator ended cannot be typed into, and says why", async () => {
     const { app, fake } = await continueOn(
       [

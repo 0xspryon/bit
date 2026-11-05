@@ -349,6 +349,17 @@ export interface ImporterSession {
    */
   readonly ended?: boolean;
   /**
+   * A message sent from this session that the server refused **after the operator had
+   * left it** — opened another session, or started a new one, while it was out (U8 review
+   * 3) — and the server's sentence. The draft is the page's, not the session's, so the
+   * words are nowhere else: they go back into the composer when the session is opened
+   * again, beside the refusal, and the session is listed meanwhile even if nothing was said
+   * in it ({@link sessionLabel}'s "Not sent"). Only set when the session on screen could
+   * not take them back itself: its own draft was not empty. `undefined` once given back.
+   */
+  readonly unsent?:
+    { readonly text: string; readonly detail: string } | undefined;
+  /**
    * The agent this session runs as (`AgentView.id`). On a session the server lists, the one
    * its row pinned at the first message. On the page's own empty session, the one the
    * operator picked on the agent chip for its first message, or absent for the server's
@@ -1507,16 +1518,20 @@ export const sessionWhen = (at: number, now: number): string => {
 
 /**
  * A session's name (S9, D5): the harness's title, or — where the harness has none to give —
- * "Session 18:02" from bit's own clock, and "New session" before a word is said.
+ * "Session 18:02" from bit's own clock, and "New session" before a word is said — or "Not
+ * sent" once a first message from it was refused while the operator was elsewhere
+ * ({@link ImporterSession.unsent}).
  *
  * The date is never replaced, only moved: under a title it is the picker row's subtitle and
  * the tooltip's second half ({@link sessionHover}), so a session the harness has forgotten,
  * or two the harness named alike, are still told apart.
  */
 export const sessionLabel = (
-  session: Pick<ImporterSession, "startedAt" | "tally" | "title">,
+  session: Pick<ImporterSession, "startedAt" | "tally" | "title" | "unsent">,
 ): string => {
-  if (session.tally.messages === 0) return "New session";
+  if (session.tally.messages === 0) {
+    return session.unsent === undefined ? "New session" : "Not sent";
+  }
   const title = session.title?.trim() ?? "";
   if (title !== "") return title;
   return `Session ${new Date(session.startedAt).toLocaleTimeString(undefined, {
@@ -1543,7 +1558,7 @@ const PDI = "\u2069";
  * the isolate early and let an override after it reach the date.
  */
 export const sessionHover = (
-  session: Pick<ImporterSession, "startedAt" | "tally" | "title">,
+  session: Pick<ImporterSession, "startedAt" | "tally" | "title" | "unsent">,
   now: number,
 ): string => {
   const when = sessionWhen(session.startedAt, now);
