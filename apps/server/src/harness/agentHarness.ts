@@ -377,9 +377,12 @@ export interface MessageEntry {
    * replay that read every `user` entry as the operator's words drew it as a message the
    * operator sent. It is `interrupted`. A `<task-notification>` — a background task done, or
    * a foreground `Bash` a Stop killed — is another, and is `task`; a compaction's summary
-   * of the conversation before it is `compacted`. Set from the harness's own markers, never
-   * from the content's shape, so an operator's message is never one whatever form its
-   * content takes. {@link text} still holds the harness's words.
+   * of the conversation before it is `compacted`. Set from the harness's own flags (`origin`,
+   * `isCompactSummary`, `is_meta`) where it has them; the interrupt note has none, so it is
+   * told by its own fixed text — a single text block opening `[Request interrupted by user`
+   * — the same test live narration uses. Never from the content's shape alone (string or
+   * list), so an operator's message whose content is a list is not mistaken for one.
+   * {@link text} still holds the harness's words.
    */
   readonly marker?: string;
   /**

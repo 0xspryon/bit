@@ -856,7 +856,8 @@ export const turnModels = (
  * The time of a turn's last item, in epoch milliseconds, or `undefined` for a turn with
  * none — or with an item whose end the harness did not keep (`LiveItem.endUnknown`): the
  * end of the span a turn footer's duration measures (A6 U4). A harness note other than an
- * error is not counted: live never narrates one, so counting it made a replay longer. Every item it reads
+ * error is not counted: it is not the agent's work, and counting a note that live never
+ * narrates (OpenCode's `system` entry) made a replay longer. Every item it reads
  * is the server's or the harness's — a call, its result, the record a write produced — so
  * it is on the same clock as a start the server stamped.
  */
@@ -868,11 +869,12 @@ export const turnEndedAt = (
     for (const item of [row.proposedBy, row.item, row.result]) {
       if (item == null) continue;
       /*
-       * A note the harness stored that live never narrates — OpenCode's `system` entry,
-       * written when the **next** turn starts and stored before its message; Claude Code's
-       * interrupt note — is not the agent's work and does not end its turn (A6 U4 review):
-       * counted, it stretched a turn's replayed length past what was watched. A harness's
-       * error is live too, and is counted.
+       * A harness note is not the agent's work and does not end its turn (A6 U4 review):
+       * OpenCode's `system` entry, written when the **next** turn starts and stored before
+       * its message, is never narrated live, and counted it stretched a turn's replayed
+       * length past what was watched. Claude Code's interrupt note is narrated live too
+       * (A6 U6 review 3) but marks the Stop, not work, so it is skipped either way and live
+       * and replay agree. A harness's error is counted.
        */
       if (item.kind === "turn.other" && item.outcome !== "failed") continue;
       // A replayed item whose harness kept only when its message began (A6 U4 review): the

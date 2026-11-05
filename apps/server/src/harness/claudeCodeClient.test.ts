@@ -56,6 +56,8 @@ import {
   type HarnessNarration,
 } from "./agentHarness";
 import { narrateCoalesced } from "../run/streamingCoalescer";
+import type { LiveInterrupt } from "./liveAgentSessions";
+import { turnStopped } from "./turnStop";
 import { projectNarration, projectReplay } from "../run/liveTranscript";
 import {
   assembleImporterPrompt,
@@ -3680,6 +3682,72 @@ describe("U6 review 3: a Stop after a Send now, and a carry only for a turn that
       "turn.operator You: Also name a colour. One word.",
       "turn.reply Reply: Two plus two equals four. Blue.",
     ]);
+  });
+
+  /*
+   * The case `stopHolds` exists for, which the measurement never reached (the CLI stopped
+   * B's turn every time): the recorded "Send now then Stop" run up to B's turn opening, then
+   * B writing and ending `success` with no interrupt marker — the reply and `result` of the
+   * recorded "Stop then Send now" run's B. The Stop moved on from A's cut turn to B's, and
+   * B's turn shows no marker, so the Stop did not land on it: B was answered.
+   */
+  test("A cut by Send now B with a Stop pending, B answered with no marker: B succeeded, and the Stop says B was answered", async () => {
+    const recorded = await lines(
+      "claude-code-frames",
+      "send-now-then-stop.jsonl",
+    );
+    const answered = await lines(
+      "claude-code-frames",
+      "stop-then-send-now.jsonl",
+    );
+    const bOpens = nth(recorded, "system", 3);
+    const bReply = nth(answered, "system", 3) + 1;
+    const frames = [
+      ...recorded.slice(0, bOpens + 1),
+      ...answered.slice(bReply),
+    ];
+    const aOpens = nth(frames, "system", 2);
+    const aEnds = nth(frames, "result", 2);
+    const sdk = scriptedSdk(frames, {
+      // The Stop is asked while A's turn is still open, B pulled.
+      onPull: { 1: [0, aOpens], 2: [aOpens, aEnds] },
+      onInterrupt: [aEnds, frames.length],
+    });
+    const { entries, status } = await drive({
+      session: SEND_NOW_THEN_STOP,
+      sdk,
+      act: (harness, pulled) =>
+        Effect.gen(function* () {
+          yield* sendAB(harness, SEND_NOW_THEN_STOP);
+          yield* Effect.promise(() => pulled(3));
+          expect(yield* harness.interruptSession(SEND_NOW_THEN_STOP)).toBe(
+            true,
+          );
+        }),
+    });
+    expect(told(entries)).toEqual([
+      `taken ${A}`,
+      "result interrupted",
+      `carried ${A}`,
+      `taken ${B}`,
+      "reply Two plus two equals four. Blue.",
+      // The moved Stop is not this turn's: it wrote and ended with no marker.
+      "result succeeded",
+    ]);
+    expect(status.outcome).toBe("succeeded");
+    // What the Stop's answer then says, from that outcome: B was answered.
+    const found = {
+      _tag: "interrupted",
+      entry: { harness: { queuedOnInterrupt: "runs" } },
+      working: false,
+      followUp: true,
+      lastOutcome: status.outcome,
+      background: false,
+    } as unknown as LiveInterrupt<undefined>;
+    expect(
+      turnStopped({ found, conversationId: "imp_1", what: "this session" })
+        .detail,
+    ).toContain("has answered it");
   });
 
   test("a Send now that cuts a turn which had already written is not a carry, even on the same diagnostic", async () => {
