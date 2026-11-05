@@ -43,6 +43,7 @@ import type {
   LiveUsage,
   PlanRoundView,
 } from "@bit/contracts";
+import { NARRATION_FIELD_MAX } from "@bit/contracts";
 import { dispositionLabel } from "./goalFormat";
 
 /**
@@ -527,13 +528,13 @@ export interface ChatRow {
 /* ── Partial blocks (A6 U5) ─────────────────────────────────────────────────── */
 
 /**
- * The most characters a **partial** carries: the server's field cap (`NARRATION_FIELD_MAX`
- * in its `agentHarness.ts`). Copied, not imported: the contracts do not carry it, and the
- * web never reads server code. A partial is cut there with no mark (A6 U5 review 2), so one
- * this long has stopped growing on screen while the agent goes on writing; a finished reply
- * is cut only at 32,000 characters (`live.ts`, "Partial items").
+ * The most characters a **partial** carries: the server's field cap, which the contracts
+ * carry since A6 U8 review 5 (`narrationCaps.ts`). A partial is cut there with no mark (A6
+ * U5 review 2), so one this long has stopped growing on screen while the agent goes on
+ * writing; a finished reply is cut only at `REPLY_FIELD_MAX` (`live.ts`, "Partial
+ * items").
  */
-export const PARTIAL_BODY_MAX = 4_000;
+export const PARTIAL_BODY_MAX = NARRATION_FIELD_MAX;
 
 /** Whether a partial has reached {@link PARTIAL_BODY_MAX}, so nothing more of it is drawn. */
 export const pastPartialCap = (item: LiveItem): boolean =>

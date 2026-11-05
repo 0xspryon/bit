@@ -21,8 +21,10 @@ import {
   ConversationStopRefused,
   ImporterConversationRefused,
   ImporterModelUnavailable,
+  NARRATION_FIELD_MAX,
   type ImporterSessionView,
   type ScopeEntryView,
+  truncateNarration,
 } from "@bit/contracts";
 
 import { App, IMPORT_POLL_MS, scenarios } from "../../src/lib/app.svelte";
@@ -1192,7 +1194,7 @@ describe("the composer posts to the server", () => {
     taken: false,
   });
 
-  test("a reply from a thread whose replay never arrived is not looked for: an earlier copy of its words is not it (U8 review 5)", async () => {
+  test("a reply from a thread whose replay never arrived: an earlier copy of its words is not it (U8 review 5, 6)", async () => {
     const fake = new FakeServer();
     // The replay GET fails, so the thread on screen holds nothing of the session's.
     fake.onImporterMessages = () => unreachable("connection reset");
@@ -1218,8 +1220,131 @@ describe("the composer posts to the server", () => {
     expect(composer().value).toBe("Say ok once more.");
     expect(text()).toContain("may send it twice");
     expect(text()).not.toContain("did reach this session");
-    // Not looked for at all: there is no baseline to tell a new copy from an old one.
-    expect(fake.countOf("importerMessages")).toBe(asked);
+    // Looked for (U8 review 6), and the copy was stamped before this message left.
+    expect(fake.countOf("importerMessages")).toBeGreaterThan(asked);
+  });
+
+  test("…and one that did arrive is found there, stamped after it left (U8 review 6)", async () => {
+    const fake = new FakeServer();
+    fake.onImporterMessages = () => unreachable("connection reset");
+    const app = await continueWith(fake);
+    expect(app.importer.current?.loaded).not.toBe(true);
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          at: Date.now(),
+          items: [
+            replayItem(0, "turn.operator", "Say ok once more.", {
+              at: Date.now() - 60_000,
+            }),
+            replayItem(1, "turn.operator", "Say ok once more.", {
+              at: Date.now(),
+              messageIds: ["msg_mine"],
+            }),
+          ],
+        }),
+      );
+    await send("Say ok once more.");
+    await settle();
+    await settle();
+
+    expect(composer().value).toBe("");
+    expect(text()).toContain("that message did reach this session");
+  });
+
+  test("a copy another device sent before this one, straight into the transcript, is not it (U8 review 6)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    expect(app.importer.current?.loaded).toBe(true);
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    const sentAt = Date.now();
+    // Taken at once on the other device, so it was never queued: only its stamp is older.
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          live: true,
+          at: Date.now(),
+          items: [
+            replayItem(0, "turn.operator", "Say ok once more.", {
+              at: sentAt - 30_000,
+              messageIds: ["msg_b"],
+            }),
+          ],
+        }),
+      );
+    await send("Say ok once more.");
+    await settle();
+    await exhaustConfirm(app);
+
+    expect(composer().value).toBe("Say ok once more.");
+    expect(text()).toContain("may send it twice");
+    expect(text()).not.toContain("did reach this session");
+  });
+
+  test("a copy under an id the thread already holds is an earlier message of this tab's, however recent (U8 review 6)", async () => {
+    const fake = new FakeServer();
+    const recent = Date.now();
+    const earlier = (targetId: string, importId: string) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          at: Date.now(),
+          items: [
+            replayItem(0, "turn.operator", "Say ok once more.", {
+              at: recent,
+              messageIds: ["msg_a"],
+            }),
+          ],
+        }),
+      );
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      earlier(targetId, importId);
+    const app = await continueWith(fake);
+    expect(app.importer.current?.loaded).toBe(true);
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    await send("Say ok once more.");
+    await settle();
+    await exhaustConfirm(app);
+
+    expect(composer().value).toBe("Say ok once more.");
+    expect(text()).not.toContain("did reach this session");
+  });
+
+  test("a lost message over the field cap is found as the server shortened it (U8 review 6)", async () => {
+    const { fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    const long =
+      `Load these: ${"https://a.example.com/ ".repeat(250)}done`.trim();
+    expect(long.length).toBeGreaterThan(NARRATION_FIELD_MAX);
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          live: true,
+          at: Date.now(),
+          items: [
+            replayItem(0, "turn.operator", truncateNarration(long), {
+              at: Date.now(),
+            }),
+          ],
+        }),
+      );
+    await send(long);
+    await settle();
+    await settle();
+
+    expect(composer().value).toBe("");
+    expect(text()).toContain("that message did reach this session");
   });
 
   test("…nor when the earlier copy is one another tab has queued (U8 review 5)", async () => {
@@ -1269,7 +1394,9 @@ describe("the composer posts to the server", () => {
             reads <= 2
               ? []
               : [
+                  // Stamped when the harness took it, after this message left.
                   replayItem(0, "turn.operator", "Say ok once more.", {
+                    at: Date.now(),
                     messageIds: ["msg_b"],
                   }),
                 ],

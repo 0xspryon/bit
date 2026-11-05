@@ -463,48 +463,25 @@ export interface MessageRead {
   readonly uploadsFolder?: string | undefined;
 }
 
-/**
- * The most characters {@link NarrationDetail} carries in one text field.
- *
- * A tool input can be a whole file and a tool result can be a directory listing, and both
- * travel over a browser connection that is holding the screen for a live run. This is the
- * cap at the point the harness's payload is *read*, so an oversized argument is cut once,
- * here, rather than growing a queue, a PubSub buffer and an SSE frame on the way out.
- *
+/*
+ * The caps on one narration field, and the mark a cut leaves, live in the contracts
+ * (`narrationCaps.ts`, A6 U8 review 5) so the browser can recognise an operator message the
+ * server shortened. They are applied here, where a harness's payload is *read*: a tool input
+ * can be a whole file and a tool result a directory listing, and both travel over a browser
+ * connection that is holding the screen for a live run, so an oversized argument is cut
+ * once, here, rather than growing a queue, a PubSub buffer and an SSE frame on the way out.
  * {@link truncateNarration} marks what it cut, in the value itself, because a silently
- * shortened tool argument is a tool argument a reader would misread.
+ * shortened tool argument is a tool argument a reader would misread. A finished reply has
+ * its own, larger cap ({@link REPLY_FIELD_MAX}); every partial stays at the field cap, since
+ * a partial is resent every ~50 ms with the whole text so far.
  */
-export const NARRATION_FIELD_MAX = 4_000;
-
-/** The marker appended to a field {@link NARRATION_FIELD_MAX} cut short. */
-export const NARRATION_TRUNCATED_MARK = "\n… (shortened)";
-
-/** Caps one narration field, saying so in the value when it cuts. */
-export const truncateNarration = (value: string): string =>
-  truncateAt(value, NARRATION_FIELD_MAX);
-
-/**
- * The most characters a **finished** reply carries (A6 U5 review, the operator's decision).
- *
- * A reply is what the operator reads the session for, and 4,000 characters cut ordinary
- * answers short — a glossary, a summary of a program's scope — live and on reload alike. So
- * a finished `reply` gets its own cap: eight times the field cap, which holds every reply
- * measured in the live runs whole, and still bounds what one item costs the narration bus
- * ({@link NARRATION_FIELD_MAX}'s reason) at 64 KB of UTF-16. Thinking, tool arguments and
- * results, and every **partial** stay at {@link NARRATION_FIELD_MAX}: a partial is resent
- * every ~50 ms with the whole text so far, so its cap is what bounds the stream's rate, and
- * the finished block replaces it with the whole reply when it ends.
- */
-export const REPLY_FIELD_MAX = 32_000;
-
-/** Caps a finished reply's text at {@link REPLY_FIELD_MAX}, saying so when it cuts. */
-export const truncateReply = (value: string): string =>
-  truncateAt(value, REPLY_FIELD_MAX);
-
-const truncateAt = (value: string, max: number): string =>
-  value.length <= max
-    ? value
-    : `${value.slice(0, max)}${NARRATION_TRUNCATED_MARK}`;
+export {
+  NARRATION_FIELD_MAX,
+  NARRATION_TRUNCATED_MARK,
+  REPLY_FIELD_MAX,
+  truncateNarration,
+  truncateReply,
+} from "@bit/contracts";
 
 /**
  * What one narrated moment *is*, in this application's vocabulary.

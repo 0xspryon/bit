@@ -908,7 +908,7 @@
     white-space: nowrap;
   }
   .count.over {
-    color: var(--text-danger, var(--text-base));
+    color: var(--state-fg-danger);
   }
 
   .icon-btn,
@@ -979,7 +979,7 @@
     overflow-wrap: anywhere;
   }
   .notice.refusal {
-    color: var(--text-danger, var(--text-base));
+    color: var(--state-fg-danger);
   }
 
   /* ── The two starters: dashed pills under the box ─────────────────────────── */

@@ -24,5 +24,6 @@ export * from "./goalUpload";
 export * from "./messageUpload";
 export * from "./event";
 export * from "./live";
+export * from "./narrationCaps";
 export * from "./mcpToolName";
 export * from "./unknownField";

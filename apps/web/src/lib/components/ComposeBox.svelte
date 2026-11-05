@@ -509,6 +509,6 @@
     color: var(--text-faint);
   }
   .refusal {
-    color: var(--text-danger, var(--text-base));
+    color: var(--state-fg-danger);
   }
 </style>
