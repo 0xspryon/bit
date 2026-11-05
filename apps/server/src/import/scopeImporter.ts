@@ -216,10 +216,15 @@ export type ScopeImportStarted =
   | {
       readonly _tag: "refused";
       /**
-       * No harness at all, the chosen one cannot take a session, or the agent asked for is
-       * granted an authority this service does not mint (see `startWith`).
+       * No harness at all, the chosen one cannot take a session, the agent asked for is
+       * granted an authority this service does not mint, or the model the operator named is
+       * not in its harness's catalogue (see `startWith`).
        */
-      readonly reason: "no_harness" | "harness_not_ready" | "agent_unavailable";
+      readonly reason:
+        | "no_harness"
+        | "harness_not_ready"
+        | "agent_unavailable"
+        | "model_unavailable";
       readonly detail: string;
     };
 
@@ -1347,6 +1352,32 @@ export class ScopeImporter extends Context.Service<
         }
 
         const harness = resolved.success.harness;
+        /*
+         * **A model the operator named is one its harness's catalogue lists** (U8 review 5),
+         * the check a switch makes (`harness/modelSwitch.ts`, `model_unavailable`) and before
+         * anything is minted or spawned. Without it an unknown model was accepted and opened
+         * a real session — Claude Code does not check the name it is given, and OpenCode
+         * answered 202 and then wrote "Model unavailable" into the transcript — so a refusal
+         * the server could have given at once became a live session with nothing to run on.
+         *
+         * **Only a fresh pick.** A reopen (`predecessor`) opens on the model its row recorded,
+         * unchecked as documented at `resolveImporterModel`: the conversation is the
+         * operator's, and a model a catalogue has since dropped is the harness's to refuse in
+         * its own words, not a reason to strand the conversation here. A model the rule
+         * picked (none named) is the catalogue's own, so it needs no check either.
+         */
+        if (
+          request.predecessor === undefined &&
+          pickedModel !== undefined &&
+          pickedModel !== "" &&
+          !harness.instance.models.some((entry) => entry.id === choice.model)
+        ) {
+          return {
+            _tag: "refused",
+            reason: "model_unavailable",
+            detail: `'${choice.model}' is not in the catalogue of ${harness.instance.displayName} (harness instance '${choice.instanceId}'), so no session was opened. Pick one of its models in the model picker.${consequence}`,
+          } as const;
+        }
         // Against the model this import resolved to, not the one the browser was showing:
         // the run path's resolver, so the two cannot disagree about what is forwarded.
         const options = yield* resolveSessionModelOptions(

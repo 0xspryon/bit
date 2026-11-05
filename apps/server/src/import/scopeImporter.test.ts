@@ -2438,6 +2438,112 @@ describe("a conversation opened with no links", () => {
   });
 });
 
+/**
+ * A fresh pick of a model its harness's catalogue does not list (U8 review 5): refused with
+ * a sentence before anything is minted or spawned, as a switch to one is. Live, OpenCode had
+ * answered 202 for `no-such-model` and opened a session that read "Model unavailable". A
+ * reopen opens on the model its row recorded, unchecked, as `resolveImporterModel` says.
+ */
+describe("a model the catalogue does not list", () => {
+  test("a conversation opened on it is refused, and no session is created or indexed", async () => {
+    const built = world([PAGE_GOOD]);
+    const runtime = ManagedRuntime.make(built.layer);
+    const opened = await runtime.runPromise(
+      Effect.gen(function* () {
+        const fleet = yield* FleetStore;
+        yield* fleet.register({
+          targetId: TARGET,
+          name: "Acme Corp",
+          scopeNote: "",
+          workspacePath: workspace,
+        });
+        yield* fleet.migrateTarget(TARGET);
+        return yield* Effect.result(
+          (yield* ScopeImporter).converse({
+            targetId: TARGET,
+            targetName: "Acme Corp",
+            workspacePath: workspace,
+            text: "Read the program page.",
+            choice: { model: "scripted/no-such-model" },
+          }),
+        );
+      }),
+    );
+    expect(opened._tag).toBe("Failure");
+    if (opened._tag !== "Failure") return;
+    expect(opened.failure._tag).toBe("ImporterConversationRefused");
+    expect(opened.failure).toMatchObject({ reason: "model_unavailable" });
+    expect(String((opened.failure as { detail: string }).detail)).toContain(
+      "'scripted/no-such-model' is not in the catalogue",
+    );
+    expect(built.script.created).toEqual([]);
+    expect(built.script.prompts).toEqual([]);
+    expect(await indexOf(runtime)).toEqual([]);
+    expect(carriedOf(built.root)).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("the create-target path refuses it too, and says the target is created", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      choice: { model: "scripted/no-such-model" },
+    });
+    expect(started._tag).toBe("refused");
+    if (started._tag === "refused") {
+      expect(started.reason).toBe("model_unavailable");
+      expect(started.detail).toContain("The target is created");
+    }
+    expect(built.script.created).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a model the catalogue lists still opens, and naming the instance alone takes its default", async () => {
+    const listed = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      choice: { model: "scripted/other" },
+    });
+    expect(listed.started._tag).toBe("started");
+    expect(listed.built.script.created[0]?.model).toBe("scripted/other");
+    await listed.runtime.dispose();
+    const defaulted = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      choice: { instanceId: STUB_INSTANCE.instanceId },
+    });
+    expect(defaulted.started._tag).toBe("started");
+    await defaulted.runtime.dispose();
+  });
+
+  test("a reopen opens on the model its row recorded, even one the catalogue has since dropped", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+      choice: { model: "scripted/model" },
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    await runtime.dispose();
+    // The catalogue no longer lists what the row says: as a provider retiring a model does.
+    const database = new Database(join(built.root, "targets", TARGET, HUNT_FILE));
+    try {
+      database
+        .query("UPDATE import_sessions SET model = ? WHERE import_id = ?")
+        .run("scripted/retired", started.importId);
+    } finally {
+      database.close();
+    }
+
+    const restarted = ManagedRuntime.make(built.layer);
+    const reopened = await sendTo(restarted, started.importId, "Continue.");
+    expect(reopened._tag).toBe("Success");
+    if (reopened._tag !== "Success") return;
+    await built.script.done;
+    expect(reopened.success.conversation).toBe("opened");
+    expect(built.script.created.map((each) => each.model)).toEqual([
+      "scripted/model",
+      "scripted/retired",
+    ]);
+    await restarted.dispose();
+  });
+});
+
 describe("a turn into a session that is not live", () => {
   test("an import the operator ended is refused, in the importer's own sentence", async () => {
     const { built, runtime, started } = await importWith([PAGE_GOOD], {

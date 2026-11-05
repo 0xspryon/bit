@@ -771,6 +771,8 @@ export type ImporterTurnAccepted = typeof ImporterTurnAccepted.Type;
  * - `upload_unwritable` — the message carried files and they could not be written into the
  *   session's `uploads/` folder (A6 F9). Nothing was said to the agent; a live session is
  *   kept.
+ * - `model_unavailable` — a new session was asked for on a model its harness's catalogue
+ *   does not list (U8 review 5), the check a model switch makes. Nothing was opened.
  *
  * `409`, for `GoalConversationRefused`'s reason. An import id this target does not hold is
  * `ScopeImportNotFound` instead, a `404`.
@@ -789,6 +791,7 @@ export class ImporterConversationRefused extends Schema.TaggedError<ImporterConv
       "store_unavailable",
       "agent_unavailable",
       "upload_unwritable",
+      "model_unavailable",
     ]),
     detail: Schema.String,
   },

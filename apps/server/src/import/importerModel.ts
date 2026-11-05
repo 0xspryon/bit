@@ -133,9 +133,12 @@ export const chooseImporterModel = (
 /**
  * What the operator picked, or the rule's answer, or nothing.
  *
- * An explicit pick wins without being validated against the catalogue, which matches how
- * `RunDraft.model` is treated: that list is what the picker *offers*, and whether a model
- * can actually run is the harness's answer to give rather than ours to pre-empt. An
+ * An explicit pick wins without being validated against the catalogue **here**: this only
+ * names the choice. A *fresh* open checks a named model against its harness's catalogue
+ * once the harness is resolved (`scopeImporter.ts` `startWith`, U8 review 5) — the check a
+ * model switch makes — because an unknown model was accepted and opened a real session. A
+ * reopen passes the model its row recorded, and that is left unchecked: the harness's
+ * answer to give rather than ours to pre-empt. An
  * explicit pick of an instance that is not ready still resolves to a choice here and is
  * refused by `HarnessResolver.resolve`, with the resolver's own sentence — never silently
  * swapped for a working one.
