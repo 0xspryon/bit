@@ -1421,9 +1421,13 @@ describe("projecting live activity", () => {
       users: "operator",
       fallbackAt: 0,
     }).items;
+    // Three messages in a row, nothing between: each but the last carried on with the next
+    // (U6 review 2), the carry naming what the message it follows names.
     expect(items.map((item) => [item.kind, item.messageIds ?? null])).toEqual([
       ["turn.operator", null],
+      ["turn.carried", null],
       ["turn.operator", ["aaaaaaaabbbbbbbbccccccccdddddddd"]],
+      ["turn.carried", ["aaaaaaaabbbbbbbbccccccccdddddddd"]],
       [
         "turn.operator",
         [
@@ -1432,6 +1436,103 @@ describe("projecting live activity", () => {
         ],
       ],
     ]);
+  });
+
+  test("U6 review 2: a message stored directly before another is carried on with it; the last one, and one a Stop ended, are not", () => {
+    const at = 1_700_000_000_000;
+    const user = (
+      text: string,
+      extra: { messageIds?: string[]; marker?: "interrupted" } = {},
+    ) => ({
+      type: "user",
+      text,
+      error: undefined,
+      parts: [],
+      model: undefined,
+      at,
+      ...extra,
+    });
+    const reply = (text: string) => ({
+      type: "assistant",
+      text,
+      error: undefined,
+      parts: [{ _tag: "reply" as const, text }],
+      model: "claude-haiku-4-5",
+      at,
+    });
+    const drawn = (entries: Parameters<typeof projectReplay>[0]["entries"]) =>
+      projectReplay({
+        entries,
+        subject: { _tag: "import", importId: "imp_1" },
+        harnessSessionId: "ses_1",
+        users: "operator",
+        fallbackAt: 0,
+      }).items.map((item) =>
+        item.kind === "turn.carried"
+          ? `carried ${(item.messageIds ?? []).join(",")}`
+          : `${item.kind}: ${item.body}`,
+      );
+    // What Claude Code stores when a Send now cuts a turn before it wrote anything.
+    expect(
+      drawn([
+        user("What is 2+2?", { messageIds: ["a".repeat(32)] }),
+        user("Also name a colour.", { messageIds: ["b".repeat(32)] }),
+        reply("Four. Blue."),
+      ]),
+    ).toEqual([
+      "turn.operator: What is 2+2?",
+      `carried ${"a".repeat(32)}`,
+      "turn.operator: Also name a colour.",
+      "turn.reply: Four. Blue.",
+    ]);
+    // The session's last message: nothing follows it, so it is still unanswered.
+    expect(drawn([user("hello"), reply("hi"), user("are you there?")])).toEqual(
+      [
+        "turn.operator: hello",
+        "turn.reply: hi",
+        "turn.operator: are you there?",
+      ],
+    );
+    // One a Stop ended: the CLI's interrupt marker is between, and the next message is a
+    // turn of its own.
+    expect(
+      drawn([
+        user("count to a hundred"),
+        user("[Request interrupted by user]", { marker: "interrupted" }),
+        user("never mind"),
+        reply("ok"),
+      ]),
+    ).toEqual([
+      "turn.operator: count to a hundred",
+      "turn.other: [Request interrupted by user]",
+      "turn.operator: never mind",
+      "turn.reply: ok",
+    ]);
+  });
+
+  test("U6 review 2: a turn carried on with the next message is a `turn.carried` item naming its message, with nothing to read", () => {
+    const frame = projectNarration(
+      narration(
+        { _tag: "carried", messageIds: ["a".repeat(32)] },
+        { subject: { _tag: "import", importId: "imp_1" } },
+      ),
+    );
+    expect(frame?._tag).toBe("item");
+    const item = frame as LiveItem;
+    expect([item.kind, item.body, item.messageIds, item.importId]).toEqual([
+      "turn.carried",
+      "",
+      ["a".repeat(32)],
+      "imp_1",
+    ]);
+    // The opening prompt has no id: the item names none, and a chat places it by where it is.
+    const opening = projectNarration(
+      narration(
+        { _tag: "carried", messageIds: [] },
+        { subject: { _tag: "import", importId: "imp_1" } },
+      ),
+    ) as LiveItem;
+    expect(opening.messageIds).toBeUndefined();
   });
 
   test("a usage entry is a frame of its own, not a row in the transcript", () => {

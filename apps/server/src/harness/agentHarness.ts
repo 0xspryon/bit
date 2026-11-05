@@ -679,6 +679,24 @@ export type NarrationDetail =
       readonly _tag: "error";
       readonly message: string;
     }
+  | {
+      /**
+       * The harness ended a turn **before it wrote anything** and sent its message on with
+       * the next one (A6 U6 review 2): one reply, in the next turn, answers both.
+       *
+       * Claude Code, when a message sent with `priority: "now"` (a Send now) lands while the
+       * turn that took an earlier message has produced nothing yet: the CLI aborts that
+       * turn's request, ends it with an `error_during_execution` `result` whose only errors
+       * are its own diagnostics, and asks the model again with both messages (measured, CLI
+       * 2.1.310: two `user` entries, then one reply). Not a failure, and not "no reply".
+       *
+       * `messageIds` are the application's ids for the messages the ended turn held, as
+       * `PromptDelivery.messageId` gave them; empty for a session's opening prompt, which
+       * has none. A chat finds the turn by where the entry lands, after that turn's take.
+       */
+      readonly _tag: "carried";
+      readonly messageIds: readonly string[];
+    }
   | { readonly _tag: "opaque" };
 
 /**

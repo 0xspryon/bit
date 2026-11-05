@@ -684,6 +684,30 @@ type ItemBase = Pick<
 >;
 
 /**
+ * The `turn.carried` item (A6 U6 review 2): the turn of the messages `messageIds` name
+ * ended before it wrote anything, and the harness sent them on with the next message, whose
+ * reply answers both. Nothing to read: a chat draws the turn's note from it, never a row.
+ * Live from Claude Code's cut turn (`carried`), and on replay from two stored operator
+ * messages in a row ({@link projectReplay}).
+ */
+const carriedItem = (
+  base: ItemBase,
+  messageIds: readonly string[],
+): LiveItem => ({
+  ...base,
+  kind: "turn.carried",
+  headline: "Answered with the next message",
+  body: "",
+  tool: null,
+  toolName: null,
+  input: null,
+  output: null,
+  callId: null,
+  outcome: null,
+  ...(messageIds.length === 0 ? {} : { messageIds: [...messageIds] }),
+});
+
+/**
  * One reply, thinking block, tool call, tool result or sub-agent state as one item, or
  * nothing — **the one
  * projection live narration and a replay share** (A6 F10).
@@ -863,6 +887,13 @@ export interface ReplayProjection {
  *   assistant message (`step.failed`) **and** on the `idle` entry that ends the turn
  *   (`execution.failed`), and live narrates only the second. An `idle` entry's error that
  *   repeats one already drawn since the turn's `user` entry is dropped (A6 U4 review).
+ * - an operator message stored **directly before another**, nothing the harness wrote
+ *   between them, as a `turn.carried` item after it (A6 U6 review 2): its turn ended before
+ *   it wrote anything and the harness sent it on with the next, whose reply answers both —
+ *   what Claude Code stores when a Send now cuts a turn that has produced nothing yet. The
+ *   item live narration draws for that cut, so the turn reads the same reloaded. Not for
+ *   the session's last message (nothing follows it) nor one a Stop ended (the CLI's
+ *   interrupt marker is between), which both still read as unanswered.
  *
  * Ids are `replay:<n>`, `n` the item's position in this answer: a render key, never a cursor
  * and never an activity order (`activity:<n>`), so a client's replay/live floor cannot read
@@ -910,8 +941,16 @@ export const projectReplay = (input: {
     });
   /** The errors drawn since the last `user` entry: a turn's, for the `idle` rule above. */
   let turnErrors = new Set<string>();
+  /**
+   * The operator message the entry before this one was, by the ids it names, if it was one:
+   * for the `turn.carried` rule above. Any other entry in between — a reply, a tool result,
+   * the CLI's interrupt marker, a harness note — clears it.
+   */
+  let lastOperator: readonly string[] | undefined;
   for (const entry of input.entries) {
     const before = items.length;
+    const previousOperator = lastOperator;
+    lastOperator = undefined;
     const started = entry.at ?? input.fallbackAt;
     /*
      * The item's time: the entry's, or when the harness finished it where it keeps one time
@@ -931,6 +970,12 @@ export const projectReplay = (input: {
           // what they mark, so a Stop shows where it landed and is not read as a message.
           note(at, entry.marker, entry.text, false);
         } else if (input.users === "operator") {
+          // Straight after another message, with nothing the harness wrote between: that
+          // one's turn ended before it wrote anything, and its message went on with this one.
+          if (previousOperator !== undefined) {
+            items.push(carriedItem(baseAt(at), previousOperator));
+          }
+          lastOperator = entry.messageIds ?? [];
           items.push({
             ...baseAt(at),
             kind: "turn.operator",
@@ -1094,6 +1139,10 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
         outcome: null,
         messageIds: [...detail.messageIds],
       };
+    case "carried":
+      // The turn ended before it wrote anything and its message went on with the next
+      // (A6 U6 review 2). The same item a replay draws for two stored messages in a row.
+      return carriedItem(base, detail.messageIds);
     case "error":
       // The item a replay draws for an entry's `error` (`projectReplay`), so a turn that
       // failed reads the same watched and reloaded: the harness's sentence, as its own.

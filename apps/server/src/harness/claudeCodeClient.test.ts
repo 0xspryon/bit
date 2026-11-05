@@ -2997,6 +2997,300 @@ describe("U4: a steer taken, and a turn the harness ended in error", () => {
   });
 });
 
+/* ── A Send now that lands before the turn it cuts has written anything (A6 U6 review 2) ── */
+
+describe("U6: a Send now that cuts a turn before it wrote anything", () => {
+  /** The fixtures' session, and its stored directory (`/tmp/ws`). */
+  const SESSION_E6 = "22222222-0000-4000-8000-0000000000e6";
+  /** Message A, sent while the session was idle; B, sent with "Send now" 0.3 s later. */
+  const A = "5e1d0a7c9b3f4e2a8c6d1b0f7a9e3c51";
+  const B = "9c2f6b1e4a7d3c8b0e5f2a9d6c1b7e43";
+
+  test("a result's CLI diagnostics are not the harness's error; any other error still is", () => {
+    const diagnostic =
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
+    const failed = (errors: readonly string[]) =>
+      ({
+        type: "result",
+        subtype: "error_during_execution",
+        errors,
+      }) as unknown as SDKMessage;
+    // What the CLI's own SDK adapter hides, bit hides: alone, nothing is narrated.
+    expect(resultError(failed([diagnostic]), "failed")).toBeUndefined();
+    expect(
+      resultError(failed(["[session_crash] the CLI's own record"]), "failed"),
+    ).toBeUndefined();
+    // Beside a real error, only the real error.
+    expect(
+      resultError(failed([diagnostic, "Reached maximum budget"]), "failed"),
+    ).toEqual({ _tag: "error", message: "Reached maximum budget" });
+  });
+
+  /**
+   * Frames from the CLI, sanitised: `testdata/claude-code-frames/send-now-before-output.jsonl`.
+   *
+   * Recorded 2026-11-05 from `@anthropic-ai/claude-agent-sdk@0.3.310` driving its bundled CLI
+   * 2.1.310 on `claude-haiku-4-5`, `includePartialMessages: true`, by a throwaway probe
+   * calling `query()` directly: an opening prompt answered; then message A sent `later`
+   * while idle and message B sent `now` 330 ms after it. The CLI opened A's turn
+   * (`system/init` naming A), aborted it before any assistant output when B arrived, ended
+   * it `error_during_execution` with only `[ede_diagnostic] …` in `errors`, then opened B's
+   * turn naming **B alone** and answered both in one reply ("Two plus two equals four.
+   * Blue."). Kept in the CLI's order, except: `stream_event`, `system/status`, hook,
+   * `command_lifecycle`, `rate_limit_event` and `thinking_tokens` frames are dropped, a
+   * `system/init` keeps only its type, uuid and `user_message_uuids`, the session id is a
+   * fixed one, signatures read `sig-redacted`, and the three messages' uuids read
+   * `pulled-1`…`pulled-3`, which the fake below replaces with the uuids the driver sent.
+   */
+  const recordedFrames = async (): Promise<string[]> =>
+    (
+      await readFile(
+        join(
+          import.meta.dir,
+          "testdata",
+          "claude-code-frames",
+          "send-now-before-output.jsonl",
+        ),
+        "utf8",
+      )
+    )
+      .split("\n")
+      .filter((line) => line !== "");
+
+  /**
+   * An SDK that answers with the recorded frames, as the CLI did: the opening turn's once the
+   * opening prompt is pulled, and the rest once A and B both are — B is what cut A's turn.
+   * Each frame's `pulled-<n>` is the uuid of the n-th message pulled.
+   */
+  const framedSdk = (lines: readonly string[]) => {
+    const uuids: string[] = [];
+    const pending: SDKMessage[] = [];
+    let wake: (() => void) | undefined;
+    const firstTurnEnds =
+      lines.findIndex((line) => line.includes('"type":"result"')) + 1;
+    const emit = (from: number, to: number): void => {
+      for (const line of lines.slice(from, to)) {
+        pending.push(
+          JSON.parse(
+            line.replace(
+              /pulled-([1-3])/g,
+              (_, n: string) => uuids[Number(n) - 1] ?? "",
+            ),
+          ) as SDKMessage,
+        );
+      }
+      const waiting = wake;
+      wake = undefined;
+      waiting?.();
+    };
+    const sdk: ClaudeCodeSdk = {
+      query: ({ prompt }) => {
+        void (async () => {
+          for await (const message of prompt) {
+            uuids.push((message as { uuid?: string }).uuid ?? "");
+            if (uuids.length === 1) emit(0, firstTurnEnds);
+            if (uuids.length === 3) emit(firstTurnEnds, lines.length);
+          }
+        })();
+        return {
+          setMcpServers: async () => ({}),
+          interrupt: async () => undefined,
+          stopTask: async () => undefined,
+          getContextUsage: async () => ({ maxTokens: CONTEXT_WINDOW }),
+          setModel: async () => undefined,
+          applyFlagSettings: async () => undefined,
+          close: () => undefined,
+          [Symbol.asyncIterator]: async function* () {
+            for (;;) {
+              while (pending.length > 0) {
+                const next = pending.shift();
+                if (next !== undefined) yield next;
+              }
+              await new Promise<void>((resolve) => {
+                wake = resolve;
+              });
+            }
+          },
+        } satisfies HarnessQuery;
+      },
+      sessionMessages: liveClaudeCodeSdk.sessionMessages,
+      sessionInfo: () => Promise.resolve(undefined),
+    };
+    return sdk;
+  };
+
+  /**
+   * The recorded run through the driver: A sent queued while idle, B sent with `bUrgency`.
+   * What it narrated from A's send to B's reply, and the transcript fixture as `messages`
+   * reads it (the real SDK, over `testdata/claude-code-transcript/send-now-before-output.cli.jsonl`).
+   */
+  const run = async (bUrgency: "queued" | "preemptive") => {
+    const lines = await recordedFrames();
+    const root = await mkdtemp(join(tmpdir(), "bit-send-now-"));
+    const previous = process.env["CLAUDE_CONFIG_DIR"];
+    try {
+      const project = join(root, "projects", "-tmp-ws");
+      await mkdir(project, { recursive: true });
+      await writeFile(
+        join(project, `${SESSION_E6}.jsonl`),
+        await readFile(
+          join(
+            import.meta.dir,
+            "testdata",
+            "claude-code-transcript",
+            "send-now-before-output.cli.jsonl",
+          ),
+          "utf8",
+        ),
+      );
+      process.env["CLAUDE_CONFIG_DIR"] = root;
+      return await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              yield* harness.createSession({
+                title: "import",
+                model: "claude-haiku-4-5",
+                directory: "/tmp/ws",
+                sessionId: SESSION_E6,
+                multiTurn: true,
+              });
+              yield* harness.prompt(SESSION_E6, "Say hi in three words.");
+              yield* harness.waitForIdle(SESSION_E6);
+              // The queue holds the opening turn's entries too: up to the second success.
+              let succeeded = 0;
+              const narration = yield* Effect.forkChild(
+                Stream.runCollect(
+                  harness
+                    .sessionEvents(SESSION_E6)
+                    .pipe(
+                      Stream.takeUntil(
+                        (entry) =>
+                          entry.type === "result" &&
+                          entry.outcome === "succeeded" &&
+                          ++succeeded === 2,
+                      ),
+                    ),
+                ),
+              );
+              yield* harness.prompt(
+                SESSION_E6,
+                "What is 2+2? Answer in one sentence.",
+                { _tag: "steer", urgency: "queued", messageId: A },
+              );
+              yield* harness.prompt(
+                SESSION_E6,
+                "Also name a colour. One word.",
+                { _tag: "steer", urgency: bUrgency, messageId: B },
+              );
+              const all = [...(yield* Fiber.join(narration))];
+              const opened = all.findIndex((entry) => entry.type === "result");
+              const entries = all.slice(opened + 1);
+              yield* harness.waitForIdle(SESSION_E6);
+              const status = yield* harness.sessionStatus(SESSION_E6);
+              const stored = yield* harness.messages(SESSION_E6);
+              return { entries, status, stored };
+            }),
+          ).pipe(
+            Effect.provide(
+              claudeCodeHarness({
+                controlTimeout: "2 seconds",
+                sdk: framedSdk(lines),
+              }),
+            ),
+            Effect.orDie,
+          ),
+        ),
+      );
+    } finally {
+      if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  };
+
+  /** What a run narrated, the details that matter here, in order. */
+  const told = (entries: readonly HarnessNarration[]) =>
+    entries.flatMap((entry) => {
+      const detail = entry.detail;
+      switch (detail._tag) {
+        case "taken":
+        case "carried":
+          return [`${detail._tag} ${detail.messageIds.join(",")}`];
+        case "error":
+          return [`error ${detail.message}`];
+        case "reply":
+          return [`reply ${detail.text}`];
+        default:
+          return entry.type === "result" ? [`result ${entry.outcome}`] : [];
+      }
+    });
+
+  test("live: the cut turn is no error, it is A carried on with B, and B's reply answers both", async () => {
+    const { entries, status } = await run("preemptive");
+    expect(told(entries)).toEqual([
+      `taken ${A}`,
+      // A's turn: no error row, `interrupted` (bit sent what cut it), and A carried on.
+      "result interrupted",
+      `carried ${A}`,
+      `taken ${B}`,
+      "reply Two plus two equals four. Blue.",
+      "result succeeded",
+    ]);
+    expect(status.activity).toBe("idle");
+  });
+
+  test("a diagnostic-only failure with no Send now waiting is no carry, and still no error row", async () => {
+    // The same frames, B sent queued: nothing this application sent cut A's turn, so it is
+    // the CLI's own failure, which says nothing besides its diagnostic.
+    const { entries } = await run("queued");
+    expect(told(entries)).toEqual([
+      `taken ${A}`,
+      "result failed",
+      `taken ${B}`,
+      "reply Two plus two equals four. Blue.",
+      "result succeeded",
+    ]);
+  });
+
+  test("after a reload: the stored A, directly before B, is carried on with B", async () => {
+    const { stored } = await run("preemptive");
+    // The CLI stored the two messages in a row, each under its own uuid, then one reply.
+    expect(
+      stored.map((entry) => [entry.type, entry.messageIds ?? null]),
+    ).toEqual([
+      ["user", null],
+      ["assistant", null],
+      ["assistant", null],
+      ["user", [A]],
+      ["user", [B]],
+      ["assistant", null],
+      ["assistant", null],
+    ]);
+    const replayed = projectReplay({
+      entries: stored,
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: SESSION_E6,
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    expect(
+      replayed.map((item) =>
+        item.kind === "turn.carried"
+          ? `carried ${(item.messageIds ?? []).join(",")}`
+          : `${item.kind} ${item.body}`,
+      ),
+    ).toEqual([
+      "turn.operator Say hi in three words.",
+      "turn.reply Hello, friend! 👋",
+      "turn.operator What is 2+2? Answer in one sentence.",
+      `carried ${A}`,
+      "turn.operator Also name a colour. One word.",
+      "turn.reply Two plus two equals four. Blue.",
+    ]);
+  });
+});
+
 describe("a second accepted message, and what settlement means after one", () => {
   test("waitForIdle waits for the steer's own turn, not the one it took over from", async () => {
     /*
@@ -5755,9 +6049,15 @@ describe("the stored transcript, as the live stream's parts (A6 F10)", () => {
         fallbackAt: 0,
       }).items.map((item) => `${item.headline}: ${item.body ?? ""}`),
     ).toEqual([
+      // Four operator messages in a row, nothing between: each but the last carried on with
+      // the next (A6 U6 review 2). The CLI's own entries after them are no operator's, and
+      // carry nothing.
       "You: What does this screenshot show?",
+      "Answered with the next message: ",
       "You: Just the words, as a list.",
+      "Answered with the next message: ",
       "You: [Request interrupted by user for tool use]",
+      "Answered with the next message: ",
       "You: typed",
       // Drawn as its status, the notification having no summary (A6 U14's review).
       "task: Task completed",

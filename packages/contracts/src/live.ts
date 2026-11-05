@@ -350,6 +350,20 @@ export const LIVE_ITEM_KINDS = [
    */
   "turn.taken",
   /**
+   * The harness ended a message's turn **before it wrote anything** and sent the message on
+   * with the next one, whose reply answers both (A6 U6 review 2). Lands in that turn, after
+   * its take, and carries its {@link LiveItem.messageIds} where the message had ids; nothing
+   * to read. A chat draws the turn as answered with the next message, never this item as a
+   * row.
+   *
+   * Live when Claude Code cuts such a turn for a Send now (`priority: "now"`): it aborts the
+   * turn's request before any output and asks the model again with both messages. In a
+   * replay, wherever the harness stored one operator message directly before another with
+   * nothing between — not after a session's last message, nor before the CLI's interrupt
+   * marker.
+   */
+  "turn.carried",
+  /**
    * A **sub-agent** the agent started, in place of everything it did (A6 U14, decided by
    * the operator). One state of it: several items share one {@link LiveItem.callId} — the
    * calling tool call's — as it starts and ends, and a reader keeps the newest per call and

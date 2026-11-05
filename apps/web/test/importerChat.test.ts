@@ -25,6 +25,7 @@ import {
   streamStates,
 } from "../src/lib/chat";
 import {
+  CARRIED_NOTE,
   LOADING_HISTORY,
   MID_BLOCK_NOTE,
   NO_HISTORY,
@@ -2753,5 +2754,151 @@ describe("A6 U5: blocks still being written", () => {
     expect(
       idle.map((group) => [group.subject.midBlock, group.prose._tag]),
     ).toEqual([[false, "none"]]);
+  });
+});
+
+/*
+ * A6 U6 review 2: a Send now that lands before the turn it cuts has written anything. Claude
+ * Code ends that turn with only its own diagnostic and sends its message on with the Send
+ * now; one reply answers both. The server says so with a `turn.carried` item, live and in a
+ * replay of the two stored messages in a row.
+ */
+describe("a message carried on with the next one", () => {
+  const A = "a".repeat(32);
+  const B = "b".repeat(32);
+  const carried = (ids: readonly string[], space = "activity:9"): LiveItem => ({
+    ...item({
+      kind: "turn.carried",
+      headline: "Answered with the next message",
+    }),
+    id: space,
+    importId: "imp_1",
+    ...(ids.length === 0 ? {} : { messageIds: [...ids] }),
+  });
+  const mine = (index: number, text: string, id: string): LiveItem => ({
+    ...operator(index, text),
+    messageIds: [id],
+  });
+  const notes = (groups: ReturnType<typeof buildImporterChat>) =>
+    groups.map((group) =>
+      group.prose._tag === "none" || group.prose._tag === "pending"
+        ? group.prose.note
+        : group.prose._tag,
+    );
+
+  test("live: its turn says it was answered with the next, not that it wrote nothing; the carry is no row", () => {
+    const groups = buildImporterChat({
+      history: NO_HISTORY,
+      items: [
+        mine(0, "What is 2+2?", A),
+        carried([A]),
+        mine(1, "Also name a colour.", B),
+        reply("Four. Blue."),
+      ],
+      working: false,
+    });
+    expect(notes(groups)).toEqual([CARRIED_NOTE, "live"]);
+    expect(groups[0]?.rows).toHaveLength(0);
+  });
+
+  test("after a reload: the replay's carry draws the same", () => {
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: [
+          replayItem(0, "turn.operator", "What is 2+2?", { messageIds: [A] }),
+          replayItem(1, "turn.carried", "", { messageIds: [A] }),
+          replayItem(2, "turn.operator", "Also name a colour.", {
+            messageIds: [B],
+          }),
+          replayItem(3, "turn.reply", "Four. Blue."),
+        ],
+      }),
+      items: [],
+      working: false,
+    });
+    expect(notes(groups)).toEqual([CARRIED_NOTE, "replayed"]);
+    // The replay's one note goes on the turn that has words, not on the carried one.
+    expect(groups[1]?.prose).toMatchObject({ note: "From the harness." });
+  });
+
+  test("a carry finds its message by id wherever it sorted, and a message no carry names keeps its own note", () => {
+    // A live carry kept below a replay's floor sorts after the replay, so after a message
+    // the server holds outside it (B, from another tab): it still marks A, never B.
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: [
+          replayItem(0, "turn.operator", "What is 2+2?", { messageIds: [A] }),
+          replayItem(1, "turn.operator", "Also name a colour.", {
+            id: "operator:queued:b",
+            messageIds: [B],
+          }),
+        ],
+      }),
+      items: [carried([A])],
+      working: true,
+    });
+    expect(notes(groups)[0]).toBe(CARRIED_NOTE);
+    expect(notes(groups)[1]).not.toBe(CARRIED_NOTE);
+  });
+
+  test("a carry naming no message (the opening prompt's) marks the turn it lands in", () => {
+    const groups = buildImporterChat({
+      history: NO_HISTORY,
+      items: [
+        operator(0, "Load the scope."),
+        carried([]),
+        operator(1, "Skip the blog."),
+        reply("Loading, without the blog."),
+      ],
+      working: false,
+    });
+    expect(notes(groups)).toEqual([CARRIED_NOTE, "live"]);
+  });
+
+  test("a live carry below the floor is kept while the replay holds its message and no carry for it, and only then", () => {
+    // Claude Code writes the Send now's message 30-130 ms after taking it: a re-read in that
+    // gap ends on A alone, while the live carry is already under its floor.
+    const gap = [
+      replayItem(0, "turn.operator", "What is 2+2?", { messageIds: [A] }),
+    ];
+    const kept = importerFeed({
+      own: [],
+      floors: {},
+      live: [carried([A], "activity:5")],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: gap,
+      callInFlight: true,
+    });
+    expect(kept.map((each) => each.kind)).toEqual(["turn.carried"]);
+    // The replay holds its own carry: the live one is the replay's, as a block is.
+    const both = importerFeed({
+      own: [],
+      floors: {},
+      live: [carried([A], "activity:5")],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: [
+        ...gap,
+        replayItem(1, "turn.carried", "", { messageIds: [A] }),
+      ],
+      callInFlight: true,
+    });
+    expect(both).toHaveLength(0);
+    // Read idle, the replay holds everything stored: nothing is still to come.
+    const idle = importerFeed({
+      own: [],
+      floors: {},
+      live: [carried([A], "activity:5")],
+      importId: "imp_1",
+      historyFloor: 20,
+      replayed: gap,
+      callInFlight: false,
+    });
+    expect(idle).toHaveLength(0);
   });
 });

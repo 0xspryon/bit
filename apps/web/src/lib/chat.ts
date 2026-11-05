@@ -100,6 +100,12 @@ const KIND_LABELS: Record<string, string | undefined> = {
    * it — it only stops drawing that message as queued — so this word is the Live panel's.
    */
   "turn.taken": "Message taken",
+  /**
+   * A message's turn ended before it wrote anything and the harness sent the message on with
+   * the next one (A6 U6 review 2). The importer chat draws it as that turn's note, never a
+   * row, so this word too is the Live panel's.
+   */
+  "turn.carried": "Answered with the next message",
   /** A sub-agent the agent started, as one entry (A6 U14). See {@link SUBAGENT_KIND}. */
   subagent: "Sub-agent",
   "action.denied": "Denied",
@@ -1485,8 +1491,9 @@ export const buildChat = (input: {
   const narration = input.narration;
   const groups = [...shown].reverse().map((round): ChatRound => {
     // A take (A6 U4) only tells the importer's chat a queued message was read; not a row.
+    // Nor is a carry (U6 review 2).
     const mine = input.items.filter(
-      (item) => item.roundId === round.roundId && item.kind !== TAKEN_KIND,
+      (item) => item.roundId === round.roundId && drawnAsRow(item),
     );
     const live = mine.filter((item) => {
       const order = activityOrder(item);
@@ -1571,6 +1578,21 @@ export const OPERATOR_TURN_KIND = "turn.operator";
  * goal and planner panels drop it.
  */
 export const TAKEN_KIND = "turn.taken";
+
+/**
+ * The kind the harness's "this message went on with the next one" item carries (`live.ts`,
+ * A6 U6 review 2): a turn ended before it wrote anything, and the next message's reply
+ * answers both. Never drawn as a row by any chat: the importer's draws its turn as answered
+ * with the next message, and the goal and planner panels drop it.
+ */
+export const CARRIED_KIND = "turn.carried";
+
+/**
+ * Whether an item is one a chat draws as a row at all: not a take ({@link TAKEN_KIND}) nor a
+ * carry ({@link CARRIED_KIND}), which only say something about the operator's messages.
+ */
+export const drawnAsRow = (item: LiveItem): boolean =>
+  item.kind !== TAKEN_KIND && item.kind !== CARRIED_KIND;
 
 /**
  * One operator message as a chat row.
@@ -1738,8 +1760,12 @@ export interface GoalChatInput {
  */
 export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
   // A take (A6 U4) only tells the importer's chat a queued message was read; it is not a row.
+  // Nor is a carry (U6 review 2), live or replayed.
+  // V2(chat): the goal chat drops a carry rather than drawing its turn as answered with the
+  // next message, as the importer's does; a goal has no Send now yet, so only a replay of
+  // two stored messages in a row can carry one here.
   const mine = input.items.filter(
-    (item) => item.goalId === input.goalId && item.kind !== TAKEN_KIND,
+    (item) => item.goalId === input.goalId && drawnAsRow(item),
   );
   const live = mine.filter((item) => {
     const order = activityOrder(item);
@@ -1747,7 +1773,7 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
     return input.narrationFloor === undefined || order > input.narrationFloor;
   });
   const hasLive = live.some((item) => item.origin === "activity");
-  const replayed = input.conversation?.items ?? [];
+  const replayed = (input.conversation?.items ?? []).filter(drawnAsRow);
 
   if (
     live.length === 0 &&

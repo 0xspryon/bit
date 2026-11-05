@@ -80,6 +80,7 @@ import type {
 } from "@bit/contracts";
 
 import {
+  CARRIED_KIND,
   OPERATOR_TURN_KIND,
   REPLY_KIND,
   TAKEN_KIND,
@@ -150,6 +151,15 @@ export interface ImporterTurn {
  */
 export const MID_BLOCK_NOTE =
   "This reply is still being written; it shows here with its next words, or once the block is finished.";
+
+/**
+ * The note on a turn the harness ended before it wrote anything and sent on with the next
+ * message (A6 U6 review 2, a `turn.carried` item in the turn): the next reply answers both.
+ * What a Claude Code turn a Send now cut that early reads, live and after a reload, in place
+ * of an error or "no reply".
+ */
+export const CARRIED_NOTE =
+  "Answered with the next message: the harness sent the two on together, and the reply below answers both.";
 
 /** One importer turn as a chat group. */
 export type ImporterGroup = ChatGroup<ImporterTurn>;
@@ -894,6 +904,34 @@ export const importerFeed = (input: {
     (isPartial(item) ||
       (input.callInFlight === true &&
         (activityOrder(item) ?? Number.POSITIVE_INFINITY) > heldUpTo));
+  /*
+   * A carry (A6 U6 review 2) below the floor that the replay cannot show yet: Claude Code
+   * writes the message that carried it on to its transcript 30–130 ms after taking it, and a
+   * take asks for a re-read, so a replay read in that gap ends on the carried message alone
+   * — no `turn.carried` of its own — while the live one is under its floor. Kept while the
+   * call can still be running, as a finished block is, when the replay holds the message
+   * it names and no carry naming it: `buildImporterChat` finds that message's turn by id.
+   * The settled re-read holds both messages and its own carry.
+   *
+   * V2(chat): a **reload** inside that 30–130 ms gap starts a feed that holds no carry, so
+   * the carried message reads "The harness holds this message and no reply to it." until
+   * the turn settles and the replay is read again. The per-import tail the V2 note above
+   * describes would keep the carry beside the blocks, and close this too.
+   */
+  const carriedInReplay = new Set<string>();
+  const writtenInReplay = new Set<string>();
+  for (const item of input.replayed ?? []) {
+    if (item.kind === CARRIED_KIND) {
+      for (const id of messagesOf(item)) carriedInReplay.add(id);
+    } else if (item.kind === OPERATOR_TURN_KIND) {
+      for (const id of messagesOf(item)) writtenInReplay.add(id);
+    }
+  }
+  const carryNotYetStored = (item: LiveItem): boolean =>
+    item.kind === CARRIED_KIND &&
+    input.callInFlight === true &&
+    messagesOf(item).some((id) => writtenInReplay.has(id)) &&
+    !messagesOf(item).some((id) => carriedInReplay.has(id));
   const mine = ours.filter((item) => {
     // A block the replay holds is the replay's, above the floor too (A6 U5 review 3): the
     // turn watch can answer, and the settled re-read land, before the block's last live
@@ -902,7 +940,8 @@ export const importerFeed = (input: {
     return (
       input.historyFloor === undefined ||
       (activityOrder(item) ?? Number.POSITIVE_INFINITY) > input.historyFloor ||
-      notYetStored(item)
+      notYetStored(item) ||
+      carryNotYetStored(item)
     );
   });
   /*
@@ -1178,6 +1217,9 @@ const leadingProse = (history: ImporterHistory, other: boolean): RoundProse => {
 /** Not a block still being written: what a turn the importer is not on draws. */
 const settled = (item: LiveItem): boolean => !isPartial(item);
 
+/** A `turn.carried` item: its turn's message went on with the next (A6 U6 review 2). */
+const isCarried = (item: LiveItem): boolean => item.kind === CARRIED_KIND;
+
 export const buildImporterChat = (
   input: ImporterChatInput,
 ): readonly ImporterGroup[] => {
@@ -1196,6 +1238,9 @@ export const buildImporterChat = (
     besideCalls(foldSubagents(joinedByTake(placed.items, taken))),
   );
   const turnCount = cut.turns.length;
+  const carriedIds = new Set(
+    [...history.items, ...input.items].filter(isCarried).flatMap(messagesOf),
+  );
   const midTurn = new Set(input.midTurn ?? []);
   const urgent = new Set(input.sentNow ?? []);
   const sentNow = (operator: LiveItem): boolean =>
@@ -1260,7 +1305,11 @@ export const buildImporterChat = (
       },
       prose,
       // A block left partial before the turn the importer is on is never finished now.
-      rows: rowsFor(cut.leading.filter(settled), false, placed.pairing),
+      rows: rowsFor(
+        cut.leading.filter((item) => settled(item) && !isCarried(item)),
+        false,
+        placed.pairing,
+      ),
     });
   }
 
@@ -1276,7 +1325,21 @@ export const buildImporterChat = (
      * its finished copy was left: the first attempt of a retried model call, which the
      * server's turn-end flush leaves partial, or one cut off with nothing to close it.
      */
-    const items = working ? turn.items : turn.items.filter(settled);
+    /*
+     * The harness ended this turn before it wrote anything and sent its message on with the
+     * next (A6 U6 review 2): said in the turn's note, never drawn as a row. Found by the
+     * message it names, wherever it sorted — a live carry kept under a replay's floor sorts
+     * after the replay, and so after a message the server holds outside it — and by place
+     * only when it names none (a session's opening prompt).
+     */
+    const carried =
+      messagesOf(turn.operator).some((id) => carriedIds.has(id)) ||
+      turn.items.some(
+        (item) => isCarried(item) && messagesOf(item).length === 0,
+      );
+    const items = (working ? turn.items : turn.items.filter(settled)).filter(
+      (item) => !isCarried(item),
+    );
     const replayed = fromReplay(turn.operator);
     const spoke = items.some((item) => item.origin === "activity");
     const midBlock = replayed && !spoke && working;
@@ -1300,35 +1363,37 @@ export const buildImporterChat = (
               ? sendingNowNote(input.sendNow ?? "unknown")
               : QUEUED_NOTE,
           }
-        : midBlock
-          ? { _tag: "pending", note: MID_BLOCK_NOTE }
-          : replayed
-            ? spoke
-              ? {
-                  _tag: "replayed",
-                  note: replayNote(),
-                  ephemeral: true,
-                  // Said once, on the first turn: the answer stopped short of the oldest items.
-                  truncated:
-                    history.truncated &&
-                    position === 0 &&
-                    cut.leading.length === 0,
-                }
-              : {
-                  _tag: "none",
-                  note: "The harness holds this message and no reply to it.",
-                }
-            : spoke
-              ? { _tag: "live" }
-              : latest
+        : carried && !spoke
+          ? { _tag: "none", note: CARRIED_NOTE }
+          : midBlock
+            ? { _tag: "pending", note: MID_BLOCK_NOTE }
+            : replayed
+              ? spoke
                 ? {
-                    _tag: "pending",
-                    note: "Sent. The importer has not answered yet.",
+                    _tag: "replayed",
+                    note: replayNote(),
+                    ephemeral: true,
+                    // Said once, on the first turn: the answer stopped short of the oldest items.
+                    truncated:
+                      history.truncated &&
+                      position === 0 &&
+                      cut.leading.length === 0,
                   }
                 : {
                     _tag: "none",
-                    note: "The importer wrote nothing in reply to this message.",
-                  },
+                    note: "The harness holds this message and no reply to it.",
+                  }
+              : spoke
+                ? { _tag: "live" }
+                : latest
+                  ? {
+                      _tag: "pending",
+                      note: "Sent. The importer has not answered yet.",
+                    }
+                  : {
+                      _tag: "none",
+                      note: "The importer wrote nothing in reply to this message.",
+                    },
       rows: rowsFor(items, working, placed.pairing),
     });
   });

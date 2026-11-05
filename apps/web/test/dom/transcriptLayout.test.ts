@@ -24,7 +24,7 @@ import {
 
 import { App, IMPORT_POLL_MS } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
-import { QUEUED_NOTE } from "../../src/lib/importerChat";
+import { CARRIED_NOTE, QUEUED_NOTE } from "../../src/lib/importerChat";
 import { mockHarnesses } from "../../src/lib/mockImporter";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
@@ -711,6 +711,154 @@ describe("U4: a message sent while a turn runs", () => {
       expect.stringContaining("Importer"),
       "Importer · m-two · 3s",
     ]);
+  });
+});
+
+/*
+ * A6 U6 review 2: a Send now that lands before the turn it cuts has written anything.
+ * Claude Code ends that turn with only its own diagnostic, which bit drew as a red error
+ * live, and after a reload as a message with no reply — while the next reply answers both.
+ */
+describe("U6: a message carried on with the Send now after it", () => {
+  const MESSAGE_ID = "aaaaaaaabbbbbbbbccccccccdddddddd";
+  const OTHER_ID = "11111111222222223333333344444444";
+  const ERROR_HEAD = "The harness stopped this turn with an error";
+
+  test("live: its turn says it was answered with the next message, with no error and no 'wrote nothing'", async () => {
+    const { app, fake } = await openWith([
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 1, { kind: "turn.reply", body: "Loaded." }),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    await settle();
+    let next = 0;
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) => {
+      next += 1;
+      return ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_a",
+          messageId: next === 1 ? MESSAGE_ID : OTHER_ID,
+          acceptedAt: AT + 4_000 + next * 300,
+        }),
+      );
+    };
+    await send("What is 2+2?");
+    fake.watch.send(
+      at("activity", 1, 4, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageIds: [MESSAGE_ID],
+      }),
+    );
+    await settle();
+    await send("Also name a colour.");
+    // The cut turn ends with nothing written, and its message goes on with the Send now.
+    fake.watch.send(
+      at("activity", 2, 5, {
+        kind: "turn.carried",
+        headline: "Answered with the next message",
+        messageIds: [MESSAGE_ID],
+      }),
+    );
+    fake.watch.send(
+      at("activity", 3, 5, {
+        kind: "turn.taken",
+        headline: "Taken",
+        messageIds: [OTHER_ID],
+      }),
+    );
+    fake.watch.send(
+      at("activity", 4, 7, {
+        kind: "turn.reply",
+        body: "Two plus two equals four. Blue.",
+        model: "m-two",
+      }),
+    );
+    await settle();
+    // While it is watched, before any re-read of the settled turn.
+    const watched = groups().map((group) => said(group));
+    expect(watched[1]).toContain(CARRIED_NOTE);
+    expect(watched[1]).not.toContain("wrote nothing in reply");
+    expect(watched[2]).toContain("Two plus two equals four. Blue.");
+    transcriptOnceSettled(fake, [
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 1, { kind: "turn.reply", body: "Loaded." }),
+      at("replay", 2, 4, {
+        kind: "turn.operator",
+        headline: "You",
+        body: "What is 2+2?",
+        messageIds: [MESSAGE_ID],
+      }),
+      at("replay", 3, 5, {
+        kind: "turn.carried",
+        headline: "Answered with the next message",
+        messageIds: [MESSAGE_ID],
+      }),
+      at("replay", 4, 5, {
+        kind: "turn.operator",
+        headline: "You",
+        body: "Also name a colour.",
+        messageIds: [OTHER_ID],
+      }),
+      at("replay", 5, 7, {
+        kind: "turn.reply",
+        body: "Two plus two equals four. Blue.",
+        model: "m-two",
+      }),
+    ]);
+    await endTurn(app, fake);
+
+    const drawn = groups().map((group) => said(group));
+    expect(drawn).toHaveLength(3);
+    expect(drawn[1]).toContain("What is 2+2?");
+    expect(drawn[1]).toContain(CARRIED_NOTE);
+    expect(drawn[2]).toContain("Also name a colour.");
+    expect(drawn[2]).toContain("Two plus two equals four. Blue.");
+    const page = said(document.querySelector(".importer"));
+    expect(page).not.toContain(ERROR_HEAD);
+    expect(page).not.toContain("wrote nothing in reply");
+    expect(page).not.toContain("no reply to it");
+    // The carry is a note, never a row of its own.
+    expect(
+      document.querySelectorAll(".importer li.harness-error"),
+    ).toHaveLength(0);
+    expect(drawn[1]).not.toContain("Answered with the next message ");
+  });
+
+  test("after a reload: the two stored messages in a row draw the first as answered with the second", async () => {
+    await openWith([
+      OPERATOR("replay", 0, "What is 2+2?"),
+      at("replay", 1, 0, {
+        kind: "turn.carried",
+        headline: "Answered with the next message",
+      }),
+      OPERATOR("replay", 2, "Also name a colour."),
+      at("replay", 3, 2, {
+        kind: "turn.reply",
+        body: "Two plus two equals four. Blue.",
+      }),
+    ]);
+    const drawn = groups().map((group) => said(group));
+    expect(drawn).toHaveLength(2);
+    expect(drawn[0]).toContain(CARRIED_NOTE);
+    expect(drawn[0]).not.toContain("no reply to it");
+    expect(drawn[1]).toContain("Two plus two equals four. Blue.");
+  });
+
+  test("after a reload, a last message with nothing after it still says the harness holds no reply", async () => {
+    // The server writes no carry for it, and the page invents none.
+    await openWith([
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 1, { kind: "turn.reply", body: "Loaded." }),
+      OPERATOR("replay", 2, "Are you there?"),
+    ]);
+    const drawn = groups().map((group) => said(group));
+    expect(drawn.at(-1)).toContain(
+      "The harness holds this message and no reply to it.",
+    );
+    expect(drawn.at(-1)).not.toContain(CARRIED_NOTE);
   });
 });
 

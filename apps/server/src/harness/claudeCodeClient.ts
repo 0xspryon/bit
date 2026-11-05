@@ -551,6 +551,12 @@ interface SessionRecord {
    */
   readonly takenTogether: Map<string, readonly string[]>;
   /**
+   * The driver uuids of the steers this session was sent `priority: "now"` (a Send now, A6
+   * U6 review 2), kept for the session's life. With {@link untaken}, what says a turn the
+   * CLI ended with only its diagnostics was cut by one: see `cutBySendNow`.
+   */
+  readonly sentNow: Set<string>;
+  /**
    * A turn is running on the stream: a turn-opening frame (`system/init`, a main-thread
    * reply or tool result — never a subagent's, see `opensTurn`) has arrived since the last
    * `result`, which closes it. Read off the stream
@@ -1747,14 +1753,44 @@ const CLI_SYNTHETIC_MODEL = "<synthetic>";
 const CLI_NO_RESPONSE = "No response requested.";
 
 /**
+ * The prefixes of the CLI's own diagnostics in a `result`'s `errors` (A6 U6 review 2):
+ * text the CLI writes for itself, which its own SDK adapter filters out before it shows a
+ * turn's errors (CLI 2.1.310), and which says nothing an operator can act on.
+ *
+ * `[ede_diagnostic] result_type=… last_content_type=… stop_reason=…` is what the CLI adds
+ * to a turn that did not end on assistant text or thinking, or with `end_turn` — measured
+ * on a turn a Send now cut before it wrote anything, where it was the only error.
+ */
+const CLI_DIAGNOSTIC_PREFIXES = [
+  "[ede_diagnostic]",
+  "[session_crash]",
+] as const;
+
+/** Whether one of a `result`'s errors is a CLI diagnostic, see {@link CLI_DIAGNOSTIC_PREFIXES}. */
+const isCliDiagnostic = (error: string): boolean =>
+  CLI_DIAGNOSTIC_PREFIXES.some((prefix) => error.startsWith(prefix));
+
+/** A `result`'s `errors` as the CLI stated them: its non-empty strings, in order. */
+const statedErrors = (message: SDKMessage): readonly string[] => {
+  const errors = (message as { readonly errors?: unknown }).errors;
+  return Array.isArray(errors)
+    ? errors.filter(
+        (each): each is string =>
+          typeof each === "string" && each.trim() !== "",
+      )
+    : [];
+};
+
+/**
  * The harness's own sentence for a turn it ended in error (A6 U4), or `undefined`.
  *
  * Only a `result` whose outcome is `failed` — so never an interrupt this application asked
  * for, which {@link outcomeOf} calls `interrupted` — and only when the CLI said something:
- * its `errors`, joined. A failed `result` with none narrates nothing, rather than a sentence
- * this server would have to word. A provider refusing a call is an `assistant` frame with
- * `error` set, which {@link assistantError} narrates; this is what that leaves: a turn that
- * ran out of turns or budget, or broke while executing.
+ * its `errors`, joined, **less its own diagnostics** ({@link CLI_DIAGNOSTIC_PREFIXES}),
+ * which the CLI's adapter hides too. A failed `result` with nothing else narrates nothing,
+ * rather than a sentence this server would have to word. A provider refusing a call is an
+ * `assistant` frame with `error` set, which {@link assistantError} narrates; this is what
+ * that leaves: a turn that ran out of turns or budget, or broke while executing.
  *
  * **Live only.** The CLI's transcript stores no `result` message, so a reload has nothing
  * to read this from: a turn that ended this way shows its error while watched and not after
@@ -1766,16 +1802,68 @@ export const resultError = (
   outcome: TerminalOutcome | undefined,
 ): NarrationDetail | undefined => {
   if (message.type !== "result" || outcome !== "failed") return undefined;
-  const errors = (message as { readonly errors?: unknown }).errors;
-  const said = Array.isArray(errors)
-    ? errors.filter(
-        (each): each is string =>
-          typeof each === "string" && each.trim() !== "",
-      )
-    : [];
+  const said = statedErrors(message).filter((error) => !isCliDiagnostic(error));
   return said.length === 0
     ? undefined
     : { _tag: "error", message: truncateNarration(said.join("\n")) };
+};
+
+/**
+ * Whether a `result` ends a turn a **Send now cut short before it wrote anything** (A6 U6
+ * review 2), the turn's messages carried on into the next.
+ *
+ * Measured on CLI 2.1.310 (haiku-4-5): a message sent idle opens its own turn (`system/init`
+ * naming it); a message sent `priority: "now"` 0.3 s later aborts that turn's API request
+ * before any assistant output; the turn ends `error_during_execution` (`terminal_reason:
+ * aborted_streaming`) with **only** the CLI's diagnostic in `errors`; and the next turn,
+ * opened naming the "now" message alone, sends **both** messages to the model in one
+ * request and answers them with one reply. The transcript holds the two `user` entries in a
+ * row, then that reply.
+ *
+ * So: a non-success `result` this application did not interrupt, whose errors are all
+ * diagnostics, while a steer sent `now` is still untaken — the CLI takes it next, which is
+ * what cut the turn. A turn cut mid-reply ends on assistant text and is a `success` (no
+ * diagnostic); a Stop is {@link SessionRecord.interrupted}; a genuine failure says
+ * something besides a diagnostic. None of them is this.
+ */
+const cutBySendNow = (
+  record: Pick<SessionRecord, "interrupted" | "untaken" | "sentNow">,
+  message: SDKMessage,
+): boolean => {
+  if (message.type !== "result" || message.subtype === "success") return false;
+  if (record.interrupted) return false;
+  const errors = statedErrors(message);
+  if (errors.length === 0 || !errors.every(isCliDiagnostic)) return false;
+  return [...record.untaken.keys()].some((uuid) => record.sentNow.has(uuid));
+};
+
+/**
+ * The `carried` entry for a turn {@link cutBySendNow}: the application's ids for the
+ * messages that turn held, from the `result`'s `user_message_uuids`. A uuid that is not one
+ * of this session's steers (the opening prompt) names nothing.
+ */
+const carriedNarration = (
+  record: Pick<SessionRecord, "deliveredIds">,
+  message: SDKMessage,
+): HarnessNarration => {
+  const byUuid = new Map(
+    [...record.deliveredIds].map(
+      (id) => [claudeCodeMessageId(id), id] as const,
+    ),
+  );
+  return {
+    type: message.type,
+    sequence: undefined,
+    at: Date.now(),
+    outcome: "interrupted",
+    detail: {
+      _tag: "carried",
+      messageIds: (answeredUuids(message) ?? []).flatMap((uuid) => {
+        const id = byUuid.get(uuid);
+        return id === undefined ? [] : [id];
+      }),
+    },
+  };
 };
 
 /**
@@ -1785,13 +1873,17 @@ export const resultError = (
  * interrupted: the SDK reports an interrupted turn as `error_during_execution`, which is
  * indistinguishable from a genuine failure on the wire. We know which it was, so saying
  * `failed` there would be recording a claim about the work that we know to be wrong.
+ *
+ * A turn a Send now cut before it wrote anything is ours to call `interrupted` too
+ * ({@link cutBySendNow}, passed as `cut`): this application sent the message that cut it.
  */
 const outcomeOf = (
   message: SDKMessage,
   interrupted: boolean,
+  cut = false,
 ): TerminalOutcome | undefined => {
   if (message.type !== "result") return undefined;
-  if (interrupted) return "interrupted";
+  if (interrupted || cut) return "interrupted";
   return message.subtype === "success" ? "succeeded" : "failed";
 };
 
@@ -2729,7 +2821,9 @@ export const claudeCodeHarness = (
             Effect.tryPromise({
               try: async () => {
                 for await (const message of live) {
-                  const outcome = outcomeOf(message, record.interrupted);
+                  // Read before the frame is narrated: the steer that cut it is still untaken.
+                  const cut = cutBySendNow(record, message);
+                  const outcome = outcomeOf(message, record.interrupted, cut);
                   trackTask(record, message);
                   if (answeredUuids(message) !== undefined) {
                     record.stamped = true;
@@ -2773,6 +2867,12 @@ export const claudeCodeHarness = (
                   }
                   for (const entry of narrate(message, outcome, record)) {
                     Queue.offerUnsafe(record.narration, entry);
+                  }
+                  if (cut) {
+                    Queue.offerUnsafe(
+                      record.narration,
+                      carriedNarration(record, message),
+                    );
                   }
                   if (message.type !== "result") continue;
                   /*
@@ -3140,6 +3240,7 @@ export const claudeCodeHarness = (
           unanswered: new Set<string>(),
           untaken: new Map<string, string>(),
           takenTogether: new Map<string, readonly string[]>(),
+          sentNow: new Set<string>(),
           turnOpen: false,
           stamped: false,
           settling: false,
@@ -3532,6 +3633,7 @@ export const claudeCodeHarness = (
         const uuid = claudeCodeMessageId(delivery.messageId);
         record.unanswered.add(uuid);
         record.untaken.set(uuid, delivery.messageId);
+        if (delivery.urgency === "preemptive") record.sentNow.add(uuid);
         offer(userMessage(record, content, uuid, delivery));
         return { delivered: true };
       });
