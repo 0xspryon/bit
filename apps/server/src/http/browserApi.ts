@@ -89,6 +89,7 @@ import {
 import {
   HttpEffect,
   HttpServer,
+  HttpServerRequest,
   HttpServerResponse,
   type Multipart,
 } from "effect/http";
@@ -304,6 +305,36 @@ export class BrowserApiSettings extends Context.Service<
  * The resolved session is provided as {@link SessionActor} so a handler reads its
  * identity from the context rather than from a header it would have to trust.
  */
+/**
+ * A refusal of the guard's, answered once a multipart body has been read to its end (U13
+ * review 1).
+ *
+ * The handler's own upload refusals already read the rest of the body before answering
+ * (`upload/uploads.ts`'s `readUploadParts`), because a server that answers while a body is
+ * still arriving closes a socket with unread data in it, which resets the connection — and
+ * the reset makes the peer's kernel throw away the answer it had received. The browser
+ * straight to Bun copes; Vite's dev proxy, the way the operator's browser reaches this
+ * server, loses the `401` and answers `502`, so a signed-out tab sending a file read "no
+ * server answered" instead of signing out (measured: a 1 MiB file, 2 of 3 tries). A proxy
+ * cannot pass through an answer it never got, so the fix is here: read first, then refuse.
+ *
+ * Only a multipart body, which is what a composer's files travel in; nothing of it is kept.
+ * Bounded like the handler's drain, by the listener's body ceiling (`http/controlPlane.ts`),
+ * past which Bun answers its own `413` without this running. A stream that fails (the
+ * client went away) only ends the reading early.
+ */
+const refuseUnauthenticated = (
+  reason: Unauthenticated["reason"],
+): Effect.Effect<never, Unauthenticated, HttpServerRequest.HttpServerRequest> =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const type = request.headers["content-type"] ?? "";
+    if (type.toLowerCase().startsWith("multipart/form-data")) {
+      yield* Stream.runDrain(request.stream).pipe(Effect.ignore);
+    }
+    return yield* new Unauthenticated({ reason });
+  });
+
 export const sessionGuardLayer: Layer.Layer<
   SessionGuard,
   never,
@@ -316,14 +347,14 @@ export const sessionGuardLayer: Layer.Layer<
       bearer: Effect.fnUntraced(function* (httpEffect, { credential }) {
         const token = Redacted.value(credential);
         if (token.length === 0) {
-          return yield* new Unauthenticated({ reason: "missing" });
+          return yield* refuseUnauthenticated("missing");
         }
         const lookup = yield* sessions.resolve(token);
         if (lookup._tag === "Expired") {
-          return yield* new Unauthenticated({ reason: "expired" });
+          return yield* refuseUnauthenticated("expired");
         }
         if (lookup._tag === "Unknown") {
-          return yield* new Unauthenticated({ reason: "unknown" });
+          return yield* refuseUnauthenticated("unknown");
         }
         return yield* Effect.provideService(
           httpEffect,

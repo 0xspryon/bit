@@ -5879,6 +5879,56 @@ describe("a message's files, on the wire (A6 F9)", () => {
     expect(created.status).toBe(200);
   });
 
+  /*
+   * U13 review 1, finding 6: answered while the body was still arriving, a 401 reset the
+   * socket and Vite's proxy said 502 instead. The guard reads a multipart body to its end
+   * before it refuses, as the handler's own refusals do.
+   */
+  test("a multipart upload with a bad bearer is read to its end before its 401", async () => {
+    const boundary = "bitguardboundary";
+    const head = new TextEncoder().encode(
+      `--${boundary}\r\ncontent-disposition: form-data; name="files"; filename="big.bin"\r\ncontent-type: application/octet-stream\r\n\r\n`,
+    );
+    const tail = new TextEncoder().encode(`\r\n--${boundary}--\r\n`);
+    const chunk = new Uint8Array(64 * 1024);
+    const chunks = 128; // 8 MiB, far past what socket buffers hold
+    let pulled = 0;
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent === 0) {
+          controller.enqueue(head);
+        } else if (sent <= chunks) {
+          controller.enqueue(chunk);
+          pulled += chunk.length;
+        } else if (sent === chunks + 1) {
+          controller.enqueue(tail);
+        } else {
+          controller.close();
+        }
+        sent += 1;
+      },
+    });
+    const response = await fetch(
+      `${api}/targets/${TARGET}/importer-sessions/imp_x/messages`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer not-a-session",
+          "content-type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body,
+        // @ts-expect-error -- Bun's fetch takes a streamed body; its types predate `duplex`.
+        duplex: "half",
+      },
+    );
+    expect(response.status).toBe(401);
+    expect(((await response.json()) as Record<string, unknown>)["reason"]).toBe(
+      "unknown",
+    );
+    expect(pulled).toBe(chunks * chunk.length);
+  });
+
   test("an importer message with files reaches the importer with its words, its urgency and each file", async () => {
     handedToImporter.length = 0;
     const response = await read(

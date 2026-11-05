@@ -50,7 +50,10 @@ const BUN_BODY_CEILING = 128 * 1024 * 1024;
  * "no server answered". The browser straight to Bun gets the `413` (measured). So a reset
  * while forwarding a body over that ceiling is answered `413` here, before Vite's own
  * handler writes its `502`; the client words it (`RequestTooLarge`). Refusals the server's
- * handler makes itself read the whole body first (`upload/uploads.ts`) and pass through.
+ * handler makes itself read the whole body first (`upload/uploads.ts`) and pass through, and
+ * so does the session guard's `401` for a multipart upload (`http/browserApi.ts`'s
+ * `refuseUnauthenticated`): a proxy cannot pass through an answer the reset made its kernel
+ * throw away, so the server reads first and answers after.
  *
  * V2(chat): a guess from the request's declared length and the error code: a server that
  * died mid-upload of a body that size would be reported as too large. Proper V2 is T3's
