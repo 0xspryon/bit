@@ -746,7 +746,24 @@ describe("A7 U8b review: marks, agent text and long names", () => {
     mounted.push({ target: sheet, destroy: () => sheet.remove() });
     expect(getComputedStyle(name).maxWidth).toBe("60%");
     expect(getComputedStyle(name).unicodeBidi).toBe("isolate");
-    expect(getComputedStyle(crumb).minWidth).toBe("9ch");
+    // The floor is the place's (8ch beside the glyph, separator and gaps). The place never
+    // shrinks as a flex item, so a short one is never cut by a sliver; it is capped at the
+    // crumb less its chrome, and the section label takes the shrink (U8b review 2).
+    expect(getComputedStyle(crumb).minWidth).toBe("calc(39px + 8ch)");
+    expect(
+      getComputedStyle(crumb).getPropertyValue("--crumb-chrome").trim(),
+    ).toBe("39px");
+    const section = crumb.querySelector(".crumb-section");
+    const place = crumb.querySelector(".crumb-place");
+    if (section === null || place === null) throw new Error("no crumb parts");
+    expect(getComputedStyle(section).flexShrink).toBe("1");
+    expect(getComputedStyle(section).minWidth).toBe("0");
+    expect(getComputedStyle(section).textOverflow).toBe("ellipsis");
+    expect(getComputedStyle(place).flexShrink).toBe("0");
+    expect(getComputedStyle(place).maxWidth).toBe("calc(100% - 39px)");
+    for (const fixed of crumb.querySelectorAll(".crumb-glyph, .crumb-sep")) {
+      expect(getComputedStyle(fixed).flexShrink).toBe("0");
+    }
   });
 });
 

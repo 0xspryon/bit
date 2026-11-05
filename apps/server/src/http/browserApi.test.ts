@@ -5853,6 +5853,48 @@ describe("a target's agent sessions", () => {
     });
   });
 
+  test("a dormant import on a configured harness that is not ready is not carried on by a message", async () => {
+    const downed = "agents-downed";
+    await register(downed);
+    const database = new Database(
+      join(fleetRoot, "targets", downed, HUNT_FILE),
+    );
+    try {
+      // Both let go by a shutdown, so both read dormant: only the harness differs.
+      for (const [importId, instanceId] of [
+        ["imp_on_ready", STUB_INSTANCE.instanceId],
+        ["imp_on_absent", "absent-harness"],
+      ] as const) {
+        database.run(
+          `INSERT INTO import_sessions (
+             import_id, target_id, harness_session_id, harness_instance_id, model,
+             caller_scope, opened_at, session_created_at, ended_at, ended_reason
+           ) VALUES (?, ?, ?, ?, 'scripted/model', ?, 100, 101, 150, 'shutdown')`,
+          [
+            importId,
+            downed,
+            `ses_${importId}`,
+            instanceId,
+            `${downed}/import/${importId}`,
+          ],
+        );
+      }
+    } finally {
+      database.close();
+    }
+    const response = await read(
+      await signedIn(`/targets/${downed}/agent-sessions?tab=all`),
+    );
+    expect(response.status).toBe(200);
+    const sessions = (response.body as unknown as AgentSessionsView).sessions;
+    expect(sessions.map((s) => [s.key, s.state, s.resumable]).sort()).toEqual([
+      // "absent-harness" is configured but was never built (`installed: false`): a message
+      // to it would be refused, so the row does not say one carries it on.
+      ["importer:imp_on_absent", "dormant", false],
+      ["importer:imp_on_ready", "dormant", true],
+    ]);
+  });
+
   test("another target's sessions are not in it", async () => {
     const response = await read(
       await signedIn(`/targets/${mixed}/agent-sessions`),

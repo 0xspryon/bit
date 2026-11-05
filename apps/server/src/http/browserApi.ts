@@ -1857,8 +1857,13 @@ const fleetHandlers = HttpApiBuilder.group(
             }),
           ),
         );
+        // Only the instances this process could send to now: a configured harness that is
+        // down (`isReady` false) would refuse the message, so its dormant sessions are not
+        // offered as carried on by one (A7 U8b review).
         const instancesRun = new Set<string>(
-          harnesses.instances.map((listing) => listing.instance.instanceId),
+          harnesses.instances
+            .filter(isReady)
+            .map((listing) => listing.instance.instanceId),
         );
         // Every subject a row could have narrated under, read from memory once.
         const subjects: NarrationSubject[] = [

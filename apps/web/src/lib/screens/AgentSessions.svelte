@@ -884,10 +884,19 @@
     height: 12px;
     background: var(--border-base);
   }
+  /*
+   * The floor is the place's. `--crumb-chrome` is what is not text: the glyph (12px), the
+   * separator (9px) and the three 6px gaps. The place never shrinks as a flex item — even a
+   * sliver of shrink would end a short place in an ellipsis — and is capped at the crumb's
+   * width less that chrome instead; the section label takes all the shrink, down to nothing
+   * (the glyph still says which section). So a place of 8ch or less always shows whole, and a
+   * longer one keeps at least 8ch (A7 U8b review 2: "Goals › Co…" at 1024 px).
+   */
   .crumb {
+    --crumb-chrome: 39px;
     display: inline-flex;
     flex: 0 10 auto;
-    min-width: 9ch;
+    min-width: calc(var(--crumb-chrome) + 8ch);
     overflow: hidden;
     align-items: center;
     gap: 6px;
@@ -897,10 +906,19 @@
   .crumb-glyph,
   .crumb-sep {
     display: inline-flex;
+    flex: none;
     color: var(--icon-faint);
   }
-  .crumb-place {
+  .crumb-section {
+    flex: 0 1 auto;
     min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .crumb-place {
+    flex: none;
+    max-width: calc(100% - var(--crumb-chrome));
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
