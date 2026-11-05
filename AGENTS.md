@@ -72,6 +72,14 @@
   array of nodes — compare strings (`outerHTML`, `textContent`).
   When a test mutates a file to prove it can fail, copy the file first and restore from
   the copy; a killed run never reaches a cleanup step after it.
+- Clean up throwaway paths (test data dirs, browser profiles, logs, scratch scripts, a
+  test session's `~/.claude/projects/*` folder) with `bit-trash <path>...`, never
+  `rm -rf`/`rm -r`/`rm -f`: on the operator's machine a recursive delete stops an agent for
+  approval even in full-access mode. `bit-trash` (`~/.local/bin`) moves each path into a
+  trash folder that an hourly user timer empties after six hours, and accepts only paths
+  under `/run/media/hbt/work`, `/tmp` and `~/.claude/projects`, never this repo. Do not
+  reword a delete to get past the check. Stopping your own processes by recorded PID, port
+  or scope unit needs no approval; never kill by name or with `pkill -f`/`pgrep -f`.
 - When in doubt about how to implement a functionality or how EffectV4 works, look
   the EffectV4, OpenCode/ T3Code better-agent repositories and gain inspiration
   from that about how how such a functionality should be implemented.
