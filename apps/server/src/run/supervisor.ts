@@ -1840,13 +1840,6 @@ const make = Effect.fnUntraced(function* (options?: {
          * A continuation's note sits between them, for both reasons at once: it is framing
          * ("you are carrying on from an attempt that was interrupted, and here is what it
          * did"), and it must not displace the question from the end.
-         *
-         * The harness closes the task with bit's sealed briefing block (U13 review 3): it is
-         * bit's prompt, not an operator message, so `prompt` is given no `operator` and the
-         * block says the text above is bit's briefing and what it quotes — the scope block
-         * may quote a program page that imitates a file line — and that it has no
-         * attachments. The block adds no instruction, so the question is still the last
-         * thing the worker is asked.
          */
         task: [
           ...(scopeBlock === undefined ? [] : [scopeBlock]),

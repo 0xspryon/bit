@@ -24,7 +24,7 @@
  * On every harness a line per file is appended to the prompt,
  * `[Attached image "<name>" is saved at: <absolute path>]` (or `file`). An image in
  * {@link MESSAGE_IMAGE_MIME_TYPES} also goes inline — a Claude Code image block, an
- * OpenCode file part — and on OpenCode so do `text/plain` and PDF. Everything else is the
+ * OpenCode file part — and on OpenCode so does a PDF. Everything else is the
  * path only, and the agent reads it with its own tools if it decides to.
  *
  * Browser-safe: Effect Schema and `effect/http`'s multipart declarations only.

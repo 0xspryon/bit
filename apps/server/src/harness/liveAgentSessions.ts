@@ -1131,8 +1131,8 @@ export const makeLiveAgentSessions = <Meta>(
                       entry.sessionId,
                       plan.openingPrompt(entry),
                       OPEN_PROMPT,
-                      // The operator's first message, inside the framing: an operator
-                      // message's block (U13 review 3), not a briefing's.
+                      // The files the operator's first message carried, listed after the
+                      // framing and the words.
                       {
                         attachments: opened.success.attachments,
                         uploadsFolder: uploadsFolderIn(entry.directory),

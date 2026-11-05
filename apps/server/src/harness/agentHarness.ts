@@ -431,10 +431,10 @@ export interface MessageEntry {
   readonly marker?: string;
   /**
    * On a `user` entry whose message carried files (A6 F9), the files, read from the
-   * harness's own record of it: the prompt's `[Attached …]` lines naming files stored in the
-   * folder the caller gave ({@link MessageRead.uploadsFolder}), which are taken out of
-   * {@link text}, typed by OpenCode's file part or else by the stored name. Absent when the
-   * message carried none, or the caller named no folder.
+   * harness's own record of it: the prompt's `[Attached …]` lines naming files in the folder
+   * the caller gave ({@link MessageRead.uploadsFolder}), which are taken out of {@link text},
+   * typed by OpenCode's file part or else by the stored name, and `missing` when no longer
+   * stored. Absent when the message carried none, or the caller named no folder.
    */
   readonly attachments?: readonly ReplayedAttachment[];
   /**
@@ -997,16 +997,15 @@ export type PromptDelivery =
 export const OPEN_PROMPT: PromptDelivery = { _tag: "open" };
 
 /**
- * A prompt the operator wrote, and the files it carried, already stored in the session's own
- * working directory (A6 F9). See {@link AgentHarness}'s `prompt`.
+ * The files a message carried, already stored in the session's own working directory (A6
+ * F9). See {@link AgentHarness}'s `prompt`.
  */
-export interface OperatorMessage {
+export interface MessageFiles {
   readonly attachments: readonly MessageAttachment[];
   /**
    * The session's uploads folder, absolute: where `storeUploads` (`upload/uploads.ts`) puts
-   * this session's files, whether or not it has put any yet. The block's header names it as
-   * the only folder an attachment is ever in (U13 review 4), and every path in
-   * `attachments` is directly inside it.
+   * this session's files. Every path in `attachments` is directly inside it, and a driver
+   * refuses to list one that is not (`harness/attachments.ts`'s `withAttachmentLines`).
    */
   readonly uploadsFolder: string;
 }
@@ -1334,21 +1333,15 @@ export class AgentHarness extends Context.Service<
       text: string,
       delivery?: PromptDelivery,
       /**
-       * Present when `text` is a message from the operator — a chat message, in the
-       * importer or a goal conversation — with the files it carried; absent when bit wrote
-       * it — a run's task, a planner round, a goal agent's steer into one (U13 review 3).
+       * The files the message carried, if any — an operator's chat message in the importer
+       * or a goal conversation. Absent or empty, `text` is sent as it is.
        *
-       * Every implementation ends `text` with bit's sealed block (`harness/attachments.ts`),
-       * whose header is chosen by this and not by whether there are files: an operator
-       * message's lists its files (or says it has none) and names the codes of the
-       * session's earlier messages the harness has not answered yet, which the driver keeps
-       * from delivery to the end of the turn that reads them, because a harness may hand
-       * several to the model at once; a briefing's says the text above is bit's and what it
-       * quotes. Each implementation also gives inline what its harness takes inline: Claude
-       * Code an image block per image, OpenCode a file part per image or PDF. A replay takes
-       * the block off again.
+       * Every implementation appends one path line per file after `text`, T3 Code's format
+       * (`harness/attachments.ts`'s `withAttachmentLines`), and gives inline what its
+       * harness takes inline: Claude Code an image block per image, OpenCode a file part per
+       * image or PDF. A replay takes the lines off again.
        */
-      operator?: OperatorMessage,
+      files?: MessageFiles,
     ) => Effect.Effect<PromptAccepted, HarnessFailure>;
     /**
      * Blocks until the session is no longer running.

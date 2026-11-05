@@ -18,8 +18,6 @@ import {
 } from "./openCodeEvents";
 import { OpenCodeServer } from "./openCodeServer";
 
-const TEST_ATTACHMENT_KEY = new Uint8Array(32).fill(7);
-
 /** What one item of {@link resubscribing} reads as, for comparing whole sequences. */
 const said = (item: Resubscribed): string =>
   item._tag === "event"
@@ -220,7 +218,6 @@ describe("the subscription the driver makes", () => {
     ) satisfies typeof globalThis.fetch;
     const layer = openCodeHarness({
       timeouts: { control: "1 second", wait: "1 second" },
-      attachmentKey: TEST_ATTACHMENT_KEY,
     }).pipe(
       Layer.provideMerge(
         Layer.succeed(OpenCodeServer, {

@@ -95,7 +95,6 @@
  * so until something does, every MCP request to this process is a `401`. An empty
  * credential registry is a closed door, not an open one.
  */
-import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { API_PREFIX } from "@bit/contracts";
@@ -118,7 +117,6 @@ import {
 import { ControlPlaneEndpoint } from "./http/controlPlane";
 import { resolveRoot } from "./http/folders";
 import { AgentHarness } from "./harness/agentHarness";
-import { ATTACHMENT_KEY_FILE, loadAttachmentKey } from "./harness/attachments";
 import {
   CLAUDE_CODE_DEFAULT_MODEL,
   claudeCodeHarness,
@@ -399,47 +397,6 @@ const fleet = FleetStore.layer(HUNT_ROOT);
 const OWNED_PROCESSES = ownedProcessDirectory(HUNT_ROOT);
 
 /**
- * The key both harnesses seal every message's attachment block with, so a replay can tell
- * the server's block from a pasted one (`harness/attachments.ts`, A6 U13): made once in
- * {@link HUNT_ROOT} with mode `0600`, read on every boot after.
- *
- * **Read at boot, and fatal when it is there but unusable** (U13 review 2, the operator's
- * decision): too open, the wrong size, a link, unreadable — or missing and impossible to
- * make. The server says what is wrong and what to do, and exits before anything is served
- * or spawned. Round 1 ran on a temporary key instead and said so in one stderr line, which
- * hid the broken setup: every chip, old and new, came back as raw words after the next
- * restart, with nothing on screen saying why. A key that is missing is made; one that is
- * there is never replaced, since a new key turns every file sent so far into words.
- */
-const ATTACHMENT_KEY: Uint8Array = (() => {
-  try {
-    mkdirSync(HUNT_ROOT, { recursive: true });
-  } catch {
-    // `loadAttachmentKey` says what is wrong with the folder.
-  }
-  const loaded = loadAttachmentKey(HUNT_ROOT);
-  if (loaded._tag === "problem") {
-    console.error(
-      `bit control plane: refusing to start: the attachment key ${loaded.problem}.`,
-    );
-    console.error(`  to fix it: ${loaded.fix}.`);
-    console.error(
-      "  the key seals the block naming each message's files, so a reload shows them as files and not as text the operator could have typed (harness/attachments.ts).",
-    );
-    process.exit(1);
-  }
-  if (loaded.made) {
-    console.log(`attachment key: made ${join(HUNT_ROOT, ATTACHMENT_KEY_FILE)}`);
-  }
-  return loaded.key;
-})();
-
-/** {@link ATTACHMENT_KEY} as both harness layers take it. */
-const attachmentKeyOption = (): { readonly attachmentKey: Uint8Array } => ({
-  attachmentKey: ATTACHMENT_KEY,
-});
-
-/**
  * Ends `opencode serve` processes a previous run of this process left behind.
  *
  * It exists because of one measured fact: `bun --watch` restarts us *in place*, reusing
@@ -609,7 +566,7 @@ const SELECTED_HARNESS = harnessSelection(process.env["HARNESS"]);
  */
 const openCode: Layer.Layer<AgentHarness, HarnessProcessError> = Layer.suspend(
   () =>
-    openCodeHarness(attachmentKeyOption()).pipe(
+    openCodeHarness().pipe(
       Layer.provide(
         OpenCodeServer.layer({
           cwd: WORKSPACE_ROOT,
@@ -629,7 +586,7 @@ const openCode: Layer.Layer<AgentHarness, HarnessProcessError> = Layer.suspend(
  * Claude Code login, the same way `opencode serve` reads theirs.
  */
 const claudeCode: Layer.Layer<AgentHarness, HarnessProcessError> =
-  Layer.suspend(() => claudeCodeHarness(attachmentKeyOption()));
+  Layer.suspend(() => claudeCodeHarness());
 
 /**
  * Everything this build can be asked to drive, as resolver candidates.

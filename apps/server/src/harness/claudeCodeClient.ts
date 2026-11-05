@@ -150,11 +150,8 @@ import {
   type TerminalOutcome,
 } from "./agentHarness";
 import {
-  ephemeralAttachmentKey,
   attachmentReader,
-  attachmentMark,
-  withClosingBlock,
-  BRIEFING,
+  withAttachmentLines,
   type AttachmentReplay,
   type MessageAttachment,
 } from "./attachments";
@@ -616,20 +613,6 @@ interface SessionRecord {
    */
   readonly unanswered: Set<string>;
   /**
-   * The code of each message's closing block (`harness/attachments.ts`), by its driver uuid,
-   * while the message is {@link unanswered} (U13 review 3): the codes a new operator
-   * message's header names as bit's, because the CLI may hand it to the model together
-   * with these. Written as a message is offered, deleted with its {@link unanswered} entry
-   * by the `result` that answers it — the end of the turn that read it.
-   *
-   * A record made for a restart or a resume starts empty: what the old CLI was sent and
-   * did not answer is in its transcript or gone, and a message delivered after the resume
-   * names nothing before it. A message the old CLI held unanswered and the new one runs
-   * together with a new one could then have its file refused; the resumed opening carries
-   * nothing of that kind.
-   */
-  readonly blockCodes: Map<string, string>;
-  /**
    * The steers this session was sent that no frame has yet said it consumed, by their driver
    * uuid, each with the application's id for it (A6 U4).
    *
@@ -896,13 +879,6 @@ const STDERR_TAIL = 4_096;
 export interface ClaudeCodeHarnessOptions {
   /** The model a run gets when it names none. */
   readonly defaultModel?: string;
-  /**
-   * The key every message's attachment block is sealed with and verified by
-   * (`harness/attachments.ts`), from `loadAttachmentKey`. The server always passes it and
-   * refuses to start without one (`main.ts`). Absent — a test, a spike — one of this
-   * layer's own, so blocks verify for the layer's life only.
-   */
-  readonly attachmentKey?: Uint8Array;
   /** Swapped out by tests. Defaults to {@link liveClaudeCodeSdk}. */
   readonly sdk?: ClaudeCodeSdk;
   /**
@@ -2363,8 +2339,8 @@ const cliMarker = (entry: SessionMessage): string | undefined => {
  */
 const flattenTranscript = (
   entries: readonly SessionMessage[],
-  /** Where this session's uploads are stored, and what verifies its blocks' seals. */
-  replay: Pick<AttachmentReplay, "uploadsFolder" | "sealing">,
+  /** Where this session's uploads are stored. */
+  replay: Pick<AttachmentReplay, "uploadsFolder">,
   /**
    * The steers this process delivered into the session, by the UUID their entry was stored
    * under to the application's ids it holds ({@link storedSteers}): what names an operator
@@ -2374,8 +2350,7 @@ const flattenTranscript = (
 ): MessageEntry[] => {
   const blocksSeen = new Map<string, number>();
   const subagents: SubagentCalls = new Map();
-  // One reader for the whole read, oldest first: a block's code is read on its first
-  // sighting only, so a real block copied into a later message stays words.
+  // One reader for the whole read: each folder's realpath is asked once.
   const readAttachments = attachmentReader(replay);
   return entries.map((entry): MessageEntry => {
     const message = (entry.message ?? {}) as {
@@ -2463,10 +2438,10 @@ const flattenTranscript = (
       };
     }
     /*
-     * The files an operator's message carried (A6 F9): bit's sealed block, which ends every
-     * message it sends, naming files in the session's own `uploads/` folder, taken out of the
-     * words. Steers the CLI took together are one entry holding a block per message (U13
-     * review 2), each read and taken off, so the entry reads as the live take does. Each file
+     * The files an operator's message carried (A6 F9): the path lines after its words,
+     * naming files in the session's own `uploads/` folder, taken out of the words. Steers the
+     * CLI took together are one entry, each message's lines before the next one's words (U13
+     * review 2), each run read and taken off, so the entry reads as the live take does. Each file
      * is typed by its stored name, not by the message's image blocks: the CLI re-encodes a
      * large image before storing it (measured: a 6.4 MiB PNG came back as `image/jpeg`), and
      * the blocks are not the lines one for one, so neither their types nor their order say
@@ -2546,9 +2521,7 @@ type ImageBlock = Extract<
  * The image blocks one prompt sends, read off disk. A file that cannot be read fails the
  * prompt before anything is sent.
  *
- * Read **before** the words are sealed ({@link userContent}), because reading yields and the
- * words name the codes of the messages still unanswered at the moment of the offer, which a
- * `result` arriving meanwhile would change.
+ * Read **before** anything about the session is touched, so an unreadable file sends nothing.
  */
 const imageBlocks = (
   attachments: readonly MessageAttachment[],
@@ -2574,10 +2547,11 @@ const imageBlocks = (
   );
 
 /**
- * The content one prompt sends: its words, already ending in bit's sealed block
- * (`harness/attachments.ts`'s `withClosingBlock`), after the image blocks when there are any.
+ * The content one prompt sends: its words, already ending in one path line per file
+ * (`harness/attachments.ts`'s `withAttachmentLines`), after the image blocks when there are
+ * any.
  *
- * Every file gets its path line in the block; an image also goes inline, as a base64 block
+ * Every file gets its path line; an image also goes inline, as a base64 block
  * **before** the text, the order the Messages API documents for an image the text then talks
  * about.
  *
@@ -2761,27 +2735,13 @@ const answer = (record: SessionRecord, message: SDKMessage): void => {
   const named = answeredUuids(message);
   if (named !== undefined) {
     record.stamped = true;
-    for (const uuid of named) {
-      record.unanswered.delete(uuid);
-      record.blockCodes.delete(uuid);
-    }
+    for (const uuid of named) record.unanswered.delete(uuid);
     return;
   }
   if (record.stamped) return;
   const oldest = record.unanswered.values().next();
-  if (oldest.done !== true) {
-    record.unanswered.delete(oldest.value);
-    record.blockCodes.delete(oldest.value);
-  }
+  if (oldest.done !== true) record.unanswered.delete(oldest.value);
 };
-
-/**
- * The codes a new operator message's header names as bit's: the blocks of the messages
- * this session has accepted and not answered, oldest first ({@link SessionRecord.blockCodes}).
- */
-const pendingCodes = (record: SessionRecord): readonly string[] => [
-  ...record.blockCodes.values(),
-];
 
 /** A turn is running on this session's query, or one it accepted is still to answer. */
 const sessionRunning = (record: SessionRecord): boolean =>
@@ -2837,7 +2797,6 @@ export const claudeCodeHarness = (
     Effect.gen(function* () {
       const sdk = options.sdk ?? liveClaudeCodeSdk;
       const defaultModel = options.defaultModel ?? CLAUDE_CODE_DEFAULT_MODEL;
-      const attachmentKey = options.attachmentKey ?? ephemeralAttachmentKey();
       const controlTimeout = options.controlTimeout ?? DEFAULT_CONTROL_TIMEOUT;
       const cliStopBounds = options.cliStopBounds ?? DEFAULT_CLI_STOP_BOUNDS;
       const cliTreeRefresh = options.cliTreeRefresh ?? DEFAULT_CLI_TREE_REFRESH;
@@ -3409,8 +3368,6 @@ export const claudeCodeHarness = (
       const launch = (
         record: SessionRecord,
         content: UserContent,
-        /** The opening prompt's block code ({@link SessionRecord.blockCodes}). */
-        mark: string,
       ): Effect.Effect<void, HarnessTransportError> =>
         Effect.gen(function* () {
           const released = Promise.withResolvers<void>();
@@ -3436,7 +3393,6 @@ export const claudeCodeHarness = (
           // that `unanswered` is true from the moment anything can be read from it.
           const opening = crypto.randomUUID();
           record.unanswered.add(opening);
-          record.blockCodes.set(opening, mark);
           record.offer(userMessage(record, content, opening, undefined));
 
           const input = async function* (): AsyncGenerator<SDKUserMessage> {
@@ -3647,7 +3603,6 @@ export const claudeCodeHarness = (
           idle,
           ended: yield* Deferred.make<void>(),
           unanswered: new Set<string>(),
-          blockCodes: new Map<string, string>(),
           untaken: new Map<string, string>(),
           takenTogether: new Map<string, readonly string[]>(),
           sentNow: new Set<string>(),
@@ -3975,34 +3930,16 @@ export const claudeCodeHarness = (
        */
       const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
         "claudeCodeHarness.prompt",
-      )(function* (sessionId, text, delivery = OPEN_PROMPT, operator) {
+      )(function* (sessionId, text, delivery = OPEN_PROMPT, files) {
         const record = yield* recordFor("session.prompt", sessionId);
         // Read before any state is touched, so an unreadable file sends nothing.
-        const images = yield* imageBlocks(operator?.attachments ?? []);
-        const mark = attachmentMark();
-        /**
-         * The words and their sealed block, built **synchronously** where they are offered:
-         * an operator message's header names the codes still unanswered at that moment
-         * ({@link pendingCodes}), and a `result` between building and offering would make
-         * the list name a code whose turn has completed.
-         */
-        const contentNow = (): UserContent =>
-          userContent(
-            withClosingBlock(
-              text,
-              operator === undefined
-                ? BRIEFING
-                : {
-                    _tag: "operator",
-                    attachments: operator.attachments,
-                    uploads: operator.uploadsFolder,
-                    pending: pendingCodes(record),
-                  },
-              { key: attachmentKey, sessionId },
-              mark,
-            ),
-            images,
-          );
+        const images = yield* imageBlocks(files?.attachments ?? []);
+        const content = userContent(
+          files === undefined
+            ? text
+            : withAttachmentLines(text, files.attachments, files.uploadsFolder),
+          images,
+        );
         if (delivery._tag === "open") {
           // Ended before it was ever prompted: launching would start a CLI for a session
           // whose authority is already over.
@@ -4019,7 +3956,7 @@ export const claudeCodeHarness = (
               `session ${sessionId} has already been prompted; carrying work on means a new attempt identity`,
             );
           }
-          yield* launch(record, contentNow(), mark);
+          yield* launch(record, content);
           return { delivered: true };
         }
         if (record.query === undefined) {
@@ -4069,9 +4006,7 @@ export const claudeCodeHarness = (
         }
         record.deliveredIds.add(delivery.messageId);
         const uuid = claudeCodeMessageId(delivery.messageId);
-        const content = contentNow();
         record.unanswered.add(uuid);
-        record.blockCodes.set(uuid, mark);
         record.untaken.set(uuid, delivery.messageId);
         if (delivery.urgency === "preemptive") record.sentNow.add(uuid);
         offer(userMessage(record, content, uuid, delivery));
@@ -4489,10 +4424,7 @@ export const claudeCodeHarness = (
          */
         return flattenTranscript(
           kept,
-          {
-            uploadsFolder: read?.uploadsFolder,
-            sealing: { key: attachmentKey, sessionId },
-          },
+          { uploadsFolder: read?.uploadsFolder },
           storedSteers(
             record?.deliveredIds ?? [],
             record?.takenTogether ?? new Map(),
