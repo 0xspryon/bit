@@ -94,6 +94,7 @@ import {
   type ChatGroup,
   type RoundProse,
 } from "./chat";
+import { parkedMark, parkedStart, type ParkedMessage } from "./importerParked";
 import { proseRuns } from "./markdown";
 
 /**
@@ -348,17 +349,6 @@ export interface ImporterSession {
    * a message to it opens a fresh session, and the server says so.
    */
   readonly ended?: boolean;
-  /**
-   * A message sent from this session that the server refused **after the operator had
-   * left it** — opened another session, or started a new one, while it was out (U8 review
-   * 3) — and the server's sentence. The draft is the page's, not the session's, so the
-   * words are nowhere else: they go back into the composer when the session is opened
-   * again, beside the refusal, and the session is listed meanwhile even if nothing was said
-   * in it ({@link sessionLabel}'s "Not sent"). Only set when the session on screen could
-   * not take them back itself: its own draft was not empty. `undefined` once given back.
-   */
-  readonly unsent?:
-    { readonly text: string; readonly detail: string } | undefined;
   /**
    * The agent this session runs as (`AgentView.id`). On a session the server lists, the one
    * its row pinned at the first message. On the page's own empty session, the one the
@@ -1518,19 +1508,21 @@ export const sessionWhen = (at: number, now: number): string => {
 
 /**
  * A session's name (S9, D5): the harness's title, or — where the harness has none to give —
- * "Session 18:02" from bit's own clock, and "New session" before a word is said — or "Not
- * sent" once a first message from it was refused while the operator was elsewhere
- * ({@link ImporterSession.unsent}).
+ * "Session 18:02" from bit's own clock, and "New session" before a word is said — or, for
+ * the page's own session whose first message's words are parked on it (`importerParked.ts`),
+ * "Not sent" or "Not confirmed" ({@link parkedMark}). A session with words of its own keeps
+ * its name, and its row is marked beside it.
  *
  * The date is never replaced, only moved: under a title it is the picker row's subtitle and
  * the tooltip's second half ({@link sessionHover}), so a session the harness has forgotten,
  * or two the harness named alike, are still told apart.
  */
 export const sessionLabel = (
-  session: Pick<ImporterSession, "startedAt" | "tally" | "title" | "unsent">,
+  session: Pick<ImporterSession, "startedAt" | "tally" | "title">,
+  parked?: Pick<ParkedMessage, "outcome">,
 ): string => {
   if (session.tally.messages === 0) {
-    return session.unsent === undefined ? "New session" : "Not sent";
+    return parked === undefined ? "New session" : parkedMark(parked);
   }
   const title = session.title?.trim() ?? "";
   if (title !== "") return title;
@@ -1546,30 +1538,43 @@ const FSI = "\u2068";
 const PDI = "\u2069";
 
 /**
+ * Untrusted text for a plain string bit's own words sit beside — a `title` attribute, a
+ * notice — isolated from them (U8 review): between FSI and PDI, every bidi control in it
+ * written out as its code point, prose's rule ({@link proseRuns}). A plain string has no
+ * element to isolate on, so a right-to-left override in it would reverse bit's words after
+ * it, and a PDI of its own would close the isolate early and let an override reach them.
+ */
+export const isolated = (text: string): string =>
+  `${FSI}${proseRuns(text)
+    .map((run) => run.text)
+    .join("")}${PDI}`;
+
+/**
  * The tooltip over a session's row and crumb: the whole name — the row cuts a long one at its
- * width — and when it started, which a title alone would hide.
+ * width — and when it started, which a title alone would hide; and, on a session holding
+ * parked words, the start of them, which tells two such rows apart.
  *
- * **The title is the harness's, so it is isolated from bit's words** (U8 review). A `title`
- * attribute is one plain string, laid out by the bidi algorithm with no element to isolate
- * on, so a right-to-left override in a title would reverse "started 5 Nov, 18:02" after it,
- * and right-to-left letters ending a title would pull the separator and the digits into
- * their run. The title goes between FSI and PDI, and every bidi control in it is written out
- * as its code point, prose's rule ({@link proseRuns}): a PDI of its own would otherwise close
- * the isolate early and let an override after it reach the date.
+ * **The title and the words are the harness's and the operator's, so each is isolated from
+ * bit's words** ({@link isolated}): a right-to-left override in a title would otherwise
+ * reverse "started 5 Nov, 18:02" after it, and right-to-left letters ending a title would
+ * pull the separator and the digits into their run.
  */
 export const sessionHover = (
-  session: Pick<ImporterSession, "startedAt" | "tally" | "title" | "unsent">,
+  session: Pick<ImporterSession, "startedAt" | "tally" | "title">,
   now: number,
+  parked?: Pick<ParkedMessage, "outcome" | "text">,
 ): string => {
   const when = sessionWhen(session.startedAt, now);
   const title = session.title?.trim() ?? "";
-  if (session.tally.messages === 0 || title === "") {
-    return `${sessionLabel(session)} · started ${when}`;
-  }
-  const shown = proseRuns(title)
-    .map((run) => run.text)
-    .join("");
-  return `${FSI}${shown}${PDI} · started ${when}`;
+  const name =
+    session.tally.messages === 0 || title === ""
+      ? sessionLabel(session, parked)
+      : isolated(title);
+  const words =
+    parked === undefined
+      ? ""
+      : ` · ${session.tally.messages === 0 ? "words" : parkedMark(parked)}: ${isolated(parkedStart(parked.text))}`;
+  return `${name} · started ${when}${words}`;
 };
 
 /**

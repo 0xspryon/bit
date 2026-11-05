@@ -40,6 +40,7 @@
     sessionWhen,
     tallyLine,
   } from "../importerChat";
+  import { parkedMark, parkedStart } from "../importerParked";
   import { navItems } from "../mock";
   import type { App } from "../app.svelte";
 
@@ -87,7 +88,7 @@
   let sessionRows = $derived(
     importer.listed.filter((session) =>
       matches(
-        `${session.title ?? ""} ${sessionWhen(session.startedAt, Date.now())} ${session.model}`,
+        `${sessionLabel(session, importer.parked[session.id])} ${sessionWhen(session.startedAt, Date.now())} ${session.model} ${importer.parked[session.id]?.text ?? ""}`,
         sessionQuery,
       ),
     ),
@@ -413,6 +414,7 @@
           <p class="group-label">Importer sessions · {app.selected?.name}</p>
           {#each sessionRows as session (session.id)}
             {@const current = session.id === importer.currentId}
+            {@const parked = importer.parked[session.id]}
             <!--
               D5's row: the name and the model it ended on, then what it wrote and when. The
               name is the harness's title (S9) — agent-authored, so a plain label, isolated
@@ -422,7 +424,7 @@
             <button
               class="option session-row"
               aria-current={current}
-              title={sessionHover(session, Date.now())}
+              title={sessionHover(session, Date.now(), parked)}
               onclick={() => importer.open(session.id)}
             >
               <span class="check" aria-hidden="true">
@@ -430,9 +432,11 @@
               </span>
               <span class="option-main">
                 <span class="session-line session-head">
-                  <span class="session-name">{sessionLabel(session)}</span>
+                  <span class="session-name"
+                    >{sessionLabel(session, parked)}</span
+                  >
                   <!--
-                    A "Not sent" row (nothing said, listed only for the refused words it
+                    A "Not sent" row (nothing said, listed only for the parked words it
                     holds) opened nothing on any model, and its `model` is the empty page's
                     placeholder rather than the chip's pick: no model is shown.
                   -->
@@ -448,6 +452,23 @@
                     >{sessionWhen(session.startedAt, Date.now())}</span
                   >
                 </span>
+                <!--
+                  Parked words (U8 review 4): marked on a session with a name of its own,
+                  whose label does not say so, and quoted on every such row, so two rows
+                  holding some are told apart. The operator's words, isolated as a title is.
+                -->
+                {#if parked !== undefined}
+                  <span class="session-line session-parked">
+                    {#if session.tally.messages !== 0}
+                      <span class="parked-mark">{parkedMark(parked)}</span>
+                    {/if}
+                    <span class="parked-words"
+                      >“<span class="parked-text"
+                        >{parkedStart(parked.text)}</span
+                      >”</span
+                    >
+                  </span>
+                {/if}
               </span>
             </button>
           {:else}
@@ -678,6 +699,26 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .session-parked {
+    justify-content: flex-start;
+    gap: 8px;
+  }
+  .parked-mark {
+    flex: none;
+    color: var(--state-fg-warning);
+    font: 500 11px/16px var(--font-sans);
+  }
+  .parked-words {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-muted);
+    font: 400 11px/16px var(--font-sans);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .parked-text {
+    unicode-bidi: isolate;
   }
   .session-tally {
     min-width: 0;

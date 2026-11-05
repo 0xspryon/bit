@@ -853,43 +853,357 @@ describe("the composer posts to the server", () => {
     return { app, fake, release, fresh: app.importer.currentId };
   };
 
+  const refusal = () =>
+    refused(
+      new ImporterConversationRefused({
+        reason: "harness_unreachable",
+        detail: "the harness would not take the message",
+      }),
+    );
+
+  /** The picker's rows, as the text each reads. */
+  const rows = async (app: App): Promise<string[]> => {
+    app.importer.pickerOpen = true;
+    await settle();
+    const found = [
+      ...document.querySelectorAll<HTMLButtonElement>("button.session-row"),
+    ].map((each) => (each.textContent ?? "").replace(/\s+/g, " ").trim());
+    app.importer.pickerOpen = false;
+    await settle();
+    return found;
+  };
+
   test("a first message refused after Start a new session comes back in the new thread's box, with why (U8 review 3)", async () => {
     const { app, fake, release, fresh } = await sendThenStart();
-    fake.onOpenImporterConversation = () => unreachable("no route");
+    fake.onOpenImporterConversation = refusal;
     release();
     await settle();
 
     expect(app.importer.currentId).toBe(fresh);
     expect(composer().value).toBe("Read https://hackerone.com/acme/policy");
     expect(text()).toContain("Your last message was not sent");
-    expect(text()).toContain("No server answered at this address.");
+    expect(text()).toContain("the harness would not take the message");
+    expect(app.importer.parked).toEqual({});
   });
 
   test("…and once the new thread has words of its own, they stay, and the refused ones wait on their session (U8 review 3)", async () => {
     const { app, fake, release, fresh } = await sendThenStart();
     typeInto(composer(), "Something else entirely");
     await settle();
-    fake.onOpenImporterConversation = () => unreachable("no route");
+    fake.onOpenImporterConversation = refusal;
     release();
     await settle();
 
     expect(app.importer.currentId).toBe(fresh);
     expect(composer().value).toBe("Something else entirely");
-    expect(text()).toContain("kept on “Not sent” in the session list");
+    expect(text()).toContain(
+      "kept in this tab as “Not sent” in the session list",
+    );
     // Not the refusal itself: that would read as being about the draft beneath it.
-    expect(text()).not.toContain("No server answered at this address.");
+    expect(text()).not.toContain("the harness would not take the message");
     app.importer.pickerOpen = true;
     await settle();
-    // Nothing was opened on any model, so the row names none.
+    // Nothing was opened on any model, so the row names none; it quotes the words instead.
     expect(button("Not sent").querySelector(".session-model")).toBeNull();
+    expect(button("Not sent").textContent).toContain(
+      "“Read https://hackerone.com/acme/policy”",
+    );
     click(button("Not sent"));
     await settle();
     expect(composer().value).toBe("Read https://hackerone.com/acme/policy");
-    expect(text()).toContain("No server answered at this address.");
+    expect(text()).toContain("the harness would not take the message");
     // Given back, it is the empty thread again, and the list no longer offers it.
     app.importer.pickerOpen = true;
     await settle();
     expect(hasButton("Not sent")).toBe(false);
+  });
+
+  test("a first message with no answer is not called 'not sent': it is 'Not confirmed', and sending it again is said to risk a second session (U8 review 4)", async () => {
+    const { app, fake, release } = await sendThenStart();
+    typeInto(composer(), "Something else entirely");
+    await settle();
+    fake.onOpenImporterConversation = () => unreachable("connection reset");
+    release();
+    await settle();
+    await settle();
+
+    expect(text()).toContain("whether it was sent is not known");
+    expect(text()).toContain("as “Not confirmed” in the session list");
+    expect(text()).not.toContain("was not sent");
+    expect(hasButton("Not sent")).toBe(false);
+    // The list is read again once, to find a session holding the words: none does.
+    expect(
+      (await rows(app)).some((row) => row.startsWith("Not confirmed")),
+    ).toBe(true);
+    app.importer.pickerOpen = true;
+    await settle();
+    click(button("Not confirmed"));
+    await settle();
+    expect(composer().value).toBe("Read https://hackerone.com/acme/policy");
+    expect(text()).toContain("may open a second session for it");
+  });
+
+  /** The server's list once it has opened `ses_opened` for the first message. */
+  const openedAfterAll = (fake: FakeServer, words: string): void => {
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: [
+          importerSessionView({
+            sessionId: "ses_opened",
+            importId: "imp_opened",
+            harnessInstanceId: "claude-code",
+            openedAt: 1_700_000_300_000,
+            running: true,
+          }),
+          ...SESSIONS,
+        ],
+      });
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          items:
+            importId === "imp_opened"
+              ? [replayItem(0, "turn.operator", words)]
+              : [],
+        }),
+      );
+  };
+
+  test("a lost answer to a first message: once the list shows the session it opened, the page moves to it and keeps no copy (U8 review 4)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    app.importer.start();
+    await settle();
+    // The server opened the session and answered 202; the connection failed on the way back.
+    fake.onOpenImporterConversation = () => unreachable("connection reset");
+    openedAfterAll(fake, "Read https://hackerone.com/acme/policy");
+    await send("Read https://hackerone.com/acme/policy");
+    await settle();
+    await settle();
+
+    expect(app.importer.currentId).toBe("ses_opened");
+    expect(app.importer.becameId).toBe("ses_opened");
+    expect(composer().value).toBe("");
+    expect(text()).toContain("the server did open a session for that message");
+    expect(app.importer.parked).toEqual({});
+    expect(
+      (await rows(app)).some((row) => row.startsWith("Not confirmed")),
+    ).toBe(false);
+    // Once: the open was never sent again.
+    expect(fake.countOf("openImporterConversation")).toBe(1);
+  });
+
+  test("…and one parked while the operator was elsewhere is dropped, and the notice names the real session (U8 review 4)", async () => {
+    const { app, fake, release, fresh } = await sendThenStart();
+    typeInto(composer(), "Something else entirely");
+    await settle();
+    fake.onOpenImporterConversation = () => unreachable("connection reset");
+    openedAfterAll(fake, "Read https://hackerone.com/acme/policy");
+    release();
+    await settle();
+    await settle();
+
+    expect(app.importer.currentId).toBe(fresh);
+    expect(composer().value).toBe("Something else entirely");
+    expect(app.importer.parked).toEqual({});
+    expect(text()).toContain("did reach the server after all");
+    const listed = await rows(app);
+    expect(listed.some((row) => row.startsWith("Not confirmed"))).toBe(false);
+    expect(listed.some((row) => row.startsWith("Session"))).toBe(true);
+  });
+
+  test("a session that holds the same words but was there before is not taken for the lost one (U8 review 4)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    app.importer.start();
+    await settle();
+    fake.onOpenImporterConversation = () => unreachable("connection reset");
+    // The newest listed session already said these words; nothing new is listed.
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          items: [replayItem(0, "turn.operator", "Read the policy")],
+        }),
+      );
+    await send("Read the policy");
+    await settle();
+    await settle();
+
+    expect(app.importer.current?.importId).toBeUndefined();
+    expect(composer().value).toBe("Read the policy");
+    expect(text()).toContain("may open a second session for it");
+  });
+
+  test("a reply refused after the operator went to another session stays on its own session, marked, and named (U8 review 4)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    const release = fake.hold("sendImporterMessage");
+    fake.onSendImporterMessage = refusal;
+    await send("Also load the staging hosts");
+    expect(app.importer.sending).toBe(true);
+    // The operator moves to another conversation, whose box is empty, while it is out.
+    app.importer.open("ses_older");
+    await settle();
+    release();
+    await settle();
+
+    // Not into this conversation's box: it is a reply to another one.
+    expect(app.importer.currentId).toBe("ses_older");
+    expect(composer().value).toBe("");
+    expect(text()).toContain("Your last message was not sent");
+    expect(text()).toContain("marked “Not sent” in the session list");
+    // Named: the session's own label, isolated as a title is.
+    expect(text()).toMatch(/on \u2068Session \d\d:\d\d\u2069/u);
+    const marked = (await rows(app)).filter((row) =>
+      row.includes("Not sent “Also load the staging hosts”"),
+    );
+    expect(marked.length).toBe(1);
+    // The row keeps its name; the mark is part of what the button is called.
+    expect(marked[0]?.startsWith("Not sent")).toBe(false);
+    // A later reading of the index keeps it marked.
+    await app.loadImporterSessions("acme-corp");
+    await settle();
+    expect(
+      (await rows(app)).filter((row) =>
+        row.includes("Not sent “Also load the staging hosts”"),
+      ).length,
+    ).toBe(1);
+    // Opened, the words come back on their own session, with why.
+    app.importer.open("ses_newest");
+    await settle();
+    expect(composer().value).toBe("Also load the staging hosts");
+    expect(text()).toContain("the harness would not take the message");
+    expect(
+      (await rows(app)).some((row) => row.includes("“Also load the staging")),
+    ).toBe(false);
+  });
+
+  test("a reply refused after Start a new session does not go into the new thread's box: it is that conversation's (U8 review 4)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    const release = fake.hold("sendImporterMessage");
+    fake.onSendImporterMessage = refusal;
+    await send("Also load the staging hosts");
+    await startNewSession(app);
+    const fresh = app.importer.currentId;
+    release();
+    await settle();
+
+    expect(app.importer.currentId).toBe(fresh);
+    expect(composer().value).toBe("");
+    expect(text()).not.toContain("sending them opens a session here");
+    expect(app.importer.parked["ses_newest"]?.text).toBe(
+      "Also load the staging hosts",
+    );
+  });
+
+  test("a reply with no answer that did reach its session is found in its thread, and the box is cleared (U8 review 4)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    await settle();
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          items: [
+            replayItem(0, "turn.operator", "Also load the staging hosts"),
+          ],
+        }),
+      );
+    await send("Also load the staging hosts");
+    await settle();
+    await settle();
+
+    expect(app.importer.currentId).toBe("ses_newest");
+    expect(composer().value).toBe("");
+    expect(text()).toContain("that message did reach this session");
+    expect(fake.countOf("sendImporterMessage")).toBe(1);
+  });
+
+  test("parked words outlive a return to the page and a reload in the same tab, and Start a new session steps over them (U8 review 4)", async () => {
+    const { app, fake, release } = await sendThenStart();
+    typeInto(composer(), "Something else entirely");
+    await settle();
+    fake.onOpenImporterConversation = refusal;
+    release();
+    await settle();
+
+    // Back to the importer page, as Goals → Back does: the page starts afresh.
+    app.openImporter();
+    await settle();
+    expect((await rows(app)).some((row) => row.startsWith("Not sent"))).toBe(
+      true,
+    );
+    // Off the empty session, then Start: never onto the row holding the words.
+    app.importer.open("ses_older");
+    await settle();
+    app.importer.start();
+    await settle();
+    expect(app.importer.current?.tally.messages).toBe(0);
+    expect(app.importer.parked[app.importer.currentId]).toBeUndefined();
+    expect(composer().value).toBe("");
+
+    // A reload: a new page, the same tab's storage.
+    for (const each of mounted) each.destroy();
+    mounted = [];
+    const reloaded = await continueWith(new FakeServer());
+    reloaded.openImporter();
+    await settle();
+    reloaded.importer.pickerOpen = true;
+    await settle();
+    click(button("Not sent"));
+    await settle();
+    expect(composer().value).toBe("Read https://hackerone.com/acme/policy");
+    expect(text()).toContain("the harness would not take the message");
+
+    // Given back, they are no one's to keep: the next visit does not list them.
+    reloaded.openImporter();
+    await settle();
+    expect(
+      (await rows(reloaded)).some((row) => row.startsWith("Not sent")),
+    ).toBe(false);
+  });
+
+  test("two parked rows are told apart by their words (U8 review 4)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.onOpenImporterConversation = refusal;
+    for (const words of ["First program page", "Second program page"]) {
+      app.importer.start();
+      await settle();
+      const release = fake.hold("openImporterConversation");
+      await send(words);
+      app.importer.open("ses_older");
+      await settle();
+      typeInto(composer(), "busy");
+      await settle();
+      release();
+      await settle();
+      typeInto(composer(), "");
+      await settle();
+    }
+    const parked = (await rows(app)).filter((row) =>
+      row.startsWith("Not sent"),
+    );
+    expect(parked.length).toBe(2);
+    expect(parked.some((row) => row.includes("“First program page”"))).toBe(
+      true,
+    );
+    expect(parked.some((row) => row.includes("“Second program page”"))).toBe(
+      true,
+    );
   });
 
   test("a first message accepted after Start a new session says nothing on the new thread (U8 review 3)", async () => {

@@ -683,6 +683,26 @@ describe("a session's name (S9, U8)", () => {
     ).toBe(false);
   });
 
+  test("a session holding parked words quotes their start on hover, isolated, and the page's own one is named by them (U8 review 4)", () => {
+    const when = sessionWhen(AT, AT);
+    const words = {
+      outcome: "refused" as const,
+      text: "Also \u202Eload\n  the staging hosts",
+    };
+    expect(sessionHover(listed("Full policy sweep"), AT, words)).toBe(
+      `\u2068Full policy sweep\u2069 · started ${when} · Not sent: \u2068Also ⟨U+202E⟩load the staging hosts\u2069`,
+    );
+    const own = {
+      startedAt: AT,
+      tally: { in: 0, out: 0, assets: 0, messages: 0 as const },
+    };
+    expect(sessionLabel(own, { outcome: "unknown" })).toBe("Not confirmed");
+    expect(sessionLabel(own, { outcome: "refused" })).toBe("Not sent");
+    expect(sessionHover(own, AT, { ...words, outcome: "unknown" })).toBe(
+      `Not confirmed · started ${when} · words: \u2068Also ⟨U+202E⟩load the staging hosts\u2069`,
+    );
+  });
+
   test("falls back to its time where the harness has no title, or only whitespace", () => {
     for (const title of [null, "", "   "]) {
       const untitled = listed(title);

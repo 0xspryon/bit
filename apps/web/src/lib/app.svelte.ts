@@ -90,6 +90,7 @@ import {
   usableRemembered,
   type ModelMemory,
 } from "./importerModelMemory";
+import { browserParkedStore, type ParkedStore } from "./importerParked";
 import {
   ImporterSessions,
   type ImporterScenario,
@@ -373,10 +374,12 @@ export class App {
     client: ServerClient = server,
     countdown: Countdown = realCountdown,
     modelMemory: ModelMemory = browserModelMemory,
+    parkedStore: ParkedStore = browserParkedStore,
   ) {
     this.client = client;
     this.countdown = countdown;
     this.modelMemory = modelMemory;
+    this.parkedStore = parkedStore;
   }
 
   /**
@@ -385,6 +388,12 @@ export class App {
    * their own so one test's pick is not the next one's default.
    */
   readonly modelMemory: ModelMemory;
+
+  /**
+   * Where the importer keeps the words of messages that did not land, per target, in this
+   * tab (`importerParked.ts`). Handed in once, like {@link modelMemory}.
+   */
+  readonly parkedStore: ParkedStore;
 
   screen = $state<Screen>("connect");
   theme = $state<Theme>("dark");
@@ -2707,7 +2716,8 @@ export class App {
             : {}),
         };
       }
-      return { _tag: "refused", detail: "No server answered at this address." };
+      // Not a refusal: the server may have taken it before the answer was lost (U8 review 4).
+      return { _tag: "unanswered" };
     };
     return {
       open: async (text, agentId) => {
@@ -2834,7 +2844,12 @@ export class App {
         }
         return undefined;
       },
-      reread: () => void this.loadImporterSessions(targetId),
+      reread: () => this.loadImporterSessions(targetId),
+      parked: {
+        read: () => this.parkedStore.read(this.serverUrl, targetId),
+        write: (parked) =>
+          this.parkedStore.write(this.serverUrl, targetId, parked),
+      },
       harnessName: (instanceId) =>
         this.harnesses.find((entry) => entry.instanceId === instanceId)
           ?.displayName ?? instanceId,
