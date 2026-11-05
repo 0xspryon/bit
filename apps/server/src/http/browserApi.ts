@@ -2350,6 +2350,18 @@ const fleetHandlers = HttpApiBuilder.group(
        *
        * Nothing here touches the supervisor. Ending a goal records that it is over; a run
        * already going under it is left alone, and stopping one is `stopRun`'s job.
+       *
+       * **Its conversation is closed** (U13 review 3), once the end is recorded: an ended
+       * goal takes no further message (`GoalConversations.send` refuses it), so the goal
+       * agent's session held here — an idle CLI with its MCP servers, about 800 MB on Claude
+       * Code — would otherwise stay until the server stops. Closing ends that session and
+       * revokes its credential; the transcript stays the harness's and still replays. A
+       * turn still running is cut, as a Stop would: the goal it worked for is over.
+       *
+       * V2(chat): a goal the goal agent ends itself (`end_goal`, `mcp/goalTools.ts`) keeps
+       * its conversation until the server stops — the call comes from inside that
+       * session's own turn, and closing it there would cut the agent's reply to it. Proper
+       * V2: close it when that turn ends.
        */
       endGoal: Effect.fn(function* ({ params, payload }) {
         const row = yield* openableTarget(fleet, params.targetId);
@@ -2391,6 +2403,8 @@ const fleetHandlers = HttpApiBuilder.group(
             ),
           );
         }
+        // Idempotent, never fails, and a goal with no session held here closes nothing.
+        yield* conversations.close(params.goalId);
         return goalView(ended);
       }),
 

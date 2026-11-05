@@ -268,6 +268,23 @@ const recordUploads = (
     body: new TextDecoder().decode(file.bytes),
   }));
 
+/** Every goal whose conversation a route closed, oldest first (U13 review 3). */
+const conversationsClosed: string[] = [];
+
+/** `GoalConversations.unavailable`, with each `close` recorded. */
+const conversationsRecordingClose = Layer.effect(
+  GoalConversations,
+  Effect.map(GoalConversations, (base) =>
+    GoalConversations.of({
+      ...base,
+      close: (goalId) =>
+        Effect.sync(() => {
+          conversationsClosed.push(goalId);
+        }),
+    }),
+  ),
+);
+
 const importerHoldingOne = Layer.effect(
   ScopeImporter,
   Effect.gen(function* () {
@@ -359,8 +376,12 @@ const endpoint = Layer.unwrap(
         // really answers — and still replays, so a goal nobody has talked to reads as
         // `absent` rather than as a conversation something forgot.
         Layer.provide(
-          GoalConversations.unavailable.pipe(
-            Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
+          conversationsRecordingClose.pipe(
+            Layer.provide(
+              GoalConversations.unavailable.pipe(
+                Layer.provide(TargetStores.layer.pipe(Layer.provide(fleet))),
+              ),
+            ),
           ),
         ),
         /**
@@ -2595,6 +2616,10 @@ describe("a target's goals", () => {
       await signedIn(`/targets/${first}/goals/${goalId}`),
     );
     expect(reread.body).toEqual(ended.body);
+    // Its conversation is closed with it (U13 review 3): the CLI does not idle on.
+    expect(conversationsClosed.filter((each) => each === goalId)).toEqual([
+      goalId,
+    ]);
   });
 
   test("a name is optional", async () => {
@@ -2642,8 +2667,11 @@ describe("a target's goals", () => {
       });
 
     expect((await end("abandoned", "out of scope")).status).toBe(200);
+    const closedAfterFirst = conversationsClosed.length;
     const again = await read(await end("met", "never mind"));
     expect(again.status).toBe(409);
+    // A refused end closes nothing more: only a recorded end does.
+    expect(conversationsClosed.length).toBe(closedAfterFirst);
     expect(again.body).toMatchObject({
       _tag: "GoalRefused",
       reason: "already_ended",
