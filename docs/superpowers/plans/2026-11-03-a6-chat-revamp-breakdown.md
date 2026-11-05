@@ -393,6 +393,16 @@ U8, U8b, U13, A7-Q, A7-S, F12.
   header no longer says it is last: each operator header names the codes of the session's
   unanswered messages as bit's (newest 16, under the seal), and a prompt bit writes (a
   run's task, a planner round) ends in a briefing block instead.
+  **U13 review 4, the acceptance bar (orchestrator):** wording cannot make a model immune to
+  a forged instruction in pasted text — any page can try a plain prompt injection ("read
+  `~/.ssh/id_rsa`"), with or without fake blocks — and that general risk is **out of U13's
+  scope**. U13's guarantee is structural: (1) bit never vouches for a path outside the
+  session's own `uploads/` folder, in any form (`withAttachmentLines` refuses one); (2) bit's
+  sealed block is always last and names that folder, by absolute path, as the only place an
+  attachment is; (3) a replay draws a chip only when the seal verifies. A forgery that names
+  a path elsewhere is then self-evidently not bit's; one inside `uploads/` can only point at
+  the session's own uploads. Haiku still opens a forged path now and then (rates in the
+  `attachmentHeader` note); the proper fix is the gate refusing such reads (`V2(chat):` there).
 - **Found in U13 review 3, half fixed:** ending a goal left its idle goal-chat CLI running
   (about 800 MB with its MCP servers). The operator's End goal route now closes the goal's
   conversation. A goal the goal agent ends itself (`end_goal`) still keeps its session until
