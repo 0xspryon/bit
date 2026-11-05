@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { ConversationContext, LiveUsage } from "@bit/contracts";
-import { modelKey, sameModel } from "@bit/contracts";
+import { modelKey, sameModel, sameWindow } from "@bit/contracts";
 
 import {
   crumbFigure,
@@ -297,6 +297,22 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(other.categoriesAt).toBeNull();
     // Why there are none comes from the reading: not asked on this model yet.
     expect(other.missing).toBe("not_asked");
+    // One model in another window: the `[1m]` variant's free space is not the plain one's
+    // (U9 review 3). The same model's dated spelling is the same window.
+    const wider = (counted: string, window: string) =>
+      crumbMeter(
+        held(
+          { model: window },
+          { categories: { rows, measuredAt: 1_000, model: counted } },
+        ),
+        undefined,
+      ).categories;
+    expect(wider("claude-sonnet-5[1m]", "claude-sonnet-5")).toBeNull();
+    expect(wider("claude-sonnet-5", "claude-sonnet-5[1m]")).toBeNull();
+    expect(wider("claude-sonnet-5[1m]", "claude-sonnet-5[1M]")?.length).toBe(1);
+    expect(wider("claude-haiku-4-5-20251001", "claude-haiku-4-5")?.length).toBe(
+      1,
+    );
   });
 });
 
@@ -335,6 +351,16 @@ describe("one model, whatever the spelling (U9 review 2)", () => {
     expect(sameModel(undefined, undefined)).toBe(false);
     expect(sameModel("", "")).toBe(false);
   });
+
+  test("one window: the same model, and the same bracketed variant (U9 review 3)", () => {
+    expect(sameWindow("claude-sonnet-5[1m]", "claude-sonnet-5")).toBe(false);
+    expect(sameWindow("claude-sonnet-5[1m]", "Claude-Sonnet-5[1M]")).toBe(true);
+    expect(sameWindow("claude-haiku-4-5-20251001", "claude-haiku-4-5")).toBe(
+      true,
+    );
+    expect(sameWindow("claude-haiku-4-5", "claude-sonnet-5")).toBe(false);
+    expect(sameWindow(null, null)).toBe(false);
+  });
 });
 
 describe("the crumb bar's context meter footer (A6 U9)", () => {
@@ -347,6 +373,15 @@ describe("the crumb bar's context meter footer (A6 U9)", () => {
     expect(after("stop")).toBe("Read after the Stop");
     expect(after("switch")).toBe("Read after the model switch");
     expect(after("asked")).toBe("Read on opening this panel");
+    // The open meter's own count of a window it had no rows for, after a switch.
+    expect(
+      crumbSource(
+        crumbMeter(
+          held({ model: "claude-sonnet-5" }, { cause: "recount" }),
+          undefined,
+        ),
+      ),
+    ).toBe("Recounted for claude-sonnet-5");
     expect(after("opened")).toBe("Read on opening the session");
     expect(after(undefined)).toBe("Read on opening the session");
     const fromLive = crumbMeter(held({}, { cause: "turn" }), live());

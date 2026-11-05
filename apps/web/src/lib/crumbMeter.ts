@@ -25,7 +25,7 @@ import type {
   ContextReading,
   LiveUsage,
 } from "@bit/contracts";
-import { sameModel } from "@bit/contracts";
+import { sameModel, sameWindow } from "@bit/contracts";
 
 import type {
   ContextReadCause,
@@ -133,7 +133,7 @@ export const crumbMeter = (
       ? prior.used
       : null;
   // The newest count, only under a reading of the window it was counted on.
-  const categories = sameModel(context?.categories?.model, reading?.model)
+  const categories = sameWindow(context?.categories?.model, reading?.model)
     ? context?.categories
     : undefined;
   const at = liveNewer ? live.at : (reading?.measuredAt ?? null);
@@ -176,6 +176,10 @@ export const crumbSource = (meter: CrumbMeter): string => {
       return "Read after the model switch";
     case "asked":
       return "Read on opening this panel";
+    case "recount":
+      return meter.model === null || meter.model === ""
+        ? "Recounted after the model switch"
+        : `Recounted for ${meter.model}`;
     default:
       return "Read on opening the session";
   }

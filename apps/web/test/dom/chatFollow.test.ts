@@ -154,3 +154,33 @@ describe("A6 U5 review: following a reply while pinned", () => {
     expect(short()).toBe(500);
   });
 });
+
+describe("A6 U9 review 2: a scroll after the thread is torn down", () => {
+  test("a scroll event that reaches the list after unmount reads nothing it no longer holds", () => {
+    const target = document.body.appendChild(document.createElement("div"));
+    const chat = mount(FollowingChat, { target });
+    flushSync();
+    const box = target.querySelector("ol.groups");
+    if (!(box instanceof HTMLElement)) throw new Error("no scroll box");
+    const errors: string[] = [];
+    const onError = (event: ErrorEvent) => errors.push(String(event.message));
+    window.addEventListener("error", onError);
+    const realError = console.error;
+    console.error = (...args: unknown[]) =>
+      errors.push(args.map(String).join(" "));
+    try {
+      // `bind:this` clears the list on teardown, and Svelte leaves a plain element's
+      // listener attached: a scroll queued before the teardown still runs the handler.
+      void unmount(chat);
+      flushSync();
+      box.dispatchEvent(new Event("scroll"));
+    } catch (thrown) {
+      errors.push(String(thrown));
+    } finally {
+      window.removeEventListener("error", onError);
+      console.error = realError;
+      target.remove();
+    }
+    expect(errors.join("\n")).toBe("");
+  });
+});

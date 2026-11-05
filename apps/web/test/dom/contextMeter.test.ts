@@ -548,6 +548,57 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(said(panel())).not.toContain("Down from");
   });
 
+  test("repro (b): the meter opened between the new model's first call starting and its first frame is no baseline (U9 review 3)", async () => {
+    // Sonnet-5 at 36,070, switched to haiku-4-5, a message sent, the meter opened ~0.9 s in:
+    // haiku's call had started and `apiUsage` was still sonnet's call. The server labels the
+    // figure with the call it is of (`usedModel`), so the count's reading is sonnet's figure
+    // under haiku's window, and haiku's first frame, 27,624, is no drop from it.
+    let at = Date.now();
+    let answer = claudeReading({
+      model: "claude-sonnet-5",
+      used: 36_070,
+      window: 1_000_000,
+      measuredAt: at,
+    });
+    const { app, fake } = await openOn(
+      importerSessionView({ harnessInstanceId: "claude-code" }),
+      "claude-code",
+      (breakdown) => answer(breakdown),
+    );
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    answer = claudeReading({
+      used: 36_070,
+      usedModel: "claude-sonnet-5",
+      measuredAt: (at += 1_000),
+    });
+    expect(await app.importer.switchModel("claude-haiku-4-5", undefined)).toBe(
+      true,
+    );
+    await settle();
+    // The meter opened mid-call: the count comes back on haiku, over sonnet's last call.
+    answer = claudeReading({
+      used: 36_070,
+      usedModel: "claude-sonnet-5",
+      measuredAt: (at += 900),
+    });
+    click(meterButton());
+    await settle();
+    expect(said(panel())).toContain("36,070 of 200,000 tokens");
+    expect(dropOf(app)).toBeNull();
+    // Haiku's first frame lands.
+    fake.watch.send(callOn("claude-haiku-4-5-20251001", 27_624, (at += 600)));
+    await settle();
+    expect(said(meterButton())).toBe("27,624");
+    expect(dropOf(app)).toBeNull();
+    expect(said(panel())).not.toContain("Down from");
+    // …and the turn's end reading on haiku does not tell one either.
+    answer = claudeReading({ used: 27_950, measuredAt: at + 2_000 });
+    await app.importer.readContext("imp_1", false, "turn");
+    await settle();
+    expect(dropOf(app)).toBeNull();
+    expect(said(panel())).not.toContain("Down from");
+  });
+
   test("a real drop on one model is still told, live and read (U9 review 2)", async () => {
     let at = Date.now();
     let answer = claudeReading({ used: 60_000, measuredAt: at });
@@ -607,6 +658,10 @@ describe("the crumb bar's context meter (A6 U9)", () => {
       "Messages 3,331 <1%",
       "Free space 182,699 18%",
     ]);
+    // The re-count was the meter's own, not the operator opening it (U9 review 3).
+    expect(said(panel()?.querySelector(".when"))).toMatch(
+      /^Recounted for claude-sonnet-5, /,
+    );
     // The figure is haiku's last call, and the popover says so.
     expect(said(panel())).toContain(
       "Measured on claude-haiku-4-5-20251001's last call",
@@ -625,6 +680,7 @@ describe("the crumb bar's context meter (A6 U9)", () => {
 
   test("a count that keeps coming back on another model is asked again only once (U9 review 2)", async () => {
     let at = Date.now();
+    let counted = 0;
     // A harness whose rows are always haiku's, whatever window it reads: the guard holds.
     const answer = (breakdown: boolean): ConversationContext => {
       const base = claudeReading({
@@ -632,6 +688,12 @@ describe("the crumb bar's context meter (A6 U9)", () => {
         window: 1_000_000,
         measuredAt: (at += 1_000),
       })(breakdown);
+      // A hard stop, so a broken guard fails this test instead of running it forever (a
+      // removed guard grew the run to 790 MB): past five counts the harness answers none,
+      // which nothing re-asks.
+      if (breakdown && (counted += 1) > 5) {
+        return { ...base, breakdown: { _tag: "none", reason: "unanswered" } };
+      }
       return base.breakdown._tag === "categories"
         ? {
             ...base,

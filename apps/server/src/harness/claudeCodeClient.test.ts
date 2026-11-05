@@ -7884,6 +7884,40 @@ describe("how full a session's window is (A6 U9)", () => {
       uuid: crypto.randomUUID(),
     }) as unknown as SDKMessage;
 
+  /** A main-thread call's `message_start` on `model`, with the prompt side it was sent. */
+  const startOn = (model: string, id: string, cacheRead: number): SDKMessage =>
+    ({
+      type: "stream_event",
+      event: {
+        type: "message_start",
+        message: {
+          id,
+          model,
+          usage: {
+            input_tokens: 2,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cacheRead,
+            output_tokens: 1,
+          },
+        },
+      },
+      parent_tool_use_id: null,
+      session_id: "ignored",
+      uuid: crypto.randomUUID(),
+    }) as unknown as SDKMessage;
+
+  /**
+   * `apiUsage` for the call {@link callOn} / {@link startOn} sent with `cacheRead`: the same
+   * prompt side, and an output side that has grown since the frame (6 at the first frame,
+   * 324 at the end, measured), which is why the label is matched on the prompt side alone.
+   */
+  const apiOf = (cacheRead: number) => ({
+    input_tokens: 2,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: cacheRead,
+    output_tokens: 324,
+  });
+
   test("after a switch: the figure is the last call's model's, the window and rows the session's now (U9 review 2)", async () => {
     /*
      * Measured on CLI 2.1.310: right after `setModel(claude-haiku-4-5)` the answer reads
@@ -7896,10 +7930,15 @@ describe("how full a session's window is (A6 U9)", () => {
           callOn("claude-sonnet-5", "msg_sonnet", 24_000),
           result("s", "success"),
         ],
-        contextUsage: () => ({ ...FULL, model: "claude-haiku-4-5" }),
+        contextUsage: () => ({
+          ...FULL,
+          model: "claude-haiku-4-5",
+          apiUsage: apiOf(24_000),
+        }),
       },
       true,
     );
+    expect(answer.used).toBe(2 + 24_000 + 324);
     expect(answer.usedModel).toBe("claude-sonnet-5");
     expect(answer.model).toBe("claude-haiku-4-5");
     expect(
@@ -7912,36 +7951,84 @@ describe("how full a session's window is (A6 U9)", () => {
           callOn("claude-haiku-4-5-20251001", "msg_haiku", 24_000),
           result("s", "success"),
         ],
-        contextUsage: () => FULL,
+        contextUsage: () => ({ ...FULL, apiUsage: apiOf(24_000) }),
       },
       true,
     );
     expect(unnamed.usedModel).toBe("claude-haiku-4-5-20251001");
-    // A count asked while a call streams: its `message_start` already named the model.
-    const streaming = await reading(
-      {
-        messages: [
-          {
-            type: "stream_event",
-            event: {
-              type: "message_start",
-              message: { id: "msg_s", model: "claude-sonnet-5" },
-            },
-            parent_tool_use_id: null,
-            session_id: "ignored",
-            uuid: crypto.randomUUID(),
-          } as unknown as SDKMessage,
-          result("s", "success"),
-        ],
-        contextUsage: () => FULL,
-      },
-      false,
-    );
-    expect(streaming.usedModel).toBe("claude-sonnet-5");
     expect(unnamed.model).toBeUndefined();
     expect(
       unnamed.breakdown._tag === "categories" && unnamed.breakdown.model,
     ).toBe("claude-haiku-4-5");
+    // A figure no call this stream saw was sent with (a resumed session's, before its
+    // first call): nobody says whose it is.
+    const unseen = await reading(
+      {
+        messages: [
+          callOn("claude-sonnet-5", "msg_sonnet", 24_000),
+          result("s", "success"),
+        ],
+        contextUsage: () => ({ ...FULL, apiUsage: apiOf(19_000) }),
+      },
+      false,
+    );
+    expect(unseen.usedModel).toBeNull();
+  });
+
+  test("a count asked after the next call's `message_start` and before its first frame: still the call before's model (U9 review 3)", async () => {
+    /*
+     * Repro (b), live on CLI 2.1.310: sonnet-5 at 36,070, a switch to haiku-4-5, a send, and
+     * the meter opened ~0.9 s in. `message_start` had come; `apiUsage` moves only around the
+     * call's first `assistant` frame, so it was still sonnet's 36,070 — read as haiku's, and
+     * haiku's first figure, 27,624, then told a false drop. Here the stream holds haiku's
+     * `message_start` and no frame of it, and `apiUsage` is the sonnet call's.
+     */
+    const early = await reading(
+      {
+        messages: [
+          callOn("claude-sonnet-5", "msg_sonnet", 36_000),
+          startOn("claude-haiku-4-5-20251001", "msg_haiku", 27_500),
+          result("s", "success"),
+        ],
+        contextUsage: () => ({
+          ...FULL,
+          model: "claude-haiku-4-5",
+          apiUsage: apiOf(36_000),
+        }),
+      },
+      false,
+    );
+    expect(early.used).toBe(2 + 36_000 + 324);
+    expect(early.usedModel).toBe("claude-sonnet-5");
+    expect(early.model).toBe("claude-haiku-4-5");
+    // Once `apiUsage` has moved to haiku's call it is haiku's — even before this stream has
+    // read the call's first frame, because its `message_start` carried the same prompt side.
+    const moved = await reading(
+      {
+        messages: [
+          callOn("claude-sonnet-5", "msg_sonnet", 36_000),
+          startOn("claude-haiku-4-5-20251001", "msg_haiku", 27_500),
+          result("s", "success"),
+        ],
+        contextUsage: () => ({ ...FULL, apiUsage: apiOf(27_500) }),
+      },
+      false,
+    );
+    expect(moved.usedModel).toBe("claude-haiku-4-5-20251001");
+    // A Stop between the two (repro (a)): the turn's `result` comes, no frame of haiku's
+    // call ever does, and `apiUsage` stays sonnet's.
+    const stopped = await reading(
+      {
+        messages: [
+          callOn("claude-sonnet-5", "msg_sonnet", 34_000),
+          startOn("claude-haiku-4-5-20251001", "msg_haiku", 26_000),
+          result("s", "error_during_execution"),
+        ],
+        contextUsage: () => ({ ...FULL, apiUsage: apiOf(34_000) }),
+      },
+      false,
+    );
+    expect(stopped.usedModel).toBe("claude-sonnet-5");
   });
 });
 

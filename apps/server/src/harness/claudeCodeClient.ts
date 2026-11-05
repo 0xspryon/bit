@@ -382,15 +382,17 @@ export interface ClaudeContextUsage {
   /** The window of the session's model, for this account. */
   readonly maxTokens?: number;
   /**
-   * The last model call's exact usage, or `null` before any call — and after a
-   * compaction, until the next (measured: `/compact` left it `null`).
-   */
-  /**
    * The model the session is on now, in the catalogue's spelling (`claude-haiku-4-5`):
    * what {@link maxTokens} and the categories are of. **Not** {@link apiUsage}'s model,
-   * which stays the last call's after a switch until the next call.
+   * which stays the last call's after a switch until the next call's first `assistant`
+   * frame.
    */
   readonly model?: string;
+  /**
+   * The last model call's exact usage, or `null` before any call — and after a
+   * compaction, until the next (measured: `/compact` left it `null`). Names no model: the
+   * harness labels it by its prompt side ({@link SessionRecord.calls}).
+   */
   readonly apiUsage?: {
     readonly input_tokens: number;
     readonly output_tokens: number;
@@ -443,6 +445,49 @@ interface StreamedBlock {
 }
 
 /** Everything one session is, before and after it is running. */
+/** One main-thread call as {@link SessionRecord.calls} holds it. */
+interface CallSeen {
+  readonly id: string;
+  readonly promptTokens: number;
+  readonly model: string;
+}
+
+/** How many calls {@link SessionRecord.calls} keeps: `apiUsage` is only ever the last. */
+const CALLS_KEPT = 8;
+
+/** Records one main-thread call's prompt side and model, once per call. */
+const sawCall = (calls: CallSeen[], envelope: unknown): void => {
+  const message = envelope as { id?: unknown; usage?: unknown } | undefined;
+  const id = message?.id;
+  const model = modelOfMessage(message);
+  if (typeof id !== "string" || model === undefined) return;
+  if (message?.usage === undefined || message.usage === null) return;
+  const promptTokens = promptTokensOf(message.usage);
+  if (promptTokens <= 0) return;
+  const at = calls.findIndex((call) => call.id === id);
+  if (at !== -1) calls.splice(at, 1);
+  calls.push({ id, promptTokens, model });
+  if (calls.length > CALLS_KEPT) calls.splice(0, calls.length - CALLS_KEPT);
+};
+
+/**
+ * The model of the call `apiUsage` is the usage of ({@link SessionRecord.calls}), or `null`
+ * when no call this stream saw has its prompt side — or two of different models do.
+ */
+const modelOfApiUsage = (
+  calls: readonly CallSeen[],
+  api: CallUsage,
+): string | null => {
+  const prompt = promptTokensOf(api);
+  const models = new Set(
+    calls
+      .filter((call) => call.promptTokens === prompt)
+      .map((call) => call.model),
+  );
+  const [only] = models;
+  return models.size === 1 && only !== undefined ? only : null;
+};
+
 interface SessionRecord {
   readonly sessionId: string;
   readonly title: string;
@@ -681,19 +726,29 @@ interface SessionRecord {
    */
   lastCallId: string | undefined;
   /**
-   * The model of the last main-thread model call seen on this stream (`message.model`, as
-   * the API spells it: `claude-haiku-4-5-20251001`), or `undefined` before one (A6 U9
-   * review 2).
-   *
-   * **What labels `getContextUsage().apiUsage`**, which is the last call's usage and says
-   * nothing of its model: the answer's own `model` is the one the session is on now, and a
-   * switch moves it at once while `apiUsage` stays the old model's call until the next
-   * (measured, CLI 2.1.310: `model: claude-haiku-4-5` over sonnet-5's 24,663 right after a
-   * mid-call switch, and that sonnet call's last frame two seconds later). Set from a
-   * `message_start` as well as from the call's `assistant` frames, so a count asked while the
-   * call streams is labelled with it. Subagents' calls never set it ({@link fromSubagent}).
+   * The model of the call {@link lastCallId} names (`message.model`, as the API spells it:
+   * `claude-haiku-4-5-20251001`), or `undefined` before one (A6 U9 review 2): what the
+   * turn's `result` usage is labelled with. Set from the same `assistant` frame as that id,
+   * so the two always describe one call. Subagents' calls never set it ({@link fromSubagent}).
    */
   lastCallModel: string | undefined;
+  /**
+   * The main-thread calls this stream has seen, newest last, each as its prompt side and
+   * model: **what labels `getContextUsage().apiUsage`** (A6 U9 review 3), which is a call's
+   * usage and names no model.
+   *
+   * **Matched by figure, not by recency.** The answer's own `model` is the session's now, and
+   * `apiUsage` lags both a switch and the next call's start: it moves only around the call's
+   * first `assistant` frame, about 0.6 s after its `message_start` (measured, CLI 2.1.310),
+   * so labelling it with the newest call's model put a sonnet-5 figure under haiku-4-5 in
+   * that gap. Its prompt side — uncached input, cache write, cache read — is the call's from
+   * its `message_start` on and never moves; only its output side grows (6 at the first
+   * frame, 324 at the end, measured). So a figure is labelled with the call whose prompt side
+   * it equals, and with nothing when no call seen matches. Recorded from `message_start` and
+   * `assistant` frames alike: both carry that call's prompt side under its own model, and the
+   * earlier one covers an answer that has moved before this stream has read the frame.
+   */
+  calls: CallSeen[];
   /**
    * The main thread's block being streamed, from its `stream_event` frames (A6 F8).
    *
@@ -1641,6 +1696,7 @@ const narrate = (
     | "contextLimit"
     | "lastCallId"
     | "lastCallModel"
+    | "calls"
     | "streamed"
     | "subagents"
     | "interrupted"
@@ -1658,13 +1714,12 @@ const narrate = (
   // A stream frame narrates its delta or nothing — never `opaque`; see this function's
   // header. It carries no outcome: only a `result` does.
   if (message.type === "stream_event") {
-    // A main-thread call's model, as soon as it starts: what labels `apiUsage` mid-call.
-    if (
-      message.event.type === "message_start" &&
-      !fromSubagent(message) &&
-      modelOfMessage(message.event.message) !== undefined
-    ) {
-      session.lastCallModel = modelOfMessage(message.event.message);
+    // A main-thread call's prompt side and model, as soon as it starts: what a count asked
+    // once `apiUsage` has moved to it is labelled by ({@link SessionRecord.calls}). Not
+    // {@link SessionRecord.lastCallModel}: `apiUsage` is still the call before until this
+    // call's first `assistant` frame.
+    if (message.event.type === "message_start" && !fromSubagent(message)) {
+      sawCall(session.calls, message.event.message);
     }
     return narrateStreamEvent(message, session.streamed).map(frame);
   }
@@ -1780,6 +1835,7 @@ const narrate = (
       if (usage._tag === "usage" && usage.model !== undefined) {
         session.lastCallModel = usage.model;
       }
+      sawCall(session.calls, (message as { message?: unknown }).message);
       details.push(usage);
     }
   } else if (message.type === "result") {
@@ -3542,6 +3598,7 @@ export const claudeCodeHarness = (
           contextLimit: undefined,
           lastCallId: undefined,
           lastCallModel: undefined,
+          calls: [],
           streamed: { messageId: undefined, index: undefined, kind: undefined },
           subagents: new Map(),
           interrupted: false,
@@ -4270,9 +4327,11 @@ export const claudeCodeHarness = (
         if (api !== undefined && api !== null) {
           return {
             used: callTokens(api),
-            // `apiUsage` names no model: the last main-thread call this stream saw does.
-            // A session held since before its first call has seen every call it made.
-            usedModel: record?.lastCallModel ?? null,
+            // `apiUsage` names no model: the call this stream saw with its prompt side does
+            // ({@link SessionRecord.calls}). A session held since before its first call has
+            // seen every call it made; a resumed one's figure before its first is unlabelled.
+            usedModel:
+              record === undefined ? null : modelOfApiUsage(record.calls, api),
             ...(model === undefined ? {} : { model }),
             window,
             reading: "measured",

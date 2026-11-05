@@ -178,3 +178,24 @@ export const sameModel = (
   a !== "" &&
   b !== "" &&
   modelKey(a) === modelKey(b);
+
+/** A model id's bracketed variant (`[1m]`), lower case, or `""` without one. */
+const variantOf = (model: string): string =>
+  /\[[^\]]*\]$/.exec(model.trim().toLowerCase())?.[0] ?? "";
+
+/**
+ * Whether two model ids name one model **and one window** (A6 U9 review 3): {@link
+ * sameModel} with the bracketed variant kept. A `[1m]` variant counts with the same tokenizer
+ * — so its figures compare — but its window is another, and so are the free space and the
+ * reserve a count of it states. What a count's categories are shown under.
+ */
+export const sameWindow = (
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean =>
+  sameModel(a, b) &&
+  a !== null &&
+  a !== undefined &&
+  b !== null &&
+  b !== undefined &&
+  variantOf(a) === variantOf(b);

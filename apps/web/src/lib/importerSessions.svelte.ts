@@ -71,7 +71,7 @@ import type {
   ModelOptionSelection,
   SteerUrgency,
 } from "@bit/contracts";
-import { sameModel } from "@bit/contracts";
+import { sameModel, sameWindow } from "@bit/contracts";
 
 import type { ErrorNotice } from "./components/ErrorDialog.svelte";
 
@@ -325,9 +325,11 @@ export interface ImporterServer {
 /**
  * What made this tab read an import's context window (A6 U9), which is what the meter's
  * footer says of the reading: opening the session, a turn's end, a Stop settling, a model
- * switch, or the operator opening the meter (`asked`).
+ * switch, the operator opening the meter (`asked`), or the open meter counting a window its
+ * rows were not counted on (`recount`, after a switch here or in another tab).
  */
-export type ContextReadCause = "opened" | "turn" | "stop" | "switch" | "asked";
+export type ContextReadCause =
+  "opened" | "turn" | "stop" | "switch" | "asked" | "recount";
 
 /**
  * What this tab holds of one import's context window (A6 U9): the server's latest reading,
@@ -1929,10 +1931,11 @@ export class ImporterSessions {
     if (held === undefined) return;
     const { breakdown, model } = held.reading;
     if (breakdown._tag === "none" && breakdown.reason !== "not_asked") return;
-    if (sameModel(held.categories?.model, model)) return;
+    if (sameWindow(held.categories?.model, model)) return;
     if (this.#recountedFor.get(importId) === model) return;
     this.#recountedFor.set(importId, model);
-    void this.#countBreakdown(server, importId, "asked");
+    // Not `asked`: the operator opened nothing, and the footer says so (U9 review 3).
+    void this.#countBreakdown(server, importId, "recount");
   }
 
   /**
