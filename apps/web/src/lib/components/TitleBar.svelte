@@ -429,9 +429,11 @@
                 {#if current}<IconCheck width="13" height="13" />{/if}
               </span>
               <span class="option-main">
-                <span class="session-line">
+                <span class="session-line session-head">
                   <span class="session-name">{sessionLabel(session)}</span>
-                  <span class="session-model">{session.model}</span>
+                  <span class="session-model" title={session.model}
+                    >{session.model}</span
+                  >
                 </span>
                 <span class="session-line">
                   <span class="session-tally">{tallyLine(session.tally)}</span>
@@ -615,7 +617,10 @@
     max-width: 260px;
     unicode-bidi: isolate;
   }
-  /* D5: two lines, each a label on the left and a mono figure on the right. */
+  /*
+   * D5: two lines. The first is the name with the model right after it; the second is what
+   * the session wrote on the left and when it started on the right.
+   */
   .session-row .option-main {
     gap: 3px;
   }
@@ -626,7 +631,18 @@
     gap: 12px;
     min-width: 0;
   }
+  /*
+   * The name is what the operator scans for, so it keeps most of the width: when the two do
+   * not fit, both truncate, the model four times as fast for its width. An OpenCode model
+   * id (`zai-coding-plan/glm-5.3-flash`, ~190 px) would otherwise leave the name a third
+   * of the row. The model's whole id is its own tooltip.
+   */
+  .session-head {
+    justify-content: flex-start;
+    gap: 8px;
+  }
   .session-name {
+    flex: 0 1 auto;
     min-width: 0;
     overflow: hidden;
     color: var(--text-base);
@@ -643,6 +659,13 @@
     flex: none;
     color: var(--text-faint);
     font: 400 11px/16px var(--font-mono);
+  }
+  .session-model {
+    flex: 0 4 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .session-tally {
     min-width: 0;
