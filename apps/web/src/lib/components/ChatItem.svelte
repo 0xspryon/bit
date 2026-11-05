@@ -56,6 +56,7 @@
     type WriteState,
   } from "../chat";
   import { IconAngleRight, IconClock } from "../icons";
+  import AttachmentChips from "./AttachmentChips.svelte";
   import Markdown from "./Markdown.svelte";
   import MarkedText from "./MarkedText.svelte";
   import StreamCursor from "./StreamCursor.svelte";
@@ -501,6 +502,16 @@
       request beneath it would be the same fact twice.
     -->
       <p class="body"><MarkedText text={summary} code /></p>
+    {/if}
+
+    {#if item.attachments !== undefined && item.attachments.length > 0}
+      <!--
+        The files an operator's message carried (A6 U13): live from the server's answer,
+        after a reload from the harness's transcript, each with a copy of its path.
+      -->
+      <div class="attached">
+        <AttachmentChips attachments={item.attachments} />
+      </div>
     {/if}
 
     {#if item.kind === SUBAGENT_KIND}
@@ -1000,5 +1011,8 @@
     line-height: 16px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+  .attached {
+    margin: 6px 0 0;
   }
 </style>

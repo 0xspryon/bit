@@ -12,6 +12,7 @@ import {
   rmSync,
   symlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -332,6 +333,41 @@ describe("storing a message's files", () => {
     expect(readdirSync(join(directory, "uploads"))).toEqual([]);
   });
 
+  test("a write that fails part-way leaves no temporary behind, and nothing stored before it (U13)", async () => {
+    const directory = sessionDirectory();
+    let calls = 0;
+    const result = await Effect.runPromise(
+      Effect.result(
+        storeUploads(
+          directory,
+          [file("first.txt", "stored whole"), file("second.txt", "0123456789")],
+          {
+            // The first file writes whole; the second gets four bytes on disk and then
+            // the disk is full — a partial temporary, in no list yet.
+            write: (handle, bytes, at) => {
+              calls += 1;
+              if (calls === 1) return writeSync(handle, bytes, at);
+              if (calls === 2) return writeSync(handle, bytes, at, 4);
+              throw Object.assign(
+                new Error("ENOSPC: no space left on device"),
+                {
+                  code: "ENOSPC",
+                },
+              );
+            },
+          },
+        ),
+      ),
+    );
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(result.failure.message).toContain("ENOSPC");
+    }
+    expect(calls).toBe(3);
+    // No `.incoming-…` partial, and the first file undone with it: all or none.
+    expect(readdirSync(join(directory, "uploads"))).toEqual([]);
+  });
+
   test("a link planted at uploads/ is refused, and nothing lands where it points", async () => {
     const directory = sessionDirectory();
     const elsewhere = mkdtempSync(join(tmpdir(), "bit-uploads-elsewhere-"));
@@ -386,6 +422,42 @@ describe("the folder swapped for a link while files are being stored", () => {
     } finally {
       rmSync(elsewhere, { recursive: true, force: true });
     }
+  });
+
+  test("a real folder swapped in with a file at the temporary's name: only the file check refuses it (U13)", async () => {
+    const directory = sessionDirectory();
+    let decoy = "";
+    const result = await Effect.runPromise(
+      Effect.result(
+        storeUploads(directory, [file("a.txt", "secret bytes")], {
+          // Not a link: a real folder at the same path, holding a file under the very name
+          // the temporary has. The path still resolves to `<uploads>/<temporary>` — the
+          // realpath half of the check passes — and only its device and inode say it is not
+          // the file this call opened.
+          afterOpen: (temporary) => {
+            renameSync(
+              join(directory, "uploads"),
+              join(directory, "uploads-real"),
+            );
+            mkdirSync(join(directory, "uploads"));
+            decoy = join(directory, "uploads", basename(temporary));
+            writeFileSync(decoy, "the agent's own bytes");
+          },
+        }),
+      ),
+    );
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      // Refused before the write, naming the temporary: without the device-and-inode half
+      // the store would write, link and fail only at the stored name's check.
+      expect(result.failure.message).toContain(
+        join(directory, "uploads", ".incoming-"),
+      );
+      expect(result.failure.message).not.toContain("a.txt");
+    }
+    // Nothing written into the held folder, and the decoy left exactly as the agent made it.
+    expect(readdirSync(join(directory, "uploads-real"))).toEqual([]);
+    expect(readFileSync(decoy, "utf8")).toBe("the agent's own bytes");
   });
 
   test("after the write: a name linked where the link points is undone, and no path outside is handed on", async () => {

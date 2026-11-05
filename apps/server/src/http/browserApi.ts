@@ -47,6 +47,7 @@ import {
   IntentRefused,
   MESSAGE_FIELD,
   MessageUploadRefused,
+  UploadedFileRefused,
   RoundNotFound,
   RunRefused,
   ScopeImportNotFound,
@@ -137,7 +138,6 @@ import { importSessionAgent } from "../import/importerHistory";
 import { importerSessionTitles } from "../import/importerTitle";
 import { ScopeImporter } from "../import/scopeImporter";
 import { GoalConversations } from "../plan/goalConversation";
-import { collectUploads } from "../plan/goalUploads";
 import { PlanSupervisor } from "../plan/planSupervisor";
 import {
   GOAL_NARRATION_ROUND_LIMIT,
@@ -151,6 +151,7 @@ import { readTranscript } from "../run/transcript";
 import { PolicyDecisions } from "../policy/service";
 import {
   DEFAULT_UPLOAD_LIMITS,
+  readStoredUpload,
   readUploadParts,
   type ReadUpload,
   type UploadLimits,
@@ -192,8 +193,7 @@ export interface BrowserApiConfig {
   readonly goalBriefingMaxChars?: number | undefined;
   /**
    * The per-file ceiling on an attachment, in bytes. Defaults to 50 MiB
-   * (`upload/uploads.ts`'s `DEFAULT_UPLOAD_MAX_BYTES`), for a message's files and the goal
-   * attach route's alike.
+   * (`upload/uploads.ts`'s `DEFAULT_UPLOAD_MAX_BYTES`), for every message's files.
    *
    * Real configuration, like {@link goalBriefingMaxChars}: `main.ts` reads
    * `UPLOAD_MAX_BYTES` and passes it, and the refusal above it names this number so an
@@ -204,12 +204,7 @@ export interface BrowserApiConfig {
    */
   readonly uploadMaxBytes?: number | undefined;
   /**
-   * How many files one message may carry, and one goal hold through the attach route.
-   * Defaults to 100 (`DEFAULT_UPLOAD_MAX_FILES`).
-   *
-   * On the attach route, per goal rather than per request, which is the only reading that
-   * cannot be walked past — and a bound on the prompt there: every attached file is named
-   * in every message this goal's agent is sent.
+   * How many files one message may carry. Defaults to 100 (`DEFAULT_UPLOAD_MAX_FILES`).
    */
   readonly uploadMaxFiles?: number | undefined;
   /** The per-image ceiling, in bytes. Defaults to 10 MiB; never above {@link uploadMaxBytes}. */
@@ -1702,6 +1697,28 @@ const fleetHandlers = HttpApiBuilder.group(
         });
       }),
 
+      /**
+       * One stored upload's bytes, for an attachment a replay drew with its path only (A6
+       * U13). `readStoredUpload` re-derives the path inside this target's own directory and
+       * serves nothing it cannot: the path came out of a transcript, so it is a request,
+       * never an address. Read off disk once per request, under the per-file cap.
+       */
+      uploadedFile: Effect.fn(function* ({ params, query }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        const read = readStoredUpload(
+          fleet.paths.targetDirectory(row.targetId),
+          query.path,
+          uploadLimitsOf(config).maxFileBytes,
+        );
+        if (read._tag === "refused") {
+          return yield* new UploadedFileRefused({
+            reason: read.reason,
+            detail: read.detail,
+          });
+        }
+        return read.bytes;
+      }),
+
       importerMessages: Effect.fn(function* ({ params }) {
         const row = yield* openableTarget(fleet, params.targetId);
         /*
@@ -2787,72 +2804,6 @@ const fleetHandlers = HttpApiBuilder.group(
           ...(payload.modelOptions === undefined
             ? {}
             : { modelOptions: payload.modelOptions }),
-        });
-      }),
-
-      /**
-       * Attaches files to one goal, where its agent can read them.
-       *
-       * **The one route on this API whose body is not JSON.** It is `multipart/form-data`,
-       * and the `asMultipartStream` declaration on {@link GoalUploadDraft} means `payload`
-       * is the parser's own `Stream<Multipart.Part, MultipartError>` — **nothing has been
-       * read, and nothing is anywhere on disk, when this handler starts**. `collectUploads`
-       * below is the consumer, and it is hand-written because it has to be: the buffered
-       * `asMultipart` shape stages every part in a temporary directory and needs a real
-       * `FileSystem`, which this build has no implementation of, so it answers an empty
-       * `500`. That contract records the measurement. The shape this one forces is better
-       * anyway — the per-file cap stops the read instead of refusing bytes already written.
-       *
-       * **Everything the browser sent is input, not instruction.** There is no path in the
-       * request and none in the answer: the bytes go under
-       * `targets/<id>/goal/<goalId>/uploads/`, which {@link GoalConversations.attach}
-       * obtains through `gatedRoleDirectory` — gate first, path after — and which is
-       * deliberately not the engagement folder, because concurrent workers share that one
-       * (DECISIONS.md §24.2). The filename is checked against an allow-list and then again
-       * as a resolved absolute path; the content type is recorded and never read.
-       *
-       * **And the files themselves are untrusted input that an agent will read.** The goal
-       * agent opens these in a directory where it holds tools that write to the
-       * investigation's record, and a document that came off the system under test can
-       * contain text shaped like an instruction to it. Nothing on this seam can prevent
-       * that. What the server does is state the rule in the agent's framing —
-       * `plan/goalPrompt.ts`'s `GOAL_ATTACHMENT_RULE`, sent once — and name the files in a
-       * block above the delimiter on every turn that has any, which is also why the list is
-       * never spliced into the operator's own message. A filename is data too, and is
-       * checked against an allow-list on the way out of the directory as well as in.
-       *
-       * **Both caps are enforced twice, on this side both times, and the two are different
-       * questions.** `collectUploads` below bounds what is *read* — the count stops the
-       * parser and the byte cap stops a part's content stream — so a hostile body cannot
-       * fill memory. {@link GoalConversations.attach} then bounds what is *stored*, with
-       * the count measured against the whole goal rather than this request. This handler's
-       * part is to pass the configured figures to both.
-       */
-      uploadGoalFiles: Effect.fn(function* ({ params, payload }) {
-        const row = yield* openableTarget(fleet, params.targetId);
-        yield* ownedGoal(stores, row.targetId, params.goalId);
-        const limits = uploadLimitsOf(config);
-        const maxBytes = limits.maxFileBytes;
-        const maxFiles = limits.maxFiles;
-        /*
-         * The body, read here and bounded while it is read.
-         *
-         * The goal is checked **first**, above, so a request aimed at a goal this target
-         * does not hold is a 404 before a byte of its body is consumed. Only then is the
-         * parser's stream drained, with both caps applied as it goes.
-         */
-        const files = yield* collectUploads(payload, {
-          maxBytes,
-          maxFiles,
-          maxImageBytes: limits.maxImageBytes,
-          maxTotalBytes: limits.maxTotalBytes,
-        });
-        return yield* conversations.attach({
-          targetId: row.targetId,
-          goalId: params.goalId,
-          files,
-          maxBytes,
-          maxFiles,
         });
       }),
 

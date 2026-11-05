@@ -77,6 +77,7 @@ import {
   type ImporterConversationView,
   type ImporterSessionView,
   type LiveItem,
+  type MessageAttachmentView,
   type ModelOptionSelection,
 } from "@bit/contracts";
 
@@ -107,6 +108,11 @@ import { proseRuns } from "./markdown";
 export interface ImporterTurn {
   /** The operator's words, or `null` on the "earlier in this session" group. */
   readonly message: string | null;
+  /**
+   * The files the message carried (A6 U13): the server's answer's while it is this tab's,
+   * the transcript's after a reload. Absent, or empty, on a message with none.
+   */
+  readonly attachments?: readonly MessageAttachmentView[];
   /** Which operator message this is, from one. `null` on the leading group. */
   readonly number: number | null;
   /**
@@ -1395,6 +1401,9 @@ export const buildImporterChat = (
       key: `turn:${String(number)}`,
       subject: {
         message: turn.operator.body,
+        ...(turn.operator.attachments === undefined
+          ? {}
+          : { attachments: turn.operator.attachments }),
         number,
         at: turn.operator.at,
         working,

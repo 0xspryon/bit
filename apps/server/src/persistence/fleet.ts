@@ -78,10 +78,6 @@ import { mkdirSync } from "node:fs";
 import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import { SqlClient, SqlSchema } from "effect/sql";
 
-// Type-only, and mutually so: `policy/install.ts` imports `UngatedRoleDirectory` from here
-// the same way. Neither module reaches the other at runtime, and this one still knows no
-// harness; see {@link FleetStore.ensureGoalUploads} for why the brand is asked for.
-import type { GatedDirectory } from "../policy/install";
 import { migrateControl } from "./controlMigrations";
 import { migrate } from "./migrations";
 import { ObservationStore } from "./store";
@@ -101,16 +97,6 @@ export const PLANNING_DIRECTORY = "planning";
 export const GOAL_DIRECTORY = "goal";
 /** Holds one directory per scope import; see {@link FleetPaths.importDirectory}. */
 export const IMPORT_DIRECTORY = "import";
-/**
- * Where a goal conversation's attachments go, **inside** that goal's own directory.
- *
- * Inside rather than beside, and that is the whole point: the goal agent's session runs in
- * `goal/<goal-id>/`, so a file put here is one it can already read with the tools it has,
- * with no path handed to it and nothing else gaining access. The engagement folder is the
- * place it is deliberately *not* — see {@link FleetPaths.goalUploadsDirectory}.
- */
-export const UPLOADS_DIRECTORY = "uploads";
-
 /**
  * Whether a string may be used as a target id.
  *
@@ -227,29 +213,6 @@ export interface FleetPaths {
    */
   readonly goalDirectory: (targetId: string, goalId: string) => string;
   /**
-   * Where files the operator attached to one goal's conversation are kept.
-   *
-   * `goal/<goal-id>/uploads/`, and the nesting is deliberate twice over.
-   *
-   * **Inside the goal's directory**, because that is the directory the goal agent's
-   * session runs in: a file here is readable by the one agent the operator is talking to,
-   * through the tools it already has, with no path passed to it and no second grant.
-   *
-   * **Never inside the engagement folder**, which is the rule this path exists to keep.
-   * Concurrent worker attempts on one target share `workspace/` (DECISIONS.md §24.2,
-   * caveat 2), so an attachment dropped there would be readable by every worker on the
-   * target — and a worker silently acquiring the operator's documents is not something
-   * attaching a file to a conversation asks for. `gatedRoleDirectory` refuses a goal
-   * directory inside the workspace, so this path inherits that refusal rather than
-   * restating it.
-   *
-   * A **path**, not an authority: it is below a role directory, so it must only ever be
-   * written to after that role directory has been through `gatedRoleDirectory`. The one
-   * function here that creates it, {@link FleetStore.ensureGoalUploads}, takes the gated
-   * path as its argument for exactly that reason.
-   */
-  readonly goalUploadsDirectory: (targetId: string, goalId: string) => string;
-  /**
    * The directory one scope import runs in.
    *
    * A fourth sibling, outside the workspace and distinct from every round's and every
@@ -301,8 +264,6 @@ export const fleetPaths = (root: string): FleetPaths => {
       `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${PLANNING_DIRECTORY}/${checkedRole("round", roundId)}`,
     goalDirectory: (targetId, goalId) =>
       `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${GOAL_DIRECTORY}/${checkedRole("goal", goalId)}`,
-    goalUploadsDirectory: (targetId, goalId) =>
-      `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${GOAL_DIRECTORY}/${checkedRole("goal", goalId)}/${UPLOADS_DIRECTORY}`,
     importDirectory: (targetId, importId) =>
       `${root}/${TARGETS_DIRECTORY}/${checked(targetId)}/${IMPORT_DIRECTORY}/${checkedRole("import", importId)}`,
   };
@@ -865,36 +826,6 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
     },
   );
 
-  /**
-   * Creates `uploads/` inside a goal directory **that has already been gated**.
-   *
-   * **The argument is the gate, which is why it is a `GatedDirectory` and not two ids.**
-   * This directory sits inside the one a goal agent's session runs in, so writing into it
-   * before the pre-execution policy gate is installed would put the operator's files in a
-   * directory where nothing is yet watching what an agent does. Taking the branded path
-   * makes that ordering a compile-time fact: the only way to obtain one is
-   * `gatedRoleDirectory` (`policy/install.ts`), which makes the directory and installs the
-   * gate before it hands anything back.
-   *
-   * It also means the path written to is **derived from the path that was gated** rather
-   * than rebuilt from ids beside it. {@link FleetPaths.goalUploadsDirectory} says the same
-   * thing and is what a reader and a test use; building the write path from the gated
-   * string is what stops the two from ever being different directories.
-   *
-   * The import of `GatedDirectory` is type-only in both directions — `policy/install.ts`
-   * imports {@link UngatedRoleDirectory} the same way — so neither module depends on the
-   * other at runtime and this one still knows no harness.
-   *
-   * Idempotent: `mkdir -p`. Outside every transaction, like {@link ensureDirectory}.
-   */
-  const ensureGoalUploads = Effect.fn("FleetStore.ensureGoalUploads")(
-    function* (goalDirectory: GatedDirectory, targetId: string) {
-      const path = `${goalDirectory}/${UPLOADS_DIRECTORY}`;
-      yield* ensureDirectory(path, targetId);
-      return path;
-    },
-  );
-
   const setting = Effect.fn("FleetStore.setting")(function* (key: string) {
     const row = yield* selectSetting(key).pipe(
       Effect.mapError(lift("settings", key)),
@@ -931,7 +862,6 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
     ensurePlanningDirectory,
     ensureGoalDirectory,
     ensureImportDirectory,
-    ensureGoalUploads,
     setting,
     setSetting,
   });
@@ -984,10 +914,6 @@ export class FleetStore extends Context.Service<
       targetId: string,
       importId: string,
     ) => Effect.Effect<UngatedRoleDirectory, FleetError | DatabaseError>;
-    readonly ensureGoalUploads: (
-      goalDirectory: GatedDirectory,
-      targetId: string,
-    ) => Effect.Effect<string, DatabaseError>;
     readonly setting: (
       key: string,
     ) => Effect.Effect<string | undefined, DatabaseError>;

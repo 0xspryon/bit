@@ -25,6 +25,7 @@ import { Schema } from "effect";
 
 import { SteerUrgency } from "./conversationTurn";
 import { LiveItem } from "./live";
+import { MessageAttachmentView } from "./messageUpload";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
@@ -130,6 +131,11 @@ export const GoalTurnAccepted = Schema.Struct({
    */
   note: Schema.String,
   acceptedAt: EpochMillis,
+  /**
+   * The files the message carried, as the server stored them (A6 U13): the operator's turn
+   * shows each with its path before any replay could. Absent on a message with none.
+   */
+  attachments: Schema.optionalKey(Schema.Array(MessageAttachmentView)),
 });
 export type GoalTurnAccepted = typeof GoalTurnAccepted.Type;
 

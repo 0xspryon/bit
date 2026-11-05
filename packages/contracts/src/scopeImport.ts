@@ -39,6 +39,7 @@ import { Schema } from "effect";
 
 import { SteerUrgency } from "./conversationTurn";
 import { LiveItem } from "./live";
+import { MessageAttachmentView } from "./messageUpload";
 
 /**
  * The three tools the importer has, and the only three values this can ever hold.
@@ -748,6 +749,11 @@ export const ImporterTurnAccepted = Schema.Struct({
    * whose message opens the turn it is in.
    */
   messageId: Schema.optionalKey(Schema.String),
+  /**
+   * The files the message carried, as the server stored them (A6 U13): the operator's turn
+   * shows each with its path before any replay could. Absent on a message with none.
+   */
+  attachments: Schema.optionalKey(Schema.Array(MessageAttachmentView)),
 });
 export type ImporterTurnAccepted = typeof ImporterTurnAccepted.Type;
 

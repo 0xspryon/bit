@@ -41,6 +41,7 @@ import type {
   GoalNarrationView,
   LiveItem,
   LiveUsage,
+  MessageAttachmentView,
   PlanRoundView,
 } from "@bit/contracts";
 import { NARRATION_FIELD_MAX } from "@bit/contracts";
@@ -1567,6 +1568,11 @@ export interface SentTurn {
   readonly at: number;
   /** The activity high-water mark when it was sent. See above. */
   readonly after: number;
+  /**
+   * The files it carried, as the server stored them (A6 U13): the accepted answer's, so the
+   * turn shows each with its path before any replay could.
+   */
+  readonly attachments?: readonly MessageAttachmentView[];
 }
 
 /**
@@ -1629,6 +1635,9 @@ export const operatorTurn = (turn: SentTurn): LiveItem => ({
   output: null,
   callId: null,
   outcome: null,
+  ...(turn.attachments === undefined || turn.attachments.length === 0
+    ? {}
+    : { attachments: turn.attachments }),
 });
 
 /** What a goal conversation's separator needs, and the whole of what the chat is given. */

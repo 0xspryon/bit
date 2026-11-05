@@ -38,7 +38,6 @@ import {
   type GoalConversationView,
   type GoalNarrationView,
   type GoalObservationView,
-  type GoalUploadView,
   type GoalView,
   type AgentSessionView,
   type AgentSessionsView,
@@ -88,6 +87,8 @@ import {
   type SentTurn,
 } from "./chat";
 import { server, type ServerClient } from "./client";
+import type { LoadedFile } from "./attachmentFiles";
+import { ComposerFiles, FILES_WITHOUT_WORDS } from "./composerFiles.svelte";
 import { indexedSession } from "./importerChat";
 import {
   browserModelMemory,
@@ -373,6 +374,17 @@ const targetGoneNote = (targetId: string): string =>
  * *different* target — so "wrong target" is the likeliest reason an operator is reading
  * this, and a sentence that only said "no such goal" would leave them hunting for it.
  */
+/**
+ * Whether a refusal of a message is about its files (A6 U13): one over a cap, a HEIC, too
+ * many or too much, a request over what the listener takes, files the server could not
+ * store. Said in the F2 dialog, with the words and the files left in the composer.
+ */
+const isFilesRefusal = (error: object): boolean =>
+  "_tag" in error &&
+  (error._tag === "MessageUploadRefused" ||
+    error._tag === "RequestTooLarge" ||
+    (("reason" in error && error.reason === "upload_unwritable") as boolean));
+
 const goalGoneNote = (goalId: string): string =>
   `This target has no goal under the id "${goalId}". A goal id belongs to one target, so it may be another target's — these are this target's goals.`;
 
@@ -1056,26 +1068,11 @@ export class App {
   goalTurns = $state<SentTurn[]>([]);
 
   /**
-   * The files this tab has attached to the open goal, as the server described them.
-   *
-   * **What the server stored, not what the operator picked.** Each entry is the name the
-   * file is kept under, its size on disk and whether it replaced one of the same name — all
-   * three from the answer, because the browser's own `File` says nothing about what happened
-   * to it. A `replaced: true` entry is why this is a list of the server's words rather than
-   * a running count.
-   *
-   * Local to the tab, like {@link goalTurns}: nothing reads the uploads directory back for
-   * the browser, and an attachment the operator made in another tab is one the agent will
-   * be told about and this list will not show. That is the honest state, and the composer
-   * says the agent is told on the next message rather than claiming to know the directory.
+   * The files the goal composer holds for the next message (A6 U13). They go in that
+   * message's own request and the agent is told of them in it; the goal's attach route,
+   * which stored files on their own and listed them in every later prompt, is retired.
    */
-  goalAttachments = $state<GoalUploadView[]>([]);
-  /** True while an upload is in flight, so the attach control spins exactly once. */
-  goalAttaching = $state(false);
-  /** Why an upload was refused, in the server's words, beside the composer. */
-  goalAttachDetail = $state("");
-  /** What the server said about the files it stored. Its sentence, not this tab's. */
-  goalAttachNote = $state("");
+  readonly goalFiles = new ComposerFiles();
 
   /** True while a round's stop is in flight, so the control spins exactly once. */
   roundStopping = $state("");
@@ -2583,10 +2580,7 @@ export class App {
     this.goalSessionNote = "";
     this.goalAgentRuntime = undefined;
     this.goalTurns = [];
-    this.goalAttachments = [];
-    this.goalAttaching = false;
-    this.goalAttachDetail = "";
-    this.goalAttachNote = "";
+    this.goalFiles.clear();
   }
 
   /** Puts every goal-briefing field back where a fresh goal leaves it. */
@@ -2824,13 +2818,14 @@ export class App {
           call.error.reason === "import_ended"
             ? { ended: true }
             : {}),
+          ...(isFilesRefusal(call.error) ? { files: true } : {}),
         };
       }
       // Not a refusal: the server may have taken it before the answer was lost (U8 review 4).
       return { _tag: "unanswered" };
     };
     return {
-      open: async (text, agentId) => {
+      open: async (text, agentId, files) => {
         // The Reasoning column's choices go with the opening message, normalised against
         // the descriptors this tab holds and absent when nothing was set — as
         // `startScopeImport` sends them. They were dropped here before U3.
@@ -2839,27 +2834,32 @@ export class App {
           this.pickedImportModelOptions,
         );
         const sent = answer(
-          await this.client.openImporterConversation(this.serverUrl, targetId, {
-            text,
-            ...(agentId === undefined ? {} : { agentId }),
-            ...(this.pickedImportInstanceId !== "" ||
-            this.pickedImportModel !== "" ||
-            importOptions !== undefined
-              ? {
-                  importModel: {
-                    ...(this.pickedImportInstanceId === ""
-                      ? {}
-                      : { instanceId: this.pickedImportInstanceId }),
-                    ...(this.pickedImportModel === ""
-                      ? {}
-                      : { model: this.pickedImportModel }),
-                    ...(importOptions === undefined
-                      ? {}
-                      : { modelOptions: importOptions }),
-                  },
-                }
-              : {}),
-          }),
+          await this.client.openImporterConversation(
+            this.serverUrl,
+            targetId,
+            {
+              text,
+              ...(agentId === undefined ? {} : { agentId }),
+              ...(this.pickedImportInstanceId !== "" ||
+              this.pickedImportModel !== "" ||
+              importOptions !== undefined
+                ? {
+                    importModel: {
+                      ...(this.pickedImportInstanceId === ""
+                        ? {}
+                        : { instanceId: this.pickedImportInstanceId }),
+                      ...(this.pickedImportModel === ""
+                        ? {}
+                        : { model: this.pickedImportModel }),
+                      ...(importOptions === undefined
+                        ? {}
+                        : { modelOptions: importOptions }),
+                    },
+                  }
+                : {}),
+            },
+            files,
+          ),
         );
         return sent._tag === "accepted"
           ? { ...sent, modelOptions: importOptions ?? [] }
@@ -2894,7 +2894,7 @@ export class App {
             "No server answered at this address, so whether the model was switched is not known. Pick it again once the server is back.",
         };
       },
-      send: async (importId, text, urgency) =>
+      send: async (importId, text, urgency, files) =>
         answer(
           await this.client.sendImporterMessage(
             this.serverUrl,
@@ -2902,6 +2902,7 @@ export class App {
             importId,
             text,
             urgency,
+            files,
           ),
         ),
       /**
@@ -4037,6 +4038,28 @@ export class App {
   }
 
   /**
+   * One stored upload's bytes, for an attachment chip in an operator's turn on the target on
+   * screen (A6 U13): the server serves it only from a session's own `uploads/` folder. An
+   * expired session signs out, as every call does; anything else is a sentence for the chip.
+   */
+  async loadUploadedFile(path: string): Promise<LoadedFile> {
+    const targetId = this.viewTargetId;
+    if (targetId === "") {
+      return { _tag: "none", detail: "No target is open." };
+    }
+    const call = await this.client.uploadedFile(this.serverUrl, targetId, path);
+    if (call._tag === "Ok") return { _tag: "file", bytes: call.value };
+    if (call._tag === "Refused") {
+      if (call.error._tag === "Unauthenticated") this.signOut("expired");
+      return {
+        _tag: "none",
+        detail: this.#refusalText(call.error, "The server would not serve it."),
+      };
+    }
+    return { _tag: "none", detail: "No server answered at this address." };
+  }
+
+  /**
    * Says what the operator typed to the open goal's agent.
    *
    * **The turn is recorded locally the moment the server accepts it, and not before.** A
@@ -4056,9 +4079,15 @@ export class App {
     const targetId = this.viewTargetId;
     const goalId = this.openGoalId;
     const text = this.goalMessage.trim();
-    if (targetId === "" || goalId === "" || text === "" || this.goalSending) {
+    if (targetId === "" || goalId === "" || this.goalSending) return;
+    // Files with no words are not sent (A6 U13), and say so in the dialog.
+    if (text === "" && this.goalFiles.items.length > 0) {
+      this.goalFiles.refuse(FILES_WITHOUT_WORDS);
       return;
     }
+    if (text === "") return;
+    // The files go in the same request, and leave the composer once the server has them.
+    const sending = this.goalFiles.items;
     this.goalSending = true;
     this.goalSendDetail = "";
     // Taken before the message goes, so the turn sorts before whatever the agent says in
@@ -4074,6 +4103,8 @@ export class App {
       targetId,
       goalId,
       text,
+      undefined,
+      sending.map((item) => item.file),
     );
     this.#agentSessionsMoved(targetId);
     if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
@@ -4089,10 +4120,16 @@ export class App {
         this.signOut("expired");
         return;
       }
-      this.goalSendDetail = this.#refusalText(
+      const detail = this.#refusalText(
         call.error,
         "That message was not delivered.",
       );
+      // About its files: the F2 dialog, with the words and the files left in the composer.
+      if (isFilesRefusal(call.error)) {
+        this.goalFiles.refuse({ title: "Message not sent", sentence: detail });
+        return;
+      }
+      this.goalSendDetail = detail;
       return;
     }
 
@@ -4103,9 +4140,13 @@ export class App {
         text,
         at: Date.now(),
         after,
+        ...(call.value.attachments === undefined
+          ? {}
+          : { attachments: call.value.attachments }),
       },
     ];
     this.goalMessage = "";
+    this.goalFiles.drop(sending.map((item) => item.id));
     // Not on a `continued` turn, which changes nothing the operator can see. On an
     // `opened` *or* a `resumed` one it does: both mean this process was not holding the
     // session when the message arrived, and the note is the sentence saying which happened.
@@ -4132,76 +4173,6 @@ export class App {
     if (call.value.conversation !== "continued") {
       void this.loadGoalConversation(goalId);
     }
-  }
-
-  /**
-   * Attaches files to the open goal, so its agent can read them.
-   *
-   * **It does not send a message and does not wait for the agent.** The route answers once
-   * the bytes are on disk in the goal's own directory; the agent is told about them on the
-   * operator's *next* message. {@link goalAttachNote} is the server's sentence saying so,
-   * and it is kept on screen rather than toasted because "the agent does not know yet" is
-   * the one thing an operator could otherwise get wrong about this control.
-   *
-   * **The caps are the server's and are not checked here.** This tab is never told
-   * `UPLOAD_MAX_BYTES` or `UPLOAD_MAX_FILES`, which is deliberate: a figure in the browser
-   * is a second copy to keep in step, and the refusal that comes back already carries the
-   * file's size, the cap and what to do about it. The cost is that an oversized file is
-   * uploaded before it is refused, which is a wasted transfer on a same-machine server and
-   * the honest price of having one place the limit lives.
-   *
-   * A refusal leaves the picked files unattached and prints the server's sentence. There is
-   * nothing to retry automatically: every reason is either a file to change or a limit to
-   * raise.
-   */
-  async attachGoalFiles(files: readonly File[]) {
-    const targetId = this.viewTargetId;
-    const goalId = this.openGoalId;
-    if (targetId === "" || goalId === "" || files.length === 0) return;
-    if (this.goalAttaching) return;
-    this.goalAttaching = true;
-    this.goalAttachDetail = "";
-
-    const call = await this.client.uploadGoalFiles(
-      this.serverUrl,
-      targetId,
-      goalId,
-      files,
-    );
-    if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
-    this.goalAttaching = false;
-
-    if (call._tag === "Unreachable") {
-      this.goalAttachDetail = "No server answered at this address.";
-      return;
-    }
-    if (call._tag === "Refused") {
-      if (call.error._tag === "Unauthenticated") {
-        this.signOut("expired");
-        return;
-      }
-      this.goalAttachDetail = this.#refusalText(
-        call.error,
-        "Those files were not attached.",
-      );
-      return;
-    }
-
-    /*
-     * The stored list, merged by the name the **server** chose rather than appended to.
-     *
-     * A re-attached file replaces the one of the same name on disk (`replaced: true` says
-     * so), and a list that grew a second row for it would show the operator two documents
-     * where the agent will see one.
-     */
-    const byName = new Map(
-      this.goalAttachments.map((file) => [file.name, file]),
-    );
-    for (const file of call.value.stored) byName.set(file.name, file);
-    this.goalAttachments = [...byName.values()].sort((left, right) =>
-      left.name < right.name ? -1 : 1,
-    );
-    this.goalAttachNote = call.value.note;
   }
 
   /**

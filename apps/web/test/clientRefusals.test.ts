@@ -23,18 +23,21 @@ import { afterAll, describe, expect, test } from "bun:test";
 
 import * as contracts from "@bit/contracts";
 import {
-  GOAL_UPLOAD_FIELD,
   GoalBriefingRefused,
   GoalNotFound,
-  GoalUploadRefused,
   IntentNotFound,
   IntentRefused,
+  MESSAGE_FIELD,
+  MESSAGE_FILES_FIELD,
+  MessageUploadRefused,
+  UploadedFileRefused,
 } from "@bit/contracts";
 
 import {
   NOT_REFUSALS,
   REFUSAL_TAGS,
   RequestNotSent,
+  RequestTooLarge,
   server,
 } from "../src/lib/client";
 
@@ -275,55 +278,114 @@ describe("the intent refusals, which were missing for the same reason", () => {
   });
 });
 
-describe("attaching files, which is the one multipart call on this client", () => {
-  test("a refused upload keeps the server's figures instead of becoming Unreachable", async () => {
-    const detail =
-      "'huge.bin' is more than 10485760 bytes (10.0 MiB), which is this server's per-file cap, so reading it was abandoned and nothing in that request was attached.";
-    answering(409, { _tag: "GoalUploadRefused", reason: "too_large", detail });
+describe("a message's files, in the message's own request (A6 U13)", () => {
+  const accepted = {
+    targetId: "acme-corp",
+    goalId: "goal_1",
+    harnessSessionId: "ses_1",
+    instanceId: "claude-code",
+    providerId: "anthropic",
+    modelId: "claude-haiku-4-5",
+    conversation: "continued",
+    priorUnavailable: false,
+    note: "",
+    acceptedAt: 0,
+  };
 
-    const call = await server.uploadGoalFiles(BASE, "acme-corp", "goal_1", [
-      new File(["x"], "huge.bin"),
-    ]);
-
-    expect(asked).toHaveLength(1);
-    expect(asked[0]).toContain("/targets/acme-corp/goals/goal_1/uploads");
-    expect(call._tag).toBe("Refused");
-    if (call._tag !== "Refused") return;
-    expect(call.error).toBeInstanceOf(GoalUploadRefused);
-    // The sentence, as written: both figures and what to do about them.
-    expect(call.error).toMatchObject({ _tag: "GoalUploadRefused", detail });
-  });
-
-  test("the request really goes out as multipart with the contract's field name", async () => {
-    /*
-     * The one thing no other test here can say. This call is the only place in the browser
-     * half that builds a body by hand, and what it has to produce is a `multipart/form-data`
-     * request with each file under the contract's own field — which is the key the server
-     * reads the parts under. The stub captures the request so the body is asserted rather
-     * than assumed.
-     */
-    answering(201, {
-      targetId: "acme-corp",
-      goalId: "goal_1",
-      stored: [],
-      attachedCount: 0,
-      note: "",
-      acceptedAt: 0,
-    });
-
-    await server.uploadGoalFiles(BASE, "acme-corp", "goal_1", [
-      new File(["a scope letter"], "scope.pdf", { type: "application/pdf" }),
-    ]);
-
+  test("with files, a goal message goes out as multipart: its JSON under `message`, each file under `files`", async () => {
+    answering(202, accepted);
+    await server.sendGoalMessage(
+      BASE,
+      "acme-corp",
+      "goal_1",
+      "Read it.",
+      undefined,
+      [new File(["a scope letter"], "scope.pdf", { type: "application/pdf" })],
+    );
     const seen = sent[0];
     expect(seen?.headers.get("content-type")).toContain("multipart/form-data");
-    // A boundary the runtime chose, which is the part a hand-set content-type would lose
-    // and the part the server's parser needs.
     expect(seen?.headers.get("content-type")).toContain("boundary=");
-    const body = await seen?.text();
-    expect(body).toContain(`name="${GOAL_UPLOAD_FIELD}"`);
-    expect(body).toContain('filename="scope.pdf"');
-    expect(body).toContain("a scope letter");
+    const form = await seen?.formData();
+    expect(form?.get(MESSAGE_FIELD)).toBe(JSON.stringify({ text: "Read it." }));
+    const file = form?.get(MESSAGE_FILES_FIELD);
+    expect(file instanceof File ? file.name : undefined).toBe("scope.pdf");
+  });
+
+  test("without files it is the JSON it always was", async () => {
+    answering(202, accepted);
+    await server.sendGoalMessage(BASE, "acme-corp", "goal_1", "Hello.");
+    expect(sent[0]?.headers.get("content-type")).toContain("application/json");
+    expect(await sent[0]?.text()).toBe(JSON.stringify({ text: "Hello." }));
+  });
+
+  test("a refused file keeps the server's figures instead of becoming Unreachable", async () => {
+    const detail =
+      "'huge.png' is an image over 10485760 bytes (10.0 MiB), this server's cap per image, so reading it stopped there and nothing in that message was stored or sent.";
+    answering(409, {
+      _tag: "MessageUploadRefused",
+      reason: "too_large",
+      detail,
+    });
+    const call = await server.sendImporterMessage(
+      BASE,
+      "acme-corp",
+      "imp_1",
+      "Look.",
+      undefined,
+      [new File(["x"], "huge.png", { type: "image/png" })],
+    );
+    expect(call._tag).toBe("Refused");
+    if (call._tag !== "Refused") return;
+    expect(call.error).toBeInstanceOf(MessageUploadRefused);
+    expect(call.error).toMatchObject({ detail });
+  });
+
+  test("the listener's empty 413 is a refusal in a sentence, naming what was sent", async () => {
+    handler = () => Promise.resolve(new Response(null, { status: 413 }));
+    const call = await server.openImporterConversation(
+      BASE,
+      "acme-corp",
+      { text: "Read these." },
+      [new File([new Uint8Array(3 * 1024 * 1024)], "big.bin")],
+    );
+    expect(call._tag).toBe("Refused");
+    if (call._tag !== "Refused") return;
+    expect(call.error).toBeInstanceOf(RequestTooLarge);
+    const detail = (call.error as RequestTooLarge).detail;
+    expect(detail).toContain("1 file (3.0 MiB together)");
+    expect(detail).toContain("Nothing was stored");
+  });
+
+  test("a stored upload is fetched by its path, and a refusal of one is a refusal", async () => {
+    handler = () =>
+      Promise.resolve(
+        new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { "content-type": "application/octet-stream" },
+        }),
+      );
+    const ok = await server.uploadedFile(
+      BASE,
+      "acme-corp",
+      "/h/a b/uploads/x.png",
+    );
+    const url = new URL(asked.at(-1) ?? "");
+    expect(url.pathname).toBe("/api/v1/targets/acme-corp/uploads");
+    expect(url.searchParams.get("path")).toBe("/h/a b/uploads/x.png");
+    expect(ok._tag === "Ok" ? [...ok.value] : undefined).toEqual([1, 2, 3]);
+    answering(404, {
+      _tag: "UploadedFileRefused",
+      reason: "not_an_upload",
+      detail: "'/etc/passwd' is not inside a session's uploads folder",
+    });
+    const refusedCall = await server.uploadedFile(
+      BASE,
+      "acme-corp",
+      "/etc/passwd",
+    );
+    expect(refusedCall._tag).toBe("Refused");
+    if (refusedCall._tag !== "Refused") return;
+    expect(refusedCall.error).toBeInstanceOf(UploadedFileRefused);
   });
 });
 

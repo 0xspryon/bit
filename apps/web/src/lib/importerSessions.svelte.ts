@@ -82,6 +82,7 @@ import {
 import type { ErrorNotice } from "./components/ErrorDialog.svelte";
 
 import { operatorTurn } from "./chat";
+import { ComposerFiles, FILES_WITHOUT_WORDS } from "./composerFiles.svelte";
 import {
   NO_HISTORY,
   TAKEN_KIND,
@@ -191,6 +192,12 @@ export type ImporterSent =
        * since the list was read, so the list is read again and the composer disables on it.
        */
       readonly ended?: boolean;
+      /**
+       * The refusal is about the message's files (A6 U13) — one over a cap, a HEIC, too many,
+       * a request over what the listener takes, files that could not be stored — and is said
+       * in the F2 dialog rather than beside the draft; the words and the files stay put.
+       */
+      readonly files?: boolean;
     }
   | {
       /**
@@ -259,6 +266,8 @@ export interface ImporterServer {
   readonly open: (
     text: string,
     agentId: string | undefined,
+    /** The files the message carries, in the same request (A6 U13). */
+    files?: readonly File[],
   ) => Promise<ImporterSent>;
   /**
    * Says `text` to one import's session: while a turn runs, `queued` (the default) waits for
@@ -268,6 +277,8 @@ export interface ImporterServer {
     importId: string,
     text: string,
     urgency?: SteerUrgency,
+    /** The files the message carries, in the same request (A6 U13). */
+    files?: readonly File[],
   ) => Promise<ImporterSent>;
   /**
    * Stops the turn running in one import's session, keeping the conversation (A6 F5): the
@@ -547,6 +558,16 @@ export class ImporterSessions {
   becameId = $state<string | undefined>(undefined);
   /** What is typed in the composer and not yet sent. */
   draft = $state("");
+  /**
+   * The files the composer holds for the next message (A6 U13), the page's like the draft.
+   *
+   * V2(chat): they live only in this page, as `File`s, so a message whose answer is lost or
+   * that is refused after the operator left its session gives back its words
+   * (`importerParked.ts`) but not its files — a `File` cannot go into `sessionStorage` — and
+   * leaving the session drops them. Proper V2 is T3's two-step upload: each file staged on
+   * the server as it is added, so a draft (and parked words) can name staged files by id.
+   */
+  readonly files = new ComposerFiles();
   /** Whether the crumb bar's session list is open. */
   pickerOpen = $state(false);
   /** True while a message is with the server and not yet answered. */
@@ -752,6 +773,7 @@ export class ImporterSessions {
     this.#forgetBreakdowns();
     this.#server = server;
     this.draft = "";
+    this.files.clear();
     this.notice = "";
     this.refused = false;
     this.sending = false;
@@ -986,6 +1008,7 @@ export class ImporterSessions {
     this.becameId = undefined;
     this.stopFailure = undefined;
     this.draft = "";
+    this.files.clear();
     this.pickerOpen = false;
     this.#sent = 0;
     this.#opening = undefined;
@@ -1065,6 +1088,7 @@ export class ImporterSessions {
       this.leaveBreakdown();
       this.currentId = id;
       this.draft = "";
+      this.files.clear();
       // A message that did not land while the operator was elsewhere comes back where it was
       // typed, with what is known of it, as if they had stayed (U8 review 3).
       const words = this.parked[id];
@@ -1431,6 +1455,7 @@ export class ImporterSessions {
       (opening !== undefined && this.draft.trim() === opening.text)
     ) {
       this.draft = "";
+      this.files.clear();
     }
     this.notice = "";
     this.refused = false;
@@ -1506,7 +1531,14 @@ export class ImporterSessions {
   send(urgency: SteerUrgency = "queued"): void {
     const text = this.draft.trim();
     const session = this.current;
-    if (text === "" || session === undefined) return;
+    if (session === undefined) return;
+    // Files with no words are not sent (A6 U13): what the agent is to do with them is the
+    // message. Said in the dialog, and the files stay attached.
+    if (text === "" && this.files.items.length > 0) {
+      this.files.refuse(FILES_WITHOUT_WORDS);
+      return;
+    }
+    if (text === "") return;
     // A session on a harness this server does not run is not asked, and not typed into:
     // the harness it does have would answer "no such session" for one that may be alive
     // elsewhere. The composer is disabled too; this is the rule, that is its face.
@@ -1525,6 +1557,8 @@ export class ImporterSessions {
       void this.#post(this.#server, session, text, urgency);
       return;
     }
+    // The state picker has no server to store files on: they are dropped with the send.
+    this.files.clear();
     const at = this.#now();
     /** How many this tab's feed already holds: the id's namespace, not the turn's number. */
     const index = session.items.filter(
@@ -1599,6 +1633,10 @@ export class ImporterSessions {
     // Taken before the message goes, so whatever the importer says in answer sorts after
     // it — including what it says before this request has been answered.
     const after = server.highWater();
+    // The files go in the same request; the ones sent are taken out of the composer only
+    // once the server has them, so a refusal leaves them attached beside the words.
+    const sending = this.files.items;
+    const files = sending.map((item) => item.file);
     // The agent the chip picked goes with an opening message only: a later one is to a
     // conversation already pinned to its agent, which the server reads off the row.
     const agentId = session.agentId;
@@ -1619,8 +1657,8 @@ export class ImporterSessions {
     };
     const answer =
       session.importId === undefined
-        ? await server.open(text, agentId)
-        : await server.send(session.importId, text, urgency);
+        ? await server.open(text, agentId, files)
+        : await server.send(session.importId, text, urgency, files);
     const pinnedAgent = agentId ?? this.agents?.defaultAgentId;
     if (opening !== undefined && this.#opening === opening) {
       this.#opening = undefined;
@@ -1629,6 +1667,15 @@ export class ImporterSessions {
     this.waitingForSwitch = false;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
+    if (
+      answer._tag === "refused" &&
+      answer.files === true &&
+      this.currentId === session.id
+    ) {
+      // About the files: said in the dialog, and the words and files stay as they were.
+      this.files.refuse({ title: "Message not sent", sentence: answer.detail });
+      return;
+    }
     if (answer._tag !== "accepted") {
       const outcome = answer._tag === "refused" ? "refused" : "unknown";
       const detail =
@@ -1685,6 +1732,7 @@ export class ImporterSessions {
       this.currentId === session.id || this.currentId === turn.harnessSessionId;
     if (here) {
       if (this.draft.trim() === text) this.draft = "";
+      this.files.drop(sending.map((item) => item.id));
       this.notice = acceptedNotice(turn);
     }
     if (
@@ -1713,7 +1761,15 @@ export class ImporterSessions {
         ),
       );
       const row = {
-        ...operatorTurn({ index: index + 1, text, at, after }),
+        ...operatorTurn({
+          index: index + 1,
+          text,
+          at,
+          after,
+          ...(turn.attachments === undefined
+            ? {}
+            : { attachments: turn.attachments }),
+        }),
         ...(turn.messageId === undefined
           ? {}
           : { messageIds: [turn.messageId] }),

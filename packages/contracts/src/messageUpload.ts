@@ -36,7 +36,7 @@ import { HttpApiSchema } from "effect/http-api";
 /** The form field the message itself travels under, as the endpoint's JSON body. */
 export const MESSAGE_FIELD = "message";
 
-/** The form field every file travels under. The goal attach route's field, too. */
+/** The form field every file travels under. */
 export const MESSAGE_FILES_FIELD = "files";
 
 /**
@@ -61,8 +61,9 @@ const isPartStream = (
 /**
  * A message and its files, as the parser's stream of parts.
  *
- * The streaming multipart shape, for `GoalUploadDraft`'s measured reason: the buffered one
- * needs a real `FileSystem` and this build has none, so it answers an empty `500`. No
+ * The streaming multipart shape, for a measured reason (the retired goal attach route's,
+ * F9): the buffered one needs a real `FileSystem` and this build has none, so it answers an
+ * empty `500`. No
  * parser limits are set here: every cap is a {@link MessageUploadRefused} naming its
  * figure, enforced while the parts are read.
  */
@@ -133,3 +134,32 @@ export class MessageUploadRefused extends Schema.TaggedError<MessageUploadRefuse
     return `${this.reason}: ${this.detail}`;
   }
 }
+
+/**
+ * Why a stored upload was not served (A6 U13): the path asked for is not a file the operator
+ * sent with a message, as stored in a session's own `uploads/` folder on this target
+ * (`not_an_upload` — outside every such folder, through a link, a temporary, not a regular
+ * file), or nothing is stored there any more (`missing`). `404` either way: there is no
+ * such upload to serve.
+ */
+export class UploadedFileRefused extends Schema.TaggedError<UploadedFileRefused>()(
+  "UploadedFileRefused",
+  {
+    reason: Schema.Literals(["not_an_upload", "missing"]),
+    detail: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {
+  override get message(): string {
+    return `${this.reason}: ${this.detail}`;
+  }
+}
+
+/**
+ * A stored upload's bytes. Always `application/octet-stream` on the wire: the browser types
+ * the blob itself from the attachment it asked for, so no response of this server's is ever
+ * rendered as the page's own HTML.
+ */
+export const UploadedFileBytes = Schema.Uint8Array.pipe(
+  HttpApiSchema.asUint8Array(),
+);

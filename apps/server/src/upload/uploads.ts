@@ -2,11 +2,11 @@
  * Files sent with a conversation message (A6 F9): read, checked, and stored.
  *
  * The one reader and validator for every route that takes files — the importer's two
- * message endpoints, a goal's message endpoint, and the goal attach route
- * (`plan/goalUploads.ts`, which reads through {@link readUploadParts}). A plain module with
- * no services in it, for `plan/goalUploads.ts`'s reason: each claim here — that a name
- * cannot escape the folder, that a cap is checked while the bytes are read, that a refused
- * request leaves nothing behind — is worth a test that needs no harness and no listener.
+ * message endpoints and a goal's message endpoint. (The goal attach route that also read
+ * through it was retired in U13: a goal's files now travel with its messages.) A plain
+ * module with no services in it: each claim here — that a name cannot escape the folder,
+ * that a cap is checked while the bytes are read, that a refused request leaves nothing
+ * behind — is worth a test that needs no harness and no listener.
  *
  * ## The limits, and where each figure comes from
  *
@@ -18,9 +18,7 @@
  * `UPLOAD_MAX_TOTAL_BYTES`, read by `main.ts` — and **the environment wins over the
  * default, nothing else is consulted**. Two of them meet: an image is a file too, so the
  * image cap in force is the smaller of the image cap and the file cap, and a lowered
- * `UPLOAD_MAX_BYTES` lowers both. `UPLOAD_MAX_BYTES` and `UPLOAD_MAX_FILES` are the goal
- * attach route's two variables from before A6, kept, with new defaults (they were 10 MiB and
- * 10); that route still counts `UPLOAD_MAX_FILES` against the whole goal.
+ * `UPLOAD_MAX_BYTES` lowers both.
  *
  * ## What is trusted
  *
@@ -36,12 +34,13 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readSync,
   realpathSync,
   unlinkSync,
   writeSync,
   constants as fsConstants,
 } from "node:fs";
-import { extname, isAbsolute, join, relative } from "node:path";
+import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 
 import {
   MESSAGE_FIELD,
@@ -53,6 +52,11 @@ import { Data, Effect, Stream } from "effect";
 import type { Multipart } from "effect/http";
 
 import type { MessageAttachment } from "../harness/attachments";
+import {
+  GOAL_DIRECTORY,
+  IMPORT_DIRECTORY,
+  isRoleDirectoryId,
+} from "../persistence/fleet";
 import { resolveThroughSymlinks } from "../policy/install";
 
 /** The folder, inside a session's working directory, that every upload is stored in. */
@@ -182,8 +186,20 @@ export const classifyUpload = (
     : { _tag: "file", mimeType };
 };
 
-/** The longest stored name, in characters: `plan/goalUploads.ts`'s pattern's bound. */
+/** The longest stored name, in characters: {@link UPLOAD_NAME_PATTERN}'s bound. */
 const NAME_MAX = 127;
+
+/**
+ * What a stored filename looks like: every name {@link sanitiseUploadName} makes, and nothing
+ * a replayed line or a request for a stored file may name beyond it.
+ *
+ * Letters, digits, space, `.`, `_`, `-`, `(` and `)`, starting with a letter or a digit, up
+ * to 127 characters. That excludes `/` and `\`, so no name is a path; excludes a leading
+ * `.`, so no name is `..`, `.` or a hidden file (an `.incoming-` temporary among them);
+ * excludes control characters, newlines and quotes, so a name cannot read as two lines of a
+ * prompt or close one; and excludes `:`.
+ */
+export const UPLOAD_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,126}$/;
 
 /**
  * A filename the folder and the prompt line can both hold, made from the one the browser
@@ -196,7 +212,7 @@ const NAME_MAX = 127;
  *   characters, quotes, brackets, newlines — becomes `_`, so a name cannot close the prompt
  *   line's quotes or start a line of its own.
  * - Leading dots and spaces are dropped, so no name is `.`, `..` or hidden; the result
- *   starts with a letter or digit, as `plan/goalUploads.ts`'s `UPLOAD_NAME_PATTERN` asks.
+ *   starts with a letter or digit, as {@link UPLOAD_NAME_PATTERN} asks.
  * - Cut to 127 characters, keeping the extension.
  * - Nothing left is `upload`, with the extension the type names.
  *
@@ -224,7 +240,7 @@ export const sanitiseUploadName = (name: string, mimeType?: string): string => {
 
 /** One file read off the wire and checked, before anything has been written. */
 export interface ReadUpload {
-  /** The name the browser sent, untouched. The goal attach route refuses on it. */
+  /** The name the browser sent, untouched: what a refusal names. */
   readonly sentName: string;
   /** {@link sanitiseUploadName} of it: the name it will be stored under, collisions aside. */
   readonly name: string;
@@ -405,6 +421,16 @@ const numbered = (name: string, n: number): string => {
 export interface StoreUploadsProbe {
   /** After the folder was checked, before any file is opened in it. */
   readonly afterCheck?: () => void;
+  /**
+   * After a file's temporary was created through the held folder, before its path is
+   * checked and before a byte is written to it.
+   */
+  readonly afterOpen?: (temporary: string) => void;
+  /**
+   * Writes bytes to the temporary in place of `writeSync`, so a test can make a write fail
+   * part-way (a full disk, a quota) after some of the bytes have landed.
+   */
+  readonly write?: (handle: number, bytes: Uint8Array, at: number) => number;
   /** After a file's bytes were written to its temporary, before it is linked to its name. */
   readonly afterWrite?: (temporary: string) => void;
 }
@@ -529,14 +555,24 @@ export const storeUploads = (
             try {
               const { dev, ino } = fstatSync(handle);
               written = { dev, ino };
+              probe.afterOpen?.(temporary);
               // Before a byte is written: the temporary's path is the file this handle holds.
               if (!namesEntry(temporary, temporaryName, written)) {
                 removeOwn(temporaryName, written);
                 throw moved(temporary);
               }
+              const write = probe.write ?? writeSync;
               let at = 0;
-              while (at < file.bytes.length) {
-                at += writeSync(handle, file.bytes, at);
+              try {
+                while (at < file.bytes.length) {
+                  at += write(handle, file.bytes, at);
+                }
+              } catch (cause) {
+                // A write that failed part-way (a full disk) left a partial temporary that
+                // is in no list yet: removed here, through the held folder, while it is
+                // still the file this handle made (U13).
+                removeOwn(temporaryName, written);
+                throw cause;
               }
             } finally {
               closeSync(handle);
@@ -589,3 +625,134 @@ export const storeUploads = (
         message: `the files could not be written into the session's ${UPLOADS_FOLDER} folder (${cause instanceof Error ? cause.message : String(cause)}), so nothing was stored and nothing was said to the agent`,
       }),
   });
+
+/** Why a stored file was not served: `missing` when nothing is there, else `not_an_upload`. */
+export type StoredUploadRefusal = {
+  readonly _tag: "refused";
+  readonly reason: "not_an_upload" | "missing";
+  readonly detail: string;
+};
+
+/**
+ * One stored upload's bytes, for a browser that has a replayed attachment's path and no bytes
+ * (A6 U13) — or why not.
+ *
+ * **The path is the browser's, so nothing about it is trusted; it is re-derived.** A replayed
+ * path is read out of a harness transcript, which is the operator's text and the agent's
+ * record, so it is only a request: this answers only when
+ *
+ * - it is absolute and already normal (no `.`, `..` or doubled separator), and inside this
+ *   target's own directory, lexically, as `<kind>/<id>/uploads/<name>`: `kind` an import's or
+ *   a goal's folder, `id` a role id ({@link isRoleDirectoryId}), `name` one
+ *   {@link UPLOAD_NAME_PATTERN} admits — so no `.incoming-` temporary, no hidden file;
+ * - its real path is exactly that path under the target's real directory, so no component —
+ *   the session folder, `uploads`, the file — is a link to anywhere, inside or out;
+ * - and it is a regular file, opened `O_NOFOLLOW`, and the file opened is the one checked
+ *   (device and inode), so a swap between the check and the open is refused too.
+ *
+ * A file over `maxBytes` (the per-file cap, which every stored upload is under) is refused
+ * rather than read into memory: the agent works in that folder and can put anything there.
+ *
+ * V2(chat): the whole file is read into memory and sent in one response, and the browser
+ * holds it as a blob. Proper V2 streams it with range requests and serves a thumbnail for an
+ * image instead of its full bytes.
+ */
+export const readStoredUpload = (
+  targetDirectory: string,
+  path: string,
+  maxBytes: number,
+):
+  | { readonly _tag: "file"; readonly bytes: Uint8Array }
+  | StoredUploadRefusal => {
+  const refuse = (detail: string): StoredUploadRefusal => ({
+    _tag: "refused",
+    reason: "not_an_upload",
+    detail: `${detail}, so it is not served. Only a file the operator sent with a message, as stored in a session's own uploads folder on this target, is.`,
+  });
+  if (!isAbsolute(path) || path.includes("\0") || normalize(path) !== path) {
+    return refuse(`'${path}' is not an absolute, normal path`);
+  }
+  /** `<kind>/<id>/uploads/<name>` under one spelling of the target's directory, or nothing. */
+  const partsUnder = (root: string) => {
+    const inside = relative(root, path);
+    if (inside === "" || inside.startsWith("..") || isAbsolute(inside)) {
+      return undefined;
+    }
+    const parts = inside.split(sep);
+    return parts.length === 4 ? parts : undefined;
+  };
+  let realTarget: string;
+  try {
+    realTarget = realpathSync(targetDirectory);
+  } catch {
+    return refuse(`this target's directory cannot be read`);
+  }
+  const parts = partsUnder(targetDirectory) ?? partsUnder(realTarget);
+  const [kind, id, folder, name] = parts ?? [];
+  if (
+    kind === undefined ||
+    id === undefined ||
+    folder === undefined ||
+    name === undefined
+  ) {
+    return refuse(
+      `'${path}' is not inside a session's uploads folder on this target`,
+    );
+  }
+  if (
+    (kind !== IMPORT_DIRECTORY && kind !== GOAL_DIRECTORY) ||
+    !isRoleDirectoryId(id) ||
+    folder !== UPLOADS_FOLDER ||
+    !UPLOAD_NAME_PATTERN.test(name)
+  ) {
+    return refuse(
+      `'${path}' is not inside a session's uploads folder on this target`,
+    );
+  }
+  let real: string;
+  try {
+    real = realpathSync(path);
+  } catch {
+    return {
+      _tag: "refused",
+      reason: "missing",
+      detail: `no file is stored at '${path}' any more: it was removed from the session's uploads folder, or the session's directory was swept.`,
+    };
+  }
+  if (real !== join(realTarget, kind, id, folder, name)) {
+    return refuse(`'${path}' resolves through a link, to '${real}'`);
+  }
+  let handle: number;
+  try {
+    handle = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    return refuse(`'${path}' could not be opened as a plain file`);
+  }
+  try {
+    const opened = fstatSync(handle);
+    const named = statOrUndefined(path);
+    if (!opened.isFile() || named === undefined || !sameEntry(named, opened)) {
+      return refuse(
+        `'${path}' is not a regular file, or changed while it was opened`,
+      );
+    }
+    if (opened.size > maxBytes) {
+      return refuse(
+        `'${path}' is ${describeBytes(opened.size)}, over ${describeBytes(maxBytes)}, the most any upload is stored at`,
+      );
+    }
+    const bytes = new Uint8Array(opened.size);
+    let at = 0;
+    while (at < bytes.length) {
+      const read = readSync(handle, bytes, at, bytes.length - at, at);
+      if (read === 0) break;
+      at += read;
+    }
+    return {
+      _tag: "file",
+      bytes: at === bytes.length ? bytes : bytes.slice(0, at),
+    };
+  } finally {
+    closeSync(handle);
+  }
+};

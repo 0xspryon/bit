@@ -328,10 +328,9 @@ const wholeNumberFromEnv = (
  *
  * - `UPLOAD_MAX_IMAGE_BYTES`, 10 MiB: per image. An image is a file too, so the cap in
  *   force is the smaller of this and `UPLOAD_MAX_BYTES`.
- * - `UPLOAD_MAX_BYTES`, 50 MiB: per file. Was 10 MiB when the goal attach route was the
- *   only upload; the variable is the same.
- * - `UPLOAD_MAX_FILES`, 100: per message — and, on the goal attach route, per goal (it was
- *   10), where it also bounds the attachment list every goal prompt carries.
+ * - `UPLOAD_MAX_BYTES`, 50 MiB: per file. Was 10 MiB when the goal attach route (retired
+ *   in U13) was the only upload; the variable is the same.
+ * - `UPLOAD_MAX_FILES`, 100: per message.
  * - `UPLOAD_MAX_TOTAL_BYTES`, 100 MiB: one request's files together, which is the memory a
  *   request can hold while it is read. The listener's body ceiling follows it.
  */

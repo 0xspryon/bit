@@ -36,10 +36,12 @@
  */
 import {
   BitApi,
-  GOAL_UPLOAD_FIELD,
+  GoalMessageDraft,
   IMPORTER_MESSAGE_MAX_CHARS,
   ImporterConversationDraft,
   ImporterMessageDraft,
+  MESSAGE_FIELD,
+  MESSAGE_FILES_FIELD,
   SessionGuard,
   type AGENT_SESSION_PAGE_SIZES,
   type AgentSessionKind,
@@ -263,16 +265,14 @@ export const REFUSAL_TAGS = new Set([
   // unactionable. Reading the conversation declares no error at all: a conversation nobody
   // has started, and one the harness has deleted, are both a `200` that says which.
   "GoalConversationRefused",
-  // Attaching files to a goal. **Every reason names the figure it is about** — this file is
-  // this many bytes against this cap, this goal already holds this many of that many, this
-  // name cannot be stored and here is what one looks like. Those sentences are the whole
-  // difference between a rejected upload an operator can act on and one that says "failed",
-  // and classifying them as transport trouble would throw all of them away.
-  "GoalUploadRefused",
   // A message's files (A6 F9), on the importer's and a goal's message endpoints: a HEIC
   // image, a file over its cap, too many, too much together. Each names the file and the
   // figure, and nothing was stored or sent — the F2 error modal prints it.
   "MessageUploadRefused",
+  // A stored upload a replayed attachment asked for (A6 U13): the path is not one of this
+  // target's uploads, or nothing is stored there any more. The chip says so instead of
+  // drawing a thumbnail; as transport trouble it would read "No server answered".
+  "UploadedFileRefused",
   // The scope import panel. An import this process has forgotten is a real answer and the
   // panel acts on it by sending the operator to Assets, where what the import *wrote* is —
   // the entries and the assets are durable rows, and only the receipt was ever in memory.
@@ -318,6 +318,7 @@ export const NOT_REFUSALS: Readonly<Record<string, string>> = {};
 
 const isRefusal = (error: unknown): boolean =>
   error instanceof RequestNotSent ||
+  error instanceof RequestTooLarge ||
   (typeof error === "object" &&
     error !== null &&
     "_tag" in error &&
@@ -342,6 +343,73 @@ export class RequestNotSent {
   readonly _tag = "RequestNotSent";
   constructor(readonly detail: string) {}
 }
+
+/**
+ * A message whose request body was over what the server's listener takes at all (A6 U13):
+ * Bun answers a body over its ceiling (128 MiB by default) that declares its length with an
+ * **empty `413`**, before the server's own handler — and its sentence — ever runs. The
+ * browser's `FormData` always declares its length, so a message with that much in files
+ * gets exactly this. It is a refusal, in a sentence this client words from what it sent:
+ * nothing was read, stored or said to the agent.
+ */
+export class RequestTooLarge {
+  readonly _tag = "RequestTooLarge";
+  constructor(readonly detail: string) {}
+}
+
+/** The sentence for a {@link RequestTooLarge}, from the files the message carried. */
+export const requestTooLargeSentence = (files: readonly File[]): string => {
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+  const mib = (total / (1024 * 1024)).toFixed(1);
+  return `The server refused this message before reading any of it: with its ${String(files.length)} ${files.length === 1 ? "file" : "files"} (${mib} MiB together) the request is over the most its listener takes in one request. Nothing was stored, and nothing was said to the agent. Send the files over several messages.`;
+};
+
+/** Whether a failure is the listener's empty `413`, which no declared error decodes. */
+const isTooLarge = (error: unknown): boolean => {
+  if (typeof error !== "object" || error === null) return false;
+  const reason = (error as { reason?: { response?: { status?: unknown } } })
+    .reason;
+  return reason?.response?.status === 413;
+};
+
+/**
+ * A message's body: its JSON as the contract encodes it, or — with files — the multipart
+ * form the endpoint takes beside JSON (A6 F9): that same JSON under {@link MESSAGE_FIELD}
+ * and each file under {@link MESSAGE_FILES_FIELD}. One request either way.
+ */
+const messageBody = <S extends Schema.Top>(
+  schema: S,
+  draft: S["Type"],
+  files: readonly File[] | undefined,
+): Effect.Effect<S["Type"] | FormData, never, S["EncodingServices"]> =>
+  files === undefined || files.length === 0
+    ? Effect.succeed(draft)
+    : Effect.map(
+        Effect.orDie(Schema.encodeUnknownEffect(schema)(draft)),
+        (encoded) => {
+          const form = new FormData();
+          form.append(MESSAGE_FIELD, JSON.stringify(encoded));
+          for (const file of files)
+            form.append(MESSAGE_FILES_FIELD, file, file.name);
+          return form;
+        },
+      );
+
+/**
+ * {@link run} for a message that may carry files: the listener's empty `413` becomes a
+ * {@link RequestTooLarge} refusal naming what was sent.
+ */
+const runMessage = <A, E>(
+  effect: Effect.Effect<A, E, never>,
+  files: readonly File[] | undefined,
+): Promise<Call<A, E | RequestTooLarge>> =>
+  run(
+    Effect.catch(effect, (error): Effect.Effect<never, E | RequestTooLarge> =>
+      isTooLarge(error)
+        ? Effect.fail(new RequestTooLarge(requestTooLargeSentence(files ?? [])))
+        : Effect.fail(error),
+    ),
+  );
 
 /**
  * The payload as the contract encodes it, or {@link RequestNotSent} with a sentence: the
@@ -787,14 +855,30 @@ export const server = {
     text: string,
     /** `queued` when absent, which is what the server defaults to as well. */
     urgency?: SteerUrgency,
+    /** The files the message carries (A6 U13), in the same request. */
+    files?: readonly File[],
   ) =>
-    run(
-      Effect.flatMap(client(baseUrl), (api) =>
-        api.fleet.sendGoalMessage({
-          params: { targetId, goalId },
-          payload: { text, ...(urgency === undefined ? {} : { urgency }) },
-        }),
+    runMessage(
+      Effect.flatMap(
+        messageBody(
+          GoalMessageDraft,
+          { text, ...(urgency === undefined ? {} : { urgency }) },
+          files,
+        ),
+        (payload) =>
+          Effect.flatMap(client(baseUrl), (api) =>
+            payload instanceof FormData
+              ? api.fleet.sendGoalMessage({
+                  params: { targetId, goalId },
+                  payload,
+                })
+              : api.fleet.sendGoalMessage({
+                  params: { targetId, goalId },
+                  payload,
+                }),
+          ),
       ),
+      files,
     ),
 
   /**
@@ -809,45 +893,6 @@ export const server = {
         api.fleet.stopGoalTurn({ params: { targetId, goalId } }),
       ),
     ),
-
-  /**
-   * Attaches files to one goal, where its agent can read them.
-   *
-   * **The one call on this client that does not send JSON**, and the only place in the
-   * browser half that builds a request body by hand. `FormData` is what the generated
-   * client takes for a multipart endpoint — the payload type of
-   * {@link BitApi.fleet.uploadGoalFiles} *is* `FormData`, because the contract brands the
-   * schema as multipart — so this is still derived from the declaration rather than a
-   * hand-rolled `fetch`: a renamed field or a moved path is a compile error here exactly as
-   * it is everywhere else.
-   *
-   * The field name comes from the contract ({@link GOAL_UPLOAD_FIELD}) rather than being
-   * typed in, since the server reads the parts under that key and a string written twice is
-   * a string that drifts.
-   *
-   * **Nothing here names a path.** A `File` from an `<input type="file">` carries only a
-   * name and its bytes; where they land is the server's decision and is not expressible in
-   * this call. The caps are the server's too, and this deliberately does not pre-check
-   * them: the browser is never told the figures, so there is no copy here to fall out of
-   * step, and the refusal that comes back carries both numbers for the composer to print.
-   */
-  uploadGoalFiles: (
-    baseUrl: string,
-    targetId: string,
-    goalId: string,
-    files: readonly File[],
-  ) => {
-    const form = new FormData();
-    for (const file of files) form.append(GOAL_UPLOAD_FIELD, file);
-    return run(
-      Effect.flatMap(client(baseUrl), (api) =>
-        api.fleet.uploadGoalFiles({
-          params: { targetId, goalId },
-          payload: form,
-        }),
-      ),
-    );
-  },
 
   /**
    * Stops one planner round, answering with the round's own row once it has settled.
@@ -971,17 +1016,29 @@ export const server = {
     baseUrl: string,
     targetId: string,
     draft: ImporterConversationDraft,
+    /** The files the message carries (A6 U13), in the same request. */
+    files?: readonly File[],
   ) =>
-    run(
+    runMessage(
       Effect.andThen(
         encodedOrNotSent(ImporterConversationDraft, draft),
-        Effect.flatMap(client(baseUrl), (api) =>
-          api.fleet.openImporterConversation({
-            params: { targetId },
-            payload: draft,
-          }),
+        Effect.flatMap(
+          messageBody(ImporterConversationDraft, draft, files),
+          (payload) =>
+            Effect.flatMap(client(baseUrl), (api) =>
+              payload instanceof FormData
+                ? api.fleet.openImporterConversation({
+                    params: { targetId },
+                    payload,
+                  })
+                : api.fleet.openImporterConversation({
+                    params: { targetId },
+                    payload,
+                  }),
+            ),
         ),
       ),
+      files,
     ),
 
   /**
@@ -998,19 +1055,42 @@ export const server = {
     text: string,
     /** `queued` when absent, which is what the server defaults to as well. */
     urgency?: SteerUrgency,
-  ) =>
-    run(
+    /** The files the message carries (A6 U13), in the same request. */
+    files?: readonly File[],
+  ) => {
+    const draft = { text, ...(urgency === undefined ? {} : { urgency }) };
+    return runMessage(
       Effect.andThen(
-        encodedOrNotSent(ImporterMessageDraft, {
-          text,
-          ...(urgency === undefined ? {} : { urgency }),
-        }),
-        Effect.flatMap(client(baseUrl), (api) =>
-          api.fleet.sendImporterMessage({
-            params: { targetId, importId },
-            payload: { text, ...(urgency === undefined ? {} : { urgency }) },
-          }),
+        encodedOrNotSent(ImporterMessageDraft, draft),
+        Effect.flatMap(
+          messageBody(ImporterMessageDraft, draft, files),
+          (payload) =>
+            Effect.flatMap(client(baseUrl), (api) =>
+              payload instanceof FormData
+                ? api.fleet.sendImporterMessage({
+                    params: { targetId, importId },
+                    payload,
+                  })
+                : api.fleet.sendImporterMessage({
+                    params: { targetId, importId },
+                    payload,
+                  }),
+            ),
         ),
+      ),
+      files,
+    );
+  },
+
+  /**
+   * One stored upload's bytes, for an attachment a replay drew from its path alone (A6
+   * U13). The path is only a request: the server serves it only from a session's own
+   * `uploads/` folder on this target (`UploadedFileRefused` otherwise).
+   */
+  uploadedFile: (baseUrl: string, targetId: string, path: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.uploadedFile({ params: { targetId }, query: { path } }),
       ),
     ),
 

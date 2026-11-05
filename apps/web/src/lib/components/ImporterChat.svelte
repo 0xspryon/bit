@@ -48,10 +48,13 @@
    * of the two, so the note above the thread says what the next message will do rather than
    * promising a resume the driver may not give (S6).
    *
-   * ## Not wired, and said
+   * ## Files, the agent and the model
    *
-   * Attach is inert for the reason `ComposeBox`'s `+` is: nothing behind it, so it is
-   * `aria-disabled` and says why. The agent chip is D7's selector ({@link AgentChip}) over
+   * Files come in by paste, by a drop on the box or by the `+` picker (A6 U13), wait in the
+   * tray above the words ({@link ComposerTray}) and go in the message's own request; the
+   * sent turn shows them as chips under the bubble ({@link AttachmentChips}), live and after
+   * a reload. A file the composer will not take, and a send refused for its files, are said
+   * in the F2 dialog. The agent chip is D7's selector ({@link AgentChip}) over
    * the server's registry, pinned once the first message is sent; the model chip is the
    * real picker ({@link ImporterModelPicker}) over whatever harnesses the app holds — the
    * server's when connected, `mockHarnesses` in the state picker. Once the session has
@@ -82,7 +85,15 @@
   } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import AgentChip from "./AgentChip.svelte";
+  import AttachmentChips from "./AttachmentChips.svelte";
   import Chat from "./Chat.svelte";
+  import ComposerTray from "./ComposerTray.svelte";
+  import { setAttachmentLoader } from "../attachmentFiles";
+  import {
+    dragHasFiles,
+    filesOfDrop,
+    filesOfPaste,
+  } from "../composerFiles.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
   import MarkedText from "./MarkedText.svelte";
@@ -138,9 +149,45 @@
   let blocked = $derived(
     stranded !== undefined || ended || refusedBecause !== undefined || noModel,
   );
+  /**
+   * Words, or files: a message of files alone is let through to Send, which refuses it in
+   * the dialog with the reason (A6 U13) rather than leaving the arrow dead without one.
+   */
   let canSend = $derived(
-    importer.draft.trim() !== "" && !blocked && !importer.sending,
+    (importer.draft.trim() !== "" || importer.files.items.length > 0) &&
+      !blocked &&
+      !importer.sending,
   );
+
+  // Attachment chips in this thread ask this target's server for their files (A6 U13).
+  setAttachmentLoader((path) => app.loadUploadedFile(path));
+
+  /** The file input behind the `+`, and the `+`, which a refusal's dialog returns focus to. */
+  let picker = $state<HTMLInputElement | undefined>(undefined);
+  let attachButton = $state<HTMLButtonElement | undefined>(undefined);
+  /** True while files are dragged over the box, which says it will take them. */
+  let dropping = $state(false);
+
+  /**
+   * The picker's files into the tray. The input is emptied straight away: it fires no
+   * `change` for the same file picked twice in a row, which removing one from the tray and
+   * picking it again is.
+   */
+  function chosen(
+    event: Event & { currentTarget: EventTarget & HTMLInputElement },
+  ): void {
+    const files = [...(event.currentTarget.files ?? [])];
+    event.currentTarget.value = "";
+    importer.files.add(files);
+  }
+
+  /** A paste of files alone attaches them; a paste with text in it is a paste of the text. */
+  function onpaste(event: ClipboardEvent): void {
+    const files = filesOfPaste(event);
+    if (files.length === 0 || blocked) return;
+    event.preventDefault();
+    importer.files.add(files);
+  }
   /**
    * How long the message is, shown once it nears the limit the server takes (U8 review 5):
    * a pasted statement of work is this page's main use, and one over the limit is refused
@@ -373,6 +420,16 @@
         -->
         <div class={["you", group.subject.queued && "queued"]}>
           <div class="bubble"><MarkedText text={group.subject.message} /></div>
+          {#if group.subject.attachments !== undefined && group.subject.attachments.length > 0}
+            <!--
+              The files the message carried (A6 U13), right-aligned under it: live from the
+              server's answer, after a reload from the harness's transcript.
+            -->
+            <AttachmentChips
+              attachments={group.subject.attachments}
+              align="end"
+            />
+          {/if}
           <!--
             D3's line under the bubble: who and when, and a copy of the words. A message
             still waiting behind the running turn says so here, until the harness takes it.
@@ -535,8 +592,29 @@
           class={[
             "box",
             groups.length === 0 && "first",
-            (focused || importer.draft !== "") && "in-use",
+            (focused ||
+              importer.draft !== "" ||
+              importer.files.items.length > 0) &&
+              "in-use",
+            dropping && "dropping",
           ]}
+          ondragover={(event) => {
+            if (blocked || !dragHasFiles(event)) return;
+            event.preventDefault();
+            dropping = true;
+          }}
+          ondragleave={(event) => {
+            const next = event.relatedTarget;
+            if (!(next instanceof Node && event.currentTarget.contains(next))) {
+              dropping = false;
+            }
+          }}
+          ondrop={(event) => {
+            dropping = false;
+            if (blocked || !dragHasFiles(event)) return;
+            event.preventDefault();
+            importer.files.add(filesOfDrop(event));
+          }}
           onfocusin={() => (focused = true)}
           onfocusout={(event) => {
             const next = event.relatedTarget;
@@ -549,6 +627,8 @@
           <label class="visually-hidden" for="importer-message"
             >Message the importer</label
           >
+          <!-- The files this message will carry, above the words (A6 U13). -->
+          <ComposerTray files={importer.files} disabled={importer.sending} />
           <textarea
             bind:this={box}
             id="importer-message"
@@ -557,14 +637,29 @@
             {placeholder}
             disabled={blocked}
             bind:value={importer.draft}
-            {onkeydown}></textarea>
+            {onkeydown}
+            {onpaste}></textarea>
           <div class="strip">
+            <label class="visually-hidden" for="importer-attach"
+              >Attach files to this message</label
+            >
+            <input
+              bind:this={picker}
+              id="importer-attach"
+              class="visually-hidden"
+              type="file"
+              multiple
+              disabled={blocked}
+              onchange={chosen}
+            />
             <button
+              bind:this={attachButton}
               class="icon-btn"
               type="button"
-              aria-disabled="true"
-              aria-label="Attach"
-              title="Attaching files is not wired to anything yet."
+              disabled={blocked}
+              aria-label="Attach files"
+              title="Attach files: drop or paste them here, or pick them. Images go to the model as images; any file goes as its path."
+              onclick={() => picker?.click()}
             >
               <IconPlus width="14" height="14" />
             </button>
@@ -671,6 +766,15 @@
     {/snippet}
   </Chat>
 </div>
+
+{#if importer.files.refusal !== undefined}
+  <!-- A file the composer would not take, or a message refused for its files (A6 U13). -->
+  <ErrorDialog
+    {...importer.files.refusal}
+    opener={attachButton ?? box ?? null}
+    ondismiss={() => importer.files.dismiss()}
+  />
+{/if}
 
 {#if importer.stopFailure !== undefined}
   <ErrorDialog
@@ -926,7 +1030,23 @@
   .icon-btn {
     background: transparent;
     color: var(--icon-muted);
+  }
+  .icon-btn:hover:not(:disabled) {
+    background: var(--overlay-hover);
+    color: var(--text-base);
+  }
+  .icon-btn:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 1px;
+  }
+  .icon-btn:disabled {
+    color: var(--text-faint);
     cursor: not-allowed;
+  }
+  /* A drag of files over the box: it says it will take them (A6 U13). */
+  .box.dropping {
+    border-style: dashed;
+    border-color: var(--border-focus);
   }
   .send {
     background: var(--bg-inverse);

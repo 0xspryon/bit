@@ -88,6 +88,7 @@ import {
   type TerminalOutcome,
 } from "./agentHarness";
 import type { HarnessNotReady } from "./resolver";
+import type { MessageAttachment } from "./attachments";
 import type { CredentialRefused, IssuedCredential } from "../mcp/credentials";
 import type { DatabaseError } from "../persistence/sql";
 import type { PolicyDecisions } from "../policy/service";
@@ -175,6 +176,12 @@ export interface LiveAgentSession<Meta> {
   readonly openedAt: number;
   /** Whether the opening prompt has been accepted. See this module's header. */
   readonly preambled: boolean;
+  /**
+   * The files the opening message carried, as stored (A6 U13): what the surface's accepted
+   * answer names, so the operator's turn shows each file's path without a replay. Empty for
+   * an opening with none.
+   */
+  readonly openedWith: readonly MessageAttachment[];
   /** What the surface keeps beside the session. Opaque here. */
   readonly meta: Meta;
 }
@@ -566,6 +573,8 @@ export interface LiveAgentSessions<Meta> {
        * harness takes it off its queue (A6 U4).
        */
       readonly messageId: string;
+      /** The files, as stored: where each is, for the operator's turn (A6 U13). */
+      readonly attachments: readonly MessageAttachment[];
     },
     HarnessFailure | UploadWriteFailed
   >;
@@ -1107,6 +1116,7 @@ export const makeLiveAgentSessions = <Meta>(
                     // message out of it until the opening prompt has landed is this
                     // flag rather than the absence of an entry.
                     preambled: false,
+                    openedWith: opened.success.attachments,
                     meta: plan.meta,
                   };
                   live.set(input.id, entry);
@@ -1218,7 +1228,7 @@ export const makeLiveAgentSessions = <Meta>(
           return yield* Effect.fail(accepted.failure);
         }
         if (accepted.success.delivered) yield* promptAccepted(entry);
-        return { messageId };
+        return { messageId, attachments };
       });
 
     const interrupt: LiveAgentSessions<Meta>["interrupt"] = (id) =>

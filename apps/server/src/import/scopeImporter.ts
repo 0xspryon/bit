@@ -169,6 +169,7 @@ import {
   type LiveSessionCloseReason,
   type LiveSessionOpenFailure,
 } from "../harness/liveAgentSessions";
+import { attachmentView, type MessageAttachment } from "../harness/attachments";
 import { resolveSessionModelOptions } from "../harness/modelOptions";
 import {
   checkModelSwitch,
@@ -1630,6 +1631,11 @@ export class ScopeImporter extends Context.Service<
         },
         /** The steer's id, on a `continued` turn: see `ImporterTurnAccepted.messageId`. */
         messageId?: string,
+        /**
+         * The files this message carried, as stored: a follow-up's from its delivery, an
+         * opening's from the entry the spine opened with them (A6 U13).
+         */
+        attachments: readonly MessageAttachment[] = entry.openedWith,
       ): ImporterTurnAccepted => ({
         targetId: entry.targetId,
         importId: entry.id,
@@ -1642,6 +1648,9 @@ export class ScopeImporter extends Context.Service<
         pagesNotAdded: [...pages.notAdded],
         acceptedAt: Date.now(),
         ...(messageId === undefined ? {} : { messageId }),
+        ...(attachments.length === 0
+          ? {}
+          : { attachments: attachments.map(attachmentView) }),
       });
 
       /**
@@ -1711,6 +1720,7 @@ export class ScopeImporter extends Context.Service<
           "",
           widened ?? { added: [], notAdded: [] },
           delivered.success.messageId,
+          delivered.success.attachments,
         );
         /*
          * Held until the transcript has it (`steers`), marked taken if the take came first.

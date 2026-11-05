@@ -80,6 +80,15 @@ import {
   type ClaudeCodeSdk,
   type HarnessQuery,
 } from "./claudeCodeClient";
+import { attachmentHeader } from "./attachments";
+
+/** A message's attachment code, as a replay test fixes it (U13). */
+const M = "0123456789abcdef0123456789abcdef";
+/** A sent prompt with its fresh code read as `MARK`, so it compares exactly. */
+const unmarked = <A>(value: A): A =>
+  JSON.parse(
+    JSON.stringify(value).replace(/\(bit:[0-9a-f]{32}\)/g, "(bit:MARK)"),
+  ) as A;
 
 /* ── A scripted SDK ──────────────────────────────────────────────────────────── */
 
@@ -6712,7 +6721,7 @@ describe("a message's files", () => {
             },
           ]);
           yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)));
-          return seen[0]?.contents;
+          return unmarked(seen[0]?.contents);
         }),
       );
       expect(contents).toEqual([
@@ -6727,7 +6736,7 @@ describe("a message's files", () => {
           },
           {
             type: "text",
-            text: `Describe it.\n\n[Attached image "shot.png" is saved at: ${png}]\n[Attached file "notes.txt" is saved at: ${notes}]`,
+            text: `Describe it.\n\n${attachmentHeader("MARK")}\n[Attached image "shot.png" is saved at: ${png}] (bit:MARK)\n[Attached file "notes.txt" is saved at: ${notes}] (bit:MARK)`,
           },
         ],
       ]);
@@ -6756,11 +6765,11 @@ describe("a message's files", () => {
           },
         ]);
         yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)));
-        return seen[0]?.contents;
+        return unmarked(seen[0]?.contents);
       }),
     );
     expect(contents).toEqual([
-      'Read it.\n\n[Attached file "policy.pdf" is saved at: /tmp/ws/uploads/policy.pdf]',
+      `Read it.\n\n${attachmentHeader("MARK")}\n[Attached file "policy.pdf" is saved at: /tmp/ws/uploads/policy.pdf] (bit:MARK)`,
     ]);
   });
 
@@ -6846,7 +6855,7 @@ describe("a message's files", () => {
           transcript: [
             operatorEntry(
               SESSION,
-              `What is in these?\n\n[Attached image "shot.png" is saved at: ${png}]\n[Attached file "notes.txt" is saved at: ${notes}]`,
+              `What is in these?\n\n${attachmentHeader(M)}\n[Attached image "shot.png" is saved at: ${png}] (bit:${M})\n[Attached file "notes.txt" is saved at: ${notes}] (bit:${M})`,
               ["image/png"],
             ),
           ],
@@ -6911,7 +6920,7 @@ describe("a message's files", () => {
   test("an image's replayed type is its stored name's, not the CLI's re-encoded block's, and not paired by position", async () => {
     const SESSION = "11111111-0000-4000-8000-0000000000fb";
     await withUploads(["big.png", "small.webp"], async (folder) => {
-      const text = `Look.\n\n[Attached image "big.png" is saved at: ${join(folder, "big.png")}]\n[Attached image "small.webp" is saved at: ${join(folder, "small.webp")}]`;
+      const text = `Look.\n\n${attachmentHeader(M)}\n[Attached image "big.png" is saved at: ${join(folder, "big.png")}] (bit:${M})\n[Attached image "small.webp" is saved at: ${join(folder, "small.webp")}] (bit:${M})`;
       for (const blocks of [
         ["image/jpeg", "image/webp"],
         // One block fewer than lines: pairing by position would type the wrong file.
@@ -6950,7 +6959,30 @@ describe("a message's files", () => {
 const RECORDED_UPLOADS =
   "/tmp/bit-f9-live/hunt/targets/cc4/import/imp_1a1a5b22561001o6wMLGWxLmQz/uploads";
 
-test("a real transcript's messages with files replay as the operator's, carrying their files", async () => {
+/**
+ * The recording was made before U13 marked the attachment block, so its lines carry no
+ * code. `remark` rewrites them as the server now writes them — the header under a code, the
+ * code after each line — which is what the CLI stores for a message sent today.
+ */
+const remarked = (jsonl: string): string =>
+  jsonl
+    .replaceAll(
+      "\\n\\n[Attached",
+      `\\n\\n${JSON.stringify(attachmentHeader(M)).slice(1, -1)}\\n[Attached`,
+    )
+    .replace(
+      /(\[Attached (?:image|file) \\"[^\\]*\\" is saved at: [^\]]*\])/g,
+      `$1 (bit:${M})`,
+    );
+
+const replayRecording = async (
+  remark: boolean,
+  check: (
+    operator: readonly LiveItem[],
+    entries: readonly { readonly text: string }[],
+    folder: string,
+  ) => void,
+) => {
   const SESSION = "00000000-0000-4000-8000-0000000000f9";
   const root = await mkdtemp(join(tmpdir(), "bit-attachments-"));
   const previous = process.env["CLAUDE_CONFIG_DIR"];
@@ -6963,19 +6995,20 @@ test("a real transcript's messages with files replay as the operator's, carrying
     for (const name of ["colours.png", "notes.txt", "colours (2).png"]) {
       await writeFile(join(folder, name), "x");
     }
+    const recorded = (
+      await readFile(
+        join(
+          import.meta.dir,
+          "testdata",
+          "claude-code-transcript",
+          "attachments.cli.jsonl",
+        ),
+        "utf8",
+      )
+    ).replaceAll(RECORDED_UPLOADS, folder);
     await writeFile(
       join(project, `${SESSION}.jsonl`),
-      (
-        await readFile(
-          join(
-            import.meta.dir,
-            "testdata",
-            "claude-code-transcript",
-            "attachments.cli.jsonl",
-          ),
-          "utf8",
-        )
-      ).replaceAll(RECORDED_UPLOADS, folder),
+      remark ? remarked(recorded) : recorded,
     );
     process.env["CLAUDE_CONFIG_DIR"] = root;
     const { sdk } = scriptedSdk();
@@ -7004,6 +7037,16 @@ test("a real transcript's messages with files replay as the operator's, carrying
       users: "operator",
       fallbackAt: 0,
     }).items.filter((item) => item.kind === "turn.operator");
+    check(operator, entries, folder);
+  } finally {
+    if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+    else process.env["CLAUDE_CONFIG_DIR"] = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+};
+
+test("a real transcript's messages with files replay as the operator's, carrying their files", async () => {
+  await replayRecording(true, (operator, entries, folder) => {
     expect(
       operator.map((item) => ({
         headline: item.headline,
@@ -7046,11 +7089,23 @@ test("a real transcript's messages with files replay as the operator's, carrying
     expect(
       entries.some((entry) => entry.text.startsWith("[Image: source:")),
     ).toBe(false);
-  } finally {
-    if (previous === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
-    else process.env["CLAUDE_CONFIG_DIR"] = previous;
-    await rm(root, { recursive: true, force: true });
-  }
+  });
+});
+
+/**
+ * The same recording with its lines as they were stored before U13: unmarked, they are what
+ * a pasted look-alike is, and replay as the operator's words with no file (U13).
+ */
+test("a recorded message whose lines carry no code replays with them as words, and no attachment (U13)", async () => {
+  await replayRecording(false, (operator) => {
+    expect(operator.map((item) => item.attachments)).toEqual([
+      undefined,
+      undefined,
+    ]);
+    // The follow-up's line stays in its words (the opening one's is trimmed with the
+    // importer's framing, which ends above the operator's text).
+    expect(operator[1]?.body).toContain('[Attached image "colours (2).png"');
+  });
 });
 
 /* ── Sub-agents (A6 U14) ─────────────────────────────────────────────────────── */

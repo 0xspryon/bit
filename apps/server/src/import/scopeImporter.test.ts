@@ -4397,6 +4397,21 @@ describe("a message's files (A6 F9)", () => {
     expect(built.script.prompts[1]).toBe("Read these.");
     const given = built.script.attachments[1] ?? [];
     const folder = join(importDirectoryOf(built.root, importId), "uploads");
+    // And the answer names what was stored, for the operator's turn (U13).
+    expect(sent._tag === "Success" ? sent.success.attachments : []).toEqual([
+      {
+        kind: "image",
+        name: "shot.png",
+        mimeType: "image/png",
+        path: join(folder, "shot.png"),
+      },
+      {
+        kind: "file",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        path: join(folder, "notes.txt"),
+      },
+    ]);
     expect(given.map((file) => [file.kind, file.name, file.path])).toEqual([
       ["image", "shot.png", join(folder, "shot.png")],
       ["file", "notes.txt", join(folder, "notes.txt")],
@@ -4515,6 +4530,19 @@ describe("a message's files (A6 F9)", () => {
       },
     ]);
     expect(readFileSync(join(folder, "policy.pdf"), "utf8")).toBe("%PDF-1.7");
+    // The opening's answer names it too (U13); a message without files names none.
+    expect(opened.success.attachments).toEqual([
+      {
+        kind: "file",
+        name: "policy.pdf",
+        mimeType: "application/pdf",
+        path: join(folder, "policy.pdf"),
+      },
+    ]);
+    const plain = await sendTo(runtime, opened.success.importId, "No files.");
+    expect(plain._tag === "Success" && plain.success.attachments).toBe(
+      undefined,
+    );
     await runtime.dispose();
   });
 });

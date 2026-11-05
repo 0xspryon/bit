@@ -32,8 +32,16 @@
    */
   import Button from "./Button.svelte";
   import Chat from "./Chat.svelte";
+  import ComposerTray from "./ComposerTray.svelte";
   import ContextMeter from "./ContextMeter.svelte";
-  import { IconArrowUp, IconPaperclip } from "../icons";
+  import ErrorDialog from "./ErrorDialog.svelte";
+  import { IconArrowUp, IconPlus } from "../icons";
+  import { setAttachmentLoader } from "../attachmentFiles";
+  import {
+    dragHasFiles,
+    filesOfDrop,
+    filesOfPaste,
+  } from "../composerFiles.svelte";
   import { whenText } from "../goalFormat";
   import type { MeterFact } from "../chat";
   import type { App } from "../app.svelte";
@@ -51,9 +59,23 @@
    * which, because a box that is simply gone is a question.
    */
   let active = $derived(goal?.status === "active");
+  /**
+   * Words, or files: a message of files alone is let through to Send, which refuses it in
+   * the dialog with the reason (A6 U13) rather than leaving the arrow dead without one.
+   */
   let canSend = $derived(
-    active && app.goalMessage.trim() !== "" && !app.goalSending,
+    active &&
+      (app.goalMessage.trim() !== "" || app.goalFiles.items.length > 0) &&
+      !app.goalSending,
   );
+
+  // Attachment chips in this chat's turns ask this target's server for their files.
+  setAttachmentLoader((path) => app.loadUploadedFile(path));
+
+  /** True while files are dragged over the composer, which says it will take them. */
+  let dropping = $state(false);
+  /** The `+`, which focus returns to when an intake refusal's dialog closes. */
+  let attachButton = $state<HTMLButtonElement | undefined>(undefined);
   /**
    * The sentence about the read itself, kept apart from a conversation saying it has no
    * prose.
@@ -123,34 +145,29 @@
   }
 
   /**
-   * The file input, which is the only way a browser can produce bytes to upload.
+   * The file input behind the `+`: a native file control cannot be opened without a real
+   * `<input>`, so it is visually hidden and stays in the accessibility tree with its label.
    *
-   * Visually hidden rather than absent, and clicked through the paperclip beside the
-   * submit button: a native file control cannot be opened without a real `<input>`, and the
-   * unstyled one does not sit in a composer strip. It stays in the accessibility tree with
-   * its own label, so the paperclip is a convenience over a working control rather than a
-   * replacement for one.
+   * **Cleared as soon as it has handed its files over.** A file input does not fire `change`
+   * when the same file is picked twice in a row, so an operator who removed a file from the
+   * tray and picked it again would otherwise get nothing.
    */
   let picker = $state<HTMLInputElement | undefined>(undefined);
 
-  /**
-   * What the operator picked, handed straight to the server.
-   *
-   * **The input is cleared before the upload, not after.** A file input does not fire
-   * `change` when the same file is picked twice in a row, so an operator who attached the
-   * wrong file, fixed it on disk and picked it again would get nothing at all. Clearing
-   * first makes every pick a new one.
-   *
-   * No size or type check here: this tab is not told the caps, and the server's refusal
-   * carries the figures — see {@link App.attachGoalFiles}.
-   */
   function chosen(
     event: Event & { currentTarget: EventTarget & HTMLInputElement },
   ): void {
     const files = [...(event.currentTarget.files ?? [])];
     event.currentTarget.value = "";
+    app.goalFiles.add(files);
+  }
+
+  /** A paste of files alone attaches them; a paste with text in it is a paste of the text. */
+  function onpaste(event: ClipboardEvent): void {
+    const files = filesOfPaste(event);
     if (files.length === 0) return;
-    void app.attachGoalFiles(files);
+    event.preventDefault();
+    app.goalFiles.add(files);
   }
 
   /**
@@ -224,46 +241,55 @@
   {/snippet}
 
   {#snippet composer()}
-    <form class="box" onsubmit={submit}>
+    <!--
+      Files come in three ways (A6 U13): dropped on the box, pasted into it, or picked with
+      the `+`. The box says it will take a drop while one is over it.
+    -->
+    <form
+      class={["box", dropping && "dropping"]}
+      onsubmit={submit}
+      ondragover={(event) => {
+        if (!active || !dragHasFiles(event)) return;
+        event.preventDefault();
+        dropping = true;
+      }}
+      ondragleave={(event) => {
+        const next = event.relatedTarget;
+        if (!(next instanceof Node && event.currentTarget.contains(next))) {
+          dropping = false;
+        }
+      }}
+      ondrop={(event) => {
+        dropping = false;
+        if (!active || !dragHasFiles(event)) return;
+        event.preventDefault();
+        app.goalFiles.add(filesOfDrop(event));
+      }}
+    >
       <label class="visually-hidden" for="goal-message"
         >Say something to this goal's agent</label
       >
+      <!-- The files this message will carry, above the words and inside the border. -->
+      {#if app.goalFiles.items.length > 0}
+        <div class="tray-slot">
+          <ComposerTray files={app.goalFiles} disabled={app.goalSending} />
+        </div>
+      {/if}
       <textarea
         id="goal-message"
         rows="3"
         placeholder="What should be investigated next?"
         bind:value={app.goalMessage}
         disabled={app.goalSending}
-        {onkeydown}></textarea>
-      <!--
-        What has been attached, above the strip and inside the composer's border.
-
-        Named rather than counted, because the name is what the agent will see: these are
-        the server's own names for the files, and an operator comparing this list against
-        what the agent says it read has to be looking at the same words. Each row carries
-        its size for the same reason the refusal does — it is the figure the cap is about.
-      -->
-      {#if app.goalAttachments.length > 0}
-        <ul class="attached" aria-label="Files attached to this goal">
-          {#each app.goalAttachments as file (file.name)}
-            <li>
-              <IconPaperclip width="10" height="10" aria-hidden="true" />
-              <span class="attached-name mono">{file.name}</span>
-              <span class="attached-size">{file.bytes} bytes</span>
-              {#if file.replaced}
-                <span class="attached-note">replaced an earlier one</span>
-              {/if}
-            </li>
-          {/each}
-        </ul>
-      {/if}
+        {onkeydown}
+        {onpaste}></textarea>
       <div class="strip">
         <span class="hint">
           It steers the planner; it cannot create intents itself. Enter sends,
           Shift+Enter for a new line.
         </span>
         <label class="visually-hidden" for="goal-attach"
-          >Attach files to this goal</label
+          >Attach files to this message</label
         >
         <input
           bind:this={picker}
@@ -271,22 +297,19 @@
           class="visually-hidden"
           type="file"
           multiple
-          disabled={app.goalAttaching}
+          disabled={app.goalSending}
           onchange={chosen}
         />
         <button
+          bind:this={attachButton}
           class="square attach"
           type="button"
-          disabled={app.goalAttaching}
-          aria-label="Attach files the goal agent can read"
-          title="Attach files the goal agent can read"
+          disabled={app.goalSending}
+          aria-label="Attach files to this message"
+          title="Attach files to this message: drop or paste them here, or pick them"
           onclick={() => picker?.click()}
         >
-          {#if app.goalAttaching}
-            <span class="spinner" aria-hidden="true"></span>
-          {:else}
-            <IconPaperclip width="14" height="14" />
-          {/if}
+          <IconPlus width="14" height="14" />
         </button>
         <button
           class="square submit"
@@ -305,25 +328,6 @@
     </form>
     {#if app.goalSendDetail !== ""}
       <p class="error" role="alert">{app.goalSendDetail}</p>
-    {/if}
-    <!--
-      A refused upload says why, in the server's words. `role="alert"` because the operator
-      just acted and the thing they did had no effect: every reason names the figure it is
-      about — this file's size against the cap, how many the goal already holds, what a
-      usable filename looks like — and all of it is the server's sentence rather than this
-      component's summary of it.
-    -->
-    {#if app.goalAttachDetail !== ""}
-      <p class="error" role="alert">{app.goalAttachDetail}</p>
-    {/if}
-    <!--
-      And an accepted one says what happens next, which is the part an operator could
-      otherwise get wrong: the files are on disk and the agent has **not** been told yet.
-      The server composes that sentence because only the server knows where they went and
-      what the next prompt will carry.
-    -->
-    {#if app.goalAttachNote !== ""}
-      <p class="hint" role="status">{app.goalAttachNote}</p>
     {/if}
   {/snippet}
 
@@ -362,6 +366,15 @@
     {/if}
   {/snippet}
 </Chat>
+
+{#if app.goalFiles.refusal !== undefined}
+  <!-- A file the composer would not take, or a message refused for its files (A6 U13). -->
+  <ErrorDialog
+    {...app.goalFiles.refusal}
+    opener={attachButton ?? null}
+    ondismiss={() => app.goalFiles.dismiss()}
+  />
+{/if}
 
 <style>
   /* The separator's own type. Its layout — the rule above it — belongs to {@link Chat}. */
@@ -432,39 +445,14 @@
     outline: 2px solid var(--border-focus);
     outline-offset: -2px;
   }
-  /*
-   * The attachment list, inside the composer's border and above its strip: these files
-   * belong to the message being written, so they read as part of the box rather than as a
-   * panel beside it. A dashed rule separates them from the textarea without adding a second
-   * solid border inside one.
-   */
-  .attached {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin: 0;
-    padding: 6px 12px;
-    border-top: 1px dashed var(--border-muted);
-    list-style: none;
+  /* The files this message will carry, inside the border above the words (A6 U13). */
+  .tray-slot {
+    padding: 10px 12px 0;
   }
-  .attached li {
-    display: flex;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: 6px;
-    font-size: 11px;
-    line-height: var(--lh-compact);
-    color: var(--text-muted);
-  }
-  .attached-name {
-    color: var(--text-base);
-    overflow-wrap: anywhere;
-  }
-  .attached-size {
-    font-variant-numeric: tabular-nums;
-  }
-  .attached-note {
-    font-style: italic;
+  /* A drag of files over the box: it says it will take them. */
+  .box.dropping {
+    border-style: dashed;
+    border-color: var(--border-focus);
   }
   .strip {
     display: flex;

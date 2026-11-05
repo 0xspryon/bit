@@ -3814,277 +3814,164 @@ describe("opening a planner round over HTTP", () => {
   });
 });
 
-describe("attaching files to a goal, on the wire", () => {
-  /**
-   * The only non-JSON route on this API, driven as a browser drives it.
-   *
-   * **This is where the multipart decode is actually exercised.** `FormData` through
-   * `fetch` with no `content-type` set by hand, so the boundary is the one the runtime
-   * generated — which is the part a hand-written body would get wrong and the part the
-   * route's own `collectUploads` consumer has to parse. The suite's conversations layer
-   * is `GoalConversations.unavailable`, so the answer is `no_harness`; the point of the
-   * assertion is that the request got *through* the parser to a typed 409 rather than
-   * dying as a 415 or a 500.
-   */
-  const upload = (
-    path: string,
-    files: readonly { readonly name: string; readonly body: string }[],
-    options?: { readonly bearer?: string | undefined; readonly field?: string },
-  ) => {
-    const form = new FormData();
-    for (const file of files) {
-      form.append(
-        options?.field ?? "files",
-        new File([file.body], file.name, { type: "text/plain" }),
-      );
-    }
-    return fetch(`${api}${path}`, {
-      method: "POST",
-      // No `content-type`: `fetch` sets it with the boundary, and a hand-set one without
-      // a boundary is exactly the request a parser cannot read.
-      headers:
-        options?.bearer === undefined
-          ? {}
-          : { authorization: `Bearer ${options.bearer}` },
-      body: form,
-    });
-  };
-
-  let counter = 0;
-  const freshTarget = async () => {
-    counter += 1;
-    const name = `upload-${String(counter)}`;
-    mkdirSync(join(workspaceRoot, name), { recursive: true });
+describe("the goal attach route is retired (U13)", () => {
+  test("a multipart post to it is a 404: a goal's files travel with its messages", async () => {
+    mkdirSync(join(workspaceRoot, "attach-gone"), { recursive: true });
     const created = await read(
       await signedIn("/targets", {
         method: "POST",
-        body: { workspacePath: join(workspaceRoot, name), name, scopeNote: "" },
+        body: {
+          workspacePath: join(workspaceRoot, "attach-gone"),
+          name: "attach-gone",
+          scopeNote: "",
+        },
       }),
     );
     expect(created.status).toBe(200);
-    return name;
-  };
-
-  const newGoal = async (targetId: string) => {
-    const created = await read(
-      await signedIn(`/targets/${targetId}/goals`, {
+    const goal = await read(
+      await signedIn("/targets/attach-gone/goals", {
         method: "POST",
-        body: { name: "Uploads", description: "Read what I attach." },
+        body: { name: "Uploads", description: "Read what I send." },
       }),
-    );
-    expect(created.status).toBe(201);
-    return String(created.body["goalId"]);
-  };
-
-  test("a multipart body is parsed and reaches the handler as a typed refusal", async () => {
-    const targetId = await freshTarget();
-    const goalId = await newGoal(targetId);
-
-    const response = await read(
-      await upload(
-        `/targets/${targetId}/goals/${goalId}/uploads`,
-        [{ name: "report.txt", body: "a scope letter" }],
-        { bearer: token },
-      ),
-    );
-
-    // 409 and not 415: the parser read the body, the handler ran, and the refusal is the
-    // one a server with no harness really gives — there is no gate installer without one,
-    // and nothing may be written into an ungated role directory.
-    expect(response.status).toBe(409);
-    expect(response.body).toMatchObject({
-      _tag: "GoalUploadRefused",
-      reason: "no_harness",
-    });
-    expect(String(response.body["detail"])).toContain("HARNESS");
-  });
-
-  test("a goal's model switch reaches the service, and a goal this target lacks is a 404 first (A6 F4)", async () => {
-    const targetId = await freshTarget();
-    const goalId = await newGoal(targetId);
-
-    // A server with no harness has no catalogue to check a model against.
-    const switched = await read(
-      await signedIn(
-        `/targets/${targetId}/goals/${goalId}/conversation/model`,
-        {
-          method: "POST",
-          body: { model: "scripted/other", modelOptions: [] },
-        },
-      ),
-    );
-    expect(switched.status).toBe(409);
-    expect(switched.body).toMatchObject({
-      _tag: "ConversationModelRefused",
-      reason: "harness_not_ready",
-    });
-
-    const unknown = await read(
-      await signedIn(
-        `/targets/${targetId}/goals/goal_not_here/conversation/model`,
-        {
-          method: "POST",
-          body: { model: "scripted/other" },
-        },
-      ),
-    );
-    expect(unknown.status).toBe(404);
-
-    // No model is a malformed request, refused by the decoder.
-    const empty = await read(
-      await signedIn(
-        `/targets/${targetId}/goals/${goalId}/conversation/model`,
-        {
-          method: "POST",
-          body: { model: "  " },
-        },
-      ),
-    );
-    expect(empty.status).toBe(400);
-  });
-
-  test("a goal's Stop with no conversation held is a 200 that says so, and a goal this target lacks is a 404 (A6 F5)", async () => {
-    const targetId = await freshTarget();
-    const goalId = await newGoal(targetId);
-    const stopped = await read(
-      await signedIn(`/targets/${targetId}/goals/${goalId}/conversation/stop`, {
-        method: "POST",
-      }),
-    );
-    expect(stopped.status).toBe(200);
-    expect(stopped.body).toMatchObject({
-      conversationId: goalId,
-      outcome: "not_live",
-      working: false,
-    });
-    const unknown = await read(
-      await signedIn(
-        `/targets/${targetId}/goals/goal_not_here/conversation/stop`,
-        { method: "POST" },
-      ),
-    );
-    expect(unknown.status).toBe(404);
-  });
-
-  test("the browser names no path: there is nowhere in the request to put one", async () => {
-    // Asserted the way the planner route's "there is no payload" test is: a request
-    // carrying extra fields that look like a destination gets the *same* answer as one
-    // carrying none, because the contract has no field for them to decode into.
-    const targetId = await freshTarget();
-    const goalId = await newGoal(targetId);
-    const path = `/targets/${targetId}/goals/${goalId}/uploads`;
-
-    const plain = await read(
-      await upload(path, [{ name: "a.txt", body: "x" }], { bearer: token }),
     );
     const form = new FormData();
     form.append("files", new File(["x"], "a.txt", { type: "text/plain" }));
-    form.append("directory", "/etc");
-    form.append("path", `${workspaceRoot}/upload-1`);
-    const stuffed = await read(
-      await fetch(`${api}${path}`, {
+    const response = await fetch(
+      `${api}/targets/attach-gone/goals/${String(goal.body["goalId"])}/uploads`,
+      {
         method: "POST",
         headers: { authorization: `Bearer ${token}` },
         body: form,
-      }),
+      },
     );
+    expect(response.status).toBe(404);
+  });
+});
 
-    expect(stuffed.status).toBe(plain.status);
-    expect(stuffed.body["reason"]).toBe(plain.body["reason"]);
+describe("serving a stored upload (U13)", () => {
+  const target = "served";
+  const other = "served-other";
+  const dir = (t: string) => join(fleetRoot, "targets", t);
+  const uploads = (t: string, kind: "import" | "goal", id: string) =>
+    join(dir(t), kind, id, "uploads");
+  const get = (path: string) =>
+    call(`/targets/${target}/uploads?path=${encodeURIComponent(path)}`, {
+      bearer: token,
+    });
+  const refusalOf = async (path: string) => {
+    const response = await get(path);
+    return {
+      status: response.status,
+      body: (await response.json()) as Record<string, unknown>,
+    };
+  };
+
+  beforeAll(async () => {
+    for (const name of [target, other]) {
+      mkdirSync(join(workspaceRoot, name), { recursive: true });
+      const created = await read(
+        await signedIn("/targets", {
+          method: "POST",
+          body: {
+            workspacePath: join(workspaceRoot, name),
+            name,
+            scopeNote: "",
+          },
+        }),
+      );
+      expect(created.status).toBe(200);
+    }
+    mkdirSync(uploads(target, "import", "imp_a"), { recursive: true });
+    mkdirSync(uploads(target, "goal", "goal_a"), { recursive: true });
+    mkdirSync(uploads(other, "import", "imp_o"), { recursive: true });
+    writeFileSync(join(uploads(target, "import", "imp_a"), "shot.png"), "png!");
+    writeFileSync(
+      join(uploads(target, "goal", "goal_a"), "notes (2).txt"),
+      "n",
+    );
+    writeFileSync(join(uploads(target, "import", "imp_a"), ".incoming-x"), "t");
+    writeFileSync(join(uploads(other, "import", "imp_o"), "theirs.txt"), "o");
+    // A link inside the folder, to the target's own database.
+    symlinkSync(
+      join(dir(target), HUNT_FILE),
+      join(uploads(target, "import", "imp_a"), "db.png"),
+    );
+    // A whole session folder whose `uploads` is a link to another session's.
+    mkdirSync(join(dir(target), "import", "imp_link"), { recursive: true });
+    symlinkSync(
+      uploads(target, "import", "imp_a"),
+      join(dir(target), "import", "imp_link", "uploads"),
+    );
   });
 
-  test("a goal this target does not hold is a 404 before anything is written", async () => {
-    const targetId = await freshTarget();
-    const other = await freshTarget();
-    const othersGoal = await newGoal(other);
-    for (const goalId of ["goal_nonesuch", othersGoal]) {
-      const response = await read(
-        await upload(
-          `/targets/${targetId}/goals/${goalId}/uploads`,
-          [{ name: "a.txt", body: "x" }],
-          { bearer: token },
-        ),
-      );
-      expect(response.status).toBe(404);
-      expect(response.body).toMatchObject({ _tag: "GoalNotFound", goalId });
+  test("a file stored in an import's or a goal's uploads folder is served, its bytes as stored", async () => {
+    const response = await get(
+      join(uploads(target, "import", "imp_a"), "shot.png"),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe(
+      "application/octet-stream",
+    );
+    expect(await response.text()).toBe("png!");
+    const goal = await get(
+      join(uploads(target, "goal", "goal_a"), "notes (2).txt"),
+    );
+    expect(goal.status).toBe(200);
+    expect(await goal.text()).toBe("n");
+  });
+
+  test("a path outside every uploads folder, or climbing out of one, is refused", async () => {
+    for (const path of [
+      join(dir(target), HUNT_FILE),
+      "/etc/passwd",
+      `${uploads(target, "import", "imp_a")}/../../../${HUNT_FILE}`,
+      `${uploads(target, "import", "imp_a")}//shot.png`,
+      "uploads/shot.png",
+      join(dir(target), "import", "imp_a", "shot.png"),
+      join(uploads(target, "import", "imp_a"), "sub", "shot.png"),
+      join(dir(target), "planning", "rnd_1", "uploads", "x.txt"),
+    ]) {
+      const refused = await refusalOf(path);
+      expect(refused.status).toBe(404);
+      expect(refused.body).toMatchObject({
+        _tag: "UploadedFileRefused",
+        reason: "not_an_upload",
+      });
     }
   });
 
-  test("a file over the cap is refused on the wire, with the configured figure", async () => {
-    /*
-     * The cap, over HTTP, on a server with no harness — which is what makes this the
-     * sharpest test of where it is enforced. The body is read by the route's own multipart
-     * consumer *before* anything that needs a harness, so this answer comes from the cap
-     * rather than from `no_harness`: the same request one byte smaller is refused for the
-     * other reason, which is asserted below.
-     */
-    const targetId = await freshTarget();
-    const goalId = await newGoal(targetId);
-    const path = `/targets/${targetId}/goals/${goalId}/uploads`;
-
-    const over = await read(
-      await upload(
-        path,
-        [{ name: "big.txt", body: "x".repeat(SUITE_UPLOAD_MAX_BYTES + 1) }],
-        { bearer: token },
-      ),
-    );
-    expect(over.status).toBe(409);
-    expect(over.body).toMatchObject({
-      _tag: "GoalUploadRefused",
-      reason: "too_large",
-    });
-    // The suite's figure, not the shipped default: the number is threaded from the config.
-    expect(String(over.body["detail"])).toContain("64 bytes");
-    expect(String(over.body["detail"])).toContain("big.txt");
-
-    // One byte under, and the cap has nothing to say: the refusal changes to the one a
-    // harness-less server gives, which is what says the size check was the thing above.
-    const under = await read(
-      await upload(
-        path,
-        [{ name: "big.txt", body: "x".repeat(SUITE_UPLOAD_MAX_BYTES) }],
-        { bearer: token },
-      ),
-    );
-    expect(under.body).toMatchObject({ reason: "no_harness" });
+  test("a link — the file, or the uploads folder itself — is refused, whatever it points at", async () => {
+    for (const path of [
+      join(uploads(target, "import", "imp_a"), "db.png"),
+      join(dir(target), "import", "imp_link", "uploads", "shot.png"),
+    ]) {
+      const refused = await refusalOf(path);
+      expect(refused.status).toBe(404);
+      expect(refused.body["reason"]).toBe("not_an_upload");
+    }
   });
 
-  test("more files than the cap in one request is refused on the wire", async () => {
-    const targetId = await freshTarget();
-    const goalId = await newGoal(targetId);
-
-    const response = await read(
-      await upload(
-        `/targets/${targetId}/goals/${goalId}/uploads`,
-        [
-          { name: "one.txt", body: "1" },
-          { name: "two.txt", body: "2" },
-          { name: "three.txt", body: "3" },
-        ],
-        { bearer: token },
-      ),
+  test("a temporary, another target's upload and a missing file are not served", async () => {
+    const temporary = await refusalOf(
+      join(uploads(target, "import", "imp_a"), ".incoming-x"),
     );
-
-    expect(response.status).toBe(409);
-    expect(response.body).toMatchObject({
-      _tag: "GoalUploadRefused",
-      reason: "too_many",
-    });
-    expect(String(response.body["detail"])).toContain("2 files");
-    expect(String(response.body["detail"])).toContain("UPLOAD_MAX_FILES");
+    expect(temporary.body["reason"]).toBe("not_an_upload");
+    const theirs = await refusalOf(
+      join(uploads(other, "import", "imp_o"), "theirs.txt"),
+    );
+    expect(theirs.body["reason"]).toBe("not_an_upload");
+    const gone = await refusalOf(
+      join(uploads(target, "import", "imp_a"), "gone.png"),
+    );
+    expect(gone).toMatchObject({ status: 404, body: { reason: "missing" } });
   });
 
-  test("an unsigned request is a 401 before the body is looked at", async () => {
-    const targetId = await freshTarget();
-    const goalId = await newGoal(targetId);
-    const response = await read(
-      await upload(`/targets/${targetId}/goals/${goalId}/uploads`, [
-        { name: "a.txt", body: "x" },
-      ]),
+  test("it needs a session, like every other fleet route", async () => {
+    const path = join(uploads(target, "import", "imp_a"), "shot.png");
+    const response = await call(
+      `/targets/${target}/uploads?path=${encodeURIComponent(path)}`,
     );
     expect(response.status).toBe(401);
-    expect(response.body).toMatchObject({ _tag: "Unauthenticated" });
   });
 });
 

@@ -20,7 +20,6 @@ export * from "./intent";
 export * from "./goal";
 export * from "./plan";
 export * from "./goalAgent";
-export * from "./goalUpload";
 export * from "./messageUpload";
 export * from "./event";
 export * from "./live";
