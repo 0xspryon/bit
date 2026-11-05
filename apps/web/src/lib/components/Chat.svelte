@@ -48,7 +48,13 @@
 
   import ChatItem from "./ChatItem.svelte";
   import ToolRun from "./ToolRun.svelte";
-  import { lastProse, threadEntries, type ChatGroup } from "../chat";
+  import {
+    SUBAGENT_KIND,
+    lastProse,
+    threadEntries,
+    type ChatGroup,
+    type ChatRow,
+  } from "../chat";
   import { atBottom } from "../scroll";
 
   let {
@@ -67,6 +73,8 @@
     detail = "",
     empty,
     layout = "panel",
+    header,
+    subagent,
   }: {
     /** The heading, and the list's accessible name. */
     label: string;
@@ -160,6 +168,22 @@
      * the style block for what each does.
      */
     layout?: "panel" | "thread";
+    /**
+     * A region at the top of the chat, for what is about the whole session rather than one
+     * turn: A7-S's sub-agents chip ("N sub-agents · running · failed", E8), which opens the
+     * panel of them. In a panel it sits in the heading's strip before the meter; in a thread,
+     * which has no heading, it is a row of its own above the note. Absent draws nothing.
+     */
+    header?: Snippet | undefined;
+    /**
+     * Draws a sub-agent's row in place of {@link ChatItem}'s entry (A7-S's cards, E7).
+     *
+     * The row is the folded one (`foldSubagents`): one per sub-agent, at the place it
+     * started, carrying its newest state. The snippet draws the card's contents; this wraps
+     * it in the list item, so the log's list stays a list. Absent, a sub-agent is
+     * `ChatItem`'s U14 entry as before.
+     */
+    subagent?: Snippet<[ChatRow]> | undefined;
   } = $props();
 
   /**
@@ -282,6 +306,9 @@
       {#if count !== ""}
         <span class="count">{count}</span>
       {/if}
+      {#if header !== undefined}
+        <div class="header-region">{@render header()}</div>
+      {/if}
       <!--
         The context indicator, at the top of the pane. Last in the strip and pushed to the
         end, so the heading and the count stay where a reader's eye starts.
@@ -290,7 +317,10 @@
         <div class="meter">{@render meter()}</div>
       {/if}
     </div>
-  {:else if !anything}
+  {:else if header !== undefined}
+    <div class="header-region">{@render header()}</div>
+  {/if}
+  {#if thread && !anything}
     <!--
       A page's empty state is its lead: the label as the heading and the sentence under it,
       with the composer directly beneath, rather than a caption over an empty frame.
@@ -381,6 +411,10 @@
             {#each threadEntries(group.rows) as entry (entry.key)}
               {#if entry._tag === "tools"}
                 <ToolRun rows={entry.rows} summary={entry.summary} />
+              {:else if subagent !== undefined && entry.row.item.kind === SUBAGENT_KIND}
+                <li class="subagent-card" data-origin={entry.row.item.origin}>
+                  {@render subagent(entry.row)}
+                </li>
               {:else}
                 <ChatItem
                   item={entry.row.item}
@@ -404,14 +438,20 @@
         {:else if group.rows.length > 0}
           <ol class="items">
             {#each group.rows as row (row.key)}
-              <ChatItem
-                item={row.item}
-                proposedBy={row.proposedBy}
-                result={row.result}
-                write={row.write}
-                summary={row.summary}
-                stream={row.stream}
-              />
+              {#if subagent !== undefined && row.item.kind === SUBAGENT_KIND}
+                <li class="subagent-card" data-origin={row.item.origin}>
+                  {@render subagent(row)}
+                </li>
+              {:else}
+                <ChatItem
+                  item={row.item}
+                  proposedBy={row.proposedBy}
+                  result={row.result}
+                  write={row.write}
+                  summary={row.summary}
+                  stream={row.stream}
+                />
+              {/if}
             {/each}
           </ol>
         {/if}
@@ -562,6 +602,14 @@
     margin: 0;
     padding: 0;
     list-style: none;
+  }
+  .header-region {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .subagent-card {
+    display: block;
   }
   .controls,
   .composer {

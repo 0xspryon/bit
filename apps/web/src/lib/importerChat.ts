@@ -77,7 +77,6 @@ import {
   type ImporterConversationView,
   type ImporterSessionView,
   type LiveItem,
-  type MessageAttachmentView,
   type ModelOptionSelection,
 } from "@bit/contracts";
 
@@ -97,62 +96,18 @@ import {
   type RoundProse,
 } from "./chat";
 import { parkedMark, parkedStart, type ParkedMessage } from "./importerParked";
+import type { ThreadTurn } from "./chatShell";
 import { proseRuns } from "./markdown";
 
 /**
  * What an importer group's separator needs, and the whole of what the chat is given.
  *
  * `message` is `null` for the leading group, which has no operator message because it is
- * what came before the first one this tab can see.
+ * what came before the first one this tab can see. The shape is the chat shell's
+ * ({@link ThreadTurn}): nothing in it is the importer's, and the goal, planner and worker
+ * chats draw the same turns.
  */
-export interface ImporterTurn {
-  /** The operator's words, or `null` on the "earlier in this session" group. */
-  readonly message: string | null;
-  /**
-   * The files the message carried (A6 U13): the server's answer's while it is this tab's,
-   * the transcript's after a reload. Absent, or empty, on a message with none.
-   */
-  readonly attachments?: readonly MessageAttachmentView[];
-  /** Which operator message this is, from one. `null` on the leading group. */
-  readonly number: number | null;
-  /**
-   * When the operator sent it, in epoch milliseconds, or `null` on the leading group.
-   *
-   * On a replayed turn it is the harness's own time for the message (A6 F10); on a live one,
-   * this tab's clock when it was sent. Shown, never used for ordering.
-   */
-  readonly at: number | null;
-  /** True while the importer is still working on this message. */
-  readonly working: boolean;
-  /**
-   * True while this message waits behind a turn already running (A6 U4): it was sent
-   * mid-turn and the harness has not yet said it took it (`turn.taken`). Drawn where the
-   * operator sent it, marked queued; once taken it is an ordinary turn.
-   */
-  readonly queued: boolean;
-  /**
-   * True when this message was sent with D3's "Send now" while a turn ran (A6 U6): a
-   * `preemptive` steer, which the harness takes at its next step, dropping the rest of the
-   * work in flight. Said under the bubble while it waits and once it was taken.
-   */
-  readonly sentNow: boolean;
-  /**
-   * When the importer started on this message, on the server's clock, or `null` on the
-   * leading group: when the harness took it, for a message that waited; otherwise when it
-   * was accepted (live) or stored (replayed). The start of the turn footer's duration.
-   */
-  readonly startedAt: number | null;
-  /**
-   * True on the turn the importer is on when this page holds nothing of its reply but the
-   * harness is still working on it (A6 U5): a reload while Claude Code is part way through
-   * a block, which it writes to its transcript only once the block is complete, and whose
-   * partials before the reload are not sent again — the next one, with the whole text so
-   * far, comes with the block's next words (A6 U5 review: a block that has paused, a GLM
-   * thought left open while nothing follows it, sends none until it finishes). Drawn as in
-   * progress ("writing…") rather than as a message the harness holds no reply to.
-   */
-  readonly midBlock: boolean;
-}
+export type ImporterTurn = ThreadTurn;
 
 /**
  * The note on a turn the page was reloaded into part way through a block ({@link

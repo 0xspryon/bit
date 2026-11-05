@@ -27,6 +27,17 @@
    * five prose states are `Chat`'s and are all reachable from here: `live`, `pending`,
    * `replayed`, `forgotten`, `loading` and `none`.
    *
+   * ## It is the importer's adapter over {@link ChatShell}
+   *
+   * The bubble, the cursor, the footer, Stop, the composer with Send now and its files, the
+   * drop and the F2 dialogs are the shared shell's (A6 prep for the goal, planner and worker
+   * chats), which draws them from a `ChatSession` (`chatShell.ts`). This file builds that
+   * session from `app.importer` and keeps what only the importer has: the starters, the
+   * agent chip, the model picker and its caption, the switch notices, and every sentence
+   * that says why a session cannot be continued. Parked words, `#confirm`, opening a session
+   * and the new-session flow are `importerSessions.svelte.ts`'s and `TitleBar`'s, and are
+   * reached from here only through `app.importer`.
+   *
    * ## The composer is enabled, unlike the planner's
    *
    * Corrections are messages, not forms (D4). The box stays enabled while the importer is
@@ -66,35 +77,26 @@
   import { IMPORTER_MESSAGE_MAX_CHARS } from "@bit/contracts";
 
   import type { App } from "../app.svelte";
-  import { IconArrowUp, IconFile, IconLink, IconPlus } from "../icons";
-  import {
-    connectionNote,
-    durationLabel,
-    lastProse,
-    turnEndedAt,
-    turnModels,
-    type ChatGroup,
-  } from "../chat";
-  import type { ImporterTurn } from "../importerChat";
-  import CopyButton from "./CopyButton.svelte";
+  import { IconFile, IconLink } from "../icons";
+  import { connectionNote } from "../chat";
+  import type {
+    ChatComposerSource,
+    ChatSession,
+    ChatWords,
+    ComposerNotice,
+  } from "../chatShell";
   import {
     ENDED_NOTE,
     readingNote,
     sendNowButtonTitle,
     sentNowTitle,
     strandedNote,
+    type ImporterTurn,
   } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import AgentChip from "./AgentChip.svelte";
-  import AttachmentChips from "./AttachmentChips.svelte";
-  import Chat from "./Chat.svelte";
-  import ComposerTray from "./ComposerTray.svelte";
-  import { setAttachmentLoader } from "../attachmentFiles";
-  import { panelFileDrop, filesOfPaste } from "../composerFiles.svelte";
-  import ErrorDialog from "./ErrorDialog.svelte";
+  import ChatShell from "./ChatShell.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
-  import MarkedText from "./MarkedText.svelte";
-  import StreamCursor from "./StreamCursor.svelte";
 
   let { app }: { app: App } = $props();
 
@@ -157,72 +159,12 @@
   let blocked = $derived(
     stranded !== undefined || ended || refusedBecause !== undefined || noModel,
   );
-  /**
-   * Words, or files: a message of files alone is let through to Send, which refuses it in
-   * the dialog with the reason (A6 U13) rather than leaving the arrow dead without one.
-   */
-  let canSend = $derived(
-    (importer.draft.trim() !== "" || importer.files.items.length > 0) &&
-      !blocked &&
-      !importer.sending,
-  );
-
-  // Attachment chips in this thread ask this target's server for their files (A6 U13).
-  setAttachmentLoader((path) => app.loadUploadedFile(path));
-
-  /** The file input behind the `+`, and the `+`, which a refusal's dialog returns focus to. */
-  let picker = $state<HTMLInputElement | undefined>(undefined);
-  let attachButton = $state<HTMLButtonElement | undefined>(undefined);
-  /** True while files are dragged over the box, which says it will take them. */
-  let dropping = $state(false);
-  const fileDrop = panelFileDrop({
-    accepting: () => !blocked,
-    take: (files) => importer.files.add(files),
-    dropping: (over) => (dropping = over),
-  });
-
-  /**
-   * The picker's files into the tray. The input is emptied straight away: it fires no
-   * `change` for the same file picked twice in a row, which removing one from the tray and
-   * picking it again is.
-   */
-  function chosen(
-    event: Event & { currentTarget: EventTarget & HTMLInputElement },
-  ): void {
-    const files = [...(event.currentTarget.files ?? [])];
-    event.currentTarget.value = "";
-    importer.files.add(files);
-  }
-
-  /** A paste of files alone attaches them; a paste with text in it is a paste of the text. */
-  function onpaste(event: ClipboardEvent): void {
-    const files = filesOfPaste(event);
-    if (files.length === 0 || blocked) return;
-    event.preventDefault();
-    importer.files.add(files);
-  }
-  /**
-   * How long the message is, shown once it nears the limit the server takes (U8 review 5):
-   * a pasted statement of work is this page's main use, and one over the limit is refused
-   * on Send with both figures. Trimmed, as the limit is counted.
-   */
-  let length = $derived(importer.draft.trim().length);
-  let nearLimit = $derived(length > IMPORTER_MESSAGE_MAX_CHARS * 0.9);
   let working = $derived(session?.working ?? false);
   /**
    * Work the agent started in the background still running outside any turn (A6 U6), as
    * the server last said. Stop is offered for it too: it stops that work.
    */
   let background = $derived(session?.background === true);
-  /**
-   * D3's "Send now" is offered while a turn runs in a session the server holds: then a
-   * message can wait for the work in flight (Enter, the arrow) or go ahead of every queued
-   * one — at the next step on Claude Code, once the message being written ends on OpenCode
-   * (`SendNowTiming`). With nothing running the two are the same, so there is one way to send.
-   */
-  let canSendNow = $derived(
-    canSend && working && session?.importId !== undefined,
-  );
   /**
    * A started session's harness and model: the harness is pinned to it, the model is not
    * (D6). `null` for the empty session, whose harness and model are still open.
@@ -260,110 +202,6 @@
     );
   });
 
-  /** "18:02": when the operator's message was sent, as D3 sets it under the bubble. */
-  const clock = (at: number): string =>
-    new Date(at).toLocaleTimeString(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-
-  /**
-   * A finished turn's footer, D4's "Importer · openai/gpt-5.6-sol · 41s" (A6 U4).
-   *
-   * - **The models are the turn's own** (`turnModels`, from each item's `model`), so an
-   *   earlier turn keeps the model that answered it after a switch, and a turn switched
-   *   mid-way names both: `claude-sonnet-4-5 → claude-haiku-4-5`. The session's current
-   *   model only where the harness named none.
-   * - **The duration** runs from when the importer started on the message — accepted, or
-   *   taken off the queue, on the server's clock; stored, on a replay — to the turn's last
-   *   item, which the server or the harness stamped. Both ends one clock, so it is a length
-   *   and not a difference between two machines. Left out when the turn has no items.
-   */
-  const footerOf = (group: ChatGroup<ImporterTurn>): string => {
-    const models = turnModels(group);
-    const model =
-      models.length > 0 ? models.join(" → ") : (session?.model ?? "");
-    const ended = turnEndedAt(group);
-    const started = group.subject.startedAt;
-    const took =
-      ended !== undefined && started !== null && ended >= started
-        ? durationLabel(ended - started)
-        : "";
-    return [agentLabel, model, took].filter((part) => part !== "").join(" · ");
-  };
-
-  /** The importer's words in a turn, as the footer's Copy copies them. */
-  const replyText = (group: ChatGroup<ImporterTurn>): string =>
-    group.rows
-      .filter((row) => row.item.kind === "turn.reply")
-      .map((row) => row.item.body.trim())
-      .filter((body) => body !== "")
-      .join("\n\n");
-
-  let box = $state<HTMLTextAreaElement | undefined>(undefined);
-  /** Whether the focus is anywhere in the composer's box, for its strong border. */
-  let focused = $state(false);
-  /** The Stop pill, which focus returns to when a refused Stop's dialog closes. */
-  let stopButton = $state<HTMLButtonElement | undefined>(undefined);
-
-  function submit(event: Event): void {
-    event.preventDefault();
-    if (canSend) importer.send();
-  }
-
-  /**
-   * D3's "Send now": a `preemptive` steer, for a message that cannot wait (A6 U6).
-   *
-   * Focus goes back to the box (A6 U6 review): the click left it on this button, which is
-   * disabled once the draft clears and gone once the turn ends, and either drops focus to
-   * `<body>` — where the operator's next words, a correction to the one just sent, would go
-   * nowhere.
-   */
-  function sendNow(): void {
-    if (!canSendNow) return;
-    importer.send("preemptive");
-    box?.focus();
-  }
-
-  /**
-   * Enter sends; Shift+Enter is a newline. {@link GoalAgentChat}'s convention, for its
-   * reason: the importer is told things in sentences, often several.
-   */
-  function onkeydown(event: KeyboardEvent): void {
-    if (event.key !== "Enter" || event.shiftKey) return;
-    event.preventDefault();
-    if (canSend) importer.send();
-  }
-
-  /**
-   * Fills the composer with a pre-written first message and puts the cursor after it.
-   *
-   * **Fill, never send** (D2: "really just pre-written first messages"). Each starter ends
-   * where the operator's own words go — the program page's URL, the pasted statement — so
-   * sending it as it stands would ask the importer to read nothing.
-   *
-   * Focus, because a click that leaves the caret on the button asks them to find the box.
-   * After a `tick`: the textarea's value follows the state, not the other way round.
-   */
-  async function choose(key: StarterKey): Promise<void> {
-    const caret = importer.useStarter(key);
-    await tick();
-    if (box === undefined) return;
-    box.focus();
-    box.setSelectionRange(caret, caret);
-  }
-
-  /**
-   * Puts focus in the composer once the page has drawn: after the model picker opened a new
-   * session on another harness, the chip that opened it is gone with the session it was
-   * for, and the draft it carried over is here.
-   */
-  async function focusComposer(): Promise<void> {
-    await tick();
-    box?.focus();
-  }
-
   /**
    * What the page says above a session the operator is reading and has not typed into
    * (`readingNote`): what the next message will do, and "earlier" only of a session that is
@@ -393,601 +231,261 @@
                 ? "Paste a policy or scope URL, or say what is in and out of scope…"
                 : "Correct it, or add what the pages do not say…",
   );
+
+  /**
+   * The sentences above the box, in D3's order.
+   *
+   * - A message sent behind a switch of this session: the server holds it until the switch
+   *   has answered (F4's review measured up to ~90 s, when the switch has to reopen the
+   *   session first). Said, so a send that sits there is not read as lost.
+   * - The server's answer to the last switch, in words that say when it applies.
+   * - The server's sentence about the last message: a refusal, or the note on one it
+   *   accepted (a session it had to open afresh says why). Its words, never ours.
+   */
+  let notices = $derived<readonly ComposerNotice[]>([
+    ...(importer.sending &&
+    importer.waitingForSwitch &&
+    switchingHere !== undefined
+      ? [
+          {
+            key: "waiting",
+            text: "Waiting for the model switch: this message is delivered once the switch has answered, which can take up to a minute and a half.",
+            tone: "status" as const,
+            kind: "waiting",
+          },
+        ]
+      : []),
+    ...(switchNote === ""
+      ? []
+      : [
+          {
+            key: "switched",
+            text: switchNote,
+            tone: "status" as const,
+            kind: "switched",
+          },
+        ]),
+    ...(importer.notice === ""
+      ? []
+      : [
+          {
+            key: "server",
+            text: importer.notice,
+            tone: importer.refused ? ("alert" as const) : ("status" as const),
+            kind: importer.refused ? "refusal" : undefined,
+          },
+        ]),
+  ]);
+
+  const WORDS: ChatWords = {
+    working: "The importer is working.",
+    copyReply: "Copy the importer's reply",
+    stopTurn: "Stop the importer's turn. The conversation stays open.",
+    stopBackground:
+      "Stop the work the importer started in the background, a sub-agent or a shell. The conversation stays open.",
+    messageLabel: "Message the importer",
+    sendLabel: "Send to the importer",
+    sendTitle: "Send to the importer",
+    sendQueuedTitle:
+      "Send to the importer, queued: it reads this once it reaches a break in the work it is doing",
+    countTitle: "Characters in this message, of the most the importer takes",
+  };
+
+  /**
+   * The composer, over `app.importer`. The draft is the importer's own state, which parks
+   * and restores across sessions, so the shell's textarea writes through to it.
+   *
+   * **It posts, on a real target** (S3): `importer.send` opens the empty session's
+   * conversation or queues a message on a listed one. D3's "Send now" is offered while a
+   * turn runs in a session the server holds: then a message can wait for the work in flight
+   * (Enter, the arrow) or go ahead of every queued one — at the next step on Claude Code,
+   * once the message being written ends on OpenCode (`SendNowTiming`).
+   */
+  const composer: ChatComposerSource = {
+    get draft() {
+      return importer.draft;
+    },
+    set draft(value: string) {
+      importer.draft = value;
+    },
+    get files() {
+      return importer.files;
+    },
+    get sending() {
+      return importer.sending;
+    },
+    get blocked() {
+      return blocked;
+    },
+    get placeholder() {
+      return placeholder;
+    },
+    maxChars: IMPORTER_MESSAGE_MAX_CHARS,
+    send: (urgency) => importer.send(urgency),
+    get sendNow() {
+      return {
+        offered: session?.importId !== undefined,
+        title: sendNowButtonTitle(importer.sendNow),
+      };
+    },
+    get notices() {
+      return notices;
+    },
+  };
+
+  /** The importer's session, as the shell draws it. */
+  const chat: ChatSession<ImporterTurn> = {
+    get label() {
+      return `Load the scope for ${target}`;
+    },
+    empty:
+      "Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread.",
+    get groups() {
+      return groups;
+    },
+    get note() {
+      return stranded !== undefined
+        ? strandedNote(stranded)
+        : ended
+          ? ENDED_NOTE
+          : refusedBecause !== undefined
+            ? refusedBecause
+            : noModel
+              ? app.importModelDetail
+              : readingSaid;
+    },
+    get connection() {
+      return connection;
+    },
+    get turn() {
+      return { working, background, stopping: importer.stopping };
+    },
+    stop: () => void importer.stop(),
+    get stopFailure() {
+      return importer.stopFailure;
+    },
+    dismissStopFailure: () => importer.dismissStopFailure(),
+    composer,
+    words: WORDS,
+    get footer() {
+      return { agent: agentLabel, model: session?.model ?? "" };
+    },
+    get sentNowTitle() {
+      return sentNowTitle(importer.sendNow);
+    },
+    // Attachment chips in this thread ask this target's server for their files (A6 U13).
+    loadFile: (path) => app.loadUploadedFile(path),
+  };
+
+  let shell = $state<ChatShell<ImporterTurn> | undefined>(undefined);
+
+  /**
+   * Fills the composer with a pre-written first message and puts the cursor after it.
+   *
+   * **Fill, never send** (D2: "really just pre-written first messages"). Each starter ends
+   * where the operator's own words go — the program page's URL, the pasted statement — so
+   * sending it as it stands would ask the importer to read nothing.
+   *
+   * Focus, because a click that leaves the caret on the button asks them to find the box.
+   * After a `tick`: the textarea's value follows the state, not the other way round.
+   */
+  async function choose(key: StarterKey): Promise<void> {
+    const caret = importer.useStarter(key);
+    await tick();
+    shell?.focusComposer(caret);
+  }
+
+  /**
+   * Puts focus in the composer once the page has drawn: after the model picker opened a new
+   * session on another harness, the chip that opened it is gone with the session it was
+   * for, and the draft it carried over is here.
+   */
+  async function focusComposer(): Promise<void> {
+    await tick();
+    shell?.focusComposer();
+  }
 </script>
 
-<!--
-  A drag of files anywhere over the panel is the panel's (U13 review 1): dropped on the box
-  or beside it, the files go into the tray, and never into a `file://` tab.
--->
-<div
-  class="importer"
-  ondragover={fileDrop.ondragover}
-  ondragleave={fileDrop.ondragleave}
-  ondrop={fileDrop.ondrop}
-  role="presentation"
->
-  <Chat
-    label={`Load the scope for ${target}`}
-    {groups}
-    readonly={false}
-    layout="thread"
-    note={stranded !== undefined
-      ? strandedNote(stranded)
-      : ended
-        ? ENDED_NOTE
-        : refusedBecause !== undefined
-          ? refusedBecause
-          : noModel
-            ? app.importModelDetail
-            : readingSaid}
-    detail={connection}
-    empty="Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread."
-  >
-    {#snippet separator(group)}
-      {#if group.subject.message === null}
-        <!--
-          What came before the first message this page can see: a hairline and a few faint
-          words, as D4 draws the seam between what scrolled away and what is here.
-        -->
-        <div class="earlier"><span>earlier in this session</span></div>
+<ChatShell bind:this={shell} session={chat} id="importer" rootClass="importer">
+  {#snippet footnote()}
+    A call marked <strong>recorded</strong> is a committed event and stays on the
+    Assets page. A dashed call, the importer's words and your messages are narration:
+    not stored, and gone on a reload unless the harness still has them.
+  {/snippet}
+
+  {#snippet strip()}
+    <AgentChip
+      agents={importer.agents}
+      agentId={session?.agentId}
+      locked={(session !== undefined && session.tally.messages !== 0) ||
+        importer.sending}
+      onpick={(agentId) => importer.pickAgent(agentId)}
+    />
+    <!--
+      V2(chat): the model picker reads and writes `app`'s importer fields directly
+      (`importPickerOpen`, `importInstance`, `importer.switchModel`…), so it is mounted here
+      and not by the shell. The goal chat has a switch route (`switchGoalModel`) and no
+      picker; a shared one takes the adapter's model, catalogue and `switchModel` instead.
+    -->
+    <ImporterModelPicker
+      {app}
+      {pinned}
+      switchable={!blocked}
+      onNewSession={focusComposer}
+    />
+    {#if pinned !== null && !blocked}
+      <!--
+        D3's caption: the harness is the session's for good, its models are not. While
+        a switch is out it says which model the session is moving to instead.
+      -->
+      {#if switchingHere !== undefined}
+        <span class="hint" role="status"
+          >Switching to {switchingHere.model}…</span
+        >
       {:else}
-        <!--
-          The operator's message is the heading of the stretch of work it asked for, set as
-          D3 draws it: right-aligned in a bubble. It is the one part of a group that
-          survives anything — it is in the harness's copy as a `user` entry and in this
-          tab's feed as a minted row — so a group whose words and calls have both gone is
-          still legible as "this is what you asked".
-
-          It is marked as prose is (`MarkedText`): the operator's own words, but the empty
-          chat asks them to paste the program's pages, so it is as often a page author's
-          words, and a bidi control in a pasted host reorders it here as in a reply.
-        -->
-        <div class={["you", group.subject.queued && "queued"]}>
-          <div class="bubble"><MarkedText text={group.subject.message} /></div>
-          {#if group.subject.attachments !== undefined && group.subject.attachments.length > 0}
-            <!--
-              The files the message carried (A6 U13), right-aligned under it: live from the
-              server's answer, after a reload from the harness's transcript.
-            -->
-            <AttachmentChips
-              attachments={group.subject.attachments}
-              align="end"
-            />
-          {/if}
-          <!--
-            D3's line under the bubble: who and when, and a copy of the words. A message
-            still waiting behind the running turn says so here, until the harness takes it.
-          -->
-          <div class="said">
-            {#if group.subject.queued}
-              <span class="queued-mark"
-                >{group.subject.sentNow ? "sending now" : "queued"}</span
-              >
-            {:else if group.subject.sentNow}
-              <!--
-                Taken (A6 U6): the harness read it ahead of any queued message, which is why
-                the turn before ends where this one begins. What it cut of that turn is the
-                harness's (`sentNowTitle`).
-              -->
-              <span class="queued-mark" title={sentNowTitle(importer.sendNow)}
-                >sent now</span
-              >
-            {/if}
-            <span class="when"
-              >You{group.subject.at === null
-                ? ""
-                : ` · ${clock(group.subject.at)}`}</span
-            >
-            <CopyButton
-              text={group.subject.message}
-              label="Copy your message"
-            />
-          </div>
-        </div>
+        <!-- The title is the whole caption, where a long model name ellipses it. -->
+        <span
+          class="hint"
+          title="{pinned.harness} for this session · any of its models"
+          >{pinned.harness} for this session · any of its models</span
+        >
       {/if}
-    {/snippet}
+    {/if}
+  {/snippet}
 
-    {#snippet tail(group)}
+  {#snippet below()}
+    {#if groups.length === 0}
       <!--
-        D3's streaming cursor: the importer is still on this message. Drawn while the turn is
-        in flight — from the server accepting it until the server says the import is no
-        longer running — and not while a pending write already draws its own, so a turn
-        never blinks twice.
-
-        The status line is the cursor's counterpart in words, for a reader who cannot see
-        either cursor, so it follows the turn and not the cursor: it is said whichever of the
-        two is drawn. It lived in the header over the reply until that header went (S3);
-        here it is still inside the group it is about, and still after the operator's words.
+        Two suggestions that are really just pre-written first messages (D2). They go
+        away with the first message: after that the thread is the prompt.
       -->
-      {#if group.subject.working}
-        <span class="visually-hidden" role="status"
-          >The importer is working.</span
-        >
-        {#if group.subject.midBlock}
-          <!--
-            Reloaded part way through a block (A6 U5): the harness is writing, and its words
-            so far are not sent again, so the turn says so rather than "no reply".
-          -->
-          <div class="streaming"><StreamCursor label="writing…" /></div>
-        {:else if !group.rows.some((row) => row.write === "pending" || row.stream === "writing" || row.stream === "shortened")}
-          <!-- A reply being written draws its own mark (`ChatItem`), so not a second here. -->
-          <div class="streaming"><StreamCursor /></div>
-        {/if}
-      {/if}
-    {/snippet}
-
-    {#snippet footer(group)}
-      <!--
-        Under the finished reply, as D4 draws it: a copy of the turn's words, then the agent,
-        the model or models that answered and how long the turn took (`footerOf`). Not while
-        the turn is in flight, as OpenCode's is not — the cursor is what is under a reply
-        still being written, and a caption that appeared mid-stream would then move down
-        with every row that landed above it.
-      -->
-      {@const words = replyText(group)}
-      {#if !group.subject.working && !group.subject.queued && (group.subject.number !== null || lastProse(group) !== null)}
-        <!--
-          Also under a turn with no reply text (A6 U4 review): one that ended in the
-          harness's error, or was stopped before it answered, still ran on a model and took
-          time. Its Copy is left out, as there are no words to copy. Not on a message still
-          queued, nor on the leading group unless it holds replayed words of its own.
-        -->
-        <div class="foot">
-          {#if words !== ""}
-            <CopyButton text={words} label="Copy the importer's reply" />
-          {/if}
-          <p class="foot-text">{footerOf(group)}</p>
-        </div>
-      {/if}
-    {/snippet}
-
-    {#snippet footnote()}
-      A call marked <strong>recorded</strong> is a committed event and stays on the
-      Assets page. A dashed call, the importer's words and your messages are narration:
-      not stored, and gone on a reload unless the harness still has them.
-    {/snippet}
-
-    {#snippet controls()}
-      {#if working || background}
-        <!--
-          Stop interrupts the harness's turn and keeps the conversation (A6 F5). The cursor
-          clears on the server's answer, not on the press. While the answer is coming the pill
-          is aria-disabled rather than disabled, so focus stays on it.
-
-          Drawn whenever the server says something runs (A6 U6): a turn, including one the
-          harness opened itself on a background task's notification, or — with no turn —
-          background work the agent started, which the pill then names, since nothing else on
-          screen says it is running.
-        -->
-        <button
-          bind:this={stopButton}
-          class="stop"
-          type="button"
-          aria-disabled={importer.stopping}
-          title={working
-            ? "Stop the importer's turn. The conversation stays open."
-            : "Stop the work the importer started in the background, a sub-agent or a shell. The conversation stays open."}
-          onclick={() => {
-            if (!importer.stopping) void importer.stop();
-          }}
-        >
-          <span class="stop-mark" aria-hidden="true"></span>
-          <span
-            >{importer.stopping
-              ? "Stopping…"
-              : working
-                ? "Stop"
-                : "Stop background work"}</span
+      <ul class="starters" aria-label="Ways to start">
+        <li>
+          <button
+            class="starter"
+            type="button"
+            onclick={() => void choose("program")}
           >
-        </button>
-      {/if}
-    {/snippet}
-
-    {#snippet composer()}
-      <div class="stack">
-        {#if importer.sending && importer.waitingForSwitch && switchingHere !== undefined}
-          <!--
-            A message sent behind a switch of this session: the server holds it until the
-            switch has answered (F4's review measured up to ~90 s, when the switch has to
-            reopen the session first). Said, so a send that sits there is not read as lost.
-          -->
-          <p class="notice waiting" role="status">
-            Waiting for the model switch: this message is delivered once the
-            switch has answered, which can take up to a minute and a half.
-          </p>
-        {/if}
-        {#if switchNote !== ""}
-          <!-- The server's answer to the last switch, in words that say when it applies. -->
-          <p class="notice switched" role="status">{switchNote}</p>
-        {/if}
-        {#if importer.notice !== ""}
-          <!--
-            The server's sentence about the last message: a refusal, or the note on one it
-            accepted (a session it had to open afresh says why). Its words, never ours.
-          -->
-          <p
-            class={["notice", importer.refused && "refusal"]}
-            role={importer.refused ? "alert" : "status"}
+            <IconLink width="12" height="12" aria-hidden="true" />
+            <span>{STARTERS.program.label}</span>
+          </button>
+        </li>
+        <li>
+          <button
+            class="starter"
+            type="button"
+            onclick={() => void choose("sow")}
           >
-            {importer.notice}
-          </p>
-        {/if}
-        <form
-          class={[
-            "box",
-            groups.length === 0 && "first",
-            (focused ||
-              importer.draft !== "" ||
-              importer.files.items.length > 0) &&
-              "in-use",
-            dropping && "dropping",
-          ]}
-          onfocusin={() => (focused = true)}
-          onfocusout={(event) => {
-            const next = event.relatedTarget;
-            focused =
-              next instanceof Node && event.currentTarget.contains(next);
-          }}
-          onsubmit={submit}
-          aria-busy={importer.sending}
-        >
-          <label class="visually-hidden" for="importer-message"
-            >Message the importer</label
-          >
-          <!-- The files this message will carry, above the words (A6 U13). -->
-          <ComposerTray files={importer.files} disabled={importer.sending} />
-          <textarea
-            bind:this={box}
-            id="importer-message"
-            rows="1"
-            class={[groups.length === 0 && "first"]}
-            {placeholder}
-            disabled={blocked}
-            bind:value={importer.draft}
-            {onkeydown}
-            {onpaste}></textarea>
-          <div class="strip">
-            <label class="visually-hidden" for="importer-attach"
-              >Attach files to this message</label
-            >
-            <input
-              bind:this={picker}
-              id="importer-attach"
-              class="visually-hidden"
-              type="file"
-              multiple
-              disabled={blocked}
-              onchange={chosen}
-            />
-            <button
-              bind:this={attachButton}
-              class="icon-btn"
-              type="button"
-              disabled={blocked}
-              aria-label="Attach files"
-              title="Attach files: drop or paste them here, or pick them. Images go to the model as images; any file goes as its path."
-              onclick={() => picker?.click()}
-            >
-              <IconPlus width="14" height="14" />
-            </button>
-            <AgentChip
-              agents={importer.agents}
-              agentId={session?.agentId}
-              locked={(session !== undefined && session.tally.messages !== 0) ||
-                importer.sending}
-              onpick={(agentId) => importer.pickAgent(agentId)}
-            />
-            <ImporterModelPicker
-              {app}
-              {pinned}
-              switchable={!blocked}
-              onNewSession={focusComposer}
-            />
-            {#if pinned !== null && !blocked}
-              <!--
-                D3's caption: the harness is the session's for good, its models are not. While
-                a switch is out it says which model the session is moving to instead.
-              -->
-              {#if switchingHere !== undefined}
-                <span class="hint" role="status"
-                  >Switching to {switchingHere.model}…</span
-                >
-              {:else}
-                <!-- The title is the whole caption, where a long model name ellipses it. -->
-                <span
-                  class="hint"
-                  title="{pinned.harness} for this session · any of its models"
-                  >{pinned.harness} for this session · any of its models</span
-                >
-              {/if}
-            {/if}
-            <span class="grow"></span>
-            {#if nearLimit}
-              <span
-                class={["count", length > IMPORTER_MESSAGE_MAX_CHARS && "over"]}
-                title="Characters in this message, of the most the importer takes"
-                >{length.toLocaleString("en-US")} / {IMPORTER_MESSAGE_MAX_CHARS.toLocaleString(
-                  "en-US",
-                )}</span
-              >
-            {/if}
-            {#if working && session?.importId !== undefined}
-              <!--
-                D3's two ways to send while a turn runs (A6 U6). The arrow and Enter queue the
-                message behind the work in flight, as a follow-up always is; this one sends it
-                ahead of every queued message, when the harness lets it in
-                (`sendNowButtonTitle`). No key of its own: D3 draws none, and Enter keeps its
-                one meaning.
-              -->
-              <button
-                class="send-now"
-                type="button"
-                disabled={!canSendNow}
-                title={sendNowButtonTitle(importer.sendNow)}
-                onclick={sendNow}>Send now</button
-              >
-            {/if}
-            <button
-              class="send"
-              type="submit"
-              disabled={!canSend}
-              aria-label="Send to the importer"
-              title={working
-                ? "Send to the importer, queued: it reads this once it reaches a break in the work it is doing"
-                : "Send to the importer"}
-            >
-              <IconArrowUp width="14" height="14" />
-            </button>
-          </div>
-        </form>
-
-        {#if groups.length === 0}
-          <!--
-            Two suggestions that are really just pre-written first messages (D2). They go
-            away with the first message: after that the thread is the prompt.
-          -->
-          <ul class="starters" aria-label="Ways to start">
-            <li>
-              <button
-                class="starter"
-                type="button"
-                onclick={() => void choose("program")}
-              >
-                <IconLink width="12" height="12" aria-hidden="true" />
-                <span>{STARTERS.program.label}</span>
-              </button>
-            </li>
-            <li>
-              <button
-                class="starter"
-                type="button"
-                onclick={() => void choose("sow")}
-              >
-                <IconFile width="12" height="12" aria-hidden="true" />
-                <span>{STARTERS.sow.label}</span>
-              </button>
-            </li>
-          </ul>
-        {/if}
-      </div>
-    {/snippet}
-  </Chat>
-</div>
-
-{#if importer.files.refusal !== undefined}
-  <!-- A file the composer would not take, or a message refused for its files (A6 U13). -->
-  <ErrorDialog
-    {...importer.files.refusal}
-    opener={attachButton ?? box ?? null}
-    ondismiss={() => importer.files.dismiss()}
-  />
-{/if}
-
-{#if importer.stopFailure !== undefined}
-  <ErrorDialog
-    {...importer.stopFailure}
-    opener={stopButton ?? null}
-    ondismiss={() => importer.dismissStopFailure()}
-  />
-{/if}
+            <IconFile width="12" height="12" aria-hidden="true" />
+            <span>{STARTERS.sow.label}</span>
+          </button>
+        </li>
+      </ul>
+    {/if}
+  {/snippet}
+</ChatShell>
 
 <style>
-  .importer {
-    display: flex;
-    flex: 1;
-    min-height: 0;
-    flex-direction: column;
-  }
-
-  .streaming {
-    padding: 4px 0 0;
-  }
-
-  /*
-    ── The separator: the operator's bubble ─────────────────────────────────────
-    Across the whole row, so the bubble can be pushed to its right end. The space under it
-    is the gap the importer's header used to fill: with the header gone the reply would
-    otherwise sit 12px under the question, closer than turns sit to each other, and the
-    question would read as the caption of the answer.
-  */
-  .you {
-    display: flex;
-    flex: 1 1 100%;
-    min-width: 0;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 7px;
-    padding-bottom: 8px;
-  }
-  /* D3's "You · 18:02" and its copy glyph, right-aligned under the bubble. */
-  .said {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    color: var(--text-muted);
-    font: 400 11px/16px var(--font-mono);
-  }
-  /*
-    A message still waiting behind the running turn: its bubble dashed and its words
-    muted, so it reads as sent and not yet read, and a word beside the time that says so.
-  */
-  .queued .bubble {
-    border: 1px dashed var(--border-strong);
-    background: transparent;
-    color: var(--text-muted);
-  }
-  .queued-mark {
-    padding: 0 6px;
-    border: 1px dashed var(--border-strong);
-    border-radius: var(--radius-sm);
-    font: 500 10px/16px var(--font-sans);
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-  .bubble {
-    max-width: 560px;
-    padding: 11px 14px;
-    box-sizing: border-box;
-    border-radius: 10px;
-    background: var(--bg-layer-02);
-    color: var(--text-base);
-    font: 400 13px/20px var(--font-sans);
-    text-wrap: pretty;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-  }
-  /*
-    The turn's footer. Muted and not faint: faint is below AA at 11px, and this is now the
-    only place on the turn the model is said, not decoration beside a label that said it.
-  */
-  .foot {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    margin: 14px 0 0;
-  }
-  .foot-text {
-    margin: 0;
-    font: 400 11px/16px var(--font-mono);
-    color: var(--text-muted);
-    overflow-wrap: anywhere;
-  }
-  .earlier {
-    display: flex;
-    flex: 1 1 100%;
-    align-items: center;
-    gap: 12px;
-    color: var(--text-muted);
-    font: 400 11px/16px var(--font-sans);
-  }
-  .earlier::before,
-  .earlier::after {
-    flex: 1;
-    height: 1px;
-    background: var(--border-muted);
-    content: "";
-  }
-
-  /* ── Stop: a pill above the composer, centred ─────────────────────────────── */
-  .stop {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    height: 28px;
-    padding: 0 12px;
-    box-sizing: border-box;
-    border: 1px solid var(--border-strong);
-    border-radius: 14px;
-    background: var(--bg-layer-01);
-    color: var(--text-base);
-    font: 500 12px/26px var(--font-sans);
-    cursor: pointer;
-  }
-  .stop:hover {
-    background: var(--overlay-pressed);
-  }
-  .stop[aria-disabled="true"] {
-    color: var(--text-muted);
-    cursor: progress;
-  }
-  .stop:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 1px;
-  }
-  .stop-mark {
-    width: 8px;
-    height: 8px;
-    border: 1.5px solid currentColor;
-    border-radius: 2px;
-  }
-
-  /* ── The composer: one box, the strip inside its border ──────────────────── */
-  .stack {
-    display: flex;
-    flex: 1 1 100%;
-    min-width: 0;
-    flex-direction: column;
-    gap: 10px;
-  }
-  .box {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding: 14px;
-    box-sizing: border-box;
-    border: 1px solid var(--border-base);
-    border-radius: 10px;
-    background: var(--bg-layer-01);
-  }
-  textarea {
-    width: 100%;
-    min-height: 22px;
-    max-height: 180px;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: var(--text-base);
-    font: 400 13px/20px var(--font-sans);
-    field-sizing: content;
-    resize: none;
-  }
-  /*
-    D2's empty box is taller than D3's — room for a pasted URL before the first line.
-  */
-  textarea.first {
-    min-height: 46px;
-  }
-  /*
-    The strong border is the composer in use (the operator's decision): focused, as D2
-    draws it, or holding words not yet sent, as D4 does. At rest and empty it is D3's base
-    border, like every other box on the page. Any focus in the box, because the textarea has no
-    focus style of its own (below) and the chip and the model picker are in the box too.
-    Tracked from `focusin`/`focusout` rather than `:focus-within`, so the DOM suite (whose
-    happy-dom has no `:focus-within`) checks the rule the browser applies.
-  */
-  .box.in-use {
-    border-color: var(--border-strong);
-  }
-  textarea::placeholder {
-    color: var(--text-faint);
-  }
-  /*
-    No focus style while typing, as in OpenCode's composer: for a text field the caret is
-    the indicator, and the box keeps its own border. `none` rather than no rule, because
-    the global `:focus-visible` ring in tokens.css matches a textarea on click as well.
-  */
-  textarea:focus-visible {
-    outline: none;
-  }
-  .strip {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .grow {
-    flex: 1;
-  }
   /*
     The strip's caption (D3: "OpenCode for this session · any of its models"). D3 sets it
     faint; muted here, as the turn footer is, because faint is below AA at 11px and this is
@@ -1008,105 +506,6 @@
     color: var(--text-muted);
     white-space: nowrap;
     text-overflow: ellipsis;
-  }
-
-  /* The message's length, once it nears the limit: a figure, so it never gives way. */
-  .count {
-    flex: none;
-    font: 400 11px/16px var(--font-mono);
-    font-variant-numeric: tabular-nums;
-    color: var(--text-muted);
-    white-space: nowrap;
-  }
-  .count.over {
-    color: var(--state-fg-danger);
-  }
-
-  .icon-btn,
-  .send {
-    display: inline-flex;
-    flex: none;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: 0;
-    border-radius: 6px;
-    cursor: pointer;
-  }
-  .icon-btn {
-    background: transparent;
-    color: var(--icon-muted);
-  }
-  .icon-btn:hover:not(:disabled) {
-    background: var(--overlay-hover);
-    color: var(--text-base);
-  }
-  .icon-btn:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 1px;
-  }
-  .icon-btn:disabled {
-    color: var(--text-faint);
-    cursor: not-allowed;
-  }
-  /* A drag of files over the box: it says it will take them (A6 U13). */
-  .box.dropping {
-    border-style: dashed;
-    border-color: var(--border-focus);
-  }
-  .send {
-    background: var(--bg-inverse);
-    color: var(--text-inverse);
-  }
-  .send:disabled {
-    background: var(--bg-layer-02);
-    color: var(--text-faint);
-    cursor: default;
-  }
-  .send:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 1px;
-  }
-  /*
-    "Send now" beside the arrow (A6 U6): a quiet bordered button, D3's chip height, so the
-    arrow stays the composer's one primary action and the urgent send is the deliberate one.
-  */
-  .send-now {
-    flex: none;
-    height: 28px;
-    padding: 0 10px;
-    box-sizing: border-box;
-    border: 1px solid var(--border-strong);
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text-base);
-    font: 500 12px/26px var(--font-sans);
-    white-space: nowrap;
-    cursor: pointer;
-  }
-  .send-now:hover:not(:disabled) {
-    background: var(--overlay-hover);
-  }
-  .send-now:disabled {
-    border-color: var(--border-base);
-    color: var(--text-faint);
-    cursor: default;
-  }
-  .send-now:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 1px;
-  }
-  /* ── The server's sentence about the last message ──────────────────────────── */
-  .notice {
-    margin: 0;
-    color: var(--text-muted);
-    font: 400 12px/18px var(--font-sans);
-    text-wrap: pretty;
-    overflow-wrap: anywhere;
-  }
-  .notice.refusal {
-    color: var(--state-fg-danger);
   }
 
   /* ── The two starters: dashed pills under the box ─────────────────────────── */

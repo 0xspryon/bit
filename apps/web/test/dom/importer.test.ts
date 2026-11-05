@@ -1015,8 +1015,9 @@ describe("the state picker", () => {
  * colour can tell apart.
  */
 describe("the composer's border", () => {
+  // The box moved to the shared shell's composer (A6 prep): its stylesheet is that file's.
   const path = new URL(
-    "../../src/lib/components/ImporterChat.svelte",
+    "../../src/lib/components/ChatComposer.svelte",
     import.meta.url,
   ).pathname;
   let sheet: HTMLStyleElement | undefined;
