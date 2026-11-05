@@ -77,6 +77,7 @@ import {
   Redacted,
   Result,
   Schema,
+  Semaphore,
   Stream,
   type Duration,
 } from "effect";
@@ -1564,6 +1565,28 @@ export const openCodeHarness = (
       const registeredIn = new Map<string, string>();
       const registrationKey = (sessionId: string, name: string): string =>
         `${sessionId}\u0000${name}`;
+      /**
+       * One lock per directory, held across a registration's `mcp.add` and across a
+       * release's `mcp.remove`, its check of {@link registeredIn} and its eviction (A6 U6
+       * review). A resume runs in its predecessor's directory, so a session closed
+       * `refused` or `open_failed` and opened again at once can register in the very
+       * directory whose Location the close is letting go of: unserialised, the eviction's
+       * check could run before the new `mcp.add` was recorded, or its request land after
+       * that add — and dispose of the Location the add went into, so the resumed agent would
+       * run on with none of bit's tools and nothing said. With the lock, an add waits for an
+       * eviction in flight and goes into the fresh Location, and an eviction waits for an add
+       * in flight and then sees it. Kept per directory ever registered in, bounded by the
+       * sessions this process opened, as {@link registeredIn} is.
+       */
+      const directoryLocks = new Map<string, Semaphore.Semaphore>();
+      const inDirectory = (directory: string) => {
+        let lock = directoryLocks.get(directory);
+        if (lock === undefined) {
+          lock = Semaphore.makeUnsafe(1);
+          directoryLocks.set(directory, lock);
+        }
+        return Semaphore.withPermit(lock);
+      };
 
       const registerMcpServer: AgentHarness["Service"]["registerMcpServer"] =
         Effect.fn("openCodeHarness.registerMcpServer")(
@@ -1575,7 +1598,14 @@ export const openCodeHarness = (
           // is therefore wider than. It is used below only as half of the key that
           // remembers where to remove the entry from.
           function* (sessionId, name, config) {
-            yield* bounded(
+            const key = registrationKey(sessionId, name);
+            /*
+             * Recorded **before** the add, and taken back if it fails (A6 U6 review): an add
+             * in flight is a registration a release must not evict under, and the lock
+             * below is what keeps a release from reading the map between the two.
+             */
+            registeredIn.set(key, config.directory);
+            const add = bounded(
               "mcp.add",
               timeouts.control,
               api.mcp.add({
@@ -1605,11 +1635,16 @@ export const openCodeHarness = (
                   }),
                 }),
               }),
+            ).pipe(
+              Effect.onError(() =>
+                Effect.sync(() => {
+                  if (registeredIn.get(key) === config.directory) {
+                    registeredIn.delete(key);
+                  }
+                }),
+              ),
             );
-            registeredIn.set(
-              registrationKey(sessionId, name),
-              config.directory,
-            );
+            yield* inDirectory(config.directory)(add);
           },
         );
 
@@ -1639,15 +1674,21 @@ export const openCodeHarness = (
             const directory = registeredIn.get(key);
             if (directory === undefined) return;
             registeredIn.delete(key);
-            yield* bounded(
-              "mcp.remove",
-              timeouts.control,
-              api.mcp.remove({
-                server: name,
-                location: { directory: directoryOf(directory) },
-              }),
+            // The remove, the check and the eviction under the directory's lock: see
+            // `directoryLocks`.
+            yield* inDirectory(directory)(
+              Effect.andThen(
+                bounded(
+                  "mcp.remove",
+                  timeouts.control,
+                  api.mcp.remove({
+                    server: name,
+                    location: { directory: directoryOf(directory) },
+                  }),
+                ),
+                releaseLocation(directory),
+              ),
             );
-            yield* releaseLocation(directory);
           },
         );
 
@@ -1674,22 +1715,24 @@ export const openCodeHarness = (
        * which is the state before this existed, and says so in the log.
        */
       const releaseLocation = (directory: string) =>
-        [...registeredIn.values()].includes(directory)
-          ? Effect.void
-          : bounded(
-              "debug.location.evict",
-              timeouts.control,
-              api.debug.location.evict({
-                location: { directory: directoryOf(directory) },
-              }),
-            ).pipe(
-              Effect.catch((failure) =>
-                Effect.logWarning(
-                  "opencode would not let go of a directory's location; its MCP servers keep running until opencode serve exits",
-                  { directory, detail: failure.message },
+        Effect.suspend(() =>
+          [...registeredIn.values()].includes(directory)
+            ? Effect.void
+            : bounded(
+                "debug.location.evict",
+                timeouts.control,
+                api.debug.location.evict({
+                  location: { directory: directoryOf(directory) },
+                }),
+              ).pipe(
+                Effect.catch((failure) =>
+                  Effect.logWarning(
+                    "opencode would not let go of a directory's location; its MCP servers keep running until opencode serve exits",
+                    { directory, detail: failure.message },
+                  ),
                 ),
               ),
-            );
+        );
 
       /**
        * The context window of each session's model, for the sessions this process opened.
@@ -1909,6 +1952,9 @@ export const openCodeHarness = (
             ...(delivery._tag === "open"
               ? {}
               : {
+                  // A `steer` is read once the message being written ends, not mid-reply
+                  // (measured, A6 U6 review): see `SendNowTiming` in the web app for what
+                  // the operator is told, and its V2(chat) note for cutting in.
                   delivery:
                     delivery.urgency === "preemptive" ? "steer" : "queue",
                   // The derived id in OpenCode's own space: `msg_` plus the hex. The brand
@@ -2093,8 +2139,14 @@ export const openCodeHarness = (
          *
          * Asked **only when it can change the answer**: no outcome to doubt, or a turn in
          * flight, and nothing is read. So the extra round trip is one bounded GET on
-         * loopback, on the settle and recovery paths only (nothing polls `sessionStatus`),
-         * and it is skipped entirely for a session that never recorded anything.
+         * loopback, skipped entirely for a session that never recorded anything.
+         *
+         * **`sessionStatus` is polled** (A6 U6): a chat watching its session asks the
+         * activity route about once a second (`IMPORT_POLL_MS` in the web app) while a turn
+         * or background work runs, and each ask is a `session.active` and a `session.get`
+         * here. This third read is not among them: a running session skips it, and the
+         * watch stops at the first answer that says nothing runs, so it is paid about once
+         * per watched turn — plus the settle and recovery paths, which ask as before.
          */
         const current =
           running || outcome === undefined

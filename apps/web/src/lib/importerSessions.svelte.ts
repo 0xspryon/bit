@@ -78,9 +78,11 @@ import {
   TAKEN_KIND,
   buildImporterChat,
   importerFeed,
+  sendNowTiming,
   takesUnknownMessage,
   withReplay,
   type ImporterGroup,
+  type SendNowTiming,
   type ImporterSession,
   acceptedNotice,
   switchedNotice,
@@ -280,6 +282,11 @@ export interface ImporterServer {
   /** A harness instance's display name, for the glyph on the composer's model chip. */
   readonly harnessName: (instanceId: string) => string;
   /**
+   * A harness instance's driver (`HarnessInstanceView.driver`), or `undefined` for one this
+   * server does not list: what "Send now" is worded by (`sendNowTiming`), never routed by.
+   */
+  readonly harnessDriver: (instanceId: string) => string | undefined;
+  /**
    * The highest activity publish order this tab has seen, or `0` for none. Read when a
    * message is sent, so the importer's answer sorts after it: see
    * `ImporterSession.floors`.
@@ -473,6 +480,19 @@ export class ImporterSessions {
     this.sessions.find((session) => session.id === this.currentId),
   );
 
+  /**
+   * When the harness of the session on screen reads a "Send now" message (A6 U6 review),
+   * for the words that say so. `unknown` without a server, or before the session names its
+   * harness instance.
+   */
+  sendNow = $derived<SendNowTiming>(
+    sendNowTiming(
+      this.current?.harnessInstanceId === undefined
+        ? undefined
+        : this.#server?.harnessDriver(this.current.harnessInstanceId),
+    ),
+  );
+
   /** The conversation on screen, one group per operator message. */
   groups = $derived<readonly ImporterGroup[]>(
     this.current === undefined
@@ -505,6 +525,7 @@ export class ImporterSessions {
           ...(this.current.sentNow === undefined
             ? {}
             : { sentNow: this.current.sentNow }),
+          sendNow: this.sendNow,
         }),
   );
 
@@ -1426,21 +1447,28 @@ export class ImporterSessions {
         }
       : undefined;
     if (stopped.working) return;
+    /*
+     * A turn's Stop stops the background work beside it too, and the answer says whether
+     * any still runs (`ConversationStopped.background`, A6 U6 review): cleared here, at the
+     * answer, or the pill would turn into "Stop background work" for the moment until the
+     * turn watch's next read said the same.
+     */
+    const backgroundOver = background || !stopped.background;
     for (const id of [importId, stopped.conversationId]) {
       const known = this.#activityOf.get(id);
       if (known === undefined) continue;
-      this.#activityOf.set(
-        id,
-        background
-          ? { ...known, background: false }
-          : { ...known, running: false },
-      );
+      this.#activityOf.set(id, {
+        running: background ? known.running : false,
+        background: backgroundOver ? false : known.background,
+      });
     }
     this.sessions = this.sessions.map((each) =>
       each.importId === importId || each.importId === stopped.conversationId
-        ? background
-          ? { ...each, background: false }
-          : { ...each, working: false }
+        ? {
+            ...each,
+            working: background ? each.working : false,
+            background: backgroundOver ? false : each.background === true,
+          }
         : each,
     );
     this.#turnsEnded();

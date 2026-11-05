@@ -17,9 +17,16 @@ import type { LiveInterrupt } from "./liveAgentSessions";
 /**
  * The answer to a Stop, from what the spine found.
  *
- * `what` names the conversation in a sentence ("import imp_…", "goal g1's conversation");
- * `conversationId` is the id the Stop landed on, which for an importer may be a successor of
- * the one addressed.
+ * `what` names the conversation in a sentence, as the operator sees it from inside it —
+ * "this session" for an importer, "this conversation" for a goal — never by its id: the
+ * sentence is shown under the composer of the conversation it is about, and an id there
+ * (`imp_…`) names nothing the operator can see (A6 U6 review). `conversationId` is the id
+ * the Stop landed on, which for an importer may be a successor of the one addressed.
+ *
+ * `background` is whether background work still runs once the Stop was answered (A6 U6
+ * review): an interrupted turn's Stop stops the background shells too
+ * (`ClaudeCodeHarness.interruptSession`), and a screen that heard only "the turn is over"
+ * would go on offering "Stop background work" until its next activity read.
  */
 export const turnStopped = <Meta>(input: {
   readonly found: LiveInterrupt<Meta>;
@@ -33,20 +40,23 @@ export const turnStopped = <Meta>(input: {
         conversationId,
         outcome: "not_live",
         working: false,
-        detail: `This server holds no session for ${what}, so nothing of it is running here and there was nothing to stop.`,
+        background: false,
+        detail: `This server does not hold ${what}, so nothing of it is running here and there was nothing to stop.`,
       };
     case "idle":
       return {
         conversationId,
         outcome: "idle",
         working: false,
-        detail: `Nothing was running in ${what}'s session, so there was nothing to stop. It is waiting for your next message.`,
+        background: false,
+        detail: `Nothing was running in ${what}, so there was nothing to stop. It is waiting for your next message.`,
       };
     case "interrupted":
       return {
         conversationId,
         outcome: "interrupted",
         working: found.working,
+        background: found.background,
         detail: interruptedDetail(found, what),
       };
     case "background":
@@ -54,9 +64,10 @@ export const turnStopped = <Meta>(input: {
         conversationId,
         outcome: "background_stopped",
         working: found.working,
+        background: found.working,
         detail: found.working
-          ? `No turn was running in ${what}'s session, but work it had started in the background was. It was told to stop, and some of it had not stopped by the time this answered, so it may still be running; stop again to ask once more.`
-          : `No turn was running in ${what}'s session, but work it had started in the background was, and that is stopped now. Everything it wrote is kept, and your next message carries the conversation on in the same session.`,
+          ? `No turn was running in ${what}, but work the agent had started in the background was. It was told to stop, and some of it had not stopped by the time this answered, so it may still be running; stop again to ask once more.`
+          : `No turn was running in ${what}, but work the agent had started in the background was, and that is stopped now. Everything it wrote is kept, and your next message carries the conversation on in the same session.`,
       };
   }
 };
@@ -74,7 +85,7 @@ const interruptedDetail = <Meta>(
   found: Extract<LiveInterrupt<Meta>, { readonly _tag: "interrupted" }>,
   what: string,
 ): string => {
-  const stopped = `Stopped the turn ${what} was taking.`;
+  const stopped = `Stopped the turn running in ${what}.`;
   if (found.followUp && found.entry.harness.queuedOnInterrupt === "held") {
     return `${stopped} The message you sent while it ran has not been answered: its harness is holding it, and will run it, ahead of your next message, when you send one. Everything written before the stop is kept.`;
   }
@@ -99,5 +110,5 @@ export const turnStopRefusal = (
 ): ConversationStopRefused =>
   new ConversationStopRefused({
     reason: "harness_unreachable",
-    detail: `The harness did not acknowledge the stop (${failure.message}), so whether ${what}'s turn stopped is uncertain. This server has let go of the session — its credential is revoked, so it can record nothing more — and your next message carries the conversation on in a session it holds again.`,
+    detail: `The harness did not acknowledge the stop (${failure.message}), so whether the turn in ${what} stopped is uncertain. This server has let go of the session — its credential is revoked, so it can record nothing more — and your next message carries the conversation on in a session it holds again.`,
   });

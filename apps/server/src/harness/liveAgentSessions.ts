@@ -396,6 +396,12 @@ export type LiveInterrupt<Meta> =
       readonly entry: LiveAgentSession<Meta>;
       readonly working: boolean;
       readonly followUp: boolean;
+      /**
+       * Whether background work still runs after the Stop (A6 U6 review): the harness
+       * stops it with the turn, and says so through its status, read after the settle.
+       * `true` when that status could not be read.
+       */
+      readonly background: boolean;
     }
   | {
       readonly _tag: "background";
@@ -1276,11 +1282,24 @@ export const makeLiveAgentSessions = <Meta>(
                   ),
                 )
             : followUp;
+        /*
+         * A Stop of a running turn stops the background work too (Claude Code's
+         * `interruptSession` stops every task listed when it began), and the screen that
+         * offered "Stop background work" beside the turn must hear that it did, or it goes
+         * on offering it until its next activity read (A6 U6 review). Read after the
+         * settle, as `background` is for a Stop with no turn; one that cannot be read is
+         * "may still be running".
+         */
+        const after = yield* Effect.result(
+          entry.harness.sessionStatus(entry.sessionId),
+        );
         return {
           _tag: "interrupted",
           entry,
           working: settled._tag === "Success" && Option.isNone(settled.success),
           followUp: held,
+          background:
+            after._tag === "Failure" || after.success.background === true,
         } as const;
       });
 

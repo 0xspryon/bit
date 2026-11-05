@@ -2824,6 +2824,8 @@ export class App {
       harnessName: (instanceId) =>
         this.harnesses.find((entry) => entry.instanceId === instanceId)
           ?.displayName ?? instanceId,
+      harnessDriver: (instanceId) =>
+        this.harnesses.find((entry) => entry.instanceId === instanceId)?.driver,
       highWater: () => this.#activityHighWater() ?? 0,
       watchTurn: (importId, update) =>
         this.#watchImporterTurn(targetId, importId, update),

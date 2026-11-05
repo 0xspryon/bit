@@ -653,12 +653,61 @@ export const QUEUED_NOTE =
   "Queued: the importer reads this once it reaches a break in the work it is doing.";
 
 /**
- * What a message sent with "Send now" says while the harness has yet to take it (A6 U6): a
- * `preemptive` steer lands at the harness's next step boundary, so a tool call already
- * running finishes first and the rest of the work in flight is dropped (`SteerUrgency`).
+ * When a "Send now" message is read, by the harness the session runs on (A6 U6 review).
+ *
+ * Both harnesses take a `preemptive` steer ahead of every message queued before it, and
+ * differ on what it cuts (measured, U6): **Claude Code** (`priority: "now"`) reads it at its
+ * next step, cutting the reply in flight mid-sentence (~0.3 s on haiku); **OpenCode 2.2.5**
+ * (`delivery: "steer"`) reads it only once the message it is writing ends — a long reply has
+ * no step inside it, and GLM finished a 77 s one in full first. `unknown` is a harness this
+ * page cannot name, which is told only what both do.
+ *
+ * Chosen from the harness's `driver`, which `HarnessInstanceView` says is shown and never
+ * routed by: this is wording, and the server delivers the same urgency to either.
+ *
+ * V2(chat): Send now on OpenCode should cut in as it does on Claude Code. V2 interrupts and
+ * then sends, but only when no tool call is in flight: an OpenCode abort kills a running
+ * tool, and holds the messages queued behind the turn (`queuedOnInterrupt: "held"`), so V2
+ * must also re-sequence a queued message ahead of or behind the one sent now, and close the
+ * race between the abort settling and the send landing (an abort that lands after the send
+ * would stop the very turn the message opened).
  */
-export const SENT_NOW_NOTE =
-  "Sending now: the importer reads this at its next step. A tool call already running finishes first; the rest of what it was doing is dropped.";
+export type SendNowTiming = "next_step" | "message_end" | "unknown";
+
+/** {@link SendNowTiming} for a harness driver (`HarnessInstanceView.driver`). */
+export const sendNowTiming = (driver: string | undefined): SendNowTiming =>
+  driver === "claude-code"
+    ? "next_step"
+    : driver === "opencode"
+      ? "message_end"
+      : "unknown";
+
+/**
+ * What a message sent with "Send now" says while the harness has yet to take it (A6 U6),
+ * by when the harness reads one ({@link SendNowTiming}).
+ */
+export const sendingNowNote = (timing: SendNowTiming): string =>
+  timing === "next_step"
+    ? "Sending now: the importer reads this at its next step, ahead of any queued message. A tool call already running finishes first; the rest of what it was doing is dropped."
+    : timing === "message_end"
+      ? "Sending now: on OpenCode the importer reads this once the message it is writing ends, ahead of any queued message. The message in flight is finished, not cut short."
+      : "Sending now: the importer reads this ahead of any queued message, as soon as its harness lets it in.";
+
+/** What a "Send now" message the harness took says of it, beside its bubble. */
+export const sentNowTitle = (timing: SendNowTiming): string =>
+  timing === "next_step"
+    ? "Sent now: the importer took this at its next step and dropped the rest of what it was doing."
+    : timing === "message_end"
+      ? "Sent now: the importer took this once the message it was writing ended, ahead of any queued message."
+      : "Sent now: the importer took this ahead of any queued message.";
+
+/** What the Send now button says it does, on the session's harness. */
+export const sendNowButtonTitle = (timing: SendNowTiming): string =>
+  timing === "next_step"
+    ? "Send now: the importer reads this at its next step, ahead of any queued message. A tool call already running finishes first; the rest of what it was doing is dropped."
+    : timing === "message_end"
+      ? "Send now: on OpenCode the importer reads this once the message it is writing ends, ahead of any queued message. The message in flight is finished, not cut short."
+      : "Send now: the importer reads this ahead of any queued message, as soon as its harness lets it in.";
 
 /**
  * What the composer says under a message the server accepted: the server's own note, then
@@ -891,6 +940,15 @@ export const importerFeed = (input: {
     }
     runs.at(-1)?.items.push(item);
   }
+  /*
+   * **In the order the harness took them, not the order they were sent** (A6 U6 review).
+   * A "Send now" sent after a queued message is taken before it (both harnesses jump a
+   * preemptive steer ahead of queued ones), so its take floor is the lower one; walked in
+   * send order, the merge below would stop at the queued row's higher floor and put the
+   * Send-now reply under the turn before. A stable sort keeps rows with equal floors — two
+   * still queued (both infinite), or taken together — in the order they were sent.
+   */
+  runs.sort((a, b) => (a.floor < b.floor ? -1 : a.floor > b.floor ? 1 : 0));
 
   const merged: LiveItem[] = [];
   let next = 0;
@@ -933,6 +991,8 @@ export interface ImporterChatInput {
   readonly midTurn?: readonly string[];
   /** {@link ImporterSession.sentNow}. Empty when omitted. */
   readonly sentNow?: readonly string[];
+  /** When the session's harness reads a "Send now" message. `unknown` when omitted. */
+  readonly sendNow?: SendNowTiming;
   /** {@link ImporterSession.taken}. Only `items`' own takes when omitted. */
   readonly taken?: Readonly<Record<string, LiveItem>>;
 }
@@ -1236,7 +1296,9 @@ export const buildImporterChat = (
       prose: queued
         ? {
             _tag: "pending",
-            note: sentNow(turn.operator) ? SENT_NOW_NOTE : QUEUED_NOTE,
+            note: sentNow(turn.operator)
+              ? sendingNowNote(input.sendNow ?? "unknown")
+              : QUEUED_NOTE,
           }
         : midBlock
           ? { _tag: "pending", note: MID_BLOCK_NOTE }

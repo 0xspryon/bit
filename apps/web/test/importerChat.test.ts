@@ -1859,6 +1859,87 @@ describe("U4: a steer sent mid-turn", () => {
 });
 
 /*
+ * A6 U6 review: a "Send now" sent after a queued message is taken before it — both
+ * harnesses jump a preemptive steer ahead of queued ones (measured on haiku and GLM) — so
+ * the tab's own rows are not in the order their takes are.
+ */
+describe("U6 review: a Send now taken ahead of a message queued before it", () => {
+  const QUEUED = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+  const NOW = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn";
+  const live = (n: number, over: Partial<LiveItem> & Pick<LiveItem, "kind">) =>
+    item({ id: `activity:${String(n)}`, importId: "imp_1", ...over });
+  const first = operator(1, "a glossary of sixty scope terms");
+  const queued = { ...operator(2, "QUEUED"), messageIds: [QUEUED] };
+  const now = { ...operator(3, "NOW"), messageIds: [NOW] };
+  // Sent in this order: the glossary, then the queued one, then the Send now.
+  const own = [first, queued, now];
+  const floors = { [first.id]: 0, [queued.id]: 5, [now.id]: 6 };
+  const feed = [
+    live(3, { kind: "turn.reply", body: "the glossary" }),
+    live(7, { kind: "turn.taken", messageIds: [NOW] }),
+    live(8, { kind: "turn.reply", body: "answering NOW" }),
+    live(9, { kind: "turn.taken", messageIds: [QUEUED] }),
+    live(10, { kind: "turn.reply", body: "answering QUEUED" }),
+  ];
+  const read = (working: boolean) =>
+    buildImporterChat({
+      history: NO_HISTORY,
+      working,
+      midTurn: [queued.id, now.id],
+      sentNow: [NOW],
+      items: importerFeed({
+        own,
+        floors,
+        live: feed,
+        importId: "imp_1",
+        midTurn: [queued.id, now.id],
+        working,
+      }),
+    }).map((group) => ({
+      message: group.subject.message,
+      rows: group.rows.map((row) => row.item.body),
+      ...(group.prose?._tag === "none" ? { none: true } : {}),
+    }));
+
+  test("each reply is under the message it answers, in the order the harness took them", () => {
+    for (const working of [true, false]) {
+      expect(read(working)).toEqual([
+        { message: "a glossary of sixty scope terms", rows: ["the glossary"] },
+        { message: "NOW", rows: ["answering NOW"] },
+        { message: "QUEUED", rows: ["answering QUEUED"] },
+      ]);
+    }
+  });
+
+  test("before either is taken, both wait at the end in the order they were sent", () => {
+    const groups = buildImporterChat({
+      history: NO_HISTORY,
+      working: true,
+      midTurn: [queued.id, now.id],
+      sentNow: [NOW],
+      items: importerFeed({
+        own,
+        floors,
+        live: feed.slice(0, 1),
+        importId: "imp_1",
+        midTurn: [queued.id, now.id],
+        working: true,
+      }),
+    });
+    expect(
+      groups.map((group) => [group.subject.message, group.subject.queued]),
+    ).toEqual([
+      ["a glossary of sixty scope terms", false],
+      ["QUEUED", true],
+      ["NOW", true],
+    ]);
+    expect(groups[0]?.rows.map((row) => row.item.body)).toEqual([
+      "the glossary",
+    ]);
+  });
+});
+
+/*
  * A6 U4 review: a message still queued in the live session is in no transcript, so the
  * server's replay carries it beside the transcript, and the page draws it as its own row.
  */

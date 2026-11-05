@@ -2430,7 +2430,8 @@ export class ScopeImporter extends Context.Service<
         const importId = yield* holdingNow(
           newerRun(input.importId, row) ?? input.importId,
         );
-        const what = `import ${importId}`;
+        // Named as the operator sees it from its own chat, never by its id (A6 U6 review).
+        const what = "this session";
         const found = yield* sessions
           .interrupt(importId)
           .pipe(Effect.mapError((failure) => turnStopRefusal(failure, what)));
@@ -2500,7 +2501,7 @@ export class ScopeImporter extends Context.Service<
           turnStopped({
             found: { _tag: "not_live" },
             conversationId: input.importId,
-            what: `import ${input.importId}`,
+            what: "this session",
           }),
         ),
       switchModel: () =>

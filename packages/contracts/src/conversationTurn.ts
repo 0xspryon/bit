@@ -68,6 +68,16 @@ export const ConversationStopped = Schema.Struct({
    * idle.
    */
   working: Schema.Boolean,
+  /**
+   * Whether work the agent started in the background — a background subagent or shell — is
+   * still running once the Stop has been answered (A6 U6 review), as the harness reported it
+   * after the Stop. A Stop of a running turn stops that work too, so a screen that offered
+   * Stop for it clears it on `false` at once rather than at its next activity read. `true`
+   * when the harness could not be asked: "may still be running", never "stopped". `false`
+   * for `idle` and `not_live`, and from a harness that does not report background work
+   * (OpenCode). For `background_stopped` it is {@link working}.
+   */
+  background: Schema.Boolean,
   /** A sentence for the operator about what happened, in the server's words. */
   detail: Schema.String,
 });

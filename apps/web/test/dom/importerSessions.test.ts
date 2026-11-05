@@ -30,7 +30,9 @@ import { PARTIAL_BODY_MAX, REPLY_PAST_CAP_LABEL } from "../../src/lib/chat";
 import {
   ENDED_NOTE,
   MID_BLOCK_NOTE,
-  SENT_NOW_NOTE,
+  sendNowButtonTitle,
+  sendingNowNote,
+  sentNowTitle,
 } from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
@@ -87,9 +89,13 @@ const hasButton = (label: string): boolean =>
 const strip = (): Element | null =>
   document.querySelector('[aria-label="Last importer session"]');
 
-const harness = (instanceId: string, displayName: string) => ({
+const harness = (
+  instanceId: string,
+  displayName: string,
+  driver: string = "opencode",
+) => ({
   instanceId,
-  driver: "opencode" as const,
+  driver,
   displayName,
   version: "1.0.0",
   ready: true,
@@ -1164,7 +1170,7 @@ describe("the Stop pill (A6 F5)", () => {
     expect(stopPill()).toBeNull();
     expect(
       document.querySelector(".importer .notice")?.textContent?.trim(),
-    ).toBe("Stopped the turn import imp_newest was taking.");
+    ).toBe("Stopped the turn running in this session.");
   });
 
   test("a turn the server says is still working keeps its cursor", async () => {
@@ -1175,6 +1181,7 @@ describe("the Stop pill (A6 F5)", () => {
         conversationId: importId,
         outcome: "interrupted",
         working: true,
+        background: false,
         detail: "Its harness went straight on to a message you sent.",
       });
     const pill = stopPill();
@@ -1199,6 +1206,7 @@ describe("the Stop pill (A6 F5)", () => {
         conversationId: importId,
         outcome: "interrupted",
         working: true,
+        background: false,
         detail: said,
       });
     const pill = stopPill();
@@ -1234,6 +1242,7 @@ describe("the Stop pill (A6 F5)", () => {
         conversationId: importId,
         outcome: "interrupted",
         working: false,
+        background: false,
         detail: said,
       });
     const pill = stopPill();
@@ -1392,6 +1401,7 @@ describe("A6 U6: Stop when the server says something runs, and Send now", () => 
         conversationId: importId,
         outcome: "background_stopped",
         working: true,
+        background: true,
         detail: said,
       });
     const app = await continueWith(fake);
@@ -1424,7 +1434,7 @@ describe("A6 U6: Stop when the server says something runs, and Send now", () => 
 
   test("Send now is offered only while a turn runs; it sends a preemptive steer, and Enter still queues", async () => {
     const { app, fake } = await continueOn(SESSIONS, [
-      harness("claude-code", "Claude Code"),
+      harness("claude-code", "Claude Code", "claude-code"),
     ]);
     fake.watch.send(liveOpened({ from: 0, latest: 0 }));
     await settle();
@@ -1463,9 +1473,15 @@ describe("A6 U6: Stop when the server says something runs, and Send now", () => 
     const now = sendNowButton();
     if (now === null) throw new Error("no Send now while a turn runs");
     expect(now.disabled).toBe(false);
+    // Claude Code cuts in at its next step, and the button says so.
+    expect(now.title).toBe(sendNowButtonTitle("next_step"));
+    // As a pointer leaves it: the button holds the focus when it is pressed.
+    now.focus();
     click(now);
     await settle();
     expect(urgencies()).toEqual(["queued", "preemptive"]);
+    // The focus is back in the box (A6 U6 review), not on a button that is now disabled.
+    expect(document.activeElement?.id).toBe("importer-message");
     // Waiting for the harness to take it, the bubble says it is being sent now.
     const marks = () =>
       [...document.querySelectorAll(".importer .queued-mark")].map(
@@ -1473,7 +1489,7 @@ describe("A6 U6: Stop when the server says something runs, and Send now", () => 
       );
     expect(marks()).toEqual(["sending now"]);
     expect(document.querySelector(".importer")?.textContent).toContain(
-      SENT_NOW_NOTE,
+      sendingNowNote("next_step"),
     );
     // Empty again: Send now is there and off, like the arrow.
     expect(sendNowButton()?.disabled).toBe(true);
@@ -1498,9 +1514,125 @@ describe("A6 U6: Stop when the server says something runs, and Send now", () => 
     );
     await settle();
     expect(marks()).toEqual(["sent now"]);
+    expect(
+      document.querySelector(".importer .queued-mark")?.getAttribute("title"),
+    ).toBe(sentNowTitle("next_step"));
     expect(document.querySelector(".importer")?.textContent).not.toContain(
-      SENT_NOW_NOTE,
+      sendingNowNote("next_step"),
     );
+  });
+
+  test("on OpenCode, Send now says it is read once the message in flight ends, not that it cuts in (A6 U6 review)", async () => {
+    // GLM finished a 77 s reply in full before it read a Send now: no step inside a message.
+    const sessions = SESSIONS.map((each) =>
+      each.importId === "imp_newest"
+        ? { ...each, harnessInstanceId: "opencode" }
+        : each,
+    );
+    const { app, fake } = await continueOn(sessions, [
+      harness("opencode", "OpenCode", "opencode"),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    await settle();
+    typeInto(composer(), "Read the policy");
+    await settle();
+    composer().focus();
+    press("Enter");
+    await settle();
+    activity(fake, { turn: "running", background: false });
+    await firePolls(app);
+    expect(app.importer.current?.working).toBe(true);
+
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_newest",
+          harnessInstanceId: "opencode",
+          model: "anthropic/claude-newest",
+          messageId: "msg_now",
+        }),
+      );
+    typeInto(composer(), "Skip the blog");
+    await settle();
+    const now = sendNowButton();
+    if (now === null) throw new Error("no Send now while a turn runs");
+    expect(now.title).toBe(sendNowButtonTitle("message_end"));
+    click(now);
+    await settle();
+    const page = document.querySelector(".importer")?.textContent ?? "";
+    expect(page).toContain(sendingNowNote("message_end"));
+    // Nothing on screen claims the reply in flight is cut short.
+    expect(page).not.toContain(sendingNowNote("next_step"));
+    expect(page).not.toContain("is dropped");
+
+    const messageId = app.importer.current?.items.at(-1)?.messageIds?.[0];
+    if (messageId === undefined) throw new Error("no message id");
+    fake.watch.send(
+      liveActivity({
+        id: "activity:30",
+        attemptId: null,
+        importId: "imp_newest",
+        kind: "turn.taken",
+        headline: "",
+        tool: null,
+        toolName: null,
+        input: null,
+        callId: null,
+        messageIds: [messageId],
+      }),
+    );
+    await settle();
+    expect(
+      document.querySelector(".importer .queued-mark")?.getAttribute("title"),
+    ).toBe(sentNowTitle("message_end"));
+  });
+
+  test("a turn's Stop that stopped the background work beside it takes the pill away at once, with no 'Stop background work' in between (A6 U6 review)", async () => {
+    const fake = new FakeServer();
+    // A turn runs and a background shell beside it.
+    activity(fake, { turn: "running", background: true });
+    fake.onStopImporterTurn = (_baseUrl, _targetId, importId) =>
+      ok({
+        conversationId: importId,
+        outcome: "interrupted",
+        working: false,
+        background: false,
+        detail: "Stopped the turn running in this session.",
+      });
+    const app = await continueWith(fake);
+    expect(app.importer.current?.working).toBe(true);
+    expect(app.importer.current?.background).toBe(true);
+    expect(stopPill()?.textContent?.trim()).toBe("Stop");
+    // The next activity read would still say the shell runs: only the answer clears it.
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill");
+    click(pill);
+    await settle();
+    expect(app.importer.current?.working).toBe(false);
+    expect(app.importer.current?.background).toBe(false);
+    expect(stopPill()).toBeNull();
+  });
+
+  test("a turn's Stop that left background work running offers 'Stop background work' next", async () => {
+    const fake = new FakeServer();
+    activity(fake, { turn: "running", background: true });
+    fake.onStopImporterTurn = (_baseUrl, _targetId, importId) =>
+      ok({
+        conversationId: importId,
+        outcome: "interrupted",
+        working: false,
+        background: true,
+        detail: "Stopped the turn running in this session.",
+      });
+    const app = await continueWith(fake);
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill");
+    click(pill);
+    await settle();
+    expect(app.importer.current?.working).toBe(false);
+    expect(stopPill()?.textContent?.trim()).toBe("Stop background work");
   });
 });
 

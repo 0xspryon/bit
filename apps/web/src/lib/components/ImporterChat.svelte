@@ -71,7 +71,12 @@
   } from "../chat";
   import type { ImporterTurn } from "../importerChat";
   import CopyButton from "./CopyButton.svelte";
-  import { ENDED_NOTE, strandedNote } from "../importerChat";
+  import {
+    ENDED_NOTE,
+    sendNowButtonTitle,
+    sentNowTitle,
+    strandedNote,
+  } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import AgentChip from "./AgentChip.svelte";
   import Chat from "./Chat.svelte";
@@ -141,8 +146,9 @@
   let background = $derived(session?.background === true);
   /**
    * D3's "Send now" is offered while a turn runs in a session the server holds: then a
-   * message can wait for the work in flight (Enter, the arrow) or land at the harness's next
-   * step. With nothing running the two are the same, so there is one way to send.
+   * message can wait for the work in flight (Enter, the arrow) or go ahead of every queued
+   * one — at the next step on Claude Code, once the message being written ends on OpenCode
+   * (`SendNowTiming`). With nothing running the two are the same, so there is one way to send.
    */
   let canSendNow = $derived(
     canSend && working && session?.importId !== undefined,
@@ -236,9 +242,18 @@
     if (canSend) importer.send();
   }
 
-  /** D3's "Send now": a `preemptive` steer, for a message that cannot wait (A6 U6). */
+  /**
+   * D3's "Send now": a `preemptive` steer, for a message that cannot wait (A6 U6).
+   *
+   * Focus goes back to the box (A6 U6 review): the click left it on this button, which is
+   * disabled once the draft clears and gone once the turn ends, and either drops focus to
+   * `<body>` — where the operator's next words, a correction to the one just sent, would go
+   * nowhere.
+   */
   function sendNow(): void {
-    if (canSendNow) importer.send("preemptive");
+    if (!canSendNow) return;
+    importer.send("preemptive");
+    box?.focus();
   }
 
   /**
@@ -365,12 +380,11 @@
               >
             {:else if group.subject.sentNow}
               <!--
-                Taken (A6 U6): the harness read it at its next step and dropped the rest of
-                the turn before, which is why that turn ends where this one begins.
+                Taken (A6 U6): the harness read it ahead of any queued message, which is why
+                the turn before ends where this one begins. What it cut of that turn is the
+                harness's (`sentNowTitle`).
               -->
-              <span
-                class="queued-mark"
-                title="Sent now: the importer took this at its next step and dropped the rest of what it was doing."
+              <span class="queued-mark" title={sentNowTitle(importer.sendNow)}
                 >sent now</span
               >
             {/if}
@@ -585,15 +599,16 @@
             {#if working && session?.importId !== undefined}
               <!--
                 D3's two ways to send while a turn runs (A6 U6). The arrow and Enter queue the
-                message behind the work in flight, as a follow-up always is; this one lands it
-                at the harness's next step instead, dropping the rest of that work. No key of
-                its own: D3 draws none, and Enter keeps its one meaning.
+                message behind the work in flight, as a follow-up always is; this one sends it
+                ahead of every queued message, when the harness lets it in
+                (`sendNowButtonTitle`). No key of its own: D3 draws none, and Enter keeps its
+                one meaning.
               -->
               <button
                 class="send-now"
                 type="button"
                 disabled={!canSendNow}
-                title="Send now: the importer reads this at its next step. A tool call already running finishes first; the rest of what it was doing is dropped."
+                title={sendNowButtonTitle(importer.sendNow)}
                 onclick={sendNow}>Send now</button
               >
             {/if}
@@ -855,8 +870,14 @@
     a sentence the operator reads. It gives way before the chips do.
   */
   .hint {
-    /* Gives way first: the chips and the send buttons are controls, this is a caption. */
-    flex-shrink: 100;
+    /*
+     * Gives way first, and wholly, before any chip does: the chips and the send buttons are
+     * controls, this is a caption. A basis of nothing and the strip's free space to grow
+     * into (A6 U6 review) — not a large `flex-shrink`, which shrinks every item in
+     * proportion, so the model chip still lost a few pixels, and ellipsed its name, the
+     * moment "Send now" appeared beside a caption that had room to spare.
+     */
+    flex: 1000 1 0;
     min-width: 0;
     overflow: hidden;
     font: 400 11px/16px var(--font-sans);

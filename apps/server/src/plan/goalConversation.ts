@@ -459,7 +459,7 @@ export class GoalConversations extends Context.Service<
             turnStopped({
               found: { _tag: "not_live" },
               conversationId: input.goalId,
-              what: `goal ${input.goalId}'s conversation`,
+              what: "this conversation",
             }),
           ),
         switchModel: () =>
@@ -1654,7 +1654,8 @@ const make = Effect.fnUntraced(function* () {
   const stopTurn: GoalConversations["Service"]["stopTurn"] = Effect.fn(
     "GoalConversations.stopTurn",
   )(function* (input) {
-    const what = `goal ${input.goalId}'s conversation`;
+    // Named as the operator sees it from its own chat, never by its id (A6 U6 review).
+    const what = "this conversation";
     const found = yield* sessions
       .interrupt(input.goalId)
       .pipe(Effect.mapError((failure) => turnStopRefusal(failure, what)));

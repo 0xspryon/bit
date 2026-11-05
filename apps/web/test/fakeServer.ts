@@ -1362,7 +1362,8 @@ export class FakeServer implements ServerClient {
       conversationId: importId,
       outcome: "interrupted",
       working: false,
-      detail: `Stopped the turn import ${importId} was taking.`,
+      background: false,
+      detail: "Stopped the turn running in this session.",
     });
 
   onStopGoalTurn: (
@@ -1372,7 +1373,8 @@ export class FakeServer implements ServerClient {
       conversationId: goalId,
       outcome: "interrupted",
       working: false,
-      detail: `Stopped the turn goal ${goalId}'s conversation was taking.`,
+      background: false,
+      detail: "Stopped the turn running in this conversation.",
     });
 
   onTranscript: (

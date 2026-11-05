@@ -567,6 +567,179 @@ describe("requests", () => {
     ]);
   });
 
+  /*
+   * A6 U6 review: a resume runs in its predecessor's directory, so a session closed
+   * `refused` or `open_failed` and opened again at once registers where the close is letting
+   * the Location go. Interleaved here with a stub that holds one answer back.
+   */
+  describe("a release and a registration in the same directory", () => {
+    const config = {
+      url: "http://127.0.0.1:1234/mcp",
+      headers: { authorization: Redacted.make("Bearer s3cret") },
+      directory: "/tmp/ws",
+    };
+    /** An answer held until `release` is called. */
+    const holdBack = () => {
+      let release = (): void => {};
+      const answered = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { answered, release: () => release() };
+    };
+    /** Resolves once `seen` is true, checked on every turn of the event loop. */
+    const until = (seen: () => boolean) =>
+      Effect.promise(async () => {
+        for (let turn = 0; turn < 200 && !seen(); turn += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 2));
+        }
+      });
+    const requests = (recorded: { urls: string[]; methods: string[] }) =>
+      recorded.urls.map(
+        (url, index) =>
+          `${recorded.methods[index] ?? "?"} ${new URL(url).pathname}`,
+      );
+
+    test("a release while another session's add is in flight there does not evict the Location the add went into", async () => {
+      const add = holdBack();
+      const { layer, recorded } = clientWith(async (url, init) => {
+        if (
+          init?.method === "PUT" &&
+          new URL(url).pathname.endsWith("/bit-import-b")
+        ) {
+          await add.answered;
+        }
+        return noContent();
+      });
+      const outcome = await Effect.runPromise(
+        Effect.scoped(
+          Effect.provide(
+            Effect.flatMap(AgentHarness, (client) =>
+              Effect.gen(function* () {
+                yield* client.registerMcpServer(
+                  "ses_1",
+                  "bit-import-a",
+                  config,
+                );
+                // The resume's add is out, and not answered yet.
+                const adding = yield* Effect.forkChild(
+                  client.registerMcpServer("ses_2", "bit-import-b", config),
+                );
+                yield* until(() =>
+                  requests(recorded).includes(
+                    "PUT /api/experimental/mcp/bit-import-b",
+                  ),
+                );
+                // The closed session lets go of its registration meanwhile.
+                const releasing = yield* Effect.forkChild(
+                  client.unregisterMcpServer("ses_1", "bit-import-a"),
+                );
+                yield* Effect.promise(
+                  () => new Promise((resolve) => setTimeout(resolve, 30)),
+                );
+                add.release();
+                yield* Fiber.join(adding);
+                yield* Fiber.join(releasing);
+                return requests(recorded);
+              }),
+            ),
+            layer,
+          ),
+        ),
+      );
+      // The add is still the directory's, so its Location stays.
+      expect(outcome).toEqual([
+        "PUT /api/experimental/mcp/bit-import-a",
+        "PUT /api/experimental/mcp/bit-import-b",
+        "DELETE /api/experimental/mcp/bit-import-a",
+      ]);
+    });
+
+    test("an add while an eviction is in flight there waits for it, and goes into the fresh Location", async () => {
+      const evict = holdBack();
+      const { layer, recorded } = clientWith(async (url) => {
+        if (new URL(url).pathname === "/api/debug/location") {
+          await evict.answered;
+        }
+        return noContent();
+      });
+      const outcome = await Effect.runPromise(
+        Effect.scoped(
+          Effect.provide(
+            Effect.flatMap(AgentHarness, (client) =>
+              Effect.gen(function* () {
+                yield* client.registerMcpServer(
+                  "ses_1",
+                  "bit-import-a",
+                  config,
+                );
+                const releasing = yield* Effect.forkChild(
+                  client.unregisterMcpServer("ses_1", "bit-import-a"),
+                );
+                yield* until(() =>
+                  requests(recorded).includes("DELETE /api/debug/location"),
+                );
+                // The resume registers while the eviction is out.
+                const adding = yield* Effect.forkChild(
+                  client.registerMcpServer("ses_2", "bit-import-b", config),
+                );
+                yield* Effect.promise(
+                  () => new Promise((resolve) => setTimeout(resolve, 30)),
+                );
+                const whileEvicting = requests(recorded);
+                evict.release();
+                yield* Fiber.join(releasing);
+                yield* Fiber.join(adding);
+                return { whileEvicting, after: requests(recorded) };
+              }),
+            ),
+            layer,
+          ),
+        ),
+      );
+      // Not sent while the eviction could still land after it.
+      expect(outcome.whileEvicting).toEqual([
+        "PUT /api/experimental/mcp/bit-import-a",
+        "DELETE /api/experimental/mcp/bit-import-a",
+        "DELETE /api/debug/location",
+      ]);
+      expect(outcome.after).toEqual([
+        ...outcome.whileEvicting,
+        "PUT /api/experimental/mcp/bit-import-b",
+      ]);
+    });
+
+    test("an add that fails is no registration a release must keep the Location for", async () => {
+      const { layer, recorded } = clientWith((url, init) =>
+        init?.method === "PUT" &&
+        new URL(url).pathname.endsWith("/bit-import-b")
+          ? json({ _tag: "BadRequest", message: "no" }, 400)
+          : noContent(),
+      );
+      const outcome = await Effect.runPromise(
+        Effect.scoped(
+          Effect.provide(
+            Effect.flatMap(AgentHarness, (client) =>
+              Effect.gen(function* () {
+                yield* client.registerMcpServer(
+                  "ses_1",
+                  "bit-import-a",
+                  config,
+                );
+                yield* Effect.result(
+                  client.registerMcpServer("ses_2", "bit-import-b", config),
+                );
+                yield* client.unregisterMcpServer("ses_1", "bit-import-a");
+                return requests(recorded);
+              }),
+            ),
+            layer,
+          ),
+        ),
+      );
+      expect(outcome.at(-1)).toBe("DELETE /api/debug/location");
+    });
+  });
+
   test("unregistering a name that was never registered makes no request", async () => {
     // There is no directory to guess, and OpenCode answers 404 for a server it does not
     // hold, so asking would turn tidy-up into a failure for no gain.

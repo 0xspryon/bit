@@ -795,6 +795,60 @@ describe("a later message and a Stop (A6 F5)", () => {
     expect(lingering.detail).toContain("may still be running");
   });
 
+  test("a turn's Stop says whether the background work beside it still runs, and an unreadable status is 'may still run' (A6 U6 review)", async () => {
+    // Claude Code's interrupt stops the shells listed when it began, beside the turn: the
+    // screen offering "Stop background work" must hear so with the answer.
+    const answer = (status: AgentHarness["Service"]["sessionStatus"]) =>
+      withImporterSessions(
+        stubHarness({
+          interruptSession: () => Effect.succeed(true),
+          sessionStatus: status,
+        }),
+        ({ sessions, plan }) =>
+          Effect.gen(function* () {
+            yield* opened(sessions, plan);
+            const found = yield* sessions.interrupt(IMPORT);
+            return turnStopped({
+              found,
+              conversationId: IMPORT,
+              what: "this session",
+            });
+          }),
+      );
+    const stopped = (
+      await answer(() =>
+        Effect.succeed({ activity: "idle" as const, background: false }),
+      )
+    ).result;
+    expect(stopped.outcome).toBe("interrupted");
+    expect(stopped.background).toBe(false);
+    // Named as the operator sees it, never by its id.
+    expect(stopped.detail).toStartWith(
+      "Stopped the turn running in this session.",
+    );
+    expect(stopped.detail).not.toContain(IMPORT);
+    const lingering = (
+      await answer(() =>
+        Effect.succeed({ activity: "idle" as const, background: true }),
+      )
+    ).result;
+    expect(lingering.background).toBe(true);
+    const unknown = (
+      await answer(() =>
+        Effect.fail(
+          new HarnessTransportError({
+            operation: "session.status",
+            status: undefined,
+            tag: undefined,
+            detail: "no answer",
+            cause: undefined,
+          }),
+        ),
+      )
+    ).result;
+    expect(unknown.background).toBe(true);
+  });
+
   test("status says what the harness says is running, including a turn no message started, and background work beside it (A6 U6)", async () => {
     const read = (
       sessionStatus: AgentHarness["Service"]["sessionStatus"],
