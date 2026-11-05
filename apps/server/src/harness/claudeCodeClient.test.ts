@@ -129,6 +129,11 @@ interface Script {
   readonly contextUsage?: (
     detail: "summary" | "full" | undefined,
   ) => ClaudeContextUsage;
+  /**
+   * Keeps the stream open after {@link messages} until the query is closed, as a live CLI
+   * does between turns: a stream that ends closes the session, which hides a turn left open.
+   */
+  readonly stayOpen?: boolean;
 }
 
 const result = (
@@ -188,6 +193,10 @@ const scriptedSdk = (script: Script = {}) => {
       const promptPulled = new Promise<void>((resolve) => {
         deliver = resolve;
       });
+      let release: (() => void) | undefined;
+      const closed = new Promise<void>((resolve) => {
+        release = resolve;
+      });
 
       void (async () => {
         for await (const message of prompt) {
@@ -227,12 +236,14 @@ const scriptedSdk = (script: Script = {}) => {
         },
         close: () => {
           seen.closes += 1;
+          release?.();
         },
         [Symbol.asyncIterator]: async function* () {
           // Nothing is narrated until the prompt has actually been sent, which is what the
           // CLI does and what makes the ordering assertions meaningful.
           await promptPulled;
           for (const message of script.messages ?? []) yield message;
+          if (script.stayOpen === true) await closed;
         },
       };
       return query;
@@ -7793,5 +7804,47 @@ describe("how full a session's window is (A6 U9)", () => {
       reading: "measured",
       breakdown: { _tag: "none", reason: "not_live" },
     });
+  });
+});
+
+describe("the CLI's echo of a model switch (A6 U9, found live)", () => {
+  test("a replayed `user` frame after a turn's `result` opens no turn: the session stays idle", async () => {
+    const sessionId = newClaudeCodeSessionId();
+    // Recorded 2026-11-05 from CLI 2.1.310: what `setModel` sends back, after the turn.
+    const echo = {
+      type: "user",
+      message: {
+        role: "user",
+        content:
+          "<local-command-stdout>Set model to `claude-sonnet-5`</local-command-stdout>",
+      },
+      session_id: sessionId,
+      parent_tool_use_id: null,
+      uuid: "e0b65c1d-e555-41ec-8593-97a5dd29b026",
+      timestamp: "2026-11-05T04:59:51.069Z",
+      isReplay: true,
+    } as unknown as SDKMessage;
+    const status = await withHarness(
+      {
+        messages: [assistant(sessionId), result(sessionId, "success"), echo],
+        stayOpen: true,
+      },
+      (harness) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "bit: t",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId,
+            multiTurn: true,
+          });
+          yield* harness.prompt(sessionId, "go");
+          yield* harness.waitForIdle(sessionId);
+          yield* Effect.sleep("50 millis");
+          return yield* harness.sessionStatus(sessionId);
+        }),
+    );
+    expect(status.activity).toBe("idle");
+    expect(status.outcome).toBe("succeeded");
   });
 });

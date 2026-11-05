@@ -2494,9 +2494,17 @@ const userMessage = (
  * bookkeeping, rate limits, command lifecycle, partial and progress frames, which carry the
  * same `parent_tool_use_id` and only arrive inside a turn `system/init` already opened — is
  * not a turn either.
+ *
+ * **Nor is a replayed `user` frame** (A6 U9, found live). `setModel` makes the CLI echo
+ * its local command's output as a main-thread `user` frame — `<local-command-stdout>Set
+ * model to …</local-command-stdout>`, `isReplay: true` — with no `system/init` before it
+ * and no `result` after (measured, CLI 2.1.310, 2026-11-05). Read as a turn, it left every
+ * session "running" after a model switch, with a Stop on screen and nothing to stop.
  */
 const opensTurn = (message: SDKMessage): boolean =>
-  ((message.type === "assistant" || message.type === "user") &&
+  ((message.type === "assistant" ||
+    (message.type === "user" &&
+      (message as { readonly isReplay?: unknown }).isReplay !== true)) &&
     message.parent_tool_use_id == null) ||
   (message.type === "system" && message.subtype === "init");
 
