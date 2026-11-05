@@ -306,8 +306,53 @@ export class BrowserApiSettings extends Context.Service<
  * identity from the context rather than from a header it would have to trust.
  */
 /**
- * A refusal of the guard's, answered once a multipart body has been read to its end (U13
- * review 1).
+ * The routes whose bodies carry a message's files (A6 F9): an importer conversation's first
+ * message, a later one, and a goal's. Matched on the request's own path, at its end, so the
+ * API prefix the router is mounted under does not matter.
+ */
+const UPLOAD_ROUTE =
+  /\/targets\/[^/]+\/(?:importer-sessions(?:\/[^/]+\/messages)?|goals\/[^/]+\/conversation)$/;
+
+/**
+ * The most of an unauthenticated body the guard reads before its `401`: every file the caps
+ * allow together, and room beside them for the `message` field (32,000 characters, JSON
+ * escaped) and each part's headers. A body past it is a composer's message no server could
+ * take anyway.
+ */
+export const guardDrainBytes = (limits: UploadLimits): number =>
+  limits.maxTotalBytes + 1024 * 1024 + limits.maxFiles * 4 * 1024;
+
+/**
+ * How much of a refused request's body the guard reads first, in bytes: `0` for anything
+ * but a multipart `POST` to an upload route ({@link UPLOAD_ROUTE}), or one that says it is
+ * longer than {@link guardDrainBytes}.
+ */
+export const guardDrainBudget = (
+  request: {
+    readonly method: string;
+    readonly originalUrl: string;
+    readonly headers: Readonly<Record<string, string | undefined>>;
+  },
+  limits: UploadLimits,
+): number => {
+  if (request.method !== "POST") return 0;
+  const type = request.headers["content-type"] ?? "";
+  if (!type.toLowerCase().startsWith("multipart/form-data")) return 0;
+  let path: string;
+  try {
+    path = new URL(request.originalUrl, "http://bit.invalid").pathname;
+  } catch {
+    return 0;
+  }
+  if (!UPLOAD_ROUTE.test(path)) return 0;
+  const cap = guardDrainBytes(limits);
+  const declared = Number(request.headers["content-length"] ?? Number.NaN);
+  return Number.isFinite(declared) && declared > cap ? 0 : cap;
+};
+
+/**
+ * A refusal of the guard's, answered once an upload's body has been read to its end (U13
+ * review 1), and only an upload's (review 2).
  *
  * The handler's own upload refusals already read the rest of the body before answering
  * (`upload/uploads.ts`'s `readUploadParts`), because a server that answers while a body is
@@ -318,19 +363,31 @@ export class BrowserApiSettings extends Context.Service<
  * server answered" instead of signing out (measured: a 1 MiB file, 2 of 3 tries). A proxy
  * cannot pass through an answer it never got, so the fix is here: read first, then refuse.
  *
- * Only a multipart body, which is what a composer's files travel in; nothing of it is kept.
- * Bounded like the handler's drain, by the listener's body ceiling (`http/controlPlane.ts`),
- * past which Bun answers its own `413` without this running. A stream that fails (the
- * client went away) only ends the reading early.
+ * **Only where a composer's files go, and only as far as the caps** ({@link
+ * guardDrainBudget}): round 1 read any multipart body on any guarded route up to the
+ * listener's ceiling, so anyone without a session could make the server read ~128 MiB per
+ * request to any route. Now a multipart `POST` to one of the three message routes is read
+ * up to what the upload caps allow; a body that says it is longer, or turns out longer, is
+ * refused at once as before, and through Vite that is a `502` — a body no message could be.
+ * Nothing read is kept. A stream that fails (the client went away) only ends the reading.
  */
 const refuseUnauthenticated = (
   reason: Unauthenticated["reason"],
+  limits: UploadLimits,
 ): Effect.Effect<never, Unauthenticated, HttpServerRequest.HttpServerRequest> =>
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
-    const type = request.headers["content-type"] ?? "";
-    if (type.toLowerCase().startsWith("multipart/form-data")) {
-      yield* Stream.runDrain(request.stream).pipe(Effect.ignore);
+    const budget = guardDrainBudget(request, limits);
+    if (budget > 0) {
+      let read = 0;
+      yield* request.stream.pipe(
+        Stream.takeWhile((chunk) => {
+          read += chunk.length;
+          return read <= budget;
+        }),
+        Stream.runDrain,
+        Effect.ignore,
+      );
     }
     return yield* new Unauthenticated({ reason });
   });
@@ -338,23 +395,24 @@ const refuseUnauthenticated = (
 export const sessionGuardLayer: Layer.Layer<
   SessionGuard,
   never,
-  BrowserSessions
+  BrowserSessions | BrowserApiSettings
 > = Layer.effect(
   SessionGuard,
   Effect.gen(function* () {
     const sessions = yield* BrowserSessions;
+    const limits = uploadLimitsOf(yield* BrowserApiSettings);
     return SessionGuard.of({
       bearer: Effect.fnUntraced(function* (httpEffect, { credential }) {
         const token = Redacted.value(credential);
         if (token.length === 0) {
-          return yield* refuseUnauthenticated("missing");
+          return yield* refuseUnauthenticated("missing", limits);
         }
         const lookup = yield* sessions.resolve(token);
         if (lookup._tag === "Expired") {
-          return yield* refuseUnauthenticated("expired");
+          return yield* refuseUnauthenticated("expired", limits);
         }
         if (lookup._tag === "Unknown") {
-          return yield* refuseUnauthenticated("unknown");
+          return yield* refuseUnauthenticated("unknown", limits);
         }
         return yield* Effect.provideService(
           httpEffect,

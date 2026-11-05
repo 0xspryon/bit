@@ -60,6 +60,8 @@ import {
   addIntentRefusal,
   browserApiRoutes,
   goalRefusal,
+  guardDrainBudget,
+  guardDrainBytes,
 } from "./browserApi";
 import { CONTROL_PLANE_IDLE_TIMEOUT } from "./controlPlane";
 import { BrowserSessions, ensureServerPassword } from "./browserSessions";
@@ -117,6 +119,11 @@ const SUITE_BRIEFING_CEILING = 12_000;
  */
 const SUITE_UPLOAD_MAX_BYTES = 64;
 const SUITE_UPLOAD_MAX_FILES = 2;
+/**
+ * The suite's cap on one message's files together: small, so the guard's drain budget
+ * (`guardDrainBytes`, about 5 MiB here) can be passed by a test body (U13 review 2).
+ */
+const SUITE_UPLOAD_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 
 const POLICY: PolicyConfig = {
   forbiddenPathFragments: ["out-of-scope/"],
@@ -323,6 +330,7 @@ const endpoint = Layer.unwrap(
         goalBriefingMaxChars: SUITE_BRIEFING_CEILING,
         uploadMaxBytes: SUITE_UPLOAD_MAX_BYTES,
         uploadMaxFiles: SUITE_UPLOAD_MAX_FILES,
+        uploadMaxTotalBytes: SUITE_UPLOAD_MAX_TOTAL_BYTES,
       }).pipe(
         Layer.provide(BrowserSessions.layer),
         // No harness in this suite, so no import can be started. `unavailable` refuses one
@@ -5879,19 +5887,18 @@ describe("a message's files, on the wire (A6 F9)", () => {
     expect(created.status).toBe(200);
   });
 
-  /*
-   * U13 review 1, finding 6: answered while the body was still arriving, a 401 reset the
-   * socket and Vite's proxy said 502 instead. The guard reads a multipart body to its end
-   * before it refuses, as the handler's own refusals do.
+  /**
+   * A multipart POST with a bad bearer, its file `chunks` of 64 KiB streamed as they are
+   * pulled: what the server answered (or `reset` when the socket was closed under the
+   * body), and how many of the file's bytes the client was asked for.
    */
-  test("a multipart upload with a bad bearer is read to its end before its 401", async () => {
+  const unauthenticatedUpload = async (path: string, chunks: number) => {
     const boundary = "bitguardboundary";
     const head = new TextEncoder().encode(
       `--${boundary}\r\ncontent-disposition: form-data; name="files"; filename="big.bin"\r\ncontent-type: application/octet-stream\r\n\r\n`,
     );
     const tail = new TextEncoder().encode(`\r\n--${boundary}--\r\n`);
     const chunk = new Uint8Array(64 * 1024);
-    const chunks = 128; // 8 MiB, far past what socket buffers hold
     let pulled = 0;
     let sent = 0;
     const body = new ReadableStream<Uint8Array>({
@@ -5909,24 +5916,122 @@ describe("a message's files, on the wire (A6 F9)", () => {
         sent += 1;
       },
     });
-    const response = await fetch(
-      `${api}/targets/${TARGET}/importer-sessions/imp_x/messages`,
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer not-a-session",
-          "content-type": `multipart/form-data; boundary=${boundary}`,
-        },
-        body,
-        // @ts-expect-error -- Bun's fetch takes a streamed body; its types predate `duplex`.
-        duplex: "half",
+    const answer = await fetch(`${api}${path}`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer not-a-session",
+        "content-type": `multipart/form-data; boundary=${boundary}`,
       },
+      body,
+      // @ts-expect-error -- Bun's fetch takes a streamed body; its types predate `duplex`.
+      duplex: "half",
+    }).then(
+      async (response) => ({
+        status: response.status,
+        reason: ((await response.json()) as Record<string, unknown>)["reason"],
+      }),
+      () => ({ status: "reset" as const, reason: undefined }),
     );
-    expect(response.status).toBe(401);
-    expect(((await response.json()) as Record<string, unknown>)["reason"]).toBe(
-      "unknown",
+    return { ...answer, pulled, total: chunks * chunk.length };
+  };
+
+  /*
+   * U13 review 1, finding 6: answered while the body was still arriving, a 401 reset the
+   * socket and Vite's proxy said 502 instead. The guard reads an upload's body to its end
+   * before it refuses, as the handler's own refusals do.
+   */
+  test("a multipart upload with a bad bearer is read to its end before its 401", async () => {
+    for (const path of [
+      `/targets/${TARGET}/importer-sessions/imp_x/messages`,
+      `/targets/${TARGET}/importer-sessions`,
+      `/targets/${TARGET}/goals/goal_x/conversation`,
+    ]) {
+      // 3 MiB, under the suite's 4 MiB of files and far past what socket buffers hold.
+      const sent = await unauthenticatedUpload(path, 48);
+      expect([path, sent.status, sent.reason]).toEqual([path, 401, "unknown"]);
+      expect(sent.pulled).toBe(sent.total);
+    }
+  });
+
+  /*
+   * U13 review 2, finding 5: round 1 read **any** multipart body on **any** guarded route,
+   * up to the listener's ceiling, for anyone without a session. Now only an upload route's,
+   * and only as far as the upload caps allow; past that the guard answers at once, as before.
+   */
+  test("a bad bearer's multipart body is not read on a route that takes no files, nor past the upload caps", async () => {
+    const elsewhere = await unauthenticatedUpload(
+      `/targets/${TARGET}/goals`,
+      128,
     );
-    expect(pulled).toBe(chunks * chunk.length);
+    expect(elsewhere.status === 401 || elsewhere.status === "reset").toBe(true);
+    expect(elsewhere.pulled).toBeLessThan(elsewhere.total);
+    // 12 MiB to a message route: past the suite's ~5 MiB budget, so never read to its end.
+    const over = await unauthenticatedUpload(
+      `/targets/${TARGET}/importer-sessions/imp_x/messages`,
+      192,
+    );
+    expect(over.status === 401 || over.status === "reset").toBe(true);
+    expect(over.pulled).toBeLessThan(over.total);
+  });
+
+  test("the guard's budget: a multipart POST to the three message routes, up to the caps; nothing else", () => {
+    const limits = {
+      maxImageBytes: 10,
+      maxFileBytes: 10,
+      maxFiles: 2,
+      maxTotalBytes: 1000,
+    };
+    const cap = guardDrainBytes(limits);
+    expect(cap).toBe(1000 + 1024 * 1024 + 2 * 4096);
+    const budget = (
+      method: string,
+      path: string,
+      headers: Record<string, string> = {},
+    ) =>
+      guardDrainBudget(
+        {
+          method,
+          originalUrl: path,
+          headers: {
+            "content-type": "multipart/form-data; boundary=x",
+            ...headers,
+          },
+        },
+        limits,
+      );
+    for (const path of [
+      "/api/v1/targets/t/importer-sessions",
+      "/api/v1/targets/t/importer-sessions/imp_1/messages",
+      "/api/v1/targets/t/goals/g_1/conversation",
+      "/api/v1/targets/t/goals/g_1/conversation?x=1",
+    ]) {
+      expect([path, budget("POST", path)]).toEqual([path, cap]);
+    }
+    for (const [method, path] of [
+      ["POST", "/api/v1/targets/t/goals"],
+      ["POST", "/api/v1/targets"],
+      ["POST", "/api/v1/targets/t/importer-sessions/imp_1/stop"],
+      ["POST", "/api/v1/targets/t/goals/g_1/conversation/extra"],
+      ["PUT", "/api/v1/targets/t/importer-sessions"],
+      ["GET", "/api/v1/targets/t/goals/g_1/conversation"],
+    ] as const) {
+      expect([method, path, budget(method, path)]).toEqual([method, path, 0]);
+    }
+    expect(
+      budget("POST", "/api/v1/targets/t/importer-sessions", {
+        "content-type": "application/json",
+      }),
+    ).toBe(0);
+    expect(
+      budget("POST", "/api/v1/targets/t/importer-sessions", {
+        "content-length": String(cap + 1),
+      }),
+    ).toBe(0);
+    expect(
+      budget("POST", "/api/v1/targets/t/importer-sessions", {
+        "content-length": String(cap),
+      }),
+    ).toBe(cap);
   });
 
   test("an importer message with files reaches the importer with its words, its urgency and each file", async () => {
