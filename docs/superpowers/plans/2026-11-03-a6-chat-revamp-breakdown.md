@@ -219,7 +219,7 @@ a URL that keeps the operator on the importer page. The server half of S9 is don
 contract); this task is the web half. Spec S9: session named from the harness title (with its five
 constraints), the write summary ("7 in · 3 out · 14 assets"), the model it ended on, the
 date, **Start a new session**; an older session read-only until the operator types.
-**A7 (operator, 2026-11-05): U8 also builds A7's E1, E2, E5 and E6**
+**U8b — A7 Agent sessions page (M), U8 → U8b.** Split out of U8 (2026-11-05) so each is reviewed on its own. Builds A7's E1, E2, E5 and E6
 (`docs/superpowers/design/A7-agent-sessions.html`) on the existing `screens/AgentSessions.svelte`:
 
 - grouping and filters replace that page's "no grouping, no filters" rule;
@@ -341,7 +341,7 @@ and checks the UI in a real browser (headless Chrome over CDP on the dev server)
 width and up. Fixes go back to the implementer; the next slice starts after review passes.
 
 F1, F2, F3, F4, F5, F6, F7, F8, F10, F9, U1, U10, U14, U12, U11, U2, U7, U3, U4, U5, U6, U9,
-U8, U13, A7-Q, A7-S, F12.
+U8, U8b, U13, A7-Q, A7-S, F12.
 
 ## Known issues found along the way (not in any slice)
 
