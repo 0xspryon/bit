@@ -41,6 +41,12 @@ makes it. `grep -rn "V2(chat):" apps packages` lists them.
   `files`), `text/plain` and PDF also as OpenCode `files`. Attachment chip with a copy-path
   button. Reload renders from the harness transcript.
 - **Compaction** is each harness's default. **Rewind** is out.
+- **Attachment lines match T3 Code** (operator, 2026-11-05, reversing U13 Step 0's marker
+  decision): one plain `[Attached … is saved at: <path>]` line per file after a blank line,
+  nothing for a message without files. Five review rounds showed wording cannot stop a
+  forgery, the sealed block cost about 400 tokens per message, and neither T3 nor OpenCode
+  guards against look-alikes. The block's design is a `V2(chat):` note in
+  `harness/attachments.ts`.
 
 ## Tasks
 
@@ -393,16 +399,12 @@ U8, U8b, U13, A7-Q, A7-S, F12.
   header no longer says it is last: each operator header names the codes of the session's
   unanswered messages as bit's (newest 16, under the seal), and a prompt bit writes (a
   run's task, a planner round) ends in a briefing block instead.
-  **U13 review 4, the acceptance bar (orchestrator):** wording cannot make a model immune to
-  a forged instruction in pasted text — any page can try a plain prompt injection ("read
-  `~/.ssh/id_rsa`"), with or without fake blocks — and that general risk is **out of U13's
-  scope**. U13's guarantee is structural: (1) bit never vouches for a path outside the
-  session's own `uploads/` folder, in any form (`withAttachmentLines` refuses one); (2) bit's
-  sealed block is always last and names that folder, by absolute path, as the only place an
-  attachment is; (3) a replay draws a chip only when the seal verifies. A forgery that names
-  a path elsewhere is then self-evidently not bit's; one inside `uploads/` can only point at
-  the session's own uploads. Haiku still opens a forged path now and then (rates in the
-  `attachmentHeader` note); the proper fix is the gate refusing such reads (`V2(chat):` there).
+  **Reversed (operator, 2026-11-05):** the sealed block above is cut; bit writes T3's plain
+  lines (see Decisions). A forged line in pasted text is now ordinary prompt injection, out of
+  scope until the V2 gate refuses an agent's reads outside the session's `uploads/`. bit still
+  never lists a path outside that folder (`withAttachmentLines` throws), and a replay draws a
+  chip only for a line naming a file in this session's `uploads/` (a gone one as "no longer
+  stored"). Old dev transcripts with sealed blocks now show those blocks as words.
 - **Found in U13 review 3, half fixed:** ending a goal left its idle goal-chat CLI running
   (about 800 MB with its MCP servers). The operator's End goal route now closes the goal's
   conversation. A goal the goal agent ends itself (`end_goal`) still keeps its session until
