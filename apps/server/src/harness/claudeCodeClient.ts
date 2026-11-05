@@ -150,8 +150,11 @@ import {
   type TerminalOutcome,
 } from "./agentHarness";
 import {
+  ephemeralAttachmentKey,
   splitAttachmentLines,
   withAttachmentLines,
+  type AttachmentReplay,
+  type AttachmentSealing,
   type MessageAttachment,
 } from "./attachments";
 import { HarnessProcessError, HarnessTransportError } from "./errors";
@@ -878,6 +881,12 @@ const STDERR_TAIL = 4_096;
 export interface ClaudeCodeHarnessOptions {
   /** The model a run gets when it names none. */
   readonly defaultModel?: string;
+  /**
+   * The key every message's attachment block is sealed with and verified by
+   * (`harness/attachments.ts`), from `loadAttachmentKey`. Absent: one of this layer's own,
+   * so blocks verify for the layer's life only.
+   */
+  readonly attachmentKey?: Uint8Array;
   /** Swapped out by tests. Defaults to {@link liveClaudeCodeSdk}. */
   readonly sdk?: ClaudeCodeSdk;
   /**
@@ -2338,7 +2347,8 @@ const cliMarker = (entry: SessionMessage): string | undefined => {
  */
 const flattenTranscript = (
   entries: readonly SessionMessage[],
-  uploadsFolder: string | undefined,
+  /** Where this session's uploads are stored, and what verifies its blocks' seals. */
+  replay: Pick<AttachmentReplay, "uploadsFolder" | "sealing">,
   /**
    * The steers this process delivered into the session, by the UUID their entry was stored
    * under to the application's ids it holds ({@link storedSteers}): what names an operator
@@ -2443,7 +2453,7 @@ const flattenTranscript = (
      */
     const split =
       entry.type === "user" && marker === undefined
-        ? splitAttachmentLines(text, { uploadsFolder })
+        ? splitAttachmentLines(text, replay)
         : undefined;
     // A steer of ours is stored under the UUID it was delivered with (A6 U4 review 2), and
     // steers taken together under the last one's (review 3).
@@ -2519,9 +2529,10 @@ type UserContent =
 const userContent = (
   text: string,
   attachments: readonly MessageAttachment[],
+  sealing: AttachmentSealing,
 ): Effect.Effect<UserContent, HarnessTransportError> =>
   Effect.gen(function* () {
-    const words = withAttachmentLines(text, attachments);
+    const words = withAttachmentLines(text, attachments, sealing);
     const images = attachments.filter((file) => file.kind === "image");
     if (images.length === 0) return words;
     const blocks = yield* Effect.forEach(images, (image) =>
@@ -2774,6 +2785,7 @@ export const claudeCodeHarness = (
     Effect.gen(function* () {
       const sdk = options.sdk ?? liveClaudeCodeSdk;
       const defaultModel = options.defaultModel ?? CLAUDE_CODE_DEFAULT_MODEL;
+      const attachmentKey = options.attachmentKey ?? ephemeralAttachmentKey();
       const controlTimeout = options.controlTimeout ?? DEFAULT_CONTROL_TIMEOUT;
       const cliStopBounds = options.cliStopBounds ?? DEFAULT_CLI_STOP_BOUNDS;
       const cliTreeRefresh = options.cliTreeRefresh ?? DEFAULT_CLI_TREE_REFRESH;
@@ -3910,7 +3922,10 @@ export const claudeCodeHarness = (
       )(function* (sessionId, text, delivery = OPEN_PROMPT, attachments = []) {
         const record = yield* recordFor("session.prompt", sessionId);
         // Read before any state is touched, so an unreadable file sends nothing.
-        const content = yield* userContent(text, attachments);
+        const content = yield* userContent(text, attachments, {
+          key: attachmentKey,
+          sessionId,
+        });
         if (delivery._tag === "open") {
           // Ended before it was ever prompted: launching would start a CLI for a session
           // whose authority is already over.
@@ -4395,7 +4410,10 @@ export const claudeCodeHarness = (
          */
         return flattenTranscript(
           kept,
-          read?.uploadsFolder,
+          {
+            uploadsFolder: read?.uploadsFolder,
+            sealing: { key: attachmentKey, sessionId },
+          },
           storedSteers(
             record?.deliveredIds ?? [],
             record?.takenTogether ?? new Map(),

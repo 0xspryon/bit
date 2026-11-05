@@ -112,8 +112,10 @@ import {
 } from "./agentHarness";
 import {
   inlinesOnOpenCode,
+  ephemeralAttachmentKey,
   splitAttachmentLines,
   withAttachmentLines,
+  type AttachmentReplay,
 } from "./attachments";
 import { isDerivedMessageId, openCodeMessageId } from "./messageId";
 import { HarnessDecodeError, HarnessTransportError } from "./errors";
@@ -1168,7 +1170,8 @@ const assistantContentParts = (
  */
 const flatten = (
   entry: unknown,
-  uploadsFolder: string | undefined,
+  /** Where this session's uploads are stored, and what verifies its blocks' seals. */
+  replay: Pick<AttachmentReplay, "uploadsFolder" | "sealing">,
   subagents: OpenCodeSubagents = openCodeSubagents(),
 ): MessageEntry => {
   const record = (entry ?? {}) as {
@@ -1245,7 +1248,7 @@ const flatten = (
   const split =
     type === "user"
       ? splitAttachmentLines(words, {
-          uploadsFolder,
+          ...replay,
           mimeOf: (path) => fileTypes.get(path),
         })
       : undefined;
@@ -1410,6 +1413,12 @@ export interface OpenCodeHarnessOptions {
   readonly timeouts?: ClientTimeouts;
   /** The model a run gets when it names none. OpenCode's `provider/model` form. */
   readonly defaultModel?: string;
+  /**
+   * The key every message's attachment block is sealed with and verified by
+   * (`harness/attachments.ts`), from `loadAttachmentKey`. Absent: one of this layer's own,
+   * so blocks verify for the layer's life only.
+   */
+  readonly attachmentKey?: Uint8Array;
 }
 
 /**
@@ -1424,6 +1433,7 @@ export const openCodeHarness = (
 ): Layer.Layer<AgentHarness, never, OpenCodeServer> => {
   const timeouts = options.timeouts ?? DEFAULT_TIMEOUTS;
   const defaultModel = options.defaultModel ?? OPENCODE_DEFAULT_MODEL;
+  const attachmentKey = options.attachmentKey ?? ephemeralAttachmentKey();
   return Layer.effect(
     AgentHarness,
     Effect.gen(function* () {
@@ -2003,7 +2013,10 @@ export const openCodeHarness = (
           timeouts.control,
           api.session.prompt({
             sessionID: sessionId as Session.ID,
-            text: withAttachmentLines(text, attachments),
+            text: withAttachmentLines(text, attachments, {
+              key: attachmentKey,
+              sessionId,
+            }),
             ...(files.length === 0 ? {} : { files }),
             // Spread rather than passed as `undefined` for `parentID`'s reason: an absent
             // field is the server's own default, and the opening prompt deliberately takes
@@ -2373,7 +2386,16 @@ export const openCodeHarness = (
           );
           if (listed.data.length === 0) return entries;
           for (const entry of listed.data) {
-            entries.push(flatten(entry, read?.uploadsFolder, subagents));
+            entries.push(
+              flatten(
+                entry,
+                {
+                  uploadsFolder: read?.uploadsFolder,
+                  sealing: { key: attachmentKey, sessionId },
+                },
+                subagents,
+              ),
+            );
           }
           const next = listed.cursor.next;
           if (typeof next !== "string") return entries;

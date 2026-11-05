@@ -95,6 +95,7 @@
  * so until something does, every MCP request to this process is a `401`. An empty
  * credential registry is a closed door, not an open one.
  */
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { API_PREFIX } from "@bit/contracts";
@@ -117,6 +118,7 @@ import {
 import { ControlPlaneEndpoint } from "./http/controlPlane";
 import { resolveRoot } from "./http/folders";
 import { AgentHarness } from "./harness/agentHarness";
+import { ATTACHMENT_KEY_FILE, loadAttachmentKey } from "./harness/attachments";
 import {
   CLAUDE_CODE_DEFAULT_MODEL,
   claudeCodeHarness,
@@ -396,6 +398,41 @@ const fleet = FleetStore.layer(HUNT_ROOT);
  */
 const OWNED_PROCESSES = ownedProcessDirectory(HUNT_ROOT);
 
+let attachmentKey: { readonly attachmentKey?: Uint8Array } | undefined;
+
+/**
+ * The key both harnesses seal every message's attachment block with, so a replay can tell
+ * the server's block from a pasted one (`harness/attachments.ts`, A6 U13): made once in
+ * {@link HUNT_ROOT} with mode `0600`, read on every boot after. Read on first use, when the
+ * first harness layer is built, and once for both.
+ *
+ * Never fatal. A key that cannot be made or read is said here, and each harness runs on a
+ * key of its own: its blocks verify until this process ends and read back as words after.
+ */
+const attachmentKeyOption = (): { readonly attachmentKey?: Uint8Array } => {
+  if (attachmentKey !== undefined) return attachmentKey;
+  try {
+    mkdirSync(HUNT_ROOT, { recursive: true });
+  } catch {
+    // `loadAttachmentKey` says what is wrong with the folder.
+  }
+  const loaded = loadAttachmentKey(HUNT_ROOT);
+  if (loaded._tag === "problem") {
+    console.error(
+      `attachment key: ${loaded.problem}. Files sent this run show as chips until the server stops, and as words after a restart.`,
+    );
+    attachmentKey = {};
+  } else {
+    if (loaded.made) {
+      console.log(
+        `attachment key: made ${join(HUNT_ROOT, ATTACHMENT_KEY_FILE)}`,
+      );
+    }
+    attachmentKey = { attachmentKey: loaded.key };
+  }
+  return attachmentKey;
+};
+
 /**
  * Ends `opencode serve` processes a previous run of this process left behind.
  *
@@ -564,15 +601,17 @@ const SELECTED_HARNESS = harnessSelection(process.env["HARNESS"]);
  * The server runs as the user and so reads the user's own stored provider credentials; we
  * never read, copy or pass those (DECISIONS.md §12).
  */
-const openCode: Layer.Layer<AgentHarness, HarnessProcessError> =
-  openCodeHarness().pipe(
-    Layer.provide(
-      OpenCodeServer.layer({
-        cwd: WORKSPACE_ROOT,
-        recordDirectory: OWNED_PROCESSES,
-      }),
+const openCode: Layer.Layer<AgentHarness, HarnessProcessError> = Layer.suspend(
+  () =>
+    openCodeHarness(attachmentKeyOption()).pipe(
+      Layer.provide(
+        OpenCodeServer.layer({
+          cwd: WORKSPACE_ROOT,
+          recordDirectory: OWNED_PROCESSES,
+        }),
+      ),
     ),
-  );
+);
 
 /**
  * The Claude Code harness, over the Claude Agent SDK.
@@ -584,7 +623,7 @@ const openCode: Layer.Layer<AgentHarness, HarnessProcessError> =
  * Claude Code login, the same way `opencode serve` reads theirs.
  */
 const claudeCode: Layer.Layer<AgentHarness, HarnessProcessError> =
-  claudeCodeHarness();
+  Layer.suspend(() => claudeCodeHarness(attachmentKeyOption()));
 
 /**
  * Everything this build can be asked to drive, as resolver candidates.

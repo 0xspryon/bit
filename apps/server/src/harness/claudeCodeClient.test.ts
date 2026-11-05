@@ -80,15 +80,40 @@ import {
   type ClaudeCodeSdk,
   type HarnessQuery,
 } from "./claudeCodeClient";
-import { attachmentHeader } from "./attachments";
+import {
+  attachmentHeader,
+  attachmentSeal,
+  imitationLines,
+  withAttachmentLines,
+  type MessageAttachment,
+} from "./attachments";
 
 /** A message's attachment code, as a replay test fixes it (U13). */
 const M = "0123456789abcdef0123456789abcdef";
-/** A sent prompt with its fresh code read as `MARK`, so it compares exactly. */
+/** The key every scripted harness in this file seals attachment blocks with. */
+const TEST_ATTACHMENT_KEY = new Uint8Array(32).fill(7);
+/**
+ * A sent prompt with its fresh code read as `MARK` and its seal as `SEAL`, so it compares
+ * exactly. The seal itself is checked by the replay tests and `attachments.test.ts`.
+ */
 const unmarked = <A>(value: A): A =>
   JSON.parse(
-    JSON.stringify(value).replace(/\(bit:[0-9a-f]{32}\)/g, "(bit:MARK)"),
+    JSON.stringify(value)
+      .replace(/\(bit:[0-9a-f]{32}\)/g, "(bit:MARK)")
+      .replace(/\(seal:[0-9a-f]{64}\)/g, "(seal:SEAL)"),
   ) as A;
+/** A replayed transcript's block, sealed for `sessionId` under the test key. */
+const sealed = (
+  sessionId: string,
+  text: string,
+  files: readonly Pick<MessageAttachment, "kind" | "name" | "path">[],
+): string =>
+  withAttachmentLines(
+    text,
+    files.map((file) => ({ ...file, mimeType: "", bytes: 0 })),
+    { key: TEST_ATTACHMENT_KEY, sessionId },
+    M,
+  );
 
 /* ── A scripted SDK ──────────────────────────────────────────────────────────── */
 
@@ -297,7 +322,13 @@ const withHarness = <A>(
   return Effect.runPromise(
     Effect.scoped(
       Effect.flatMap(AgentHarness, (harness) => use(harness, launched)).pipe(
-        Effect.provide(claudeCodeHarness({ sdk, controlTimeout: "2 seconds" })),
+        Effect.provide(
+          claudeCodeHarness({
+            sdk,
+            controlTimeout: "2 seconds",
+            attachmentKey: TEST_ATTACHMENT_KEY,
+          }),
+        ),
         Effect.orDie,
       ),
     ),
@@ -6736,7 +6767,7 @@ describe("a message's files", () => {
           },
           {
             type: "text",
-            text: `Describe it.\n\n${attachmentHeader("MARK")}\n[Attached image "shot.png" is saved at: ${png}] (bit:MARK)\n[Attached file "notes.txt" is saved at: ${notes}] (bit:MARK)`,
+            text: `Describe it.\n\n${attachmentHeader("MARK")} (seal:SEAL)\n[Attached image "shot.png" is saved at: ${png}] (bit:MARK)\n[Attached file "notes.txt" is saved at: ${notes}] (bit:MARK)`,
           },
         ],
       ]);
@@ -6769,7 +6800,7 @@ describe("a message's files", () => {
       }),
     );
     expect(contents).toEqual([
-      `Read it.\n\n${attachmentHeader("MARK")}\n[Attached file "policy.pdf" is saved at: /tmp/ws/uploads/policy.pdf] (bit:MARK)`,
+      `Read it.\n\n${attachmentHeader("MARK")} (seal:SEAL)\n[Attached file "policy.pdf" is saved at: /tmp/ws/uploads/policy.pdf] (bit:MARK)`,
     ]);
   });
 
@@ -6855,7 +6886,10 @@ describe("a message's files", () => {
           transcript: [
             operatorEntry(
               SESSION,
-              `What is in these?\n\n${attachmentHeader(M)}\n[Attached image "shot.png" is saved at: ${png}] (bit:${M})\n[Attached file "notes.txt" is saved at: ${notes}] (bit:${M})`,
+              sealed(SESSION, "What is in these?", [
+                { kind: "image", name: "shot.png", path: png },
+                { kind: "file", name: "notes.txt", path: notes },
+              ]),
               ["image/png"],
             ),
           ],
@@ -6920,7 +6954,10 @@ describe("a message's files", () => {
   test("an image's replayed type is its stored name's, not the CLI's re-encoded block's, and not paired by position", async () => {
     const SESSION = "11111111-0000-4000-8000-0000000000fb";
     await withUploads(["big.png", "small.webp"], async (folder) => {
-      const text = `Look.\n\n${attachmentHeader(M)}\n[Attached image "big.png" is saved at: ${join(folder, "big.png")}] (bit:${M})\n[Attached image "small.webp" is saved at: ${join(folder, "small.webp")}] (bit:${M})`;
+      const text = sealed(SESSION, "Look.", [
+        { kind: "image", name: "big.png", path: join(folder, "big.png") },
+        { kind: "image", name: "small.webp", path: join(folder, "small.webp") },
+      ]);
       for (const blocks of [
         ["image/jpeg", "image/webp"],
         // One block fewer than lines: pairing by position would type the wrong file.
@@ -6960,20 +6997,49 @@ const RECORDED_UPLOADS =
   "/tmp/bit-f9-live/hunt/targets/cc4/import/imp_1a1a5b22561001o6wMLGWxLmQz/uploads";
 
 /**
- * The recording was made before U13 marked the attachment block, so its lines carry no
- * code. `remark` rewrites them as the server now writes them — the header under a code, the
- * code after each line — which is what the CLI stores for a message sent today.
+ * The recording was made before U13 marked and sealed the attachment block, so its lines
+ * carry no code. `remarked` rewrites each operator message's block as the server now writes
+ * it — the sealed header under a code, the code after each line — which is what the CLI
+ * stores for a message sent today.
  */
-const remarked = (jsonl: string): string =>
-  jsonl
-    .replaceAll(
-      "\\n\\n[Attached",
-      `\\n\\n${JSON.stringify(attachmentHeader(M)).slice(1, -1)}\\n[Attached`,
-    )
-    .replace(
-      /(\[Attached (?:image|file) \\"[^\\]*\\" is saved at: [^\]]*\])/g,
-      `$1 (bit:${M})`,
+const remarked = (jsonl: string, sessionId: string): string => {
+  const reseal = (text: string): string => {
+    const at = text.indexOf("\n\n[Attached");
+    if (at < 0) return text;
+    const words = text.slice(0, at);
+    const lines = text
+      .slice(at + 2)
+      .split("\n")
+      .map((line) => `${line} (bit:${M})`);
+    const header = attachmentHeader(M, imitationLines(words));
+    const seal = attachmentSeal(
+      { key: TEST_ATTACHMENT_KEY, sessionId },
+      header,
+      lines,
     );
+    return `${words}\n\n${[`${header} (seal:${seal})`, ...lines].join("\n")}`;
+  };
+  return jsonl
+    .split("\n")
+    .map((line) => {
+      if (!line.includes("[Attached")) return line;
+      const entry = JSON.parse(line) as {
+        message?: { content?: string | { type: string; text?: string }[] };
+      };
+      const content = entry.message?.content;
+      if (entry.message === undefined || content === undefined) return line;
+      entry.message.content =
+        typeof content === "string"
+          ? reseal(content)
+          : content.map((block) =>
+              block.type === "text" && typeof block.text === "string"
+                ? { ...block, text: reseal(block.text) }
+                : block,
+            );
+      return JSON.stringify(entry);
+    })
+    .join("\n");
+};
 
 const replayRecording = async (
   remark: boolean,
@@ -7008,7 +7074,7 @@ const replayRecording = async (
     ).replaceAll(RECORDED_UPLOADS, folder);
     await writeFile(
       join(project, `${SESSION}.jsonl`),
-      remark ? remarked(recorded) : recorded,
+      remark ? remarked(recorded, SESSION) : recorded,
     );
     process.env["CLAUDE_CONFIG_DIR"] = root;
     const { sdk } = scriptedSdk();
@@ -7024,6 +7090,7 @@ const replayRecording = async (
                 sessionMessages: liveClaudeCodeSdk.sessionMessages,
               },
               controlTimeout: "2 seconds",
+              attachmentKey: TEST_ATTACHMENT_KEY,
             }),
           ),
           Effect.orDie,

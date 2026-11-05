@@ -382,6 +382,12 @@ U8, U8b, U13, A7-Q, A7-S, F12.
   indistinguishable to the _agent_ from a real attachment line. The replay no longer trusts
   such lines (F9 fix), but the live prompt does; a per-message nonce on real lines would
   close it. Treated as ordinary prompt injection for V1.
+  **Done in U13, tightened in U13 review 1:** the real block's header says it is bit's and
+  the last in the message, and counts any lines in the operator's text imitating it (a
+  file-less message with such lines gets the header alone); the header carries an
+  HMAC-SHA256 seal under a key in `HUNT_ROOT/attachment-seal.key` over the session id,
+  the header and the file lines, and a replay reads a block only when its seal verifies
+  (`harness/attachments.ts`).
 - **Not done, operator may want it:** the importer prompt does not tell agents about the
   blockquote source convention (a last line starting with `—` renders as the quote's
   source, U10). Adding it changes the prompt and needs the F1 prompt-hash pins in
