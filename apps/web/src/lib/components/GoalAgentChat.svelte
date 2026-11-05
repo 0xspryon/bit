@@ -39,7 +39,7 @@
   import { setAttachmentLoader } from "../attachmentFiles";
   import { panelFileDrop, filesOfPaste } from "../composerFiles.svelte";
   import { whenText } from "../goalFormat";
-  import type { MeterFact } from "../chat";
+  import { connectionNote, goalUsageScope, type MeterFact } from "../chat";
   import type { App } from "../app.svelte";
 
   let { app }: { app: App } = $props();
@@ -86,7 +86,17 @@
    * *successful* read and says so on its own separator, which is why that case never
    * reaches here.
    */
-  let detail = $derived(app.goalConversationDetail);
+  /**
+   * The conversation's read failing, or else the server's connection to its narration being
+   * down (U13 review 5), as an alert over the thread.
+   */
+  let detail = $derived(
+    app.goalConversationDetail !== ""
+      ? app.goalConversationDetail
+      : goal === undefined
+        ? ""
+        : connectionNote(app.liveConnection[goalUsageScope(goal.goalId)]),
+  );
 
   /**
    * What the context panel can say about this conversation, and only what it can.

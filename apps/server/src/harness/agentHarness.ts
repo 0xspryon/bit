@@ -743,6 +743,22 @@ export type NarrationDetail =
       readonly marker: string;
       readonly text: string;
     }
+  | {
+      /**
+       * The driver's own connection to the harness's narration broke, or came back (U13
+       * review 5) — nothing the session did. OpenCode's event stream is one HTTP request
+       * that can fail (`harness/openCodeEvents.ts`); this is how a chat learns that what it
+       * shows may lack what was said while it was down.
+       *
+       * `reconnecting` once when it breaks, `restored` when it is open again, `lost` after
+       * failing for long enough that the operator should know. What was narrated in the gap
+       * is not sent again: on `restored` a chat reads the session's replay. `reason` is the
+       * transport's own words for the break, `""` on `restored`.
+       */
+      readonly _tag: "connection";
+      readonly state: "reconnecting" | "restored" | "lost";
+      readonly reason: string;
+    }
   | { readonly _tag: "opaque" };
 
 /**

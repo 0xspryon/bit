@@ -1203,6 +1203,19 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
         importId: base.importId,
         at: base.at,
       };
+    case "connection":
+      // The driver's connection to the harness broke or came back (U13 review 5): a frame
+      // about the session, not a row in it (`LiveConnection`).
+      return {
+        _tag: "connection",
+        state: detail.state,
+        detail: detail.reason,
+        attemptId: base.attemptId,
+        roundId: base.roundId,
+        goalId: base.goalId,
+        importId: base.importId,
+        at: base.at,
+      };
     case "opaque":
       return undefined;
   }

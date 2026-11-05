@@ -3721,6 +3721,45 @@ describe("the goal conversation", () => {
       liveRows(app.goalConversationChat.groups[0]).map((row) => row.item.body),
     ).toEqual(["what is happening?", "One round has run so far."]);
   });
+
+  test("a restored narration connection reads the conversation again, and once more when its turn ends (U13 review 5)", async () => {
+    const [app, fake] = await onGoal();
+    const asked = fake.countOf("goalConversation");
+    const frame = (state: "reconnecting" | "restored") => ({
+      _tag: "connection" as const,
+      state,
+      detail: "",
+      attemptId: null,
+      roundId: null,
+      goalId: "goal_1",
+      importId: null,
+      at: Date.now(),
+    });
+    app.applyLiveFrame("acme-corp", frame("reconnecting"));
+    await settle();
+    expect(app.liveConnection["goal:goal_1"]?.state).toBe("reconnecting");
+    expect(fake.countOf("goalConversation")).toBe(asked);
+
+    app.applyLiveFrame("acme-corp", frame("restored"));
+    await settle();
+    expect(fake.countOf("goalConversation")).toBe(asked + 1);
+
+    const turnEnded = {
+      _tag: "turnEnded" as const,
+      attemptId: null,
+      roundId: null,
+      goalId: "goal_1",
+      importId: null,
+      at: Date.now(),
+    };
+    app.applyLiveFrame("acme-corp", turnEnded);
+    await settle();
+    expect(fake.countOf("goalConversation")).toBe(asked + 2);
+    // Once: a later turn's end is an ordinary one.
+    app.applyLiveFrame("acme-corp", turnEnded);
+    await settle();
+    expect(fake.countOf("goalConversation")).toBe(asked + 2);
+  });
 });
 
 /* ── The context meter ───────────────────────────────────────────────────────── */

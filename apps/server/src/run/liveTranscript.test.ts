@@ -2046,6 +2046,32 @@ describe("the record and live activity, together", () => {
     );
   });
 
+  test("a narration connection's break and return are frames about the session, not rows (U13 review 5)", () => {
+    for (const state of ["reconnecting", "restored", "lost"] as const) {
+      const base = narration({
+        _tag: "connection",
+        state,
+        reason: state === "restored" ? "" : "socket closed",
+      });
+      const frame = projectNarration(base);
+      expect(frame).toEqual({
+        _tag: "connection",
+        state,
+        detail: state === "restored" ? "" : "socket closed",
+        attemptId: "attempt-1",
+        roundId: null,
+        goalId: null,
+        importId: null,
+        at: base.entry.at,
+      });
+      expect(Schema.decodeUnknownSync(LiveFrame)(frame)).toEqual(
+        frame as LiveFrame,
+      );
+      // No outcome, so no turn ends with it.
+      expect(turnEndedFrame(base)).toBeUndefined();
+    }
+  });
+
   test("another target's narration does not appear", async () => {
     const path = newDatabasePath();
     const frames = await withStore(path, (store) =>

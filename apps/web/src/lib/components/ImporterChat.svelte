@@ -68,6 +68,7 @@
   import type { App } from "../app.svelte";
   import { IconArrowUp, IconFile, IconLink, IconPlus } from "../icons";
   import {
+    connectionNote,
     durationLabel,
     lastProse,
     turnEndedAt,
@@ -99,6 +100,17 @@
 
   let importer = $derived(app.importer);
   let session = $derived(importer.current);
+  /**
+   * The server's connection to this session's narration, when it is down (U13 review 5):
+   * said over the thread, as an alert, until it is back.
+   */
+  let connection = $derived(
+    connectionNote(
+      session?.importId === undefined
+        ? undefined
+        : app.liveConnection[`import:${session.importId}`],
+    ),
+  );
   let groups = $derived(importer.groups);
   let target = $derived(app.selected?.name ?? app.viewTargetId);
   /** Set when the session's harness is one this server does not run: see `strandedNote`. */
@@ -408,6 +420,7 @@
           : noModel
             ? app.importModelDetail
             : readingSaid}
+    detail={connection}
     empty="Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread."
   >
     {#snippet separator(group)}

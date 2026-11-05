@@ -48,6 +48,7 @@ import {
   type ImporterModelView,
   type ImporterSessionView,
   type IntentView,
+  type LiveConnection,
   type LiveFrame,
   type LiveItem,
   type LiveUsage,
@@ -1529,6 +1530,20 @@ export class App {
    * figure from another target's run has no place on this one's screen.
    */
   liveUsage = $state<Record<string, LiveUsage>>({});
+
+  /**
+   * Where the server's connection to each session's narration stands, keyed by
+   * {@link usageScope}: the last {@link LiveConnection} frame for it (U13 review 5). A chat
+   * shows `connectionNote` of its own session's. Cleared with {@link liveUsage}.
+   */
+  liveConnection = $state<Record<string, LiveConnection>>({});
+
+  /**
+   * The goal whose conversation was read again on a `restored` while its turn ran, so its
+   * turn's end reads it once more: a replay read mid-turn may lack the block still being
+   * written, as `importerSessions`' `#readMidTurn` records for the importer.
+   */
+  #goalRereadAtTurnEnd: string | undefined = undefined;
 
   /**
    * The open goal's chat: its rounds, their replayed prose and their live rows.
@@ -5678,6 +5693,7 @@ export class App {
       this.liveItems = [];
       this.liveCursor = 0;
       this.liveUsage = {};
+      this.liveConnection = {};
       this.liveRecoveries = [];
       this.#shown = new Set();
       this.#shownOrder = [];
@@ -5789,6 +5805,7 @@ export class App {
     this.liveTargetId = "";
     this.liveItems = [];
     this.liveUsage = {};
+    this.liveConnection = {};
     this.liveCursor = 0;
     this.liveCaughtUp = false;
     this.liveSkipped = 0;
@@ -5919,6 +5936,33 @@ export class App {
       // A session's turn ended: its row has gone from running to idle, which no item says
       // when the turn's last entry renders nothing (`LiveTurnEnded`, A7 U8b review).
       this.#agentSessionsStale(targetId);
+      if (frame.goalId !== null && frame.goalId === this.#goalRereadAtTurnEnd) {
+        this.#goalRereadAtTurnEnd = undefined;
+        if (frame.goalId === this.openGoalId) {
+          void this.loadGoalConversation(frame.goalId);
+        }
+      }
+      return;
+    }
+    if (frame._tag === "connection") {
+      /*
+       * The server's connection to one session's narration broke or came back (U13 review
+       * 5). Kept per session for the chat's note; and on `restored` the session's replay is
+       * read again, because what was said while it was down is not sent again and the
+       * replay holds it. The importer's sessions do that themselves (`noteConnection`).
+       */
+      const scope = usageScope(frame);
+      if (scope === undefined) return;
+      this.liveConnection = { ...this.liveConnection, [scope]: frame };
+      this.importer.noteConnection(frame);
+      if (
+        frame.state === "restored" &&
+        frame.goalId !== null &&
+        frame.goalId === this.openGoalId
+      ) {
+        this.#goalRereadAtTurnEnd = frame.goalId;
+        void this.loadGoalConversation(frame.goalId);
+      }
       return;
     }
     if (frame._tag === "usage") {

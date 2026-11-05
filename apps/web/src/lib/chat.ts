@@ -39,6 +39,7 @@
 import type {
   GoalConversationView,
   GoalNarrationView,
+  LiveConnection,
   LiveItem,
   LiveUsage,
   MessageAttachmentView,
@@ -1911,7 +1912,10 @@ export const buildGoalConversation = (input: GoalChatInput): GoalChatView => {
  * trusted at a glance.
  */
 export const usageScope = (
-  usage: Pick<LiveUsage, "attemptId" | "roundId" | "goalId" | "importId">,
+  usage: Pick<
+    LiveUsage | LiveConnection,
+    "attemptId" | "roundId" | "goalId" | "importId"
+  >,
 ): string | undefined => {
   if (usage.roundId !== null) return `round:${usage.roundId}`;
   if (usage.goalId !== null) return `goal:${usage.goalId}`;
@@ -1921,6 +1925,23 @@ export const usageScope = (
   if (usage.attemptId !== null) return `attempt:${usage.attemptId}`;
   return undefined;
 };
+
+/**
+ * What a chat says while the server's connection to its harness's narration is down (U13
+ * review 5, `LiveConnection`), or `""` when it is up or was never down.
+ *
+ * Words for the operator, not the transport's: the frame's `detail` is a decoder's message
+ * and says nothing they can act on. `restored` says nothing, because by then the chat is
+ * reading the session's replay again, which is the whole of what it missed.
+ */
+export const connectionNote = (
+  frame: Pick<LiveConnection, "state"> | undefined,
+): string =>
+  frame === undefined || frame.state === "restored"
+    ? ""
+    : frame.state === "reconnecting"
+      ? "The harness's live narration was cut off; reconnecting. What it says meanwhile is read back from its transcript once the connection is up again."
+      : "The harness's live narration could not be reconnected, and is still being retried. The agent may be working all the same: reload the page to see what its transcript holds.";
 
 /** The key a pane asks the usage map for. See {@link usageScope}. */
 export const roundUsageScope = (roundId: string): string => `round:${roundId}`;

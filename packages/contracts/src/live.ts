@@ -911,6 +911,37 @@ export const LiveTurnEnded = Schema.Struct({
 export type LiveTurnEnded = typeof LiveTurnEnded.Type;
 
 /**
+ * The harness's narration of one session stopped reaching this server, or reaches it again
+ * (U13 review 5).
+ *
+ * The server reads a session's narration over a connection to the harness (OpenCode's event
+ * stream is an HTTP request), and that connection can break — an oversized event, the
+ * harness restarting. The server makes it again with backoff and says where it stands:
+ *
+ * - `reconnecting` — it broke; nothing the session says is reaching the chat until it is back.
+ * - `restored` — it is back. What was said in between is **not** sent again: a client reads
+ *   the session's replay, which holds it.
+ * - `lost` — it has kept failing (about 30 s). The server goes on trying, and a later
+ *   `restored` still comes; until then the chat shows nothing new, and a reload is how to
+ *   see what the harness has.
+ *
+ * `detail` is the transport's own words for the break, `""` on `restored`. Whose session it
+ * is, exactly as {@link LiveUsage} says it. Activity-channel and lossy, like
+ * {@link LiveTurnEnded}; the cost of a new `_tag` is the one those state.
+ */
+export const LiveConnection = Schema.Struct({
+  _tag: Schema.Literal("connection"),
+  state: Schema.Literals(["reconnecting", "restored", "lost"]),
+  detail: Schema.String,
+  attemptId: Schema.NullOr(Schema.String),
+  roundId: Schema.NullOr(Schema.String),
+  goalId: Schema.NullOr(Schema.String),
+  importId: Schema.NullOr(Schema.String),
+  at: EpochMillis,
+});
+export type LiveConnection = typeof LiveConnection.Type;
+
+/**
  * One frame of the live transcript.
  *
  * Tagged, because a client has to branch on it, and discriminated by `_tag` rather than by
@@ -922,5 +953,6 @@ export const LiveFrame = Schema.Union([
   LiveCursor,
   LiveUsage,
   LiveTurnEnded,
+  LiveConnection,
 ]);
 export type LiveFrame = typeof LiveFrame.Type;

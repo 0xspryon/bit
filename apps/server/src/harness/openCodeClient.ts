@@ -131,6 +131,11 @@ import {
   type HarnessInstance,
   type ModelProvenance,
 } from "./identity";
+import {
+  resubscribing,
+  subscribeOpenCodeEvents,
+  type Resubscribed,
+} from "./openCodeEvents";
 import { OpenCodeServer } from "./openCodeServer";
 
 /**
@@ -850,6 +855,22 @@ export const openCodeNarration = (
     detail,
   };
 };
+
+/**
+ * A change in the event stream's connection as a narration entry (U13 review 5): no
+ * sequence, no outcome, `at` this process's clock, since no harness event carries it.
+ * Exported for the tests.
+ */
+export const connectionNarration = (
+  item: Extract<Resubscribed, { _tag: "connection" }>,
+  at: number,
+): HarnessNarration => ({
+  type: `bit.connection.${item.state}`,
+  sequence: undefined,
+  at,
+  outcome: undefined,
+  detail: { _tag: "connection", state: item.state, reason: item.reason },
+});
 
 /** A `Model.Ref` (`{ id, providerID }`) as the `provider/model` this build names it by. */
 const modelRefName = (value: unknown): string | undefined => {
@@ -2659,9 +2680,10 @@ export const openCodeHarness = (
       });
 
       /**
-       * The generated subscription, filtered and reduced.
+       * The session's narration: OpenCode's event stream, filtered and reduced, re-made
+       * whenever it breaks (`harness/openCodeEvents.ts`).
        *
-       * ## Why `event.subscribe()` and not `session.log`
+       * ## Why the event stream and not `session.log`
        *
        * Both calls exist on the generated client; `session.log({ sessionID, follow: true })`
        * is per session by construction and replays a durable log, which on paper makes it
@@ -2685,10 +2707,14 @@ export const openCodeHarness = (
        * **One subscription per watched session, not one shared and demultiplexed.** N
        * concurrent runs open N streams to a local server, which is a cost worth paying for
        * the lifetime it buys: each belongs to one supervisor fiber and is cancelled at the
-       * socket when that fiber is interrupted.
+       * socket when that fiber is interrupted. Since `@opencode/client` 2.2.5 the generated
+       * `event.subscribe()` is one shared subscription, so it is no longer called; the
+       * request is this driver's own (`subscribeOpenCodeEvents`), and a failure is one
+       * session's, made again for it with a `connection` entry each way (U13 review 5).
        *
-       * `Stream.mapError` rather than the `bounded` helper the others use: `bounded`
-       * applies `Effect.timeout`, which is the one thing a followed stream must not have.
+       * Not through the `bounded` helper the others use: `bounded` applies
+       * `Effect.timeout`, which is the one thing a followed stream must not have. It does
+       * not fail at all now; the connection's own failures are what `connection` narrates.
        *
        * `filterMap` rather than `filter` then `map`: an event belonging to another session
        * and an event with no session on it are both dropped by the same step that reads the
@@ -2709,25 +2735,45 @@ export const openCodeHarness = (
         const models = new Map<string, string>();
         /** The sub-agents this stream saw started. See {@link openCodeNarration}. */
         const subagents = openCodeSubagents();
-        return api.event.subscribe().pipe(
-          Stream.mapError(fail("event.subscribe")),
-          Stream.filterMap(
-            Filter.make((event: unknown) =>
-              sessionOf(event) === sessionId
-                ? Result.succeed(
-                    // Read per event rather than once per stream: `switchModel` can
-                    // move a live session onto a model with another window, and a
-                    // stream opened before the switch would otherwise draw every later
-                    // call against the old model's limit. One map lookup per event.
-                    openCodeNarration(
-                      event,
-                      names,
-                      contextLimits.get(sessionId),
-                      models,
-                      subagents,
-                    ),
+        return resubscribing(() =>
+          subscribeOpenCodeEvents(http, server.baseUrl),
+        ).pipe(
+          // Said in the server's log too: the chat is not the only reader that should know
+          // a session's narration was cut off.
+          Stream.tap((item) =>
+            item._tag !== "connection"
+              ? Effect.void
+              : item.state === "restored"
+                ? Effect.logInfo(
+                    "an OpenCode session's narration stream is back; what it said meanwhile is in its replay",
+                    { sessionId },
                   )
-                : Result.fail(event),
+                : Effect.logWarning(
+                    item.state === "lost"
+                      ? "an OpenCode session's narration stream keeps failing; still trying"
+                      : "an OpenCode session's narration stream broke; reconnecting",
+                    { sessionId, detail: item.reason },
+                  ),
+          ),
+          Stream.filterMap(
+            Filter.make((item: Resubscribed) =>
+              item._tag === "connection"
+                ? Result.succeed(connectionNarration(item, Date.now()))
+                : sessionOf(item.event) === sessionId
+                  ? Result.succeed(
+                      // Read per event rather than once per stream: `switchModel` can
+                      // move a live session onto a model with another window, and a
+                      // stream opened before the switch would otherwise draw every later
+                      // call against the old model's limit. One map lookup per event.
+                      openCodeNarration(
+                        item.event,
+                        names,
+                        contextLimits.get(sessionId),
+                        models,
+                        subagents,
+                      ),
+                    )
+                  : Result.fail(item),
             ),
           ),
         );

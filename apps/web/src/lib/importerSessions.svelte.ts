@@ -67,6 +67,7 @@ import type {
   ConversationStopped,
   ImporterConversationView,
   ImporterTurnAccepted,
+  LiveConnection,
   LiveItem,
   LiveUsage,
   ModelOptionSelection,
@@ -1394,6 +1395,23 @@ export class ImporterSessions {
       return;
     }
     this.#watch(importId);
+  }
+
+  /**
+   * The server's connection to an import's narration came back (U13 review 5,
+   * `LiveConnection`): what the importer said while it was down is not sent again, so the
+   * session's replay is read again now, and once more when its turn settles — a replay read
+   * mid-turn may lack the block still being written ({@link #readMidTurn}). Not now while
+   * this tab has a message with the server; its turn's settling reads it.
+   */
+  noteConnection(frame: LiveConnection): void {
+    const importId = frame.importId;
+    if (frame.state !== "restored" || importId === null) return;
+    const session = this.sessions.find((each) => each.importId === importId);
+    if (session === undefined) return;
+    this.#readMidTurn.add(importId);
+    if (this.sending) return;
+    void this.#rereadHistory(session.id);
   }
 
   /**

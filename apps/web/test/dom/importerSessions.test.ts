@@ -2983,3 +2983,80 @@ describe("A6 U5: a block while it is being written", () => {
     expect(reads).toBe(before + 1);
   });
 });
+
+describe("the server's connection to the importer's narration (U13 review 5)", () => {
+  /** A `LiveConnection` frame for the newest session's import. */
+  const connection = (
+    state: "reconnecting" | "restored" | "lost",
+    importId = "imp_newest",
+  ) => ({
+    _tag: "connection" as const,
+    state,
+    detail:
+      state === "restored"
+        ? ""
+        : "SseError: Pending SSE event exceeded the maximum size of 10485760",
+    attemptId: null,
+    roundId: null,
+    goalId: null,
+    importId,
+    at: Date.now(),
+  });
+
+  test("a break is said over the thread; its return reads the replay again, shows what the gap said, and clears the note", async () => {
+    const fake = new FakeServer();
+    const app = await continueWith(fake);
+    expect(app.importer.current?.importId).toBe("imp_newest");
+    fake.watch.send(liveOpened());
+    fake.watch.send(connection("reconnecting"));
+    await settle();
+    expect(text()).toContain("live narration was cut off; reconnecting");
+    // The decoder's words are the log's, not the operator's.
+    expect(text()).not.toContain("SseError");
+
+    // What the importer said while the connection was down is in its transcript.
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          at: Date.now(),
+          items: [
+            replayItem(0, "turn.operator", "Describe the three images."),
+            replayItem(1, "turn.reply", "Three squares: red, green and blue."),
+          ],
+        }),
+      );
+    const asked = fake.countOf("importerMessages");
+    fake.watch.send(connection("restored"));
+    await settle();
+    expect(fake.countOf("importerMessages")).toBe(asked + 1);
+    expect(text()).not.toContain("cut off");
+    expect(text()).toContain("Three squares: red, green and blue.");
+  });
+
+  test("a connection that cannot be made again says so, and points at a reload", async () => {
+    const fake = new FakeServer();
+    await continueWith(fake);
+    fake.watch.send(liveOpened());
+    fake.watch.send(connection("reconnecting"));
+    fake.watch.send(connection("lost"));
+    await settle();
+    expect(text()).toContain("could not be reconnected");
+    expect(text()).toContain("reload the page");
+    expect(text()).not.toContain("reconnecting.");
+  });
+
+  test("another import's break is not this thread's, and its return reads nothing here", async () => {
+    const fake = new FakeServer();
+    await continueWith(fake);
+    fake.watch.send(liveOpened());
+    const asked = fake.countOf("importerMessages");
+    fake.watch.send(connection("reconnecting", "imp_somebody_else"));
+    await settle();
+    expect(text()).not.toContain("cut off");
+    fake.watch.send(connection("restored", "imp_somebody_else"));
+    await settle();
+    expect(fake.countOf("importerMessages")).toBe(asked);
+  });
+});
