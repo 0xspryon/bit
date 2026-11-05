@@ -567,6 +567,52 @@ describe("requests", () => {
     ]);
   });
 
+  test("a remove that fails still lets the directory's Location go, and the caller still sees the failure (A6 U6 review 2)", async () => {
+    /*
+     * The registration is forgotten before the remove is sent, so nothing would ever release
+     * the directory again: a refused or timed-out remove left its Location and every MCP
+     * server in it (~500 MB) running for the server's life. Evicting it drops the
+     * registration the remove could not.
+     */
+    const { layer, recorded } = clientWith((url, init) =>
+      init?.method === "DELETE" &&
+      new URL(url).pathname.startsWith("/api/experimental/mcp/")
+        ? json({ _tag: "BadRequest", message: "no" }, 400)
+        : noContent(),
+    );
+    const outcome = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (client) =>
+              Effect.gen(function* () {
+                yield* client.registerMcpServer("ses_1", "bit-import-a", {
+                  url: "http://127.0.0.1:1234/mcp",
+                  headers: { authorization: Redacted.make("Bearer s3cret") },
+                  directory: "/tmp/ws",
+                });
+                yield* client.unregisterMcpServer("ses_1", "bit-import-a");
+              }),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(outcome._tag).toBe("Failure");
+    expect(
+      recorded.urls.map(
+        (url, index) =>
+          `${recorded.methods[index] ?? "?"} ${new URL(url).pathname}`,
+      ),
+    ).toEqual([
+      "PUT /api/experimental/mcp/bit-import-a",
+      "DELETE /api/experimental/mcp/bit-import-a",
+      "DELETE /api/debug/location",
+    ]);
+    expect(recorded.urls[2]).toContain(encodeURIComponent("/tmp/ws"));
+  });
+
   /*
    * A6 U6 review: a resume runs in its predecessor's directory, so a session closed
    * `refused` or `open_failed` and opened again at once registers where the close is letting

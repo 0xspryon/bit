@@ -1674,20 +1674,24 @@ export const openCodeHarness = (
             const directory = registeredIn.get(key);
             if (directory === undefined) return;
             registeredIn.delete(key);
-            // The remove, the check and the eviction under the directory's lock: see
-            // `directoryLocks`.
+            /*
+             * The remove, the check and the eviction under the directory's lock: see
+             * `directoryLocks`. The eviction runs **whether or not the remove did** (A6 U6
+             * review 2): the key is already gone, so nothing would ever release this
+             * directory again, and a remove that failed or timed out left its Location —
+             * and the ~500 MB of MCP servers in it — running for the server's life.
+             * Evicting it drops the registration the remove could not, so the remove's
+             * failure is still the caller's to see, and the release never adds one.
+             */
             yield* inDirectory(directory)(
-              Effect.andThen(
-                bounded(
-                  "mcp.remove",
-                  timeouts.control,
-                  api.mcp.remove({
-                    server: name,
-                    location: { directory: directoryOf(directory) },
-                  }),
-                ),
-                releaseLocation(directory),
-              ),
+              bounded(
+                "mcp.remove",
+                timeouts.control,
+                api.mcp.remove({
+                  server: name,
+                  location: { directory: directoryOf(directory) },
+                }),
+              ).pipe(Effect.ensuring(releaseLocation(directory))),
             );
           },
         );
