@@ -94,6 +94,7 @@ import {
   type ChatGroup,
   type RoundProse,
 } from "./chat";
+import { proseRuns } from "./markdown";
 
 /**
  * What an importer group's separator needs, and the whole of what the chat is given.
@@ -1525,9 +1526,21 @@ export const sessionLabel = (
   })}`;
 };
 
+/** U+2068 FIRST STRONG ISOLATE and U+2069 POP DIRECTIONAL ISOLATE. */
+const FSI = "\u2068";
+const PDI = "\u2069";
+
 /**
  * The tooltip over a session's row and crumb: the whole name — the row cuts a long one at its
  * width — and when it started, which a title alone would hide.
+ *
+ * **The title is the harness's, so it is isolated from bit's words** (U8 review). A `title`
+ * attribute is one plain string, laid out by the bidi algorithm with no element to isolate
+ * on, so a right-to-left override in a title would reverse "started 5 Nov, 18:02" after it,
+ * and right-to-left letters ending a title would pull the separator and the digits into
+ * their run. The title goes between FSI and PDI, and every bidi control in it is written out
+ * as its code point, prose's rule ({@link proseRuns}): a PDI of its own would otherwise close
+ * the isolate early and let an override after it reach the date.
  */
 export const sessionHover = (
   session: Pick<ImporterSession, "startedAt" | "tally" | "title">,
@@ -1535,9 +1548,13 @@ export const sessionHover = (
 ): string => {
   const when = sessionWhen(session.startedAt, now);
   const title = session.title?.trim() ?? "";
-  return session.tally.messages === 0 || title === ""
-    ? `${sessionLabel(session)} · started ${when}`
-    : `${title} · started ${when}`;
+  if (session.tally.messages === 0 || title === "") {
+    return `${sessionLabel(session)} · started ${when}`;
+  }
+  const shown = proseRuns(title)
+    .map((run) => run.text)
+    .join("");
+  return `${FSI}${shown}${PDI} · started ${when}`;
 };
 
 /**

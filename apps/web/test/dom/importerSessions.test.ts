@@ -344,7 +344,7 @@ describe("Continue that session", () => {
       ["7 in · 3 out · 14 assets", sessionWhen(1_700_000_200_000, Date.now())],
     ]);
     expect(rows[0]?.getAttribute("title")).toBe(
-      `Full policy sweep · started ${sessionWhen(1_700_000_200_000, Date.now())}`,
+      `\u2068Full policy sweep\u2069 · started ${sessionWhen(1_700_000_200_000, Date.now())}`,
     );
     // Escaped text, never markup: no element was made of the title.
     const name = rows[1]?.querySelector(".session-name");
