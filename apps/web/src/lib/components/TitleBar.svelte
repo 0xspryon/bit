@@ -431,9 +431,16 @@
               <span class="option-main">
                 <span class="session-line session-head">
                   <span class="session-name">{sessionLabel(session)}</span>
-                  <span class="session-model" title={session.model}
-                    >{session.model}</span
-                  >
+                  <!--
+                    A "Not sent" row (nothing said, listed only for the refused words it
+                    holds) opened nothing on any model, and its `model` is the empty page's
+                    placeholder rather than the chip's pick: no model is shown.
+                  -->
+                  {#if session.tally.messages !== 0}
+                    <span class="session-model" title={session.model}
+                      >{session.model}</span
+                    >
+                  {/if}
                 </span>
                 <span class="session-line">
                   <span class="session-tally">{tallyLine(session.tally)}</span>

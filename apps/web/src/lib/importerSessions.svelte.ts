@@ -996,6 +996,10 @@ export class ImporterSessions {
   }
 
   /** Opens a session from the picker. An older one is read-only until the operator types. */
+  // V2(chat): the draft is the page's, so what the operator typed and did not send is
+  // dropped when they open another session or start one — including on the way to a "Not
+  // sent" row's words (U8 review 3), which are given back but replace what was in the box.
+  // V2 keeps a draft per session, which would also make `unsent` an ordinary draft.
   open(id: string): void {
     this.pickerOpen = false;
     this.becameId = undefined;

@@ -880,6 +880,8 @@ describe("the composer posts to the server", () => {
     expect(text()).not.toContain("No server answered at this address.");
     app.importer.pickerOpen = true;
     await settle();
+    // Nothing was opened on any model, so the row names none.
+    expect(button("Not sent").querySelector(".session-model")).toBeNull();
     click(button("Not sent"));
     await settle();
     expect(composer().value).toBe("Read https://hackerone.com/acme/policy");
