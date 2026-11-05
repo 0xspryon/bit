@@ -34,7 +34,12 @@
   import { countsLine, goalTitle, statusLabel, whenText } from "../goalFormat";
   import { navGlyphs } from "../navGlyphs";
   import { crumbMeter } from "../crumbMeter";
-  import { sessionLabel, sessionWhen, tallyLine } from "../importerChat";
+  import {
+    sessionHover,
+    sessionLabel,
+    sessionWhen,
+    tallyLine,
+  } from "../importerChat";
   import { navItems } from "../mock";
   import type { App } from "../app.svelte";
 
@@ -82,7 +87,7 @@
   let sessionRows = $derived(
     importer.listed.filter((session) =>
       matches(
-        `${sessionWhen(session.startedAt, Date.now())} ${session.model}`,
+        `${session.title ?? ""} ${sessionWhen(session.startedAt, Date.now())} ${session.model}`,
         sessionQuery,
       ),
     ),
@@ -397,26 +402,43 @@
           {:else if importer.current?.tally.messages === 0}
             <IconPlus width="11" height="11" />
           {/if}
-          <span class="crumb-text">{sessionName}</span>
+          <span
+            class="crumb-text crumb-session"
+            title={importer.current === undefined
+              ? undefined
+              : sessionHover(importer.current, Date.now())}>{sessionName}</span
+          >
         {/snippet}
         {#snippet rows()}
           <p class="group-label">Importer sessions · {app.selected?.name}</p>
           {#each sessionRows as session (session.id)}
             {@const current = session.id === importer.currentId}
+            <!--
+              D5's row: the name and the model it ended on, then what it wrote and when. The
+              name is the harness's title (S9) — agent-authored, so a plain label, isolated
+              so a bidi control in it cannot reorder the row — or the time where it has none.
+              The date stays on the row either way: it is bit's own, and outlives the title.
+            -->
             <button
-              class="option"
+              class="option session-row"
               aria-current={current}
+              title={sessionHover(session, Date.now())}
               onclick={() => importer.open(session.id)}
             >
               <span class="check" aria-hidden="true">
                 {#if current}<IconCheck width="13" height="13" />{/if}
               </span>
               <span class="option-main">
-                <span class="option-name">
-                  {sessionWhen(session.startedAt, Date.now())}
+                <span class="session-line">
+                  <span class="session-name">{sessionLabel(session)}</span>
                   <span class="session-model">{session.model}</span>
                 </span>
-                <span class="option-sub">{tallyLine(session.tally)}</span>
+                <span class="session-line">
+                  <span class="session-tally">{tallyLine(session.tally)}</span>
+                  <span class="session-when"
+                    >{sessionWhen(session.startedAt, Date.now())}</span
+                  >
+                </span>
               </span>
             </button>
           {:else}
@@ -588,10 +610,47 @@
     letter-spacing: 0.1em;
     text-transform: uppercase;
   }
-  .session-model {
-    margin-left: 8px;
+  /* A title is agent-authored: isolated, so a bidi control in it stays inside it. */
+  .crumb-session {
+    max-width: 260px;
+    unicode-bidi: isolate;
+  }
+  /* D5: two lines, each a label on the left and a mono figure on the right. */
+  .session-row .option-main {
+    gap: 3px;
+  }
+  .session-line {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    min-width: 0;
+  }
+  .session-name {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-base);
+    font: 400 13px/18px var(--font-sans);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    unicode-bidi: isolate;
+  }
+  .session-row[aria-current="true"] .session-name {
+    font-weight: 500;
+  }
+  .session-model,
+  .session-when {
+    flex: none;
+    color: var(--text-faint);
+    font: 400 11px/16px var(--font-mono);
+  }
+  .session-tally {
+    min-width: 0;
+    overflow: hidden;
     color: var(--text-muted);
-    font: 400 11px/15px var(--font-mono);
+    font: 400 11px/16px var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .check {
     display: inline-flex;

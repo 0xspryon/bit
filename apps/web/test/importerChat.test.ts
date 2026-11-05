@@ -35,7 +35,10 @@ import {
   importerFeed,
   indexedSession,
   lastSessionSentence,
+  readingNote,
+  sessionHover,
   sessionLabel,
+  sessionWhen,
   tallyLine,
   type ImporterHistory,
   type ImporterSession,
@@ -641,6 +644,93 @@ describe("a session the server lists", () => {
     expect(held.loaded).toBeUndefined();
     // And an unknown count is not the empty session: it keeps a time label.
     expect(sessionLabel(held)).toMatch(/^Session /);
+  });
+});
+
+describe("a session's name (S9, U8)", () => {
+  const listed = (title: string | null) =>
+    indexedSession(importerSessionView({ title, openedAt: AT }), "OpenCode");
+
+  test("is the harness's title, with the date kept beside it on hover", () => {
+    const named = listed("Full policy sweep");
+    expect(named.title).toBe("Full policy sweep");
+    expect(sessionLabel(named)).toBe("Full policy sweep");
+    // The date is bit's own and outlives the title: never replaced, only moved.
+    expect(sessionHover(named, AT)).toBe(
+      `Full policy sweep · started ${sessionWhen(AT, AT)}`,
+    );
+  });
+
+  test("falls back to its time where the harness has no title, or only whitespace", () => {
+    for (const title of [null, "", "   "]) {
+      const untitled = listed(title);
+      expect(untitled.title).toBeUndefined();
+      expect(sessionLabel(untitled)).toMatch(/^Session \d\d:\d\d$/u);
+      expect(sessionHover(untitled, AT)).toContain("started Today");
+    }
+  });
+
+  test("is New session before a word, whatever the harness says", () => {
+    expect(
+      sessionLabel({
+        startedAt: AT,
+        title: "Ignored",
+        tally: { in: 0, out: 0, assets: 0, messages: 0 },
+      }),
+    ).toBe("New session");
+  });
+});
+
+describe("the note above a session being read (U8)", () => {
+  const reading = (
+    continuation: "live" | "resume" | "fresh" | undefined,
+    over: Partial<ImporterSession> = {},
+  ) => ({
+    reading: true,
+    working: false,
+    history: {
+      ...LOADING_HISTORY,
+      ...(continuation === undefined ? {} : { standing: { continuation } }),
+    },
+    ...over,
+  });
+
+  test("never calls a running session earlier, newest or not (found in U5's live runs)", () => {
+    for (const newest of [true, false]) {
+      expect(readingNote(reading("live", { working: true }), newest)).toBe("");
+      expect(readingNote(reading("live", { background: true }), newest)).toBe(
+        "",
+      );
+    }
+  });
+
+  test("the newest session: nothing while it is live, what the next message does otherwise", () => {
+    expect(readingNote(reading("live"), true)).toBe("");
+    expect(readingNote(reading(undefined), true)).toBe("");
+    expect(readingNote(reading("resume"), true)).toContain(
+      "Your next message takes it back over",
+    );
+    expect(readingNote(reading("fresh"), true)).toContain(
+      "Your next message starts a new one",
+    );
+    for (const continuation of ["live", "resume", "fresh"] as const) {
+      expect(readingNote(reading(continuation), true)).not.toContain("earlier");
+    }
+  });
+
+  test("an older one opened from the picker is an earlier session, read-only until typed into", () => {
+    expect(readingNote(reading("live"), false)).toBe(
+      "You are reading an earlier session. Your next message continues it, with the scope as it stands now, not as it stood then.",
+    );
+    expect(readingNote(reading("resume"), false)).toContain(
+      "You are reading an earlier session. Your next message takes it back over",
+    );
+    expect(readingNote(reading("fresh"), false)).toContain(
+      "earlier session that cannot be carried on",
+    );
+    // Typed into: no longer being read.
+    expect(readingNote(reading("live", { reading: false }), false)).toBe("");
+    expect(readingNote(undefined, false)).toBe("");
   });
 });
 

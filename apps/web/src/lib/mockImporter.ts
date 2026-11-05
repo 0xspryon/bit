@@ -447,6 +447,8 @@ const todaySession = (now: number, stage: Stage): ImporterSession => {
   return {
     id: "ses_today",
     startedAt,
+    // D5's names, as a harness would title them after the first turn (S9).
+    ...(stage === "complete" ? { title: "Full policy sweep" } : {}),
     model: IMPORTER_MODEL,
     harness: "OpenCode",
     history: NO_HISTORY,
@@ -543,6 +545,7 @@ export const mockNewSession = (
 const questionSession = (now: number): ImporterSession => ({
   id: "ses_question",
   startedAt: now - 9 * DAY,
+  title: "Aborted SOW paste",
   model: "anthropic/claude-code",
   harness: "Claude Code",
   history: {
@@ -615,6 +618,8 @@ export const mockForgottenSession = (now: number): ImporterSession => {
   return {
     id: "ses_forgotten",
     startedAt: now - 12 * DAY,
+    // No title: the harness swept the session, and its name went with it (S9's first
+    // constraint). The row is named by its date instead.
     model: "openai/gpt-5.5",
     harness: "OpenCode",
     history: {
@@ -656,7 +661,7 @@ export const mockImporterIndex = (now: number): ImporterSessionView[] => [
     harnessInstanceId: "claude-code",
     model: "anthropic/claude-code",
     openedAt: now - 9 * DAY,
-    title: null,
+    title: "Aborted SOW paste",
     running: false,
     endedAt: now - 9 * DAY + 4 * 60_000,
     endedReason: "shutdown",

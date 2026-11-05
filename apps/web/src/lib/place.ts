@@ -115,6 +115,13 @@ export type Place =
       readonly targetId: string;
       readonly sessionId: string;
     }
+  /**
+   * The Auto-load page on its empty session, before a first message gives it an id (U8):
+   * `/t/<id>/assets/chat`. A place of its own rather than the Assets page it sits on, so
+   * opening the importer, "Start a new session", a reload and Back all keep the operator on
+   * the importer. It names no session — there is none yet — so a reload opens an empty one.
+   */
+  | { readonly kind: "newChat"; readonly targetId: string }
   | {
       readonly kind: "attempt";
       readonly targetId: string;
@@ -206,8 +213,12 @@ export const placeOf = (app: App): Place => {
   }
 
   if (app.navItem === "assets") {
-    const sessionId = chatSessionOf(app);
-    if (sessionId !== "") return { kind: "chat", targetId, sessionId };
+    if (app.importerOpen) {
+      const sessionId = chatSessionOf(app);
+      return sessionId === ""
+        ? { kind: "newChat", targetId }
+        : { kind: "chat", targetId, sessionId };
+    }
     return app.assetsTab === "scope"
       ? { kind: "scope", targetId }
       : { kind: "estate", targetId, filter: app.estateFilter };
@@ -255,8 +266,8 @@ export const placeOf = (app: App): Place => {
  * Only a session the **server lists** has one. The empty session the page opens with is
  * minted here and known to nothing else, so there is no id a link could carry and nothing
  * for one to restore; a path naming it would be a promise this app cannot keep. In that
- * state the place is the Assets page the Auto-load sub-page sits on, which is where a
- * reload or a Back honestly lands.
+ * state the place is {@link Place}'s `newChat` — the importer on an empty session — which
+ * is where a reload or a Back honestly lands (U8: it used to be the Estate tab).
  */
 const chatSessionOf = (app: App): string => {
   if (!app.importerOpen) return "";
@@ -290,6 +301,8 @@ export const pathOf = (place: Place): string => {
       return `${target}/assets/scope`;
     case "chat":
       return `${target}/assets/chat/${segment(place.sessionId)}`;
+    case "newChat":
+      return `${target}/assets/chat`;
     case "attempt":
       return `${target}/${ATTEMPTS}/${segment(place.attemptId)}`;
   }
@@ -330,13 +343,15 @@ export const parsePath = (path: string): Place => {
     if (third === "scope") return { kind: "scope", targetId };
     if (third === "chat") {
       const sessionId = parts[4] ?? "";
-      // A chat with no session named is the page it is a sub-page of, not an empty chat:
-      // there is no conversation to open and the Assets page is what the link was near.
-      if (sessionId !== "") return { kind: "chat", targetId, sessionId };
+      // A chat with no session named is the importer on an empty session (U8): what
+      // opening the importer, or "Start a new session", writes.
+      return sessionId === ""
+        ? { kind: "newChat", targetId }
+        : { kind: "chat", targetId, sessionId };
     }
-    // Everything else under `assets` is the page on the tab it opens on: no tab named, a
-    // tab this app does not have, a chat with no session. A tab is not a resource that
-    // can be missing, so there is nothing here to report as gone.
+    // Everything else under `assets` is the page on the tab it opens on: no tab named, or a
+    // tab this app does not have. A tab is not a resource that can be missing, so there is
+    // nothing here to report as gone.
     return { kind: "estate", targetId, filter: filterOf(query) };
   }
 
@@ -490,6 +505,20 @@ export const applyPlace = (app: App, place: Place): Promise<void> => {
        * nothing; S5 moved it and this case needs no special handling for it.
        */
       return app.openImporterSession(place.sessionId).then(IGNORED);
+    case "newChat":
+      /*
+       * The importer on an empty session (U8). Already on the importer with an empty session
+       * on screen — a Back from the session a first message opened — is that session kept,
+       * draft and all, rather than a second blank one; anywhere else opens the page fresh,
+       * as the Scope tab's "Auto-load…" does.
+       */
+      if (app.importerOpen && app.viewTargetId === place.targetId) {
+        app.importer.start();
+        return SETTLED;
+      }
+      app.toSection("assets");
+      app.openImporter();
+      return SETTLED;
     case "attempt":
       /*
        * The rail goes to Workers, which the path does not say — decision 1's consequence.

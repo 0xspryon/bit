@@ -33,6 +33,7 @@ import {
   sendNowButtonTitle,
   sendingNowNote,
   sentNowTitle,
+  sessionWhen,
 } from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
@@ -269,8 +270,12 @@ describe("Continue that session", () => {
     expect(app.importer.currentId).toBe("ses_newest");
     expect(app.importer.current?.indexed).toBe(true);
     expect(document.querySelector("#importer-message")).not.toBeNull();
-    // It is read-only until the operator types, and says so.
-    expect(text()).toContain("You are reading an earlier session");
+    // It is the target's newest session, so not an "earlier" one (U8); the server let it go
+    // (`resume`), so the page says what the next message does.
+    expect(text()).not.toContain("earlier session");
+    expect(text()).toContain(
+      "This session is no longer held by the server. Your next message takes it back over",
+    );
     // And its words are on screen, read back from the harness (S6): the operator's own
     // message as the heading of the turn it opened, and the importer's reply under it.
     expect(text()).toContain("Read the policy page");
@@ -306,6 +311,82 @@ describe("Continue that session", () => {
     // No message count is printed for a session whose messages this page cannot count.
     expect(said.join(" ")).not.toContain("message");
     expect(rows[0]?.getAttribute("aria-current")).toBe("true");
+  });
+
+  test("D5's rows: the harness's name and the model it ended on, then what it wrote and when (U8)", async () => {
+    const titled = [
+      importerSessionView({
+        ...SESSIONS[0],
+        title: "Full policy sweep",
+      }),
+      // A name an agent wrote, with markup and a bidi override in it: a plain label.
+      importerSessionView({
+        ...SESSIONS[1],
+        title: "<b>Pass</b> \u202Eevil",
+      }),
+    ];
+    const { app } = await openScope(titled);
+    click(button("Continue that session"));
+    await settle();
+    app.importer.pickerOpen = true;
+    await settle();
+    const rows = [
+      ...document.querySelectorAll<HTMLElement>(
+        '[role="dialog"][aria-label="Importer sessions"] button.option',
+      ),
+    ];
+    const lines = (row: HTMLElement | undefined) =>
+      [...(row?.querySelectorAll(".session-line") ?? [])].map((line) =>
+        [...line.children].map((part) => part.textContent?.trim() ?? ""),
+      );
+    expect(lines(rows[0])).toEqual([
+      ["Full policy sweep", "anthropic/claude-newest"],
+      ["7 in · 3 out · 14 assets", sessionWhen(1_700_000_200_000, Date.now())],
+    ]);
+    expect(rows[0]?.getAttribute("title")).toBe(
+      `Full policy sweep · started ${sessionWhen(1_700_000_200_000, Date.now())}`,
+    );
+    // Escaped text, never markup: no element was made of the title.
+    const name = rows[1]?.querySelector(".session-name");
+    expect(name?.textContent).toBe("<b>Pass</b> \u202Eevil");
+    expect(name?.querySelector("b")).toBeNull();
+    // The crumb names the session on screen by its title, with the date on hover.
+    const crumb = document.querySelector(".crumb-session");
+    expect(crumb?.textContent?.trim()).toBe("Full policy sweep");
+    expect(crumb?.getAttribute("title")).toContain("started");
+  });
+
+  test("an older session opened from the picker is an earlier one, read-only until typed into (U8)", async () => {
+    const { app } = await openScope(SESSIONS);
+    click(button("Continue that session"));
+    await settle();
+    app.importer.open("ses_older");
+    await settle();
+    expect(text()).toContain("You are reading an earlier session");
+    expect(composer().disabled).toBe(false);
+    expect(app.importer.current?.reading).toBe(true);
+  });
+
+  test("a reload of the newest session while it runs: never an earlier one (U8, found in U5's live runs)", async () => {
+    const running = SESSIONS.map((each, index) =>
+      index === 0 ? { ...each, running: true } : each,
+    );
+    const { app, fake } = await openScope(running);
+    fake.onImporterActivity = (_baseUrl, _targetId, importId) =>
+      ok({ conversationId: importId, turn: "running", background: false });
+    fake.onImporterMessages = () =>
+      ok(importerConversationView({ continuation: "live", live: true }));
+    app.openImporter("ses_newest");
+    await settle();
+    expect(app.importer.current?.working).toBe(true);
+    expect(text()).not.toContain("earlier session");
+    // Even an older session, while it runs, is not called earlier.
+    fake.onImporterMessages = () =>
+      ok(importerConversationView({ continuation: "live", live: true }));
+    app.importer.open("ses_older");
+    await settle();
+    expect(app.importer.current?.working).toBe(true);
+    expect(text()).not.toContain("earlier session");
   });
 
   test("opening the importer without continuing starts on an empty session beside the server's", async () => {

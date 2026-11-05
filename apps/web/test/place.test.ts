@@ -78,6 +78,8 @@ const INVENTORY: readonly (readonly [string, Place])[] = [
     "/t/acme-corp/assets/chat/ses_1",
     { kind: "chat", targetId: T, sessionId: "ses_1" },
   ],
+  // The importer on its empty session, before a first message gives it an id (U8).
+  ["/t/acme-corp/assets/chat", { kind: "newChat", targetId: T }],
   [
     "/t/acme-corp/attempts/attempt-7",
     { kind: "attempt", targetId: T, attemptId: "attempt-7" },
@@ -185,10 +187,9 @@ const GARBAGE: readonly (readonly [string, Place])[] = [
     "/t/acme-corp/assets?filter=uncovered",
     { kind: "estate", targetId: T, filter: "uncovered" },
   ],
-  // A chat with no session named: there is no conversation to open, so it is the page the
-  // Auto-load sub-page sits on.
-  ["/t/acme-corp/assets/chat", { kind: "estate", targetId: T, filter: "all" }],
-  ["/t/acme-corp/assets/chat/", { kind: "estate", targetId: T, filter: "all" }],
+  // A chat with no session named is the importer on an empty session (U8), not the Estate
+  // tab it used to fall to.
+  ["/t/acme-corp/assets/chat/", { kind: "newChat", targetId: T }],
   // `attempts` is a collection with no page of its own, and Workers is where its rows will
   // be listed — which is also where replaying one puts the rail.
   [
@@ -500,6 +501,35 @@ describe("replaying a place", () => {
       targetId: T,
       sessionId: "ses_1",
     });
+  });
+
+  test("the importer on an empty session keeps its own place, and Start a new session goes back to it (U8)", async () => {
+    // Found in U3's review: the empty session's place was the Estate tab, so a reload of a
+    // new session, or of "Start a new session", landed off the importer.
+    const app = await landed({ kind: "newChat", targetId: T });
+    expect(app.importerOpen).toBe(true);
+    expect(app.importer.current?.tally.messages).toBe(0);
+    expect(placeOf(app)).toEqual({ kind: "newChat", targetId: T });
+    // On a listed session, then "Start a new session": the empty one's place again.
+    applyPlace(app, { kind: "chat", targetId: T, sessionId: "ses_1" });
+    await settle();
+    expect(placeOf(app)).toEqual({
+      kind: "chat",
+      targetId: T,
+      sessionId: "ses_1",
+    });
+    app.importer.start();
+    expect(placeOf(app)).toEqual({ kind: "newChat", targetId: T });
+    // Back to the session and forward to the empty one: the same empty thread, not a
+    // second one stacked beside it.
+    const empties = () =>
+      app.importer.sessions.filter((each) => each.tally.messages === 0).length;
+    const before = empties();
+    app.importer.open("ses_1");
+    applyPlace(app, { kind: "newChat", targetId: T });
+    await settle();
+    expect(placeOf(app)).toEqual({ kind: "newChat", targetId: T });
+    expect(empties()).toBe(before);
   });
 
   test("a chat whose session is gone does not open the page on the wrong one", async () => {

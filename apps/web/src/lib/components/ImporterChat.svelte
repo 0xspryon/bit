@@ -73,6 +73,7 @@
   import CopyButton from "./CopyButton.svelte";
   import {
     ENDED_NOTE,
+    readingNote,
     sendNowButtonTitle,
     sentNowTitle,
     strandedNote,
@@ -295,21 +296,17 @@
   }
 
   /**
-   * What the page says above an earlier session the operator is reading, which depends on
-   * what the next message will actually do (S6).
-   *
-   * **The server decides, and this only words it.** `continuation` is the server's answer —
-   * it knows whether this process holds the session and, for one it does not, whether the
-   * harness will continue it, which is a round trip this page cannot make. Three readings,
-   * because the operator's next message lands somewhere different in each, and the one thing
-   * that must not happen is "resumes it" over a session that cannot be resumed.
+   * What the page says above a session the operator is reading and has not typed into
+   * (`readingNote`): what the next message will do, and "earlier" only of a session that is
+   * neither running nor the target's newest (U8). **The server decides, and this only words
+   * it**: `continuation` is the server's answer, which knows whether this process holds the
+   * session and, for one it does not, whether the harness will continue it.
    */
-  let readingNote = $derived(
-    session?.history.standing?.continuation === "resume"
-      ? "You are reading an earlier session. Your next message takes it back over: the importer keeps everything above, and works against the scope as it stands now, not as it stood then."
-      : session?.history.standing?.continuation === "fresh"
-        ? "You are reading an earlier session that cannot be carried on. Your next message starts a new one, and the importer in it will not have read any of this — what this session wrote is on the Scope tab and in the Estate."
-        : "You are reading an earlier session. Your next message continues it, with the scope as it stands now, not as it stood then.",
+  let readingSaid = $derived(
+    readingNote(
+      session,
+      session !== undefined && importer.newestId === session.id,
+    ),
   );
 
   let placeholder = $derived(
@@ -343,9 +340,7 @@
           ? refusedBecause
           : noModel
             ? app.importModelDetail
-            : session?.reading
-              ? readingNote
-              : ""}
+            : readingSaid}
     empty="Paste the program's pages, or describe the engagement in your own words. The importer reads, narrates what it is doing, and writes scope entries and assets onto this target. You can correct it in the same thread."
   >
     {#snippet separator(group)}

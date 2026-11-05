@@ -988,6 +988,12 @@ export class ScopeImporter extends Context.Service<
                 : { options: input.options }),
               sessionId: input.sessionId,
               // `importerTitle.ts` recognises this name when a harness hands it back.
+              // V2(chat): V1 opens every session under this name, and OpenCode titles only a
+              // session created without one, so an OpenCode importer session is never named
+              // in D5's list — it is labelled by its date alone (seen live in U8 on
+              // zai-coding-plan/glm-5.3-flash, after three turns). V2 should open OpenCode
+              // sessions with no title, so OpenCode names them from the first turn, once
+              // nothing else is found to rely on this name.
               title: importerSessionTitle(input.request.targetName),
               ...(resume === undefined ? {} : { resume: resume.sessionId }),
               /*

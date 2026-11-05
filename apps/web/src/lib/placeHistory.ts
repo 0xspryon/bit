@@ -58,6 +58,13 @@
  * cleared by the next navigation the operator chooses, so the very next write after that is
  * an ordinary push again.
  *
+ * ## Why an empty chat that became a session replaces
+ *
+ * The fourth input, `became`, is the path of the session the importer's empty one turned
+ * into on its first message (U8). `/assets/chat` names "the importer on a session with no id
+ * yet", and once the server has given it one that entry *is* the session: renaming it keeps
+ * Back from landing on a blank thread the operator had already written in.
+ *
  * Pure, so the rule is testable without a DOM, a router or an `App` (`test/placeHistory.test.ts`).
  */
 import { placeArrivedAt } from "./arrival";
@@ -108,13 +115,21 @@ export const historyWrite = (
   here: Address,
   next: string,
   arrival: Arrival = "landed",
+  became?: string,
 ): HistoryWrite => {
   if (next === here.pathname + here.search) return "skip";
   // Before the path comparison, because a fallback is a change of path by construction —
   // the place it lands on is a *container* of the one the link named — so the rule below
   // would always answer `"push"` for it.
   if (arrival === "fell-back") return "replace";
-  const held = pathOf(placeArrivedAt(here.pathname, here.search));
+  const arrived = placeArrivedAt(here.pathname, here.search);
+  // The importer's empty session becoming the session its first message opened (U8): the
+  // same thread under the id the server gave it, so the entry is renamed, not added — or
+  // Back would land on a blank thread the operator had already filled.
+  if (arrived.kind === "newChat" && became !== undefined && next === became) {
+    return "replace";
+  }
+  const held = pathOf(arrived);
   return pathnameOf(held) === pathnameOf(next) ? "replace" : "push";
 };
 

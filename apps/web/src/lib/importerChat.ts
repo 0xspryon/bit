@@ -266,6 +266,14 @@ export const historyOf = (view: ImporterConversationView): ImporterHistory => ({
 export interface ImporterSession {
   readonly id: string;
   readonly startedAt: number;
+  /**
+   * What the harness calls the session (S9), one line of at most 120 characters, or absent
+   * where it has no name to give: before its first turn is over, once the harness has swept
+   * it, or when it could not be asked in time. Read through on every list and never kept, so
+   * a retitle shows on the next read. Agent-authored text: drawn as a plain, bidi-isolated
+   * label, never as markup. {@link startedAt} is always shown beside it ({@link sessionLabel}).
+   */
+  readonly title?: string;
   /** `provider/model`, shown and not editable: changing harness starts a new session. */
   readonly model: string;
   /** The harness it ran on, by display name: the glyph on the composer's model chip. */
@@ -1496,17 +1504,83 @@ export const sessionWhen = (at: number, now: number): string => {
   return `${date}, ${time}`;
 };
 
-/** The crumb's short label for a session: "Session 18:02", or "New session" before a word. */
+/**
+ * A session's name (S9, D5): the harness's title, or — where the harness has none to give —
+ * "Session 18:02" from bit's own clock, and "New session" before a word is said.
+ *
+ * The date is never replaced, only moved: under a title it is the picker row's subtitle and
+ * the tooltip's second half ({@link sessionHover}), so a session the harness has forgotten,
+ * or two the harness named alike, are still told apart.
+ */
 export const sessionLabel = (
-  session: Pick<ImporterSession, "startedAt" | "tally">,
-): string =>
-  session.tally.messages === 0
-    ? "New session"
-    : `Session ${new Date(session.startedAt).toLocaleTimeString(undefined, {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      })}`;
+  session: Pick<ImporterSession, "startedAt" | "tally" | "title">,
+): string => {
+  if (session.tally.messages === 0) return "New session";
+  const title = session.title?.trim() ?? "";
+  if (title !== "") return title;
+  return `Session ${new Date(session.startedAt).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })}`;
+};
+
+/**
+ * The tooltip over a session's row and crumb: the whole name — the row cuts a long one at its
+ * width — and when it started, which a title alone would hide.
+ */
+export const sessionHover = (
+  session: Pick<ImporterSession, "startedAt" | "tally" | "title">,
+  now: number,
+): string => {
+  const when = sessionWhen(session.startedAt, now);
+  const title = session.title?.trim() ?? "";
+  return session.tally.messages === 0 || title === ""
+    ? `${sessionLabel(session)} · started ${when}`
+    : `${title} · started ${when}`;
+};
+
+/**
+ * What the page says above a session the operator is reading and has not typed into, by what
+ * the next message will do (S6) and by whether the session is an *earlier* one (U8).
+ *
+ * **Never "earlier" for the conversation that is still going.** A session is earlier only when
+ * nothing runs in it and a newer session exists on the target: a reload of the session that is
+ * running — or of the newest one, idle — is the operator's conversation, not one they went
+ * back to (found in U5's live runs). The server decides the rest: `live` is a session this
+ * process holds, and the next message simply carries it on, so the newest one needs no note at
+ * all; `resume` and `fresh` say what happens to a session it let go of, which matters newest
+ * or not. While the server's answer is out (`standing` absent) the newest session says
+ * nothing rather than guess.
+ */
+export const readingNote = (
+  session:
+    | Pick<ImporterSession, "reading" | "working" | "background" | "history">
+    | undefined,
+  newest: boolean,
+): string => {
+  if (session === undefined || !session.reading) return "";
+  if (session.working || session.background === true) return "";
+  const continuation = session.history.standing?.continuation;
+  if (newest) {
+    switch (continuation) {
+      case "resume":
+        return "This session is no longer held by the server. Your next message takes it back over: the importer keeps everything above, and works against the scope as it stands now.";
+      case "fresh":
+        return "This session cannot be carried on. Your next message starts a new one, and the importer in it will not have read any of this — what this session wrote is on the Scope tab and in the Estate.";
+      default:
+        return "";
+    }
+  }
+  switch (continuation) {
+    case "resume":
+      return "You are reading an earlier session. Your next message takes it back over: the importer keeps everything above, and works against the scope as it stands now, not as it stood then.";
+    case "fresh":
+      return "You are reading an earlier session that cannot be carried on. Your next message starts a new one, and the importer in it will not have read any of this — what this session wrote is on the Scope tab and in the Estate.";
+    default:
+      return "You are reading an earlier session. Your next message continues it, with the scope as it stands now, not as it stood then.";
+  }
+};
 
 /**
  * What the page holds for a session it has asked the server about and not heard back on.
@@ -1548,6 +1622,9 @@ export const indexedSession = (
 ): ImporterSession => ({
   id: view.sessionId,
   startedAt: view.openedAt,
+  ...(view.title === null || view.title.trim() === ""
+    ? {}
+    : { title: view.title }),
   model: view.model,
   harness,
   history: LOADING_HISTORY,

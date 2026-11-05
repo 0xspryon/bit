@@ -497,6 +497,14 @@ export class ImporterSessions {
   readonly #recountedFor = new Map<string, string>();
   /** The one on screen. */
   currentId = $state("");
+  /**
+   * The server's id for the session the page's own empty one became on its first message,
+   * until the operator next opens or starts a session (U8): the address bar's
+   * `/assets/chat` entry *is* that session from then on, so the route corrects the entry
+   * rather than adding one (`placeHistory.historyWrite`), and Back does not land on a blank
+   * thread the operator already filled.
+   */
+  becameId = $state<string | undefined>(undefined);
   /** What is typed in the composer and not yet sent. */
   draft = $state("");
   /** Whether the crumb bar's session list is open. */
@@ -649,6 +657,16 @@ export class ImporterSessions {
   );
 
   /**
+   * The target's newest session with anything said in it, or `undefined`: the conversation a
+   * reload or "Continue that session" comes back to, which the page never calls an earlier
+   * one (`readingNote`, U8).
+   */
+  // V2(chat): V1 takes the newest by when a session was opened (bit's own row), so an older
+  // session the operator went back to and carried on is still "earlier" once they leave it
+  // and return. V2 could order by last activity once the list carries it.
+  newestId = $derived<string | undefined>(this.listed[0]?.id);
+
+  /**
    * Opens the page on a target: an empty session to type into, beside the ones the server
    * lists.
    *
@@ -675,6 +693,7 @@ export class ImporterSessions {
     this.waitingForSwitch = false;
     this.#switchedTo.clear();
     this.#movedTo.clear();
+    this.becameId = undefined;
     this.stopFailure = undefined;
     this.pickerOpen = false;
     this.#sent = 0;
@@ -887,6 +906,7 @@ export class ImporterSessions {
     this.waitingForSwitch = false;
     this.#switchedTo.clear();
     this.#movedTo.clear();
+    this.becameId = undefined;
     this.stopFailure = undefined;
     this.draft = "";
     this.pickerOpen = false;
@@ -952,6 +972,7 @@ export class ImporterSessions {
   /** Opens a session from the picker. An older one is read-only until the operator types. */
   open(id: string): void {
     this.pickerOpen = false;
+    this.becameId = undefined;
     this.switchNotice = undefined;
     this.notice = "";
     this.refused = false;
@@ -1306,11 +1327,22 @@ export class ImporterSessions {
    */
   start(options: { readonly keepDraft?: boolean } = {}): void {
     this.pickerOpen = false;
+    this.becameId = undefined;
     if (options.keepDraft !== true) this.draft = "";
     this.notice = "";
     this.refused = false;
     this.switchNotice = undefined;
     if (this.current?.tally.messages === 0) return;
+    // An empty one left behind by opening another session — then Back to `/assets/chat`
+    // (U8) — is the same choice again, not a second blank thread.
+    const empty = this.sessions.find(
+      (session) => session.indexed !== true && session.tally.messages === 0,
+    );
+    if (empty !== undefined) {
+      this.leaveBreakdown();
+      this.currentId = empty.id;
+      return;
+    }
     this.#sent += 1;
     const fresh = mockNewSession(this.#now(), `ses_new_${String(this.#sent)}`);
     this.sessions = [...this.sessions, fresh];
@@ -1536,7 +1568,10 @@ export class ImporterSessions {
       this.sessions = stillThere
         ? this.sessions.map((each) => (each.id === session.id ? next : each))
         : [...this.sessions, next];
-      if (this.currentId === session.id) this.currentId = next.id;
+      if (this.currentId === session.id) {
+        this.currentId = next.id;
+        if (session.indexed !== true) this.becameId = next.id;
+      }
     } else {
       // A fresh session opened in place of one the server no longer held: a new thread,
       // and the old one stays in the list as what it was.

@@ -193,3 +193,27 @@ describe("an arrival that fell back", () => {
     expect(historyWrite(at("/"), "/t/acme-corp")).toBe("push");
   });
 });
+
+describe("the importer's empty session becoming a session (U8)", () => {
+  test("renames the entry, so Back does not land on a blank thread already written in", () => {
+    const chat = "/t/acme/assets/chat/ses_9";
+    expect(historyWrite(at("/t/acme/assets/chat"), chat, "landed", chat)).toBe(
+      "replace",
+    );
+    // Without that hint it is opening a resource, like any other.
+    expect(historyWrite(at("/t/acme/assets/chat"), chat)).toBe("push");
+    // Another session opened from the empty one pushes: it is not the one it became.
+    expect(
+      historyWrite(
+        at("/t/acme/assets/chat"),
+        "/t/acme/assets/chat/ses_old",
+        "landed",
+        chat,
+      ),
+    ).toBe("push");
+    // And "Start a new session" from a session pushes the empty one's place.
+    expect(historyWrite(at(chat), "/t/acme/assets/chat", "landed", chat)).toBe(
+      "push",
+    );
+  });
+});

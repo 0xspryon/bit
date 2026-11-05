@@ -275,10 +275,18 @@
       return;
     }
     const next = pathOf(placeOf(app));
+    const became = app.importer.becameId;
     const write = historyWrite(
       location,
       next,
       app.arrivalNote === "" ? "landed" : "fell-back",
+      became === undefined || app.viewTargetId === ""
+        ? undefined
+        : pathOf({
+            kind: "chat",
+            targetId: app.viewTargetId,
+            sessionId: became,
+          }),
     );
     if (write === "skip") return;
     void goto(new URL(next, location.href), {
