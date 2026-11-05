@@ -398,19 +398,20 @@ const fleet = FleetStore.layer(HUNT_ROOT);
  */
 const OWNED_PROCESSES = ownedProcessDirectory(HUNT_ROOT);
 
-let attachmentKey: { readonly attachmentKey?: Uint8Array } | undefined;
-
 /**
  * The key both harnesses seal every message's attachment block with, so a replay can tell
  * the server's block from a pasted one (`harness/attachments.ts`, A6 U13): made once in
- * {@link HUNT_ROOT} with mode `0600`, read on every boot after. Read on first use, when the
- * first harness layer is built, and once for both.
+ * {@link HUNT_ROOT} with mode `0600`, read on every boot after.
  *
- * Never fatal. A key that cannot be made or read is said here, and each harness runs on a
- * key of its own: its blocks verify until this process ends and read back as words after.
+ * **Read at boot, and fatal when it is there but unusable** (U13 review 2, the operator's
+ * decision): too open, the wrong size, a link, unreadable — or missing and impossible to
+ * make. The server says what is wrong and what to do, and exits before anything is served
+ * or spawned. Round 1 ran on a temporary key instead and said so in one stderr line, which
+ * hid the broken setup: every chip, old and new, came back as raw words after the next
+ * restart, with nothing on screen saying why. A key that is missing is made; one that is
+ * there is never replaced, since a new key turns every file sent so far into words.
  */
-const attachmentKeyOption = (): { readonly attachmentKey?: Uint8Array } => {
-  if (attachmentKey !== undefined) return attachmentKey;
+const ATTACHMENT_KEY: Uint8Array = (() => {
   try {
     mkdirSync(HUNT_ROOT, { recursive: true });
   } catch {
@@ -419,19 +420,24 @@ const attachmentKeyOption = (): { readonly attachmentKey?: Uint8Array } => {
   const loaded = loadAttachmentKey(HUNT_ROOT);
   if (loaded._tag === "problem") {
     console.error(
-      `attachment key: ${loaded.problem}. Files sent this run show as chips until the server stops, and as words after a restart.`,
+      `bit control plane: refusing to start: the attachment key ${loaded.problem}.`,
     );
-    attachmentKey = {};
-  } else {
-    if (loaded.made) {
-      console.log(
-        `attachment key: made ${join(HUNT_ROOT, ATTACHMENT_KEY_FILE)}`,
-      );
-    }
-    attachmentKey = { attachmentKey: loaded.key };
+    console.error(`  to fix it: ${loaded.fix}.`);
+    console.error(
+      "  the key seals the block naming each message's files, so a reload shows them as files and not as text the operator could have typed (harness/attachments.ts).",
+    );
+    process.exit(1);
   }
-  return attachmentKey;
-};
+  if (loaded.made) {
+    console.log(`attachment key: made ${join(HUNT_ROOT, ATTACHMENT_KEY_FILE)}`);
+  }
+  return loaded.key;
+})();
+
+/** {@link ATTACHMENT_KEY} as both harness layers take it. */
+const attachmentKeyOption = (): { readonly attachmentKey: Uint8Array } => ({
+  attachmentKey: ATTACHMENT_KEY,
+});
 
 /**
  * Ends `opencode serve` processes a previous run of this process left behind.

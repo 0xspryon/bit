@@ -337,10 +337,15 @@ const SEALED_HEADER =
  *
  * Made under a temporary name and linked into place, so two processes starting at once
  * agree on one key and neither reads a half-written one. Read `O_NOFOLLOW`, and refused —
- * `problem`, never a throw — when it is not a regular file of exactly
- * {@link ATTACHMENT_KEY_BYTES}, or anyone but its owner can read it. The caller says so and
- * runs on a key of its own for the process's life: blocks then verify until the restart and
- * read back as words after it, which is the honest degradation.
+ * `problem`, never a throw — when it is a link, is not a regular file of exactly
+ * {@link ATTACHMENT_KEY_BYTES}, anyone but its owner can read it, it cannot be read, or it
+ * was missing and could not be made. Each problem comes with the `fix` an operator applies.
+ *
+ * **The caller refuses to start on a problem** (U13 review 2, the operator's decision):
+ * round 1 ran on a temporary key instead, which hid a broken setup — every chip, old and
+ * new, read as raw words after the next restart with nothing on screen saying why. Only a
+ * missing key is made; a key that is there and unusable is never replaced, because
+ * replacing it turns every file sent so far into words.
  *
  * `root` is `HUNT_ROOT`, which holds every session's working directory beneath it
  * (`targets/<id>/{goal,import,planning}/<id>`) and is never inside one: a target's
@@ -356,12 +361,39 @@ export const loadAttachmentKey = (
   root: string,
 ):
   | { readonly _tag: "key"; readonly key: Uint8Array; readonly made: boolean }
-  | { readonly _tag: "problem"; readonly problem: string } => {
+  | {
+      readonly _tag: "problem";
+      /** What is wrong, naming the file. */
+      readonly problem: string;
+      /** What the operator does about it. */
+      readonly fix: string;
+    } => {
   const path = join(root, ATTACHMENT_KEY_FILE);
+  const why = (cause: unknown): string =>
+    cause instanceof Error ? cause.message : String(cause);
+  /** Said of every fix that makes a new key: what that costs. */
+  const anew = `the server then makes a new key, and the files in messages sent before it show as plain text in those messages`;
   let made = false;
+  let existing: ReturnType<typeof lstatSync> | undefined;
   try {
-    lstatSync(path);
-  } catch {
+    existing = lstatSync(path);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
+      return {
+        _tag: "problem",
+        problem: `${path} could not be looked at (${why(cause)})`,
+        fix: `make ${root} readable and writable by the user the server runs as`,
+      };
+    }
+  }
+  if (existing?.isSymbolicLink() === true) {
+    return {
+      _tag: "problem",
+      problem: `${path} is a symbolic link, and the key must be a regular file`,
+      fix: `put the key file itself there (cp --remove-destination "$(readlink -f '${path}')" '${path}' && chmod 600 '${path}'), or remove the link and restart: ${anew}`,
+    };
+  }
+  if (existing === undefined) {
     const temporary = `${path}.incoming-${attachmentMark()}`;
     try {
       const handle = openSync(
@@ -388,7 +420,8 @@ export const loadAttachmentKey = (
     } catch (cause) {
       return {
         _tag: "problem",
-        problem: `${path} could not be made (${cause instanceof Error ? cause.message : String(cause)})`,
+        problem: `${path} is missing and could not be made (${why(cause)})`,
+        fix: `make ${root} writable by the user the server runs as, or make the key yourself: head -c ${String(ATTACHMENT_KEY_BYTES)} /dev/urandom > '${path}' && chmod 600 '${path}'`,
       };
     } finally {
       try {
@@ -402,9 +435,17 @@ export const loadAttachmentKey = (
   try {
     handle = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   } catch (cause) {
+    const code = (cause as NodeJS.ErrnoException).code;
     return {
       _tag: "problem",
-      problem: `${path} could not be opened (${cause instanceof Error ? cause.message : String(cause)})`,
+      problem:
+        code === "ELOOP"
+          ? `${path} is a symbolic link, and the key must be a regular file`
+          : `${path} could not be read (${why(cause)})`,
+      fix:
+        code === "ELOOP"
+          ? `put the key file itself there, or remove the link and restart: ${anew}`
+          : `make it readable by the user the server runs as and by no one else (chown that user, chmod 600 '${path}')`,
     };
   }
   try {
@@ -412,31 +453,44 @@ export const loadAttachmentKey = (
     if (!stat.isFile() || stat.size !== ATTACHMENT_KEY_BYTES) {
       return {
         _tag: "problem",
-        problem: `${path} is not a regular file of ${String(ATTACHMENT_KEY_BYTES)} bytes`,
+        problem: stat.isFile()
+          ? `${path} is ${String(stat.size)} bytes, and the key is exactly ${String(ATTACHMENT_KEY_BYTES)}`
+          : `${path} is not a regular file`,
+        fix: `put the right key back if you have it (a copy from a backup of ${root}); otherwise move this one aside and restart: ${anew}`,
       };
     }
     if ((stat.mode & 0o077) !== 0) {
       return {
         _tag: "problem",
-        problem: `${path} can be read by others (mode ${(stat.mode & 0o777).toString(8)}); it must be 600`,
+        problem: `${path} can be read by others (mode ${(stat.mode & 0o777).toString(8)}), and it must be 600`,
+        fix: `chmod 600 '${path}'`,
       };
     }
     const key = new Uint8Array(ATTACHMENT_KEY_BYTES);
     if (readSync(handle, key, 0, key.length, 0) !== key.length) {
-      return { _tag: "problem", problem: `${path} could not be read whole` };
+      return {
+        _tag: "problem",
+        problem: `${path} could not be read whole`,
+        fix: `check the disk; then put the right key back, or move this one aside and restart: ${anew}`,
+      };
     }
     return { _tag: "key", key, made };
   } catch (cause) {
     return {
       _tag: "problem",
-      problem: `${path} could not be read (${cause instanceof Error ? cause.message : String(cause)})`,
+      problem: `${path} could not be read (${why(cause)})`,
+      fix: `make it readable by the user the server runs as and by no one else (chown that user, chmod 600 '${path}')`,
     };
   } finally {
     closeSync(handle);
   }
 };
 
-/** A key for a process that has none on disk, or a test: good until the process ends. */
+/**
+ * A key for a harness layer built without one — a test, a spike — good until the process
+ * ends. The server never runs on one: it reads its key from `HUNT_ROOT` at boot and refuses
+ * to start without it (`main.ts`).
+ */
 export const ephemeralAttachmentKey = (): Uint8Array =>
   crypto.getRandomValues(new Uint8Array(ATTACHMENT_KEY_BYTES));
 

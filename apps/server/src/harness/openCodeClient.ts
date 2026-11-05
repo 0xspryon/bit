@@ -1415,8 +1415,9 @@ export interface OpenCodeHarnessOptions {
   readonly defaultModel?: string;
   /**
    * The key every message's attachment block is sealed with and verified by
-   * (`harness/attachments.ts`), from `loadAttachmentKey`. Absent: one of this layer's own,
-   * so blocks verify for the layer's life only.
+   * (`harness/attachments.ts`), from `loadAttachmentKey`. The server always passes it and
+   * refuses to start without one (`main.ts`). Absent — a test, a spike — one of this
+   * layer's own, so blocks verify for the layer's life only.
    */
   readonly attachmentKey?: Uint8Array;
 }
