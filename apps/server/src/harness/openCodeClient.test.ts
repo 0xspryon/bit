@@ -495,12 +495,76 @@ describe("requests", () => {
     );
 
     expect(outcome._tag).toBe("Success");
-    expect(recorded.urls).toHaveLength(2);
+    expect(recorded.urls).toHaveLength(3);
     expect(recorded.urls[1]).toContain("/api/experimental/mcp/bit-attempt-1");
-    expect(recorded.methods).toEqual(["PUT", "DELETE"]);
+    expect(recorded.methods).toEqual(["PUT", "DELETE", "DELETE"]);
     // The directory it was registered into travels with the removal, taken from the
     // registration rather than re-stated by the caller.
     expect(recorded.urls[1]).toContain(encodeURIComponent("/tmp/ws"));
+    // And nothing of ours is left in it, so its Location is let go (A6 U6).
+    expect(new URL(recorded.urls[2] ?? "").pathname).toBe(
+      "/api/debug/location",
+    );
+    expect(recorded.urls[2]).toContain(encodeURIComponent("/tmp/ws"));
+  });
+
+  test("a directory's Location is let go only once its last registration is removed, and a refusal to let go fails nothing (A6 U6)", async () => {
+    /*
+     * OpenCode keeps one Location per directory, each with its own copy of every MCP server
+     * the operator's config names, until `opencode serve` exits: measured ~500 MB a set,
+     * one set left behind by every ended session. Letting it go while another registration
+     * is still in it would drop that registration with it.
+     */
+    const { layer, recorded } = clientWith((url) =>
+      new URL(url).pathname === "/api/debug/location"
+        ? json({ _tag: "NotFound", message: "no such route" }, 404)
+        : noContent(),
+    );
+    const config = {
+      url: "http://127.0.0.1:1234/mcp",
+      headers: { authorization: Redacted.make("Bearer s3cret") },
+      directory: "/tmp/ws",
+    };
+    const outcome = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(
+            Effect.flatMap(AgentHarness, (client) =>
+              Effect.gen(function* () {
+                yield* client.registerMcpServer(
+                  "ses_1",
+                  "bit-import-a",
+                  config,
+                );
+                yield* client.registerMcpServer(
+                  "ses_2",
+                  "bit-import-b",
+                  config,
+                );
+                yield* client.unregisterMcpServer("ses_1", "bit-import-a");
+                const afterFirst = recorded.urls.length;
+                yield* client.unregisterMcpServer("ses_2", "bit-import-b");
+                return afterFirst;
+              }),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(outcome).toMatchObject({ _tag: "Success", success: 3 });
+    expect(
+      recorded.urls.map(
+        (url, index) =>
+          `${recorded.methods[index] ?? "?"} ${new URL(url).pathname}`,
+      ),
+    ).toEqual([
+      "PUT /api/experimental/mcp/bit-import-a",
+      "PUT /api/experimental/mcp/bit-import-b",
+      "DELETE /api/experimental/mcp/bit-import-a",
+      "DELETE /api/experimental/mcp/bit-import-b",
+      "DELETE /api/debug/location",
+    ]);
   });
 
   test("unregistering a name that was never registered makes no request", async () => {
@@ -524,7 +588,7 @@ describe("requests", () => {
     expect(recorded.urls).toEqual([]);
   });
 
-  test("unregistering twice makes exactly one request", async () => {
+  test("unregistering twice removes it once", async () => {
     const { layer, recorded } = clientWith(noContent);
     await Effect.runPromise(
       Effect.scoped(
@@ -547,7 +611,8 @@ describe("requests", () => {
       ),
     );
 
-    expect(recorded.methods).toEqual(["PUT", "DELETE"]);
+    // One removal, and the Location let go after it (A6 U6): nothing for the second.
+    expect(recorded.methods).toEqual(["PUT", "DELETE", "DELETE"]);
   });
 
   test("a session id with URL-significant characters is encoded", async () => {

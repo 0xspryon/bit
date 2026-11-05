@@ -1647,8 +1647,49 @@ export const openCodeHarness = (
                 location: { directory: directoryOf(directory) },
               }),
             );
+            yield* releaseLocation(directory);
           },
         );
+
+      /**
+       * Lets go of a directory's OpenCode **Location** once nothing of ours is left in it
+       * (A6 U6, from U5's review 3).
+       *
+       * OpenCode keeps one Location per directory it is asked about — a whole copy of its
+       * services, **including every MCP server the operator's global config names, each its
+       * own process** — and never lets one go by itself (`idleTimeToLive: infinity` in
+       * 2.2.5's `location-services.ts`). bit gives every import, goal, round and attempt a
+       * directory of its own, so each session left one full set behind after it ended:
+       * measured on a throwaway server, ~500 MB per set (sequential-thinking,
+       * browser-control-mcp, svelte-mcp), three sets after two GLM sessions, 1.95 GB in a
+       * 2 GB scope with nothing running.
+       *
+       * `DELETE /api/debug/location` (`debug.location.evict`) disposes exactly the
+       * requested Location; its next use boots it fresh from config, so a later resume in
+       * the same directory gets its MCP servers back. Asked only when this process holds
+       * no other registration in the directory: a session still registered there is still
+       * ours, and an eviction would drop its in-memory registration with the Location.
+       * **Cleanup, so it never fails the caller**: a server that does not have the route
+       * (it is OpenCode's debug group) or does not answer leaves the Location as it was,
+       * which is the state before this existed, and says so in the log.
+       */
+      const releaseLocation = (directory: string) =>
+        [...registeredIn.values()].includes(directory)
+          ? Effect.void
+          : bounded(
+              "debug.location.evict",
+              timeouts.control,
+              api.debug.location.evict({
+                location: { directory: directoryOf(directory) },
+              }),
+            ).pipe(
+              Effect.catch((failure) =>
+                Effect.logWarning(
+                  "opencode would not let go of a directory's location; its MCP servers keep running until opencode serve exits",
+                  { directory, detail: failure.message },
+                ),
+              ),
+            );
 
       /**
        * The context window of each session's model, for the sessions this process opened.
