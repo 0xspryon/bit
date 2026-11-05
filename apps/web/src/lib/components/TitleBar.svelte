@@ -660,9 +660,14 @@
     color: var(--text-faint);
     font: 400 11px/16px var(--font-mono);
   }
+  /*
+   * Shrinks four times as fast as the name, but never away (U8 review 3): flex shrink is
+   * weighted by basis, so a name past about 450px would otherwise take the model to 0px and
+   * leave only the gap. A stub and its ellipsis say a model is there; the tooltip names it.
+   */
   .session-model {
     flex: 0 4 auto;
-    min-width: 0;
+    min-width: 5ch;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
