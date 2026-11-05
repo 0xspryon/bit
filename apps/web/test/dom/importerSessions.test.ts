@@ -758,6 +758,81 @@ describe("the composer posts to the server", () => {
     expect(text()).toContain("A new importer session was opened");
   });
 
+  /** Answers the empty session's first message as the server does, held until released. */
+  const holdOpening = (fake: FakeServer): (() => void) => {
+    fake.onOpenImporterConversation = (_baseUrl, targetId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId: "imp_opened",
+          harnessSessionId: "ses_opened",
+          conversation: "opened",
+        }),
+      );
+    return fake.hold("openImporterConversation");
+  };
+
+  const startNewSession = async (app: App): Promise<void> => {
+    app.importer.pickerOpen = true;
+    await settle();
+    click(button("Start a new session"));
+    await settle();
+  };
+
+  test("Start a new session never lands on the empty session whose first message is out (U8 review)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    app.importer.start();
+    await settle();
+    const opening = app.importer.currentId;
+    const release = holdOpening(fake);
+    await send("Read https://hackerone.com/acme/policy");
+    expect(app.importer.sending).toBe(true);
+    // While the server opens the harness, the operator looks at another session…
+    app.importer.open("ses_older");
+    await settle();
+    // …and then asks for a new one: an empty thread, not the conversation being opened.
+    await startNewSession(app);
+    const fresh = app.importer.currentId;
+    expect(fresh).not.toBe(opening);
+    expect(fresh).not.toBe("ses_older");
+    expect(app.importer.current?.tally.messages).toBe(0);
+    release();
+    await settle();
+    // The answer lands on the session it opened, and leaves the operator where they are.
+    expect(app.importer.currentId).toBe(fresh);
+    expect(app.importer.becameId).toBeUndefined();
+    expect(app.importer.sessions.some((each) => each.id === "ses_opened")).toBe(
+      true,
+    );
+  });
+
+  test("Start a new session from the first message still on its way opens a fresh empty one (U8 review)", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    app.importer.start();
+    await settle();
+    const opening = app.importer.currentId;
+    const release = holdOpening(fake);
+    await send("Read https://hackerone.com/acme/policy");
+    expect(app.importer.sending).toBe(true);
+    await startNewSession(app);
+    const fresh = app.importer.currentId;
+    expect(fresh).not.toBe(opening);
+    expect(app.importer.current?.tally.messages).toBe(0);
+    // The words on their way are that message's, not a draft for the new thread.
+    expect(composer().value).toBe("");
+    release();
+    await settle();
+    expect(app.importer.currentId).toBe(fresh);
+    expect(app.importer.becameId).toBeUndefined();
+    // A second ask, once nothing is out, is the empty one on screen again: not a third.
+    await startNewSession(app);
+    expect(app.importer.currentId).toBe(fresh);
+  });
+
   test("a session the operator ended cannot be typed into, and says why", async () => {
     const { app, fake } = await continueOn(
       [

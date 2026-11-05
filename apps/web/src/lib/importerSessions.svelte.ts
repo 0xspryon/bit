@@ -393,6 +393,14 @@ export class ImporterSessions {
   #skipped: () => number = () => 0;
   #sent = 0;
   /**
+   * The page's empty session whose first message is with the server, and that message's
+   * words; `undefined` when no opening message is out. **That session is not empty any more,
+   * though nothing on it says so yet**: the server's answer turns it into the conversation it
+   * opened and, if it is on screen then, writes that conversation's id over `/assets/chat`
+   * (`becameId`). So "Start a new session" must neither land on it nor stay on it.
+   */
+  #opening: { readonly sessionId: string; readonly text: string } | undefined;
+  /**
    * The imports whose conversation is being read right now, by import id.
    *
    * **One request per session, and this is what makes that true rather than nearly true.**
@@ -697,6 +705,7 @@ export class ImporterSessions {
     this.stopFailure = undefined;
     this.pickerOpen = false;
     this.#sent = 0;
+    this.#opening = undefined;
     this.agents = this.#serverAgents;
     this.sessions = [fresh, ...indexed];
     this.currentId = fresh.id;
@@ -911,6 +920,7 @@ export class ImporterSessions {
     this.draft = "";
     this.pickerOpen = false;
     this.#sent = 0;
+    this.#opening = undefined;
     this.agents = mockAgents();
     const show = (
       current: ImporterSession,
@@ -1323,24 +1333,41 @@ export class ImporterSessions {
    * Starts an empty session on the same target.
    *
    * Reuses the empty one the operator is already looking at rather than stacking a second:
-   * two blank threads are one choice, not two.
+   * two blank threads are one choice, not two. **Never the one whose first message is with
+   * the server** ({@link #opening}): that is a conversation being opened, and the server's
+   * answer would carry the operator into it. From it, this opens a fresh one beside it.
    */
   start(options: { readonly keepDraft?: boolean } = {}): void {
+    const opening = this.#opening;
     this.pickerOpen = false;
     this.becameId = undefined;
-    if (options.keepDraft !== true) this.draft = "";
+    // The words of the message on its way are that message's, not a draft for the next
+    // session, which would then hold a copy of what was just sent.
+    if (
+      options.keepDraft !== true ||
+      (opening !== undefined && this.draft.trim() === opening.text)
+    ) {
+      this.draft = "";
+    }
     this.notice = "";
     this.refused = false;
     this.switchNotice = undefined;
-    if (this.current?.tally.messages === 0) return;
+    const empty = (session: ImporterSession): boolean =>
+      session.indexed !== true &&
+      session.tally.messages === 0 &&
+      session.id !== opening?.sessionId;
+    if (
+      this.current?.tally.messages === 0 &&
+      this.current.id !== opening?.sessionId
+    ) {
+      return;
+    }
     // An empty one left behind by opening another session — then Back to `/assets/chat`
     // (U8) — is the same choice again, not a second blank thread.
-    const empty = this.sessions.find(
-      (session) => session.indexed !== true && session.tally.messages === 0,
-    );
-    if (empty !== undefined) {
+    const left = this.sessions.find(empty);
+    if (left !== undefined) {
       this.leaveBreakdown();
-      this.currentId = empty.id;
+      this.currentId = left.id;
       return;
     }
     this.#sent += 1;
@@ -1483,11 +1510,19 @@ export class ImporterSessions {
     // The agent the chip picked goes with an opening message only: a later one is to a
     // conversation already pinned to its agent, which the server reads off the row.
     const agentId = session.agentId;
+    const opening =
+      session.importId === undefined
+        ? { sessionId: session.id, text }
+        : undefined;
+    if (opening !== undefined) this.#opening = opening;
     const answer =
       session.importId === undefined
         ? await server.open(text, agentId)
         : await server.send(session.importId, text, urgency);
     const pinnedAgent = agentId ?? this.agents?.defaultAgentId;
+    if (opening !== undefined && this.#opening === opening) {
+      this.#opening = undefined;
+    }
     this.sending = false;
     this.waitingForSwitch = false;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
