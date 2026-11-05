@@ -11,7 +11,16 @@
   import "../lib/styles/tokens.css";
   import type { Snippet } from "svelte";
 
+  import { refuseStrayFileDrop } from "../lib/composerFiles.svelte";
+
   let { children }: { children: Snippet } = $props();
 </script>
+
+<!--
+  A file dropped anywhere the chat panels do not cover would be the browser's, which opens it
+  in a file:// tab and leaves the app (U13 review 2). The panels take their own drops first;
+  this refuses the rest.
+-->
+<svelte:window ondragover={refuseStrayFileDrop} ondrop={refuseStrayFileDrop} />
 
 {@render children()}

@@ -212,6 +212,21 @@ export const panelFileDrop = (options: {
   },
 });
 
+/**
+ * The window's handler for a file drag that no chat panel took (U13 review 2): over the
+ * title bar, the nav rail, the status bar, a page with no composer. The browser's own drop
+ * opens the file in a `file://` tab and leaves the app, so a drag carrying files is refused
+ * here — the default prevented, and the no-drop cursor (`dropEffect = "none"`) — on
+ * `dragover` and `drop` alike. A panel that took the drag has already prevented the default
+ * and set its own effect, and is left alone; a drag carrying no files (text, a link) is the
+ * browser's, as before.
+ */
+export const refuseStrayFileDrop = (event: DragEvent): void => {
+  if (event.defaultPrevented || !dragHasFiles(event)) return;
+  event.preventDefault();
+  if (event.dataTransfer !== null) event.dataTransfer.dropEffect = "none";
+};
+
 /** The files a drop carries. */
 export const filesOfDrop = (event: DragEvent): readonly File[] => [
   ...(event.dataTransfer?.files ?? []),
