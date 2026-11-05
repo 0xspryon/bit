@@ -6,6 +6,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { ConversationContext, LiveUsage } from "@bit/contracts";
+import { modelKey, sameModel } from "@bit/contracts";
 
 import {
   crumbFigure,
@@ -23,6 +24,8 @@ const reading = (
   conversationId: "imp_1",
   model: "claude-haiku-4-5",
   used: 24_106,
+  // As the API spells haiku-4-5's calls (measured, CLI 2.1.310).
+  usedModel: "claude-haiku-4-5-20251001",
   window: 200_000,
   reading: "measured",
   breakdown: { _tag: "none", reason: "not_asked" },
@@ -35,7 +38,7 @@ const held = (
   extra: Partial<ImporterContext> = {},
 ): ImporterContext => ({
   reading: reading(over),
-  previousUsed: null,
+  previous: null,
   ...extra,
 });
 
@@ -46,6 +49,7 @@ const live = (over: Partial<LiveUsage> = {}): LiveUsage => ({
   outputTokens: 120,
   contextLimit: 200_000,
   compactionAt: null,
+  model: "claude-haiku-4-5-20251001",
   attemptId: null,
   roundId: null,
   goalId: null,
@@ -107,8 +111,13 @@ describe("the crumb bar's context meter (A6 U9)", () => {
   test("a compaction: the reading says so with the figure before it; a large drop says it too; a recount does not", () => {
     const compacted = crumbMeter(
       held(
-        { used: null, reading: "compacted", measuredAt: 5_000 },
-        { previousUsed: 118_204 },
+        {
+          used: null,
+          usedModel: null,
+          reading: "compacted",
+          measuredAt: 5_000,
+        },
+        { previous: { used: 118_204, model: "claude-haiku-4-5-20251001" } },
       ),
       // A call from before the compaction is older than the reading and does not count.
       live({ at: 4_000 }),
@@ -120,14 +129,22 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     );
     // The next call measures it again, and the drop is still told against the old figure.
     const after = crumbMeter(
-      held({ used: 40_000 }, { previousUsed: 118_204 }),
+      held(
+        { used: 40_000 },
+        { previous: { used: 118_204, model: "claude-haiku-4-5-20251001" } },
+      ),
       undefined,
     );
     expect(after.droppedFrom).toBe(118_204);
     // A model recounting the same conversation a little smaller is not a compaction.
     expect(
-      crumbMeter(held({ used: 23_500 }, { previousUsed: 24_106 }), undefined)
-        .droppedFrom,
+      crumbMeter(
+        held(
+          { used: 23_500 },
+          { previous: { used: 24_106, model: "claude-haiku-4-5-20251001" } },
+        ),
+        undefined,
+      ).droppedFrom,
     ).toBeNull();
     // A live call far below the reading, mid-turn: the harness compacted on its own.
     expect(
@@ -179,23 +196,148 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(shareOf(108, null)).toBe("");
   });
 
-  test("a reading's figure that may be the model before a switch is no baseline for a live call (A6 U9 review)", () => {
-    // Sonnet-5's 31,603, read back under haiku's window, then haiku's own first call.
-    const switched = held(
-      { used: 31_603 },
-      { previousUsed: null, usedBeforeSwitch: true },
+  test("after a reload, a reading of the old model's figure is no baseline for the new model's call (U9 review 2)", () => {
+    // Repro 1: sonnet-5 at 31,842, switched to haiku-4-5, reloaded before haiku's first
+    // call. The reading is haiku's window over sonnet's last call; haiku then reads 25,405.
+    const reloaded = held({
+      model: "claude-haiku-4-5",
+      used: 31_842,
+      usedModel: "claude-sonnet-5",
+    });
+    const meter = crumbMeter(
+      reloaded,
+      live({ promptTokens: 25_405, outputTokens: 0 }),
     );
+    expect(meter.used).toBe(25_405);
+    expect(meter.droppedFrom).toBeNull();
+    // And the turn-end reading after it, told against the reading before (sonnet's).
     expect(
-      crumbMeter(switched, live({ promptTokens: 24_507, outputTokens: 0 }))
-        .droppedFrom,
+      crumbMeter(
+        held(
+          { used: 25_405 },
+          { previous: { used: 31_842, model: "claude-sonnet-5" } },
+        ),
+        undefined,
+      ).droppedFrom,
     ).toBeNull();
-    // The same drop on one model is a compaction.
-    expect(
-      crumbMeter(held({ used: 31_603 }), live({ promptTokens: 24_507 }))
-        .droppedFrom,
-    ).toBe(31_603);
   });
 
+  test("a live call the old model finished after a switch is no baseline either (U9 review 2)", () => {
+    // Repro 2: a sonnet-5 call running when the switch to haiku-4-5 landed ends on sonnet
+    // (36,464), and the Stop's reading is labelled so; haiku's next call reads 28,406.
+    const stopped = held({
+      model: "claude-haiku-4-5",
+      used: 36_464,
+      usedModel: "claude-sonnet-5",
+    });
+    expect(
+      crumbMeter(stopped, live({ promptTokens: 28_406, outputTokens: 0 }))
+        .droppedFrom,
+    ).toBeNull();
+    // The late sonnet frame itself, newer than a haiku reading: not compared either.
+    expect(
+      crumbMeter(
+        held({ used: 20_000 }),
+        live({ promptTokens: 36_464, model: "claude-sonnet-5" }),
+      ).droppedFrom,
+    ).toBeNull();
+    // A frame or reading that names no model is compared with nothing.
+    expect(
+      crumbMeter(held({ used: 60_000 }), live({ model: null })).droppedFrom,
+    ).toBeNull();
+  });
+
+  test("a drop on one model is a compaction, however the model is spelt (U9 review 2)", () => {
+    // A live call far below the reading, mid-turn: the harness compacted on its own.
+    expect(
+      crumbMeter(
+        held({ used: 31_603 }),
+        live({ promptTokens: 24_507, model: "claude-haiku-4-5" }),
+      ).droppedFrom,
+    ).toBe(31_603);
+    // A reading told against the figure before it on the same model.
+    expect(
+      crumbMeter(
+        held(
+          { used: 40_000, usedModel: "claude-sonnet-5" },
+          { previous: { used: 118_204, model: "claude-sonnet-5" } },
+        ),
+        undefined,
+      ).droppedFrom,
+    ).toBe(118_204);
+  });
+
+  test("the figure says which model measured it", () => {
+    expect(crumbMeter(held(), undefined).usedModel).toBe(
+      "claude-haiku-4-5-20251001",
+    );
+    expect(
+      crumbMeter(held(), live({ model: "claude-sonnet-5" })).usedModel,
+    ).toBe("claude-sonnet-5");
+  });
+
+  test("categories of another model's window are not shown (U9 review 2)", () => {
+    const rows = [
+      {
+        id: "free_space",
+        name: "Free space",
+        tokens: 937_064,
+        kind: "free" as const,
+      },
+    ];
+    // Sonnet-5's rows under haiku-4-5's window: 469 % free, measured before the fix.
+    const other = crumbMeter(
+      held(
+        {},
+        { categories: { rows, measuredAt: 1_000, model: "claude-sonnet-5" } },
+      ),
+      undefined,
+    );
+    expect(other.categories).toBeNull();
+    expect(other.categoriesAt).toBeNull();
+    // Why there are none comes from the reading: not asked on this model yet.
+    expect(other.missing).toBe("not_asked");
+  });
+});
+
+describe("one model, whatever the spelling (U9 review 2)", () => {
+  test("a release date and a bracketed variant are not part of the model", () => {
+    // Observed 2026-11-05, CLI 2.1.310: frames date haiku-4-5 and not sonnet-5.
+    expect(sameModel("claude-haiku-4-5-20251001", "claude-haiku-4-5")).toBe(
+      true,
+    );
+    expect(sameModel("claude-sonnet-5", "claude-sonnet-5")).toBe(true);
+    expect(sameModel("claude-sonnet-5[1m]", "claude-sonnet-5")).toBe(true);
+    expect(sameModel("claude-haiku-4-5@20251001", "Claude-Haiku-4-5")).toBe(
+      true,
+    );
+    expect(modelKey("claude-haiku-4-5-20251001")).toBe("claude-haiku-4-5");
+    // OpenCode's provider/model is compared whole.
+    expect(
+      sameModel(
+        "zai-coding-plan/glm-5.3-flash",
+        "zai-coding-plan/glm-5.3-flash",
+      ),
+    ).toBe(true);
+    expect(
+      sameModel("zai-coding-plan/glm-5.3-flash", "opencode/glm-5.3-flash-free"),
+    ).toBe(false);
+  });
+
+  test("different models, and a model nobody stated, are not one", () => {
+    expect(sameModel("claude-haiku-4-5-20251001", "claude-sonnet-5")).toBe(
+      false,
+    );
+    expect(sameModel("claude-sonnet-4-5", "claude-sonnet-5")).toBe(false);
+    // A version number is not a date: 4-5 and 4-6 differ.
+    expect(sameModel("claude-haiku-4-5", "claude-haiku-4-6")).toBe(false);
+    expect(sameModel(null, "claude-sonnet-5")).toBe(false);
+    expect(sameModel(undefined, undefined)).toBe(false);
+    expect(sameModel("", "")).toBe(false);
+  });
+});
+
+describe("the crumb bar's context meter footer (A6 U9)", () => {
   test("the footer says what the reading was taken after, and a live call says it is one (A6 U9 review)", () => {
     const after = (cause: ImporterContext["cause"]) =>
       crumbSource(

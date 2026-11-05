@@ -1913,6 +1913,8 @@ describe("reading opencode's token usage", () => {
       // reasoning model by most of what it produced.
       outputTokens: 53,
       contextLimit: 200_000,
+      // No `session.step.started` seen for it: nothing says which model made it.
+      model: undefined,
       // Beside the window, not instead of it: where the harness will rewrite the session
       // on its own. See `openCodeCompactionAt`.
       compactionAt: 170_000,
@@ -1991,8 +1993,23 @@ describe("reading opencode's token usage", () => {
       // beats a fraction of a window nobody stated. And no threshold either: both numbers
       // come from the same catalogue entry, so a session with no entry has neither.
       contextLimit: undefined,
+      model: undefined,
       compactionAt: undefined,
     });
+  });
+
+  test("a step's usage names the model its start named (U9 review 2)", () => {
+    // A step running when a switch lands finishes on the model it started on.
+    const models = new Map([["msg_1", "zai-coding-plan/glm-5.3-flash"]]);
+    const entry = openCodeNarration(
+      stepEnded({ input: 1, output: 1 }),
+      new Map(),
+      undefined,
+      models,
+    );
+    expect(
+      entry.detail._tag === "usage" ? entry.detail.model : "not usage",
+    ).toBe("zai-coding-plan/glm-5.3-flash");
   });
 
   test("reasoning streams as thinking, and its ordinal is not the reply's", () => {
@@ -3807,7 +3824,12 @@ describe("how full a session's window is (A6 U9)", () => {
         assistantWith(TOKENS),
         assistantWith({ ...TOKENS, input: 99_999 }),
       ]),
-    ).toEqual({ used: 150 + 3 + 12 + 13_600, reading: "measured" });
+    ).toEqual({
+      used: 150 + 3 + 12 + 13_600,
+      // The call's own model, as the catalogue names it.
+      usedModel: "opencode/glm-5.3-flash-free",
+      reading: "measured",
+    });
     // A call with no tokens yet (still streaming) is passed over for the one before it.
     expect(
       openCodeContext([assistantWith(undefined), assistantWith(TOKENS)])?.used,
@@ -3817,7 +3839,7 @@ describe("how full a session's window is (A6 U9)", () => {
         { type: "compaction", status: "completed", summary: "…" },
         assistantWith(TOKENS),
       ]),
-    ).toEqual({ used: null, reading: "compacted" });
+    ).toEqual({ used: null, usedModel: null, reading: "compacted" });
     // Running or failed: nothing was rewritten yet.
     for (const status of ["running", "failed"]) {
       expect(
@@ -3882,12 +3904,16 @@ describe("how full a session's window is (A6 U9)", () => {
       );
     expect(await read("opencode/glm-5.3-flash-free")).toEqual({
       used: 13_765,
+      usedModel: "opencode/glm-5.3-flash-free",
       window: 200_000,
       reading: "measured",
       breakdown: { _tag: "none", reason: "harness_gives_none" },
     });
-    // Switched: the same last call, against the new model's window.
-    expect((await read("openai/gpt-5.6-sol")).window).toBe(400_000);
+    // Switched: the same last call, against the new model's window, and still labelled
+    // with the model that made it.
+    const switched = await read("openai/gpt-5.6-sol");
+    expect(switched.window).toBe(400_000);
+    expect(switched.usedModel).toBe("opencode/glm-5.3-flash-free");
     // A model the catalogue does not list states no window.
     expect((await read("opencode/unlisted")).window).toBeNull();
     expect(pages.map((page) => page.searchParams.get("order"))).toEqual([

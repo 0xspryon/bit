@@ -3750,6 +3750,7 @@ describe("the context meter", () => {
     outputTokens: 0,
     contextLimit: 200_000,
     compactionAt: 170_000,
+    model: null,
     attemptId: null,
     roundId: "rnd_1",
     goalId: null,

@@ -342,6 +342,8 @@ interface Script {
   readonly contextReads: string[];
   /** How long a `contextUsage` read takes to answer, in milliseconds (a `full` count's second). */
   contextLatency: number;
+  /** The model a `contextUsage` answer names for its window, if any (Claude Code's). */
+  contextModel: string | undefined;
   holdContinuation:
     | {
         readonly entered: Deferred.Deferred<void>;
@@ -386,6 +388,7 @@ const newScript = (readable: readonly string[]): Script => {
     holdContinuation: undefined,
     contextReads: [],
     contextLatency: 0,
+    contextModel: undefined,
   };
 };
 
@@ -469,6 +472,10 @@ const scriptedHarness = (script: Script) => {
         );
         return {
           used: 13_765,
+          usedModel: "opencode/glm-5.3-flash-free",
+          ...(script.contextModel === undefined
+            ? {}
+            : { model: script.contextModel }),
           window: 200_000,
           reading: "measured" as const,
           breakdown: {
@@ -4035,12 +4042,22 @@ describe("how full an import's window is (A6 U9)", () => {
         conversationId: importId,
         model: row.model,
         used: 13_765,
+        // The figure's own model, passed through as the harness labelled it.
+        usedModel: "opencode/glm-5.3-flash-free",
         window: 200_000,
         reading: "measured",
       });
     }
+    // A harness that says which model its window is (Claude Code): that one, over the row,
+    // which a switch writes only once the harness has taken it (U9 review 2).
+    built.script.contextModel = "claude-haiku-4-5";
+    const named = await read(importId, false);
+    expect(named._tag === "Success" && named.success.model).toBe(
+      "claude-haiku-4-5",
+    );
     expect(built.script.contextReads).toEqual([
       `${row.harness_session_id} ${row.model} true`,
+      `${row.harness_session_id} ${row.model} false`,
     ]);
     const unknown = await read("imp_nonesuch", false);
     expect(unknown._tag).toBe("Failure");

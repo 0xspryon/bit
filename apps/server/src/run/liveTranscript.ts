@@ -1196,6 +1196,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
         outputTokens: detail.outputTokens ?? null,
         contextLimit: detail.contextLimit ?? null,
         compactionAt: detail.compactionAt ?? null,
+        model: detail.model ?? null,
         attemptId: base.attemptId,
         roundId: base.roundId,
         goalId: base.goalId,

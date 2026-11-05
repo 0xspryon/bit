@@ -1549,6 +1549,7 @@ describe("projecting live activity", () => {
           promptTokens: 13_572,
           outputTokens: 53,
           contextLimit: 200_000,
+          model: "claude-sonnet-5",
           compactionAt: 170_000,
         },
         { subject: { _tag: "round", roundId: "rnd_7" } },
@@ -1561,6 +1562,8 @@ describe("projecting live activity", () => {
       outputTokens: 53,
       contextLimit: 200_000,
       compactionAt: 170_000,
+      // The call's own model: what a meter compares figures by (U9 review 2).
+      model: "claude-sonnet-5",
       // The attribution a page with two agents on it needs to tell one meter from the
       // other. Taken from the bus's own tagged subject, never from the harness's payload.
       attemptId: null,
@@ -1581,6 +1584,7 @@ describe("projecting live activity", () => {
         promptTokens: 21_388,
         outputTokens: undefined,
         contextLimit: undefined,
+        model: undefined,
         compactionAt: undefined,
       }),
     );
@@ -1591,6 +1595,7 @@ describe("projecting live activity", () => {
     // The same for the harness's own threshold: "we have not been told" must not arrive as
     // a number a bar could be marked at.
     expect(frame.compactionAt).toBeNull();
+    expect(frame.model).toBeNull();
     expect(frame.promptTokens).toBe(21_388);
   });
 

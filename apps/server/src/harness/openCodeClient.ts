@@ -716,6 +716,9 @@ export const openCodeNarration = (
             count(tokens.cache?.write),
           outputTokens: count(tokens.output) + count(tokens.reasoning),
           contextLimit: window?.contextLimit,
+          // The step's own model, from its `session.step.started`: a step running when a
+          // switch lands finishes on the model it started on.
+          model: stepModel,
           compactionAt: window?.compactionAt,
         };
       }
@@ -1312,7 +1315,7 @@ const tokenCount = (value: unknown): number =>
 
 export const openCodeContext = (
   newestFirst: readonly unknown[],
-): Pick<HarnessContextUsage, "used" | "reading"> | undefined => {
+): Pick<HarnessContextUsage, "used" | "usedModel" | "reading"> | undefined => {
   for (const entry of newestFirst) {
     const message = (entry ?? {}) as {
       readonly type?: unknown;
@@ -1325,7 +1328,7 @@ export const openCodeContext = (
       };
     };
     if (message.type === "compaction" && message.status === "completed") {
-      return { used: null, reading: "compacted" };
+      return { used: null, usedModel: null, reading: "compacted" };
     }
     if (message.type !== "assistant" || message.tokens === undefined) continue;
     const used =
@@ -1334,7 +1337,15 @@ export const openCodeContext = (
       tokenCount(message.tokens.reasoning) +
       tokenCount(message.tokens.cache?.read) +
       tokenCount(message.tokens.cache?.write);
-    if (used > 0) return { used, reading: "measured" };
+    // The call's own model (`Model.Ref`, `provider/model` as the catalogue names it), which
+    // after a switch may not be the one the window is read for.
+    if (used > 0) {
+      return {
+        used,
+        usedModel: modelRefName((entry as { model?: unknown }).model) ?? null,
+        reading: "measured",
+      };
+    }
   }
   return undefined;
 };
@@ -2419,7 +2430,13 @@ export const openCodeHarness = (
           if (listed.data.length === 0 || typeof next !== "string") break;
           cursor = next;
         }
-        return { used: null, window, reading: "no_call_yet", breakdown };
+        return {
+          used: null,
+          usedModel: null,
+          window,
+          reading: "no_call_yet",
+          breakdown,
+        };
       });
 
       const interruptSession: AgentHarness["Service"]["interruptSession"] =

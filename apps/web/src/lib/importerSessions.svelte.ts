@@ -71,6 +71,7 @@ import type {
   ModelOptionSelection,
   SteerUrgency,
 } from "@bit/contracts";
+import { sameModel } from "@bit/contracts";
 
 import type { ErrorNotice } from "./components/ErrorDialog.svelte";
 
@@ -335,20 +336,20 @@ export type ContextReadCause = "opened" | "turn" | "stop" | "switch" | "asked";
 export interface ImporterContext {
   readonly reading: ConversationContext;
   /**
-   * A `used` before {@link reading}'s that was a different figure, or `null`: what a drop —
-   * a compaction — is told against. A reading with the same figure leaves it as it was, so a
-   * second read of an unchanged window (the meter's breakdown) does not forget a drop.
-   * Never a figure from another model: each counts the same conversation with its own
-   * tokenizer (sonnet-5 about 35 % above haiku-4-5, measured), so across a switch there is
-   * no baseline.
+   * The measured figure before {@link reading}'s that differed from it, with the model that
+   * measured it, or `null`: what a drop — a compaction — is told against. A reading with
+   * the same figure leaves it as it was, so a second read of an unchanged window (the
+   * meter's breakdown) does not forget a drop.
+   *
+   * Kept whatever model measured it: the meter compares two figures only when the server
+   * labels them with one model (`sameModel`), because each model counts the same
+   * conversation with its own tokenizer (haiku-4-5 about 22 % below sonnet-5, measured). No
+   * guess about switches is made here (A6 U9 review 2).
    */
-  readonly previousUsed: number | null;
-  /**
-   * Whether {@link reading}'s `used` may be the count of the model before a switch: the
-   * switch changes the model at once, and the figure only at the next model call. Such a
-   * figure is no baseline for a drop either. Absent is `false`.
-   */
-  readonly usedBeforeSwitch?: boolean;
+  readonly previous: {
+    readonly used: number;
+    readonly model: string | null;
+  } | null;
   /** What made this tab take {@link reading}; absent where nothing said. */
   readonly cause?: ContextReadCause;
   /**
@@ -360,9 +361,10 @@ export interface ImporterContext {
     readonly rows: readonly ContextCategory[];
     readonly measuredAt: number;
     /**
-     * The model they were counted on. Only shown under a reading on the same model: the
-     * free space and the reserve are that model's window (A6 U9 review, measured: sonnet-5's
-     * 937,064 free read as 469 % of haiku-4-5's window after a switch).
+     * The model they were counted on, as the server labelled them. Only shown under a
+     * reading of the same window (`crumbMeter`): the free space and the reserve are that
+     * model's (A6 U9 review, measured: sonnet-5's 937,064 free read as 469 % of haiku-4-5's
+     * window after a switch).
      */
     readonly model: string;
   };
@@ -479,11 +481,17 @@ export class ImporterSessions {
     { wanted: boolean; done: Promise<void> }
   >();
   /**
-   * How many model switches this tab has seen accepted for each import. A context read out
-   * when one is accepted may be labelled with the old model and measured on the new one,
-   * so its answer is dropped ({@link #askContext}).
+   * Imports whose meter is open (A6 U9 review 2): the operator is looking at the
+   * categories, so a reading of a window they were not counted on is followed by one count
+   * of it ({@link #recountIfStale}).
    */
-  readonly #switchesSeen = new Map<string, number>();
+  readonly #meterOpen = new Set<string>();
+  /**
+   * The window model each import was last re-counted for while its meter stayed open: at
+   * most one count per model per opening, so a count that comes back on another model
+   * than the reading cannot ask again, and again ({@link #recountIfStale}).
+   */
+  readonly #recountedFor = new Map<string, string>();
   /** The one on screen. */
   currentId = $state("");
   /** What is typed in the composer and not yet sent. */
@@ -1710,10 +1718,8 @@ export class ImporterSessions {
       };
     }
     this.#switchedTo.set(switched.conversationId, switched.model);
-    // The figure held is the old model's count until the next call (A6 U9 review): no
-    // baseline for a drop from here, even for a live call that lands before the reading.
-    this.#contextSwitched([importId, switched.conversationId]);
-    // The window is the new model's (A6 U9); the figure stays the last call's until the next.
+    // The window is the new model's (A6 U9); the figure stays the last call's until the
+    // next, and the server labels it with the model that made that call.
     void this.readContext(switched.conversationId, false, "switch");
     this.sessions = this.sessions.map((each) =>
       each.id === session.id ||
@@ -1767,6 +1773,9 @@ export class ImporterSessions {
     const server = this.#server;
     if (server === undefined) return Promise.resolve();
     if (!breakdown) return this.#askContext(server, importId, false, cause);
+    // The operator opened the meter: a fresh opening may re-count once more per model.
+    this.#meterOpen.add(importId);
+    this.#recountedFor.delete(importId);
     const out = this.#breakdowns.get(importId);
     if (out !== undefined) {
       out.wanted = true;
@@ -1778,23 +1787,19 @@ export class ImporterSessions {
     // request would only stop the server waiting while the CLI went on counting, and a
     // meter opened again would start a second count beside it. V2 could abort once the
     // harness call can be withdrawn.
-    return this.#countBreakdown(server, importId, cause, false);
+    return this.#countBreakdown(server, importId, cause);
   }
 
-  /**
-   * Starts the one breakdown read for an import. `again` is a count asked once more because
-   * the first crossed a model switch ({@link #askContext}); it is not asked again.
-   */
+  /** Starts the one breakdown read for an import. */
   #countBreakdown(
     server: ImporterServer,
     importId: string,
     cause: ContextReadCause,
-    again: boolean,
   ): Promise<void> {
     const read = { wanted: true, done: Promise.resolve() };
     this.#breakdowns.set(importId, read);
     this.#counting(importId, true);
-    read.done = this.#askContext(server, importId, true, cause, read, again);
+    read.done = this.#askContext(server, importId, true, cause, read);
     return read.done;
   }
 
@@ -1805,6 +1810,8 @@ export class ImporterSessions {
    * again first ({@link readContext}).
    */
   leaveBreakdown(importId?: string): void {
+    if (importId === undefined) this.#meterOpen.clear();
+    else this.#meterOpen.delete(importId);
     for (const [id, read] of this.#breakdowns) {
       if (importId !== undefined && id !== importId) continue;
       read.wanted = false;
@@ -1818,13 +1825,11 @@ export class ImporterSessions {
     breakdown: boolean,
     cause: ContextReadCause,
     read?: { wanted: boolean },
-    again = false,
   ): Promise<void> {
     this.#readingContext.set(
       importId,
       (this.#readingContext.get(importId) ?? 0) + 1,
     );
-    const switchesSeen = this.#switchesSeen.get(importId) ?? 0;
     let answer: ConversationContext | undefined;
     try {
       answer = await server.context(importId, breakdown);
@@ -1839,61 +1844,41 @@ export class ImporterSessions {
     }
     if (answer === undefined || this.#server !== server) return;
     if (read !== undefined && !read.wanted) return;
-    /*
-     * A read out while a model switch was accepted is dropped whole: the server labels a
-     * reading with the import row's model, which is written only once the harness has taken
-     * the switch, so an answer from in between is the new model's window and count under
-     * the old model's name (measured: haiku-4-5's name over sonnet-5's 1,000,000 and rows).
-     * The switch's own reading follows it. A count of another model than the reading held
-     * is dropped by `#takeContext` too. Either way the open meter would be left with no
-     * rows: one more count, of the model the session is on now.
-     */
-    // V2(chat): the reading's `model` is the import row's. V2 should report the model the
-    // harness measured on (`getContextUsage().model` on Claude Code, the call's `modelID` on
-    // OpenCode), mapped to the catalogue's ids, so a read crossing a switch is labelled
-    // truly instead of dropped.
-    const crossed = (this.#switchesSeen.get(importId) ?? 0) !== switchesSeen;
-    const otherModel = !crossed && this.#takeContext(importId, answer, cause);
-    if (read !== undefined && (crossed || otherModel) && !again) {
-      await this.#countBreakdown(server, importId, cause, true);
-    }
+    this.#takeContext(importId, answer, cause);
+    this.#recountIfStale(server, importId);
   }
 
   /**
-   * Puts one answer of {@link readContext} into {@link contexts}, and says whether it
-   * carried categories of another model than the reading held, which are dropped.
+   * Puts one answer of {@link readContext} into {@link contexts}.
+   *
+   * Every figure and every count carries the model the server says measured it (A6 U9
+   * review 2), so nothing here guesses across a switch: the newest count is kept whatever
+   * its model, and the meter shows it only under a reading of the same window; the figure
+   * before is kept with its model, and the meter compares only figures of one model.
    */
   #takeContext(
     importId: string,
     answer: ConversationContext,
     cause: ContextReadCause,
-  ): boolean {
+  ): void {
     const held = this.contexts[importId];
     const counted =
       answer.breakdown._tag === "categories"
         ? {
             rows: answer.breakdown.categories,
             measuredAt: answer.measuredAt,
-            model: answer.model,
+            model: answer.breakdown.model,
           }
         : undefined;
-    const older =
-      held !== undefined && answer.measuredAt < held.reading.measuredAt;
-    // The newest count of the categories on the model of the reading that will be held,
-    // whichever reading carries the figure.
-    const model = older ? held.reading.model : answer.model;
-    const categories = [counted, held?.categories]
-      .filter((each) => each?.model === model)
-      .reduce<ImporterContext["categories"]>(
-        (newest, each) =>
-          newest === undefined ||
-          (each !== undefined && each.measuredAt > newest.measuredAt)
-            ? each
-            : newest,
-        undefined,
-      );
-    const otherModel = counted !== undefined && counted.model !== model;
-    if (older) {
+    const categories =
+      counted !== undefined &&
+      (held?.categories === undefined ||
+        counted.measuredAt >= held.categories.measuredAt)
+        ? counted
+        : held?.categories;
+    // Measured before the reading held: its figure is not the newer, but a slow count it
+    // carries may still be the newest.
+    if (held !== undefined && answer.measuredAt < held.reading.measuredAt) {
       if (categories !== held.categories) {
         this.contexts = {
           ...this.contexts,
@@ -1903,55 +1888,51 @@ export class ImporterSessions {
           },
         };
       }
-      return otherModel;
+      return;
     }
     const before = held?.reading;
-    const switched = before !== undefined && before.model !== answer.model;
-    const unchanged = before !== undefined && before.used === answer.used;
-    const usedBeforeSwitch =
-      answer.used !== null &&
-      (switched || (unchanged && held?.usedBeforeSwitch === true));
-    const previousUsed =
-      held === undefined || switched || held.usedBeforeSwitch === true
-        ? null
-        : unchanged
-          ? held.previousUsed
-          : before?.reading === "measured" && before.used !== null
-            ? before.used
-            : held.previousUsed;
+    const moved =
+      before !== undefined &&
+      before.reading === "measured" &&
+      before.used !== null &&
+      (before.used !== answer.used ||
+        !sameModel(before.usedModel, answer.usedModel));
     this.contexts = {
       ...this.contexts,
       [importId]: {
         reading: answer,
-        previousUsed,
-        ...(usedBeforeSwitch ? { usedBeforeSwitch } : {}),
+        previous: moved
+          ? { used: before.used, model: before.usedModel }
+          : (held?.previous ?? null),
         cause,
         ...(categories === undefined ? {} : { categories }),
       },
     };
-    return otherModel;
   }
 
   /**
-   * A model switch was accepted for these imports: the figure each holds is the old
-   * model's count until the next call, so it is no baseline for a drop (A6 U9 review).
+   * The meter is open and the reading now held is of a window its categories were not
+   * counted on — a switch, here or in another tab — so the panel would show no rows
+   * (A6 U9 review 2): one count of the window the reading is of.
+   *
+   * **Cannot loop.** Nothing is asked while a breakdown read is out (its answer comes back
+   * here); a harness that gives none, a session not held and one that did not answer are
+   * not asked again; and each window model is re-counted at most once per opening of the
+   * meter ({@link #recountedFor}), so a count that comes back on another model asks again
+   * only for a model not yet asked for, which takes another switch.
    */
-  #contextSwitched(importIds: readonly string[]): void {
-    let next = this.contexts;
-    for (const id of new Set(importIds)) {
-      this.#switchesSeen.set(id, (this.#switchesSeen.get(id) ?? 0) + 1);
-      const held = next[id];
-      if (held === undefined) continue;
-      next = {
-        ...next,
-        [id]: {
-          ...held,
-          previousUsed: null,
-          ...(held.reading.used === null ? {} : { usedBeforeSwitch: true }),
-        },
-      };
+  #recountIfStale(server: ImporterServer, importId: string): void {
+    if (!this.#meterOpen.has(importId) || this.#breakdowns.has(importId)) {
+      return;
     }
-    this.contexts = next;
+    const held = this.contexts[importId];
+    if (held === undefined) return;
+    const { breakdown, model } = held.reading;
+    if (breakdown._tag === "none" && breakdown.reason !== "not_asked") return;
+    if (sameModel(held.categories?.model, model)) return;
+    if (this.#recountedFor.get(importId) === model) return;
+    this.#recountedFor.set(importId, model);
+    void this.#countBreakdown(server, importId, "asked");
   }
 
   /**
@@ -1961,6 +1942,7 @@ export class ImporterSessions {
   #forgetBreakdowns(): void {
     this.leaveBreakdown();
     this.#breakdowns.clear();
+    this.#recountedFor.clear();
     this.countingBreakdown = new Set();
   }
 

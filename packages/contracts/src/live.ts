@@ -861,6 +861,13 @@ export const LiveUsage = Schema.Struct({
    */
   compactionAt: Schema.NullOr(Schema.Int),
   /**
+   * The model that made this call, in the harness's own spelling (Claude Code's
+   * `message.model`, OpenCode's step `provider/model`), or `null` where the stream did not
+   * say. Not always the model the session is on now: a call running when a switch lands
+   * finishes on the old one. Compare with `sameModel` (`conversationContext.ts`).
+   */
+  model: Schema.NullOr(Schema.String),
+  /**
    * Whose session this call belongs to, exactly as {@link LiveItem} carries it.
    *
    * One of the four is set. A page showing a planner round and a goal conversation side by

@@ -22,6 +22,7 @@
     shareOf,
     type CrumbMeter,
   } from "../crumbMeter";
+  import { sameModel } from "@bit/contracts";
   import { groupDigits } from "../chat";
   import { whenText } from "../goalFormat";
 
@@ -187,6 +188,13 @@
           This model's window is {groupDigits(meter.window)} tokens.
         </p>
       {/if}
+      {#if meter.used !== null && meter.usedModel !== null && meter.model !== null && meter.model !== "" && !sameModel(meter.usedModel, meter.model)}
+        <p class="note other-model">
+          Measured on <span class="mono">{meter.usedModel}</span>'s last call.
+          The next call, on {meter.model}, measures it again with that model's
+          own count.
+        </p>
+      {/if}
 
       {#if meter.droppedFrom !== null}
         <p class="note loud" role="status">
@@ -237,6 +245,13 @@
         </p>
       {:else if meter.missing === "unanswered" && meter.reading !== "unread"}
         <p class="note">The session did not answer for a breakdown.</p>
+      {:else if meter.missing === "not_asked"}
+        <p class="note">
+          {harness} counts what fills the window only when asked, and has not counted
+          it for {meter.model !== null && meter.model !== ""
+            ? meter.model
+            : "this model"} yet. Close this panel and open it again to count.
+        </p>
       {/if}
 
       {#if meter.used !== null && meter.window === null}
@@ -403,6 +418,10 @@
     color: var(--text-muted);
     font-size: 11px;
     line-height: var(--lh-compact);
+  }
+  .other-model .mono {
+    font: 400 11px/16px var(--font-mono);
+    overflow-wrap: anywhere;
   }
   .note.loud {
     color: var(--state-fg-warning);

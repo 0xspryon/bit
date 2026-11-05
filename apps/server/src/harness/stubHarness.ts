@@ -257,6 +257,7 @@ export const stubHarness = (
     contextUsage: () =>
       Effect.succeed({
         used: null,
+        usedModel: null,
         window: null,
         reading: "no_call_yet",
         breakdown: { _tag: "none", reason: "harness_gives_none" },

@@ -385,6 +385,12 @@ export interface ClaudeContextUsage {
    * The last model call's exact usage, or `null` before any call — and after a
    * compaction, until the next (measured: `/compact` left it `null`).
    */
+  /**
+   * The model the session is on now, in the catalogue's spelling (`claude-haiku-4-5`):
+   * what {@link maxTokens} and the categories are of. **Not** {@link apiUsage}'s model,
+   * which stays the last call's after a switch until the next call.
+   */
+  readonly model?: string;
   readonly apiUsage?: {
     readonly input_tokens: number;
     readonly output_tokens: number;
@@ -674,6 +680,20 @@ interface SessionRecord {
    * `assistant` frame states no usage rather than inventing a call to hang it on.
    */
   lastCallId: string | undefined;
+  /**
+   * The model of the last main-thread model call seen on this stream (`message.model`, as
+   * the API spells it: `claude-haiku-4-5-20251001`), or `undefined` before one (A6 U9
+   * review 2).
+   *
+   * **What labels `getContextUsage().apiUsage`**, which is the last call's usage and says
+   * nothing of its model: the answer's own `model` is the one the session is on now, and a
+   * switch moves it at once while `apiUsage` stays the old model's call until the next
+   * (measured, CLI 2.1.310: `model: claude-haiku-4-5` over sonnet-5's 24,663 right after a
+   * mid-call switch, and that sonnet call's last frame two seconds later). Set from a
+   * `message_start` as well as from the call's `assistant` frames, so a count asked while the
+   * call streams is labelled with it. Subagents' calls never set it ({@link fromSubagent}).
+   */
+  lastCallModel: string | undefined;
   /**
    * The main thread's block being streamed, from its `stream_event` frames (A6 F8).
    *
@@ -1142,6 +1162,7 @@ const usageOfAssistant = (
     promptTokens: promptTokensOf(envelope?.usage),
     outputTokens: undefined,
     contextLimit,
+    model: modelOfMessage(envelope),
     // Claude Code states no compaction threshold this build has measured. Its context
     // breakdown carries `autocompact_buffer` and `compact_buffer` categories, so one
     // exists; deriving a number from a policy nobody measured is what
@@ -1167,6 +1188,7 @@ const usageOfResult = (
   message: SDKMessage,
   lastCallId: string | undefined,
   contextLimit: number | undefined,
+  lastCallModel: string | undefined,
 ): NarrationDetail | undefined => {
   if (lastCallId === undefined) return undefined;
   const usage = (message as { usage?: unknown }).usage;
@@ -1183,6 +1205,8 @@ const usageOfResult = (
     // a breakdown of it, not an addition to it, which is the opposite of OpenCode's shape.
     outputTokens: count(record["output_tokens"]),
     contextLimit,
+    // The call {@link lastCallId} names: the turn's last, whose model was remembered with it.
+    model: lastCallModel,
     // See `usageOfAssistant`: this driver states no threshold this build has measured.
     compactionAt: undefined,
   };
@@ -1614,7 +1638,12 @@ const narrate = (
    */
   session: Pick<
     SessionRecord,
-    "contextLimit" | "lastCallId" | "streamed" | "subagents" | "interrupted"
+    | "contextLimit"
+    | "lastCallId"
+    | "lastCallModel"
+    | "streamed"
+    | "subagents"
+    | "interrupted"
   >,
 ): readonly HarnessNarration[] => {
   const at = Date.now();
@@ -1629,6 +1658,14 @@ const narrate = (
   // A stream frame narrates its delta or nothing — never `opaque`; see this function's
   // header. It carries no outcome: only a `result` does.
   if (message.type === "stream_event") {
+    // A main-thread call's model, as soon as it starts: what labels `apiUsage` mid-call.
+    if (
+      message.event.type === "message_start" &&
+      !fromSubagent(message) &&
+      modelOfMessage(message.event.message) !== undefined
+    ) {
+      session.lastCallModel = modelOfMessage(message.event.message);
+    }
     return narrateStreamEvent(message, session.streamed).map(frame);
   }
   // A thinking-progress estimate narrates nothing either, for the same reason: the CLI sends
@@ -1740,6 +1777,9 @@ const narrate = (
     const usage = usageOfAssistant(message, session.contextLimit);
     if (usage !== undefined) {
       session.lastCallId = usage._tag === "usage" ? usage.callId : undefined;
+      if (usage._tag === "usage" && usage.model !== undefined) {
+        session.lastCallModel = usage.model;
+      }
       details.push(usage);
     }
   } else if (message.type === "result") {
@@ -1747,6 +1787,7 @@ const narrate = (
       message,
       session.lastCallId,
       session.contextLimit,
+      session.lastCallModel,
     );
     if (usage !== undefined) details.push(usage);
     const failure = resultError(message, outcome);
@@ -2063,12 +2104,12 @@ const callTokens = (usage: CallUsage): number =>
  */
 export const transcriptContext = (
   entries: readonly SessionMessage[],
-): Pick<HarnessContextUsage, "used" | "reading"> => {
+): Pick<HarnessContextUsage, "used" | "usedModel" | "reading"> => {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
     if (entry === undefined || entry.parent_tool_use_id !== null) continue;
     if ((entry as { readonly isCompactSummary?: unknown }).isCompactSummary) {
-      return { used: null, reading: "compacted" };
+      return { used: null, usedModel: null, reading: "compacted" };
     }
     if (entry.type !== "assistant") continue;
     const message = entry.message as
@@ -2077,9 +2118,15 @@ export const transcriptContext = (
       continue;
     }
     const used = callTokens(message.usage);
-    if (used > 0) return { used, reading: "measured" };
+    if (used > 0) {
+      return {
+        used,
+        usedModel: modelOfMessage(message) ?? null,
+        reading: "measured",
+      };
+    }
   }
-  return { used: null, reading: "no_call_yet" };
+  return { used: null, usedModel: null, reading: "no_call_yet" };
 };
 
 /**
@@ -3494,6 +3541,7 @@ export const claudeCodeHarness = (
           tokens: undefined,
           contextLimit: undefined,
           lastCallId: undefined,
+          lastCallModel: undefined,
           streamed: { messageId: undefined, index: undefined, kind: undefined },
           subagents: new Map(),
           interrupted: false,
@@ -4195,6 +4243,17 @@ export const claudeCodeHarness = (
         if (answer !== undefined && max !== undefined && record !== undefined) {
           record.contextLimit = window ?? undefined;
         }
+        /*
+         * The model the answer is about: the CLI's own `model`, which moves with its
+         * `maxTokens` and its rows in one answer (measured, CLI 2.1.310: a count asked
+         * beside a `setModel` came back wholly haiku-4-5's, the first after it wholly
+         * sonnet-5's, at 200,000 and 1,000,000). The caller's record is written only once the
+         * switch has returned, so it is the fallback, not the label.
+         */
+        const model =
+          answer?.model !== undefined && answer.model !== ""
+            ? answer.model
+            : undefined;
         const breakdown: HarnessContextUsage["breakdown"] =
           live === undefined
             ? { _tag: "none", reason: "not_live" }
@@ -4204,12 +4263,17 @@ export const claudeCodeHarness = (
                 ? { _tag: "none", reason: "not_asked" }
                 : {
                     _tag: "categories",
+                    model: model ?? read.model,
                     categories: claudeCodeCategories(answer.categories),
                   };
         const api = answer?.apiUsage;
         if (api !== undefined && api !== null) {
           return {
             used: callTokens(api),
+            // `apiUsage` names no model: the last main-thread call this stream saw does.
+            // A session held since before its first call has seen every call it made.
+            usedModel: record?.lastCallModel ?? null,
+            ...(model === undefined ? {} : { model }),
             window,
             reading: "measured",
             breakdown,
@@ -4228,7 +4292,12 @@ export const claudeCodeHarness = (
               `could not read session ${sessionId}'s transcript: ${String(cause)}`,
             ),
         });
-        return { ...transcriptContext(stored), window, breakdown };
+        return {
+          ...transcriptContext(stored),
+          ...(model === undefined ? {} : { model }),
+          window,
+          breakdown,
+        };
       });
 
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(

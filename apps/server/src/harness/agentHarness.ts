@@ -191,6 +191,17 @@ export interface ContextRead {
  */
 export interface HarnessContextUsage {
   readonly used: number | null;
+  /**
+   * The model whose call measured {@link used}, as the harness spells it, or `null` with
+   * no figure or where the harness did not say. See `ConversationContext.usedModel`.
+   */
+  readonly usedModel: string | null;
+  /**
+   * The model {@link window} is, where the harness said which it answered for (Claude
+   * Code's `getContextUsage().model`); absent where the caller's {@link ContextRead.model}
+   * is the one.
+   */
+  readonly model?: string;
   readonly window: number | null;
   readonly reading: ContextReading;
   readonly breakdown: ContextBreakdown;
@@ -662,6 +673,12 @@ export type NarrationDetail =
        * that has not answered yet — and a consumer draws no percentage without it.
        */
       readonly contextLimit: number | undefined;
+      /**
+       * The model that made this call, as the harness spells it (Claude Code's
+       * `message.model`, OpenCode's step `provider/model`), or `undefined` where the stream
+       * did not say. A call running when a switch lands finishes on the old model.
+       */
+      readonly model: string | undefined;
       /**
        * Where the **harness itself** will summarise this session, when it states a policy.
        *

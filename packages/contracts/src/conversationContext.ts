@@ -66,6 +66,12 @@ export const ContextBreakdown = Schema.Union([
   Schema.Struct({
     _tag: Schema.Literal("categories"),
     /**
+     * The model the categories were counted on: the free space and the reserve are this
+     * model's window, so a screen shows them only under a reading of the same window
+     * ({@link sameModel} with {@link ConversationContext.model}).
+     */
+    model: Schema.String,
+    /**
      * In the harness's order, used rows first. **Estimates**, counted by the harness against
      * its own idea of the prompt: their sum is close to {@link ConversationContext.used} and
      * not equal to it, and a screen says so rather than presenting either as the other.
@@ -106,10 +112,26 @@ export const ConversationContext = Schema.Struct({
    * now, as `ConversationActivity.conversationId` is.
    */
   conversationId: Schema.String,
-  /** The model the session is on now: the one {@link window} belongs to. */
+  /**
+   * The model the session is on now: the one {@link window} belongs to. Where the harness
+   * says which model it answered for (Claude Code's `getContextUsage().model`), that one;
+   * otherwise the model the server recorded the session on.
+   */
   model: Schema.String,
   /** Tokens in the window on the last model call, sent plus generated. See {@link reading}. */
   used: Schema.NullOr(Schema.Int),
+  /**
+   * The model whose call measured {@link used}, in the harness's own spelling (Claude
+   * Code's `message.model`, which dates some models: `claude-haiku-4-5-20251001`), or
+   * `null` where `used` is, or where the harness did not say.
+   *
+   * **Not always {@link model}.** A switch moves the window at once and the figure only at
+   * the next call, and a call already running when the switch lands finishes on the old
+   * model. Two figures are comparable — a drop between them is a compaction — only when
+   * {@link sameModel} says they were measured on one model: each model counts the same
+   * conversation with its own tokenizer (haiku-4-5 about 22 % below sonnet-5, measured).
+   */
+  usedModel: Schema.NullOr(Schema.String),
   /**
    * The window of {@link model}, or `null` where the harness has not said. A screen draws a
    * fraction only when this is set.
@@ -121,3 +143,38 @@ export const ConversationContext = Schema.Struct({
   measuredAt: EpochMillis,
 });
 export type ConversationContext = typeof ConversationContext.Type;
+
+/**
+ * A model id as one model, whatever the spelling: lower case, with a trailing release date
+ * (`-20251001`, `@20251001`) and a bracketed variant (`[1m]`) taken off.
+ *
+ * Measured 2026-11-05 on Claude Code (CLI 2.1.310): a call's `message.model` reads
+ * `claude-haiku-4-5-20251001` for the catalogue's `claude-haiku-4-5`, and `claude-sonnet-5`
+ * for `claude-sonnet-5`; `getContextUsage().model` and the `/model` echo use the catalogue's
+ * spelling. OpenCode names a call's model as the catalogue does, `provider/model`.
+ */
+export const modelKey = (model: string): string =>
+  model
+    .trim()
+    .toLowerCase()
+    .replace(/\[[^\]]*\]$/, "")
+    .replace(/[-@]\d{8}$/, "");
+
+/**
+ * Whether two model ids name one model ({@link modelKey}), so figures measured on them were
+ * counted by one tokenizer. `null` — a model nobody stated — matches nothing.
+ */
+// V2(chat): a provider prefix (Bedrock's `us.anthropic.…-v1:0`, Vertex's region forms) is not
+// taken off: V1 runs Claude Code on Anthropic's own API, which spells neither. V2 should map
+// a call's model to the catalogue entry it was asked as, where the harness gives the mapping.
+export const sameModel = (
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean =>
+  a !== null &&
+  a !== undefined &&
+  b !== null &&
+  b !== undefined &&
+  a !== "" &&
+  b !== "" &&
+  modelKey(a) === modelKey(b);

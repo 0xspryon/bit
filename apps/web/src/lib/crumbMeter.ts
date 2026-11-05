@@ -13,6 +13,11 @@
  * Neither is a spend total: both are the last model call's tokens sent plus generated
  * (DECISIONS.md §24.4), so taking the newer is choosing between two measurements of the
  * same thing at different times.
+ *
+ * **Each figure says which model measured it** (`usedModel` on the reading, `model` on the
+ * live frame), and the meter trusts that and guesses nothing (A6 U9 review 2): two figures
+ * are compared for a drop only when they were measured on one model, and the categories are
+ * shown only under a reading of the window they were counted on.
  */
 import type {
   ContextBreakdownMissing,
@@ -20,6 +25,7 @@ import type {
   ContextReading,
   LiveUsage,
 } from "@bit/contracts";
+import { sameModel } from "@bit/contracts";
 
 import type {
   ContextReadCause,
@@ -46,7 +52,15 @@ export interface CrumbMeter {
   readonly source: "turn" | "live" | null;
   /** The model the window belongs to, or `null` with no reading. */
   readonly model: string | null;
-  /** The categories, when the harness last counted them; `null` when it never did. */
+  /**
+   * The model whose call measured {@link used}, as the harness spells it, or `null` where
+   * nothing said. Another model than {@link model} after a switch, until the next call.
+   */
+  readonly usedModel: string | null;
+  /**
+   * The categories, when the harness last counted them on {@link model}'s window; `null`
+   * when it never did, or counted another model's.
+   */
   readonly categories: readonly ContextCategory[] | null;
   /** Whether {@link categories} were counted before {@link used} was measured. */
   readonly categoriesStale: boolean;
@@ -55,8 +69,9 @@ export interface CrumbMeter {
   /** Why there are no categories, from the latest reading; `null` when there are some. */
   readonly missing: ContextBreakdownMissing | null;
   /**
-   * The figure before a drop, when the window shrank since the last reading — a compaction
-   * — or the reading says the conversation was summarised. `null` otherwise.
+   * The figure before a drop, when the window shrank since the figure before on the same
+   * model — a compaction — or the reading says the conversation was summarised. `null`
+   * otherwise.
    */
   readonly droppedFrom: number | null;
   /** When {@link used} was measured, in epoch milliseconds, or `null`. */
@@ -68,7 +83,8 @@ export interface CrumbMeter {
 /**
  * How much smaller a figure must be than the one before it to be told as a drop. Context
  * only grows within a conversation but for a compaction. Figures from two models are never
- * compared (`ImporterContext.previousUsed`): their tokenizers differ by far more than this.
+ * compared (`sameModel`): their tokenizers differ by far more than this (haiku-4-5 reads
+ * about 22 % below sonnet-5 on one conversation, measured).
  */
 // V2(chat): V1 tells a compaction by the reading's `compacted` or by a drop of over 10 %
 // against the figure this tab last held, which a reload forgets. V2 should carry the
@@ -94,22 +110,32 @@ export const crumbMeter = (
     (live === undefined ? null : positive(live.contextLimit));
   const fraction =
     used === null || window === null ? null : clamp(used / window);
-  // A live call is on the model the session is on now; a reading's figure that may be the
-  // model before a switch is no baseline for it.
-  const prior = liveNewer
-    ? context?.usedBeforeSwitch === true
-      ? null
-      : (reading?.used ?? context?.previousUsed ?? null)
-    : (context?.previousUsed ?? null);
+  // V2(chat): after a switch V1 draws the old model's last call over the new model's
+  // window until the next call, and says so in the popover (`usedModel`): the ring is off
+  // by the tokenizers' gap (~22 % between haiku-4-5 and sonnet-5) for that while. V2 could
+  // have the harness count the window on the new model at the switch, where it can.
+  const usedModel = liveNewer ? live.model : (reading?.usedModel ?? null);
+  // The figure before this one: the reading's, under a newer live call, else the one the
+  // tab held before the reading. Whatever its model — it is compared only on the same one.
+  const prior =
+    liveNewer && reading !== undefined && reading.used !== null
+      ? { used: reading.used, model: reading.usedModel }
+      : (context?.previous ?? null);
   const kind: CrumbMeter["reading"] = liveNewer
     ? "measured"
     : (reading?.reading ?? "none");
   const droppedFrom =
     prior !== null &&
-    (kind === "compacted" || (used !== null && used < prior * DROP))
-      ? prior
+    (kind === "compacted" ||
+      (used !== null &&
+        sameModel(usedModel, prior.model) &&
+        used < prior.used * DROP))
+      ? prior.used
       : null;
-  const categories = context?.categories;
+  // The newest count, only under a reading of the window it was counted on.
+  const categories = sameModel(context?.categories?.model, reading?.model)
+    ? context?.categories
+    : undefined;
   const at = liveNewer ? live.at : (reading?.measuredAt ?? null);
   return {
     used,
@@ -119,6 +145,7 @@ export const crumbMeter = (
     reading: kind,
     source: liveNewer ? "live" : reading === undefined ? null : "turn",
     model: reading?.model ?? null,
+    usedModel,
     categories: categories?.rows ?? null,
     categoriesStale:
       categories !== undefined && at !== null && categories.measuredAt < at,

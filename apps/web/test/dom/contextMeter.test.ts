@@ -10,6 +10,7 @@ import type { ConversationContext, ImporterSessionView } from "@bit/contracts";
 
 import { App, IMPORT_POLL_MS } from "../../src/lib/app.svelte";
 import { crumbMeter } from "../../src/lib/crumbMeter";
+import CrumbContextMeter from "../../src/lib/components/CrumbContextMeter.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
@@ -57,18 +58,30 @@ const harnessOf = (driver: "claude-code" | "opencode") => ({
   models: [{ id: "m" }],
 });
 
-/** Claude Code's reading after a turn, with the categories when they are asked for. */
+/** How the API spells each model's calls (measured, CLI 2.1.310). */
+const CALL_MODEL: Record<string, string> = {
+  "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+  "claude-sonnet-5": "claude-sonnet-5",
+};
+
+/**
+ * Claude Code's reading after a turn, with the categories when they are asked for. The
+ * figure is labelled with the window's model's call unless `over` says otherwise, and the
+ * categories with the window's model, as the server labels them.
+ */
 const claudeReading =
   (over: Partial<ConversationContext> = {}) =>
   (breakdown: boolean): ConversationContext => ({
     conversationId: "imp_1",
     model: "claude-haiku-4-5",
     used: 24_106,
+    usedModel: CALL_MODEL[over.model ?? "claude-haiku-4-5"] ?? null,
     window: 200_000,
     reading: "measured",
     breakdown: breakdown
       ? {
           _tag: "categories",
+          model: over.model ?? "claude-haiku-4-5",
           categories: [
             {
               id: "system_tools",
@@ -180,6 +193,9 @@ describe("the crumb bar's context meter (A6 U9)", () => {
       "Free space 182,699 91%",
     ]);
     expect(said(open)).toContain("Claude Code's own count of each part");
+    // The call's dated `claude-haiku-4-5-20251001` is the window's `claude-haiku-4-5`: no
+    // line saying the figure is another model's.
+    expect(open?.querySelector(".other-model")).toBeNull();
 
     press("Escape");
     await settle();
@@ -193,6 +209,7 @@ describe("the crumb bar's context meter (A6 U9)", () => {
       conversationId: "imp_1",
       model: "openai/gpt-5.6-sol",
       used: 13_765,
+      usedModel: "openai/gpt-5.6-sol",
       window: 400_000,
       reading: "measured",
       breakdown: { _tag: "none", reason: "harness_gives_none" },
@@ -295,6 +312,7 @@ describe("the crumb bar's context meter (A6 U9)", () => {
       outputTokens: null,
       contextLimit: 200_000,
       compactionAt: null,
+      model: "claude-haiku-4-5-20251001",
       attemptId: null,
       roundId: null,
       goalId: null,
@@ -320,77 +338,6 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(said(meterButton())).toBe("31,450");
   });
 
-  test("a switch between models is never told as a drop; a real one after it still is (A6 U9 review)", async () => {
-    let at = Date.now();
-    let answer = claudeReading({
-      model: "claude-sonnet-5",
-      used: 31_603,
-      window: 1_000_000,
-      measuredAt: at,
-    });
-    const { app, fake } = await openOn(
-      importerSessionView({ harnessInstanceId: "claude-code" }),
-      "claude-code",
-      (breakdown) => answer(breakdown),
-    );
-    const dropTold = async (): Promise<boolean> => {
-      click(meterButton());
-      await settle();
-      const told = said(panel()).includes("Down from");
-      press("Escape");
-      await settle();
-      return told;
-    };
-    const dropNow = () =>
-      crumbMeter(app.importer.contexts["imp_1"], app.liveUsage["import:imp_1"])
-        .droppedFrom;
-    // Haiku counts the same conversation about a quarter lower than sonnet-5 (measured).
-    // The switch's own reading is held: haiku's first call lands before it.
-    answer = claudeReading({ used: 31_603, measuredAt: (at += 1_000) });
-    const release = fake.holdOne("importerContext");
-    expect(await app.importer.switchModel("claude-haiku-4-5", undefined)).toBe(
-      true,
-    );
-    await settle();
-    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
-    fake.watch.send({
-      _tag: "usage",
-      callId: "msg_haiku",
-      promptTokens: 24_507,
-      outputTokens: null,
-      contextLimit: 200_000,
-      compactionAt: null,
-      attemptId: null,
-      roundId: null,
-      goalId: null,
-      importId: "imp_1",
-      at: at + 500,
-    });
-    await settle();
-    expect(said(meterButton())).toBe("24,507");
-    expect(dropNow()).toBeNull();
-    // The switch's reading lands: the old model's figure under the new model's window.
-    release();
-    await settle();
-    expect(app.importer.contexts["imp_1"]?.reading.model).toBe(
-      "claude-haiku-4-5",
-    );
-    expect(dropNow()).toBeNull();
-    expect(said(meterButton())).toBe("24,507");
-    answer = claudeReading({ used: 24_507, measuredAt: (at += 1_000) });
-    expect(await dropTold()).toBe(false);
-    await app.importer.readContext("imp_1", false, "turn");
-    await settle();
-    expect(await dropTold()).toBe(false);
-    // Back on the same model, a real compaction is told against haiku's own figure.
-    answer = claudeReading({ used: 12_000, measuredAt: at + 1_000 });
-    await app.importer.readContext("imp_1", false, "turn");
-    await settle();
-    click(meterButton());
-    await settle();
-    expect(said(panel())).toContain("Down from 24,507 tokens");
-  });
-
   test("a reading on another model than the one held, switched from elsewhere, is not a drop (A6 U9 review)", async () => {
     let answer = claudeReading({
       model: "claude-sonnet-5",
@@ -412,7 +359,7 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(said(panel())).not.toContain("Down from");
   });
 
-  test("categories counted on another model are not shown under this one's window (A6 U9 review)", async () => {
+  test("categories counted on another model are not shown under this one's window, and the open meter counts this one once (U9 review 2)", async () => {
     let at = Date.now();
     let answer = claudeReading({ measuredAt: at });
     const { app, fake } = await openOn(
@@ -465,46 +412,7 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     );
   });
 
-  test("a count out while a switch is accepted is dropped, even under the old model's name, and counted again (A6 U9 review)", async () => {
-    let at = Date.now();
-    let answer = claudeReading({ measuredAt: at });
-    const { app, fake } = await openOn(
-      importerSessionView({ harnessInstanceId: "claude-code" }),
-      "claude-code",
-      (breakdown) => answer(breakdown),
-    );
-    const sonnet = { model: "claude-sonnet-5", window: 1_000_000 };
-    let firstCount = true;
-    answer = (breakdown) => {
-      if (breakdown && firstCount) {
-        // The harness had switched, the row had not: sonnet-5's window under haiku's name,
-        // and it lands newest of all.
-        firstCount = false;
-        return claudeReading({ window: 1_000_000, measuredAt: at + 5_000 })(
-          true,
-        );
-      }
-      return claudeReading({ ...sonnet, measuredAt: (at += 1_000) })(breakdown);
-    };
-    const release = fake.holdOne("importerContext");
-    click(meterButton());
-    await settle();
-    expect(await app.importer.switchModel("claude-sonnet-5", undefined)).toBe(
-      true,
-    );
-    await settle();
-    release();
-    await settle();
-    const held = app.importer.contexts["imp_1"];
-    expect(held?.reading.model).toBe("claude-sonnet-5");
-    expect(held?.categories?.model).toBe("claude-sonnet-5");
-    expect(
-      contextCalls(fake).filter((call) => call === "imp_1 true").length,
-    ).toBe(2);
-    expect(panel()?.querySelectorAll(".row").length).toBe(3);
-  });
-
-  test("a count of the model before a switch made elsewhere is dropped and counted again (A6 U9 review)", async () => {
+  test("a count of the model before a switch made elsewhere is not shown, and counted again once (U9 review 2)", async () => {
     const at = Date.now();
     let answer = claudeReading({ measuredAt: at });
     const { app, fake } = await openOn(
@@ -537,6 +445,213 @@ describe("the crumb bar's context meter (A6 U9)", () => {
       "claude-sonnet-5",
     );
     expect(panel()?.querySelectorAll(".row").length).toBe(3);
+  });
+
+  /** A live call frame for `imp_1` on `model`. */
+  const callOn = (
+    model: string,
+    promptTokens: number,
+    at: number,
+    callId = `msg_${String(at)}`,
+  ) => ({
+    _tag: "usage" as const,
+    callId,
+    promptTokens,
+    outputTokens: null,
+    contextLimit: 200_000,
+    compactionAt: null,
+    model,
+    attemptId: null,
+    roundId: null,
+    goalId: null,
+    importId: "imp_1",
+    at,
+  });
+
+  const dropOf = (app: App) =>
+    crumbMeter(app.importer.contexts["imp_1"], app.liveUsage["import:imp_1"])
+      .droppedFrom;
+
+  test("repro 1: reloaded after a switch, the old model's figure is no baseline for the new model's call (U9 review 2)", async () => {
+    // Sonnet-5 at 31,842, switched to haiku-4-5, reloaded before haiku's first call: a
+    // fresh tab whose first reading is haiku's window over sonnet's last call.
+    const at = Date.now();
+    let answer = claudeReading({
+      used: 31_842,
+      usedModel: "claude-sonnet-5",
+      measuredAt: at,
+    });
+    const { app, fake } = await openOn(
+      importerSessionView({ harnessInstanceId: "claude-code" }),
+      "claude-code",
+      (breakdown) => answer(breakdown),
+    );
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(callOn("claude-haiku-4-5-20251001", 25_405, at + 1_000));
+    await settle();
+    expect(said(meterButton())).toBe("25,405");
+    expect(dropOf(app)).toBeNull();
+    // The turn's end reading, on haiku, told against sonnet's figure before it: no drop.
+    answer = claudeReading({ used: 25_405, measuredAt: at + 2_000 });
+    await app.importer.readContext("imp_1", false, "turn");
+    await settle();
+    click(meterButton());
+    await settle();
+    expect(said(panel())).toContain("25,405 of 200,000 tokens");
+    expect(said(panel())).not.toContain("Down from");
+  });
+
+  test("repro 2: a call the old model finishes after a switch, then a Stop, is no baseline either (U9 review 2)", async () => {
+    let at = Date.now();
+    let answer = claudeReading({
+      model: "claude-sonnet-5",
+      used: 30_000,
+      window: 1_000_000,
+      measuredAt: at,
+    });
+    const { app, fake } = await openOn(
+      importerSessionView({ harnessInstanceId: "claude-code" }),
+      "claude-code",
+      (breakdown) => answer(breakdown),
+    );
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    // Switched to haiku while a sonnet call streams: the server labels the figure sonnet's.
+    answer = claudeReading({
+      used: 30_000,
+      usedModel: "claude-sonnet-5",
+      measuredAt: (at += 1_000),
+    });
+    expect(await app.importer.switchModel("claude-haiku-4-5", undefined)).toBe(
+      true,
+    );
+    await settle();
+    // Sonnet's call lands two seconds after the switch, on sonnet.
+    fake.watch.send(callOn("claude-sonnet-5", 36_464, (at += 2_000)));
+    await settle();
+    expect(said(meterButton())).toBe("36,464");
+    // The Stop's reading: haiku's window, sonnet's last call.
+    answer = claudeReading({
+      used: 36_464,
+      usedModel: "claude-sonnet-5",
+      measuredAt: (at += 500),
+    });
+    await app.importer.stop();
+    await settle();
+    expect(dropOf(app)).toBeNull();
+    // Haiku's next call counts the same conversation lower: not a compaction.
+    fake.watch.send(callOn("claude-haiku-4-5-20251001", 28_406, at + 1_000));
+    await settle();
+    expect(said(meterButton())).toBe("28,406");
+    expect(dropOf(app)).toBeNull();
+    click(meterButton());
+    await settle();
+    expect(said(panel())).not.toContain("Down from");
+  });
+
+  test("a real drop on one model is still told, live and read (U9 review 2)", async () => {
+    let at = Date.now();
+    let answer = claudeReading({ used: 60_000, measuredAt: at });
+    const { app, fake } = await openOn(
+      importerSessionView({ harnessInstanceId: "claude-code" }),
+      "claude-code",
+      (breakdown) => answer(breakdown),
+    );
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    fake.watch.send(callOn("claude-haiku-4-5-20251001", 20_000, (at += 1_000)));
+    await settle();
+    expect(dropOf(app)).toBe(60_000);
+    answer = claudeReading({ used: 20_100, measuredAt: at + 1_000 });
+    await app.importer.readContext("imp_1", false, "turn");
+    await settle();
+    click(meterButton());
+    await settle();
+    expect(said(panel())).toContain("Down from 60,000 tokens");
+  });
+
+  test("a switch with the meter open counts the new model's rows once (U9 review 2)", async () => {
+    let at = Date.now();
+    let answer = claudeReading({ measuredAt: at });
+    const { app, fake } = await openOn(
+      importerSessionView({ harnessInstanceId: "claude-code" }),
+      "claude-code",
+      (breakdown) => answer(breakdown),
+    );
+    const counts = () =>
+      contextCalls(fake).filter((call) => call === "imp_1 true").length;
+    click(meterButton());
+    await settle();
+    expect(counts()).toBe(1);
+    expect(panel()?.querySelectorAll(".row").length).toBe(3);
+    // The switch's reading carries no rows; haiku's rows are not sonnet's window's.
+    answer = claudeReading({
+      model: "claude-sonnet-5",
+      usedModel: "claude-haiku-4-5-20251001",
+      window: 1_000_000,
+      measuredAt: (at += 1_000),
+    });
+    const release = fake.hold("importerContext");
+    expect(await app.importer.switchModel("claude-sonnet-5", undefined)).toBe(
+      true,
+    );
+    await settle();
+    // While the switch's reading is out, haiku's rows are still the window's.
+    expect(panel()?.querySelectorAll(".row").length).toBe(3);
+    release();
+    await settle();
+    expect(counts()).toBe(2);
+    expect(said(panel())).toContain("24,106 of 1,000,000 tokens");
+    expect(
+      [...(panel()?.querySelectorAll(".row") ?? [])].map((row) => said(row)),
+    ).toEqual([
+      "System tools 10,722 1%",
+      "Messages 3,331 <1%",
+      "Free space 182,699 18%",
+    ]);
+    // The figure is haiku's last call, and the popover says so.
+    expect(said(panel())).toContain(
+      "Measured on claude-haiku-4-5-20251001's last call",
+    );
+    // A later reading on the same model asks nothing more.
+    answer = claudeReading({
+      model: "claude-sonnet-5",
+      used: 31_000,
+      window: 1_000_000,
+      measuredAt: at + 1_000,
+    });
+    await app.importer.readContext("imp_1", false, "turn");
+    await settle();
+    expect(counts()).toBe(2);
+  });
+
+  test("a count that keeps coming back on another model is asked again only once (U9 review 2)", async () => {
+    let at = Date.now();
+    // A harness whose rows are always haiku's, whatever window it reads: the guard holds.
+    const answer = (breakdown: boolean): ConversationContext => {
+      const base = claudeReading({
+        model: "claude-sonnet-5",
+        window: 1_000_000,
+        measuredAt: (at += 1_000),
+      })(breakdown);
+      return base.breakdown._tag === "categories"
+        ? {
+            ...base,
+            breakdown: { ...base.breakdown, model: "claude-haiku-4-5" },
+          }
+        : base;
+    };
+    const { fake } = await openOn(
+      importerSessionView({ harnessInstanceId: "claude-code" }),
+      "claude-code",
+      (breakdown) => answer(breakdown),
+    );
+    click(meterButton());
+    await settle();
+    await settle();
+    await settle();
+    expect(
+      contextCalls(fake).filter((call) => call === "imp_1 true").length,
+    ).toBe(2);
+    expect(panel()?.querySelectorAll(".row").length).toBe(0);
   });
 
   test("opening the meter after a compaction keeps its drop note (A6 U9 review)", async () => {
@@ -721,5 +836,68 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(app.importer.current?.working).toBe(false);
     expect(contextCalls(fake).slice(before)).toEqual(["imp_1 false"]);
     expect(app.importer.contexts["imp_1"]?.cause).toBe("turn");
+  });
+});
+
+describe("the meter's popover on its own (U9 review 2)", () => {
+  const reading = (
+    over: Partial<ConversationContext> = {},
+  ): ConversationContext => ({
+    conversationId: "imp_1",
+    model: "claude-sonnet-5",
+    used: 24_106,
+    usedModel: "claude-sonnet-5",
+    window: 1_000_000,
+    reading: "measured",
+    breakdown: { _tag: "none", reason: "not_asked" },
+    measuredAt: Date.now(),
+    ...over,
+  });
+
+  test("not asked: a sentence, never an empty panel", async () => {
+    mounted.push(
+      mountInto(CrumbContextMeter, {
+        meter: crumbMeter({ reading: reading(), previous: null }, undefined),
+        harness: "Claude Code",
+      }),
+    );
+    click(meterButton());
+    await settle();
+    expect(said(panel())).toContain(
+      "Claude Code counts what fills the window only when asked, and has not counted it for claude-sonnet-5 yet.",
+    );
+  });
+
+  test("rows counted on another model are not drawn; the figure says when it is another model's", async () => {
+    mounted.push(
+      mountInto(CrumbContextMeter, {
+        meter: crumbMeter(
+          {
+            reading: reading({ usedModel: "claude-haiku-4-5-20251001" }),
+            previous: null,
+            categories: {
+              rows: [
+                {
+                  id: "free_space",
+                  name: "Free space",
+                  tokens: 175_000,
+                  kind: "free",
+                },
+              ],
+              measuredAt: Date.now(),
+              model: "claude-haiku-4-5",
+            },
+          },
+          undefined,
+        ),
+        harness: "Claude Code",
+      }),
+    );
+    click(meterButton());
+    await settle();
+    expect(panel()?.querySelectorAll(".row").length).toBe(0);
+    expect(said(panel())).toContain(
+      "Measured on claude-haiku-4-5-20251001's last call. The next call, on claude-sonnet-5, measures it again",
+    );
   });
 });

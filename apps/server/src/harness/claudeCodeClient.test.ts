@@ -1100,6 +1100,7 @@ describe("outcomes", () => {
           promptTokens: number;
           outputTokens: number | undefined;
           contextLimit: number | undefined;
+          model: string | undefined;
         } => (detail as { _tag?: string })._tag === "usage",
       );
 
@@ -1232,6 +1233,51 @@ describe("outcomes", () => {
      * certainly answered.
      */
     expect(measured[1]?.contextLimit).toBe(CONTEXT_WINDOW);
+  });
+
+  test("each call's entries name the model that made it, the result's too (U9 review 2)", async () => {
+    // Measured on CLI 2.1.310: a call's `message.model` dates haiku-4-5 and not sonnet-5.
+    const frame = (id: string, model: string): SDKMessage =>
+      ({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id,
+          model,
+          usage: {
+            input_tokens: 2,
+            cache_read_input_tokens: 9,
+            output_tokens: 1,
+          },
+          content: [{ type: "text", text: "hi" }],
+        },
+        parent_tool_use_id: null,
+        session_id: "ignored",
+        uuid: crypto.randomUUID(),
+      }) as unknown as SDKMessage;
+    const turnResult = {
+      ...(result("ignored", "success") as object),
+      usage: {
+        input_tokens: 4,
+        output_tokens: 9,
+        iterations: [{ input_tokens: 2, output_tokens: 7 }],
+      },
+    } as unknown as SDKMessage;
+    const outcome = await run([
+      frame("msg_a", "claude-haiku-4-5-20251001"),
+      // A call that started before a switch finishes on the model it started on.
+      frame("msg_b", "claude-sonnet-5"),
+      turnResult,
+    ]);
+    expect(
+      usageOf([...outcome.narrated]).map(
+        (entry) => `${entry.callId} ${entry.model ?? "-"}`,
+      ),
+    ).toEqual([
+      "msg_a claude-haiku-4-5-20251001",
+      "msg_b claude-sonnet-5",
+      "msg_b claude-sonnet-5",
+    ]);
   });
 
   test("a subagent's call narrates as its entry, its words as nothing, and does not feed the meter", async () => {
@@ -7638,8 +7684,10 @@ describe("how full a session's window is (A6 U9)", () => {
 
   test("the transcript's reading: the newest real call, a compaction after it, or none", () => {
     // The newest main-thread call, prompt side plus its stored output.
+    // …labelled with the model that made that call, in the API's own spelling.
     expect(transcriptContext([call(12_000), call(17_286, 3)])).toEqual({
       used: 10 + 1_061 + 17_286 + 3,
+      usedModel: "claude-haiku-4-5-20251001",
       reading: "measured",
     });
     // A provider refusal or the CLI's filler made no call; a sub-agent's is its own.
@@ -7659,7 +7707,11 @@ describe("how full a session's window is (A6 U9)", () => {
           { parent_tool_use_id: "toolu_1" },
         ),
       ]),
-    ).toEqual({ used: 10 + 1_061 + 12_000 + 2, reading: "measured" });
+    ).toEqual({
+      used: 10 + 1_061 + 12_000 + 2,
+      usedModel: "claude-haiku-4-5-20251001",
+      reading: "measured",
+    });
     // A compaction summary after the last call: the old size is no longer the window's.
     expect(
       transcriptContext([
@@ -7668,7 +7720,7 @@ describe("how full a session's window is (A6 U9)", () => {
         }),
         stored("user", { content: "go on" }),
       ]),
-    ).toEqual({ used: null, reading: "compacted" });
+    ).toEqual({ used: null, usedModel: null, reading: "compacted" });
     // …and a call after it is measured again.
     expect(
       transcriptContext([
@@ -7678,6 +7730,7 @@ describe("how full a session's window is (A6 U9)", () => {
     ).toBe("measured");
     expect(transcriptContext([stored("user", { content: "hi" })])).toEqual({
       used: null,
+      usedModel: null,
       reading: "no_call_yet",
     });
   });
@@ -7718,6 +7771,8 @@ describe("how full a session's window is (A6 U9)", () => {
     const plain = await reading(script, false);
     expect(plain).toEqual({
       used: 10 + 110 + 5_111 + 12_175,
+      // The stream made no call this script shows, so nothing says whose this is.
+      usedModel: null,
       window: 200_000,
       reading: "measured",
       breakdown: { _tag: "none", reason: "not_asked" },
@@ -7793,6 +7848,7 @@ describe("how full a session's window is (A6 U9)", () => {
     );
     expect(silent).toEqual({
       used: 10 + 1_061 + 20_000 + 2,
+      usedModel: "claude-haiku-4-5-20251001",
       window: null,
       reading: "measured",
       breakdown: { _tag: "none", reason: "unanswered" },
@@ -7800,10 +7856,92 @@ describe("how full a session's window is (A6 U9)", () => {
     const notHeld = await reading({ transcript: [call(20_000)] }, true, false);
     expect(notHeld).toEqual({
       used: 10 + 1_061 + 20_000 + 2,
+      usedModel: "claude-haiku-4-5-20251001",
       window: null,
       reading: "measured",
       breakdown: { _tag: "none", reason: "not_live" },
     });
+  });
+
+  /** One main-thread call's finished frame on `model`, as the CLI sends it. */
+  const callOn = (model: string, id: string, cacheRead: number): SDKMessage =>
+    ({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id,
+        model,
+        content: [{ type: "text", text: "hi" }],
+        usage: {
+          input_tokens: 2,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: cacheRead,
+          output_tokens: 1,
+        },
+      },
+      parent_tool_use_id: null,
+      session_id: "ignored",
+      uuid: crypto.randomUUID(),
+    }) as unknown as SDKMessage;
+
+  test("after a switch: the figure is the last call's model's, the window and rows the session's now (U9 review 2)", async () => {
+    /*
+     * Measured on CLI 2.1.310: right after `setModel(claude-haiku-4-5)` the answer reads
+     * `model: claude-haiku-4-5` with haiku's window and rows, while `apiUsage` is still the
+     * sonnet-5 call before it. The figure's model is the call's, never the answer's.
+     */
+    const answer = await reading(
+      {
+        messages: [
+          callOn("claude-sonnet-5", "msg_sonnet", 24_000),
+          result("s", "success"),
+        ],
+        contextUsage: () => ({ ...FULL, model: "claude-haiku-4-5" }),
+      },
+      true,
+    );
+    expect(answer.usedModel).toBe("claude-sonnet-5");
+    expect(answer.model).toBe("claude-haiku-4-5");
+    expect(
+      answer.breakdown._tag === "categories" && answer.breakdown.model,
+    ).toBe("claude-haiku-4-5");
+    // An answer naming no model: the caller's record is the window's, and the rows'.
+    const unnamed = await reading(
+      {
+        messages: [
+          callOn("claude-haiku-4-5-20251001", "msg_haiku", 24_000),
+          result("s", "success"),
+        ],
+        contextUsage: () => FULL,
+      },
+      true,
+    );
+    expect(unnamed.usedModel).toBe("claude-haiku-4-5-20251001");
+    // A count asked while a call streams: its `message_start` already named the model.
+    const streaming = await reading(
+      {
+        messages: [
+          {
+            type: "stream_event",
+            event: {
+              type: "message_start",
+              message: { id: "msg_s", model: "claude-sonnet-5" },
+            },
+            parent_tool_use_id: null,
+            session_id: "ignored",
+            uuid: crypto.randomUUID(),
+          } as unknown as SDKMessage,
+          result("s", "success"),
+        ],
+        contextUsage: () => FULL,
+      },
+      false,
+    );
+    expect(streaming.usedModel).toBe("claude-sonnet-5");
+    expect(unnamed.model).toBeUndefined();
+    expect(
+      unnamed.breakdown._tag === "categories" && unnamed.breakdown.model,
+    ).toBe("claude-haiku-4-5");
   });
 });
 

@@ -2468,6 +2468,7 @@ export class ScopeImporter extends Context.Service<
               conversationId: importId,
               model,
               used: null,
+              usedModel: null,
               window: null,
               reading: "unread",
               breakdown: { _tag: "none", reason: "unanswered" },
@@ -2492,10 +2493,13 @@ export class ScopeImporter extends Context.Service<
           );
           return yield* unread(row.model);
         }
+        // The window's model as the harness answered it, where it said (A6 U9 review 2):
+        // the row is written only once a switch has returned.
+        const { model, ...usage } = answered.success;
         return {
           conversationId: importId,
-          model: row.model,
-          ...answered.success,
+          model: model ?? row.model,
+          ...usage,
           measuredAt: yield* Clock.currentTimeMillis,
         };
       });
@@ -2596,6 +2600,7 @@ export class ScopeImporter extends Context.Service<
           conversationId: input.importId,
           model: "",
           used: null,
+          usedModel: null,
           window: null,
           reading: "unread" as const,
           breakdown: { _tag: "none" as const, reason: "unanswered" as const },
