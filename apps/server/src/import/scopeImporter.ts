@@ -123,6 +123,7 @@ import {
   type ConversationModelDraft,
   type ConversationModelSwitched,
   type ConversationActivity,
+  type ConversationContext,
   type ConversationStopped,
   type ImporterConversationView,
   type ImporterQueuedMessage,
@@ -133,6 +134,7 @@ import {
   type SteerUrgency,
 } from "@bit/contracts";
 import {
+  Clock,
   Context,
   Deferred,
   Effect,
@@ -560,6 +562,17 @@ export class ScopeImporter extends Context.Service<
       readonly targetId: string;
       readonly importId: string;
     }) => Effect.Effect<ConversationActivity, ScopeImportNotFound>;
+    /**
+     * How full one import's context window is (A6 U9): the harness's `contextUsage` for the
+     * import holding the session now, found as {@link activity} finds it, on the model its
+     * row says it is on now — which a switch updates. Never fails but for an import this
+     * target does not hold: a harness that cannot be asked answers `unread`.
+     */
+    readonly context: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+      readonly breakdown: boolean;
+    }) => Effect.Effect<ConversationContext, ScopeImportNotFound>;
     /**
      * Moves one import's session onto another model of its harness, or other options of its
      * model (A6 F4). The harness is the row's and is never changed here.
@@ -2406,6 +2419,78 @@ export class ScopeImporter extends Context.Service<
         };
       });
 
+      const context: ScopeImporter["Service"]["context"] = Effect.fn(
+        "ScopeImporter.context",
+      )(function* (input) {
+        const readRow = (importId: string) =>
+          Effect.result(
+            withTargetStore(stores, input.targetId, (store) =>
+              store.importSession(importId),
+            ),
+          );
+        const read = yield* readRow(input.importId);
+        const addressed = read._tag === "Success" ? read.success : undefined;
+        if (
+          read._tag === "Success" &&
+          (addressed === undefined || addressed.targetId !== input.targetId)
+        ) {
+          return yield* new ScopeImportNotFound({
+            reason: "unknown_import",
+            importId: input.importId,
+            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no context to measure`,
+          });
+        }
+        const importId = yield* holdingNow(
+          (addressed === undefined
+            ? undefined
+            : newerRun(input.importId, addressed)) ?? input.importId,
+        );
+        // The successor's own row: its harness session and model are the conversation's now.
+        const row =
+          importId === input.importId
+            ? addressed
+            : yield* Effect.map(readRow(importId), (again) =>
+                again._tag === "Success" &&
+                again.success?.targetId === input.targetId
+                  ? again.success
+                  : addressed,
+              );
+        const measuredAt = yield* Clock.currentTimeMillis;
+        const unread = (model: string): ConversationContext => ({
+          conversationId: importId,
+          model,
+          used: null,
+          window: null,
+          reading: "unread",
+          breakdown: { _tag: "none", reason: "unanswered" },
+          measuredAt,
+        });
+        if (row === undefined) return unread("");
+        const answered = yield* Effect.result(
+          Effect.flatMap(
+            resolver.resolve(row.harnessInstanceId ?? undefined),
+            ({ harness }) =>
+              harness.contextUsage(row.harnessSessionId, {
+                model: row.model,
+                breakdown: input.breakdown,
+              }),
+          ),
+        );
+        if (answered._tag === "Failure") {
+          yield* Effect.logDebug(
+            "an import's harness could not report its context; answering unread",
+            { importId, detail: answered.failure.message },
+          );
+          return unread(row.model);
+        }
+        return {
+          conversationId: importId,
+          model: row.model,
+          ...answered.success,
+          measuredAt,
+        };
+      });
+
       const stopTurn: ScopeImporter["Service"]["stopTurn"] = Effect.fn(
         "ScopeImporter.stopTurn",
       )(function* (input) {
@@ -2448,6 +2533,7 @@ export class ScopeImporter extends Context.Service<
         switchModel,
         stopTurn,
         activity,
+        context,
         holds: (importId) =>
           Effect.sync(() => sessions.get(importId) !== undefined),
         heldSteers: (importId) =>
@@ -2495,6 +2581,17 @@ export class ScopeImporter extends Context.Service<
           turn: "not_live",
           background: false,
         }),
+      // No harness, so nothing to ask: the reading claims nothing.
+      context: (input) =>
+        Effect.map(Clock.currentTimeMillis, (measuredAt) => ({
+          conversationId: input.importId,
+          model: "",
+          used: null,
+          window: null,
+          reading: "unread" as const,
+          breakdown: { _tag: "none" as const, reason: "unanswered" as const },
+          measuredAt,
+        })),
       // No harness, so no session this server could hold: nothing of any import runs here.
       stopTurn: (input) =>
         Effect.succeed(

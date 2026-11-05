@@ -8,6 +8,7 @@ export * from "./api";
 export * from "./modelOption";
 export * from "./conversationModel";
 export * from "./conversationTurn";
+export * from "./conversationContext";
 export * from "./observation";
 export * from "./briefing";
 export * from "./asset";

@@ -253,6 +253,14 @@ export const stubHarness = (
     // Nothing held, which is what a `runs` harness always answers. A test about a held
     // message says so.
     holding: () => Effect.succeed(false),
+    // Nothing measured, no window: what a harness that has made no call answers.
+    contextUsage: () =>
+      Effect.succeed({
+        used: null,
+        window: null,
+        reading: "no_call_yet",
+        breakdown: { _tag: "none", reason: "harness_gives_none" },
+      }),
     // Ended without recording, like `unregisterMcpServer`: a test about closing overrides it.
     endSession: () => Effect.void,
     // Empty rather than open: a suite that wants a stream which stays up until it is

@@ -338,6 +338,8 @@ interface Script {
    * Parks `sessionContinuation` until `gate` opens, signalling `entered` on the way in: a
    * message reopening an import, holding its reopen permit, and not yet opening anything.
    */
+  /** Each `contextUsage` read (A6 U9): the session, the model and whether categories were asked. */
+  readonly contextReads: string[];
   holdContinuation:
     | {
         readonly entered: Deferred.Deferred<void>;
@@ -380,6 +382,7 @@ const newScript = (readable: readonly string[]): Script => {
     holdPrompt: undefined,
     holdRegister: undefined,
     holdContinuation: undefined,
+    contextReads: [],
   };
 };
 
@@ -456,6 +459,21 @@ const scriptedHarness = (script: Script) => {
             });
             return { id };
           }),
+    contextUsage: (sessionId, read) =>
+      Effect.sync(() => {
+        script.contextReads.push(
+          `${sessionId} ${read.model} ${String(read.breakdown)}`,
+        );
+        return {
+          used: 13_765,
+          window: 200_000,
+          reading: "measured" as const,
+          breakdown: {
+            _tag: "none" as const,
+            reason: "harness_gives_none" as const,
+          },
+        };
+      }),
     switchModel: (sessionId, model, options) =>
       script
         .recordSwitch(sessionId, model, options)
@@ -3980,6 +3998,52 @@ describe("what is running in an import's session (A6 U6)", () => {
       turn: "not_live",
       background: false,
     });
+    await runtime.dispose();
+  });
+});
+
+describe("how full an import's window is (A6 U9)", () => {
+  test("asked of the session's harness on the row's model, answered for the import; an id this target does not hold is refused", async () => {
+    const { built, runtime, importId } = await liveOne();
+    const read = (id: string, breakdown: boolean) =>
+      runtime.runPromise(
+        Effect.result(
+          Effect.flatMap(ScopeImporter, (importer) =>
+            importer.context({ targetId: TARGET, importId: id, breakdown }),
+          ),
+        ),
+      );
+    const database = new Database(
+      join(built.root, "targets", TARGET, HUNT_FILE),
+      {
+        readonly: true,
+      },
+    );
+    const row = database
+      .query(
+        "SELECT model, harness_session_id FROM import_sessions WHERE import_id = ?",
+      )
+      .get(importId) as { model: string; harness_session_id: string };
+    database.close();
+    const answered = await read(importId, true);
+    expect(answered._tag).toBe("Success");
+    if (answered._tag === "Success") {
+      expect(answered.success).toMatchObject({
+        conversationId: importId,
+        model: row.model,
+        used: 13_765,
+        window: 200_000,
+        reading: "measured",
+      });
+    }
+    expect(built.script.contextReads).toEqual([
+      `${row.harness_session_id} ${row.model} true`,
+    ]);
+    const unknown = await read("imp_nonesuch", false);
+    expect(unknown._tag).toBe("Failure");
+    if (unknown._tag === "Failure") {
+      expect(unknown.failure._tag).toBe("ScopeImportNotFound");
+    }
     await runtime.dispose();
   });
 });

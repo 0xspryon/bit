@@ -49,6 +49,7 @@ import {
   ConversationStopped,
   ConversationStopRefused,
 } from "./conversationTurn";
+import { ConversationContext } from "./conversationContext";
 import { AssetView } from "./asset";
 import { ScopeEntryDraft, ScopeLabelDraft, ScopeView } from "./scope";
 import { GoalDraft, GoalEndDraft, GoalView } from "./goal";
@@ -1630,6 +1631,28 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       {
         params: { targetId: Schema.String, importId: Schema.String },
         success: ConversationActivity,
+        error: [ScopeImportNotFound, TargetNotFound, TargetUnavailable],
+      },
+    ),
+    /**
+     * How full one import's context window is, and what fills it where the harness says
+     * (A6 U9): the crumb bar's meter. Asked by the chat on opening the session, after each
+     * turn and after a model switch — never per model call, and never polled.
+     *
+     * `breakdown=1` asks for the categories too, which on Claude Code costs a token count
+     * per category (about a second, measured): the chat asks for them when the operator
+     * opens the meter. OpenCode gives no breakdown either way. Answered for the import
+     * holding the session now, as {@link importerActivity} is. A read: a harness that
+     * cannot answer is reported as a reading with nothing measured, not refused. An id this
+     * target does not hold is a `404`.
+     */
+    HttpApiEndpoint.get(
+      "importerContext",
+      "/targets/:targetId/importer-sessions/:importId/context",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        query: { breakdown: Schema.optional(Schema.Literal("1")) },
+        success: ConversationContext,
         error: [ScopeImportNotFound, TargetNotFound, TargetUnavailable],
       },
     ),

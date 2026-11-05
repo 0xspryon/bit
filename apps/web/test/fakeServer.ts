@@ -1330,6 +1330,24 @@ export class FakeServer implements ServerClient {
    * otherwise read as busy. A test of a turn the harness opened itself, or of background
    * work, sets this.
    */
+  /**
+   * One import's context reading (A6 U9). By default a session that has made no model call
+   * on a harness that gives no breakdown, measured at the test's start; a test of the
+   * meter sets this.
+   */
+  onImporterContext: (
+    ...args: Parameters<ServerClient["importerContext"]>
+  ) => Answer<"importerContext"> = (_baseUrl, _targetId, importId) =>
+    ok({
+      conversationId: importId,
+      model: "opencode/big-pickle",
+      used: null,
+      window: null,
+      reading: "no_call_yet",
+      breakdown: { _tag: "none", reason: "harness_gives_none" },
+      measuredAt: 0,
+    });
+
   onImporterActivity: (
     ...args: Parameters<ServerClient["importerActivity"]>
   ) => Answer<"importerActivity"> = (baseUrl, targetId, importId) => {
@@ -1574,6 +1592,9 @@ export class FakeServer implements ServerClient {
     this.record("importerActivity", args, () =>
       this.onImporterActivity(...args),
     );
+
+  importerContext = (...args: Parameters<ServerClient["importerContext"]>) =>
+    this.record("importerContext", args, () => this.onImporterContext(...args));
 
   stopImporterTurn = (...args: Parameters<ServerClient["stopImporterTurn"]>) =>
     this.record("stopImporterTurn", args, () =>

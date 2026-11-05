@@ -65,6 +65,7 @@ import {
 } from "../import/importerPrompt";
 import { SETTLEMENT_ASK_TIMEOUT } from "../run/settlement";
 import {
+  claudeCodeCategories,
   claudeCodeHarness,
   DEFAULT_CLI_STOP_BOUNDS,
   DEFAULT_INTERRUPT_TIMEOUT,
@@ -73,7 +74,9 @@ import {
   resultError,
   storedSteers,
   takenNarration,
+  transcriptContext,
   type ClaudeCodeHarnessOptions,
+  type ClaudeContextUsage,
   type ClaudeCodeSdk,
   type HarnessQuery,
 } from "./claudeCodeClient";
@@ -119,6 +122,13 @@ interface Script {
    * can make the read itself throw, as a busy or unreadable store does.
    */
   readonly info?: () => Partial<SDKSessionInfo>;
+  /**
+   * What `getContextUsage` answers (A6 U9), given the detail asked for; throws to stand for
+   * a session that will not answer. A window alone when absent.
+   */
+  readonly contextUsage?: (
+    detail: "summary" | "full" | undefined,
+  ) => ClaudeContextUsage;
 }
 
 const result = (
@@ -207,7 +217,8 @@ const scriptedSdk = (script: Script = {}) => {
         // The window this account gets for this model, which is the only place a Claude
         // Code limit can come from: it is session-time, not catalogue-time. See
         // `HarnessQuery.getContextUsage`.
-        getContextUsage: async () => ({ maxTokens: CONTEXT_WINDOW }),
+        getContextUsage: async (opts) =>
+          script.contextUsage?.(opts?.detail) ?? { maxTokens: CONTEXT_WINDOW },
         setModel: async (model) => {
           seen.switches.push(`model:${String(model)}`);
         },
@@ -7526,5 +7537,261 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       "task: Task killed",
     ]);
     expect(JSON.stringify(entries)).not.toContain("evil.example");
+  });
+});
+
+/* ── The context meter's reading (A6 U9) ───────────────────────────────────────── */
+
+describe("how full a session's window is (A6 U9)", () => {
+  /** A main-thread transcript entry. */
+  const stored = (
+    type: SessionMessage["type"],
+    message: unknown,
+    extra: Record<string, unknown> = {},
+  ): SessionMessage =>
+    ({
+      type,
+      uuid: `u-${String(Math.random())}`,
+      session_id: "s",
+      message,
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      ...extra,
+    }) as SessionMessage;
+
+  /** A call's usage as the CLI stores it: prompt side exact, output the start snapshot. */
+  const call = (cacheRead: number, output = 2) =>
+    stored("assistant", {
+      model: "claude-haiku-4-5-20251001",
+      content: [{ type: "text", text: "hi" }],
+      usage: {
+        input_tokens: 10,
+        cache_creation_input_tokens: 1_061,
+        cache_read_input_tokens: cacheRead,
+        output_tokens: output,
+      },
+    });
+
+  /*
+   * Recorded 2026-11-05 from CLI 2.1.310 on haiku-4-5, `getContextUsage({detail:"full"})`
+   * after one turn (rows as the CLI sent them; colours dropped).
+   */
+  const FULL = {
+    maxTokens: 200_000,
+    apiUsage: {
+      input_tokens: 10,
+      output_tokens: 110,
+      cache_creation_input_tokens: 5_111,
+      cache_read_input_tokens: 12_175,
+    },
+    categories: [
+      { id: "system_prompt", name: "System prompt", kind: "used", tokens: 108 },
+      {
+        id: "system_tools",
+        name: "System tools",
+        kind: "used",
+        tokens: 10_722,
+      },
+      {
+        id: "mcp_tools_deferred",
+        name: "MCP tools (deferred)",
+        kind: "deferred",
+        tokens: 1_833,
+      },
+      { id: "messages", name: "Messages", kind: "used", tokens: 3_331 },
+      {
+        id: "autocompact_buffer",
+        name: "Autocompact buffer",
+        kind: "buffer",
+        tokens: 33_000,
+      },
+      { id: "free_space", name: "Free space", kind: "free", tokens: 182_699 },
+      // A kind a later CLI might add: treated as absent, as the SDK's doc says.
+      { name: "Something new", kind: "novel", tokens: 5 },
+    ],
+  } satisfies ClaudeContextUsage;
+
+  test("the CLI's rows: deferred and unknown kinds left out, ids kept", () => {
+    expect(
+      claudeCodeCategories(FULL.categories).map(
+        (row) => `${row.id ?? "-"} ${row.kind} ${String(row.tokens)}`,
+      ),
+    ).toEqual([
+      "system_prompt used 108",
+      "system_tools used 10722",
+      "messages used 3331",
+      "autocompact_buffer buffer 33000",
+      "free_space free 182699",
+    ]);
+  });
+
+  test("the transcript's reading: the newest real call, a compaction after it, or none", () => {
+    // The newest main-thread call, prompt side plus its stored output.
+    expect(transcriptContext([call(12_000), call(17_286, 3)])).toEqual({
+      used: 10 + 1_061 + 17_286 + 3,
+      reading: "measured",
+    });
+    // A provider refusal or the CLI's filler made no call; a sub-agent's is its own.
+    expect(
+      transcriptContext([
+        call(12_000),
+        stored("assistant", {
+          model: "<synthetic>",
+          usage: { input_tokens: 0, output_tokens: 0 },
+        }),
+        stored(
+          "assistant",
+          {
+            model: "claude-haiku-4-5",
+            usage: { input_tokens: 999_999, output_tokens: 1 },
+          },
+          { parent_tool_use_id: "toolu_1" },
+        ),
+      ]),
+    ).toEqual({ used: 10 + 1_061 + 12_000 + 2, reading: "measured" });
+    // A compaction summary after the last call: the old size is no longer the window's.
+    expect(
+      transcriptContext([
+        stored("user", "This session is being continued…", {
+          isCompactSummary: true,
+        }),
+        stored("user", { content: "go on" }),
+      ]),
+    ).toEqual({ used: null, reading: "compacted" });
+    // …and a call after it is measured again.
+    expect(
+      transcriptContext([
+        stored("user", "summary", { isCompactSummary: true }),
+        call(12_175),
+      ]).reading,
+    ).toBe("measured");
+    expect(transcriptContext([stored("user", { content: "hi" })])).toEqual({
+      used: null,
+      reading: "no_call_yet",
+    });
+  });
+
+  /** One held session's reading, after its opening prompt, with `read`. */
+  const reading = (script: Script, breakdown: boolean, held = true) => {
+    const sessionId = newClaudeCodeSessionId();
+    return withHarness(script, (harness) =>
+      Effect.gen(function* () {
+        if (held) {
+          yield* harness.createSession({
+            title: "bit: t",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId,
+            multiTurn: true,
+          });
+          yield* harness.prompt(sessionId, "go");
+          yield* harness.waitForIdle(sessionId);
+        }
+        return yield* harness.contextUsage(sessionId, {
+          model: "claude-haiku-4-5",
+          breakdown,
+        });
+      }),
+    );
+  };
+
+  test("a held session: the last call's exact usage and its window, categories only when asked", async () => {
+    const asked: (string | undefined)[] = [];
+    const script: Script = {
+      messages: [result("s", "success")],
+      contextUsage: (detail) => {
+        asked.push(detail);
+        return FULL;
+      },
+    };
+    const plain = await reading(script, false);
+    expect(plain).toEqual({
+      used: 10 + 110 + 5_111 + 12_175,
+      window: 200_000,
+      reading: "measured",
+      breakdown: { _tag: "none", reason: "not_asked" },
+    });
+    // The cheap read, never the per-category count, unless the categories are wanted.
+    expect(asked.at(-1)).toBe("summary");
+    const full = await reading(script, true);
+    expect(asked.at(-1)).toBe("full");
+    expect(full.breakdown._tag).toBe("categories");
+    expect(
+      full.breakdown._tag === "categories"
+        ? full.breakdown.categories.map((row) => row.name)
+        : [],
+    ).toEqual([
+      "System prompt",
+      "System tools",
+      "Messages",
+      "Autocompact buffer",
+      "Free space",
+    ]);
+  });
+
+  test("a held session with no last call: the transcript says whether it is new or compacted", async () => {
+    const noCall = { maxTokens: 200_000, apiUsage: null };
+    const fresh = await reading(
+      {
+        messages: [result("s", "success")],
+        contextUsage: () => noCall,
+        transcript: [stored("user", { content: "go" })],
+      },
+      false,
+    );
+    expect(fresh).toMatchObject({
+      used: null,
+      window: 200_000,
+      reading: "no_call_yet",
+    });
+    // Measured live: `/compact` leaves `apiUsage` null until the next call.
+    const compacted = await reading(
+      {
+        messages: [result("s", "success")],
+        contextUsage: () => noCall,
+        transcript: [stored("user", "summary", { isCompactSummary: true })],
+      },
+      false,
+    );
+    expect(compacted).toMatchObject({ used: null, reading: "compacted" });
+    // A resumed session has made no call of its own yet, and is not empty.
+    const resumed = await reading(
+      {
+        messages: [result("s", "success")],
+        contextUsage: () => noCall,
+        transcript: [call(40_000)],
+      },
+      false,
+    );
+    expect(resumed).toMatchObject({
+      used: 10 + 1_061 + 40_000 + 2,
+      reading: "measured",
+    });
+  });
+
+  test("a session that will not answer, and one not held: the transcript, and no categories", async () => {
+    const silent = await reading(
+      {
+        messages: [result("s", "success")],
+        contextUsage: () => {
+          throw new Error("control channel closed");
+        },
+        transcript: [call(20_000)],
+      },
+      true,
+    );
+    expect(silent).toEqual({
+      used: 10 + 1_061 + 20_000 + 2,
+      window: null,
+      reading: "measured",
+      breakdown: { _tag: "none", reason: "unanswered" },
+    });
+    const notHeld = await reading({ transcript: [call(20_000)] }, true, false);
+    expect(notHeld).toEqual({
+      used: 10 + 1_061 + 20_000 + 2,
+      window: null,
+      reading: "measured",
+      breakdown: { _tag: "none", reason: "not_live" },
+    });
   });
 });

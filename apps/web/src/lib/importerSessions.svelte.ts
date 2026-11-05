@@ -60,6 +60,8 @@
  */
 import type {
   AgentsView,
+  ContextCategory,
+  ConversationContext,
   ConversationModelDraft,
   ConversationModelSwitched,
   ConversationStopped,
@@ -309,6 +311,36 @@ export interface ImporterServer {
     importId: string,
     update: (activity: ImporterActivity) => void,
   ) => () => void;
+  /**
+   * How full one import's context window is (A6 U9), `breakdown` asking for the categories
+   * too. `undefined` for a read that did not answer, which leaves the meter as it was.
+   */
+  readonly context: (
+    importId: string,
+    breakdown: boolean,
+  ) => Promise<ConversationContext | undefined>;
+}
+
+/**
+ * What this tab holds of one import's context window (A6 U9): the server's latest reading,
+ * the figure before it, and the categories when they were last counted.
+ */
+export interface ImporterContext {
+  readonly reading: ConversationContext;
+  /**
+   * `used` of the measured reading before {@link reading}, or `null`: what a drop — a
+   * compaction — is told against.
+   */
+  readonly previousUsed: number | null;
+  /**
+   * The categories the harness last counted, and when: kept across the cheaper readings
+   * that follow a turn, which carry none, so an open breakdown does not empty itself. A
+   * screen compares {@link ConversationContext.measuredAt} to say they predate the figure.
+   */
+  readonly categories?: {
+    readonly rows: readonly ContextCategory[];
+    readonly measuredAt: number;
+  };
 }
 
 /** What a stand-in reply says, so no one reads it as the importer's own words. */
@@ -395,6 +427,19 @@ export class ImporterSessions {
 
   /** Every session on the target, in no particular order. */
   sessions = $state.raw<readonly ImporterSession[]>([]);
+  /**
+   * Each import's context reading (A6 U9), by import id: what the crumb bar's meter draws.
+   *
+   * **Read when something can have changed it, never per model call**: on opening a
+   * session, when a turn ends, after a model switch (the window is the model's), and with
+   * categories when the operator opens the meter. Between those the meter draws the live
+   * feed's per-call frames where they are newer (`crumbMeter`).
+   */
+  contexts = $state.raw<Readonly<Record<string, ImporterContext>>>({});
+  /** Imports whose categories are being counted: the breakdown says so meanwhile. */
+  countingBreakdown = $state.raw<ReadonlySet<string>>(new Set());
+  /** Imports whose context is being read, so the list's first reading does not ask again. */
+  readonly #readingContext = new Set<string>();
   /** The one on screen. */
   currentId = $state("");
   /** What is typed in the composer and not yet sent. */
@@ -697,6 +742,15 @@ export class ImporterSessions {
     // And its words, if this is the first list that named it: `openImporter` can open a
     // session by id before the index has arrived, so the read cannot only hang off `open`.
     if (current !== undefined) void this.#loadHistory(current);
+    // And its meter, on the same first list (A6 U9).
+    const importId = current?.importId;
+    if (
+      importId !== undefined &&
+      this.contexts[importId] === undefined &&
+      !this.#readingContext.has(importId)
+    ) {
+      void this.readContext(importId);
+    }
   }
 
   /**
@@ -835,6 +889,10 @@ export class ImporterSessions {
       // rather than only in the tab that sent the message.
       if (opened.importId !== undefined && opened.ended !== true) {
         this.#watch(opened.importId);
+      }
+      // Its meter, whatever state it is in: an ended session is measured from its transcript.
+      if (opened.importId !== undefined) {
+        void this.readContext(opened.importId);
       }
       void this.#loadHistory(opened);
     }
@@ -1088,6 +1146,8 @@ export class ImporterSessions {
       if (wasWorking && !activity.running) {
         this.#turnsEnded();
         this.#rereadSettled();
+        // A turn ended: its calls are what fills the window now (A6 U9).
+        void this.readContext(importId);
       }
       // What ran wrote what it wrote: the list's tally is the server's to restate.
       if (over && busy) server.reread();
@@ -1587,6 +1647,8 @@ export class ImporterSessions {
       };
     }
     this.#switchedTo.set(switched.conversationId, switched.model);
+    // The window is the new model's (A6 U9); the figure stays the last call's until the next.
+    void this.readContext(switched.conversationId);
     this.sessions = this.sessions.map((each) =>
       each.id === session.id ||
       each.importId === importId ||
@@ -1605,6 +1667,59 @@ export class ImporterSessions {
     );
     server.reread();
     return true;
+  }
+
+  /**
+   * Reads one import's context window from the server (A6 U9), and the categories too when
+   * `breakdown` — which costs Claude Code a count per category, so it is asked only when the
+   * operator opens the meter. Keyed by the import addressed, which is the one the session
+   * on screen names; the answer's own `conversationId` may be a successor's.
+   *
+   * An answer older than the reading already held is dropped: two reads can cross, and the
+   * later-measured one is the truer. An answer for a page that was left, or one that did not
+   * come, changes nothing. Without a server — the state picker — there is nothing to ask.
+   */
+  // V2(chat): V1 reads the window on opening, at each turn's end and after a model switch,
+  // and between those draws the live feed's per-call frames; the categories are counted
+  // only when the meter is opened and not again while it stays open (they are labelled
+  // stale instead). V2 should have the server push a reading at each turn's end and after
+  // a compaction on the live feed, so every tab's meter and its breakdown follow without
+  // asking.
+  async readContext(importId: string, breakdown = false): Promise<void> {
+    const server = this.#server;
+    if (server === undefined) return;
+    if (breakdown) {
+      this.countingBreakdown = new Set([...this.countingBreakdown, importId]);
+    }
+    this.#readingContext.add(importId);
+    const answer = await server.context(importId, breakdown).finally(() => {
+      this.#readingContext.delete(importId);
+      if (!breakdown || !this.countingBreakdown.has(importId)) return;
+      const still = new Set(this.countingBreakdown);
+      still.delete(importId);
+      this.countingBreakdown = still;
+    });
+    if (answer === undefined || this.#server !== server) return;
+    const held = this.contexts[importId];
+    if (held !== undefined && answer.measuredAt < held.reading.measuredAt) {
+      return;
+    }
+    const counted =
+      answer.breakdown._tag === "categories"
+        ? { rows: answer.breakdown.categories, measuredAt: answer.measuredAt }
+        : held?.categories;
+    const before = held?.reading;
+    this.contexts = {
+      ...this.contexts,
+      [importId]: {
+        reading: answer,
+        previousUsed:
+          before?.reading === "measured" && before.used !== null
+            ? before.used
+            : (held?.previousUsed ?? null),
+        ...(counted === undefined ? {} : { categories: counted }),
+      },
+    };
   }
 
   /** A refused switch of one session, not yet dismissed, if there is one. */

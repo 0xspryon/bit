@@ -2829,6 +2829,23 @@ export class App {
       highWater: () => this.#activityHighWater() ?? 0,
       watchTurn: (importId, update) =>
         this.#watchImporterTurn(targetId, importId, update),
+      /**
+       * One import's context reading (A6 U9). An expired session signs out, as every call
+       * here does; anything else unanswered leaves the meter as it was.
+       */
+      context: async (importId, breakdown) => {
+        const call = await this.client.importerContext(
+          this.serverUrl,
+          targetId,
+          importId,
+          breakdown,
+        );
+        if (call._tag === "Ok") return call.value;
+        if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
+          this.signOut("expired");
+        }
+        return undefined;
+      },
     };
   }
 

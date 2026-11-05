@@ -1645,6 +1645,19 @@ const fleetHandlers = HttpApiBuilder.group(
       }),
 
       /**
+       * How full one import's context window is (A6 U9). The target is checked here and the
+       * import inside the importer, as its activity's are.
+       */
+      importerContext: Effect.fn(function* ({ params, query }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.context({
+          targetId: row.targetId,
+          importId: params.importId,
+          breakdown: query.breakdown === "1",
+        });
+      }),
+
+      /**
        * One import session's conversation, replayed from the harness (S6).
        *
        * The target is checked here and the import inside the importer — which reads the row

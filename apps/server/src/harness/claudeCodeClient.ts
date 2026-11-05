@@ -91,6 +91,7 @@ import { readFileSync } from "node:fs";
 
 import {
   MODEL_OPTION_DEFAULT_CHOICE,
+  type ContextCategory,
   type HarnessModelView,
   type ModelOptionDescriptor,
   type ModelOptionSelection,
@@ -133,6 +134,7 @@ import {
   subagentDescription,
   truncateNarration,
   truncateReply,
+  type HarnessContextUsage,
   type HarnessFailure,
   type HarnessNarration,
   type McpRegistration,
@@ -333,12 +335,21 @@ export interface HarnessQuery extends AsyncIterable<SDKMessage> {
    * is this account's, for the model as this session resolved it — which is exactly why it
    * must not be copied into a constant.
    *
-   * Narrowed to the one field read, like `setMcpServers`' return: the SDK's own response is
-   * a dozen fields of category breakdown, and `totalTokens` among them is a *category
-   * estimate* that did not move between two turns whose real contexts differed. The meter's
-   * numerator comes from the stream; only the denominator comes from here.
+   * Narrowed to the fields read, like `setMcpServers`' return. `totalTokens` is left out on
+   * purpose: it is a *category estimate* that did not move between two turns whose real
+   * contexts differed. The meter's numerator is the last call's exact `apiUsage` (or the
+   * stream's per-call frames); the categories are what the crumb bar's breakdown shows
+   * (A6 U9).
+   *
+   * `detail: "summary"` answers from the last response and local estimates in 10–60 ms;
+   * `"full"` (the SDK's default) counts every category with the token-count API, ~1 s
+   * (measured, CLI 2.1.310 on haiku-4-5, 2026-11-05). In summary mode the category
+   * figures are rough — system tools read 21 534 against a counted 10 722, and "Messages"
+   * read 5 after a turn — so only a screen showing the categories asks for `full`.
    */
-  getContextUsage(): Promise<{ readonly maxTokens?: number }>;
+  getContextUsage(opts?: {
+    readonly detail?: "summary" | "full";
+  }): Promise<ClaudeContextUsage>;
   /**
    * Moves the live session onto another model, from its next response.
    *
@@ -361,6 +372,31 @@ export interface HarnessQuery extends AsyncIterable<SDKMessage> {
     readonly effortLevel: EffortLevel | null;
   }): Promise<void>;
   close(): void;
+}
+
+/**
+ * The part of the CLI's `get_context_usage` answer this harness reads ({@link
+ * HarnessQuery.getContextUsage}). All optional, so a test can answer with only a window.
+ */
+export interface ClaudeContextUsage {
+  /** The window of the session's model, for this account. */
+  readonly maxTokens?: number;
+  /**
+   * The last model call's exact usage, or `null` before any call — and after a
+   * compaction, until the next (measured: `/compact` left it `null`).
+   */
+  readonly apiUsage?: {
+    readonly input_tokens: number;
+    readonly output_tokens: number;
+    readonly cache_creation_input_tokens: number;
+    readonly cache_read_input_tokens: number;
+  } | null;
+  readonly categories?: readonly {
+    readonly id?: string;
+    readonly name: string;
+    readonly tokens: number;
+    readonly kind: string;
+  }[];
 }
 
 /**
@@ -1970,6 +2006,83 @@ const outcomeOf = (
 };
 
 /**
+ * The CLI's category rows as the contract carries them (A6 U9). `deferred` rows — tool
+ * schemas held out of the window until a call loads them — are not in the window and are
+ * left out, as is any kind a later CLI adds: its own doc says to treat an unknown one as
+ * absent.
+ */
+export const claudeCodeCategories = (
+  rows: NonNullable<ClaudeContextUsage["categories"]>,
+): readonly ContextCategory[] =>
+  rows.flatMap((row) =>
+    (row.kind === "used" || row.kind === "buffer" || row.kind === "free") &&
+    Number.isFinite(row.tokens)
+      ? [
+          {
+            id: row.id ?? null,
+            name: row.name,
+            tokens: Math.max(0, Math.round(row.tokens)),
+            kind: row.kind,
+          },
+        ]
+      : [],
+  );
+
+/** A call's usage as the API reports it: prompt side and output. */
+interface CallUsage {
+  readonly input_tokens?: unknown;
+  readonly output_tokens?: unknown;
+  readonly cache_creation_input_tokens?: unknown;
+  readonly cache_read_input_tokens?: unknown;
+}
+
+const tokensIn = (value: unknown): number =>
+  typeof value === "number" && Number.isFinite(value) ? value : 0;
+
+/** One call's tokens in the window: sent (uncached, cache write, cache read) plus generated. */
+const callTokens = (usage: CallUsage): number =>
+  tokensIn(usage.input_tokens) +
+  tokensIn(usage.cache_creation_input_tokens) +
+  tokensIn(usage.cache_read_input_tokens) +
+  tokensIn(usage.output_tokens);
+
+/**
+ * How full the window was on the last model call the stored transcript holds (A6 U9): what
+ * a session this process does not hold is measured by, and a live one before its first
+ * call (a resume) or just after a compaction.
+ *
+ * The newest main-thread `assistant` entry with usage, read from the end. Its
+ * `output_tokens` is the stream's start snapshot (the CLI writes each block with the usage
+ * it started with), so the figure runs short by what that call generated — tens to hundreds
+ * of tokens against a window of hundreds of thousands. A `<synthetic>` entry (a provider
+ * refusal, or the CLI's own filler) made no call and is passed over.
+ *
+ * A compaction summary met first means the conversation was summarised after its last
+ * call: `getSessionMessages` starts its read at the summary, so the calls before it are not
+ * in the read at all. That is `compacted`, not a figure. Nothing at all is `no_call_yet`.
+ */
+export const transcriptContext = (
+  entries: readonly SessionMessage[],
+): Pick<HarnessContextUsage, "used" | "reading"> => {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry === undefined || entry.parent_tool_use_id !== null) continue;
+    if ((entry as { readonly isCompactSummary?: unknown }).isCompactSummary) {
+      return { used: null, reading: "compacted" };
+    }
+    if (entry.type !== "assistant") continue;
+    const message = entry.message as
+      { readonly model?: unknown; readonly usage?: CallUsage } | undefined;
+    if (message?.model === "<synthetic>" || message?.usage === undefined) {
+      continue;
+    }
+    const used = callTokens(message.usage);
+    if (used > 0) return { used, reading: "measured" };
+  }
+  return { used: null, reading: "no_call_yet" };
+};
+
+/**
  * The CLI's interrupt marker's text, if a `user` message's content is one: a single text
  * block opening `[Request interrupted by user` (`… for tool use]` when a tool call was
  * cut). What the CLI writes in the user's place where a Stop landed — stored, and sent live
@@ -3074,7 +3187,10 @@ export const claudeCodeHarness = (
               Effect.timeout(
                 Effect.tap(
                   Effect.tryPromise({
-                    try: () => live.getContextUsage(),
+                    // `summary`: the window is the same either way, and `full` would
+                    // count every category (~1 s of token-count calls) on each launch
+                    // and switch for a figure nobody reads here.
+                    try: () => live.getContextUsage({ detail: "summary" }),
                     catch: (cause) =>
                       transport(
                         "context_usage",
@@ -4011,6 +4127,102 @@ export const claudeCodeHarness = (
           : ({ _tag: "titled", title } satisfies SessionTitle);
       });
 
+      /**
+       * How full one session's window is (A6 U9). See `AgentHarness.contextUsage`.
+       *
+       * A session this process holds is asked over its control channel — a read the CLI
+       * answers between and during turns, in 10–60 ms with `summary` and about a second
+       * with `full`, which is what the categories need. Its `apiUsage` is the last call's
+       * exact usage; `null` before any call and after a compaction, and then the stored
+       * transcript says which ({@link transcriptContext}) — a resumed session has no call
+       * of its own yet and is not empty. A session not held, or one that would not answer,
+       * is the transcript's reading alone, with the window this process last read for it.
+       */
+      // V2(chat): a session this process does not hold (ended, or the server restarted) is
+      // measured from its transcript, whose stored `output_tokens` is the stream's start
+      // snapshot, and with no window: Claude Code states one only to a live session. V1's
+      // meter then shows a slightly short count and no fraction. V2 should record the
+      // window per session when it is read (the import row) and read the true output from
+      // the turn's `result` usage, so a reloaded meter after a restart is as exact as a live one.
+      const contextUsage: AgentHarness["Service"]["contextUsage"] = Effect.fn(
+        "claudeCodeHarness.contextUsage",
+      )(function* (sessionId, read) {
+        const record = sessions.get(sessionId);
+        const live =
+          record !== undefined && !record.closed ? record.query : undefined;
+        const answer =
+          live === undefined
+            ? undefined
+            : yield* Effect.tryPromise({
+                try: () =>
+                  live.getContextUsage({
+                    detail: read.breakdown ? "full" : "summary",
+                  }),
+                catch: (cause) =>
+                  transport(
+                    "context_usage",
+                    `the session would not report its context: ${String(cause)}`,
+                  ),
+              }).pipe(
+                // The control bound, which is room enough for `full`'s token counts.
+                Effect.timeoutOrElse({
+                  duration: controlTimeout,
+                  orElse: () => Effect.succeed(undefined),
+                }),
+                Effect.catch((failure) =>
+                  Effect.as(
+                    Effect.logDebug(
+                      "a Claude Code session would not report its context; reading the transcript",
+                      { sessionId, detail: failure.message },
+                    ),
+                    undefined,
+                  ),
+                ),
+              );
+        const max = answer?.maxTokens;
+        const window =
+          max !== undefined && Number.isFinite(max) && max > 0
+            ? max
+            : (record?.contextLimit ?? null);
+        if (answer !== undefined && max !== undefined && record !== undefined) {
+          record.contextLimit = window ?? undefined;
+        }
+        const breakdown: HarnessContextUsage["breakdown"] =
+          live === undefined
+            ? { _tag: "none", reason: "not_live" }
+            : answer === undefined
+              ? { _tag: "none", reason: "unanswered" }
+              : !read.breakdown || answer.categories === undefined
+                ? { _tag: "none", reason: "not_asked" }
+                : {
+                    _tag: "categories",
+                    categories: claudeCodeCategories(answer.categories),
+                  };
+        const api = answer?.apiUsage;
+        if (api !== undefined && api !== null) {
+          return {
+            used: callTokens(api),
+            window,
+            reading: "measured",
+            breakdown,
+          };
+        }
+        const directory = record?.directory;
+        const stored = yield* Effect.tryPromise({
+          try: () =>
+            sdk.sessionMessages(
+              sessionId,
+              directory === undefined ? {} : { dir: directory },
+            ),
+          catch: (cause) =>
+            transport(
+              "message.list",
+              `could not read session ${sessionId}'s transcript: ${String(cause)}`,
+            ),
+        });
+        return { ...transcriptContext(stored), window, breakdown };
+      });
+
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(
         "claudeCodeHarness.messages",
       )(function* (sessionId, read) {
@@ -4256,6 +4468,7 @@ export const claudeCodeHarness = (
         prompt,
         waitForIdle,
         sessionStatus,
+        contextUsage,
         sessionContinuation,
         sessionTitle,
         messages,

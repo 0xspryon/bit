@@ -19,6 +19,7 @@
    *   ones kept but dimmed — with "New goal" at its foot.
    */
   import Badge from "./Badge.svelte";
+  import CrumbContextMeter from "./CrumbContextMeter.svelte";
   import CrumbPicker from "./CrumbPicker.svelte";
   import {
     IconAngleRight,
@@ -32,6 +33,7 @@
   } from "../icons";
   import { countsLine, goalTitle, statusLabel, whenText } from "../goalFormat";
   import { navGlyphs } from "../navGlyphs";
+  import { crumbMeter } from "../crumbMeter";
   import { sessionLabel, sessionWhen, tallyLine } from "../importerChat";
   import { navItems } from "../mock";
   import type { App } from "../app.svelte";
@@ -56,6 +58,26 @@
   );
   let sessionName = $derived(
     importer.current === undefined ? "" : sessionLabel(importer.current),
+  );
+  /**
+   * The session's context meter (A6 U9, D3), beside its crumb: the server's reading for its
+   * import, and the live feed's newest call frame for it where that is newer. The empty
+   * session before its first message has neither, and reads "0" as D3's first screen does.
+   */
+  // V2(chat): only the importer's crumb bar has this meter. The goal conversation keeps
+  // `ContextMeter` in its own pane, fed by live frames alone, so it shows nothing after a
+  // reload and no categories. V2 should give the goal conversation the same reading
+  // (`ConversationContext`, a goal route) and one meter component for both.
+  let contextImport = $derived(importer.current?.importId);
+  let meter = $derived(
+    crumbMeter(
+      contextImport === undefined
+        ? undefined
+        : importer.contexts[contextImport],
+      contextImport === undefined
+        ? undefined
+        : app.liveUsage[`import:${contextImport}`],
+    ),
   );
   let sessionRows = $derived(
     importer.listed.filter((session) =>
@@ -338,6 +360,19 @@
   {/if}
 
   <div class="right">
+    {#if importerShown}
+      <CrumbContextMeter
+        {meter}
+        harness={importer.current?.harness ?? "This harness"}
+        counting={contextImport !== undefined &&
+          importer.countingBreakdown.has(contextImport)}
+        onopen={() => {
+          if (contextImport !== undefined) {
+            void importer.readContext(contextImport, true);
+          }
+        }}
+      />
+    {/if}
     {#if importerShown && importer.current !== undefined}
       <CrumbPicker
         label="Importer sessions"

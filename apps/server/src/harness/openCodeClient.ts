@@ -99,6 +99,7 @@ import {
   truncateNarration,
   truncateReply,
   type BlockChannel,
+  type HarnessContextUsage,
   type HarnessNarration,
   type MessageEntry,
   type MessagePart,
@@ -1294,6 +1295,51 @@ const flatten = (
 };
 
 /**
+ * How full the window was on the session's newest stored model call (A6 U9), from
+ * `message.list` entries **newest first**.
+ *
+ * The newest `assistant` message with tokens, summed as OpenCode's own meter sums it
+ * (`packages/tui/src/util/session.ts` `contextUsage`): `input + output + reasoning +
+ * cache.read + cache.write` — `input` is the uncached remainder and `reasoning` sits beside
+ * `output` on this harness (DECISIONS.md §24.4). A **completed** `compaction` message met
+ * first means the conversation was summarised after that call, and the call's size no
+ * longer describes the window: `compacted`, measured again by the next call. A running or
+ * failed compaction changed nothing yet. `undefined` when this page holds neither, for the
+ * caller to read on.
+ */
+const tokenCount = (value: unknown): number =>
+  typeof value === "number" && Number.isFinite(value) ? value : 0;
+
+export const openCodeContext = (
+  newestFirst: readonly unknown[],
+): Pick<HarnessContextUsage, "used" | "reading"> | undefined => {
+  for (const entry of newestFirst) {
+    const message = (entry ?? {}) as {
+      readonly type?: unknown;
+      readonly status?: unknown;
+      readonly tokens?: {
+        readonly input?: unknown;
+        readonly output?: unknown;
+        readonly reasoning?: unknown;
+        readonly cache?: { readonly read?: unknown; readonly write?: unknown };
+      };
+    };
+    if (message.type === "compaction" && message.status === "completed") {
+      return { used: null, reading: "compacted" };
+    }
+    if (message.type !== "assistant" || message.tokens === undefined) continue;
+    const used =
+      tokenCount(message.tokens.input) +
+      tokenCount(message.tokens.output) +
+      tokenCount(message.tokens.reasoning) +
+      tokenCount(message.tokens.cache?.read) +
+      tokenCount(message.tokens.cache?.write);
+    if (used > 0) return { used, reading: "measured" };
+  }
+  return undefined;
+};
+
+/**
  * Messages asked for per `message.list` page: the server's own maximum
  * (`SessionMessagesQuery`: `limit` is 1..200), so a long session costs the fewest requests.
  */
@@ -2330,6 +2376,52 @@ export const openCodeHarness = (
         });
       });
 
+      /**
+       * How full one session's window is (A6 U9). See `AgentHarness.contextUsage`.
+       *
+       * The newest stored call, read newest first a page at a time until one is found
+       * ({@link openCodeContext}) — one request for any session that has run — and the
+       * catalogue's window for the model the caller says the session is on now, so a switch
+       * moves the window before the next call is made. OpenCode stores every session, so a
+       * session this process does not hold answers the same. No categories: OpenCode
+       * publishes none.
+       *
+       * V2(chat): OpenCode gives tokens per call and a window per model, and nothing per
+       * category, so V1's meter shows the total and the window with a line saying the
+       * harness gives no breakdown. V2 could estimate one from the session's own parts
+       * (system prompt, tool schemas, messages by role), labelled as bit's estimate.
+       */
+      const contextUsage: AgentHarness["Service"]["contextUsage"] = Effect.fn(
+        "openCodeHarness.contextUsage",
+      )(function* (sessionId, read) {
+        const window =
+          models.find((model) => model.id === read.model)?.contextLimit ??
+          contextLimits.get(sessionId)?.contextLimit ??
+          null;
+        const breakdown = {
+          _tag: "none",
+          reason: "harness_gives_none",
+        } as const;
+        let cursor: string | undefined;
+        for (let page = 0; page < MESSAGE_PAGE_CEILING; page += 1) {
+          const listed = yield* bounded(
+            "message.list",
+            timeouts.control,
+            api.message.list({
+              sessionID: sessionId as Session.ID,
+              limit: MESSAGE_PAGE_SIZE,
+              ...(cursor === undefined ? { order: "desc" } : { cursor }),
+            }),
+          );
+          const found = openCodeContext(listed.data);
+          if (found !== undefined) return { ...found, window, breakdown };
+          const next = listed.cursor.next;
+          if (listed.data.length === 0 || typeof next !== "string") break;
+          cursor = next;
+        }
+        return { used: null, window, reading: "no_call_yet", breakdown };
+      });
+
       const interruptSession: AgentHarness["Service"]["interruptSession"] =
         Effect.fn("openCodeHarness.interruptSession")(function* (sessionId) {
           const result = yield* bounded(
@@ -2498,6 +2590,7 @@ export const openCodeHarness = (
         unregisterMcpServer,
         createSession,
         switchModel,
+        contextUsage,
         prompt,
         waitForIdle,
         sessionStatus,

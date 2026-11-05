@@ -4693,6 +4693,32 @@ describe("a target's importer sessions", () => {
     expect(elsewhere.status).toBe(404);
   });
 
+  test("a session's context with no harness claims nothing, `breakdown` is checked, and an unknown target is a 404 (A6 U9)", async () => {
+    const context = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/context?breakdown=1`,
+      ),
+    );
+    expect(context.status).toBe(200);
+    expect(context.body).toMatchObject({
+      conversationId: "imp_old",
+      used: null,
+      window: null,
+      reading: "unread",
+      breakdown: { _tag: "none", reason: "unanswered" },
+    });
+    const odd = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/context?breakdown=yes`,
+      ),
+    );
+    expect(odd.status).toBe(400);
+    const elsewhere = await read(
+      await signedIn("/targets/not-a-target/importer-sessions/imp_old/context"),
+    );
+    expect(elsewhere.status).toBe(404);
+  });
+
   test("a message to an unknown target is a 404 before the importer is asked", async () => {
     const response = await read(
       await signedIn(

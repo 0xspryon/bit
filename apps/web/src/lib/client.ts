@@ -963,6 +963,25 @@ export const server = {
     ),
 
   /**
+   * How full one import's context window is (A6 U9); `breakdown` asks for the categories
+   * too, which the server counts only when asked.
+   */
+  importerContext: (
+    baseUrl: string,
+    targetId: string,
+    importId: string,
+    breakdown: boolean,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.importerContext({
+          params: { targetId, importId },
+          query: breakdown ? { breakdown: "1" } : {},
+        }),
+      ),
+    ),
+
+  /**
    * Moves one import's session onto another model of its harness, or other options of its
    * model (A6 F4). The answer's `applied` says whether the harness took it live — from its
    * next model call — or only the record changed, for the next message to reopen on; a

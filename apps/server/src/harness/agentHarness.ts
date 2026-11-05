@@ -88,7 +88,11 @@
  * Had this been a free function the supervisor chose between, the supervisor would branch
  * on driver kind, which is the one thing this slice is trying to make impossible.
  */
-import type { ModelOptionSelection } from "@bit/contracts";
+import type {
+  ContextBreakdown,
+  ContextReading,
+  ModelOptionSelection,
+} from "@bit/contracts";
 import {
   Context,
   type Effect,
@@ -162,6 +166,35 @@ export type TerminalOutcome = typeof TerminalOutcome.Type;
  * defect above.
  */
 export type SessionActivity = "running" | "idle";
+
+/** What {@link AgentHarness.contextUsage} is asked for (A6 U9). */
+export interface ContextRead {
+  /**
+   * The model the session is on now, by the caller's record — which a model switch
+   * updates. OpenCode's window is this model's catalogue entry; Claude Code's comes from
+   * the live session and this is not read.
+   */
+  readonly model: string;
+  /**
+   * Whether to ask for the categories too. On Claude Code they cost a token count per
+   * category (about a second, measured 2026-11-05), so only a screen showing them asks.
+   */
+  readonly breakdown: boolean;
+}
+
+/**
+ * One session's context window, as its harness answered (A6 U9): the shape of
+ * `ConversationContext` without the identity the caller adds.
+ *
+ * `used` is **the last model call's** tokens sent plus generated, never a spend total
+ * (DECISIONS.md §24.4), and `null` unless `reading` is `measured`.
+ */
+export interface HarnessContextUsage {
+  readonly used: number | null;
+  readonly window: number | null;
+  readonly reading: ContextReading;
+  readonly breakdown: ContextBreakdown;
+}
 
 /**
  * What the harness currently says about one session.
@@ -1324,6 +1357,22 @@ export class AgentHarness extends Context.Service<
     readonly sessionStatus: (
       sessionId: string,
     ) => Effect.Effect<SessionStatus, HarnessFailure>;
+    /**
+     * How full one session's context window is, and what fills it where the harness can
+     * say (A6 U9). A read for a meter, asked when a screen asks — on opening a conversation,
+     * after a turn, after a model switch — and never per model call.
+     *
+     * Claude Code answers a session this process holds from the CLI's own
+     * `getContextUsage()`: the last call's exact usage, the model's window, and — when
+     * `read.breakdown` — the CLI's category counts. One it does not hold is read from the
+     * stored transcript, with no window and no categories. OpenCode answers from the
+     * session's newest stored call and the catalogue's window for `read.model`, and has no
+     * categories to give. See {@link HarnessContextUsage}.
+     */
+    readonly contextUsage: (
+      sessionId: string,
+      read: ContextRead,
+    ) => Effect.Effect<HarnessContextUsage, HarnessFailure>;
     /**
      * Whether a session this process no longer holds can be continued (S6).
      *

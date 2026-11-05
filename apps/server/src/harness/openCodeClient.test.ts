@@ -35,6 +35,7 @@ import {
 } from "./agentHarness";
 import {
   openCodeCompactionAt,
+  openCodeContext,
   openCodeHarness,
   openCodeNarration,
   openCodeSubagents,
@@ -3780,5 +3781,119 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       items.filter((item) => item.kind === "subagent").map(shape);
     expect(agents(liveItems)).toEqual(agents(replayed));
     expect(agents(replayed)).toHaveLength(4);
+  });
+});
+
+/* ── The context meter's reading (A6 U9) ───────────────────────────────────────── */
+
+describe("how full a session's window is (A6 U9)", () => {
+  const assistantWith = (tokens: unknown) => ({
+    type: "assistant",
+    model: { id: "glm-5.3-flash-free", providerID: "opencode" },
+    tokens,
+  });
+  const TOKENS = {
+    input: 150,
+    output: 3,
+    reasoning: 12,
+    cache: { read: 13_600, write: 0 },
+  };
+
+  test("the newest call, summed as OpenCode's own meter sums it; a completed compaction after it", () => {
+    // Newest first. DECISIONS.md §24.4's fifth call plus some reasoning: 13 765.
+    expect(
+      openCodeContext([
+        { type: "user", text: "go on" },
+        assistantWith(TOKENS),
+        assistantWith({ ...TOKENS, input: 99_999 }),
+      ]),
+    ).toEqual({ used: 150 + 3 + 12 + 13_600, reading: "measured" });
+    // A call with no tokens yet (still streaming) is passed over for the one before it.
+    expect(
+      openCodeContext([assistantWith(undefined), assistantWith(TOKENS)])?.used,
+    ).toBe(13_765);
+    expect(
+      openCodeContext([
+        { type: "compaction", status: "completed", summary: "…" },
+        assistantWith(TOKENS),
+      ]),
+    ).toEqual({ used: null, reading: "compacted" });
+    // Running or failed: nothing was rewritten yet.
+    for (const status of ["running", "failed"]) {
+      expect(
+        openCodeContext([{ type: "compaction", status }, assistantWith(TOKENS)])
+          ?.reading,
+      ).toBe("measured");
+    }
+    expect(openCodeContext([{ type: "user", text: "hi" }])).toBeUndefined();
+  });
+
+  test("a session's reading: one newest-first page, and the window of the model the caller names", async () => {
+    const pages: URL[] = [];
+    const { layer } = clientWith((url) => {
+      if (url.includes("/api/model")) {
+        return json({
+          location: { directory: "/tmp" },
+          data: [catalogueEntry, defaultCatalogueEntry],
+        });
+      }
+      if (url.includes("/message")) {
+        pages.push(new URL(url));
+        // Shapes the client decodes, as a live 2.2.5 answers them (newest first).
+        return json({
+          data: [
+            {
+              id: "msg_000000000002AAAAAAAAAAAAAA",
+              time: { created: 1_793_577_000_002 },
+              text: "go",
+              type: "user",
+            },
+            {
+              id: "msg_000000000001AAAAAAAAAAAAAA",
+              time: {
+                created: 1_793_577_000_001,
+                completed: 1_793_577_000_002,
+              },
+              type: "assistant",
+              agent: "build",
+              model: { id: "glm-5.3-flash-free", providerID: "opencode" },
+              content: [{ type: "text", text: "hi" }],
+              finish: "stop",
+              rawFinish: "stop",
+              cost: 0,
+              tokens: TOKENS,
+            },
+          ],
+          cursor: { previous: null, next: "c2" },
+        });
+      }
+      return json(sessionInfo());
+    });
+    const read = (model: string) =>
+      Effect.runPromise(
+        Effect.scoped(
+          Effect.provide(
+            Effect.flatMap(AgentHarness, (client) =>
+              client.contextUsage("ses_1", { model, breakdown: true }),
+            ),
+            layer,
+          ),
+        ),
+      );
+    expect(await read("opencode/glm-5.3-flash-free")).toEqual({
+      used: 13_765,
+      window: 200_000,
+      reading: "measured",
+      breakdown: { _tag: "none", reason: "harness_gives_none" },
+    });
+    // Switched: the same last call, against the new model's window.
+    expect((await read("openai/gpt-5.6-sol")).window).toBe(400_000);
+    // A model the catalogue does not list states no window.
+    expect((await read("opencode/unlisted")).window).toBeNull();
+    expect(pages.map((page) => page.searchParams.get("order"))).toEqual([
+      "desc",
+      "desc",
+      "desc",
+    ]);
   });
 });
