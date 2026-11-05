@@ -219,6 +219,20 @@ a URL that keeps the operator on the importer page. The server half of S9 is don
 contract); this task is the web half. Spec S9: session named from the harness title (with its five
 constraints), the write summary ("7 in · 3 out · 14 assets"), the model it ended on, the
 date, **Start a new session**; an older session read-only until the operator types.
+**A7 (operator, 2026-11-05): U8 also builds A7's E1, E2, E5 and E6**
+(`docs/superpowers/design/A7-agent-sessions.html`) on the existing `screens/AgentSessions.svelte`:
+- grouping and filters replace that page's "no grouping, no filters" rule;
+- Active is grouped Needs you / Running / Idle, with a second line of what each session is
+  doing (last tool, call count);
+- Active/Ended/All tabs with counts, a Needs you toggle with an "N more hidden" line, an
+  agent filter and a text filter;
+- Ended is grouped by day with outcome marks (completed, stopped by you, failed with
+  "resumable", empty), and a deleted surface is struck through but its transcript still opens;
+- **server-side pagination** for Ended: 25/50/100 rows, range and total, and each day's full
+  count on every page;
+- the sidebar entry under Operations: a warning count of sessions waiting on you, falling back
+  to a quiet active count.
+"Needs you" stays empty until A7-Q lands.
 
 **U9 — D3 context meter (S).** Ring and token count in the crumb bar, clickable to show what
 fills the window: Claude Code's `getContextUsage()` categories; on OpenCode, tokens and
@@ -275,6 +289,42 @@ a visible note that viewing a sub-agent's content is postponed to V2, and the co
 a `V2(chat):` comment: proper V2 replays the sub-agent's own transcript (Claude Code keeps
 it in a `subagents/` folder) labelled as the sub-agent's.
 
+**A7-Q — The question dock (M+M), U13 → A7-Q. Decided by the operator (2026-11-05).** A7's E3/E4.
+- Follow T3: each harness's **native** question mechanism maps onto one pending-question
+  contract, whose answerability is `live`, `message` or `not_resumable`.
+- **OpenCode 2.2.5: forms.** The 1.x question API is gone; the model's `question` tool *is* a
+  form (`metadata.kind: "question"`, fields `q0…qN`). Use the `form.created`, `form.replied`
+  and `form.cancelled` events; `session.form.list` on (re)connect; `session.form.reply` to
+  answer; `session.form.cancel` to dismiss. A `FormAlreadySettledError` counts as settled.
+  Forms are in memory only, so an OpenCode restart loses them.
+- **Claude Code:** `AskUserQuestion`, caught in `canUseTool` and answered as T3 does (`allow`
+  with `updatedInput` carrying `answers`). Limits: at most 4 questions and 4 options each, no
+  required flag, answers keyed by question text.
+- **The dock:** it always uses the full interface with Jump to, even for 1–4 questions. It is
+  **dismissible**: dismissing cancels the native request so the agent is told the operator
+  declined. A question that is no longer answerable offers to send the answers as an
+  ordinary message.
+- **Waiting on you:** pending questions drive E1's Needs you group and E6's warning count.
+- Step 0 measures each harness live: an interrupt while waiting, a reload, a restart, and a
+  dismiss.
+
+**A7-S — Sub-agent cards and panel (M), A7-Q → A7-S. Decided by the operator (2026-11-05):
+replaces U14's "omit content".** A7's E7/E8.
+- **Cards:**
+  - running cards show their last tool lines, the current activity, the time and the call
+    count;
+  - finished cards quote what was returned to the parent;
+  - failed cards carry a danger tint, the reason and the raw error;
+  - "Open its thread" is disabled until V2, and keeps its `V2(chat):` note.
+- **Stop:**
+  - a per-card Stop for background sub-agents (`stopTask`);
+  - **hidden, with the reason, for a foreground Claude Code sub-agent**, since only the whole
+    turn can be stopped;
+  - on OpenCode, interrupt the child session, measured first;
+  - "Stop all".
+- **E8:** a header chip ("N sub-agents · running · failed") opens a 400px reflowing panel
+  grouped Running / Failed / Finished, and selecting a row scrolls to its card.
+
 **F12 — Built server cannot open Claude Code sessions (S), last.** `bun dist/main.js`
 refuses every Claude Code import with `import_ungated`: it resolves the policy hook at
 `apps/plugins/claudeCodeGate.ts`, which does not exist (`bun src/main.ts` works). Fix the
@@ -288,7 +338,7 @@ and checks the UI in a real browser (headless Chrome over CDP on the dev server)
 width and up. Fixes go back to the implementer; the next slice starts after review passes.
 
 F1, F2, F3, F4, F5, F6, F7, F8, F10, F9, U1, U10, U14, U12, U11, U2, U7, U3, U4, U5, U6, U9,
-U8, U13, F12.
+U8, U13, A7-Q, A7-S, F12.
 
 ## Known issues found along the way (not in any slice)
 
