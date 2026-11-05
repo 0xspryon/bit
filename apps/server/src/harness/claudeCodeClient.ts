@@ -4201,6 +4201,13 @@ export const claudeCodeHarness = (
        * The directory is passed when this process holds the session, so the SDK reads one
        * project's folder rather than searching all of them; otherwise it searches.
        */
+      // V2(chat): the CLI's `ai-title` is generated from the whole first prompt, which is
+      // mostly this server's importer framing, so unrelated sessions on one target come out
+      // with the same name (live in U8 on claude-haiku-4-5: two sessions with different
+      // operator messages were both "Acme bug bounty scope review"). V1 shows it as the
+      // harness gave it, and the D5 row's date is what tells such sessions apart. The fix —
+      // a title bit authors from the operator's own words, or none — waits on an operator
+      // decision about bit-authored titles.
       const sessionTitle: AgentHarness["Service"]["sessionTitle"] = Effect.fn(
         "claudeCodeHarness.sessionTitle",
       )(function* (sessionId) {

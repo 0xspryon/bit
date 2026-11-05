@@ -991,9 +991,13 @@ export class ScopeImporter extends Context.Service<
               // V2(chat): V1 opens every session under this name, and OpenCode titles only a
               // session created without one, so an OpenCode importer session is never named
               // in D5's list — it is labelled by its date alone (seen live in U8 on
-              // zai-coding-plan/glm-5.3-flash, after three turns). V2 should open OpenCode
-              // sessions with no title, so OpenCode names them from the first turn, once
-              // nothing else is found to rely on this name.
+              // zai-coding-plan/glm-5.3-flash, after three turns). Opening it untitled is
+              // not the fix by itself: OpenCode would title it from the whole first user
+              // message (`session/title.ts`, no cut), which is this server's ~3 KB framing
+              // with the operator's words at the end, so its names would repeat as Claude
+              // Code's do (`claudeCodeClient.ts`, `sessionTitle`); and each title is one more
+              // LLM call per session (`source: "title"` usage, which bit does not read). It
+              // waits on the same operator decision about bit-authored titles.
               title: importerSessionTitle(input.request.targetName),
               ...(resume === undefined ? {} : { resume: resume.sessionId }),
               /*
