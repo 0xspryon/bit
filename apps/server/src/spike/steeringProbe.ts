@@ -348,7 +348,7 @@ const openCodeRound = Effect.fnUntraced(function* (input: {
   // after *both* executions: that is the point of waiting rather than sleeping.
   const settled = yield* Effect.result(
     Effect.timeout(
-      api.session.wait({ sessionID: sessionId as Session.ID }),
+      api.experimental.session.wait({ sessionID: sessionId as Session.ID }),
       "4 minutes",
     ),
   );

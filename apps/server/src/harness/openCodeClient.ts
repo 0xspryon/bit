@@ -1705,7 +1705,7 @@ export const openCodeHarness = (
             const add = bounded(
               "mcp.add",
               timeouts.control,
-              api.mcp.add({
+              api.experimental.mcp.add({
                 server: name,
                 location: { directory: directoryOf(config.directory) },
                 config: new Mcp.RemoteConfig({
@@ -1784,7 +1784,7 @@ export const openCodeHarness = (
               bounded(
                 "mcp.remove",
                 timeouts.control,
-                api.mcp.remove({
+                api.experimental.mcp.remove({
                   server: name,
                   location: { directory: directoryOf(directory) },
                 }),
@@ -2194,7 +2194,7 @@ export const openCodeHarness = (
         yield* bounded(
           "session.wait",
           timeouts.wait,
-          api.session.wait({ sessionID: sessionId as Session.ID }),
+          api.experimental.session.wait({ sessionID: sessionId as Session.ID }),
         );
       });
 

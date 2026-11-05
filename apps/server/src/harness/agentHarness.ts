@@ -1262,7 +1262,7 @@ export class AgentHarness extends Context.Service<
      * Makes our MCP endpoint reachable from one session, under one credential.
      *
      * **`sessionId` is a parameter because the second harness needed it to be.** OpenCode
-     * registers an MCP server into a *directory* — `api.mcp.add({ server, location: {
+     * registers an MCP server into a *directory* — `api.experimental.mcp.add({ server, location: {
      * directory } })` — so the session is implicit and the original signature had no room
      * for it. Claude Code registers into a *session*, over that session's own control
      * channel, and has no directory-scoped equivalent. Taking the session id explicitly is

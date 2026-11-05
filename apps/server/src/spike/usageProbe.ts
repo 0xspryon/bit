@@ -346,7 +346,7 @@ const openCodeLeg = Effect.fnUntraced(function* () {
       );
       const settled = yield* Effect.result(
         Effect.timeout(
-          api.session.wait({ sessionID: sessionId as Session.ID }),
+          api.experimental.session.wait({ sessionID: sessionId as Session.ID }),
           "4 minutes",
         ),
       );
