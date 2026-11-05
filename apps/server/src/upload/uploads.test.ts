@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
+import type { MessageUploadRefused } from "@bit/contracts";
 import { Effect } from "effect";
 import { HttpServerRequest } from "effect/http";
 
@@ -165,13 +166,97 @@ describe("reading a message's files, under every cap", () => {
     ]);
   });
 
-  test("a HEIC image is refused with the reason, before its bytes are read", async () => {
+  test("a HEIC image is refused with the reason, and none of its bytes are kept", async () => {
     const refusal = await refusalOf(
       form([{ name: "IMG_0001.HEIC", body: "x", type: "image/heic" }]),
     );
     expect(refusal.reason).toBe("unsupported_image");
     expect(refusal.detail).toContain("IMG_0001.HEIC");
     expect(refusal.detail).toContain("JPEG or PNG");
+  });
+
+  /*
+   * U13, measured live: answering while the body is still arriving resets the socket, and
+   * Vite's dev proxy then answers 502 rather than the refusal. So a refused body is read to
+   * its end — and its bytes past the cap are not kept.
+   */
+  test("a refused body is still read to its end before the refusal, for every cap", async () => {
+    const cases: readonly [
+      FormData,
+      UploadLimits | undefined,
+      MessageUploadRefused["reason"],
+    ][] = [
+      [
+        form([
+          { name: "big.png", body: "123456789", type: "image/png" },
+          { name: "after.txt", body: "x".repeat(4000), type: "text/plain" },
+        ]),
+        SMALL,
+        "too_large",
+      ],
+      [
+        form([
+          { name: "IMG.HEIC", body: "x".repeat(4000), type: "image/heic" },
+          { name: "after.txt", body: "y", type: "text/plain" },
+        ]),
+        undefined,
+        "unsupported_image",
+      ],
+      [
+        form([
+          { name: "a.txt", body: "1", type: "text/plain" },
+          { name: "b.txt", body: "2", type: "text/plain" },
+          { name: "c.txt", body: "x".repeat(4000), type: "text/plain" },
+        ]),
+        SMALL,
+        "too_many",
+      ],
+    ];
+    for (const [body, limits, reason] of cases) {
+      const request = new Request("http://localhost/", {
+        method: "POST",
+        body,
+      });
+      // Read before the body is: Bun fills a FormData body's type in as it serialises it.
+      const contentType = request.headers.get("content-type") ?? "";
+      const bytes = new Uint8Array(await request.arrayBuffer());
+      let pulled = 0;
+      // Pulled lazily, a small chunk at a time: what was pulled is what the reader read.
+      const counted = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            if (pulled >= bytes.length) {
+              controller.close();
+              return;
+            }
+            const chunk = bytes.slice(pulled, pulled + 256);
+            pulled += chunk.length;
+            controller.enqueue(chunk);
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const result = await Effect.runPromise(
+        Effect.result(
+          readUploadParts(
+            HttpServerRequest.fromWeb(
+              new Request("http://localhost/", {
+                method: "POST",
+                headers: { "content-type": contentType },
+                body: counted,
+                // @ts-expect-error -- Bun's `Request` takes a stream body without `duplex`.
+                duplex: "half",
+              }),
+            ).multipartStream,
+            limits ?? DEFAULT_UPLOAD_LIMITS,
+            ["message"],
+          ),
+        ),
+      );
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") expect(result.failure.reason).toBe(reason);
+      expect(pulled).toBe(bytes.length);
+    }
   });
 
   test("an empty file is refused", async () => {

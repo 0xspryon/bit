@@ -34,6 +34,57 @@ const controlPlane = (): string => {
   return `http://127.0.0.1:${port !== undefined && port.trim() !== "" ? port.trim() : "3000"}`;
 };
 
+/**
+ * Bun's own ceiling on a request body, which the server raises only past it
+ * (`apps/server/src/main.ts`, `maxRequestBodySize`).
+ */
+const BUN_BODY_CEILING = 128 * 1024 * 1024;
+
+/**
+ * An upload the control plane's listener refused before reading it, said as the `413` it
+ * was (A6 U13).
+ *
+ * Bun answers a body over its ceiling with an empty `413` and closes the socket with the
+ * rest of the body unread, which resets the connection: this proxy, still writing the body,
+ * sees the reset and — left alone — answers `502`, which the composer could only read as
+ * "no server answered". The browser straight to Bun gets the `413` (measured). So a reset
+ * while forwarding a body over that ceiling is answered `413` here, before Vite's own
+ * handler writes its `502`; the client words it (`RequestTooLarge`). Refusals the server's
+ * handler makes itself read the whole body first (`upload/uploads.ts`) and pass through.
+ *
+ * V2(chat): a guess from the request's declared length and the error code: a server that
+ * died mid-upload of a body that size would be reported as too large. Proper V2 is T3's
+ * two-step upload, whose size-pinned URL is refused before any body is sent.
+ */
+const tooLargeOnReset = (proxy: {
+  on: (
+    event: "error",
+    listener: (
+      error: Error & { code?: string },
+      request: { headers: Record<string, string | string[] | undefined> },
+      response: unknown,
+    ) => void,
+  ) => unknown;
+}): void => {
+  proxy.on("error", (error, request, response) => {
+    const declared = Number(request.headers["content-length"] ?? 0);
+    if (
+      declared <= BUN_BODY_CEILING ||
+      (error.code !== "ECONNRESET" && error.code !== "EPIPE")
+    ) {
+      return;
+    }
+    const res = response as {
+      headersSent?: boolean;
+      writableEnded?: boolean;
+      writeHead?: (status: number) => { end: () => void };
+    };
+    if (res.writeHead !== undefined && !res.headersSent && !res.writableEnded) {
+      res.writeHead(413).end();
+    }
+  });
+};
+
 export default defineConfig({
   plugins: [
     /**
@@ -68,7 +119,15 @@ export default defineConfig({
       adapter: adapter({ fallback: "index.html" }),
     }),
   ],
-  server: { proxy: { "/api": controlPlane() } },
+  server: {
+    proxy: {
+      "/api": {
+        target: controlPlane(),
+        changeOrigin: true,
+        configure: tooLargeOnReset,
+      },
+    },
+  },
   /**
    * The highlighter's worker (`src/lib/highlight.worker.ts`) loads each grammar with its own
    * `import()`, and code-splitting needs ES-module output: Vite's default for a worker is

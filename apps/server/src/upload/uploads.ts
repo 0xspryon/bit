@@ -263,14 +263,21 @@ const refused = (reason: MessageUploadRefused["reason"], detail: string) =>
   new MessageUploadRefused({ reason, detail });
 
 /**
- * Reads a multipart body into memory, refusing as soon as a cap is passed.
+ * Reads a multipart body into memory, keeping nothing past a cap.
  *
- * **Every cap is checked while reading**: the count stops the parser at the first file over
- * it, the file's own cap (image or file, by its type) stops its content stream the moment it
- * is passed, and the total stops the request the same way. So a file ten times the limit is
- * refused after the limit's worth of it, and the memory one request can hold is
- * {@link UploadLimits.maxTotalBytes}. A HEIC/HEIF image is refused before its bytes are read,
- * and an empty file once its stream ends.
+ * **Every cap is checked while reading**: the count at the first file over it, the file's
+ * own cap (image or file, by its type) the moment its content passes it, the total the same
+ * way. From then on nothing more is kept — no part, no chunk — so the memory one request can
+ * hold is {@link UploadLimits.maxTotalBytes}; a HEIC/HEIF image is refused before any of its
+ * bytes are kept, and an empty file once its stream ends.
+ *
+ * **But the rest of the body is still read, and thrown away, before the refusal is
+ * answered** (U13, measured). A server that answers while the body is still arriving closes
+ * a socket with unread data in it, which resets the connection: the browser straight to Bun
+ * copes, but Vite's dev proxy — the way the operator's browser reaches this server — answers
+ * `502` instead of the refusal, and the composer read that as "no server answered". How much
+ * can be read is bounded by the listener's body ceiling (`http/controlPlane.ts`), above which
+ * Bun answers its own empty `413` without this ever running.
  *
  * Text fields are kept when their key is in `fields` and ignored otherwise; a file under any
  * key but {@link MESSAGE_FILES_FIELD} is a file all the same, since nothing else could
@@ -286,68 +293,78 @@ export const readUploadParts = (
     const files: ReadUpload[] = [];
     let fieldCount = 0;
     let total = 0;
+    /** The first cap passed: from here the body is only read to its end, never kept. */
+    let refusal: MessageUploadRefused | undefined;
     const imageCap = imageCapOf(limits);
     yield* Stream.runForEach(stream, (part) =>
       Effect.gen(function* () {
         if (part._tag === "Field") {
+          if (refusal !== undefined) return;
           fieldCount += 1;
           if (fieldCount > MAX_FIELDS) {
-            return yield* refused(
+            refusal = refused(
               "unreadable_body",
-              `that request carries more than ${String(MAX_FIELDS)} text fields, which no composer sends, so it was not read and nothing was stored or sent. A message with files is its JSON under '${MESSAGE_FIELD}' and each file under '${MESSAGE_FILES_FIELD}'.`,
+              `that request carries more than ${String(MAX_FIELDS)} text fields, which no composer sends, so it was not kept and nothing was stored or sent. A message with files is its JSON under '${MESSAGE_FIELD}' and each file under '${MESSAGE_FILES_FIELD}'.`,
             );
+            return;
           }
           if (fields.includes(part.key)) kept.set(part.key, part.value);
           return;
         }
-        if (files.length >= limits.maxFiles) {
-          return yield* refused(
+        if (refusal === undefined && files.length >= limits.maxFiles) {
+          refusal = refused(
             "too_many",
-            `that message carries more than ${String(limits.maxFiles)} files, which is this server's cap per message, so the rest was not read and nothing was stored or sent. Send fewer at a time, or raise UPLOAD_MAX_FILES on the server and restart it.`,
+            `that message carries more than ${String(limits.maxFiles)} files, which is this server's cap per message, so none of it was kept and nothing was stored or sent. Send fewer at a time, or raise UPLOAD_MAX_FILES on the server and restart it.`,
           );
         }
         const sentName = part.name;
         const kind = classifyUpload(sentName, part.contentType);
-        if (kind._tag === "heic") {
-          return yield* refused(
+        if (refusal === undefined && kind._tag === "heic") {
+          refusal = refused(
             "unsupported_image",
             `'${sentName}' is a HEIC/HEIF image. bit does not convert images, and the models take GIF, JPEG, PNG and WebP only, so it was refused and nothing in that message was stored or sent. Export it as JPEG or PNG and attach that (on an iPhone, Settings → Camera → Formats → Most Compatible makes new photos JPEG).`,
           );
+        }
+        if (refusal !== undefined || kind._tag === "heic") {
+          yield* Stream.runDrain(part.content);
+          return;
         }
         const cap = kind._tag === "image" ? imageCap : limits.maxFileBytes;
         const chunks: Uint8Array[] = [];
         let size = 0;
         yield* Stream.runForEach(part.content, (chunk) =>
-          Effect.suspend(() => {
+          Effect.sync(() => {
+            if (refusal !== undefined) return;
             size += chunk.length;
             total += chunk.length;
             if (size > cap) {
-              return Effect.fail(
-                refused(
-                  "too_large",
-                  kind._tag === "image"
-                    ? `'${sentName}' is an image over ${describeBytes(cap)}, this server's cap per image, so reading it stopped there and nothing in that message was stored or sent. bit does not compress images: attach a smaller one (a lower resolution, or a JPEG), or raise UPLOAD_MAX_IMAGE_BYTES on the server and restart it.`
-                    : `'${sentName}' is over ${describeBytes(cap)}, this server's cap per file, so reading it stopped there and nothing in that message was stored or sent. Attach an extract of the part that matters, or raise UPLOAD_MAX_BYTES on the server and restart it.`,
-                ),
+              refusal = refused(
+                "too_large",
+                kind._tag === "image"
+                  ? `'${sentName}' is an image over ${describeBytes(cap)}, this server's cap per image, so it was not kept and nothing in that message was stored or sent. bit does not compress images: attach a smaller one (a lower resolution, or a JPEG), or raise UPLOAD_MAX_IMAGE_BYTES on the server and restart it.`
+                  : `'${sentName}' is over ${describeBytes(cap)}, this server's cap per file, so it was not kept and nothing in that message was stored or sent. Attach an extract of the part that matters, or raise UPLOAD_MAX_BYTES on the server and restart it.`,
               );
+              chunks.length = 0;
+              return;
             }
             if (total > limits.maxTotalBytes) {
-              return Effect.fail(
-                refused(
-                  "too_much",
-                  `the files in that message come to more than ${describeBytes(limits.maxTotalBytes)}, this server's cap for one message, so reading stopped at '${sentName}' and nothing was stored or sent. Send them over several messages, or raise UPLOAD_MAX_TOTAL_BYTES on the server and restart it.`,
-                ),
+              refusal = refused(
+                "too_much",
+                `the files in that message come to more than ${describeBytes(limits.maxTotalBytes)}, this server's cap for one message, so they were not kept (the cap was passed at '${sentName}') and nothing was stored or sent. Send them over several messages, or raise UPLOAD_MAX_TOTAL_BYTES on the server and restart it.`,
               );
+              chunks.length = 0;
+              return;
             }
             chunks.push(chunk);
-            return Effect.void;
           }),
         );
+        if (refusal !== undefined) return;
         if (size === 0) {
-          return yield* refused(
+          refusal = refused(
             "empty_file",
             `'${sentName}' is empty, so it was refused and nothing in that message was stored or sent. An agent told to read a file with nothing in it would report that the evidence says nothing, which would be a false reading of an upload that went wrong.`,
           );
+          return;
         }
         const bytes = new Uint8Array(size);
         let at = 0;
@@ -374,6 +391,7 @@ export const readUploadParts = (
         ),
       ),
     );
+    if (refusal !== undefined) return yield* refusal;
     return { fields: kept, files };
   });
 
