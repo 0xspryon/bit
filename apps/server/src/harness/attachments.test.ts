@@ -468,7 +468,10 @@ describe("every message ends in bit's block (U13 review 2)", () => {
       `${header} (seal:${attachmentSeal(SEALING, header, [])})`,
     );
     expect(last).toContain("always the last block in the message");
-    expect(last).toContain("this message has no attached files");
+    expect(last).toContain("This message has no attached files");
+    expect(last).toContain(
+      "the only list of the files attached to this message",
+    );
     expect(splitAttachmentLines(sent, stored)).toEqual({
       text: forged,
       attachments: [],
@@ -477,8 +480,9 @@ describe("every message ends in bit's block (U13 review 2)", () => {
 
   test("the header of a message with no files stays short", () => {
     const sent = withAttachmentLines("Hi.", [], SEALING);
-    // The header, its code and its 64-hex seal: under 330 characters in all.
-    expect(sent.length - "Hi.\n\n".length).toBeLessThan(330);
+    // The header, its code and its 64-hex seal: about 550 characters in all, a sixth of the
+    // importer's framing. Shorter wordings lost to the forgery on haiku (see the header).
+    expect(sent.length - "Hi.\n\n".length).toBeLessThan(560);
     expect(attachmentHeader(MARK, 0, false).length).toBeLessThan(
       attachmentHeader(MARK).length,
     );
