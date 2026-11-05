@@ -388,6 +388,16 @@ U8, U8b, U13, A7-Q, A7-S, F12.
   HMAC-SHA256 seal under a key in `HUNT_ROOT/attachment-seal.key` over the session id,
   the header and the file lines, and a replay reads a block only when its seal verifies
   (`harness/attachments.ts`).
+  **U13 review 3:** messages a harness hands to the model together (Claude Code joins steers
+  it takes at once; OpenCode puts waiting messages in one call) each end in a block, so the
+  header no longer says it is last: each operator header names the codes of the session's
+  unanswered messages as bit's (newest 16, under the seal), and a prompt bit writes (a
+  run's task, a planner round) ends in a briefing block instead.
+- **Found in U13 review 3, half fixed:** ending a goal left its idle goal-chat CLI running
+  (about 800 MB with its MCP servers). The operator's End goal route now closes the goal's
+  conversation. A goal the goal agent ends itself (`end_goal`) still keeps its session until
+  the server stops, because the call comes from inside that session's own turn — a
+  `V2(chat):` note at `endGoal` in `http/browserApi.ts`.
 - **Not done, operator may want it:** the importer prompt does not tell agents about the
   blockquote source convention (a last line starting with `—` renders as the quote's
   source, U10). Adding it changes the prompt and needs the F1 prompt-hash pins in
