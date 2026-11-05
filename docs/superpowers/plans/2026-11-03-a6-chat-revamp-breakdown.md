@@ -221,6 +221,7 @@ constraints), the write summary ("7 in · 3 out · 14 assets"), the model it end
 date, **Start a new session**; an older session read-only until the operator types.
 **A7 (operator, 2026-11-05): U8 also builds A7's E1, E2, E5 and E6**
 (`docs/superpowers/design/A7-agent-sessions.html`) on the existing `screens/AgentSessions.svelte`:
+
 - grouping and filters replace that page's "no grouping, no filters" rule;
 - Active is grouped Needs you / Running / Idle, with a second line of what each session is
   doing (last tool, call count);
@@ -232,7 +233,7 @@ date, **Start a new session**; an older session read-only until the operator typ
   count on every page;
 - the sidebar entry under Operations: a warning count of sessions waiting on you, falling back
   to a quiet active count.
-"Needs you" stays empty until A7-Q lands.
+  "Needs you" stays empty until A7-Q lands.
 
 **U9 — D3 context meter (S).** Ring and token count in the crumb bar, clickable to show what
 fills the window: Claude Code's `getContextUsage()` categories; on OpenCode, tokens and
@@ -290,9 +291,10 @@ a `V2(chat):` comment: proper V2 replays the sub-agent's own transcript (Claude 
 it in a `subagents/` folder) labelled as the sub-agent's.
 
 **A7-Q — The question dock (M+M), U13 → A7-Q. Decided by the operator (2026-11-05).** A7's E3/E4.
+
 - Follow T3: each harness's **native** question mechanism maps onto one pending-question
   contract, whose answerability is `live`, `message` or `not_resumable`.
-- **OpenCode 2.2.5: forms.** The 1.x question API is gone; the model's `question` tool *is* a
+- **OpenCode 2.2.5: forms.** The 1.x question API is gone; the model's `question` tool _is_ a
   form (`metadata.kind: "question"`, fields `q0…qN`). Use the `form.created`, `form.replied`
   and `form.cancelled` events; `session.form.list` on (re)connect; `session.form.reply` to
   answer; `session.form.cancel` to dismiss. A `FormAlreadySettledError` counts as settled.
@@ -310,6 +312,7 @@ it in a `subagents/` folder) labelled as the sub-agent's.
 
 **A7-S — Sub-agent cards and panel (M), A7-Q → A7-S. Decided by the operator (2026-11-05):
 replaces U14's "omit content".** A7's E7/E8.
+
 - **Cards:**
   - running cards show their last tool lines, the current activity, the time and the call
     count;
