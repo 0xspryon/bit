@@ -89,11 +89,7 @@
   import Chat from "./Chat.svelte";
   import ComposerTray from "./ComposerTray.svelte";
   import { setAttachmentLoader } from "../attachmentFiles";
-  import {
-    dragHasFiles,
-    filesOfDrop,
-    filesOfPaste,
-  } from "../composerFiles.svelte";
+  import { panelFileDrop, filesOfPaste } from "../composerFiles.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
   import MarkedText from "./MarkedText.svelte";
@@ -167,6 +163,11 @@
   let attachButton = $state<HTMLButtonElement | undefined>(undefined);
   /** True while files are dragged over the box, which says it will take them. */
   let dropping = $state(false);
+  const fileDrop = panelFileDrop({
+    accepting: () => !blocked,
+    take: (files) => importer.files.add(files),
+    dropping: (over) => (dropping = over),
+  });
 
   /**
    * The picker's files into the tray. The input is emptied straight away: it fires no
@@ -382,7 +383,17 @@
   );
 </script>
 
-<div class="importer">
+<!--
+  A drag of files anywhere over the panel is the panel's (U13 review 1): dropped on the box
+  or beside it, the files go into the tray, and never into a `file://` tab.
+-->
+<div
+  class="importer"
+  ondragover={fileDrop.ondragover}
+  ondragleave={fileDrop.ondragleave}
+  ondrop={fileDrop.ondrop}
+  role="presentation"
+>
   <Chat
     label={`Load the scope for ${target}`}
     {groups}
@@ -598,23 +609,6 @@
               "in-use",
             dropping && "dropping",
           ]}
-          ondragover={(event) => {
-            if (blocked || !dragHasFiles(event)) return;
-            event.preventDefault();
-            dropping = true;
-          }}
-          ondragleave={(event) => {
-            const next = event.relatedTarget;
-            if (!(next instanceof Node && event.currentTarget.contains(next))) {
-              dropping = false;
-            }
-          }}
-          ondrop={(event) => {
-            dropping = false;
-            if (blocked || !dragHasFiles(event)) return;
-            event.preventDefault();
-            importer.files.add(filesOfDrop(event));
-          }}
           onfocusin={() => (focused = true)}
           onfocusout={(event) => {
             const next = event.relatedTarget;

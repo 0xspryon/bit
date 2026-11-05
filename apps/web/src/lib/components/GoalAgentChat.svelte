@@ -37,11 +37,7 @@
   import ErrorDialog from "./ErrorDialog.svelte";
   import { IconArrowUp, IconPlus } from "../icons";
   import { setAttachmentLoader } from "../attachmentFiles";
-  import {
-    dragHasFiles,
-    filesOfDrop,
-    filesOfPaste,
-  } from "../composerFiles.svelte";
+  import { panelFileDrop, filesOfPaste } from "../composerFiles.svelte";
   import { whenText } from "../goalFormat";
   import type { MeterFact } from "../chat";
   import type { App } from "../app.svelte";
@@ -74,6 +70,11 @@
 
   /** True while files are dragged over the composer, which says it will take them. */
   let dropping = $state(false);
+  const fileDrop = panelFileDrop({
+    accepting: () => active,
+    take: (files) => app.goalFiles.add(files),
+    dropping: (over) => (dropping = over),
+  });
   /** The `+`, which focus returns to when an intake refusal's dialog closes. */
   let attachButton = $state<HTMLButtonElement | undefined>(undefined);
   /**
@@ -186,165 +187,157 @@
   }
 </script>
 
-<Chat
-  label="Goal conversation"
-  {groups}
-  readonly={!active}
-  count={app.goalTurns.length === 0
-    ? ""
-    : `${String(app.goalTurns.length)} sent from this tab`}
-  note={app.goalSessionNote}
-  {detail}
-  empty="Nobody has talked to this goal's agent yet. Say what you want investigated and it will steer the planner; it cannot create intents itself."
+<!--
+  A drag of files anywhere over the conversation is its own (U13 review 1): dropped on the
+  box or beside it, the files go into the tray, and never into a `file://` tab. The wrapper
+  takes no box of its own (`display: contents`); events still bubble through it.
+-->
+<div
+  class="drop-area"
+  ondragover={fileDrop.ondragover}
+  ondragleave={fileDrop.ondragleave}
+  ondrop={fileDrop.ondrop}
+  role="presentation"
 >
-  {#snippet separator(group)}
-    <!--
+  <Chat
+    label="Goal conversation"
+    {groups}
+    readonly={!active}
+    count={app.goalTurns.length === 0
+      ? ""
+      : `${String(app.goalTurns.length)} sent from this tab`}
+    note={app.goalSessionNote}
+    {detail}
+    empty="Nobody has talked to this goal's agent yet. Say what you want investigated and it will steer the planner; it cannot create intents itself."
+  >
+    {#snippet separator(group)}
+      <!--
       The heading. Everything in it is a fact the server stated: which session this is, and
       whether this process is still holding it. A conversation whose words came back from a
       session nobody holds is readable and not continuable, and that is the one thing a
       reader must not have to infer.
     -->
-    <span class="sep-title">Goal agent</span>
-    {#if group.subject.conversation?.harnessSessionId}
-      <span
-        class="sep-id mono"
-        title="Harness session {group.subject.conversation.harnessSessionId}"
-        >{group.subject.conversation.harnessSessionId}</span
-      >
-      <span class="sep-when"
-        >read {whenText(group.subject.conversation.at)}</span
-      >
-    {/if}
-    {#if group.subject.conversation !== undefined && !group.subject.conversation.live}
-      <span class="chip">not this process's</span>
-    {/if}
-    {#if group.subject.awaiting}
-      <span class="chip" data-tint="warning">waiting</span>
-    {/if}
-  {/snippet}
+      <span class="sep-title">Goal agent</span>
+      {#if group.subject.conversation?.harnessSessionId}
+        <span
+          class="sep-id mono"
+          title="Harness session {group.subject.conversation.harnessSessionId}"
+          >{group.subject.conversation.harnessSessionId}</span
+        >
+        <span class="sep-when"
+          >read {whenText(group.subject.conversation.at)}</span
+        >
+      {/if}
+      {#if group.subject.conversation !== undefined && !group.subject.conversation.live}
+        <span class="chip">not this process's</span>
+      {/if}
+      {#if group.subject.awaiting}
+        <span class="chip" data-tint="warning">waiting</span>
+      {/if}
+    {/snippet}
 
-  {#snippet meter()}
-    <ContextMeter
-      meter={app.goalContextMeter}
-      label="Goal agent context"
-      facts={meterFacts}
-    />
-  {/snippet}
+    {#snippet meter()}
+      <ContextMeter
+        meter={app.goalContextMeter}
+        label="Goal agent context"
+        facts={meterFacts}
+      />
+    {/snippet}
 
-  {#snippet footnote()}
-    Rows marked <strong>record</strong> are committed events and arrive in the
-    order the store assigned them. Rows marked
-    <strong>activity</strong> — including your own messages — are not part of the
-    record and are not stored here. On a reload the conversation — your messages,
-    the agent's words and its tool calls — comes back from the harness while the harness
-    keeps it.
-  {/snippet}
+    {#snippet footnote()}
+      Rows marked <strong>record</strong> are committed events and arrive in the
+      order the store assigned them. Rows marked
+      <strong>activity</strong> — including your own messages — are not part of the
+      record and are not stored here. On a reload the conversation — your messages,
+      the agent's words and its tool calls — comes back from the harness while the
+      harness keeps it.
+    {/snippet}
 
-  {#snippet composer()}
-    <!--
+    {#snippet composer()}
+      <!--
       Files come in three ways (A6 U13): dropped on the box, pasted into it, or picked with
       the `+`. The box says it will take a drop while one is over it.
     -->
-    <form
-      class={["box", dropping && "dropping"]}
-      onsubmit={submit}
-      ondragover={(event) => {
-        if (!active || !dragHasFiles(event)) return;
-        event.preventDefault();
-        dropping = true;
-      }}
-      ondragleave={(event) => {
-        const next = event.relatedTarget;
-        if (!(next instanceof Node && event.currentTarget.contains(next))) {
-          dropping = false;
-        }
-      }}
-      ondrop={(event) => {
-        dropping = false;
-        if (!active || !dragHasFiles(event)) return;
-        event.preventDefault();
-        app.goalFiles.add(filesOfDrop(event));
-      }}
-    >
-      <label class="visually-hidden" for="goal-message"
-        >Say something to this goal's agent</label
-      >
-      <!-- The files this message will carry, above the words and inside the border. -->
-      {#if app.goalFiles.items.length > 0}
-        <div class="tray-slot">
-          <ComposerTray files={app.goalFiles} disabled={app.goalSending} />
+      <form class={["box", dropping && "dropping"]} onsubmit={submit}>
+        <label class="visually-hidden" for="goal-message"
+          >Say something to this goal's agent</label
+        >
+        <!-- The files this message will carry, above the words and inside the border. -->
+        {#if app.goalFiles.items.length > 0}
+          <div class="tray-slot">
+            <ComposerTray files={app.goalFiles} disabled={app.goalSending} />
+          </div>
+        {/if}
+        <textarea
+          id="goal-message"
+          rows="3"
+          placeholder="What should be investigated next?"
+          bind:value={app.goalMessage}
+          disabled={app.goalSending}
+          {onkeydown}
+          {onpaste}></textarea>
+        <div class="strip">
+          <span class="hint">
+            It steers the planner; it cannot create intents itself. Enter sends,
+            Shift+Enter for a new line.
+          </span>
+          <label class="visually-hidden" for="goal-attach"
+            >Attach files to this message</label
+          >
+          <input
+            bind:this={picker}
+            id="goal-attach"
+            class="visually-hidden"
+            type="file"
+            multiple
+            disabled={app.goalSending}
+            onchange={chosen}
+          />
+          <button
+            bind:this={attachButton}
+            class="square attach"
+            type="button"
+            disabled={app.goalSending}
+            aria-label="Attach files to this message"
+            title="Attach files to this message: drop or paste them here, or pick them"
+            onclick={() => picker?.click()}
+          >
+            <IconPlus width="14" height="14" />
+          </button>
+          <button
+            class="square submit"
+            type="submit"
+            disabled={!canSend}
+            aria-label="Send to the goal agent"
+            title="Send to the goal agent"
+          >
+            {#if app.goalSending}
+              <span class="spinner" aria-hidden="true"></span>
+            {:else}
+              <IconArrowUp width="14" height="14" />
+            {/if}
+          </button>
         </div>
+      </form>
+      {#if app.goalSendDetail !== ""}
+        <p class="error" role="alert">{app.goalSendDetail}</p>
       {/if}
-      <textarea
-        id="goal-message"
-        rows="3"
-        placeholder="What should be investigated next?"
-        bind:value={app.goalMessage}
-        disabled={app.goalSending}
-        {onkeydown}
-        {onpaste}></textarea>
-      <div class="strip">
-        <span class="hint">
-          It steers the planner; it cannot create intents itself. Enter sends,
-          Shift+Enter for a new line.
-        </span>
-        <label class="visually-hidden" for="goal-attach"
-          >Attach files to this message</label
-        >
-        <input
-          bind:this={picker}
-          id="goal-attach"
-          class="visually-hidden"
-          type="file"
-          multiple
-          disabled={app.goalSending}
-          onchange={chosen}
-        />
-        <button
-          bind:this={attachButton}
-          class="square attach"
-          type="button"
-          disabled={app.goalSending}
-          aria-label="Attach files to this message"
-          title="Attach files to this message: drop or paste them here, or pick them"
-          onclick={() => picker?.click()}
-        >
-          <IconPlus width="14" height="14" />
-        </button>
-        <button
-          class="square submit"
-          type="submit"
-          disabled={!canSend}
-          aria-label="Send to the goal agent"
-          title="Send to the goal agent"
-        >
-          {#if app.goalSending}
-            <span class="spinner" aria-hidden="true"></span>
-          {:else}
-            <IconArrowUp width="14" height="14" />
-          {/if}
-        </button>
-      </div>
-    </form>
-    {#if app.goalSendDetail !== ""}
-      <p class="error" role="alert">{app.goalSendDetail}</p>
-    {/if}
-  {/snippet}
+    {/snippet}
 
-  {#snippet controls()}
-    {#if !active}
-      <!--
+    {#snippet controls()}
+      {#if !active}
+        <!--
         No composer, and a sentence instead of a disabled box. An ended goal's agent has no
         authority left, so a box that submitted into a refusal would be worse than one that
         explains itself — the same argument the end control on this page makes.
       -->
-      <p class="hint">
-        This goal has ended, so its agent has no authority left: nothing new is
-        dispatched under it and no planner round is opened on it. What was said
-        is above for as long as the harness keeps it.
-      </p>
-    {:else if app.goalAwaiting}
-      <!--
+        <p class="hint">
+          This goal has ended, so its agent has no authority left: nothing new
+          is dispatched under it and no planner round is opened on it. What was
+          said is above for as long as the harness keeps it.
+        </p>
+      {:else if app.goalAwaiting}
+        <!--
         V2(chat): the goal chat has no Stop and no "Send now" (A6 U6 gives them to the
         importer only). This page knows a turn of the goal agent is running only as "a message
         of this tab's has had no reply yet" (`goalAwaiting`) and watches nothing on the server,
@@ -354,18 +347,19 @@
         activity read (`ConversationActivity`, polled while it runs, started by its live
         words) and draws `ImporterChat`'s Stop pill and Send now over its composer.
       -->
-      <span class="pulse" aria-hidden="true"></span>
-      <span class="status" role="status">Waiting for the agent…</span>
-      <Button
-        size="sm"
-        variant="quiet"
-        onclick={() => void app.loadGoalConversation(app.openGoalId)}
-      >
-        Re-read
-      </Button>
-    {/if}
-  {/snippet}
-</Chat>
+        <span class="pulse" aria-hidden="true"></span>
+        <span class="status" role="status">Waiting for the agent…</span>
+        <Button
+          size="sm"
+          variant="quiet"
+          onclick={() => void app.loadGoalConversation(app.openGoalId)}
+        >
+          Re-read
+        </Button>
+      {/if}
+    {/snippet}
+  </Chat>
+</div>
 
 {#if app.goalFiles.refusal !== undefined}
   <!-- A file the composer would not take, or a message refused for its files (A6 U13). -->
@@ -377,6 +371,9 @@
 {/if}
 
 <style>
+  .drop-area {
+    display: contents;
+  }
   /* The separator's own type. Its layout — the rule above it — belongs to {@link Chat}. */
   .sep-title {
     font: 600 12px/var(--lh-compact) var(--font-sans);

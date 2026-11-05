@@ -7,6 +7,9 @@
    * The size is the browser's figure for the file, which is the one the server's caps are
    * about. The name is the file's own; the server may store it under a cleaned-up one
    * (no quotes, no path), which the sent turn's chip then shows.
+   *
+   * The tray is at most about three rows tall and scrolls past that, so however many files
+   * are held (up to the server's 100) the words and Send stay on screen.
    */
   import { sizeLabel, type ComposerFiles } from "../composerFiles.svelte";
   import { IconClose, IconFile } from "../icons";
@@ -15,6 +18,33 @@
     files,
     disabled = false,
   }: { files: ComposerFiles; disabled?: boolean } = $props();
+
+  /**
+   * Takes one file out. When its button held focus — a keyboard's Enter or Space, or a
+   * click — focus goes to the next file's remove button, else the previous one's, else the
+   * composer's words, so it never falls back to the page.
+   */
+  const remove = (event: MouseEvent, id: string): void => {
+    const button = event.currentTarget;
+    if (!(button instanceof HTMLButtonElement)) {
+      files.remove(id);
+      return;
+    }
+    const held = document.activeElement === button;
+    const buttons = [
+      ...(button
+        .closest(".tray")
+        ?.querySelectorAll<HTMLButtonElement>("button.remove") ?? []),
+    ];
+    const at = buttons.indexOf(button);
+    const next = buttons[at + 1] ?? buttons[at - 1];
+    const words = button.closest("form")?.querySelector("textarea");
+    if (held) {
+      if (next !== undefined) next.focus();
+      else words?.focus();
+    }
+    files.remove(id);
+  };
 </script>
 
 {#if files.items.length > 0}
@@ -43,7 +73,7 @@
           {disabled}
           aria-label={`Remove ${item.file.name}`}
           title={`Remove ${item.file.name}`}
-          onclick={() => files.remove(item.id)}
+          onclick={(event) => remove(event, item.id)}
         >
           <IconClose width="11" height="11" />
         </button>
@@ -55,10 +85,15 @@
 <style>
   .tray {
     display: flex;
+    /* About three rows of 46 px, then it scrolls (U13 review 1). */
+    max-height: 154px;
     flex-wrap: wrap;
     gap: 6px;
-    margin: 0;
-    padding: 0;
+    /* Room for a remove button's focus ring, which the scroll box would otherwise clip. */
+    margin: -3px;
+    padding: 3px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     list-style: none;
   }
   .pending {

@@ -14,6 +14,7 @@ import {
   MessageUploadRefused,
   type MessageAttachmentView,
 } from "@bit/contracts";
+import { compile } from "svelte/compiler";
 
 import { App } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
@@ -164,6 +165,120 @@ describe("files in the importer's composer (A6 U13)", () => {
     await settle();
     expect(textual.defaultPrevented).toBe(false);
     expect(trayNames()).toEqual(["pasted.png", "picked.pdf"]);
+  });
+
+  test("taking a file out by keyboard moves focus to the next file, else the previous, else the words (U13 review 1)", async () => {
+    const app = await load(server());
+    app.openImporter();
+    await settle();
+    pickFiles(["a.txt", "b.txt", "c.txt"].map((name) => new File(["x"], name)));
+    await settle();
+    const removeButton = (name: string): HTMLButtonElement => {
+      const button = document.querySelector<HTMLButtonElement>(
+        `button[aria-label="Remove ${name}"]`,
+      );
+      if (button === null) throw new Error(`no remove button for ${name}`);
+      return button;
+    };
+    /** What holds focus, as a string: never the node itself. */
+    const focusedLabel = (): string => {
+      const active = document.activeElement;
+      if (active === null || active === document.body) return "<body>";
+      return active.getAttribute("aria-label") ?? `#${active.id}`;
+    };
+    const press = async (name: string): Promise<void> => {
+      const button = removeButton(name);
+      button.focus();
+      click(button);
+      await settle();
+    };
+
+    await press("b.txt");
+    expect(trayNames()).toEqual(["a.txt", "c.txt"]);
+    expect(focusedLabel()).toBe("Remove c.txt");
+    // The last one: the previous takes focus.
+    await press("c.txt");
+    expect(trayNames()).toEqual(["a.txt"]);
+    expect(focusedLabel()).toBe("Remove a.txt");
+    // The only one: the words do.
+    await press("a.txt");
+    expect(trayNames()).toEqual([]);
+    expect(focusedLabel()).toBe("#importer-message");
+  });
+
+  test("the tray scrolls past about three rows, so many files never push Send off screen (U13 review 1)", async () => {
+    const app = await load(server());
+    app.openImporter();
+    await settle();
+    pickFiles(
+      Array.from(
+        { length: 40 },
+        (_, n) => new File(["x"], `f${String(n)}.txt`),
+      ),
+    );
+    await settle();
+    const path = new URL(
+      "../../src/lib/components/ComposerTray.svelte",
+      import.meta.url,
+    ).pathname;
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    const sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+    try {
+      const tray = document.querySelector(".tray");
+      if (tray === null) throw new Error("no tray");
+      const style = getComputedStyle(tray);
+      expect([style.maxHeight, style.overflowY]).toEqual(["154px", "auto"]);
+      expect(trayNames()).toHaveLength(40);
+    } finally {
+      sheet.remove();
+    }
+  });
+
+  test("files dropped beside the composer go into the tray, and the browser never opens them (U13 review 1)", async () => {
+    const app = await load(server());
+    app.openImporter();
+    await settle();
+    const panel = document.querySelector(".importer");
+    const form = composer().closest("form");
+    if (panel === null || form === null) throw new Error("no importer panel");
+    // Somewhere in the panel that is not the composer's box.
+    const beside =
+      [...panel.querySelectorAll("*")].find(
+        (element) => !form.contains(element) && !element.contains(form),
+      ) ?? panel;
+    const events = ["dragover", "drop"].map((kind) => {
+      const event = new Event(kind, { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "dataTransfer", {
+        value: {
+          types: ["Files"],
+          files: [new File(["x"], "beside.txt")],
+          dropEffect: "none",
+        },
+      });
+      beside.dispatchEvent(event);
+      return event;
+    });
+    await settle();
+    expect(events.map((event) => event.defaultPrevented)).toEqual([true, true]);
+    expect(trayNames()).toEqual(["beside.txt"]);
+    // A drop on the box itself is taken once, not again by the panel.
+    drop([new File(["y"], "on-box.txt")]);
+    await settle();
+    expect(trayNames()).toEqual(["beside.txt", "on-box.txt"]);
+    // A drag that carries no files (text, a link) is left to the browser.
+    const text = new Event("dragover", { bubbles: true, cancelable: true });
+    Object.defineProperty(text, "dataTransfer", {
+      value: { types: ["text/plain"], files: [] },
+    });
+    beside.dispatchEvent(text);
+    expect(text.defaultPrevented).toBe(false);
   });
 
   test("a HEIC image and an empty file are refused in the dialog as they come in", async () => {

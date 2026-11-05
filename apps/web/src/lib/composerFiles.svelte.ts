@@ -152,7 +152,13 @@ const revoke = (item: ComposerFile): void => {
 /**
  * The files a paste carries, or none: a paste that carries text as well is a paste of the
  * text (copying from a page or a spreadsheet often brings a picture of it along), so only
- * a paste of files alone — a screenshot, a file copied in a file manager — attaches them.
+ * a paste of files alone attaches them — a screenshot, and a file copied in a file manager
+ * that puts only the file on the clipboard. Some file managers also put the file's name
+ * (or its path) there as text, and a paste of what they copied is then a paste of the name.
+ *
+ * V2(chat): a file copied in such a file manager cannot be pasted in; it has to be dropped
+ * or picked with `+`. Proper V2: attach the files when the text is no more than their
+ * names or `file://` URIs, and paste the text otherwise.
  */
 export const filesOfPaste = (event: ClipboardEvent): readonly File[] => {
   const data = event.clipboardData;
@@ -164,6 +170,47 @@ export const filesOfPaste = (event: ClipboardEvent): readonly File[] => {
 /** Whether a drag carries files, so the composer can take the drop. */
 export const dragHasFiles = (event: DragEvent): boolean =>
   event.dataTransfer?.types.includes("Files") ?? false;
+
+/**
+ * A chat panel's handlers for a drag of files anywhere over it (U13 review 1): a drop
+ * just outside the composer's box used to be the browser's own, which opens the file in a
+ * `file://` tab and leaves the app. Every file drag over the panel is the panel's: taken
+ * into the tray when `accepting()`, refused with the no-drop cursor otherwise — and never
+ * the browser's. `dropping` says whether one is over the panel now, for the box to light
+ * up.
+ */
+export const panelFileDrop = (options: {
+  readonly accepting: () => boolean;
+  readonly take: (files: readonly File[]) => void;
+  readonly dropping: (over: boolean) => void;
+}) => ({
+  ondragover: (event: DragEvent): void => {
+    if (!dragHasFiles(event)) return;
+    event.preventDefault();
+    const accepting = options.accepting();
+    if (event.dataTransfer !== null) {
+      event.dataTransfer.dropEffect = accepting ? "copy" : "none";
+    }
+    options.dropping(accepting);
+  },
+  ondragleave: (event: DragEvent): void => {
+    const next = event.relatedTarget;
+    const panel = event.currentTarget;
+    if (!(
+      next instanceof Node &&
+      panel instanceof Node &&
+      panel.contains(next)
+    )) {
+      options.dropping(false);
+    }
+  },
+  ondrop: (event: DragEvent): void => {
+    options.dropping(false);
+    if (!dragHasFiles(event)) return;
+    event.preventDefault();
+    if (options.accepting()) options.take(filesOfDrop(event));
+  },
+});
 
 /** The files a drop carries. */
 export const filesOfDrop = (event: DragEvent): readonly File[] => [
