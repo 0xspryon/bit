@@ -29,6 +29,7 @@
  * a panel covers a form — those are measured in a browser, and are CSS.
  */
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { beforeEach } from "bun:test";
 
 import { installComponents, installIcons, installRunes } from "../transforms";
 
@@ -71,3 +72,12 @@ Reflect.deleteProperty(globalThis, "Worker");
 installRunes();
 installComponents("client");
 installIcons("client");
+
+/*
+ * One window for the whole run, so one `localStorage`: what a test leaves there — the
+ * importer's remembered model (`importerModelMemory.ts`) — would be the next test's
+ * starting state. Each test starts with none, as a first visit does.
+ */
+beforeEach(() => {
+  localStorage.clear();
+});

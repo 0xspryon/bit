@@ -86,6 +86,11 @@ import {
 import { server, type ServerClient } from "./client";
 import { indexedSession } from "./importerChat";
 import {
+  browserModelMemory,
+  usableRemembered,
+  type ModelMemory,
+} from "./importerModelMemory";
+import {
   ImporterSessions,
   type ImporterScenario,
   type ImporterSent,
@@ -367,10 +372,19 @@ export class App {
   constructor(
     client: ServerClient = server,
     countdown: Countdown = realCountdown,
+    modelMemory: ModelMemory = browserModelMemory,
   ) {
     this.client = client;
     this.countdown = countdown;
+    this.modelMemory = modelMemory;
   }
+
+  /**
+   * Where the harness and model last picked for a new importer session are kept, per target
+   * (`importerModelMemory.ts`). Handed in once, like {@link countdown}; the tests hand in
+   * their own so one test's pick is not the next one's default.
+   */
+  readonly modelMemory: ModelMemory;
 
   screen = $state<Screen>("connect");
   theme = $state<Theme>("dark");
@@ -4465,6 +4479,10 @@ export class App {
     this.#nextLinkId = 2;
     this.pickedImportInstanceId = "";
     this.pickedImportModel = "";
+    this.#pickFromMemory = false;
+    // The model last picked for a new session here, over D15's rule, when the catalogue
+    // already read can honour it; otherwise once `loadHarnesses` has read it.
+    this.#useRememberedModel();
     this.importPickerOpen = false;
     this.importModelQuery = "";
     this.scopeImport = undefined;
@@ -4678,6 +4696,7 @@ export class App {
     this.importer.start({ keepDraft: true });
     this.pickedImportInstanceId = instanceId;
     this.pickedImportModel = model;
+    this.#rememberImportModel();
     this.importModelQuery = "";
     this.importPickerOpen = false;
     this.importModelOptionsByModel = {
@@ -4697,6 +4716,7 @@ export class App {
     // screen showing a model the chosen harness has never heard of.
     this.pickedImportModel = "";
     this.importModelQuery = "";
+    this.#rememberImportModel();
   }
 
   /**
@@ -4705,7 +4725,56 @@ export class App {
    */
   pickImportModel(model: string) {
     this.pickedImportModel = model;
+    this.#rememberImportModel();
   }
+
+  /**
+   * Keeps the harness and model the operator just picked for a new session on this target
+   * (U8 review), so the next opening of the importer starts on them rather than on D15's
+   * default. What is kept is what the chip now shows: a harness picked without a model is
+   * that harness's default model. Only an operator's pick is kept, never a default.
+   */
+  #rememberImportModel(): void {
+    this.#pickFromMemory = false;
+    const targetId = this.viewTargetId;
+    const instanceId = this.importInstance?.instanceId;
+    const model = this.effectiveImportModel;
+    if (targetId === "" || instanceId === undefined || model === "") return;
+    this.modelMemory.write(this.serverUrl, targetId, { instanceId, model });
+  }
+
+  /**
+   * Puts the chip on the model last picked for a new session on this target, when its
+   * harness is ready and still lists it (`usableRemembered`). Nothing is changed otherwise,
+   * so D15's rule — the server's resolved default — stands; and nothing is changed once the
+   * operator has picked on this page, which a late catalogue read must not undo.
+   */
+  #useRememberedModel(): void {
+    const targetId = this.viewTargetId;
+    if (targetId === "" || !this.harnessesLoaded) return;
+    const usable = usableRemembered(
+      this.modelMemory.read(this.serverUrl, targetId),
+      this.harnesses,
+    );
+    // Put on from memory by an earlier reading of the catalogue, which a newer one says
+    // can no longer be honoured: back to D15's rule rather than a refusal at the send.
+    if (this.#pickFromMemory && usable === undefined) {
+      this.#pickFromMemory = false;
+      this.pickedImportInstanceId = "";
+      this.pickedImportModel = "";
+      return;
+    }
+    if (this.pickedImportInstanceId !== "" || this.pickedImportModel !== "") {
+      return;
+    }
+    if (usable === undefined) return;
+    this.pickedImportInstanceId = usable.instanceId;
+    this.pickedImportModel = usable.model;
+    this.#pickFromMemory = true;
+  }
+
+  /** Whether the import pick on this page is {@link #useRememberedModel}'s, not the operator's. */
+  #pickFromMemory = false;
 
   /** {@link pickModelOption}, for the importer's model and the importer's store. */
   pickImportModelOption(descriptorId: string, value: string) {
@@ -5254,6 +5323,7 @@ export class App {
     if (call._tag === "Unreachable") return;
     this.harnesses = call.value.map((entry) => ({ ...entry }));
     this.harnessesLoaded = true;
+    if (this.importerOpen) this.#useRememberedModel();
     // The Auto-load page names each session's harness, and may be showing the id until now.
     if (this.importerOpen) this.importer.syncIndexed(this.#indexedSessions());
     // A picked instance the server no longer configures is dropped back to the default
@@ -5893,6 +5963,7 @@ export class App {
     this.importModelNoHarness = false;
     this.pickedImportInstanceId = "";
     this.pickedImportModel = "";
+    this.#pickFromMemory = false;
     this.importModelOptionsByModel = {};
     this.importPickerOpen = false;
     this.importModelQuery = "";
