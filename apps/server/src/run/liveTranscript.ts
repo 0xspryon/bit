@@ -1209,6 +1209,19 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
 };
 
 /**
+ * The {@link LiveTurnEnded} frame for an entry that ends a turn — the one entry that carries
+ * a terminal `outcome` (`HarnessNarration.outcome`) — or `undefined` for any other.
+ */
+export const turnEndedFrame = (item: RunNarration): LiveFrame | undefined =>
+  item.entry.outcome === undefined
+    ? undefined
+    : {
+        _tag: "turnEnded",
+        ...subjectIds(item.subject),
+        at: item.entry.at,
+      };
+
+/**
  * One refused action as one transcript item.
  *
  * Only called for a denial; see the contract on why an allowed decision is not projected.
@@ -1380,17 +1393,20 @@ export const liveTranscript = (
 
   const activity = Stream.merge(
     input.narrations.subscribe({ targetId: input.targetId }).pipe(
-      Stream.filterMap(
-        Filter.make((item: RunNarration) => {
-          const projected = projectNarration(item);
-          return projected === undefined ||
-            (!partials &&
-              projected._tag === "item" &&
-              projected.streaming === true)
-            ? Result.fail(item)
-            : Result.succeed(projected);
-        }),
-      ),
+      Stream.map((item: RunNarration): readonly LiveFrame[] => {
+        const projected = projectNarration(item);
+        const shown =
+          projected === undefined ||
+          (!partials &&
+            projected._tag === "item" &&
+            projected.streaming === true)
+            ? []
+            : [projected];
+        // The turn's end, after whatever its entry drew: see `LiveTurnEnded`.
+        const ended = turnEndedFrame(item);
+        return ended === undefined ? shown : [...shown, ended];
+      }),
+      Stream.flattenIterable,
     ),
     input.decisions.answered.pipe(
       Stream.filterMapEffect(

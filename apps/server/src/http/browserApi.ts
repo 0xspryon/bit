@@ -133,6 +133,7 @@ import {
   unknownAgentDetail,
 } from "../agent/registry";
 import { chooseImporterModel } from "../import/importerModel";
+import { importSessionAgent } from "../import/importerHistory";
 import { importerSessionTitles } from "../import/importerTitle";
 import { ScopeImporter } from "../import/scopeImporter";
 import { GoalConversations } from "../plan/goalConversation";
@@ -1849,8 +1850,15 @@ const fleetHandlers = HttpApiBuilder.group(
             Effect.forEach(session.importIds, (importId) =>
               importer.holds(importId),
             ),
-            (holds) => ({ ...session, held: holds.some(Boolean) }),
+            (holds) => ({
+              ...session,
+              held: holds.some(Boolean),
+              agentDefined: importSessionAgent(session.agentId) !== undefined,
+            }),
           ),
+        );
+        const instancesRun = new Set<string>(
+          harnesses.instances.map((listing) => listing.instance.instanceId),
         );
         // Every subject a row could have narrated under, read from memory once.
         const subjects: NarrationSubject[] = [
@@ -1889,6 +1897,7 @@ const fleetHandlers = HttpApiBuilder.group(
             goals: read.goals,
             goalLive: conversations.live,
             importers,
+            instanceRun: (instanceId) => instancesRun.has(instanceId),
             workers: read.workers,
             planners: read.planners,
             activity: (subject) => summaries.get(activityKey(subject)),

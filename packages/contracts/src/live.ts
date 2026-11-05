@@ -884,6 +884,33 @@ export const LiveUsage = Schema.Struct({
 export type LiveUsage = typeof LiveUsage.Type;
 
 /**
+ * A session's turn ended (A7 U8b review): its summary on the Agent sessions list has moved
+ * from running to idle, and a client showing that list, or the rail's count, reads it again.
+ *
+ * **Why it is a frame and not inferred from the items.** The entry that ends a turn is
+ * often one nothing renders — OpenCode's `session.execution.succeeded` is `opaque`, Claude
+ * Code's `result` a `usage` measurement — so a client watching items saw the turn's last
+ * reply and then nothing, and a list read between that reply and the turn's end said
+ * "Running" until something else narrated (measured: 20 s and more). This is the turn's end
+ * itself, sent after the server has folded it, so a read it prompts sees it.
+ *
+ * Nothing to show and nothing to keep: like {@link LiveUsage} it has no id, no sequence and
+ * is not a transcript row, and it carries only whose session it was. Activity-channel, so
+ * lossy: a client that misses one is corrected by its next read. The cost is the one
+ * {@link LiveUsage} states for a new `_tag`: a tab a deploy behind cannot decode it and
+ * reconnects until it is reloaded.
+ */
+export const LiveTurnEnded = Schema.Struct({
+  _tag: Schema.Literal("turnEnded"),
+  attemptId: Schema.NullOr(Schema.String),
+  roundId: Schema.NullOr(Schema.String),
+  goalId: Schema.NullOr(Schema.String),
+  importId: Schema.NullOr(Schema.String),
+  at: EpochMillis,
+});
+export type LiveTurnEnded = typeof LiveTurnEnded.Type;
+
+/**
  * One frame of the live transcript.
  *
  * Tagged, because a client has to branch on it, and discriminated by `_tag` rather than by
@@ -894,5 +921,6 @@ export const LiveFrame = Schema.Union([
   LiveItem,
   LiveCursor,
   LiveUsage,
+  LiveTurnEnded,
 ]);
 export type LiveFrame = typeof LiveFrame.Type;

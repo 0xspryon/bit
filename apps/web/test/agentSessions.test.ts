@@ -144,39 +144,94 @@ const row = (
   ...over,
 });
 
+const DOING = {
+  running: true,
+  calls: 14,
+  lastTool: "Bash",
+  subagent: null,
+  text: null,
+  failure: null,
+  at: 1,
+};
+
 describe("a row's second line", () => {
-  test("waiting is in warning and says what on", () => {
-    expect(doingLine(row({ waiting: "approve a 5-step plan" }))).toEqual({
-      text: "Waiting on you · approve a 5-step plan",
-      tone: "warning",
-    });
+  test("waiting is in warning and says what on, the agent's words marked as theirs", () => {
+    const line = doingLine(row({ waiting: "approve a 5-step plan" }));
+    expect(line.text).toBe("Waiting on you · approve a 5-step plan");
+    expect(line.tone).toBe("warning");
+    expect(line.parts).toEqual([
+      { text: "Waiting on you", agent: false, before: "" },
+      { text: "approve a 5-step plan", agent: true, before: " · " },
+    ]);
   });
 
   test("a running turn: what it is writing, or its last tool, and the calls so far", () => {
-    const doing = {
-      running: true,
-      calls: 14,
-      lastTool: "Bash",
-      text: null,
-      at: 1,
-    };
-    expect(doingLine(row({ activity: doing })).text).toBe(
-      "Running Bash · 14 tool calls so far",
-    );
+    const running = doingLine(row({ activity: DOING }));
+    expect(running.text).toBe("Running Bash · 14 tool calls so far");
+    // The tool's name is the harness's: isolated, running on from "Running".
+    expect(running.parts.map((part) => [part.before, part.agent])).toEqual([
+      ["", false],
+      [" ", true],
+      [" · ", false],
+    ]);
     expect(
-      doingLine(row({ activity: { ...doing, text: "Replaying the login" } }))
+      doingLine(row({ activity: { ...DOING, text: "Replaying the login" } }))
         .text,
     ).toBe("Replaying the login · 14 tool calls so far");
     expect(
       doingLine(
         row({
-          activity: { ...doing, calls: 1, running: false, text: "Done." },
+          activity: { ...DOING, calls: 1, running: false, text: "Done." },
         }),
       ).text,
     ).toBe("Last reply: Done. · 1 tool call in its last turn");
   });
 
-  test("how a finished one ended: failure alone in colour, and whether it resumes", () => {
+  test("a sub-agent at work is named, not 'Working · 0 calls' (A7 U8b review)", () => {
+    expect(
+      doingLine(
+        row({
+          activity: { ...DOING, calls: 0, lastTool: null, subagent: "Explore" },
+        }),
+      ).text,
+    ).toBe("Sub-agent · Explore");
+    // Even after the caller wrote something: the sub-agent is what the turn is doing.
+    expect(
+      doingLine(
+        row({
+          activity: {
+            ...DOING,
+            calls: 2,
+            text: "Let me survey it",
+            subagent: "Explore",
+          },
+        }),
+      ).text,
+    ).toBe("Sub-agent · Explore · 2 tool calls so far");
+  });
+
+  test("a live session whose last turn failed says so, in the harness's words, until the next turn (A7 U8b review)", () => {
+    const line = doingLine(
+      row({
+        activity: {
+          ...DOING,
+          running: false,
+          calls: 0,
+          lastTool: null,
+          failure: "Free usage limit reached",
+        },
+      }),
+    );
+    expect(line.text).toBe("Last turn failed · Free usage limit reached");
+    expect(line.tone).toBe("danger");
+    expect(line.parts.at(-1)?.agent).toBe(true);
+    // A running turn is the next turn: what it does, not the old failure.
+    expect(
+      doingLine(row({ activity: { ...DOING, failure: "old" } })).text,
+    ).toBe("Running Bash · 14 tool calls so far");
+  });
+
+  test("how a finished one ended: failure alone in colour, and a message carries it on only where it would", () => {
     expect(
       doingLine(
         row({
@@ -186,23 +241,113 @@ describe("a row's second line", () => {
           resumable: true,
         }),
       ),
-    ).toEqual({
-      text: "Failed · the session did not open · resumable",
+    ).toMatchObject({
+      text: "Failed · the session did not open · a message carries it on",
       tone: "danger",
     });
     expect(
-      doingLine(row({ state: "dormant", outcome: "completed" })).text,
-    ).toBe("Completed · 3 in · 0 out · 5 assets · a message carries it on");
+      doingLine(
+        row({
+          state: "dormant",
+          outcome: "failed",
+          detail: "refused",
+          resumable: false,
+        }),
+      ).text,
+    ).toBe("Failed · the harness would not take the prompt");
     expect(doingLine(row({ state: "ended", outcome: "stopped" })).text).toBe(
       "Ended by you · 3 in · 0 out · 5 assets",
     );
     expect(doingLine(row({ state: "ended", outcome: "empty" })).text).toBe(
-      "Ended without writing anything",
+      "Ended by you · wrote nothing",
     );
     expect(
       doingLine(row({ kind: "worker", state: "ended", outcome: "stopped" }))
         .tone,
     ).toBe("muted");
+  });
+
+  test("A7 U8b review: every outcome line is true of its row", () => {
+    const say = (over: Partial<Parameters<typeof doingLine>[0]>) =>
+      doingLine(row(over));
+    // A met goal completed; a message to it is refused, so nothing says one carries it on.
+    expect(
+      say({
+        kind: "goal",
+        tally: null,
+        state: "dormant",
+        outcome: "completed",
+      }),
+    ).toMatchObject({ text: "Completed · goal met", tone: "muted" });
+    expect(
+      say({ kind: "goal", tally: null, state: "dormant", outcome: "stopped" })
+        .text,
+    ).toBe("Stopped · the goal was abandoned");
+    // An active goal's conversation this server does not hold — a restart, a turn cut short.
+    expect(
+      say({
+        kind: "goal",
+        tally: null,
+        state: "dormant",
+        outcome: null,
+        resumable: true,
+      }).text,
+    ).toBe("Not running · a message carries it on");
+    // An uncertain worker or round: not known, neutral, never "Failed".
+    for (const kind of ["worker", "planner"] as const) {
+      expect(
+        say({
+          kind,
+          tally: null,
+          state: kind === "worker" ? "ended" : "dormant",
+          outcome: "unknown",
+          detail: "uncertain",
+        }),
+      ).toMatchObject({ text: "Outcome not known", tone: "muted" });
+    }
+    // An importer let go with nothing written, by a shutdown or with no reason recorded.
+    for (const detail of ["shutdown", null]) {
+      expect(
+        say({
+          state: "dormant",
+          outcome: null,
+          detail,
+          tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+          resumable: true,
+        }).text,
+      ).toBe("Not running · wrote nothing · a message carries it on");
+    }
+    // One that wrote, let go the same way, says what it wrote.
+    expect(say({ state: "dormant", outcome: null, resumable: true }).text).toBe(
+      "Not running · 3 in · 0 out · 5 assets · a message carries it on",
+    );
+    // One the send would refuse (agent unavailable, harness not configured) offers nothing.
+    expect(
+      say({
+        state: "dormant",
+        outcome: null,
+        tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+        resumable: false,
+      }).text,
+    ).toBe("Not running · wrote nothing");
+    // "resumable" is never the word: it was unchecked.
+    expect(
+      say({ state: "dormant", outcome: "failed", resumable: true }).text,
+    ).not.toContain("resumable");
+    // A planner that settled says its disposition; a worker's success is plain.
+    expect(
+      say({
+        kind: "planner",
+        tally: null,
+        state: "dormant",
+        outcome: "completed",
+        detail: "proposed_intents",
+      }).text,
+    ).toBe("Completed · proposed intents");
+    expect(
+      say({ kind: "worker", tally: null, state: "ended", outcome: "completed" })
+        .text,
+    ).toBe("Completed");
   });
 });
 

@@ -52,6 +52,7 @@ import {
   projectEvent,
   projectNarration,
   projectReplay,
+  turnEndedFrame,
   type LiveTranscriptInput,
 } from "./liveTranscript";
 import { RunNarrations, type RunNarration } from "./narration";
@@ -1973,6 +1974,75 @@ describe("the record and live activity, together", () => {
     expect(cursors(asked)).toEqual(cursors(without));
     expect(records(asked).map((item) => item.id)).toEqual(
       records(without).map((item) => item.id),
+    );
+  });
+
+  test("A7 U8b review: a turn's end is a frame of its own, after whatever its entry drew, even when that is nothing", async () => {
+    // OpenCode ends a turn on an `opaque` entry and Claude Code on a `usage` one: a client
+    // watching items alone never learned the turn was over.
+    const ended = (detail: NarrationDetail, id: number): RunNarration => {
+      const base = narration(detail, {
+        id,
+        subject: { _tag: "import", importId: "imp_1" },
+      });
+      return { ...base, entry: { ...base.entry, outcome: "succeeded" } };
+    };
+    const streamed = narrationsFrom([
+      narration({ _tag: "reply", text: "Done." }, { id: 1 }),
+      ended({ _tag: "opaque" }, 2),
+      ended({ _tag: "error", message: "Free usage limit reached" }, 3),
+    ]);
+    const frames = await withStore(newDatabasePath(), (store) =>
+      Effect.gen(function* () {
+        yield* seed(store);
+        return yield* Effect.promise(() =>
+          framesUntil(
+            over(store, { cursor: 0, narrations: streamed }),
+            (collected) =>
+              collected.filter((frame) => frame._tag === "turnEnded").length ===
+                2 && caughtUp(collected),
+          ),
+        );
+      }),
+    );
+    const activity = frames.filter(
+      (frame) =>
+        frame._tag === "turnEnded" ||
+        (frame._tag === "item" && frame.origin === "activity"),
+    );
+    expect(
+      activity.map((frame) =>
+        frame._tag === "turnEnded"
+          ? ["turnEnded", frame.importId, frame.attemptId]
+          : frame._tag === "item"
+            ? ["item", frame.body]
+            : [frame._tag],
+      ),
+    ).toEqual([
+      ["item", "Done."],
+      ["turnEnded", "imp_1", null],
+      ["item", "Free usage limit reached"],
+      ["turnEnded", "imp_1", null],
+    ]);
+  });
+
+  test("a turn's end decodes as a live frame, and an entry without an outcome makes none", () => {
+    const base = narration({ _tag: "opaque" });
+    expect(turnEndedFrame(base)).toBeUndefined();
+    const frame = turnEndedFrame({
+      ...base,
+      entry: { ...base.entry, outcome: "interrupted" },
+    });
+    expect(frame).toEqual({
+      _tag: "turnEnded",
+      attemptId: "attempt-1",
+      roundId: null,
+      goalId: null,
+      importId: null,
+      at: base.entry.at,
+    });
+    expect(Schema.decodeUnknownSync(LiveFrame)(frame)).toEqual(
+      frame as LiveFrame,
     );
   });
 

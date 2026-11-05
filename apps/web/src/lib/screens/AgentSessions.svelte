@@ -89,6 +89,7 @@
     IconSearch,
     IconUser,
   } from "../icons";
+  import { isolated } from "../importerChat";
   import { applyPlace, pathOf, type Place } from "../place";
   import { routedInApp } from "../placeLink";
 
@@ -119,19 +120,61 @@
   } as const;
   const KINDS = AgentSessionKind.literals;
 
-  /** Each row with the group label drawn above it, where its group starts on this page. */
-  let drawn = $derived(
-    rows.map((session, index) => ({
-      session,
-      group:
-        index === 0 || rows[index - 1]?.group !== session.group
-          ? (page?.groups.find((each) => each.key === session.group) ?? {
-              key: session.group,
-              count: 0,
-            })
-          : undefined,
-    })),
-  );
+  /**
+   * This page's rows by group, in order, each group with its full count. A group is a
+   * heading and a list of its own, so a screen reader counts a list's rows and nothing else
+   * (A7 U8b review): a header inside the row list was announced as one more row.
+   */
+  let sections = $derived.by(() => {
+    const out: {
+      key: string;
+      count: number;
+      rows: AgentSessionView[];
+    }[] = [];
+    for (const session of rows) {
+      const last = out.at(-1);
+      if (last !== undefined && last.key === session.group) {
+        last.rows.push(session);
+      } else {
+        out.push({
+          key: session.group,
+          count:
+            page?.groups.find((each) => each.key === session.group)?.count ?? 0,
+          rows: [session],
+        });
+      }
+    }
+    return out;
+  });
+
+  const TABS = [
+    ["active", "Active"],
+    ["ended", "Ended"],
+    ["all", "All"],
+  ] as const;
+  let tabButtons: HTMLButtonElement[] = $state([]);
+  /**
+   * The WAI-ARIA tabs pattern: one tab in the Tab order (the selected one), arrows move
+   * between tabs and select as they go, Home and End go to the ends.
+   */
+  const onTabKey = (event: KeyboardEvent, index: number) => {
+    const to =
+      event.key === "ArrowRight"
+        ? (index + 1) % TABS.length
+        : event.key === "ArrowLeft"
+          ? (index - 1 + TABS.length) % TABS.length
+          : event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? TABS.length - 1
+              : undefined;
+    if (to === undefined) return;
+    event.preventDefault();
+    const tab = TABS[to];
+    if (tab === undefined) return;
+    tabButtons[to]?.focus();
+    app.setAgentSessionsQuery({ tab: tab[0] });
+  };
   let pages = $derived(
     page === undefined
       ? 1
@@ -186,9 +229,9 @@
     class={[
       "mark",
       // Prefixed: an outcome is also a word this page styles elsewhere (`.empty`).
-      `is-${live ? (session.waiting !== null ? "waiting" : session.group) : (session.outcome ?? "none")}`,
+      `is-${live ? (session.waiting !== null ? "waiting" : session.group) : (session.outcome ?? "dormant")}`,
     ]}
-    data-mark={live ? session.group : session.outcome}
+    data-mark={live ? session.group : (session.outcome ?? "dormant")}
     aria-hidden="true"
   >
     {#if live}
@@ -199,13 +242,21 @@
       <span class="square"></span>
     {:else if session.outcome === "empty"}
       <span class="dash"></span>
-    {:else}
+    {:else if session.outcome === "unknown"}
+      <!-- Not known is not failure: outlined and neutral, never the danger colour. -->
+      <span class="unknown">?</span>
+    {:else if session.outcome === "completed"}
       <span class="check">✓</span>
+    {:else}
+      <!-- Not running, not ended: the idle ring, since a message carries it on. -->
+      <span class="dot"></span>
     {/if}
   </span>
   <span class="main">
     <span class="line1">
-      <span class="name" title={sessionName(session)}
+      <!-- The name is agent text (a harness title, a goal, a worker's question): its own
+           isolate, so a bidi control in it cannot reorder the breadcrumb beside it. -->
+      <span class="name" title={isolated(sessionName(session))}
         >{sessionName(session)}</span
       >
       <span class="divider" aria-hidden="true"></span>
@@ -235,7 +286,9 @@
       {/if}
     </span>
     <span class={["line2", line.tone]} title={stateTitle(session)}
-      >{line.text}</span
+      >{#each line.parts as part, index (index)}{part.before}{#if part.agent}<span
+            class="said">{part.text}</span
+          >{:else}{part.text}{/if}{/each}</span
     >
   </span>
   <span class="agent">
@@ -261,12 +314,17 @@
   {#snippet filters()}
     <div class="toolbar">
       <div class="tabs" role="tablist" aria-label="Which sessions">
-        {#each [["active", "Active"], ["ended", "Ended"], ["all", "All"]] as const as [tab, label] (tab)}
+        {#each TABS as [tab, label], index (tab)}
           <button
+            bind:this={tabButtons[index]}
             role="tab"
+            id="agent-sessions-tab-{tab}"
             aria-selected={query.tab === tab}
+            aria-controls="agent-sessions-panel"
+            tabindex={query.tab === tab ? 0 : -1}
             class={["tab", query.tab === tab && "on"]}
             onclick={() => app.setAgentSessionsQuery({ tab })}
+            onkeydown={(event) => onTabKey(event, index)}
           >
             {label}
             <span class="tab-count">{page?.counts[tab] ?? ""}</span>
@@ -334,163 +392,192 @@
   {/snippet}
 
   {#snippet body()}
-    {#if app.agentSessionsState === "failed" && rows.length === 0}
-      <div class="notice">
-        <Banner tone="danger">{app.agentSessionsDetail}</Banner>
-        <Button onclick={() => void app.loadAgentSessions(app.viewTargetId)}>
-          Try again
-        </Button>
-      </div>
-    {:else if page === undefined}
-      <p class="quiet" role="status">Reading this target's agent sessions…</p>
-    {:else if page.counts.all === 0}
-      <div class="empty">
-        <IconRobot width="28" height="28" />
-        <p class="empty-lead">No agent sessions on this target yet.</p>
-        <p class="empty-more">
-          A session appears here once a goal conversation is opened, a scope
-          import runs, a goal is planned, or a worker attempt starts on its
-          harness.
-        </p>
-      </div>
-    {:else}
-      <!--
+    <div
+      class="panel"
+      role="tabpanel"
+      id="agent-sessions-panel"
+      aria-labelledby="agent-sessions-tab-{query.tab}"
+    >
+      {#if app.agentSessionsState === "failed" && rows.length === 0}
+        <div class="notice">
+          <Banner tone="danger">{app.agentSessionsDetail}</Banner>
+          <Button onclick={() => void app.loadAgentSessions(app.viewTargetId)}>
+            Try again
+          </Button>
+        </div>
+      {:else if page === undefined}
+        <p class="quiet" role="status">Reading this target's agent sessions…</p>
+      {:else if page.counts.all === 0}
+        <div class="empty">
+          <IconRobot width="28" height="28" />
+          <p class="empty-lead">No agent sessions on this target yet.</p>
+          <p class="empty-more">
+            A session appears here once a goal conversation is opened, a scope
+            import runs, a goal is planned, or a worker attempt starts on its
+            harness.
+          </p>
+        </div>
+      {:else}
+        <!--
         No banner of its own. A row whose session has gone is answered by the shell's
         arrival banner, which is on this page and on every other page such a link can land
         on; see `App.arrivalNote`.
       -->
-      <div class="table" role="presentation">
-        <div class="head" aria-hidden="true">
-          <span class="h-session">Session · where it lives</span>
-          <span>Agent</span>
-          <span>Model</span>
-          <span class="h-when">Last activity</span>
-        </div>
-        <ul class="rows" aria-label="Agent sessions">
-          {#each drawn as { session, group } (session.key)}
-            {#if group !== undefined}
-              <li class="group" data-group={group.key}>
-                <span class="group-label">{groupLabel(group.key, now)}</span>
-                <span class="group-count">{group.count}</span>
-              </li>
-            {/if}
-            {@const place = placeOfSession(session, app.viewTargetId)}
-            <li class="row-item" data-key={session.key}>
-              {#if place !== null}
-                <!--
+        <div class="table" role="presentation">
+          <div class="head" aria-hidden="true">
+            <span class="h-session">Session · where it lives</span>
+            <span>Agent</span>
+            <span>Model</span>
+            <span class="h-when">Last activity</span>
+          </div>
+          <div class="rows">
+            {#each sections as section (section.key)}
+              <section
+                class="group-block"
+                aria-labelledby="agent-sessions-group-{section.key}"
+              >
+                <h3
+                  class="group"
+                  id="agent-sessions-group-{section.key}"
+                  data-group={section.key}
+                >
+                  <span class="group-label">{groupLabel(section.key, now)}</span
+                  >
+                  <span class="group-count">{section.count}</span>
+                </h3>
+                <ul
+                  class="group-rows"
+                  aria-labelledby="agent-sessions-group-{section.key}"
+                >
+                  {#each section.rows as session (session.key)}
+                    {@const place = placeOfSession(session, app.viewTargetId)}
+                    <li class="row-item" data-key={session.key}>
+                      {#if place !== null}
+                        <!--
                   A real href, so the operator can copy it, middle-click it, or open it beside
                   what they are reading. The handler is what keeps an ordinary click from
                   reloading the document; see `routedInApp`.
                 -->
-                <a
-                  class={["row", "go", session.waiting !== null && "waiting"]}
-                  href={pathOf(place)}
-                  onclick={(event) => follow(place, event)}
-                >
-                  {@render content(session, true)}
-                </a>
+                        <a
+                          class={[
+                            "row",
+                            "go",
+                            session.waiting !== null && "waiting",
+                          ]}
+                          href={pathOf(place)}
+                          onclick={(event) => follow(place, event)}
+                        >
+                          {@render content(session, true)}
+                        </a>
+                      {:else}
+                        <!-- Inert: there is no screen for a worker attempt to open yet. -->
+                        <div class="row">{@render content(session, false)}</div>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
+              </section>
+            {/each}
+          </div>
+          {#if rows.length === 0}
+            <p class="quiet none" role="status">
+              {#if query.needsYou}
+                Nothing in {query.tab === "all"
+                  ? "these sessions"
+                  : `${query.tab} sessions`}
+                is waiting on you.
+              {:else if filtered}
+                No {query.tab === "all" ? "" : `${query.tab} `}session matches
+                these filters.
+              {:else if query.tab === "active"}
+                Nothing is running on this target right now.
               {:else}
-                <!-- Inert: there is no screen for a worker attempt to open yet. -->
-                <div class="row">{@render content(session, false)}</div>
+                No session on this target has ended yet.
               {/if}
-            </li>
-          {/each}
-        </ul>
-        {#if rows.length === 0}
-          <p class="quiet none" role="status">
-            {#if query.needsYou}
-              Nothing in {query.tab === "all"
-                ? "these sessions"
-                : `${query.tab} sessions`}
-              is waiting on you.
-            {:else if filtered}
-              No {query.tab === "all" ? "" : `${query.tab} `}session matches
-              these filters.
-            {:else if query.tab === "active"}
-              Nothing is running on this target right now.
-            {:else}
-              No session on this target has ended yet.
-            {/if}
-          </p>
-        {/if}
-        {#if hidden !== null}
-          <p class="hidden-line" role="status">
-            {hidden}
-            <button
-              class="link"
-              onclick={() => app.setAgentSessionsQuery({ needsYou: false })}
-              >Clear the filter</button
-            >
-          </p>
-        {/if}
-        {#if app.agentSessionsWorkersOmitted > 0}
-          <p class="quiet-small" role="status">
-            {app.agentSessionsWorkersOmitted} older worker {app.agentSessionsWorkersOmitted ===
-            1
-              ? "session is"
-              : "sessions are"} not counted here. Worker attempts accumulate with
-            every intent, so the list reads the newest.
-          </p>
-        {/if}
-      </div>
-      <footer class="pager">
-        <span class="range mono"
-          >{rangeLabel(page, rows.length, query.needsYou)}</span
-        >
-        {#if query.tab !== "active"}
-          <span class="pager-right">
-            <label class="per-page">
-              Rows per page
-              <select
-                aria-label="Rows per page"
-                value={String(query.pageSize)}
-                onchange={(event) => {
-                  const size = Number(event.currentTarget.value);
-                  const chosen = AGENT_SESSION_PAGE_SIZES.find(
-                    (each) => each === size,
-                  );
-                  if (chosen !== undefined)
-                    app.setAgentSessionsQuery({ pageSize: chosen });
-                }}
+            </p>
+          {/if}
+          {#if hidden !== null}
+            <p class="hidden-line" role="status">
+              {hidden}
+              <button
+                class="link"
+                onclick={() => app.setAgentSessionsQuery({ needsYou: false })}
+                >Clear the filter</button
               >
-                {#each AGENT_SESSION_PAGE_SIZES as size (size)}
-                  <option value={String(size)}>{size}</option>
+            </p>
+          {/if}
+          {#if app.agentSessionsWorkersOmitted > 0}
+            <p class="quiet-small" role="status">
+              {app.agentSessionsWorkersOmitted} older worker {app.agentSessionsWorkersOmitted ===
+              1
+                ? "session is"
+                : "sessions are"} not counted here. Worker attempts accumulate with
+              every intent, so the list reads the newest.
+            </p>
+          {/if}
+        </div>
+        <footer class="pager">
+          <span class="range mono"
+            >{rangeLabel(page, rows.length, query.needsYou)}</span
+          >
+          {#if query.tab !== "active"}
+            <span class="pager-right">
+              <label class="per-page">
+                Rows per page
+                <select
+                  aria-label="Rows per page"
+                  value={String(query.pageSize)}
+                  onchange={(event) => {
+                    const size = Number(event.currentTarget.value);
+                    const chosen = AGENT_SESSION_PAGE_SIZES.find(
+                      (each) => each === size,
+                    );
+                    if (chosen !== undefined)
+                      app.setAgentSessionsQuery({ pageSize: chosen });
+                  }}
+                >
+                  {#each AGENT_SESSION_PAGE_SIZES as size (size)}
+                    <option value={String(size)}>{size}</option>
+                  {/each}
+                </select>
+              </label>
+              <nav class="pages" aria-label="Pages">
+                <button
+                  class="page-step"
+                  aria-label="Previous page"
+                  disabled={page.page <= 1}
+                  onclick={() =>
+                    app.setAgentSessionsQuery({ page: page.page - 1 })}
+                  >‹</button
+                >
+                {#each pagerPages(page.page, pages) as number, index (index)}
+                  {#if number === null}
+                    <span class="gap" aria-hidden="true">…</span>
+                  {:else}
+                    <button
+                      class={["page-number", number === page.page && "on"]}
+                      aria-current={number === page.page ? "page" : undefined}
+                      aria-label="Page {number}"
+                      onclick={() =>
+                        app.setAgentSessionsQuery({ page: number })}
+                      >{number}</button
+                    >
+                  {/if}
                 {/each}
-              </select>
-            </label>
-            <nav class="pages" aria-label="Pages">
-              <button
-                class="page-step"
-                aria-label="Previous page"
-                disabled={page.page <= 1}
-                onclick={() =>
-                  app.setAgentSessionsQuery({ page: page.page - 1 })}>‹</button
-              >
-              {#each pagerPages(page.page, pages) as number, index (index)}
-                {#if number === null}
-                  <span class="gap" aria-hidden="true">…</span>
-                {:else}
-                  <button
-                    class={["page-number", number === page.page && "on"]}
-                    aria-current={number === page.page ? "page" : undefined}
-                    aria-label="Page {number}"
-                    onclick={() => app.setAgentSessionsQuery({ page: number })}
-                    >{number}</button
-                  >
-                {/if}
-              {/each}
-              <button
-                class="page-step"
-                aria-label="Next page"
-                disabled={page.page >= pages}
-                onclick={() =>
-                  app.setAgentSessionsQuery({ page: page.page + 1 })}>›</button
-              >
-            </nav>
-          </span>
-        {/if}
-      </footer>
-    {/if}
+                <button
+                  class="page-step"
+                  aria-label="Next page"
+                  disabled={page.page >= pages}
+                  onclick={() =>
+                    app.setAgentSessionsQuery({ page: page.page + 1 })}
+                  >›</button
+                >
+              </nav>
+            </span>
+          {/if}
+        </footer>
+      {/if}
+    </div>
   {/snippet}
 </PageFrame>
 
@@ -663,7 +750,8 @@
   .h-when {
     text-align: right;
   }
-  .rows {
+  .rows,
+  .group-rows {
     list-style: none;
     margin: 0;
     padding: 0;
@@ -671,6 +759,7 @@
     flex-direction: column;
   }
   .group {
+    margin: 0;
     display: flex;
     align-items: baseline;
     gap: 8px;
@@ -745,6 +834,23 @@
     font-size: 11px;
     line-height: 1;
   }
+  /* Outcome not known: an outlined "?", neutral like the other marks (A7 U8b review). */
+  .mark .unknown {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 11px;
+    height: 11px;
+    border: 1.2px solid var(--icon-muted);
+    border-radius: 50%;
+    font: 600 8px/1 var(--font-sans);
+    box-sizing: border-box;
+  }
+  /* Not running and not ended (dormant): the idle ring. */
+  .mark.is-dormant .dot {
+    background: transparent;
+    box-shadow: inset 0 0 0 1.5px var(--icon-muted);
+  }
   .main {
     display: flex;
     flex-direction: column;
@@ -757,11 +863,17 @@
     gap: 10px;
     min-width: 0;
   }
-  /* The name keeps its room; the breadcrumb gives way first, its place cut short. */
+  /*
+   * The name keeps its room; the breadcrumb gives way first, its place cut short. Capped, so
+   * a long name (a worker's question) is cut before the breadcrumb is: where it lives must
+   * always show (A7 U8b review: it shrank to 0 px).
+   */
   .name {
     flex: 0 1 auto;
     min-width: 12ch;
+    max-width: 60%;
     overflow: hidden;
+    unicode-bidi: isolate;
     font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -775,7 +887,7 @@
   .crumb {
     display: inline-flex;
     flex: 0 10 auto;
-    min-width: 0;
+    min-width: 9ch;
     overflow: hidden;
     align-items: center;
     gap: 6px;
@@ -808,6 +920,10 @@
     line-height: 16px;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* Agent text on the second line: its own isolate, like the name. */
+  .said {
+    unicode-bidi: isolate;
   }
   .line2.muted {
     color: var(--text-muted);

@@ -5739,10 +5739,14 @@ describe("a target's agent sessions", () => {
       [`importer:${LIVE_IMPORT_ID}`, "live", "idle", null],
       ["worker:att_done_main", "ended", "day:1970-01-01", "failed"],
       // `GoalConversations.unavailable` holds nothing: a recorded conversation this
-      // process cannot reach reads dormant, and its model is not known.
-      ["goal:goal_main", "dormant", "day:1970-01-01", "completed"],
+      // process cannot reach reads dormant, and its model is not known. Its goal is
+      // active, so it did not end: no outcome (A7 U8b review), and a message carries it on.
+      ["goal:goal_main", "dormant", "day:1970-01-01", null],
       ["planner:goal_main_quiet", "dormant", "day:1970-01-01", "empty"],
     ]);
+    expect(
+      body.sessions.find((s) => s.key === "goal:goal_main")?.resumable,
+    ).toBe(true);
     expect(body.sessions[0]).toMatchObject({
       kind: "worker",
       sessionId: "ses_worker_run_main",

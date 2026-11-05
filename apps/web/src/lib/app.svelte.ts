@@ -701,6 +701,14 @@ export class App {
   #agentSessionsRead = 0;
   /** A refresh scheduled by live frames, or `undefined` (A7 U8b). */
   #agentSessionsRefresh: (() => void) | undefined;
+  /**
+   * The order the rail's counts were asked for in, by every read that carries them — the
+   * page's and the rail's own — and the newest whose answer has been applied. An answer
+   * asked for before the one already applied is older news and is dropped (A7 U8b review:
+   * a slow rail read overwrote a newer page read's counts).
+   */
+  #agentCountsAsked = 0;
+  #agentCountsApplied = 0;
   /*
    * `agentSessionsNote` was here: "why the last click on a row went nowhere", with the one
    * case being an importer session the importer's index no longer lists.
@@ -2801,6 +2809,8 @@ export class App {
     const answer = (
       call: Awaited<ReturnType<ServerClient["sendImporterMessage"]>>,
     ): ImporterSent => {
+      // A message opens a session, or reopens one this server had let go (A7 U8b review).
+      this.#agentSessionsMoved(targetId);
       if (call._tag === "Ok") return { _tag: "accepted", turn: call.value };
       if (call._tag === "Refused") {
         if (call.error._tag === "Unauthenticated") this.signOut("expired");
@@ -2905,6 +2915,7 @@ export class App {
           targetId,
           importId,
         );
+        this.#agentSessionsMoved(targetId);
         if (call._tag === "Ok") return { _tag: "stopped", stopped: call.value };
         if (call._tag === "Refused") {
           if (call.error._tag === "Unauthenticated") this.signOut("expired");
@@ -3336,6 +3347,7 @@ export class App {
     const titles = options.titles ?? true;
     const query = this.agentSessionsQuery;
     const read = ++this.#agentSessionsRead;
+    const counted = ++this.#agentCountsAsked;
 
     const call = await this.client.agentSessions(this.serverUrl, id, {
       ...query,
@@ -3381,11 +3393,7 @@ export class App {
       this.agentSessionsQuery = { ...query, page: page.page };
     }
     this.agentSessionsWorkersOmitted = page.workersOmitted;
-    this.agentSessionCounts = {
-      targetId: id,
-      active: page.counts.active,
-      needsYou: page.counts.needsYou,
-    };
+    this.#applyAgentCounts(id, counted, page.counts);
     this.agentSessionsState = "ready";
   }
 
@@ -3407,16 +3415,54 @@ export class App {
    */
   async loadAgentSessionCounts(id: string) {
     if (this.viewTargetId !== id) return;
+    const counted = ++this.#agentCountsAsked;
     const call = await this.client.agentSessions(this.serverUrl, id, {
       tab: "active",
       timeZone: browserTimeZone(),
     });
     if (this.viewTargetId !== id || call._tag !== "Ok") return;
+    this.#applyAgentCounts(id, counted, call.value.counts);
+  }
+
+  /** Takes one read's counts for the rail, unless a read asked for later has landed first. */
+  #applyAgentCounts(
+    id: string,
+    counted: number,
+    counts: { readonly active: number; readonly needsYou: number },
+  ) {
+    // Another target's counts are not older news about this one.
+    if (
+      counted < this.#agentCountsApplied &&
+      this.agentSessionCounts?.targetId === id
+    ) {
+      return;
+    }
+    this.#agentCountsApplied = counted;
     this.agentSessionCounts = {
       targetId: id,
-      active: call.value.counts.active,
-      needsYou: call.value.counts.needsYou,
+      active: counts.active,
+      needsYou: counts.needsYou,
     };
+  }
+
+  /**
+   * This tab did something that changes a session's liveness — opened one, sent to one,
+   * stopped or ended one (A7 U8b review): read the list, or the rail's counts, now. Not
+   * throttled like {@link #agentSessionsStale}: it is one read per click, and the rail
+   * said "2" for twelve seconds after a stop because nothing else prompted one.
+   *
+   * V2(chat): another tab learns of a session ended or opened while idle only at its next
+   * read — a turn's end reaches every tab (`LiveTurnEnded`), but a change of liveness with
+   * no turn in it (ending an idle importer session, a goal conversation let go) publishes
+   * nothing. Proper V2: a liveness frame from the registries that hold sessions.
+   */
+  #agentSessionsMoved(targetId: string) {
+    if (this.viewTargetId !== targetId || this.screen !== "target") return;
+    if (this.navItem === "agent-sessions") {
+      void this.loadAgentSessions(targetId, { titles: false });
+    } else {
+      void this.loadAgentSessionCounts(targetId);
+    }
   }
 
   /**
@@ -3647,6 +3693,8 @@ export class App {
         status: this.goalEndStatus,
         reason: this.goalEndReason.trim(),
       });
+      // A goal's end ends its conversation's row (A7 U8b review).
+      this.#agentSessionsMoved(targetId);
       if (this.viewTargetId !== targetId) return;
       if (call._tag === "Unreachable") {
         this.goalEndDetail = "No server answered at this address.";
@@ -4027,6 +4075,7 @@ export class App {
       goalId,
       text,
     );
+    this.#agentSessionsMoved(targetId);
     if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
     if (visit !== this.#goalConversationVisit) return;
     this.goalSending = false;
@@ -4200,6 +4249,7 @@ export class App {
         goalId,
         roundId,
       );
+      this.#agentSessionsMoved(targetId);
       if (this.viewTargetId !== targetId || this.openGoalId !== goalId) return;
       if (call._tag === "Unreachable") {
         this.roundStopDetail = "No server answered at this address.";
@@ -4748,6 +4798,7 @@ export class App {
         : {}),
     });
     this.importStarting = false;
+    this.#agentSessionsMoved(targetId);
 
     if (call._tag === "Ok") {
       const started = call.value.scopeImport;
@@ -5346,6 +5397,7 @@ export class App {
       targetId,
       importId,
     );
+    this.#agentSessionsMoved(targetId);
     if (call._tag === "Ok") {
       this.scopeImport = call.value;
       return;
@@ -5409,6 +5461,7 @@ export class App {
           })(),
         },
       );
+      this.#agentSessionsMoved(targetId);
       if (call._tag === "Unreachable") {
         this.runDetail = "No server answered at this address.";
         return;
@@ -5487,6 +5540,7 @@ export class App {
         running.targetId,
         running.attemptId,
       );
+      this.#agentSessionsMoved(running.targetId);
       if (call._tag === "Unreachable") {
         this.runDetail = "No server answered at this address.";
         return;
@@ -5888,6 +5942,12 @@ export class App {
     if (frame._tag === "cursor") {
       this.liveCursor = Math.max(this.liveCursor, frame.sequence);
       this.liveCaughtUp = frame.caughtUp;
+      return;
+    }
+    if (frame._tag === "turnEnded") {
+      // A session's turn ended: its row has gone from running to idle, which no item says
+      // when the turn's last entry renders nothing (`LiveTurnEnded`, A7 U8b review).
+      this.#agentSessionsStale(targetId);
       return;
     }
     if (frame._tag === "usage") {

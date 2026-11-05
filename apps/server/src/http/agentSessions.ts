@@ -84,7 +84,19 @@ export interface AgentSessionSources {
     readonly entriesIn: number;
     readonly entriesOut: number;
     readonly assets: number;
+    /**
+     * Whether this server still defines the agent the session runs as
+     * (`importSessionAgent`). A message to one it does not is refused, so the row does not
+     * say a message carries it on. Absent: defined.
+     */
+    readonly agentDefined?: boolean | undefined;
   }[];
+  /**
+   * Whether this server runs a harness instance, by id. A message to an importer session
+   * recorded on an instance it does not run is refused (`importerReopenFor`), so the row
+   * does not offer it. Absent: every instance is taken as run.
+   */
+  readonly instanceRun?: ((instanceId: string) => boolean) | undefined;
   readonly workers: {
     readonly sessions: readonly {
       readonly attemptId: string;
@@ -154,6 +166,7 @@ export const unionAgentSessions = (
   sources: AgentSessionSources,
 ): { readonly rows: AgentSessionRow[]; readonly workersOmitted: number } => {
   const activity = sources.activity ?? (() => undefined);
+  const instanceRun = sources.instanceRun ?? (() => true);
 
   const goals = sources.goals.map((goal): AgentSessionRow => {
     const held = sources.goalLive(goal.goalId);
@@ -183,14 +196,21 @@ export const unionAgentSessions = (
       lastActivityAt: Math.max(goal.openedAt, doing?.at ?? 0),
       activity: doing,
       waiting: null,
-      // A conversation this server does not hold finished its last turn; the goal's own end
-      // says more where it has one. An abandoned goal was stopped.
+      // A conversation this server does not hold has ended only if its goal has: a met goal
+      // completed it, an abandoned one stopped it, and a message to either is refused
+      // (`plan/goalConversation.ts` answers `goal_not_active`). An active goal's conversation
+      // did not end — a restart let it go, or cut its turn short — so it has no outcome,
+      // and a message carries it on.
       outcome: live
         ? null
-        : goal.goalStatus === "abandoned"
-          ? "stopped"
-          : "completed",
-      resumable: false,
+        : goal.goalStatus === "met"
+          ? "completed"
+          : goal.goalStatus === "abandoned"
+            ? "stopped"
+            : null,
+      resumable:
+        !live &&
+        (goal.goalStatus === undefined || goal.goalStatus === "active"),
     };
   });
 
@@ -215,16 +235,19 @@ export const unionAgentSessions = (
     const failed =
       session.endedReason !== null &&
       ENDED_IMPORTER_FAILURES.has(session.endedReason);
+    // Only an operator's end ended it; a refused prompt or a failed open failed it. One a
+    // shutdown let go, or that recorded no reason, did not end at all: no outcome, whether
+    // or not it wrote anything — the tally says that.
     const outcome: AgentSessionOutcome | null =
       state === "live"
         ? null
         : failed
           ? "failed"
-          : !wrote
-            ? "empty"
-            : session.endedReason === "operator"
+          : session.endedReason === "operator"
+            ? wrote
               ? "stopped"
-              : "completed";
+              : "empty"
+            : null;
     return {
       kind: "importer",
       key: `importer:${session.latestImportId}`,
@@ -249,9 +272,14 @@ export const unionAgentSessions = (
       activity: doing,
       waiting: null,
       outcome,
-      // Only an operator's end is final; a refused prompt or a failed open is carried on by
-      // the next message, in a fresh session.
-      resumable: failed,
+      // Only an operator's end is final; anything else not held is carried on by the next
+      // message — unless the send would refuse it: an agent this server no longer defines,
+      // or a harness instance it no longer runs (`importerReopenFor`).
+      resumable:
+        state === "dormant" &&
+        session.agentDefined !== false &&
+        (session.harnessInstanceId === null ||
+          instanceRun(session.harnessInstanceId)),
     };
   });
 
@@ -304,9 +332,16 @@ export const unionAgentSessions = (
       model: round?.model ?? null,
       startedAt: lineage.createdAt,
       // The lineage is resumed by the goal's next round, so between rounds it is not running
-      // and nothing ended it for good: dormant, with the last round's status beside it.
+      // and nothing ended it for good: dormant, with the last round's status beside it — its
+      // disposition only when it settled: an uncertain or interrupted round's plan is not
+      // what it ended on.
       state: live ? "live" : "dormant",
-      detail: round === null ? null : (round.disposition ?? round.status),
+      detail:
+        round === null
+          ? null
+          : round.status === "settled"
+            ? (round.disposition ?? round.status)
+            : round.status,
       tally: null,
       surface: { section: "goals", place: "Plan", gone: false },
       lastActivityAt: Math.max(
@@ -335,13 +370,18 @@ export const unionAgentSessions = (
   };
 };
 
-/** How a worker attempt's or a planner round's final status reads as an outcome. */
-const attemptOutcome = (status: string): AgentSessionOutcome =>
+/**
+ * How a worker attempt's or a planner round's final status reads as an outcome. `uncertain`
+ * is nobody knowing how it ended, which is not a failure: `unknown`.
+ */
+export const attemptOutcome = (status: string): AgentSessionOutcome =>
   status === "succeeded" || status === "settled"
     ? "completed"
     : status === "interrupted"
       ? "stopped"
-      : "failed";
+      : status === "uncertain"
+        ? "unknown"
+        : "failed";
 
 /* ── Grouping and paging ──────────────────────────────────────────────────── */
 
@@ -376,19 +416,29 @@ export const activeGroup = (
  * The calendar day a time falls on in a time zone, as `YYYY-MM-DD`. An unknown zone is
  * read as UTC rather than refused: the grouping is a convenience, the rows are the answer.
  */
-export const dayIn = (at: number, timeZone: string): string => {
-  const format = (zone: string) =>
+export const dayIn = (at: number, timeZone: string): string =>
+  dayFormatter(timeZone)(at);
+
+/**
+ * {@link dayIn} for one zone, built once: an `Intl.DateTimeFormat` costs tens of
+ * microseconds to construct and almost nothing to use, so a read builds one and formats
+ * every row's day with it (A7 U8b review: one per row was 75 ms of a 2,000-row read).
+ */
+export const dayFormatter = (timeZone: string): ((at: number) => string) => {
+  const make = (zone: string) =>
     new Intl.DateTimeFormat("en-CA", {
       timeZone: zone,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
-    }).format(at);
+    });
+  let format: Intl.DateTimeFormat;
   try {
-    return format(timeZone);
+    format = make(timeZone);
   } catch {
-    return format("UTC");
+    format = make("UTC");
   }
+  return (at) => format.format(at);
 };
 
 const matchesText = (row: AgentSessionRow, q: string): boolean => {
@@ -449,11 +499,10 @@ export const pageAgentSessions = (
       (query.agent === undefined || row.kind === query.agent) &&
       matchesText(row, query.q.trim()),
   );
+  const day = dayFormatter(query.timeZone);
   const grouped = narrowed.map((row) => ({
     ...row,
-    group: isActive(row)
-      ? activeGroup(row)
-      : `day:${dayIn(row.lastActivityAt, query.timeZone)}`,
+    group: isActive(row) ? activeGroup(row) : `day:${day(row.lastActivityAt)}`,
   }));
   const shown = query.needsYou
     ? grouped.filter((row) => row.waiting !== null)

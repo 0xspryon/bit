@@ -87,10 +87,24 @@ export const AgentSessionActivity = Schema.Struct({
   running: Schema.Boolean,
   /** Tool calls in the current (or last) turn. */
   calls: Schema.Int,
-  /** The last tool it called in that turn, as the harness named it. */
+  /**
+   * The last tool it called in that turn, as the list names it: an MCP tool without its
+   * `mcp__<server>__` prefix (the server is bit's own, per session, and says nothing).
+   */
   lastTool: Schema.NullOr(Schema.String),
+  /**
+   * The sub-agent running in that turn, by its type or, failing that, its task's short
+   * description; null when none is running. Agent text: drawn isolated, as plain text.
+   */
+  subagent: Schema.NullOr(Schema.String),
   /** The last line of what it last wrote, shortened; null before it wrote anything. */
   text: Schema.NullOr(Schema.String),
+  /**
+   * Why the last turn failed, in the harness's own words (one line, capped), or null. Set
+   * by a turn that ended with an error ("Free usage limit reached"); cleared when the next
+   * turn starts. Untrusted text: a provider's error can quote anything.
+   */
+  failure: Schema.NullOr(Schema.String),
   /** When the last of it was narrated, in epoch milliseconds. */
   at: Schema.Int,
 });
@@ -98,13 +112,21 @@ export type AgentSessionActivity = typeof AgentSessionActivity.Type;
 
 /**
  * How a session that is no longer running ended (A7 E5): `completed`; `stopped` by the
- * operator or interrupted; `failed`; `empty`, which ended without writing anything.
+ * operator or interrupted; `failed`; `empty`, which ended without writing anything; and
+ * `unknown`, which ended in a way nobody could tell — a worker attempt or a planner round
+ * whose status is `uncertain`. Unknown is not failure: the list draws it neutrally, and
+ * failure stays the only outcome in colour.
+ *
+ * A session this server merely does not hold — a goal conversation after a restart, an
+ * importer session a shutdown let go — has **no** outcome: it did not end, and a message
+ * carries it on. Its row is `dormant` with `outcome: null`.
  */
 export const AgentSessionOutcome = Schema.Literals([
   "completed",
   "stopped",
   "failed",
   "empty",
+  "unknown",
 ]);
 export type AgentSessionOutcome = typeof AgentSessionOutcome.Type;
 
@@ -181,9 +203,17 @@ export const AgentSessionView = Schema.Struct({
    * counts already turn on it.
    */
   waiting: Schema.NullOr(Schema.String),
-  /** How an ended (or dormant) session finished; null while it is live. */
+  /**
+   * How a finished session ended; null while it is live, and null for a `dormant` one that
+   * did not end — this server let it go, and a message carries it on.
+   */
   outcome: Schema.NullOr(AgentSessionOutcome),
-  /** Whether a failed session can be carried on by a message. */
+  /**
+   * Whether a message to it carries it on: a goal conversation of an active goal, or an
+   * importer session not ended by the operator whose agent this server still defines and
+   * whose harness it still runs (`importerReopen`'s refusals). Always false while live —
+   * there is nothing to carry on — and for a worker attempt or a planner round.
+   */
   resumable: Schema.Boolean,
   /** The row's group on this page: `needs_you`, `running`, `idle`, or `day:<YYYY-MM-DD>`. */
   group: Schema.String,

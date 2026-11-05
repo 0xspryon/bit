@@ -17,6 +17,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { type AgentSessionView, type AgentSessionsView } from "@bit/contracts";
+import { compile } from "svelte/compiler";
 
 import { AGENT_SESSIONS_REFRESH_MS, App } from "../../src/lib/app.svelte";
 import type { AgentSessionsRequest } from "../../src/lib/client";
@@ -78,7 +79,9 @@ const IMPORTER = agentSessionView({
     running: true,
     calls: 14,
     lastTool: "Bash",
+    subagent: null,
     text: "Testing X-Forwarded-For rotation",
+    failure: null,
     at: Date.now(),
   },
   group: "running",
@@ -255,7 +258,9 @@ describe("the Agent sessions list", () => {
     expect(rows[1]).toContain("Goals");
     expect(rows[1]).toContain("Conversation");
     expect(rows[1]).toContain("Goal agent");
-    expect(rows[1]).toContain("Completed · a message carries it on");
+    // A dormant goal recorded as completed is a met goal: no message carries it on.
+    expect(rows[1]).toContain("Completed · goal met");
+    expect(rows[1]).not.toContain("carries it on");
     expect(rows[1]).toContain("—");
     // The worker: failed, the one outcome in colour.
     expect(rows[2]).toContain("Failed");
@@ -572,6 +577,249 @@ describe("live, without asking a harness (A7 U8b)", () => {
     expect(pageReads(fake)).toHaveLength(before + 1);
     expect(pageReads(fake).at(-1)).toMatchObject({ titles: false });
     expect(rowTexts()[0]).toContain("Full policy sweep");
+  });
+});
+
+describe("A7 U8b review: the rail and the list follow what changed", () => {
+  test("a turn's end reads the list again, even after the last scheduled read has gone", async () => {
+    const { app, fake } = await openList([IMPORTER]);
+    const countdown = app.countdown as FakeCountdown;
+    const before = pageReads(fake).length;
+    app.applyLiveFrame(
+      "acme-corp",
+      liveActivity({ id: "activity:1", attemptId: null, importId: "imp_1" }),
+    );
+    countdown.live
+      .filter((each) => each.ms === AGENT_SESSIONS_REFRESH_MS)
+      .at(0)
+      ?.fire();
+    await settle();
+    expect(pageReads(fake)).toHaveLength(before + 1);
+    // The turn ends on an entry nothing renders: its frame alone has to arm a read.
+    app.applyLiveFrame("acme-corp", {
+      _tag: "turnEnded",
+      attemptId: null,
+      roundId: null,
+      goalId: null,
+      importId: "imp_1",
+      at: Date.now(),
+    });
+    const armed = countdown.live.filter(
+      (each) => each.ms === AGENT_SESSIONS_REFRESH_MS,
+    );
+    expect(armed).toHaveLength(1);
+    armed[0]?.fire();
+    await settle();
+    expect(pageReads(fake)).toHaveLength(before + 2);
+  });
+
+  test("a stop from this tab reads the rail's count at once, with no frame to prompt it", async () => {
+    const fake = new FakeServer();
+    let active = 2;
+    fake.onAgentSessions = () =>
+      ok(
+        agentSessionsPage([], {
+          counts: { active, ended: 0, all: active, needsYou: 0 },
+        }),
+      );
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    expect(app.navCount("agent-sessions")).toBe(2);
+    active = 1;
+    app.openGoalId = "goal_1";
+    await app.stopRound("rnd_1");
+    await settle();
+    expect(app.navCount("agent-sessions")).toBe(1);
+  });
+
+  test("an older rail read landing after a newer page read does not put its counts back", async () => {
+    const { app, fake } = await openList([IMPORTER]);
+    // The rail's read asks for no titles; the page's asks for them, or not, explicitly.
+    fake.onAgentSessions = (_base, _target, query) =>
+      ok(
+        agentSessionsPage([IMPORTER], {
+          counts:
+            query?.titles === undefined
+              ? { active: 7, ended: 0, all: 7, needsYou: 0 }
+              : { active: 3, ended: 0, all: 3, needsYou: 0 },
+        }),
+      );
+    const release = fake.holdOne("agentSessions");
+    const rail = app.loadAgentSessionCounts("acme-corp");
+    await app.loadAgentSessions("acme-corp");
+    expect(app.navCount("agent-sessions")).toBe(3);
+    release();
+    await rail;
+    await settle();
+    expect(app.navCount("agent-sessions")).toBe(3);
+  });
+});
+
+describe("A7 U8b review: marks, agent text and long names", () => {
+  test("an outcome not known has its own neutral mark; a session not running has the idle ring", async () => {
+    await openList([
+      agentSessionView({
+        kind: "worker",
+        key: "worker:u",
+        state: "ended",
+        detail: "uncertain",
+        outcome: "unknown",
+      }),
+      agentSessionView({
+        key: "goal:g2",
+        subjectId: "g2",
+        outcome: null,
+        resumable: true,
+      }),
+    ]);
+    const marks = [...document.querySelectorAll(".rows .row-item .mark")];
+    expect(marks.map((mark) => mark.getAttribute("data-mark"))).toEqual([
+      "unknown",
+      "dormant",
+    ]);
+    expect(marks[0]?.querySelector(".unknown")?.textContent).toBe("?");
+    // Failure is the only outcome in colour, and the unknown line is muted.
+    expect(marks[0]?.classList.contains("is-failed")).toBe(false);
+    const lines = [...document.querySelectorAll(".rows .row-item .line2")];
+    expect(lines[0]?.classList.contains("muted")).toBe(true);
+    expect(lines[0]?.textContent).toBe("Outcome not known");
+    expect(lines[1]?.textContent).toBe("Not running · a message carries it on");
+  });
+
+  test("the agent's words are each in an isolate of their own; bit's beside them are not", async () => {
+    const said = "\u202eesrever ni";
+    await openList([
+      {
+        ...IMPORTER,
+        title: "\u202eTitle",
+        activity: {
+          running: true,
+          calls: 2,
+          lastTool: "Bash",
+          subagent: null,
+          text: said,
+          failure: null,
+          at: Date.now(),
+        },
+      },
+    ]);
+    const line = document.querySelector(".rows .row-item .line2");
+    const isolates = [...(line?.querySelectorAll(".said") ?? [])];
+    expect(isolates.map((each) => each.textContent)).toEqual([said]);
+    expect(line?.textContent).toBe(`${said} · 2 tool calls so far`);
+    // The name's tooltip is a plain string: isolated with FSI … PDI.
+    const name = document.querySelector(".rows .row-item .name");
+    expect(name?.getAttribute("title")?.startsWith("\u2068")).toBe(true);
+    expect(name?.getAttribute("title")?.endsWith("\u2069")).toBe(true);
+  });
+
+  test("a long name is capped, so where it lives keeps its room", async () => {
+    await openList([
+      agentSessionView({
+        kind: "worker",
+        key: "worker:long",
+        subject: "Does ".repeat(80),
+        state: "ended",
+        outcome: "completed",
+      }),
+    ]);
+    const name = document.querySelector(".rows .row-item .name");
+    const crumb = document.querySelector(".rows .row-item .crumb");
+    if (name === null || crumb === null) throw new Error("no row");
+    // The DOM suite injects no component CSS: compile the page's and apply it.
+    const path = new URL(
+      "../../src/lib/screens/AgentSessions.svelte",
+      import.meta.url,
+    ).pathname;
+    const { css } = compile(await Bun.file(path).text(), {
+      filename: path,
+      generate: "client",
+      css: "external",
+      dev: true,
+    });
+    const sheet = document.createElement("style");
+    sheet.textContent = css?.code ?? "";
+    document.head.append(sheet);
+    mounted.push({ target: sheet, destroy: () => sheet.remove() });
+    expect(getComputedStyle(name).maxWidth).toBe("60%");
+    expect(getComputedStyle(name).unicodeBidi).toBe("isolate");
+    expect(getComputedStyle(crumb).minWidth).toBe("9ch");
+  });
+});
+
+describe("A7 U8b review: tabs and groups for assistive technology", () => {
+  test("the tabs follow the WAI-ARIA pattern: one in the Tab order, arrows and Home/End move and select, each controls the panel", async () => {
+    const { app } = await openList([IMPORTER]);
+    const tabs = () => [
+      ...document.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+    ];
+    expect(tabs().map((tab) => tab.getAttribute("tabindex"))).toEqual([
+      "0",
+      "-1",
+      "-1",
+    ]);
+    const panel = document.getElementById(
+      tabs()[0]?.getAttribute("aria-controls") ?? "",
+    );
+    expect(panel?.getAttribute("role")).toBe("tabpanel");
+    expect(panel?.getAttribute("aria-labelledby")).toBe(tabs()[0]?.id);
+    const press = (key: string) => {
+      const on = tabs().find((tab) => tab.getAttribute("tabindex") === "0");
+      on?.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+    };
+    press("ArrowRight");
+    await settle();
+    expect(app.agentSessionsQuery.tab).toBe("ended");
+    expect(document.activeElement?.textContent).toContain("Ended");
+    press("End");
+    await settle();
+    expect(app.agentSessionsQuery.tab).toBe("all");
+    press("ArrowRight");
+    await settle();
+    expect(app.agentSessionsQuery.tab).toBe("active");
+    press("ArrowLeft");
+    await settle();
+    expect(app.agentSessionsQuery.tab).toBe("all");
+    press("Home");
+    await settle();
+    expect(app.agentSessionsQuery.tab).toBe("active");
+    expect(tabs()[0]?.getAttribute("tabindex")).toBe("0");
+  });
+
+  test("a group's header is a heading over its own list, never an item of the rows", async () => {
+    const idle = agentSessionView({
+      key: "goal:goal_2",
+      subjectId: "goal_2",
+      state: "live",
+      group: "idle",
+    });
+    await openList([IMPORTER, idle]);
+    const lists = [...document.querySelectorAll(".rows ul")];
+    expect(lists).toHaveLength(2);
+    for (const list of lists) {
+      const items = [...list.querySelectorAll("li")];
+      expect(items.every((item) => item.classList.contains("row-item"))).toBe(
+        true,
+      );
+      const heading = document.getElementById(
+        list.getAttribute("aria-labelledby") ?? "",
+      );
+      expect(heading?.tagName).toBe("H3");
+      expect(heading?.closest("li")).toBeNull();
+    }
+    expect(
+      lists.map((list) =>
+        (
+          document.getElementById(list.getAttribute("aria-labelledby") ?? "")
+            ?.textContent ?? ""
+        )
+          .replace(/\s+/g, " ")
+          .trim(),
+      ),
+    ).toEqual(["Running 1", "Idle 1"]);
   });
 });
 

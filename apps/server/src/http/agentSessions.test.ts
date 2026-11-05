@@ -10,6 +10,9 @@ import { describe, expect, test } from "bun:test";
 
 import {
   activeGroup,
+  attemptOutcome,
+  dayFormatter,
+  dayIn,
   pageAgentSessions,
   unionAgentSessions,
   type AgentSessionSources,
@@ -64,6 +67,38 @@ describe("a goal conversation", () => {
       state: "dormant",
       model: "anthropic/claude-sonnet-5",
     });
+  });
+
+  test("how a conversation not held ended is its goal's: met completed it, abandoned stopped it, an active goal's did not end (A7 U8b review)", () => {
+    const rows = unionAgentSessions(
+      sources({
+        goals: (["met", "abandoned", "active", undefined] as const).map(
+          (goalStatus, index) => ({
+            ...GOAL,
+            goalId: `g${String(index)}`,
+            ...(goalStatus === undefined ? {} : { goalStatus }),
+          }),
+        ),
+      }),
+    ).rows;
+    expect(rows.map((r) => [r.state, r.outcome, r.resumable])).toEqual([
+      // A message to a met or abandoned goal is refused (`goal_not_active`).
+      ["dormant", "completed", false],
+      ["dormant", "stopped", false],
+      // Not held — a restart, or a turn it cut short — and a message carries it on.
+      ["dormant", null, true],
+      ["dormant", null, true],
+    ]);
+  });
+
+  test("a live goal conversation has no outcome and nothing to carry on", () => {
+    const [row] = unionAgentSessions(
+      sources({
+        goals: [{ ...GOAL, goalStatus: "active" }],
+        goalLive: () => ({ sessionId: "ses_goal_1", model: "x/y" }),
+      }),
+    ).rows;
+    expect(row).toMatchObject({ outcome: null, resumable: false });
   });
 
   test("a held session that is not the one the index names is not reported live for that row", () => {
@@ -128,6 +163,16 @@ describe("an importer session", () => {
       ["dormant", "shutdown"],
       ["dormant", null],
     ]);
+  });
+});
+
+describe("a final status as an outcome", () => {
+  test("uncertain is unknown, not failed; settled and succeeded completed; interrupted stopped", () => {
+    expect(
+      ["succeeded", "settled", "interrupted", "failed", "uncertain"].map(
+        attemptOutcome,
+      ),
+    ).toEqual(["completed", "completed", "stopped", "failed", "unknown"]);
   });
 });
 
@@ -196,7 +241,7 @@ const ATTEMPT = (id: string, status: string, startedAt = 1) => ({
 });
 
 describe("how a session that is not running ended (A7 E5)", () => {
-  test("an importer: a refused prompt or failed open is failed and resumable; nothing written is empty; your end is stopped", () => {
+  test("an importer: a refused prompt or failed open is failed and resumable; your end is stopped, or empty with nothing written; a shutdown did not end it", () => {
     const rows = unionAgentSessions(
       sources({
         importers: [
@@ -229,12 +274,72 @@ describe("how a session that is not running ended (A7 E5)", () => {
         ],
       }),
     ).rows;
-    expect(rows.map((r) => [r.subjectId, r.outcome, r.resumable])).toEqual([
-      ["a", "failed", true],
-      ["b", "empty", false],
-      ["c", "stopped", false],
-      ["d", "completed", false],
-      ["e", null, false],
+    expect(
+      rows.map((r) => [r.subjectId, r.state, r.outcome, r.resumable]),
+    ).toEqual([
+      ["a", "dormant", "failed", true],
+      ["b", "ended", "empty", false],
+      ["c", "ended", "stopped", false],
+      // Let go by a shutdown: not ended, no outcome, and a message carries it on.
+      ["d", "dormant", null, true],
+      // Live: nothing to carry on.
+      ["e", "live", null, false],
+    ]);
+  });
+
+  test("an importer not held that wrote nothing, with no reason or a shutdown, is not ended (A7 U8b review)", () => {
+    const rows = unionAgentSessions(
+      sources({
+        importers: [
+          { ...IMPORTER, latestImportId: "a", entriesIn: 0 },
+          {
+            ...IMPORTER,
+            latestImportId: "b",
+            entriesIn: 0,
+            endedAt: 5,
+            endedReason: "shutdown",
+          },
+        ],
+      }),
+    ).rows;
+    expect(
+      rows.map((r) => [r.subjectId, r.state, r.outcome, r.resumable]),
+    ).toEqual([
+      ["a", "dormant", null, true],
+      ["b", "dormant", null, true],
+    ]);
+  });
+
+  test("an importer the send would refuse is not resumable: its agent is not defined, or its harness is not run", () => {
+    const rows = unionAgentSessions(
+      sources({
+        importers: [
+          { ...IMPORTER, latestImportId: "agent", agentDefined: false },
+          {
+            ...IMPORTER,
+            latestImportId: "gone",
+            harnessInstanceId: "old-harness",
+          },
+          {
+            ...IMPORTER,
+            latestImportId: "failed-gone",
+            harnessInstanceId: "old-harness",
+            endedAt: 5,
+            endedReason: "refused",
+          },
+          // Recorded before instances were: the default is asked, as the send does.
+          { ...IMPORTER, latestImportId: "none", harnessInstanceId: null },
+          { ...IMPORTER, latestImportId: "ok" },
+        ],
+        instanceRun: (id) => id === "opencode",
+      }),
+    ).rows;
+    expect(rows.map((r) => [r.subjectId, r.resumable])).toEqual([
+      ["agent", false],
+      ["gone", false],
+      ["failed-gone", false],
+      ["none", true],
+      ["ok", true],
     ]);
   });
 
@@ -249,11 +354,12 @@ describe("how a session that is not running ended (A7 E5)", () => {
         },
       }),
     ).rows;
-    expect(rows.map((r) => r.outcome)).toEqual([
-      "completed",
-      "stopped",
-      "failed",
-      "failed",
+    // Uncertain is nobody knowing, not a failure (A7 U8b review).
+    expect(rows.map((r) => [r.outcome, r.resumable])).toEqual([
+      ["completed", false],
+      ["stopped", false],
+      ["failed", false],
+      ["unknown", false],
     ]);
   });
 
@@ -291,6 +397,22 @@ describe("how a session that is not running ended (A7 E5)", () => {
             createdAt: 1,
             round: null,
           },
+          // An uncertain round that recorded a plan: the status, not the plan, is how it
+          // ended (A7 U8b review: it read "Failed · proposed intents").
+          {
+            goalId: "g4",
+            goalName: "Map auth",
+            harnessSessionId: "p4",
+            createdAt: 1,
+            round: { ...round("uncertain"), disposition: "proposed_intents" },
+          },
+          {
+            goalId: "g5",
+            goalName: "Map auth",
+            harnessSessionId: "p5",
+            createdAt: 1,
+            round: { ...round("interrupted"), disposition: "proposed_intents" },
+          },
         ],
       }),
     ).rows;
@@ -300,6 +422,8 @@ describe("how a session that is not running ended (A7 E5)", () => {
       ["planner", "live", null, "running", 10],
       ["planner", "dormant", "completed", "actionable", 20],
       ["planner", "dormant", "empty", null, 1],
+      ["planner", "dormant", "unknown", "uncertain", 20],
+      ["planner", "dormant", "stopped", "interrupted", 20],
     ]);
     expect(rows[0]?.surface).toEqual({
       section: "goals",
@@ -320,7 +444,9 @@ describe("what a session is doing (A7 E1)", () => {
                 running: subject.importId === "imp_1",
                 calls: 3,
                 lastTool: "Bash",
+                subagent: null,
                 text: null,
+                failure: null,
                 at: subject.importId === "imp_1" ? 50 : 40,
               }
             : undefined,
@@ -348,7 +474,9 @@ describe("what a session is doing (A7 E1)", () => {
           running: true,
           calls: 0,
           lastTool: null,
+          subagent: null,
           text: null,
+          failure: null,
           at: 1,
         },
       }),
@@ -457,6 +585,13 @@ describe("a page of the list", () => {
     expect(
       pageAgentSessions(union, query({ timeZone: "Not/AZone" })).groups[0]?.key,
     ).toBe("day:2026-11-05");
+  });
+
+  test("one day formatter per read answers as dayIn does, an unknown zone as UTC", () => {
+    const day = dayFormatter("Pacific/Auckland");
+    expect(day(T0)).toBe(dayIn(T0, "Pacific/Auckland"));
+    expect(day(T0)).toBe("2026-11-06");
+    expect(dayFormatter("Not/AZone")(T0)).toBe("2026-11-05");
   });
 
   test("a page past the end is the last page; page size 50 and 100 are honoured", () => {

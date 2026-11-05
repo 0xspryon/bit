@@ -1255,6 +1255,37 @@ describe("the composer posts to the server", () => {
     expect(text()).toContain("that message did reach this session");
   });
 
+  test("its own copy stamped a little before this tab's estimate of when it left is still found: the clock slack (A7 U8b review)", async () => {
+    // The estimate runs late by the answer's journey, so a server stamp can read as up to a
+    // second before it; without `CONFIRM_CLOCK_SLACK` this delivered message reads lost.
+    const fake = new FakeServer();
+    fake.onImporterMessages = () => unreachable("connection reset");
+    const app = await continueWith(fake);
+    expect(app.importer.current?.loaded).not.toBe(true);
+    fake.onSendImporterMessage = () => unreachable("connection reset");
+    const sentAt = Date.now();
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          at: Date.now(),
+          items: [
+            replayItem(0, "turn.operator", "Say ok once more.", {
+              at: sentAt - 400,
+              messageIds: ["msg_mine"],
+            }),
+          ],
+        }),
+      );
+    await send("Say ok once more.");
+    await settle();
+    await settle();
+
+    expect(composer().value).toBe("");
+    expect(text()).toContain("that message did reach this session");
+  });
+
   test("a copy another device sent before this one, straight into the transcript, is not it (U8 review 6)", async () => {
     const { app, fake } = await continueOn(SESSIONS, [
       harness("claude-code", "Claude Code"),

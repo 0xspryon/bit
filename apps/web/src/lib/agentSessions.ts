@@ -150,9 +150,34 @@ const plural = (count: number, one: string, many: string): string =>
   `${String(count)} ${count === 1 ? one : many}`;
 
 /**
+ * One piece of a row's second line: bit's own words, or the agent's (`agent`), which the
+ * row draws in an isolate of its own so a bidi control in it stays inside it.
+ */
+export interface LinePart {
+  readonly text: string;
+  readonly agent: boolean;
+  /** What goes before it on the line: " · ", or "" for the first part; " " to run on. */
+  readonly before: string;
+}
+
+type Piece = {
+  readonly text: string;
+  readonly agent: boolean;
+  readonly runOn?: true;
+};
+const theirs = (text: string): Piece => ({ text, agent: true });
+/** The agent's words run on from the part before, with a space ("Running Bash"). */
+const after = (text: string): Piece => ({ text, agent: true, runOn: true });
+
+/**
  * The row's second line (A7 E1, E5): what a live session is doing or waiting on, or how a
  * finished one ended. `warning` on a waiting row, so the dot is never the only cue;
- * `danger` on a failure, the only outcome in colour.
+ * `danger` on a failure, the only outcome in colour. `parts` are the line's pieces, joined
+ * by " · " into `text`; the agent's are marked so the row can isolate them.
+ *
+ * **Every sentence has to be true of the row** (A7 U8b review): "Completed" only for what
+ * finished, "a message carries it on" only where the send would take one (`resumable`, the
+ * server's answer), and a session this server merely let go is "Not running", not ended.
  */
 export const doingLine = (
   session: Pick<
@@ -166,22 +191,43 @@ export const doingLine = (
     | "outcome"
     | "resumable"
   >,
-): { readonly text: string; readonly tone: "muted" | "warning" | "danger" } => {
+): {
+  readonly text: string;
+  readonly tone: "muted" | "warning" | "danger";
+  readonly parts: readonly LinePart[];
+} => {
+  const line = (
+    tone: "muted" | "warning" | "danger",
+    ...pieces: readonly (Piece | string | null)[]
+  ) => {
+    const parts = pieces
+      .filter((piece) => piece !== null)
+      .map((piece, index): LinePart => ({
+        text: typeof piece === "string" ? piece : piece.text,
+        agent: typeof piece !== "string" && piece.agent,
+        before:
+          index === 0
+            ? ""
+            : typeof piece !== "string" && piece.runOn === true
+              ? " "
+              : " · ",
+      }));
+    return {
+      text: parts.map((part) => part.before + part.text).join(""),
+      tone,
+      parts,
+    };
+  };
   if (session.waiting !== null) {
-    return { text: `Waiting on you · ${session.waiting}`, tone: "warning" };
+    return line("warning", "Waiting on you", theirs(session.waiting));
   }
+  const carriesOn = session.resumable ? "a message carries it on" : null;
   if (session.state === "live") {
     const doing = session.activity;
     if (doing === null) {
       return session.kind === "worker" || session.kind === "planner"
-        ? {
-            text: "Running · nothing narrated through this server yet",
-            tone: "muted",
-          }
-        : {
-            text: "Open · nothing said since this server took it",
-            tone: "muted",
-          };
+        ? line("muted", "Running", "nothing narrated through this server yet")
+        : line("muted", "Open", "nothing said since this server took it");
     }
     const calls =
       doing.calls > 0
@@ -192,82 +238,77 @@ export const doingLine = (
           )
         : null;
     if (doing.running) {
-      const what =
-        doing.text ??
-        (doing.lastTool === null ? "Working" : `Running ${doing.lastTool}`);
-      return {
-        text: [what, calls].filter((part) => part !== null).join(" · "),
-        tone: "muted",
-      };
+      // A sub-agent at work is what the turn is doing, whatever the caller last wrote.
+      if (doing.subagent !== null) {
+        return line("muted", "Sub-agent", theirs(doing.subagent), calls);
+      }
+      if (doing.text !== null) return line("muted", theirs(doing.text), calls);
+      return doing.lastTool === null
+        ? line("muted", "Working", calls)
+        : line("muted", "Running", after(doing.lastTool), calls);
     }
-    return {
-      text: [doing.text === null ? "Idle" : `Last reply: ${doing.text}`, calls]
-        .filter((part) => part !== null)
-        .join(" · "),
-      tone: "muted",
-    };
+    // The last turn failed: the harness's sentence, until the next turn starts.
+    if (doing.failure !== null) {
+      return line("danger", "Last turn failed", theirs(doing.failure));
+    }
+    return doing.text === null
+      ? line("muted", "Idle", calls)
+      : line("muted", "Last reply:", after(doing.text), calls);
   }
   const reason =
     session.detail === null ? null : session.detail.replaceAll("_", " ");
   const tally = tallySentence(session.tally);
+  const wrote =
+    session.tally !== null &&
+    session.tally.entriesIn + session.tally.entriesOut + session.tally.assets >
+      0;
   switch (session.outcome) {
     case "failed":
-      return {
-        text: [
-          "Failed",
-          session.kind === "importer"
-            ? session.detail === "refused"
-              ? "the harness would not take the prompt"
-              : "the session did not open"
-            : session.detail === "uncertain"
-              ? "how it ended is not known"
-              : // "Failed · failed" says nothing twice.
-                reason === "failed"
-                ? null
-                : reason,
-          session.resumable ? "resumable" : null,
-        ]
-          .filter((part) => part !== null)
-          .join(" · "),
-        tone: "danger",
-      };
+      return line(
+        "danger",
+        "Failed",
+        session.kind === "importer"
+          ? session.detail === "refused"
+            ? "the harness would not take the prompt"
+            : "the session did not open"
+          : // "Failed · failed" says nothing twice.
+            reason === "failed"
+            ? null
+            : reason,
+        carriesOn,
+      );
+    case "unknown":
+      // Neither success nor failure: nobody could tell how it ended (`uncertain`).
+      return line("muted", "Outcome not known");
     case "empty":
-      return {
-        text:
-          session.kind === "planner"
-            ? "Never ran a planning round"
-            : "Ended without writing anything",
-        tone: "muted",
-      };
+      return session.kind === "planner"
+        ? line("muted", "Never ran a planning round")
+        : session.kind === "importer"
+          ? line("muted", "Ended by you", "wrote nothing")
+          : line("muted", "Ended without writing anything");
     case "stopped":
-      return {
-        text:
-          session.kind === "importer"
-            ? ["Ended by you", tally]
-                .filter((part) => part !== null)
-                .join(" · ")
-            : session.kind === "goal"
-              ? "Stopped · the goal was abandoned"
-              : "Stopped · interrupted",
-        tone: "muted",
-      };
+      return session.kind === "importer"
+        ? line("muted", "Ended by you", tally)
+        : session.kind === "goal"
+          ? line("muted", "Stopped", "the goal was abandoned")
+          : line("muted", "Stopped", "interrupted");
     case "completed":
+      return line(
+        "muted",
+        "Completed",
+        session.kind === "goal" ? "goal met" : null,
+        session.kind === "importer" ? tally : null,
+        session.kind === "planner" ? reason : null,
+      );
     case null:
-      return {
-        text: [
-          "Completed",
-          session.kind === "importer" ? tally : null,
-          session.kind === "planner" ? reason : null,
-          // A conversation this server does not hold is carried on by a message.
-          session.state === "dormant" &&
-          (session.kind === "goal" || session.kind === "importer")
-            ? "a message carries it on"
-            : null,
-        ]
-          .filter((part) => part !== null)
-          .join(" · "),
-        tone: "muted",
-      };
+      // Not ended: this server let it go (a restart, a shutdown, a turn cut short), and
+      // where the send would take a message, one carries it on.
+      return line(
+        "muted",
+        "Not running",
+        session.kind === "importer" ? (wrote ? tally : "wrote nothing") : null,
+        carriesOn,
+      );
   }
 };
 
