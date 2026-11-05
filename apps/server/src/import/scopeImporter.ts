@@ -122,6 +122,7 @@ import {
   ScopeImportNotFound,
   type ConversationModelDraft,
   type ConversationModelSwitched,
+  type ConversationActivity,
   type ConversationStopped,
   type ImporterConversationView,
   type ImporterQueuedMessage,
@@ -549,6 +550,16 @@ export class ScopeImporter extends Context.Service<
       ConversationStopped,
       ConversationStopRefused | ScopeImportNotFound
     >;
+    /**
+     * Whether a turn, or background work, is running in one import's session (A6 U6): the
+     * spine's `status`, for the import holding the session now, found as {@link stopTurn}
+     * finds it. Never fails but for an import this target does not hold: a record that cannot
+     * be read is answered for the import addressed.
+     */
+    readonly activity: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+    }) => Effect.Effect<ConversationActivity, ScopeImportNotFound>;
     /**
      * Moves one import's session onto another model of its harness, or other options of its
      * model (A6 F4). The harness is the row's and is never changed here.
@@ -2324,6 +2335,77 @@ export class ScopeImporter extends Context.Service<
         });
       });
 
+      /**
+       * The import holding the session now, from the newest run the rows know of: whatever
+       * this process has opened after it. An open still in flight is waited for, so a Stop
+       * pressed as a reopen lands reaches the session it opened rather than finding none.
+       * The chain only ever runs forward (a successor is minted after its predecessor), so
+       * this ends.
+       */
+      const holdingNow = Effect.fnUntraced(function* (from: string) {
+        let importId = from;
+        for (;;) {
+          const opening = inFlight.get(importId);
+          if (opening !== undefined) yield* Deferred.await(opening.known);
+          const next = successors.get(importId);
+          if (next === undefined) break;
+          importId = next;
+        }
+        return importId;
+      });
+
+      const activity: ScopeImporter["Service"]["activity"] = Effect.fn(
+        "ScopeImporter.activity",
+      )(function* (input) {
+        const read = yield* Effect.result(
+          withTargetStore(stores, input.targetId, (store) =>
+            store.importSession(input.importId),
+          ),
+        );
+        if (read._tag === "Failure") {
+          yield* Effect.logWarning(
+            "an import's record could not be read for its activity; answering for the import addressed",
+            { importId: input.importId, detail: read.failure.message },
+          );
+        }
+        const row = read._tag === "Success" ? read.success : undefined;
+        if (
+          read._tag === "Success" &&
+          (row === undefined || row.targetId !== input.targetId)
+        ) {
+          return yield* new ScopeImportNotFound({
+            reason: "unknown_import",
+            importId: input.importId,
+            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so nothing of it is running`,
+          });
+        }
+        const importId = yield* holdingNow(
+          (row === undefined ? undefined : newerRun(input.importId, row)) ??
+            input.importId,
+        );
+        const found = yield* sessions.status(importId);
+        if (found._tag === "not_live") {
+          return {
+            conversationId: importId,
+            turn: "not_live",
+            background: false,
+          };
+        }
+        /*
+         * Running while the import is, too: from a message's acceptance until its settle has
+         * read the closing report, which the session list's `running` reports. So this answer
+         * says "running" whenever the list does, and a screen reading both never sees the
+         * list call a turn running that this calls over.
+         */
+        const view = yield* progress.view(importId);
+        return {
+          conversationId: importId,
+          turn:
+            found.running || view?.status === "running" ? "running" : "idle",
+          background: found.background,
+        };
+      });
+
       const stopTurn: ScopeImporter["Service"]["stopTurn"] = Effect.fn(
         "ScopeImporter.stopTurn",
       )(function* (input) {
@@ -2345,21 +2427,9 @@ export class ScopeImporter extends Context.Service<
             detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no turn to stop`,
           });
         }
-        /*
-         * The import holding the session now: the newest run the rows know of, then whatever
-         * this process has opened after it. An open still in flight is waited for, so a Stop
-         * pressed as a reopen lands reaches the session it opened rather than finding none.
-         * The chain only ever runs forward (a successor is minted after its predecessor), so
-         * this ends.
-         */
-        let importId = newerRun(input.importId, row) ?? input.importId;
-        for (;;) {
-          const opening = inFlight.get(importId);
-          if (opening !== undefined) yield* Deferred.await(opening.known);
-          const next = successors.get(importId);
-          if (next === undefined) break;
-          importId = next;
-        }
+        const importId = yield* holdingNow(
+          newerRun(input.importId, row) ?? input.importId,
+        );
         const what = `import ${importId}`;
         const found = yield* sessions
           .interrupt(importId)
@@ -2376,6 +2446,7 @@ export class ScopeImporter extends Context.Service<
         replay,
         switchModel,
         stopTurn,
+        activity,
         holds: (importId) =>
           Effect.sync(() => sessions.get(importId) !== undefined),
         heldSteers: (importId) =>
@@ -2417,6 +2488,12 @@ export class ScopeImporter extends Context.Service<
       heldSteers: () => Effect.succeed(0),
       converse: () => Effect.fail(noHarness),
       send: () => Effect.fail(noHarness),
+      activity: (input) =>
+        Effect.succeed({
+          conversationId: input.importId,
+          turn: "not_live",
+          background: false,
+        }),
       // No harness, so no session this server could hold: nothing of any import runs here.
       stopTurn: (input) =>
         Effect.succeed(

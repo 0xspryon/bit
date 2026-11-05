@@ -952,6 +952,17 @@ export const server = {
     ),
 
   /**
+   * Whether a turn, or background work, is running in one import's session (A6 U6): what
+   * the chat polls to offer Stop. `conversationId` is the import holding the session now.
+   */
+  importerActivity: (baseUrl: string, targetId: string, importId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.importerActivity({ params: { targetId, importId } }),
+      ),
+    ),
+
+  /**
    * Moves one import's session onto another model of its harness, or other options of its
    * model (A6 F4). The answer's `applied` says whether the harness took it live — from its
    * next model call — or only the record changed, for the next message to reopen on; a

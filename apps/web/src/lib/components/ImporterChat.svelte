@@ -135,6 +135,19 @@
   );
   let working = $derived(session?.working ?? false);
   /**
+   * Work the agent started in the background still running outside any turn (A6 U6), as
+   * the server last said. Stop is offered for it too: it stops that work.
+   */
+  let background = $derived(session?.background === true);
+  /**
+   * D3's "Send now" is offered while a turn runs in a session the server holds: then a
+   * message can wait for the work in flight (Enter, the arrow) or land at the harness's next
+   * step. With nothing running the two are the same, so there is one way to send.
+   */
+  let canSendNow = $derived(
+    canSend && working && session?.importId !== undefined,
+  );
+  /**
    * A started session's harness and model: the harness is pinned to it, the model is not
    * (D6). `null` for the empty session, whose harness and model are still open.
    */
@@ -221,6 +234,11 @@
   function submit(event: Event): void {
     event.preventDefault();
     if (canSend) importer.send();
+  }
+
+  /** D3's "Send now": a `preemptive` steer, for a message that cannot wait (A6 U6). */
+  function sendNow(): void {
+    if (canSendNow) importer.send("preemptive");
   }
 
   /**
@@ -342,7 +360,19 @@
           -->
           <div class="said">
             {#if group.subject.queued}
-              <span class="queued-mark">queued</span>
+              <span class="queued-mark"
+                >{group.subject.sentNow ? "sending now" : "queued"}</span
+              >
+            {:else if group.subject.sentNow}
+              <!--
+                Taken (A6 U6): the harness read it at its next step and dropped the rest of
+                the turn before, which is why that turn ends where this one begins.
+              -->
+              <span
+                class="queued-mark"
+                title="Sent now: the importer took this at its next step and dropped the rest of what it was doing."
+                >sent now</span
+              >
             {/if}
             <span class="when"
               >You{group.subject.at === null
@@ -419,23 +449,37 @@
     {/snippet}
 
     {#snippet controls()}
-      {#if working}
+      {#if working || background}
         <!--
           Stop interrupts the harness's turn and keeps the conversation (A6 F5). The cursor
           clears on the server's answer, not on the press. While the answer is coming the pill
           is aria-disabled rather than disabled, so focus stays on it.
+
+          Drawn whenever the server says something runs (A6 U6): a turn, including one the
+          harness opened itself on a background task's notification, or — with no turn —
+          background work the agent started, which the pill then names, since nothing else on
+          screen says it is running.
         -->
         <button
           bind:this={stopButton}
           class="stop"
           type="button"
           aria-disabled={importer.stopping}
+          title={working
+            ? "Stop the importer's turn. The conversation stays open."
+            : "Stop the work the importer started in the background, a sub-agent or a shell. The conversation stays open."}
           onclick={() => {
             if (!importer.stopping) void importer.stop();
           }}
         >
           <span class="stop-mark" aria-hidden="true"></span>
-          <span>{importer.stopping ? "Stopping…" : "Stop"}</span>
+          <span
+            >{importer.stopping
+              ? "Stopping…"
+              : working
+                ? "Stop"
+                : "Stop background work"}</span
+          >
         </button>
       {/if}
     {/snippet}
@@ -538,12 +582,29 @@
               {/if}
             {/if}
             <span class="grow"></span>
+            {#if working && session?.importId !== undefined}
+              <!--
+                D3's two ways to send while a turn runs (A6 U6). The arrow and Enter queue the
+                message behind the work in flight, as a follow-up always is; this one lands it
+                at the harness's next step instead, dropping the rest of that work. No key of
+                its own: D3 draws none, and Enter keeps its one meaning.
+              -->
+              <button
+                class="send-now"
+                type="button"
+                disabled={!canSendNow}
+                title="Send now: the importer reads this at its next step. A tool call already running finishes first; the rest of what it was doing is dropped."
+                onclick={sendNow}>Send now</button
+              >
+            {/if}
             <button
               class="send"
               type="submit"
               disabled={!canSend}
               aria-label="Send to the importer"
-              title="Send to the importer"
+              title={working
+                ? "Send to the importer, queued: it reads this once it reaches a break in the work it is doing"
+                : "Send to the importer"}
             >
               <IconArrowUp width="14" height="14" />
             </button>
@@ -794,6 +855,8 @@
     a sentence the operator reads. It gives way before the chips do.
   */
   .hint {
+    /* Gives way first: the chips and the send buttons are controls, this is a caption. */
+    flex-shrink: 100;
     min-width: 0;
     overflow: hidden;
     font: 400 11px/16px var(--font-sans);
@@ -829,6 +892,35 @@
     cursor: default;
   }
   .send:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 1px;
+  }
+  /*
+    "Send now" beside the arrow (A6 U6): a quiet bordered button, D3's chip height, so the
+    arrow stays the composer's one primary action and the urgent send is the deliberate one.
+  */
+  .send-now {
+    flex: none;
+    height: 28px;
+    padding: 0 10px;
+    box-sizing: border-box;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-base);
+    font: 500 12px/26px var(--font-sans);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .send-now:hover:not(:disabled) {
+    background: var(--overlay-hover);
+  }
+  .send-now:disabled {
+    border-color: var(--border-base);
+    color: var(--text-faint);
+    cursor: default;
+  }
+  .send-now:focus-visible {
     outline: 2px solid var(--border-focus);
     outline-offset: 1px;
   }

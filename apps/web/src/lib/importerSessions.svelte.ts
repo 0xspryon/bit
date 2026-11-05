@@ -67,6 +67,7 @@ import type {
   ImporterTurnAccepted,
   LiveItem,
   ModelOptionSelection,
+  SteerUrgency,
 } from "@bit/contracts";
 
 import type { ErrorNotice } from "./components/ErrorDialog.svelte";
@@ -208,6 +209,16 @@ export type ImporterStopAnswer =
   | { readonly _tag: "refused"; readonly detail: string };
 
 /**
+ * What the server says is running in one import's session (A6 U6), as the turn watch hands
+ * it on: a turn — one the operator's message started, or one the harness opened by itself —
+ * and work the agent started in the background, which runs outside any turn.
+ */
+export interface ImporterActivity {
+  readonly running: boolean;
+  readonly background: boolean;
+}
+
+/**
  * The page's way to the server, handed in by the app when the page is a real target's.
  *
  * Absent in the state picker's scenarios, which never touch a server and answer with the
@@ -222,8 +233,15 @@ export interface ImporterServer {
     text: string,
     agentId: string | undefined,
   ) => Promise<ImporterSent>;
-  /** Says `text` to one import's session. */
-  readonly send: (importId: string, text: string) => Promise<ImporterSent>;
+  /**
+   * Says `text` to one import's session: while a turn runs, `queued` (the default) waits for
+   * the work in flight, and `preemptive` ("Send now") lands at the harness's next step.
+   */
+  readonly send: (
+    importId: string,
+    text: string,
+    urgency?: SteerUrgency,
+  ) => Promise<ImporterSent>;
   /**
    * Stops the turn running in one import's session, keeping the conversation (A6 F5): the
    * harness is interrupted and the session stays open for the next message.
@@ -268,16 +286,22 @@ export interface ImporterServer {
    */
   readonly highWater: () => number;
   /**
-   * Watches one import until its turn is over, then calls `idle` once.
+   * Watches what is running in one import's session (A6 U6), calling `update` with each
+   * answer, until an answer says nothing is — no turn and no background work — which is
+   * the last call. A refusal, or no server answering, is reported as nothing running.
    *
    * **Asked, because the narration cannot say it.** The bus carries what the agent says and
    * nothing about when it has stopped — a harness's stream has no "idle" entry, and an
-   * agent can be silent for a minute while it reads a page. The server does know: the
-   * import is `running` from the moment a message is accepted until `waitForIdle` returns
-   * for it (`progress.resume`, then `settle`). So the turn's cursor is cleared by that
-   * answer and by nothing guessed from the feed. Returns a function that stops watching.
+   * agent can be silent for a minute while it reads a page. The server does know, from the
+   * harness: a turn is running from the moment a message is accepted until the harness goes
+   * idle, and also while a turn the harness opened by itself runs, which no message here
+   * started. So the turn's cursor and its Stop follow that answer and nothing guessed from
+   * the feed. Returns a function that stops watching.
    */
-  readonly watchTurn: (importId: string, idle: () => void) => () => void;
+  readonly watchTurn: (
+    importId: string,
+    update: (activity: ImporterActivity) => void,
+  ) => () => void;
 }
 
 /** What a stand-in reply says, so no one reads it as the importer's own words. */
@@ -333,18 +357,34 @@ export class ImporterSessions {
    * the transcript lacks after reading it, so the first replay is already whole.
    */
   readonly #readMidTurn = new Set<string>();
+  /**
+   * The turn watch's last answer for each import it has watched (A6 U6), by import id.
+   *
+   * **Newer than the list's `running`, and what a reading of the list defers to.** The list
+   * reads the import's own status, which is `finished` while a turn the harness opened by
+   * itself runs and says nothing of background work; the watch asks the harness. Once an
+   * import has been asked about, new work in it is noticed from the live feed
+   * ({@link noteActivity}) or from a message this tab sends, either of which watches it again.
+   */
+  readonly #activityOf = new Map<string, ImporterActivity>();
   /** Stops watching the turn in flight, if one is being watched. */
   #unwatch: (() => void) | undefined = undefined;
   /** The import {@link #unwatch} is for. */
   #watching: string | undefined = undefined;
   /**
    * A Stop's sentence about a conversation that was still busy when it was answered, and the
-   * ids it is about. It describes the turn the Stop left running, so it is over when that
-   * turn is: the turn watch clears it from {@link notice} when the import goes idle.
+   * ids it is about. It describes what the Stop left running, so it is over when that is:
+   * the turn watch clears it from {@link notice} when the turn ends (`turn`), or when the
+   * background work it may have left running is over (`background`, A6 U6) — not at the end
+   * of the next turn.
    */
   #busyStop:
-    { readonly ids: readonly string[]; readonly text: string } | undefined =
-    undefined;
+    | {
+        readonly ids: readonly string[];
+        readonly text: string;
+        readonly about: "turn" | "background";
+      }
+    | undefined = undefined;
 
   /** Every session on the target, in no particular order. */
   sessions = $state.raw<readonly ImporterSession[]>([]);
@@ -462,6 +502,9 @@ export class ImporterSessions {
           ...(this.current.taken === undefined
             ? {}
             : { taken: this.current.taken }),
+          ...(this.current.sentNow === undefined
+            ? {}
+            : { sentNow: this.current.sentNow }),
         }),
   );
 
@@ -492,6 +535,7 @@ export class ImporterSessions {
     this.#stopWatching();
     this.#reading.clear();
     this.#readMidTurn.clear();
+    this.#activityOf.clear();
     this.#server = server;
     this.draft = "";
     this.notice = "";
@@ -581,7 +625,7 @@ export class ImporterSessions {
     );
     const own = this.sessions.filter((session) => session.indexed !== true);
     const refreshed = indexed.map((listed) => {
-      const session = this.#withSwitchedModel(listed);
+      const session = this.#withActivity(this.#withSwitchedModel(listed));
       const kept = touched.get(session.id);
       return kept === undefined
         ? session
@@ -593,6 +637,7 @@ export class ImporterSessions {
             // Which of those rows were sent mid-turn, and so wait for a take (A6 U4): this
             // tab's knowledge of its own rows, as the floors are.
             ...(kept.midTurn === undefined ? {} : { midTurn: kept.midTurn }),
+            ...(kept.sentNow === undefined ? {} : { sentNow: kept.sentNow }),
             // And where the harness took them, once seen: the live window slides on.
             ...(kept.taken === undefined ? {} : { taken: kept.taken }),
             ...(kept.historyFloor === undefined
@@ -622,7 +667,7 @@ export class ImporterSessions {
     // from another tab, say — is watched to its end like one sent from this one.
     const current = this.current;
     if (
-      current?.working === true &&
+      (current?.working === true || current?.background === true) &&
       current.importId !== undefined &&
       this.#watching !== current.importId
     ) {
@@ -631,6 +676,29 @@ export class ImporterSessions {
     // And its words, if this is the first list that named it: `openImporter` can open a
     // session by id before the index has arrived, so the read cannot only hang off `open`.
     if (current !== undefined) void this.#loadHistory(current);
+  }
+
+  /**
+   * An index row, with what the turn watch last said is running in it, if it has said.
+   *
+   * **The row's `running: true` is believed and its `false` is not.** The server's activity
+   * answer runs whenever the import does (`ScopeImporter.activity`), so a row that says
+   * running is a turn the watch will see too; a row that says not running may be a session
+   * whose harness opened a turn by itself, which only the watch can see, and which the watch
+   * ends when it is over.
+   */
+  #withActivity(session: ImporterSession): ImporterSession {
+    const known =
+      session.importId === undefined
+        ? undefined
+        : this.#activityOf.get(session.importId);
+    return known === undefined
+      ? session
+      : {
+          ...session,
+          working: session.working || known.running,
+          background: known.background,
+        };
   }
 
   /**
@@ -657,6 +725,7 @@ export class ImporterSessions {
     this.#stopWatching();
     this.#reading.clear();
     this.#readMidTurn.clear();
+    this.#activityOf.clear();
     this.#server = undefined;
     this.notice = "";
     this.refused = false;
@@ -739,9 +808,11 @@ export class ImporterSessions {
     if (opened !== undefined) {
       this.currentId = id;
       this.draft = "";
-      // A session the server says is running is watched to its end, so its cursor clears
-      // here too rather than only in the tab that sent the message.
-      if (opened.working && opened.importId !== undefined) {
+      // Asked what is running in it (A6 U6), not only when the list says it is: a turn the
+      // harness opened by itself, or background work, runs under an import the list calls
+      // finished. Watched to its end, so its cursor and its Stop follow the server here too
+      // rather than only in the tab that sent the message.
+      if (opened.importId !== undefined && opened.ended !== true) {
         this.#watch(opened.importId);
       }
       void this.#loadHistory(opened);
@@ -943,29 +1014,90 @@ export class ImporterSessions {
     const server = this.#server;
     if (server === undefined) return;
     this.#stopWatching();
-    const stop = server.watchTurn(importId, () => {
+    /** Whether anything ran while watched: only then does the list need reading again. */
+    let busy = this.sessions.some(
+      (session) =>
+        session.importId === importId &&
+        (session.working || session.background === true),
+    );
+    const stop = server.watchTurn(importId, (activity) => {
       if (this.#unwatch !== stop) return;
-      this.#unwatch = undefined;
-      this.#watching = undefined;
-      this.sessions = this.sessions.map((session) =>
-        session.importId === importId
-          ? { ...session, working: false }
-          : session,
-      );
-      // A Stop's "is answering it now" is about the turn that just ended, so it goes with
-      // the pill rather than outliving it. Only if it is still what the line says.
-      const busy = this.#busyStop;
-      if (busy !== undefined && busy.ids.includes(importId)) {
-        this.#busyStop = undefined;
-        if (this.notice === busy.text) this.notice = "";
+      this.#activityOf.set(importId, activity);
+      const over = !activity.running && !activity.background;
+      if (over) {
+        this.#unwatch = undefined;
+        this.#watching = undefined;
       }
-      this.#turnsEnded();
-      this.#rereadSettled();
-      // The turn wrote what it wrote: the list's tally is the server's to restate.
-      server.reread();
+      if (!over) busy = true;
+      // Every session filed under the import: a reopen's fresh thread shares its old one's
+      // import id until the list is read again.
+      const under = this.sessions.filter(
+        (session) => session.importId === importId,
+      );
+      const wasWorking = under.some((session) => session.working);
+      if (
+        under.some(
+          (session) =>
+            session.working !== activity.running ||
+            (session.background === true) !== activity.background,
+        )
+      ) {
+        this.sessions = this.sessions.map((session) =>
+          session.importId === importId
+            ? {
+                ...session,
+                working: activity.running,
+                background: activity.background,
+              }
+            : session,
+        );
+      }
+      // A Stop's "is answering it now" is about the turn it left running, and "may still be
+      // running" about the background work: each goes with what it describes rather than
+      // outliving it. Only if it is still what the line says.
+      const said = this.#busyStop;
+      if (
+        said !== undefined &&
+        said.ids.includes(importId) &&
+        (said.about === "turn" ? !activity.running : !activity.background)
+      ) {
+        this.#busyStop = undefined;
+        if (this.notice === said.text) this.notice = "";
+      }
+      if (wasWorking && !activity.running) {
+        this.#turnsEnded();
+        this.#rereadSettled();
+      }
+      // What ran wrote what it wrote: the list's tally is the server's to restate.
+      if (over && busy) server.reread();
     });
     this.#unwatch = stop;
     this.#watching = importId;
+  }
+
+  /**
+   * Starts watching the session on screen when the live feed carries its importer's words
+   * while this tab thinks nothing is running in it (A6 U6): a turn the harness opened by
+   * itself — Claude Code's, on a background task's notification — which no message of this
+   * tab's started. The server is asked rather than the item believed: a late frame of a turn
+   * already over answers idle, and costs one request. Called by the app for every live item,
+   * partials included.
+   */
+  noteActivity(item: LiveItem): void {
+    const session = this.current;
+    const importId = session?.importId;
+    if (
+      importId === undefined ||
+      item.importId !== importId ||
+      item.origin !== "activity" ||
+      this.sending ||
+      session?.ended === true ||
+      session?.working === true ||
+      this.#watching === importId
+    ) {
+      return;
+    }
+    this.#watch(importId);
   }
 
   #stopWatching(): void {
@@ -1028,8 +1160,15 @@ export class ImporterSessions {
     return lead.length;
   }
 
-  /** Sends the draft into the session on screen, resuming it if it was only being read. */
-  send(): void {
+  /**
+   * Sends the draft into the session on screen, resuming it if it was only being read.
+   *
+   * `urgency` is how a message sent while a turn runs lands (A6 U6): `queued`, the default
+   * and what Enter sends, waits for the work in flight; `preemptive` — D3's "Send now" —
+   * lands at the harness's next step, and the rest of the work in flight is dropped. To a
+   * session with nothing running the two are the same.
+   */
+  send(urgency: SteerUrgency = "queued"): void {
     const text = this.draft.trim();
     const session = this.current;
     if (text === "" || session === undefined) return;
@@ -1040,7 +1179,7 @@ export class ImporterSessions {
     // The operator ended it; the server would refuse, and the composer says so instead.
     if (session.ended === true) return;
     if (this.#server !== undefined) {
-      void this.#post(this.#server, session, text);
+      void this.#post(this.#server, session, text, urgency);
       return;
     }
     const at = this.#now();
@@ -1099,6 +1238,7 @@ export class ImporterSessions {
     server: ImporterServer,
     session: ImporterSession,
     text: string,
+    urgency: SteerUrgency,
   ): Promise<void> {
     if (this.sending) return;
     this.sending = true;
@@ -1122,7 +1262,7 @@ export class ImporterSessions {
     const answer =
       session.importId === undefined
         ? await server.open(text, agentId)
-        : await server.send(session.importId, text);
+        : await server.send(session.importId, text, urgency);
     const pinnedAgent = agentId ?? this.agents?.defaultAgentId;
     this.sending = false;
     this.waitingForSwitch = false;
@@ -1171,6 +1311,9 @@ export class ImporterSessions {
       return {
         ...before,
         ...(midTurn ? { midTurn: [...(before.midTurn ?? []), row.id] } : {}),
+        ...(midTurn && urgency === "preemptive" && turn.messageId !== undefined
+          ? { sentNow: [...(before.sentNow ?? []), turn.messageId] }
+          : {}),
         id: turn.harnessSessionId,
         importId: turn.importId,
         model: turn.model,
@@ -1216,6 +1359,12 @@ export class ImporterSessions {
       this.sessions = [...this.sessions, fresh];
       if (this.currentId === session.id) this.currentId = fresh.id;
     }
+    // Running until the watch says otherwise: a reading of the list in between must not
+    // put back an older answer about this import.
+    this.#activityOf.set(turn.importId, {
+      running: true,
+      background: this.#activityOf.get(turn.importId)?.background ?? false,
+    });
     this.#watch(turn.importId);
     server.reread();
   }
@@ -1241,7 +1390,11 @@ export class ImporterSessions {
     const server = this.#server;
     const importId = session.importId;
     if (server === undefined || importId === undefined) {
-      this.#replace(session.id, (before) => ({ ...before, working: false }));
+      this.#replace(session.id, (before) => ({
+        ...before,
+        working: false,
+        background: false,
+      }));
       this.#turnsEnded();
       return;
     }
@@ -1258,13 +1411,36 @@ export class ImporterSessions {
     const stopped = answer.stopped;
     this.notice = stopped.detail;
     this.refused = false;
+    /*
+     * What the Stop reached. Background work stopped with no turn running leaves the turn
+     * as it was — none — and what may still be running is the background work, which the
+     * turn watch goes on asking about (A6 U6). Otherwise the turn is what is still running,
+     * or is over.
+     */
+    const background = stopped.outcome === "background_stopped";
     this.#busyStop = stopped.working
-      ? { ids: [importId, stopped.conversationId], text: stopped.detail }
+      ? {
+          ids: [importId, stopped.conversationId],
+          text: stopped.detail,
+          about: background ? "background" : "turn",
+        }
       : undefined;
     if (stopped.working) return;
+    for (const id of [importId, stopped.conversationId]) {
+      const known = this.#activityOf.get(id);
+      if (known === undefined) continue;
+      this.#activityOf.set(
+        id,
+        background
+          ? { ...known, background: false }
+          : { ...known, running: false },
+      );
+    }
     this.sessions = this.sessions.map((each) =>
       each.importId === importId || each.importId === stopped.conversationId
-        ? { ...each, working: false }
+        ? background
+          ? { ...each, background: false }
+          : { ...each, working: false }
         : each,
     );
     this.#turnsEnded();

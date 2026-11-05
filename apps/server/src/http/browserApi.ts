@@ -1633,6 +1633,18 @@ const fleetHandlers = HttpApiBuilder.group(
       }),
 
       /**
+       * Whether a turn, or background work, is running in one import's session (A6 U6). The
+       * target is checked here and the import inside the importer, as a Stop's are.
+       */
+      importerActivity: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.activity({
+          targetId: row.targetId,
+          importId: params.importId,
+        });
+      }),
+
+      /**
        * One import session's conversation, replayed from the harness (S6).
        *
        * The target is checked here and the import inside the importer — which reads the row

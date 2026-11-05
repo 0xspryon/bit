@@ -74,6 +74,45 @@ export const ConversationStopped = Schema.Struct({
 export type ConversationStopped = typeof ConversationStopped.Type;
 
 /**
+ * Whether a turn is running in a conversation, as this server holds it (A6 U6).
+ *
+ * - `running` — a turn is in flight: a message the operator sent is being answered, or the
+ *   harness opened a turn by itself (Claude Code does on a background task's notification).
+ * - `idle` — this server holds the session and no turn is running in it.
+ * - `not_live` — this server holds no session for the conversation, so nothing of it runs
+ *   here.
+ */
+export const ConversationTurnActivity = Schema.Literals([
+  "running",
+  "idle",
+  "not_live",
+]);
+export type ConversationTurnActivity = typeof ConversationTurnActivity.Type;
+
+/**
+ * What a conversation is doing right now (A6 U6): what a screen reads to decide whether to
+ * offer Stop. Read from the harness, so it covers the turns no message of the operator's
+ * started, which a screen counting its own messages cannot see.
+ */
+export const ConversationActivity = Schema.Struct({
+  /**
+   * The conversation the answer is about: for an importer, the import holding the session
+   * now — the one addressed unless this server has carried the conversation on under a
+   * successor.
+   */
+  conversationId: Schema.String,
+  turn: ConversationTurnActivity,
+  /**
+   * Whether work the agent started in the background — a background subagent or shell,
+   * which outlives the turn that started it — is still running. A Stop with no turn running
+   * stops it and answers `background_stopped`. `false` from a harness that does not report
+   * background work (OpenCode), and when the harness could not be asked.
+   */
+  background: Schema.Boolean,
+});
+export type ConversationActivity = typeof ConversationActivity.Type;
+
+/**
  * Why a Stop could not be carried out. Each `detail` is a sentence for the error dialog.
  *
  * - `harness_unreachable` — the harness was asked to stop the turn and did not acknowledge

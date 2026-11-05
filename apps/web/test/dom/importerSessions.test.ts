@@ -27,7 +27,11 @@ import {
 import { App, IMPORT_POLL_MS, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import { PARTIAL_BODY_MAX, REPLY_PAST_CAP_LABEL } from "../../src/lib/chat";
-import { ENDED_NOTE, MID_BLOCK_NOTE } from "../../src/lib/importerChat";
+import {
+  ENDED_NOTE,
+  MID_BLOCK_NOTE,
+  SENT_NOW_NOTE,
+} from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import {
@@ -1278,6 +1282,225 @@ describe("the Stop pill (A6 F5)", () => {
     click(close);
     await settle();
     expect(dialog()).toBeNull();
+  });
+});
+
+/*
+ * A6 U6: Stop follows what the server says runs — a turn the harness opened by itself, and
+ * background work outside any turn — and D3's "Send now" beside the queued send.
+ */
+describe("A6 U6: Stop when the server says something runs, and Send now", () => {
+  const stopPill = (): HTMLButtonElement | null =>
+    document.querySelector<HTMLButtonElement>(".importer button.stop");
+  const sendNowButton = (): HTMLButtonElement | null =>
+    document.querySelector<HTMLButtonElement>(".importer button.send-now");
+  const noticeText = (): string =>
+    document.querySelector(".importer .notice")?.textContent?.trim() ?? "";
+  const cursor = (): Element | null =>
+    document.querySelector(".importer .streaming .stream-cursor");
+  /** The server's activity answers, changed by the test as the session's state moves. */
+  const activity = (
+    fake: FakeServer,
+    state: { turn: "running" | "idle" | "not_live"; background: boolean },
+  ) => {
+    fake.onImporterActivity = (_baseUrl, _targetId, importId) =>
+      ok({ conversationId: importId, ...state });
+  };
+  const firePolls = async (app: App): Promise<void> => {
+    for (const armed of (app.countdown as FakeCountdown).live.filter(
+      (each) => each.ms === IMPORT_POLL_MS,
+    )) {
+      armed.fire();
+    }
+    await settle();
+  };
+  const word = (id: string, body: string) =>
+    liveActivity({
+      id,
+      attemptId: null,
+      importId: "imp_newest",
+      kind: "turn.reply",
+      headline: "Reply",
+      tool: null,
+      toolName: null,
+      input: null,
+      callId: null,
+      body,
+    });
+
+  test("a turn the harness opened by itself shows Stop once its words arrive, and Stop stops it", async () => {
+    // Claude Code opens a turn of its own on a background task's notification: no message of
+    // this tab's started it, and the list calls the import finished throughout.
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    await settle();
+    expect(stopPill()).toBeNull();
+    const asked = fake.countOf("importerActivity");
+
+    activity(fake, { turn: "running", background: false });
+    fake.watch.send(word("activity:5", "The background check came back."));
+    await settle();
+    expect(fake.countOf("importerActivity")).toBe(asked + 1);
+    expect(app.importer.current?.working).toBe(true);
+    expect(stopPill()?.textContent?.trim()).toBe("Stop");
+    expect(cursor()).not.toBeNull();
+
+    // More words while it runs ask nothing more: the watch is on it.
+    fake.watch.send(word("activity:6", "It printed done."));
+    await settle();
+    expect(fake.countOf("importerActivity")).toBe(asked + 1);
+
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill");
+    click(pill);
+    await settle();
+    expect(
+      fake.calls
+        .filter((call) => call.method === "stopImporterTurn")
+        .map((call) => call.args.slice(1)),
+    ).toEqual([["acme-corp", "imp_newest"]]);
+    expect(stopPill()).toBeNull();
+  });
+
+  test("a reading of the list that calls it finished does not take Stop away from a turn the server says runs", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    activity(fake, { turn: "running", background: false });
+    fake.watch.send(word("activity:5", "The background check came back."));
+    await settle();
+    await app.loadImporterSessions("acme-corp");
+    await settle();
+    expect(stopPill()).not.toBeNull();
+    // The watch says it is over, and the pill goes.
+    activity(fake, { turn: "idle", background: false });
+    await firePolls(app);
+    expect(stopPill()).toBeNull();
+    expect(app.importer.current?.working).toBe(false);
+  });
+
+  test("background work outside any turn is offered Stop on open, and the 'may still be running' sentence goes when it is over", async () => {
+    const fake = new FakeServer();
+    activity(fake, { turn: "idle", background: true });
+    const said =
+      "No turn was running, but work it had started in the background was. It was told to stop, and some of it may still be running; stop again to ask once more.";
+    fake.onStopImporterTurn = (_baseUrl, _targetId, importId) =>
+      ok({
+        conversationId: importId,
+        outcome: "background_stopped",
+        working: true,
+        detail: said,
+      });
+    const app = await continueWith(fake);
+    expect(app.importer.current?.working).toBe(false);
+    expect(app.importer.current?.background).toBe(true);
+    // No turn: no cursor, and the pill says what it stops.
+    expect(cursor()).toBeNull();
+    expect(stopPill()?.textContent?.trim()).toBe("Stop background work");
+
+    const pill = stopPill();
+    if (pill === null) throw new Error("no Stop pill");
+    click(pill);
+    await settle();
+    expect(noticeText()).toBe(said);
+    // Some of it still runs: the pill stays, to ask again, and so does the sentence while
+    // the server says it runs — no turn ending is what it waits for.
+    expect(stopPill()).not.toBeNull();
+    await firePolls(app);
+    expect(noticeText()).toBe(said);
+    expect(stopPill()).not.toBeNull();
+
+    // The background work ends, with no turn ending at all: the sentence goes with it, not
+    // at the end of the next turn.
+    activity(fake, { turn: "idle", background: false });
+    await firePolls(app);
+    expect(noticeText()).toBe("");
+    expect(stopPill()).toBeNull();
+    expect(app.importer.current?.background).toBe(false);
+  });
+
+  test("Send now is offered only while a turn runs; it sends a preemptive steer, and Enter still queues", async () => {
+    const { app, fake } = await continueOn(SESSIONS, [
+      harness("claude-code", "Claude Code"),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    await settle();
+    // Idle: one way to send.
+    typeInto(composer(), "Also the partner portal");
+    await settle();
+    expect(sendNowButton()).toBeNull();
+
+    // A turn runs (the operator's first message, queued as ever by Enter).
+    composer().focus();
+    press("Enter");
+    await settle();
+    activity(fake, { turn: "running", background: false });
+    await firePolls(app);
+    expect(app.importer.current?.working).toBe(true);
+    const urgencies = () =>
+      fake.calls
+        .filter((call) => call.method === "sendImporterMessage")
+        .map((call) => call.args[4] ?? "queued");
+    expect(urgencies()).toEqual(["queued"]);
+
+    // Delivered as a steer, under an id its take will name.
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_newest",
+          harnessInstanceId: "claude-code",
+          model: "anthropic/claude-newest",
+          messageId: "msg_now",
+        }),
+      );
+    typeInto(composer(), "Stop reading the blog, it is out of scope");
+    await settle();
+    const now = sendNowButton();
+    if (now === null) throw new Error("no Send now while a turn runs");
+    expect(now.disabled).toBe(false);
+    click(now);
+    await settle();
+    expect(urgencies()).toEqual(["queued", "preemptive"]);
+    // Waiting for the harness to take it, the bubble says it is being sent now.
+    const marks = () =>
+      [...document.querySelectorAll(".importer .queued-mark")].map(
+        (each) => each.textContent?.trim() ?? "",
+      );
+    expect(marks()).toEqual(["sending now"]);
+    expect(document.querySelector(".importer")?.textContent).toContain(
+      SENT_NOW_NOTE,
+    );
+    // Empty again: Send now is there and off, like the arrow.
+    expect(sendNowButton()?.disabled).toBe(true);
+
+    // The harness takes it at its next step: the mark says what happened.
+    const sent = app.importer.current?.items.at(-1);
+    const messageId = sent?.messageIds?.[0];
+    if (messageId === undefined) throw new Error("no message id");
+    fake.watch.send(
+      liveActivity({
+        id: "activity:30",
+        attemptId: null,
+        importId: "imp_newest",
+        kind: "turn.taken",
+        headline: "",
+        tool: null,
+        toolName: null,
+        input: null,
+        callId: null,
+        messageIds: [messageId],
+      }),
+    );
+    await settle();
+    expect(marks()).toEqual(["sent now"]);
+    expect(document.querySelector(".importer")?.textContent).not.toContain(
+      SENT_NOW_NOTE,
+    );
   });
 });
 

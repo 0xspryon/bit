@@ -89,6 +89,7 @@ import {
   ImporterSessions,
   type ImporterScenario,
   type ImporterSent,
+  type ImporterActivity,
   type ImporterServer,
 } from "./importerSessions.svelte";
 import {
@@ -2759,13 +2760,14 @@ export class App {
             "No server answered at this address, so whether the model was switched is not known. Pick it again once the server is back.",
         };
       },
-      send: async (importId, text) =>
+      send: async (importId, text, urgency) =>
         answer(
           await this.client.sendImporterMessage(
             this.serverUrl,
             targetId,
             importId,
             text,
+            urgency,
           ),
         ),
       /**
@@ -2823,48 +2825,61 @@ export class App {
         this.harnesses.find((entry) => entry.instanceId === instanceId)
           ?.displayName ?? instanceId,
       highWater: () => this.#activityHighWater() ?? 0,
-      watchTurn: (importId, idle) =>
-        this.#watchImporterTurn(targetId, importId, idle),
+      watchTurn: (importId, update) =>
+        this.#watchImporterTurn(targetId, importId, update),
     };
   }
 
   /**
-   * Polls one import until its turn is over, then calls `idle` once.
+   * Polls what is running in one import's session (A6 U6), handing each answer to `update`,
+   * until nothing is: no turn and no background work.
    *
    * {@link watchImport}'s loop — rescheduled after each answer, one request in flight — and
    * separate from it because it watches a different thing for a different reader: that one
-   * settles the progress panel, this one only clears a chat's cursor, and the two must not
-   * stop each other.
+   * settles the progress panel, this one draws a chat's cursor and its Stop, and the two must
+   * not stop each other.
    *
-   * **Anything but `running` is the end of the turn**: settled, stopped, failed, forgotten
-   * by a restarted server, or no server answering. Each of those means nothing more is
-   * coming for this turn that this tab could see, and a cursor left blinking over a
-   * conversation that has stopped would be a claim the chat cannot back.
+   * **The harness's account, not the import's** (`importerActivity`): a turn the harness
+   * opened by itself — Claude Code's, on a background task's notification — runs with the
+   * import `finished`, and background work runs outside any turn. **Anything that is not an
+   * answer is the end**: a refusal, or no server answering, means nothing more is coming that
+   * this tab could see, and a cursor left blinking over a conversation that has stopped
+   * would be a claim the chat cannot back.
    */
   #watchImporterTurn(
     targetId: string,
     importId: string,
-    idle: () => void,
+    update: (activity: ImporterActivity) => void,
   ): () => void {
     let stopped = false;
     let cancelNext: (() => void) | undefined;
     const loop = async (): Promise<void> => {
       if (stopped) return;
-      const call = await this.client.scopeImport(
+      const call = await this.client.importerActivity(
         this.serverUrl,
         targetId,
         importId,
       );
       if (stopped) return;
-      if (call._tag === "Ok" && call.value.status === "running") {
-        cancelNext = this.countdown.after(IMPORT_POLL_MS, () => void loop());
+      if (call._tag === "Ok") {
+        const activity = {
+          running: call.value.turn === "running",
+          background: call.value.background,
+        };
+        const going = activity.running || activity.background;
+        if (going) {
+          cancelNext = this.countdown.after(IMPORT_POLL_MS, () => void loop());
+        } else {
+          stopped = true;
+        }
+        update(activity);
         return;
       }
       if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
         this.signOut("expired");
       }
       stopped = true;
-      idle();
+      update({ running: false, background: false });
     };
     void loop();
     return () => {
@@ -5607,6 +5622,8 @@ export class App {
       if (placed !== undefined && placed !== this.liveItems) {
         this.#keepLive(placed);
       }
+      // A turn's first words are a partial: a turn the harness opened itself (A6 U6).
+      this.importer.noteActivity(frame);
       return;
     }
     if (this.#shown.has(frame.id)) return;
@@ -5625,6 +5642,8 @@ export class App {
     );
     // A take is kept on its importer session, since this list slides (A6 U4 review).
     this.importer.noteTaken(frame);
+    // And words from a session this tab thinks idle start its turn watch (A6 U6).
+    this.importer.noteActivity(frame);
     this.#refreshIntentsFor(targetId, frame);
     this.#refreshGoalBriefingFor(targetId, frame);
     this.#refreshPlanRoundsFor(targetId, frame);

@@ -3943,6 +3943,47 @@ describe("a message's urgency (A6 F5)", () => {
   });
 });
 
+describe("what is running in an import's session (A6 U6)", () => {
+  const activityOf = (
+    runtime: ManagedRuntime.ManagedRuntime<ScopeImporter, unknown>,
+    importId: string,
+  ) =>
+    runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.activity({ targetId: TARGET, importId }),
+      ),
+    );
+
+  test("a held, settled session is idle; an import this target does not hold is refused; an ended one is not live", async () => {
+    const { runtime, importId } = await liveOne();
+    expect(await activityOf(runtime, importId)).toEqual({
+      conversationId: importId,
+      turn: "idle",
+      background: false,
+    });
+    const unknown = await runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.activity({ targetId: TARGET, importId: "imp_nonesuch" }),
+        ),
+      ),
+    );
+    expect(unknown._tag).toBe("Failure");
+    if (unknown._tag === "Failure") {
+      expect(unknown.failure._tag).toBe("ScopeImportNotFound");
+    }
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) => importer.stop(importId)),
+    );
+    expect(await activityOf(runtime, importId)).toEqual({
+      conversationId: importId,
+      turn: "not_live",
+      background: false,
+    });
+    await runtime.dispose();
+  });
+});
+
 describe("stopping an import's turn (A6 F5)", () => {
   test("interrupts the live session's turn and keeps the conversation: the next message continues it under the same import", async () => {
     const { built, runtime, importId } = await liveOne();

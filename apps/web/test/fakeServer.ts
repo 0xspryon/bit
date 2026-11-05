@@ -1321,6 +1321,39 @@ export class FakeServer implements ServerClient {
       changed: true,
     });
 
+  /**
+   * What is running in one import's session (A6 U6), by default read the way the turn watch
+   * read it before U6: a turn runs while {@link onScopeImport} says the import is `running`
+   * — for an import the list says is running or one this client sent a message to, which
+   * were the only ones watched then — and there is no background work. `scopeImportView`'s
+   * default status is `running`, so an idle row the page now asks about on open would
+   * otherwise read as busy. A test of a turn the harness opened itself, or of background
+   * work, sets this.
+   */
+  onImporterActivity: (
+    ...args: Parameters<ServerClient["importerActivity"]>
+  ) => Answer<"importerActivity"> = (baseUrl, targetId, importId) => {
+    const call = this.onScopeImport(baseUrl, targetId, importId);
+    if (call._tag === "Refused") return refused(call.error);
+    if (call._tag === "Unreachable") return unreachable(call.detail);
+    const listed = this.onImporterSessions(baseUrl, targetId);
+    const watched =
+      (listed._tag === "Ok" &&
+        listed.value.sessions.some(
+          (session) => session.importId === importId && session.running,
+        )) ||
+      this.calls.some(
+        (each) =>
+          each.method === "openImporterConversation" ||
+          (each.method === "sendImporterMessage" && each.args[2] === importId),
+      );
+    return ok({
+      conversationId: importId,
+      turn: watched && call.value.status === "running" ? "running" : "idle",
+      background: false,
+    });
+  };
+
   /** A turn the harness stopped, settled: the dull answer to a Stop (A6 F5). */
   onStopImporterTurn: (
     ...args: Parameters<ServerClient["stopImporterTurn"]>
@@ -1534,6 +1567,11 @@ export class FakeServer implements ServerClient {
 
   stopScopeImport = (...args: Parameters<ServerClient["stopScopeImport"]>) =>
     this.record("stopScopeImport", args, () => this.onStopScopeImport(...args));
+
+  importerActivity = (...args: Parameters<ServerClient["importerActivity"]>) =>
+    this.record("importerActivity", args, () =>
+      this.onImporterActivity(...args),
+    );
 
   stopImporterTurn = (...args: Parameters<ServerClient["stopImporterTurn"]>) =>
     this.record("stopImporterTurn", args, () =>

@@ -340,6 +340,16 @@
         is above for as long as the harness keeps it.
       </p>
     {:else if app.goalAwaiting}
+      <!--
+        V2(chat): the goal chat has no Stop and no "Send now" (A6 U6 gives them to the
+        importer only). This page knows a turn of the goal agent is running only as "a message
+        of this tab's has had no reply yet" (`goalAwaiting`) and watches nothing on the server,
+        so a turn the harness opened itself, or background work, is invisible here, and every
+        message goes `queued`. The server has both halves already (`stopGoalTurn`, and
+        `urgency` on `GoalMessageDraft`). V2 gives the goal conversation the importer's
+        activity read (`ConversationActivity`, polled while it runs, started by its live
+        words) and draws `ImporterChat`'s Stop pill and Send now over its composer.
+      -->
       <span class="pulse" aria-hidden="true"></span>
       <span class="status" role="status">Waiting for the agent…</span>
       <Button

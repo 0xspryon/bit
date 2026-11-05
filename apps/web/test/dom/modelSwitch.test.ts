@@ -790,20 +790,26 @@ describe("U3 review: the switch confirmation goes stale with what it described",
     await settle();
   });
 
-  test("mid-turn it is put in the past when only a reading of the list says the turn ended", async () => {
-    const { app, fake } = await midTurn();
-    // The turn ended — from another tab's Stop, say — and the next reading of the list
-    // is the first this tab hears of it.
+  test("U6: a reading of the list that says not running does not end a turn the server's activity says runs", async () => {
+    // Before U6 a reading of the list alone ended the turn. It no longer does: the list
+    // cannot see a turn the harness opened by itself, so its "not running" is not believed
+    // over the watch's "running", and the watch is what ends the turn.
+    const { app, fake, countdown } = await midTurn();
     fake.onImporterSessions = () =>
       ok({
         sessions: [importerSessionView({ sessionId: "ses_old", model: FIVE })],
       });
     await app.loadImporterSessions("acme-corp");
     await settle();
+    expect(app.importer.current?.working).toBe(true);
+    expect(page()).toContain(MID);
 
-    expect(fake.countOf("stopImporterTurn")).toBe(0);
+    // The watch says it is over, and only then is it.
+    fake.onImporterActivity = (_baseUrl, _targetId, importId) =>
+      ok({ conversationId: importId, turn: "idle", background: false });
+    countdown.fire();
+    await settle();
     expect(app.importer.current?.working).toBe(false);
-    expect(page()).not.toContain("is on now");
     expect(page()).toContain(ENDED);
   });
 

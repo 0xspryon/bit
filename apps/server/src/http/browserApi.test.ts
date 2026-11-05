@@ -4673,6 +4673,26 @@ describe("a target's importer sessions", () => {
     expect(elsewhere.status).toBe(404);
   });
 
+  test("a session's activity with nothing held says nothing runs, and an unknown target is a 404 (A6 U6)", async () => {
+    const activity = await read(
+      await signedIn(
+        `/targets/${withSessions}/importer-sessions/imp_old/activity`,
+      ),
+    );
+    expect(activity.status).toBe(200);
+    expect(activity.body).toEqual({
+      conversationId: "imp_old",
+      turn: "not_live",
+      background: false,
+    });
+    const elsewhere = await read(
+      await signedIn(
+        "/targets/not-a-target/importer-sessions/imp_old/activity",
+      ),
+    );
+    expect(elsewhere.status).toBe(404);
+  });
+
   test("a message to an unknown target is a 404 before the importer is asked", async () => {
     const response = await read(
       await signedIn(

@@ -412,7 +412,12 @@
   /* A6's chip: 28px, a hairline border, a letter for the harness and the model in mono. */
   .chip {
     display: inline-flex;
-    flex: none;
+    /*
+     * Shrinks inside `.picker` when the strip is short of room (U6's "Send now" took some
+     * at 1024), so the model name ellipses rather than the chip spilling over the caption.
+     */
+    flex: 0 1 auto;
+    min-width: 0;
     align-items: center;
     gap: 8px;
     max-width: 280px;

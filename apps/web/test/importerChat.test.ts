@@ -1134,6 +1134,27 @@ describe("the importer's words from the live feed", () => {
     ).toEqual([[false, ["Reading the policy page and [writing]"]]]);
   });
 
+  test("U6: a message sent now keeps its mark when the replay's copy of it replaces this tab's row", () => {
+    // Read again once the turn settles, the replay draws the harness's copy of the message,
+    // which carries the id the server delivered it under, in place of the row sent here.
+    const groups = buildImporterChat({
+      history: history({
+        source: "harness",
+        note: "From the harness.",
+        items: [
+          replayItem(0, "turn.operator", "Read the page"),
+          replayItem(1, "turn.operator", "Reply with PINEAPPLE", {
+            messageIds: ["msg_now"],
+          }),
+        ],
+      }),
+      items: [],
+      working: false,
+      sentNow: ["msg_now"],
+    });
+    expect(groups.map((group) => group.subject.sentNow)).toEqual([false, true]);
+  });
+
   test("a record is kept whatever the floor: it is durable, and the replay never holds one", () => {
     // `scope.entry.added` carries no activity order, and dropping it would lose the half of
     // the screen that survives a reload.

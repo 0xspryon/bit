@@ -404,6 +404,35 @@ export type LiveInterrupt<Meta> =
     };
 
 /**
+ * What {@link LiveAgentSessions.status} found (A6 U6).
+ *
+ * - `not_live` — no session is held under the id, so nothing of it runs in this process.
+ * - `live` — a session is held. `running` is whether a turn is in flight: a prompt this
+ *   registry delivered and the harness has not yet gone idle after, **or** the harness saying
+ *   a turn is running — which is also true of a turn the harness opened by itself (Claude
+ *   Code's turn on a background task's notification), which no prompt of this registry's
+ *   started. `background` is whether work the agent started in the background is still
+ *   running outside any turn (`SessionStatus.background`). `uncertain` is set when the
+ *   harness could not be asked, and then `running` is this registry's own account alone and
+ *   `background` is `false`.
+ */
+export type LiveStatus =
+  | { readonly _tag: "not_live" }
+  | {
+      readonly _tag: "live";
+      readonly running: boolean;
+      readonly background: boolean;
+      readonly uncertain: boolean;
+    };
+
+/**
+ * How long {@link LiveAgentSessions.status} waits for the harness's `sessionStatus`. A
+ * screen polls it about once a second, so an answer slower than this is reported as
+ * uncertain rather than queued behind.
+ */
+export const STATUS_ASK: Duration.Input = "3 seconds";
+
+/**
  * What the spine knows about one session's turns, for a Stop's answer and nothing else.
  *
  * `busy` is set when a prompt is accepted and cleared when the harness next says the session
@@ -547,6 +576,13 @@ export interface LiveAgentSessions<Meta> {
   readonly interrupt: (
     id: string,
   ) => Effect.Effect<LiveInterrupt<Meta>, HarnessFailure>;
+  /**
+   * What one id's session is doing now (A6 U6): whether a turn is running and whether
+   * background work is, for a screen deciding whether to offer Stop. A read, and it never
+   * fails: a harness that cannot answer is {@link LiveStatus} `uncertain`. A session still
+   * being opened is running — its opening turn is about to be.
+   */
+  readonly status: (id: string) => Effect.Effect<LiveStatus>;
   /** {@link closeSession} by id. Idempotent, and safe for an id with nothing live. */
   readonly close: (
     id: string,
@@ -1248,6 +1284,41 @@ export const makeLiveAgentSessions = <Meta>(
         } as const;
       });
 
+    const status: LiveAgentSessions<Meta>["status"] = (id) =>
+      Effect.gen(function* () {
+        if (live.get(id) === undefined) return { _tag: "not_live" } as const;
+        const entry = ready(id);
+        // Published and not yet preambled: its opener is sending the opening prompt.
+        if (entry === undefined) {
+          return {
+            _tag: "live",
+            running: true,
+            background: false,
+            uncertain: false,
+          } as const;
+        }
+        const busy = turnsOf(entry.scope).busy;
+        const asked = yield* Effect.result(
+          entry.harness
+            .sessionStatus(entry.sessionId)
+            .pipe(Effect.timeout(STATUS_ASK)),
+        );
+        if (asked._tag === "Failure") {
+          return {
+            _tag: "live",
+            running: busy,
+            background: false,
+            uncertain: true,
+          } as const;
+        }
+        return {
+          _tag: "live",
+          running: busy || asked.success.activity === "running",
+          background: asked.success.background === true,
+          uncertain: false,
+        } as const;
+      });
+
     /**
      * The ids with a model switch in flight. A set rather than a permit, because the second
      * switch is refused rather than made to wait; checked and added in one synchronous step,
@@ -1354,6 +1425,7 @@ export const makeLiveAgentSessions = <Meta>(
       closeSession,
       deliver,
       interrupt,
+      status,
       switchModel,
       close: (id, reason) => {
         const entry = live.get(id);

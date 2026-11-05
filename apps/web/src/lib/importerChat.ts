@@ -121,6 +121,12 @@ export interface ImporterTurn {
    */
   readonly queued: boolean;
   /**
+   * True when this message was sent with D3's "Send now" while a turn ran (A6 U6): a
+   * `preemptive` steer, which the harness takes at its next step, dropping the rest of the
+   * work in flight. Said under the bubble while it waits and once it was taken.
+   */
+  readonly sentNow: boolean;
+  /**
    * When the importer started on this message, on the server's clock, or `null` on the
    * leading group: when the harness took it, for a message that waited; otherwise when it
    * was accepted (live) or stored (replayed). The start of the turn footer's duration.
@@ -343,6 +349,25 @@ export interface ImporterSession {
    * placed meanwhile and {@link ImporterTurn.queued} for how it is drawn.
    */
   readonly midTurn?: readonly string[];
+  /**
+   * The messages sent with "Send now" (A6 U6) — `preemptive` steers — by the id the server
+   * delivered each under (`ImporterTurnAccepted.messageId`). By message rather than by row,
+   * so the mark survives the replay read again at the turn's end, which draws the harness's
+   * copy of the message (carrying the same id) in place of this tab's row.
+   *
+   * V2(chat): this tab's knowledge only, as {@link midTurn} is. The server's queued messages
+   * (`ImporterConversationView.queued`) do not carry the urgency they were sent at, so after
+   * a reload a "Send now" message the harness has not taken yet is drawn as queued, and one it
+   * took as an ordinary turn. V2 records the urgency on the server's held steer
+   * (`ImporterQueuedMessage.urgency`) and reads it back here.
+   */
+  readonly sentNow?: readonly string[];
+  /**
+   * True while work the agent started in the background — a background subagent or shell —
+   * is still running outside any turn, as the turn watch last heard from the server (A6 U6).
+   * Stop is offered for it: a Stop with no turn running stops it (`background_stopped`).
+   */
+  readonly background?: boolean;
   /**
    * Each `turn.taken` item this tab has seen for this session, by the message it names,
    * kept from the first sighting (A6 U4 review) — as {@link floors} are, and for their
@@ -628,6 +653,14 @@ export const QUEUED_NOTE =
   "Queued: the importer reads this once it reaches a break in the work it is doing.";
 
 /**
+ * What a message sent with "Send now" says while the harness has yet to take it (A6 U6): a
+ * `preemptive` steer lands at the harness's next step boundary, so a tool call already
+ * running finishes first and the rest of the work in flight is dropped (`SteerUrgency`).
+ */
+export const SENT_NOW_NOTE =
+  "Sending now: the importer reads this at its next step. A tool call already running finishes first; the rest of what it was doing is dropped.";
+
+/**
  * What the composer says under a message the server accepted: the server's own note, then
  * which pages the message made citable.
  *
@@ -898,6 +931,8 @@ export interface ImporterChatInput {
   readonly recordsSkipped?: number;
   /** {@link ImporterSession.midTurn}. Empty when omitted. */
   readonly midTurn?: readonly string[];
+  /** {@link ImporterSession.sentNow}. Empty when omitted. */
+  readonly sentNow?: readonly string[];
   /** {@link ImporterSession.taken}. Only `items`' own takes when omitted. */
   readonly taken?: Readonly<Record<string, LiveItem>>;
 }
@@ -1102,6 +1137,9 @@ export const buildImporterChat = (
   );
   const turnCount = cut.turns.length;
   const midTurn = new Set(input.midTurn ?? []);
+  const urgent = new Set(input.sentNow ?? []);
+  const sentNow = (operator: LiveItem): boolean =>
+    messagesOf(operator).some((id) => urgent.has(id));
   /** Whether a turn's message still waits behind the turn running before it. */
   const waiting = (operator: LiveItem): boolean =>
     input.working &&
@@ -1156,6 +1194,7 @@ export const buildImporterChat = (
         at: null,
         working: false,
         queued: false,
+        sentNow: false,
         startedAt: null,
         midBlock: false,
       },
@@ -1190,11 +1229,15 @@ export const buildImporterChat = (
         at: turn.operator.at,
         working,
         queued,
+        sentNow: sentNow(turn.operator),
         startedAt: take?.at ?? turn.operator.at,
         midBlock,
       },
       prose: queued
-        ? { _tag: "pending", note: QUEUED_NOTE }
+        ? {
+            _tag: "pending",
+            note: sentNow(turn.operator) ? SENT_NOW_NOTE : QUEUED_NOTE,
+          }
         : midBlock
           ? { _tag: "pending", note: MID_BLOCK_NOTE }
           : replayed

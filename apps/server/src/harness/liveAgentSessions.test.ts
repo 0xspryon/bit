@@ -795,6 +795,73 @@ describe("a later message and a Stop (A6 F5)", () => {
     expect(lingering.detail).toContain("may still be running");
   });
 
+  test("status says what the harness says is running, including a turn no message started, and background work beside it (A6 U6)", async () => {
+    const read = (
+      sessionStatus: AgentHarness["Service"]["sessionStatus"],
+      waitForIdle?: AgentHarness["Service"]["waitForIdle"],
+    ) =>
+      withImporterSessions(
+        stubHarness({
+          sessionStatus,
+          ...(waitForIdle === undefined ? {} : { waitForIdle }),
+        }),
+        ({ sessions, plan }) =>
+          Effect.gen(function* () {
+            const before = yield* sessions.status(IMPORT);
+            yield* opened(sessions, plan);
+            // The opening prompt's idle watcher runs first, as it would before a poll.
+            yield* Effect.sleep("10 millis");
+            return { before, after: yield* sessions.status(IMPORT) };
+          }),
+      );
+    const cliTurn = (
+      await read(() =>
+        Effect.succeed({ activity: "running" as const, background: false }),
+      )
+    ).result;
+    expect(cliTurn.before).toEqual({ _tag: "not_live" });
+    expect(cliTurn.after).toEqual({
+      _tag: "live",
+      running: true,
+      background: false,
+      uncertain: false,
+    });
+    const backgroundOnly = (
+      await read(() =>
+        Effect.succeed({ activity: "idle" as const, background: true }),
+      )
+    ).result;
+    expect(backgroundOnly.after).toEqual({
+      _tag: "live",
+      running: false,
+      background: true,
+      uncertain: false,
+    });
+    // A harness that cannot answer: the registry's own account — a prompt it delivered that
+    // has not gone idle — and nothing claimed about background work.
+    const unreachable = (
+      await read(
+        () =>
+          Effect.fail(
+            new HarnessTransportError({
+              operation: "session.status",
+              status: undefined,
+              tag: undefined,
+              detail: "no answer",
+              cause: undefined,
+            }),
+          ),
+        () => Effect.never,
+      )
+    ).result;
+    expect(unreachable.after).toEqual({
+      _tag: "live",
+      running: true,
+      background: false,
+      uncertain: true,
+    });
+  });
+
   test("a harness that will not acknowledge the Stop fails it, and the session is let go as refused", async () => {
     const harness = stubHarness({
       interruptSession: () =>

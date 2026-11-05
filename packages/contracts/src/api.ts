@@ -45,6 +45,7 @@ import {
   ConversationModelSwitched,
 } from "./conversationModel";
 import {
+  ConversationActivity,
   ConversationStopped,
   ConversationStopRefused,
 } from "./conversationTurn";
@@ -1611,6 +1612,25 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
           TargetNotFound,
           TargetUnavailable,
         ],
+      },
+    ),
+    /**
+     * Whether a turn, or background work, is running in one import's session (A6 U6).
+     *
+     * What the chat polls to offer Stop, rather than counting the messages it sent: a turn
+     * the harness opened by itself (a background task's notification on Claude Code) and
+     * background work outside any turn are both the harness's to report. Addressed by
+     * import id and answered for the import that holds the session now, as a Stop is. A
+     * read: a harness that cannot answer is reported from what this server delivered alone.
+     * An id this target does not hold is a `404`.
+     */
+    HttpApiEndpoint.get(
+      "importerActivity",
+      "/targets/:targetId/importer-sessions/:importId/activity",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        success: ConversationActivity,
+        error: [ScopeImportNotFound, TargetNotFound, TargetUnavailable],
       },
     ),
     /**
