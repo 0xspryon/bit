@@ -2455,17 +2455,26 @@ export class ScopeImporter extends Context.Service<
                   ? again.success
                   : addressed,
               );
-        const measuredAt = yield* Clock.currentTimeMillis;
-        const unread = (model: string): ConversationContext => ({
-          conversationId: importId,
-          model,
-          used: null,
-          window: null,
-          reading: "unread",
-          breakdown: { _tag: "none", reason: "unanswered" },
-          measuredAt,
-        });
-        if (row === undefined) return unread("");
+        /*
+         * Stamped once the harness has answered, not when it was asked (A6 U9 review): a
+         * `full` count takes about a second, and stamped at the asking, one asked mid-turn
+         * would read as older than the turn-end reading that overtook it, though it saw at
+         * least as much.
+         */
+        const unread = (model: string) =>
+          Effect.map(
+            Clock.currentTimeMillis,
+            (measuredAt): ConversationContext => ({
+              conversationId: importId,
+              model,
+              used: null,
+              window: null,
+              reading: "unread",
+              breakdown: { _tag: "none", reason: "unanswered" },
+              measuredAt,
+            }),
+          );
+        if (row === undefined) return yield* unread("");
         const answered = yield* Effect.result(
           Effect.flatMap(
             resolver.resolve(row.harnessInstanceId ?? undefined),
@@ -2481,13 +2490,13 @@ export class ScopeImporter extends Context.Service<
             "an import's harness could not report its context; answering unread",
             { importId, detail: answered.failure.message },
           );
-          return unread(row.model);
+          return yield* unread(row.model);
         }
         return {
           conversationId: importId,
           model: row.model,
           ...answered.success,
-          measuredAt,
+          measuredAt: yield* Clock.currentTimeMillis,
         };
       });
 

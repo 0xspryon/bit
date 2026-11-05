@@ -340,6 +340,8 @@ interface Script {
    */
   /** Each `contextUsage` read (A6 U9): the session, the model and whether categories were asked. */
   readonly contextReads: string[];
+  /** How long a `contextUsage` read takes to answer, in milliseconds (a `full` count's second). */
+  contextLatency: number;
   holdContinuation:
     | {
         readonly entered: Deferred.Deferred<void>;
@@ -383,6 +385,7 @@ const newScript = (readable: readonly string[]): Script => {
     holdRegister: undefined,
     holdContinuation: undefined,
     contextReads: [],
+    contextLatency: 0,
   };
 };
 
@@ -473,7 +476,7 @@ const scriptedHarness = (script: Script) => {
             reason: "harness_gives_none" as const,
           },
         };
-      }),
+      }).pipe(Effect.delay(script.contextLatency)),
     switchModel: (sessionId, model, options) =>
       script
         .recordSwitch(sessionId, model, options)
@@ -4044,6 +4047,21 @@ describe("how full an import's window is (A6 U9)", () => {
     if (unknown._tag === "Failure") {
       expect(unknown.failure._tag).toBe("ScopeImportNotFound");
     }
+    await runtime.dispose();
+  });
+
+  test("a reading is stamped when the harness answered, not when it was asked (A6 U9 review)", async () => {
+    const { built, runtime, importId } = await liveOne();
+    // A `full` count takes about a second; stamped at the asking, a count asked mid-turn
+    // would read as older than the turn-end reading that overtook it.
+    built.script.contextLatency = 120;
+    const asked = Date.now();
+    const answered = await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) =>
+        importer.context({ targetId: TARGET, importId, breakdown: true }),
+      ),
+    );
+    expect(answered.measuredAt - asked).toBeGreaterThanOrEqual(100);
     await runtime.dispose();
   });
 });

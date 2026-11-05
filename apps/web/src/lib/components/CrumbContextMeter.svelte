@@ -17,6 +17,7 @@
   import {
     crumbFigure,
     crumbLabel,
+    crumbSource,
     ringDash,
     shareOf,
     type CrumbMeter,
@@ -29,6 +30,7 @@
     harness,
     counting = false,
     onopen,
+    onclose,
   }: {
     meter: CrumbMeter;
     /** The harness's display name, for the line saying it gives no breakdown. */
@@ -37,6 +39,11 @@
     counting?: boolean;
     /** Called each time the popover opens: where the caller asks for the categories. */
     onopen?: () => void;
+    /**
+     * Called when the open popover closes, or goes with the bar: a count it asked for is
+     * no longer wanted.
+     */
+    onclose?: () => void;
   } = $props();
 
   let open = $state(false);
@@ -56,8 +63,14 @@
 
   function close(refocus: boolean) {
     open = false;
+    onclose?.();
     if (refocus) button?.focus();
   }
+
+  // A popover open when the bar drops the meter (the page left) closes with it.
+  $effect(() => () => {
+    if (open) onclose?.();
+  });
 
   function toggle() {
     if (open) {
@@ -203,8 +216,10 @@
         <p class="note">
           {harness}'s own count of each part. They add up close to the last
           model call's figure above, not exactly to it.
-          {#if meter.categoriesStale}
-            Counted before the latest call{counting ? "; counting again…" : "."}
+          {#if meter.categoriesStale && meter.categoriesAt !== null}
+            Counted before the latest call, {whenText(
+              meter.categoriesAt,
+            )}{counting ? "; counting again…" : "."}
           {/if}
         </p>
       {:else if counting}
@@ -233,9 +248,7 @@
 
       {#if meter.at !== null && meter.at > 0}
         <p class="when">
-          {meter.source === "live"
-            ? "From the latest model call"
-            : "Read after the last turn"}, {whenText(meter.at)}
+          {crumbSource(meter)}, {whenText(meter.at)}
         </p>
       {/if}
     </div>

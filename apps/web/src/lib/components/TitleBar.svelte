@@ -371,6 +371,9 @@
             void importer.readContext(contextImport, true);
           }
         }}
+        onclose={() => {
+          importer.leaveBreakdown(contextImport);
+        }}
       />
     {/if}
     {#if importerShown && importer.current !== undefined}

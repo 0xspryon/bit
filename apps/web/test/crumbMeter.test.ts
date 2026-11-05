@@ -11,6 +11,7 @@ import {
   crumbFigure,
   crumbLabel,
   crumbMeter,
+  crumbSource,
   ringDash,
   shareOf,
 } from "../src/lib/crumbMeter";
@@ -166,5 +167,38 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(shareOf(10_722, 200_000)).toBe("5%");
     expect(shareOf(108, 200_000)).toBe("<1%");
     expect(shareOf(108, null)).toBe("");
+  });
+
+  test("a reading's figure that may be the model before a switch is no baseline for a live call (A6 U9 review)", () => {
+    // Sonnet-5's 31,603, read back under haiku's window, then haiku's own first call.
+    const switched = held(
+      { used: 31_603 },
+      { previousUsed: null, usedBeforeSwitch: true },
+    );
+    expect(
+      crumbMeter(switched, live({ promptTokens: 24_507, outputTokens: 0 }))
+        .droppedFrom,
+    ).toBeNull();
+    // The same drop on one model is a compaction.
+    expect(
+      crumbMeter(held({ used: 31_603 }), live({ promptTokens: 24_507 }))
+        .droppedFrom,
+    ).toBe(31_603);
+  });
+
+  test("the footer says what the reading was taken after, and a live call says it is one (A6 U9 review)", () => {
+    const after = (cause: ImporterContext["cause"]) =>
+      crumbSource(
+        crumbMeter(held({}, cause === undefined ? {} : { cause }), undefined),
+      );
+    expect(after("turn")).toBe("Read after the last turn");
+    expect(after("stop")).toBe("Read after the Stop");
+    expect(after("switch")).toBe("Read after the model switch");
+    expect(after("asked")).toBe("Read on opening this panel");
+    expect(after("opened")).toBe("Read on opening the session");
+    expect(after(undefined)).toBe("Read on opening the session");
+    const fromLive = crumbMeter(held({}, { cause: "turn" }), live());
+    expect(fromLive.cause).toBeNull();
+    expect(crumbSource(fromLive)).toBe("From the latest model call");
   });
 });

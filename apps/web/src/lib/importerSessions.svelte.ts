@@ -322,16 +322,35 @@ export interface ImporterServer {
 }
 
 /**
+ * What made this tab read an import's context window (A6 U9), which is what the meter's
+ * footer says of the reading: opening the session, a turn's end, a Stop settling, a model
+ * switch, or the operator opening the meter (`asked`).
+ */
+export type ContextReadCause = "opened" | "turn" | "stop" | "switch" | "asked";
+
+/**
  * What this tab holds of one import's context window (A6 U9): the server's latest reading,
  * the figure before it, and the categories when they were last counted.
  */
 export interface ImporterContext {
   readonly reading: ConversationContext;
   /**
-   * `used` of the measured reading before {@link reading}, or `null`: what a drop — a
-   * compaction — is told against.
+   * A `used` before {@link reading}'s that was a different figure, or `null`: what a drop —
+   * a compaction — is told against. A reading with the same figure leaves it as it was, so a
+   * second read of an unchanged window (the meter's breakdown) does not forget a drop.
+   * Never a figure from another model: each counts the same conversation with its own
+   * tokenizer (sonnet-5 about 35 % above haiku-4-5, measured), so across a switch there is
+   * no baseline.
    */
   readonly previousUsed: number | null;
+  /**
+   * Whether {@link reading}'s `used` may be the count of the model before a switch: the
+   * switch changes the model at once, and the figure only at the next model call. Such a
+   * figure is no baseline for a drop either. Absent is `false`.
+   */
+  readonly usedBeforeSwitch?: boolean;
+  /** What made this tab take {@link reading}; absent where nothing said. */
+  readonly cause?: ContextReadCause;
   /**
    * The categories the harness last counted, and when: kept across the cheaper readings
    * that follow a turn, which carry none, so an open breakdown does not empty itself. A
@@ -438,8 +457,21 @@ export class ImporterSessions {
   contexts = $state.raw<Readonly<Record<string, ImporterContext>>>({});
   /** Imports whose categories are being counted: the breakdown says so meanwhile. */
   countingBreakdown = $state.raw<ReadonlySet<string>>(new Set());
-  /** Imports whose context is being read, so the list's first reading does not ask again. */
-  readonly #readingContext = new Set<string>();
+  /**
+   * Imports whose context is being read, by the number of reads out, so the list's first
+   * reading does not ask again.
+   */
+  readonly #readingContext = new Map<string, number>();
+  /**
+   * The breakdown read out for each import (A6 U9 review): at most one, which a meter
+   * opened again while it is out joins rather than asking the harness to count again.
+   * `wanted` goes false when the meter closes or the session on screen changes, and an
+   * unwanted read's answer is dropped when it lands.
+   */
+  readonly #breakdowns = new Map<
+    string,
+    { wanted: boolean; done: Promise<void> }
+  >();
   /** The one on screen. */
   currentId = $state("");
   /** What is typed in the composer and not yet sent. */
@@ -602,6 +634,7 @@ export class ImporterSessions {
     this.#reading.clear();
     this.#readMidTurn.clear();
     this.#activityOf.clear();
+    this.#forgetBreakdowns();
     this.#server = server;
     this.draft = "";
     this.notice = "";
@@ -675,6 +708,9 @@ export class ImporterSessions {
    * newer reading is for. One the server no longer lists is kept too, for the same reason.
    */
   syncIndexed(indexed: readonly ImporterSession[]): void {
+    const onScreen = this.current;
+    const ranOnScreen =
+      onScreen?.working === true ? onScreen.importId : undefined;
     const touched = new Map(
       this.sessions
         .filter(
@@ -751,6 +787,15 @@ export class ImporterSessions {
     ) {
       void this.readContext(importId);
     }
+    // A turn this reading of the list found over, which the turn watch was not there to see
+    // end (A6 U9 review): its calls are what fills the window now.
+    if (
+      ranOnScreen !== undefined &&
+      current?.importId === ranOnScreen &&
+      current.working !== true
+    ) {
+      void this.readContext(ranOnScreen, false, "turn");
+    }
   }
 
   /**
@@ -801,6 +846,7 @@ export class ImporterSessions {
     this.#reading.clear();
     this.#readMidTurn.clear();
     this.#activityOf.clear();
+    this.#forgetBreakdowns();
     this.#server = undefined;
     this.notice = "";
     this.refused = false;
@@ -881,6 +927,8 @@ export class ImporterSessions {
     this.refused = false;
     const opened = this.sessions.find((session) => session.id === id);
     if (opened !== undefined) {
+      // The meter on screen is the new session's: no breakdown read still out is for it.
+      this.leaveBreakdown();
       this.currentId = id;
       this.draft = "";
       // Asked what is running in it (A6 U6), not only when the list says it is: a turn the
@@ -1147,7 +1195,7 @@ export class ImporterSessions {
         this.#turnsEnded();
         this.#rereadSettled();
         // A turn ended: its calls are what fills the window now (A6 U9).
-        void this.readContext(importId);
+        void this.readContext(importId, false, "turn");
       }
       // What ran wrote what it wrote: the list's tally is the server's to restate.
       if (over && busy) server.reread();
@@ -1533,6 +1581,9 @@ export class ImporterSessions {
     );
     this.#turnsEnded();
     this.#rereadSettled();
+    // What the stopped turn left in the window (A6 U9 review): the turn watch does not see
+    // this turn end, since the session already reads as idle when it next answers.
+    void this.readContext(importId, false, "stop");
   }
 
   /** The switch of one session that is with the server, if there is one. */
@@ -1647,8 +1698,11 @@ export class ImporterSessions {
       };
     }
     this.#switchedTo.set(switched.conversationId, switched.model);
+    // The figure held is the old model's count until the next call (A6 U9 review): no
+    // baseline for a drop from here, even for a live call that lands before the reading.
+    this.#contextSwitched([importId, switched.conversationId]);
     // The window is the new model's (A6 U9); the figure stays the last call's until the next.
-    void this.readContext(switched.conversationId);
+    void this.readContext(switched.conversationId, false, "switch");
     this.sessions = this.sessions.map((each) =>
       each.id === session.id ||
       each.importId === importId ||
@@ -1673,53 +1727,188 @@ export class ImporterSessions {
    * Reads one import's context window from the server (A6 U9), and the categories too when
    * `breakdown` — which costs Claude Code a count per category, so it is asked only when the
    * operator opens the meter. Keyed by the import addressed, which is the one the session
-   * on screen names; the answer's own `conversationId` may be a successor's.
+   * on screen names; the answer's own `conversationId` may be a successor's. `cause` is
+   * what the meter's footer says the reading was taken after.
    *
-   * An answer older than the reading already held is dropped: two reads can cross, and the
-   * later-measured one is the truer. An answer for a page that was left, or one that did not
-   * come, changes nothing. Without a server — the state picker — there is nothing to ask.
+   * **One breakdown read at a time per import** (A6 U9 review): a meter opened again while
+   * one is out joins it, so toggling the meter asks the harness to count once. Closing the
+   * meter or opening another session ({@link leaveBreakdown}) leaves it to run and drops its
+   * answer, unless the meter is opened again first and takes it back.
+   *
+   * Two reads can cross, and the later-measured one is the truer: an answer measured before
+   * the reading held does not replace its figure, but its categories are kept when they are
+   * newer than the ones held — a slow count asked mid-turn that lands after the turn's own
+   * reading is still the newest count. An answer for a page that was left, or one that did
+   * not come, changes nothing. Without a server — the state picker — there is nothing to ask.
    */
-  // V2(chat): V1 reads the window on opening, at each turn's end and after a model switch,
-  // and between those draws the live feed's per-call frames; the categories are counted
-  // only when the meter is opened and not again while it stays open (they are labelled
-  // stale instead). V2 should have the server push a reading at each turn's end and after
-  // a compaction on the live feed, so every tab's meter and its breakdown follow without
-  // asking.
-  async readContext(importId: string, breakdown = false): Promise<void> {
+  // V2(chat): V1 reads the window on opening, at each turn's end, after a Stop and after a
+  // model switch, and between those draws the live feed's per-call frames; the categories
+  // are counted only when the meter is opened and not again while it stays open (they are
+  // labelled stale instead). V2 should have the server push a reading at each turn's end
+  // and after a compaction on the live feed, so every tab's meter and its breakdown follow
+  // without asking.
+  readContext(
+    importId: string,
+    breakdown = false,
+    cause: ContextReadCause = breakdown ? "asked" : "opened",
+  ): Promise<void> {
     const server = this.#server;
-    if (server === undefined) return;
-    if (breakdown) {
-      this.countingBreakdown = new Set([...this.countingBreakdown, importId]);
+    if (server === undefined) return Promise.resolve();
+    if (!breakdown) return this.#askContext(server, importId, false, cause);
+    const out = this.#breakdowns.get(importId);
+    if (out !== undefined) {
+      out.wanted = true;
+      this.#counting(importId, true);
+      return out.done;
     }
-    this.#readingContext.add(importId);
-    const answer = await server.context(importId, breakdown).finally(() => {
-      this.#readingContext.delete(importId);
-      if (!breakdown || !this.countingBreakdown.has(importId)) return;
-      const still = new Set(this.countingBreakdown);
-      still.delete(importId);
-      this.countingBreakdown = still;
-    });
+    // V2(chat): a breakdown read nobody wants any more is left to run, not aborted: the
+    // harness's count (Claude Code's `getContextUsage`) takes no signal, so cancelling the
+    // request would only stop the server waiting while the CLI went on counting, and a
+    // meter opened again would start a second count beside it. V2 could abort once the
+    // harness call can be withdrawn.
+    const read = { wanted: true, done: Promise.resolve() };
+    this.#breakdowns.set(importId, read);
+    this.#counting(importId, true);
+    read.done = this.#askContext(server, importId, true, cause, read);
+    return read.done;
+  }
+
+  /**
+   * The meter closed, or another session came on screen (A6 U9 review): the breakdown read
+   * out for `importId` — for every import without one — is not wanted. Nothing reads as
+   * counting any more, and the answer is dropped when it lands unless the meter is opened
+   * again first ({@link readContext}).
+   */
+  leaveBreakdown(importId?: string): void {
+    for (const [id, read] of this.#breakdowns) {
+      if (importId !== undefined && id !== importId) continue;
+      read.wanted = false;
+      this.#counting(id, false);
+    }
+  }
+
+  async #askContext(
+    server: ImporterServer,
+    importId: string,
+    breakdown: boolean,
+    cause: ContextReadCause,
+    read?: { wanted: boolean },
+  ): Promise<void> {
+    this.#readingContext.set(
+      importId,
+      (this.#readingContext.get(importId) ?? 0) + 1,
+    );
+    let answer: ConversationContext | undefined;
+    try {
+      answer = await server.context(importId, breakdown);
+    } finally {
+      const left = (this.#readingContext.get(importId) ?? 1) - 1;
+      if (left > 0) this.#readingContext.set(importId, left);
+      else this.#readingContext.delete(importId);
+      if (read !== undefined && this.#breakdowns.get(importId) === read) {
+        this.#breakdowns.delete(importId);
+        this.#counting(importId, false);
+      }
+    }
     if (answer === undefined || this.#server !== server) return;
+    if (read !== undefined && !read.wanted) return;
+    this.#takeContext(importId, answer, cause);
+  }
+
+  /** Puts one answer of {@link readContext} into {@link contexts}. */
+  #takeContext(
+    importId: string,
+    answer: ConversationContext,
+    cause: ContextReadCause,
+  ): void {
     const held = this.contexts[importId];
-    if (held !== undefined && answer.measuredAt < held.reading.measuredAt) {
-      return;
-    }
     const counted =
       answer.breakdown._tag === "categories"
         ? { rows: answer.breakdown.categories, measuredAt: answer.measuredAt }
+        : undefined;
+    // The newest count of the categories, whichever reading carries the figure.
+    const categories =
+      counted !== undefined &&
+      (held?.categories === undefined ||
+        counted.measuredAt >= held.categories.measuredAt)
+        ? counted
         : held?.categories;
+    if (held !== undefined && answer.measuredAt < held.reading.measuredAt) {
+      if (categories !== held.categories) {
+        this.contexts = {
+          ...this.contexts,
+          [importId]: {
+            ...held,
+            ...(categories === undefined ? {} : { categories }),
+          },
+        };
+      }
+      return;
+    }
     const before = held?.reading;
+    const switched = before !== undefined && before.model !== answer.model;
+    const unchanged = before !== undefined && before.used === answer.used;
+    const usedBeforeSwitch =
+      answer.used !== null &&
+      (switched || (unchanged && held?.usedBeforeSwitch === true));
+    const previousUsed =
+      held === undefined || switched || held.usedBeforeSwitch === true
+        ? null
+        : unchanged
+          ? held.previousUsed
+          : before?.reading === "measured" && before.used !== null
+            ? before.used
+            : held.previousUsed;
     this.contexts = {
       ...this.contexts,
       [importId]: {
         reading: answer,
-        previousUsed:
-          before?.reading === "measured" && before.used !== null
-            ? before.used
-            : (held?.previousUsed ?? null),
-        ...(counted === undefined ? {} : { categories: counted }),
+        previousUsed,
+        ...(usedBeforeSwitch ? { usedBeforeSwitch } : {}),
+        cause,
+        ...(categories === undefined ? {} : { categories }),
       },
     };
+  }
+
+  /**
+   * A model switch was accepted for these imports: the figure each holds is the old
+   * model's count until the next call, so it is no baseline for a drop (A6 U9 review).
+   */
+  #contextSwitched(importIds: readonly string[]): void {
+    let next = this.contexts;
+    for (const id of new Set(importIds)) {
+      const held = next[id];
+      if (held === undefined) continue;
+      next = {
+        ...next,
+        [id]: {
+          ...held,
+          previousUsed: null,
+          ...(held.reading.used === null ? {} : { usedBeforeSwitch: true }),
+        },
+      };
+    }
+    this.contexts = next;
+  }
+
+  /**
+   * Another page, or the state picker: no breakdown read out is this page's any more, and a
+   * meter opened on the next one must not join one asked of the last.
+   */
+  #forgetBreakdowns(): void {
+    this.leaveBreakdown();
+    this.#breakdowns.clear();
+    this.countingBreakdown = new Set();
+  }
+
+  /** Marks one import's categories as being counted, or not. */
+  #counting(importId: string, counting: boolean): void {
+    if (this.countingBreakdown.has(importId) === counting) return;
+    const next = new Set(this.countingBreakdown);
+    if (counting) next.add(importId);
+    else next.delete(importId);
+    this.countingBreakdown = next;
   }
 
   /** A refused switch of one session, not yet dismissed, if there is one. */
