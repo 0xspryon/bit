@@ -6712,6 +6712,82 @@ const makeStore = Effect.fnUntraced(function* () {
     };
   });
 
+  const PlannerSessionListRow = Schema.Struct({
+    goal_id: Schema.String,
+    name: Schema.String,
+    description: Schema.String,
+    harness_session_id: Schema.String,
+    created_at: Schema.Finite,
+    round_id: Schema.NullOr(Schema.String),
+    status: Schema.NullOr(Schema.String),
+    harness_instance_id: Schema.NullOr(Schema.String),
+    provider_id: Schema.NullOr(Schema.String),
+    model_id: Schema.NullOr(Schema.String),
+    started_at: Schema.NullOr(Schema.Finite),
+    ended_at: Schema.NullOr(Schema.Finite),
+    disposition: Schema.NullOr(Schema.String),
+  });
+
+  const selectPlannerSessionsForTarget = SqlSchema.findAll({
+    Request: Schema.String,
+    Result: PlannerSessionListRow,
+    execute: (targetId) =>
+      sql`SELECT l.goal_id AS goal_id, g.name AS name, g.description AS description,
+                 l.harness_session_id AS harness_session_id, l.created_at AS created_at,
+                 r.id AS round_id, r.status AS status,
+                 r.harness_instance_id AS harness_instance_id,
+                 r.provider_id AS provider_id, r.model_id AS model_id,
+                 r.started_at AS started_at, r.ended_at AS ended_at,
+                 r.disposition AS disposition
+          FROM planner_lineages l
+          JOIN goals g ON g.id = l.goal_id
+          LEFT JOIN planner_rounds r ON r.id = (
+            SELECT p.id FROM planner_rounds p
+            WHERE p.goal_id = l.goal_id
+            ORDER BY p.started_at DESC, p.id DESC
+            LIMIT 1)
+          WHERE g.target_id = ${targetId}
+          ORDER BY l.created_at DESC, l.goal_id DESC`,
+  });
+
+  /**
+   * The planner sessions a target's goals have, newest first (A7 U8b): one per goal's
+   * lineage — the session every planning round of that goal resumes — with its latest round,
+   * which says whether it is running, what it runs on, and how it last ended.
+   *
+   * One per goal, like `goal_sessions`, so it grows by the operator's goals and is not
+   * bounded; the rounds themselves, which grow with every replan, are read one per lineage.
+   * A lineage whose rounds were never recorded reads with every round field null.
+   */
+  const plannerSessionsForTarget = Effect.fn(
+    "ObservationStore.plannerSessionsForTarget",
+  )(function* (targetId: string) {
+    const rows = yield* selectPlannerSessionsForTarget(targetId).pipe(
+      Effect.mapError(lift("planner_lineages", targetId)),
+    );
+    return rows.map((row) => ({
+      goalId: row.goal_id,
+      goalName: row.name === "" ? row.description : row.name,
+      harnessSessionId: row.harness_session_id,
+      createdAt: row.created_at,
+      round:
+        row.round_id === null || row.status === null || row.started_at === null
+          ? null
+          : {
+              roundId: row.round_id,
+              status: row.status,
+              harnessInstanceId: row.harness_instance_id,
+              model:
+                row.provider_id === null || row.model_id === null
+                  ? null
+                  : `${row.provider_id}/${row.model_id}`,
+              startedAt: row.started_at,
+              endedAt: row.ended_at,
+              disposition: row.disposition,
+            },
+    }));
+  });
+
   /* ── The scope importer's sessions ─────────────────────────────────────────── */
 
   const ImportSessionRow = Schema.Struct({
@@ -8739,6 +8815,7 @@ const makeStore = Effect.fnUntraced(function* () {
     recordGoalSessionModel,
     goalSessionsForTarget,
     workerSessionsForTarget,
+    plannerSessionsForTarget,
     importSessions,
     recordImportSession,
     recordImportPages,
@@ -9452,6 +9529,28 @@ export class ObservationStore extends Context.Service<
         }[];
         readonly total: number;
       },
+      DatabaseError | StoredRowError
+    >;
+    /**
+     * The planner sessions a target's goals have, newest first (A7 U8b): one per goal's
+     * lineage, with its latest round, or `null` where none was recorded.
+     */
+    readonly plannerSessionsForTarget: (targetId: string) => Effect.Effect<
+      readonly {
+        readonly goalId: string;
+        readonly goalName: string;
+        readonly harnessSessionId: string;
+        readonly createdAt: number;
+        readonly round: {
+          readonly roundId: string;
+          readonly status: string;
+          readonly harnessInstanceId: string | null;
+          readonly model: string | null;
+          readonly startedAt: number;
+          readonly endedAt: number | null;
+          readonly disposition: string | null;
+        } | null;
+      }[],
       DatabaseError | StoredRowError
     >;
     /**

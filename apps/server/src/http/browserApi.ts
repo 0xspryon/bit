@@ -57,6 +57,7 @@ import {
   TargetRefused,
   TargetUnavailable,
   Unauthenticated,
+  type AgentSessionActivity,
   type AssetScopeLabel,
   type AssetView,
   type AttemptTranscript,
@@ -95,7 +96,11 @@ import {
   listFolder,
 } from "./folders";
 import { BrowserSessions } from "./browserSessions";
-import { unionAgentSessions, WORKER_SESSIONS_LISTED } from "./agentSessions";
+import {
+  pageAgentSessions,
+  unionAgentSessions,
+  WORKER_SESSIONS_LISTED,
+} from "./agentSessions";
 import {
   DEFAULT_GOAL_BRIEFING_MAX_CHARS,
   buildGoalBriefing,
@@ -138,7 +143,8 @@ import {
   roundNarration,
 } from "../plan/roundNarration";
 import { liveTranscript } from "../run/liveTranscript";
-import { RunNarrations } from "../run/narration";
+import { RunNarrations, type NarrationSubject } from "../run/narration";
+import { activityKey } from "../run/sessionActivity";
 import { RunSupervisor } from "../run/supervisor";
 import { readTranscript } from "../run/transcript";
 import { PolicyDecisions } from "../policy/service";
@@ -1807,17 +1813,23 @@ const fleetHandlers = HttpApiBuilder.group(
       }),
 
       /**
-       * Every long-running agent session on this target, of every kind that has an index.
+       * One page of this target's long-running agent sessions, of every kind that has an
+       * index (A7 U8b).
        *
-       * **A read-time union** (`http/agentSessions.ts`): the goal, importer and worker indexes
-       * are read from this target's own file and folded into one shape, and what this process
-       * holds is asked of its own registries — the goal conversations' and the importer's —
-       * because liveness is stored nowhere. An importer session is live when this process
-       * **holds** it, between turns as well as during one. All three ids a registry is asked
-       * about were read off this target's rows, so no other target's session can be answered
-       * for.
+       * **A read-time union** (`http/agentSessions.ts`): the goal, importer, worker and
+       * planner indexes are read from this target's own file and folded into one shape, and
+       * what this process holds is asked of its own registries — the goal conversations' and
+       * the importer's — because liveness is stored nowhere. An importer session is live when
+       * this process **holds** it, between turns as well as during one. What each session is
+       * doing comes from the narration bus's summaries (`run/sessionActivity.ts`), which are
+       * memory: no harness is asked. All the ids a registry is asked about were read off this
+       * target's rows, so no other target's session can be answered for.
+       *
+       * Then filtered, grouped and paged (`pageAgentSessions`). Titles are asked of the
+       * harnesses only when the browser asks (`titles=1`), and only for the importer rows on
+       * the page: a refresh while sessions narrate asks for none, and keeps the ones it has.
        */
-      agentSessions: Effect.fn(function* ({ params }) {
+      agentSessions: Effect.fn(function* ({ params, query }) {
         const row = yield* openableTarget(fleet, params.targetId);
         const read = yield* withTargetStore(stores, row.targetId, (store) =>
           Effect.all({
@@ -1827,6 +1839,7 @@ const fleetHandlers = HttpApiBuilder.group(
               row.targetId,
               WORKER_SESSIONS_LISTED,
             ),
+            planners: store.plannerSessionsForTarget(row.targetId),
           }),
         ).pipe(Effect.orDie);
         // "Held", not "a run is in flight": a session is open between turns (S2), and the
@@ -1839,12 +1852,83 @@ const fleetHandlers = HttpApiBuilder.group(
             (holds) => ({ ...session, held: holds.some(Boolean) }),
           ),
         );
-        return unionAgentSessions({
-          goals: read.goals,
-          goalLive: conversations.live,
-          importers,
-          workers: read.workers,
-        });
+        // Every subject a row could have narrated under, read from memory once.
+        const subjects: NarrationSubject[] = [
+          ...read.goals.map((goal) => ({
+            _tag: "goal" as const,
+            goalId: goal.goalId,
+          })),
+          ...read.importers.flatMap((session) =>
+            session.importIds.map((importId) => ({
+              _tag: "import" as const,
+              importId,
+            })),
+          ),
+          ...read.workers.sessions.map((attempt) => ({
+            _tag: "attempt" as const,
+            attemptId: attempt.attemptId,
+          })),
+          ...read.planners.flatMap((lineage) =>
+            lineage.round === null
+              ? []
+              : [{ _tag: "round" as const, roundId: lineage.round.roundId }],
+          ),
+        ];
+        const summaries = new Map<string, AgentSessionActivity>();
+        yield* Effect.forEach(
+          subjects,
+          (subject) =>
+            Effect.map(narrations.activity(subject), (found) => {
+              if (found !== undefined)
+                summaries.set(activityKey(subject), found);
+            }),
+          { discard: true },
+        );
+        const page = pageAgentSessions(
+          unionAgentSessions({
+            goals: read.goals,
+            goalLive: conversations.live,
+            importers,
+            workers: read.workers,
+            planners: read.planners,
+            activity: (subject) => summaries.get(activityKey(subject)),
+          }),
+          {
+            tab: query.tab ?? "active",
+            needsYou: query.needsYou === "1",
+            agent: query.agent,
+            q: query.q ?? "",
+            page: query.page ?? 1,
+            pageSize: Number(query.pageSize ?? "25"),
+            timeZone: query.tz ?? "UTC",
+          },
+        );
+        const titles =
+          query.titles === "1"
+            ? yield* importerSessionTitles({
+                resolver: harnesses,
+                sessions: page.sessions.flatMap((session) =>
+                  session.kind === "importer"
+                    ? [
+                        {
+                          harnessSessionId: session.sessionId,
+                          harnessInstanceId: session.harnessInstanceId,
+                        },
+                      ]
+                    : [],
+                ),
+              })
+            : new Map<string, string>();
+        return {
+          ...page,
+          sessions: page.sessions.map((session) => ({
+            ...session,
+            title:
+              session.kind === "importer"
+                ? (titles.get(session.sessionId) ?? null)
+                : null,
+          })),
+        };
       }),
 
       /**

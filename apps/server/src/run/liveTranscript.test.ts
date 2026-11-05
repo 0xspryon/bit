@@ -179,6 +179,7 @@ const narrationsFrom = (items: readonly RunNarration[]) =>
         ),
       ),
     subscriberCount: Effect.succeed(0),
+    activity: () => Effect.succeed(undefined),
   }) satisfies RunNarrations["Service"];
 
 /** A decision bus that answers from a list, for the same reason. */

@@ -3,14 +3,18 @@ import { Schema } from "effect";
 import { ImporterSessionTally } from "./scopeImport";
 
 /**
- * Which surface a long-running agent session belongs to.
+ * Which agent a long-running session is, and so which surface it belongs to.
  *
- * A planner round is a fourth session-shaped thing and is **not** here: the first list is the
- * three kinds the importer-conversation design's S8 names. It is derivable the same way a
- * worker attempt is (`planner_rounds` carries the session, instance, model and a status), so
- * adding it is a new literal and a new read, not a change of shape.
+ * The planner is the fourth (A7 U8b): one row per goal's planner lineage, the session every
+ * planning round of that goal resumes, read with its latest round (`planner_rounds` carries
+ * the session, instance, model and a status).
  */
-export const AgentSessionKind = Schema.Literals(["goal", "importer", "worker"]);
+export const AgentSessionKind = Schema.Literals([
+  "goal",
+  "importer",
+  "worker",
+  "planner",
+]);
 export type AgentSessionKind = typeof AgentSessionKind.Type;
 
 /**
@@ -37,6 +41,72 @@ export type AgentSessionKind = typeof AgentSessionKind.Type;
  */
 export const AgentSessionState = Schema.Literals(["live", "ended", "dormant"]);
 export type AgentSessionState = typeof AgentSessionState.Type;
+
+/** The rail section a session's surface is under, whose sidebar icon its breadcrumb uses. */
+export const AgentSessionSection = Schema.Literals([
+  "goals",
+  "assets",
+  "workers",
+]);
+export type AgentSessionSection = typeof AgentSessionSection.Type;
+
+/** Each section's name as the rail says it, which a breadcrumb repeats and the text filter matches. */
+export const AGENT_SESSION_SECTION_LABEL: Record<AgentSessionSection, string> =
+  {
+    goals: "Goals",
+    assets: "Assets",
+    workers: "Workers",
+  };
+
+/**
+ * Each kind's agent as the list names it (A7 E1): the Agent column, the agent filter, and
+ * what the text filter matches. The importer is named for its page, Auto-load.
+ */
+export const AGENT_SESSION_AGENT_LABEL: Record<AgentSessionKind, string> = {
+  goal: "Goal agent",
+  importer: "Auto-load",
+  worker: "Worker",
+  planner: "Planner",
+};
+
+export const AgentSessionSurface = Schema.Struct({
+  section: AgentSessionSection,
+  /** The place within the section: a goal's name, `Auto-load`. */
+  place: Schema.String,
+  gone: Schema.Boolean,
+});
+export type AgentSessionSurface = typeof AgentSessionSurface.Type;
+
+/**
+ * What a session has been doing, summarised by this process from the narration it
+ * published (A7 U8b) — never asked of a harness. Kept in memory, per session, for the
+ * sessions this process has narrated since it started; a restart begins with none.
+ */
+export const AgentSessionActivity = Schema.Struct({
+  /** Whether a turn is in flight: something was narrated after the last turn's outcome. */
+  running: Schema.Boolean,
+  /** Tool calls in the current (or last) turn. */
+  calls: Schema.Int,
+  /** The last tool it called in that turn, as the harness named it. */
+  lastTool: Schema.NullOr(Schema.String),
+  /** The last line of what it last wrote, shortened; null before it wrote anything. */
+  text: Schema.NullOr(Schema.String),
+  /** When the last of it was narrated, in epoch milliseconds. */
+  at: Schema.Int,
+});
+export type AgentSessionActivity = typeof AgentSessionActivity.Type;
+
+/**
+ * How a session that is no longer running ended (A7 E5): `completed`; `stopped` by the
+ * operator or interrupted; `failed`; `empty`, which ended without writing anything.
+ */
+export const AgentSessionOutcome = Schema.Literals([
+  "completed",
+  "stopped",
+  "failed",
+  "empty",
+]);
+export type AgentSessionOutcome = typeof AgentSessionOutcome.Type;
 
 /**
  * One row of the "Agent sessions" list: a session of any kind, in the one shape the list
@@ -89,14 +159,103 @@ export const AgentSessionView = Schema.Struct({
   detail: Schema.NullOr(Schema.String),
   /** What the session wrote, for the one kind that derives it (the importer), else null. */
   tally: Schema.NullOr(ImporterSessionTally),
+  /**
+   * The harness's title for the session, where it was asked for (`titles=1`) and the kind
+   * has one — the importer's, read as the importer's own list reads it (S9) — else null.
+   * Never stored: a title is the harness's, read through.
+   */
+  title: Schema.NullOr(Schema.String),
+  /**
+   * Where the session lives, as the row's breadcrumb draws it: the rail section (whose icon
+   * it borrows) and the place within it. `gone` marks a surface that no longer exists; the
+   * row then draws it struck through and still opens.
+   */
+  surface: AgentSessionSurface,
+  /** The latest thing known to have happened in it, in epoch milliseconds. */
+  lastActivityAt: Schema.Int,
+  /** What it is doing now, from what it narrated through this process; null if nothing. */
+  activity: Schema.NullOr(AgentSessionActivity),
+  /**
+   * What it is waiting on the operator for, in words, or null. **Always null until A7-Q**
+   * (the question dock) supplies a pending question; the list's Needs you group, toggle and
+   * counts already turn on it.
+   */
+  waiting: Schema.NullOr(Schema.String),
+  /** How an ended (or dormant) session finished; null while it is live. */
+  outcome: Schema.NullOr(AgentSessionOutcome),
+  /** Whether a failed session can be carried on by a message. */
+  resumable: Schema.Boolean,
+  /** The row's group on this page: `needs_you`, `running`, `idle`, or `day:<YYYY-MM-DD>`. */
+  group: Schema.String,
 });
 export type AgentSessionView = typeof AgentSessionView.Type;
 
+/** Which tab the list is on: live sessions, finished ones, or both. */
+export const AgentSessionsTab = Schema.Literals(["active", "ended", "all"]);
+export type AgentSessionsTab = typeof AgentSessionsTab.Type;
+
+/** Rows per page (A7 E5). */
+export const AGENT_SESSION_PAGE_SIZES = [25, 50, 100] as const;
+export const AgentSessionsPageSize = Schema.Literals(["25", "50", "100"]);
+
+/**
+ * What a read of the list asks for. Every field optional: none is Active, every agent, no
+ * text, page 1 of 25, grouped by day in UTC, no titles.
+ */
+export const AgentSessionsQuery = {
+  tab: Schema.optional(AgentSessionsTab),
+  /** `1` narrows the tab to sessions waiting on the operator. */
+  needsYou: Schema.optional(Schema.Literal("1")),
+  /** One kind, or absent for every agent. */
+  agent: Schema.optional(AgentSessionKind),
+  /** Matched, case-insensitively, against each row's name and where it lives. */
+  q: Schema.optional(Schema.String),
+  page: Schema.optional(Schema.FiniteFromString),
+  pageSize: Schema.optional(AgentSessionsPageSize),
+  /** The browser's IANA time zone, which ended rows are grouped into days by. */
+  tz: Schema.optional(Schema.String),
+  /** `1` asks the harnesses for the titles of the importer rows on this page. */
+  titles: Schema.optional(Schema.Literal("1")),
+};
+
+/** One group on a page, with its count over the whole filtered list, not just this page. */
+export const AgentSessionGroup = Schema.Struct({
+  key: Schema.String,
+  count: Schema.Int,
+});
+export type AgentSessionGroup = typeof AgentSessionGroup.Type;
+
 export const AgentSessionsView = Schema.Struct({
-  /** Newest first, across kinds. */
+  /** This page's rows, in display order: Active by group, Ended by day, newest first. */
   sessions: Schema.Array(AgentSessionView),
+  /** The groups this page draws, in order, each with its full count across pages. */
+  groups: Schema.Array(AgentSessionGroup),
   /**
-   * How many worker sessions the target has beyond those listed. Worker attempts accumulate
+   * The tabs' counts and the waiting count, **unfiltered** — by the toggle, the agent and the
+   * text alike — so changing a filter never makes the totals jump (A7 E2).
+   */
+  counts: Schema.Struct({
+    active: Schema.Int,
+    ended: Schema.Int,
+    all: Schema.Int,
+    needsYou: Schema.Int,
+  }),
+  /** How many rows the filtered tab holds, which the range ("1–25 of 123") is out of. */
+  total: Schema.Int,
+  /** The page answered (clamped into range), and its size. */
+  page: Schema.Int,
+  pageSize: Schema.Int,
+  /**
+   * What the Needs you toggle hides from the tab, by group, after the other filters: zero
+   * when the toggle is off. Feeds "3 more active sessions are hidden by this filter".
+   */
+  hidden: Schema.Struct({
+    running: Schema.Int,
+    idle: Schema.Int,
+    ended: Schema.Int,
+  }),
+  /**
+   * How many worker sessions the target has beyond those read. Worker attempts accumulate
    * with every intent the hunt runs, so they are bounded and the other kinds are not; the
    * number is here so a truncated list says so rather than looking complete.
    */

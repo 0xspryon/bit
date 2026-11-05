@@ -8,7 +8,10 @@
    * does this rail's job (see `TitleBar`).
    *
    * Only Findings and Blockers may show an attention state, and only Blockers is in colour.
-   * If everything can demand attention, nothing does.
+   * If everything can demand attention, nothing does. The one other voice is Agent sessions'
+   * (A7 E6): its count is the sessions waiting on the operator, in the warning colour with a
+   * dot, and otherwise a quiet count of active ones — so it never shouts while agents are
+   * merely running.
    */
   import { IconCog, IconHelp } from "../icons";
   import { navGlyphs } from "../navGlyphs";
@@ -25,20 +28,29 @@
       {#each group.items as item (item.id)}
         {@const Glyph = navGlyphs[item.icon]}
         {@const count = app.navCount(item.id)}
+        {@const waiting = app.navWaiting(item.id)}
         <button
           class={["item", app.navItem === item.id && "active"]}
           data-item={item.id}
           aria-current={app.navItem === item.id ? "page" : undefined}
+          aria-label={waiting
+            ? `${item.label}, ${String(count)} waiting on you`
+            : undefined}
           onclick={() => app.toSection(item.id)}
         >
           <span class="glyph">
             {#if Glyph}<Glyph width="15" height="15" />{/if}
           </span>
           <span class="item-label">{item.label}</span>
+          {#if waiting}<span class="dot" aria-hidden="true"></span>{/if}
           {#if count !== undefined}
-            <span class={["count", item.attention && "attention"]}>
-              {count}
-            </span>
+            <span
+              class={[
+                "count",
+                item.attention && "attention",
+                waiting && "waiting",
+              ]}>{count}</span
+            >
           {/if}
         </button>
       {/each}
@@ -143,6 +155,19 @@
   [data-item="blockers"] .glyph,
   [data-item="blockers"] .count {
     color: var(--state-fg-warning);
+  }
+  /* Sessions waiting on the operator (A7 E6): the warning colour, and a dot, so colour is
+     never the only cue. The selected row keeps it. */
+  .count.waiting {
+    color: var(--state-fg-warning);
+  }
+  .dot {
+    flex: none;
+    margin-right: -4px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--state-fg-warning);
   }
 
   .foot {

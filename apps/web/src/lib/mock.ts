@@ -177,6 +177,9 @@ export const navGroups: ReadonlyArray<{
     label: "Operations",
     items: [
       { id: "workers", label: "Workers", icon: "workers", placeholderRows: 2 },
+      // Between Workers and Blockers (A7 E6): how the machinery is behaving, next to the
+      // other two things that can need the operator.
+      { id: "agent-sessions", label: "Agent sessions", icon: "agent-sessions" },
       {
         id: "blockers",
         label: "Blockers",
@@ -185,7 +188,6 @@ export const navGroups: ReadonlyArray<{
         attention: true,
       },
       { id: "events", label: "Event log", icon: "events" },
-      { id: "agent-sessions", label: "Agent sessions", icon: "agent-sessions" },
     ],
   },
 ];

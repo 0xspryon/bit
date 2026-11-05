@@ -41,6 +41,9 @@ import {
   ImporterConversationDraft,
   ImporterMessageDraft,
   SessionGuard,
+  type AGENT_SESSION_PAGE_SIZES,
+  type AgentSessionKind,
+  type AgentSessionsTab,
   type ConversationModelDraft,
   type GoalDraft,
   type GoalEndDraft,
@@ -898,13 +901,34 @@ export const server = {
     run(Effect.flatMap(client(baseUrl), (api) => api.fleet.agents())),
 
   /**
-   * Every long-running agent session on this target, of any kind, newest first. A read-time
-   * union on the server: there is no table of "agent sessions" behind it.
+   * One page of this target's long-running agent sessions (A7 U8b): a tab, filtered,
+   * grouped and paged by the server, with the tabs' unfiltered counts. A read-time union on
+   * the server: there is no table of "agent sessions" behind it.
    */
-  agentSessions: (baseUrl: string, targetId: string) =>
+  agentSessions: (
+    baseUrl: string,
+    targetId: string,
+    query: AgentSessionsRequest = {},
+  ) =>
     run(
       Effect.flatMap(client(baseUrl), (api) =>
-        api.fleet.agentSessions({ params: { targetId } }),
+        api.fleet.agentSessions({
+          params: { targetId },
+          query: {
+            ...(query.tab === undefined ? {} : { tab: query.tab }),
+            ...(query.needsYou === true ? { needsYou: "1" as const } : {}),
+            ...(query.agent === undefined ? {} : { agent: query.agent }),
+            ...(query.q === undefined || query.q.trim() === ""
+              ? {}
+              : { q: query.q.trim() }),
+            ...(query.page === undefined ? {} : { page: query.page }),
+            ...(query.pageSize === undefined
+              ? {}
+              : { pageSize: String(query.pageSize) as "25" | "50" | "100" }),
+            ...(query.timeZone === undefined ? {} : { tz: query.timeZone }),
+            ...(query.titles === true ? { titles: "1" as const } : {}),
+          },
+        }),
       ),
     ),
 
@@ -1215,3 +1239,15 @@ export const server = {
  * success shape, because those are the contract's own types, named and checked.
  */
 export type ServerClient = typeof server;
+
+/** What the Agent sessions page asks the server for (`agentSessions`), decoded. */
+export interface AgentSessionsRequest {
+  readonly tab?: AgentSessionsTab | undefined;
+  readonly needsYou?: boolean | undefined;
+  readonly agent?: AgentSessionKind | undefined;
+  readonly q?: string | undefined;
+  readonly page?: number | undefined;
+  readonly pageSize?: (typeof AGENT_SESSION_PAGE_SIZES)[number] | undefined;
+  readonly timeZone?: string | undefined;
+  readonly titles?: boolean | undefined;
+}

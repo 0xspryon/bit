@@ -7,8 +7,15 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  doingLine,
+  groupLabel,
   harnessOf,
+  hiddenLine,
+  lastActivityLabel,
+  pagerPages,
   placeOfSession,
+  rangeLabel,
+  sessionName,
   stateLabel,
   tallySentence,
 } from "../src/lib/agentSessions";
@@ -118,5 +125,148 @@ describe("the tally and where a row leads", () => {
       "/t/acme-corp/assets/chat/ses_1",
     );
     expect(goal === null ? "" : pathOf(goal)).toBe("/t/acme-corp/goals/goal_1");
+  });
+});
+
+/* ── A7 U8b ───────────────────────────────────────────────────────────────── */
+
+const row = (
+  over: Partial<Parameters<typeof doingLine>[0]> = {},
+): Parameters<typeof doingLine>[0] => ({
+  kind: "importer",
+  state: "live",
+  detail: null,
+  tally: { entriesIn: 3, entriesOut: 0, assets: 5 },
+  activity: null,
+  waiting: null,
+  outcome: null,
+  resumable: false,
+  ...over,
+});
+
+describe("a row's second line", () => {
+  test("waiting is in warning and says what on", () => {
+    expect(doingLine(row({ waiting: "approve a 5-step plan" }))).toEqual({
+      text: "Waiting on you · approve a 5-step plan",
+      tone: "warning",
+    });
+  });
+
+  test("a running turn: what it is writing, or its last tool, and the calls so far", () => {
+    const doing = {
+      running: true,
+      calls: 14,
+      lastTool: "Bash",
+      text: null,
+      at: 1,
+    };
+    expect(doingLine(row({ activity: doing })).text).toBe(
+      "Running Bash · 14 tool calls so far",
+    );
+    expect(
+      doingLine(row({ activity: { ...doing, text: "Replaying the login" } }))
+        .text,
+    ).toBe("Replaying the login · 14 tool calls so far");
+    expect(
+      doingLine(
+        row({
+          activity: { ...doing, calls: 1, running: false, text: "Done." },
+        }),
+      ).text,
+    ).toBe("Last reply: Done. · 1 tool call in its last turn");
+  });
+
+  test("how a finished one ended: failure alone in colour, and whether it resumes", () => {
+    expect(
+      doingLine(
+        row({
+          state: "dormant",
+          outcome: "failed",
+          detail: "open_failed",
+          resumable: true,
+        }),
+      ),
+    ).toEqual({
+      text: "Failed · the session did not open · resumable",
+      tone: "danger",
+    });
+    expect(
+      doingLine(row({ state: "dormant", outcome: "completed" })).text,
+    ).toBe("Completed · 3 in · 0 out · 5 assets · a message carries it on");
+    expect(doingLine(row({ state: "ended", outcome: "stopped" })).text).toBe(
+      "Ended by you · 3 in · 0 out · 5 assets",
+    );
+    expect(doingLine(row({ state: "ended", outcome: "empty" })).text).toBe(
+      "Ended without writing anything",
+    );
+    expect(
+      doingLine(row({ kind: "worker", state: "ended", outcome: "stopped" }))
+        .tone,
+    ).toBe("muted");
+  });
+});
+
+describe("labels and the pager", () => {
+  const NOW = new Date(2026, 10, 5, 15, 0).getTime();
+
+  test("groups: Active's three, then Today, Yesterday and dates", () => {
+    expect(groupLabel("needs_you", NOW)).toBe("Needs you");
+    expect(groupLabel("day:2026-11-05", NOW)).toBe("Today");
+    expect(groupLabel("day:2026-11-04", NOW)).toBe("Yesterday");
+    expect(groupLabel("day:2026-10-24", NOW)).not.toMatch(/Today|Yesterday/);
+  });
+
+  test("last activity: relative while live, a clock time today, a date before", () => {
+    expect(lastActivityLabel(NOW - 20_000, NOW, true)).toBe("now");
+    expect(lastActivityLabel(NOW - 12 * 60_000, NOW, true)).toBe("12 min");
+    expect(lastActivityLabel(NOW - 2 * 3_600_000, NOW, true)).toBe("2 h");
+    expect(lastActivityLabel(NOW - 20 * 60_000, NOW, false)).toMatch(/14:40/);
+  });
+
+  test("what the toggle hides, and the range", () => {
+    expect(hiddenLine({ running: 2, idle: 1, ended: 0 }, "active")).toBe(
+      "3 more active sessions are hidden by this filter — 2 running, 1 idle.",
+    );
+    expect(hiddenLine({ running: 0, idle: 1, ended: 0 }, "active")).toBe(
+      "1 more active session is hidden by this filter — 1 idle.",
+    );
+    expect(hiddenLine({ running: 0, idle: 0, ended: 0 }, "all")).toBeNull();
+    expect(rangeLabel({ page: 2, pageSize: 25, total: 123 }, 25, false)).toBe(
+      "26–50 of 123",
+    );
+    expect(rangeLabel({ page: 1, pageSize: 25, total: 2 }, 2, true)).toBe(
+      "1–2 of 2 waiting",
+    );
+  });
+
+  test("pages: all up to seven, else the ends and the neighbours with gaps", () => {
+    expect(pagerPages(1, 5)).toEqual([1, 2, 3, 4, 5]);
+    expect(pagerPages(1, 12)).toEqual([1, 2, null, 12]);
+    expect(pagerPages(6, 12)).toEqual([1, 2, null, 5, 6, 7, null, 12]);
+  });
+
+  test("an importer session is named by its title, else when it started; the planner opens its goal", () => {
+    expect(
+      sessionName({
+        kind: "importer",
+        subject: "Scope import",
+        title: " Sweep ",
+        startedAt: 0,
+      }),
+    ).toBe("Sweep");
+    expect(
+      sessionName({
+        kind: "importer",
+        subject: "Scope import",
+        title: null,
+        startedAt: 0,
+      }),
+    ).toMatch(/^Session /);
+    expect(
+      placeOfSession(
+        { kind: "planner", sessionId: "s", subjectId: "g" },
+        TARGET,
+      ),
+    ).toEqual({ kind: "goal", targetId: TARGET, goalId: "g" });
   });
 });

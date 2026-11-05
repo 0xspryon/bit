@@ -41,6 +41,10 @@ import {
   type GoalUploadView,
   type GoalView,
   type AgentSessionView,
+  type AgentSessionsView,
+  type AgentSessionKind,
+  type AgentSessionsTab,
+  type AGENT_SESSION_PAGE_SIZES,
   type HarnessInstanceView,
   type ImporterModelView,
   type ImporterSessionView,
@@ -128,6 +132,48 @@ export interface Countdown {
   /** Schedules `fire` for `ms` from now. The returned function cancels it. */
   readonly after: (ms: number, fire: () => void) => () => void;
 }
+
+/** What the Agent sessions page asks for, as the page holds it (A7 U8b). */
+export interface AgentSessionsQueryState {
+  readonly tab: AgentSessionsTab;
+  readonly needsYou: boolean;
+  readonly agent: AgentSessionKind | undefined;
+  readonly q: string;
+  readonly page: number;
+  readonly pageSize: (typeof AGENT_SESSION_PAGE_SIZES)[number];
+}
+
+export const DEFAULT_AGENT_QUERY: AgentSessionsQueryState = {
+  tab: "active",
+  needsYou: false,
+  agent: undefined,
+  q: "",
+  page: 1,
+  pageSize: 25,
+};
+
+/**
+ * How long the frames of a narrating session settle before the Agent sessions list, or the
+ * rail's count, is read again (A7 U8b). A turn narrates several frames a second; the second
+ * line only has to keep up with a person reading it.
+ */
+export const AGENT_SESSIONS_REFRESH_MS = 2_500;
+
+/** The browser's IANA zone, which the server groups ended sessions into days by. */
+const browserTimeZone = (): string => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch {
+    return "UTC";
+  }
+};
+
+/** Whether a live frame is a session's narration, which can move the Agent sessions list. */
+const sessionFrame = (frame: LiveItem): boolean =>
+  frame.importId !== null ||
+  frame.goalId !== null ||
+  frame.attemptId !== null ||
+  frame.roundId !== null;
 
 /** `setTimeout`, as a {@link Countdown}. What the app runs with. */
 export const realCountdown: Countdown = {
@@ -627,6 +673,34 @@ export class App {
   agentSessionsTargetId = $state("");
   agentSessionsState = $state<AssetsState>("idle");
   agentSessionsDetail = $state("");
+  /**
+   * The page the rows are, with its groups, counts, range and what the Needs you toggle
+   * hides (A7 U8b); `undefined` before the first answer for {@link agentSessionsTargetId}.
+   */
+  agentSessionsPage = $state<Omit<AgentSessionsView, "sessions"> | undefined>(
+    undefined,
+  );
+  /** What the page asks for: the tab, the filters and the page (A7 E1, E2, E5). */
+  agentSessionsQuery = $state<AgentSessionsQueryState>(DEFAULT_AGENT_QUERY);
+  /**
+   * The open target's counts for the rail (A7 E6): sessions waiting on the operator, and
+   * active ones. Read on opening the target, on every read of the list, and again while its
+   * sessions narrate; `undefined` until the first answer for this target.
+   */
+  agentSessionCounts = $state<
+    | {
+        readonly targetId: string;
+        readonly active: number;
+        readonly needsYou: number;
+      }
+    | undefined
+  >(undefined);
+  /** Titles already read, by row key, which a refresh that asks for none keeps. */
+  #agentTitles = new Map<string, string>();
+  /** The newest read of the list: an older answer that lands after it is dropped. */
+  #agentSessionsRead = 0;
+  /** A refresh scheduled by live frames, or `undefined` (A7 U8b). */
+  #agentSessionsRefresh: (() => void) | undefined;
   /*
    * `agentSessionsNote` was here: "why the last click on a row went nowhere", with the one
    * case being an importer session the importer's index no longer lists.
@@ -1224,7 +1298,31 @@ export class App {
     if (id === "goals") return this.goalCount;
     if (id === "observations") return this.viewCounts?.observations;
     if (id === "assets") return this.viewCounts?.assets;
+    if (id === "agent-sessions") {
+      // A7 E6: the number waiting on the operator; with nobody waiting, a quiet count of
+      // active sessions; with nothing active, none — ended sessions are history.
+      const counts = this.agentSessionCounts;
+      if (counts === undefined || counts.targetId !== this.viewTargetId) {
+        return undefined;
+      }
+      if (counts.needsYou > 0) return counts.needsYou;
+      return counts.active > 0 ? counts.active : undefined;
+    }
     return undefined;
+  }
+
+  /**
+   * Whether a rail item's count is sessions waiting on the operator (A7 E6): drawn in the
+   * warning colour, with a dot, and the dot is on the hidden rail's toggle too.
+   */
+  navWaiting(id: string): boolean {
+    if (id !== "agent-sessions") return false;
+    const counts = this.agentSessionCounts;
+    return (
+      counts !== undefined &&
+      counts.targetId === this.viewTargetId &&
+      counts.needsYou > 0
+    );
   }
 
   /* ── The harness and model picker ─────────────────────────────────────────── */
@@ -2058,6 +2156,8 @@ export class App {
     // back, so a run already in progress starts appearing while the header is still
     // loading rather than after it.
     this.watchLive(id);
+    // The rail's Agent sessions count (A7 E6), which is on screen on every section.
+    void this.loadAgentSessionCounts(id);
   }
 
   /**
@@ -3218,18 +3318,31 @@ export class App {
    * the last one, because unlike the importer's index this list *is* the answer to "what is
    * running", and a stale one would be a wrong answer rather than a stale pointer.
    */
-  async loadAgentSessions(id: string) {
+  async loadAgentSessions(
+    id: string,
+    options: { readonly titles?: boolean } = {},
+  ) {
     if (this.viewTargetId !== id) return;
     if (this.agentSessionsTargetId !== id) {
       this.agentSessions = [];
       this.agentSessionsWorkersOmitted = 0;
+      this.agentSessionsPage = undefined;
+      this.agentSessionsQuery = DEFAULT_AGENT_QUERY;
+      this.#agentTitles = new Map();
       this.agentSessionsTargetId = id;
     }
     this.agentSessionsState = "loading";
     this.agentSessionsDetail = "";
+    const titles = options.titles ?? true;
+    const query = this.agentSessionsQuery;
+    const read = ++this.#agentSessionsRead;
 
-    const call = await this.client.agentSessions(this.serverUrl, id);
-    if (this.viewTargetId !== id) return;
+    const call = await this.client.agentSessions(this.serverUrl, id, {
+      ...query,
+      timeZone: browserTimeZone(),
+      titles,
+    });
+    if (this.viewTargetId !== id || read !== this.#agentSessionsRead) return;
 
     if (call._tag === "Unreachable") {
       this.agentSessionsState = "failed";
@@ -3248,9 +3361,85 @@ export class App {
       );
       return;
     }
-    this.agentSessions = call.value.sessions;
-    this.agentSessionsWorkersOmitted = call.value.workersOmitted;
+    const { sessions, ...page } = call.value;
+    // A refresh asked for no titles: the rows keep the ones the last full read found.
+    for (const row of sessions) {
+      if (titles && row.title !== null)
+        this.#agentTitles.set(row.key, row.title);
+      if (titles && row.title === null) this.#agentTitles.delete(row.key);
+    }
+    this.agentSessions = titles
+      ? sessions
+      : sessions.map((row) =>
+          row.title === null && this.#agentTitles.has(row.key)
+            ? { ...row, title: this.#agentTitles.get(row.key) ?? null }
+            : row,
+        );
+    this.agentSessionsPage = page;
+    // The server clamps a page past the end; the query follows, so Next is not offered.
+    if (page.page !== query.page) {
+      this.agentSessionsQuery = { ...query, page: page.page };
+    }
+    this.agentSessionsWorkersOmitted = page.workersOmitted;
+    this.agentSessionCounts = {
+      targetId: id,
+      active: page.counts.active,
+      needsYou: page.counts.needsYou,
+    };
     this.agentSessionsState = "ready";
+  }
+
+  /**
+   * Changes what the Agent sessions page asks for and reads it again (A7 U8b). Any change
+   * but the page itself goes back to page 1: a filter that narrows the list leaves page 4
+   * meaning nothing.
+   */
+  setAgentSessionsQuery(patch: Partial<AgentSessionsQueryState>) {
+    const next = { ...this.agentSessionsQuery, ...patch };
+    this.agentSessionsQuery =
+      patch.page === undefined ? { ...next, page: 1 } : next;
+    void this.loadAgentSessions(this.viewTargetId);
+  }
+
+  /**
+   * Reads the open target's Agent sessions counts for the rail only (A7 E6), off the page:
+   * one row asked for, no titles.
+   */
+  async loadAgentSessionCounts(id: string) {
+    if (this.viewTargetId !== id) return;
+    const call = await this.client.agentSessions(this.serverUrl, id, {
+      tab: "active",
+      timeZone: browserTimeZone(),
+    });
+    if (this.viewTargetId !== id || call._tag !== "Ok") return;
+    this.agentSessionCounts = {
+      targetId: id,
+      active: call.value.counts.active,
+      needsYou: call.value.counts.needsYou,
+    };
+  }
+
+  /**
+   * A session on this target narrated something (A7 U8b): the Agent sessions page's second
+   * lines and the rail's count may have moved. Read again once the frames have settled for
+   * {@link AGENT_SESSIONS_REFRESH_MS} — the list while the operator is on it, the counts
+   * otherwise — and never more often: a turn narrates many frames a second. No harness is
+   * asked: the server answers from its rows and its narration summaries.
+   */
+  #agentSessionsStale(targetId: string) {
+    if (this.#agentSessionsRefresh !== undefined) return;
+    this.#agentSessionsRefresh = this.countdown.after(
+      AGENT_SESSIONS_REFRESH_MS,
+      () => {
+        this.#agentSessionsRefresh = undefined;
+        if (this.viewTargetId !== targetId || this.screen !== "target") return;
+        if (this.navItem === "agent-sessions") {
+          void this.loadAgentSessions(targetId, { titles: false });
+        } else {
+          void this.loadAgentSessionCounts(targetId);
+        }
+      },
+    );
   }
 
   /**
@@ -5733,6 +5922,7 @@ export class App {
       }
       // A turn's first words are a partial: a turn the harness opened itself (A6 U6).
       this.importer.noteActivity(frame);
+      if (sessionFrame(frame)) this.#agentSessionsStale(targetId);
       return;
     }
     if (this.#shown.has(frame.id)) return;
@@ -5756,6 +5946,7 @@ export class App {
     this.#refreshIntentsFor(targetId, frame);
     this.#refreshGoalBriefingFor(targetId, frame);
     this.#refreshPlanRoundsFor(targetId, frame);
+    if (sessionFrame(frame)) this.#agentSessionsStale(targetId);
   }
 
   /** Puts `next` on screen, the newest {@link App.LIVE_KEPT} of it. */

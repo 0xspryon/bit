@@ -109,6 +109,12 @@
     goals.filter((goal) => matches(goalTitle(goal), goalQuery)),
   );
   let section = $derived(navItems.find((item) => item.id === app.navItem));
+  /** Sessions waiting on the operator, for the hidden rail's dot (A7 E6). */
+  let railWaiting = $derived(
+    app.navWaiting("agent-sessions")
+      ? (app.navCount("agent-sessions") ?? 0)
+      : 0,
+  );
   let SectionGlyph = $derived(navGlyphs[section?.icon ?? ""]);
   let goal = $derived(app.navItem === "goals" ? app.openGoalView : undefined);
   let goalName = $derived(goal === undefined ? "" : goalTitle(goal));
@@ -134,14 +140,23 @@
 
 <header class="titlebar">
   {#if app.screen === "target"}
+    <!-- With the rail hidden, sessions waiting on the operator still show (A7 E6): a
+         warning dot at the toggle's corner, and the count in its accessible name. -->
     <button
       class="drawer"
-      aria-label={app.drawerHidden ? "Show panel" : "Hide panel"}
+      aria-label={app.drawerHidden
+        ? railWaiting > 0
+          ? `Show panel — ${String(railWaiting)} agent ${railWaiting === 1 ? "session is" : "sessions are"} waiting on you`
+          : "Show panel"
+        : "Hide panel"}
       aria-pressed={!app.drawerHidden}
       title={app.drawerHidden ? "Show panel" : "Hide panel"}
       onclick={() => (app.drawerHidden = !app.drawerHidden)}
     >
       <IconPanel width="15" height="15" />
+      {#if app.drawerHidden && railWaiting > 0}
+        <span class="waiting-dot" aria-hidden="true"></span>
+      {/if}
     </button>
 
     <CrumbPicker
@@ -261,7 +276,13 @@
                 <span class="option-name">{item.label}</span>
               </span>
               {#if count !== undefined}
-                <span class={["section-count", item.attention && "attention"]}>
+                <span
+                  class={[
+                    "section-count",
+                    item.attention && "attention",
+                    app.navWaiting(item.id) && "waiting",
+                  ]}
+                >
                   {count}
                 </span>
               {/if}
@@ -528,9 +549,19 @@
     cursor: pointer;
   }
   .drawer {
+    position: relative;
     width: 38px;
     height: 38px;
     color: var(--icon-base);
+  }
+  .waiting-dot {
+    position: absolute;
+    top: 9px;
+    right: 8px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--state-fg-warning);
   }
   .drawer[aria-pressed="false"] {
     color: var(--icon-muted);
@@ -608,6 +639,9 @@
     flex: none;
     color: var(--text-muted);
     font: 500 12px/16px var(--font-mono);
+  }
+  .section-count.waiting {
+    color: var(--state-fg-warning);
   }
   .section-count.attention {
     color: var(--text-base);

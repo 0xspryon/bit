@@ -16,16 +16,20 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { type AgentSessionView } from "@bit/contracts";
+import { type AgentSessionView, type AgentSessionsView } from "@bit/contracts";
 
-import { App } from "../../src/lib/app.svelte";
+import { AGENT_SESSIONS_REFRESH_MS, App } from "../../src/lib/app.svelte";
+import type { AgentSessionsRequest } from "../../src/lib/client";
 import Sidebar from "../../src/lib/components/Sidebar.svelte";
+import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import {
   FakeServer,
   agentSessionView,
+  agentSessionsPage,
   importerSessionView,
+  liveActivity,
   ok,
   unreachable,
 } from "../fakeServer";
@@ -67,6 +71,17 @@ const IMPORTER = agentSessionView({
   startedAt: 1_700_000_200_000,
   state: "live",
   tally: { entriesIn: 7, entriesOut: 3, assets: 1 },
+  title: "Full policy sweep",
+  lastActivityAt: Date.now(),
+  surface: { section: "assets", place: "Auto-load", gone: false },
+  activity: {
+    running: true,
+    calls: 14,
+    lastTool: "Bash",
+    text: "Testing X-Forwarded-For rotation",
+    at: Date.now(),
+  },
+  group: "running",
 });
 const WORKER = agentSessionView({
   kind: "worker",
@@ -79,15 +94,16 @@ const WORKER = agentSessionView({
   startedAt: 1_700_000_100_000,
   state: "ended",
   detail: "failed",
+  surface: { section: "workers", place: "Attempt", gone: false },
+  outcome: "failed",
 });
 
 const openList = async (
   sessions: AgentSessionView[],
-  over: { workersOmitted?: number } = {},
+  over: Partial<AgentSessionsView> = {},
 ): Promise<{ app: App; fake: FakeServer }> => {
   const fake = new FakeServer();
-  fake.onAgentSessions = () =>
-    ok({ sessions, workersOmitted: over.workersOmitted ?? 0 });
+  fake.onAgentSessions = () => ok(agentSessionsPage(sessions, over));
   fake.onHarnesses = () =>
     ok([
       harness("claude-code", "Claude Code"),
@@ -105,8 +121,34 @@ const openList = async (
   return { app, fake };
 };
 
+/** The rows on screen, as text, without the group labels. */
+const rowTexts = (): string[] =>
+  [...document.querySelectorAll(".rows .row-item")].map((each) =>
+    (each.textContent ?? "").replace(/\s+/g, " ").trim(),
+  );
+
+/** The query of every page read of the list (the rail's count reads are not the page's). */
+const pageReads = (fake: FakeServer) =>
+  fake.calls
+    .filter((call) => call.method === "agentSessions")
+    .map((call) => call.args[2] as AgentSessionsRequest)
+    .filter((query) => query.titles !== undefined);
+
+const buttonNamed = (name: string): HTMLButtonElement => {
+  const found = [...document.querySelectorAll("button")].find((each) =>
+    (each.textContent ?? "").replace(/\s+/g, " ").includes(name),
+  );
+  if (found === undefined) throw new Error(`no button "${name}"`);
+  return found;
+};
+
+const choose = (select: HTMLSelectElement, value: string) => {
+  select.value = value;
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+};
+
 describe("the Agent sessions tab", () => {
-  test("is in the rail under Operations, beside Workers, Blockers and Event log", async () => {
+  test("is in the rail under Operations, between Workers and Blockers (A7 E6)", async () => {
     const fake = new FakeServer();
     const app = new App(fake, new FakeCountdown());
     app.password = "correct-horse";
@@ -121,44 +163,180 @@ describe("the Agent sessions tab", () => {
     );
     const tab = labels.findIndex((each) => each?.startsWith("Agent sessions"));
     expect(tab).toBeGreaterThan(-1);
-    expect(labels.findIndex((each) => each?.startsWith("Event log"))).toBe(
-      tab - 1,
-    );
+    expect(labels[tab - 1]?.startsWith("Workers")).toBe(true);
+    expect(labels[tab + 1]?.startsWith("Blockers")).toBe(true);
     // It has a glyph: the rail draws one svg per item.
     expect(
       document.querySelectorAll(".item")[tab]?.querySelector("svg"),
     ).not.toBeNull();
   });
+
+  const railWith = async (counts: { active: number; needsYou: number }) => {
+    const fake = new FakeServer();
+    fake.onAgentSessions = () =>
+      ok(
+        agentSessionsPage([], {
+          counts: {
+            active: counts.active,
+            ended: 4,
+            all: counts.active + 4,
+            needsYou: counts.needsYou,
+          },
+        }),
+      );
+    const app = new App(fake, new FakeCountdown());
+    app.password = "correct-horse";
+    await app.connect();
+    app.openTarget("acme-corp");
+    await settle();
+    mounted.push(mountInto(Sidebar, { app }), mountInto(TitleBar, { app }));
+    await settle();
+    const item = document.querySelector('.item[data-item="agent-sessions"]');
+    return { app, item };
+  };
+
+  test("with nothing active it has no count: ended sessions are history", async () => {
+    const { item } = await railWith({ active: 0, needsYou: 0 });
+    expect(item?.querySelector(".count")).toBeNull();
+  });
+
+  test("with sessions active and nobody waiting, a quiet count of them", async () => {
+    const { item } = await railWith({ active: 3, needsYou: 0 });
+    const count = item?.querySelector(".count");
+    expect(count?.textContent?.trim()).toBe("3");
+    expect(count?.classList.contains("waiting")).toBe(false);
+    expect(item?.querySelector(".dot")).toBeNull();
+  });
+
+  test("with sessions waiting, the number waiting, with a dot, in warning; the hidden rail keeps the dot", async () => {
+    const { app, item } = await railWith({ active: 3, needsYou: 2 });
+    const count = item?.querySelector(".count");
+    expect(count?.textContent?.trim()).toBe("2");
+    expect(count?.classList.contains("waiting")).toBe(true);
+    expect(item?.querySelector(".dot")).not.toBeNull();
+    expect(item?.getAttribute("aria-label")).toBe(
+      "Agent sessions, 2 waiting on you",
+    );
+    expect(document.querySelector(".drawer .waiting-dot")).toBeNull();
+    app.drawerHidden = true;
+    await settle();
+    const drawer = document.querySelector(".drawer");
+    expect(drawer?.querySelector(".waiting-dot")).not.toBeNull();
+    expect(drawer?.getAttribute("aria-label")).toBe(
+      "Show panel — 2 agent sessions are waiting on you",
+    );
+  });
 });
 
 describe("the Agent sessions list", () => {
-  test("says kind, subject, harness and model, state and tally for each kind of session", async () => {
-    const { fake } = await openList([GOAL, IMPORTER, WORKER]);
+  test("each row reads name · where it lives, what it is doing, the agent, the model and when (A7 E1)", async () => {
+    const { fake } = await openList([IMPORTER, GOAL, WORKER]);
 
-    expect(fake.calls.filter((c) => c.method === "agentSessions")).toHaveLength(
-      1,
-    );
-    const rows = [...document.querySelectorAll(".rows li")].map((each) =>
-      (each.textContent ?? "").replace(/\s+/g, " "),
-    );
+    expect(pageReads(fake)).toHaveLength(1);
+    expect(pageReads(fake)[0]).toMatchObject({
+      tab: "active",
+      page: 1,
+      pageSize: 25,
+      titles: true,
+    });
+    const rows = rowTexts();
     expect(rows).toHaveLength(3);
-    // The goal: its harness resolved to a name, no model it can know, not held.
-    expect(rows[0]).toContain("Goal");
-    expect(rows[0]).toContain("Find auth bypasses");
-    expect(rows[0]).toContain("Claude Code");
-    expect(rows[0]).toContain("model not recorded");
-    expect(rows[0]).toContain("Not running");
-    // The importer: live, with the one tally a kind derives.
-    expect(rows[1]).toContain("Importer");
-    expect(rows[1]).toContain("Scope import");
-    expect(rows[1]).toContain("openai/gpt-5.6-sol");
-    expect(rows[1]).toContain("Live");
-    expect(rows[1]).toContain("7 in · 3 out · 1 asset");
-    // The worker: ended, with how, and no tally invented.
-    expect(rows[2]).toContain("Worker");
-    expect(rows[2]).toContain("Does /invoices accept another tenant id?");
-    expect(rows[2]).toContain("Ended · failed");
-    expect(rows[2]).not.toContain(" in · ");
+    // The importer: its harness title, its surface, what it is doing now, live.
+    expect(rows[0]).toContain("Full policy sweep");
+    expect(rows[0]).toContain("Assets");
+    expect(rows[0]).toContain("Auto-load");
+    expect(rows[0]).toContain(
+      "Testing X-Forwarded-For rotation · 14 tool calls so far",
+    );
+    expect(rows[0]).toContain("openai/gpt-5.6-sol");
+    expect(rows[0]).toContain("now");
+    // The goal: dormant, its conversation on the goal page, no model it can know.
+    expect(rows[1]).toContain("Find auth bypasses");
+    expect(rows[1]).toContain("Goals");
+    expect(rows[1]).toContain("Conversation");
+    expect(rows[1]).toContain("Goal agent");
+    expect(rows[1]).toContain("Completed · a message carries it on");
+    expect(rows[1]).toContain("—");
+    // The worker: failed, the one outcome in colour.
+    expect(rows[2]).toContain("Failed");
+    expect(rows[2]).not.toContain("Failed · failed");
+    const line = document.querySelectorAll(".rows .row-item .line2")[2];
+    expect(line?.classList.contains("danger")).toBe(true);
+    expect(
+      document
+        .querySelectorAll(".rows .row-item .mark")[2]
+        ?.getAttribute("data-mark"),
+    ).toBe("failed");
+  });
+
+  test("Active is grouped Needs you, Running, Idle, each label with its count", async () => {
+    const waiting = agentSessionView({
+      kind: "importer",
+      key: "importer:imp_w",
+      sessionId: "ses_w",
+      state: "live",
+      surface: { section: "assets", place: "Auto-load", gone: false },
+      waiting: "question 2 of 3 — how far the WordPress rule reaches",
+      group: "needs_you",
+    });
+    const idle = agentSessionView({
+      key: "goal:goal_2",
+      subjectId: "goal_2",
+      state: "live",
+      group: "idle",
+    });
+    await openList([waiting, IMPORTER, idle]);
+    const groups = [...document.querySelectorAll(".rows .group")].map((each) =>
+      (each.textContent ?? "").replace(/\s+/g, " ").trim(),
+    );
+    expect(groups).toEqual(["Needs you 1", "Running 1", "Idle 1"]);
+    // A waiting row says what it waits on, in warning.
+    const line = document.querySelector(".rows .row-item .line2");
+    expect(line?.textContent).toBe(
+      "Waiting on you · question 2 of 3 — how far the WordPress rule reaches",
+    );
+    expect(line?.classList.contains("warning")).toBe(true);
+  });
+
+  test("an Ended day keeps its full count on every page, and a day that runs on is named again (A7 E5)", async () => {
+    const today = new Date();
+    const key = `day:${String(today.getFullYear())}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const ended = [
+      WORKER,
+      { ...WORKER, key: "worker:att_2", subjectId: "att_2" },
+    ].map((row) => ({ ...row, group: key }));
+    await openList(ended, {
+      groups: [{ key, count: 30 }],
+      counts: { active: 0, ended: 31, all: 31, needsYou: 0 },
+      total: 31,
+      page: 2,
+      pageSize: 25,
+    });
+    const group = document.querySelector(".rows .group");
+    expect((group?.textContent ?? "").replace(/\s+/g, " ").trim()).toBe(
+      "Today 30",
+    );
+  });
+
+  test("an outcome's mark never wears a class the page styles for itself (an empty session is not the empty page)", async () => {
+    await openList([agentSessionView({ outcome: "empty" })]);
+    const mark = document.querySelector(".rows .row-item .mark");
+    expect(mark?.getAttribute("data-mark")).toBe("empty");
+    expect(mark?.classList.contains("is-empty")).toBe(true);
+    // `.empty` is the no-sessions block, 48 px of margin: on a mark it made the row 135 px tall.
+    expect(mark?.classList.contains("empty")).toBe(false);
+  });
+
+  test("a surface that is gone is struck through, and its row still opens", async () => {
+    await openList([
+      agentSessionView({
+        surface: { section: "goals", place: "Conversation", gone: true },
+      }),
+    ]);
+    expect(document.querySelector(".crumb.gone")).not.toBeNull();
+    expect(document.querySelector("a.row.go")?.getAttribute("href")).toBe(
+      "/t/acme-corp/goals/goal_1",
+    );
   });
 
   test("a target with no sessions says so instead of drawing an empty frame", async () => {
@@ -208,22 +386,19 @@ describe("the Agent sessions list", () => {
       agentSessionView({ harnessInstanceId: "retired-harness" }),
       IMPORTER,
     ]);
-    const rows = [...document.querySelectorAll(".rows li")];
+    const rows = rowTexts();
     expect(rows).toHaveLength(2);
-    expect(rows[0]?.textContent).toContain(
+    expect(rows[0]).toContain(
       "Harness “retired-harness” is no longer configured",
     );
     // And a session on a harness this server does run is not.
-    expect(rows[1]?.textContent).not.toContain("no longer configured");
+    expect(rows[1]).not.toContain("no longer configured");
   });
 
   test("does not call a harness gone before the harness listing has arrived", async () => {
     const fake = new FakeServer();
     fake.onAgentSessions = () =>
-      ok({
-        sessions: [agentSessionView({ harnessInstanceId: "x" })],
-        workersOmitted: 0,
-      });
+      ok(agentSessionsPage([agentSessionView({ harnessInstanceId: "x" })]));
     // The listing never arrives: `harnessesLoaded` stays false.
     fake.onHarnesses = () => unreachable("no route");
     const app = new App(fake, new FakeCountdown());
@@ -234,13 +409,169 @@ describe("the Agent sessions list", () => {
     app.toSection("agent-sessions");
     mounted.push(mountInto(Target, { app }));
     await settle();
-    expect(document.querySelectorAll(".rows li")).toHaveLength(1);
+    expect(rowTexts()).toHaveLength(1);
     expect(text()).not.toContain("no longer configured");
   });
 
   test("says how many worker sessions the bound left out", async () => {
     await openList([WORKER], { workersOmitted: 42 });
-    expect(text()).toContain("42 older worker sessions are not shown");
+    expect(text()).toContain("42 older worker sessions are not counted here");
+  });
+});
+
+describe("tabs and filters (A7 E1, E2)", () => {
+  test("the tabs carry the server's unfiltered counts, and choosing one asks for it from page 1", async () => {
+    const { app, fake } = await openList([IMPORTER], {
+      counts: { active: 5, ended: 123, all: 128, needsYou: 2 },
+    });
+    const tabs = [...document.querySelectorAll('[role="tab"]')].map((each) =>
+      (each.textContent ?? "").replace(/\s+/g, " ").trim(),
+    );
+    expect(tabs).toEqual(["Active 5", "Ended 123", "All 128"]);
+    click(buttonNamed("Ended"));
+    await settle();
+    expect(app.agentSessionsQuery.tab).toBe("ended");
+    expect(pageReads(fake).at(-1)).toMatchObject({ tab: "ended", page: 1 });
+  });
+
+  test("the Needs you toggle narrows the tab, and the line under the list says what it hides, with a way back", async () => {
+    const { app, fake } = await openList([], {
+      counts: { active: 3, ended: 0, all: 3, needsYou: 0 },
+      hidden: { running: 2, idle: 1, ended: 0 },
+    });
+    click(buttonNamed("Needs you"));
+    await settle();
+    expect(pageReads(fake).at(-1)).toMatchObject({ needsYou: true });
+    expect(app.agentSessionsQuery.needsYou).toBe(true);
+    expect(text()).toContain(
+      "3 more active sessions are hidden by this filter — 2 running, 1 idle.",
+    );
+    expect(text()).toContain("Nothing in active sessions is waiting on you.");
+    click(buttonNamed("Clear the filter"));
+    await settle();
+    expect(pageReads(fake).at(-1)).toMatchObject({ needsYou: false });
+  });
+
+  test("on Ended the toggle is dimmed: an ended session cannot be waiting", async () => {
+    const { app } = await openList([WORKER]);
+    app.setAgentSessionsQuery({ tab: "ended" });
+    await settle();
+    expect(buttonNamed("Needs you").disabled).toBe(true);
+  });
+
+  test("the agent filter asks for one kind; the text filter asks once typing pauses", async () => {
+    const { app, fake } = await openList([IMPORTER]);
+    const agent = document.querySelector(
+      ".agent-filter select",
+    ) as HTMLSelectElement;
+    expect([...agent.options].map((option) => option.textContent)).toEqual([
+      "Every agent",
+      "Goal agent",
+      "Auto-load",
+      "Worker",
+      "Planner",
+    ]);
+    choose(agent, "planner");
+    await settle();
+    expect(pageReads(fake).at(-1)).toMatchObject({ agent: "planner" });
+
+    const box = document.querySelector(".search input") as HTMLInputElement;
+    box.value = "policy";
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+    const before = pageReads(fake).length;
+    // Nothing yet: the read waits for typing to pause.
+    expect(pageReads(fake)).toHaveLength(before);
+    const countdown = app.countdown as FakeCountdown;
+    countdown.live.find((armed) => armed.ms === 300)?.fire();
+    await settle();
+    expect(pageReads(fake).at(-1)).toMatchObject({ q: "policy", page: 1 });
+  });
+});
+
+describe("pages (A7 E5)", () => {
+  test("Ended shows the range and total, rows per page, and the pages; choosing either reads again", async () => {
+    const { app, fake } = await openList([WORKER], {
+      counts: { active: 0, ended: 123, all: 123, needsYou: 0 },
+      total: 123,
+    });
+    // The server answers the page it was asked for, as the real one does within range.
+    fake.onAgentSessions = (_baseUrl, _targetId, query) =>
+      ok(
+        agentSessionsPage([WORKER], {
+          counts: { active: 0, ended: 123, all: 123, needsYou: 0 },
+          total: 123,
+          page: query?.page ?? 1,
+        }),
+      );
+    app.setAgentSessionsQuery({ tab: "ended" });
+    await settle();
+    expect(document.querySelector(".range")?.textContent?.trim()).toBe(
+      "1–1 of 123",
+    );
+    const numbers = [...document.querySelectorAll(".pages button")].map(
+      (each) => each.getAttribute("aria-label"),
+    );
+    expect(numbers).toEqual([
+      "Previous page",
+      "Page 1",
+      "Page 2",
+      "Page 3",
+      "Page 4",
+      "Page 5",
+      "Next page",
+    ]);
+    click(document.querySelector('[aria-label="Next page"]') as Element);
+    await settle();
+    expect(pageReads(fake).at(-1)).toMatchObject({ tab: "ended", page: 2 });
+    expect(app.agentSessionsQuery.page).toBe(2);
+    choose(
+      document.querySelector(
+        'select[aria-label="Rows per page"]',
+      ) as HTMLSelectElement,
+      "50",
+    );
+    await settle();
+    expect(pageReads(fake).at(-1)).toMatchObject({ pageSize: 50, page: 1 });
+  });
+
+  test("Active comes in one piece: a range, no pager", async () => {
+    await openList([IMPORTER]);
+    expect(document.querySelector(".range")?.textContent?.trim()).toBe(
+      "1–1 of 1",
+    );
+    expect(document.querySelector(".pages")).toBeNull();
+  });
+});
+
+describe("live, without asking a harness (A7 U8b)", () => {
+  test("a session's narration reads the list again once its frames settle, once, keeping the titles it has", async () => {
+    const { app, fake } = await openList([IMPORTER]);
+    const before = pageReads(fake).length;
+    // The next read asks for no titles, and the server answers none.
+    fake.onAgentSessions = () =>
+      ok(agentSessionsPage([{ ...IMPORTER, title: null }]));
+    for (let index = 0; index < 5; index += 1) {
+      app.applyLiveFrame(
+        "acme-corp",
+        liveActivity({
+          id: `activity:${String(index)}`,
+          attemptId: null,
+          importId: "imp_1",
+        }),
+      );
+    }
+    await settle();
+    const countdown = app.countdown as FakeCountdown;
+    const armed = countdown.live.filter(
+      (each) => each.ms === AGENT_SESSIONS_REFRESH_MS,
+    );
+    expect(armed).toHaveLength(1);
+    armed[0]?.fire();
+    await settle();
+    expect(pageReads(fake)).toHaveLength(before + 1);
+    expect(pageReads(fake).at(-1)).toMatchObject({ titles: false });
+    expect(rowTexts()[0]).toContain("Full policy sweep");
   });
 });
 
@@ -248,10 +579,20 @@ describe("a row that leads somewhere", () => {
   test("is a link carrying the path of the place it leads to", async () => {
     // The row the whole routing design exists for: an operator can read this href out of
     // the status bar, copy it, and send it to themselves for later review.
-    await openList([IMPORTER, GOAL]);
+    await openList([
+      IMPORTER,
+      GOAL,
+      agentSessionView({
+        kind: "planner",
+        key: "planner:goal_1",
+        surface: { section: "goals", place: "Plan", gone: false },
+      }),
+    ]);
     const links = [...document.querySelectorAll<HTMLAnchorElement>("a.row.go")];
+    // The planner lives on its goal's page, beside the conversation.
     expect(links.map((each) => each.getAttribute("href"))).toEqual([
       "/t/acme-corp/assets/chat/ses_import_1",
+      "/t/acme-corp/goals/goal_1",
       "/t/acme-corp/goals/goal_1",
     ]);
   });

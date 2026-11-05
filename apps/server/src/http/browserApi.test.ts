@@ -42,6 +42,7 @@ import {
   type LiveItem,
   type RunningAttempt,
   type ScopeImportView,
+  type AgentSessionsView,
 } from "@bit/contracts";
 import {
   Context,
@@ -5669,6 +5670,29 @@ describe("a target's agent sessions", () => {
       attempt(`att_done_${tag}`, `ses_worker_done_${tag}`, "failed", base + 28);
       // Claimed before its session existed: a row, but not yet a session.
       attempt(`att_early_${tag}`, null, "running", base + 40);
+      // A planner lineage with a running round, and one that never ran a round (A7 U8b).
+      database.run(
+        `INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
+         VALUES (?, ?, ?)`,
+        [`goal_${tag}`, `pses_${tag}`, base + 2],
+      );
+      database.run(
+        `INSERT INTO planner_rounds (
+           id, goal_id, target_id, status, harness_session_id, harness_instance_id,
+           provider_id, model_id, started_at_sequence, budget, started_at
+         ) VALUES (?, ?, ?, 'running', ?, 'opencode', 'openai', 'gpt-5.5', 0, 3, ?)`,
+        [`round_${tag}`, `goal_${tag}`, targetId, `pses_${tag}`, base + 3],
+      );
+      database.run(
+        `INSERT INTO goals (id, target_id, description, created_at, name, status)
+         VALUES (?, ?, 'Quiet', ?, ?, 'active')`,
+        [`goal_${tag}_quiet`, targetId, base, `Quiet ${tag}`],
+      );
+      database.run(
+        `INSERT INTO planner_lineages (goal_id, harness_session_id, created_at)
+         VALUES (?, ?, ?)`,
+        [`goal_${tag}_quiet`, `pses_${tag}_quiet`, base + 1],
+      );
     } finally {
       database.close();
     }
@@ -5696,71 +5720,92 @@ describe("a target's agent sessions", () => {
     }
   });
 
-  test("unions the goal, importer and worker sessions into one list, newest first", async () => {
+  test("unions the goal, importer, worker and planner sessions into one list: Active's groups, then Ended by day (A7 U8b)", async () => {
     const response = await read(
-      await signedIn(`/targets/${mixed}/agent-sessions`),
+      await signedIn(`/targets/${mixed}/agent-sessions?tab=all`),
     );
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({
-      workersOmitted: 0,
-      sessions: [
-        {
-          kind: "worker",
-          key: "worker:att_run_main",
-          sessionId: "ses_worker_run_main",
-          subject: "Does /invoices accept another tenant id?",
-          subjectId: "att_run_main",
-          harnessInstanceId: null,
-          model: "anthropic/sonnet-5",
-          startedAt: 1_030,
-          state: "live",
-          detail: "running",
-          tally: null,
-        },
-        {
-          kind: "worker",
-          key: "worker:att_done_main",
-          sessionId: "ses_worker_done_main",
-          subject: "Does /invoices accept another tenant id?",
-          subjectId: "att_done_main",
-          harnessInstanceId: null,
-          model: "anthropic/sonnet-5",
-          startedAt: 1_028,
-          state: "ended",
-          detail: "failed",
-          tally: null,
-        },
-        {
-          // `GoalConversations.unavailable` holds nothing: a recorded conversation this
-          // process cannot reach reads dormant, and its model is not known.
-          kind: "goal",
-          key: "goal:goal_main",
-          sessionId: "ses_goal_main",
-          subject: "Billing auth main",
-          subjectId: "goal_main",
-          harnessInstanceId: "claude-code",
-          model: null,
-          startedAt: 1_020,
-          state: "dormant",
-          detail: null,
-          tally: null,
-        },
-        {
-          kind: "importer",
-          key: `importer:${LIVE_IMPORT_ID}`,
-          sessionId: "ses_import_main",
-          subject: "Scope import",
-          subjectId: LIVE_IMPORT_ID,
-          harnessInstanceId: "opencode",
-          model: "openai/gpt-5.6-sol",
-          startedAt: 1_010,
-          // This process holds LIVE_IMPORT_ID as running, and nothing stored says so.
-          state: "live",
-          detail: null,
-          tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
-        },
-      ],
+    const body = response.body as unknown as AgentSessionsView;
+    expect(body.counts).toEqual({ active: 3, ended: 3, all: 6, needsYou: 0 });
+    expect(body.workersOmitted).toBe(0);
+    expect(
+      body.sessions.map((s) => [s.key, s.state, s.group, s.outcome]),
+    ).toEqual([
+      // A live attempt is one prompt: running, though nothing narrated through this process.
+      ["worker:att_run_main", "live", "running", null],
+      // So is a running planner round.
+      ["planner:goal_main", "live", "running", null],
+      // This process holds LIVE_IMPORT_ID, and nothing stored says so; nothing narrated: idle.
+      [`importer:${LIVE_IMPORT_ID}`, "live", "idle", null],
+      ["worker:att_done_main", "ended", "day:1970-01-01", "failed"],
+      // `GoalConversations.unavailable` holds nothing: a recorded conversation this
+      // process cannot reach reads dormant, and its model is not known.
+      ["goal:goal_main", "dormant", "day:1970-01-01", "completed"],
+      ["planner:goal_main_quiet", "dormant", "day:1970-01-01", "empty"],
+    ]);
+    expect(body.sessions[0]).toMatchObject({
+      kind: "worker",
+      sessionId: "ses_worker_run_main",
+      subject: "Does /invoices accept another tenant id?",
+      subjectId: "att_run_main",
+      harnessInstanceId: null,
+      model: "anthropic/sonnet-5",
+      startedAt: 1_030,
+      detail: "running",
+      tally: null,
+      title: null,
+      surface: { section: "workers", place: "Attempt", gone: false },
+      activity: null,
+      waiting: null,
     });
+    expect(body.sessions[1]).toMatchObject({
+      kind: "planner",
+      sessionId: "pses_main",
+      subject: "Billing auth main",
+      model: "openai/gpt-5.5",
+      surface: { section: "goals", place: "Plan", gone: false },
+    });
+    expect(body.sessions[2]).toMatchObject({
+      kind: "importer",
+      model: "openai/gpt-5.6-sol",
+      tally: { entriesIn: 0, entriesOut: 0, assets: 0 },
+      surface: { section: "assets", place: "Auto-load", gone: false },
+    });
+    expect(body.sessions[4]).toMatchObject({ model: null, detail: null });
+    expect(body.groups).toEqual([
+      { key: "running", count: 2 },
+      { key: "idle", count: 1 },
+      { key: "day:1970-01-01", count: 3 },
+    ]);
+  });
+
+  test("Active by default, and Ended paged by the query (A7 U8b)", async () => {
+    const active = (await read(
+      await signedIn(`/targets/${mixed}/agent-sessions`),
+    )) as { status: number; body: unknown };
+    expect(
+      (active.body as AgentSessionsView).sessions.map((s) => s.state),
+    ).toEqual(["live", "live", "live"]);
+    const ended = (
+      await read(
+        await signedIn(
+          `/targets/${mixed}/agent-sessions?tab=ended&page=2&pageSize=25&agent=worker&q=invoices&tz=Europe%2FParis`,
+        ),
+      )
+    ).body as unknown as AgentSessionsView;
+    // One ended worker matches: page 2 of one page is page 1.
+    expect(ended.page).toBe(1);
+    expect(ended.pageSize).toBe(25);
+    expect(ended.total).toBe(1);
+    expect(ended.sessions.map((s) => s.key)).toEqual(["worker:att_done_main"]);
+    expect(ended.groups).toEqual([{ key: "day:1970-01-01", count: 1 }]);
+  });
+
+  test("a page size the list does not offer is refused", async () => {
+    const response = await read(
+      await signedIn(`/targets/${mixed}/agent-sessions?pageSize=7`),
+    );
+    expect(response.status).toBe(400);
   });
 
   test("an importer conversation held open between turns reads live, with no run in flight", async () => {
@@ -5790,7 +5835,7 @@ describe("a target's agent sessions", () => {
 
   test("an ended import reads ended, with the reason beside it", async () => {
     const response = await read(
-      await signedIn(`/targets/${other}/agent-sessions`),
+      await signedIn(`/targets/${other}/agent-sessions?tab=ended`),
     );
     expect(response.status).toBe(200);
     const sessions = response.body["sessions"] as readonly {
@@ -5816,7 +5861,16 @@ describe("a target's agent sessions", () => {
       await signedIn(`/targets/${quiet}/agent-sessions`),
     );
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ sessions: [], workersOmitted: 0 });
+    expect(response.body).toEqual({
+      sessions: [],
+      groups: [],
+      counts: { active: 0, ended: 0, all: 0, needsYou: 0 },
+      total: 0,
+      page: 1,
+      pageSize: 25,
+      hidden: { running: 0, idle: 0, ended: 0 },
+      workersOmitted: 0,
+    });
   });
 
   test("an unknown target is refused rather than answered empty", async () => {

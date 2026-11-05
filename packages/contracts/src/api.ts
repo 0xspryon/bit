@@ -80,7 +80,7 @@ import {
   RoundNotFound,
   RunningRound,
 } from "./plan";
-import { AgentSessionsView } from "./agentSessions";
+import { AgentSessionsQuery, AgentSessionsView } from "./agentSessions";
 import { LiveFrame } from "./live";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
 import {
@@ -1518,13 +1518,16 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
       },
     ),
     /**
-     * Every long-running agent session this target has, of any kind, newest first.
+     * One page of the long-running agent sessions this target has, of any kind (A7 U8b):
+     * a tab (Active, Ended, All), narrowed by the query's filters, grouped, and paged here
+     * rather than in the browser, with the tabs' unfiltered counts.
      *
-     * **A read-time union** of the goal, importer and worker indexes; there is no table behind
-     * it. See {@link AgentSessionsView}.
+     * **A read-time union** of the goal, importer, worker and planner indexes; there is no
+     * table behind it. See {@link AgentSessionsView}.
      */
     HttpApiEndpoint.get("agentSessions", "/targets/:targetId/agent-sessions", {
       params: { targetId: Schema.String },
+      query: AgentSessionsQuery,
       success: AgentSessionsView,
       error: [TargetNotFound, TargetUnavailable],
     }),

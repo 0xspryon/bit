@@ -234,6 +234,10 @@ date, **Start a new session**; an older session read-only until the operator typ
 - the sidebar entry under Operations: a warning count of sessions waiting on you, falling back
   to a quiet active count.
   "Needs you" stays empty until A7-Q lands.
+  **Built (2026-11-05):** the Needs you plumbing is in place end to end; A7-Q only sets
+  `waiting` per row in `apps/server/src/http/agentSessions.ts` (`unionAgentSessions`, see its
+  `V2(chat):` note), including the planner's "approve a plan" state, which no round status
+  records today.
 
 **U9 — D3 context meter (S).** Ring and token count in the crumb bar, clickable to show what
 fills the window: Claude Code's `getContextUsage()` categories; on OpenCode, tokens and

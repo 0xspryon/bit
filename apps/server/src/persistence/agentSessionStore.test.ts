@@ -1,6 +1,7 @@
 /**
- * Real-SQLite tests for the two reads the "Agent sessions" list adds
- * (`goalSessionsForTarget`, `workerSessionsForTarget`).
+ * Real-SQLite tests for the reads the "Agent sessions" list adds
+ * (`goalSessionsForTarget`, `workerSessionsForTarget`, and A7 U8b's
+ * `plannerSessionsForTarget`).
  *
  * Nothing checks a SQL identifier or a placeholder at compile time, so each read is executed
  * against a real migrated file. The rows come from the **real write paths** —
@@ -16,7 +17,7 @@ import { join } from "node:path";
 
 import { Effect } from "effect";
 
-import { ObservationStore, type SeedInput } from "./store";
+import { ObservationStore, operatorScope, type SeedInput } from "./store";
 
 type Store = ObservationStore["Service"];
 
@@ -270,5 +271,101 @@ describe("the worker sessions of a target", () => {
     );
     expect(listed.sessions).toHaveLength(2);
     expect(listed.total).toBe(3);
+  });
+});
+
+describe("the planner sessions of a target (A7 U8b)", () => {
+  const host = (targetId: string) =>
+    ({ callerScope: operatorScope(targetId), targetId }) as const;
+
+  test("one per goal's lineage, with its latest round's status, model and ending, for this target only", async () => {
+    const rows = await withStore((store) =>
+      Effect.gen(function* () {
+        yield* store.seedAttempt(seed("a"));
+        yield* store.seedAttempt(seed("b"));
+        yield* store.seedAttempt(
+          seed("c", { targetId: "target-2", goalId: "goal-elsewhere" }),
+        );
+        yield* store.recordPlannerLineage("goal-a", "pses-a");
+        yield* store.recordPlannerLineage("goal-b", "pses-b");
+        yield* store.recordPlannerLineage("goal-elsewhere", "pses-c");
+        // goal-a: an earlier round settled, then a later one still running.
+        yield* store.openRound(host("target-1"), {
+          goalId: "goal-a",
+          roundId: "round-a1",
+          budget: 3,
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt-5.5",
+          harnessSessionId: "pses-a",
+        });
+        yield* store.settleRound("round-a1", "settled", {
+          _tag: "supervisor",
+        });
+        yield* Effect.sleep("5 millis");
+        yield* store.openRound(host("target-1"), {
+          goalId: "goal-a",
+          roundId: "round-a2",
+          budget: 3,
+          harnessInstanceId: "claude-code",
+          providerId: "anthropic",
+          modelId: "claude-sonnet-5",
+          harnessSessionId: "pses-a",
+        });
+        yield* store.openRound(host("target-2"), {
+          goalId: "goal-elsewhere",
+          roundId: "round-c1",
+          budget: 3,
+          harnessInstanceId: "opencode",
+          providerId: "openai",
+          modelId: "gpt-5.5",
+          harnessSessionId: "pses-c",
+        });
+        return yield* store.plannerSessionsForTarget("target-1");
+      }),
+    );
+    expect(rows.map((row) => row.goalId).sort()).toEqual(["goal-a", "goal-b"]);
+    const a = rows.find((row) => row.goalId === "goal-a");
+    expect(a).toMatchObject({
+      goalName: "Objective a",
+      harnessSessionId: "pses-a",
+      round: {
+        roundId: "round-a2",
+        status: "running",
+        harnessInstanceId: "claude-code",
+        model: "anthropic/claude-sonnet-5",
+        endedAt: null,
+      },
+    });
+    // A lineage whose rounds were never recorded reads with no round at all.
+    expect(rows.find((row) => row.goalId === "goal-b")?.round).toBeNull();
+  });
+
+  test("a settled latest round carries its ending", async () => {
+    const rows = await withStore((store) =>
+      Effect.gen(function* () {
+        yield* store.seedAttempt(seed("a"));
+        yield* store.recordPlannerLineage("goal-a", "pses-a");
+        yield* store.openRound(host("target-1"), {
+          goalId: "goal-a",
+          roundId: "round-a1",
+          budget: 3,
+          harnessInstanceId: "opencode",
+          providerId: null,
+          modelId: null,
+          harnessSessionId: "pses-a",
+        });
+        yield* store.settleRound("round-a1", "interrupted", {
+          _tag: "supervisor",
+        });
+        return yield* store.plannerSessionsForTarget("target-1");
+      }),
+    );
+    expect(rows[0]?.round).toMatchObject({
+      roundId: "round-a1",
+      status: "interrupted",
+      model: null,
+    });
+    expect(rows[0]?.round?.endedAt).toBeNumber();
   });
 });

@@ -31,6 +31,7 @@ import {
 } from "@bit/contracts";
 import type {
   AgentSessionView,
+  AgentSessionsView,
   AssetView,
   AttemptTranscript,
   FolderListing,
@@ -245,8 +246,49 @@ export const agentSessionView = (
   state: "dormant",
   detail: null,
   tally: null,
+  title: null,
+  surface: { section: "goals", place: "Conversation", gone: false },
+  lastActivityAt: over.startedAt ?? AT,
+  activity: null,
+  waiting: null,
+  outcome: over.state === "live" ? null : "completed",
+  resumable: false,
+  group: over.state === "live" ? "idle" : "day:2023-11-14",
   ...over,
 });
+
+/**
+ * A page of the Agent sessions list holding exactly these rows, as one page, with each row's
+ * group counted and the tab counts read off the rows — unless a test says otherwise.
+ */
+export const agentSessionsPage = (
+  sessions: AgentSessionView[],
+  over: Partial<AgentSessionsView> = {},
+): AgentSessionsView => {
+  const groups: { key: string; count: number }[] = [];
+  for (const row of sessions) {
+    const last = groups.at(-1);
+    if (last?.key === row.group) last.count += 1;
+    else groups.push({ key: row.group, count: 1 });
+  }
+  const active = sessions.filter((row) => row.state === "live").length;
+  return {
+    sessions,
+    groups,
+    counts: {
+      active,
+      ended: sessions.length - active,
+      all: sessions.length,
+      needsYou: sessions.filter((row) => row.waiting !== null).length,
+    },
+    total: sessions.length,
+    page: 1,
+    pageSize: 25,
+    hidden: { running: 0, idle: 0, ended: 0 },
+    workersOmitted: 0,
+    ...over,
+  };
+};
 
 /** One message to the importer, accepted into a live session unless a test says otherwise. */
 export const importerTurnAccepted = (
@@ -1261,7 +1303,7 @@ export class FakeServer implements ServerClient {
 
   onAgentSessions: (
     ...args: Parameters<ServerClient["agentSessions"]>
-  ) => Answer<"agentSessions"> = () => ok({ sessions: [], workersOmitted: 0 });
+  ) => Answer<"agentSessions"> = () => ok(agentSessionsPage([]));
 
   onImporterSessions: (
     ...args: Parameters<ServerClient["importerSessions"]>

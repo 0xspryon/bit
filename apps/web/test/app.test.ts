@@ -3162,6 +3162,8 @@ describe("the live transcript's silence watchdog", () => {
     expect(clock.latest.ms).toBe(LIVE_SILENCE_LIMIT_SECONDS * 1_000);
   });
 
+  // The frames here name no session (`attemptId: null`): a session's frame also arms the
+  // Agent sessions refresh (A7 U8b), a second timer this watchdog has nothing to do with.
   test("every frame re-arms it, and only one is ever outstanding", async () => {
     const { fake, clock } = await watching();
     const first = clock.latest;
@@ -3171,7 +3173,9 @@ describe("the live transcript's silence watchdog", () => {
     expect(clock.live).toHaveLength(1);
 
     const second = clock.latest;
-    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    fake.watch.send(
+      liveItem({ id: "record:e1", sequence: 1, attemptId: null }),
+    );
     expect(second.cancelled).toBe(true);
     expect(clock.live).toHaveLength(1);
   });
@@ -3197,18 +3201,24 @@ describe("the live transcript's silence watchdog", () => {
 
   test("a duplicate frame still counts as evidence of life", async () => {
     const { app, fake, clock } = await watching();
-    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    fake.watch.send(
+      liveItem({ id: "record:e1", sequence: 1, attemptId: null }),
+    );
     const armed = clock.latest;
     // Already shown, so it changes nothing on screen — but it arrived, so the socket works.
     // A reconnect that re-read a range would otherwise look like silence.
-    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    fake.watch.send(
+      liveItem({ id: "record:e1", sequence: 1, attemptId: null }),
+    );
     expect(armed.cancelled).toBe(true);
     expect(app.liveItems).toHaveLength(1);
   });
 
   test("when it fires, the tab stops claiming to be live and says why", async () => {
     const { app, fake, clock } = await watching();
-    fake.watch.send(liveItem({ id: "record:e1", sequence: 1 }));
+    fake.watch.send(
+      liveItem({ id: "record:e1", sequence: 1, attemptId: null }),
+    );
     clock.fire();
 
     expect(app.liveWatching).toBe(false);

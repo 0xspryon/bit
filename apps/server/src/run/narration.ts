@@ -49,9 +49,11 @@
  * (`effect/src/PubSub.ts`, `subscriberCount === 0`). So the no-subscriber case this slice
  * runs in costs one function call per entry.
  */
+import type { AgentSessionActivity } from "@bit/contracts";
 import { Channel, Context, Effect, Layer, PubSub, Stream } from "effect";
 
 import type { HarnessNarration } from "../harness/agentHarness";
+import { SessionActivities } from "./sessionActivity";
 
 /**
  * How many entries are held for a subscriber that is behind.
@@ -251,6 +253,15 @@ export class RunNarrations extends Context.Service<
      * hold in practice and that is exactly the kind of thing that stops holding.
      */
     readonly subscriberCount: Effect.Effect<number>;
+    /**
+     * What one subject has been doing, summarised from what was published for it
+     * (`run/sessionActivity.ts`, A7 U8b): the Agent sessions list's second line. Read from
+     * memory, never from a harness; `undefined` for a subject nothing was published for
+     * since this process started, or one that fell out of the bounded store.
+     */
+    readonly activity: (
+      subject: NarrationSubject,
+    ) => Effect.Effect<AgentSessionActivity | undefined>;
   }
 >()("bit/run/RunNarrations") {
   static readonly layer: Layer.Layer<RunNarrations> = Layer.effect(
@@ -264,10 +275,13 @@ export class RunNarrations extends Context.Service<
       // to satisfy a diagnostic is a cast that breaks on a patch release. See `subscribe`
       // for *when* this moves, which is the part that makes it meaningful.
       let subscribers = 0;
+      // Folded at publish, whether or not anyone is subscribed: the list reads it later.
+      const activities = new SessionActivities();
       return RunNarrations.of({
         publish: (item) =>
           Effect.suspend(() => {
             published += 1;
+            activities.record(item.subject, item.entry);
             return Effect.asVoid(
               PubSub.publish(pubsub, { ...item, id: published }),
             );
@@ -308,6 +322,7 @@ export class RunNarrations extends Context.Service<
             (item) => matches(filter, item),
           ),
         subscriberCount: Effect.sync(() => subscribers),
+        activity: (subject) => Effect.sync(() => activities.get(subject)),
       });
     }),
   );
