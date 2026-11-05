@@ -2521,7 +2521,9 @@ describe("a model the catalogue does not list", () => {
     if (started._tag !== "started") throw new Error("the import did not start");
     await runtime.dispose();
     // The catalogue no longer lists what the row says: as a provider retiring a model does.
-    const database = new Database(join(built.root, "targets", TARGET, HUNT_FILE));
+    const database = new Database(
+      join(built.root, "targets", TARGET, HUNT_FILE),
+    );
     try {
       database
         .query("UPDATE import_sessions SET model = ? WHERE import_id = ?")
