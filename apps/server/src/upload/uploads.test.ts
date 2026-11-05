@@ -27,6 +27,7 @@ import { decide, PERMISSIVE_POLICY } from "../policy/service";
 import {
   classifyUpload,
   DEFAULT_UPLOAD_LIMITS,
+  inUploadsFolder,
   readStoredUpload,
   readUploadParts,
   sanitiseUploadName,
@@ -754,5 +755,67 @@ describe("serving a stored upload, against a swap and a hardlink", () => {
     const read = readStoredUpload(target, linked, 1024);
     expect(read).toMatchObject({ _tag: "refused", reason: "not_an_upload" });
     if (read._tag === "refused") expect(read.detail).toContain("2 links");
+  });
+});
+
+describe("inUploadsFolder (U13 review 5)", () => {
+  test("the same folder spelled through a link or not is the folder; another folder, or another name, is not", () => {
+    const base = mkdtempSync(join(tmpdir(), "bit-in-uploads-"));
+    try {
+      const real = join(
+        base,
+        "hunt",
+        "targets",
+        "acme",
+        "import",
+        "imp_1",
+        "uploads",
+      );
+      const other = join(
+        base,
+        "hunt",
+        "targets",
+        "acme",
+        "import",
+        "imp_2",
+        "uploads",
+      );
+      mkdirSync(real, { recursive: true });
+      mkdirSync(other, { recursive: true });
+      symlinkSync(join(base, "hunt"), join(base, "hunt-link"));
+      const linked = join(
+        base,
+        "hunt-link",
+        "targets",
+        "acme",
+        "import",
+        "imp_1",
+        "uploads",
+      );
+      const resolved = new Map<string, string | undefined>();
+      expect(
+        inUploadsFolder(join(real, "a.png"), "a.png", real, resolved),
+      ).toBe(true);
+      expect(
+        inUploadsFolder(join(linked, "a.png"), "a.png", real, resolved),
+      ).toBe(true);
+      expect(
+        inUploadsFolder(join(real, "a.png"), "a.png", linked, resolved),
+      ).toBe(true);
+      expect(
+        inUploadsFolder(join(linked, "a.png"), "b.png", real, resolved),
+      ).toBe(false);
+      expect(
+        inUploadsFolder(join(other, "a.png"), "a.png", real, resolved),
+      ).toBe(false);
+      // A folder that does not resolve is not the session's.
+      expect(
+        inUploadsFolder(join(base, "gone", "a.png"), "a.png", real, resolved),
+      ).toBe(false);
+      // One realpath per folder, however many lines name it.
+      expect(resolved.size).toBe(4);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });

@@ -73,7 +73,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-import { mimeTypeOfName, UPLOAD_NAME_PATTERN } from "../upload/uploads";
+import {
+  inUploadsFolder,
+  mimeTypeOfName,
+  UPLOAD_NAME_PATTERN,
+} from "../upload/uploads";
 
 /** One stored file, as a harness is given it. */
 export interface MessageAttachment {
@@ -824,11 +828,13 @@ export const attachmentReader = (
   replay: AttachmentReplay,
 ): AttachmentReader => {
   const seen = new Set<string>();
+  const resolved = new Map<string, string | undefined>();
   return (text, mimeOf) =>
     readBlocks(
       text,
       mimeOf === undefined ? replay : { ...replay, mimeOf },
       seen,
+      resolved,
     );
 };
 
@@ -854,6 +860,8 @@ const readBlocks = (
   text: string,
   replay: AttachmentReplay,
   seen: Set<string>,
+  /** Each folder's `realpath`, for this transcript (`inUploadsFolder`). */
+  resolved: Map<string, string | undefined>,
 ): SplitMessage => {
   const unchanged = { text, attachments: [] } as const;
   const sealing = replay.sealing;
@@ -895,19 +903,22 @@ const readBlocks = (
         name === undefined ||
         path === undefined ||
         !UPLOAD_NAME_PATTERN.test(name) ||
-        path !== join(folder, name)
+        !inUploadsFolder(path, name, folder, resolved)
       ) {
         continue;
       }
       const k = kind === "image" ? "image" : "file";
+      // In the folder's spelling now, which is the one the server serves uploads from.
+      const stored = join(folder, name);
       attachments.push({
         kind: k,
         name,
+        // The harness kept the path it was given, in the spelling it was sent in.
         mimeType: replay.mimeOf?.(path, k) ?? mimeTypeOfName(name),
-        path,
+        path: stored,
         // Sent with this message, as the seal says, and gone from `uploads/` since: drawn
         // as such rather than dropped without a word (U13 review 3).
-        ...(isStored(path) ? {} : { missing: true as const }),
+        ...(isStored(stored) ? {} : { missing: true as const }),
       });
     }
     // The next message's words: after the `\n\n` two Send nows are joined by, or straight

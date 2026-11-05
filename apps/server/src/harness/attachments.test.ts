@@ -2,6 +2,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -1058,5 +1059,147 @@ describe("the uploads folder (U13 review 4)", () => {
         },
       ],
     });
+  });
+});
+
+/*
+ * U13 review 5, finding 3: a server restarted with `HUNT_ROOT` spelled another way — the
+ * real path in place of a link to it, the same files — names each session's uploads folder
+ * differently from the paths its old blocks carry, and the exact comparison dropped every
+ * chip of every older session without a word.
+ */
+describe("a hunt root spelled another way (U13 review 5)", () => {
+  /** A real root, a link to it, and one session's uploads folder holding `shot.png`. */
+  const roots = () => {
+    const base = mkdtempSync(join(tmpdir(), "bit-respell-"));
+    const real = join(base, "hunt");
+    const link = join(base, "hunt-link");
+    const folder = (root: string) =>
+      join(root, "targets", "acme", "imports", "imp_1", "uploads");
+    mkdirSync(folder(real), { recursive: true });
+    symlinkSync(real, link);
+    writeFileSync(join(folder(real), "shot.png"), "x");
+    writeFileSync(join(folder(real), "notes.txt"), "y");
+    return { base, real: folder(real), link: folder(link) };
+  };
+  const sent = (uploads: string) =>
+    withAttachmentLines(
+      "Two files.",
+      [
+        {
+          ...file("shot.png", "image", "image/png"),
+          path: join(uploads, "shot.png"),
+        },
+        {
+          ...file("notes.txt", "file", "text/plain"),
+          path: join(uploads, "notes.txt"),
+        },
+      ],
+      { ...SEALING, uploads },
+    );
+
+  test("a block sent under the link reads under the real path, its paths in the spelling read now — and back", () => {
+    const { base, real, link } = roots();
+    try {
+      for (const [then, now] of [
+        [link, real],
+        [real, link],
+      ] as const) {
+        expect(
+          splitAttachmentLines(sent(then), {
+            uploadsFolder: now,
+            sealing: SEALING,
+          }),
+        ).toEqual({
+          text: "Two files.",
+          attachments: [
+            {
+              kind: "image",
+              name: "shot.png",
+              mimeType: "image/png",
+              path: join(now, "shot.png"),
+            },
+            {
+              kind: "file",
+              name: "notes.txt",
+              mimeType: "text/plain",
+              path: join(now, "notes.txt"),
+            },
+          ],
+        });
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("the seal is the one it was: a block sealed under the old spelling still verifies, and an edited path does not", () => {
+    const { base, real, link } = roots();
+    try {
+      const block = sent(link);
+      // Unchanged bytes: verified, so the words come back without the block.
+      expect(
+        splitAttachmentLines(block, { uploadsFolder: real, sealing: SEALING })
+          .text,
+      ).toBe("Two files.");
+      // The same block with its path respelled by hand is not bit's: the seal covers the line.
+      const edited = block.replaceAll(link, real);
+      expect(
+        splitAttachmentLines(edited, { uploadsFolder: real, sealing: SEALING })
+          .attachments,
+      ).toEqual([]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("another session's folder is still not this one's, however it resolves", () => {
+    const { base, real, link } = roots();
+    try {
+      const other = join(
+        base,
+        "hunt",
+        "targets",
+        "acme",
+        "imports",
+        "imp_2",
+        "uploads",
+      );
+      mkdirSync(other, { recursive: true });
+      writeFileSync(join(other, "shot.png"), "x");
+      expect(
+        splitAttachmentLines(sent(link), {
+          uploadsFolder: other,
+          sealing: SEALING,
+        }).attachments,
+      ).toEqual([]);
+      void real;
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("bit still refuses to vouch for a path not written in the folder's own spelling, under either spelling", () => {
+    const { base, real, link } = roots();
+    try {
+      // Each spelling vouches for its own paths…
+      expect(() => sent(link)).not.toThrow();
+      expect(() => sent(real)).not.toThrow();
+      // …and a path in the other spelling is refused: rule 1 is the sender's, and stays exact.
+      for (const [uploads, path] of [
+        [link, join(real, "shot.png")],
+        [real, join(link, "shot.png")],
+      ] as const) {
+        expect(() =>
+          withAttachmentLines(
+            "One file.",
+            [{ ...file("shot.png", "image", "image/png"), path }],
+            { ...SEALING, uploads },
+          ),
+        ).toThrow("bit vouches only for files in the session's uploads folder");
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });

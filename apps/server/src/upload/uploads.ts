@@ -40,7 +40,16 @@ import {
   writeSync,
   constants as fsConstants,
 } from "node:fs";
-import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  normalize,
+  relative,
+  sep,
+} from "node:path";
 
 import {
   MESSAGE_FIELD,
@@ -69,6 +78,48 @@ export const UPLOADS_FOLDER = "uploads";
  */
 export const uploadsFolderIn = (directory: string): string =>
   join(directory, UPLOADS_FOLDER);
+
+/**
+ * Whether `path`, as a message named it, is the file `name` in `folder` — a session's uploads
+ * folder ({@link uploadsFolderIn}) — however either is spelled (U13 review 5): equal as
+ * written, or the same folder once each side's links are resolved (`realpath`).
+ *
+ * A path is written into a message in the spelling the server's `HUNT_ROOT` had when it was
+ * sent. A server restarted with the real path in place of a link to it — the same files —
+ * names the session's folder another way, and an exact comparison then dropped every chip
+ * of every older session without a word. Here, beside {@link uploadsFolderIn}, because it
+ * is a fact about where uploads live, not about how a message marks them: a replay reads a
+ * line as a file only when its path passes this and the file is stored.
+ *
+ * Only the *folder* is resolved, never the file: a link named like an upload stays the
+ * caller's "is it stored" question (`lstat`). `resolved` keeps each folder's answer, so a
+ * caller reading a whole transcript pays one `realpath` per distinct folder.
+ *
+ * V2(chat): a spelling that no longer resolves (the link removed, the hunt root moved) still
+ * loses those chips silently. Proper V2: keep each upload's path relative to `HUNT_ROOT` in
+ * the message, so a moved root reads the same.
+ */
+export const inUploadsFolder = (
+  path: string,
+  name: string,
+  folder: string,
+  resolved: Map<string, string | undefined> = new Map(),
+): boolean => {
+  if (path === join(folder, name)) return true;
+  if (basename(path) !== name) return false;
+  const real = (at: string): string | undefined => {
+    if (!resolved.has(at)) {
+      try {
+        resolved.set(at, realpathSync(at));
+      } catch {
+        resolved.set(at, undefined);
+      }
+    }
+    return resolved.get(at);
+  };
+  const theirs = real(dirname(path));
+  return theirs !== undefined && theirs === real(folder);
+};
 
 const MiB = 1024 * 1024;
 
