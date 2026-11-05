@@ -251,7 +251,7 @@ const fakeHarness = (
       sessionId,
       text,
       delivery = { _tag: "open" as const },
-      attachments,
+      operator,
     ) =>
       options?.promptFails === true
         ? Effect.fail(
@@ -276,10 +276,10 @@ const fakeHarness = (
               ...(delivery._tag === "steer"
                 ? { urgency: delivery.urgency }
                 : {}),
-              ...(attachments === undefined || attachments.length === 0
+              ...(operator === undefined || operator.attachments.length === 0
                 ? {}
                 : {
-                    attachments: attachments.map(
+                    attachments: operator.attachments.map(
                       (file) => [file.kind, file.name, file.path] as const,
                     ),
                   }),

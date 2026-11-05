@@ -16,6 +16,11 @@
    * **The path is what is copied**, because it is what the agent was told: an operator
    * pointing the agent at "the second screenshot" again, or at it from a shell, needs the
    * path, not the bytes.
+   *
+   * **A file no longer stored** (`missing`, U13 review 3: moved aside or deleted since the
+   * message was sent) keeps its chip, so the turn still says what it carried, and says it is
+   * gone: no open, no thumbnail, and the path still copies, since it is what the agent was
+   * told.
    */
   import type { MessageAttachmentView } from "@bit/contracts";
 
@@ -36,7 +41,12 @@
     new Blob([bytes as Uint8Array<ArrayBuffer>], { type });
 
   $effect(() => {
-    if (attachment.kind !== "image" || load === undefined) return;
+    if (
+      attachment.kind !== "image" ||
+      attachment.missing === true ||
+      load === undefined
+    )
+      return;
     const type = openableType(attachment.mimeType);
     if (type === undefined || !type.startsWith("image/")) return;
     let url: string | undefined;
@@ -93,25 +103,43 @@
   }
 </script>
 
-<li class={["attachment", `attachment-${attachment.kind}`]}>
-  <button
-    class="open"
-    type="button"
-    title={unavailable === undefined
-      ? `Open ${attachment.name}`
-      : `${attachment.name} is not available: ${unavailable}`}
-    disabled={load === undefined}
-    onclick={() => void open()}
-  >
-    {#if thumbnail !== undefined}
-      <img class="thumb" src={thumbnail} alt="" />
-    {:else}
+<li
+  class={[
+    "attachment",
+    `attachment-${attachment.kind}`,
+    attachment.missing === true && "attachment-missing",
+  ]}
+>
+  {#if attachment.missing === true}
+    <span class="gone" title={`${attachment.name} is no longer stored`}>
       <span class="glyph" aria-hidden="true"
         ><IconFile width="14" height="14" /></span
       >
-    {/if}
-    <span class="name">{attachment.name}</span>
-  </button>
+      <span class="label">
+        <span class="name">{attachment.name}</span>
+        <span class="note">no longer stored</span>
+      </span>
+    </span>
+  {:else}
+    <button
+      class="open"
+      type="button"
+      title={unavailable === undefined
+        ? `Open ${attachment.name}`
+        : `${attachment.name} is not available: ${unavailable}`}
+      disabled={load === undefined}
+      onclick={() => void open()}
+    >
+      {#if thumbnail !== undefined}
+        <img class="thumb" src={thumbnail} alt="" />
+      {:else}
+        <span class="glyph" aria-hidden="true"
+          ><IconFile width="14" height="14" /></span
+        >
+      {/if}
+      <span class="name">{attachment.name}</span>
+    </button>
+  {/if}
   <CopyButton
     text={attachment.path}
     label={`Copy the path of ${attachment.name}`}
@@ -177,6 +205,30 @@
     border-radius: 5px;
     background: var(--bg-layer-02);
     color: var(--icon-muted);
+  }
+  .gone {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: 7px;
+    padding: 0 2px 0 0;
+    color: var(--text-muted);
+    font: 400 12px/16px var(--font-sans);
+  }
+  .gone .glyph {
+    color: var(--icon-faint);
+  }
+  .label {
+    display: inline-flex;
+    min-width: 0;
+    flex-direction: column;
+  }
+  .note {
+    font-size: 11px;
+    line-height: 14px;
+  }
+  .attachment-missing {
+    border-style: dashed;
   }
   .name {
     min-width: 0;

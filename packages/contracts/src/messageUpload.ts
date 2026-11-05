@@ -95,6 +95,11 @@ export const MessageAttachmentView = Schema.Struct({
   mimeType: Schema.String,
   /** The absolute path it is saved at, for the chip's copy-path button. */
   path: Schema.String,
+  /**
+   * Present on a replayed message whose file is no longer stored — moved aside or deleted
+   * since it was sent (U13 review 3). The chip says so and offers no open.
+   */
+  missing: Schema.optionalKey(Schema.Literal(true)),
 });
 export type MessageAttachmentView = typeof MessageAttachmentView.Type;
 

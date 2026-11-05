@@ -517,7 +517,7 @@ const scriptedHarness = (script: Script) => {
       _sessionId,
       text,
       delivery = { _tag: "open" as const },
-      attachments,
+      operator,
     ) =>
       delivery._tag === "steer"
         ? script.failSteer
@@ -533,7 +533,7 @@ const scriptedHarness = (script: Script) => {
           : Effect.sync(() => {
               script.prompts.push(text);
               script.deliveries.push(delivery);
-              script.attachments.push(attachments);
+              script.attachments.push(operator?.attachments);
               const registration = script.registrations.at(-1);
               const onSteer = script.onSteer;
               if (registration !== undefined && onSteer !== undefined) {
@@ -558,7 +558,7 @@ const scriptedHarness = (script: Script) => {
           : Effect.sync(() => {
               script.prompts.push(text);
               script.deliveries.push(delivery);
-              script.attachments.push(attachments);
+              script.attachments.push(operator?.attachments);
               const registration = script.registrations.at(-1);
               if (registration === undefined) return { delivered: true };
               const url = registration.url;

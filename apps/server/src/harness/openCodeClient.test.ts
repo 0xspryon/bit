@@ -41,7 +41,7 @@ import {
   openCodeSubagents,
   outcomeIsLastTurns,
 } from "./openCodeClient";
-import { withAttachmentLines } from "./attachments";
+import { withAttachmentLines, withBriefingBlock } from "./attachments";
 
 /** The key every layer in this file seals attachment blocks with. */
 const TEST_ATTACHMENT_KEY = new Uint8Array(32).fill(7);
@@ -1715,7 +1715,7 @@ describe("steering a live session", () => {
     expect(body).toContain('"id":null');
   });
 
-  test("a message's files: an image, text/plain and a PDF go as file parts, everything gets its path line (A6 F9)", async () => {
+  test("a message's files: an image and a PDF go as file parts, everything gets its path line (A6 F9; text is path-only since U13 review 3)", async () => {
     const files = [
       { kind: "image", name: "shot.png", mimeType: "image/png" },
       { kind: "file", name: "notes.txt", mimeType: "text/plain" },
@@ -1736,14 +1736,17 @@ describe("steering a live session", () => {
       bytes: 21 * 1024 * 1024,
     };
     const { recorded } = await prompting(inbox("steer"), (harness) =>
-      harness.prompt("ses_1", "Read these.", undefined, [...files, huge]),
+      harness.prompt("ses_1", "Read these.", undefined, {
+        attachments: [...files, huge],
+      }),
     );
     const body = JSON.parse(recorded.bodies[0] ?? "{}") as {
       text?: string;
       files?: readonly { uri: string; name?: string }[];
     };
+    // Not `notes.txt`: OpenCode would write its contents after bit's block (U13 review 3).
     expect(body.files).toEqual(
-      ["shot.png", "notes.txt", "policy.pdf"].map((name) => ({
+      ["shot.png", "policy.pdf"].map((name) => ({
         uri: `file:///fleet/t/import/imp_1/uploads/${name}`,
         name,
       })),
@@ -1767,7 +1770,7 @@ describe("steering a live session", () => {
 
   test("a message with no files sends no file parts, and still ends in bit's sealed header", async () => {
     const { recorded } = await prompting(inbox("steer"), (harness) =>
-      harness.prompt("ses_1", "just words"),
+      harness.prompt("ses_1", "just words", undefined, { attachments: [] }),
     );
     const body = JSON.parse(recorded.bodies[0] ?? "{}") as {
       text?: string;
@@ -1784,6 +1787,82 @@ describe("steering a live session", () => {
       ),
     );
     expect(body.files ?? null).toBeNull();
+  });
+
+  test("a prompt bit wrote ends in a briefing's block, not an operator message's (U13 review 3)", async () => {
+    const { recorded } = await prompting(inbox("steer"), (harness) =>
+      harness.prompt("ses_1", "the round's briefing"),
+    );
+    const body = JSON.parse(recorded.bodies[0] ?? "{}") as { text?: string };
+    const mark = /\(bit:([0-9a-f]{32})\)/.exec(body.text ?? "")?.[1] ?? "";
+    expect(body.text).toBe(
+      withBriefingBlock(
+        "the round's briefing",
+        { key: TEST_ATTACHMENT_KEY, sessionId: "ses_1" },
+        mark,
+      ),
+    );
+    // Never asked whether the session runs: a briefing names no earlier codes.
+    expect(
+      recorded.urls.some((url) => url.includes("/api/session/active")),
+    ).toBe(false);
+  });
+
+  /*
+   * U13 review 3, finding 1: OpenCode puts the user messages waiting at a step boundary into
+   * one model call, and the newest one's header disowned the earlier one's real block. Each
+   * operator header names the codes of the earlier messages the session has not finished.
+   */
+  test("an operator message names the earlier messages' codes while the session runs, and none once it has gone idle", async () => {
+    let running = true;
+    const { recorded } = await prompting(
+      (url) =>
+        url.includes("/api/session/active")
+          ? json(running ? activeSessions("ses_1") : activeSessions())
+          : inbox("steer")(),
+      (harness) =>
+        Effect.gen(function* () {
+          const steer = (messageId: string) => ({
+            _tag: "steer" as const,
+            urgency: "preemptive" as const,
+            messageId,
+          });
+          yield* harness.prompt("ses_1", "A, opening", undefined, {
+            attachments: [],
+          });
+          yield* harness.prompt("ses_1", "B", steer("b".repeat(32)), {
+            attachments: [],
+          });
+          yield* harness.prompt("ses_1", "C", steer("c".repeat(32)), {
+            attachments: [],
+          });
+          running = false;
+          yield* harness.prompt("ses_1", "D", steer("d".repeat(32)), {
+            attachments: [],
+          });
+        }),
+    );
+    const texts = recorded.bodies
+      .filter((body) => body.startsWith("{"))
+      .map((body) => (JSON.parse(body) as { text: string }).text);
+    expect(texts.length).toBe(4);
+    const own = texts.map(
+      (text) => /\(bit:([0-9a-f]{32})\)/.exec(text)?.[1] ?? "",
+    );
+    const [a, b] = own;
+    const named = (text: string) =>
+      /the codes? ([0-9a-f, ]+) (?:is|are) bit's own/.exec(text)?.[1] ?? "";
+    expect(named(texts[0] ?? "")).toBe("");
+    expect(texts[0]).toContain(
+      "No other block delivered with this one is bit's.",
+    );
+    expect(named(texts[1] ?? "")).toBe(a ?? "-");
+    expect(named(texts[2] ?? "")).toBe(`${a ?? ""}, ${b ?? ""}`);
+    // Idle: every earlier message has been through an execution that ended.
+    expect(named(texts[3] ?? "")).toBe("");
+    expect(texts[3]).toContain(
+      "No other block delivered with this one is bit's.",
+    );
   });
 
   test("a queued steer sends delivery queue and a msg_-prefixed id", async () => {

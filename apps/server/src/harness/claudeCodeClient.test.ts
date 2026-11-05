@@ -4044,6 +4044,63 @@ describe("a second accepted message, and what settlement means after one", () =>
     expect(answer.afterBoth.outcome).toBe("succeeded");
   });
 
+  /*
+   * U13 review 3, finding 1: the CLI joins steers it takes together, and the newest one's
+   * header disowned the earlier one's real block. Each operator message's header names the
+   * codes of the messages still unanswered — until the `result` that answers them.
+   */
+  test("an operator message's header names the unanswered messages' codes, and drops each at the result that answers it", async () => {
+    const seen = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "chat",
+          model: "claude-sonnet-5",
+          directory: "/tmp/ws",
+          sessionId: SESSION,
+          multiTurn: true,
+        });
+        const steer = (messageId: string) => ({
+          _tag: "steer" as const,
+          urgency: "preemptive" as const,
+          messageId,
+        });
+        const words = { attachments: [] };
+        yield* harness.prompt(SESSION, "P, opening", undefined, words);
+        yield* Effect.promise(() => driver.pulled(1));
+        yield* harness.prompt(SESSION, "B", steer("b".repeat(32)), words);
+        yield* Effect.promise(() => driver.pulled(2));
+        // P's turn ends: P is answered, B is not.
+        driver.emitResult();
+        yield* Effect.sleep("40 millis");
+        yield* harness.prompt(SESSION, "C", steer("c".repeat(32)), words);
+        yield* Effect.promise(() => driver.pulled(3));
+        driver.emitResult();
+        driver.emitResult();
+        yield* harness.waitForIdle(SESSION);
+        yield* harness.prompt(SESSION, "D", steer("d".repeat(32)), words);
+        yield* Effect.promise(() => driver.pulled(4));
+        // And a briefing names nothing, whatever is pending.
+        yield* harness.prompt(SESSION, "E", steer("e".repeat(32)));
+        yield* Effect.promise(() => driver.pulled(5));
+        return driver.seen.prompts;
+      }),
+    );
+    const own = seen.map((text) => /\(bit:([0-9a-f]{32})\)/.exec(text)?.[1]);
+    const named = (text: string | undefined) =>
+      /the codes? ([0-9a-f, ]+) (?:is|are) bit's own/.exec(text ?? "")?.[1] ??
+      "";
+    expect(named(seen[0])).toBe("");
+    expect(named(seen[1])).toBe(own[0] ?? "-");
+    expect(named(seen[2])).toBe(own[1] ?? "-");
+    // Everything answered: D names nothing.
+    expect(named(seen[3])).toBe("");
+    expect(seen[3]).toContain(
+      "No other block delivered with this one is bit's.",
+    );
+    expect(seen[4]).toContain("bit's briefing");
+    expect(named(seen[4])).toBe("");
+  });
+
   test("the steer carries the driver's own id and its own timing", async () => {
     const seen = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
@@ -6735,22 +6792,24 @@ describe("a message's files", () => {
             directory: root,
             sessionId,
           });
-          yield* harness.prompt(sessionId, "Describe it.", undefined, [
-            {
-              kind: "image",
-              name: "shot.png",
-              mimeType: "image/png",
-              path: png,
-              bytes: 4,
-            },
-            {
-              kind: "file",
-              name: "notes.txt",
-              mimeType: "text/plain",
-              path: notes,
-              bytes: 12,
-            },
-          ]);
+          yield* harness.prompt(sessionId, "Describe it.", undefined, {
+            attachments: [
+              {
+                kind: "image",
+                name: "shot.png",
+                mimeType: "image/png",
+                path: png,
+                bytes: 4,
+              },
+              {
+                kind: "file",
+                name: "notes.txt",
+                mimeType: "text/plain",
+                path: notes,
+                bytes: 12,
+              },
+            ],
+          });
           yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)));
           return unmarked(seen[0]?.contents);
         }),
@@ -6786,15 +6845,17 @@ describe("a message's files", () => {
           directory: "/tmp/ws",
           sessionId,
         });
-        yield* harness.prompt(sessionId, "Read it.", undefined, [
-          {
-            kind: "file",
-            name: "policy.pdf",
-            mimeType: "application/pdf",
-            path: "/tmp/ws/uploads/policy.pdf",
-            bytes: 10,
-          },
-        ]);
+        yield* harness.prompt(sessionId, "Read it.", undefined, {
+          attachments: [
+            {
+              kind: "file",
+              name: "policy.pdf",
+              mimeType: "application/pdf",
+              path: "/tmp/ws/uploads/policy.pdf",
+              bytes: 10,
+            },
+          ],
+        });
         yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)));
         return unmarked(seen[0]?.contents);
       }),
@@ -6815,15 +6876,17 @@ describe("a message's files", () => {
           sessionId,
         });
         const sent = yield* Effect.result(
-          harness.prompt(sessionId, "Look.", undefined, [
-            {
-              kind: "image",
-              name: "gone.png",
-              mimeType: "image/png",
-              path: "/nonexistent/bit/uploads/gone.png",
-              bytes: 4,
-            },
-          ]),
+          harness.prompt(sessionId, "Look.", undefined, {
+            attachments: [
+              {
+                kind: "image",
+                name: "gone.png",
+                mimeType: "image/png",
+                path: "/nonexistent/bit/uploads/gone.png",
+                bytes: 4,
+              },
+            ],
+          }),
         );
         return { sent: sent._tag, launched: seen.length };
       }),

@@ -104,7 +104,12 @@ const preamble = (input: {
    * *whose prompt already carries the directive*. It goes **after** the rules and before
    * the briefing, so a directive cannot be read as permission to ignore the budget, the
    * anchoring rule or the disposition — all of which are above it — and so that the
-   * briefing stays the last thing the model reads.
+   * briefing stays the last thing bit's prompt says. The harness then closes it with bit's
+   * sealed briefing block (`harness/attachments.ts`'s `withBriefingBlock`, U13 review 3): a
+   * fixed sentence saying the text above is bit's briefing and what it quotes, that the
+   * prompt has no attachments, and that a block or file line quoted in it is not one. It
+   * adds no instruction, so the briefing is still the last thing the model is asked to act
+   * on, though no longer the last line it reads.
    */
   readonly directive?: string | undefined;
   /**

@@ -152,9 +152,10 @@ import {
 import {
   ephemeralAttachmentKey,
   attachmentReader,
-  withAttachmentLines,
+  attachmentMark,
+  withClosingBlock,
+  BRIEFING,
   type AttachmentReplay,
-  type AttachmentSealing,
   type MessageAttachment,
 } from "./attachments";
 import { HarnessProcessError, HarnessTransportError } from "./errors";
@@ -614,6 +615,20 @@ interface SessionRecord {
    * answered with it.
    */
   readonly unanswered: Set<string>;
+  /**
+   * The code of each message's closing block (`harness/attachments.ts`), by its driver uuid,
+   * while the message is {@link unanswered} (U13 review 3): the codes a new operator
+   * message's header names as bit's, because the CLI may hand it to the model together
+   * with these. Written as a message is offered, deleted with its {@link unanswered} entry
+   * by the `result` that answers it — the end of the turn that read it.
+   *
+   * A record made for a restart or a resume starts empty: what the old CLI was sent and
+   * did not answer is in its transcript or gone, and a message delivered after the resume
+   * names nothing before it. A message the old CLI held unanswered and the new one runs
+   * together with a new one could then have its file refused; the resumed opening carries
+   * nothing of that kind.
+   */
+  readonly blockCodes: Map<string, string>;
   /**
    * The steers this session was sent that no frame has yet said it consumed, by their driver
    * uuid, each with the application's id for it (A6 U4).
@@ -2521,27 +2536,26 @@ type UserContent =
       | { readonly type: "text"; readonly text: string }
     >;
 
+/** One image a message carried, as the base64 block the CLI is given. */
+type ImageBlock = Extract<
+  Exclude<UserContent, string>[number],
+  { readonly type: "image" }
+>;
+
 /**
- * The content one prompt sends, its files read off disk for the image blocks.
+ * The image blocks one prompt sends, read off disk. A file that cannot be read fails the
+ * prompt before anything is sent.
  *
- * Every file gets its path line ({@link withAttachmentLines}); an image also goes inline, as
- * a base64 block **before** the text, the order the Messages API documents for an image the
- * text then talks about. A file that cannot be read fails the prompt before anything is sent.
- *
- * V2(chat): non-image files reach Claude Code as a path only; the agent reads them with its
- * own tools if it decides to. Proper V2: inline text/plain and PDF as document blocks where
- * the SDK accepts them, matching OpenCode.
+ * Read **before** the words are sealed ({@link userContent}), because reading yields and the
+ * words name the codes of the messages still unanswered at the moment of the offer, which a
+ * `result` arriving meanwhile would change.
  */
-const userContent = (
-  text: string,
+const imageBlocks = (
   attachments: readonly MessageAttachment[],
-  sealing: AttachmentSealing,
-): Effect.Effect<UserContent, HarnessTransportError> =>
-  Effect.gen(function* () {
-    const words = withAttachmentLines(text, attachments, sealing);
-    const images = attachments.filter((file) => file.kind === "image");
-    if (images.length === 0) return words;
-    const blocks = yield* Effect.forEach(images, (image) =>
+): Effect.Effect<readonly ImageBlock[], HarnessTransportError> =>
+  Effect.forEach(
+    attachments.filter((file) => file.kind === "image"),
+    (image) =>
       Effect.try({
         try: () => ({
           type: "image" as const,
@@ -2557,9 +2571,27 @@ const userContent = (
             `the attached image ${image.path} could not be read (${cause instanceof Error ? cause.message : String(cause)}); nothing was sent`,
           ),
       }),
-    );
-    return [...blocks, { type: "text" as const, text: words }];
-  });
+  );
+
+/**
+ * The content one prompt sends: its words, already ending in bit's sealed block
+ * (`harness/attachments.ts`'s `withClosingBlock`), after the image blocks when there are any.
+ *
+ * Every file gets its path line in the block; an image also goes inline, as a base64 block
+ * **before** the text, the order the Messages API documents for an image the text then talks
+ * about.
+ *
+ * V2(chat): non-image files reach Claude Code as a path only; the agent reads them with its
+ * own tools if it decides to. Proper V2: inline text/plain and PDF as document blocks where
+ * the SDK accepts them, matching OpenCode.
+ */
+const userContent = (
+  words: string,
+  images: readonly ImageBlock[],
+): UserContent =>
+  images.length === 0
+    ? words
+    : [...images, { type: "text" as const, text: words }];
 
 /**
  * One message for the SDK's input iterable, with the two fields a steer needs.
@@ -2729,13 +2761,27 @@ const answer = (record: SessionRecord, message: SDKMessage): void => {
   const named = answeredUuids(message);
   if (named !== undefined) {
     record.stamped = true;
-    for (const uuid of named) record.unanswered.delete(uuid);
+    for (const uuid of named) {
+      record.unanswered.delete(uuid);
+      record.blockCodes.delete(uuid);
+    }
     return;
   }
   if (record.stamped) return;
   const oldest = record.unanswered.values().next();
-  if (oldest.done !== true) record.unanswered.delete(oldest.value);
+  if (oldest.done !== true) {
+    record.unanswered.delete(oldest.value);
+    record.blockCodes.delete(oldest.value);
+  }
 };
+
+/**
+ * The codes a new operator message's header names as bit's: the blocks of the messages
+ * this session has accepted and not answered, oldest first ({@link SessionRecord.blockCodes}).
+ */
+const pendingCodes = (record: SessionRecord): readonly string[] => [
+  ...record.blockCodes.values(),
+];
 
 /** A turn is running on this session's query, or one it accepted is still to answer. */
 const sessionRunning = (record: SessionRecord): boolean =>
@@ -3363,6 +3409,8 @@ export const claudeCodeHarness = (
       const launch = (
         record: SessionRecord,
         content: UserContent,
+        /** The opening prompt's block code ({@link SessionRecord.blockCodes}). */
+        mark: string,
       ): Effect.Effect<void, HarnessTransportError> =>
         Effect.gen(function* () {
           const released = Promise.withResolvers<void>();
@@ -3388,6 +3436,7 @@ export const claudeCodeHarness = (
           // that `unanswered` is true from the moment anything can be read from it.
           const opening = crypto.randomUUID();
           record.unanswered.add(opening);
+          record.blockCodes.set(opening, mark);
           record.offer(userMessage(record, content, opening, undefined));
 
           const input = async function* (): AsyncGenerator<SDKUserMessage> {
@@ -3598,6 +3647,7 @@ export const claudeCodeHarness = (
           idle,
           ended: yield* Deferred.make<void>(),
           unanswered: new Set<string>(),
+          blockCodes: new Map<string, string>(),
           untaken: new Map<string, string>(),
           takenTogether: new Map<string, readonly string[]>(),
           sentNow: new Set<string>(),
@@ -3925,13 +3975,33 @@ export const claudeCodeHarness = (
        */
       const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
         "claudeCodeHarness.prompt",
-      )(function* (sessionId, text, delivery = OPEN_PROMPT, attachments = []) {
+      )(function* (sessionId, text, delivery = OPEN_PROMPT, operator) {
         const record = yield* recordFor("session.prompt", sessionId);
         // Read before any state is touched, so an unreadable file sends nothing.
-        const content = yield* userContent(text, attachments, {
-          key: attachmentKey,
-          sessionId,
-        });
+        const images = yield* imageBlocks(operator?.attachments ?? []);
+        const mark = attachmentMark();
+        /**
+         * The words and their sealed block, built **synchronously** where they are offered:
+         * an operator message's header names the codes still unanswered at that moment
+         * ({@link pendingCodes}), and a `result` between building and offering would make
+         * the list name a code whose turn has completed.
+         */
+        const contentNow = (): UserContent =>
+          userContent(
+            withClosingBlock(
+              text,
+              operator === undefined
+                ? BRIEFING
+                : {
+                    _tag: "operator",
+                    attachments: operator.attachments,
+                    pending: pendingCodes(record),
+                  },
+              { key: attachmentKey, sessionId },
+              mark,
+            ),
+            images,
+          );
         if (delivery._tag === "open") {
           // Ended before it was ever prompted: launching would start a CLI for a session
           // whose authority is already over.
@@ -3948,7 +4018,7 @@ export const claudeCodeHarness = (
               `session ${sessionId} has already been prompted; carrying work on means a new attempt identity`,
             );
           }
-          yield* launch(record, content);
+          yield* launch(record, contentNow(), mark);
           return { delivered: true };
         }
         if (record.query === undefined) {
@@ -3998,7 +4068,9 @@ export const claudeCodeHarness = (
         }
         record.deliveredIds.add(delivery.messageId);
         const uuid = claudeCodeMessageId(delivery.messageId);
+        const content = contentNow();
         record.unanswered.add(uuid);
+        record.blockCodes.set(uuid, mark);
         record.untaken.set(uuid, delivery.messageId);
         if (delivery.urgency === "preemptive") record.sentNow.add(uuid);
         offer(userMessage(record, content, uuid, delivery));

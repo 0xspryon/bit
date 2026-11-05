@@ -980,6 +980,14 @@ export type PromptDelivery =
 /** The default for every existing caller: one session, one prompt, never resubmitted. */
 export const OPEN_PROMPT: PromptDelivery = { _tag: "open" };
 
+/**
+ * A prompt the operator wrote, and the files it carried, already stored in the session's own
+ * working directory (A6 F9). See {@link AgentHarness}'s `prompt`.
+ */
+export interface OperatorMessage {
+  readonly attachments: readonly MessageAttachment[];
+}
+
 /** What a harness says about a prompt it took. */
 export interface PromptAccepted {
   /**
@@ -1303,15 +1311,21 @@ export class AgentHarness extends Context.Service<
       text: string,
       delivery?: PromptDelivery,
       /**
-       * The files this message carried, already stored in the session's own working
-       * directory (A6 F9). Every implementation ends `text` with bit's sealed block
-       * (`withAttachmentLines`) — one line per file, and the header alone when there are
-       * none (U13 review 2), so a block imitated in the text is never the last one the agent
-       * reads — and gives inline what its harness takes inline: Claude Code an image block
-       * per image, OpenCode a file part per image, `text/plain` or PDF
-       * (`harness/attachments.ts`). A replay takes the block off again.
+       * Present when `text` is a message from the operator — a chat message, in the
+       * importer or a goal conversation — with the files it carried; absent when bit wrote
+       * it — a run's task, a planner round, a goal agent's steer into one (U13 review 3).
+       *
+       * Every implementation ends `text` with bit's sealed block (`harness/attachments.ts`),
+       * whose header is chosen by this and not by whether there are files: an operator
+       * message's lists its files (or says it has none) and names the codes of the
+       * session's earlier messages the harness has not answered yet, which the driver keeps
+       * from delivery to the end of the turn that reads them, because a harness may hand
+       * several to the model at once; a briefing's says the text above is bit's and what it
+       * quotes. Each implementation also gives inline what its harness takes inline: Claude
+       * Code an image block per image, OpenCode a file part per image or PDF. A replay takes
+       * the block off again.
        */
-      attachments?: readonly MessageAttachment[],
+      operator?: OperatorMessage,
     ) => Effect.Effect<PromptAccepted, HarnessFailure>;
     /**
      * Blocks until the session is no longer running.

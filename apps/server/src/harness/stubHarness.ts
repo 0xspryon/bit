@@ -136,7 +136,10 @@ export interface RecordedPrompt {
   readonly text: string;
   /** Verbatim, `undefined` included: an omitted delivery is the seam's `open` default. */
   readonly delivery: PromptDelivery | undefined;
-  /** The files it carried (A6 F9), `undefined` when the caller passed none. */
+  /**
+   * The files it carried (A6 F9) when the operator wrote it; `undefined` when bit did (a
+   * briefing, U13 review 3), which the seam says by passing no `operator`.
+   */
   readonly attachments: readonly MessageAttachment[] | undefined;
 }
 
@@ -154,9 +157,14 @@ export const recordPrompts = (): {
   const prompts: RecordedPrompt[] = [];
   return {
     prompts,
-    prompt: (sessionId, text, delivery, attachments) =>
+    prompt: (sessionId, text, delivery, operator) =>
       Effect.sync(() => {
-        prompts.push({ sessionId, text, delivery, attachments });
+        prompts.push({
+          sessionId,
+          text,
+          delivery,
+          attachments: operator?.attachments,
+        });
         return { delivered: true };
       }),
   };

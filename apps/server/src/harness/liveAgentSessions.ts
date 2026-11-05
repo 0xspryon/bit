@@ -1130,7 +1130,9 @@ export const makeLiveAgentSessions = <Meta>(
                       entry.sessionId,
                       plan.openingPrompt(entry),
                       OPEN_PROMPT,
-                      opened.success.attachments,
+                      // The operator's first message, inside the framing: an operator
+                      // message's block (U13 review 3), not a briefing's.
+                      { attachments: opened.success.attachments },
                     ),
                   );
                   if (prompted._tag === "Failure") {
@@ -1220,7 +1222,7 @@ export const makeLiveAgentSessions = <Meta>(
               urgency,
               messageId,
             },
-            attachments,
+            { attachments },
           ),
         );
         if (accepted._tag === "Failure") {

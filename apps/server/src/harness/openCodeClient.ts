@@ -114,7 +114,10 @@ import {
   inlinesOnOpenCode,
   ephemeralAttachmentKey,
   attachmentReader,
-  withAttachmentLines,
+  attachmentMark,
+  withClosingBlock,
+  BRIEFING,
+  PENDING_CODES_MAX,
   type AttachmentReader,
 } from "./attachments";
 import { isDerivedMessageId, openCodeMessageId } from "./messageId";
@@ -1969,6 +1972,30 @@ export const openCodeHarness = (
       const delivered = new Map<string, Set<string>>();
 
       /**
+       * The codes of each session's closing blocks (`harness/attachments.ts`) that its
+       * execution may not have read yet, oldest first, the newest
+       * {@link PENDING_CODES_MAX} (U13 review 3): what a new operator message's header names
+       * as bit's, because OpenCode puts the user messages waiting at a step boundary into
+       * one model call, and the model reads them as one message.
+       *
+       * **Emptied by asking, not by watching.** This driver holds no live-session state
+       * and no event stream of its own (see `prompt`), so before an operator message is
+       * sent the session is looked for in `session.active`: absent, nothing is executing,
+       * and every message admitted before has been through an execution that ended —
+       * OpenCode's coordinator registers an execution in the same step that admits a
+       * prompt (`execution.wake` after `admission.admit`) and keeps it until its inbox
+       * drains, a successor starting in the same step as it settles
+       * (`run-coordinator.ts`, read 2026-11-05). Present, the list stands. A Stop cancels
+       * the inbox (`interruptSession`), so nothing held survives into the next execution.
+       * The read is one loopback GET; if it fails the list stands, which only vouches for
+       * blocks bit did send.
+       *
+       * After a restart this is empty: a message sent before it and still unread would not
+       * be named. Per process, like {@link delivered}.
+       */
+      const pendingBlocks = new Map<string, readonly string[]>();
+
+      /**
        * Gives a session its opening prompt, or a second message into a live one.
        *
        * ## What a steer does here, and the one thing this driver cannot tell us
@@ -1993,31 +2020,61 @@ export const openCodeHarness = (
        */
       const prompt: AgentHarness["Service"]["prompt"] = Effect.fn(
         "openCodeHarness.prompt",
-      )(function* (sessionId, text, delivery = OPEN_PROMPT, attachments = []) {
+      )(function* (sessionId, text, delivery = OPEN_PROMPT, operator) {
         /*
-         * The files (A6 F9): a path line each on the text, and an image, `text/plain` or PDF
-         * also as a file part, which OpenCode reads off disk itself (a `file://` uri, its
-         * own composer's form) and stores in the message with its type.
+         * The files (A6 F9): a path line each on the text, and an image or PDF also as a
+         * file part, which OpenCode reads off disk itself (a `file://` uri, its own
+         * composer's form) and stores in the message with its type.
          */
-        const files = attachments.filter(inlinesOnOpenCode).map((file) => ({
-          uri: pathToFileURL(file.path).href,
-          name: file.name,
-        }));
+        const files = (operator?.attachments ?? [])
+          .filter(inlinesOnOpenCode)
+          .map((file) => ({
+            uri: pathToFileURL(file.path).href,
+            name: file.name,
+          }));
         if (delivery._tag === "steer") {
           const sent = delivered.get(sessionId) ?? new Set<string>();
           if (sent.has(delivery.messageId)) return { delivered: false };
           sent.add(delivery.messageId);
           delivered.set(sessionId, sent);
         }
+        const mark = attachmentMark();
+        let pending: readonly string[] = [];
+        if (operator !== undefined && delivery._tag === "steer") {
+          const active = yield* Effect.result(
+            bounded("session.active", timeouts.control, api.session.active()),
+          );
+          pending =
+            active._tag === "Success" &&
+            !Object.hasOwn(active.success, sessionId)
+              ? []
+              : (pendingBlocks.get(sessionId) ?? []);
+        }
+        // Named before it is sent: a prompt whose answer is lost may still have landed,
+        // and naming a code nobody else knows vouches for nothing but bit's own block.
+        if (operator !== undefined) {
+          pendingBlocks.set(
+            sessionId,
+            [...pending, mark].slice(-PENDING_CODES_MAX),
+          );
+        }
         yield* bounded(
           "session.prompt",
           timeouts.control,
           api.session.prompt({
             sessionID: sessionId as Session.ID,
-            text: withAttachmentLines(text, attachments, {
-              key: attachmentKey,
-              sessionId,
-            }),
+            text: withClosingBlock(
+              text,
+              operator === undefined
+                ? BRIEFING
+                : {
+                    _tag: "operator",
+                    attachments: operator.attachments,
+                    pending,
+                  },
+              { key: attachmentKey, sessionId },
+              mark,
+            ),
             ...(files.length === 0 ? {} : { files }),
             // Spread rather than passed as `undefined` for `parentID`'s reason: an absent
             // field is the server's own default, and the opening prompt deliberately takes

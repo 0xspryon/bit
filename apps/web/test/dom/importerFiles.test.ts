@@ -394,6 +394,49 @@ describe("files in the importer's composer (A6 U13)", () => {
     );
   });
 
+  test("after a reload, a file no longer stored keeps its chip, says so, and offers only its path (U13 review 3)", async () => {
+    const fake = server();
+    const gone = { ...STORED, missing: true as const };
+    fake.onImporterSessions = () => ok({ sessions: [importerSessionView()] });
+    fake.onImporterMessages = (_baseUrl, targetId, importId) =>
+      ok(
+        importerConversationView({
+          targetId,
+          importId,
+          items: [
+            replayItem(0, "turn.operator", "What does this show?", {
+              importId,
+              attachments: [gone],
+            }),
+            replayItem(1, "turn.reply", "A login form.", { importId }),
+          ],
+        }),
+      );
+    const app = await load(fake);
+    app.openImporter();
+    await settle();
+    app.importer.open("ses_1");
+    await settle();
+    await settle();
+    const chip = document.querySelector(".you .attachments .attachment");
+    expect(chip?.textContent).toContain("shot.png");
+    expect(chip?.textContent).toContain("no longer stored");
+    expect(chip?.classList.contains("attachment-missing")).toBe(true);
+    // Nothing to open, and its bytes are never asked for: no thumbnail of a file not there.
+    expect(chip?.querySelector("button.open")).toBeNull();
+    expect(chip?.querySelector("img")).toBeNull();
+    expect(
+      fake.calls.some(
+        (each) =>
+          each.method === "uploadedFile" && each.args[2] === STORED.path,
+      ),
+    ).toBe(false);
+    // The path still copies: it is what the agent was told.
+    expect(
+      chip?.querySelector('[aria-label="Copy the path of shot.png"]'),
+    ).not.toBeNull();
+  });
+
   test("after a reload, the replayed message's files are chips again, their thumbnails from the server", async () => {
     const fake = server();
     fake.onImporterSessions = () => ok({ sessions: [importerSessionView()] });
