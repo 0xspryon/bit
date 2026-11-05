@@ -146,14 +146,24 @@ describe("the crumb bar's context meter (A6 U9)", () => {
       },
     ];
     const fresh = crumbMeter(
-      held({}, { categories: { rows, measuredAt: 1_000 } }),
+      held(
+        {},
+        { categories: { rows, measuredAt: 1_000, model: "claude-haiku-4-5" } },
+      ),
       undefined,
     );
     expect(fresh.categories).toEqual(rows);
     expect(fresh.categoriesStale).toBe(false);
     expect(
-      crumbMeter(held({}, { categories: { rows, measuredAt: 1_000 } }), live())
-        .categoriesStale,
+      crumbMeter(
+        held(
+          {},
+          {
+            categories: { rows, measuredAt: 1_000, model: "claude-haiku-4-5" },
+          },
+        ),
+        live(),
+      ).categoriesStale,
     ).toBe(true);
     expect(
       crumbMeter(
