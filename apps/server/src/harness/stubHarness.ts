@@ -141,6 +141,8 @@ export interface RecordedPrompt {
    * briefing, U13 review 3), which the seam says by passing no `operator`.
    */
   readonly attachments: readonly MessageAttachment[] | undefined;
+  /** The uploads folder the operator's message was sent with (U13 review 4). */
+  readonly uploadsFolder?: string | undefined;
 }
 
 /**
@@ -164,6 +166,7 @@ export const recordPrompts = (): {
           text,
           delivery,
           attachments: operator?.attachments,
+          uploadsFolder: operator?.uploadsFolder,
         });
         return { delivered: true };
       }),

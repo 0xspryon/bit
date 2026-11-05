@@ -3995,6 +3995,7 @@ export const claudeCodeHarness = (
                 : {
                     _tag: "operator",
                     attachments: operator.attachments,
+                    uploads: operator.uploadsFolder,
                     pending: pendingCodes(record),
                   },
               { key: attachmentKey, sessionId },

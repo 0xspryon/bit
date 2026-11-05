@@ -72,8 +72,6 @@ import {
 } from "@bit/contracts";
 import { Context, Effect, Layer, type Duration } from "effect";
 
-import { join } from "node:path";
-
 import type { AgentHarness } from "../harness/agentHarness";
 import {
   makeLiveAgentSessions,
@@ -108,7 +106,7 @@ import {
 } from "./goalPrompt";
 import { goalConversationNarration } from "./goalNarration";
 import { attachmentView } from "../harness/attachments";
-import { UPLOADS_FOLDER, type ReadUpload } from "../upload/uploads";
+import { uploadsFolderIn, type ReadUpload } from "../upload/uploads";
 
 /**
  * One goal's live conversation, as this process holds it.
@@ -970,10 +968,9 @@ const make = Effect.fnUntraced(function* () {
      */
     let uploadsFolder: string | undefined;
     try {
-      uploadsFolder = join(
+      uploadsFolder = uploadsFolderIn(
         here?.directory ??
           fleet.paths.goalDirectory(input.targetId, input.goalId),
-        UPLOADS_FOLDER,
       );
     } catch {
       uploadsFolder = undefined;

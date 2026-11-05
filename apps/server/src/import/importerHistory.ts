@@ -70,7 +70,6 @@
  * needed to change — but the note must not promise that only the first message was
  * trimmed, and it does not.
  */
-import { join } from "node:path";
 
 import {
   type ImporterContinuation,
@@ -91,7 +90,7 @@ import { roleDirectoryMatcher, sessionReopen } from "../harness/sessionReopen";
 import { isRoleDirectoryId } from "../persistence/fleet";
 import type { CallerContext } from "../persistence/store";
 import { projectReplay } from "../run/liveTranscript";
-import { UPLOADS_FOLDER } from "../upload/uploads";
+import { uploadsFolderIn } from "../upload/uploads";
 
 /** How long the harness is given to answer about one conversation. */
 export const IMPORTER_HISTORY_FETCH_TIMEOUT: Duration.Input = "5 seconds";
@@ -558,7 +557,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
     Effect.timeout(
       harness.messages(sessionId, {
         uploadsFolder:
-          runsIn === undefined ? undefined : join(runsIn, UPLOADS_FOLDER),
+          runsIn === undefined ? undefined : uploadsFolderIn(runsIn),
       }),
       input.fetchTimeout ?? IMPORTER_HISTORY_FETCH_TIMEOUT,
     ),

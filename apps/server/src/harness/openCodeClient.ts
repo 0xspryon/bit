@@ -1985,15 +1985,72 @@ export const openCodeHarness = (
        * OpenCode's coordinator registers an execution in the same step that admits a
        * prompt (`execution.wake` after `admission.admit`) and keeps it until its inbox
        * drains, a successor starting in the same step as it settles
-       * (`run-coordinator.ts`, read 2026-11-05). Present, the list stands. A Stop cancels
-       * the inbox (`interruptSession`), so nothing held survives into the next execution.
-       * The read is one loopback GET; if it fails the list stands, which only vouches for
-       * blocks bit did send.
+       * (`run-coordinator.ts`, read 2026-11-05). Present, the list stands.
+       *
+       * **Absent, the list keeps what is still in the inbox** (U13 review 4). A Stop
+       * (`interruptSession`) does not cancel the inbox: a queued message is held there,
+       * unread, and runs when the session is next prompted (measured, U13 review 4; see
+       * `holding`). So an idle session's list is narrowed to the codes whose message is
+       * still a `user` item in `session.inbox.list` — found by its `(bit:<code>)`, which
+       * only bit's own header for that message carries — rather than emptied. Each read is
+       * one loopback GET; if one fails the list stands, which only vouches for blocks bit
+       * did send.
+       *
+       * **One send at a time per session** ({@link sendingIn}): the reads, the update and
+       * `session.prompt`'s admission run under one permit, so a second message's read
+       * cannot land before the first is admitted and see the session idle with nothing
+       * pending — the race U13 review 4 reproduced with a file message and a Send now fired
+       * together (both went out naming no earlier code). `session.prompt` answers at
+       * admission (`timeouts.control`), so the permit is never held while the model works.
        *
        * After a restart this is empty: a message sent before it and still unread would not
        * be named. Per process, like {@link delivered}.
        */
       const pendingBlocks = new Map<string, readonly string[]>();
+
+      /** One permit per session, for {@link pendingBlocks}' read-update-admit. Kept like {@link delivered}. */
+      const sendLocks = new Map<string, Semaphore.Semaphore>();
+      const sendingIn = (sessionId: string) => {
+        let lock = sendLocks.get(sessionId);
+        if (lock === undefined) {
+          lock = Semaphore.makeUnsafe(1);
+          sendLocks.set(sessionId, lock);
+        }
+        return Semaphore.withPermit(lock);
+      };
+
+      /**
+       * The codes {@link pendingBlocks} keeps for `sessionId` at this moment: all of them
+       * while the session executes, those still in its inbox while it is idle.
+       */
+      const stillPending = Effect.fn("openCodeHarness.stillPending")(function* (
+        sessionId: string,
+      ) {
+        const known = pendingBlocks.get(sessionId) ?? [];
+        if (known.length === 0) return known;
+        const active = yield* Effect.result(
+          bounded("session.active", timeouts.control, api.session.active()),
+        );
+        if (
+          active._tag === "Failure" ||
+          Object.hasOwn(active.success, sessionId)
+        )
+          return known;
+        const waiting = yield* Effect.result(
+          bounded(
+            "session.inbox.list",
+            timeouts.control,
+            api.session.inbox.list({ sessionID: sessionId as Session.ID }),
+          ),
+        );
+        if (waiting._tag === "Failure") return known;
+        const held = waiting.success.flatMap((item) =>
+          item.type === "user" ? [item.payload.text] : [],
+        );
+        return known.filter((code) =>
+          held.some((text) => text.includes(`(bit:${code})`)),
+        );
+      });
 
       /**
        * Gives a session its opening prompt, or a second message into a live one.
@@ -2039,64 +2096,61 @@ export const openCodeHarness = (
           delivered.set(sessionId, sent);
         }
         const mark = attachmentMark();
-        let pending: readonly string[] = [];
-        if (operator !== undefined && delivery._tag === "steer") {
-          const active = yield* Effect.result(
-            bounded("session.active", timeouts.control, api.session.active()),
-          );
-          pending =
-            active._tag === "Success" &&
-            !Object.hasOwn(active.success, sessionId)
-              ? []
-              : (pendingBlocks.get(sessionId) ?? []);
-        }
-        // Named before it is sent: a prompt whose answer is lost may still have landed,
-        // and naming a code nobody else knows vouches for nothing but bit's own block.
-        if (operator !== undefined) {
-          pendingBlocks.set(
-            sessionId,
-            [...pending, mark].slice(-PENDING_CODES_MAX),
-          );
-        }
-        yield* bounded(
-          "session.prompt",
-          timeouts.control,
-          api.session.prompt({
-            sessionID: sessionId as Session.ID,
-            text: withClosingBlock(
-              text,
-              operator === undefined
-                ? BRIEFING
+        const send = Effect.gen(function* () {
+          const pending: readonly string[] =
+            operator !== undefined && delivery._tag === "steer"
+              ? yield* stillPending(sessionId)
+              : [];
+          // Named before it is sent: a prompt whose answer is lost may still have landed,
+          // and naming a code nobody else knows vouches for nothing but bit's own block.
+          if (operator !== undefined) {
+            pendingBlocks.set(
+              sessionId,
+              [...pending, mark].slice(-PENDING_CODES_MAX),
+            );
+          }
+          yield* bounded(
+            "session.prompt",
+            timeouts.control,
+            api.session.prompt({
+              sessionID: sessionId as Session.ID,
+              text: withClosingBlock(
+                text,
+                operator === undefined
+                  ? BRIEFING
+                  : {
+                      _tag: "operator",
+                      attachments: operator.attachments,
+                      uploads: operator.uploadsFolder,
+                      pending,
+                    },
+                { key: attachmentKey, sessionId },
+                mark,
+              ),
+              ...(files.length === 0 ? {} : { files }),
+              // Spread rather than passed as `undefined` for `parentID`'s reason: an absent
+              // field is the server's own default, and the opening prompt deliberately takes
+              // it. §24.1 reports that the server resolved an omitted `delivery` to `steer`
+              // and said so on the inbox record it answered with — which is harmless for a
+              // first prompt, since there is nothing in flight to cut off.
+              ...(delivery._tag === "open"
+                ? {}
                 : {
-                    _tag: "operator",
-                    attachments: operator.attachments,
-                    pending,
-                  },
-              { key: attachmentKey, sessionId },
-              mark,
-            ),
-            ...(files.length === 0 ? {} : { files }),
-            // Spread rather than passed as `undefined` for `parentID`'s reason: an absent
-            // field is the server's own default, and the opening prompt deliberately takes
-            // it. §24.1 reports that the server resolved an omitted `delivery` to `steer`
-            // and said so on the inbox record it answered with — which is harmless for a
-            // first prompt, since there is nothing in flight to cut off.
-            ...(delivery._tag === "open"
-              ? {}
-              : {
-                  // A `steer` is read once the message being written ends, not mid-reply
-                  // (measured, A6 U6 review): see `SendNowTiming` in the web app for what
-                  // the operator is told, and its V2(chat) note for cutting in.
-                  delivery:
-                    delivery.urgency === "preemptive" ? "steer" : "queue",
-                  // The derived id in OpenCode's own space: `msg_` plus the hex. The brand
-                  // checks only that prefix.
-                  id: openCodeMessageId(
-                    delivery.messageId,
-                  ) as SessionMessage.ID,
-                }),
-          }),
-        );
+                    // A `steer` is read once the message being written ends, not mid-reply
+                    // (measured, A6 U6 review): see `SendNowTiming` in the web app for what
+                    // the operator is told, and its V2(chat) note for cutting in.
+                    delivery:
+                      delivery.urgency === "preemptive" ? "steer" : "queue",
+                    // The derived id in OpenCode's own space: `msg_` plus the hex. The brand
+                    // checks only that prefix.
+                    id: openCodeMessageId(
+                      delivery.messageId,
+                    ) as SessionMessage.ID,
+                  }),
+            }),
+          );
+        });
+        yield* sendingIn(sessionId)(send);
         return { delivered: true };
       });
 

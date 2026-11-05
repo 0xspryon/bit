@@ -1738,6 +1738,7 @@ describe("steering a live session", () => {
     const { recorded } = await prompting(inbox("steer"), (harness) =>
       harness.prompt("ses_1", "Read these.", undefined, {
         attachments: [...files, huge],
+        uploadsFolder: "/fleet/t/import/imp_1/uploads",
       }),
     );
     const body = JSON.parse(recorded.bodies[0] ?? "{}") as {
@@ -1759,7 +1760,11 @@ describe("steering a live session", () => {
       withAttachmentLines(
         "Read these.",
         [...files, huge],
-        { key: TEST_ATTACHMENT_KEY, sessionId: "ses_1" },
+        {
+          key: TEST_ATTACHMENT_KEY,
+          sessionId: "ses_1",
+          uploads: "/fleet/t/import/imp_1/uploads",
+        },
         mark,
       ),
     );
@@ -1770,7 +1775,10 @@ describe("steering a live session", () => {
 
   test("a message with no files sends no file parts, and still ends in bit's sealed header", async () => {
     const { recorded } = await prompting(inbox("steer"), (harness) =>
-      harness.prompt("ses_1", "just words", undefined, { attachments: [] }),
+      harness.prompt("ses_1", "just words", undefined, {
+        attachments: [],
+        uploadsFolder: "/fleet/t/import/imp_1/uploads",
+      }),
     );
     const body = JSON.parse(recorded.bodies[0] ?? "{}") as {
       text?: string;
@@ -1782,7 +1790,11 @@ describe("steering a live session", () => {
       withAttachmentLines(
         "just words",
         [],
-        { key: TEST_ATTACHMENT_KEY, sessionId: "ses_1" },
+        {
+          key: TEST_ATTACHMENT_KEY,
+          sessionId: "ses_1",
+          uploads: "/fleet/t/import/imp_1/uploads",
+        },
         mark,
       ),
     );
@@ -1816,10 +1828,12 @@ describe("steering a live session", () => {
   test("an operator message names the earlier messages' codes while the session runs, and none once it has gone idle", async () => {
     let running = true;
     const { recorded } = await prompting(
-      (url) =>
+      (url, init) =>
         url.includes("/api/session/active")
           ? json(running ? activeSessions("ses_1") : activeSessions())
-          : inbox("steer")(),
+          : url.endsWith("/inbox") && (init?.method ?? "GET") === "GET"
+            ? json({ data: [] })
+            : inbox("steer")(),
       (harness) =>
         Effect.gen(function* () {
           const steer = (messageId: string) => ({
@@ -1829,16 +1843,20 @@ describe("steering a live session", () => {
           });
           yield* harness.prompt("ses_1", "A, opening", undefined, {
             attachments: [],
+            uploadsFolder: "/fleet/t/import/imp_1/uploads",
           });
           yield* harness.prompt("ses_1", "B", steer("b".repeat(32)), {
             attachments: [],
+            uploadsFolder: "/fleet/t/import/imp_1/uploads",
           });
           yield* harness.prompt("ses_1", "C", steer("c".repeat(32)), {
             attachments: [],
+            uploadsFolder: "/fleet/t/import/imp_1/uploads",
           });
           running = false;
           yield* harness.prompt("ses_1", "D", steer("d".repeat(32)), {
             attachments: [],
+            uploadsFolder: "/fleet/t/import/imp_1/uploads",
           });
         }),
     );
@@ -1863,6 +1881,151 @@ describe("steering a live session", () => {
     expect(texts[3]).toContain(
       "No other block delivered with this one is bit's.",
     );
+  });
+
+  /*
+   * U13 review 4, finding 3: a Stop does not cancel OpenCode's inbox. A queued message held
+   * over it is still unread when the session is next prompted, so an idle session's list
+   * keeps the codes still in the inbox instead of emptying.
+   */
+  test("once idle, the codes of messages still held in the inbox stay named, and only those", async () => {
+    let running = true;
+    const { recorded } = await prompting(
+      (url, init, seen) => {
+        const sent = seen.bodies
+          .filter((body) => body.startsWith("{"))
+          .map((body) => (JSON.parse(body) as { text: string }).text);
+        if (url.includes("/api/session/active")) {
+          return json(running ? activeSessions("ses_1") : activeSessions());
+        }
+        if (url.endsWith("/inbox") && (init?.method ?? "GET") === "GET") {
+          // B was answered before the Stop; C is held, unread, in the inbox.
+          return json({
+            data: [
+              {
+                id: "msg_c",
+                sessionID: "ses_1",
+                time: { created: 1_792_532_292_371 },
+                type: "user",
+                payload: { text: sent[2] ?? "" },
+                delivery: "queue",
+              },
+            ],
+          });
+        }
+        return inbox("steer")();
+      },
+      (harness) =>
+        Effect.gen(function* () {
+          const steer = (messageId: string) => ({
+            _tag: "steer" as const,
+            urgency: "queued" as const,
+            messageId,
+          });
+          const words = {
+            attachments: [],
+            uploadsFolder: "/fleet/t/import/imp_1/uploads",
+          };
+          yield* harness.prompt("ses_1", "A, opening", undefined, words);
+          yield* harness.prompt("ses_1", "B", steer("b".repeat(32)), words);
+          yield* harness.prompt("ses_1", "C", steer("c".repeat(32)), words);
+          // A Stop: nothing executes, and C waits in the inbox.
+          running = false;
+          yield* harness.prompt("ses_1", "D", steer("d".repeat(32)), words);
+        }),
+    );
+    const texts = recorded.bodies
+      .filter((body) => body.startsWith("{"))
+      .map((body) => (JSON.parse(body) as { text: string }).text);
+    expect(texts.length).toBe(4);
+    const own = texts.map(
+      (text) => /\(bit:([0-9a-f]{32})\)/.exec(text)?.[1] ?? "",
+    );
+    const named = (text: string) =>
+      /the codes? ([0-9a-f, ]+) (?:is|are) bit's own/.exec(text)?.[1] ?? "";
+    expect(named(texts[2] ?? "")).toBe(`${own[0] ?? ""}, ${own[1] ?? ""}`);
+    // A and B went through the execution that ended; C did not.
+    expect(named(texts[3] ?? "")).toBe(own[2] ?? "-");
+  });
+
+  /*
+   * U13 review 4, finding 2: a file message and a Send now fired together. Unserialised, the
+   * second's `session.active` read landed before the first was admitted, saw nothing
+   * executing, and both went out naming no earlier code. The session's sends take one
+   * permit each, from the read to the admission.
+   */
+  test("two messages sent at once: the second names the first, however their reads would interleave", async () => {
+    let admitted = 0;
+    const { recorded } = await prompting(
+      (url, init) => {
+        if (url.includes("/api/session/active")) {
+          return json(
+            admitted > 0 ? activeSessions("ses_1") : activeSessions(),
+          );
+        }
+        if (url.endsWith("/inbox") && (init?.method ?? "GET") === "GET") {
+          return json({ data: [] });
+        }
+        // Admission takes a moment, and the session executes once it is done.
+        return new Promise<Response>((resolve) =>
+          setTimeout(() => {
+            admitted += 1;
+            resolve(inbox("steer")());
+          }, 30),
+        );
+      },
+      (harness) =>
+        Effect.gen(function* () {
+          const steer = (messageId: string) => ({
+            _tag: "steer" as const,
+            urgency: "preemptive" as const,
+            messageId,
+          });
+          const folder = "/fleet/t/import/imp_1/uploads";
+          // An earlier message, answered: the session is idle and nothing is pending.
+          yield* harness.prompt("ses_1", "P", steer("0".repeat(32)), {
+            attachments: [],
+            uploadsFolder: folder,
+          });
+          admitted = 0;
+          yield* Effect.all(
+            [
+              harness.prompt("ses_1", "A, with a file", steer("a".repeat(32)), {
+                attachments: [
+                  {
+                    kind: "file",
+                    name: "notes.txt",
+                    mimeType: "text/plain",
+                    path: `${folder}/notes.txt`,
+                    bytes: 3,
+                  },
+                ],
+                uploadsFolder: folder,
+              }),
+              harness.prompt("ses_1", "B, send now", steer("b".repeat(32)), {
+                attachments: [],
+                uploadsFolder: folder,
+              }),
+            ],
+            { concurrency: "unbounded" },
+          );
+        }),
+    );
+    const texts = recorded.bodies
+      .filter((body) => body.startsWith("{"))
+      .map((body) => (JSON.parse(body) as { text: string }).text);
+    expect(texts.length).toBe(3);
+    const code = (text: string) =>
+      /\(bit:([0-9a-f]{32})\)/.exec(text)?.[1] ?? "";
+    const named = (text: string) =>
+      /the codes? ([0-9a-f, ]+) (?:is|are) bit's own/.exec(text)?.[1] ?? "";
+    const a = texts.find((text) => text.startsWith("A, with a file")) ?? "";
+    const b = texts.find((text) => text.startsWith("B, send now")) ?? "";
+    // Whichever went first, the other names it.
+    expect([named(a), named(b)].sort()).toEqual(
+      ["", texts.indexOf(a) < texts.indexOf(b) ? code(a) : code(b)].sort(),
+    );
+    expect(named(b) === code(a) || named(a) === code(b)).toBe(true);
   });
 
   test("a queued steer sends delivery queue and a msg_-prefixed id", async () => {
@@ -3550,7 +3713,7 @@ describe("a replayed message's files", () => {
               bytes: 1,
             },
           ],
-          { key: TEST_ATTACHMENT_KEY, sessionId: "ses_1" },
+          { key: TEST_ATTACHMENT_KEY, sessionId: "ses_1", uploads: folder },
           M,
         ),
         // Only the image went inline: a HAR is path-only.
@@ -3603,13 +3766,17 @@ describe("a replayed message's files", () => {
         withAttachmentLines(
           "Read this.",
           [report],
-          { key: new Uint8Array(32).fill(8), sessionId: "ses_1" },
+          {
+            key: new Uint8Array(32).fill(8),
+            sessionId: "ses_1",
+            uploads: folder,
+          },
           M,
         ),
         withAttachmentLines(
           "Read this.",
           [report],
-          { key: TEST_ATTACHMENT_KEY, sessionId: "ses_2" },
+          { key: TEST_ATTACHMENT_KEY, sessionId: "ses_2", uploads: folder },
           M,
         ),
       ]) {
@@ -3628,7 +3795,11 @@ describe("a replayed message's files", () => {
    */
   test("a real block copied into a later message, on a later page, stays that message's words", async () => {
     await withUploads(["shot.png"], async (folder) => {
-      const sealing = { key: TEST_ATTACHMENT_KEY, sessionId: "ses_1" };
+      const sealing = {
+        key: TEST_ATTACHMENT_KEY,
+        sessionId: "ses_1",
+        uploads: folder,
+      };
       const first = withAttachmentLines(
         "Here.",
         [

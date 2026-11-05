@@ -62,6 +62,14 @@ import { resolveThroughSymlinks } from "../policy/install";
 /** The folder, inside a session's working directory, that every upload is stored in. */
 export const UPLOADS_FOLDER = "uploads";
 
+/**
+ * The uploads folder of a session working in `directory`: the one folder {@link storeUploads}
+ * writes to, and the one a driver's header names as the only place an attachment is ever in
+ * (`harness/attachments.ts`, U13 review 4). One definition, so the two cannot disagree.
+ */
+export const uploadsFolderIn = (directory: string): string =>
+  join(directory, UPLOADS_FOLDER);
+
 const MiB = 1024 * 1024;
 
 /** Per image: 10 MiB (T3's `PROVIDER_SEND_TURN_MAX_IMAGE_BYTES`). */
@@ -496,7 +504,7 @@ export const storeUploads = (
 ): Effect.Effect<readonly MessageAttachment[], UploadWriteFailed> =>
   Effect.try({
     try: () => {
-      const folder = join(directory, UPLOADS_FOLDER);
+      const folder = uploadsFolderIn(directory);
       mkdirSync(folder, { recursive: true, mode: 0o700 });
       let folderHandle: number;
       try {

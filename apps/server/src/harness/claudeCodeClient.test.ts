@@ -28,7 +28,7 @@
  */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import type {
@@ -111,7 +111,12 @@ const sealed = (
   withAttachmentLines(
     text,
     files.map((file) => ({ ...file, mimeType: "", bytes: 0 })),
-    { key: TEST_ATTACHMENT_KEY, sessionId },
+    {
+      key: TEST_ATTACHMENT_KEY,
+      sessionId,
+      uploads:
+        files[0] === undefined ? "/tmp/ws/uploads" : dirname(files[0].path),
+    },
     M,
   );
 
@@ -4064,7 +4069,7 @@ describe("a second accepted message, and what settlement means after one", () =>
           urgency: "preemptive" as const,
           messageId,
         });
-        const words = { attachments: [] };
+        const words = { attachments: [], uploadsFolder: "/tmp/ws/uploads" };
         yield* harness.prompt(SESSION, "P, opening", undefined, words);
         yield* Effect.promise(() => driver.pulled(1));
         yield* harness.prompt(SESSION, "B", steer("b".repeat(32)), words);
@@ -6809,6 +6814,7 @@ describe("a message's files", () => {
                 bytes: 12,
               },
             ],
+            uploadsFolder: join(root, "uploads"),
           });
           yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)));
           return unmarked(seen[0]?.contents);
@@ -6826,7 +6832,7 @@ describe("a message's files", () => {
           },
           {
             type: "text",
-            text: `Describe it.\n\n${attachmentHeader("MARK")} (seal:SEAL)\n[Attached image "shot.png" is saved at: ${png}] (bit:MARK)\n[Attached file "notes.txt" is saved at: ${notes}] (bit:MARK)`,
+            text: `Describe it.\n\n${attachmentHeader("MARK", 0, { _tag: "files", uploads: join(root, "uploads") })} (seal:SEAL)\n[Attached image "shot.png" is saved at: ${png}] (bit:MARK)\n[Attached file "notes.txt" is saved at: ${notes}] (bit:MARK)`,
           },
         ],
       ]);
@@ -6855,13 +6861,14 @@ describe("a message's files", () => {
               bytes: 10,
             },
           ],
+          uploadsFolder: "/tmp/ws/uploads",
         });
         yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)));
         return unmarked(seen[0]?.contents);
       }),
     );
     expect(contents).toEqual([
-      `Read it.\n\n${attachmentHeader("MARK")} (seal:SEAL)\n[Attached file "policy.pdf" is saved at: /tmp/ws/uploads/policy.pdf] (bit:MARK)`,
+      `Read it.\n\n${attachmentHeader("MARK", 0, { _tag: "files", uploads: "/tmp/ws/uploads" })} (seal:SEAL)\n[Attached file "policy.pdf" is saved at: /tmp/ws/uploads/policy.pdf] (bit:MARK)`,
     ]);
   });
 
@@ -6886,6 +6893,7 @@ describe("a message's files", () => {
                 bytes: 4,
               },
             ],
+            uploadsFolder: "/nonexistent/bit/uploads",
           }),
         );
         return { sent: sent._tag, launched: seen.length };
@@ -7079,7 +7087,10 @@ const remarked = (jsonl: string, sessionId: string): string => {
       .slice(at + 2)
       .split("\n")
       .map((line) => `${line} (bit:${mark})`);
-    const header = attachmentHeader(mark, imitationLines(words));
+    const header = attachmentHeader(mark, imitationLines(words), {
+      _tag: "files",
+      uploads: RECORDED_UPLOADS,
+    });
     const seal = attachmentSeal(
       { key: TEST_ATTACHMENT_KEY, sessionId },
       header,
@@ -7261,7 +7272,11 @@ test("two steers stored as one entry replay as the live take draws them, and a c
     const folder = join(root, "uploads");
     await mkdir(folder);
     await writeFile(join(folder, "a.png"), "x");
-    const sealing = { key: TEST_ATTACHMENT_KEY, sessionId: SESSION };
+    const sealing = {
+      key: TEST_ATTACHMENT_KEY,
+      sessionId: SESSION,
+      uploads: folder,
+    };
     const steerA = withAttachmentLines(
       "Steer A: this one carries a file.",
       [

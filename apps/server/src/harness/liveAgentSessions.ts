@@ -106,6 +106,7 @@ import {
 import type { WorkerUrls } from "../run/supervisor";
 import {
   storeUploads,
+  uploadsFolderIn,
   type ReadUpload,
   type UploadWriteFailed,
 } from "../upload/uploads";
@@ -1132,7 +1133,10 @@ export const makeLiveAgentSessions = <Meta>(
                       OPEN_PROMPT,
                       // The operator's first message, inside the framing: an operator
                       // message's block (U13 review 3), not a briefing's.
-                      { attachments: opened.success.attachments },
+                      {
+                        attachments: opened.success.attachments,
+                        uploadsFolder: uploadsFolderIn(entry.directory),
+                      },
                     ),
                   );
                   if (prompted._tag === "Failure") {
@@ -1222,7 +1226,7 @@ export const makeLiveAgentSessions = <Meta>(
               urgency,
               messageId,
             },
-            { attachments },
+            { attachments, uploadsFolder: uploadsFolderIn(entry.directory) },
           ),
         );
         if (accepted._tag === "Failure") {

@@ -986,6 +986,13 @@ export const OPEN_PROMPT: PromptDelivery = { _tag: "open" };
  */
 export interface OperatorMessage {
   readonly attachments: readonly MessageAttachment[];
+  /**
+   * The session's uploads folder, absolute: where `storeUploads` (`upload/uploads.ts`) puts
+   * this session's files, whether or not it has put any yet. The block's header names it as
+   * the only folder an attachment is ever in (U13 review 4), and every path in
+   * `attachments` is directly inside it.
+   */
+  readonly uploadsFolder: string;
 }
 
 /** What a harness says about a prompt it took. */

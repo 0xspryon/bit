@@ -700,6 +700,47 @@ describe("a later message and a Stop (A6 F5)", () => {
     ]);
   });
 
+  /*
+   * U13 review 4: the header names the session's uploads folder as the only place an
+   * attachment is, so the folder a driver is given must be exactly where `storeUploads`
+   * wrote — the entry's own directory's `uploads/` — for a message with files and without.
+   */
+  test("deliver gives the harness the folder its files were stored in, files or none", async () => {
+    const recorded = recordPrompts();
+    const harness = stubHarness({ prompt: recorded.prompt });
+    const directory = await withImporterSessions(
+      harness,
+      ({ sessions, plan }) =>
+        Effect.gen(function* () {
+          const entry = yield* opened(sessions, plan);
+          yield* sessions.deliver(entry, "words only", "queued");
+          yield* sessions.deliver(entry, "with a file", "queued", [
+            {
+              sentName: "notes.txt",
+              name: "notes.txt",
+              contentType: "text/plain",
+              kind: "file",
+              mimeType: "text/plain",
+              bytes: new TextEncoder().encode("hi"),
+            },
+          ]);
+          return entry.directory;
+        }),
+    );
+    const sent = recorded.prompts.filter(
+      (each) => each.attachments !== undefined,
+    );
+    const folder = join(directory.result, "uploads");
+    expect(sent.map((each) => each.uploadsFolder)).toEqual(
+      sent.map(() => folder),
+    );
+    const withFile = sent.find((each) => each.text === "with a file");
+    expect(withFile?.attachments?.map((file) => file.path)).toEqual([
+      join(folder, "notes.txt"),
+    ]);
+    expect(sent.map((each) => each.text)).toContain("words only");
+  });
+
   test("a Stop of a running turn interrupts the harness and keeps the session, credential and all", async () => {
     const interrupted: string[] = [];
     const harness = stubHarness({
