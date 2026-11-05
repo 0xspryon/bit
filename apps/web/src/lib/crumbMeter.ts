@@ -104,10 +104,26 @@ export const crumbMeter = (
   const used = liveNewer
     ? live.promptTokens + (live.outputTokens ?? 0)
     : (reading?.used ?? null);
+  /*
+   * A live call on a model the reading knows nothing of: the session was moved to it after
+   * the reading, from another client (A6 U9 review 4), so the reading's window and model are
+   * the old model's. Not a late frame of the call that was running when this tab's own
+   * switch landed: that one is on the model the reading's figure was measured on
+   * (`usedModel`), and the reading — asked again on the switch — has the new window.
+   */
+  const movedSince =
+    liveNewer &&
+    reading !== undefined &&
+    live.model !== null &&
+    live.model !== "" &&
+    !sameModel(live.model, reading.model) &&
+    !sameModel(live.model, reading.usedModel);
   // The reading's window first: it is asked again on a switch, so it is the new model's.
-  const window =
-    positive(reading?.window ?? null) ??
-    (live === undefined ? null : positive(live.contextLimit));
+  const window = movedSince
+    ? positive(live.contextLimit)
+    : (positive(reading?.window ?? null) ??
+      (live === undefined ? null : positive(live.contextLimit)));
+  const model = movedSince ? live.model : (reading?.model ?? null);
   const fraction =
     used === null || window === null ? null : clamp(used / window);
   // V2(chat): after a switch V1 draws the old model's last call over the new model's
@@ -133,7 +149,7 @@ export const crumbMeter = (
       ? prior.used
       : null;
   // The newest count, only under a reading of the window it was counted on.
-  const categories = sameWindow(context?.categories?.model, reading?.model)
+  const categories = sameWindow(context?.categories?.model, model)
     ? context?.categories
     : undefined;
   const at = liveNewer ? live.at : (reading?.measuredAt ?? null);
@@ -144,7 +160,7 @@ export const crumbMeter = (
     percent: fraction === null ? null : Math.round(fraction * 100),
     reading: kind,
     source: liveNewer ? "live" : reading === undefined ? null : "turn",
-    model: reading?.model ?? null,
+    model,
     usedModel,
     categories: categories?.rows ?? null,
     categoriesStale:

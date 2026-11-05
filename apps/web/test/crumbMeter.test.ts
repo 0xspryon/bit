@@ -108,6 +108,55 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(meter.model).toBe("claude-sonnet-5");
   });
 
+  test("a switch made from another client: the live call's window and model, not the reading's (U9 review 4)", () => {
+    // This tab read sonnet-5 (1,000,000) before another client moved the session to
+    // haiku-4-5; haiku's first call streams before this tab reads again.
+    const before = held(
+      {
+        model: "claude-sonnet-5",
+        usedModel: "claude-sonnet-5",
+        used: 36_000,
+        window: 1_000_000,
+      },
+      {
+        categories: {
+          rows: [],
+          measuredAt: 1_000,
+          model: "claude-sonnet-5",
+        },
+      },
+    );
+    const meter = crumbMeter(
+      before,
+      live({ promptTokens: 28_000, outputTokens: 100, contextLimit: 200_000 }),
+    );
+    expect(meter.window).toBe(200_000);
+    expect(meter.percent).toBe(14);
+    expect(sameModel(meter.model, "claude-haiku-4-5")).toBe(true);
+    // So the popover's "Measured on …'s last call. The next call, on …" note is not drawn.
+    expect(sameModel(meter.usedModel, meter.model)).toBe(true);
+    // Sonnet's categories are not haiku's window.
+    expect(meter.categories).toBeNull();
+    // A frame that states no window draws no fraction rather than the old model's.
+    expect(
+      crumbMeter(before, live({ contextLimit: null, promptTokens: 28_000 }))
+        .window,
+    ).toBeNull();
+    // A late frame of the call that ran when this tab's own switch landed is on the model
+    // the reading's figure was measured on: the reading's window stays.
+    const switchedHere = held({
+      model: "claude-haiku-4-5",
+      usedModel: "claude-sonnet-5",
+      window: 200_000,
+    });
+    const late = crumbMeter(
+      switchedHere,
+      live({ model: "claude-sonnet-5", contextLimit: 1_000_000 }),
+    );
+    expect(late.window).toBe(200_000);
+    expect(late.model).toBe("claude-haiku-4-5");
+  });
+
   test("a compaction: the reading says so with the figure before it; a large drop says it too; a recount does not", () => {
     const compacted = crumbMeter(
       held(

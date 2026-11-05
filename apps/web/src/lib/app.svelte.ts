@@ -5628,6 +5628,7 @@ export class App {
       const scope = usageScope(frame);
       if (scope === undefined) return;
       this.liveUsage = { ...this.liveUsage, [scope]: frame };
+      this.importer.noteUsage(frame);
       return;
     }
     /*

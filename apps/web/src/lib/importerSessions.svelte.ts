@@ -68,6 +68,7 @@ import type {
   ImporterConversationView,
   ImporterTurnAccepted,
   LiveItem,
+  LiveUsage,
   ModelOptionSelection,
   SteerUrgency,
 } from "@bit/contracts";
@@ -560,6 +561,11 @@ export class ImporterSessions {
    * it would put the chip back on a model the session has left.
    */
   readonly #switchedTo = new Map<string, string>();
+  /**
+   * The model a live frame showed each import moved to, from another client, once this tab
+   * has read the list and the window again for it ({@link noteUsage}).
+   */
+  readonly #movedTo = new Map<string, string>();
   /** The server's registry as last read, kept across visits: it is read once per page load. */
   #serverAgents: AgentsView | undefined = undefined;
   #server: ImporterServer | undefined = undefined;
@@ -668,6 +674,7 @@ export class ImporterSessions {
     this.switchFailures = [];
     this.waitingForSwitch = false;
     this.#switchedTo.clear();
+    this.#movedTo.clear();
     this.stopFailure = undefined;
     this.pickerOpen = false;
     this.#sent = 0;
@@ -879,6 +886,7 @@ export class ImporterSessions {
     this.switchFailures = [];
     this.waitingForSwitch = false;
     this.#switchedTo.clear();
+    this.#movedTo.clear();
     this.stopFailure = undefined;
     this.draft = "";
     this.pickerOpen = false;
@@ -1249,6 +1257,39 @@ export class ImporterSessions {
       return;
     }
     this.#watch(importId);
+  }
+
+  /**
+   * Reads the list and the window again when a live call frame names a model this tab does
+   * not have the session on (A6 U9 review 4): another client switched it, and the chip and
+   * the meter's window are still the old model's. Not for a late frame of the call that was
+   * running when a switch landed, which is on the model the reading's figure was measured on,
+   * nor while this tab's own switch of it is out. Once per import and model, so the frames of
+   * one call ask once. Called by the app for every usage frame.
+   */
+  // V2(chat): V1 learns of another client's switch from the first call on the new model,
+  // so the chip is stale until then (a switch made while the session idles shows only at its
+  // next call or reload). V2 should put a model switch on the live feed for every tab.
+  noteUsage(frame: LiveUsage): void {
+    const importId = frame.importId;
+    const model = frame.model;
+    const server = this.#server;
+    if (
+      server === undefined ||
+      importId === null ||
+      model === null ||
+      model === ""
+    ) {
+      return;
+    }
+    const session = this.sessions.find((each) => each.importId === importId);
+    if (session === undefined || sameModel(model, session.model)) return;
+    if (sameModel(model, this.contexts[importId]?.reading.usedModel)) return;
+    if (this.switches.some((each) => each.importId === importId)) return;
+    if (sameModel(model, this.#movedTo.get(importId))) return;
+    this.#movedTo.set(importId, model);
+    server.reread();
+    void this.readContext(importId, false, "switch");
   }
 
   #stopWatching(): void {

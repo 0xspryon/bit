@@ -359,6 +359,69 @@ describe("the crumb bar's context meter (A6 U9)", () => {
     expect(said(panel())).not.toContain("Down from");
   });
 
+  test("a switch made from another client: the new model's first call reads the list and the window again, once (U9 review 4)", async () => {
+    let answer = claudeReading({
+      model: "claude-sonnet-5",
+      used: 36_000,
+      window: 1_000_000,
+    });
+    const { app, fake } = await openOn(
+      importerSessionView({
+        harnessInstanceId: "claude-code",
+        model: "claude-sonnet-5",
+      }),
+      "claude-code",
+      (breakdown) => answer(breakdown),
+    );
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    await settle();
+    const lists = () =>
+      fake.calls.filter((call) => call.method === "importerSessions").length;
+    const listsBefore = lists();
+    const readsBefore = contextCalls(fake).length;
+    // Another client moved the session to haiku-4-5; this tab still reads sonnet-5. The
+    // server answers the new model from here on.
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: [
+          importerSessionView({
+            harnessInstanceId: "claude-code",
+            model: "claude-haiku-4-5",
+          }),
+        ],
+      });
+    answer = claudeReading({ used: 36_000, usedModel: "claude-sonnet-5" });
+    const frame = (callId: string, at: number) => ({
+      _tag: "usage" as const,
+      callId,
+      promptTokens: 28_000,
+      outputTokens: null,
+      contextLimit: 200_000,
+      compactionAt: null,
+      model: "claude-haiku-4-5-20251001",
+      attemptId: null,
+      roundId: null,
+      goalId: null,
+      importId: "imp_1",
+      at,
+    });
+    fake.watch.send(frame("msg_h1", Date.now() + 1_000));
+    fake.watch.send(frame("msg_h1", Date.now() + 1_100));
+    await settle();
+    expect(lists()).toBe(listsBefore + 1);
+    expect(contextCalls(fake).length).toBe(readsBefore + 1);
+    expect(app.importer.current?.model).toBe("claude-haiku-4-5");
+    // The figure is the live call's, over haiku's window, and no note calls it sonnet's.
+    click(meterButton());
+    await settle();
+    expect(said(panel())).toContain("of 200,000 tokens");
+    expect(said(panel())).not.toContain("Measured on");
+    // A later call on the same model asks nothing more.
+    fake.watch.send(frame("msg_h2", Date.now() + 2_000));
+    await settle();
+    expect(lists()).toBe(listsBefore + 1);
+  });
+
   test("categories counted on another model are not shown under this one's window, and the open meter counts this one once (U9 review 2)", async () => {
     let at = Date.now();
     let answer = claudeReading({ measuredAt: at });

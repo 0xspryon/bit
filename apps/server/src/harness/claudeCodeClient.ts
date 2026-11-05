@@ -444,7 +444,6 @@ interface StreamedBlock {
   kind: string | undefined;
 }
 
-/** Everything one session is, before and after it is running. */
 /** One main-thread call as {@link SessionRecord.calls} holds it. */
 interface CallSeen {
   readonly id: string;
@@ -488,6 +487,7 @@ const modelOfApiUsage = (
   return models.size === 1 && only !== undefined ? only : null;
 };
 
+/** Everything one session is, before and after it is running. */
 interface SessionRecord {
   readonly sessionId: string;
   readonly title: string;

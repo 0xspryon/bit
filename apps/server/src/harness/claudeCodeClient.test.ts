@@ -8030,6 +8030,56 @@ describe("how full a session's window is (A6 U9)", () => {
     );
     expect(stopped.usedModel).toBe("claude-sonnet-5");
   });
+
+  test("a sub-agent's call is never the one `apiUsage` is labelled by (U9 review 4)", async () => {
+    // A sub-agent's `message_start` carries the sub-agent's model and prompt side; `apiUsage`
+    // stays the main thread's (measured live: a web-fetch sub-agent did not move it). A figure
+    // that happens to equal the sub-agent's prompt side is still nobody's this stream saw.
+    const subagentStart = {
+      ...(startOn("claude-haiku-4-5-20251001", "msg_sub", 19_000) as object),
+      parent_tool_use_id: "toolu_agent",
+    } as unknown as SDKMessage;
+    const answer = await reading(
+      {
+        messages: [
+          callOn("claude-sonnet-5", "msg_sonnet", 24_000),
+          subagentStart,
+          result("s", "success"),
+        ],
+        contextUsage: () => ({ ...FULL, apiUsage: apiOf(19_000) }),
+      },
+      false,
+    );
+    expect(answer.usedModel).toBeNull();
+  });
+
+  test("two calls of different models with the prompt side `apiUsage` has: nobody says whose it is (U9 review 4)", async () => {
+    const answer = await reading(
+      {
+        messages: [
+          callOn("claude-sonnet-5", "msg_sonnet", 24_000),
+          startOn("claude-haiku-4-5-20251001", "msg_haiku", 24_000),
+          result("s", "success"),
+        ],
+        contextUsage: () => ({ ...FULL, apiUsage: apiOf(24_000) }),
+      },
+      false,
+    );
+    expect(answer.usedModel).toBeNull();
+    // Two calls of one model with that prompt side are still that model's.
+    const same = await reading(
+      {
+        messages: [
+          callOn("claude-sonnet-5", "msg_one", 24_000),
+          callOn("claude-sonnet-5", "msg_two", 24_000),
+          result("s", "success"),
+        ],
+        contextUsage: () => ({ ...FULL, apiUsage: apiOf(24_000) }),
+      },
+      false,
+    );
+    expect(same.usedModel).toBe("claude-sonnet-5");
+  });
 });
 
 describe("the CLI's echo of a model switch (A6 U9, found live)", () => {
