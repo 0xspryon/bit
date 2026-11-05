@@ -1596,9 +1596,10 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
      *
      * The path is the attachment's own (`MessageAttachmentView.path`) and is **only a
      * request**: the server re-derives it — inside this target's directory as
-     * `<import|goal>/<id>/uploads/<name>`, no `..`, no link anywhere along it, a regular file
-     * — and serves nothing else ({@link UploadedFileRefused}). Its bytes are always
-     * `application/octet-stream`; the browser types the blob from the attachment.
+     * `<import|goal>/<id>/uploads/<name>`, no `..`, no link anywhere along it, the file
+     * opened being the file checked, a regular file with one link — and serves nothing else
+     * ({@link UploadedFileRefused}). Its bytes are always `application/octet-stream`, sent
+     * `nosniff`; the browser types the blob from the attachment.
      */
     HttpApiEndpoint.get("uploadedFile", "/targets/:targetId/uploads", {
       params: { targetId: Schema.String },

@@ -23,6 +23,7 @@ import { Database } from "bun:sqlite";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -3912,6 +3913,7 @@ describe("serving a stored upload (U13)", () => {
     expect(response.headers.get("content-type")).toBe(
       "application/octet-stream",
     );
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(await response.text()).toBe("png!");
     const goal = await get(
       join(uploads(target, "goal", "goal_a"), "notes (2).txt"),
@@ -3949,6 +3951,19 @@ describe("serving a stored upload (U13)", () => {
       expect(refused.status).toBe(404);
       expect(refused.body["reason"]).toBe("not_an_upload");
     }
+  });
+
+  test("a hardlink in the uploads folder to a file outside it is refused, and a refusal is nosniff too (U13 review 1)", async () => {
+    const outside = join(dir(target), "outside-secret.txt");
+    writeFileSync(outside, "secret");
+    const linked = join(uploads(target, "import", "imp_a"), "linked.txt");
+    linkSync(outside, linked);
+    const response = await get(linked);
+    expect(response.status).toBe(404);
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body["reason"]).toBe("not_an_upload");
+    expect(String(body["detail"])).toContain("2 links");
   });
 
   test("a temporary, another target's upload and a missing file are not served", async () => {

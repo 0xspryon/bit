@@ -4,6 +4,7 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import {
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -26,6 +27,7 @@ import { decide, PERMISSIVE_POLICY } from "../policy/service";
 import {
   classifyUpload,
   DEFAULT_UPLOAD_LIMITS,
+  readStoredUpload,
   readUploadParts,
   sanitiseUploadName,
   storeUploads,
@@ -684,5 +686,73 @@ describe("the gate and an uploaded file (no new authority)", () => {
         },
       ).effect,
     ).toBe("deny");
+  });
+});
+
+/*
+ * U13 review 1, finding 3: swapping `goal/<id>/uploads` for a link while the route was
+ * hammered served the outside file (61 times in ~92k requests), and a hardlink in `uploads/`
+ * to an outside file was served outright. `O_NOFOLLOW` guards the last component only; what
+ * decides now is the file the descriptor holds.
+ */
+describe("serving a stored upload, against a swap and a hardlink", () => {
+  /** A target directory with one goal upload, and a secret outside it. */
+  const setUp = () => {
+    const root = mkdtempSync(join(base, "served-"));
+    const target = join(root, "target");
+    const folder = join(target, "goal", "goal_a", "uploads");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "notes.txt"), "the upload");
+    const outside = join(root, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "notes.txt"), "the secret");
+    return { target, folder, outside, path: join(folder, "notes.txt") };
+  };
+
+  test("a stored upload is served", () => {
+    const { target, path } = setUp();
+    const read = readStoredUpload(target, path, 1024);
+    expect(read._tag).toBe("file");
+    if (read._tag === "file") {
+      expect(new TextDecoder().decode(read.bytes)).toBe("the upload");
+    }
+  });
+
+  test("the uploads folder swapped for a link between the check and the open: refused, never the outside file", () => {
+    const { target, folder, outside, path } = setUp();
+    const read = readStoredUpload(target, path, 1024, {
+      beforeOpen: () => {
+        renameSync(folder, `${folder}-real`);
+        symlinkSync(outside, folder);
+      },
+    });
+    expect(read).toMatchObject({ _tag: "refused", reason: "not_an_upload" });
+    if (read._tag === "refused") {
+      expect(read.detail).toContain("changed while it was opened");
+      expect(read.detail).toContain(join(outside, "notes.txt"));
+    }
+  });
+
+  test("the session folder swapped for a link between the check and the open: refused", () => {
+    const { target, outside, path } = setUp();
+    const session = join(target, "goal", "goal_a");
+    mkdirSync(join(outside, "uploads"));
+    writeFileSync(join(outside, "uploads", "notes.txt"), "the secret");
+    const read = readStoredUpload(target, path, 1024, {
+      beforeOpen: () => {
+        renameSync(session, `${session}-real`);
+        symlinkSync(outside, session);
+      },
+    });
+    expect(read).toMatchObject({ _tag: "refused", reason: "not_an_upload" });
+  });
+
+  test("a hardlink in the uploads folder to a file outside it: refused, though its path is inside", () => {
+    const { target, folder, outside } = setUp();
+    const linked = join(folder, "linked.txt");
+    linkSync(join(outside, "notes.txt"), linked);
+    const read = readStoredUpload(target, linked, 1024);
+    expect(read).toMatchObject({ _tag: "refused", reason: "not_an_upload" });
+    if (read._tag === "refused") expect(read.detail).toContain("2 links");
   });
 });

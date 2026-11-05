@@ -86,7 +86,12 @@ import {
   Stream,
   type Duration,
 } from "effect";
-import { HttpServer, type Multipart } from "effect/http";
+import {
+  HttpEffect,
+  HttpServer,
+  HttpServerResponse,
+  type Multipart,
+} from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
 
 import {
@@ -1702,8 +1707,21 @@ const fleetHandlers = HttpApiBuilder.group(
        * U13). `readStoredUpload` re-derives the path inside this target's own directory and
        * serves nothing it cannot: the path came out of a transcript, so it is a request,
        * never an address. Read off disk once per request, under the per-file cap.
+       *
+       * Every answer is `X-Content-Type-Options: nosniff`, so a browser opening the bytes
+       * never second-guesses `application/octet-stream` into something it would run — the
+       * agent works in that folder and can put anything there.
        */
       uploadedFile: Effect.fn(function* ({ params, query }) {
+        yield* HttpEffect.appendPreResponseHandler((_request, response) =>
+          Effect.succeed(
+            HttpServerResponse.setHeader(
+              response,
+              "x-content-type-options",
+              "nosniff",
+            ),
+          ),
+        );
         const row = yield* openableTarget(fleet, params.targetId);
         const read = readStoredUpload(
           fleet.paths.targetDirectory(row.targetId),

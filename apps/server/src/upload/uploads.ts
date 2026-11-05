@@ -665,8 +665,15 @@ export type StoredUploadRefusal = {
  *   {@link UPLOAD_NAME_PATTERN} admits — so no `.incoming-` temporary, no hidden file;
  * - its real path is exactly that path under the target's real directory, so no component —
  *   the session folder, `uploads`, the file — is a link to anywhere, inside or out;
- * - and it is a regular file, opened `O_NOFOLLOW`, and the file opened is the one checked
- *   (device and inode), so a swap between the check and the open is refused too.
+ * - it is opened `O_NOFOLLOW`, which guards the **last** component only — a session folder
+ *   or `uploads` swapped for a link between the check above and the open is followed. So
+ *   what decides is the file **opened**: the kernel's own path for the open descriptor
+ *   (`/proc/self/fd/<fd>`) must be that same real path, and the file must be a regular file
+ *   with exactly one link, since a hardlink in `uploads/` to a file outside is the outside
+ *   file under an inside name, and no path check can tell.
+ *
+ * bit runs on Linux only, which is what makes `/proc/self/fd` there to read; where it is
+ * not, every file is refused rather than served unchecked.
  *
  * A file over `maxBytes` (the per-file cap, which every stored upload is under) is refused
  * rather than read into memory: the agent works in that folder and can put anything there.
@@ -679,6 +686,8 @@ export const readStoredUpload = (
   targetDirectory: string,
   path: string,
   maxBytes: number,
+  /** For tests: runs between the path checks and the open, where a swap would land. */
+  probe: { readonly beforeOpen?: () => void } = {},
 ):
   | { readonly _tag: "file"; readonly bytes: Uint8Array }
   | StoredUploadRefusal => {
@@ -737,9 +746,11 @@ export const readStoredUpload = (
       detail: `no file is stored at '${path}' any more: it was removed from the session's uploads folder, or the session's directory was swept.`,
     };
   }
-  if (real !== join(realTarget, kind, id, folder, name)) {
+  const expected = join(realTarget, kind, id, folder, name);
+  if (real !== expected) {
     return refuse(`'${path}' resolves through a link, to '${real}'`);
   }
+  probe.beforeOpen?.();
   let handle: number;
   try {
     handle = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -747,19 +758,33 @@ export const readStoredUpload = (
     return refuse(`'${path}' could not be opened as a plain file`);
   }
   try {
-    const opened = fstatSync(handle);
-    const named = statOrUndefined(path);
-    if (!opened.isFile() || named === undefined || !sameEntry(named, opened)) {
+    let opened: string;
+    try {
+      // Linux's own name for what the descriptor holds, whatever path reached it.
+      opened = realpathSync(`/proc/self/fd/${String(handle)}`);
+    } catch {
+      return refuse(`'${path}' could not be confirmed after it was opened`);
+    }
+    if (opened !== expected) {
       return refuse(
-        `'${path}' is not a regular file, or changed while it was opened`,
+        `'${path}' changed while it was opened: what was opened is '${opened}'`,
       );
     }
-    if (opened.size > maxBytes) {
+    const stat = fstatSync(handle);
+    if (!stat.isFile()) {
+      return refuse(`'${path}' is not a regular file`);
+    }
+    if (stat.nlink !== 1) {
       return refuse(
-        `'${path}' is ${describeBytes(opened.size)}, over ${describeBytes(maxBytes)}, the most any upload is stored at`,
+        `'${path}' has ${String(stat.nlink)} links, so it may be a file stored somewhere else under a name in the uploads folder`,
       );
     }
-    const bytes = new Uint8Array(opened.size);
+    if (stat.size > maxBytes) {
+      return refuse(
+        `'${path}' is ${describeBytes(stat.size)}, over ${describeBytes(maxBytes)}, the most any upload is stored at`,
+      );
+    }
+    const bytes = new Uint8Array(stat.size);
     let at = 0;
     while (at < bytes.length) {
       const read = readSync(handle, bytes, at, bytes.length - at, at);
